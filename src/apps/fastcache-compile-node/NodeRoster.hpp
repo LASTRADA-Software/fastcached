@@ -3,6 +3,7 @@
 
 #include "NodeConfig.hpp"
 #include "NodeProofClient.hpp"
+#include "SchedulerReachability.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
@@ -78,6 +79,13 @@ class IPresenceRoster
 /// started, or one whose roster lapsed, is a worker compiling nothing -- and bounded below by
 /// what a scheduler can bear: one announcement per wanting node every few seconds.
 inline constexpr std::chrono::seconds RosterWantingInterval { 2 };
+
+// This interval feeds `SchedulerReachability` exactly as `NodeAnnounceInterval` does --
+// `NodePresence::WaitOutInterval` substitutes it for the ordinary one, never runs both --
+// so it owes the tracker the same bound: strictly below the cadence, or a wanting node's
+// rounds would each read as due for a reminder rather than as the ordinary presence round
+// they are.
+static_assert(RosterWantingInterval < SchedulerUnreachableCadence);
 
 /// The roster this node verifies grants against, as one object (#178).
 class NodeRoster final: public IPresenceRoster, public IServerTrust

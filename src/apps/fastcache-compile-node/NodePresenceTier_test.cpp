@@ -16,6 +16,7 @@
 // never did, fails exactly one of them. Neither alone tests anything.
 #include "EndpointDialerTestUtils.hpp"
 #include "NodePresenceTier.hpp"
+#include "SchedulerReachability.hpp"
 
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -29,12 +30,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -106,12 +109,14 @@ struct PresenceFixture
 {
     NodeConfig cfg;
     AtomicMetricsSink metrics;
-    NullLogger logger;
+    CapturingLogger logger;
     SilentLoadSampler loadSampler;
     Testing::PlacedWallClock wall;
     Wire::CapacityFields capacity {};
     FleetSampler sampler { std::nullopt, metrics, NodeFacts(), wall, HistoryPaths {}, logger };
     NodeConditions conditions;
+    core::platform::ManualClock clock;
+    SchedulerReachability reachability { clock, &conditions };
 
     PresenceFixture()
     {
@@ -139,7 +144,8 @@ struct PresenceFixture
                                .conditions = conditions,
                                .roster = nullptr,
                                // Nothing proves: the scripted fleet serves no handshake (#178).
-                               .prover = nullptr };
+                               .prover = nullptr,
+                               .reachability = reachability };
     }
 
     /// Announce once through @p dialer.
@@ -240,6 +246,8 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
     Wire::CapacityFields const capacity {};
     FleetSampler sampler { std::nullopt, metrics, NodeFacts(), wall, HistoryPaths {}, logger };
     NodeConditions const conditions;
+    core::platform::ManualClock clock;
+    SchedulerReachability reachability { clock };
 
     REQUIRE(sampler.NextHistoryBatch(8).empty());
 
@@ -254,7 +262,8 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
                                                               .logger = logger,
                                                               .conditions = conditions,
                                                               .roster = nullptr,
-                                                              .prover = nullptr },
+                                                              .prover = nullptr,
+                                                              .reachability = reachability },
                                               link,
                                               dialer);
 
@@ -295,4 +304,64 @@ TEST_CASE("A machine announces its condition rows, as they stand when the round 
     };
     CHECK(stateOf(NodeCondition::EnrollmentWindowOpen) == "clear");
     CHECK(stateOf(NodeCondition::ScratchRootUnmappable) == "raised");
+}
+
+TEST_CASE("A presence refused round after round is one Warn and not one per round", "[node][presence][reachability]")
+{
+    PresenceFixture fixture;
+    auto const refused = Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "");
+    Testing::ScriptedDialer dialer { { refused, refused, refused } };
+
+    for ([[maybe_unused]] auto const _: std::views::iota(0, 3))
+    {
+        CHECK_FALSE(fixture.AnnounceThrough(dialer));
+        fixture.clock.advance(NodeAnnounceInterval);
+    }
+
+    auto const records = fixture.logger.Snapshot();
+    auto const warns =
+        std::ranges::count_if(records, [](CapturingLogger::Record const& record) { return record.level == LogLevel::Warn; });
+    CHECK(warns == 1);
+    CHECK(std::ranges::any_of(records, [](CapturingLogger::Record const& record) {
+        return record.level == LogLevel::Warn && record.message.contains("did not record this machine at");
+    }));
+}
+
+TEST_CASE("A presence exchange that stalls after connecting is unreachable, not a refused presence",
+          "[node][presence][reachability][conditions]")
+{
+    // A connection this scheduler ACCEPTED and then never finished answering never told this node
+    // anything to act on: it is the scheduler being unreachable, not a refusal to record this
+    // machine. Counting it as `PresenceRefused` sends an operator hunting for a problem with the
+    // machine's own record that was never the issue, and it left `scheduler-unreachable` unraised
+    // for exactly the outage it exists to report.
+    PresenceFixture fixture;
+    // Two bytes -- short of `Wire::ReplyHeaderSize` -- so the dial SUCCEEDS (a real scripted
+    // socket, never a failed dial) and the reply read then hits EOF partway through the header:
+    // what a peer that accepted the connection and then stalled or was lost produces.
+    Testing::ScriptedDialer dialer { { std::vector<std::byte>(2) } };
+
+    CHECK_FALSE(fixture.AnnounceThrough(dialer));
+
+    CHECK(fixture.conditions.StateOf(NodeCondition::SchedulerUnreachable) == Wire::ConditionState::Raised);
+    auto const records = fixture.logger.Snapshot();
+    CHECK(std::ranges::any_of(records, [](CapturingLogger::Record const& record) {
+        return record.level == LogLevel::Warn && record.message.contains("unreachable");
+    }));
+    CHECK_FALSE(std::ranges::any_of(
+        records, [](CapturingLogger::Record const& record) { return record.message.contains("did not record"); }));
+}
+
+TEST_CASE("A presence refusal the scheduler actually answered never raises scheduler-unreachable",
+          "[node][presence][reachability][conditions]")
+{
+    // The control for the case above: a real `PresenceRefused` -- the scheduler answered, plainly
+    // -- must leave the condition exactly where the constructor left it, `clear`, because the
+    // remedy for `NotAMember` names this node's membership, never the network.
+    PresenceFixture fixture;
+    Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "") } };
+
+    CHECK_FALSE(fixture.AnnounceThrough(dialer));
+
+    CHECK(fixture.conditions.StateOf(NodeCondition::SchedulerUnreachable) == Wire::ConditionState::Clear);
 }

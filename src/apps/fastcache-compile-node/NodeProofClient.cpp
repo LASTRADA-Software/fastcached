@@ -73,12 +73,10 @@ namespace
     /// exchange that follows.
     /// @param prover Who is proving; what it borrows must outlive the coroutine.
     /// @param peer The connection; not owned.
-    /// @param notice Where an unwanted credential is reported; not owned. The handshake presents none.
     /// @param trust Whom the prover may prove itself to; not owned.
     /// @return The step, or the attempt the handshake ended as.
     [[nodiscard]] core::async::Task<std::expected<ProofStep, NodeProofAttempt>> Challenge(Prover prover,
                                                                                           SealedFrameSocket* peer,
-                                                                                          Cc::CredentialNotice* notice,
                                                                                           IServerTrust const* trust)
     {
         // `nonce` and `ephemeral`, and `request` built from them, are held across the challenge's
@@ -105,7 +103,7 @@ namespace
         std::ranges::copy(*nonce, request.nonce.begin());
         std::ranges::copy(ephemeral->publicKey, request.ephemeral.begin());
 
-        auto const challenged = co_await Cc::ExchangeFramed(peer, notice, Wire::EncodeNodeChallenge(request));
+        auto const challenged = co_await Cc::ExchangeWithSchedulerAsync(peer, Wire::EncodeNodeChallenge(request));
         if (!challenged.IsHit())
             co_return std::unexpected { Unproved(challenged) };
 
@@ -158,11 +156,9 @@ namespace
 
 core::async::Task<NodeProofAttempt> NodeProofClient::ProveAsync(SealedFrameSocket* peer, IServerTrust const* trust) const
 {
-    // Silent and never consulted: a notice reports a credential the peer ignored, and a proof
-    // presents none -- the proof IS this machine's credential (`Cc::ExchangeWithScheduler`'s rule).
-    // Held in this frame, so it outlives every suspension below.
-    auto notice = Cc::CredentialNotice::Silent();
-    auto step = co_await Challenge(Prover { .nodeId = _nodeId, .key = &_key, .random = &_random }, peer, &notice, trust);
+    // Both exchanges present NO credential, by the seam's signature rather than by an argument left
+    // out: the proof IS this machine's credential (`Cc::ExchangeWithSchedulerAsync`).
+    auto step = co_await Challenge(Prover { .nodeId = _nodeId, .key = &_key, .random = &_random }, peer, trust);
     if (!step.has_value())
         co_return std::move(step).error();
 
@@ -170,7 +166,7 @@ core::async::Task<NodeProofAttempt> NodeProofClient::ProveAsync(SealedFrameSocke
     // before the proof leaves; the sending one only once the answer has verified, since the proof
     // itself travels in the clear.
     peer->SealReceiving(std::move(step->keys.serverToCaller));
-    auto const proved = co_await Cc::ExchangeFramed(peer, &notice, std::move(step->frame));
+    auto const proved = co_await Cc::ExchangeWithSchedulerAsync(peer, std::move(step->frame));
     if (!proved.IsHit())
         co_return Unproved(proved, step->standing);
 

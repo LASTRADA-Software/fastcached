@@ -111,6 +111,33 @@ TEST_CASE("An address this machine loses stays admitted for at most one interval
     CHECK_FALSE(locality.IsThisMachine("10.0.0.8"));
 }
 
+TEST_CASE("The set a heartbeat reports is the set IsThisMachine answers from, refreshed on the same interval",
+          "[platform][locality]")
+{
+    // A worker's heartbeat reports `Addresses()`, and a dial hint derived from that report is spent
+    // here only if `IsThisMachine` accepts its host. So the two answer from ONE set changed at ONE
+    // moment, and asking for the set is no more a reason to probe than a miss is.
+    Testing::ScriptedHostAddresses machine { { "10.0.0.7" } };
+    core::platform::ManualClock clock;
+    CachedLocalityOracle const locality { machine, clock, Interval };
+    REQUIRE(machine.Calls() == 1);
+
+    machine.Publish({ "10.0.0.8" });
+    for ([[maybe_unused]] auto const attempt: std::views::iota(0, 5))
+        CHECK(locality.Addresses() == std::vector<std::string> { "10.0.0.7" });
+    CHECK(machine.Calls() == 1);
+    // Unrefreshed, the report and the check still agree: neither knows the new address yet.
+    CHECK_FALSE(locality.IsThisMachine("10.0.0.8"));
+
+    clock.advance(Interval);
+    CHECK(locality.Addresses() == std::vector<std::string> { "10.0.0.8" });
+    CHECK(machine.Calls() == 2);
+    // The refresh the report caused is the one the check reads: no second probe, same answer.
+    CHECK(locality.IsThisMachine("10.0.0.8"));
+    CHECK_FALSE(locality.IsThisMachine("10.0.0.7"));
+    CHECK(machine.Calls() == 2);
+}
+
 TEST_CASE("A dual-stack caller is folded against the interface list, both spellings", "[platform][locality]")
 {
     // A surface bound to `::` reports an IPv4 peer as `::ffff:10.0.0.7`, and which

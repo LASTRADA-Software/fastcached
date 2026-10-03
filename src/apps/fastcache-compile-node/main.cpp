@@ -47,6 +47,7 @@
 #include "NodeToolchains.hpp"
 #include "OperatorCredentials.hpp"
 #include "SchedulerLink.hpp"
+#include "SchedulerReachability.hpp"
 #include "SchedulerTier.hpp"
 #include "ScratchClaim.hpp"
 #include "SessionResponder.hpp"
@@ -718,6 +719,11 @@ using Node::NodeReloader;
     // And who may cordon this worker is "this machine" for the same reason (#1303):
     // whether a machine's CPU serves the fleet is decided on that machine. One oracle,
     // asked by both, so the two surfaces cannot disagree about which machine this is.
+    //
+    // And it is what the worker's heartbeat REPORTS (`HeartbeatRound::locality`): the
+    // scheduler hints a dial at a reported address, the client mints its ticket for that
+    // address, and the ticket audience below answers from this same set -- so a hint can
+    // never name an address this node would refuse the ticket for. No second probe.
     auto const hostAddresses = MakeSystemHostAddresses();
     CachedLocalityOracle const locality { *hostAddresses, cacheClock };
 
@@ -826,7 +832,6 @@ using Node::NodeReloader;
                                                                                             : Node::SocketActivation::No,
                                                         .membership = membership.Oracle(),
                                                         .locality = locality,
-                                                        .addresses = *hostAddresses,
                                                         .io = nodeIo,
                                                         .host = *host,
                                                         .cacheTier = cacheTier.get(),
@@ -1329,6 +1334,16 @@ using Node::NodeReloader;
     }
     auto const adminSurface = std::move(*surfaceOrRefusal);
 
+    // How loudly a scheduler that does not answer, or refuses, is said: ONE for the process, lent to
+    // the worker's heartbeat and to the presence loop below, so a machine says each loss and each
+    // recovery once rather than once per loop. Declared before both handles, so it outlives the
+    // threads that report into it.
+    core::platform::SteadyClock const reachabilityClock;
+    // The same predicate `NodePresence::Start` asks, so the scope and the loop cannot disagree about
+    // whether this node announces. Only an announcing node answers the row; `Settle` answers the rest.
+    auto const announces = Node::SchedulerLink::For(cfg.schedulers).has_value();
+    Node::SchedulerReachability schedulerReachability { reachabilityClock, announces ? &conditions : nullptr };
+
     // Both surfaces have bound and adopted, so the loop can start accepting. Doing
     // it here rather than at construction is the ordering `ConsensusTier::Launch`
     // already uses, and for the same reason: a client that dials the instant a port
@@ -1343,7 +1358,8 @@ using Node::NodeReloader;
                                                                            .scheduler = schedulerTier != nullptr,
                                                                            .adminSurface = adminSurface.endpoint != nullptr,
                                                                            .enrollment = servesEnrollment,
-                                                                           .consensus = Node::RunsConsensus(cfg) }))
+                                                                           .consensus = Node::RunsConsensus(cfg),
+                                                                           .announces = announces }))
         logger.Logf(LogLevel::Error,
                     "condition {} was never evaluated although this node runs what evaluates it; every surface "
                     "reports it undecided",
@@ -1356,7 +1372,7 @@ using Node::NodeReloader;
     // through is destroyed: the handle is declared after it.
     std::optional<Node::WorkerHeartbeat> heartbeat;
     if (workerTier != nullptr)
-        heartbeat.emplace(workerTier->Launch(statusClock));
+        heartbeat.emplace(workerTier->Launch(statusClock, schedulerReachability));
 
     // **Started unconditionally, and that one word is the whole of #1440.** A node with
     // `--slots=0` has no `workerTier`, so before this existed such a machine reached the fleet
@@ -1376,7 +1392,8 @@ using Node::NodeReloader;
                                                                               .logger = logger,
                                                                               .conditions = conditions,
                                                                               .roster = nodeRoster.get(),
-                                                                              .prover = AddressOrNull(prover) });
+                                                                              .prover = AddressOrNull(prover),
+                                                                              .reachability = schedulerReachability });
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.

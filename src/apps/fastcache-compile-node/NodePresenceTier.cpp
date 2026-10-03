@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <format>
 #include <span>
 #include <utility>
 #include <vector>
@@ -30,12 +31,14 @@ namespace
                              Wire::CapacityFields const& capacity,
                              Wire::LoadFields const& load,
                              std::span<std::byte const> endorsement,
-                             ILogger& logger) noexcept:
+                             ILogger& logger,
+                             SchedulerReachability& reachability) noexcept:
             _endpoint { endpoint },
             _capacity { capacity },
             _load { load },
             _endorsement { endorsement },
-            _logger { logger }
+            _logger { logger },
+            _reachability { reachability }
         {
         }
 
@@ -46,19 +49,38 @@ namespace
             {
                 _accepted = true;
                 _reply = *std::move(sent);
+                if (auto const back = _reachability.Succeeded(AnnounceStage::Announcement, endpoint); back.has_value())
+                    _logger.Log(back->level, back->message);
                 return AnnounceOutcome { .accepted = 1, .leader = std::nullopt };
             }
 
-            // At Warn rather than Error, for the reason a registration refusal is: a scheduler
-            // mid-election and a peer too old to know the verb are both what a healthy fleet
-            // looks like for a few seconds, and the round carries on either way. It names BOTH
-            // addresses because they are different facts -- the scheduler that refused, and the
-            // machine it refused -- and a message carrying one of them reads as the other.
-            _logger.Logf(LogLevel::Warn,
-                         "scheduler {} did not record this machine at {}: {}",
-                         endpoint,
-                         _endpoint,
-                         sent.error().reason);
+            // Both addresses, because they are different facts -- the scheduler that refused, and the
+            // machine it refused -- and a message carrying one of them reads as the other. A refusal
+            // naming a LEADER is the redirect the round follows at once: Debug, never the tracker, or
+            // every election spends a scheduler's Warn. Formatted from the table's own sentence
+            // rather than restated here, so the words cannot drift from what `SchedulerReachability`
+            // says for the same outcome.
+            auto const reason = std::format("at {}: {}", _endpoint, sent.error().reason);
+            if (sent.error().leader.has_value())
+            {
+                auto const subject = std::string_view {}; // No toolchain: presence names the machine, not one.
+                _logger.Log(LogLevel::Debug,
+                            std::vformat(SchedulerOutcomeRowOf(SchedulerOutcome::PresenceRefused).failure,
+                                         std::make_format_args(endpoint, subject, reason)));
+            }
+            else
+            {
+                // A stall or a lost peer after the socket connected never told this node
+                // anything to act on, so it is this scheduler being unreachable -- not a
+                // refusal to record this machine. Without this split, a hung connection
+                // logged and counted as `PresenceRefused` and never raised
+                // `scheduler-unreachable`.
+                auto const outcome = sent.error().kind == Cc::AnnounceRefusalKind::Transport
+                                         ? SchedulerOutcome::Unreachable
+                                         : SchedulerOutcome::PresenceRefused;
+                auto const said = _reachability.Failed(outcome, SchedulerFailure { .endpoint = endpoint, .reason = reason });
+                _logger.Log(said.level, said.message);
+            }
             return AnnounceOutcome { .accepted = 0, .leader = sent.error().leader };
         }
 
@@ -82,6 +104,7 @@ namespace
         Wire::LoadFields const& _load;
         std::span<std::byte const> _endorsement;
         ILogger& _logger;
+        SchedulerReachability& _reachability;
         bool _accepted = false;
         std::vector<std::byte> _reply;
     };
@@ -116,6 +139,7 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
             .load = load,
             .logger = round.logger,
             .prover = round.prover,
+            .reachability = round.reachability,
         },
         round.roster,
         link,
@@ -132,8 +156,10 @@ bool AnnouncePresence(PresenceMessage const& message, IPresenceRoster* roster, S
     // the leader can certify -- which a node that holds none adopts in this same round, from
     // whichever scheduler the round's redirects and fallbacks reached.
     auto const endorsement = roster != nullptr ? roster->Endorsement() : std::vector<std::byte> {};
-    PresenceAnnouncement announcement { message.endpoint, message.capacity, message.load, endorsement, message.logger };
-    (void) DialAndAnnounce(link, dialer, message.logger, announcement, AnnounceProof { .prover = message.prover });
+    PresenceAnnouncement announcement { message.endpoint, message.capacity, message.load,
+                                        endorsement,      message.logger,   message.reachability };
+    (void) DialAndAnnounce(
+        link, message.reachability, dialer, message.logger, announcement, AnnounceProof { .prover = message.prover });
 
     if (announcement.Accepted() && roster != nullptr)
         roster->Offered(announcement.Reply());
@@ -160,6 +186,7 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _conditions { parts.conditions },
     _roster { parts.roster },
     _prover { parts.prover },
+    _reachability { parts.reachability },
     _capacityWire { Distributed::CapacityToWire(parts.capacity) },
     _loadSampler { MakeHostLoadSampler(MakeSystemCounterSource()) },
     _dialer { PresenceIoTimeout },
@@ -195,7 +222,8 @@ void NodePresence::Loop(std::stop_token const& stop)
                                                        .logger = _logger,
                                                        .conditions = _conditions,
                                                        .roster = _roster,
-                                                       .prover = _prover },
+                                                       .prover = _prover,
+                                                       .reachability = _reachability },
                                        _link,
                                        _dialer);
 

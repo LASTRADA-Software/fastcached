@@ -2551,3 +2551,21 @@ TEST_CASE("A compile inside its grant is served, and one from a keyless worker i
         CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
     }
 }
+
+TEST_CASE("An exchange with a scheduler sends the command alone, awaited or run to completion",
+          "[worker][protocol][credential]")
+{
+    // The seam a node's every scheduler verb and its proof go through presents NO credential, and
+    // the awaited twin is the same exchange: the bytes on the wire are the request, with no AUTH
+    // pipelined ahead of it. The guarantee is the signature -- neither takes a credential -- so
+    // what is asserted is that the one place spelling the credential spells none.
+    auto const frame = Wire::EncodeHeartbeat("w-1", /*inFlight=*/0, Wire::LoadFields {});
+
+    Testing::ScriptedSocket blocking { Wire::EncodeReply(Wire::Status::Ok, {}) };
+    CHECK(Cc::ExchangeWithScheduler(blocking, frame).IsHit());
+    CHECK(blocking.Sent() == frame);
+
+    Testing::ScriptedSocket awaited { Wire::EncodeReply(Wire::Status::Ok, {}) };
+    CHECK(core::async::syncRun(Cc::ExchangeWithSchedulerAsync(&awaited, frame)).IsHit());
+    CHECK(awaited.Sent() == frame);
+}

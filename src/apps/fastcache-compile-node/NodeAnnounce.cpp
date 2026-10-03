@@ -2,6 +2,7 @@
 #include "NodeAnnounce.hpp"
 #include "NodeProofClient.hpp"
 #include "SchedulerLink.hpp"
+#include "SchedulerReachability.hpp"
 #include "WorkerLease.hpp"
 
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
@@ -94,11 +95,12 @@ ReportableAddresses ReportableInterfaceAddresses(std::vector<std::string> addres
 
 namespace
 {
-    /// What this round reports this machine answers on, read from the seam NOW.
+    /// What this round reports this machine answers on: the locality oracle's set as of NOW.
     ///
-    /// Asked per round and never cached across rounds, because the answer this exists for is
-    /// the one that moves: a VPN that reconnects under a new address mid-session. The probe
-    /// costs about two milliseconds on Windows, against a round every twenty seconds.
+    /// Asked per round, because the answer this exists for is the one that moves: a VPN that
+    /// reconnects under a new address mid-session. The oracle refreshes on its own interval,
+    /// never because a round asked -- and that interval is what keeps the report and the ticket
+    /// audience one value (`HeartbeatRound::locality`).
     ///
     /// A cap that bit is said ONCE per process, at Info: the interface count is the
     /// machine's, so the line would otherwise repeat unchanged on every heartbeat.
@@ -106,7 +108,7 @@ namespace
     /// @return The addresses to send on every REGISTER and HEARTBEAT of this round.
     [[nodiscard]] std::vector<std::string> AddressesToReport(HeartbeatRound const& round)
     {
-        auto reportable = ReportableInterfaceAddresses(round.addresses.Addresses());
+        auto reportable = ReportableInterfaceAddresses(round.locality.Addresses());
         if (reportable.overCap > 0 && !round.addressCapNoticed.exchange(true))
             round.logger.Logf(LogLevel::Info,
                               "this machine answers on {} reportable addresses and a report carries at most {}: the "
@@ -213,6 +215,10 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
             {
                 ++accepted;
                 ++beats;
+                if (auto const back =
+                        round.reachability.Succeeded(AnnounceStage::Announcement, endpoint, registrar.Fingerprint());
+                    back.has_value())
+                    round.logger.Log(back->level, back->message);
                 continue;
             }
             if (!leader.has_value())
@@ -234,6 +240,10 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
             round.lease.fleet.Pin(registrar.ClusterId());
             ++accepted;
             ++registrations;
+            if (auto const back =
+                    round.reachability.Succeeded(AnnounceStage::Announcement, endpoint, registrar.Fingerprint());
+                back.has_value())
+                round.logger.Log(back->level, back->message);
 
             // A registration carries no load, so a scheduler that has just (re)admitted a
             // CORDONED worker believes it serving until its next heartbeat -- a new leader
@@ -250,19 +260,37 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
         {
             if (!leader.has_value())
                 leader = registered.error().leader;
-            round.logger.Logf(LogLevel::Warn,
-                              "scheduler {} did not register {}: {}",
-                              endpoint,
-                              registrar.Fingerprint(),
-                              registered.error().reason);
+            // A refusal naming a LEADER is the redirect this round follows at once, not a setback:
+            // Debug, and never the tracker, or every election spends a scheduler's Warn. Formatted
+            // from the table's own sentence rather than restated here, so the words cannot drift
+            // from what `SchedulerReachability` says for the same outcome.
+            if (registered.error().leader.has_value())
+                round.logger.Log(
+                    LogLevel::Debug,
+                    std::vformat(SchedulerOutcomeRowOf(SchedulerOutcome::RegistrationRefused).failure,
+                                 std::make_format_args(endpoint, registrar.Fingerprint(), registered.error().reason)));
+            else
+            {
+                // A stall or a lost peer after the socket connected never told this node
+                // anything to act on, so it is this scheduler being unreachable -- not a
+                // toolchain it refused. Without this split, a hung connection logged and
+                // counted as `RegistrationRefused` and never raised `scheduler-unreachable`.
+                auto const outcome = registered.error().kind == Cc::AnnounceRefusalKind::Transport
+                                         ? SchedulerOutcome::Unreachable
+                                         : SchedulerOutcome::RegistrationRefused;
+                auto const said = round.reachability.Failed(outcome,
+                                                            SchedulerFailure { .endpoint = endpoint,
+                                                                               .subject = registrar.Fingerprint(),
+                                                                               .reason = registered.error().reason });
+                round.logger.Log(said.level, said.message);
+            }
         }
     }
     // What this round DID, and how loudly to say it -- see `DescribeAnnounceRound`,
     // which owns both because the wording is the defect it was written for (#999) and
-    // `main.cpp` is in no test target (#909). The shortfall-behind-a-leader rule it
-    // carries is the one that used to live here: nothing is wrong with a fleet that has
-    // just elected, and the caller follows the redirect inside this same round.
-    auto const report = DescribeAnnounceRound(beats, registrations, round.registrars.size(), leader.has_value());
+    // `main.cpp` is in no test target (#909). A shortfall is Debug whatever caused it:
+    // each refusal it counts was said above, through the tracker or as a redirect.
+    auto const report = DescribeAnnounceRound(beats, registrations, round.registrars.size());
     round.logger.Logf(report.level, "scheduler {}: {}", endpoint, report.message);
     return AnnounceOutcome { .accepted = accepted, .leader = std::move(leader) };
 }
@@ -289,34 +317,16 @@ std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEnd
     };
 
     WorkerAnnouncement announcement { round };
-    return DialAndAnnounce(link, dialer, round.logger, announcement, AnnounceProof { .prover = round.prover });
+    return DialAndAnnounce(
+        link, round.reachability, dialer, round.logger, announcement, AnnounceProof { .prover = round.prover });
 }
 
-namespace
-{
-    /// What an unproved connection is logged as, per outcome: each names a different machine to fix.
-    /// @param attempt What the proof learned.
-    /// @param target Where it was dialled.
-    /// @return The sentence.
-    [[nodiscard]] std::string DescribeUnproved(NodeProofAttempt const& attempt, std::string_view target)
-    {
-        switch (attempt.result)
-        {
-            case NodeProofResult::NotOffered:
-                return std::format(
-                    "{} serves no identity handshake, so it is no scheduler of this fleet: {}", target, attempt.reason);
-            case NodeProofResult::Untrusted:
-                return std::format("this machine will not prove itself to {}: {}", target, attempt.reason);
-            case NodeProofResult::Refused:
-            case NodeProofResult::Proved:
-                break;
-        }
-        return std::format("{} did not accept this machine's identity: {}", target, attempt.reason);
-    }
-} // namespace
-
-std::size_t DialAndAnnounce(
-    SchedulerLink& link, IEndpointDialer& dialer, ILogger& logger, IAnnouncement& announcement, AnnounceProof const& proof)
+std::size_t DialAndAnnounce(SchedulerLink& link,
+                            SchedulerReachability& reachability,
+                            IEndpointDialer& dialer,
+                            ILogger& logger,
+                            IAnnouncement& announcement,
+                            AnnounceProof const& proof)
 {
     for (link.BeginRound();;)
     {
@@ -325,13 +335,14 @@ std::size_t DialAndAnnounce(
         {
             // Named BEFORE `Lost()` moves the target, and the fallback named after it:
             // with several `--scheduler` values the sentence has to say where this node
-            // went next, which "the configured endpoint" no longer identifies (#1310).
+            // went next, which "the configured endpoint" no longer identifies (#1310). How
+            // LOUDLY is `SchedulerReachability`'s: on the transition, then on a cadence,
+            // never per round.
             auto const unreachable = link.Target();
             auto const next = link.Lost();
-            logger.Logf(LogLevel::Warn,
-                        "scheduler {} unreachable{}",
-                        unreachable,
-                        next.has_value() ? std::format("; trying {}", *next) : std::string {});
+            auto const said = reachability.Failed(SchedulerOutcome::Unreachable,
+                                                  SchedulerFailure { .endpoint = unreachable, .next = next });
+            logger.Log(said.level, said.message);
             // Another configured endpoint is tried now rather than a heartbeat interval
             // from now: this machine is out of the fleet for as long as it takes, and a
             // configured endpoint is the one still standing after an election the
@@ -341,6 +352,8 @@ std::size_t DialAndAnnounce(
                 return 0;
             continue;
         }
+        if (auto const back = reachability.Succeeded(AnnounceStage::Dial, link.Target()); back.has_value())
+            logger.Log(back->level, back->message);
 
         // Proved before anything is said, and sealed from then on (#178). A connection the proof did
         // not seal is one no joining verb can be heard on, so it counts as an endpoint that did not
@@ -356,16 +369,20 @@ std::size_t DialAndAnnounce(
             auto const attempt = proof.prover->Prove(*sealed);
             if (attempt.result != NodeProofResult::Proved)
             {
+                // What each unproved outcome is called, and which machine it names to fix, is the
+                // `SchedulerOutcomeTable`'s proof rows; `Proved` never reaches this arm.
                 auto const unproved = link.Target();
                 auto const next = link.Lost();
-                logger.Logf(LogLevel::Warn,
-                            "{}{}",
-                            DescribeUnproved(attempt, unproved),
-                            next.has_value() ? std::format("; trying {}", *next) : std::string {});
+                auto const said =
+                    reachability.Failed(SchedulerOutcomeOfProof(attempt.result),
+                                        SchedulerFailure { .endpoint = unproved, .reason = attempt.reason, .next = next });
+                logger.Log(said.level, said.message);
                 if (!next.has_value())
                     return 0;
                 continue;
             }
+            if (auto const back = reachability.Succeeded(AnnounceStage::Proof, link.Target()); back.has_value())
+                logger.Log(back->level, back->message);
             client = std::move(sealed);
         }
 

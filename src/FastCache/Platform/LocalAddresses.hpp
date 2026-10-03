@@ -101,6 +101,18 @@ class ILocalityOracle
     ///        ephemeral source port, which is why nothing here compares a port.
     /// @return True when that address belongs to the machine this process runs on.
     [[nodiscard]] virtual bool IsThisMachine(std::string_view host) const = 0;
+
+    /// The addresses `IsThisMachine` answers from, as it would answer now.
+    ///
+    /// **The ONE set this machine both reports and checks by.** A worker's heartbeat reports it,
+    /// the scheduler derives a grant's dial hint from it, and a machine ticket minted for that
+    /// hint is spent here only if `IsThisMachine` accepts the hint's host -- so the two must be one
+    /// reading of one value, never a snapshot each. With two, a VPN reconnect lets the heartbeat
+    /// report the new address at once while the audience refuses it until its own refresh: every
+    /// hinted compile in that window is refused `wrong-audience`, and that refusal is final, so the
+    /// build compiles locally rather than falling back to the name.
+    /// @return The addresses, as the source spelled them; empty when it would not say.
+    [[nodiscard]] virtual std::vector<std::string> Addresses() const = 0;
 };
 
 /// The production oracle: loopback answered outright, everything else against an
@@ -192,7 +204,24 @@ class CachedLocalityOracle final: public ILocalityOracle
     /// @copydoc ILocalityOracle::IsThisMachine
     [[nodiscard]] bool IsThisMachine(std::string_view host) const override;
 
+    /// The set `IsThisMachine` answers from, refreshed on the same interval and by the same rule:
+    /// asking never forces a probe the interval has not allowed.
+    ///
+    /// What a stale set does to the dial hints a heartbeat of it produces, both directions:
+    ///
+    ///   - **An address just GAINED is not reported** until the next refresh, so the scheduler
+    ///     derives no hint from it (`NotAReportedInterface`) and the client dials the advertised
+    ///     name, as it did before hints existed. Fails safe, self-heals within one interval.
+    ///   - **An address just LOST is still reported** for at most one interval. A hint naming it
+    ///     reaches nothing, or another worker that refuses the lease `LeaseEndpointMismatch`; both
+    ///     send the client on to the name.
+    /// @return The current set.
+    [[nodiscard]] std::vector<std::string> Addresses() const override;
+
   private:
+    /// Replace the set when the interval has passed since it was taken. Call with `_mutex` held.
+    void RefreshIfDue() const;
+
     IHostAddressSource const& _source;
     core::platform::IClock& _clock;
     std::chrono::milliseconds _refreshInterval;

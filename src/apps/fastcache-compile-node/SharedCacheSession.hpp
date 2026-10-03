@@ -211,7 +211,6 @@ class SharedCacheDialer
     core::net::EventLoop* _reactor;
     IMetricsSink& _metrics;
     SharedCacheDialPolicy _policy;
-    Cc::CredentialNotice _notice;
     std::optional<Hint> _hint;
 };
 

@@ -70,9 +70,7 @@ SharedCacheDialer::SharedCacheDialer(NodeProofClient const& prover,
     _connector { connector },
     _reactor { reactor },
     _metrics { metrics },
-    _policy { policy },
-    // Silent, because nothing on this leg ever presents a credential for it to report ignored.
-    _notice { Cc::CredentialNotice::Silent() }
+    _policy { policy }
 {
 }
 

@@ -15,10 +15,13 @@
 // what the extraction bought.
 #include "EndpointDialerTestUtils.hpp"
 #include "NodeAnnounce.hpp"
+#include "NodePresenceTier.hpp"
+#include "SchedulerReachability.hpp"
 
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -29,11 +32,15 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <regex>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -383,12 +390,18 @@ struct AnnounceFixture
     NodeConfig cfg;
     AtomicMetricsSink metrics;
     CapturingLogger logger;
+    core::platform::ManualClock clock;
+    NodeConditions conditions;
+    SchedulerReachability reachability { clock, &conditions };
     SilentLoadSampler loadSampler;
     /// What this machine answers on: one of each thing a report leaves out, a repeat, and two
     /// routable addresses listed out of order.
     Testing::ScriptedHostAddresses addresses {
         { "127.0.0.1", "192.168.1.20", "::1", "fe80::1", "169.254.3.4", "10.8.0.7", "10.8.0.7" }
     };
+    /// What the round reports FROM: the production oracle over `addresses`, as `main` builds it,
+    /// so a change to the machine reaches a report only at the oracle's refresh (`Moved`).
+    CachedLocalityOracle const locality { addresses, clock };
     std::atomic<bool> addressCapNoticed { false };
     // The process singleton wall clock, for the reason `NodeCredential_test` gives beside
     // the same construction: the sampler keeps the ADDRESS and reads it from its own thread.
@@ -396,6 +409,15 @@ struct AnnounceFixture
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
     std::vector<Cc::WorkerRegistrar> registrars;
     std::vector<Cc::WorkerRegistrar> withdrawals;
+
+    /// The machine now answers on @p now, and the oracle's interval has passed, so its next
+    /// question refreshes -- as a VPN reconnect reaches a report in production.
+    /// @param now The machine's addresses from here on.
+    void Moved(std::vector<std::string> now)
+    {
+        addresses.Publish(std::move(now));
+        clock.advance(CachedLocalityOracle::DefaultRefreshInterval);
+    }
 
     AnnounceFixture()
     {
@@ -412,7 +434,7 @@ struct AnnounceFixture
                                 .withdrawals = withdrawals,
                                 .capacity = capacity,
                                 .loadSampler = loadSampler,
-                                .addresses = addresses,
+                                .locality = locality,
                                 .addressCapNoticed = addressCapNoticed,
                                 .cacheTier = nullptr,
                                 .metrics = metrics,
@@ -421,7 +443,8 @@ struct AnnounceFixture
                                 // (#178). The proof is `FrameEndpoint_test`'s, over a real socket.
                                 .prover = nullptr,
                                 .lease = lease,
-                                .logger = logger };
+                                .logger = logger,
+                                .reachability = reachability };
     }
 
     /// Announce once to a scheduler answering @p replies.
@@ -489,6 +512,19 @@ constexpr auto HeartbeatOp = static_cast<std::uint8_t>(Wire::Op::Heartbeat);
     auto const link = SchedulerLink::For(schedulers);
     REQUIRE(link.has_value());
     return Unwrap(link);
+}
+
+/// How many lines @p logger captured at exactly @p level whose text contains @p phrase.
+/// @param logger What a round logged into.
+/// @param level The level to count.
+/// @param phrase A substring every counted line carries; empty counts every line at @p level.
+/// @return The count.
+[[nodiscard]] std::ptrdiff_t LinesAt(CapturingLogger const& logger, LogLevel level, std::string_view phrase)
+{
+    auto const records = logger.Snapshot();
+    return std::ranges::count_if(records, [level, phrase](CapturingLogger::Record const& record) {
+        return record.level == level && record.message.contains(phrase);
+    });
 }
 
 } // namespace
@@ -769,9 +805,14 @@ TEST_CASE("A registration and every heartbeat carry the addresses this machine a
     REQUIRE(beat.size() == 1);
     CHECK(BeatAddresses(beat[0]) == std::optional { expected });
 
-    // A VPN reconnect between two rounds: the NEXT beat reports the new set, not the one the
-    // registration carried.
+    // A VPN reconnect between two rounds. Until the oracle's refresh the beat still reports what
+    // the ticket audience accepts -- the set it answers from -- so no hint can name an address
+    // this node would refuse; the first beat after it reports the new set.
     fix.addresses.Publish({ "10.8.0.42", "127.0.0.1" });
+    auto const unrefreshed = fix.AnnounceTo(HeartbeatOk());
+    REQUIRE(unrefreshed.size() == 1);
+    CHECK(BeatAddresses(unrefreshed[0]) == std::optional { expected });
+    fix.clock.advance(CachedLocalityOracle::DefaultRefreshInterval);
     auto const moved = fix.AnnounceTo(HeartbeatOk());
     REQUIRE(moved.size() == 1);
     CHECK(BeatAddresses(moved[0]) == std::optional { std::vector<std::string> { "10.8.0.42" } });
@@ -781,7 +822,7 @@ TEST_CASE("A machine whose addresses cannot be read still registers and heartbea
           "[node][announce][dialhint]")
 {
     AnnounceFixture fix;
-    fix.addresses.Publish({});
+    fix.Moved({});
 
     auto const registered = fix.AnnounceTo(RegisterOk("w-7"));
     REQUIRE(registered.size() == 1);
@@ -799,7 +840,7 @@ TEST_CASE("A machine with more addresses than a report carries says so once, not
     SECTION("over the cap: one line across a registration and two heartbeats, naming the dropped count")
     {
         AnnounceFixture fix;
-        fix.addresses.Publish(RoutableAddresses(Wire::MaxInterfaceAddresses + 8));
+        fix.Moved(RoutableAddresses(Wire::MaxInterfaceAddresses + 8));
 
         (void) fix.AnnounceTo(RegisterOk("w-7"));
         (void) fix.AnnounceTo(HeartbeatOk());
@@ -816,11 +857,343 @@ TEST_CASE("A machine with more addresses than a report carries says so once, not
     SECTION("at the cap: nothing to say")
     {
         AnnounceFixture fix;
-        fix.addresses.Publish(RoutableAddresses(Wire::MaxInterfaceAddresses));
+        fix.Moved(RoutableAddresses(Wire::MaxInterfaceAddresses));
 
         (void) fix.AnnounceTo(RegisterOk("w-7"));
         (void) fix.AnnounceTo(HeartbeatOk());
 
         CHECK(CapNotices(fix.logger) == 0);
     }
+}
+
+TEST_CASE("An hour of unreachable heartbeat rounds warns once and reminds on the cadence", "[node][announce][reachability]")
+{
+    // At the seam production dials through. An hour of a dead scheduler is 180 rounds of this loop;
+    // what it says about them is one Warn when the dials start failing, an Info reminder per cadence
+    // while they go on failing, and a Warn when the scheduler answers again -- everything else Debug.
+    AnnounceFixture fix;
+    auto link = LinkOver(fix.cfg.schedulers);
+
+    constexpr std::size_t Rounds = 180;
+    std::vector<std::vector<std::byte>> script(Rounds); // every dial fails...
+    script.push_back(RegisterOk("w-7"));                // ...and then the scheduler answers
+    Testing::ScriptedDialer dialer { std::move(script) };
+
+    for ([[maybe_unused]] auto const _: std::views::iota(std::size_t { 0 }, Rounds))
+    {
+        CHECK(AnnounceRound(fix.Round(), link, dialer) == 0);
+        fix.clock.advance(NodeAnnounceInterval);
+    }
+    CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
+
+    constexpr auto Reminders = ((static_cast<long long>(Rounds) - 1) * NodeAnnounceInterval) / SchedulerUnreachableCadence;
+    static_assert(Reminders == 5);
+    CHECK(LinesAt(fix.logger, LogLevel::Warn, "scheduler.example:6676 unreachable") == 1);
+    CHECK(LinesAt(fix.logger, LogLevel::Info, "unreachable -- still, after") == Reminders);
+    CHECK(LinesAt(fix.logger, LogLevel::Warn, "scheduler.example:6676 reachable again after 3600s unreachable") == 1);
+}
+
+TEST_CASE("Two announce loops sharing one reachability say the transition once", "[node][announce][reachability]")
+{
+    // Two WORKER rounds per interval, each over a link of its own and both reporting into one tracker.
+    // They stand in for the worker's heartbeat and the machine's presence loop, which reach an
+    // unreachable scheduler through the same arm of `DialAndAnnounce` -- only what is SAID after a
+    // connect differs between them -- and which `main` lends one tracker, so a machine running both
+    // says a loss once. What the presence loop itself says is the case below and `NodePresenceTier_test`.
+    AnnounceFixture fix;
+    auto firstLink = LinkOver(fix.cfg.schedulers);
+    auto secondLink = LinkOver(fix.cfg.schedulers);
+    Testing::ScriptedDialer dialer { std::vector<std::vector<std::byte>>(6) };
+
+    for ([[maybe_unused]] auto const _: std::views::iota(0, 3))
+    {
+        CHECK(AnnounceRound(fix.Round(), firstLink, dialer) == 0);
+        CHECK(AnnounceRound(fix.Round(), secondLink, dialer) == 0);
+        fix.clock.advance(NodeAnnounceInterval);
+    }
+
+    CHECK(LinesAt(fix.logger, LogLevel::Warn, "unreachable") == 1);
+    CHECK(LinesAt(fix.logger, LogLevel::Debug, "unreachable (for") == 5);
+}
+
+TEST_CASE("A registration refused round after round is one Warn and not one per round", "[node][announce][reachability]")
+{
+    // Three refused rounds say exactly one Warn line between them: the refusal's transition. The
+    // `0 of 1 toolchain(s) registered` summary is Debug on every round, because the refusal it counts
+    // is said on its own.
+    AnnounceFixture fix;
+    auto link = LinkOver(fix.cfg.schedulers);
+    auto const refused = Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "");
+    Testing::ScriptedDialer dialer { { refused, refused, refused } };
+
+    for ([[maybe_unused]] auto const _: std::views::iota(0, 3))
+    {
+        CHECK(AnnounceRound(fix.Round(), link, dialer) == 0);
+        fix.clock.advance(NodeAnnounceInterval);
+    }
+
+    CHECK(LinesAt(fix.logger, LogLevel::Warn, "") == 1);
+    CHECK(LinesAt(fix.logger, LogLevel::Warn, "did not register gcc-14") == 1);
+    CHECK(LinesAt(fix.logger, LogLevel::Debug, "0 of 1 toolchain(s) registered") == 3);
+}
+
+TEST_CASE("A registration exchange that stalls after connecting is unreachable, not a refused registration",
+          "[node][announce][reachability][conditions]")
+{
+    // A scheduler that ACCEPTED the connection and then never finished answering never told this
+    // node anything about the toolchain: it is the scheduler being unreachable, not a refused
+    // registration. Counting it as `RegistrationRefused` sends an operator hunting for a
+    // fingerprint problem that was never the issue, and leaves `scheduler-unreachable` unraised
+    // for exactly the outage it exists to report.
+    AnnounceFixture fix;
+    // Empty: the peer accepted the write and closed without a byte back, which is EOF on the
+    // very first read -- what a stall this node's own deadline eventually cuts off, or a lost
+    // peer, produces on the read side.
+    (void) fix.AnnounceTo({});
+
+    CHECK(fix.conditions.StateOf(NodeCondition::SchedulerUnreachable) == CompileCacheWire::ConditionState::Raised);
+    CHECK(LinesAt(fix.logger, LogLevel::Warn, "unreachable") == 1);
+    CHECK(LinesAt(fix.logger, LogLevel::Warn, "did not register") == 0);
+}
+
+TEST_CASE("A registration refusal the scheduler actually answered never raises scheduler-unreachable",
+          "[node][announce][reachability][conditions]")
+{
+    // The control for the case above: a real `RegistrationRefused` -- the scheduler answered,
+    // plainly -- must leave the condition exactly where the constructor left it, `clear`, because
+    // the remedy for `NotAMember` names this node's membership, never the network.
+    AnnounceFixture fix;
+    (void) fix.AnnounceTo(Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, ""));
+
+    CHECK(fix.conditions.StateOf(NodeCondition::SchedulerUnreachable) == CompileCacheWire::ConditionState::Clear);
+    CHECK(LinesAt(fix.logger, LogLevel::Warn, "did not register") == 1);
+}
+
+TEST_CASE("A worker's success at a scheduler does not end the presence loop's refusal there",
+          "[node][announce][presence][reachability]")
+{
+    // Both loops report into one tracker, and at one scheduler they share the place `(endpoint, "")`:
+    // a dial, a proof and this machine's presence are all filed there. A worker's registration and
+    // heartbeat are filed under their FINGERPRINT instead, so neither can end the presence loop's
+    // refusal -- which, filed under the empty subject, would log "recorded this machine again" about
+    // a machine that scheduler is still refusing. The worker's dial succeeding does not end it
+    // either: a dial is an earlier stage than the announcement that is being refused.
+    AnnounceFixture fix;
+    auto workerLink = LinkOver(fix.cfg.schedulers);
+    auto presenceLink = LinkOver(fix.cfg.schedulers);
+    auto const refused = Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "");
+    auto const recorded = Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {});
+    Testing::ScriptedDialer dialer { { refused, RegisterOk("w-7"), HeartbeatOk(), refused, recorded } };
+
+    auto const capacity = Wire::CapacityFields {};
+    auto const load = Wire::LoadFields {};
+    auto const announcePresence = [&] {
+        return AnnouncePresence(PresenceMessage { .endpoint = ThisNode,
+                                                  .capacity = capacity,
+                                                  .load = load,
+                                                  .logger = fix.logger,
+                                                  .prover = nullptr,
+                                                  .reachability = fix.reachability },
+                                nullptr,
+                                presenceLink,
+                                dialer);
+    };
+
+    CHECK_FALSE(announcePresence());
+    CHECK(LinesAt(fix.logger, LogLevel::Warn, "did not record this machine at 10.0.0.2:6677") == 1);
+
+    // The worker registers, and a round later heartbeats: two successes at the same scheduler.
+    CHECK(AnnounceRound(fix.Round(), workerLink, dialer) == 1);
+    fix.clock.advance(NodeAnnounceInterval);
+    CHECK(AnnounceRound(fix.Round(), workerLink, dialer) == 1);
+    CHECK(OpsSentOn(dialer, 2) == std::vector<std::uint8_t> { HeartbeatOp });
+
+    // Neither said the machine was recorded again, at any level.
+    auto const records = fix.logger.Snapshot();
+    CHECK_FALSE(std::ranges::any_of(records, [](CapturingLogger::Record const& record) {
+        return record.message.contains("recorded this machine again");
+    }));
+
+    // The next refusal is the SAME setback lasting, not a new one: Debug, and timed from the first.
+    CHECK_FALSE(announcePresence());
+    CHECK(LinesAt(fix.logger, LogLevel::Debug, "did not record this machine at 10.0.0.2:6677") == 1);
+    CHECK(LinesAt(fix.logger, LogLevel::Debug, "(for 20s)") == 1);
+
+    // And only the presence loop's own success ends it, at the level its loss was said at.
+    CHECK(announcePresence());
+    CHECK(LinesAt(fix.logger, LogLevel::Warn, "scheduler.example:6676 recorded this machine again after 20s") == 1);
+}
+
+namespace
+{
+
+/// One line of a source file, as code.
+struct CodeLine
+{
+    std::size_t number; ///< 1-based.
+    std::string code;   ///< The line with any `//` comment cut.
+};
+
+/// @p line with a `//` comment cut off. A `//` inside a string literal is not a comment. A `/* */`
+/// comment is left in place: a scan reading the result then errs toward refusing a mention in it.
+/// @param line One source line.
+/// @return Its code.
+[[nodiscard]] std::string WithoutLineComment(std::string line)
+{
+    auto inString = false;
+    for (auto const at: std::views::iota(std::size_t { 0 }, line.size()))
+    {
+        if (line[at] == '"' && (at == 0 || line[at - 1] != '\\'))
+            inString = !inString;
+        else if (!inString && line.compare(at, 2, "//") == 0)
+        {
+            line.resize(at);
+            break;
+        }
+    }
+    return line;
+}
+
+/// The lines of @p path that carry code, numbered as the file numbers them.
+/// @param path A source file.
+/// @return Every line with code left once its comment is cut; blank lines are dropped.
+[[nodiscard]] std::vector<CodeLine> CodeLinesOf(std::filesystem::path const& path)
+{
+    std::ifstream in { path, std::ios::binary };
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    std::istringstream text { std::move(contents).str() };
+    std::vector<CodeLine> lines;
+    std::string line;
+    std::size_t number = 0;
+    while (std::getline(text, line))
+    {
+        ++number;
+        auto code = WithoutLineComment(line);
+        if (code.find_first_not_of(" \t") != std::string::npos)
+            lines.push_back(CodeLine { .number = number, .code = std::move(code) });
+    }
+    return lines;
+}
+
+/// Whether one mention of `SchedulerReachability` is a spelling that can never make an instance.
+///
+/// An ALLOWLIST: the include, a reference, a `const` reference and a qualified member anywhere; the
+/// class head, the constructors and the destructor in the type's own two files. Everything else is
+/// not harmless, whether or not it makes an instance.
+/// @param code The whole line.
+/// @param before The line's text before the mention.
+/// @param after The line's text after it.
+/// @param definesTheType Whether the line is in `SchedulerReachability.hpp` or `.cpp`.
+/// @return True when harmless.
+[[nodiscard]] bool HarmlessMention(std::string const& code,
+                                   std::string const& before,
+                                   std::string const& after,
+                                   bool definesTheType)
+{
+    if (std::regex_search(code, std::regex { R"(^\s*#include "SchedulerReachability\.hpp"\s*$)" }))
+        return true;
+    if (std::regex_search(after, std::regex { R"(^(&|::|\s*const\s*&))" }))
+        return true;
+    if (!definesTheType)
+        return false;
+    // The class head, or a `(` after the name with a constructor's or the destructor's lead-in before it.
+    return std::regex_search(code, std::regex { R"(^\s*class SchedulerReachability\s*$)" })
+           || (after.starts_with('(') && std::regex_search(before, std::regex { R"((^\s*(explicit\s+)?|~|::)$)" }));
+}
+
+} // namespace
+
+TEST_CASE("The node lends ONE SchedulerReachability to both announce loops", "[node][announce][reachability]")
+{
+    // The case above is the property in miniature; this is the wiring it depends on. `main.cpp` is in
+    // no test target, so the wiring is read from the source, and each loop takes a REFERENCE, which binds
+    // to any instance -- nothing else compels one tracker. A second one, as a member of either loop or a
+    // second local, is a machine that says every loss twice.
+    //
+    // **The scan fails CLOSED: it lists what may be spelled, never what may not.** Every mention of the
+    // type in the node's non-test code is one `HarmlessMention` allows, or it is the ONE declaration,
+    // in `main.cpp`, in the one shape `declaration` accepts. Anything else -- `auto x =
+    // SchedulerReachability { ... }`, a temporary, a value member, a second declarator on the
+    // declaration's line -- is refused by `file:line`, whether or not it makes a second tracker: a
+    // spelling this scan cannot classify is exactly the one it would otherwise vouch for.
+    //
+    // Its blind spot, and the direction it fails in: a second instance reached without writing the
+    // type's NAME at all -- `decltype(schedulerReachability)`, a deduced `auto` alias, a template
+    // parameter -- leaves no `SchedulerReachability` token for `mention` to find, so this scan sees
+    // nothing and reports clean. That failure is OPEN, the opposite of the one this test proves shut.
+    std::filesystem::path const nodeDir =
+        std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node";
+    REQUIRE(std::filesystem::is_directory(nodeDir));
+
+    std::regex const mention { R"(\bSchedulerReachability\b)" };
+    // The ONE declaration: alone on its line, one declarator, braced from one clock and the announce gate.
+    std::regex const declaration {
+        R"(^\s*(Node::)?SchedulerReachability ([A-Za-z_]\w*) \{ [A-Za-z_]\w*, [A-Za-z_]\w* \? &[A-Za-z_]\w* : nullptr \};$)"
+    };
+
+    struct Mention
+    {
+        std::string file;
+        std::size_t line;
+        std::string code;
+    };
+    std::vector<Mention> unclassified;
+    std::size_t scanned = 0;
+    std::size_t harmless = 0;
+    std::vector<std::string> mainLines;
+
+    for (auto const& entry: std::filesystem::directory_iterator { nodeDir })
+    {
+        auto const name = entry.path().filename().string();
+        auto const extension = entry.path().extension().string();
+        if ((extension != ".cpp" && extension != ".hpp") || name.ends_with("_test.cpp"))
+            continue;
+        auto const lines = CodeLinesOf(entry.path());
+        REQUIRE_FALSE(lines.empty());
+        ++scanned;
+        auto const definesTheType = name.starts_with("SchedulerReachability.");
+        for (auto const& [number, code]: lines)
+        {
+            if (name == "main.cpp")
+                mainLines.push_back(code);
+            if (!code.contains("SchedulerReachability"))
+                continue;
+            auto const found = std::sregex_iterator { code.begin(), code.end(), mention };
+            for (auto const& match: std::ranges::subrange { found, std::sregex_iterator {} })
+            {
+                if (HarmlessMention(code, match.prefix().str(), match.suffix().str(), definesTheType))
+                    ++harmless;
+                else
+                    unclassified.push_back(Mention { .file = name, .line = number, .code = code });
+            }
+        }
+    }
+
+    // The positive controls. A scan over the wrong directory, or one whose pattern stopped matching,
+    // finds nothing unclassified and would read as a tree with no tracker at all; so it must have read
+    // the tree, and recognised the harmless spellings the loops' own declarations use.
+    CHECK(scanned > 20);
+    CHECK(harmless > 10);
+    REQUIRE_FALSE(mainLines.empty());
+
+    INFO("every mention of SchedulerReachability that is not a spelling that cannot make an instance: " << [&] {
+        std::string joined;
+        for (auto const& unknown: unclassified)
+            joined += std::format("\n  {}:{}: {}", unknown.file, unknown.line, unknown.code);
+        return joined;
+    }());
+    REQUIRE(unclassified.size() == 1);
+    CHECK(unclassified.front().file == "main.cpp");
+    std::smatch declared;
+    REQUIRE(std::regex_match(unclassified.front().code, declared, declaration));
+
+    auto const tracker = declared[2].str();
+    auto const linesMatching = [&mainLines](std::regex const& pattern) {
+        return std::ranges::count_if(mainLines,
+                                     [&pattern](std::string const& line) { return std::regex_search(line, pattern); });
+    };
+    INFO("the one tracker is " << tracker);
+    CHECK(linesMatching(std::regex { R"(->Launch\(.*\b)" + tracker + R"(\b)" }) == 1);
+    CHECK(linesMatching(std::regex { R"(\.reachability\s*=\s*)" + tracker + R"(\b)" }) == 1);
 }

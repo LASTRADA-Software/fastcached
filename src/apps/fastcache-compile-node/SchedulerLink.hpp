@@ -195,12 +195,8 @@ struct RoundReport
 /// @param beats         Registrars that heartbeated successfully.
 /// @param registrations Registrars that registered this round.
 /// @param total         Registrars attempted.
-/// @param leaderKnown   Whether a `NotLeader` named somewhere to go next.
 /// @return The level and the sentence.
-[[nodiscard]] inline RoundReport DescribeAnnounceRound(std::size_t beats,
-                                                       std::size_t registrations,
-                                                       std::size_t total,
-                                                       bool leaderKnown)
+[[nodiscard]] inline RoundReport DescribeAnnounceRound(std::size_t beats, std::size_t registrations, std::size_t total)
 {
     auto const accepted = beats + registrations;
 
@@ -212,9 +208,13 @@ struct RoundReport
     // Rewording either form breaks that distinction in a fixture rather than in a
     // build, which is a timeout with no failed assertion. #999 is about the STEADY
     // round, which no fixture waits on, so only that gains a new sentence.
+    //
+    // Debug, whoever caused it. A shortfall is registrars a scheduler refused or redirected, and each
+    // of those is said on its own: a refusal by `SchedulerReachability`, at Warn on its transition and
+    // quietly while it lasts; a redirect at Info, as the round follows it. This line only counts them,
+    // on every round, so anything louder than Debug would say each refusal again every interval.
     if (accepted < total)
-        return { .level = leaderKnown ? LogLevel::Debug : LogLevel::Warn,
-                 .message = std::format("{} of {} toolchain(s) registered", accepted, total) };
+        return { .level = LogLevel::Debug, .message = std::format("{} of {} toolchain(s) registered", accepted, total) };
 
     // A heartbeat that fell through to a registration: the scheduler had forgotten this
     // worker and it re-announced itself. Named rather than folded into either pure case,

@@ -121,6 +121,7 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x2c` | enrollment-host-full | The request came from an address that already has as many enrollment requests waiting as one host may hold, counted by the address each request first came from, so it was not recorded. Its own code rather than enrollment-full, because one address asking a lot and many machines waiting are different problems; a joiner treats both as a wait. |
 | `0x2d` | ticket-refused | An AUTH presenting a machine ticket this node did not accept: a signature that does not verify, a machine the roster does not hold, a revoked key, an audience that is not this node, or an expiry passed. One code for all of them. The message names the reason when the caller could have checked it itself -- malformed bytes, a wrong audience, an expiry -- or when it is the node's own state; a forgery, a machine the roster does not hold and a revoked key all read `not admitted by this node`, because AUTH answers any address and those three would tell a stranger which ids the roster holds. The node still counts each of them apart. Not `unauthenticated`, which says a credential is still owed; this one says a credential was presented and judged. |
 | `0x2e` | identified-caller-required | An operator's **control** verb -- `CLUSTER-ADMIT` in every form, `CLUSTER-FORGET`, `CLUSTER-SET`, `ENROLL-CONTROL` -- from a caller admitted by `--fleet-open` alone. `--fleet-open` admits a caller to what the fleet serves and never to what decides the fleet; a caller on this machine, one that proved a node key, or one presenting a verified machine ticket is admitted to these verbs. Not `not-a-member`: the caller is admitted, and the remedy is to identify itself. |
+| `0x2f` | not-shared-cache | A `SHARED-FETCH` or `SHARED-STORE` at a node that is not the fleet's shared cache right now: the `shared-cache` setting names another machine or none, or names this one and its tier could not be opened. Not `unknown-opcode`, since every node implements the verbs and a client told otherwise would conclude the build is too old; not `not-a-member`, which would tell a proven member it is not one. A `fastcached` answers it too, so a client has one refusal to read as a miss whichever wrong machine it reached. |
 
 Every one of these is a **refusal the client answers by compiling locally**,
 never by failing. They are distinct codes rather than one "no" because they mean
@@ -225,6 +226,36 @@ pending in the enrollment window, `0x04` revoked, `0x05` unknown — and an **em
 for the question about the connection. A reader refuses a verdict or a standing it cannot
 name and keeps a route bit it cannot name, so a newer node's answer is never misreported as
 a healthy one.
+
+### SHARED-FETCH
+
+```
+[0xFC][ver][0x20][u32 len]  payload: [key]
+```
+
+`FETCH`'s payload and replies -- `Ok` carrying the stored value in its canonical form, `Miss`,
+or an error -- and a reply as large as the artefact it carries, as `FETCH`'s is. A different
+verb because a different policy: `FETCH` reads this machine's private tier and answers this
+machine alone, while this reads the **fleet's** shared cache and answers any caller whose
+connection proved a key the fleet holds or presented a ticket the node verifies. This
+machine's own address and `--fleet-open` admit nobody here, and a revoked key is refused from
+any address.
+
+Served only on the machine the cluster's `shared-cache` setting names, and only while its
+tier is open; every other node answers `not-shared-cache` (`0x2f`), and so does a `fastcached`,
+which is never the fleet's shared cache -- one refusal, read as a miss, whichever wrong machine
+a client reached.
+
+### SHARED-STORE
+
+```
+[0xFC][ver][0x21][u32 len]  payload: [key][prefetchGroup][srcRoot][buildTree][value]
+```
+
+`STORE`'s payload, canonicalized the same way, under `SHARED-FETCH`'s policy. The reply is `Ok`
+or an error, bounded to 64 MiB (`MaxReportReply`) as `STORE`'s is. Both verbs are read under the
+session's payload ceiling, like their twins, and are reachable only after the connection's
+admission.
 
 ## Distributed execution
 

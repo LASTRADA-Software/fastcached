@@ -12,7 +12,6 @@
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
-#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -38,6 +37,7 @@
 #include <core/net/IAsyncAddressResolver.hpp>
 #include <core/net/IConnector.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/LocalityFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
@@ -78,6 +78,10 @@ constexpr std::string_view SecondSecret = "secret-after-rotation";
 constexpr std::chrono::milliseconds RefreshInterval { 30'000 };
 constexpr std::chrono::milliseconds ConnectTimeout { 1'000 };
 constexpr std::chrono::milliseconds IoTimeout { 5'000 };
+// Its own constant rather than reusing `RefreshInterval`: the two answer different
+// questions -- how long a resolved address is trusted, versus how long a failed
+// exchange is -- and neither case here ever fails, so nothing asserts this value.
+constexpr std::chrono::milliseconds UnreachableRetryInterval { 10'000 };
 
 /// A credential source an operator can be simulated rotating.
 ///
@@ -303,8 +307,17 @@ TEST_CASE("Site 1: the shared cache is asked with the secret in force NOW", "[no
     ScriptingConnector connector { AcceptedThen(Wire::EncodeReply(Wire::Status::Miss, {})) };
     core::platform::ManualClock clock;
 
-    RemoteUpstream upstream { "127.0.0.1:6674", credential, [](std::string_view) {}, connector, nullptr,
-                              resolver,         clock,      ConnectTimeout,          IoTimeout, RefreshInterval };
+    RemoteUpstream upstream { "127.0.0.1:6674",
+                              credential,
+                              [](std::string_view) {},
+                              connector,
+                              nullptr,
+                              resolver,
+                              clock,
+                              UpstreamTimings { .connectTimeout = ConnectTimeout,
+                                                .ioTimeout = IoTimeout,
+                                                .addressRefreshInterval = RefreshInterval,
+                                                .unreachableRetryInterval = UnreachableRetryInterval } };
 
     (void) core::async::syncRun(upstream.Fetch("k"));
     REQUIRE(connector.Dials() == 1);
@@ -331,8 +344,17 @@ TEST_CASE("Site 1, the other verb: a STORE presents the rotated secret too", "[n
     ScriptingConnector connector { AcceptedThen(Wire::EncodeReply(Wire::Status::Ok, {})) };
     core::platform::ManualClock clock;
 
-    RemoteUpstream upstream { "127.0.0.1:6674", credential, [](std::string_view) {}, connector, nullptr,
-                              resolver,         clock,      ConnectTimeout,          IoTimeout, RefreshInterval };
+    RemoteUpstream upstream { "127.0.0.1:6674",
+                              credential,
+                              [](std::string_view) {},
+                              connector,
+                              nullptr,
+                              resolver,
+                              clock,
+                              UpstreamTimings { .connectTimeout = ConnectTimeout,
+                                                .ioTimeout = IoTimeout,
+                                                .addressRefreshInterval = RefreshInterval,
+                                                .unreachableRetryInterval = UnreachableRetryInterval } };
 
     auto const value = std::vector<std::byte> { std::byte { 0x01 } };
     (void) core::async::syncRun(upstream.Store("k", value));
@@ -480,12 +502,14 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
     SilentLoadSampler loadSampler;
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
-    Testing::ScriptedHostAddresses const addresses;
+    Testing::ThisMachineIs const locality {};
     std::atomic<bool> addressCapNoticed { false };
     std::vector<Cc::WorkerRegistrar> registrars;
     registrars.emplace_back("gcc-14", "10.0.0.2:6677", 1U, Wire::CodecList {}, Wire::CapacityFields {});
     std::vector<Cc::WorkerRegistrar> withdrawals;
 
+    core::platform::ManualClock reachabilityClock;
+    SchedulerReachability reachability { reachabilityClock };
     auto const key = Testing::TestKeyPair("worker-a");
     AnyServer const trust;
     Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
@@ -497,13 +521,14 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
                                 .withdrawals = withdrawals,
                                 .capacity = capacity,
                                 .loadSampler = loadSampler,
-                                .addresses = addresses,
+                                .locality = locality,
                                 .addressCapNoticed = addressCapNoticed,
                                 .cacheTier = nullptr,
                                 .metrics = metrics,
                                 .prover = proving,
                                 .lease = lease,
-                                .logger = logger };
+                                .logger = logger,
+                                .reachability = reachability };
     };
 
     SECTION("a registration")
@@ -529,12 +554,15 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
         auto link = Testing::Unwrap(SchedulerLink::For(cfg.schedulers));
         Wire::CapacityFields const machine {};
         Wire::LoadFields const load {};
-        CHECK_FALSE(AnnouncePresence(
-            PresenceMessage {
-                .endpoint = "10.0.0.2:6677", .capacity = machine, .load = load, .logger = logger, .prover = nullptr },
-            nullptr,
-            link,
-            dialer));
+        CHECK_FALSE(AnnouncePresence(PresenceMessage { .endpoint = "10.0.0.2:6677",
+                                                       .capacity = machine,
+                                                       .load = load,
+                                                       .logger = logger,
+                                                       .prover = nullptr,
+                                                       .reachability = reachability },
+                                     nullptr,
+                                     link,
+                                     dialer));
         CheckBare(dialer.SentOn(0), Wire::Op::NodeAnnounce);
     }
 }

@@ -8,6 +8,7 @@
 #include "NodeConfig.hpp"
 #include "NodeRoster.hpp"
 #include "SchedulerLink.hpp"
+#include "SchedulerReachability.hpp"
 
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
@@ -45,6 +46,8 @@ struct NodePresenceParts
 
     /// How this machine proves itself on each connection (#178); null where nothing proves.
     NodeProofClient const* prover;
+    /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
+    SchedulerReachability& reachability;
 };
 
 /// What one presence announcement is made of.
@@ -66,6 +69,8 @@ struct PresenceRound
     NodeConditions const& conditions;                 ///< What is wrong with this machine, as of this round.
     IPresenceRoster* roster;                          ///< The roster half of the verb; may be null.
     NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
+    /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
+    SchedulerReachability& reachability;
 };
 
 /// Announce this machine once, and hand over the history it owes.
@@ -88,6 +93,8 @@ struct PresenceMessage
     CompileCacheWire::LoadFields const& load;         ///< What it is doing, and the history it hands over.
     ILogger& logger;                                  ///< Where a refusal is named.
     NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
+    /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
+    SchedulerReachability& reachability;
 };
 
 /// Make one presence announcement: dial, follow a redirect, fall back, and carry the roster both
@@ -179,6 +186,7 @@ class NodePresence
     NodeConditions const& _conditions;
     IPresenceRoster* _roster;
     NodeProofClient const* _prover;
+    SchedulerReachability& _reachability;
 
     /// This machine's capacity record, converted once: it is compiled-in and configured
     /// state, and nothing about it changes between rounds.

@@ -613,12 +613,19 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
                                                         .correlation = Wire::AsBytes(outcome->correlation) }));
 }
 
-CacheOutcome ExchangeWithScheduler(core::net::ISocket& scheduler, std::vector<std::byte> frame)
+core::async::Task<CacheOutcome> ExchangeWithSchedulerAsync(core::net::ISocket* scheduler, std::vector<std::byte> frame)
 {
     // Silent and never consulted: a notice reports a credential the peer ignored, and this
-    // exchange presents none.
-    auto notice = CredentialNotice::Silent();
-    return core::async::syncRun(ExchangeFramed(&scheduler, &notice, std::move(frame)));
+    // exchange presents none. Constructed in this frame rather than taken from a call, since it is
+    // held across the await -- the shape #1545 miscompiled keeps a call's RESULT there.
+    CredentialNotice notice { CredentialNotice::Sink {} };
+    // The credential spelled, never defaulted: this is the one place that decides it is none.
+    co_return co_await ExchangeFramed(scheduler, &notice, std::move(frame), Credential {});
+}
+
+CacheOutcome ExchangeWithScheduler(core::net::ISocket& scheduler, std::vector<std::byte> frame)
+{
+    return core::async::syncRun(ExchangeWithSchedulerAsync(&scheduler, std::move(frame)));
 }
 
 WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
@@ -659,7 +666,9 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocke
         // `NotLeader` whose message is prose, or names a bare port, is not a
         // redirect, and that judgement belongs in one place for the launcher's
         // lease chain and this alike.
-        return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
+        return std::unexpected { AnnounceRefusal { .kind = AnnounceRefusalKindOf(outcome),
+                                                   .reason = DescribeOutcome(outcome),
+                                                   .leader = RedirectTarget(outcome) } };
 
     // The reply is a record since wire version 4, not a bare id. A payload this
     // build cannot read is a refusal rather than a worker id of whatever the bytes
@@ -706,7 +715,8 @@ std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(core
     // id to forget. A registrar clears its worker id on that refusal so the caller's retry
     // re-registers; presence has nothing corresponding, because the ENDPOINT is the key and it
     // does not stop being the key when a scheduler restarts.
-    return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
+    return std::unexpected { AnnounceRefusal {
+        .kind = AnnounceRefusalKindOf(outcome), .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
 std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(core::net::ISocket& scheduler,
@@ -737,7 +747,8 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(core::net::ISock
     // leader it names may well be holding the very registration this id belongs to,
     // since the registry is replicated. Clearing it here would turn every election
     // into a re-registration storm across the whole fleet.
-    return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
+    return std::unexpected { AnnounceRefusal {
+        .kind = AnnounceRefusalKindOf(outcome), .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
 std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(core::net::ISocket& scheduler)
@@ -759,7 +770,8 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(core::net::ISocke
     // an `UnknownOpcode` from a scheduler too old to know the verb, leaves the same
     // fallback standing: the entry stops being heartbeated and expires on its own.
     // A withdrawal is an optimisation over that, never a replacement for it.
-    return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
+    return std::unexpected { AnnounceRefusal {
+        .kind = AnnounceRefusalKindOf(outcome), .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
 } // namespace FastCache::Cc

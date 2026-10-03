@@ -312,7 +312,7 @@
 
 # cap the shared tier this node serves when the fleet's shared-cache setting
 # names it (default 64g; 0 grows as needed). Kept under
-# <cluster-dir>/shared-cache.
+# <state-dir>/shared-cache, in this node's state directory.
 #shared_cache_disk:
 
 # back the local cache tier with disk at this path. Memory-only otherwise: a

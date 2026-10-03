@@ -2520,6 +2520,14 @@ shapes and they are not a spectrum:
   miss** (a miss-triggered refresh hands a remote peer a free amplifier: one expensive
   probe per request, just by asking); and **an injected seam with an injected clock**,
   because a cache with a hidden clock is untestable by construction.
+  The node's unreachable-UPSTREAM memo is the same shape (`UpstreamReachability`,
+  `RemoteUpstream.hpp`): a stale *unreachable* ignores a returned shared cache for at most one
+  retry interval, which is a local compile; a stale *reachable* costs the one exchange that
+  discovers the outage, which every miss paid before. What it remembers is whether the EXCHANGE
+  completed -- a dial that did not connect and a connection that stalled or lost its peer are one
+  answer, the second the costlier -- and never a miss. Its next probe is stamped when GRANTED, not
+  when it fails: a probe suspends for up to its ceiling, and every miss arriving meanwhile would
+  otherwise try too.
 - **Staleness that produces a wrong answer which LOOKS right is not cacheable**, however
   expensive the probe. `DiscoverTargetTriple` is the instance, above: ~40 ms per
   translation unit and deliberately not memoized, because the triple reaches `compilerId`

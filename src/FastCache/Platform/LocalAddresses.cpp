@@ -365,6 +365,26 @@ std::unique_ptr<IHostAddressSource> MakeSystemHostAddresses()
     return std::make_unique<SystemHostAddresses>();
 }
 
+void CachedLocalityOracle::RefreshIfDue() const
+{
+    // On an interval, never because a call did not find the address. A refresh a
+    // stranger can provoke is a probe a stranger can bill this machine for, once per
+    // request, and on Windows that probe costs milliseconds.
+    auto const now = _clock.now();
+    if (now - _sampledAt >= _refreshInterval)
+    {
+        _addresses = _source.Addresses();
+        _sampledAt = now;
+    }
+}
+
+std::vector<std::string> CachedLocalityOracle::Addresses() const
+{
+    std::scoped_lock const guard { _mutex };
+    RefreshIfDue();
+    return _addresses;
+}
+
 bool CachedLocalityOracle::IsThisMachine(std::string_view host) const
 {
     // First, and without the lock: this is what the cache surface sees for
@@ -375,16 +395,7 @@ bool CachedLocalityOracle::IsThisMachine(std::string_view host) const
         return true;
 
     std::scoped_lock const guard { _mutex };
-
-    // On an interval, never because this call did not find the address. A refresh a
-    // stranger can provoke is a probe a stranger can bill this machine for, once per
-    // request, and on Windows that probe costs milliseconds.
-    auto const now = _clock.now();
-    if (now - _sampledAt >= _refreshInterval)
-    {
-        _addresses = _source.Addresses();
-        _sampledAt = now;
-    }
+    RefreshIfDue();
 
     // `SameHost` rather than a string compare, and that is load-bearing: a surface
     // bound to `::` reports an IPv4 caller as `::ffff:10.0.0.1` while the probe

@@ -20,6 +20,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/async/Task.hpp>
 #include <core/net/ISocket.hpp>
 #include <core/platform/Clock.hpp>
 
@@ -379,6 +380,19 @@ class WorkerProtocol
 /// @return The outcome.
 [[nodiscard]] CacheOutcome ExchangeWithScheduler(core::net::ISocket& scheduler, std::vector<std::byte> frame);
 
+/// `ExchangeWithScheduler` for a caller that must not block -- the node's proof, which the
+/// shared-cache leg awaits on its reactor -- presenting NO credential, for the same reason and in
+/// the same way: the parameter does not exist, so presenting one is a new signature, never a
+/// forgotten argument. `ExchangeWithScheduler` is this, run to completion.
+///
+/// The seam every no-credential exchange goes through, so `ExchangeFramed`'s defaulted
+/// credential is reached from one place that spells it, and from no caller that could forget it.
+/// @param scheduler Connected transport; not owned, and must outlive the coroutine.
+/// @param frame A complete framed request.
+/// @return The outcome.
+[[nodiscard]] core::async::Task<CacheOutcome> ExchangeWithSchedulerAsync(core::net::ISocket* scheduler,
+                                                                         std::vector<std::byte> frame);
+
 /// Register this worker with a scheduler, and keep it registered.
 ///
 /// Separate from `WorkerProtocol` because it is the one part of a worker that
@@ -399,8 +413,35 @@ class WorkerProtocol
 /// Meanwhile the launcher followed the same refusal correctly and arrived at a
 /// leader whose registry this node had expired out of, so every lease answered
 /// `NoWorker` and the fleet distributed nothing while every counter read zero.
+///
+/// Whether a refusal is something the scheduler ANSWERED, or an exchange that never
+/// completed. A stall or a lost peer after the socket connected reaches this exactly
+/// as a genuine `Rejected` does -- both are "not a `Hit`" -- but they call for
+/// opposite remedies: naming the toolchain is right for one and naming the network is
+/// right for the other. Folding both into one string is what let a stalled connection
+/// log and count as `RegistrationRefused`/`PresenceRefused` and never raise
+/// `scheduler-unreachable`, so the node's own diagnosis was backwards for exactly the
+/// case an operator most needs it right for.
+enum class AnnounceRefusalKind : std::uint8_t
+{
+    Refused,   ///< The scheduler answered: a reason to log, or a redirect to follow.
+    Transport, ///< The exchange never completed; this machine cannot say why not.
+};
+
+/// @param outcome A round trip that did not land as a `Hit`.
+/// @return `Transport` for an exchange that never completed; `Refused` for
+///         everything else -- the same split `DescribeOutcome` draws in words.
+[[nodiscard]] inline AnnounceRefusalKind AnnounceRefusalKindOf(CacheOutcome const& outcome) noexcept
+{
+    return outcome.kind == CacheOutcomeKind::Transport ? AnnounceRefusalKind::Transport : AnnounceRefusalKind::Refused;
+}
+
 struct AnnounceRefusal
 {
+    /// Refused, or never answered at all. `Refused` for a refusal this type
+    /// synthesizes itself (no worker id yet, a malformed reply): neither is a
+    /// transport failure.
+    AnnounceRefusalKind kind { AnnounceRefusalKind::Refused };
     /// The scheduler's own words, ready to log.
     std::string reason;
     /// Where to announce instead, when this was a redirect. Filled from

@@ -744,6 +744,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             _advertised { std::move(endpoint) },
             _roster { BuildRoster(fleet, anchors) },
             _link { Unwrap(FastCache::Node::SchedulerLink::For(std::move(schedulers))) },
+            _reachability { fleet._clock },
             _lease { Distributed::SchedulerTermRegressionNotice::Silent() },
             _validator { Cc::SignedLeaseValidator(*_roster->Lease(), _advertised, fleet._wallClock, _lease, fleet._metrics) }
         {
@@ -765,7 +766,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                                                                         // Nothing proves over this
                                                                                         // harness's transport; see
                                                                                         // `Caller`.
-                                                                                        .prover = nullptr },
+                                                                                        .prover = nullptr,
+                                                                                        .reachability = _reachability },
                                                      _roster.get(),
                                                      _link,
                                                      _fleet);
@@ -834,6 +836,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         Advertised _advertised;
         std::unique_ptr<FastCache::Node::NodeRoster> _roster;
         FastCache::Node::SchedulerLink _link;
+        /// How loudly this worker says a setback at a scheduler, on the harness's clock.
+        FastCache::Node::SchedulerReachability _reachability;
         Distributed::WorkerLeaseState _lease;
         Cc::LeaseValidator _validator;
         ExactAudience _audience { _advertised.Current() };

@@ -48,6 +48,7 @@ enum class NodeCondition : std::uint8_t
     ForeignFleetVisible,            ///< Another established fleet proves itself on this segment; neither will merge.
     SharedCacheUnavailable,         ///< The fleet names this machine its shared cache, and its shared tier will not open.
     SharedCacheUnproven,            ///< The fleet names another machine its shared cache, and this node is not reaching it.
+    SchedulerUnreachable,           ///< A --scheduler endpoint does not answer a dial.
     Last,                           ///< Not a condition.
 };
 
@@ -64,6 +65,7 @@ enum class ConditionScope : std::uint8_t
     AdminSurface, ///< The admin HTTP surface; absent without `--admin-listen`.
     Enrollment,   ///< The enrollment window; served only by a consensus node that also schedules.
     Consensus,    ///< Consensus and the cluster state it replicates; absent without `--listen-raft`.
+    Announce,     ///< The announce loops; absent without --scheduler.
     Last,         ///< Not a scope.
 };
 
@@ -76,6 +78,7 @@ struct PresentComponents
     bool adminSurface; ///< An admin endpoint is serving.
     bool enrollment;   ///< An enrollment window is reachable.
     bool consensus;    ///< Consensus runs.
+    bool announces;    ///< The announce loops run: this node names a --scheduler.
 };
 
 /// One scope: which `PresentComponents` member says it runs, and what a row of it answers when it
@@ -108,6 +111,9 @@ inline constexpr EnumTable<ConditionScope, ConditionScopeRow> ConditionScopeTabl
     { .scope = ConditionScope::Consensus,
       .present = &PresentComponents::consensus,
       .notEvaluated = "this node runs no consensus (no --listen-raft), so no cluster state reaches it" },
+    { .scope = ConditionScope::Announce,
+      .present = &PresentComponents::announces,
+      .notEvaluated = "this node names no --scheduler, so it dials no scheduler that could be unreachable" },
 } };
 static_assert(RowsInEnumeratorOrder(ConditionScopeTable, &ConditionScopeRow::scope),
               "ConditionScopeTable must hold one row per ConditionScope, in enumerator order");
@@ -233,6 +239,14 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "impostor -- nothing was sent to it), the named machine refusing this node's key (its roster does not "
                 "hold it, or holds it revoked), one that did not answer, or a setting naming a machine this cluster "
                 "cannot reach by key. Check --cluster-status and the named machine's own --node-status." },
+    { .condition = NodeCondition::SchedulerUnreachable,
+      .id = "scheduler-unreachable",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Announce,
+      .remedy = "Check the VPN or network between this machine and the schedulers named here; the node keeps "
+                "serving this machine meanwhile. It rejoins the fleet by itself on the first round that gets "
+                "through, so nothing needs restarting once the network is back." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");

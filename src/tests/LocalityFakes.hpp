@@ -38,6 +38,11 @@ class ThisMachineIs final: public ILocalityOracle
         return std::ranges::contains(_hosts, host);
     }
 
+    [[nodiscard]] std::vector<std::string> Addresses() const override
+    {
+        return _hosts;
+    }
+
   private:
     std::vector<std::string> _hosts;
 };

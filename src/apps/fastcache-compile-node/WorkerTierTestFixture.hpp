@@ -117,7 +117,6 @@ struct WorkerTierFixture
                                                    .activation = SocketActivation::No,
                                                    .membership = membership,
                                                    .locality = locality,
-                                                   .addresses = addresses,
                                                    .io = io,
                                                    .host = *host,
                                                    .cacheTier = nullptr,

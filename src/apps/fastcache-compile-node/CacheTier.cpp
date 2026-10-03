@@ -78,6 +78,30 @@ namespace
     /// issues far more than one cache operation per thirty seconds.
     constexpr std::chrono::milliseconds UpstreamAddressRefreshInterval { 30'000 };
 
+    /// How long a failed EXCHANGE with the upstream -- a dial that did not connect, or a connection
+    /// that stalled or lost its peer -- is believed before the next is tried.
+    ///
+    /// Both directions, per `UpstreamReachability`. Too LONG, and a shared cache that came back
+    /// is ignored for that long -- every miss compiled locally, every store kept local -- which
+    /// fails closed and costs throughput, never correctness. Too SHORT, and a cache that is down
+    /// costs one probe that often: up to `UpstreamConnectTimeout` where the dial fails, and up to
+    /// `UpstreamConnectTimeout` plus `UpstreamIoTimeout` where the peer accepts and then stalls.
+    /// Before this existed it cost that per MISS. Ten seconds bounds the first to a few seconds
+    /// of local-only builds after the cache returns, and the second to one probe in ten seconds.
+    /// The per-miss cost it removes is INFERRED from those two ceilings, not measured: up to one
+    /// second where the network drops a SYN (a VPN peer asleep), up to six where a peer accepts
+    /// and stalls, next to nothing where it refuses.
+    constexpr std::chrono::milliseconds UpstreamUnreachableRetryInterval { 10'000 };
+
+    // A probe is stamped when it is GRANTED, so the next one is granted one interval later whether
+    // or not the first has finished. The interval must therefore outlast the longest probe the two
+    // ceilings allow -- a dial to its ceiling, then an exchange to its own -- or a stalled cache
+    // collects a second probe while the first is still hanging, and then a third. A floor rather
+    // than a guarantee: `RemoteUpstream::DialTarget`'s address lookup is bounded by neither
+    // ceiling, so a probe whose lookup hangs can still outlast an interval.
+    static_assert(UpstreamUnreachableRetryInterval > UpstreamConnectTimeout + UpstreamIoTimeout,
+                  "a probe bounded by both ceilings must finish inside one retry interval");
+
     /// Largest single object the on-disk tier accepts.
     ///
     /// `CowTreeStorage`'s own default is 1 MiB, which is right for the memcached
@@ -343,9 +367,10 @@ std::unique_ptr<ICacheUpstream> BuildRemoteUpstream(UpstreamParts const& parts)
         &parts.io.Reactor(),
         parts.io.Resolver(),
         parts.clock,
-        UpstreamConnectTimeout,
-        UpstreamIoTimeout,
-        UpstreamAddressRefreshInterval);
+        UpstreamTimings { .connectTimeout = UpstreamConnectTimeout,
+                          .ioTimeout = UpstreamIoTimeout,
+                          .addressRefreshInterval = UpstreamAddressRefreshInterval,
+                          .unreachableRetryInterval = UpstreamUnreachableRetryInterval });
 }
 
 std::unique_ptr<ICacheUpstream> BuildSharedCacheUpstream(UpstreamParts const& parts)

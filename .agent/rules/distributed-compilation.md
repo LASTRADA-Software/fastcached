@@ -506,10 +506,21 @@ Consequences that are each load-bearing:
       grant when it is dialled, never a fresh budget, and the two dials are one lease,
       released once. A hint that reached nothing while the name answered is a stale
       address, never an unreachable worker, so only a dead NAME enters the exclusion memo.
-    - **The worker reads that list from `IHostAddressSource` in EVERY round, never once
-      at construction** -- `HeartbeatRound::addresses` is the seam, not a vector, for
+    - **The worker reads that list from its LOCALITY ORACLE in EVERY round, never once
+      at construction** -- `HeartbeatRound::locality` is the seam, not a vector, for
       `--requirepass`'s reason: a captured list is the address the VPN had before it
       reconnected, and the hint would then be vetoed as a NAT for the rest of the process.
+    - **And the report is the SET the ticket audience answers from -- one value, never a
+      second probe** (`ILocalityOracle::Addresses`, the integration of lane 3's hints with
+      lane 2b's tickets). The client mints a ticket for the address it DIALS, so a hinted
+      compile is spent at the worker only if `NodeAudience`'s oracle calls the hint's host
+      this machine; a heartbeat reporting from its own probe hints a VPN's new address
+      before the audience knows it, and the `wrong-audience` refusal is final -- a local
+      compile rather than the name. With one set, a GAINED address is not reported until
+      the refresh (no hint: the name, as before hints existed) and a LOST one is reported
+      for one interval (a hint that reaches nothing or `LeaseEndpointMismatch`: the name).
+      The oracle refreshes on its interval, never because a heartbeat asked.
+      `FleetDialHint_test`'s refresh case goes RED with a second acquisition.
       `Node::ReportableInterfaceAddresses` leaves out, one `UnreportedAddresses` row
       each, what the wire refuses (`IsCarriedInterfaceAddress`, asked and never restated),
       loopback and link-local -- nothing the scheduler could ever hint, so none of it may

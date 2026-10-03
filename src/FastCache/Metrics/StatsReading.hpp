@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -516,22 +517,22 @@ struct CounterSoleWriter
 /// a row silently absent from the attribution and indistinguishable from one nobody had
 /// considered, cannot recur by omission ([#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)).
 ///
-/// **How the 218 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 56
-/// of them and would have rendered the other 162 absent -- the same defect as the bug, three
+/// **How the 219 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 56
+/// of them and would have rendered the other 163 absent -- the same defect as the bug, three
 /// times larger. The rows are written by five mechanisms, and reading only `SurfaceRefusal`
-/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 135 of the 162 and
+/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 136 of the 163 and
 /// leaves 27 looking unwritten:
 ///
 /// | mechanism | rows |
 /// |---|---|
-/// | a `.counter` table row: a `SurfaceRefusal` spent by `Refuse(row)`, or an outcome table spent by its reader | 136 |
+/// | a `.counter` table row: a `SurfaceRefusal` spent by `Refuse(row)`, or an outcome table spent by its reader | 137 |
 /// | a `LeaseToken.hpp` outcome row's `workerCounter` | 10 |
 /// | returned by a classifier for its caller to spend | 4 |
 /// | a `CacheTierProfile` member, spent by the tier built with it | 16 |
 /// | `Increment(Counter::X)` directly | 56 |
 ///
-/// The column sums past 218 because four rows are written two ways -- and the 135 above is not
-/// the 136 here: 136 rows HAVE a refusal row, and 135 of those have no increment site, which is
+/// The column sums past 219 because four rows are written two ways -- and the 136 above is not
+/// the 137 here: 137 rows HAVE a refusal row, and 136 of those have no increment site, which is
 /// what a `SurfaceRefusal`-only reading would reach. Two figures one apart, measuring different
 /// things, is exactly how a census comes to be quoted wrong, so both are asserted.
 ///
@@ -973,22 +974,30 @@ inline constexpr std::array CounterSoleWriterTable {
 /// held then were in that state, so the silence read as coverage exactly the way the rulebook
 /// says it does. A measurement of that moment, so it does not move with the catalogue.
 ///
+/// Which counters `CounterSoleWriterTable` names at least once, indexed by enumerator.
+///
+/// ONE pass over the table. The walk it replaces asked the whole table once per counter, which is
+/// counters x rows steps inside a constant expression: at 219 x 220, over MSVC's checked array
+/// iterators, clang's default `-fconstexpr-steps` ran out, and every clang-cl or clang-tidy parse
+/// of a translation unit including this header failed the `static_assert` below. `cl` does not
+/// count steps the same way, so the Windows build stayed green while the analyser could not parse.
+/// @return One flag per `IMetricsSink::Counter`, true when some row names it.
+[[nodiscard]] constexpr std::array<bool, EnumeratorCount<IMetricsSink::Counter>> AttributedCounters() noexcept
+{
+    auto named = std::array<bool, EnumeratorCount<IMetricsSink::Counter>> {};
+    for (auto const& row: CounterSoleWriterTable)
+        named[static_cast<std::size_t>(row.counter)] = true;
+    return named;
+}
+
 /// A `consteval` fold rather than a size comparison, because `CounterSoleWriterTable.size()`
-/// counts (counter, surface) PAIRS: it is 219 for 218 counters today, and a row duplicated
+/// counts (counter, surface) PAIRS: it is 220 for 219 counters today, and a row duplicated
 /// while another went missing would leave any arithmetic on the size perfectly consistent.
 ///
 /// @return True when no enumerator is missing from the table.
 [[nodiscard]] consteval bool EveryCounterIsAttributed() noexcept
 {
-    for (auto const counter: Enumerators<IMetricsSink::Counter>())
-    {
-        auto found = false;
-        for (auto const& row: CounterSoleWriterTable)
-            found = found || row.counter == counter;
-        if (!found)
-            return false;
-    }
-    return true;
+    return std::ranges::all_of(AttributedCounters(), std::identity {});
 }
 
 static_assert(EveryCounterIsAttributed(),
@@ -1007,15 +1016,7 @@ static_assert(EveryCounterIsAttributed(),
 /// @return The number of counters with at least one attributed surface.
 [[nodiscard]] constexpr std::size_t AttributedCounterCount() noexcept
 {
-    auto count = std::size_t { 0 };
-    for (auto const counter: Enumerators<IMetricsSink::Counter>())
-        for (auto const& row: CounterSoleWriterTable)
-            if (row.counter == counter)
-            {
-                ++count;
-                break;
-            }
-    return count;
+    return static_cast<std::size_t>(std::ranges::count(AttributedCounters(), true));
 }
 
 /// Whether a process serving @p surfaces could ever write @p counter.

@@ -530,7 +530,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved when lane 3's `dispatch_leases_all_excluded` joined the catalogue after `withdrawn`, in
     // integration order (ruling 8). Read off the built test, never computed by hand.
-    CHECK(StatsReadingLayout == 0xed690b6da9395300ULL);
+    CHECK(StatsReadingLayout == 0xe39d289812046125ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

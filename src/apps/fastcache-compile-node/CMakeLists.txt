@@ -61,6 +61,7 @@ add_executable(fastcache-compile-node
     NodeProofClient.cpp
     NodeProofResponder.cpp
     SchedulerLink.cpp
+    SchedulerReachability.cpp
     SchedulerTier.cpp
     SessionResponder.cpp
     ScratchClaim.cpp
@@ -169,6 +170,8 @@ if(FASTCACHED_BUILD_TESTS)
         NodePresenceTier_test.cpp
         SchedulerLink.cpp
         SchedulerLink_test.cpp
+        SchedulerReachability.cpp
+        SchedulerReachability_test.cpp
         SchedulerTier.cpp
         SchedulerTier_test.cpp
         SessionResponder.cpp

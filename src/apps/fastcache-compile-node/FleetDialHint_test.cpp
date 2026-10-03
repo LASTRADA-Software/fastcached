@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CompileCapacity.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeAudience.hpp"
+#include "NodeConfig.hpp"
+#include "SchedulerLink.hpp"
+#include "SchedulerReachability.hpp"
 
+#include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/TicketVerifier.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/HostLoad.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
+#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -23,8 +33,10 @@
 #include <ReachabilityMemo.hpp>
 #include <ReachabilityMemoTestSupport.hpp>
 #include <TicketCredentials.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/FleetHarness.hpp>
 #include <tests/LocalityFakes.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 
@@ -34,6 +46,7 @@ namespace Wire = CompileCacheWire;
 
 constexpr std::string_view Sched = "sched-a:6676";
 constexpr std::string_view Laptop = "laptop.corp:6677";   // what the laptop ADVERTISES
+constexpr std::string_view OldHost = "10.8.0.7";          // where the laptop was before the reconnect
 constexpr std::string_view NewHost = "10.8.0.42";         // where the VPN put it
 constexpr std::string_view NewAddress = "10.8.0.42:6677"; // the hint the scheduler derives from it
 constexpr std::string_view Toolchain = "msvc-19.44";
@@ -178,6 +191,16 @@ void TicketedLaptopMovedTo(Testing::FleetHarness& fleet, Distributed::IAudience 
     fleet.AddWorkerAddress(std::string { NewAddress }, CompiledReply());
     fleet.VerifyTicketsAtWorker(std::string { NewAddress }, audience, Sched);
 }
+
+/// A load sampler that reports nothing: what a heartbeat SAYS about load decides nothing here.
+class SilentLoadSampler final: public IHostLoadSampler
+{
+  public:
+    [[nodiscard]] HostLoad Sample() override
+    {
+        return HostLoad {};
+    }
+};
 } // namespace
 
 TEST_CASE("After a VPN reconnect the compile reaches the laptop at its NEW address", "[node][fleet][dialhint]")
@@ -335,4 +358,90 @@ TEST_CASE("A worker whose addresses do not include the hint refuses its ticket a
     CHECK(compiles[0].code == Wire::ErrorCode::TicketRefused);
     CHECK(fleet.Metrics().Read(IMetricsSink::Counter::NodeTicketsRefusedWrongAudience) == 1);
     CHECK_FALSE(fleet.IsInFlight(Sched, "k6"));
+}
+
+TEST_CASE("A heartbeat reports what the audience accepts, so a hint names a new address only once the audience knows it",
+          "[node][fleet][dialhint][ticket]")
+{
+    // The laptop's heartbeat as `main` builds it -- production's round over the ONE locality oracle
+    // its ticket audience answers from -- announcing into the fleet. The VPN reconnects: the
+    // scheduler sees the rounds arrive from the new address at once, but the oracle knows it only
+    // at its refresh. Until then the report still names the old set, so the scheduler vetoes the
+    // hint (`NotAReportedInterface`) and the compile goes to the NAME; after it, the hint names the
+    // new address and its ticket is accepted there, because the audience reads the same set.
+    //
+    // RED when the report is a second, independent acquisition (hand the round a `CachedLocalityOracle`
+    // of its own, interval zero, over `machine`): the first compile goes to the new address and the
+    // audience, still on the old set, refuses its ticket `wrong-audience` -- a refusal is final, so
+    // that build compiles locally.
+    Testing::FleetHarness fleet;
+    fleet.AddScheduler(std::string { Sched });
+    fleet.ElectLeader(Sched);
+    fleet.SetClusterStateAt(Sched, Testing::FleetHarness::StateOf({ std::string { Sched } }, {}, 1));
+    fleet.AdmitMachine(std::string { Builder });
+
+    Testing::ScriptedHostAddresses machine { { std::string { OldHost } } };
+    core::platform::ManualClock clock;
+    CachedLocalityOracle const locality { machine, clock };
+    Node::AnnouncedEndpoint const advertised { Laptop };
+    Node::NodeAudience const audience { advertised, "laptop", { 6677 }, locality };
+    fleet.AddWorkerAddress(std::string { Laptop }, CompiledReply());
+    fleet.AddWorkerAddress(std::string { NewAddress }, CompiledReply());
+    fleet.VerifyTicketsAtWorker(std::string { Laptop }, audience, Sched);
+    fleet.VerifyTicketsAtWorker(std::string { NewAddress }, audience, Sched);
+
+    Node::NodeConfig cfg;
+    cfg.schedulers = { std::string { Sched } };
+    AtomicMetricsSink workerMetrics;
+    NullLogger logger;
+    SilentLoadSampler loadSampler;
+    Node::CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    std::vector<Cc::WorkerRegistrar> registrars;
+    registrars.emplace_back(
+        std::string { Toolchain }, std::string { Laptop }, 1U, Wire::CodecList {}, Wire::CapacityFields {});
+    std::vector<Cc::WorkerRegistrar> withdrawals;
+    std::atomic<bool> addressCapNoticed { false };
+    Node::SchedulerReachability reachability { clock };
+    auto link = Testing::Unwrap(Node::SchedulerLink::For(cfg.schedulers));
+    Node::HeartbeatRound const round { .cfg = cfg,
+                                       .registrars = registrars,
+                                       .withdrawals = withdrawals,
+                                       .capacity = capacity,
+                                       .loadSampler = loadSampler,
+                                       .locality = locality,
+                                       .addressCapNoticed = addressCapNoticed,
+                                       .cacheTier = nullptr,
+                                       .metrics = workerMetrics,
+                                       // Nothing proves over this harness's transport; see `Caller`.
+                                       .prover = nullptr,
+                                       .lease = lease,
+                                       .logger = logger,
+                                       .reachability = reachability };
+
+    // The reconnect: the machine answers at the new address, and its rounds arrive from there.
+    machine.Publish({ std::string { NewHost } });
+    fleet.SetCallerHost(std::string { NewHost });
+    REQUIRE(Node::AnnounceRound(round, link, fleet) == 1); // registers, reporting the oracle's set
+
+    TicketPerDial tickets { fleet, Builder };
+    Cc::CredentialedExchange credentialed { fleet, tickets };
+
+    // Before the refresh: no hint names the new address, and the name compiles.
+    auto before = fleet.Calls().size();
+    auto const unrefreshed = Cc::Dispatch(credentialed, Ask("k7"));
+    REQUIRE(unrefreshed.Ran());
+    CHECK(unrefreshed.dialledEndpoint == Laptop);
+    CHECK(fleet.CompiledAt(before) == std::vector<std::string> { std::string { Laptop } });
+
+    // The oracle's interval passes; the next heartbeat reports the new address, and a hinted
+    // compile's ticket is accepted there.
+    clock.advance(CachedLocalityOracle::DefaultRefreshInterval);
+    REQUIRE(Node::AnnounceRound(round, link, fleet) == 1);
+    before = fleet.Calls().size();
+    auto const refreshed = Cc::Dispatch(credentialed, Ask("k8"));
+    REQUIRE(refreshed.Ran());
+    CHECK(refreshed.dialledEndpoint == NewAddress);
+    CHECK(fleet.CompiledAt(before) == std::vector<std::string> { std::string { NewAddress } });
+    CHECK(fleet.Metrics().Read(IMetricsSink::Counter::NodeTicketsRefusedWrongAudience) == 0);
 }

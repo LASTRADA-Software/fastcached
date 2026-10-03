@@ -1039,6 +1039,38 @@ The log lines stay.
 - **A condition with no detection behind it is not a row.** `--scheduler` naming a literal seed
   address (#1310) was a candidate and is not wired: nothing detects it, and a row nothing can
   raise would read `undecided` forever -- the defect above, shipped on purpose.
+- **A setback that repeats every round is said on its TRANSITION, never once per round.** Both
+  announce loops logged an unreachable scheduler, an unproved identity and a refused registration
+  or presence at Warn on every round -- about 360 lines an hour from one machine running a worker
+  and the presence loop -- which is a log nobody reads for the one line that changed.
+  `SchedulerReachability` (`apps/fastcache-compile-node/`) keys on the round's OUTCOME, one row
+  of `SchedulerOutcomeTable` per kind, and says it through `ReachabilityTable`. Its `cadence`
+  column is the one interval. Each property below is tested with a `ManualClock` by counting
+  lines per level (`[reachability]`):
+  - **A change of outcome at one place is a transition**, and so is a new place. A repeat is not.
+  - **At most one Warn per scheduler per cadence, and the budget counts LOSSES** (`Lost`, then
+    `Further` at Info, then `Relapse` at Debug). Strict transitions alone are 90 Warns an hour on
+    a flapping VPN link -- the same flood through another door.
+  - **A recovery is said at the level of the loudest line said about its setback**: an operator
+    told it went away is told it came back, and one who was not, is not.
+  - **ONE per PROCESS**, owned by `main` and lent to both loops, or one machine says each
+    transition twice.
+  - **"Still" is claimed only about a place still being ASKED.** One nothing touched for a whole
+    cadence -- a remembered leader `SchedulerLink` let go of, a PC that slept -- is forgotten
+    silently, and a failure after that is news again at Warn.
+  - **A refusal naming a LEADER is not a setback**: it is the redirect the round follows at once,
+    and it stays at Debug.
+  - **The constructor pre-answers every row `clear`, before any round has run.** `Evaluate()` runs
+    once over an empty `_setbacks` set from the constructor, so a component wired at construction
+    reads `clear` rather than `undecided` from its first poll -- a window bounded by the time
+    before the first round completes, not a claim that anything was checked in it.
+
+  Its row is `scheduler-unreachable`: LIVE, raised only by the `Unreachable` outcome through the
+  table's `raises` column, from the same state -- no second observation. A refusal does not raise
+  it, because the remedy names the network and a scheduler that refused did answer -- and a
+  connection that stalled or lost its peer after it answered is folded into `Unreachable` for the
+  same reason, at `AnnounceRefusalKind::Transport` (`WorkerProtocol.hpp`): the exchange never
+  completed, so nothing about a toolchain or a fingerprint was actually refused.
 
 ## Open work
 

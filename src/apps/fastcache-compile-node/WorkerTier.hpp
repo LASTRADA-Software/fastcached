@@ -11,6 +11,7 @@
 #include "NodeStatusResponder.hpp"
 #include "NodeToolchains.hpp"
 #include "SchedulerLink.hpp"
+#include "SchedulerReachability.hpp"
 #include "ScratchClaim.hpp"
 #include "WorkerLease.hpp"
 
@@ -103,10 +104,9 @@ struct WorkerTierParts
     AnnouncedEndpoint& announced;
     SocketActivation activation;                      ///< Whether a supervisor handed the port over.
     Distributed::IMembershipOracle const& membership; ///< Who may send a compile at all.
-    ILocalityOracle const& locality;                  ///< Who may cordon this worker.
-    /// What this machine answers on, asked on every heartbeat: the same source `locality`
-    /// caches, read here uncached because a VPN address moves while the process runs.
-    IHostAddressSource const& addresses;
+    /// Who may cordon this worker, and what each heartbeat reports it answers on: ONE set, the
+    /// one the ticket audience checks, so a dial hint never names an address this node refuses.
+    ILocalityOracle const& locality;
     NodeIoLoop& io;               ///< The reactor a compile's reply returns to.
     IHostFactsSource const& host; ///< The hostname a registration labels.
     CacheTier const* cacheTier;   ///< Null on a node with no cache.
@@ -194,8 +194,10 @@ class WorkerTier
     /// NODE-ANNOUNCE from the presence loop, which runs on every node (#1440). This tier
     /// hands over none, so it reads none.
     /// @param statusClock The clock `node-status` differences a registration against.
+    /// @param reachability How loudly a scheduler that does not answer, or refuses, is said: the
+    ///        process's one, shared with the presence loop. Must outlive the returned heartbeat.
     /// @return The running heartbeat.
-    [[nodiscard]] WorkerHeartbeat Launch(core::platform::IClock const& statusClock);
+    [[nodiscard]] WorkerHeartbeat Launch(core::platform::IClock const& statusClock, SchedulerReachability& reachability);
 
     /// @return What answers the compile family on this node's `0xFC` listener.
     [[nodiscard]] CompileResponder& Responder() noexcept
@@ -275,7 +277,9 @@ class WorkerTier
                std::uint32_t slots);
 
     /// The heartbeat thread's body: the first survey, then a round per interval.
-    void Heartbeat(std::stop_token const& stop, core::platform::IClock const& statusClock);
+    void Heartbeat(std::stop_token const& stop,
+                   core::platform::IClock const& statusClock,
+                   SchedulerReachability& reachability);
 
     /// One registrar per served toolchain, carrying this machine's capacity record and
     /// the endpoint in force when it is called.
@@ -313,9 +317,9 @@ class WorkerTier
     /// check both read. Borrowed from `main`, which declares it above this tier and destroys
     /// it after -- `_prover`'s arrangement, for `_prover`'s reason.
     AnnouncedEndpoint& _announced;
-    /// What each heartbeat reports this machine answers on. Borrowed from `main`, which
-    /// declares it above this tier.
-    IHostAddressSource const& _addresses;
+    /// What each heartbeat reports this machine answers on: the locality oracle's own set
+    /// (`HeartbeatRound::locality`). Borrowed from `main`, which declares it above this tier.
+    ILocalityOracle const& _locality;
     WorkerMachine _machine;
     core::platform::SteadyClock _toolchainClock;
     DiscoveredToolchains _discovered;

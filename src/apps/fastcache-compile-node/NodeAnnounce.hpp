@@ -8,6 +8,7 @@
 #include "NodeConfig.hpp"
 #include "NodeProofClient.hpp"
 #include "SchedulerLink.hpp"
+#include "SchedulerReachability.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -190,13 +191,19 @@ struct HeartbeatRound
     std::vector<Cc::WorkerRegistrar>& withdrawals;
     CompileCapacity const& capacity; ///< For the in-flight count and the cordon.
     IHostLoadSampler& loadSampler;   ///< CPU, memory and scratch.
-    /// What this machine answers on, asked every round: a VPN address moves while the
-    /// process runs, and the scheduler's dial hint is only as right as the last report.
+    /// What this machine answers on, asked every round: the locality oracle's own set
+    /// (`ILocalityOracle::Addresses`), the one this node's ticket audience and cache surface
+    /// answer from.
     ///
-    /// The seam and never a list, for #404's reason: a list here would be a
-    /// copy taken when the round was built, and a worker whose VPN reconnected under a new
-    /// address would go on reporting the old one until it was restarted.
-    IHostAddressSource const& addresses;
+    /// **One value with the audience, never a second acquisition.** A grant's dial hint is
+    /// derived from this report, and the ticket the client mints for the hint is spent here only
+    /// if the audience accepts the hint's host; reported from a probe of its own, a VPN reconnect
+    /// is hinted before the audience knows it, and every hinted compile in that window is
+    /// refused. Stale in either direction it fails safe -- see `CachedLocalityOracle::Addresses`.
+    ///
+    /// The seam and never a list, for #404's reason: a list here would be a copy taken when the
+    /// round was built, and a worker whose VPN reconnected would never report the new address.
+    ILocalityOracle const& locality;
     /// Set once this process has said that it answers on more addresses than a report
     /// carries. Never lowered: the machine's interface count is a property of the machine,
     /// and repeating the line every heartbeat would bury it rather than say it.
@@ -215,6 +222,13 @@ struct HeartbeatRound
     /// read it. Registration is the only place that fact arrives (#401).
     Distributed::WorkerLeaseState& lease;
     ILogger& logger; ///< Where a refusal is named.
+    /// How loudly a scheduler that does not answer, or refuses, is said across rounds. SHARED with
+    /// the presence loop -- `main` owns one per process -- so a machine says each transition once.
+    ///
+    /// A registration or heartbeat is filed under its toolchain's FINGERPRINT, never under the
+    /// empty subject: that place is where the presence loop's refusal lives, and a worker's success
+    /// filed there would announce "recorded this machine again" about a machine still refused.
+    SchedulerReachability& reachability;
 };
 
 /// What one announcement learned, beyond how many entries landed.
@@ -339,6 +353,11 @@ inline constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
 /// machine's fleet row expire on a schedule nothing else in this process knew about -- and the
 /// two loops run in the same process against the same timeout (#1440).
 constexpr std::chrono::seconds NodeAnnounceInterval { 20 };
+
+// Strictly below the cadence a setback lasts silently at, or a machine that only ever
+// announces once a cadence would see every round as due for a reminder -- "still" would
+// stop meaning "still being asked" and start meaning "asked once, a while ago".
+static_assert(NodeAnnounceInterval < SchedulerUnreachableCadence);
 
 /// The load record describing this MACHINE, sampled once.
 ///
@@ -475,13 +494,19 @@ struct AnnounceProof
 /// joining verb can be heard, and it is treated exactly as an endpoint that did not answer --
 /// the next `--scheduler` is tried in the same round.
 /// @param link Which endpoint to try, and what an answer teaches it.
+/// @param reachability How loudly an endpoint that does not answer, or refuses the proof, is said:
+///        on the transition, then on a cadence, never per round. One per process, shared by every loop.
 /// @param dialer How a connection is made.
 /// @param logger Where an unreachable endpoint, a refused proof and a redirect are named.
 /// @param announcement What to say.
 /// @param proof How this machine proves itself on each connection.
 /// @return How many entries the endpoint that answered accepted.
-[[nodiscard]] std::size_t DialAndAnnounce(
-    SchedulerLink& link, IEndpointDialer& dialer, ILogger& logger, IAnnouncement& announcement, AnnounceProof const& proof);
+[[nodiscard]] std::size_t DialAndAnnounce(SchedulerLink& link,
+                                          SchedulerReachability& reachability,
+                                          IEndpointDialer& dialer,
+                                          ILogger& logger,
+                                          IAnnouncement& announcement,
+                                          AnnounceProof const& proof);
 
 [[nodiscard]] std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer);
 

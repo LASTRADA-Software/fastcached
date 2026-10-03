@@ -7,6 +7,7 @@
 #include "NodeDefaults.hpp"
 #include "NodeMembership.hpp"
 #include "NodeStatusText.hpp"
+#include "SchedulerReachability.hpp"
 #include "SchedulerTier.hpp"
 #include "SharedCacheResponder.hpp"
 #include "SharedCacheSession.hpp"
@@ -69,12 +70,12 @@ NullLogger membershipLog;
 
 /// Every component present: what `main` passes on a node that runs all of them.
 constexpr PresentComponents EveryComponent {
-    .worker = true, .scheduler = true, .adminSurface = true, .enrollment = true, .consensus = true
+    .worker = true, .scheduler = true, .adminSurface = true, .enrollment = true, .consensus = true, .announces = true
 };
 
 /// No component present but the process itself.
 constexpr PresentComponents NoComponent {
-    .worker = false, .scheduler = false, .adminSurface = false, .enrollment = false, .consensus = false
+    .worker = false, .scheduler = false, .adminSurface = false, .enrollment = false, .consensus = false, .announces = false
 };
 
 /// A port nothing is bound to, from a probe released at once: `Start` refuses port 0.
@@ -387,6 +388,10 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
         admin, *host, metrics, QuietSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
+
+    // The announce scope: the one tracker both announce loops share, with the registry, as `main` builds it.
+    core::platform::ManualClock reachabilityClock;
+    SchedulerReachability reachability { reachabilityClock, &conditions };
 
     CHECK(conditions.Settle(EveryComponent).empty());
     for (auto const& row: NodeConditionTable)

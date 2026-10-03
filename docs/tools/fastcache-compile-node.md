@@ -523,8 +523,9 @@ reading the cache, so it also repairs a stale entry on its way past.
 A pinned fingerprint is yours to choose, and it has to be **text** —
 specifically, valid UTF-8. So do `--advertise` and the version the node reports
 about itself. A scheduler refuses a registration that is not, with
-`malformed-registration` naming the offending field, and the node says so once
-per heartbeat:
+`malformed-registration` naming the offending field, and the node says so at
+warn when it starts, then at info every ten minutes while it lasts (every
+heartbeat in between is debug):
 
 ```
 scheduler scheduler.internal:6675 did not register a1b2c3:
@@ -566,13 +567,25 @@ Two things follow that are worth knowing when reading logs:
   connect timeout rather than for a whole interval. The same line names the next
   value when one of several `--scheduler`s does not answer; with none left to try it
   ends at `unreachable`.
+- That line, and every refusal line in this section, is said at `warn` **once**, when it
+  starts -- not once per heartbeat. While it lasts the node says so again at `info` every
+  ten minutes (`scheduler … unreachable -- still, after 600s`), and when it ends it says
+  so at the level of the loudest line said about it (`scheduler … reachable again after
+  1260s unreachable`). Every heartbeat in between is `debug`. One scheduler gets at most one
+  `warn` LOSS (and its recovery) every ten minutes, so a link that keeps dropping, or a
+  scheduler that changes from refusing to unreachable and back, says the rest at `info` or
+  `debug`. The worker's
+  heartbeat and the machine's presence announcement share that record, so a machine
+  running both says each change once. While any scheduler does not answer, `--node-status`
+  also shows the `scheduler-unreachable` condition.
 - The chain is bounded at two hops. Two schedulers that disagree about who leads
   — a partition healing — produce `gave up following leader redirects` and the
   node simply tries again next heartbeat. Seeing that line *repeatedly* is worth
   investigating; seeing it once around an election is not.
 
 A node whose own registration is refused for any other reason still reports it
-per heartbeat, as above — a redirect is the one refusal that is not a problem.
+on its own transitions, as above — a redirect is the one refusal that is not a
+problem.
 
 ### A change the leader will not record
 
@@ -844,6 +857,17 @@ tier caches locally and never tries to reach a fleet. On a node that runs consen
 empty `--upstream` is also what lets the fleet's
 [`shared-cache` setting](#the-fleets-shared-cache) decide where the tier reads through
 to.
+
+### An unreachable `--upstream`
+
+A shared cache that does not answer -- a dial that does not connect, or a connection
+that stalls until the per-operation timeout or loses its peer -- is remembered as
+unreachable for ten seconds. Inside that window a local miss is answered as a miss and a
+store is not offered upstream, without dialling, so a build with the shared cache down
+pays at most one timeout every ten seconds rather than one per miss. The first operation
+after the window tries again, and one that gets any answer ends the window at once. A
+store skipped this way counts in `fastcache_node_cache_upstream_store_failures_total`,
+exactly as a refused one does: the fleet did not get the object either way.
 
 ### Reading it
 
@@ -3051,6 +3075,7 @@ Every row says two things before anything else:
 | `foreign-fleet-visible` | live | warning | this node's fleet is established and discovery proves another established fleet on the segment that neither yields to, so they will not merge; the detail names both cluster ids | decide which fleet each machine belongs to and `--cluster-forget` it from the other; it clears a few minutes after the other fleet stops being heard |
 | `shared-cache-unavailable` | live | alert | the fleet's `shared-cache` setting names this machine and its shared tier will not open, so every other node's builds miss and compile locally; the detail says why | fix what the detail names — usually another process holding `<state-dir>/shared-cache`, or a full disk — and it opens at the next change the cluster applies or within 30 seconds; or name another machine with `--cluster-set shared-cache=<id>` |
 | `shared-cache-unproven` | live | warning | the fleet's `shared-cache` setting names another machine and this node's builds are not reaching it, so they compile locally; the detail says why — a machine at the announced address that proved another key (nothing was sent to it), the named machine refusing this node's key, one that did not answer, or a setting naming a machine this cluster cannot reach by key | check `--cluster-status` and the named machine's own `--node-status`; it clears by itself at the next operation that proves the named machine's key, and at the apply that stops the setting naming another machine or names a different one (not tried until an operation tries it); a setting naming a machine this cluster cannot reach by key raises it at the apply, before any build asks, and it clears at the apply that resolves it (not tried until an operation tries it); an operation still running when an apply moved the setting says nothing about the machine it had dialled |
+| `scheduler-unreachable` | live | warning | a `--scheduler` endpoint (or a leader it named) has not answered a dial; the detail names each, and one nobody has dialled for ten minutes is dropped from it | check the VPN or network between this machine and the schedulers named; the node keeps serving this machine meanwhile and rejoins by itself |
 
 The remedy each row carries is longer than this column, and it is the node's text: an older
 client or leader prints a newer node's row exactly as that node wrote it, rather than looking
@@ -4171,8 +4196,9 @@ node, by its operator. A refusal the caller can
 check for itself -- malformed bytes, a wrong audience, an expiry -- or one about this node's own
 state still names itself.
 
-A node whose proof is not accepted says so once per round, naming the scheduler and the
-reason, and **tries the next `--scheduler`** in the same round -- a connection that proved
+A node whose proof is not accepted says so, naming the scheduler and the reason -- at warn
+when it starts, then at info every ten minutes while it lasts, as a scheduler that does not
+answer is --, and **tries the next `--scheduler`** in the same round -- a connection that proved
 nothing is one on which no joining verb can be heard, so it counts as an endpoint that did
 not answer:
 

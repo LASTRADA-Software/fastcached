@@ -309,7 +309,7 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     _metrics { parts.metrics },
     _logger { parts.logger },
     _announced { parts.announced },
-    _addresses { parts.addresses },
+    _locality { parts.locality },
     _machine { std::move(machine) },
     _discovered { std::move(discovered) },
     _scratchClaim { std::move(scratchClaim) },
@@ -422,13 +422,15 @@ void WorkerTier::AnnounceAs(std::string endpoint)
     PublishToolchains(_runtime, _toolchains.size(), _discovered.entries.size());
 }
 
-WorkerHeartbeat WorkerTier::Launch(core::platform::IClock const& statusClock)
+WorkerHeartbeat WorkerTier::Launch(core::platform::IClock const& statusClock, SchedulerReachability& reachability)
 {
     return WorkerHeartbeat { std::jthread {
-        [this, &statusClock](std::stop_token const& stop) { Heartbeat(stop, statusClock); } } };
+        [this, &statusClock, &reachability](std::stop_token const& stop) { Heartbeat(stop, statusClock, reachability); } } };
 }
 
-void WorkerTier::Heartbeat(std::stop_token const& stop, core::platform::IClock const& statusClock)
+void WorkerTier::Heartbeat(std::stop_token const& stop,
+                           core::platform::IClock const& statusClock,
+                           SchedulerReachability& reachability)
 {
     // One sampler for the whole loop, not one per heartbeat: CPU utilization is a
     // difference between two readings, so a sampler per beat would report nothing,
@@ -440,13 +442,14 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, core::platform::IClock c
                                  .withdrawals = _withdrawals,
                                  .capacity = _capacity,
                                  .loadSampler = *loadSampler,
-                                 .addresses = _addresses,
+                                 .locality = _locality,
                                  .addressCapNoticed = _addressCapNoticed,
                                  .cacheTier = _cacheTier,
                                  .metrics = _metrics,
                                  .prover = _prover,
                                  .lease = *_leaseState,
-                                 .logger = _logger };
+                                 .logger = _logger,
+                                 .reachability = reachability };
 
     // The configuration snapshot this thread last surveyed against, so a reload is
     // noticed by COMPARISON rather than by a flag somebody else sets. Seeded BEFORE the
