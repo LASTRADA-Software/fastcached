@@ -270,10 +270,12 @@ inline constexpr std::size_t MaxConditionIdBytes = ConditionFieldCeiling(&NodeCo
 
 /// The most rows one list may carry.
 ///
-/// A node's table is a handful of rows and every one travels, so this is headroom for tables to
-/// come rather than a limit anything meets today -- and the node asserts its table fits, so a list
-/// is never cut short to honour it.
-inline constexpr std::size_t MaxNodeConditions = 12;
+/// Every row of a node's table travels, and the node asserts its table fits, so a list is never cut
+/// short to honour this. Fourteen rows today; sixteen leaves headroom, and the budget it costs is
+/// `CompileCacheWire::ConditionPayloadShare`'s, checked there in one sum with everything else a
+/// NODE-ANNOUNCE carries. A DECODER bound: raised from 12 at the integration that brought the
+/// thirteenth and fourteenth rows, so it moves with lane 0's version bump.
+inline constexpr std::size_t MaxNodeConditions = 16;
 
 /// What one encoded row costs at most, framing included: every field at its ceiling behind its
 /// length prefix, plus the prefix on the row itself.

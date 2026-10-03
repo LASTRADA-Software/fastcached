@@ -2288,3 +2288,63 @@ TEST_CASE("A dispatch names the worker, and the hint address when that is what c
     CHECK(DescribeWorkerReached(lostAtHint) == Hint);
     CHECK(lostAtHint.detail.contains(std::format("{} at {}", Worker, Hint)));
 }
+
+TEST_CASE("A lease names the toolchain the client compiles with, in words", "[dispatch]")
+{
+    // What lets the leader's `unserved-toolchain` say WHICH compiler nobody serves.
+    std::vector<std::string> const args { "-O2" };
+    auto request = Request(args);
+    request.toolchainLabel = "g++ 14.2.0";
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply(request, "OBJECTBYTES"));
+    REQUIRE(Dispatch(fleet, request).Ran());
+
+    auto const frames = FramesTo(fleet, Scheduler);
+    REQUIRE_FALSE(frames.empty());
+    REQUIRE(OpOf(frames.front()) == Wire::Op::Lease);
+    auto const lease = Wire::DecodeLeasePayload(frames.front().subspan(Wire::RequestHeaderSize));
+    REQUIRE(lease.has_value());
+    CHECK(Wire::AsStringView(Unwrap(lease).toolchainLabel) == "g++ 14.2.0");
+}
+
+TEST_CASE("A lease never carries a label a scheduler would refuse it for", "[dispatch]")
+{
+    // The label is display only, and a scheduler refuses the WHOLE lease over one that is not text or
+    // is longer than it records -- so sending it would cost this compile its distribution for a
+    // name. It goes out empty instead, and the lease still asks under the fingerprint.
+    struct Case
+    {
+        std::string_view why;
+        std::string label;
+        std::string sent;
+    };
+    auto const atBound = std::string(Wire::MaxToolchainLabelBytes, 'x');
+    auto const cases = std::array {
+        Case { .why = "not text", .label = "g++ \xff 14.2.0", .sent = "" },
+        Case { .why = "over the bound", .label = atBound + "x", .sent = "" },
+        // The control, which a guard dropping every label would fail.
+        Case { .why = "at the bound", .label = atBound, .sent = atBound },
+    };
+
+    std::vector<std::string> const args { "-O2" };
+    for (auto const& [why, label, sent]: cases)
+    {
+        INFO(why);
+        auto request = Request(args);
+        request.toolchainLabel = label;
+
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantReply());
+        fleet.Serve(std::string { Worker }, CompileReply(request, "OBJECTBYTES"));
+        REQUIRE(Dispatch(fleet, request).Ran());
+
+        auto const frames = FramesTo(fleet, Scheduler);
+        REQUIRE_FALSE(frames.empty());
+        REQUIRE(OpOf(frames.front()) == Wire::Op::Lease);
+        auto const lease = Wire::DecodeLeasePayload(frames.front().subspan(Wire::RequestHeaderSize));
+        REQUIRE(lease.has_value());
+        CHECK(Wire::AsStringView(Unwrap(lease).toolchainLabel) == sent);
+    }
+}

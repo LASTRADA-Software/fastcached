@@ -902,12 +902,11 @@ struct NodeConfig
 /// one** -- the rule this function exists to hold, and the one it got wrong. The
 /// memory a node holds back from compiles is the memory its tier actually holds, and
 /// `cacheMemoryBytes` is only ever the request: `--listen-node=` builds no tier at
-/// all, `--cache-memory 0` builds no memory half, and a DEFAULT cache port already
-/// held by a `fastcached` on the same machine is a warning the node carries on past.
-/// None of the three is visible in the flag, so sizing from it reserved a quarter of
-/// RAM for a tier that was never built and offered the fleet fewer slots than the
-/// machine has -- silently, since nothing reports a reservation for a tier that does
-/// not exist (#167).
+/// all, and `--cache-memory 0` builds no memory half. Neither is visible in the flag
+/// (a held port no longer is a third: it refuses the start), so sizing from it
+/// reserved a quarter of RAM for a tier that was never built and offered the fleet
+/// fewer slots than the machine has -- silently, since nothing reports a reservation
+/// for a tier that does not exist (#167).
 ///
 /// Hence a **required** parameter rather than a defaulted convenience: a caller that
 /// could omit it is a caller that can quietly go back to guessing. It must also be

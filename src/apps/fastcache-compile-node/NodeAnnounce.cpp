@@ -83,6 +83,13 @@ namespace
     }
 } // namespace
 
+Wire::CapacityFields AnnouncedCapacity(Distributed::NodeCapacity const& capacity)
+{
+    auto fields = Distributed::CapacityToWire(capacity);
+    fields.version = AdvertisedVersion();
+    return fields;
+}
+
 std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
                                                        std::shared_ptr<NodeConfig const> const& live)
 {

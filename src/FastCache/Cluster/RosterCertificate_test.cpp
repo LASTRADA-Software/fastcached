@@ -4,6 +4,7 @@
 #include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -306,4 +307,15 @@ TEST_CASE("Anchors certify a first roster by key alone, each counted once", "[cl
     auto const refused = Decide(Offer(RosterOf({ "n1", "n2", "n3" }), 1, { "n3", "n9" }), voters);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error() == RosterRefusal::Uncertified);
+}
+
+TEST_CASE("The longest endorsement a node attaches is exactly the NODE-ANNOUNCE budget's ceiling for it",
+          "[cluster][roster][endorsement][wire]")
+{
+    // `CompileCacheWire::MaxRosterEndorsementBytes` is summed into one NODE-ANNOUNCE budget from
+    // a header that cannot name this type, so it is checked here, against the real encoding: both
+    // ids at the one id bound every fleet id is held to.
+    auto const longestId = std::string(CompileCacheWire::MaxIdBytes, 'n');
+    auto const endorsement = Endorse(longestId, {}, 1, std::chrono::system_clock::time_point {}, longestId);
+    CHECK(EncodeEndorsement(endorsement).size() == CompileCacheWire::MaxRosterEndorsementBytes);
 }

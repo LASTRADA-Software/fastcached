@@ -49,6 +49,8 @@ enum class NodeCondition : std::uint8_t
     SharedCacheUnavailable,         ///< The fleet names this machine its shared cache, and its shared tier will not open.
     SharedCacheUnproven,            ///< The fleet names another machine its shared cache, and this node is not reaching it.
     SchedulerUnreachable,           ///< A --scheduler endpoint does not answer a dial.
+    UnservedToolchain,              ///< Clients asked the leader for a toolchain no live worker serves.
+    MixedNodeVersions,              ///< The leader sees one wire served by more than one build.
     Last,                           ///< Not a condition.
 };
 
@@ -247,6 +249,25 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .remedy = "Check the VPN or network between this machine and the schedulers named here; the node keeps "
                 "serving this machine meanwhile. It rejoins the fleet by itself on the first round that gets "
                 "through, so nothing needs restarting once the network is back." },
+    { .condition = NodeCondition::UnservedToolchain,
+      .id = "unserved-toolchain",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Scheduler,
+      .remedy = "Put the named compiler, at the named version, on at least one worker, or move the clients to a "
+                "compiler the fleet already serves (the fleet page's compiler column lists them): every lease counted "
+                "here was refused and compiled on the client's own machine instead. It clears once a worker serving "
+                "it registers, or once no client has asked for it for fifteen minutes." },
+    { .condition = NodeCondition::MixedNodeVersions,
+      .id = "mixed-node-versions",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Scheduler,
+      .remedy = "Upgrade every node to one build: these still speak one wire, so nothing refuses them and nothing "
+                "else reports it, but a fleet upgrades as one and two builds can disagree about anything the wire "
+                "does not carry. The detail and the fleet page's version column name each build and its machines. It "
+                "clears once the last odd machine runs the fleet's build or has been gone for ninety seconds; see "
+                "docs/operations/upgrading-a-fleet.md." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");

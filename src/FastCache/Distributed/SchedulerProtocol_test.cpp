@@ -1111,3 +1111,18 @@ TEST_CASE("Where a worker was seen and what it answers on cross the wire into a 
     REQUIRE(StatusOf(fixture.protocol.Answer(beat, afterReconnect)) == Wire::Status::Ok);
     CHECK(hintFor("k2") == "10.8.0.42:7100");
 }
+
+TEST_CASE("A LEASE's toolchain label reaches the scheduler's unserved list",
+          "[distributed][scheduler][protocol][conditions]")
+{
+    // Through the protocol, not around it: a decoder that dropped the fourth field would leave the
+    // service tests green and every unserved toolchain unlabelled.
+    Fixture fixture;
+    auto const frame = Wire::EncodeLease(
+        Wire::LeaseRequest { .fingerprint = "fp-cl", .key = "k", .acceptedCodecs = {}, .toolchainLabel = "cl 19.44.35207" });
+    CHECK(ErrorOf(fixture.protocol.Answer(frame, Insider)) == Wire::ErrorCode::NoWorker);
+
+    auto const unserved = fixture.service.UnservedToolchainsNow();
+    REQUIRE(unserved.size() == 1);
+    CHECK(unserved.front().label == "cl 19.44.35207");
+}

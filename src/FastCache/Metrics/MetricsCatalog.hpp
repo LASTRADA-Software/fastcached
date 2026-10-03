@@ -1395,6 +1395,31 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "refusal exists for. Never sum with fastcache_enrollment_control_refused_not_a_member_total, a "
               "caller nothing admitted at all.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchLeasesMalformed,
+      .prometheusName = "fastcached_dispatch_leases_malformed_total",
+      .help = "Lease requests refused because their key, toolchain fingerprint or toolchain label "
+              "is not UTF-8. Nothing is recorded for them. This project's launcher checks its label "
+              "before sending it, so any rise names a client that does not.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchLeasesFieldTooLong,
+      .prometheusName = "fastcached_dispatch_leases_field_too_long_total",
+      .help = "Lease requests refused because their key, toolchain fingerprint or toolchain label is "
+              "longer than a scheduler records. Nothing is recorded for them. This project's launcher "
+              "sends none that long, so any rise names a client that does.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchWorkerRegistrationsFieldTooLong,
+      .prometheusName = "fastcached_dispatch_worker_registrations_field_too_long_total",
+      .help = "Worker registrations refused because their fingerprint, endpoint, version, toolchain "
+              "label, display name or codec list is longer than a scheduler records. Nothing is recorded "
+              "for them. This project's nodes send none that long, so any rise names a peer that does.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchNodeAnnouncementsFieldTooLong,
+      .prometheusName = "fastcached_dispatch_node_announcements_field_too_long_total",
+      .help = "Machine announcements refused because their endpoint or version is longer than a "
+              "scheduler records. Nothing is recorded for them. An overlong condition field is refused "
+              "earlier, when the frame is decoded, and is not counted here. This project's nodes send "
+              "none that long, so any rise names a peer that does.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents

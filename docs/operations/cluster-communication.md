@@ -659,9 +659,8 @@ The rules between them, complete:
   to fail because a cache was down.
 
 On a machine running both `fastcached` and a node, one of them loses the `:6674`
-bind. The node warns and carries on with no local tier, and the launcher reaches
-the daemon on that port instead. Give one of them a port of its own if you want
-both.
+bind, and a node that loses it refuses to start. Run one of them — the node answers
+every verb the daemon does — or give one of them a port of its own.
 
 ## The operator's own connections
 

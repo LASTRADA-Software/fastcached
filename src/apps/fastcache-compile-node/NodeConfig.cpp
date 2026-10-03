@@ -397,6 +397,30 @@ namespace
         };
     }
 
+    /// An `--advertise` value: text, and no longer than a scheduler records an endpoint.
+    ///
+    /// Both are asked by the parse for `ParseToolchain`'s reason: a scheduler refuses a
+    /// registration whose endpoint is either, on every heartbeat, and a node started or
+    /// reloaded with one would register nowhere while it looked healthy. A host that long is
+    /// one no resolver answers for, so nothing that worked is refused.
+    /// @param sv The flag's value.
+    /// @return `sv` verbatim, or why a scheduler would refuse it.
+    [[nodiscard]] std::expected<std::string, ConfigError> ParseAdvertise(std::string_view sv)
+    {
+        auto text = ParseUtf8Text(sv);
+        if (text.has_value() && sv.size() > CompileCacheWire::MaxEndpointBytes)
+            return std::unexpected(ConfigError { .code = ConfigErrorCode::ParseError,
+                                                 .source = {},
+                                                 .line = 0,
+                                                 .field = {},
+                                                 .context = std::format("an endpoint of {} bytes is longer than the "
+                                                                        "{} a scheduler records; a registration "
+                                                                        "carrying it is refused on every round",
+                                                                        sv.size(),
+                                                                        CompileCacheWire::MaxEndpointBytes) });
+        return text;
+    }
+
     /// A `--toolchain` value, with the half that TRAVELS checked for being text.
     ///
     /// Split on the first `=`, as `SplitToolchain` does and for the same reason: a
@@ -434,8 +458,23 @@ namespace
     [[nodiscard]] std::expected<std::string, ConfigError> ParseToolchain(std::string_view sv)
     {
         if (auto const eq = sv.find('='); eq != std::string_view::npos)
+        {
             if (auto const pinned = ParseUtf8Text(sv.substr(0, eq)); !pinned.has_value())
                 return std::unexpected(pinned.error());
+            // And no longer than a scheduler records one. A pin that long could never match a
+            // client's digest anyway, and a scheduler refuses its registration on every round --
+            // the fails-at-every-boot shape above, so asked here for the same reason.
+            if (eq > CompileCacheWire::MaxToolchainFingerprintBytes)
+                return std::unexpected(ConfigError {
+                    .code = ConfigErrorCode::ParseError,
+                    .source = {},
+                    .line = 0,
+                    .field = {},
+                    .context = std::format("a pinned fingerprint of {} bytes is longer than the {} a scheduler "
+                                           "records; a registration carrying it is refused on every round",
+                                           eq,
+                                           CompileCacheWire::MaxToolchainFingerprintBytes) });
+        }
         if (!SplitToolchain(sv).has_value())
             return std::unexpected(
                 ConfigError { .code = ConfigErrorCode::ParseError,
@@ -936,7 +975,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .primary = "--advertise",
             .arity = Arity::Value,
             .operand = "=<host:port>",
-            .apply = AssignFrom<&NodeConfig::advertise, ParseUtf8Text>(),
+            .apply = AssignFrom<&NodeConfig::advertise, ParseAdvertise>(),
             .explicitBit = &NodeConfig::advertiseExplicit,
             .description = "host:port CLIENTS should use to reach this worker.\n"
                            "Defaults to this machine's fully qualified name on the\n"

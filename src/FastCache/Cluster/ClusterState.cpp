@@ -960,7 +960,7 @@ namespace
     /// the completeness check below proves one row per VERB, not one entry per field,
     /// so a fourth string added to `Command` and copied by `Apply` would get neither an
     /// entry here nor a compile error. That is the same residual
-    /// `RegistrationTextFields` records about `WorkerRegistration`, and the reason both
+    /// `RegistrationFields` records about `WorkerRegistration`, and the reason both
     /// are tables rather than checks written out.
     constexpr std::array<TextField<Command>, 3> AddMemberText { {
         { .name = "a member id", .project = [](Command const& c) -> std::string_view { return c.key; } },

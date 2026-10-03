@@ -1477,6 +1477,35 @@ class IMetricsSink
         /// from `EnrollmentControlRefusedNotAMember`, which is a caller nothing admitted at all.
         EnrollmentControlRefusedIdentifiedCallerRequired,
 
+        /// Lease requests refused because a string they carried -- the key, the toolchain
+        /// fingerprint, or the label a person reads that toolchain by -- is not UTF-8. The lease-side
+        /// twin of `DispatchWorkerRegistrationsMalformed`: a lease refused `no-worker` is recorded for
+        /// the leader's `unserved-toolchain` condition and a granted one is listed with its key, so
+        /// what a lease names enters the fleet's state and is gated where it enters. This project's
+        /// launcher sends only a label it checked, so a rise names a client that does not.
+        DispatchLeasesMalformed,
+        /// Lease requests refused because a string they carried is longer than a scheduler records:
+        /// the key (`CompileCacheWire::MaxLeaseKeyBytes`), the toolchain fingerprint
+        /// (`MaxToolchainFingerprintBytes`) or its label (`MaxToolchainLabelBytes`). Each is kept, so
+        /// each has a ceiling far below the frame's. Apart from `DispatchLeasesMalformed` because the
+        /// two have different causes: that one is bytes that are not text, this one text longer than
+        /// anything a real client writes -- and this project's launcher sends neither.
+        DispatchLeasesFieldTooLong,
+
+        /// Registrations refused because a field they carried is longer than a scheduler records:
+        /// the fingerprint, endpoint, version, toolchain label, display name or codec list, each
+        /// against its `CompileCacheWire` ceiling. Every one is kept in the worker's entry. Apart from
+        /// `DispatchWorkerRegistrationsMalformed`, which counts bytes that are not text: this one is
+        /// a field longer than anything this project's nodes send.
+        DispatchWorkerRegistrationsFieldTooLong,
+        /// Machine announcements (NODE-ANNOUNCE) refused because their endpoint or version is longer
+        /// than a scheduler records. Both are kept in the machine's row on the fleet page. A condition
+        /// row's fields have ceilings too, but over the wire the decoder refuses an overlong one first,
+        /// as a malformed frame that no counter moves for -- so this counts those only for a caller
+        /// of the service in the same process. This project's nodes send none that long, so a rise
+        /// names a peer that does.
+        DispatchNodeAnnouncementsFieldTooLong,
+
         Last,
     };
 

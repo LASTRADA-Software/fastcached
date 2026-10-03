@@ -55,11 +55,12 @@ is the reproducible lesson, since no unit test can reach either:
     the answer is a second column on the *name* table rather than a new question.
     Above both, a build may state the language itself (`/TP`, `-x c++`, which is
     what CMake emits for `set_source_files_properties(... LANGUAGE CXX)`); the
-    launcher appends its own spelling **last** so it wins, which is right when
-    nothing else spoke and silently overriding when something did — so such a
-    command line is **refused** instead. `/Tc`/`/Tp` are refused by the same row for
-    a second reason: they name a file, and with a bare file name they carry no
-    separator, so `CouldNameAFile` lets them past.
+    launcher FOLDS that selector into the language it appends **last** and drops the
+    build's copy, so the two cannot disagree (the entry on CMake emitting `/TP` below
+    is why this is not a refusal). Refused are only a selector it cannot restate --
+    an `-x` value with no `SourceLanguage` -- and `/Tc`/`/Tp`, for a second reason:
+    they name a file, and with a bare file name they carry no separator, so
+    `CouldNameAFile` lets them past.
   - **An extension whose language depends on the driver is never guessed at.** `.C`
     is C++ to a GNU driver and C to an MSVC one, and `.M` likewise — so the
     extension does not answer the question and a guess would hand a worker the wrong
@@ -2094,18 +2095,17 @@ Six more about what the tier IS and who gets to see it:
 - **What a node holds back from compiles is what its tier BUILT, never what a flag
   asked for.** `--cache-memory` is a request, and three things grant it and one
   denies it: `--cache-memory 0` with no `--cache-dir` leaves nowhere to keep objects
-  and builds no tier at all, `--cache-memory 0` beside a `--cache-dir` builds no
-  memory half, and a DEFAULT `--listen-node` already held — by the `fastcached` on
-  the same machine, which is where that port points — is a warning the node carries
-  on past, leaving the tier unreachable. None of the three touches `cacheMemoryBytes`, whose default is a quarter
-  of RAM, so `NodeCapacityOf` reading the flag reserved 8 GiB on a 32 GiB box that
-  cached nothing and offered the fleet 24 slots instead of 32. Under-utilisation
-  rather than breakage, and therefore silent forever: nothing anywhere reports a
-  reservation for a tier that does not exist. `NodeCapacityOf` takes the
-  `NodeCacheCapacity` that `CacheCapacityOf` read off the tier, which is why
-  `WorkerBody` derives capacity and `slots` BELOW the tier startup rather than above
-  it — and why the record the leader renders and the number the worker enforces are
-  now one call rather than a patched copy.
+  and builds no tier at all, and `--cache-memory 0` beside a `--cache-dir` builds no
+  memory half. Neither touches `cacheMemoryBytes` (a held `--listen-node` no longer
+  is a third: it refuses the start), whose default is a quarter of RAM, so
+  `NodeCapacityOf` reading the flag reserved 8 GiB on a 32 GiB box that cached
+  nothing and offered the fleet 24 slots instead of 32. Under-utilisation rather than
+  breakage, and therefore silent forever: nothing anywhere reports a reservation for
+  a tier that does not exist. `NodeCapacityOf` takes the `NodeCacheCapacity` that
+  `CacheCapacityOf` read off the tier, which is why `WorkerBody` derives capacity and
+  `slots` BELOW the tier startup rather than above it — and why the record the leader
+  renders and the number the worker enforces are now one call rather than a patched
+  copy.
 - **Which tiers cost the machine RAM is a column of `StorageTierTable`, not a check
   for `StorageTier::Memory`.** The taxonomy is open — the enum's own comment
   foreshadows a tier on a peer and a tier on a second filesystem — and enumerators
@@ -2249,10 +2249,8 @@ Six more about what the tier IS and who gets to see it:
   a *fleet participant* -- `--scheduler`, `--fleet-open` -- restores
   no ergonomics: the wider bind is what makes `CompilePortFacesTheNetwork` true, so
   a way to check a lease becomes required, and the wider bind *becomes* the advertised
-  endpoint, so `AdvertisesWildcard` requires `--advertise` too. It costs three things.
-  It silences `AdvertisesPastALoopbackBind`, whose message is the remedy. It moves the
-  fleet-facing bind onto the DEFAULTED path, where a port already held is a warning and
-  the node runs with no `0xFC` port while still registering and being leased. And "is
+  endpoint, so `AdvertisesWildcard` requires `--advertise` too. It costs two things.
+  It silences `AdvertisesPastALoopbackBind`, whose message is the remedy. And "is
   this a fleet participant" already has three deliberately different spellings -- the
   reachability rows' gate, `AdmitsRemotePeers`, `CompilePortFacesTheNetwork` -- so a
   fourth would decide a bind by one predicate and judge it by another.

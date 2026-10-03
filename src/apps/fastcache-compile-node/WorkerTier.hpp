@@ -74,6 +74,17 @@ struct WorkerMachine
     std::filesystem::path scratchBase;                  ///< Where scratch roots are claimed.
 };
 
+/// The label a REGISTER for @p toolchain carries: its own, or none when a scheduler would
+/// refuse the whole registration over it (`Cc::ToolchainLabelWithheldBecause`).
+///
+/// The label is display only, so the worker registers without it rather than not at all --
+/// and says so once per toolchain at Warn, naming the compiler and why, because a fleet page
+/// showing no name for a compiler this node serves is otherwise a question nobody can answer.
+/// @param toolchain What this worker serves.
+/// @param logger Where the Warn goes.
+/// @return The label to send; empty when it is withheld.
+[[nodiscard]] std::string RegisteredToolchainLabel(ServedToolchain const& toolchain, ILogger& logger);
+
 /// This machine's own worker seams: the real process runner, toolchain host, discovery
 /// and scratch claimant, claiming under `ScratchBaseDirectory()`.
 ///
@@ -293,6 +304,19 @@ class WorkerTier
         return _jobs.CompilerFor(fingerprint);
     }
 
+    /// One registrar per served toolchain, carrying this machine's capacity record and
+    /// the endpoint in force when it is called.
+    ///
+    /// A pure query -- it reads `_toolchains`' entries and `_announced`'s current value and
+    /// builds a `Cc::WorkerRegistrar` per one, whose own constructor only stores what it is
+    /// given -- so it is public rather than reached through a test-only seam: calling it
+    /// does not register, heartbeat or withdraw anything, and a case can ask it directly
+    /// for what a real round would build without spinning the heartbeat thread that is
+    /// `Serve`'s and `AnnounceAs`'s only production caller.
+    /// @param served What this worker currently serves, fingerprint to toolchain.
+    /// @return One registrar per entry of @p served.
+    [[nodiscard]] std::vector<Cc::WorkerRegistrar> RegistrarsFor(std::map<std::string, ServedToolchain> const& served);
+
     /// Stop admitting compiles, and wait for the ones admitted to finish.
     void StopAndDrain();
 
@@ -318,10 +342,6 @@ class WorkerTier
     void Heartbeat(std::stop_token const& stop,
                    core::platform::IClock const& statusClock,
                    SchedulerReachability& reachability);
-
-    /// One registrar per served toolchain, carrying this machine's capacity record and
-    /// the endpoint in force when it is called.
-    [[nodiscard]] std::vector<Cc::WorkerRegistrar> RegistrarsFor(std::map<std::string, ServedToolchain> const& served);
 
     /// Make @p served what the compile port and the registrations answer, in that order.
     void Serve(std::map<std::string, ServedToolchain> served);

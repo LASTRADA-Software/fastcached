@@ -2286,6 +2286,10 @@ void RecordManifest(InvocationRecord const& record,
     Cc::ThreadedParallelFor parallel;
     auto const identity = Cc::CachedToolchainFingerprint(
         ProcessRunner(), ToolchainHost(), cmd.compiler, compilerBanner, Cc::DriverOf(cmd.flavor), parallel);
+    // What a person calls this compiler, so a scheduler with no worker for the fingerprint can name
+    // it (`unserved-toolchain`). Derived by the one function the worker labels its own registration
+    // with, so both ends spell one compiler alike. Display only -- the fingerprint decides.
+    auto const toolchainLabel = Cc::ToolchainLabel(cmd.compiler, compilerBanner);
 
     // A digest that does not identify this toolchain is not dispatched with. The
     // outcome either way is a local compile -- a scheduler cannot match a value no
@@ -2409,7 +2413,8 @@ void RecordManifest(InvocationRecord const& record,
                                                             .compileDirReplacement = compileDirReplacement,
                                                             .sourceRoot = sourceRoot,
                                                             .sourceRootReplacement = sourceRootReplacement,
-                                                            .excludedWorkers = excludedWorkers },
+                                                            .excludedWorkers = excludedWorkers,
+                                                            .toolchainLabel = toolchainLabel },
                                       DispatchBudgetsOf(cfg),
                                       Cc::Credential {});
     // Every outcome is absorbed -- an Unreached scheduler is remembered, a completed lease

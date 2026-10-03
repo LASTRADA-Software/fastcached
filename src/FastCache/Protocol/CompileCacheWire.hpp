@@ -2211,7 +2211,7 @@ inline constexpr std::array OpTable {
                    .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::Lease,
                    .name = "lease",
-                   .fieldCount = 4, // fingerprint, key, accepted codecs, exclusions
+                   .fieldCount = 5, // fingerprint, key, accepted codecs, exclusions, toolchain label
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
@@ -3686,6 +3686,19 @@ struct CodecEnvelopeView
 /// harmless and is what a client with compression compiled out does.
 using CodecList = std::vector<std::uint8_t>;
 
+/// The longest codec list a REGISTER carries that a scheduler records, in ids -- one byte each.
+///
+/// KEPT: the worker entry holds it for as long as the worker heartbeats, and reads it against
+/// every lease. Not text, so only the length question reaches it, and refused and counted past it
+/// (`fastcached_dispatch_worker_registrations_field_too_long_total`) like the strings beside it.
+///
+/// Sized from what a list IS: the codecs a build can produce, most-preferred first --
+/// `Cc::AvailableCodecs()`, at most the compressed codecs it tries plus `Identity`, three today.
+/// The `static_assert` holding this at twice that sits in `fastcache-cc/CodecEnvelope.cpp`, where
+/// the list is built; a codec added there that would overrun it fails the build rather than every
+/// registration.
+inline constexpr std::size_t MaxCodecListIds = 16;
+
 /// Encode a codec preference list.
 /// @param codecs The ids, most-preferred first.
 /// @return One byte per id.
@@ -3749,6 +3762,13 @@ using CodecList = std::vector<std::uint8_t>;
 /// that predates them.
 template <typename T>
 using PerTier = std::vector<std::optional<T>>;
+
+/// How many tiers a sender of this build puts in a `PerTier` list: `StorageTier`'s count.
+///
+/// Named here because this header names no `Cache/` type, and a payload budget has to know the
+/// worst case it adds up (`MaxNodeAnnounceOtherBytes`). `CompileCacheWire_test` asserts it equals
+/// the enum's count, so a third tier fails a build rather than a budget.
+inline constexpr std::size_t CarriedCacheTiers = 2;
 
 /// What one cache tier is, stable for the life of the sending process.
 ///
@@ -4328,6 +4348,100 @@ static_assert((MaxLeaseExclusions * (MaxExcludedEndpointBytes + WireFields::Fiel
                   <= MaxControlPayload / 8,
               "a full exclusion list must leave a LEASE room for everything else it carries");
 
+/// The longest toolchain label a scheduler records, in bytes: a LEASE's `toolchainLabel` and a
+/// REGISTER's `CapacityFields::toolchainLabel` alike.
+///
+/// A label is KEPT -- the leader remembers what a client refused `no-worker` called its toolchain,
+/// for `unserved-toolchain`, and a worker entry what its compiler is called -- so it is bounded
+/// where it enters, apart from the frame's own `MaxControlPayload`: text a peer chose, rendered
+/// into a condition, a page and the JSON a script parses. A lease or a registration carrying a
+/// longer one is refused and counted (`fastcached_dispatch_leases_field_too_long_total`,
+/// `fastcached_dispatch_worker_registrations_field_too_long_total`), never truncated: a scheduler
+/// that cut it short would be a second author of what the peer said.
+///
+/// Sized from what a label IS. `Cc::ToolchainLabel` writes the compiler's file name and one version
+/// token -- `cl 19.44.35207`, `aarch64-none-elf-gcc 12.2.0` -- and the longest real names are the
+/// target-prefixed cross drivers, a little under forty bytes. The `static_assert` below holds the
+/// bound at twice the longest of them or more, so a toolchain a little longer than any listed still
+/// fits; a name longer than that is not one a person reads anyway.
+inline constexpr std::size_t MaxToolchainLabelBytes = 128;
+
+static_assert(std::ranges::all_of(std::to_array<std::string_view>({ "cl 19.44.35207",
+                                                                    "clang-cl 22.1.3",
+                                                                    "g++-13 13.3.0",
+                                                                    "clang++ 17.0.6",
+                                                                    "aarch64-none-elf-gcc 12.2.0",
+                                                                    "x86_64-w64-mingw32-g++-posix 13.2.0",
+                                                                    "arm-none-linux-gnueabihf-g++ 13.3.1",
+                                                                    "powerpc64le-linux-gnu-g++-14 14.2.0",
+                                                                    "x86_64-unknown-linux-gnu-clang++ 18.1.8" }),
+                                  [](std::string_view label) { return label.size() * 2 <= MaxToolchainLabelBytes; }),
+              "MaxToolchainLabelBytes must hold twice the longest real toolchain label");
+
+/// The longest toolchain fingerprint a scheduler records, in bytes: a LEASE's and a REGISTER's.
+///
+/// KEPT, as the label is: a lease refused `no-worker` is remembered under its fingerprint and named
+/// by `unserved-toolchain`, so without its own ceiling that record is sixteen times the frame's
+/// 64 KiB of text a peer chose; and a worker entry is filed under the fingerprint it registered.
+/// Refused and counted past it, like the label.
+///
+/// Sized from what a fingerprint IS. `ComputeToolchainFingerprint` -- one translation unit, which
+/// the launcher and the worker both compile -- renders a `KeyDigest`: `KeyDigest::HexLength`, 32
+/// lowercase hex characters. 64 is twice that, room for a digest twice as wide before this bound
+/// has to move. The `static_assert` holding it there sits in `fastcache-cc/Dispatch.cpp`, where the
+/// lease is built and both this bound and `KeyDigest` are visible; this header may not include an
+/// app's. A worker's pinned `<fingerprint>=<compiler>` is a copy of a client's digest, or it
+/// matches no lease at any length -- so a pin longer than this was already a worker nothing picks,
+/// and is now one the scheduler says so to.
+inline constexpr std::size_t MaxToolchainFingerprintBytes = 64;
+
+/// The longest `LeaseRequest::key` a scheduler records, in bytes.
+///
+/// KEPT by the lease table for as long as the lease lives, and listed among `/fleet.json`'s
+/// outstanding leases. The launcher's key is a `KeyDigest` too (`objkey-v*`, `fastcache-cc/CacheKey.cpp`),
+/// so it is sized as the fingerprint is and held there by the same `static_assert`.
+inline constexpr std::size_t MaxLeaseKeyBytes = 64;
+
+/// The longest endpoint a REGISTER or a NODE-ANNOUNCE names that a scheduler records, in bytes.
+///
+/// KEPT: it is what a worker entry and a machine's row are filed under, where a granted lease
+/// sends a client, and a column of the fleet page and `/fleet.json`. Refused and counted past it,
+/// never truncated -- a shortened endpoint is an address nothing answers on.
+///
+/// Sized from what an endpoint IS: a host, a colon and a port. The longest host anything can dial
+/// is a DNS name, 253 characters as text and 254 with the root's trailing dot (RFC 1035's 255
+/// octets on the wire); a bracketed IPv6 literal with a zone is a third of that. So 254 and
+/// `:65535`. No producer is visible to a `static_assert`: a node advertises what an operator typed
+/// into `--advertise`, or its listen surface's host, and a host longer than this is one no resolver
+/// answers for.
+inline constexpr std::size_t MaxEndpointBytes = 254 + std::string_view { ":65535" }.size();
+
+/// The longest version a REGISTER or a NODE-ANNOUNCE states that a scheduler records, in bytes.
+///
+/// KEPT by the worker entry and the machine's row, and rendered as the fleet page's version column
+/// -- read most during a rolling upgrade, when a peer this fleet did not build is likeliest to fill
+/// it with something surprising.
+///
+/// Sized from what a version IS: `FastCache::VersionString`, which `cmake/Version.cmake` writes as
+/// `X.Y.Z`, as `X.Y.Z-<distance>-g<commit>` between tags and with `-dirty` on an unclean tree --
+/// under fifty bytes at any abbreviation git picks for a repository this size -- or a vendor's
+/// `-DFASTCACHED_VERSION_STRING`. The `static_assert` holding this at twice the running build's
+/// sits in `fastcache-compile-node/WorkerTier.cpp`, where the version is put on the wire; this
+/// header may not include the generated `Version.hpp`.
+inline constexpr std::size_t MaxNodeVersionBytes = 128;
+
+/// The longest display name a REGISTER carries that a scheduler records, in bytes.
+///
+/// KEPT by the worker entry and rendered as the fleet page's name column (#1024) -- a label that
+/// decides nothing, and text a peer chose all the same.
+///
+/// Sized from what a display name IS: the host's own name, which `QueryHostFacts` reads into a
+/// buffer of `MaxHostNameBytes` and a terminator, so it can be no longer -- and 255 is DNS's own
+/// ceiling on a name, above what either platform's call returns for a host. The `static_assert`
+/// holding the two together sits in `fastcache-compile-node/WorkerTier.cpp`, where the name is put
+/// on the wire.
+inline constexpr std::size_t MaxDisplayNameBytes = 255;
+
 /// A client asking the scheduler where to compile.
 struct LeaseRequest
 {
@@ -4337,6 +4451,19 @@ struct LeaseRequest
     /// Workers this client could not reach moments ago, by the endpoint they
     /// ADVERTISE, newest first. They narrow THIS request's pick and nothing else.
     std::span<std::string_view const> excluded {};
+
+    /// What a person calls that toolchain, e.g. `cl 19.44.35207`; empty when the client did not say.
+    ///
+    /// **Display only, and never an identity** -- `CapacityFields::toolchainLabel`'s rule, from the
+    /// client's end: the fingerprint decides every match. It travels so a scheduler with no worker
+    /// for the fingerprint can NAME what nobody serves (`unserved-toolchain`); the digest is opaque
+    /// by design (#194), so without the client's own words an operator is shown a hash. Defaulted
+    /// and LAST, so a caller with nothing to say does not spell it.
+    ///
+    /// UTF-8 and at most `MaxToolchainLabelBytes`, or the scheduler refuses the WHOLE lease: it is
+    /// kept, and what is kept is gated where it enters -- as the key and the fingerprint are, against
+    /// `MaxLeaseKeyBytes` and `MaxToolchainFingerprintBytes`. Empty is always acceptable.
+    std::string_view toolchainLabel {};
 };
 
 /// The same, as views into a received payload.
@@ -4346,6 +4473,7 @@ struct LeaseView
     std::span<std::byte const> key;
     CodecList acceptedCodecs;
     std::vector<std::span<std::byte const>> excluded; ///< Borrowed from the payload, newest first.
+    std::span<std::byte const> toolchainLabel; ///< Empty when the client did not say.
 };
 
 /// A client handing a worker one translation unit.
@@ -4648,7 +4776,9 @@ inline constexpr std::size_t MaxHistoryBucketBytes =
 /// whole subsystem exists to make visible rather than to cause. Half the payload is
 /// left for everything else, which is two orders of magnitude more than the rest of
 /// a heartbeat needs.
-static_assert(MaxHistoryBucketsPerHeartbeat * MaxHistoryBucketBytes <= MaxControlPayload / 2,
+inline constexpr std::size_t HistoryPayloadShare = MaxControlPayload / 2;
+
+static_assert(MaxHistoryBucketsPerHeartbeat * MaxHistoryBucketBytes <= HistoryPayloadShare,
               "a history batch must leave room for the heartbeat carrying it");
 
 /// Frame a run of closed buckets as one nested field list.
@@ -4808,13 +4938,76 @@ struct LoadFields
     std::vector<std::string> interfaceAddresses {};
 };
 
-/// A list of conditions fits in a `NodeAnnounce` beside everything else it carries.
+/// The part of `MaxControlPayload` a node's condition list may take: a THIRD.
 ///
-/// A quarter of the payload, with the history batch holding its half: the two are the only
-/// variable-length passengers the verb has, and a ceiling nobody checked is a frame a leader
-/// refuses -- a machine the fleet stops seeing, over the report of what is wrong with it.
-static_assert(MaxNodeConditionListBytes <= MaxControlPayload / 4,
-              "a node's conditions must leave room for the history and the load beside them");
+/// A third rather than a quarter so that every row keeps its words -- a remedy is what an operator
+/// reads, and the longest is 487 of its 512 bytes -- at sixteen rows. Lane 2a's second batch may
+/// add rows; `MaxNodeConditions` and this share are re-checked when it lands.
+inline constexpr std::size_t ConditionPayloadShare = MaxControlPayload / 3;
+
+static_assert(MaxNodeConditionListBytes <= ConditionPayloadShare,
+              "a node's conditions must fit the share of the payload they are given");
+
+namespace Detail
+{
+    /// @param bytes What a field holds.
+    /// @return What it costs on the wire, its length prefix included.
+    [[nodiscard]] consteval std::size_t FramedField(std::size_t bytes) noexcept
+    {
+        return WireFields::FieldPrefixSize + bytes;
+    }
+} // namespace Detail
+
+/// The longest address list `EncodeAddressList` writes, its own prefix excluded.
+inline constexpr std::size_t MaxAddressListBytes = MaxInterfaceAddresses * Detail::FramedField(MaxInterfaceAddressBytes);
+
+/// The longest capacity record `EncodeCapacity` writes, field by field in its order: cores, memory,
+/// class, reserved cores, the cache record (one field holding the tier list, each tier one u64),
+/// version, reserved memory, toolchain label, display name, interface addresses.
+inline constexpr std::size_t MaxCapacityRecordBytes =
+    Detail::FramedField(sizeof(std::uint32_t)) + Detail::FramedField(sizeof(std::uint64_t)) + Detail::FramedField(1)
+    + Detail::FramedField(sizeof(std::uint32_t))
+    + Detail::FramedField(
+        Detail::FramedField(CarriedCacheTiers * Detail::FramedField(Detail::FramedField(sizeof(std::uint64_t)))))
+    + Detail::FramedField(MaxNodeVersionBytes) + Detail::FramedField(sizeof(std::uint64_t))
+    + Detail::FramedField(MaxToolchainLabelBytes) + Detail::FramedField(MaxDisplayNameBytes)
+    + Detail::FramedField(MaxAddressListBytes);
+
+/// The longest load record `EncodeLoad` writes WITHOUT its two variable passengers, whose own
+/// shares cover them: CPU, memory, scratch, the cache record (the tier list, each tier four u64s,
+/// then hits and misses), the history field's prefix, the cordon byte, the conditions field's
+/// prefix, interface addresses.
+inline constexpr std::size_t MaxLoadRecordFixedBytes =
+    Detail::FramedField(sizeof(std::uint32_t)) + Detail::FramedField(sizeof(std::uint64_t))
+    + Detail::FramedField(sizeof(std::uint64_t))
+    + Detail::FramedField(
+        Detail::FramedField(CarriedCacheTiers * Detail::FramedField(4 * Detail::FramedField(sizeof(std::uint64_t))))
+        + Detail::FramedField(sizeof(std::uint64_t)) + Detail::FramedField(sizeof(std::uint64_t)))
+    + Detail::FramedField(0) + Detail::FramedField(1) + Detail::FramedField(0) + Detail::FramedField(MaxAddressListBytes);
+
+/// The longest roster endorsement a node attaches: `Cluster::EncodeEndorsement`'s six fields --
+/// cluster id, roster version, the roster's SHA-256 (32 bytes), not-after, endorser id, signature.
+/// OPAQUE to this header, which names no `Cluster/` type; `RosterCertificate_test` encodes the
+/// longest one and asserts it fits.
+inline constexpr std::size_t MaxRosterEndorsementBytes =
+    Detail::FramedField(MaxIdBytes) + Detail::FramedField(sizeof(std::uint64_t)) + Detail::FramedField(32)
+    + Detail::FramedField(sizeof(std::uint64_t)) + Detail::FramedField(MaxIdBytes) + Detail::FramedField(NodeSignatureBytes);
+
+/// Everything a NODE-ANNOUNCE carries besides its history batch and its condition list, at its
+/// longest: the endpoint, the capacity record, the load record's fixed fields, the endorsement.
+inline constexpr std::size_t MaxNodeAnnounceOtherBytes =
+    Detail::FramedField(MaxEndpointBytes) + Detail::FramedField(MaxCapacityRecordBytes)
+    + Detail::FramedField(MaxLoadRecordFixedBytes) + Detail::FramedField(MaxRosterEndorsementBytes);
+
+/// ONE budget for the verb, summed, rather than two fractions each checked alone (which said
+/// nothing about whether the rest still fit). With the field ceilings above:
+///   history     its share 65536 / 2 = 32768 (a full batch is 128 x 112 = 14336),
+///   conditions  its share 65536 / 3 = 21845 (a full list is 16 x 1212 = 19392),
+///   the rest    5689 (endpoint 264 + capacity 2792 + load 2365 + endorsement 268),
+/// 32768 + 21845 + 5689 = 60302 <= 65536. `CompileCacheWire_test` encodes the worst case of all
+/// three, asserts its size is exactly what these constants say, and decodes it.
+static_assert(HistoryPayloadShare + ConditionPayloadShare + MaxNodeAnnounceOtherBytes <= MaxControlPayload,
+              "a NODE-ANNOUNCE's history, conditions and everything else must fit one control payload together");
 
 /// Frame a live-load record as one nested field list.
 ///
@@ -5125,7 +5318,8 @@ struct WithdrawView
                                  { AsBytes(request.fingerprint),
                                    AsBytes(request.key),
                                    std::span<std::byte const> { codecs },
-                                   std::span<std::byte const> { excluded } });
+                                   std::span<std::byte const> { excluded },
+                                   AsBytes(request.toolchainLabel) });
 }
 
 /// Split a LEASE payload.
@@ -5142,7 +5336,8 @@ struct WithdrawView
     return LeaseView { .fingerprint = (*fields)[0],
                        .key = (*fields)[1],
                        .acceptedCodecs = DecodeCodecList((*fields)[2]),
-                       .excluded = *std::move(excluded) };
+                       .excluded = *std::move(excluded),
+                       .toolchainLabel = (*fields)[4] };
 }
 
 /// A client reporting that the job it leased has ended.

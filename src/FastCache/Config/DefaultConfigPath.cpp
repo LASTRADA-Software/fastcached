@@ -271,7 +271,7 @@ std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path con
     // repair exists for: any standard account can create a %ProgramData%
     // subdirectory and drop a config into it long before the installer runs,
     // and returning AlreadyPresent at that point would leave the squatter
-    // owning the directory of a LocalSystem service's configuration forever.
+    // owning the directory of the Windows service's configuration forever.
     // The MSI cannot close it either — its PermissionEx replaces the access
     // list but not the owner.
     auto const parent = destination.parent_path();

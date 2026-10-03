@@ -4,6 +4,7 @@
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 
+#include <array>
 #include <concepts>
 #include <utility>
 
@@ -160,8 +161,14 @@ Wire::CodecList AvailableCodecs()
     // introducing a third hand-maintained number to save two reallocations of a
     // three-byte vector, in a change whose point is removing duplicated inventories,
     // is the wrong trade.
+    //
+    // Named rather than a braced list at the loop, so a scheduler's ceiling on a REGISTER's codec
+    // list can be held against the most this can produce: every candidate, and `Identity`.
+    constexpr auto CompressedCandidates = std::array { CompressionCodec::Zstd, CompressionCodec::Lz4 };
+    static_assert((CompressedCandidates.size() + 1) * 2 <= Wire::MaxCodecListIds,
+                  "a scheduler must record twice the codec list this build can advertise");
     Wire::CodecList out;
-    for (auto const codec: { CompressionCodec::Zstd, CompressionCodec::Lz4 })
+    for (auto const codec: CompressedCandidates)
         if (Compression::IsAvailable(codec))
             out.push_back(static_cast<std::uint8_t>(codec));
     out.push_back(Wire::IdentityCodec); // always, and always last

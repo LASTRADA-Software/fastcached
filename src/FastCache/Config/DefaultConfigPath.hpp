@@ -106,13 +106,13 @@ class IConfigPathProbe
     ///         Asked of every candidate a *privileged* process would use, for a
     ///         specific attack: `%ProgramData%` subdirectories are
     ///         user-creatable by default, so a standard account could plant the
-    ///         configuration a LocalSystem service then obeys. See
+    ///         configuration the Windows service then obeys. See
     ///         Platform/FileTrust.hpp for why the test is the containing
     ///         directory and not the owner.
     [[nodiscard]] virtual bool IsTrustedSystemLocation(std::filesystem::path const& path) const = 0;
 
     /// @return true when this process runs with the rights the machine-wide
-    ///         daemon has — root, or an elevated administrator / LocalSystem.
+    ///         daemon has — root, or an elevated administrator or a service logon.
     ///         Decides both halves of the rule below: which candidates apply,
     ///         and which have to be vouched for.
     [[nodiscard]] virtual bool IsPrivilegedProcess() const = 0;
@@ -177,7 +177,8 @@ struct ConfigLookup
 ///   configure a per-user instance for the wrong job. That is also why the
 ///   packaged systemd *user* unit passes no `--config` and expects built-in
 ///   defaults.
-/// - **Privileged** (root, elevated administrator, LocalSystem): every row
+/// - **Privileged** (root, an elevated administrator, or a Windows service
+///   logon — `IsPrivilegedProcess` says which): every row
 ///   applies, and *every* row must be one only an administrator could have
 ///   written — the per-user rows included. `$HOME` and `$XDG_CONFIG_HOME` are
 ///   inputs an unprivileged account often controls, and `sudo -E fastcached`

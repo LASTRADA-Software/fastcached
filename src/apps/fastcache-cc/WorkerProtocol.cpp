@@ -642,6 +642,11 @@ WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
     // of scalars and is now a struct holding a vector, so a copy allocates.
     _capacity { std::move(capacity) }
 {
+    // The one field of the record a scheduler would refuse the whole registration over and that
+    // decides nothing: a compiler named in bytes that are not text, or at length, keeps its worker
+    // in the fleet and loses only the name. The fingerprint and the endpoint go as given: both are
+    // matched, so a repaired one would register a different worker.
+    _capacity.toolchainLabel = std::string { SendableToolchainLabel(_capacity.toolchainLabel) };
 }
 
 std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocket& scheduler,

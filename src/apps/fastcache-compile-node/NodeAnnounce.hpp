@@ -13,7 +13,9 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
+#include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
@@ -117,6 +119,35 @@ class AnnouncedEndpoint final: public Cc::IAdvertisedEndpointSource
     mutable std::mutex _mutex;
     std::string _endpoint;
 };
+
+/// This machine's build, as every capacity record it sends carries it -- REGISTER's
+/// through the worker registrar and NODE-ANNOUNCE's through the presence loop alike.
+///
+/// One spelling asked from both call sites rather than each stamping `VersionString` into
+/// its own `CapacityFields` in its own words, which is how a node running no worker came
+/// to advertise none (#1440's second half): `NodePresenceTier` built one straight from
+/// `Distributed::CapacityToWire`, which knows nothing of the version because it is derived
+/// from `NodeCapacity`, a record with no version field of its own to read. See
+/// `AnnouncedCapacity`, which is `NodePresenceTier`'s answer to that.
+/// @return This build's version, compiled in and never configurable.
+[[nodiscard]] constexpr std::string_view AdvertisedVersion() noexcept
+{
+    static_assert(VersionString.size() * 2 <= CompileCacheWire::MaxNodeVersionBytes,
+                  "a scheduler must record twice the version this node sends");
+    return VersionString;
+}
+
+/// This machine's capacity record, as NODE-ANNOUNCE carries it: `capacity`, converted, with
+/// this build's version set on it.
+///
+/// `Distributed::CapacityToWire` alone answers for cores, memory, class and cache -- it is
+/// derived from `NodeCapacity`, which has no version field -- so a caller that stopped at
+/// its answer would carry an absent version, exactly the shape #1440's second half found. A
+/// free function rather than a line repeated at each of `NodePresenceTier`'s call sites,
+/// answering both questions together so neither can be asked without the other.
+/// @param capacity What this machine is.
+/// @return The wire record NODE-ANNOUNCE sends, version included.
+[[nodiscard]] CompileCacheWire::CapacityFields AnnouncedCapacity(Distributed::NodeCapacity const& capacity);
 
 /// A move of the endpoint this worker advertises: the new value, and what to say.
 ///

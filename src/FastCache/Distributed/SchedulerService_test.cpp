@@ -14,9 +14,11 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <functional>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -2610,4 +2612,436 @@ TEST_CASE("The hint follows a worker whose VPN address moved, and a beat reporti
     // no hint: the client dials the name, as it would have without this feature.
     REQUIRE(fleet.service.Heartbeat(after, id, NodeLoad {}, {}, {}).status == Wire::Status::Ok);
     CHECK(HintOf(fleet.service.Lease(Insider, Ask("gcc-14", "k3"))).empty());
+}
+
+TEST_CASE("A lease refused no-worker names its toolchain until a worker serves it", "[distributed][scheduler][conditions]")
+{
+    Leading fleet;
+    CHECK(fleet.service.UnservedToolchainsNow().empty());
+
+    auto const first = Wire::LeaseRequest {
+        .fingerprint = "fp-cl", .key = "key-1", .acceptedCodecs = {}, .toolchainLabel = "cl 19.44.35207"
+    };
+    auto const second = Wire::LeaseRequest {
+        .fingerprint = "fp-cl", .key = "key-2", .acceptedCodecs = {}, .toolchainLabel = "cl 19.44.35207"
+    };
+    REQUIRE(fleet.service.Lease(Insider, first).error == Wire::ErrorCode::NoWorker);
+    REQUIRE(fleet.service.Lease(Insider, second).error == Wire::ErrorCode::NoWorker);
+
+    auto const unserved = fleet.service.UnservedToolchainsNow();
+    REQUIRE(unserved.size() == 1);
+    CHECK(unserved.front().fingerprint == "fp-cl");
+    CHECK(unserved.front().label == "cl 19.44.35207");
+    CHECK(unserved.front().refusals == 2);
+
+    // A worker serving it is the fix, and the list says so at once rather than after the window.
+    REQUIRE(fleet.service.Register(Insider, OneSlot("fp-cl", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    CHECK(fleet.service.UnservedToolchainsNow().empty());
+}
+
+TEST_CASE("A capacity refusal is not an unserved toolchain", "[distributed][scheduler][conditions]")
+{
+    // A full fleet SERVES the toolchain; naming it would send an operator to install a compiler
+    // they already have.
+    Leading fleet;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::NoCapacity);
+    CHECK(fleet.service.UnservedToolchainsNow().empty());
+
+    // That check alone cannot fail: the list is filtered at READ against the live workers, so a
+    // capacity refusal that WAS recorded is hidden for exactly as long as the worker that was full
+    // stays up. The worker going away is what separates the two -- inside the window, a recorded
+    // capacity refusal would come back as though a client had been refused `no-worker` for a
+    // toolchain the fleet was serving when it asked.
+    //
+    // Pinned, because the step only separates them while it lands INSIDE the window: a heartbeat
+    // bound that outgrew the window would expire the record too, and the check below would pass
+    // with nothing tested.
+    static_assert(WorkerRegistry::DefaultHeartbeatTimeout + 1s < UnservedToolchains::Window);
+    fleet.clock.advance(WorkerRegistry::DefaultHeartbeatTimeout + 1s);
+    CHECK(fleet.service.UnservedToolchainsNow().empty());
+
+    // The control: once nothing serves it, the same toolchain IS recorded, at the same fleet --
+    // and its count is this one refusal, with nothing carried over from the capacity refusal.
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "key-3")).error == Wire::ErrorCode::NoWorker);
+    auto const unserved = fleet.service.UnservedToolchainsNow();
+    REQUIRE(unserved.size() == 1);
+    CHECK(unserved.front().fingerprint == "gcc-14");
+    CHECK(unserved.front().refusals == 1);
+}
+
+TEST_CASE("A lease naming its toolchain in bytes that are not text is refused, and never recorded",
+          "[distributed][scheduler][conditions]")
+{
+    // The label is text a peer sent, and a lease refused `no-worker` is where it ENTERS this
+    // scheduler's state -- to be rendered by the leader's condition, on the fleet page and in the
+    // JSON a script parses. Refused at the door, as a registration is, rather than repaired by
+    // whichever renderer notices first.
+    Leading fleet;
+    using Counter = IMetricsSink::Counter;
+
+    auto const label = fleet.service.Lease(
+        Insider,
+        Wire::LeaseRequest {
+            .fingerprint = "fp-cl", .key = "key-1", .acceptedCodecs = {}, .toolchainLabel = "cl \xff 19.44.35207" });
+    // WHICH refusal: its code, the one counter that moved, and the field it names.
+    CHECK(label.error == Wire::ErrorCode::MalformedFrame);
+    CHECK(label.message == "toolchain label is not valid UTF-8");
+    CHECK(fleet.metrics.Read(Counter::DispatchLeasesMalformed) == 1);
+    CHECK(fleet.metrics.Read(Counter::DispatchLeasesFieldTooLong) == 0);
+    CHECK(fleet.metrics.Read(Counter::DispatchLeasesNoWorker) == 0);
+    CHECK(fleet.service.UnservedToolchainsNow().empty());
+
+    // The fingerprint is stored beside the label and named by the same condition, so it passes
+    // the same gate -- before this record existed an unmatched fingerprint was compared and
+    // dropped, and nothing kept it.
+    auto const fingerprint = fleet.service.Lease(
+        Insider,
+        Wire::LeaseRequest {
+            .fingerprint = "fp-\xc0", .key = "key-2", .acceptedCodecs = {}, .toolchainLabel = "cl 19.44.35207" });
+    CHECK(fingerprint.error == Wire::ErrorCode::MalformedFrame);
+    CHECK(fingerprint.message == "fingerprint is not valid UTF-8");
+    CHECK(fleet.metrics.Read(Counter::DispatchLeasesMalformed) == 2);
+    CHECK(fleet.service.UnservedToolchainsNow().empty());
+
+    // And the key, which a granted lease keeps and the fleet page lists among outstanding leases.
+    auto const key = fleet.service.Lease(
+        Insider,
+        Wire::LeaseRequest {
+            .fingerprint = "fp-cl", .key = "key-\xfe", .acceptedCodecs = {}, .toolchainLabel = "cl 19.44.35207" });
+    CHECK(key.error == Wire::ErrorCode::MalformedFrame);
+    CHECK(key.message == "key is not valid UTF-8");
+    CHECK(fleet.metrics.Read(Counter::DispatchLeasesMalformed) == 3);
+    CHECK(fleet.metrics.Read(Counter::DispatchLeasesNoWorker) == 0);
+
+    // The control: the same lease in text is refused `no-worker`, and IS recorded.
+    REQUIRE(
+        fleet.service
+            .Lease(Insider,
+                   Wire::LeaseRequest {
+                       .fingerprint = "fp-cl", .key = "key-3", .acceptedCodecs = {}, .toolchainLabel = "cl 19.44.35207" })
+            .error
+        == Wire::ErrorCode::NoWorker);
+    CHECK(fleet.metrics.Read(Counter::DispatchLeasesMalformed) == 3);
+    auto const unserved = fleet.service.UnservedToolchainsNow();
+    REQUIRE(unserved.size() == 1);
+    CHECK(unserved.front().label == "cl 19.44.35207");
+}
+
+namespace
+{
+/// One string a LEASE carries that the scheduler keeps, and where it is kept.
+struct KeptLeaseField
+{
+    std::string_view name;                             ///< What a refusal calls it.
+    std::size_t ceiling;                               ///< The longest a scheduler records.
+    bool served;                                       ///< Whether a GRANT keeps it, rather than a `no-worker` refusal.
+    Wire::LeaseRequest (*ask)(std::string_view value); ///< A lease carrying @p value there.
+    std::vector<std::string> (*kept)(SchedulerService const& service); ///< Every value of it kept now.
+};
+
+/// The lease every row varies one field of.
+[[nodiscard]] Wire::LeaseRequest Unremarkable() noexcept
+{
+    return Wire::LeaseRequest {
+        .fingerprint = "fp-cl", .key = "key-1", .acceptedCodecs = {}, .toolchainLabel = "cl 19.44.35207"
+    };
+}
+} // namespace
+
+TEST_CASE("A lease field longer than a scheduler records is refused, and never recorded",
+          "[distributed][scheduler][conditions]")
+{
+    // Every string a LEASE carries is KEPT somewhere -- the fingerprint and the label by the
+    // unserved record, the key by the lease table and the fleet page's outstanding leases -- so each
+    // has a ceiling of its own, far below the frame's 64 KiB.
+    using Counter = IMetricsSink::Counter;
+    auto const fields = std::array {
+        KeptLeaseField { .name = "key",
+                         .ceiling = Wire::MaxLeaseKeyBytes,
+                         .served = true,
+                         .ask =
+                             [](std::string_view value) {
+                                 auto request = Unremarkable();
+                                 request.key = value;
+                                 return request;
+                             },
+                         .kept =
+                             [](SchedulerService const& service) {
+                                 auto keys = std::vector<std::string> {};
+                                 for (auto const& lease: service.OutstandingLeases(4).oldest)
+                                     keys.push_back(lease.key);
+                                 return keys;
+                             } },
+        KeptLeaseField { .name = "fingerprint",
+                         .ceiling = Wire::MaxToolchainFingerprintBytes,
+                         .served = false,
+                         .ask =
+                             [](std::string_view value) {
+                                 auto request = Unremarkable();
+                                 request.fingerprint = value;
+                                 return request;
+                             },
+                         .kept =
+                             [](SchedulerService const& service) {
+                                 auto fingerprints = std::vector<std::string> {};
+                                 for (auto const& toolchain: service.UnservedToolchainsNow())
+                                     fingerprints.push_back(toolchain.fingerprint);
+                                 return fingerprints;
+                             } },
+        KeptLeaseField { .name = "toolchain label",
+                         .ceiling = Wire::MaxToolchainLabelBytes,
+                         .served = false,
+                         .ask =
+                             [](std::string_view value) {
+                                 auto request = Unremarkable();
+                                 request.toolchainLabel = value;
+                                 return request;
+                             },
+                         .kept =
+                             [](SchedulerService const& service) {
+                                 auto labels = std::vector<std::string> {};
+                                 for (auto const& toolchain: service.UnservedToolchainsNow())
+                                     labels.push_back(toolchain.label);
+                                 return labels;
+                             } },
+    };
+
+    for (auto const& field: fields)
+    {
+        INFO(field.name);
+        Leading fleet;
+        if (field.served)
+            REQUIRE(fleet.service.Register(Insider, OneSlot("fp-cl", "10.0.0.2:7100")).status == Wire::Status::Ok);
+        auto const atBound = std::string(field.ceiling, 'x');
+        auto const over = atBound + "x";
+
+        // Text, so it is the LENGTH that is refused and not the encoding. WHICH refusal: the code,
+        // the sentence naming the field, and the one counter that moved.
+        auto const refused = fleet.service.Lease(Insider, field.ask(over));
+        CHECK(refused.error == Wire::ErrorCode::MalformedFrame);
+        CHECK(refused.message
+              == std::format("{} is {} bytes; a scheduler records at most {}", field.name, over.size(), field.ceiling));
+        CHECK(fleet.metrics.Read(Counter::DispatchLeasesFieldTooLong) == 1);
+        CHECK(fleet.metrics.Read(Counter::DispatchLeasesMalformed) == 0);
+        CHECK(fleet.metrics.Read(Counter::DispatchLeasesNoWorker) == 0);
+        CHECK(fleet.metrics.Read(Counter::DispatchLeasesGranted) == 0);
+        CHECK(field.kept(fleet.service).empty());
+
+        // AT the ceiling is a field like any other: answered as the fleet would answer it, and kept
+        // whole.
+        auto const accepted = fleet.service.Lease(Insider, field.ask(atBound));
+        if (field.served)
+            CHECK(accepted.status == Wire::Status::Ok);
+        else
+            CHECK(accepted.error == Wire::ErrorCode::NoWorker);
+        CHECK(fleet.metrics.Read(Counter::DispatchLeasesFieldTooLong) == 1);
+        CHECK(field.kept(fleet.service) == std::vector<std::string> { atBound });
+    }
+}
+
+namespace
+{
+/// One string a REGISTER carries that the scheduler keeps in the worker's entry.
+struct KeptRegistrationField
+{
+    std::string_view name;                                                 ///< What a refusal calls it.
+    std::size_t ceiling;                                                   ///< The longest a scheduler records.
+    void (*set)(WorkerRegistration& registration, std::string_view value); ///< Put @p value there.
+    std::string WorkerInfo::* kept;                                        ///< Where the entry keeps it.
+};
+} // namespace
+
+TEST_CASE("A registration field longer than a scheduler records is refused, and never recorded", "[distributed][scheduler]")
+{
+    // Every string a REGISTER carries is KEPT in the worker's entry for as long as it heartbeats, and
+    // rendered on the fleet page and in `/fleet.json` -- so each has a ceiling of its own, far below
+    // the frame's 64 KiB, as a lease's strings do.
+    using Counter = IMetricsSink::Counter;
+    auto const fields = std::array {
+        KeptRegistrationField { .name = "fingerprint",
+                                .ceiling = Wire::MaxToolchainFingerprintBytes,
+                                .set = [](WorkerRegistration& r, std::string_view v) { r.fingerprint = v; },
+                                .kept = &WorkerInfo::fingerprint },
+        KeptRegistrationField { .name = "endpoint",
+                                .ceiling = Wire::MaxEndpointBytes,
+                                .set = [](WorkerRegistration& r, std::string_view v) { r.endpoint = v; },
+                                .kept = &WorkerInfo::endpoint },
+        KeptRegistrationField { .name = "version",
+                                .ceiling = Wire::MaxNodeVersionBytes,
+                                .set = [](WorkerRegistration& r, std::string_view v) { r.version = v; },
+                                .kept = &WorkerInfo::version },
+        KeptRegistrationField { .name = "toolchain label",
+                                .ceiling = Wire::MaxToolchainLabelBytes,
+                                .set = [](WorkerRegistration& r, std::string_view v) { r.toolchainLabel = v; },
+                                .kept = &WorkerInfo::toolchainLabel },
+        KeptRegistrationField { .name = "display name",
+                                .ceiling = Wire::MaxDisplayNameBytes,
+                                .set = [](WorkerRegistration& r, std::string_view v) { r.displayName = v; },
+                                .kept = &WorkerInfo::displayName },
+    };
+
+    for (auto const& field: fields)
+    {
+        INFO(field.name);
+        Leading fleet;
+        auto const atBound = std::string(field.ceiling, 'x');
+        auto const over = atBound + "x";
+        auto const registration = [&field](std::string_view value) {
+            auto r = OneSlot("gcc-14", "10.0.0.2:7100");
+            r.version = "1.2.3";
+            r.toolchainLabel = "g++ 14.2.0";
+            r.displayName = "buildnode-3";
+            field.set(r, value);
+            return r;
+        };
+
+        // Text, so it is the LENGTH that is refused and not the encoding. WHICH refusal: the code a
+        // registration is refused with, the sentence naming the field, and the one counter that moved.
+        auto const refused = fleet.service.Register(Insider, registration(over));
+        CHECK(refused.error == Wire::ErrorCode::MalformedRegistration);
+        CHECK(refused.message
+              == std::format("{} is {} bytes; a scheduler records at most {}", field.name, over.size(), field.ceiling));
+        CHECK(fleet.metrics.Read(Counter::DispatchWorkerRegistrationsFieldTooLong) == 1);
+        CHECK(fleet.metrics.Read(Counter::DispatchWorkerRegistrationsMalformed) == 0);
+        CHECK(fleet.metrics.Read(Counter::DispatchWorkerRegistrations) == 0);
+        CHECK(fleet.service.Workers().LiveWorkers().empty());
+
+        // AT the ceiling is a field like any other: admitted, and kept whole.
+        CHECK(fleet.service.Register(Insider, registration(atBound)).status == Wire::Status::Ok);
+        CHECK(fleet.metrics.Read(Counter::DispatchWorkerRegistrationsFieldTooLong) == 1);
+        CHECK(fleet.metrics.Read(Counter::DispatchWorkerRegistrations) == 1);
+        auto kept = std::vector<std::string> {};
+        for (auto const& worker: fleet.service.Workers().LiveWorkers())
+            kept.push_back(worker.*field.kept);
+        CHECK(kept == std::vector<std::string> { atBound });
+    }
+}
+
+TEST_CASE("A registration's codec list longer than a scheduler records is refused, and never recorded",
+          "[distributed][scheduler]")
+{
+    // Not a string, and kept all the same: the worker's entry holds the list for as long as it
+    // heartbeats. So it has a ceiling too, asked by the same table and counted by the same row --
+    // and never the text question, since a codec id is a byte rather than a character: a list of
+    // ids at or above 0x80 is not UTF-8 and is a perfectly good list.
+    using Counter = IMetricsSink::Counter;
+    Leading fleet;
+    auto const atBound = std::vector<std::uint8_t>(Wire::MaxCodecListIds, std::uint8_t { 0xF0 });
+    auto over = atBound;
+    over.push_back(std::uint8_t { 0xF0 });
+
+    auto registration = OneSlot("gcc-14", "10.0.0.2:7100");
+    registration.codecs = over;
+    auto const refused = fleet.service.Register(Insider, registration);
+    CHECK(refused.error == Wire::ErrorCode::MalformedRegistration);
+    CHECK(refused.message
+          == std::format("codec list is {} bytes; a scheduler records at most {}", over.size(), Wire::MaxCodecListIds));
+    CHECK(fleet.metrics.Read(Counter::DispatchWorkerRegistrationsFieldTooLong) == 1);
+    CHECK(fleet.metrics.Read(Counter::DispatchWorkerRegistrationsMalformed) == 0);
+    CHECK(fleet.service.Workers().LiveWorkers().empty());
+
+    // AT the ceiling, bytes that are not text included: admitted, and kept whole.
+    registration.codecs = atBound;
+    CHECK(fleet.service.Register(Insider, registration).status == Wire::Status::Ok);
+    CHECK(fleet.metrics.Read(Counter::DispatchWorkerRegistrationsFieldTooLong) == 1);
+    CHECK(fleet.metrics.Read(Counter::DispatchWorkerRegistrationsMalformed) == 0);
+    auto kept = std::vector<std::vector<std::uint8_t>> {};
+    for (auto const& worker: fleet.service.Workers().LiveWorkers())
+        kept.push_back(worker.codecs);
+    CHECK(kept == std::vector<std::vector<std::uint8_t>> { atBound });
+}
+
+namespace
+{
+/// One string a NODE-ANNOUNCE carries that the scheduler keeps in the machine's row.
+struct KeptPresenceField
+{
+    std::string name;                                                         ///< What a refusal calls it.
+    std::size_t ceiling;                                                      ///< The longest a scheduler records.
+    std::function<void(NodePresence& presence, std::string_view value)> set;  ///< Put @p value there.
+    std::function<std::optional<std::string>(NodeReport const& report)> kept; ///< What the row kept.
+};
+
+/// A condition row a node would send, every field text and short.
+[[nodiscard]] Wire::NodeConditionFields OrdinaryCondition()
+{
+    return Wire::NodeConditionFields { .id = "scratch-low",
+                                       .persistence = "live",
+                                       .severity = "warning",
+                                       .state = "raised",
+                                       .detail = "1 GiB free",
+                                       .remedy = "free some space" };
+}
+} // namespace
+
+TEST_CASE("A machine's announcement field longer than a scheduler records is refused, and never recorded",
+          "[distributed][scheduler][conditions]")
+{
+    // What a NODE-ANNOUNCE says is kept in the machine's row -- its endpoint, its version, and every
+    // string of every condition it raised -- and rendered on the fleet page. Each has a ceiling of its
+    // own; a condition field's is the one its row of `ConditionFieldTable` states, walked here rather
+    // than restated, so a column appended there is tested without anybody remembering to.
+    using Counter = IMetricsSink::Counter;
+    auto fields = std::vector<KeptPresenceField> {
+        KeptPresenceField { .name = "endpoint",
+                            .ceiling = Wire::MaxEndpointBytes,
+                            .set = [](NodePresence& p, std::string_view v) { p.endpoint = v; },
+                            .kept = [](NodeReport const& r) -> std::optional<std::string> { return r.endpoint; } },
+        KeptPresenceField { .name = "version",
+                            .ceiling = Wire::MaxNodeVersionBytes,
+                            .set = [](NodePresence& p, std::string_view v) { p.version = v; },
+                            .kept = [](NodeReport const& r) -> std::optional<std::string> { return r.version; } },
+    };
+    for (auto const& column: Wire::ConditionFieldTable)
+        fields.push_back(KeptPresenceField {
+            .name = std::format("condition {}", column.name),
+            .ceiling = column.maxBytes,
+            .set = [member = column.member](NodePresence& p,
+                                            std::string_view v) { p.conditions->front().*member = std::string { v }; },
+            .kept = [member = column.member](NodeReport const& r) -> std::optional<std::string> {
+                if (!r.conditions.has_value() || r.conditions->empty())
+                    return std::nullopt;
+                return r.conditions->front().*member;
+            } });
+    // Two presence rows and one per condition column, so a walk that found no columns fails here
+    // rather than passing over nothing.
+    REQUIRE(fields.size() == 2 + Wire::ConditionFieldTable.size());
+
+    for (auto const& field: fields)
+    {
+        INFO(field.name);
+        Leading fleet;
+        auto const atBound = std::string(field.ceiling, 'x');
+        auto const over = atBound + "x";
+        auto const announce = [&fleet, &field](std::string_view value) {
+            auto presence = NodePresence { .endpoint = "10.0.0.5:6674",
+                                           .version = "1.2.3",
+                                           .capacity = {},
+                                           .load = {},
+                                           .conditions = std::vector { OrdinaryCondition() },
+                                           .endorsement = {} };
+            field.set(presence, value);
+            return fleet.service.AnnounceNode(Insider, presence, {});
+        };
+
+        // WHICH refusal: the code an announcement is refused with, the sentence naming the field, and
+        // the one counter that moved.
+        auto const refused = announce(over);
+        CHECK(refused.error == Wire::ErrorCode::MalformedRegistration);
+        CHECK(refused.message
+              == std::format("{} is {} bytes; a scheduler records at most {}", field.name, over.size(), field.ceiling));
+        CHECK(fleet.metrics.Read(Counter::DispatchNodeAnnouncementsFieldTooLong) == 1);
+        CHECK(fleet.metrics.Read(Counter::DispatchWorkerRegistrationsMalformed) == 0);
+        CHECK(fleet.service.Workers().NodeReports().empty());
+
+        // AT the ceiling: accepted, and kept whole.
+        CHECK(announce(atBound).status == Wire::Status::Ok);
+        CHECK(fleet.metrics.Read(Counter::DispatchNodeAnnouncementsFieldTooLong) == 1);
+        auto kept = std::vector<std::optional<std::string>> {};
+        for (auto const& report: fleet.service.Workers().NodeReports())
+            kept.push_back(field.kept(report));
+        CHECK(kept == std::vector<std::optional<std::string>> { atBound });
+    }
 }

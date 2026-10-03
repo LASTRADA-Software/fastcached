@@ -350,7 +350,7 @@ TEST_CASE("DefaultConfigPath: a machine-wide candidate a non-admin could have wr
 
     // Readable, and the only candidate there is — but in a directory anyone can
     // write, which is how a standard account plants the configuration that a
-    // LocalSystem service would then obey.
+    // Windows service would then obey.
     probe.MakeReadable(systemPath);
     probe.MakeUntrusted(systemPath);
 

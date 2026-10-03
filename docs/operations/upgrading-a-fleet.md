@@ -41,8 +41,8 @@ be.
 2. **Stop every node**, including any machine running only the scheduler or only a
    cache tier.
 3. **Upgrade every node and every client to the same release.** The launcher
-   (`fastcache-cc`) speaks this wire too, so a client left behind is a client that
-   silently stops using the cache.
+   (`fastcache-cc`) speaks this wire too, so a client left behind stops using the
+   cache — saying so on the developer's terminal, where you are not looking.
 4. **Start the nodes**, schedulers first if you run them separately.
 5. **Confirm** with the counter below before releasing the builds.
 
@@ -52,8 +52,9 @@ The order matters only in that nothing old should be running once anything new i
 
 **A version mismatch never fails a build.** `fastcache-cc` treats an unusable cache as a
 miss and compiles locally, which is the contract that keeps a cache problem from
-becoming a build problem. The cost is silent: every affected client loses the cache and
-every dispatched compile stops being dispatched.
+becoming a build problem. The cost is quiet: every affected client loses the cache and
+every dispatched compile stops being dispatched, and what a client says about it is said
+on the machine that ran the build.
 
 The signal is server-side, and it is spread over **four** counters because a fleet has
 four places a frame can be refused. Watch all of them: a mismatch shows up only on the
@@ -72,12 +73,21 @@ These are the *only* places a mismatch is visible, so an operator who has not be
 to watch them will not see one — which is why they are named here rather than left to
 be found during a rollout.
 
-All four are exported only when `--metrics` is set. If you do not scrape, the honest
-statement is that you cannot tell whether the upgrade was complete, which is a reason
-to do step 5 rather than a reason to skip it.
+The three node counters are on every node whatever it was started with:
+`fastcache-cli node-metrics` reads them over the node's `0xFC` port, and a node with
+`--admin-listen` also serves them on `/metrics`. The daemon's is exported only when
+`fastcached` runs with `--metrics`. If you cannot read them, you cannot tell whether the
+upgrade was complete, which is a reason to do step 5 rather than a reason to skip it.
 
-The asymmetry is worth stating plainly: **the server can see this and the client
-cannot.** Check the servers.
+**The servers count every refusal; a client only mentions it, on its own machine.** A
+launcher refused by a cache on the other version prints one line naming it at most every
+five minutes, and one refused by the fleet tallies it in `--show-stats` as *this launcher
+and the fleet disagree about the wire* — both on a developer's machine, not yours. Check
+the servers.
+
+And a fleet on **one wire at two builds** is refused by nothing at all, so none of the
+counters above moves. The leader raises the `mixed-node-versions` condition for that,
+naming each build and the machines running it (`fastcache-cli fleet`, its conditions section).
 
 ## The consensus peer wire, version 4
 

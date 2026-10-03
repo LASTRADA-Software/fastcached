@@ -4,8 +4,11 @@
 
 #include <FastCache/Core/HostPort.hpp>
 
+#include <FastCache/Core/Utf8.hpp>
+
 #include <algorithm>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -18,6 +21,18 @@ namespace FastCache::Cc
 namespace
 {
     namespace Wire = CompileCacheWire;
+
+    // The lease's other two kept strings need no guard like `SendableToolchainLabel`'s, because
+    // their size is decided by construction: the fingerprint (`ComputeToolchainFingerprint`) and the
+    // object key (`objkey-v*`) are both `KeyDigest` hex, `KeyDigest::HexLength` characters of
+    // `[0-9a-f]`. What CAN change is the digest, and this is where a wider one would first overrun
+    // a scheduler's ceiling -- so the ceilings are held at twice today's digest here, where both
+    // sides are visible, rather than by a runtime check that would silently strip a lease of its
+    // identity.
+    static_assert(KeyDigest::HexLength * 2 <= Wire::MaxToolchainFingerprintBytes,
+                  "a scheduler must record twice the fingerprint this launcher sends");
+    static_assert(KeyDigest::HexLength * 2 <= Wire::MaxLeaseKeyBytes,
+                  "a scheduler must record twice the object key this launcher sends");
 
     /// How to name the correlation a worker sent back, in a message an operator reads.
     ///
@@ -402,7 +417,8 @@ namespace
             auto frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = request.fingerprint,
                                                                 .key = request.objectKey,
                                                                 .acceptedCodecs = accepted,
-                                                                .excluded = excluded });
+                                                                .excluded = excluded,
+                                                                .toolchainLabel = SendableToolchainLabel(request.toolchainLabel) });
             attempt.outcome = exchange.Exchange(attempt.scheduler, std::move(frame), credential, budget);
 
             auto redirect = RedirectTarget(attempt.outcome);
@@ -425,6 +441,20 @@ namespace
     }
 
 } // namespace
+
+std::optional<std::string> ToolchainLabelWithheldBecause(std::string_view label)
+{
+    if (!IsValidUtf8(label))
+        return std::string { "it is not valid UTF-8" };
+    if (label.size() > Wire::MaxToolchainLabelBytes)
+        return std::format("it is {} bytes, and a scheduler records at most {}", label.size(), Wire::MaxToolchainLabelBytes);
+    return std::nullopt;
+}
+
+std::string_view SendableToolchainLabel(std::string_view label)
+{
+    return ToolchainLabelWithheldBecause(label).has_value() ? std::string_view {} : label;
+}
 
 std::vector<std::string> DecodeArgs(std::span<std::byte const> field)
 {

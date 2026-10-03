@@ -777,6 +777,13 @@ struct DispatchRequest
     /// `CompileCacheWire::MaxLeaseExclusions`, the newest ones, which is also as many as
     /// the memo keeps.
     std::span<std::string const> excludedWorkers {};
+
+    /// What a person calls this client's toolchain, e.g. `cl 19.44.35207`, from `ToolchainLabel`;
+    /// empty when there is nothing to call it.
+    ///
+    /// Sent with the LEASE so a scheduler with no worker for `fingerprint` can say WHICH compiler
+    /// nobody serves. Display only: nothing matches on it, and the fingerprint decides.
+    std::string_view toolchainLabel {};
 };
 
 /// Ask the scheduler for a worker and have it compile this translation unit.
@@ -855,6 +862,26 @@ struct DispatchRequest
 /// @param field The encoded argument field.
 /// @return The arguments, or an empty list when the field is malformed.
 [[nodiscard]] std::vector<std::string> DecodeArgs(std::span<std::byte const> field);
+
+/// The toolchain label this project's clients send a scheduler: their own, unless a scheduler would
+/// refuse what carries it.
+///
+/// A scheduler KEEPS the label -- a LEASE's for `unserved-toolchain`, a REGISTER's in the worker's
+/// entry -- so it refuses the whole request whose label is not UTF-8 or is longer than
+/// `CompileCacheWire::MaxToolchainLabelBytes`, rather than keep it. The label is display only --
+/// nothing matches on it -- so sending one of those would trade a compile's distribution, or a
+/// worker's place in the fleet, for a name; sending none loses only the name. The same predicate and
+/// the same bound the scheduler refuses by, so the two ends cannot disagree about which labels travel.
+/// @param label What `ToolchainLabel` called the compiler.
+/// @return @p label, or empty when a scheduler would refuse it.
+[[nodiscard]] std::string_view SendableToolchainLabel(std::string_view label);
+
+/// Why a scheduler would refuse what carries @p label, in words for a log line -- the one
+/// predicate `SendableToolchainLabel` answers by, so the two cannot disagree. Text is asked
+/// first, as the scheduler asks it.
+/// @param label What `ToolchainLabel` called the compiler.
+/// @return The reason, or nullopt when the label travels.
+[[nodiscard]] std::optional<std::string> ToolchainLabelWithheldBecause(std::string_view label);
 
 // The exchange that talks over real TCP connections is `MakeTcpExchange()` in
 // `ReactorExchange.hpp`, deliberately not here. It needs a reactor, and this header

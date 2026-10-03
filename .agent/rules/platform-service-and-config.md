@@ -627,9 +627,11 @@ readable and silently ignored. Every rule below has already been one of them.
   the file itself forever (see the next bullet) and make
   `InlineCredentialRejection` name a path nobody typed.
 - **The lookup's two rules both turn on one question: is this process the
-  machine-wide daemon, or somebody's own?** `probe.IsPrivilegedProcess()` (root;
-  elevated administrator or LocalSystem on Windows, via `CheckTokenMembership`,
-  which is false for the unelevated half of a split token) decides both halves,
+  machine-wide daemon, or somebody's own?** `probe.IsPrivilegedProcess()` (root; on
+  Windows an elevated administrator OR a service logon, `NT AUTHORITY\SERVICE` -- the
+  virtual-account service is no administrator and IS the machine-wide instance, #860 --
+  via `CheckTokenMembership`, which is false for the unelevated half of a split token)
+  decides both halves,
   and neither is driven by the platform or by the row alone:
   - **Unprivileged runs skip every `ConfigScope::System` row.** The machine-wide
     file describes the system service, whose cache only the service account can
@@ -647,7 +649,8 @@ readable and silently ignored. Every rule below has already been one of them.
 - **A machine-wide config is only obeyed when only an administrator could have
   written it.** `C:\ProgramData` grants `BUILTIN\Users` create-file on every
   subdirectory it hands down to, so moving the Windows config there made the
-  configuration of a *LocalSystem* service plantable by any standard account —
+  configuration of the service — which then ran as *LocalSystem* — plantable by
+  any standard account —
   `storage_path:` alone turns that into arbitrary directory creation and file
   writes as SYSTEM. Two halves, and both are needed: the MSI owns
   `%ProgramData%\fastcached` and gives it a protected access list of its own
@@ -1177,8 +1180,9 @@ boot, silently, because a registration replays its command line forever. So:
   `--install-service` time, after `CreateService`, the way `GrantPathAccess` already
   does for `ownedPaths`; the obstacle is that the MSI passes no `--config`, so
   `ServiceSpec::configPath` is empty there and the machine-wide path would have to be
-  resolved from `applicationName`. **After #860**: if that holds, nothing reads this
-  file on Windows today, so a narrower grant can be observed neither to work nor to
-  break.
+  resolved from `applicationName`. Since #860 closed, the service DOES read this file
+  (`IsPrivilegedProcess` accepts a service logon), so a narrower grant is observable:
+  `package-windows` seeds `port: 6699` and requires an answer there, which is what
+  would show it working or breaking.
 
 

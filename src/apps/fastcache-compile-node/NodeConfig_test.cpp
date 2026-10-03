@@ -3320,6 +3320,51 @@ TEST_CASE("A pinned toolchain fingerprint is in the column; the compiler is not"
               .has_value());
 }
 
+TEST_CASE("A value longer than a scheduler records is refused by the parse, not at every heartbeat", "[node][config][utf8]")
+{
+    // A scheduler refuses a registration whose endpoint or pinned fingerprint is longer than it
+    // records (`CompileCacheWire`'s ceilings), on every round -- so a node started with one would
+    // register nowhere while it looked healthy. Refused where the value is parsed instead, and at
+    // exactly the scheduler's ceiling: the at-bound half is the control, accepted.
+    struct Row
+    {
+        std::string_view flag; ///< The flag under test.
+        std::string atBound;   ///< Its value at the scheduler's ceiling.
+        std::string over;      ///< One byte longer.
+        std::size_t ceiling;   ///< The ceiling the refusal names.
+    };
+    auto const endpointAt = std::string(CompileCacheWire::MaxEndpointBytes - 6, 'h') + ":65535";
+    auto const fingerprintAt = std::string(CompileCacheWire::MaxToolchainFingerprintBytes, 'a');
+    auto const rows = std::array {
+        Row { .flag = "--advertise",
+              .atBound = endpointAt,
+              .over = "h" + endpointAt,
+              .ceiling = CompileCacheWire::MaxEndpointBytes },
+        Row { .flag = "--toolchain",
+              .atBound = fingerprintAt + "=/usr/bin/g++",
+              .over = fingerprintAt + "a=/usr/bin/g++",
+              .ceiling = CompileCacheWire::MaxToolchainFingerprintBytes },
+    };
+
+    for (auto const& row: rows)
+    {
+        INFO("flag: " << row.flag);
+        auto const over = std::format("{}={}", row.flag, row.over);
+        // WHICH refusal: this flag, and the ceiling rather than the encoding. CHECKed rather than
+        // REQUIREd, so one row going wrong does not hide the other.
+        auto const refused = ParseNodeArgv({ over.c_str() });
+        CHECK_FALSE(refused.has_value());
+        if (!refused.has_value())
+        {
+            CHECK(refused.error().field == row.flag);
+            CHECK(refused.error().context.contains(std::format("longer than the {} a scheduler records", row.ceiling)));
+        }
+
+        auto const atBound = std::format("{}={}", row.flag, row.atBound);
+        CHECK(ParseNodeArgv({ atBound.c_str() }).has_value());
+    }
+}
+
 TEST_CASE("A cluster change an operator commits is in the column; forgetting is not", "[node][config][utf8]")
 {
     // `--cluster-admit` and `--cluster-set` COMMIT their operand through consensus:
@@ -4407,6 +4452,28 @@ TEST_CASE("A malformed toolchain is declined by the reload, not applied", "[node
         // The live configuration is untouched, which is the half that matters: the
         // worker goes on serving what it was serving.
         CHECK(reloader.Current()->toolchains == std::vector<std::string> { "/usr/bin/g++" });
+    }
+}
+
+TEST_CASE("A reload cannot advertise an endpoint longer than a scheduler records", "[node][config][reload][advertise]")
+{
+    // `--advertise` is reloadable, and a reload rebuilds its candidate through the same appliers the
+    // start does -- so the parse refuses the value there too, and the running configuration stays.
+    auto const endpointAt = std::string(CompileCacheWire::MaxEndpointBytes - 6, 'h') + ":65535";
+    for (auto const& [value, accepted]: { std::pair { endpointAt, true }, std::pair { "h" + endpointAt, false } })
+    {
+        INFO("accepted: " << accepted);
+        Testing::ScratchDirectory const scratch { "node-reload-long-advertise" };
+        auto const path = WriteRunnableNodeConfigFile(scratch.Path(), std::format("advertise: \"{}\"\n", value));
+
+        auto initial = RunningNode();
+        initial.advertise = "10.0.0.2:6677";
+
+        auto reloader = MakeNodeReloader(initial, path);
+        auto const outcome = reloader.Reload();
+        INFO("refusal: " << (outcome.has_value() ? std::string { "(none)" } : outcome.error().context));
+        CHECK(outcome.has_value() == accepted);
+        CHECK(reloader.Current()->advertise == (accepted ? value : std::string { "10.0.0.2:6677" }));
     }
 }
 

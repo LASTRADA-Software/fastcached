@@ -566,10 +566,11 @@ locally and not cached either. So is a `cl` compile that uses a precompiled
 header (`/Yu`): its object names the `pch.obj` it was compiled against by
 absolute path, and with `cl` 19.51 a hit in another checkout failed to link while
 one after a PCH rebuild silently lost its debug info. clang-cl's `/Yu` object
-carries no such tie and is cached. A command line that names its own input
-language (`/TP`, `-x c++`) is not distributed or cached either, because the
-launcher must state the language of the preprocessed text it sends and would
-otherwise silently override yours.
+carries no such tie and is cached. So is a command line whose language selector
+the launcher cannot restate — `-x assembler`, or `/Tc<file>` / `/Tp<file>`, which
+name a file. A plain `/TP`, `/TC` or `-x c++`, which CMake emits for every C++
+source it hands MSVC, is folded into the language the launcher states and
+dispatched.
 
 **Caching never breaks a build.** Every error path — an unreachable daemon, a
 refused lease, a malformed value, a stale dependency record — ends in the

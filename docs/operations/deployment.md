@@ -528,8 +528,12 @@ is where they are explained one by one.
 | `fastcached_dispatch_leases_reclaimed_total` | A machine went away mid-job and the keys it was building were freed. |
 | `fastcached_dispatch_leases_unauthorized_total` | A lease token this cluster never signed was handed back. |
 | `fastcached_dispatch_leases_released_late_total` | A compile outran the lease timeout and reported back too late. Read as a fraction of `released_total`; a steady fraction means the lease bound is too short for this site's slowest translation unit. |
+| `fastcached_dispatch_leases_malformed_total` | A client asked for a lease naming its key, toolchain or toolchain label in bytes that are not UTF-8, and was refused. |
+| `fastcached_dispatch_leases_field_too_long_total` | A client asked for a lease with a key, toolchain fingerprint or toolchain label longer than a scheduler records, and was refused. |
 | `fastcached_dispatch_worker_registrations_total` | Workers registering. A steady rise means heartbeats are not arriving. |
 | `fastcached_dispatch_worker_registrations_malformed_total` | A peer named its toolchain, endpoint or version in bytes that are not UTF-8 and was refused. |
+| `fastcached_dispatch_worker_registrations_field_too_long_total` | A peer registered with a fingerprint, endpoint, version, toolchain label, display name or codec list longer than a scheduler records, and was refused. |
+| `fastcached_dispatch_node_announcements_field_too_long_total` | A machine announced itself with an endpoint or version longer than a scheduler records, and was refused. An overlong condition field is refused earlier, when the frame is decoded, and is not counted here. |
 | `fastcached_dispatch_worker_endpoint_mismatch_total` | A worker was admitted while advertising an endpoint whose host is not the address it connected from. |
 | `fastcached_dispatch_workers_expired_total` | A machine stopped heartbeating and was dropped. |
 | `fastcached_dispatch_workers_withdrawn_total` | A machine re-surveyed, found it no longer serves a toolchain, and retired that registration itself. |

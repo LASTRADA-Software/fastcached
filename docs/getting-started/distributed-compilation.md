@@ -574,6 +574,10 @@ start it with `--admin-listen` and these count the outcomes.
 | `fastcached_dispatch_leases_reclaimed_total` | A machine went away mid-job, or restarted, and the keys it was building were freed. Work nobody will report done — a build that lost part of its distribution, which is a different thing to fix from a fleet that is merely full. |
 | `fastcached_dispatch_leases_unauthorized_total` | A client handed back a lease token this cluster never signed. Never sum it with the `unknown-lease` refusals beside it: those name a lease this scheduler *did* issue and has since forgotten, while a rise here is a forged release — or, far more likely, a launcher predating signed leases, in which case it tracks a rollout and stops when the rollout finishes. |
 | `fastcached_dispatch_leases_released_late_total` | A client reported a job whose lease had **already expired**: a real compile outran the lease timeout. Read it as a fraction of `released_total` — a steady fraction means the lease bound is shorter than this site's slowest translation unit. **Not** a count of leases that expired: a client that never reports back at all reaches this nowhere, and is `reclaimed` or nothing. |
+| `fastcached_dispatch_leases_malformed_total` | A client asked for a lease naming its key, toolchain or toolchain label in bytes that are not UTF-8, and was refused before anything it named was kept. `fastcache-cc` checks its label before sending it, so any rise names a client that does not. |
+| `fastcached_dispatch_leases_field_too_long_total` | A client asked for a lease with a key, toolchain fingerprint or toolchain label longer than a scheduler records, and was refused before any of it was kept. Each is a few dozen bytes from a real client, and `fastcache-cc` sends none longer, so any rise names a client that does. |
+| `fastcached_dispatch_worker_registrations_field_too_long_total` | A worker registered with a fingerprint, endpoint, version, toolchain label, display name or codec list longer than a scheduler records, and was refused before any of it was kept. Each is kept in the worker's entry, and this project's nodes send none that long -- a compiler whose name would overrun its ceiling registers without the name -- so any rise names a peer that does. |
+| `fastcached_dispatch_node_announcements_field_too_long_total` | A machine announced itself with an endpoint or version longer than a scheduler records, and was refused before any of it was kept. A condition field has a ceiling too, but an overlong one is refused earlier, when the frame is decoded, as a malformed frame no counter moves for -- so this series never sees it from the network. This project's nodes send none that long, so any rise names a peer that does. |
 
 The first three refusals are different operator problems and are deliberately
 counted apart: summing them hides a misconfiguration behind a busy fleet, and
@@ -1017,16 +1021,12 @@ minute and is spent once.
   replayed after a PCH rebuild linked without the translation unit's debug info
   (`LNK4206`). clang-cl's `/Yu` object carries no such tie, so it is cached, but
   it is still compiled locally: the header it reads is on your machine, not the
-  worker's. A command line that names its input language itself (`/TP`,
-  `-x c++`) is not distributed or cached either, because the launcher has to
-  state the language of the preprocessed text it sends and would otherwise
-  silently override yours. Run with `FASTCACHE_VERBOSE=1` to
-  see which of these applied.
-- **An unreachable scheduler is remembered for fifteen seconds.** When a launcher could
-  not reach the scheduler at all, the launchers after it compile locally without dialling
-  it again for fifteen seconds (`not dispatched (the scheduler was unreachable moments
-  ago …)` under `FASTCACHE_VERBOSE=1`). The memo lives in the per-user state directory
-  (`%LOCALAPPDATA%\fastcache-cc\reachability.memo`), and deleting it is always safe.
+  worker's. So is a command line whose language selector the launcher cannot
+  restate for the preprocessed text it sends — an `-x` value with no preprocessed
+  form such as `-x assembler`, or `/Tc<file>` / `/Tp<file>`, which name a file. A
+  plain `/TP`, `/TC` or `-x c++` — CMake puts `/TP` on every C++ source it hands
+  MSVC — is folded into the language the launcher states, and dispatched. Run with
+  `FASTCACHE_VERBOSE=1` to see which of these applied.
 
 - **A node's `--requirepass` is for its `--upstream` alone.** It is the secret of the
   shared `fastcached`, presented there and nowhere else. The fleet's own traffic is

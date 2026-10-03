@@ -398,10 +398,11 @@ A worker needs no port of its own. Dispatched compiles arrive on the **same
 
 A compile node also serves a **cache tier of its own**, on the same `--listen-node`
 port, which defaults to `6674` on loopback — the same address as the daemon's,
-deliberately, because that is where `fastcache-cc` already looks. On a machine running both, the
-node loses the bind, warns, and carries on with no local tier — the launcher
-reaches the daemon on that port instead. Give one of them a port of its own if you
-want the node's tier as well.
+deliberately, because that is where `fastcache-cc` already looks. A node that cannot
+bind that port **refuses to start** and names the address, whether you typed it or
+not: it opens exactly one `0xFC` port, and without it would register an address
+nothing answers. So do not run a node and `fastcached` on one machine — the node
+answers every verb the daemon does — or give one of them a port of its own.
 A node running consensus additionally binds `--listen-raft` — every connection on that
 port proves the member's own identity key before a message is read — and,
 with discovery on, a UDP `--discovery` port plus a per-node answering port; none has

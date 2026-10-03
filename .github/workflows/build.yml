@@ -3792,9 +3792,10 @@ jobs:
           #
           # 6676, matching --advertise, so the two agree -- a loopback bind under a
           # loopback advertise is the coherent single-machine shape and passes the
-          # startup table. Whether this job should co-install a daemon and a worker
-          # on one machine at all is a real question (#229 says it should not), and
-          # not one this step is the place to settle.
+          # startup table. Co-installing a daemon and a worker on one machine is not
+          # a supported shape -- a node answers every verb the daemon does
+          # (docs/tools/fastcache-compile-node.md) -- and this job does it only
+          # because the MSI under test ships both features.
           & $node --install-service `
               --scheduler=127.0.0.1:6675 `
               --listen-node=127.0.0.1:6676 `

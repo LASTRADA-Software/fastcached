@@ -14,6 +14,7 @@
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -23,6 +24,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 
 #include <core/platform/Clock.hpp>
@@ -31,6 +33,32 @@ namespace FastCache::Node
 {
 
 class NodeIoLoop;
+
+/// How often a scheduler re-asks its fleet-wide conditions, beside the moments that move them.
+///
+/// **An interval as well as the events, because both rows clear by TIME**: a toolchain nobody has
+/// asked for inside `UnservedToolchains::Window`, a machine whose presence has expired. Answered only
+/// when a verb arrived, a leader nobody talks to would go on reporting a fleet that has changed. Five
+/// seconds against a window of minutes and a presence timeout of ninety seconds: a row lags its cause
+/// by at most this, and a pass costs one registry walk.
+inline constexpr std::chrono::milliseconds SchedulerConditionInterval { 5000 };
+
+/// What the fleet-wide conditions are read from.
+struct SchedulerConditionInputs
+{
+    Distributed::SchedulerService const& service; ///< The fleet as this scheduler sees it.
+    std::string_view ownVersion;                  ///< This build, as `VersionString` spells it.
+    std::string_view ownEndpoint;                 ///< Where this node answers; its name in the version spread.
+};
+
+/// Answer every `ConditionScope::Scheduler` row.
+///
+/// **A fleet-wide row is the LEADER's.** On the leader each is raised or cleared; on any other
+/// scheduler each is `not-evaluated`, naming the leader when one is known -- never `clear`, which from
+/// a node that cannot see the fleet would be a confident wrong signal.
+/// @param conditions Where the answers go.
+/// @param inputs What they are read from.
+void EvaluateSchedulerConditions(NodeConditions& conditions, SchedulerConditionInputs const& inputs);
 
 /// The node's scheduler surface: service, protocol, membership, responder and
 /// listener, owned as one thing.
@@ -65,6 +93,10 @@ class SchedulerTier
     /// @param logger Where the tier reports what it is doing.
     /// @param identityKey This node's identity key pair, as its start resolved it; copied,
     ///        so the tier signs with its own copy for as long as it lives.
+    /// @param conditions The node's condition registry; this tier answers its fleet-wide rows into it
+    ///        before `Start` returns, so `Settle` finds none undecided. Must outlive the tier.
+    /// @param conditionInterval How often the watch re-asks them: `SchedulerConditionInterval` in
+    ///        production, a long interval in a case that drives every evaluation itself.
     /// @return The tier, or why it could not be built.
     [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, std::string> Start(
         NodeConfig const& cfg,
@@ -73,7 +105,9 @@ class SchedulerTier
         core::platform::WallClockRef wallClock,
         IMetricsSink& metrics,
         ILogger& logger,
-        std::optional<Ed25519KeyPair> const& identityKey);
+        std::optional<Ed25519KeyPair> const& identityKey,
+        NodeConditions& conditions,
+        std::chrono::milliseconds conditionInterval);
 
     ~SchedulerTier() = default;
 
@@ -85,12 +119,11 @@ class SchedulerTier
     /// Tell the scheduler what this node is, and who leads if it does not.
     ///
     /// The seam consensus drives, and the only one: every scheduler runs consensus.
+    /// Re-asks the fleet-wide conditions at once: a new leader starts vouching for them, a demoted
+    /// one stops.
     /// @param role What this node is now.
     /// @param leaderEndpoint Where the leader answers, empty when nobody leads.
-    void SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch)
-    {
-        _service.SetRole(role, leaderEndpoint, epoch);
-    }
+    void SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch);
 
     /// Take this node's own endorsement of the roster it applied (#178).
     ///
@@ -171,6 +204,10 @@ class SchedulerTier
         return _service;
     }
 
+    /// Answer this scheduler's fleet-wide condition rows now. Thread-safe: the consensus thread (via
+    /// `SetRole`), the watch and a case may all call it.
+    void EvaluateConditions();
+
   private:
     SchedulerTier(Distributed::IMembershipOracle const& membership,
                   core::platform::IClock& clock,
@@ -179,7 +216,13 @@ class SchedulerTier
                   ILogger& logger,
                   std::string signerId,
                   Ed25519KeyPair identityKey,
-                  std::string_view clusterId);
+                  std::string_view clusterId,
+                  NodeConditions& conditions,
+                  std::string ownEndpoint);
+
+    /// Start the thread that re-asks the fleet-wide rows every @p interval. Called by `Start` once the
+    /// tier is fully built, never from the constructor.
+    void WatchConditions(std::chrono::milliseconds interval);
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it.
@@ -199,6 +242,19 @@ class SchedulerTier
     /// surfaces start serving.
     std::mutex _ownEndorsementMutex;
     std::optional<Cluster::RosterEndorsement> _ownEndorsement; ///< Guarded by `_ownEndorsementMutex`.
+
+    /// Where the fleet-wide rows are answered. Borrowed; outlives this tier.
+    NodeConditions& _conditions;
+
+    /// Where this node answers, as its start resolved it -- its name in the version spread. A snapshot:
+    /// after an `--advertise` reload the leader may be listed once more under its own build, which
+    /// changes a count and never which builds serve the fleet.
+    std::string _ownEndpoint;
+
+    /// Re-asks the fleet-wide rows on an interval. **Declared LAST, and the order is load-bearing**:
+    /// its body touches `_service` and `_conditions`, so every member is built before it can start and
+    /// destroyed only after `~jthread` has requested a stop and joined.
+    std::jthread _conditionWatch;
 };
 
 } // namespace FastCache::Node

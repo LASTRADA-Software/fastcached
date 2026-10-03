@@ -94,7 +94,8 @@ namespace
     /// @return The host name, or empty.
     [[nodiscard]] std::string QueryHostName()
     {
-        std::array<char, 256> buffer {};
+        // One byte past the longest name reported, for its terminator.
+        std::array<char, MaxHostNameBytes + 1> buffer {};
 #if defined(_WIN32)
         auto size = static_cast<DWORD>(buffer.size());
         if (GetComputerNameExA(ComputerNameDnsHostname, buffer.data(), &size) == 0)

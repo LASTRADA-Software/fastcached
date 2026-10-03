@@ -70,6 +70,8 @@ target_sources(FastCache
         Core/Logger.cpp
         Distributed/LeaseTable.cpp
         Distributed/WorkerRegistry.cpp
+        Distributed/UnservedToolchains.cpp
+        Distributed/FleetVersions.cpp
         Distributed/RosterStore.cpp
         Distributed/NodeProof.cpp
         Distributed/RosterTrust.cpp

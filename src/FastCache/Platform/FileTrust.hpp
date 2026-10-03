@@ -26,21 +26,24 @@ namespace FastCache
 /// adopted it would be configured for a daemon it is not: pointed at a state
 /// directory it cannot open, or at a port the real daemon already holds.
 ///
-/// On Windows this asks whether `BUILTIN\Administrators` is *enabled* in the
-/// effective token, which is false for the unelevated half of an
-/// administrator's split token — correctly, since that process could not have
-/// written the machine-wide config either. LocalSystem, and therefore the
-/// service, answers true.
+/// On Windows this asks two things of the effective token. Whether
+/// `BUILTIN\Administrators` is *enabled* -- false for the unelevated half of an
+/// administrator's split token, correctly, since that process could not have
+/// written the machine-wide config either. And whether it is a SERVICE logon
+/// (`NT AUTHORITY\SERVICE`, S-1-5-6): the service runs as the virtual account
+/// `NT SERVICE\<name>`, which is no administrator and IS the machine-wide
+/// instance (#860). Widening the lookup does not widen trust -- the one caller
+/// demands `IsTrustedSystemLocation` of every row a privileged process uses.
 ///
-/// @return true when the caller is root (POSIX) or an elevated administrator
-///         or LocalSystem (Windows). False when it cannot be determined, which
+/// @return true when the caller is root (POSIX), or an elevated administrator or
+///         a service logon (Windows). False when it cannot be determined, which
 ///         keeps an undecidable case out of the machine-wide config.
 [[nodiscard]] bool IsPrivilegedProcess();
 
 /// Can only an administrator have put the file that is at @p path there?
 ///
 /// The question a machine-wide configuration has to answer before it is
-/// obeyed. A daemon running as LocalSystem (Windows) or root (POSIX) takes its
+/// obeyed. A daemon running as a Windows service or as root (POSIX) takes its
 /// `storage_path`, `bind` and `requirepass` from that file, so a file an
 /// unprivileged account could have written is an unprivileged account telling a
 /// privileged process what to do.

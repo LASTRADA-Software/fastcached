@@ -355,7 +355,19 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    // Moved by a lease exclusion list: `dispatch_leases_all_excluded` joined the catalogue after
+    // Moved by the ceilings on what REGISTER and NODE-ANNOUNCE keep: two counters joined the
+    // catalogue for a registration (`dispatch_worker_registrations_field_too_long`) and an
+    // announcement (`dispatch_node_announcements_field_too_long`) refused for a string longer than a
+    // scheduler records, which changes which cells every live-stats reading carries. Clients and
+    // nodes upgrade together, as below.
+    //
+    // Moved by the unserved-toolchain record before that: two counters joined the catalogue for the LEASE a
+    // scheduler refuses before it keeps anything the lease names -- a key, fingerprint or label
+    // that is not UTF-8 (`dispatch_leases_malformed`) and one longer than a scheduler records
+    // (`dispatch_leases_field_too_long`) -- which changes which cells every live-stats reading
+    // carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved by a lease exclusion list before that: `dispatch_leases_all_excluded` joined the catalogue after
     // `withdrawn`, for a lease whose every matching worker the client had excluded. Clients and
     // nodes upgrade together, as below.
     //

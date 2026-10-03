@@ -5,7 +5,6 @@
 #include "NodeIoLoop.hpp"
 #include "WorkerTier.hpp"
 
-#include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 
@@ -18,6 +17,7 @@
 #include <utility>
 
 #include <CacheProtocol.hpp>
+#include <Dispatch.hpp>
 
 namespace FastCache::Node
 {
@@ -363,8 +363,27 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     // binary is running on each machine, mid-upgrade most often. And the hostname, a
     // LABEL that decides nothing (#1024). Both ride the capacity record because it is
     // REGISTER's one extensible field.
-    _advertisedWire.version = VersionString;
+    //
+    // The version's own ceiling is `AdvertisedVersion`'s to hold, asked from both this
+    // registrar and the presence loop rather than each stamping its own copy; the name's
+    // is held here, at the most the host query can return at all.
+    static_assert(MaxHostNameBytes <= CompileCacheWire::MaxDisplayNameBytes,
+                  "a scheduler must record any host name this node can send");
+    _advertisedWire.version = AdvertisedVersion();
     _advertisedWire.displayName = parts.host.Facts().hostName;
+}
+
+std::string RegisteredToolchainLabel(ServedToolchain const& toolchain, ILogger& logger)
+{
+    auto const withheld = Cc::ToolchainLabelWithheldBecause(toolchain.label);
+    if (!withheld.has_value())
+        return toolchain.label;
+    logger.Logf(LogLevel::Warn,
+                "scheduler: {} registers without its toolchain label, because {}; it is served all the same, and "
+                "the fleet page shows no name for it",
+                toolchain.compiler,
+                *withheld);
+    return {};
 }
 
 std::vector<Cc::WorkerRegistrar> WorkerTier::RegistrarsFor(std::map<std::string, ServedToolchain> const& served)
@@ -385,7 +404,7 @@ std::vector<Cc::WorkerRegistrar> WorkerTier::RegistrarsFor(std::map<std::string,
         // A copy per registrar: the label is the one field of this record that is NOT
         // node-wide (#194).
         auto perToolchain = _advertisedWire;
-        perToolchain.toolchainLabel = toolchain.label;
+        perToolchain.toolchainLabel = RegisteredToolchainLabel(toolchain, _logger);
         built.emplace_back(fingerprint, advertised, _slots, Cc::AvailableCodecs(), perToolchain);
     }
     return built;

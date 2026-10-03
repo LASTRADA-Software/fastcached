@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Distributed/MachineTicket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -4443,4 +4444,100 @@ TEST_CASE("A LEASE naming too many, an empty or an over-long exclusion is refuse
     REQUIRE(Unwrap(view).excluded.size() == MaxLeaseExclusions);
     CHECK(AsStringView(Unwrap(view).excluded.front()) == "w0:1");
     CHECK(AsStringView(Unwrap(view).excluded.back()) == std::format("w{}:1", MaxLeaseExclusions - 1));
+}
+
+TEST_CASE("A LEASE carries the client's toolchain label", "[wire][lease]")
+{
+    // The label is what `unserved-toolchain` names when no worker serves the fingerprint: the
+    // digest is opaque by design (#194), so without the client's own words an operator is shown a
+    // hash. Display only -- nothing matches on it.
+    //
+    // Asserted by field NAME and round trip only, never by position: lane 0 owns LEASE's field
+    // order in the v15 bump and adds the byte pin once that order is fixed. Every other field is
+    // asserted beside the label, so a decoder reading the label out of a neighbour's slot fails.
+    constexpr std::string_view Label = "cl 19.44.35207";
+    auto const frame =
+        EncodeLease(LeaseRequest { .fingerprint = "fp", .key = "objkey", .acceptedCodecs = { 1 }, .toolchainLabel = Label });
+    auto const decoded = DecodeLeasePayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
+    REQUIRE(decoded.has_value());
+    CHECK(AsStringView(Unwrap(decoded).toolchainLabel) == Label);
+    CHECK(AsStringView(Unwrap(decoded).fingerprint) == "fp");
+    CHECK(AsStringView(Unwrap(decoded).key) == "objkey");
+    CHECK(Unwrap(decoded).acceptedCodecs == CodecList { 1 });
+
+    // Unlabelled is an EMPTY field, never an absent one: the arity is exact, so a LEASE that names
+    // nothing still decodes.
+    auto const unlabelled = EncodeLease(LeaseRequest { .fingerprint = "fp", .key = "k", .acceptedCodecs = {} });
+    auto const bare = DecodeLeasePayload(std::span<std::byte const> { unlabelled }.subspan(RequestHeaderSize));
+    REQUIRE(bare.has_value());
+    CHECK(Unwrap(bare).toolchainLabel.empty());
+    CHECK(AsStringView(Unwrap(bare).fingerprint) == "fp");
+}
+
+// What `CarriedCacheTiers` stands for, in a file that may name both: this header stays free of
+// `Cache/`, and a third tier must fail a build here rather than a payload budget at run time.
+static_assert(CarriedCacheTiers == static_cast<std::size_t>(StorageTier::Last),
+              "CarriedCacheTiers must equal StorageTier's count, or the NODE-ANNOUNCE budget adds up the wrong worst case");
+
+TEST_CASE("The longest NODE-ANNOUNCE is exactly the budget its constants add up and it decodes", "[wire][node-announce]")
+{
+    // The budget beside `MaxNodeAnnounceOtherBytes` is a sum of named ceilings; this builds the
+    // request that meets every one of them at once -- sixteen full condition rows, a full history
+    // batch, every string and list at its ceiling -- and asserts the payload is EXACTLY that sum, so
+    // a field the constants forgot, or one they count twice, is a red case rather than a frame a
+    // leader one day refuses.
+    auto const fill = [](std::size_t bytes, char c) {
+        return std::string(bytes, c);
+    };
+    auto const addresses = std::vector<std::string>(MaxInterfaceAddresses, fill(MaxInterfaceAddressBytes, 'a'));
+
+    CapacityFields capacity {};
+    capacity.logicalCores = 64;
+    capacity.totalMemoryBytes = 1;
+    capacity.nodeClassRaw = 1;
+    capacity.reservedCores = 2;
+    capacity.cache.tiers = PerTier<CacheTierBudget>(CarriedCacheTiers, CacheTierBudget { .bytesLimit = 1 });
+    capacity.version = fill(MaxNodeVersionBytes, 'v');
+    capacity.reservedMemoryBytes = 1;
+    capacity.toolchainLabel = fill(MaxToolchainLabelBytes, 'l');
+    capacity.displayName = fill(MaxDisplayNameBytes, 'd');
+    capacity.interfaceAddresses = addresses;
+
+    LoadFields load {};
+    load.cpuBusyPermille = 1000;
+    load.availableMemoryBytes = 1;
+    load.freeScratchBytes = 1;
+    load.cache.tiers = PerTier<CacheTierUsage>(
+        CarriedCacheTiers, CacheTierUsage { .itemCount = 1, .bytesUsed = 1, .evictions = 1, .indexBytes = 1 });
+    load.cache.hits = 1;
+    load.cache.misses = 1;
+    load.history = std::vector<HistoryBucketFields>(MaxHistoryBucketsPerHeartbeat, HistoryBucketFields { .startMillis = 1 });
+    load.cordoned = true;
+    NodeConditionFields row {};
+    for (auto const& column: ConditionFieldTable)
+        row.*column.member = fill(column.maxBytes, 'c');
+    load.conditions = std::vector<NodeConditionFields>(MaxNodeConditions, row);
+    load.interfaceAddresses = addresses;
+
+    auto const endorsement = std::vector<std::byte>(MaxRosterEndorsementBytes, std::byte { 0x5e });
+    auto const frame = EncodeNodeAnnounce(NodeAnnounceRequest {
+        .endpoint = fill(MaxEndpointBytes, 'e'), .capacity = capacity, .load = load, .endorsement = endorsement });
+    auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+
+    CHECK(payload.size()
+          == MaxNodeAnnounceOtherBytes + (MaxHistoryBucketsPerHeartbeat * MaxHistoryBucketBytes)
+                 + MaxNodeConditionListBytes);
+    CHECK(payload.size() <= MaxControlPayload);
+    REQUIRE(DecodeRequestHeader(frame).has_value());
+
+    auto const decoded = DecodeNodeAnnouncePayload(payload);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).endpoint.size() == MaxEndpointBytes);
+    CHECK(Unwrap(decoded).capacity.displayName.size() == MaxDisplayNameBytes);
+    CHECK(Unwrap(decoded).capacity.interfaceAddresses.size() == MaxInterfaceAddresses);
+    CHECK(Unwrap(decoded).load.history.size() == MaxHistoryBucketsPerHeartbeat);
+    REQUIRE(Unwrap(decoded).load.conditions.has_value());
+    CHECK(Unwrap(decoded).load.conditions->size() == MaxNodeConditions);
+    CHECK(Unwrap(decoded).load.conditions->back().remedy.size() == MaxConditionRemedyBytes);
+    CHECK(Unwrap(decoded).endorsement.size() == MaxRosterEndorsementBytes);
 }

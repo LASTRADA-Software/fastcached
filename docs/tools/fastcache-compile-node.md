@@ -289,7 +289,7 @@ address other machines can reach.
 Serving the scheduler moved a bare port to the wildcard; `--scheduler` and
 `--fleet-open` did not, and
 [#463](https://github.com/LASTRADA-Software/fastcached/issues/463) asked whether they
-should. They did not, for the four reasons below — and the zero-config defaults have
+should. They did not, for the three reasons below — and the zero-config defaults have
 since moved the default to the wildcard on every node (see the table above), on the
 strength of admission rather than of the socket:
 
@@ -301,10 +301,6 @@ strength of admission rather than of the socket:
 - **It would silence the message that teaches.** The refusal you get today for naming
   `--advertise` and leaving the bind alone *is* the fix, spelled out, while you are
   watching.
-- **A defaulted `--listen-node` whose port is already held is a warning, not fatal**
-  (see the table above). Today a fleet worker types that address, so a collision stops
-  the node. Under a widened default the fleet-facing case would land on the warning
-  path — no `0xFC` port, still registering, still leased, answering nothing.
 - **A listening socket that widened itself on a predicate over three flags is a
   security decision nobody typed.** The cache verbs would stay closed —
   `CacheResponder` admits this machine alone whatever the bind is — but that is a
@@ -737,9 +733,8 @@ and a peer too old to report it is sized exactly as it always was.
 node that ends up with no tier subtracts nothing and offers the whole machine. Two
 ways of ending up there leave `--cache-memory` reading as though it still meant
 something: `--cache-memory=0` with no `--cache-dir` leaves nowhere to keep objects
-and so builds no tier, and a *default* `--listen-node` that something else already
-holds — a `fastcached` on the same box, usually — is a warning the node carries on
-past. Both used to reserve the
+and so builds no tier, and an emptied `--listen-node=` opens no port for a tier to
+answer on. Both used to reserve the
 configured budget regardless, so on a 32 GiB machine such a node held back the
 default 8 GiB it was not using and offered 24 slots where it could serve 32. A
 disk-only cache (`--cache-memory=0 --cache-dir=…`) is resident nowhere and so
@@ -1044,31 +1039,18 @@ of its own. It does not any more: `--listen-node` is what a worker advertises an
 what a dispatched compile arrives on, so there is one address to open in a firewall,
 one address in a lease, and one address to get wrong.
 
-That port is also `fastcached`'s, and what happens when both want it depends on
-whether **you typed the address**:
+That port is also `fastcached`'s default, and a node that cannot bind it **refuses to
+start**, naming the address — whether you typed it or not. A node opens exactly one
+`0xFC` port; without it, it would still register and advertise that address, and every
+client leased to it would meet a failed connection and compile locally, in silence.
+Do not run a node and a `fastcached` on one machine: the node answers every verb the
+daemon does. If you must, give one of them a port of its own.
 
-| `--listen-node` | Port already held |
-|---|---|
-| defaulted | Warned, and the node starts **with no 0xFC port at all** — no local tier and no `COMPILE`. Your builds reach the daemon on that port instead, so local caching still works; but this node no longer has a second port for dispatched compiles to arrive on, so it can serve none. It still registers with its `--scheduler` and advertises that address, which means clients are leased an endpoint nothing is listening on. Do not run a node and a `fastcached` on one machine: the node answers every verb the daemon does. |
-| named by you | Fatal. The node refuses to start and says so. |
-
-The asymmetry is the point: a node sharing a machine with `fastcached` should not
-refuse to start over a convenience nobody requested, while an address an operator
-typed is a promise and a broken promise is fatal. Neither is silent. Give one of
-them a port of its own if you want the node's tier as well.
-
-**"Named by you" means you typed the flag, not that you typed something unusual.**
-`--listen-node=127.0.0.1:6674` — reading the address off the startup line and
-typing it back to pin it — is a named address, and a port already held is fatal for
-it. Until #286 the node decided this by comparing your value against the default,
-so pinning the default port was indistinguishable from never mentioning it: the node
-started, logged a warning, reported healthy on `/healthz`, and served no cache.
-
-The distinction survives `--install-service`. The registration records
-`--listen-node` when you typed it, whatever its value, so a service installed with
-a port you named refuses to start when something else holds it — rather than warning
-past it at every boot. A port you never named is left out of the registration, so
-the service picks up a changed default rather than one frozen at install time.
+Whether you **typed** `--listen-node` still matters to `--install-service`: the
+registration records it when you typed it, whatever its value, and leaves a port you
+never named out, so the service picks up a changed default rather than one frozen at
+install time. Until #286 that was decided by comparing your value against the default,
+so pinning the default port was indistinguishable from never mentioning it.
 
 ### Who may use it
 
@@ -3166,7 +3148,8 @@ Every row says two things before anything else:
   differently everywhere, because *still broken* and *was broken and is fixed* must not look
   alike.
 - its **state**: `raised` (it holds now), `clear` (checked and benign), `not-evaluated`
-  (this node runs nothing that could raise it, and the detail says what), or `undecided` —
+  (this node runs nothing that could raise it — or, for a fleet-wide row, is not the leader
+  that decides it — and the detail says which), or `undecided` —
   nothing evaluated it at all, which is a node wired wrongly and is itself worth reporting.
   *Checked and benign* and *nobody decided* are different claims, so they are different words.
 
@@ -3184,6 +3167,8 @@ Every row says two things before anything else:
 | `shared-cache-unavailable` | live | alert | the fleet's `shared-cache` setting names this machine and its shared tier will not open, so every other node's builds miss and compile locally; the detail says why | fix what the detail names — usually another process holding `<state-dir>/shared-cache`, or a full disk — and it opens at the next change the cluster applies or within 30 seconds; or name another machine with `--cluster-set shared-cache=<id>` |
 | `shared-cache-unproven` | live | warning | the fleet's `shared-cache` setting names another machine and this node's builds are not reaching it, so they compile locally; the detail says why — a machine at the announced address that proved another key (nothing was sent to it), the named machine refusing this node's key, one that did not answer, or a setting naming a machine this cluster cannot reach by key | check `--cluster-status` and the named machine's own `--node-status`; it clears by itself at the next operation that proves the named machine's key, and at the apply that stops the setting naming another machine or names a different one (not tried until an operation tries it); a setting naming a machine this cluster cannot reach by key raises it at the apply, before any build asks, and it clears at the apply that resolves it (not tried until an operation tries it); an operation still running when an apply moved the setting says nothing about the machine it had dialled |
 | `scheduler-unreachable` | live | warning | a `--scheduler` endpoint (or a leader it named) has not answered a dial; the detail names each, and one nobody has dialled for ten minutes is dropped from it | check the VPN or network between this machine and the schedulers named; the node keeps serving this machine meanwhile and rejoins by itself |
+| `unserved-toolchain` | live | warning | clients asked the leader for a toolchain no live worker serves, so those compiles ran on the clients' own machines; the detail names each by driver and version as the client reported it (`cl 19.44.35207`), with how many leases were refused. Decided by the leader; any other scheduler answers `not-evaluated` | put that compiler version on a worker, or move the clients to one the fleet serves; clears once a worker serves it, or after fifteen minutes with nobody asking |
+| `mixed-node-versions` | live | warning | the leader sees more than one build serving one wire — nothing refuses that, so nothing else says so; the detail names each build and the machines on it. Decided by the leader; any other scheduler answers `not-evaluated` | upgrade every node to one build ([Upgrading a fleet](../operations/upgrading-a-fleet.md)); clears once the odd machine is upgraded or has been gone ninety seconds |
 
 The remedy each row carries is longer than this column, and it is the node's text: an older
 client or leader prints a newer node's row exactly as that node wrote it, rather than looking

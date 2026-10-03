@@ -188,7 +188,10 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _roster { parts.roster },
     _prover { parts.prover },
     _reachability { parts.reachability },
-    _capacityWire { Distributed::CapacityToWire(parts.capacity) },
+    // `AnnouncedCapacity` rather than `Distributed::CapacityToWire` alone: the latter knows
+    // nothing of the version, so a node with no worker sent NODE-ANNOUNCE with none, and the
+    // leader recorded it exactly as absent as a build too old to know the field.
+    _capacityWire { AnnouncedCapacity(parts.capacity) },
     _loadSampler { MakeHostLoadSampler(MakeSystemCounterSource()) },
     _dialer { parts.dialer },
     _link { std::move(link) },

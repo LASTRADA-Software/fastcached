@@ -22,6 +22,7 @@
 #include "SchedulerReachability.hpp"
 
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostEvents.hpp>
@@ -603,4 +604,19 @@ TEST_CASE("A host event's presence round runs on the loop's thread and never on 
     REQUIRE(threads.size() >= 2);
     CHECK(std::ranges::count(threads, std::this_thread::get_id()) == 0);
     CHECK(std::ranges::count(threads, threads.front()) == static_cast<std::ptrdiff_t>(threads.size()));
+}
+
+TEST_CASE("AnnouncedCapacity sets this build's compiled-in version on the converted capacity", "[node][presence]")
+{
+    // #1440's second half: `Distributed::CapacityToWire` derives the capacity record from
+    // `NodeCapacity`, which has no version field to read, so a caller that stopped at its
+    // answer -- as `NodePresenceTier` once did -- carries an absent version, indistinguishable
+    // on the leader's page from a build too old to know the field at all. `AnnouncedCapacity` is
+    // `NodePresenceTier`'s one call for both questions; this asserts what it answers.
+    Distributed::NodeCapacity const capacity { .logicalCores = 8 };
+    auto const wire = AnnouncedCapacity(capacity);
+    CHECK(wire.version == FastCache::VersionString);
+    // And the conversion itself still ran -- a version stapled onto a default-constructed
+    // record would pass the check above having thrown away everything else `capacity` said.
+    CHECK(wire.logicalCores == 8);
 }

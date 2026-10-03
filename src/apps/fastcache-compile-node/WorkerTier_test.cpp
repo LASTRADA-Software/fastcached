@@ -21,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -29,6 +30,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -388,4 +390,72 @@ TEST_CASE("A running heartbeat withdraws for a suspend and lets it go: the tier'
     }
     // One dial, the first round's: a withdrawal with nothing registered dials nobody.
     CHECK(fixture.Dialer().Dialed().size() == 1);
+}
+
+TEST_CASE("A toolchain label a scheduler would refuse is withheld from the registration, and said so",
+          "[node][worker-tier][label]")
+{
+    // The label is display only, and a scheduler refuses the WHOLE registration over one that is not
+    // text or is longer than it records -- so the worker registers without it. Silently, the fleet page
+    // would show no name for a compiler this node serves and nothing would say why; so one Warn per
+    // toolchain, naming the compiler and the reason. The at-bound row is the control: sent, and quiet.
+    struct Case
+    {
+        std::string_view why;    ///< What the case is about.
+        std::string label;       ///< What the probe called the compiler.
+        std::string sent;        ///< What the registration carries.
+        std::string_view reason; ///< What the Warn says, or empty for none.
+    };
+    auto const atBound = std::string(CompileCacheWire::MaxToolchainLabelBytes, 'x');
+    auto const cases = std::array {
+        Case { .why = "not text", .label = "g++ \xff 14.2.0", .sent = "", .reason = "it is not valid UTF-8" },
+        Case { .why = "over the bound", .label = atBound + "x", .sent = "", .reason = "a scheduler records at most" },
+        Case { .why = "at the bound", .label = atBound, .sent = atBound, .reason = "" },
+    };
+
+    for (auto const& [why, label, sent, reason]: cases)
+    {
+        INFO(why);
+        CapturingLogger logger;
+        auto const registered = RegisteredToolchainLabel(
+            ServedToolchain { .compiler = "/opt/cross/bin/g++", .label = label, .witness = std::nullopt }, logger);
+        CHECK(registered == sent);
+
+        // CHECK rather than REQUIRE on the count, so a case that goes wrong does not hide the ones
+        // after it.
+        auto const records = logger.Snapshot();
+        CHECK(records.size() == (reason.empty() ? 0U : 1U));
+        for (auto const& record: records)
+        {
+            CHECK(record.level == LogLevel::Warn);
+            CHECK(record.message.contains("/opt/cross/bin/g++"));
+            CHECK(record.message.contains(reason));
+        }
+    }
+}
+
+TEST_CASE("RegistrarsFor asks RegisteredToolchainLabel rather than sending a label unchecked", "[node][worker-tier][label]")
+{
+    // The case above proves what `RegisteredToolchainLabel` decides; nothing proves `RegistrarsFor`
+    // actually asks it -- it is the only caller, and the survey that would exercise it for real runs
+    // on the heartbeat thread this suite does not spin up. `RegistrarsFor` is a pure query, so this
+    // calls it directly rather than through a seam of its own.
+    WorkerTierFixture fixture;
+    auto const tier = fixture.Start();
+    REQUIRE(tier.has_value());
+    REQUIRE(tier.value() != nullptr);
+    fixture.logger.Clear(); // Startup may itself have warned; only what RegistrarsFor logs matters here.
+
+    auto const served = std::map<std::string, ServedToolchain> {
+        { "fp-cross",
+          ServedToolchain { .compiler = "/opt/cross/bin/g++", .label = "g++ \xff 14.2.0", .witness = std::nullopt } },
+    };
+    auto const registrars = tier.value()->RegistrarsFor(served);
+    CHECK(registrars.size() == 1);
+
+    auto const records = fixture.logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    CHECK(records.front().level == LogLevel::Warn);
+    CHECK(records.front().message.contains("/opt/cross/bin/g++"));
+    CHECK(records.front().message.contains("it is not valid UTF-8"));
 }

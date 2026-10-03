@@ -952,6 +952,36 @@ outright rather than drawing with a gap.
   applied AFTER it is committed, so a peer built before the refusal existed can
   still replicate a member id past it with nobody left to refuse. Both escapers
   in `FleetText.hpp` walk one shared decoder so they cannot disagree.
+- **A verb that starts KEEPING a string owes it the gate that day, and "it is
+  only matched" is the claim that goes stale.** LEASE's key and fingerprint were
+  compared and dropped, so nothing gated them -- except the key was already kept,
+  by the lease table, and listed among `/fleet.json`'s outstanding leases. When
+  the `no-worker` refusals began to be remembered for `unserved-toolchain`, the
+  fingerprint and the client's toolchain label joined it in the leader's state.
+  **Every kept field owes TWO gates, text and a ceiling of its own**, because the
+  frame's ceiling is 64 KiB and a kept string lives as long as its record: sixteen
+  unserved toolchains at the frame's bound is a megabyte a peer chose. So
+  `SchedulerService::Lease` asks both of every row of `LeaseFields` -- one table,
+  each row carrying its ceiling, so a fourth kept string cannot be checked for one
+  and forgotten for the other. A ceiling is sized from what the field IS and
+  `static_assert`ed where the producer is visible: the key and the fingerprint are
+  `KeyDigest` hex (`MaxLeaseKeyBytes`, `MaxToolchainFingerprintBytes`, held in
+  `fastcache-cc/Dispatch.cpp`), the label a compiler's name and version
+  (`MaxToolchainLabelBytes`, beside its constant). Two refusal rows, not text and
+  too long (`MalformedFrame` on the wire, a counter each), never
+  `MalformedRegistration`, whose counter is the WORKER's. And the launcher sends
+  only a label that passes the same predicate and bound: the label is display
+  only, and a client refused its whole lease over one would lose distribution for
+  a name. REGISTER and NODE-ANNOUNCE are held by the same table shape --
+  `RegistrationFields` (its codec list a length-only row), and `PresenceFields`
+  plus each condition row against its `ConditionFieldTable` ceiling, all gated
+  through the one `RefuseUnkept` -- with `MalformedRegistration` for both
+  questions and a too-long counter per verb, the version, host-name and codec
+  ceilings `static_assert`ed at their producers, `--advertise` and a pinned
+  fingerprint refused by the node's parse, and the registrar withholding a label
+  as the launcher does, at Warn; an overlong condition field is refused first by
+  the decoder as a malformed frame no counter moves for, so the service gate and
+  its counter cover only a caller in the same process.
 - **Markup carries what XML's `Char` production admits, and that is a rule about
   CODE POINTS, not bytes.** JSON spells every control byte with a legal
   `\uXXXX` escape and puts no hole in its character range at all. XML admits
@@ -1004,8 +1034,9 @@ The log lines stay.
   are the same pixels -- so every test of a surface drives one of each and asserts they differ,
   and a neuter that renders every row as latched fails exactly those cases.
 - **Four states, and two of them are claims nobody else can make.** `raised`, `clear` (checked
-  and benign), `not-evaluated` (this node runs nothing that could raise it, with the reason), and
-  `undecided` (nothing evaluated it). The last is *forgot* and must not be spelled like the
+  and benign), `not-evaluated` (this node runs nothing that could raise it, or -- for a
+  fleet-wide row -- is not the leader that decides it, with the reason), and `undecided`
+  (nothing evaluated it). The last is *forgot* and must not be spelled like the
   second, which is *decided*: `NodeConditions::Settle` answers an absent component's rows
   `not-evaluated` and hands back every row still `undecided`, which `main` logs as an error. A
   row whose component is PRESENT is left undecided on purpose -- filling it in would hide the
@@ -1071,6 +1102,17 @@ The log lines stay.
   connection that stalled or lost its peer after it answered is folded into `Unreachable` for the
   same reason, at `AnnounceRefusalKind::Transport` (`WorkerProtocol.hpp`): the exchange never
   completed, so nothing about a toolchain or a fingerprint was actually refused.
+- **A FLEET-wide row is the LEADER's, and every other node says so.** `unserved-toolchain` and
+  `mixed-node-versions` read the leader's registry -- what clients asked it for, what every machine
+  announced to it -- and a follower's copy holds none of that. So a scheduler that is not leading
+  answers them `not-evaluated`, naming the leader when it knows one, and never `clear`: *clear* from
+  a node that cannot see the fleet is a confident wrong signal. Both clear by TIME as well as by
+  event -- nobody asking inside `UnservedToolchains::Window`, a machine's presence expiring -- so
+  `SchedulerTier` re-asks them on `SchedulerConditionInterval` as well as at `Start` and every
+  `SetRole`; answered only when a verb arrived, a leader nobody talks to would go on naming a machine
+  that left. `EveryFleetRowHasAnEvaluator` makes a `Scheduler`-scope row with no evaluator a BUILD
+  failure. The LEASE's toolchain label is display only, like a worker's, and reaches the row through
+  `ListDetail`, which escapes it: a label is never a reason to refuse a lease.
 
 ## Open work
 

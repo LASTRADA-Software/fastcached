@@ -525,7 +525,7 @@ struct CounterSoleWriter
 ///
 /// | mechanism | rows |
 /// |---|---|
-/// | a `.counter` table row: a `SurfaceRefusal` spent by `Refuse(row)`, or an outcome table spent by its reader | 137 |
+/// | a `.counter` table row: a `SurfaceRefusal` spent by `Refuse(row)`, a `VerbRefusalRow` by `RefuseAs`, or an outcome table spent by its reader | 137 |
 /// | a `LeaseToken.hpp` outcome row's `workerCounter` | 10 |
 /// | returned by a classifier for its caller to spend | 4 |
 /// | a `CacheTierProfile` member, spent by the tier built with it | 16 |
@@ -965,6 +965,14 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::NodeCacheTier },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheSessionsOpened,
                         .surface = MetricsSurface::NodeCacheTier },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesMalformed,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesFieldTooLong,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchWorkerRegistrationsFieldTooLong,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchNodeAnnouncementsFieldTooLong,
+                        .surface = MetricsSurface::CompileScheduler },
 };
 
 /// Whether every catalogue row has at least one surface attributed to it.

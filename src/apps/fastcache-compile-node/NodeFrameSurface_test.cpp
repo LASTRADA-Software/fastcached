@@ -1478,8 +1478,18 @@ TEST_CASE("With every component present, the surface main composes routes each f
     schedulerCfg.raftListen = "127.0.0.1:6680";
     core::platform::ManualWallClock wallClock;
     std::optional<Ed25519KeyPair> const identityKey { Testing::TestKeyPair("n1") };
-    auto scheduler =
-        SchedulerTier::Start(schedulerCfg, fix.membership, fix.clock, wallClock, fix.metrics, fix.logger, identityKey);
+    // The scheduler answers its fleet-wide condition rows as it starts. The watch interval is one
+    // no case reaches, so no watch thread reads the `ManualClock` this case drives.
+    NodeConditions conditions;
+    auto scheduler = SchedulerTier::Start(schedulerCfg,
+                                          fix.membership,
+                                          fix.clock,
+                                          wallClock,
+                                          fix.metrics,
+                                          fix.logger,
+                                          identityKey,
+                                          conditions,
+                                          std::chrono::hours { 24 });
     REQUIRE(scheduler.has_value());
     REQUIRE(*scheduler != nullptr);
 

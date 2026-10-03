@@ -309,15 +309,21 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     auto clustered = Testing::FirstStart(NodeConfig {});
     NodeMembership membership { clustered, membershipLog };
 
-    // The scheduler scope: a scheduler, signing with its identity key (#178). It answers no row
-    // of its own since unsigned grants went; it is started so a row joining its scope later is
-    // asked here.
+    // The scheduler scope: a scheduler, signing with its identity key (#178), started the way `main`
+    // starts it -- with the registry -- because it answers its fleet-wide rows as it starts.
     auto scheduling = Testing::FirstStart(NodeConfig {});
     scheduling.nodeId = "n1";
     core::platform::ManualClock schedulerClock;
     core::platform::ManualWallClock wallClock;
-    auto scheduler = SchedulerTier::Start(
-        scheduling, membership.Oracle(), schedulerClock, wallClock, metrics, logger, FastCache::Testing::TestKeyPair("n1"));
+    auto scheduler = SchedulerTier::Start(scheduling,
+                                          membership.Oracle(),
+                                          schedulerClock,
+                                          wallClock,
+                                          metrics,
+                                          logger,
+                                          FastCache::Testing::TestKeyPair("n1"),
+                                          conditions,
+                                          SchedulerConditionInterval);
     REQUIRE(scheduler.has_value());
 
     // The worker scope.

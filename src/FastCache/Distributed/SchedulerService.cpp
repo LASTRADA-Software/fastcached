@@ -207,15 +207,32 @@ namespace
                   "a release refusal carries its own counter, so its code must not also carry a code-keyed one");
 
     /// A refusal decided by one verb before anything is proposed, which moves a counter of
-    /// its own while its wire code moves none.
+    /// its own and ONLY that. `RefuseAs` is its only spend path: `Increment(row.counter)` beside
+    /// `Refuse(row.code)` counts twice whenever the code carries a counter of its own.
     ///
     /// The shape `ReleaseRefusalRow` has and for its reason: the row is the REFUSAL, not the
-    /// code, so two refusals may share a code and must not share a counter.
+    /// code, so two refusals may share a code and must not share a counter. Spent through
+    /// `RefuseAs`, which never consults `RefusalTable` -- so a row may answer with a code that
+    /// carries a code-keyed counter of its own (`MalformedRegistration`) and still move exactly
+    /// the one it names.
     struct VerbRefusalRow
     {
         Wire::ErrorCode code;          ///< What the client is told.
         IMetricsSink::Counter counter; ///< What the operator sees rise.
     };
+
+    /// Refuse by a verb's own row: its counter rises, and no other.
+    /// @param metrics Where the counter is.
+    /// @param row The refusal.
+    /// @param message Words for a person.
+    /// @return The reply.
+    [[nodiscard]] SchedulerReply RefuseAs(IMetricsSink& metrics, VerbRefusalRow const& row, std::string message)
+    {
+        metrics.Increment(row.counter);
+        return SchedulerReply {
+            .status = Wire::Status::Error, .error = row.code, .message = std::move(message), .payload = {}
+        };
+    }
 
     /// A CLUSTER-ADMIT naming a key that is not one (#178).
     ///
@@ -236,18 +253,48 @@ namespace
         .counter = IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey,
     };
 
-    /// Whether a verb's own refusal is counted once: its code must carry no code-keyed
-    /// counter, or `Refuse` would move a second one beside the row's.
-    /// @param row The verb's refusal.
-    /// @return True when `RefusalTable` holds no row for its code.
-    [[nodiscard]] consteval bool CountsOnce(VerbRefusalRow const& row) noexcept
+    /// What one verb answers a string it keeps with, when the string fails one of the two questions
+    /// `RefuseUnkept` asks of it.
+    struct KeptFieldRefusals
     {
-        return std::ranges::none_of(RefusalTable,
-                                    [&row](RefusalDescriptor const& counted) { return counted.code == row.code; });
-    }
+        VerbRefusalRow notText; ///< Bytes that are not UTF-8.
+        VerbRefusalRow tooLong; ///< Text longer than the field's ceiling.
+    };
 
-    static_assert(CountsOnce(MalformedAdmissionKey),
-                  "a verb's own refusal carries its own counter, so its code must not also carry a code-keyed one");
+    /// A LEASE's two.
+    ///
+    /// `MalformedFrame` on the wire, and not `MalformedRegistration`, although that is the code the
+    /// other verbs' refusals answer with: a client asking for a lease is not a worker registering,
+    /// and the launcher files both codes under one cause anyway. Two rows sharing one code, because
+    /// bytes that are not text and text longer than any real client writes are different causes, and
+    /// one counter would say neither; ONE row for every too-long field, because that cause is one --
+    /// the sentence names which field, and the ceilings are sizes of the same rule.
+    constexpr KeptFieldRefusals LeaseFieldRefusals {
+        .notText = { .code = Wire::ErrorCode::MalformedFrame, .counter = IMetricsSink::Counter::DispatchLeasesMalformed },
+        .tooLong = { .code = Wire::ErrorCode::MalformedFrame, .counter = IMetricsSink::Counter::DispatchLeasesFieldTooLong },
+    };
+
+    /// A REGISTER's two, both `MalformedRegistration` -- the code a worker's registration has always
+    /// been refused with, which its `DescribeOutcome` reads back into the node's log. The not-text
+    /// row moves the counter that code has always moved; the too-long row moves its own, and only
+    /// its own, which is what `RefuseAs` is for.
+    constexpr KeptFieldRefusals RegistrationFieldRefusals {
+        .notText = { .code = Wire::ErrorCode::MalformedRegistration,
+                     .counter = IMetricsSink::Counter::DispatchWorkerRegistrationsMalformed },
+        .tooLong = { .code = Wire::ErrorCode::MalformedRegistration,
+                     .counter = IMetricsSink::Counter::DispatchWorkerRegistrationsFieldTooLong },
+    };
+
+    /// A NODE-ANNOUNCE's two, with the code and the not-text counter REGISTER's refusals use: the
+    /// announcement is the machine half of the same statement about itself. Its too-long row is its
+    /// own, because a machine refused here registers no worker, and a registration counter would
+    /// name one.
+    constexpr KeptFieldRefusals PresenceFieldRefusals {
+        .notText = { .code = Wire::ErrorCode::MalformedRegistration,
+                     .counter = IMetricsSink::Counter::DispatchWorkerRegistrationsMalformed },
+        .tooLong = { .code = Wire::ErrorCode::MalformedRegistration,
+                     .counter = IMetricsSink::Counter::DispatchNodeAnnouncementsFieldTooLong },
+    };
 
     /// What a consensus refusal becomes on the wire.
     struct ProposalRefusalRow
@@ -310,6 +357,11 @@ namespace
         Wire::ErrorCode reported;      ///< What the client is told.
         IMetricsSink::Counter counter; ///< What the operator sees rise.
         std::string_view detail;       ///< Words for a person; empty where the code says it all.
+        /// Whether the refusal says the fleet serves no such TOOLCHAIN, and is remembered for the
+        /// leader's `unserved-toolchain`. Only `NoWorker`: a full or withdrawn fleet serves the
+        /// toolchain, and so does one whose every worker this client excluded -- naming it would
+        /// send an operator to install a compiler they already have.
+        bool unservedToolchain;
     };
 
     /// One row per `PickError`, in enumerator order: the wire code it becomes and the
@@ -325,20 +377,24 @@ namespace
         { .error = PickError::NoWorker,
           .reported = Wire::ErrorCode::NoWorker,
           .counter = IMetricsSink::Counter::DispatchLeasesNoWorker,
-          .detail = {} },
+          .detail = {},
+          .unservedToolchain = true },
         { .error = PickError::NoCapacity,
           .reported = Wire::ErrorCode::NoCapacity,
           .counter = IMetricsSink::Counter::DispatchLeasesNoCapacity,
-          .detail = {} },
+          .detail = {},
+          .unservedToolchain = false },
         { .error = PickError::Withdrawn,
           .reported = Wire::ErrorCode::Withdrawn,
           .counter = IMetricsSink::Counter::DispatchLeasesWithdrawn,
-          .detail = {} },
+          .detail = {},
+          .unservedToolchain = false },
         // The same CODE as the first row and a different COUNTER: the row is the refusal.
         { .error = PickError::Excluded,
           .reported = Wire::ErrorCode::NoWorker,
           .counter = IMetricsSink::Counter::DispatchLeasesAllExcluded,
-          .detail = "every worker serving this toolchain is on this client's exclusion list" },
+          .detail = "every worker serving this toolchain is on this client's exclusion list",
+          .unservedToolchain = false },
     } };
 
     static_assert(RowsInEnumeratorOrder(PickErrorTable, &PickErrorRow::error),
@@ -364,30 +420,68 @@ namespace
     static_assert(PickRefusalsCountOnce(),
                   "a pick refusal carries its own counter, so its code must not also carry a code-keyed one");
 
-    /// Every string a REGISTER carries, in one place.
+    /// What one kept field holds, as `RefuseUnkept` asks it: its bytes when it is text, and its
+    /// length either way.
+    struct KeptReading
+    {
+        /// The bytes, when the field is text; absent for a list that is measured and never rendered
+        /// as text, which the text question does not reach.
+        std::optional<std::string_view> text;
+        std::size_t size; ///< Its length in bytes.
+    };
+
+    /// @param value A field that is text.
+    /// @return It, as a reading both questions are asked of.
+    [[nodiscard]] constexpr KeptReading Text(std::string_view value) noexcept
+    {
+        return KeptReading { .text = value, .size = value.size() };
+    }
+
+    /// One field a verb carries that this scheduler KEEPS, and the most of it that is kept.
     ///
-    /// A table rather than three checks written out, because the failure this
-    /// guards against is a FOURTH string being added to `WorkerRegistration` and
+    /// Both questions in one row, so a kept string cannot be checked for text and forgotten for
+    /// length: the frame's ceiling is `MaxControlPayload`, and a kept field is held for as long as
+    /// its record lives. The sizing of each ceiling is at its constant.
+    template <typename Record>
+    struct KeptField
+    {
+        std::string_view name;              ///< What a refusal calls it.
+        KeptReading (*read)(Record const&); ///< Where to read it.
+        /// The longest a scheduler records, in bytes. Zero if a row forgets it, so the row refuses
+        /// every value rather than none -- a missing ceiling fails closed.
+        std::size_t ceiling {};
+    };
+
+    /// Every field a REGISTER carries that the worker's entry keeps, in one place -- the strings
+    /// rendered on the fleet page, `/fleet.json` and `--cluster-status`, and the codec list read
+    /// against every lease.
+    ///
+    /// A table rather than checks written out, because the failure this
+    /// guards against is another field being added to `WorkerRegistration` and
     /// nobody remembering to check it -- which stays invisible until a peer sends
-    /// one that is not text, by which time the bytes are in the leader's view of
-    /// the fleet and in everything rendered from it.
+    /// one that is not text, or one a megabyte long, by which time the bytes are in
+    /// the leader's view of the fleet and in everything rendered from it.
     ///
     /// The extent is DEDUCED rather than spelled out. A row count written beside the
     /// rows is a second place the same fact lives, and the two part company the first
     /// time somebody appends one -- which is not hypothetical here: this table has
     /// already grown its fourth row once.
-    constexpr std::array RegistrationTextFields {
-        TextField<WorkerRegistration> { .name = "fingerprint",
-                                        .project = [](WorkerRegistration const& r) { return r.fingerprint; } },
-        TextField<WorkerRegistration> { .name = "endpoint",
-                                        .project = [](WorkerRegistration const& r) { return r.endpoint; } },
-        TextField<WorkerRegistration> { .name = "version",
-                                        .project = [](WorkerRegistration const& r) { return r.version; } },
+    constexpr std::array RegistrationFields {
+        KeptField<WorkerRegistration> { .name = "fingerprint",
+                                        .read = [](WorkerRegistration const& r) { return Text(r.fingerprint); },
+                                        .ceiling = Wire::MaxToolchainFingerprintBytes },
+        KeptField<WorkerRegistration> { .name = "endpoint",
+                                        .read = [](WorkerRegistration const& r) { return Text(r.endpoint); },
+                                        .ceiling = Wire::MaxEndpointBytes },
+        KeptField<WorkerRegistration> { .name = "version",
+                                        .read = [](WorkerRegistration const& r) { return Text(r.version); },
+                                        .ceiling = Wire::MaxNodeVersionBytes },
         // The fourth string this table's own comment anticipated. It matters more than
         // most: it is raw compiler output rather than anything this project composed,
         // so it is the likeliest field to arrive as bytes that are not text.
-        TextField<WorkerRegistration> { .name = "toolchain label",
-                                        .project = [](WorkerRegistration const& r) { return r.toolchainLabel; } },
+        KeptField<WorkerRegistration> { .name = "toolchain label",
+                                        .read = [](WorkerRegistration const& r) { return Text(r.toolchainLabel); },
+                                        .ceiling = Wire::MaxToolchainLabelBytes },
         // The fifth, and it comes from the same place the fourth does: the machine
         // itself, not this project. `gethostname` and `GetComputerNameExA` hand back
         // whatever the host is called, in whatever encoding the host chose -- so this
@@ -395,20 +489,137 @@ namespace
         // byte that is not UTF-8 makes `/fleet.json` unparseable for the whole fleet,
         // and a renderer that repaired it would be a second author of the value while
         // every surface that did not repair still carried the original (#1024).
-        TextField<WorkerRegistration> { .name = "display name",
-                                        .project = [](WorkerRegistration const& r) { return r.displayName; } },
+        KeptField<WorkerRegistration> { .name = "display name",
+                                        .read = [](WorkerRegistration const& r) { return Text(r.displayName); },
+                                        .ceiling = Wire::MaxDisplayNameBytes },
+        // Not a string, and kept all the same: the entry holds it for as long as the worker
+        // heartbeats and reads it against every lease. Measured and never rendered as text, so
+        // only the length question reaches it -- a codec id is a byte, not a character.
+        KeptField<WorkerRegistration> {
+            .name = "codec list",
+            .read =
+                [](WorkerRegistration const& r) { return KeptReading { .text = std::nullopt, .size = r.codecs.size() }; },
+            .ceiling = Wire::MaxCodecListIds },
     };
 
-    /// The strings a presence announcement carries that another machine will read.
+    /// The strings a LEASE carries that this scheduler KEEPS, and so renders.
     ///
-    /// Its own table rather than a reuse of `RegistrationTextFields`, which projects from
+    /// The fingerprint and the label are kept when the lease is refused `no-worker`
+    /// (`UnservedToolchains`, for the leader's `unserved-toolchain`), and the key is kept by the
+    /// lease table and listed among the fleet page's outstanding leases -- so all three are text a
+    /// peer sent entering the fleet's state, refused where they enter rather than repaired by
+    /// whichever renderer meets them first. Sixteen unserved toolchains at the frame's bound would
+    /// be a megabyte a peer chose, which is what each row's ceiling is for.
+    constexpr std::array LeaseFields {
+        KeptField<Wire::LeaseRequest> { .name = "key",
+                                        .read = [](Wire::LeaseRequest const& r) { return Text(r.key); },
+                                        .ceiling = Wire::MaxLeaseKeyBytes },
+        KeptField<Wire::LeaseRequest> { .name = "fingerprint",
+                                        .read = [](Wire::LeaseRequest const& r) { return Text(r.fingerprint); },
+                                        .ceiling = Wire::MaxToolchainFingerprintBytes },
+        KeptField<Wire::LeaseRequest> { .name = "toolchain label",
+                                        .read = [](Wire::LeaseRequest const& r) { return Text(r.toolchainLabel); },
+                                        .ceiling = Wire::MaxToolchainLabelBytes },
+    };
+
+    /// The strings a presence announcement carries that this scheduler KEEPS in the machine's row.
+    ///
+    /// Its own table rather than a reuse of `RegistrationFields`, which projects from
     /// `WorkerRegistration`: two records, two projections, one validator. Shorter for the
     /// honest reason -- a presence announcement carries no fingerprint, no toolchain label and
-    /// no display name, because it registers nothing.
-    constexpr std::array PresenceTextFields {
-        TextField<NodePresence> { .name = "endpoint", .project = [](NodePresence const& p) { return p.endpoint; } },
-        TextField<NodePresence> { .name = "version", .project = [](NodePresence const& p) { return p.version; } },
+    /// no display name, because it registers nothing. Its condition rows are kept too, and are
+    /// asked the same two questions against their own table's ceilings: `KeptPresenceValues`.
+    constexpr std::array PresenceFields {
+        KeptField<NodePresence> { .name = "endpoint",
+                                  .read = [](NodePresence const& p) { return Text(p.endpoint); },
+                                  .ceiling = Wire::MaxEndpointBytes },
+        KeptField<NodePresence> { .name = "version",
+                                  .read = [](NodePresence const& p) { return Text(p.version); },
+                                  .ceiling = Wire::MaxNodeVersionBytes },
     };
+
+    /// One kept field as a verb carried it: what a refusal calls it, what it holds and its ceiling.
+    ///
+    /// Flattened out of the tables above so a verb whose kept strings live in more than one record
+    /// -- a NODE-ANNOUNCE's own fields and its condition rows -- asks each question over all of them
+    /// before the next, exactly as a verb with one record does.
+    struct KeptValue
+    {
+        std::string_view qualifier; ///< What the field belongs to, prefixed to its name; empty for the verb's own.
+        std::string_view name;      ///< What a refusal calls the field.
+        KeptReading reading;        ///< What the peer sent.
+        std::size_t ceiling;        ///< The longest a scheduler records, in bytes.
+    };
+
+    /// Every row of @p fields, read from @p record.
+    /// @param record What the verb carried.
+    /// @param fields The strings of it this scheduler keeps.
+    /// @return One value per row, in the table's order.
+    template <typename Record, std::size_t Count>
+    [[nodiscard]] std::array<KeptValue, Count> KeptValuesOf(Record const& record,
+                                                            std::array<KeptField<Record>, Count> const& fields)
+    {
+        auto values = std::array<KeptValue, Count> {};
+        std::ranges::transform(fields, values.begin(), [&record](KeptField<Record> const& field) {
+            return KeptValue {
+                .qualifier = {}, .name = field.name, .reading = field.read(record), .ceiling = field.ceiling
+            };
+        });
+        return values;
+    }
+
+    /// Every string a NODE-ANNOUNCE carries that this scheduler keeps: `PresenceFields`, then every
+    /// field of every condition row against the ceiling its column of `ConditionFieldTable` states --
+    /// the table that says which fields a row HAS, so a field appended to it is checked without
+    /// anybody remembering to (#1364).
+    /// @param presence What the machine announced.
+    /// @return The values, the machine's own first.
+    [[nodiscard]] std::vector<KeptValue> KeptPresenceValues(NodePresence const& presence)
+    {
+        auto const own = KeptValuesOf(presence, PresenceFields);
+        auto values = std::vector<KeptValue> { own.begin(), own.end() };
+        if (presence.conditions.has_value())
+            for (auto const& row: *presence.conditions)
+                for (auto const& column: Wire::ConditionFieldTable)
+                    values.push_back(KeptValue { .qualifier = "condition ",
+                                                 .name = column.name,
+                                                 .reading = Text(row.*column.member),
+                                                 .ceiling = column.maxBytes });
+        return values;
+    }
+
+    /// The refusal a verb's kept strings earn, if any.
+    ///
+    /// Refused where they ENTER, before anything can keep a byte of them, rather than repaired by
+    /// whichever renderer meets them first: a renderer that repaired one would be a second author of
+    /// what the peer said, and the surfaces that did not would still carry the original. The whole
+    /// request goes rather than the offending string -- a fingerprint, a key and an endpoint are
+    /// matched byte for byte, so a repaired one would be a different request.
+    ///
+    /// Text first, over every value, then length: a string that is not text is the stronger claim
+    /// about the peer, whichever field carries it.
+    /// @param metrics Where the refusal's counter is.
+    /// @param values What the verb carried that this scheduler keeps.
+    /// @param refusals The verb's two refusals.
+    /// @return The refusal, or nullopt when every text value is text and every value is within its ceiling.
+    [[nodiscard]] std::optional<SchedulerReply> RefuseUnkept(IMetricsSink& metrics,
+                                                             std::span<KeptValue const> values,
+                                                             KeptFieldRefusals const& refusals)
+    {
+        for (auto const& kept: values)
+            if (kept.reading.text.has_value() && !IsValidUtf8(*kept.reading.text))
+                return RefuseAs(metrics, refusals.notText, NotTextRefusal(std::format("{}{}", kept.qualifier, kept.name)));
+        for (auto const& kept: values)
+            if (kept.reading.size > kept.ceiling)
+                return RefuseAs(metrics,
+                                refusals.tooLong,
+                                std::format("{}{} is {} bytes; a scheduler records at most {}",
+                                            kept.qualifier,
+                                            kept.name,
+                                            kept.reading.size,
+                                            kept.ceiling));
+        return std::nullopt;
+    }
 
     /// Whether a registration's endpoint names the host it arrived from.
     ///
@@ -494,7 +705,8 @@ SchedulerService::SchedulerService(core::platform::IClock& clock,
     _signer { signer },
     _clusterId { clusterId },
     _workers { clock },
-    _leases { clock }
+    _leases { clock },
+    _unserved { clock }
 {
 }
 
@@ -688,14 +900,12 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
     {
         auto parsed = ParseEd25519PublicKey(*publicKey);
         if (!parsed.has_value())
-        {
-            _metrics.Increment(MalformedAdmissionKey.counter);
-            return Refuse(MalformedAdmissionKey.code,
-                          std::format("{} was sent with a key that is not one ({}): {}",
-                                      memberId,
-                                      *publicKey,
-                                      DescribePublicKeyFault(parsed.error())));
-        }
+            return RefuseAs(_metrics,
+                            MalformedAdmissionKey,
+                            std::format("{} was sent with a key that is not one ({}): {}",
+                                        memberId,
+                                        *publicKey,
+                                        DescribePublicKeyFault(parsed.error())));
         key = *parsed;
     }
 
@@ -808,14 +1018,12 @@ SchedulerReply SchedulerService::ClusterAdmitWorker(CallerContext const& caller,
 
     auto const parsed = ParseEd25519PublicKey(publicKey);
     if (!parsed.has_value())
-    {
-        _metrics.Increment(MalformedAdmissionKey.counter);
-        return Refuse(MalformedAdmissionKey.code,
-                      std::format("{} was sent with a key that is not one ({}): {}",
-                                  workerId,
-                                  publicKey,
-                                  DescribePublicKeyFault(parsed.error())));
-    }
+        return RefuseAs(_metrics,
+                        MalformedAdmissionKey,
+                        std::format("{} was sent with a key that is not one ({}): {}",
+                                    workerId,
+                                    publicKey,
+                                    DescribePublicKeyFault(parsed.error())));
 
     auto reply = AdmitPrincipal(caller, workerId, *parsed, Cluster::PrincipalRole::Worker);
     if (reply.status != Wire::Status::Ok)
@@ -903,8 +1111,12 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     // match nothing and sit in the fleet never being picked. A refusal reaches the
     // worker's own log through `DescribeOutcome`; the counter is what an operator
     // sees when the peer is not one of ours and never says anything at all.
-    if (auto const field = FirstFieldNotText(registration, RegistrationTextFields); field.has_value())
-        return Refuse(Wire::ErrorCode::MalformedRegistration, NotTextRefusal(*field));
+    //
+    // Length as well as encoding: every one of these strings is kept for as long as the worker
+    // heartbeats, so each has a ceiling of its own far below the frame's.
+    if (auto refusal = RefuseUnkept(_metrics, KeptValuesOf(registration, RegistrationFields), RegistrationFieldRefusals);
+        refusal.has_value())
+        return std::move(*refusal);
 
     // No zero-slot refusal any more, and its removal is a decision rather than a
     // simplification. A zero used to mean "a worker that will never be picked" and
@@ -992,27 +1204,18 @@ SchedulerReply SchedulerService::AnnounceNode(CallerContext const& caller,
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
 
-    // Refused where it ENTERS, through the same validator the registration goes through: one
-    // byte that is not UTF-8 makes the fleet document unparseable for the whole fleet, and a
-    // renderer that repaired it would be a second author of the value.
-    if (auto const field = FirstFieldNotText(presence, PresenceTextFields); field.has_value())
-        return Refuse(Wire::ErrorCode::MalformedRegistration, NotTextRefusal(*field));
+    // Refused where it ENTERS, through the same gate the registration goes through: one byte
+    // that is not UTF-8 makes the fleet document unparseable for the whole fleet, one string as
+    // long as the frame is held in the machine's row for as long as it announces, and a renderer that
+    // repaired either would be a second author of the value. Every string of every condition row
+    // included, for the same reason (#1364).
+    if (auto refusal = RefuseUnkept(_metrics, KeptPresenceValues(presence), PresenceFieldRefusals); refusal.has_value())
+        return std::move(*refusal);
 
     // The endpoint is the KEY, so an empty one is not a machine that declined to say where it
     // answers -- it is a row that would collide with every other machine that did the same.
     if (presence.endpoint.empty())
         return Refuse(Wire::ErrorCode::MalformedRegistration, "a machine announces the endpoint it answers on");
-
-    // Every string of every condition row, from the table that says which fields a row HAS -- so a
-    // field appended to it is checked without anybody remembering to (#1364). Refused like the
-    // fields above rather than dropped, for their reason: a renderer that repaired it would be a
-    // second author of what the machine said.
-    if (presence.conditions.has_value())
-        for (auto const& row: *presence.conditions)
-            for (auto const& field: Wire::ConditionFieldTable)
-                if (!IsValidUtf8(row.*field.member))
-                    return Refuse(Wire::ErrorCode::MalformedRegistration,
-                                  NotTextRefusal(std::format("condition {}", field.name)));
 
     _workers.NoteNodePresent(std::string { presence.endpoint },
                              presence.capacity,
@@ -1213,9 +1416,24 @@ void SchedulerService::ReapExpiredWorkers()
         _metrics.Increment(IMetricsSink::Counter::DispatchLeasesReclaimed, static_cast<std::uint64_t>(reclaimed));
 }
 
+std::vector<UnservedToolchain> SchedulerService::UnservedToolchainsNow() const
+{
+    auto const live = _workers.LiveWorkers();
+    auto unserved = _unserved.Recent();
+    std::erase_if(unserved, [&live](UnservedToolchain const& toolchain) {
+        return std::ranges::contains(live, toolchain.fingerprint, &WorkerInfo::fingerprint);
+    });
+    return unserved;
+}
+
 SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseRequest const& request)
 {
     if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+
+    // Refused where it ENTERS, before anything below can keep a byte of it: a lease refused
+    // `no-worker` is remembered with its fingerprint and label, and a granted one with its key.
+    if (auto refusal = RefuseUnkept(_metrics, KeptValuesOf(request, LeaseFields), LeaseFieldRefusals); refusal.has_value())
         return std::move(*refusal);
 
     // Before the key is asked about, not after: a worker that vanished mid-job left
@@ -1249,6 +1467,10 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
         // here rather than a refusal that silently arrives as one of the other four.
         auto const& row = PickErrorTable[static_cast<std::size_t>(picked.error())];
         _metrics.Increment(row.counter);
+        // Remembered before answering: the refusal reaches ONE client, and a toolchain nobody
+        // serves refuses every client using it one at a time. The leader names it once.
+        if (row.unservedToolchain)
+            _unserved.Refused(request.fingerprint, request.toolchainLabel);
         return Refuse(row.reported, std::string { row.detail });
     }
 

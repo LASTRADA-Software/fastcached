@@ -700,8 +700,15 @@ using Node::NodeReloader;
     std::unique_ptr<Node::SchedulerTier> schedulerTier;
     if (Node::ServesScheduler(cfg))
     {
-        auto started = Node::SchedulerTier::Start(
-            cfg, membership.Oracle(), schedulerClock, schedulerWallClock, metrics, logger, identityKey);
+        auto started = Node::SchedulerTier::Start(cfg,
+                                                  membership.Oracle(),
+                                                  schedulerClock,
+                                                  schedulerWallClock,
+                                                  metrics,
+                                                  logger,
+                                                  identityKey,
+                                                  conditions,
+                                                  Node::SchedulerConditionInterval);
         if (!started.has_value())
         {
             // Fatal for the same reason the admin endpoint's is: an operator who asked

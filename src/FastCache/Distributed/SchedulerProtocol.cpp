@@ -458,7 +458,8 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                   Wire::LeaseRequest { .fingerprint = Wire::AsStringView(fields->fingerprint),
                                                        .key = Wire::AsStringView(fields->key),
                                                        .acceptedCodecs = fields->acceptedCodecs,
-                                                       .excluded = excluded });
+                                                       .excluded = excluded,
+                                                       .toolchainLabel = Wire::AsStringView(fields->toolchainLabel) });
         }
         case Wire::Op::Release: {
             auto const fields = Wire::DecodeReleasePayload(payload);

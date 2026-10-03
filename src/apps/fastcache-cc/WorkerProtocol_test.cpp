@@ -1907,6 +1907,43 @@ TEST_CASE("A registration carries the addresses it is handed, and the next one d
     CHECK(RegisteredAddressesOn(second) == std::optional { std::vector<std::string> {} });
 }
 
+TEST_CASE("A registration never carries a label a scheduler would refuse it for", "[cc][registrar][label]")
+{
+    // The registration twin of the lease's rule. A scheduler refuses the WHOLE registration over a
+    // label that is not text or is longer than it records, and the label is display only -- so
+    // sending it would keep this worker out of the fleet for a name. It goes out empty instead, and
+    // the worker registers under its fingerprint as before.
+    struct Case
+    {
+        std::string_view why;
+        std::string label;
+        std::string sent;
+    };
+    auto const atBound = std::string(Wire::MaxToolchainLabelBytes, 'x');
+    auto const cases = std::array {
+        Case { .why = "not text", .label = "g++ \xff 14.2.0", .sent = "" },
+        Case { .why = "over the bound", .label = atBound + "x", .sent = "" },
+        // The control, which a guard dropping every label would fail.
+        Case { .why = "at the bound", .label = atBound, .sent = atBound },
+    };
+
+    for (auto const& [why, label, sent]: cases)
+    {
+        INFO(why);
+        auto registrar = WorkerRegistrar {
+            "gcc-14", "10.0.0.2:6677", 4, Wire::CodecList {}, Wire::CapacityFields { .toolchainLabel = label }
+        };
+        Testing::ScriptedSocket scheduler { RegisterOk("w-1") };
+        REQUIRE(registrar.Register(scheduler, {}).has_value());
+
+        auto const& frame = scheduler.Sent();
+        REQUIRE(frame.size() >= Wire::RequestHeaderSize);
+        auto const registration = Wire::DecodeRegisterPayload(std::span { frame }.subspan(Wire::RequestHeaderSize));
+        REQUIRE(registration.has_value());
+        CHECK(Unwrap(registration).capacity.toolchainLabel == sent);
+    }
+}
+
 TEST_CASE("A heartbeat refused UnknownLease forgets its worker id and names no leader", "[cc][registrar][notleader]")
 {
     auto registrar = MakeRegistrar();

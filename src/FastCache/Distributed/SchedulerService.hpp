@@ -8,6 +8,7 @@
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
+#include <FastCache/Distributed/UnservedToolchains.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -991,6 +992,14 @@ class SchedulerService
         return _leases.LiveLeases(limit);
     }
 
+    /// The toolchains clients asked this scheduler for within `UnservedToolchains::Window` that no
+    /// live worker serves -- what the leader's `unserved-toolchain` condition names.
+    ///
+    /// Filtered against the registry at READ, so a worker that starts serving one clears it at
+    /// once, and one whose last worker expired comes back while clients still ask.
+    /// @return Sorted by label, then fingerprint.
+    [[nodiscard]] std::vector<UnservedToolchain> UnservedToolchainsNow() const;
+
     /// The registry, for the admin endpoint and for tests.
     [[nodiscard]] WorkerRegistry const& Workers() const noexcept
     {
@@ -1200,6 +1209,8 @@ class SchedulerService
 
     WorkerRegistry _workers;
     LeaseTable _leases;
+    /// What `Lease` refused `no-worker`, by toolchain. See `UnservedToolchainsNow`.
+    UnservedToolchains _unserved;
 
     /// This node's standing, and where the leader is.
     ///
