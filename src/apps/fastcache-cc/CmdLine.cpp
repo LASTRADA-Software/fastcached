@@ -76,6 +76,9 @@ namespace
     /// They carry absolute paths, which is exactly why the KEY's probe suppresses
     /// them and why this text must never reach `ComputeKey`. The two runs answer two
     /// questions and only one of them has to be portable.
+    /// The argument after which a driver reads everything as an input file.
+    constexpr std::string_view EndOfOptions = "--";
+
     constexpr std::array<std::string_view, 1> MsvcDispatchPreprocess { "/E" };
     constexpr std::array<std::string_view, 1> GnuDispatchPreprocess { "-E" };
 
@@ -406,7 +409,7 @@ namespace
     // the producing machine's object path into every Windows key and two checkouts
     // at different roots could never share an entry.
 
-    constexpr std::array<PathValueFlag, 19> PathValues { {
+    constexpr std::array<PathValueFlag, 21> PathValues { {
         // The prefix-map row first, being the longest spelling. GNU-only: `cl` has
         // no path-map switch at all, and clang-cl accepts `-ffile-prefix-map`
         // while ignoring it for the records that matter -- measured, an object
@@ -431,6 +434,16 @@ namespace
           .valueTailSeparator = '=' },
         { .spelling = "/external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         { .spelling = "-external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
+        // clang-cl's spelling of the same thing, and the one CMake writes for a `SYSTEM`
+        // include directory under clang-cl (`-imsvc<dir>`, measured with CMake 4.3.1 and
+        // clang-cl 22.1.3). Unrecognised, `CouldNameAFile` refused every such unit as not
+        // dispatchable. It needs no worker-side counterpart, which is why it is dropped
+        // like `/external:I`: clang-cl's `/E` marks each header found under it as a
+        // system header in the line markers (`# 1 "..." 3`), and the worker suppresses
+        // warnings on those lines by that flag -- measured, `/W4 /WX`, local exit 0 and
+        // the worker's `.i` exit 0 with the flag gone.
+        { .spelling = "-imsvc", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
+        { .spelling = "/imsvc", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         // clang-cl's pass-through spellings of the GNU dependency flags, which is how
         // CMake's Ninja generator asks clang-cl for a depfile (#1531). Unrecognised,
         // the launcher never learned the depfile's path: a miss wrote one as a side
@@ -1444,6 +1457,14 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
         if (a == cmd.source)
             continue;
 
+        // The end-of-options marker, which CMake's clang-cl rule writes before every
+        // source (`-c -- $in`). It belongs to the SOURCE, which never travels, and
+        // forwarded it did harm twice over: the worker's allowlist has no row for it, so
+        // every CMake + clang-cl unit came back refused; and a worker that took it would
+        // read the language flags appended below as input files.
+        if (a == EndOfOptions)
+            continue;
+
         // The compile-only marker and the dependency switches, off the driver's own
         // list. Same rule PreprocessCommand applies, and the same reason for reading
         // it here rather than restating it: a spelling added to that table has to be
@@ -1479,7 +1500,14 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
         {
             // The separated `-x c++` form owns the next argument too, and leaving
             // its value behind would hand the worker a bare `c++` to open as a file.
-            if (a == row->spelling && i + 1 < argv.size())
+            //
+            // ONLY a row whose language arrives as a VALUE. `/TP` carries its language
+            // in its own spelling, and this skip used to take the argument after it as
+            // well: `/TP /W4 /WX` reached a worker as `/WX` alone, compiled at the
+            // default warning level what the client compiled at `/W4`, and served the
+            // object of a compile that fails locally. CMake writes a `-D` after `/TP`,
+            // which is dropped here anyway, and that is how it hid.
+            if (!row->language.has_value() && a == row->spelling && i + 1 < argv.size())
                 skipUntil = i + 2;
             continue;
         }

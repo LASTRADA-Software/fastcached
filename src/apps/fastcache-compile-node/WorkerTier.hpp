@@ -12,6 +12,7 @@
 #include "NodeReload.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeToolchains.hpp"
+#include "RefusedArguments.hpp"
 #include "SchedulerLink.hpp"
 #include "SchedulerReachability.hpp"
 #include "ScratchClaim.hpp"
@@ -208,6 +209,22 @@ class WorkerHeartbeat
   private:
     std::jthread _thread;
 };
+
+/// Adopt a reloaded compile-argument allowlist, and say so when it changed.
+///
+/// Out here rather than private to the heartbeat, so the one decision a reload makes about
+/// refused arguments is one a test can reach with the objects the tier holds.
+/// @param jobs The runner the set is applied to.
+/// @param refused What this worker has refused; re-judged against the set now in force when the
+///        set changes, because a changed allowlist is the operator acting on exactly that report.
+/// @param logger Where the change is announced, at Warn.
+/// @param inForce The set applied now; replaced when the candidate differs.
+/// @param candidate The set the live configuration names.
+void AdoptAllowlist(Cc::CompileJobRunner& jobs,
+                    RefusedArgumentsReport& refused,
+                    ILogger& logger,
+                    std::vector<std::string>& inForce,
+                    std::vector<std::string> const& candidate);
 
 /// The node's worker: survey, scratch root, job runner, lease check, slot cap, compile
 /// responder and heartbeat, owned as one thing (#1387).
@@ -406,6 +423,9 @@ class WorkerTier
     Cc::CompileJobRunner _jobs;
     std::vector<std::string> _appliedExtraArgs;
     std::unique_ptr<Distributed::WorkerLeaseState> _leaseState;
+    /// Which arguments this worker refused, said as a condition and once per argument in the
+    /// log. Declared before `_protocol`, which borrows it, so member order keeps it alive.
+    RefusedArgumentsReport _refusedArguments;
     Cc::WorkerProtocol _protocol;
     std::uint32_t _slots;
     core::async::ThreadPoolExecutor _pool;

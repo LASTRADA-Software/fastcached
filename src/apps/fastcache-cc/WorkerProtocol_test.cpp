@@ -23,6 +23,7 @@
 #include <functional>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -273,6 +274,28 @@ constexpr std::uint64_t GrantTerm = 4;
     return SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics, slack);
 }
 
+/// Remembers every refusal it is told of, in order; safe from the pool threads a worker runs on.
+class RecordingRefusals final: public IJobRefusalObserver
+{
+  public:
+    void OnJobRefused(JobError const& error) override
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        _seen.push_back(error);
+    }
+
+    /// @return What was reported so far.
+    [[nodiscard]] std::vector<JobError> Seen() const
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        return _seen;
+    }
+
+  private:
+    mutable std::mutex _mutex;
+    std::vector<JobError> _seen;
+};
+
 struct Fixture
 {
     StubRunner runner;
@@ -294,6 +317,10 @@ struct Fixture
     /// a rule somebody remembers is what keeps the borrow alive.
     MovingEndpoint endpoint { ThisWorker };
 
+    /// Every job the runner refused, as the worker reported it -- declared before `worker`, which
+    /// borrows it, for `lease`'s reason.
+    RecordingRefusals refusals;
+
     WorkerProtocol worker;
 
     /// @param codecs What this worker can produce and decode; the production node
@@ -308,7 +335,7 @@ struct Fixture
                      LeasePolicy policy = LeasePolicy::Unchecked,
                      std::chrono::seconds slack = Distributed::LeaseTokenClockSkewSlack):
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
-        worker { jobs, MakeLeaseValidator(policy, lease, endpoint, metrics, slack), std::move(codecs), metrics }
+        worker { jobs, MakeLeaseValidator(policy, lease, endpoint, metrics, slack), std::move(codecs), metrics, refusals }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -703,7 +730,9 @@ TEST_CASE("The envelope ceiling is the surface's own, not a figure this class as
     CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
     AtomicMetricsSink metrics;
     constexpr std::size_t TinyCap = 8;
-    WorkerProtocol worker { jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, TinyCap };
+    WorkerProtocol worker {
+        jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, IgnoreJobRefusals(), TinyCap
+    };
 
     // Well under the default ceiling, and over this worker's.
     auto const answer = worker.Answer(CompileFrame("gcc-13", "int main(){return 0;}"));
@@ -2058,7 +2087,7 @@ TEST_CASE("A reply carries the runner's own correlation, not one recomputed here
 
     LyingRunner runner { std::string { Sentinel } };
     AtomicMetricsSink metrics;
-    WorkerProtocol worker { runner, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
+    WorkerProtocol worker { runner, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, IgnoreJobRefusals() };
 
     auto const answer = worker.Answer(CompileFrame());
     REQUIRE(answer.has_value());
@@ -2085,7 +2114,7 @@ TEST_CASE("The real runner is what a correlation comes from", "[worker-protocol]
     FastCache::Testing::ScratchDirectory const scratch { "fc-wp-corr" };
     CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
     AtomicMetricsSink metrics;
-    WorkerProtocol worker { jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
+    WorkerProtocol worker { jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, IgnoreJobRefusals() };
 
     constexpr std::string_view Source = "int main(){return 0;}";
     auto const answer = worker.Answer(CompileFrame("gcc-13", Source));
@@ -2277,6 +2306,7 @@ TEST_CASE("A worker's reply is accepted by the client that asked for it", "[work
                                            .fingerprint = "gcc-13",
                                            .objectKey = "objkey",
                                            .args = args,
+                                           .family = DriverFamily::Gnu,
                                            .preprocessed = "int main(){return 0;}",
                                            .sourceName = "/home/dev/checkout/src/Widget.cpp",
                                            .compileDir = {},
@@ -2290,6 +2320,69 @@ TEST_CASE("A worker's reply is accepted by the client that asked for it", "[work
     REQUIRE(result.status == DispatchStatus::Compiled);
     CHECK(result.exitCode == 0);
     CHECK_FALSE(result.object.empty());
+}
+
+TEST_CASE("A worker refusing an argument is read by the client as exactly that, naming it", "[worker-protocol][decline]")
+{
+    // Both ends, in one process, because the defect lived BETWEEN them: the worker answered a
+    // refused argument `malformed-frame`, each half was consistent with itself, and the launcher
+    // read that code as "this launcher and the fleet disagree about the wire" -- a version skew,
+    // reported 122 times by a cl-debug build whose client and node were one build. What the
+    // worker says and what the client makes of it are asserted against each other.
+    Fixture fixture { { Wire::IdentityCodec } };
+    LiveFleet fleet { fixture.worker };
+
+    std::vector<std::string> const args { "-O2", "-fanalyzer" };
+    auto const request = DispatchRequest { .schedulerEndpoint = SchedulerEndpoint,
+                                           .fingerprint = "gcc-13",
+                                           .objectKey = "objkey",
+                                           .args = args,
+                                           .family = DriverFamily::Gnu,
+                                           .preprocessed = "int main(){return 0;}",
+                                           .sourceName = "a.cpp",
+                                           .compileDir = {},
+                                           .compileDirReplacement = {},
+                                           .sourceRoot = {},
+                                           .sourceRootReplacement = {} };
+
+    auto const result = Dispatch(fleet, request);
+    INFO("dispatch said: " << result.detail);
+
+    // The worker's half: refused, counted under the argument row, and NOT as a frame fault.
+    REQUIRE(result.status == DispatchStatus::Declined);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedRejectedArgument) == 1);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::WorkerFramesRefusedMalformedPayload) == 0);
+    CHECK(result.detail.contains("worker-rejected-argument"));
+
+    // The client's half: WHICH decline. Not the protocol row, and not the one-machine row
+    // either -- every worker of this build refuses the same flag.
+    CHECK(result.decline == DeclineCause::ArgumentRefused);
+    CHECK(result.decline != DeclineCause::ProtocolMismatch);
+    CHECK(result.decline != DeclineCause::WorkerRefused);
+
+    // And the argument travels in the peer's words, without the endpoint `detail` wraps them in,
+    // which is what the invocation log records.
+    CHECK(result.refusal.contains("-fanalyzer"));
+    CHECK_FALSE(result.refusal.contains(WorkerEndpoint));
+
+    // And the node is told WHICH, beside the counter's how many: the argument alone, which is
+    // what it lists where an operator looks.
+    auto const seen = fixture.refusals.Seen();
+    REQUIRE(seen.size() == 1);
+    CHECK(seen.front().reason == JobRefusal::RejectedArgument);
+    CHECK(seen.front().subject == "-fanalyzer");
+}
+
+TEST_CASE("A refusal that names no argument reaches the observer with no subject", "[worker-protocol][decline]")
+{
+    // The observer is told of EVERY runner refusal, so a node that keys on the reason is not
+    // handed a fingerprint mismatch dressed as an argument.
+    Fixture fix;
+    REQUIRE(fix.worker.Answer(CompileFrame("clang-19")).has_value());
+    auto const seen = fix.refusals.Seen();
+    REQUIRE(seen.size() == 1);
+    CHECK(seen.front().reason == JobRefusal::UnknownFingerprint);
+    CHECK(seen.front().subject.empty());
 }
 
 TEST_CASE("A worker that has not registered honours no grant, however authentic", "[cc][lease][fleet]")

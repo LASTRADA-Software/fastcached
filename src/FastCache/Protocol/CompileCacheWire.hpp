@@ -1306,6 +1306,23 @@ enum class ErrorCode : std::uint8_t
     /// rather than `NotAMember`, which would tell a proven member it is not one. A client treats
     /// it as a miss.
     NotSharedCache = 0x2F,
+
+    /// A worker will not pass one of the job's arguments to its compiler: the argument is not on
+    /// its per-driver-family allowlist, or a path-mapping value it was sent cannot be spelled into
+    /// a rule. The message names the argument.
+    ///
+    /// **Its own code rather than `MalformedFrame`, which is what it was answered with until a
+    /// cl-debug build met it**: the frame was perfectly formed, and a launcher reading
+    /// `malformed-frame` reported every such refusal as *this launcher and the fleet disagree
+    /// about the wire* -- a version skew, on a fleet where both ends were one build. The remedy is
+    /// the opposite of an upgrade: a flag this fleet does not dispatch, which an operator either
+    /// adds with `--allow-compile-arg` on the workers or leaves to compile locally.
+    ///
+    /// A new byte and no version bump, because the reply GRAMMAR is unchanged -- a status, a code
+    /// and a message -- and a launcher that predates it reads it as a refusal it does not know
+    /// (`DeclineCause::Unrecognised`), which is true, rather than as anything it would act on
+    /// wrongly.
+    WorkerRejectedArgument = 0x30,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -2929,6 +2946,12 @@ inline constexpr std::array ErrorTable {
                                         "another machine, or none",
                       .retry = RetryWillNotHelp,
                       .retryWhy = "the shared-cache setting is the cluster's, and names another machine until an operator changes it" },
+    ErrorDescriptor { .code = ErrorCode::WorkerRejectedArgument,
+                      .name = "worker-rejected-argument",
+                      .defaultMessage = "this worker will not pass one of the job's arguments to its compiler",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the worker's allowlist does not change while it is asked; an operator adds the "
+                                  "argument with --allow-compile-arg, or the compile runs locally" },
 };
 
 /// Whether every row says why asking again may or may not help.

@@ -7,6 +7,7 @@
 // `Markup.hpp` pulls in `Ranges.hpp` and `Utf8.hpp` and there is no `.cpp` between
 // the three, which is what makes the shared escaper reachable from here at all.
 #include <FastCache/Core/Markup.hpp>
+#include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Platform/Environment.hpp>
 
 #include <algorithm>
@@ -106,6 +107,56 @@ namespace
 #else
         return static_cast<std::uint64_t>(::getpid());
 #endif
+    }
+
+    /// The dispatch specifics as the log may hold them: printable text, and bounded.
+    ///
+    /// Part of this text is a PEER's -- a worker's refusal message arrives verbatim -- and part is
+    /// the launcher's own, which carries a client's paths and arguments; so it is reduced here, at
+    /// the one writer, rather than trusted. Walked a CODE POINT at a time through the one UTF-8
+    /// decoder this tree shares, because both halves of the reduction are about characters:
+    ///
+    ///   - a control character becomes a space. C0 and DEL (a tab would split the line into
+    ///     columns this build never wrote) and C1 as well: `U+009B` is a whole CSI to a terminal
+    ///     that reads UTF-8, so an escape sequence would otherwise reach whoever reads the log;
+    ///   - a byte that begins no valid sequence becomes `?`, so what the log holds is UTF-8 even
+    ///     when the peer's text was not;
+    ///   - the cap is taken at a sequence boundary. A cut by byte would leave half a character at
+    ///     the end of a non-ASCII path, which is invalid UTF-8 in a log a reader decodes as UTF-8.
+    ///
+    /// The cap is well above any refusal sentence this tree writes. It bounds THIS column only: the
+    /// line's other columns are not bounded here, and the line's atomicity comes from one append
+    /// per line, not from its length.
+    /// @param text The specifics, as the launcher holds them.
+    /// @return What the log records.
+    [[nodiscard]] std::string BoundedSpecifics(std::string_view text)
+    {
+        constexpr std::size_t MaxSpecificsBytes = 320;
+        constexpr char32_t FirstPrintable = 0x20;
+        constexpr char32_t Delete = 0x7F;
+        constexpr char32_t LastC1Control = 0x9F;
+        std::string out;
+        std::size_t at = 0;
+        while (at < text.size())
+        {
+            auto const rest = text.substr(at);
+            auto const decoded = DecodeUtf8(rest);
+            auto const length = decoded.has_value() ? decoded->length : 1;
+            // What is written for this sequence is never longer than the sequence itself, so
+            // asking with its own length keeps the column under the cap and whole characters in it.
+            if (out.size() + length > MaxSpecificsBytes)
+                break;
+            if (!decoded.has_value())
+                out += '?';
+            else if (decoded->value < FirstPrintable || (decoded->value >= Delete && decoded->value <= LastC1Control))
+                out += ' ';
+            else
+                out += rest.substr(0, length);
+            at += length;
+        }
+        if (at < text.size())
+            out += "...";
+        return out;
     }
 
     /// Directory holding the log, created on demand. Empty on failure.
@@ -236,6 +287,16 @@ namespace
         return DispatchTable[static_cast<std::size_t>(outcome)];
     }
 
+    /// Whether a recorded dispatch carries the peer's words into the log's specifics column.
+    ///
+    /// Private to this file and never persisted: the log holds the TEXT, not this choice.
+    enum class Specifics : std::uint8_t
+    {
+        None,    ///< Nothing to act on beyond the reason.
+        Refusal, ///< `DispatchResult::refusal`, which names what to act on.
+        ByCause, ///< Whatever the decline's own row in `DeclineReasonTable` says.
+    };
+
     /// How one `DispatchStatus` — what `Dispatch` actually returned — is recorded on
     /// the axis above.
     ///
@@ -252,25 +313,42 @@ namespace
         std::string_view reason;
         DispatchStatus status {};   ///< Which status this row describes.
         DispatchOutcome outcome {}; ///< How the reports bucket it.
+        Specifics specifics {};     ///< What rides the specifics column.
     };
 
     constexpr EnumTable<DispatchStatus, DispatchRecordingRow> DispatchRecordingTable { {
-        DispatchRecordingRow { .reason = {}, .status = DispatchStatus::Compiled, .outcome = DispatchOutcome::Dispatched },
+        DispatchRecordingRow { .reason = {},
+                               .status = DispatchStatus::Compiled,
+                               .outcome = DispatchOutcome::Dispatched,
+                               .specifics = Specifics::None },
         // No reason of its own: a decline's reason comes from `DeclineReasonTable`
         // below, keyed on the CAUSE. This row used to read "the fleet declined this
         // compile" for every way a fleet can say no, so an operator saw one bucket
         // covering "nothing serves your compiler", "the fleet is busy" and "a worker
         // refused the job" -- three remedies that are not adjacent (#618).
-        DispatchRecordingRow { .reason = {}, .status = DispatchStatus::Declined, .outcome = DispatchOutcome::Declined },
+        DispatchRecordingRow { .reason = {},
+                               .status = DispatchStatus::Declined,
+                               .outcome = DispatchOutcome::Declined,
+                               .specifics = Specifics::ByCause },
         DispatchRecordingRow { .reason = "the fleet could not be reached",
                                .status = DispatchStatus::Unavailable,
-                               .outcome = DispatchOutcome::Unreachable },
+                               .outcome = DispatchOutcome::Unreachable,
+                               .specifics = Specifics::None },
         // No reason, and here that is a decision rather than the absence of a
         // failure. The launcher already puts #280's sentence on the CACHE axis, which
         // that rule requires -- a copy here would print the identical sentence under
         // two headings of one report, and two rankings of one event read as two
         // events. The state says it: `crossed reply` is a line no other state emits.
-        DispatchRecordingRow { .reason = {}, .status = DispatchStatus::Mismatched, .outcome = DispatchOutcome::Mismatched },
+        DispatchRecordingRow { .reason = {},
+                               .status = DispatchStatus::Mismatched,
+                               .outcome = DispatchOutcome::Mismatched,
+                               .specifics = Specifics::None },
+        // This machine's refusal, beside the command lines it will not send: the fleet was
+        // never asked, so it says nothing about the fleet. The argument rides the specifics.
+        DispatchRecordingRow { .reason = "the command line carries an argument no worker passes to a compiler",
+                               .status = DispatchStatus::DeniedHere,
+                               .outcome = DispatchOutcome::Refused,
+                               .specifics = Specifics::Refusal },
     } };
     static_assert(RowsInEnumeratorOrder(DispatchRecordingTable, &DispatchRecordingRow::status),
                   "DispatchRecordingTable must hold exactly one row per DispatchStatus, in enumerator order");
@@ -280,6 +358,10 @@ namespace
     {
         std::string_view reason; ///< The FIXED tally reason.
         DeclineCause cause {};   ///< Which cause this row describes.
+        /// Whether the peer's words are recorded: only where they name what to DO -- the
+        /// argument, the ceiling, the machine's own failure. Where they would name an endpoint or
+        /// a code the reason already stands for, they stay on the verbose line.
+        Specifics specifics {};
     };
 
     /// One row per `DeclineCause`, in enumerator order.
@@ -296,21 +378,46 @@ namespace
     /// this repository's metrics rules already refuse to sum -- a misconfigured
     /// fleet, a fleet that is too small, and a fleet that is unavailable.
     constexpr EnumTable<DeclineCause, DeclineReasonRow> DeclineReasonTable { {
-        DeclineReasonRow { .reason = "no worker serves this toolchain", .cause = DeclineCause::NoToolchain },
-        DeclineReasonRow { .reason = "the fleet was full of its own work", .cause = DeclineCause::NoCapacity },
-        DeclineReasonRow { .reason = "matching workers had withdrawn their slots", .cause = DeclineCause::Withdrawn },
+        DeclineReasonRow {
+            .reason = "no worker serves this toolchain", .cause = DeclineCause::NoToolchain, .specifics = Specifics::None },
+        DeclineReasonRow { .reason = "the fleet was full of its own work",
+                           .cause = DeclineCause::NoCapacity,
+                           .specifics = Specifics::None },
+        DeclineReasonRow { .reason = "matching workers had withdrawn their slots",
+                           .cause = DeclineCause::Withdrawn,
+                           .specifics = Specifics::None },
         DeclineReasonRow { .reason = "another client was already building this key",
-                           .cause = DeclineCause::AlreadyBuilding },
-        DeclineReasonRow { .reason = "the fleet refused this client", .cause = DeclineCause::NotPermitted },
-        DeclineReasonRow { .reason = "the worker refused the job", .cause = DeclineCause::WorkerRefused },
-        DeclineReasonRow { .reason = "the fleet named no leader to ask", .cause = DeclineCause::NoLeader },
+                           .cause = DeclineCause::AlreadyBuilding,
+                           .specifics = Specifics::None },
+        DeclineReasonRow {
+            .reason = "the fleet refused this client", .cause = DeclineCause::NotPermitted, .specifics = Specifics::None },
+        // What the machine could not do -- a lease it would not honour, a scratch root, a spawn.
+        DeclineReasonRow {
+            .reason = "the worker refused the job", .cause = DeclineCause::WorkerRefused, .specifics = Specifics::Refusal },
+        // The argument, which is the whole of what an operator needs and nothing else names.
+        DeclineReasonRow { .reason = "a worker would not take an argument of this compile",
+                           .cause = DeclineCause::ArgumentRefused,
+                           .specifics = Specifics::Refusal },
+        // The ceiling the unit went over.
+        DeclineReasonRow { .reason = "the job is larger than a worker accepts",
+                           .cause = DeclineCause::TooLarge,
+                           .specifics = Specifics::Refusal },
+        // An exhausted redirect chain's message IS the last leader's endpoint: peer text, and
+        // the verbose line's business rather than something to act on from the log.
+        DeclineReasonRow {
+            .reason = "the fleet named no leader to ask", .cause = DeclineCause::NoLeader, .specifics = Specifics::None },
         DeclineReasonRow { .reason = "this launcher and the fleet disagree about the wire",
-                           .cause = DeclineCause::ProtocolMismatch },
+                           .cause = DeclineCause::ProtocolMismatch,
+                           .specifics = Specifics::None },
         DeclineReasonRow { .reason = "the fleet refused with a reason this launcher does not know",
-                           .cause = DeclineCause::Unrecognised },
+                           .cause = DeclineCause::Unrecognised,
+                           .specifics = Specifics::None },
     } };
     static_assert(RowsInEnumeratorOrder(DeclineReasonTable, &DeclineReasonRow::cause),
                   "DeclineReasonTable must hold exactly one row per DeclineCause, in enumerator order");
+    static_assert(std::ranges::none_of(DeclineReasonTable,
+                                       [](DeclineReasonRow const& row) { return row.specifics == Specifics::ByCause; }),
+                  "a decline's row decides its specifics itself; ByCause here would name no answer");
 
     /// Widest label the distribution section can print.
     ///
@@ -516,6 +623,10 @@ namespace
             record.dispatch = ParseDispatchOutcome(fields[11]);
         if (fields.size() >= 13)
             record.dispatchDetail = std::string { fields[12] };
+        // Newer still, and read only when present for the same reason: a line from before it
+        // says nothing about which argument was refused, which is not the same as "none".
+        if (fields.size() >= 14)
+            record.dispatchSpecifics = std::string { fields[13] };
         return record;
     }
 
@@ -787,6 +898,19 @@ DispatchRecording RecordingFor(DispatchStatus status, DeclineCause cause) noexce
                                .outcome = row.outcome };
 }
 
+std::string SpecificsFor(DispatchResult const& result)
+{
+    // Out of range on either axis says nothing this build can report on, as `RecordingFor` answers.
+    if (static_cast<std::size_t>(result.status) >= EnumeratorCount<DispatchStatus>)
+        return {};
+    auto specifics = DispatchRecordingTable[static_cast<std::size_t>(result.status)].specifics;
+    if (specifics == Specifics::ByCause)
+        specifics = static_cast<std::size_t>(result.decline) < EnumeratorCount<DeclineCause>
+                        ? DeclineReasonTable[static_cast<std::size_t>(result.decline)].specifics
+                        : Specifics::None;
+    return specifics == Specifics::Refusal ? result.refusal : std::string {};
+}
+
 std::string_view ToStringView(DispatchOutcome outcome) noexcept
 {
     // Read off the same table the parser searches, so a token cannot be written in
@@ -879,6 +1003,8 @@ void AppendRecord(Record const& record)
     line += ToStringView(record.dispatch);
     line += FieldSeparator;
     line += Sanitize(record.dispatchDetail);
+    line += FieldSeparator;
+    line += BoundedSpecifics(record.dispatchSpecifics);
     line += '\n';
 
 #if defined(_WIN32)

@@ -178,26 +178,27 @@ namespace
         return compilers;
     }
 
-    /// Adopt a reloaded compile-argument allowlist, and say so when it changed.
-    /// @param jobs The runner the set is applied to.
-    /// @param logger Where the change is announced, at Warn.
-    /// @param inForce The set applied now; replaced when the candidate differs.
-    /// @param candidate The set the live configuration names.
-    void AdoptAllowlist(Cc::CompileJobRunner& jobs,
-                        ILogger& logger,
-                        std::vector<std::string>& inForce,
-                        std::vector<std::string> const& candidate)
-    {
-        auto const said = AllowlistAnnouncement(AllowlistMoment::Reload, inForce, candidate);
-        if (!said)
-            return;
-
-        inForce = candidate;
-        jobs.ReplaceExtraAllowedArgs(inForce);
-        logger.Log(LogLevel::Warn, *said);
-    }
-
 } // namespace
+
+void AdoptAllowlist(Cc::CompileJobRunner& jobs,
+                    RefusedArgumentsReport& refused,
+                    ILogger& logger,
+                    std::vector<std::string>& inForce,
+                    std::vector<std::string> const& candidate)
+{
+    auto const said = AllowlistAnnouncement(AllowlistMoment::Reload, inForce, candidate);
+    if (!said)
+        return;
+
+    inForce = candidate;
+    jobs.ReplaceExtraAllowedArgs(inForce);
+    // The report RE-JUDGES what it named against the set now in force, rather than clearing. It
+    // cannot assume every refusal from here on was judged by that set: `CompileJobRunner::Run`
+    // copies the set when a job starts, so a job begun before the line above reports after it --
+    // and the report answers that by asking the set in force, not by trusting the order here.
+    refused.AllowlistChanged(inForce);
+    logger.Log(LogLevel::Warn, *said);
+}
 
 WorkerMachine MakeSystemWorkerMachine()
 {
@@ -322,10 +323,13 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
             Cc::ToolchainSurvey::InFlight() },
     _appliedExtraArgs { parts.cfg.extraAllowedArgs },
     _leaseState { std::move(leaseState) },
+    _refusedArguments { parts.conditions, parts.logger, parts.cfg.extraAllowedArgs },
     // The envelope ceiling is THIS surface's request cap, named rather than left to the
     // decoder's default. `AvailableCodecs()`, never a literal: this list is what the
     // worker answers a compile in, chosen against what the client accepts (#265).
-    _protocol { _jobs, std::move(validator), Cc::AvailableCodecs(), parts.metrics, WorkerMaxRequestBytes },
+    _protocol {
+        _jobs, std::move(validator), Cc::AvailableCodecs(), parts.metrics, _refusedArguments, WorkerMaxRequestBytes
+    },
     _slots { slots },
     // Sized to the slot cap, which is what makes an admitted job always find a thread,
     // and declared before the capacity and the responder, so neither outlives it.
@@ -527,7 +531,7 @@ void WorkerTier::Heartbeat(std::stop_token const& stop,
         // Compared SEPARATELY from `reloaded`: extending the allowlist changes nothing
         // this worker advertises, so gating it on that answer would be a reload an
         // operator watched do nothing.
-        AdoptAllowlist(_jobs, _logger, _appliedExtraArgs, liveCfg.extraAllowedArgs);
+        AdoptAllowlist(_jobs, _refusedArguments, _logger, _appliedExtraArgs, liveCfg.extraAllowedArgs);
 
         // Compared SEPARATELY from `reloaded` as well, and for the opposite half of that
         // reason: this changes what the fleet must be TOLD while changing nothing about

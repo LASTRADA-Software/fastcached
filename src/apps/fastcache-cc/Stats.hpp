@@ -143,6 +143,20 @@ struct DispatchRecording
 /// @return The state to record and the reason to tally it under.
 [[nodiscard]] DispatchRecording RecordingFor(DispatchStatus status, DeclineCause cause) noexcept;
 
+/// What the invocation log records as `Record::dispatchSpecifics` for what `Dispatch` returned.
+///
+/// Beside `RecordingFor` and for its reason: `main.cpp` is in no test target, so which field
+/// reaches the log is decided here, where a case can assert it. `DispatchResult::refusal` is
+/// recorded only where it names what to act on -- the argument a worker would not take, the
+/// ceiling a job went over, what one worker could not do, the argument this launcher would not
+/// send -- and chosen by the row of the status and, for a decline, of its cause. Nothing else
+/// carries anything: a compile that ran has nothing to act on, and a text that would name an
+/// endpoint -- an unreachable fleet's, an exhausted redirect chain's -- or a code the reason
+/// already stands for is the verbose line's business.
+/// @param result What `Dispatch` returned.
+/// @return The specifics to record; empty when there are none.
+[[nodiscard]] std::string SpecificsFor(DispatchResult const& result);
+
 /// One recorded invocation.
 struct Record
 {
@@ -181,6 +195,17 @@ struct Record
     /// Only tallied for a state the report prints, so the reason list and the state
     /// list always reconcile — see `FoldRecords`.
     std::string dispatchDetail;
+
+    /// What to act on about `dispatchDetail`, when the cause alone does not say: the argument
+    /// a worker would not take (in its own words), the flag this launcher would not send, the
+    /// ceiling a translation unit exceeded. Empty when there is nothing more to say.
+    ///
+    /// **Recorded, never tallied** -- the one variable-text column on the dispatch axis. It is
+    /// kept apart from `dispatchDetail` precisely so the tally stays one row per cause while
+    /// the log still says WHICH flag, which is what an operator needs in order to act without
+    /// `FASTCACHE_VERBOSE` or the node's counters. `AppendRecord` bounds it and strips control
+    /// characters, since part of it is a peer's text.
+    std::string dispatchSpecifics;
 
     // Phase breakdown of elapsedMs. A hit is not "cache latency": it also pays a
     // full preprocess to derive the key, so a slow hit needs these to attribute.

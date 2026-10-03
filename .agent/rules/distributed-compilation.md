@@ -187,13 +187,42 @@ is the reproducible lesson, since no unit test can reach either:
     which is this rulebook's most-repeated shape and was true here for months before it
     could bite. They are `Deny` rows now, plus the side-artefact set (`/Zi`, `/ZI`,
     `-gsplit-dwarf`, `-fprofile-*`) that three test comments also called deliberate.
-  - **A `Deny` row takes `ArgValue::AnySuffix`, never `NoPathSeparator`**, and the
-    difference is the wrong way round from the intuition: a refusal must not be
-    escapable by the shape rule that exists to NARROW an allowance. `-fplugin=evil`
-    carries no separator and `-fplugin=/tmp/evil.so` does, so a `NoPathSeparator` deny
-    matches the harmless-looking spelling and lets the one naming a payload fall
-    through. `static_assert`ed to `Deny` rows, because on an `Allow` row it is the
-    opposite mistake.
+  - **A flag that decides what a compile of PREPROCESSED text reports is forwarded, never
+    dropped — under `/WX` a dropped warning switch is a failed compile the client passed.**
+    MSVC's `/external:` family is the case that forced it: CMake writes `-external:I<dir>
+    -external:W0` on every `SYSTEM`-include unit, the worker had no row for the level, and
+    a cl-debug build of this repository dispatched almost nothing while the node counted
+    hundreds of refusals. The dispatch preprocess brackets each external header with
+    `#pragma external_header(push)`/`(pop)`, and `cl` classifies the `.i` by those, so the
+    DIRECTORIES stay behind (`/external:I` and `/external:env:` are `Deny` rows) while
+    `/external:W<n>` and `/external:templates-` must travel; `/external:anglebrackets` is
+    inert on a `.i` and travels so its builds dispatch. Measured, cl 19.51, `/W4 /WX`, a
+    header with C4100, C4101 and a template C4244: local and worker agree in every
+    combination, and the worker's `.i` with the level DROPPED exits 2 on all three. The
+    rows are `Msvc` and so admit clang-cl too, which was measured rather than assumed:
+    clang-cl 22.1.3, same shape, agrees in every combination — its `/E` marks a system
+    header with line-marker flag `3`, so the level is inert on its `.i` (dropped, it still
+    exits 0), and `/external:templates-` and `/external:anglebrackets`, which it does not
+    implement, fail `/WX` as unused on BOTH ends because they travel. Both measurements
+    sit on the `external:W` row in `CompileJob.cpp`; a new flag of this kind is decided
+    the same way — local against the worker's `.i`, both exit codes, on EVERY driver the
+    row's family admits.
+  - **A `Deny` row is a PREFIX whose remainder is never examined, never a
+    `NoPathSeparator` match**, and the difference is the wrong way round from the
+    intuition: a refusal must not be escapable by the shape rule that exists to NARROW an
+    allowance. `-fplugin=evil` carries no separator and `-fplugin=/tmp/evil.so` does, so
+    a `NoPathSeparator` deny matches the harmless-looking spelling and lets the one naming
+    a payload fall through. The rows are now `DeniedArguments` (`apps/fastcache-cc/ArgumentDenials.hpp`),
+    where EVERY row is a prefix whose remainder is not examined, so the property is the
+    table's shape rather than a `static_assert` over a column.
+  - **ONE table, read by both ends, and the launcher reads it BEFORE the lease.** A row
+    is a refusal no operator setting lifts, so a client that forwarded a denied argument
+    spent a lease, a round trip and the whole translation unit on an answer it could read
+    off the same table: `Dispatch` returns `DispatchStatus::DeniedHere`, recorded as this
+    machine's refusal and naming the argument, and asks nobody. Header-only, for
+    `CompileCacheWire.hpp`'s reason -- the launcher does not link `FastCache`. The worker
+    still enforces it, because two ends can be two builds and the launcher is not the only
+    thing that reaches a worker's port.
   - **Operator entries EXTEND and can never shrink**, which is a property of the ORDER:
     they are consulted last, after `ProducesSideArtefact`, after the introducer rule and
     after every `Deny` row has returned. Matched WHOLE and exactly, with the same
@@ -1588,6 +1617,14 @@ Consequences that are each load-bearing:
   The test is a **CMake-shaped** command line, not a minimal one. The hand-written
   argv the old test used is what let this through: the refusal reads as correct on
   `cl /c /TP a.c`, and the line CMake actually emits is the one nobody wrote down.
+  - **And the CMake-shaped line hid the next defect in the same drop.** The skip that
+    lets `-x c++` take its value also fired for `/TP`, whose language is in its own
+    spelling, so the argument AFTER `/TP` never reached a worker. CMake writes a `-D`
+    there, which the dispatched line drops anyway, so every CMake case stayed green;
+    `/TP /W4 /WX` reached the worker as `/WX` alone, and a template warning that
+    fails the local compile under `/W4 /WX` passed on the worker and was SERVED. Only
+    a row whose language arrives as a VALUE owns the next argument; the case puts a
+    code-generation and a warning flag right after the selector, where CMake never does.
 - **A worker being dropped has to be an EVENT, or nothing can release what was held
   against it.** Registry expiry used to be a filter — `IsLive` hid a dead worker
   from `Pick` while its entry stayed in the map forever — so `ReleaseWorker` had no

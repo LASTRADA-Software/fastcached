@@ -218,6 +218,28 @@ TEST_CASE("The key probe and the dispatched line drop clang-cl's pass-through de
     CHECK(std::ranges::contains(*remote, "/EHsc"));
 }
 
+TEST_CASE("The end-of-options marker stays with the source, which never travels")
+{
+    // CMake's clang-cl rule ends `-c -- $in`. The launcher dropped the source and forwarded
+    // the `--`, the worker's allowlist has no row for it, and so every CMake + clang-cl unit
+    // came back `argument -- is not on this worker's accepted-flag list`. Found writing the
+    // clang-cl `-imsvc` case with the rule's own argument order.
+    std::vector<std::string> const argv {
+        R"(C:\LLVM\bin\clang-cl.exe)", "/nologo", "-TP", "/EHsc", "/W4", R"(/Foa.obj)", "-c", "--", R"(C:\src\main.cpp)",
+    };
+    auto const cmd = Parse(argv);
+    REQUIRE(cmd.parsedOk);
+    CHECK(cmd.source == R"(C:\src\main.cpp)");
+
+    auto const remote = RemoteCompileArgs(cmd, argv, {});
+    REQUIRE(remote.has_value());
+    CHECK_FALSE(std::ranges::contains(*remote, "--"));
+    // The control: the flag right before it travels, and the client's own preprocess still
+    // carries the marker in front of the source it protects.
+    CHECK(std::ranges::contains(*remote, "/W4"));
+    CHECK(std::ranges::contains(PreprocessCommand(cmd, argv), "--"));
+}
+
 TEST_CASE("ParseCommand does not treat an absolute path as an option for GNU drivers")
 {
     // A GNU driver only introduces options with '-', so /usr/src/a.cpp is a
@@ -1484,6 +1506,38 @@ TEST_CASE("A CMake-shaped MSVC command line is dispatchable")
     // blockers: with `/TP` handled, this one alone still made every CMake + MSVC
     // compile fall back to a local build.
     CHECK(std::ranges::none_of(out, [](std::string const& a) { return a.starts_with("/Fd"); }));
+}
+
+TEST_CASE("A language selector that names its language owns no following argument")
+{
+    // `/TP` was dropped as a folded language selector AND took the next argument with it,
+    // under a rule written for the separated `-x c++` form. CMake writes `/TP` first and a
+    // `-D` next, which is dropped from a dispatched line anyway -- so the swallow hid there,
+    // and surfaced only on a line whose `/TP` was followed by a warning or code-generation
+    // flag: `/TP /W4 /WX` reached the worker as `/WX` alone and compiled at the default level
+    // what the client compiled at `/W4`. Measured: a `/W4 /WX` template warning that fails
+    // the local compile passed on the worker, and the object was served.
+    for (auto const* selector: { "/TP", "-TP", "/TC", "-TC" })
+    {
+        std::vector<std::string> const argv { "cl", "/nologo", selector, "/W4", "/WX", "/EHsc", "/c", "a.cpp", "/Foa.obj" };
+        auto const cmd = ParseCommand(argv);
+        auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+        INFO("selector: " << selector);
+        REQUIRE(parsed.has_value());
+        auto const& out = Unwrap(parsed);
+        CHECK(std::ranges::contains(out, "/W4"));
+        CHECK(std::ranges::contains(out, "/WX"));
+        CHECK(std::ranges::contains(out, "/EHsc"));
+    }
+
+    // The control: the separated `-x` form DOES own its value, which must not reach a worker
+    // as a bare word it would open as a file -- and the flag after the value still travels.
+    std::vector<std::string> const gnu { "g++", "-x", "c++", "-Wall", "-c", "a.c", "-o", "a.o" };
+    auto const gnuCmd = ParseCommand(gnu);
+    auto const gnuOut = RemoteCompileArgs(gnuCmd, gnu, /*targetTriple=*/ {});
+    REQUIRE(gnuOut.has_value());
+    CHECK_FALSE(std::ranges::contains(Unwrap(gnuOut), "c++"));
+    CHECK(std::ranges::contains(Unwrap(gnuOut), "-Wall"));
 }
 
 TEST_CASE("A compile writing a shared PDB is not dispatched")

@@ -4600,7 +4600,9 @@ struct TicketedNode
     StubCompiler compiler;
     Testing::ScratchDirectory const scratch { "fc-ticketed-node" };
     Cc::CompileJobRunner jobs { compiler, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() };
-    Cc::WorkerProtocol worker { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, fleet.metrics };
+    Cc::WorkerProtocol worker {
+        jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, fleet.metrics, Cc::IgnoreJobRefusals()
+    };
     core::async::ThreadPoolExecutor pool { 1 };
     CompileCapacity capacity { 1, WorkerMaxRequestBytes, std::chrono::seconds { 5 }, fleet.logger };
     /// The addresses this machine answers on beyond loopback; set by the constructor.

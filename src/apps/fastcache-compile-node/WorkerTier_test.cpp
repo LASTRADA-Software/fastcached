@@ -3,6 +3,7 @@
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
 #include "NodeIoLoop.hpp"
+#include "PeerIdentity.hpp"
 #include "SchedulerReachability.hpp"
 #include "ScratchClaim.hpp"
 #include "WorkerTier.hpp"
@@ -24,23 +25,29 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
+#include <Dispatch.hpp>
 #include <IProcessRunner.hpp>
 #include <ToolchainDiscovery.hpp>
 #include <ToolchainHost.hpp>
+#include <core/async/Task.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SteppedDrainWait.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -112,6 +119,153 @@ TEST_CASE("A worker that gave up while serving ends as a failure, so a compiler 
     CHECK_FALSE(WorkerEnding(false).has_value());
     CHECK(WorkerEnding(true) == NodeRefusalCause::ToolchainSurvey);
     CHECK(ExitOf(NodeRefusalCause::ToolchainSurvey) == ProcessExit::Failed);
+}
+
+TEST_CASE("A worker answers the refused-arguments row the moment it exists", "[node][worker-tier][conditions]")
+{
+    // The tier builds the report into its own protocol, against the registry `main` shares: a
+    // worker that has refused nothing has CHECKED, so the row reads clear -- never undecided,
+    // which `Settle` would name as a wiring defect -- and a node with no worker answers nothing,
+    // leaving the row to `Settle`'s not-evaluated.
+    namespace Wire = CompileCacheWire;
+    WorkerTierFixture fixture;
+
+    SECTION("a worker")
+    {
+        auto const tier = fixture.Start();
+        REQUIRE(tier.has_value());
+        REQUIRE(tier.value() != nullptr);
+        CHECK(fixture.conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Clear);
+    }
+
+    SECTION("no worker")
+    {
+        fixture.cfg.slots = 0;
+        auto const none = fixture.Start();
+        REQUIRE(none.has_value());
+        REQUIRE(none.value() == nullptr);
+        CHECK(fixture.conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Undecided);
+    }
+}
+
+namespace
+{
+
+/// A COMPILE frame for @p fingerprint carrying @p args, framed the way the launcher frames them.
+/// @param fingerprint The toolchain to claim.
+/// @param args The job's arguments.
+/// @return The request frame.
+[[nodiscard]] std::vector<std::byte> CompileFrameWith(std::string_view fingerprint, std::vector<std::string> const& args)
+{
+    namespace Wire = CompileCacheWire;
+    std::vector<std::byte> argsField;
+    for (auto const& arg: args)
+    {
+        auto const length = static_cast<std::uint32_t>(arg.size());
+        for (auto const shift: { 24U, 16U, 8U, 0U })
+            argsField.push_back(static_cast<std::byte>((length >> shift) & 0xFFU));
+        for (auto const c: arg)
+            argsField.push_back(static_cast<std::byte>(c));
+    }
+    // The framing is the worker's own decoder's to judge, so a list it would read differently
+    // fails here rather than as a refusal for some other reason.
+    REQUIRE(Cc::DecodeArgs(argsField) == args);
+
+    constexpr std::string_view Source = "int main(){return 0;}";
+    auto const enveloped =
+        Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(Source.size()), Wire::AsBytes(Source));
+    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                      .fingerprint = fingerprint,
+                                                      .args = argsField,
+                                                      .source = enveloped,
+                                                      .acceptedCodecs = { Wire::IdentityCodec },
+                                                      .sourceName = "a.cpp",
+                                                      .compileDir = {},
+                                                      .compileDirReplacement = {},
+                                                      .sourceRoot = {},
+                                                      .sourceRootReplacement = {} });
+}
+
+} // namespace
+
+TEST_CASE("A worker tier reports a refused argument through its OWN protocol", "[node][worker-tier][conditions]")
+{
+    // The wiring, at the door a client knocks on: the tier's responder, over the protocol the tier
+    // built, into the registry the tier was handed. A report the tier constructs and never hands
+    // its protocol reads `clear` forever and passes every case that builds a protocol by hand.
+    namespace Wire = CompileCacheWire;
+    WorkerTierFixture fixture;
+    // A PINNED identity, so the survey serves it without spawning anything: the tier cannot judge
+    // a job's arguments until it knows which driver the job names.
+    fixture.cfg.toolchains = { "deadbeef=/opt/none/g++" };
+    // The heartbeat's rounds dial the scheduler once the survey lands. Spare replies, because a dial
+    // past the script would FAIL on the heartbeat's thread, where no assertion may run.
+    auto const ok = Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {});
+    fixture.heartbeatReplies = { ok, ok, ok, ok, ok, ok };
+
+    auto const started = fixture.Start();
+    REQUIRE(started.has_value());
+    auto const& tier = started.value();
+    REQUIRE(tier != nullptr);
+    core::platform::ManualClock statusClock;
+    SchedulerReachability reachability { statusClock, nullptr };
+    auto heartbeat = tier->Launch(statusClock, reachability);
+    REQUIRE(Testing::WaitUntil(
+        "the heartbeat's survey to serve the pinned toolchain",
+        [&tier] { return !tier->CompilerFor("deadbeef").empty(); },
+        [&tier] { return std::format("compiler for deadbeef: '{}'", tier->CompilerFor("deadbeef")); }));
+
+    // Driven ON the node's reactor, the shape `FrameEndpoint::ServeConnection` has: the compile hops
+    // to the pool and its reply is posted back to this loop, which `blockOn` turns on this thread
+    // until the answer is in -- so nothing here needs a reactor thread the fixture never starts.
+    // The reply's slot is released before the answer is handed over, as the endpoint releases it
+    // once the reply is written.
+    auto const bytes = fixture.io.Reactor().blockOn(
+        [](CompileResponder* responder, std::vector<std::byte> request) -> core::async::Task<std::vector<std::byte>> {
+            auto answer = co_await responder->Answer(request, PeerIdentity { .host = "127.0.0.1" });
+            answer.hold.reset();
+            co_return std::move(answer.bytes);
+        }(&tier->Responder(), CompileFrameWith("deadbeef", { "-O2", "-fanalyzer" })));
+    auto const decoded = Wire::DecodeErrorPayload(std::span<std::byte const> { bytes }.subspan(Wire::ReplyHeaderSize));
+    REQUIRE(decoded.has_value());
+    CHECK(Testing::Unwrap(decoded).first == Wire::ErrorCode::WorkerRejectedArgument);
+
+    CHECK(fixture.conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Raised);
+    auto const rows = fixture.conditions.Snapshot();
+    auto const row =
+        std::ranges::find(rows, RowFor(NodeCondition::RefusedCompileArguments).id, &Wire::NodeConditionFields::id);
+    REQUIRE(row != rows.end());
+    CHECK(row->detail.contains("-fanalyzer"));
+
+    // As `main` does before anything is destroyed: every compile drained while the reactor turns.
+    tier->StopAndDrain();
+}
+
+TEST_CASE("A reloaded allowlist re-judges the refused-arguments row", "[node][worker-tier][conditions]")
+{
+    // `AdoptAllowlist` is what the heartbeat runs on every reload: the runner and the report must
+    // move together, or the operator's fix lands on the runner and the row keeps saying the
+    // argument is refused -- or the row clears over one that still is.
+    namespace Wire = CompileCacheWire;
+    NodeConditions conditions;
+    NullLogger logger;
+    auto runner = Cc::MakeProcessRunner();
+    FastCache::Testing::ScratchDirectory scratch { "fc-adopt-allowlist" };
+    Cc::CompileJobRunner jobs { *runner, scratch.Path(), { { "gcc", "/opt/none/g++" } }, Cc::ToolchainSurvey::Completed() };
+    std::vector<std::string> inForce;
+    RefusedArgumentsReport report { conditions, logger, inForce };
+    report.OnJobRefused(Cc::JobError::RejectedArgumentNaming("-fanalyzer", Cc::Flavor::Gcc));
+    REQUIRE(conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Raised);
+
+    AdoptAllowlist(jobs, report, logger, inForce, { "-fanalyzer" });
+
+    CHECK(inForce == std::vector<std::string> { "-fanalyzer" });
+    CHECK(conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Clear);
+
+    // An unchanged candidate is no reload at all, and changes nothing the row says.
+    report.OnJobRefused(Cc::JobError::RejectedArgumentNaming("-fno-such", Cc::Flavor::Gcc));
+    AdoptAllowlist(jobs, report, logger, inForce, { "-fanalyzer" });
+    CHECK(conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Raised);
 }
 
 TEST_CASE("A worker answers whether its scratch root can be written into a mapping rule", "[node][worker-tier][conditions]")

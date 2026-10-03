@@ -59,8 +59,11 @@ namespace
         { .refusal = JobRefusal::UnknownFingerprint,
           .code = Wire::ErrorCode::FingerprintMismatch,
           .counter = IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint },
+        // Its own code since a cl-debug build met it (`ErrorCode::WorkerRejectedArgument`).
+        // It was `MalformedFrame` -- about a frame that parsed perfectly -- and the launcher
+        // duly reported every such refusal as a wire disagreement between two ends of one build.
         { .refusal = JobRefusal::RejectedArgument,
-          .code = Wire::ErrorCode::MalformedFrame,
+          .code = Wire::ErrorCode::WorkerRejectedArgument,
           .counter = IMetricsSink::Counter::WorkerJobsRefusedRejectedArgument },
         { .refusal = JobRefusal::ScratchUnavailable,
           .code = Wire::ErrorCode::WorkerScratchUnavailable,
@@ -336,15 +339,29 @@ LeaseValidator UncheckedLeaseValidator()
     };
 }
 
+IJobRefusalObserver& IgnoreJobRefusals() noexcept
+{
+    struct Ignoring final: IJobRefusalObserver
+    {
+        void OnJobRefused(JobError const& /*error*/) override {}
+    };
+    // A function-local static: stateless, so sharing one across every protocol and every
+    // thread shares nothing, and it outlives any protocol handed it.
+    static Ignoring ignoring;
+    return ignoring;
+}
+
 WorkerProtocol::WorkerProtocol(ICompileJobRunner& jobs,
                                LeaseValidator validator,
                                Wire::CodecList acceptedCodecs,
                                IMetricsSink& metrics,
+                               IJobRefusalObserver& refusals,
                                std::size_t maxDecompressedBytes):
     _jobs { jobs },
     _validator { std::move(validator) },
     _acceptedCodecs { std::move(acceptedCodecs) },
     _metrics { metrics },
+    _refusals { refusals },
     _maxDecompressedBytes { maxDecompressedBytes }
 {
 }
@@ -540,6 +557,9 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
         // for every refusal that has nothing to add, which reproduces the previous
         // empty-message wire exactly.
         auto const& descriptor = DescriptorFor(outcome.error().reason);
+        // Told WHICH, at the moment the counter below is told HOW MANY and for the same row,
+        // so the node can name the argument somewhere an operator looks.
+        _refusals.OnJobRefused(outcome.error());
         return Refuse(
             _metrics, SurfaceRefusal { .code = descriptor.code, .counter = descriptor.counter }, outcome.error().detail);
     }

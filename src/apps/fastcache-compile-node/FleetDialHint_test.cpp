@@ -62,6 +62,7 @@ constexpr std::chrono::system_clock::time_point Noon { std::chrono::seconds { 1'
                                  .fingerprint = Toolchain,
                                  .objectKey = key,
                                  .args = {},
+                                 .family = Cc::DriverFamily::Gnu,
                                  .preprocessed = "int main() { return 0; }",
                                  .sourceName = "main.cpp",
                                  .compileDir = {},

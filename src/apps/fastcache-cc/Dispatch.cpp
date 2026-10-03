@@ -76,7 +76,8 @@ namespace
                                 .declinedAt = {},
                                 .leaseTransport = TransportFailure::None,
                                 .leaseEndpoint = {},
-                                .unreachedWorker = {} };
+                                .unreachedWorker = {},
+                                .refusal = {} };
     }
 
     /// Build a declined `DispatchResult`, classified by what the peer answered.
@@ -108,6 +109,9 @@ namespace
         result.decline =
             outcome.kind == CacheOutcomeKind::Rejected ? DeclineCauseFor(outcome.code) : DeclineCause::Unrecognised;
         result.declinedAt = std::move(site);
+        // The peer's words alone, without the endpoint and code name `detail` wraps them in:
+        // the half an operator acts on, kept for the log rather than only the verbose line.
+        result.refusal = outcome.message;
         return result;
     }
 
@@ -316,7 +320,8 @@ namespace
                                 .declinedAt = {},
                                 .leaseTransport = TransportFailure::None,
                                 .leaseEndpoint = {},
-                                .unreachedWorker = {} };
+                                .unreachedWorker = {},
+                                .refusal = {} };
     }
 
     /// Tell the scheduler this lease is done with, however the job ended.
@@ -487,6 +492,24 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
     // not the same question -- see where the source is enveloped below.
     auto const available = AvailableCodecs();
     auto const& accepted = acceptedCodecs.empty() ? available : acceptedCodecs;
+
+    // --- refuse what no worker will run -------------------------------------
+    // Before the lease, and that is the whole point: an argument every worker refuses by
+    // a row of `DeniedArguments` cannot be bought with a lease, and asking cost one, a
+    // round trip, and the whole preprocessed translation unit on the wire for a refusal
+    // this client could read off the same table the worker reads. The first such
+    // argument is named -- reduced the way the worker's own refusal reduces it, because
+    // it is text a build wrote and it lands in a log.
+    for (auto const& arg: request.args)
+        if (FindDeniedArgument(arg, request.family) != nullptr)
+        {
+            auto result =
+                Refused(DispatchStatus::DeniedHere,
+                        std::format("argument {} is one no worker passes to a compiler, whatever it is configured to allow",
+                                    PrintableArgument(arg)));
+            result.refusal = result.detail;
+            return result;
+        }
 
     // --- ask the scheduler where to compile ---------------------------------
     // Following `NotLeader` rather than reading it as a refusal, and remembering who

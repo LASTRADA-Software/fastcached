@@ -76,6 +76,7 @@ add_executable(fastcache-compile-node
     NodeFirewall.cpp
     NodeFormation.cpp
     NodeReload.cpp
+    RefusedArguments.cpp
     NodeFrameSurface.cpp
     NodeIdentity.cpp
     NodeKey.cpp
@@ -196,6 +197,8 @@ if(FASTCACHED_BUILD_TESTS)
         OneShotAnswer_test.cpp
         NodeConditions.cpp
         NodeConditions_test.cpp
+        RefusedArguments.cpp
+        RefusedArguments_test.cpp
         NodeConfig.cpp
         NodeCredential_test.cpp
         NodeReload.cpp

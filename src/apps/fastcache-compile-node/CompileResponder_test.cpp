@@ -127,7 +127,7 @@ struct Fixture
 
     Fixture():
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
-        protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics }
+        protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, Cc::IgnoreJobRefusals() }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -1080,7 +1080,7 @@ struct MergedWorker
     ///        seconds to observe one frame.
     MergedWorker(Fixture& fix, NodeIoLoop& io, std::chrono::milliseconds progressInterval = Wire::DefaultProgressInterval):
         jobs { runner, fix.scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
-        protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, fix.metrics },
+        protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, fix.metrics, Cc::IgnoreJobRefusals() },
         // **Five seconds rather than the thirty-second default: the NET, not the
         // diagnostic.** `DrainedWithin` above is what reports a slot that never came
         // back, as an ordinary red assertion with a number. This only bounds how long a

@@ -278,6 +278,40 @@ using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, 
 /// is not a scheduler and not a cache. That refusal is a *reply*: a client that
 /// sent the wrong verb to the wrong port learns which, rather than seeing a dropped
 /// connection it cannot tell from a dead host.
+/// Told of every job this worker refused before a compiler ran, with what the refusal named.
+///
+/// The counter a refusal moves says HOW MANY; nothing said WHICH. A node that refused 372 jobs
+/// over one argument showed `fastcache_worker_jobs_refused_rejected_argument_total 372` and named
+/// the argument nowhere an operator could see -- not its log, not its conditions -- so the one
+/// fact the remedy needs took a reproduction to find. This is where the node learns it, at the
+/// same moment and from the same row as the counter.
+///
+/// An interface rather than a callback, and required rather than defaulted, for
+/// `SchedulerTermRegressionNotice`'s reason: a defaulted observer is how a diagnostic comes to be
+/// dropped at every call site that never thought about it. A caller with nowhere to report
+/// passes `IgnoreJobRefusals()` and says so.
+///
+/// Called on whichever thread ran the job, so an implementation is thread-safe.
+class IJobRefusalObserver
+{
+  public:
+    IJobRefusalObserver() = default;
+    IJobRefusalObserver(IJobRefusalObserver const&) = delete;
+    IJobRefusalObserver& operator=(IJobRefusalObserver const&) = delete;
+    IJobRefusalObserver(IJobRefusalObserver&&) = delete;
+    IJobRefusalObserver& operator=(IJobRefusalObserver&&) = delete;
+    virtual ~IJobRefusalObserver() = default;
+
+    /// One job was refused.
+    /// @param error Why, as the runner reported it -- the reason `RefusalTable` counted it
+    ///        under, and its detail and subject.
+    virtual void OnJobRefused(JobError const& error) = 0;
+};
+
+/// The observer for a caller that reports refusals nowhere but their counters.
+/// @return An observer that does nothing; static, so it outlives every protocol given it.
+[[nodiscard]] IJobRefusalObserver& IgnoreJobRefusals() noexcept;
+
 class WorkerProtocol
 {
   public:
@@ -304,6 +338,8 @@ class WorkerProtocol
     /// interface is header-only and depends on nothing but the standard library,
     /// so including it costs `fastcache-cc` — which compiles this file in without
     /// linking `FastCache` — nothing at link time.
+    /// @param refusals Told of every job the runner refused, beside the counter; must outlive
+    ///        this. Required: see `IJobRefusalObserver`.
     /// @param maxDecompressedBytes Ceiling on what a request's codec envelope may
     ///        declare it expands to. **The surface's own request cap**, passed in
     ///        rather than assumed: this class never sees the listener that enforced
@@ -314,6 +350,7 @@ class WorkerProtocol
                    LeaseValidator validator,
                    CompileCacheWire::CodecList acceptedCodecs,
                    IMetricsSink& metrics,
+                   IJobRefusalObserver& refusals,
                    std::size_t maxDecompressedBytes = DefaultMaxDecompressedBytes);
 
     /// Answer one complete request frame.
@@ -331,6 +368,7 @@ class WorkerProtocol
     LeaseValidator _validator;
     CompileCacheWire::CodecList _acceptedCodecs;
     IMetricsSink& _metrics;
+    IJobRefusalObserver& _refusals; ///< Told which refusal, beside `_metrics`' how many.
     /// What a request's envelope may declare it expands to; see the constructor.
     std::size_t _maxDecompressedBytes;
 };

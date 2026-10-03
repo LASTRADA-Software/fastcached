@@ -4117,6 +4117,20 @@ TEST_CASE("The node handshake's widths, verbs and refusals are pinned as bytes",
     }
 }
 
+TEST_CASE("A worker's refusal of an argument is its own byte, not a malformed frame", "[wire]")
+{
+    // The byte is what a launcher of another build reads, and the name is what the verbose
+    // line and a log print -- so both are pinned, beside the raw enumerator.
+    CHECK(static_cast<std::uint8_t>(ErrorCode::WorkerRejectedArgument) == 0x30);
+    auto const* const row = Describe(ErrorCode::WorkerRejectedArgument);
+    REQUIRE(row != nullptr);
+    CHECK(row->name == "worker-rejected-argument");
+
+    // And it is not the code it was answered with before: `malformed-frame` is a framing
+    // disagreement, which is what the launcher then told an operator it was.
+    CHECK(ErrorCode::WorkerRejectedArgument != ErrorCode::MalformedFrame);
+}
+
 TEST_CASE("A node challenge carries a nonce and an ephemeral key, each exactly as wide as it is", "[wire][nodeproof]")
 {
     auto request = NodeChallengeRequest {};

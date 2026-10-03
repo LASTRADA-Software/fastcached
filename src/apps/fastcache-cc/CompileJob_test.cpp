@@ -1129,6 +1129,178 @@ TEST_CASE("The allowlist admits the flags this repository's own builds dispatch 
     }
 }
 
+TEST_CASE("A plain MSVC Debug compile is dispatched whole to a cl worker", "[compile-job][msvc]")
+{
+    // Both ends of the pairing, through the functions production runs: the launcher's
+    // `RemoteCompileArgs` decides what a real Ninja line sends, and the worker's
+    // `CompileJobRunner::Run` decides whether it compiles it. A case that asked either
+    // half alone could pass while the two disagree, and that disagreement is what cost
+    // a whole cl-debug build its distribution: the client forwarded `-external:W0`
+    // (it has no path separator), the worker had no row for it, and every miss spent
+    // a lease on a refusal.
+    //
+    // The line is the one the cl-debug preset generates for a dependency built with
+    // `SYSTEM` include directories, taken from `build.ninja` rather than composed here,
+    // plus the flags the same build puts on first-party and vendored units.
+    std::vector<std::string> const argv {
+        R"(C:\MSVC\bin\Hostx64\x64\cl.exe)",
+        "/nologo",
+        "/TP",
+        "-DNOMINMAX",
+        "-DWIN32_LEAN_AND_MEAN",
+        "-D_WIN32_WINNT=0x0A00",
+        R"(-external:IC:\deps\core-cpp\src)",
+        R"(-external:IC:\build\_deps\core-cpp-build\include)",
+        "-external:W0",
+        "/DWIN32",
+        "/D_WINDOWS",
+        "/EHsc",
+        "/Ob0",
+        "/Od",
+        "/RTC1",
+        "-std:c++latest",
+        "-MDd",
+        "-Z7",
+        "/W4",
+        "/utf-8",
+        "/permissive-",
+        "/Zc:__cplusplus",
+        "/Zc:inline",
+        "/wd4127",
+        "/wd4355",
+        "/arch:AVX2",
+        "/showIncludes",
+        R"(/Fo_deps\core-cpp-build\src\core\net\CMakeFiles\core-cpp-net.dir\SocketAddress.cpp.obj)",
+        R"(/Fd_deps\core-cpp-build\src\core\net\CMakeFiles\core-cpp-net.dir\core-cpp-net.pdb)",
+        "/FS",
+        "-c",
+        R"(C:\deps\core-cpp\src\core\net\SocketAddress.cpp)",
+    };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const remote = RemoteCompileArgs(cmd, argv, {});
+    INFO("the launcher refused: " << remote.error_or(""));
+    REQUIRE(remote.has_value());
+    // What makes the external warning level meaningful on the worker at all: the
+    // dispatch preprocess brackets every header found under `-external:I` with
+    // `#pragma external_header(push/pop)`, and `cl` honours those in preprocessed text
+    // only under `/external:W<n>`. Dropped, the worker re-reports every warning inside
+    // those headers -- under `/WX`, a failed compile the client never had.
+    CHECK(std::ranges::contains(*remote, "-external:W0"));
+    {
+        // The other two members that decide warnings on the worker, spliced into the same line.
+        auto withTemplates = argv;
+        withTemplates.insert(withTemplates.begin() + 9, "/external:templates-");
+        auto const parsed = ParseCommand(withTemplates);
+        REQUIRE(parsed.parsedOk);
+        auto const forwarded = RemoteCompileArgs(parsed, withTemplates, {});
+        REQUIRE(forwarded.has_value());
+        std::string line;
+        for (auto const& arg: *forwarded)
+            line += arg + ' ';
+        INFO("forwarded: " << line);
+        CHECK(std::ranges::contains(*forwarded, "/external:templates-"));
+    }
+
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "msvc", argv.front() } }, ToolchainSurvey::Completed() };
+    auto job = Job(*remote);
+    job.fingerprint = "msvc";
+
+    auto const outcome = jobs.Run(job);
+    INFO("the worker refused: " << (outcome.has_value() ? std::string {} : outcome.error().detail));
+    REQUIRE(outcome.has_value());
+    CHECK(std::ranges::contains(runner.Argv(), "-external:W0"));
+}
+
+TEST_CASE("A clang-cl unit with a SYSTEM include directory is dispatched, and the directory stays behind",
+          "[compile-job][msvc][clang-cl]")
+{
+    // CMake 4.3.1 writes `-imsvc<dir>` for a `SYSTEM` include directory under clang-cl, where it
+    // writes `-external:I<dir> -external:W0` under cl. Unrecognised, the launcher refused every
+    // such unit as naming a file; the directory is `/external:I`'s twin, so it is kept for the
+    // client's own preprocess, dropped from the worker's line, and refused by row at the worker.
+    std::vector<std::string> const argv {
+        R"(C:\LLVM\bin\clang-cl.exe)",
+        "/nologo",
+        "-TP",
+        "-DNOMINMAX",
+        R"(-imsvcC:\deps\core-cpp\src)",
+        "/DWIN32",
+        "/D_WINDOWS",
+        "/EHsc",
+        "/Ob0",
+        "/Od",
+        "/RTC1",
+        "-MDd",
+        "-Z7",
+        "/W4",
+        "/WX",
+        "/showIncludes",
+        R"(/Fosrc\a.cpp.obj)",
+        R"(/Fdsrc\a.pdb)",
+        "-c",
+        "--",
+        R"(C:\deps\core-cpp\src\a.cpp)",
+    };
+    auto const cmd = ParseCommand(argv);
+    REQUIRE(cmd.parsedOk);
+
+    // The client's own preprocess still resolves headers there: that is what marks them system.
+    CHECK(std::ranges::contains(PreprocessCommand(cmd, argv), R"(-imsvcC:\deps\core-cpp\src)"));
+
+    auto const remote = RemoteCompileArgs(cmd, argv, {});
+    INFO("the launcher refused: " << remote.error_or(""));
+    REQUIRE(remote.has_value());
+    CHECK(std::ranges::none_of(*remote, [](std::string const& a) { return a.contains("imsvc"); }));
+    CHECK(std::ranges::contains(*remote, "/W4"));
+
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "clang-cl", argv.front() } }, ToolchainSurvey::Completed() };
+    auto job = Job(*remote);
+    job.fingerprint = "clang-cl";
+    auto const outcome = jobs.Run(job);
+    INFO("the worker refused: " << (outcome.has_value() ? std::string {} : outcome.error().detail));
+    CHECK(outcome.has_value());
+
+    // And a client that sent it anyway is refused by ROW, which an operator entry cannot lift.
+    auto const& clangCl = DriverOf(Flavor::ClangCl);
+    std::vector<std::string> const operatorAllowed { R"(-imsvcC:\deps)" };
+    CHECK_FALSE(IsAcceptableJobArgument(R"(-imsvcC:\deps)", clangCl, operatorAllowed));
+    CHECK_FALSE(IsAcceptableJobArgument("/imsvcdeps", clangCl, { std::vector<std::string> { "/imsvcdeps" } }));
+}
+
+TEST_CASE("Of the external-header family, what decides warnings travels and the directories never do", "[compile-job][msvc]")
+{
+    // The rows are drawn from a measurement (see the `external:W` row): the level and
+    // `templates-` change what a compile of preprocessed text reports under `/WX`, so they
+    // must reach the worker; `anglebrackets` is inert there and travels so its builds still
+    // dispatch; the directories are paths the pragmas in the text already stand in for.
+    auto const& cl = DriverOf(Flavor::Cl);
+    for (auto const* flag:
+         { "-external:W0", "/external:W0", "/external:W4", "/external:templates-", "-external:anglebrackets" })
+    {
+        INFO("travels: " << flag);
+        CHECK(IsAcceptableJobArgument(flag, cl));
+    }
+
+    // Refused by ROW, which is what an operator entry cannot reach: `/external:I` is an
+    // include path like `/I`, and `/external:env:` reads include paths from THIS machine.
+    std::vector<std::string> const operatorAllowed { "/external:Idep", "/external:env:INCLUDE" };
+    for (auto const* flag: { "/external:Idep", "-external:IC:\\deps\\src", "/external:env:INCLUDE" })
+    {
+        INFO("refused: " << flag);
+        CHECK_FALSE(IsAcceptableJobArgument(flag, cl));
+        CHECK_FALSE(IsAcceptableJobArgument(flag, cl, operatorAllowed));
+    }
+
+    // And a value on the level cannot smuggle a path, which is the shape rule inside the row.
+    CHECK_FALSE(IsAcceptableJobArgument("/external:W0/../x", cl));
+}
+
 TEST_CASE("A compiler this worker cannot classify refuses the JOB, not its arguments", "[compile-job]")
 {
     // Two things go wrong if the fail-safe only gates arguments. The refusal surfaces
@@ -1168,21 +1340,29 @@ TEST_CASE("A refusal names the offending argument without echoing arbitrary byte
     // `detail` is encoded into the reply message and lands in the client's fallback
     // log, so client-supplied bytes are capped and reduced to printable ASCII where
     // the refusal is built -- once, rather than at each future producer.
-    auto const control = JobError::RejectedArgumentNaming(std::string { "-W" } + '\x1b' + "[31mred" + '\n');
+    auto const control = JobError::RejectedArgumentNaming(std::string { "-W" } + '\x1b' + "[31mred" + '\n', Flavor::Gcc);
     CHECK(control.reason == JobRefusal::RejectedArgument);
     CHECK(control.detail.contains("-W?[31mred?"));
     // No control byte survives, so no terminal escape reaches a log.
     CHECK(std::ranges::none_of(control.detail, [](char c) { return c >= 0 && c < 0x20; }));
 
     // A long argument is truncated rather than reflected whole.
-    auto const huge = JobError::RejectedArgumentNaming(std::string(4096, 'x'));
+    auto const huge = JobError::RejectedArgumentNaming(std::string(4096, 'x'), Flavor::Gcc);
     CHECK(huge.detail.size() < 200);
     CHECK(huge.detail.contains("..."));
 
     // A non-ASCII byte becomes `?`, so the message is valid UTF-8 whatever arrived --
     // which the fleet requires of text a peer sent.
-    auto const invalid = JobError::RejectedArgumentNaming("-W\xff\xfe");
+    auto const invalid = JobError::RejectedArgumentNaming("-W\xff\xfe", Flavor::Gcc);
     CHECK(invalid.detail.contains("-W??"));
+
+    // Each of those names something that is not the argument, so none says which driver judged
+    // it: asked of the rules again, `-W?[31mred?` is a different argument from the one refused.
+    // An argument named verbatim keeps its driver, which is what lets a reader re-ask the rules.
+    CHECK_FALSE(control.judgedFor.has_value());
+    CHECK_FALSE(huge.judgedFor.has_value());
+    CHECK_FALSE(invalid.judgedFor.has_value());
+    CHECK(JobError::RejectedArgumentNaming("-fanalyzer", Flavor::Gcc).judgedFor == Flavor::Gcc);
 }
 
 TEST_CASE("The output flag follows the worker's own driver family", "[compile-job]")

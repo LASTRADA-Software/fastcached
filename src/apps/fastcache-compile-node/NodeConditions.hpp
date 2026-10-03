@@ -52,6 +52,7 @@ enum class NodeCondition : std::uint8_t
     UnservedToolchain,              ///< Clients asked the leader for a toolchain no live worker serves.
     MixedNodeVersions,              ///< The leader sees one wire served by more than one build.
     OwnRecordAwaited,               ///< Its own cluster has not recorded this node's key, so it announces to nobody.
+    RefusedCompileArguments,        ///< The worker refused compiles over arguments it will not pass to its compiler.
     Last,                           ///< Not a condition.
 };
 
@@ -279,6 +280,20 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "it: --enroll-from=<seed> here, or --cluster-admit=<id>=<host>:<port>@<key> on a member, with what "
                 "--print-identity prints. If the detail says its id is recorded under another key, restore that "
                 "node-key, or --cluster-forget=<id> and admit this key." },
+    // Live: an operator's reload of the allowlist is the fix landing, and the row clears there.
+    // A warning and not an alert, because nothing is WRONG with what a build produces -- each
+    // refused compile runs on its own client -- only distribution is lost, which is what the
+    // counter alone could say and never say which flag.
+    { .condition = NodeCondition::RefusedCompileArguments,
+      .id = "refused-compile-arguments",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Worker,
+      .remedy = "Builds are still correct: each refused compile ran on its own client, so only distribution was lost. "
+                "If a named argument runs no program and names no path, admit it on every worker with "
+                "--allow-compile-arg=<argument> (allow_compile_arg in the configuration file) and reload; the row "
+                "clears at that reload and returns only if a refusal follows. A flag every build of this kind "
+                "carries belongs in the built-in table: report it rather than configuring it everywhere." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");

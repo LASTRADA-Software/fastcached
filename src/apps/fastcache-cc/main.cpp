@@ -444,6 +444,9 @@ struct InvocationRecord
     /// Why distribution did not help, under `RecordFallback`'s fixed-string rule.
     /// Empty when there is nothing to explain.
     std::string dispatchDetail;
+    /// What to act on about `dispatchDetail` -- the refused argument, in the refusing
+    /// end's own words. Recorded and never tallied; see `Cc::Record::dispatchSpecifics`.
+    std::string dispatchSpecifics;
     std::uint64_t valueBytes = 0; ///< Cached payload size; 0 when nothing moved.
 
     std::uint64_t preprocessMs = 0; ///< Deriving the key (preprocess + compiler id).
@@ -2233,11 +2236,15 @@ void RecordManifest(InvocationRecord const& record,
     // stays inside the function that owns the argument order, where it is tested.
     auto const args = Cc::RemoteCompileArgs(cmd, argv, targetTriple);
     if (!args.has_value())
-        // The offending flag varies per compile, so it rides the verbose line and
-        // never the tally -- otherwise one row per command line instead of per cause.
+    {
+        // The offending flag varies per compile, so it rides the verbose line and the
+        // log's specifics column, and never the tally -- otherwise one row per command
+        // line instead of per cause.
+        record.dispatchSpecifics = args.error();
         return DeclineDispatch(record,
                                RefusedHere("the command line is not dispatchable"),
                                std::format("not dispatchable ({}); compiling locally", args.error()));
+    }
 
     // Asked BEFORE the second preprocess and the fingerprint, because saving those is
     // half the point: a scheduler nothing reached a moment ago costs this compile one
@@ -2407,6 +2414,7 @@ void RecordManifest(InvocationRecord const& record,
                                                             .fingerprint = identity.fingerprint,
                                                             .objectKey = key,
                                                             .args = *args,
+                                                            .family = Cc::DriverOf(cmd.flavor).family,
                                                             .preprocessed = preprocessRun.out,
                                                             .sourceName = sourceName,
                                                             .compileDir = compileDirPath,
@@ -2426,6 +2434,7 @@ void RecordManifest(InvocationRecord const& record,
     // tested file -- `main.cpp` is in no test target. A decline whose DECLINING exchange
     // presented no ticket is recorded under WHY, which names the thing to fix.
     auto const fleetAnswer = Cc::RecordedReason(outcome, credentialed.Refusals());
+    record.dispatchSpecifics = Cc::SpecificsFor(outcome);
 
     if (outcome.status == Cc::DispatchStatus::Mismatched)
     {
@@ -3416,6 +3425,7 @@ int main(int argc, char** argv)
             .elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
             .detail = record.outcomeDetail,
             .dispatchDetail = record.dispatchDetail,
+            .dispatchSpecifics = record.dispatchSpecifics,
             .preprocessMs = record.preprocessMs,
             .cacheMs = record.cacheMs,
             .directMs = record.directMs,

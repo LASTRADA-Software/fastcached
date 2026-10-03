@@ -642,6 +642,18 @@ Writes use an atomic append (`FILE_APPEND_DATA` / `O_APPEND`) so the hundreds of
 concurrent compilers in one build interleave whole lines instead of shredding
 each other's. Recording failures are swallowed: statistics never break a build.
 
+A line is tab-separated, and its last two columns are the distribution axis: the
+fixed reason tallied under `why distribution did not help`, and then what to act on
+about it when the reason alone does not say — the argument a worker would not take,
+in the worker's own words, the ceiling a job went over, what one worker could not
+do, or the flag this launcher would not send. A decline whose peer text would only
+name an endpoint, such as a redirect chain that found no leader, leaves it empty;
+`FASTCACHE_VERBOSE` carries that. The last column is recorded and never tallied, so
+the report stays one row per cause while the log still names the flag. It is cut
+at 320 bytes between characters, holds no control character (C0, DEL or C1), and
+spells a byte that begins no UTF-8 character as `?`, since part of it is a peer's
+text.
+
 ```
 $ fastcache-cc --show-stats
 
@@ -736,7 +748,8 @@ none of them is a caching failure.
 
 | Reason | Meaning |
 |--------|---------|
-| `the command line is not dispatchable` | `RemoteCompileArgs` found something on the line it cannot account for, so nothing was sent. Refusing costs one local compile, where stripping an unrecognised argument would change the generated code and hand back an object nobody asked for. `FASTCACHE_VERBOSE` names the offending flag; it is deliberately not in this tally, or you would get one row per command line instead of one per cause. |
+| `the command line is not dispatchable` | `RemoteCompileArgs` found something on the line it cannot account for, so nothing was sent. Refusing costs one local compile, where stripping an unrecognised argument would change the generated code and hand back an object nobody asked for. `FASTCACHE_VERBOSE` names the offending flag, and so does the last column of the invocation log; it is deliberately not in this tally, or you would get one row per command line instead of one per cause. |
+| `the command line carries an argument no worker passes to a compiler` | An argument on the line is one every worker refuses by a fixed rule -- a sub-tool pass-through such as `-Xclang`, a plugin loader, a linker switch, a path the worker would open. `--allow-compile-arg` cannot lift these, so the launcher reads the same table the workers read and compiles locally without asking for a lease. The last column of the invocation log names the argument. |
 | `the dispatch preprocess failed` | A worker is fed a *second* preprocess, with `#line` markers that the cache key's copy suppresses, and that run failed. The key's own preprocess had already succeeded, so this is about the marker-emitting form of the command specifically. |
 | `this toolchain has no usable fingerprint` | The toolchain digest does not identify this compiler, so no worker could match it. Deliberately refused here rather than sent: a scheduler asked for an unidentifiable fingerprint answers `NoWorker`, which reads as "the fleet has nobody on your toolchain" and sends you to look at the fleet for a problem on this machine. `fastcache-cc --print-toolchain-fingerprint <compiler>` says what this machine computes and why it is unusable. |
 | `no worker serves this toolchain` | Nothing in the fleet carries your compiler's fingerprint. A machine is missing, or a fingerprint has drifted — upgrading the toolchain on the clients and not the workers looks exactly like this. Never read as a capacity problem: more machines of the wrong compiler change nothing. |
@@ -745,8 +758,10 @@ none of them is a caching failure.
 | `another client was already building this key` | Duplicate-work suppression, and **not a failure**: another client holds the lease for this exact object and this compile ran locally instead. Sixty clients missing one key after a header change is the ordinary shape of a shared cache. A high count here is the design working. |
 | `the fleet refused this client` | A credential, membership or lease refusal — the fleet would not let this client ask. Fixed where the client is configured or on the scheduler's member list, never by adding machines. |
 | `the worker refused the job` | A lease was granted and the worker then said no: a lease it would not honour, a scratch root it cannot write, a compiler it could not spawn. **One machine to go and look at**, and `FASTCACHE_VERBOSE` names it. |
+| `a worker would not take an argument of this compile` | The worker's allowlist has no row for a flag on this command line, which every worker of the same build refuses alike — so it is a flag this *fleet* does not dispatch, not one machine. The last column of the invocation log carries the worker's sentence naming the argument. If it runs no program and names no path, add it on the workers with `--allow-compile-arg`; otherwise those compiles stay local, correctly. Until the worker had a code of its own for this it answered `malformed-frame`, and this row read as the wire disagreement below. |
+| `the job is larger than a worker accepts` | The translation unit's frame, or the size its compressed envelope declares, is over the ceiling a worker's compile surface takes. That ceiling is fixed in the worker's build, so every worker of one build refuses the same unit alike: a property of the unit, not of one machine and not a wire disagreement. Nothing to fix; the compile runs here, correctly, and the last column of the invocation log carries the worker's sentence naming the ceiling. |
 | `the fleet named no leader to ask` | The scheduler chain answered `NotLeader` until the redirect ceiling. Transient during an election and permanent when a fleet is misconfigured; the rate is what separates those, which is why it is not folded in with the credential refusal above. |
-| `this launcher and the fleet disagree about the wire` | A protocol, codec or framing mismatch. Expected and bounded during a staggered upgrade; a count that keeps rising afterwards names a machine that never came back. |
+| `this launcher and the fleet disagree about the wire` | A protocol, codec or framing mismatch, or a peer answering a compile with a refusal from another surface. Expected and bounded during a staggered upgrade; a count that keeps rising afterwards names a machine that never came back. Two machines of one build cannot produce it. |
 | `the fleet refused with a reason this launcher does not know` | A refusal code newer than this launcher. Upgrade `fastcache-cc`; the verbose line carries the code the fleet actually sent. |
 | `the fleet could not be reached` | The scheduler or the worker did not answer, broke mid-reply, or ran out of budget. If every compile shows this, check the address in `FASTCACHE_SCHEDULER` before suspecting the fleet — a wrong one looks exactly like a fleet that is entirely down. |
 | `a worker compile failed and was retried locally` | The remote compiler exited non-zero, so the result was discarded and the translation unit compiled here to confirm. Broken code produces this on every machine and is not a fleet problem; a *rising* count against a build that keeps succeeding is a worker producing failures that are not real, and the verbose line names the machine. |

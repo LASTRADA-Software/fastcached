@@ -45,6 +45,7 @@ constexpr std::string_view Key = "obj-abcdef";
                                  .fingerprint = Toolchain,
                                  .objectKey = Key,
                                  .args = {},
+                                 .family = Cc::DriverFamily::Gnu,
                                  .preprocessed = "int main() { return 0; }",
                                  .sourceName = "main.cpp",
                                  .compileDir = {},

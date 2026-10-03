@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "ArgumentDenials.hpp"
 #include "CompileCorrelation.hpp"
+#include "CompileJob.hpp"
 #include "Dispatch.hpp"
+#include "Stats.hpp"
 #include "TicketCredentials.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
@@ -397,6 +400,7 @@ struct ReplyFields
                              .fingerprint = "gcc-13-abc",
                              .objectKey = "objkey",
                              .args = args,
+                             .family = DriverFamily::Gnu,
                              .preprocessed = "int main() { return 0; }",
                              .sourceName = "a.cpp",
                              .compileDir = {},
@@ -794,6 +798,101 @@ TEST_CASE("A decline says WHICH kind, from either end of the fleet", "[dispatch]
     // reads as a peer from the future rather than this build forgetting one.
     CHECK(DeclineCauseFor(Wire::ErrorCode::WorkerCompilerUnclassified) != DeclineCause::Unrecognised);
     CHECK(refused.decline != noWorker);
+}
+
+TEST_CASE("An argument no worker runs is refused before a lease is asked for", "[dispatch][decline][denied]")
+{
+    // The worker refuses these by a row no `--allow-compile-arg` can lift, so asking cost a
+    // lease, a round trip and the whole translation unit for an answer the client can read off
+    // the same table. The seam's promise is that NOTHING is dialled -- a scripted scheduler
+    // that would grant is served, and must never be reached.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::WorkerRejectedArgument, {}));
+
+    std::vector<std::string> const args { "-O2", "-Xclang", "-load", "-fanalyzer" };
+    auto const result = Dispatch(fleet, Request(args));
+
+    CHECK(result.status == DispatchStatus::DeniedHere);
+    CHECK(fleet.Dialled().empty());
+    CHECK(fleet.SentTo(std::string { Scheduler }).empty());
+    // The FIRST denied argument, named for the log; `-fanalyzer` is merely unlisted, which an
+    // operator may extend, so it is not this refusal's business.
+    CHECK(result.refusal.contains("-Xclang"));
+    CHECK_FALSE(result.refusal.contains("-fanalyzer"));
+    CHECK(RecordingFor(result.status, result.decline).outcome == DispatchOutcome::Refused);
+    CHECK(SpecificsFor(result) == result.refusal);
+
+    // The control: an argument the table does not deny still asks the fleet, so the refusal
+    // above is the table's rather than a dispatch that asks nobody.
+    ScriptedFleet asking;
+    asking.Serve(std::string { Scheduler }, GrantReply());
+    asking.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::WorkerRejectedArgument, {}));
+    std::vector<std::string> const unlisted { "-O2", "-fanalyzer" };
+    auto const asked = Dispatch(asking, Request(unlisted));
+    CHECK(asked.status == DispatchStatus::Declined);
+    CHECK_FALSE(asking.Dialled().empty());
+}
+
+TEST_CASE("The launcher refuses exactly what the worker refuses by row", "[dispatch][denied]")
+{
+    // One table, read by both ends: every row's spelling, under both introducers where its
+    // family has them, is refused by the worker's own predicate -- AND by it with an operator
+    // entry naming the argument, which is what makes a row a row rather than an absence.
+    for (auto const& row: DeniedArguments)
+        for (auto const family: { DriverFamily::Msvc, DriverFamily::Gnu })
+        {
+            if (!Overlaps(row.families, family))
+                continue;
+            for (auto const introducer: IntroducersOf(family))
+            {
+                auto const arg = std::string(1, introducer) + std::string { row.spelling } + "x";
+                INFO("argument " << arg);
+                REQUIRE(FindDeniedArgument(arg, family) != nullptr);
+                auto const& driver = DriverOf(family == DriverFamily::Msvc ? Flavor::Cl : Flavor::Gcc);
+                std::vector<std::string> const operatorAllowed { arg };
+                CHECK_FALSE(IsAcceptableJobArgument(arg, driver, operatorAllowed));
+            }
+        }
+}
+
+TEST_CASE("Two machines of one build cannot be reported as disagreeing about the wire", "[dispatch][decline]")
+{
+    // `ProtocolMismatch` says a staggered upgrade that never finished. Two refusals were graded
+    // that way that two ends of ONE build produce every day: a flag the worker's allowlist does
+    // not carry, and a translation unit larger than the worker's surface takes. An operator told
+    // "disagree about the wire" goes looking for an old binary that is not there.
+    auto declineFor = [](Wire::ErrorCode workerAnswer, std::string_view message) {
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantReply());
+        fleet.Serve(std::string { Worker }, Wire::EncodeErrorReply(workerAnswer, message));
+        std::vector<std::string> const args { "-O2" };
+        return Dispatch(fleet, Request(args));
+    };
+
+    auto const argument = declineFor(Wire::ErrorCode::WorkerRejectedArgument,
+                                     "argument -external:W0 is not on this worker's accepted-flag list");
+    REQUIRE(argument.status == DispatchStatus::Declined);
+    CHECK(argument.decline == DeclineCause::ArgumentRefused);
+    // The peer's words, which name the argument, ride apart from the endpoint-bearing detail.
+    CHECK(argument.refusal == "argument -external:W0 is not on this worker's accepted-flag list");
+
+    auto const tooLarge = declineFor(Wire::ErrorCode::PayloadTooLarge, "frame exceeds this surface's ceiling");
+    REQUIRE(tooLarge.status == DispatchStatus::Declined);
+    CHECK(tooLarge.decline == DeclineCause::TooLarge);
+    // A property of the unit under a ceiling every worker of one build shares, so it is not the
+    // one-machine row either.
+    CHECK(tooLarge.decline != DeclineCause::WorkerRefused);
+    CHECK(tooLarge.refusal == "frame exceeds this surface's ceiling");
+
+    // The discrimination: neither is the protocol row, and they are not each other either.
+    CHECK(argument.decline != DeclineCause::ProtocolMismatch);
+    CHECK(tooLarge.decline != DeclineCause::ProtocolMismatch);
+    CHECK(argument.decline != tooLarge.decline);
+
+    // The control: a frame fault still IS a wire disagreement, so the rows above are a
+    // classification rather than a table that stopped answering `ProtocolMismatch` at all.
+    CHECK(declineFor(Wire::ErrorCode::MalformedFrame, {}).decline == DeclineCause::ProtocolMismatch);
 }
 
 TEST_CASE("An exhausted redirect chain declines as no-leader, not as a refusal", "[dispatch][decline][redirect]")

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "ArgumentDenials.hpp"
 #include "CacheProtocol.hpp"
 #include "CodecEnvelope.hpp"
 
@@ -392,6 +393,15 @@ enum class DispatchStatus : std::uint8_t
     /// the object, which would be a wrong object under a correct key — the failure
     /// this whole mechanism exists to make impossible.
     Mismatched,
+    /// THIS launcher refused before asking: an argument of the job is one every worker
+    /// refuses by a row of `DeniedArguments`, which no operator setting can lift.
+    ///
+    /// Its own status rather than a `Declined`, because the fleet was never asked --
+    /// no lease was requested, no worker dialled, no translation unit sent -- and
+    /// `Declined` is recorded as the fleet declining. It is recorded as this machine's
+    /// refusal instead, beside the other command lines this launcher will not send.
+    /// `refusal` names the argument.
+    DeniedHere,
     /// The enumerator count, so a table over this enum takes its extent from the
     /// enum itself rather than from a literal. See `Core/EnumTable.hpp`: a length
     /// anchored on an enumerator by name is a guard that fires only when nothing is
@@ -453,6 +463,23 @@ enum class DeclineCause : std::uint8_t
     /// a toolchain it no longer has, a scratch root it cannot write. One machine to
     /// go and look at, rather than a fleet-shaped problem.
     WorkerRefused,
+    /// A worker would not pass one of this compile's arguments to its compiler.
+    ///
+    /// Not `WorkerRefused`, because the remedy is not one machine: every worker running this
+    /// build refuses the same flag, so it is a flag this FLEET does not dispatch. An operator
+    /// adds it with `--allow-compile-arg` on the workers when it runs no program and names no
+    /// path, or leaves those compiles local. And never `ProtocolMismatch`, which is what it read
+    /// as while the worker answered it `malformed-frame`: two ends of one build, reported as a
+    /// version skew. `DispatchResult::refusal` carries the worker's sentence, which names it.
+    ArgumentRefused,
+    /// The job was larger than a worker's surface takes.
+    ///
+    /// A FLEET fact for the same reason `ArgumentRefused` is one: the ceiling is a constant of the
+    /// worker's build (`WorkerMaxRequestBytes`), so every worker of that build refuses the same
+    /// translation unit alike, and "one machine to go and look at" would send an operator to a
+    /// machine for a property of the unit. Nothing to fix on either end; the compile runs here,
+    /// correctly, and the peer's message naming the ceiling rides `DispatchResult::refusal`.
+    TooLarge,
     /// The fleet could not name a leader to ask.
     ///
     /// Its own row rather than a share of `NotPermitted`, because it is transient by
@@ -499,7 +526,14 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnsupportedVersion, .cause = DeclineCause::ProtocolMismatch },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownOpcode, .cause = DeclineCause::ProtocolMismatch },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::MalformedFrame, .cause = DeclineCause::ProtocolMismatch },
-    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::PayloadTooLarge, .cause = DeclineCause::ProtocolMismatch },
+    // A size ceiling, which two machines of one build meet as readily as two of different
+    // builds: a translation unit whose frame, or whose declared expansion, is larger than the
+    // worker's surface will take. Graded `ProtocolMismatch` it read as a staggered upgrade that
+    // never finished; `TooLarge` says why it is neither that nor one machine's fault.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::PayloadTooLarge, .cause = DeclineCause::TooLarge },
+    // A STORE refusal, which no dispatch sends: a launcher meets it on a compile only by talking
+    // to a surface that is not the one it thinks it is -- a disagreement about the wire in the
+    // cluster rows' sense below, and not a claim about either end's version.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::MalformedValue, .cause = DeclineCause::ProtocolMismatch },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::StorageWriteFailed, .cause = DeclineCause::WorkerRefused },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::Unauthenticated, .cause = DeclineCause::NotPermitted },
@@ -592,6 +626,7 @@ inline constexpr std::array DeclineCauseTable {
     // surface it did not think it was talking to -- the enrollment rows' reasoning. A row so it
     // does not arrive `Unrecognised`, which reads as a peer from the future.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NotSharedCache, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerRejectedArgument, .cause = DeclineCause::ArgumentRefused },
 };
 
 /// Whether every refusal this build's wire header knows carries a classification.
@@ -691,6 +726,14 @@ struct DispatchResult
     /// named here. Nor is a dial HINT that reached nothing while the name then answered:
     /// that is a stale address, not a dead machine.
     std::string unreachedWorker;
+    /// The refusing peer's own message, on a `Declined` result; empty otherwise.
+    ///
+    /// Apart from `detail`, which formats an endpoint and the code's name around it for the
+    /// verbose line: this is the part an operator ACTS on -- which argument a worker would not
+    /// take, which ceiling a translation unit exceeded -- and it is what the invocation log
+    /// records beside the fixed tally reason, so a refusal can be acted on without `-v` and
+    /// without the node's counters.
+    std::string refusal;
 
     /// @return True when a worker actually ran the compiler.
     [[nodiscard]] bool Ran() const noexcept
@@ -734,7 +777,11 @@ struct DispatchRequest
     std::string_view fingerprint;       ///< This client's toolchain identity.
     std::string_view objectKey;         ///< The cache key, for duplicate suppression.
     std::span<std::string const> args;  ///< Already filtered by `RemoteCompileArgs`.
-    std::string_view preprocessed;      ///< The translation unit, preprocessed.
+    /// The family of the driver `args` are spelled for -- the client's, which the
+    /// fingerprint binds to the worker's. Read against `DeniedArguments` before anything
+    /// is asked of the fleet.
+    DriverFamily family;
+    std::string_view preprocessed; ///< The translation unit, preprocessed.
     /// The translation unit's path, as the build system spelled it, and it travels
     /// WHOLE (#660).
     ///
