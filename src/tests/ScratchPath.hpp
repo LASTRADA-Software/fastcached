@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iostream>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -60,6 +62,54 @@ namespace FastCache::Testing
     return std::filesystem::temp_directory_path() / std::format("{}-{}-{}", prefix, pid, ++counter);
 }
 
+/// Empty @p path and create it afresh, or throw naming the path and the error.
+///
+/// **A directory that cannot be cleared is a refusal, never a reuse.** The name a
+/// `ScratchDirectory` takes is this process's pid and a counter, so what this can reach is
+/// this process's own earlier leftovers or a dead process's whose pid was reused -- and a
+/// leftover that SURVIVES the clear is exactly that inheritance: four consensus-tier cases
+/// once read a stale Raft log out of one and failed about one run in two. The clear used to
+/// discard `remove_all`'s error, so a directory holding a file somebody still had open was
+/// handed back with its contents as if it were fresh.
+///
+/// Throws, rather than returning a code, because every caller is a fixture: Catch2 reports the
+/// throw as a failure of the case that constructed it, which is where it belongs.
+/// @param path The directory to empty and create.
+inline void ClearScratch(std::filesystem::path const& path)
+{
+    auto error = std::error_code {};
+    std::filesystem::remove_all(path, error);
+    if (error)
+        throw std::runtime_error { std::format(
+            "scratch: cannot clear {} before using it ({}); refusing to reuse what an earlier run left there",
+            path.string(),
+            error.message()) };
+    std::filesystem::create_directories(path, error);
+    if (error)
+        throw std::runtime_error { std::format("scratch: cannot create {}: {}", path.string(), error.message()) };
+}
+
+/// Remove @p path, and say so on @p diagnostics when it cannot be removed.
+///
+/// A WARNING rather than a throw, because its caller is a destructor: one that throws while a
+/// failed assertion is already unwinding ends the process and loses the report of the failure
+/// that caused it. The warning is enough because the next construction under the same name is
+/// what guards the reuse -- `ClearScratch` refuses a directory it cannot clear -- so a leftover
+/// costs disk space and a line of output, never a test reading another run's files.
+/// @param path The directory to remove.
+/// @param diagnostics Where a failure is reported.
+/// @return True when nothing is left at @p path.
+inline bool ReleaseScratch(std::filesystem::path const& path, std::ostream& diagnostics)
+{
+    auto error = std::error_code {};
+    std::filesystem::remove_all(path, error);
+    if (!error)
+        return true;
+    diagnostics << std::format(
+        "scratch: WARNING: cannot remove {} ({}); it is left behind\n", path.string(), error.message());
+    return false;
+}
+
 /// A scratch directory that exists for as long as the object does.
 ///
 /// RAII rather than a teardown statement, because a teardown written after the
@@ -77,6 +127,7 @@ class ScratchDirectory
   public:
     /// Create a directory under the system temp location.
     /// @param prefix Human-recognisable tag; see `UniqueScratchPath`.
+    /// @throws std::runtime_error When the directory cannot be cleared or created (`ClearScratch`).
     explicit ScratchDirectory(std::string_view prefix):
         _path { UniqueScratchPath(prefix) }
     {
@@ -85,9 +136,7 @@ class ScratchDirectory
         // dead process whose pid was reused. It can never reach a live peer's
         // directory -- which is precisely what it did do while the name was a
         // bare counter, turning a name collision into deleted data.
-        auto error = std::error_code {};
-        std::filesystem::remove_all(_path, error);
-        std::filesystem::create_directories(_path, error);
+        ClearScratch(_path);
     }
 
     ScratchDirectory(ScratchDirectory const&) = delete;
@@ -95,10 +144,13 @@ class ScratchDirectory
     ScratchDirectory& operator=(ScratchDirectory const&) = delete;
     ScratchDirectory& operator=(ScratchDirectory&&) = delete;
 
+    /// Removes the directory, warning on stderr when it cannot (`ReleaseScratch`).
     ~ScratchDirectory()
     {
-        auto error = std::error_code {};
-        std::filesystem::remove_all(_path, error);
+        // Implicitly noexcept: `ReleaseScratch` reports rather than throws, and the one thing that
+        // could still escape it -- an allocation failure formatting the warning -- ends the process,
+        // which in a test binary is the loud outcome anyway.
+        ReleaseScratch(_path, std::cerr);
     }
 
     /// @return The directory, which exists.

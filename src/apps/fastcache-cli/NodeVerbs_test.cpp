@@ -1225,6 +1225,24 @@ TEST_CASE("cluster-admit sends the key it was given and reports the key the lead
         CHECK(node.Sent().empty());
     }
 
+    SECTION("a small-order or non-canonical key is refused here by name, and nothing is sent")
+    {
+        // Well-formed text naming a point no signature proves anything under: the all-zero key,
+        // under which the all-zero signature verifies every message, and p + 3, a second spelling.
+        for (auto const& [text, fault]:
+             { std::pair { std::string_view { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, PublicKeyFault::SmallOrder },
+               std::pair { std::string_view { "8P_______________________________________38" },
+                           PublicKeyFault::NonCanonical } })
+        {
+            INFO("key: " << text);
+            ScriptedNodeExchange node { {} };
+            auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675", std::string { text } });
+            CHECK(answer.outcome == Outcome::Usage);
+            CHECK(AdvisoryText(answer).contains(DescribePublicKeyFault(fault)));
+            CHECK(node.Sent().empty());
+        }
+    }
+
     SECTION("no key operand sends none, and the receipt's none is said as what it means")
     {
         auto const receipt = Cc::EncodeClusterAdmitReceipt(

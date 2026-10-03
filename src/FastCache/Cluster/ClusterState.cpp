@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
@@ -49,7 +50,7 @@ std::expected<ClusterMember, std::string> ParseMemberSpec(std::string_view spec)
         auto parsed = ParseEd25519PublicKey(keyText);
         if (!parsed.has_value())
             return std::unexpected { std::format(
-                "{} names a key that is not one ({}): {}", spec, keyText, DescribePublicKeyTextFault(parsed.error())) };
+                "{} names a key that is not one ({}): {}", spec, keyText, DescribePublicKeyFault(parsed.error())) };
         publicKey = *parsed;
     }
 
@@ -192,6 +193,7 @@ namespace
     /// revoked or a borrowed key is.
     enum class KeyStanding : std::uint8_t
     {
+        Unusable,      ///< A small-order or non-canonical point (`Ed25519PublicKeyFaultOf`): never admitted.
         Available,     ///< Nobody else holds it, and it was never revoked.
         Revoked,       ///< In `revokedKeys`: never admitted again, whoever asks.
         HeldElsewhere, ///< Held live by another id: one key, one identity.
@@ -204,6 +206,10 @@ namespace
     /// @return Its standing.
     [[nodiscard]] KeyStanding StandingOf(ClusterState const& state, std::string_view id, Ed25519PublicKey const& key)
     {
+        // Unusable before anything the state says, because it is a fact about the POINT: a key
+        // under which a signature verifies without a secret proves nothing for anybody.
+        if (!Ed25519PublicKeyIsUsable(key))
+            return KeyStanding::Unusable;
         // Revoked first: a key that is both revoked and held would be a state `Apply` never
         // makes, and the permanent answer is the one worth giving if one ever arrived.
         if (state.IsRevoked(key))
@@ -254,6 +260,8 @@ namespace
 
         if (std::ranges::any_of(live, [&state](Ed25519PublicKey const& key) { return state.IsRevoked(key); }))
             return "a revoked key is still held";
+        if (!std::ranges::all_of(live, Ed25519PublicKeyIsUsable))
+            return "a held key is a small-order or non-canonical point, which proves nothing";
         std::ranges::sort(live);
         if (std::ranges::adjacent_find(live) != live.end())
             return "one key is held by two ids";
@@ -1180,6 +1188,12 @@ std::expected<void, ConsensusError> ValidateAgainst(ClusterState const& state, C
         auto const& key = *command.publicKey;
         switch (StandingOf(state, command.key, key))
         {
+            case KeyStanding::Unusable:
+                return std::unexpected(InvalidConfiguration(
+                    std::format("{} cannot be {}'s key: {}",
+                                FormatEd25519PublicKey(key),
+                                command.key,
+                                DescribePublicKeyFault(Ed25519PublicKeyFaultOf(key).value_or(PublicKeyFault::SmallOrder)))));
             case KeyStanding::Available:
                 return {};
             case KeyStanding::Revoked: {

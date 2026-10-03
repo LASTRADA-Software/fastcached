@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/RaftPeerKeyFakes.hpp>
@@ -129,6 +130,44 @@ TEST_CASE("A roster another build laid out is refused by name, and a damaged one
         auto const decoded = DecodeRoster(bytes);
         REQUIRE_FALSE(decoded.has_value());
         CHECK(decoded.error().code == ConsensusErrorCode::MalformedFrame);
+    }
+}
+
+TEST_CASE("A roster holding a small-order or non-canonical live key is refused, naming its holder",
+          "[cluster][roster][identity][security]")
+{
+    // A roster is what a worker checks grants and endorsements against, so a small-order voter key
+    // in one is a voter anybody can sign as -- under it the all-zero signature verifies every
+    // message. Refused on decode by the holder's name, as a member's key and as a principal's; the
+    // control is the same key REVOKED, which grants nothing and is kept.
+    auto nonCanonical = Ed25519PublicKey {};
+    nonCanonical.fill(std::byte { 0xFF });
+    nonCanonical.back() = std::byte { 0x7F };
+
+    for (auto const& [key, fault]: { std::pair { Ed25519PublicKey {}, PublicKeyFault::SmallOrder },
+                                     std::pair { nonCanonical, PublicKeyFault::NonCanonical } })
+    {
+        INFO("key " << FormatEd25519PublicKey(key));
+        auto asMember = ProjectRoster(SampleState());
+        asMember.members[1].publicKey = key;
+        auto asPrincipal = ProjectRoster(SampleState());
+        asPrincipal.principals[0].publicKey = key;
+
+        for (auto const& [roster, holder]:
+             { std::pair { asMember, std::string_view { "n2" } }, std::pair { asPrincipal, std::string_view { "w1" } } })
+        {
+            auto const decoded = DecodeRoster(EncodeRoster(roster));
+            REQUIRE_FALSE(decoded.has_value());
+            CHECK(decoded.error().code == ConsensusErrorCode::MalformedFrame);
+            CHECK(decoded.error().context.contains(std::string { holder } + "'s key"));
+            CHECK(decoded.error().context.contains(DescribePublicKeyFault(fault)));
+        }
+
+        auto revoked = ProjectRoster(SampleState());
+        revoked.revoked.push_back(RevokedKey { .id = "gone", .publicKey = key });
+        auto const kept = DecodeRoster(EncodeRoster(revoked));
+        REQUIRE(kept.has_value());
+        CHECK(*kept == revoked);
     }
 }
 

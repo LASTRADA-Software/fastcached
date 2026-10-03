@@ -10,6 +10,7 @@
 #include "Stats.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Platform/Environment.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -82,8 +83,7 @@ class ScopedStateDir
 
     [[nodiscard]] static std::optional<std::string> Current()
     {
-        char const* const value = std::getenv(VariableName);
-        return value != nullptr ? std::optional { std::string { value } } : std::nullopt;
+        return FastCache::ReadEnvironmentVariable(VariableName);
     }
 
     static void Set(std::string const& value)

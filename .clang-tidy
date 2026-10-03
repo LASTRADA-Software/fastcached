@@ -145,6 +145,12 @@ CheckOptions:
     value:           '0'
   - key:             cppcoreguidelines-explicit-virtual-functions.IgnoreDestructors
     value:           '1'
+  # The C functions whose result is an OWNER, so `gsl::owner<std::FILE*> x = f(...)` is accepted
+  # for them. The check's default list plus `::_wfsopen`: the CRT's wide-path, share-mode `fopen`,
+  # which DurableFile.cpp and NodeKey.cpp call on Windows exactly where POSIX calls `std::fopen`.
+  # Setting the key REPLACES the default, so the default's seven stay spelled out.
+  - key:             cppcoreguidelines-owning-memory.LegacyResourceProducers
+    value:           '::malloc;::aligned_alloc;::realloc;::calloc;::fopen;::freopen;::tmpfile;::_wfsopen'
   - key:             cppcoreguidelines-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
     value:           '1'
   - key:             google-readability-braces-around-statements.ShortStatementLines

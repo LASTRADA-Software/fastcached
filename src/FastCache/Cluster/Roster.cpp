@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/Base64.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
@@ -183,6 +184,28 @@ std::expected<Roster, ConsensusError> DecodeRoster(std::span<std::byte const> by
     });
     if (!members.has_value() || !principals.has_value() || !revoked.has_value())
         return std::unexpected(MalformedWireFrame("a roster entry is malformed"));
+
+    // A LIVE key no signature can prove anything under is refused by the holder's name: a roster is
+    // what a worker trusts grants and endorsements by, and a small-order key in it would be a voter
+    // anybody can sign as. A revoked entry is not asked -- revoking such a key grants nothing.
+    auto const unusable = [](std::string const& id, Ed25519PublicKey const& key) -> std::optional<std::string> {
+        auto const fault = Ed25519PublicKeyFaultOf(key);
+        if (!fault.has_value())
+            return std::nullopt;
+        return std::format("{}'s key {} is refused: {}", id, FormatEd25519PublicKey(key), DescribePublicKeyFault(*fault));
+    };
+    for (auto const& member: *members)
+    {
+        if (!member.publicKey.has_value())
+            continue;
+        if (auto why = unusable(member.id, *member.publicKey); why.has_value())
+            return std::unexpected(MalformedWireFrame(*std::move(why)));
+    }
+    for (auto const& principal: *principals)
+    {
+        if (auto why = unusable(principal.id, principal.publicKey); why.has_value())
+            return std::unexpected(MalformedWireFrame(*std::move(why)));
+    }
 
     return Roster { .members = *std::move(members), .principals = *std::move(principals), .revoked = *std::move(revoked) };
 }

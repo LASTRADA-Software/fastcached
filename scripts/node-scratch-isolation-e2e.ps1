@@ -63,6 +63,12 @@ if (-not $SelfTest) {
 # shared module exists to stop rather than a choice anybody made (#1284).
 Import-Module (Join-Path $PSScriptRoot "lib/E2EPorts.psm1") -Force
 
+# The teardown: kill, confirm each process EXITED within one shared bound, and name
+# what did not. It used to kill and sleep 400 ms, confirming nothing -- the teardown
+# `dist-compile-e2e.ps1` had when a survivor failed its next driver with nothing
+# naming it. The phases here already share no directory and no port.
+Import-Module (Join-Path $PSScriptRoot "lib/E2EProcesses.psm1") -Force
+
 # ---------------------------------------------------------------------------
 # The toolchain survey's two bounds, and the relation between them (#1157).
 #
@@ -1140,7 +1146,12 @@ function Invoke-SelfTest {
         }
     }
 
-    $total = $cases.Count + $messageCases.Count + $surveyCases.Count + $boundCases.Count
+    # The teardown's cases live beside it, in `lib/E2EProcesses.psm1`; running them
+    # here also proves this fixture's import of it works.
+    $teardown = Invoke-E2EProcessesSelfTest
+    $failures += $teardown.Failures
+
+    $total = $cases.Count + $messageCases.Count + $surveyCases.Count + $boundCases.Count + $teardown.Cases
     if ($failures -gt 0) {
         Write-Host ("node-scratch-isolation-e2e -SelfTest: {0} of {1} cases FAILED" -f $failures, $total)
         return 1
@@ -1228,10 +1239,16 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
     New-SlowSource $srcB 202
 
     $procs = @()
+    # What each spawned process was started AS, keyed by PID, so a teardown that
+    # finds one still running can say which one it is.
+    $commandLines = @{}
     try {
-        $procs += Start-Process -FilePath $Fastcached -ArgumentList @("--port=$cachePort", "--bind=127.0.0.1") `
+        $cacheArgs = @("--port=$cachePort", "--bind=127.0.0.1")
+        $cacheProc = Start-Process -FilePath $Fastcached -ArgumentList $cacheArgs `
                     -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $phaseDir "cache.out.log") `
                     -RedirectStandardError (Join-Path $phaseDir "cache.err.log")
+        $commandLines[$cacheProc.Id] = (@($Fastcached) + $cacheArgs) -join ' '
+        $procs += $cacheProc
 
         function Start-NodeIn([string]$name, [string[]]$argv, [string]$tempOverride) {
             $savedTemp = $env:TEMP; $savedTmp = $env:TMP
@@ -1240,9 +1257,12 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
                 $env:TEMP = $tempOverride; $env:TMP = $tempOverride
             }
             try {
-                return Start-Process -FilePath $Node -ArgumentList (ConvertTo-QuotedArgs $argv) -NoNewWindow -PassThru `
+                $quoted = ConvertTo-QuotedArgs $argv
+                $nodeProc = Start-Process -FilePath $Node -ArgumentList $quoted -NoNewWindow -PassThru `
                        -RedirectStandardOutput (Join-Path $phaseDir "$name.out.log") `
                        -RedirectStandardError  (Join-Path $phaseDir "$name.err.log")
+                $commandLines[$nodeProc.Id] = (@($Node) + @($quoted)) -join ' '
+                return $nodeProc
             } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
         }
 
@@ -1469,8 +1489,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         Write-Host "  ok: 2 of 2 dispatched, both overlapped, each object its own"
     }
     finally {
-        foreach ($p in $procs) { try { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } } catch {} }
-        Start-Sleep -Milliseconds 400
+        foreach ($line in @(Stop-E2EProcesses $procs $commandLines)) { Write-Host "  teardown: $line" }
     }
 }
 

@@ -1080,10 +1080,52 @@ Consequences that are each load-bearing:
     `crypto_ed25519_key_pair` WIPES the seed it is handed, so it is handed a copy. A signature
     whose S is not below L is refused -- that range check is all that stops a valid signature
     being turned into a second one. An all-zero X25519 result is refused, since a low-order peer
-    key fixes it for everybody. And a raw X25519 secret is not a key: it goes through HKDF.
-  - **One leniency, stated rather than found later:** Monocypher accepts a non-canonical
-    encoding of R or A (y at or above p), where RFC 8032 has decoding fail. Only a point whose y
-    is below 19 has such a spelling, so an honest signature or key has none in practice.
+    key fixes it for everybody -- the ephemeral exchange of the node proof and of the Raft peer
+    handshake both reach it (`DeriveNodeSessionKeys`, `RaftPeerSession`). And a raw X25519
+    secret is not a key: it goes through HKDF.
+  - **A small-order key proves nothing, and Monocypher does not say so.** It checks the COFACTORED
+    equation, [8](SB - hA - R) = 0, and multiplying by 8 sends every point of small order to the
+    identity -- so with a small-order A, a small-order R and S = 0 the equation holds for EVERY
+    message. Its decoding refuses neither point. The all-zero key with the all-zero signature
+    verified anything -- 400 of 400 through `DiscoveryService` with real secure-random nonces when
+    it was reported: a proof whose key vouches for itself was no proof, and one reaching the roster
+    question as an UNKNOWN key was reported with the `--cluster-admit` that would admit a key
+    anybody can prove. So `Ed25519Verify` asks `Ed25519PublicKeyFaultOf` of A AND of R before
+    Monocypher is asked, and the vendored library stays unmodified -- the seam is where a missing
+    check goes, as it is where a missing primitive goes.
+    - **SMALL-ORDER is libsodium's blocklist** (`ge25519_has_small_order`), seven rows compared
+      with the SIGN BIT MASKED: the five y coordinates of the eight torsion points (0, 1, p - 1
+      and the two of order 8) and the non-canonical twins p and p + 1. Masking covers both x of
+      each y, and the x = 0 "negative zero" RFC 8032 refuses. It is a TABLE in `Ed25519.cpp`, and
+      it was re-derived independently before it was trusted -- the subgroup generated in exact
+      arithmetic from the order-8 point, and every y + p below 2^255 decoded -- because a
+      blocklist copied wrong refuses nothing and passes every test that uses the same copy. The
+      test file spells its OWN copy for the same reason.
+    - **NON-CANONICAL is y at or above p**, which Monocypher accepts ("*Allow* non-cannonical
+      encoding" in `crypto_eddsa_check_equation`, `fe_frombytes` masking bit 255 and reducing)
+      and RFC 8032 section 5.1.3 refuses. Ten of the nineteen such spellings decode to points
+      that are NOT of small order (y + p for y in 3-6, 9, 10, 14-16, 18): nobody holds their
+      discrete logarithms, so none can sign, but each is a second spelling of a point, and a
+      revocation or a roster keyed on bytes would miss the twin. Refused for A and for R.
+    - **A MIXED-order key is not refused**: telling one apart takes a multiplication by L, and it
+      grants nothing a freshly minted key does not -- only the holder of the honest half signs.
+      So a REVOCATION is per key bytes: a forgotten holder's A0 + T reads as unknown, not
+      revoked (`consensus-and-cluster.md`, "per key BYTES, not per HOLDER").
+  - **And every door a key ENTERS by asks the same predicate and refuses BY NAME, before anything
+    is stored or approved.** The verify is the guarantee; the door is where somebody is TOLD, and
+    where a key that proves nothing is kept out of a list an operator reads and compares. The
+    doors on master: `ParseEd25519PublicKey` (every flag and verb reading a key as TEXT --
+    `--raft-peer`, `--cluster-admit[-learner]`, `--cluster-admit-worker`, `--voter-key`, the
+    cli's `cluster-admit`, the leader's `ClusterAdmit` and `ClusterAdmitWorker`);
+    `SchedulerService::AdmitPrincipal`, which takes BYTES, since an enrollment approval hands
+    over the key its row holds; the enrollment door (`EnrollmentResponder::AnswerEnroll`, the
+    malformed row: no build mints such a key); `ValidateAgainst` and `Apply`
+    (`KeyStanding::Unusable`, asked first, since it is a fact about the POINT); `DecodeState`'s
+    roster rules; and `DecodeRoster`, by the holder's name. A REVOKED entry is not asked --
+    revoking a key that proves nothing grants nothing. A key reaching a VERIFY only (a discovery
+    proof, a node proof, a Raft handshake, an endorsement, a lease) needs no door of its own.
+    A node's OWN key is derived by `Ed25519KeyPair::FromSeed` from a clamped scalar, which is
+    never of small order, and its file is refused when the stored half disagrees.
   - Secrets at the seam live in `SecureByteBuffer`, temporaries are wiped with `SecureZero` --
     the tree's one zeroing primitive, rather than Monocypher's `crypto_wipe` beside it -- and the
     names they are held under are rows of `scripts/check-credential-containers.sh`, which since

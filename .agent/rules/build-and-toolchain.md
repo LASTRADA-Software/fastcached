@@ -3390,6 +3390,28 @@ makes it anyway and says so there.
   findings, and refuses to print a clean verdict it did not earn. Use it, and if you
   write a one-off loop instead, make it fail loudly the same way.
 
+  **The exit status and the output are read TOGETHER, per unit.** A non-zero exit is
+  how clang-tidy reports findings AND how it reports a unit it did not process, and
+  the second can come with no diagnostic line at all. The sweep used to read only
+  `rc ≥ 126` as a failure and filter everything else through `grep 'error:|warning:'`,
+  so a unit exiting 1 in silence was summed into `CLEAN` -- measured end to end with a
+  stub that did exactly that on all 698 units: `TIDY SWEEP CLEAN (502 of 504
+  file(s) contributed code …)`, exit 0. `TidyUnitVerdict` now answers `unanalysed`
+  for it, and the table fails CLOSED: `clean` needs a zero exit, or a non-zero one
+  whose only DIAGNOSTIC lines are unknown-warning-option ones -- non-diagnostic lines
+  (`Error while processing`, `Stack dump:`) are tolerated there, because a crash exits
+  at or above 126 and is `fatal` first -- measured under Git Bash for a RELEASE-CRT
+  program: an access violation 139, a stack overflow, `__fastfail` and `abort()` 127. A
+  Debug-CRT `abort()` exits 3 (measured), and the pinned 22.1.8 `clang-tidy.exe` is a
+  release-CRT build by its import table (`VCRUNTIME140`, `MSVCP140`, `api-ms-win-crt-*`;
+  no `ucrtbased`, `vcruntime140d` or `msvcp140d`); a Debug-CRT crash with no diagnostic
+  line would land on `unanalysed`, still a failure -- and "no checks enabled" is the canary's
+  question. Those lines are judged by their TAG at the end of the line, never by the
+  words: a substring filter swallowed a finding that mentioned them. The build's
+  own path, `CMAKE_CXX_CLANG_TIDY` (what `local-gate.sh`'s clang-debug leg runs),
+  already fails: CMake's co-compile step returns clang-tidy's status and builds no
+  object, measured against the same stub.
+
   "Refuses a verdict it did not earn" is four separate refusals, and each one closes
   a path that ends in `CLEAN` over nothing: the plan's exit status is *observed*
   (`mapfile < <(plan)` throws it away, and every way a compile database can fail to
@@ -3810,6 +3832,20 @@ carriage return, so such a script does not misbehave — it fails to start at al
     (166880b6) and took `Linux-gcc-release` red — so **the source is not the place**,
     and a fourth attempt needs a GCC 16 AND a g++-13/14 before it lands.
 
+- **Fatality is spelled per FRONTEND: `-Werror` on a GNU-style driver, `/WX` on an
+  MSVC-style one, `clang-cl` included** (it has clang's ID and MSVC's frontend, so it
+  takes `/W4` and therefore `/WX`). The MSVC `/WX` sat commented out from the first
+  commit, so no Windows preset was ever fatal, while AGENT.md said warnings break the
+  Windows build. Master's four Windows CI legs were green over fourteen first-party
+  warning sites, and the fatality table asserted the absence as correct.
+  - On MSVC a warning `/W4` makes visible is fixed at the source. One that reports
+    INTENDED behaviour, with no source change that keeps the behaviour, is a
+    `<flag>|<rationale>` row of `PEDANTIC_COMPILER_MSVC_SUPPRESSIONS` in
+    `cmake/PedanticSuppressions.cmake`, applied beside `/W4` — a statement about which
+    warnings exist, so `PEDANTIC_COMPILER`'s. It is never a `#pragma` at the site and
+    never a fatality exemption. C4324 is such a row: `alignas` padding
+    `InMemoryLruStorage`'s cache-line layout, and every struct holding one.
+
 - **`ctest -R pedantic-suppressions` is the reader, and it DRIVES the file rather
   than scanning it.** It includes `PedanticCompiler.cmake` twice per compiler
   persona — the pair `CMAKE_CXX_COMPILER_ID`/`CMAKE_CXX_COMPILER_FRONTEND_VARIANT`,
@@ -3827,12 +3863,14 @@ carriage return, so such a script does not misbehave — it fails to start at al
 
 - A guard nobody has watched refuse is not a guard, and *"it was seen failing before
   the fix"* is a fact about one commit that stops reproducing the moment the fix
-  lands. `ctest -R pedantic-suppressions-selftest` runs **ten cases** -- eight
+  lands. `ctest -R pedantic-suppressions-selftest` runs **fourteen cases** -- twelve
   synthetic subjects plus two absent inputs -- and names every one on every run,
   because a figure that disagrees with what the tool prints is the defect #723
-  exists to prevent. Three are shapes an unwatched guard accepts: the suppression
-  **copied** outward rather than moved, a subject that no longer adds `-pedantic`,
-  and an MSVC arm that adds nothing.
+  exists to prevent. Four are shapes an unwatched guard accepts: the suppression
+  **copied** outward rather than moved, one added **outside every condition** (in
+  each spelling family, `-Wno-X`, `-wdN`, `/w` and `-w`, since a classifier that
+  knew `/wdN` passed the rest), a subject that no longer adds `-pedantic`, and an
+  MSVC arm that adds nothing.
   - **The sharpest instance of it is a mode a failing tool tells you to re-run in.**
     `check-e2e-helpers.sh --case NAME` ended in a literal `exit 0`, so a run printing
     `BUG: the bound is sleeping through commands that have already finished` and a
@@ -6031,6 +6069,43 @@ drive letter, a different distro and possibly WSL1. What transfers is *the build
 belong on a filesystem reached over a protocol*; what does not transfer is any of the numbers
 below.
 
+### git in a work tree both operating systems use re-hashes every tracked file
+
+The sources staying on `/mnt/<drive>` has one cost that no build-tree move removes, and it
+reads like a hang. **Windows git and WSL git in one work tree each re-hash every tracked file
+after the other has run.** The index caches per-file stat data, and the two record different
+stat data for the same DrvFs file. Each therefore finds every entry changed, and re-reads and
+re-hashes the whole tree over 9p before it can answer. A configure meets it whenever the other
+operating system's git touched the index last: `cmake/Version.cmake` runs `git status` for the
+version string's dirty suffix, so a lane that alternates a Windows `cl-debug` configure with a
+WSL gate configure in one worktree pays it on every WSL configure.
+
+Measured on 2026-09-28, in one worktree on `/mnt/d` (1,355 tracked files), WSL git 2.53.0 against
+Git for Windows, `git status --porcelain --untracked-files=no` timed with a monotonic clock at
+load1 of about 5-6:
+
+<!-- table-total: none -->
+| sequence | WSL `git status` |
+|---|---|
+| WSL after WSL, three times | 1.90, 1.94, 1.96 s |
+| WSL after a Windows `git status` (0.27-0.32 s), three rounds | 9.30, 8.88, 8.66 s |
+| WSL after WSL again, twice | 1.76, 1.81 s |
+
+About 4.6 times the cost, and it grows with load: the first WSL status after a Windows build of
+that tree took 148 s (load1 1.55 when it started, rising past 20 during the session), and in the
+same session the TAG `describe`,
+which never touches the work tree, once took 26.8 s. So **a git query on `/mnt/<drive>` has no
+bound worth writing down**, and no cheaper command removes the re-hash: any correct dirty
+check must stat every tracked file. `--no-optional-locks` makes it worse, since it never writes
+the refreshed index back, and `diff-index` without a refresh reports every stat mismatch as a
+change.
+
+That is why `cmake/Version.cmake` does not treat a query that did not answer within its bound
+as a negative. It names what that query lost -- the tag, the distance, or the dirty state
+(`-dirty-unknown`) -- and makes the version Provisional, which `FASTCACHED_REQUIRE_EXACT_VERSION`
+refuses. The 20 s bound stays: raising it hides the cost this section names.
+`ctest -R version-git-unanswered` drives each query past a small injected bound.
+
 ### The measurement, pinned (2026-09-18)
 
 Conditions are PINNED here and deliberately do not point at their source: a measurement's
@@ -6555,6 +6630,60 @@ ruled out — an over-report that points sites at exemptions they do not need.
 is deliberately outside it. For argv, the target is `std::span<char* const>{argv, argc}.subspan(1)`,
 because argv is the raw array `std::span` exists for and an `iota(1, argc)` still indexes a bare
 pointer.
+
+## An MSVC-style debug-info link is never incremental
+
+<!-- agent-tripwire: No MSVC-style debug-info link is incremental -->
+
+CMake links Debug and RelWithDebInfo with `/debug /INCREMENTAL` on an MSVC-style toolchain.
+`cmake/IncrementalLink.cmake` rewrites the EXE, SHARED and MODULE linker flags of both to
+`/INCREMENTAL:NO`, in one place, before any dependency or target exists, and
+`ctest -R incremental-link` reads the GENERATED `build.ninja` rather than the module's word
+for it (the configure-output rule above).
+
+**What failed.** Five times on one Windows host on 2026-09-28, in two lanes' `cl-debug`
+trees, the incremental relink of a test executable stopped with
+`X.obj : fatal error LNK1163: invalid selection for COMDAT section 0x2F53`. Each time the
+section was the vftable of a header-inline polymorphic test class, a pick-LARGEST COMDAT
+that every including object declares identically, just after a header edit recompiled those
+objects. A plain retry with nothing recompiled linked.
+
+**The cause is INCONCLUSIVE, and the mitigation does not wait for it.** A standalone
+reproduction with this tree's flags failed 0 times in 860 links: 250 each with no launcher, a
+warm cache and a cold cache, and 110 with `/INCREMENTAL:NO`. Its control never failing means
+it clears nothing and implicates nothing, so it is not evidence for either reading. Every tree
+that failed builds through `fastcache-cc`, so *where* it happened cannot separate launcher from
+linker. What a launcher-fronted tree differs in is two things. (i) The bytes a HIT restores:
+measured identical to `cl`'s own apart from the one-byte COFF timestamp, and both failing
+objects that could be placed were `cl`'s own MISS output. (ii) The `/Z7` that
+`cmake/portable/CompileCache.cmake` forces. Neither is launcher CODE acting at link time; (ii)
+is a configuration. What survives either reading is incremental-link state, and a link that
+keeps no `.ilk` has none to go stale.
+
+**So it is never gated on the launcher.** A gate there bets on the one reading the evidence
+cannot make, and leaves `/Zi` plus `/INCREMENTAL` exposed, which was never tested. Two
+spellings are not stacked: the module REMOVES every form of the switch and states one, because
+which of two spellings wins is the linker's choice, and `/debug` with no switch at all links
+incrementally by default.
+
+**What it costs**, measured on the real `fastcache-compile-node-tests` inputs (118 objects,
+410 MB, copied out of an idle tree), with link 14.51.36252 on a host at 100% CPU and 9
+interleaved pairs:
+
+<!-- table-total: none -->
+| link | wall time |
+| --- | --- |
+| `/INCREMENTAL:NO`, full | 1.6-2.5 s, median 1.7 s |
+| `/INCREMENTAL`, one object changed | 0.3-2.7 s |
+
+That is at most about a second per link, and each test executable stops carrying a ~200 MB
+`.ilk`. These figures are conditions, not a constant: re-measure before citing them for a
+different executable or host.
+
+**clang-cl is covered by the same condition and is unaffected by it.** `MSVC` is true for cl
+and clang-cl. clang-cl links through `lld-link`, which never links incrementally and accepts
+`/INCREMENTAL:NO` silently (LLD 22.1.3, checked with `/debug`, alone and beside `/INCREMENTAL`).
+A GNU-style driver on Windows spells no such switch and is left alone.
 
 ## Open work
 

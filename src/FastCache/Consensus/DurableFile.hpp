@@ -28,7 +28,7 @@ namespace FastCache::Consensus
 /// `std::fopen` takes a narrow path, which on Windows is converted through
 /// the active code page — so a directory containing a character that page
 /// cannot represent would fail to open for a reason having nothing to do with
-/// the storage. `_wfopen` takes the `wstring` the path already holds there.
+/// the storage. `_wfsopen` takes the `wstring` the path already holds there.
 /// @param path File to open.
 /// @param mode An `fopen` mode string.
 /// @return The stream, or nullptr.

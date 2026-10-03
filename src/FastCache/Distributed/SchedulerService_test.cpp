@@ -2054,6 +2054,55 @@ TEST_CASE("An admission whose key is not one is refused and counted before anyth
     CHECK(counted(fleet) == expected);
 }
 
+TEST_CASE("An admission under a small-order or non-canonical key is refused by name, whichever verb carries it",
+          "[distributed][scheduler][cluster-admit][identity][security]")
+{
+    // Three doors onto the leader: a member's key as TEXT, a worker's as TEXT, and a principal's
+    // as BYTES, which is how an enrollment approval hands over the key its row holds and which the
+    // one parser never sees. Each refuses before anything is proposed, on the malformed-key row,
+    // naming the fault -- a small-order key admitted is one anybody can prove. The control is a
+    // real key through the same three doors, proposed and counting nothing.
+    auto const smallOrder = Ed25519PublicKey {};
+    auto const nonCanonical = [] {
+        auto key = Ed25519PublicKey {};
+        key.fill(std::byte { 0xFF });
+        key.front() = std::byte { 0xF0 };
+        key.back() = std::byte { 0x7F };
+        return key;
+    }();
+    auto const admitThrough = [](SchedulerService& service, std::string_view door, Ed25519PublicKey const& key) {
+        auto const text = FormatEd25519PublicKey(key);
+        if (door == "member")
+            return service.ClusterAdmit(
+                Insider, "node-c", "10.0.0.9:6675", std::string_view { text }, Cluster::MemberSeat::Voter);
+        if (door == "worker")
+            return service.ClusterAdmitWorker(Insider, "worker-c", text);
+        return service.AdmitPrincipal(Insider, "worker-c", key, Cluster::PrincipalRole::Worker);
+    };
+
+    for (auto const door: { std::string_view { "member" }, std::string_view { "worker" }, std::string_view { "principal" } })
+    {
+        INFO("door: " << door);
+        Admitting fleet;
+        auto expected = std::uint64_t { 0 };
+        for (auto const& [key, fault]: { std::pair { smallOrder, PublicKeyFault::SmallOrder },
+                                         std::pair { nonCanonical, PublicKeyFault::NonCanonical } })
+        {
+            auto const reply = admitThrough(fleet.Service(), door, key);
+            REQUIRE(reply.status == Wire::Status::Error);
+            CHECK(reply.error == Wire::ErrorCode::InvalidClusterChange);
+            CHECK(reply.message.contains(DescribePublicKeyFault(fault)));
+            CHECK(fleet.cluster.proposed.empty());
+            CHECK(fleet.leading.metrics.Read(IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey) == ++expected);
+        }
+
+        auto const accepted = admitThrough(fleet.Service(), door, Testing::TestKeyPair("node-c").PublicKey());
+        CHECK(accepted.status == Wire::Status::Ok);
+        CHECK(fleet.cluster.proposed.size() == 1);
+        CHECK(fleet.leading.metrics.Read(IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey) == expected);
+    }
+}
+
 TEST_CASE("An admission naming a revoked key is refused by the roster, and is not counted as malformed",
           "[distributed][scheduler][cluster-admit][identity]")
 {

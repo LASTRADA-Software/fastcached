@@ -257,6 +257,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Asymmetric crypto has ONE seam: `Core/Ed25519`, `Core/X25519`, `Core/Hkdf` over the vendored
   Monocypher (`ctest -R crypto-seam`), RFC 8032 Ed25519 and never Monocypher's default EdDSA over
   BLAKE2b; a missing primitive is added THERE.
+- Monocypher's COFACTORED verify accepts a SMALL-ORDER key — the all-zero key and signature
+  verified every message — so `Ed25519Verify` refuses a small-order or non-canonical A and R first,
+  and every door a key ENTERS by refuses one BY NAME (`Ed25519PublicKeyFaultOf`).
 - A credential lives in `SecureByteBuffer` and the wipe is an **allocator**, not a destructor.
   Container-agnostic is not SUFFICIENT — SSO keeps a short secret where no allocator is called, so
   a secret is never a `std::basic_string`: `SecureString` holds its characters in a `std::vector`,
@@ -531,9 +534,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A reply carries a status byte and NO kind, so step-over-what-you-do-not-know is REQUEST-side
   only: `Status::Progress` moved `MinSupportedVersion` with `CurrentVersion`. Its `static_assert`ed
   verb column, empty payload and terminal-status loop are in the rules file.
-- Silence is only measurable against something that would otherwise be said, so the worker's
-  cadence and the client's idle bound are ONE `static_assert`ed pair of numbers in
-  `CompileCacheWire`.
+- Silence is only measurable against something that would otherwise be said, so the worker's cadence
+  and the client's idle bound are ONE `static_assert`ed pair of numbers in `CompileCacheWire`.
 - A pulse is a SECOND writer for the length of the answer, so the endpoint settles it before it
   writes anything and one still parked past the bound ends the connection — `SettleWatch`'s rule on
   the write side, with the vacuous "every frame but the last is a pulse" test beside it.
@@ -647,10 +649,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   otherwise drops bytes. `Testing::ParkingReadableSocket` COUNTS orphans.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through
   `Schedule`/`CancelPending`, and bound any sleep a peer can move the deadline of.
-- A reactor resumes what it parks or FREES it, and may free only what nothing else owns —
-  `Schedule` BORROWS, so ownership travels with the park (`ParkedWork::abandon`) and what is freed
-  is the chain ROOT. Resuming is a hang, not an alternative; `Resume()` disowns and resumes in ONE
-  expression.
+- A reactor resumes what it parks or FREES it, and may free only what nothing else owns — `Schedule`
+  BORROWS, so ownership travels with the park (`ParkedWork::abandon`) and what is freed is the chain
+  ROOT. Resuming is a hang, not an alternative; `Resume()` disowns and resumes in ONE expression.
 - Re-declaring ONE overload in a derived interface HIDES the base's others, and here it hid the one
   carrying ownership. Nothing diagnoses it; the detection is the compiler, and the `no viable
   conversion` errors from converting the sites enumerate the defect's reach.
@@ -945,14 +946,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - `cmake/portable/CompileCache.cmake` stays stock-CMake-only and must never fail a configure: ask
   `ENABLED_LANGUAGES` first, and CHECK a flag rather than gating on a compiler-ID string. What it
   computes is checked as a computation (`ctest -R debug-prefix-map-rules`).
-- A sanitizer that is on in the cache is not one that is on in the build — a tool that silently
-  does nothing is worse than one that is visibly off.
+- A sanitizer on in the cache is not proof it is on in the build; a silent no-op is worse than off.
 - **`NDEBUG` is not optimisation, and `CMAKE_BUILD_TYPE` is a LABEL that decides nothing.** A
   benchmark states its build on **stderr** before any case runs and marks every figure, from a
   macro the COMPILER defines in the asking TU. `ctest -R bench-build-banner`.
 - A Windows **Debug** leg is run for `_ITERATOR_DEBUG_LEVEL=2`, not for the compiler, so it runs
-  `ctest` rather than only building: `iterator-debug-canary` must die and
-  `scripts/iterator-debug-gate.ps1` refuses a build where it survives.
+  `ctest`: `iterator-debug-canary` must die; `scripts/iterator-debug-gate.ps1` refuses it surviving.
+- **No MSVC-style debug-info link is incremental** (`cmake/IncrementalLink.cmake`): LNK1163 failed
+  relinks a retry cleared, cause INCONCLUSIVE, so never launcher-gated. `ctest -R incremental-link`.
 - **No executable raises a modal error dialog, and the BUILD installs that, never each `main`** —
   `cmake/ErrorPopups.cmake` attaches one TU to every executable and
   `ctest -R error-popup-coverage` reads the LINK LINES. A new `catch_discover_tests` names
@@ -990,9 +991,8 @@ what differs between compilers, standard libraries, hosts and tool versions.
   `scripts/ci-scope.sh` decides.
 - A **merge queue** is the third door to that same never-arrives failure: it dispatches
   `merge_group`, which `pull_request_target` does not fire on. Check the concurrency key, state
-  `merge_group` in the scope classifier, add no JOB to `build.yml`;
-  `ctest -R merge-queue-contexts`. **Neither the SET nor its COUNT is written in prose**, and
-  nothing GUARDS this.
+  `merge_group` in the scope classifier, add no JOB to `build.yml`; `ctest -R merge-queue-contexts`.
+  **Neither the SET nor its COUNT is written in prose**, and nothing GUARDS this.
 - A **CONFLICTING** pull request is the fourth door: GitHub computes no merge ref, so a
   `pull_request` workflow dispatches NOTHING and ITS contexts are ABSENT rather than pending —
   while `pull_request_target` ones report normally throughout, which is the tell pointing the wrong

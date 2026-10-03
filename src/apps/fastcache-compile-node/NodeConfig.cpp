@@ -177,7 +177,7 @@ namespace
     template <EnrollAction Action>
     [[nodiscard]] constexpr auto SelectEnrollAction() noexcept
     {
-        return [](auto& result, std::string_view value) -> std::expected<void, ConfigError> {
+        return [](auto& result, [[maybe_unused]] std::string_view value) -> std::expected<void, ConfigError> {
             auto& request = TargetOf<&NodeConfig::enroll>(result);
             request.action = Action;
 
@@ -220,7 +220,7 @@ namespace
     template <ClusterAction Action>
     [[nodiscard]] constexpr auto SelectClusterAction() noexcept
     {
-        return [](auto& result, std::string_view value) -> std::expected<void, ConfigError> {
+        return [](auto& result, [[maybe_unused]] std::string_view value) -> std::expected<void, ConfigError> {
             auto& request = TargetOf<&NodeConfig::cluster>(result);
             request.action = Action;
 
@@ -318,7 +318,7 @@ namespace
                 if (!key.has_value())
                     return std::unexpected(ArgvError(ConfigErrorCode::ParseError,
                                                      "cluster-admit-worker",
-                                                     std::string { DescribePublicKeyTextFault(key.error()) }));
+                                                     std::string { DescribePublicKeyFault(key.error()) }));
                 request.key = std::string { value.substr(0, at) };
                 request.value.clear();
                 request.publicKey = *key;
@@ -536,8 +536,8 @@ namespace
     {
         auto key = ParseEd25519PublicKey(sv);
         if (!key.has_value())
-            return std::unexpected(ArgvError(
-                ConfigErrorCode::ParseError, "voter-key", std::string { DescribePublicKeyTextFault(key.error()) }));
+            return std::unexpected(
+                ArgvError(ConfigErrorCode::ParseError, "voter-key", std::string { DescribePublicKeyFault(key.error()) }));
         return *key;
     }
 

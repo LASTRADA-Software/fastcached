@@ -1348,6 +1348,57 @@ TEST_CASE("A snapshot that breaks a rule of the roster is refused rather than ha
     bothLists.revokedKeys.clear();
     bothLists.principals.push_back(ClusterPrincipal { .id = "n1", .publicKey = KeyOf(0xB3), .role = PrincipalRole::Worker });
     CHECK(refusalOf(bothLists).contains("both as a member and as a principal"));
+
+    // A LIVE key no signature proves anything under, whichever list holds it -- and the control:
+    // the same key REVOKED is a state `Apply` can make, since revoking such a key grants nothing.
+    ClusterState smallOrderPrincipal;
+    smallOrderPrincipal.principals.push_back(
+        ClusterPrincipal { .id = "w1", .publicKey = Ed25519PublicKey {}, .role = PrincipalRole::Worker });
+    CHECK(refusalOf(smallOrderPrincipal).contains("small-order or non-canonical point"));
+
+    ClusterState nonCanonicalMember = liveRevoked;
+    nonCanonicalMember.revokedKeys.clear();
+    nonCanonicalMember.members.front().publicKey = KeyOf(0xFF);
+    CHECK(refusalOf(nonCanonicalMember).contains("small-order or non-canonical point"));
+
+    ClusterState revokedSmallOrder;
+    revokedSmallOrder.revokedKeys.push_back(RevokedKey { .id = "w1", .publicKey = Ed25519PublicKey {} });
+    CHECK(DecodeState(Encode(revokedSmallOrder)).has_value());
+}
+
+TEST_CASE("A key that is a small-order or non-canonical point is never admitted, by any verb, and is named",
+          "[cluster][state][identity][security]")
+{
+    // The courtesy and the guarantee, as for a revoked key: `ValidateAgainst` refuses it by the
+    // fault's name where an operator reads the answer, and `Apply` drops the command that was
+    // judged elsewhere and committed anyway. The all-zero key is the point under which the
+    // all-zero signature verifies every message; KeyOf(0xFF) is y = 2^255 - 1, at or above p.
+    ClusterState state;
+    Apply(state, Keyed(CommandKind::AdmitPrincipal, "w0", KeyOf(0xC1)));
+    auto const before = state;
+
+    for (auto const& [key, fault]: { std::pair { Ed25519PublicKey {}, PublicKeyFault::SmallOrder },
+                                     std::pair { KeyOf(0xFF), PublicKeyFault::NonCanonical } })
+    {
+        for (auto const& command: { Keyed(CommandKind::AdmitPrincipal, "w1", key),
+                                    Keyed(CommandKind::AddMember, "n1", key, "10.0.0.1:6675"),
+                                    Keyed(CommandKind::AddLearner, "n1", key, "10.0.0.1:6675") })
+        {
+            INFO("command " << static_cast<int>(command.kind) << ", key " << FormatEd25519PublicKey(key));
+            // The command alone is well formed; the key is what is refused.
+            CHECK(Validate(command).has_value());
+            auto const refused = RefusedAgainst(state, command);
+            CHECK(refused.code == ConsensusErrorCode::InvalidConfiguration);
+            CHECK(refused.context.contains(DescribePublicKeyFault(fault)));
+            CHECK(refused.context.contains(FormatEd25519PublicKey(key)));
+            Apply(state, command);
+            CHECK(state == before);
+        }
+    }
+
+    // The control: an ordinary key through the same verbs is admitted.
+    CHECK(ValidateAgainst(state, Keyed(CommandKind::AdmitPrincipal, "w1", KeyOf(0xC2))).has_value());
+    CHECK(ValidateAgainst(state, Keyed(CommandKind::AddMember, "n1", KeyOf(0xC3), "10.0.0.1:6675")).has_value());
 }
 
 TEST_CASE("A peer's key rides the same token after an @, and a key that is not one is refused as a key",
@@ -1376,7 +1427,7 @@ TEST_CASE("A peer's key rides the same token after an @, and a key that is not o
     auto const shortKey = ParseMemberSpec(std::format("n1=10.0.0.1:6680@{}", keyText.substr(0, 42)));
     REQUIRE_FALSE(shortKey.has_value());
     CHECK(shortKey.error().contains("names a key that is not one"));
-    CHECK(shortKey.error().contains(DescribePublicKeyTextFault(PublicKeyTextFault::WrongLength)));
+    CHECK(shortKey.error().contains(DescribePublicKeyFault(PublicKeyFault::WrongLength)));
 
     // A second `@` is a token nobody wrote correctly: no host contains one and no key does.
     CHECK_FALSE(ParseMemberSpec(std::format("n1=h@st:6680@{}", keyText)).has_value());

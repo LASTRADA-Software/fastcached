@@ -1283,9 +1283,6 @@ std::string LaunchctlStatusText(LaunchctlReadings const& readings)
 
 namespace
 {
-    /// One-line description registered with the SCM (shown in services.msc).
-    constexpr std::string_view ServiceDescription = "fastcached — fast cache daemon";
-
     /// Standard "needs elevation" guidance reused across SCM error paths.
     [[nodiscard]] std::string ElevationHint(std::string_view action)
     {

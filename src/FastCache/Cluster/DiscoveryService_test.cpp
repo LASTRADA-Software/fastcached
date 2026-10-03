@@ -573,6 +573,44 @@ TEST_CASE("A proof whose signature does not verify is counted as forged and name
     CHECK(bob.service.PendingChallenges() == 0);
 }
 
+TEST_CASE("A proof under the all-zero key with the all-zero signature is forged, and no admission is suggested for it",
+          "[cluster][discovery][service][security]")
+{
+    // The small-order forgery, end to end on the wire and with a real challenge: nobody signed
+    // anything, and before the seam refused a small-order key this "verified" for every nonce.
+    // Then it reached the roster question as an UNKNOWN key and was reported with the
+    // `--cluster-admit` that would admit it -- a command naming a key anybody can prove, which the
+    // report's own premise ("only its holder could have signed this") made look safe to paste.
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
+    ScriptedSecureRandom random { NonceScript({ 7 }) };
+    CapturingLogger logger;
+
+    auto const roster = SharedRoster::Of({ "alice", "bob" });
+    Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", roster };
+    Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", roster };
+
+    REQUIRE(alice.service.SendBeacon());
+    REQUIRE(bob.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);
+    REQUIRE(alice.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
+    auto const captured = alice.socket->receive(1ms);
+    REQUIRE(captured.has_value());
+    REQUIRE(DiscoveryWire::DecodeChallenge(captured->payload).has_value());
+
+    // Answering for alice, at the endpoint that was challenged -- the only answer bob will judge --
+    // with bytes that do not depend on the nonce at all.
+    auto const proof =
+        DiscoveryWire::Proof { .nodeId = "alice", .raftEndpoint = "10.0.0.1:7000", .publicKey = {}, .signature = {} };
+    REQUIRE(alice.socket->send(DiscoveryWire::EncodeProof(proof), AtEndpoint("10.0.0.2:7000")).has_value());
+
+    CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::ProofRejected);
+    CHECK(bob.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedForged) == 1);
+    CHECK(bob.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey) == 0);
+    CHECK(bob.directory.AuthenticatedPeers().empty());
+    CHECK(Warned(logger, "--cluster-admit") == 0);
+    CHECK(Warned(logger, FormatEd25519PublicKey(Ed25519PublicKey {})) == 0);
+}
+
 TEST_CASE("Proofs under keys the roster does not accept are all counted and reported at most once a minute",
           "[cluster][discovery][service]")
 {

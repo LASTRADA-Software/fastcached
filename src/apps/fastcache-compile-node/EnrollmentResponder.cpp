@@ -4,6 +4,7 @@
 
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/Utf8.hpp>
@@ -227,6 +228,19 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
                           std::format("an enroll request names an id, and a {} {} a consensus endpoint",
                                       role.name,
                                       role.statesEndpoint ? "must name" : "names no"));
+
+    // A key no signature can PROVE anything under -- a small-order point, or a non-canonical
+    // spelling of one -- is refused at the door too, before the window records a row an operator
+    // might approve: approving it would admit a key anybody can forge for. No build of this
+    // software mints one (`Ed25519KeyPair::FromSeed`), so this is the malformed row: the request
+    // came from no version of this client.
+    if (auto const fault = Ed25519PublicKeyFaultOf(fields->publicKey); fault.has_value())
+        return Cc::Refuse(_metrics,
+                          { .code = Wire::ErrorCode::MalformedFrame,
+                            .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed },
+                          std::format("{} cannot be enrolled: {}",
+                                      FormatEd25519PublicKey(fields->publicKey),
+                                      DescribePublicKeyFault(*fault)));
 
     // A key the cluster has REVOKED is refused at the door (#1555), before the window records
     // anything. No approval could admit it -- `Cluster::ValidateAgainst` refuses it by name --

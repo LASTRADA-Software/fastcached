@@ -112,7 +112,23 @@ $NoLocalCache = "--cache-memory=0"
 # launcher is a string prefix comparison. The reconciliation added for issue #66
 # handles that now, but a fixture whose roots are ambiguous is testing the
 # reconciliation as well as its own property.
-$scratch = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "dist-e2e"
+#
+# The BASE of every run. Each run claims a root of its own under it
+# (`New-E2ERunRoot`, never reused), and each driver gets a directory of its own under
+# that and a port block of its own (see the driver loop), because a process is not
+# known to be gone when whatever follows it starts: `Stop-Spawned` bounds its wait
+# and a killed process can outlive the bound. Between RUNS the same thing happened:
+# with one root cleared at each start, an immediate rerun died in 0 s on
+# "raft-log ... being used by another process" while the holders' PIDs sat in the
+# previous run's log. So old roots are swept best-effort, and one that will not go
+# is reported with the processes whose command line names it. With one directory shared between the
+# drivers, the second one's `Remove-Item` met the first one's isolation worker
+# still holding `iso-worker.log` and failed the run with "being used by another
+# process" -- a teardown overlap reported as a fault of the case that ran next.
+# Not a LOG name problem: with every kill made late, the same removal met the
+# isolation scheduler's `raft-log` first, and a state directory has no per-driver
+# name to give it. Waiting longer only moves that line; sharing nothing removes it.
+$scratchBase = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "dist-e2e"
 
 # How many consecutive ports the run needs, counted from `$BasePort`.
 #
@@ -169,23 +185,23 @@ function Get-FreePortBlock([int]$count) {
     throw "could not find $count consecutive free ports"
 }
 
-# Not under `-SelfTest`, which drives no process and opens no socket -- which is
-# precisely why CMake keeps it in the DEFAULT ctest set rather than labelling it
-# `smoke`. Probing here would give that case eight connect attempts it has no use
-# for, and a way to fail ("could not find 8 consecutive free ports") on a machine
-# whose ports are none of its business.
-if (-not $SelfTest -and $BasePort -eq 0) { $BasePort = Get-FreePortBlock $PortsNeeded }
-
-$cachePort    = $BasePort
-$dispatchPort = $BasePort + 1
-$workerPort   = $BasePort + 2
-# Each scheduler's consensus port (#178): a scheduler is a cluster of one, bound to
-# loopback where nothing dials it. +6 and +7 were free since the dedicated compile port
-# went.
-$schedRaftPort = $BasePort + 6
-$isoRaftPort   = $BasePort + 7
+# What the caller pinned, if anything. The block itself is drawn per DRIVER, inside
+# the driver loop, for the reason `$scratchBase` gives: a process of the previous
+# driver that outlived its teardown bound still holds its ports, and a fresh draw
+# steps around it where a shared block would fail the next bind. A pinned block is
+# shared by every driver, because pinning one is asking for exactly that.
+#
+# Not probed under `-SelfTest`, which never reaches the driver loop and opens no
+# port of its own -- which is precisely why CMake keeps it in the DEFAULT ctest set
+# rather than labelling it `smoke`. Probing there would give that case connect
+# attempts it has no use for, and a way to fail ("could not find 9 consecutive free
+# ports") on a machine whose ports are none of its business.
+$PinnedBasePort = $BasePort
 
 $procs = @()
+# What each spawned process was started AS, keyed by PID, so a teardown that finds
+# one still running can say which one it is rather than only that one is.
+$spawnedCommandLines = @{}
 
 # Quote the arguments Start-Process will not quote for you.
 #
@@ -227,23 +243,22 @@ function Start-Background([string]$path, [string[]]$arguments, [string]$errorLog
         PassThru              = $true
         RedirectStandardError = $errorLog
     }
-    if ($IsWindows) { return Start-Process @common -WindowStyle Hidden }
-    return Start-Process @common
+    $proc = if ($IsWindows) { Start-Process @common -WindowStyle Hidden } else { Start-Process @common }
+    $script:spawnedCommandLines[$proc.Id] = (@($path) + @($common.ArgumentList)) -join ' '
+    return $proc
 }
+
+# The teardown DECISION -- kill, confirm each process EXITED within one shared
+# bound, name what did not -- is shared with node-scratch-isolation-e2e.ps1, and
+# its cases run from `-SelfTest` below.
+Import-Module (Join-Path $PSScriptRoot "lib/E2EProcesses.psm1") -Force
 
 function Stop-Spawned {
     # Every spawned process, on every exit path. One left holding a port makes the
-    # NEXT run fail at startup for a reason unrelated to what actually broke.
-    foreach ($p in $script:procs) {
-        if ($null -eq $p) { continue }
-        # Both swallow deliberately: a process that exited between the check and
-        # the Kill throws, and so does WaitForExit on a handle that is already
-        # gone. Cleanup runs on every exit path INCLUDING the failing ones, so
-        # anything thrown here would replace the real diagnostic with a secondary
-        # one about tearing down.
-        try { if (-not $p.HasExited) { $p.Kill() } } catch { $null = $_ }
-        try { $p.WaitForExit(5000) | Out-Null } catch { $null = $_ }
-    }
+    # NEXT run fail at startup for a reason unrelated to what actually broke -- so
+    # one that outlives the bound is NAMED, rather than returned from in silence.
+    $survivors = @(Stop-E2EProcesses $script:procs $script:spawnedCommandLines)
+    foreach ($line in $survivors) { Write-Host "teardown: $line" }
     $script:procs = @()
 }
 
@@ -959,6 +974,14 @@ function Invoke-SelfTest {
         } finally {
             $listener.Stop()
         }
+
+        # ---- the teardown's report --------------------------------------
+        #
+        # The cases live beside the decision, in `lib/E2EProcesses.psm1`; running
+        # them here also proves this fixture's import of it works.
+        $teardown = Invoke-E2EProcessesSelfTest
+        $script:selfTestCases += $teardown.Cases
+        $script:selfTestFailures += $teardown.Failures
     } finally {
         Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
     }
@@ -968,10 +991,10 @@ function Invoke-SelfTest {
     # down in a comment anywhere: it moves whenever a case is added, and a
     # restated total is a second thing to be wrong.
     if ($script:selfTestFailures -ne 0) {
-        Write-Host "dist-compile-e2e self-test FAILED ($script:selfTestFailures of $script:selfTestCases case(s): object comparison and the readiness waits)"
+        Write-Host "dist-compile-e2e self-test FAILED ($script:selfTestFailures of $script:selfTestCases case(s): object comparison, the readiness waits, the teardown report and scratch roots)"
         return 1
     }
-    Write-Host "dist-compile-e2e self-test PASSED ($script:selfTestCases case(s): object comparison and the readiness waits)"
+    Write-Host "dist-compile-e2e self-test PASSED ($script:selfTestCases case(s): object comparison, the readiness waits, the teardown report and scratch roots)"
     return 0
 }
 
@@ -1002,7 +1025,13 @@ $Drivers = @(
     @{ Name = "clang-cl"; Rules = @{ Sections = @();                       TailMayDiffer = $false } }
 )
 
+$runRoot = $null
 try {
+    # Old roots first, reported and never fatal; then this run's own: see `$scratchBase`.
+    foreach ($line in @(Clear-E2EStaleRoots -Base $scratchBase)) { Write-Host "stale scratch: $line" }
+    $runRoot = New-E2ERunRoot -Base $scratchBase
+    $scratchRoot = $runRoot.Path
+    Write-Host "== scratch root for this run: $scratchRoot"
     foreach ($driver in $Drivers) {
         $cc = $driver.Name
         $rules = $driver.Rules
@@ -1011,8 +1040,19 @@ try {
             continue
         }
 
-        if (Test-Path $scratch) { Remove-Item -Recurse -Force $scratch }
+        # This driver's own directory and its own port block -- nothing the previous
+        # driver's processes could still be holding (see `$scratchBase`).
+        $scratch = Join-Path $scratchRoot $cc
         New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+        $BasePort = if ($PinnedBasePort -ne 0) { $PinnedBasePort } else { Get-FreePortBlock $PortsNeeded }
+        $cachePort    = $BasePort
+        $dispatchPort = $BasePort + 1
+        $workerPort   = $BasePort + 2
+        # Each scheduler's consensus port (#178): a scheduler is a cluster of one, bound
+        # to loopback where nothing dials it. +6 and +7 were free since the dedicated
+        # compile port went.
+        $schedRaftPort = $BasePort + 6
+        $isoRaftPort   = $BasePort + 7
 
         # No key file (#178 PR 6): every scheduler signs with its own identity key, a
         # worker CHECKS the signature when it is given that key with --voter-key, as each
@@ -1024,7 +1064,7 @@ try {
             continue
         }
         $ranAnyCompiler = $true
-        Write-Host "== driver: $cc"
+        Write-Host "== driver: $cc (ports $BasePort..$($BasePort + $PortsNeeded - 1), scratch $scratch)"
 
         # Statistics are per-user state; keep this run out of the developer's log.
         $env:LOCALAPPDATA = Join-Path $scratch "state"
@@ -1455,6 +1495,8 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
     $exit = 1
 } finally {
     Stop-Spawned
+    # Released LAST, once nothing this run started should still be writing under it.
+    if ($null -ne $runRoot) { $runRoot.Claim.Dispose() }
 }
 
 exit $exit

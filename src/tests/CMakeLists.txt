@@ -10,6 +10,8 @@ file(GLOB_RECURSE FASTCACHE_TEST_SOURCES
 
 add_executable(FastCacheTest
     test_main.cpp
+    # The shared test helpers' own cases: not under src/FastCache, so the glob above cannot reach them.
+    ScratchPath_test.cpp
     ${FASTCACHE_TEST_SOURCES}
 )
 
@@ -948,6 +950,28 @@ set_tests_properties("version-fallback-warning" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
+)
+
+# A git query that does not answer is never read as its negative: an unanswered dirty check
+# is `-dirty-unknown` and never "clean", an unanswered distance fails the git-tag row and never
+# yields the bare tag, and either makes the version Provisional, so
+# FASTCACHED_REQUIRE_EXACT_VERSION refuses it. Drives the real GetVersionInformation against a
+# stub git (a `.cmd` on Windows, a shell script elsewhere) that holds one chosen query past an
+# injected bound. The all-answer cases are the positive control that the stub ran. PASS as well
+# as FAIL: the script refuses when fewer cases ran than it calls, and the count line must be
+# printed at all, so a run that stopped before judging anything is not a pass.
+add_test(
+    NAME "version-git-unanswered"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/version-git-unanswered"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-version-git-unanswered.cmake"
+)
+set_tests_properties("version-git-unanswered" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    PASS_REGULAR_EXPRESSION "version-git-unanswered: [0-9]+ case\\(s\\) run"
+    LABELS "hygiene"
+    TIMEOUT 180
 )
 
 # ---------------------------------------------------------------------------
@@ -2188,10 +2212,11 @@ set_tests_properties("pedantic-suppressions" PROPERTIES
 # And the half that proves the above can refuse. It was watched failing on
 # 0db96dc8, naming exactly the four suppressions once per GNU-style persona -- but
 # that is a fact about one commit and stops reproducing the moment the fix lands.
-# This runs ten cases instead -- eight synthetic subjects plus two absent inputs --
-# and names each one on every run, because a stated figure that disagrees with what
-# the tool prints is the defect #723 exists to prevent. Three are shapes an
-# unwatched guard accepts: the suppression COPIED outside rather than moved, a
+# This runs fourteen cases instead -- twelve synthetic subjects plus two absent
+# inputs -- and names each one on every run, because a stated figure that disagrees
+# with what the tool prints is the defect #723 exists to prevent. Four are shapes an
+# unwatched guard accepts: the suppression COPIED outside rather than moved, one
+# added outside every condition (in four spellings: `-Wno-X`, `-wdN`, `/w`, `-w`), a
 # subject that no longer adds `-pedantic`, and an MSVC arm that adds nothing.
 #
 # The copied one is why the check compares flag COUNTS rather than membership: a
@@ -3888,9 +3913,17 @@ if(NOT WIN32)
             NAME "tidy-sweep-selftest"
             COMMAND ${FASTCACHED_BASH44} "${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh" --self-test
         )
+        # `PASS_REGULAR_EXPRESSION` replaces the exit status as the verdict, and that is
+        # the point: an EARLY STOP -- a `return 0` planted at the top of `SelfTest`, a helper
+        # that returns before its block -- exits 0 having judged nothing, and ctest scored
+        # it green on the exit code alone (measured). The script prints the line only once
+        # every case ran, the case count agreed with `SelfTestCases`, and nothing failed.
+        # `FASTCACHED_SCRIPT_CHECK_FAILED` is the tree's one spelling for a `cmake -P`
+        # check's verdict and does not apply: this is a bash self-test naming its own pass.
         set_tests_properties("tidy-sweep-selftest" PROPERTIES
             LABELS "hygiene"
             SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "TIDY SWEEP SELF-TEST PASSED"
             TIMEOUT 60
         )
     else()
@@ -6389,8 +6422,14 @@ if(NOT WIN32)
         NAME "repair-worktree-pointers-selftest"
         COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/repair-worktree-pointers.sh" --self-test
     )
+    # `PASS_REGULAR_EXPRESSION` as well, for `tidy-sweep-selftest`'s reason: an EARLY
+    # STOP exits 0 having judged nothing (a planted `return 0` printed nothing and ctest
+    # said Passed, measured), and the script prints its pass line only once the count of
+    # checks matched `RepairSelfTestChecks` and none failed. The skip arms' lines end
+    # `-- SKIPPED: ...` and cannot match it, and SKIP_RETURN_CODE still decides a skip.
     set_tests_properties("repair-worktree-pointers-selftest" PROPERTIES
         FAIL_REGULAR_EXPRESSION "REPAIR SELF-TEST FAILED:"
+        PASS_REGULAR_EXPRESSION "REPAIR SELF-TEST PASSED"
         LABELS "hygiene"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
@@ -7292,6 +7331,38 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-error-popups-selftest.cmake"
 )
 set_tests_properties("error-popup-coverage-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+# No MSVC-style link in a debug-info configuration is incremental (cmake/IncrementalLink.cmake
+# says why, and what it costs). `incremental-link` reads the GENERATED build.ninja -- the
+# module's configure output is its claim, the link line the artefact -- and SKIPs by name on a
+# toolchain or configuration with no `/INCREMENTAL` to judge. Its self-test stages both
+# directions, since a guard nobody has watched refuse is not known to work.
+add_test(
+    NAME "incremental-link"
+    COMMAND ${CMAKE_COMMAND}
+        "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DCONFIG=$<CONFIG>"
+        "-DMSVC_STYLE=$<BOOL:${MSVC}>"
+        -DANCHOR=FastCacheTest
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-incremental-link.cmake"
+)
+set_tests_properties("incremental-link" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+add_test(
+    NAME "incremental-link-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/incremental-link-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-incremental-link-selftest.cmake"
+)
+set_tests_properties("incremental-link-selftest" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 120

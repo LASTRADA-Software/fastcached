@@ -32,6 +32,14 @@ vendored copy does not get it — the module still works anywhere, but the prope
 it relies on is checked only here. Whoever copies it inherits the flags and not
 the check.
 
+`PedanticCompiler.cmake` carries no project's warning decisions. A project that
+suppresses an MSVC warning `/W4` makes visible sets
+`PEDANTIC_COMPILER_MSVC_SUPPRESSIONS` before including it, one
+`<flag>|<rationale>` row per warning, and the module applies them beside `/W4`,
+under `PEDANTIC_COMPILER`. A row without a rationale stops the configure, and so
+does a `;` inside a row, which a list splits in two. Left unset, nothing is
+suppressed. This project's rows are in `../PedanticSuppressions.cmake`.
+
 ## `CompileCache.cmake`
 
 Picks a compiler-cache launcher — `fastcache-cc`, `sccache` or `ccache` — and,

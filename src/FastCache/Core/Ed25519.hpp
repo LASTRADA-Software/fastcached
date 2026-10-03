@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -105,11 +106,14 @@ class Ed25519KeyPair
 /// L is REFUSED, so a valid signature cannot be turned into a second valid signature of the
 /// same message by adding L to it. An R or an A that is not a point on the curve is refused.
 ///
-/// One leniency, stated rather than left to be found: Monocypher accepts a NON-CANONICAL
-/// encoding of R or A -- a y coordinate at or above p, where RFC 8032 §5.1.3 has decoding
-/// fail (`crypto_eddsa_check_equation`, "*Allow* non-cannonical encoding"). Only a point
-/// whose y is below 19 has such a second spelling, so an honestly made signature or key has
-/// none in practice, and this seam does not re-check it.
+/// **And an A or an R that `Ed25519PublicKeyFaultOf` faults is refused BEFORE Monocypher is
+/// asked.** Monocypher checks the COFACTORED equation, [8](SB - hA - R) = 0, and multiplying by 8
+/// sends every point of small order to the identity -- so with a small-order A, a small-order R
+/// and S = 0 the equation holds for EVERY message: the all-zero key and the all-zero signature
+/// verified anything. Its own decoding refuses neither, and it accepts a NON-CANONICAL encoding
+/// (a y coordinate at or above p, "*Allow* non-cannonical encoding" in
+/// `crypto_eddsa_check_equation`) where RFC 8032 §5.1.3 has decoding fail. The seam asks both
+/// questions itself, and the vendored library stays unmodified.
 /// @param publicKey The signer's public key.
 /// @param message What was signed.
 /// @param signature The signature to check.
@@ -125,42 +129,86 @@ class Ed25519KeyPair
 /// that has already been compared as if it were the whole -- the node-id rule, one value along.
 inline constexpr std::size_t Ed25519PublicKeyTextLength = 43;
 
-/// Why a string is not a public key's text form.
+/// Why a string, or 32 bytes, is not a public key this build will trust.
 ///
-/// **Private: never transmitted or persisted.** A key travels as its 32 bytes, and only the
-/// text an operator types reaches this; the enumerators carry no values for that reason.
-enum class PublicKeyTextFault : std::uint8_t
+/// Two TEXT faults, which only the text an operator types can have, and two POINT faults, which
+/// 32 bytes from anywhere can: `ParseEd25519PublicKey` answers all four, and
+/// `Ed25519PublicKeyFaultOf` the last two.
+///
+/// **Private: never transmitted or persisted.** A key travels as its 32 bytes, and a refusal
+/// travels as its sentence; the enumerators carry no values for that reason.
+enum class PublicKeyFault : std::uint8_t
 {
     WrongLength,  ///< Not 43 characters, which is the only length 32 bytes encode to.
     NotBase64Url, ///< A character outside `A-Z a-z 0-9 - _`, or a last one carrying bits no key has.
+    NonCanonical, ///< A y coordinate at or above p: a second spelling of a point, which RFC 8032 refuses.
+    SmallOrder,   ///< A point of small order, under which a signature verifies without any secret.
     Last,         ///< Not a fault, and has no row: the length of a table keyed by one.
 };
 
-/// One row per `PublicKeyTextFault`: what an operator is told.
-struct PublicKeyTextFaultRow
+/// One row per `PublicKeyFault`: what an operator is told.
+struct PublicKeyFaultRow
 {
-    PublicKeyTextFault fault; ///< The fault.
-    std::string_view why;     ///< The sentence, naming what a key looks like.
+    PublicKeyFault fault; ///< The fault.
+    std::string_view why; ///< The sentence, naming what a key looks like or what this one would grant.
 };
 
 /// The sentence for every fault, in enumerator order.
-inline constexpr EnumTable<PublicKeyTextFault, PublicKeyTextFaultRow> PublicKeyTextFaults { {
-    { .fault = PublicKeyTextFault::WrongLength,
+inline constexpr EnumTable<PublicKeyFault, PublicKeyFaultRow> PublicKeyFaults { {
+    { .fault = PublicKeyFault::WrongLength,
       .why = "a public key is 43 base64url characters, as --node-status and the startup log print it" },
-    { .fault = PublicKeyTextFault::NotBase64Url,
+    { .fault = PublicKeyFault::NotBase64Url,
       .why = "a public key is written in base64url (A-Z a-z 0-9 - _) with no padding, and its last character "
              "may carry no bits a 32-byte key does not have" },
+    { .fault = PublicKeyFault::NonCanonical,
+      .why = "the key spells its point non-canonically (a y coordinate at or above 2^255-19), which RFC 8032 "
+             "refuses and no key a node mints ever does" },
+    { .fault = PublicKeyFault::SmallOrder,
+      .why = "the key is a point of small order, under which a signature can be forged for any message without "
+             "a secret, so it proves nothing" },
 } };
 
-static_assert(RowsInEnumeratorOrder(PublicKeyTextFaults, &PublicKeyTextFaultRow::fault),
-              "PublicKeyTextFaults must hold one row per PublicKeyTextFault, in enumerator order");
+static_assert(RowsInEnumeratorOrder(PublicKeyFaults, &PublicKeyFaultRow::fault),
+              "PublicKeyFaults must hold one row per PublicKeyFault, in enumerator order");
 
 /// What an operator is told about @p fault.
-/// @param fault Why a string was not a key.
+/// @param fault Why a string or 32 bytes were not a key.
 /// @return The sentence.
-[[nodiscard]] constexpr std::string_view DescribePublicKeyTextFault(PublicKeyTextFault fault) noexcept
+[[nodiscard]] constexpr std::string_view DescribePublicKeyFault(PublicKeyFault fault) noexcept
 {
-    return PublicKeyTextFaults[static_cast<std::size_t>(fault)].why;
+    return PublicKeyFaults[static_cast<std::size_t>(fault)].why;
+}
+
+/// Why 32 bytes are not a public key a signature can PROVE anything under, or nothing.
+///
+/// **The admission predicate: every place a key ENTERS this build's trust state asks it** -- an
+/// operator's flag, an admission verb, an enrollment request, a replicated command, a roster --
+/// and refuses by the fault's name before anything is stored or approved. `Ed25519Verify` asks it
+/// of A and of R as well, so a key that slipped past an entry still verifies nothing: the entry is
+/// where somebody is TOLD, the verify is the guarantee.
+///
+/// Two questions, neither of which Monocypher asks (see `Ed25519Verify`):
+///  - `NonCanonical`: the y coordinate, bit 255 aside, is at or above p = 2^255 - 19.
+///  - `SmallOrder`: the encoding, with the sign bit (bit 255) MASKED, is one of the seven in
+///    libsodium's blocklist (`ge25519_has_small_order`) -- the five y coordinates the eight points
+///    of the torsion subgroup have, and the non-canonical twins of the two below 19. Masking the
+///    sign is what covers both x of each y, and the x = 0 "negative zero" RFC 8032 would refuse.
+///    Asked FIRST, so a non-canonical twin is named for what it would grant.
+///
+/// A MIXED-order key -- an honest key plus a torsion point -- is not asked about: telling it apart
+/// takes a multiplication by L, and it grants nothing a freshly minted key does not, since only the
+/// holder of the honest half can sign under it.
+/// @param key The 32 bytes.
+/// @return `SmallOrder` or `NonCanonical`, or nullopt for a key that is usable.
+[[nodiscard]] std::optional<PublicKeyFault> Ed25519PublicKeyFaultOf(Ed25519PublicKey const& key) noexcept;
+
+/// Whether @p key is one a signature can prove anything under: `Ed25519PublicKeyFaultOf`'s
+/// nullopt, for a caller with nobody to name the fault to.
+/// @param key The 32 bytes.
+/// @return True when the key is usable.
+[[nodiscard]] inline bool Ed25519PublicKeyIsUsable(Ed25519PublicKey const& key) noexcept
+{
+    return !Ed25519PublicKeyFaultOf(key).has_value();
 }
 
 /// Spell @p key the way an operator reads and types it: 43 characters of unpadded base64url.
@@ -179,12 +227,14 @@ static_assert(RowsInEnumeratorOrder(PublicKeyTextFaults, &PublicKeyTextFaultRow:
 /// strings naming one key would be two things an operator could type into a roster and one key
 /// a revocation could miss.
 ///
-/// Whether the 32 bytes are a point on the curve is NOT asked. A key that is not one verifies no
-/// signature, so admitting it grants nothing -- and this seam offers no point test, deliberately:
-/// a check whose only effect is a nicer refusal for a string nobody printed is not worth a
+/// And the 32 bytes must pass `Ed25519PublicKeyFaultOf`, so every flag and verb that reads a key
+/// through here refuses a small-order or non-canonical one by name -- not a nicer refusal for a
+/// string nobody printed: a small-order key verifies a FORGED signature, so admitting one admits
+/// whoever cares to claim it. Whether the bytes are on the curve at all is still not asked: a key
+/// that is not a point verifies nothing, so admitting it grants nothing, and asking would take a
 /// second route into the curve arithmetic.
 /// @param text What the operator typed.
 /// @return The key, or why the text is not one.
-[[nodiscard]] std::expected<Ed25519PublicKey, PublicKeyTextFault> ParseEd25519PublicKey(std::string_view text);
+[[nodiscard]] std::expected<Ed25519PublicKey, PublicKeyFault> ParseEd25519PublicKey(std::string_view text);
 
 } // namespace FastCache

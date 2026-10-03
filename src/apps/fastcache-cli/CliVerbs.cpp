@@ -1910,7 +1910,7 @@ namespace
                 return Concluded(Outcome::Usage,
                                  std::format("`{}` is not a public key: {}",
                                              context.operands[2],
-                                             DescribePublicKeyTextFault(parsed.error())));
+                                             DescribePublicKeyFault(parsed.error())));
             keyText = FormatEd25519PublicKey(*parsed);
         }
         auto const reply = AskNode(

@@ -57,11 +57,18 @@ inline void SuppressWindowsErrorPopups() noexcept
 #if defined(_MSC_VER)
     // CRT debug reports: assert(), _CrtDbgReport, and the _STL_VERIFY checks that
     // `_ITERATOR_DEBUG_LEVEL=2` compiles in.
+    //
+    // Only a DEBUG CRT has them. Without `_DEBUG`, <crtdbg.h> defines both calls as
+    // `((int)0)`, so in a release build this loop did nothing, and its variable was
+    // unused (C4189, clang-cl's -Wunused-variable). The guard says what was already
+    // true, and it is `_DEBUG` because that is the macro <crtdbg.h> itself tests.
+    #if defined(_DEBUG)
     for (int const report: { _CRT_ASSERT, _CRT_ERROR, _CRT_WARN })
     {
         _CrtSetReportMode(report, _CRTDBG_MODE_FILE);
         _CrtSetReportFile(report, _CRTDBG_FILE_STDERR);
     }
+    #endif
 
     // abort(): write the message, do not raise the "send to Microsoft" dialog.
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);

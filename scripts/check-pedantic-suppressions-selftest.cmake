@@ -263,6 +263,28 @@ pedantic_selftest_case(msvc-arm-gone-is-not-a-pass fail "/W4 is not added"
     endif()"
 "    # the MSVC arm adds nothing")
 
+# --- a suppression outside every condition -----------------------------------
+# The #611 defect with the condition removed rather than swapped: present at BOTH `WERROR`
+# settings, so the asymmetry cannot see it, and present with the pedantic set OFF. Written after
+# the arms rather than inside one, which is the one shape `pedantic_selftest_case` cannot write.
+# One case per SPELLING family, because a classifier that knew `/wdN` passed `-wdN` and `/w`: the
+# GNU `-Wno-X`, MSVC's dash spelling of one warning off, MSVC's every-warning-off, and GNU's.
+# @param 1 Case name, which is also the file name.
+# @param 2 The flag written unconditionally after the arms.
+function(pedantic_selftest_unconditional caseName flag)
+    set(subjectFile "${FASTCACHED_SELFTEST_DIR}/${caseName}.cmake")
+    file(WRITE "${subjectFile}"
+         "${subjectPreamble}${subjectMsvcArm}\nelse()\n    try_add_compile_options(-pedantic)\nendif()\nendif()\ntry_add_compile_options(${flag})\n")
+    pedantic_selftest_run("${caseName}" fail "${flag} is added when PEDANTIC_COMPILER is OFF"
+        "-DFASTCACHED_PEDANTIC_FILE=${subjectFile}")
+    set(failures "${failures}" PARENT_SCOPE)
+    set(casesRun "${casesRun}" PARENT_SCOPE)
+endfunction()
+pedantic_selftest_unconditional(suppression-unconditional -Wno-c2y-extensions)
+pedantic_selftest_unconditional(suppression-unconditional-msvc-dash -wd4324)
+pedantic_selftest_unconditional(suppression-unconditional-msvc-all /w)
+pedantic_selftest_unconditional(suppression-unconditional-gnu-all -w)
+
 # --- the check must notice its own inputs are missing -------------------------
 # Not synthetic subjects but absent ones: `absent`, `unreadable` and `clean` are
 # different states, and only a refusal keeps the third from swallowing the others.

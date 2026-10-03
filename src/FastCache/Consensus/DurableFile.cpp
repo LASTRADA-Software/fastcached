@@ -14,6 +14,7 @@
 
 #if defined(_WIN32)
     #include <io.h>
+    #include <share.h>
 #else
     #include <unistd.h>
 #endif
@@ -28,7 +29,10 @@ gsl::owner<std::FILE*> OpenBinary(std::filesystem::path const& path, char const*
     for (char const symbol: std::string_view { mode })
         wide.push_back(static_cast<wchar_t>(symbol));
 
-    return ::_wfopen(path.wstring().c_str(), wide.c_str());
+    // `_wfsopen` with `_SH_DENYNO` is `_wfopen` exactly -- the same share mode -- without the
+    // deprecation. `_wfopen_s`, the replacement the deprecation names, opens the file
+    // non-shareable for writing, which would change who else may open the file while it is held.
+    return ::_wfsopen(path.wstring().c_str(), wide.c_str(), _SH_DENYNO);
 #else
     return std::fopen(path.c_str(), mode);
 #endif

@@ -356,6 +356,40 @@ no other. The two weaker claims beside it — *exited non-zero* and *named the p
 both stayed GREEN under the neuter, because a fixture that proceeds fails downstream
 and announces its port on the accepting path too.
 
+### A teardown confirms EXIT, and what runs next shares nothing with it
+
+`dist-compile-e2e.ps1` killed each process and waited five seconds, but it threw the
+answer away. Its two COFF drivers shared one scratch directory and one port block, so a
+killed isolation worker that outlived the wait was still holding `iso-worker.log` when the
+next driver's `Remove-Item` reached it. The run failed with "being used by another
+process", which read as a fault of the case that ran next, and nothing named the process.
+Reproduced by making the kill land 8 s late. With every kill late, the same removal met
+the isolation scheduler's `raft-log` first, so the fix could not be a per-driver LOG name.
+
+Two halves, and neither is a longer wait:
+- The FIXTURE shares no directory and no port between phases: per driver in
+  `dist-compile-e2e.ps1`, and per phase in `node-scratch-isolation-e2e.ps1`, which
+  already did. It shares none between RUNS either. With one root cleared at each start,
+  an immediate rerun died in 0 s on `raft-log`, naming the file while the holders' PIDs
+  sat in the previous run's log. So `New-E2ERunRoot` claims a root no run reuses: an
+  exclusive `CreateNew` of `.claim`, held open for the run. `Clear-E2EStaleRoots`
+  sweeps old roots, leaves a claimed one alone, and names the processes whose command
+  line mentions any root that will not go. It never fails the run.
+  - **A pipe HIDES this overlap.** The survivors inherit the caller's pipe, so the
+    caller waits for them and the next run cannot start early. To reproduce it, run each
+    fixture in its own console with no pipe (ShellExecute, output via a transcript).
+  - The sweep names only holders whose command line mentions the root. A daemon given
+    no path of the root on its command line holds files there anonymously.
+- The teardown is `scripts/lib/E2EProcesses.psm1`'s `Stop-E2EProcesses`. It kills
+  everything, then confirms each process EXITED within ONE shared bound, and returns a
+  line naming the PID and the recorded command line of each that did not.
+  - It has three answers, not two: still running is not "could not be asked".
+  - PowerShell turns a property getter's exception into `$null` rather than throwing.
+    On a Process with no handle, `HasExited` AND `Id` both read `$null`, and a `$null`
+    key makes `ContainsKey` throw from inside a `finally`.
+  - Its cases live beside it (`Invoke-E2EProcessesSelfTest`), and every importing
+    fixture runs them from its own `-SelfTest`.
+
 ## A bounded wait must also say WHICH KIND of failure it was
 
 <!-- agent-tripwire: when it times out, which KIND of failure it was -->

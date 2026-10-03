@@ -53,6 +53,75 @@ set(FastCachedFallbackVersionTriple "0.0.0")
 option(FASTCACHED_REQUIRE_EXACT_VERSION
     "Fail configuration when the version cannot be resolved from a git tag" OFF)
 
+# How long one git query may take, in seconds. A PARAMETER rather than a literal
+# so the seam test can drive a timeout without waiting 20 s per case; it is not a
+# cache variable, so nothing typed at configure time raises it. Do not raise it to
+# accommodate a slow work tree: a query that does not answer is a supported,
+# reported outcome, and a larger budget only hides the cost. The usual cost is a
+# work tree that Windows git and WSL git both use, measured in
+# .agent/rules/build-and-toolchain.md.
+if(NOT DEFINED FastCachedGitTimeoutSeconds)
+    set(FastCachedGitTimeoutSeconds 20)
+endif()
+
+# The ways a git query can end other than with an answer, one row each, tried IN ORDER:
+#
+#   <kind> | <outcome> | <match> | <what happened, for the query's own warning> | <what to do>
+#
+# <match> is a regular expression over execute_process's RESULT_VARIABLE: an exit status
+# when git ran to completion, and CMake's own words for how it ended otherwise. Those words,
+# measured on CMake 4.2 (Linux) and 4.3.1 (Windows):
+#
+#   a timeout          "Process terminated due to timeout", on both
+#   git did not start  "no such file or directory" and "permission denied" (libuv's spawn
+#                      errors, on both); "unknown error" (Windows, a file that is no image)
+#   git died, Linux    SIGKILL "Subprocess killed", SIGSEGV "Segmentation fault",
+#                      SIGTERM "Subprocess terminated", SIGABRT "Subprocess aborted"
+#   git died, Windows  0xC0000005 "Access violation", 0xC000013A "User interrupt",
+#                      0xC00000FD "Stack overflow", 0xC000001D "Illegal instruction",
+#                      0xC0000409 "Exit code 0xc0000409" (a code CMake has no name for)
+#
+# Those are every death measured, not every death there is: `died` catches the rest.
+#
+# `died` matches ANYTHING and is the last row, so a way of ending no row names lands there
+# rather than in the nearest neighbour: before it, every non-timeout was "could not run",
+# which sent the operator to GIT_EXECUTABLE for a git that had started and crashed. Its
+# words quote CMake's, and a start failure it turns out to catch belongs in `unrunnable`'s
+# <match>. <outcome> is what FastCachedRunGit reports: `failed` is git answering "no",
+# `unanswered` is no answer at all.
+#
+# `@QUERY@`, `@RESULT@`, `@BOUND@` and `@GIT@` are filled in per query. A kind is a row
+# rather than a branch because each needs its OWN words: a git that never started is not
+# a timeout, and blaming the Windows/WSL index re-hash for a missing binary sends an
+# operator to the wrong machine. Fields are separated by " | ", so a <match>'s own
+# alternation is written without spaces; no row may contain a ';' (these are CMake lists).
+set(FastCachedGitNonAnswers
+    "failed | failed | ^[0-9]+$ | failed `@QUERY@` (exit @RESULT@) | run the quoted git command in the source tree to see why it failed"
+    "timeout | unanswered | due to timeout$ | did not answer `@QUERY@` within @BOUND@ s (@RESULT@) | re-run cmake once git answers. A work tree that Windows git and WSL git both use re-hashes every tracked file on each switch, see .agent/rules/build-and-toolchain.md"
+    "unrunnable | unanswered | ^(no such file or directory|permission denied|unknown error)$ | could not run `@QUERY@` (@RESULT@, GIT_EXECUTABLE is @GIT@) | check GIT_EXECUTABLE: a cached path to a git that has since moved or gone is the usual cause"
+    "died | unanswered | . | ended `@QUERY@` without an answer (@RESULT@) | run the quoted git command in the source tree. The words in parentheses are CMake's for how it ended: a crash or a signal, or a way of failing to start that the unrunnable row does not name yet"
+)
+
+## Split one FastCachedGitNonAnswers row into its fields.
+## @param Row The row.
+## @param Prefix Receives <Prefix>Kind, <Prefix>Outcome, <Prefix>Match, <Prefix>Happened and
+##        <Prefix>Advice in the caller's scope.
+# Written once because the classifier and the final report both read the table, and a row
+# with a field too many or too few is refused here rather than read shifted by one.
+function(FastCachedGitNonAnswerFields Row Prefix)
+    string(REPLACE " | " ";" fields "${Row}")
+    list(LENGTH fields count)
+    if(NOT count EQUAL 5)
+        message(FATAL_ERROR "FastCachedGitNonAnswers: a row has 5 fields separated by ' | ', this one has ${count}: ${Row}")
+    endif()
+    set(index 0)
+    foreach(name IN ITEMS Kind Outcome Match Happened Advice)
+        list(GET fields ${index} value)
+        set(${Prefix}${name} "${value}" PARENT_SCOPE)
+        math(EXPR index "${index} + 1")
+    endforeach()
+endfunction()
+
 # git, located once. find_program and not find_package(Git): this module is
 # included before project(), where find_package's toolchain-dependent machinery
 # has nothing to stand on, while a PATH search for a program has no such
@@ -109,14 +178,31 @@ set(FastCachedVersionFieldLimits
 
 ## Run git in the source tree and return its stripped standard output.
 ## @param OutputVar Name of the variable to receive the output. Set to the empty
-##        string when git is absent or the command failed.
-## @param ARGN The git arguments.
+##        string unless git answered.
+## @param OutcomeVar Name of the variable to receive HOW the query went:
+##        `answered` (git exited 0), `failed` (git ran and exited non-zero, or is
+##        absent), or `unanswered` (git did not finish -- a timeout, a git that
+##        could not start, or one that died). The table FastCachedGitNonAnswers decides.
+## @param LOSS What this caller loses when the query does not answer, as a
+##        sentence. A caller names its OWN loss, because only some of these
+##        queries make the version fall back.
+## @param ANSWER_ON_FAILURE Given when a non-zero exit is an ordinary answer (no
+##        tag, not a work tree). Without it, `failed` is reported like `unanswered`.
+## @param ARGS The git arguments.
 # Written once because every call below needs exactly this. The previous version
 # of this file grew four copy-pasted execute_process blocks, two of which ran in
 # CMAKE_CURRENT_SOURCE_DIR while the others used CMAKE_SOURCE_DIR.
-function(FastCachedRunGit OutputVar)
+#
+# A query that did not answer is recorded in the global property
+# FastCachedVersionUnanswered, which GetVersionInformation reads, so a version
+# built from a partial answer is never reported as Exact. Reading an unanswered
+# query as its NEGATIVE -- "no distance", "clean" -- is what let a timed-out dirty
+# check publish a string claiming a clean tree under the Exact severity.
+function(FastCachedRunGit OutputVar OutcomeVar)
+    cmake_parse_arguments(PARSE_ARGV 2 git "ANSWER_ON_FAILURE" "LOSS" "ARGS")
+    set(${OutputVar} "" PARENT_SCOPE)
     if(NOT GIT_EXECUTABLE)
-        set(${OutputVar} "" PARENT_SCOPE)
+        set(${OutcomeVar} "failed" PARENT_SCOPE)
         return()
     endif()
 
@@ -126,41 +212,64 @@ function(FastCachedRunGit OutputVar)
     # slow. git is not a pure computation on a local directory -- it takes
     # repository locks, and `gc --auto` can be repacking underneath it -- so
     # "it is only `git describe`" is not a bound.
-    #
-    # 20s is far above any healthy answer here (measured: ~10ms on this
-    # repository) and far below the point where somebody starts diagnosing their
-    # build. Timing out is ALREADY a supported outcome: `commandResult` is then a
-    # sentence rather than "0", which takes the same branch as a git that failed,
-    # and the version falls back exactly as it does on a tarball with no .git.
     execute_process(
-        COMMAND "${GIT_EXECUTABLE}" ${ARGN}
+        COMMAND "${GIT_EXECUTABLE}" ${git_ARGS}
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         OUTPUT_VARIABLE commandOutput
         OUTPUT_STRIP_TRAILING_WHITESPACE
         ERROR_QUIET
-        TIMEOUT 20
+        TIMEOUT ${FastCachedGitTimeoutSeconds}
         RESULT_VARIABLE commandResult
     )
-    if(NOT commandResult STREQUAL "0")
-        # Named, because a silent fallback here is a version that is quietly
-        # wrong and a hang that is quietly survived -- and an operator seeing
-        # neither cannot tell this ran at all.
-        if(NOT commandResult MATCHES "^[0-9]+$")
-            message(WARNING "fastcached: git did not answer (${commandResult}); version falls back")
-        endif()
-        set(commandOutput "")
+    if(commandResult STREQUAL "0")
+        set(${OutputVar} "${commandOutput}" PARENT_SCOPE)
+        set(${OutcomeVar} "answered" PARENT_SCOPE)
+        return()
     endif()
-    set(${OutputVar} "${commandOutput}" PARENT_SCOPE)
+
+    # The first row whose <match> the result satisfies says what happened: an exit
+    # status is git saying no, and anything else is CMake's words for a git that did
+    # not finish, told apart because their remedies are on different machines.
+    set(kind "")
+    foreach(row IN LISTS FastCachedGitNonAnswers)
+        FastCachedGitNonAnswerFields("${row}" row)
+        if(kind STREQUAL "" AND commandResult MATCHES "${rowMatch}")
+            set(kind "${rowKind}")
+            set(outcome "${rowOutcome}")
+            set(happened "${rowHappened}")
+        endif()
+    endforeach()
+    if(kind STREQUAL "")
+        message(FATAL_ERROR "FastCachedGitNonAnswers has no row for `${commandResult}`: its last row must match anything")
+    endif()
+    set(${OutcomeVar} "${outcome}" PARENT_SCOPE)
+    if(outcome STREQUAL "failed" AND git_ANSWER_ON_FAILURE)
+        return()
+    endif()
+
+    list(JOIN git_ARGS " " query)
+    string(REPLACE "@QUERY@" "git ${query}" happened "${happened}")
+    string(REPLACE "@RESULT@" "${commandResult}" happened "${happened}")
+    string(REPLACE "@BOUND@" "${FastCachedGitTimeoutSeconds}" happened "${happened}")
+    string(REPLACE "@GIT@" "${GIT_EXECUTABLE}" happened "${happened}")
+    set_property(GLOBAL APPEND PROPERTY FastCachedVersionUnanswered "git ${query}")
+    set_property(GLOBAL APPEND PROPERTY FastCachedVersionUnansweredKinds "${kind}")
+    message(WARNING "fastcached: git ${happened}: ${git_LOSS}")
 endfunction()
 
 ## Suffix marking a work tree with uncommitted changes to tracked files.
-## @param OutputVar Name of the variable to receive "-dirty" or "".
+## @param OutputVar Name of the variable to receive "-dirty", "" or, when git did
+##        not answer, "-dirty-unknown" -- never "" for a question nobody answered.
 # Untracked files deliberately do not count: out/, .cache/ and a local
 # version.txt are all legitimate and none of them changes what the source says.
 # Written once because both git resolvers append the same marker.
 function(FastCachedGitDirtyMarker OutputVar)
-    FastCachedRunGit(pendingChanges status --porcelain --untracked-files=no)
-    if(pendingChanges STREQUAL "")
+    FastCachedRunGit(pendingChanges outcome
+        LOSS "whether the tree has uncommitted changes is unknown, so the version string says -dirty-unknown"
+        ARGS status --porcelain --untracked-files=no)
+    if(NOT outcome STREQUAL "answered")
+        set(${OutputVar} "-dirty-unknown" PARENT_SCOPE)
+    elseif(pendingChanges STREQUAL "")
         set(${OutputVar} "" PARENT_SCOPE)
     else()
         set(${OutputVar} "-dirty" PARENT_SCOPE)
@@ -286,7 +395,9 @@ function(FastCachedVersionFromGitTag RequestedTripleName RequestedStringName
     #   the nearest tag, fails the pattern below, and drops the build to the
     #   fallback while a perfectly good release tag sits one commit further back.
     # --abbrev=0 yields the tag name alone, which is where the triple comes from.
-    FastCachedRunGit(nearestTag describe --tags --abbrev=0 --match "v[0-9]*")
+    FastCachedRunGit(nearestTag outcome ANSWER_ON_FAILURE
+        LOSS "the release tag is unknown, so the version falls back past the git-tag row"
+        ARGS describe --tags --abbrev=0 --match "v[0-9]*")
     if(nearestTag MATCHES "^v?([0-9]+\\.[0-9]+\\.[0-9]+)")
         set(triple "${CMAKE_MATCH_1}")
     else()
@@ -297,9 +408,15 @@ function(FastCachedVersionFromGitTag RequestedTripleName RequestedStringName
     # the abbreviated commit, so a build between releases is identifiable:
     # 0.1.0-12-gdeadbee. On the tagged commit it degrades to the tag name alone,
     # so a release build's string is exactly its triple.
-    FastCachedRunGit(described describe --tags --match "v[0-9]*")
-    if(described STREQUAL "")
-        set(described "${nearestTag}")
+    #
+    # When it does not answer, this row does not answer either. Substituting the
+    # bare tag would make a build fourteen commits past v0.3.0 claim to BE v0.3.0,
+    # under the Exact severity; the commit row below says only what it knows.
+    FastCachedRunGit(described outcome
+        LOSS "the distance from the tag is unknown, so the git-tag row cannot name this build and the version falls back past it"
+        ARGS describe --tags --match "v[0-9]*")
+    if(NOT outcome STREQUAL "answered" OR described STREQUAL "")
+        return()
     endif()
 
     # A dirty marker is a configure-time observation, so it is slightly stale by
@@ -338,7 +455,9 @@ function(FastCachedVersionFromGitCommit RequestedTripleName RequestedStringName
     set(${StringOutVar} "" PARENT_SCOPE)
     set(${DetailOutVar} "" PARENT_SCOPE)
 
-    FastCachedRunGit(insideWorkTree rev-parse --is-inside-work-tree)
+    FastCachedRunGit(insideWorkTree outcome ANSWER_ON_FAILURE
+        LOSS "whether this is a git work tree is unknown, so the version falls back past the commit row"
+        ARGS rev-parse --is-inside-work-tree)
     if(NOT insideWorkTree STREQUAL "true")
         return()
     endif()
@@ -347,7 +466,9 @@ function(FastCachedVersionFromGitCommit RequestedTripleName RequestedStringName
     # name here, and this row is only ever reached because no tag was usable — a
     # v1.2 tag that failed the triple pattern would otherwise end up spliced into
     # the string as 0.0.0-0-gv1.2-3-gdeadbee.
-    FastCachedRunGit(shortCommit rev-parse --short HEAD)
+    FastCachedRunGit(shortCommit outcome ANSWER_ON_FAILURE
+        LOSS "the commit is unknown, so the version falls back past the commit row"
+        ARGS rev-parse --short HEAD)
     if(shortCommit STREQUAL "")
         return()  # a work tree whose HEAD has no commit yet
     endif()
@@ -392,6 +513,8 @@ function(GetVersionInformation VersionTripleVar VersionStringVar)
     set(resolvedTriple "")
     set(resolvedString "")
     set(resolvedDetail "")
+    set_property(GLOBAL PROPERTY FastCachedVersionUnanswered "")
+    set_property(GLOBAL PROPERTY FastCachedVersionUnansweredKinds "")
 
     foreach(sourceRow IN LISTS FastCachedVersionSources)
         string(REPLACE "|" ";" sourceFields "${sourceRow}")
@@ -428,6 +551,29 @@ function(GetVersionInformation VersionTripleVar VersionStringVar)
 
     message(STATUS "[Version] triple: ${resolvedTriple}")
     message(STATUS "[Version] string: ${resolvedString}")
+
+    # A query that did not answer makes the result Provisional whichever row won:
+    # the row answered from what it could see, and what it could not see is exactly
+    # what an Exact version promises. So a publishing job refuses it, and every
+    # other build is told which queries went unanswered.
+    # The advice is the union of what the recorded KINDS call for, each once: the
+    # index re-hash only when something timed out, GIT_EXECUTABLE only when git could
+    # not be run.
+    get_property(unanswered GLOBAL PROPERTY FastCachedVersionUnanswered)
+    get_property(unansweredKinds GLOBAL PROPERTY FastCachedVersionUnansweredKinds)
+    if(unanswered)
+        list(JOIN unanswered "`, `" unansweredText)
+        set(sourceAuthority "Provisional")
+        string(APPEND sourceAdvice
+            " git gave no answer to `${unansweredText}`, so this is not necessarily the "
+            "version the work tree would report.")
+        foreach(row IN LISTS FastCachedGitNonAnswers)
+            FastCachedGitNonAnswerFields("${row}" row)
+            if(rowKind IN_LIST unansweredKinds)
+                string(APPEND sourceAdvice " To fix it: ${rowAdvice}.")
+            endif()
+        endforeach()
+    endif()
 
     # One report, three severities, all of it taken from the winning row: an
     # exact source is a STATUS line, a provisional one warns and prints its

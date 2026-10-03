@@ -701,7 +701,7 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
                           std::format("{} was sent with a key that is not one ({}): {}",
                                       memberId,
                                       *publicKey,
-                                      DescribePublicKeyTextFault(parsed.error())));
+                                      DescribePublicKeyFault(parsed.error())));
         }
         key = *parsed;
     }
@@ -782,6 +782,19 @@ SchedulerReply SchedulerService::AdmitPrincipal(CallerContext const& caller,
     if (_admin == nullptr)
         return Refuse(Wire::ErrorCode::NoCluster);
 
+    // The key arrives as BYTES here -- an enrollment approval hands over the key its row holds --
+    // so the one parser has not seen it, and the question it would have asked of the point is asked
+    // now, before anything is proposed: a small-order key admitted is a key anybody can prove.
+    if (auto const fault = Ed25519PublicKeyFaultOf(publicKey); fault.has_value())
+    {
+        _metrics.Increment(MalformedAdmissionKey.counter);
+        return Refuse(MalformedAdmissionKey.code,
+                      std::format("{} was sent with a key that is not usable ({}): {}",
+                                  principalId,
+                                  FormatEd25519PublicKey(publicKey),
+                                  DescribePublicKeyFault(*fault)));
+    }
+
     // No value and no scheduler endpoint: a principal has no address anybody dials, which is
     // the difference between it and a member (`ClusterPrincipal`).
     return Offer(Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
@@ -808,7 +821,7 @@ SchedulerReply SchedulerService::ClusterAdmitWorker(CallerContext const& caller,
                       std::format("{} was sent with a key that is not one ({}): {}",
                                   workerId,
                                   publicKey,
-                                  DescribePublicKeyTextFault(parsed.error())));
+                                  DescribePublicKeyFault(parsed.error())));
     }
 
     auto reply = AdmitPrincipal(caller, workerId, *parsed, Cluster::PrincipalRole::Worker);

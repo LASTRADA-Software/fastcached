@@ -787,7 +787,8 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "an undecodable compile payload, two AUTH payloads and the cache tier's bodies. A "
               "client of this tree sends two length-prefixed fields, so a body that splits into "
               "anything else came from no version of this software -- and the peer had presented "
-              "nothing when it sent it, which is what makes this one worth reading.",
+              "nothing when it sent it, which is what makes this one worth reading. So did one asking "
+              "under a small-order or non-canonical key, which no build mints and none may admit.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey,
       .prometheusName = "fastcache_enrollment_requests_refused_revoked_key_total",
@@ -1043,7 +1044,8 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
     { .counter = IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey,
       .prometheusName = "fastcache_cluster_admissions_refused_malformed_key_total",
       .help = "cluster-admit requests the leader refused because the member's identity key was not one: not 43 "
-              "base64url characters naming 32 bytes. Nothing was proposed. This project's clients check the key "
+              "base64url characters naming 32 bytes, or 32 bytes naming a small-order or non-canonical point, "
+              "under which a signature proves nothing. Nothing was proposed. This project's clients check the key "
               "where it is typed, so a rise names a client that does not.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedUnknownKey,

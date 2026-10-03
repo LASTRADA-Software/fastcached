@@ -951,6 +951,48 @@ TEST_CASE("A forgotten worker's key is revoked: its next enrollment is refused a
     CHECK(seed.cluster.ClusterState().principals.empty());
 }
 
+TEST_CASE("A joiner asking under a small-order or non-canonical key is refused at the door, by name",
+          "[enrollment][responder][security][identity]")
+{
+    // A row an operator might approve is a key the cluster would then admit, and under a
+    // small-order key the all-zero signature verifies every message -- so the approval would admit
+    // whoever cares to claim it. Refused before the window records anything, for either role, on
+    // the malformed row: no build of this software mints such a key. The control is an ordinary
+    // key asking the same way, which the window records.
+    auto const nonCanonical = [] {
+        auto key = Filled(0xFF);
+        key.front() = std::byte { 0xF0 };
+        key.back() = std::byte { 0x7F };
+        return key;
+    }();
+    Seed seed;
+    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
+
+    auto refusals = std::uint64_t { 0 };
+    for (auto const& [role, endpoint]: { std::pair { Wire::EnrollRole::Member, JoinerEndpoint },
+                                         std::pair { Wire::EnrollRole::Worker, std::string_view {} } })
+    {
+        for (auto const& [key, fault]: { std::pair { Ed25519PublicKey {}, PublicKeyFault::SmallOrder },
+                                         std::pair { nonCanonical, PublicKeyFault::NonCanonical } })
+        {
+            INFO("role " << static_cast<int>(role) << ", key " << FormatEd25519PublicKey(key));
+            auto const refused = AnswerNow(seed.responder, EnrollFrame("joiner-x", endpoint, role, key), JoinerAddress);
+            CHECK(RefusalIn(refused) == Wire::ErrorCode::MalformedFrame);
+            auto const message = Unwrap(Wire::DecodeErrorPayload(PayloadOf(refused))).second;
+            CHECK(message.contains(DescribePublicKeyFault(fault)));
+            CHECK(message.contains(FormatEd25519PublicKey(key)));
+            CHECK_FALSE(seed.window.Find("joiner-x").has_value());
+            CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == ++refusals);
+        }
+    }
+
+    auto const control = AnswerNow(
+        seed.responder, EnrollFrame("joiner-x", JoinerEndpoint, Wire::EnrollRole::Member, Filled(0x59)), JoinerAddress);
+    CHECK(RefusalIn(control) == std::nullopt);
+    CHECK(seed.window.Find("joiner-x").has_value());
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == refusals);
+}
+
 TEST_CASE("A machine nobody forgot enrolls as before, beside a revoked key", "[enrollment][responder][forget]")
 {
     // The control for the door: a revocation refuses the key it names and nothing else, so a

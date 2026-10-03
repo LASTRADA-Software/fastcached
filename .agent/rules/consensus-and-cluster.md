@@ -1605,6 +1605,14 @@ right, because the wire now trusts it.
   generic permanent wire code (`InvalidClusterChange`) -- a code of its own would claim a
   client acts differently, and none does. `revokedKeys` keeps the WHOLE key and is never
   shortened.
+  - **It holds per key BYTES, not per HOLDER.** A forgotten machine presenting its old key plus
+    a torsion point, A0 + T, presents different bytes: the roster reads it as UNKNOWN, exactly
+    like a freshly minted key, and it reaches admission only the way any new key does -- through
+    an operator's approval of a key they were shown. Under the COFACTORED verify only the holder
+    of a0 can sign under A0 + T, so it proves the same machine; recognising it would take a
+    multiplication by L, and refusing it would grant nothing that moving `--cluster-dir` aside to
+    mint a fresh identity does not already (the mixed-order clause of the crypto seam,
+    `distributed-compilation.md`). Do not read this rule as "that machine can never come back".
 - **A forget revokes, in the same entry, and there is no verb that only revokes (#1555).**
   `--cluster-forget=<id>` is `CommandKind::Forget` -- `RemoveMember`'s ordinal, widened: the id
   leaves whichever list records it, a member or a principal, and the key that record held is

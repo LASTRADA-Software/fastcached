@@ -378,6 +378,35 @@ TEST_CASE("A signature that does not verify is refused, and counted apart from a
     CHECK(StatusOf(right.reply) == Wire::Status::Ok);
 }
 
+TEST_CASE("A proof under the all-zero key with the all-zero signature is a forgery, never an unknown key",
+          "[node][proof][security]")
+{
+    // Nobody signed this: under a small-order key the cofactored equation holds for every
+    // transcript, so before the seam refused such a key the proof VERIFIED and reached the roster
+    // question -- answered `NodeKeyUnknown`, "a machine waiting to be enrolled", with a key anybody
+    // can present. It is a forgery, and counted as one.
+    ProvingNode node;
+    auto const challenged = Challenge(node);
+    auto const decoded = Wire::DecodeProveNodePayload(ProofOver(challenged, UnknownNode, UnknownNode));
+    REQUIRE(decoded.has_value());
+    auto forged = Unwrap(decoded);
+    std::ranges::fill(forged.publicKey, std::byte { 0 });
+    std::ranges::fill(forged.signature, std::byte { 0 });
+
+    auto const verdict =
+        node.prover.Verify(challenged.issued.handshake, Testing::RequestPayloadOf(Wire::EncodeProveNode(forged)));
+    CHECK(ErrorOf(verdict.reply) == Wire::ErrorCode::NodeProofRejected);
+    CHECK_FALSE(verdict.identity.has_value());
+    CHECK(node.metrics.Read(IMetricsSink::Counter::NodeProofsRejected) == 1);
+    CHECK(node.metrics.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 0);
+    CHECK(node.metrics.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
+
+    // The control, over a fresh challenge: the admitted machine's own proof is accepted.
+    auto const again = Challenge(node);
+    CHECK(StatusOf(node.prover.Verify(again.issued.handshake, ProofOver(again, AdmittedNode, AdmittedNode)).reply)
+          == Wire::Status::Ok);
+}
+
 TEST_CASE("A key the cluster does not hold is refused as unknown, never as a forgery", "[node][proof]")
 {
     // The caller signed: it IS the machine holding that key, and the cluster simply has not admitted

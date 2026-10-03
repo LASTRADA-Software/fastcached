@@ -1048,8 +1048,83 @@ CanaryVerdict() {
     echo ok
 }
 
+# The FINDING lines in one unit's output: every diagnostic line except the ones the
+# compiler emits for a warning option it does not know (the GCC-only flags a clang
+# build has no use for).
+#
+# Judged by the TAG, anchored at the end of the line -- never by the words anywhere
+# on it. A substring filter swallowed real findings: a message that merely mentions
+# `unknown-warning-option`, and every finding in a file whose PATH contains it, both
+# read as nothing to report. The tag has two spellings in clang-tidy's output:
+# `[clang-diagnostic-unknown-warning-option]`, and the same with `,-warnings-as-errors`
+# appended under `WarningsAsErrors: "*"`. The compiler's own `[-Wunknown-warning-option]`
+# is deliberately NOT dropped: clang-tidy does not print it (measured: 22.1.8, through a
+# database naming GCC-only flags, printed no unknown-warning line at all), and a filter
+# wider than the tool's output can only swallow something else. Colour escapes and a
+# Windows `\r` are stripped first: this tree's `.clang-tidy` colours output even into a
+# file (measured), and `$` would otherwise sit after them.
+# @param 1 Everything the unit printed, stdout and stderr together.
+# @return Prints the finding lines, possibly none; always succeeds.
+FindingLines() {
+    printf '%s\n' "$1" \
+        | sed -e $'s/\x1b\\[[0-9;]*m//g' -e $'s/\r$//' \
+        | grep -E '(error|warning):' \
+        | grep -vE '\[clang-diagnostic-unknown-warning-option(,-warnings-as-errors)?\]$' \
+        || true
+}
+
+# What one unit's run of clang-tidy says about that unit.
+#
+# A non-zero exit is how clang-tidy reports FINDINGS, and is also how it reports
+# having analysed NOTHING: a unit it could not process can exit 1 and print no
+# diagnostic at all. The finding filter below then finds no line, and the unit used to
+# be summed into `TIDY SWEEP CLEAN` -- a file that was never read, reported clean. So
+# the exit status is read together with the output: non-zero with no diagnostic line
+# of ANY kind is `unanalysed`, a failure of the sweep and never a pass.
+#
+# `clean` needs a reason, and there are two: a zero exit, or a non-zero one whose only
+# DIAGNOSTIC lines are unknown-warning-option ones (`FindingLines` drops them: GCC-only
+# flags a clang build ignores). Non-diagnostic lines are TOLERATED in that second case
+# -- an `Error while processing`, even a `Stack dump:` -- and that leniency is bounded
+# on purpose rather than by accident: a crash exits at or above 126, which is `fatal`
+# before this row is reached (128 plus the signal on POSIX; measured under Git Bash on
+# Windows, for a RELEASE-CRT program: an access violation 139, a stack overflow,
+# `__fastfail` and `abort()` each 127). A DEBUG-CRT `abort()` exits 3 (measured), below
+# that line -- and the release case is the one that applies, measured from the pinned
+# 22.1.8 `clang-tidy.exe`'s import table: `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll`,
+# `MSVCP140.dll` and the `api-ms-win-crt-*` set, with no `ucrtbased`, `vcruntime140d` or
+# `msvcp140d`. A Debug-CRT crash that printed no diagnostic line would reach `unanalysed`
+# rather than `fatal`: still a failure, never `clean`. And a run that analysed nothing because no check was
+# enabled is the canary's question, asked once before any unit. Anything else falls to
+# `unanalysed` -- the table fails CLOSED, so a combination nobody thought of reads as a
+# unit not covered.
+# @param 1 The unit's exit status.
+# @param 2 `yes` when `FindingLines` found a line in the output, `no` otherwise.
+# @param 3 `yes` when the output held a diagnostic line of any kind, `no` otherwise.
+# @return Prints `fatal`, `findings`, `clean` or `unanalysed`.
+TidyUnitVerdict() {
+    local rc="$1" findings="$2" anyDiagnostic="$3"
+    if [[ "$rc" -ge 126 ]]; then
+        echo fatal
+    elif [[ "$findings" == yes ]]; then
+        echo findings
+    elif [[ "$rc" -eq 0 ]]; then
+        echo clean
+    elif [[ "$anyDiagnostic" == yes ]]; then
+        echo clean
+    else
+        echo unanalysed
+    fi
+}
+
+# How many `Expect` cases `SelfTest` runs. Printed AND asserted, because a self-test
+# that stopped early -- a helper that `return`ed, a block skipped by a failed
+# precondition, a row deleted by mistake -- would otherwise print PASSED over fewer
+# judgements than it claims. Change it in the same edit that adds or removes a row.
+SelfTestCases=93
+
 SelfTest() {
-    local status=0
+    local status=0 cases=0
     # A literal apostrophe, so the canary expectations below can carry the ones
     # clang-tidy's own messages do without a line of nested quoting each.
     local SQ="'"
@@ -1074,6 +1149,7 @@ SelfTest() {
 
     Expect() {
         local what="$1" want="$2" got="$3"
+        cases=$((cases + 1))
         if [[ "$want" == "$got" ]]; then
             echo "  ok   ${what}"
         else
@@ -1532,6 +1608,36 @@ STUB
            "not-parsing fatal error: ${SQ}stddef.h${SQ} file not found" \
            "$(CanaryVerdict 0 "fatal error: ${SQ}stddef.h${SQ} file not found")"
 
+    # One unit's verdict, every arm. The accepting direction first, for the canary's
+    # reason: a `TidyUnitVerdict` answering `unanalysed` unconditionally would satisfy
+    # the refusing case while failing every branch in the tree.
+    Expect "a zero exit with no finding is a clean unit" "clean" "$(TidyUnitVerdict 0 no no)"
+    Expect "a non-zero exit explained only by unknown warning options is a clean unit" \
+           "clean" "$(TidyUnitVerdict 1 no yes)"
+    Expect "findings are findings, whatever the exit" "findings" "$(TidyUnitVerdict 1 yes yes)"
+    Expect "a warning under a zero exit is still a finding" "findings" "$(TidyUnitVerdict 0 yes yes)"
+    Expect "a binary that never started is fatal" "fatal" "$(TidyUnitVerdict 127 no no)"
+    # The case this function exists for: exit 1 and not one diagnostic line. It used to
+    # read as CLEAN, which is a file nobody analysed reported as covered.
+    Expect "a non-zero exit with NO diagnostic is a unit nobody analysed" \
+           "unanalysed" "$(TidyUnitVerdict 1 no no)"
+
+    # Which lines are findings: the unknown-warning-option TAG is dropped, in both of
+    # clang-tidy's spellings and through colour escapes -- and nothing that merely MENTIONS it.
+    local uwo="warning: unknown warning option '-Wno-foo'"
+    Expect "clang-tidy's unknown-warning-option tag is not a finding" \
+           "" "$(FindingLines "${uwo} [clang-diagnostic-unknown-warning-option]")"
+    Expect "nor is it under warnings-as-errors" \
+           "" "$(FindingLines "error: unknown warning option '-Wno-foo' [clang-diagnostic-unknown-warning-option,-warnings-as-errors]")"
+    Expect "nor when Windows colours it and ends it with a carriage return" \
+           "" "$(FindingLines $'\x1b[0;1;35m'"${uwo}"$' [clang-diagnostic-unknown-warning-option]\x1b[0m\r')"
+    Expect "a finding whose MESSAGE mentions unknown-warning-option is still a finding" \
+           "src/x.cpp:1:1: warning: comment says unknown-warning-option here [readability-foo]" \
+           "$(FindingLines "src/x.cpp:1:1: warning: comment says unknown-warning-option here [readability-foo]")"
+    Expect "a finding in a file whose PATH holds unknown-warning-option is still a finding" \
+           "src/unknown-warning-option/x.cpp:1:1: warning: bad [readability-foo]" \
+           "$(FindingLines "src/unknown-warning-option/x.cpp:1:1: warning: bad [readability-foo]")"
+
     # The third-party roots (#1370), planted: a scratch repository whose roots file names
     # `vendor`, holding one first-party source and one vendored one. The sweep's file set
     # must keep the first and decline the second BY NAME -- a roots reader that silently
@@ -1567,6 +1673,11 @@ STUB
     Expect "a listing with no object-order phony selects nothing, which the step refuses" \
            "" "$(ObjectOrderTargets "$(printf 'all: phony\nclean: CLEAN\n')")"
 
+    echo "TIDY SWEEP SELF-TEST: ${cases} case(s) ran, ${SelfTestCases} expected"
+    if [[ "$cases" -ne "$SelfTestCases" ]]; then
+        echo "  FAIL the self-test ran ${cases} case(s) where it declares ${SelfTestCases}: it stopped early, skipped a block or lost a row -- or SelfTestCases was not updated with one"
+        status=1
+    fi
     [[ "$status" -eq 0 ]] && echo "TIDY SWEEP SELF-TEST PASSED"
     return "$status"
 }
@@ -2002,16 +2113,21 @@ TidyOne() {
     esac
     out="$("$TIDY" -p "$database" --quiet "$file" 2>&1)"
     rc=$?
-    if [[ "$rc" -ge 126 ]]; then
-        printf '%s (exit %s)\n' "$file" "$rc" > "${slot}.fatal"
-        return
-    fi
-    # Unknown *warning options* are the GCC-only flags a clang build has no use
-    # for; everything else is a finding.
-    hits="$(printf '%s\n' "$out" | grep -E 'error:|warning:' | grep -v 'unknown-warning-option')"
-    if [[ -n "$hits" ]]; then
-        printf '=== %s\n%s\n' "$file" "$hits" > "${slot}.out"
-    fi
+    hits="$(FindingLines "$out")"
+    local findings=no anyDiagnostic=no
+    [[ -n "$hits" ]] && findings=yes
+    # A bash match rather than `grep -q <<<`: the output can pass 64 KiB, where a Git Bash
+    # herestring deadlocks.
+    [[ "$out" =~ (error|warning): ]] && anyDiagnostic=yes
+    case "$(TidyUnitVerdict "$rc" "$findings" "$anyDiagnostic")" in
+        fatal)      printf '%s (exit %s)\n' "$file" "$rc" > "${slot}.fatal" ;;
+        findings)   printf '=== %s\n%s\n' "$file" "$hits" > "${slot}.out" ;;
+        clean)      : ;;
+        # Named, with what it did print, so the next person starts from the evidence.
+        unanalysed) { printf '%s (exit %s, and not one diagnostic line)\n' "$file" "$rc"
+                      [[ -z "$out" ]] || printf '%s\n' "$out" | head -3 | sed 's/^/    /'; } > "${slot}.unanalysed" ;;
+        *)          printf '%s (unrecognised unit verdict)\n' "$file" > "${slot}.unanalysed" ;;
+    esac
 }
 
 
@@ -2071,6 +2187,16 @@ for report in "$scratch"/*.out; do
     cat "$report"
     status=1
 done
+
+# A unit clang-tidy exited non-zero on without printing a diagnostic was not ANALYSED,
+# and must not be counted into the clean verdict below (`TidyUnitVerdict`).
+unanalysed=("$scratch"/*.unanalysed)
+if [[ "${#unanalysed[@]}" -gt 0 ]]; then
+    echo "TIDY SWEEP: ${#unanalysed[@]} unit(s) exited non-zero with no diagnostic, so they were NOT analysed" >&2
+    echo "            and this run says nothing about them; it is a failure, not a pass:" >&2
+    cat "${unanalysed[@]}" >&2
+    status=1
+fi
 
 # The count that means something, and the two that qualify it (#466).
 #

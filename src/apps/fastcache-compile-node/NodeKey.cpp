@@ -19,6 +19,7 @@
 
 #if defined(_WIN32)
     #include <io.h>
+    #include <share.h>
 #else
     #include <sys/stat.h>
 
@@ -66,9 +67,12 @@ namespace
 
     /// Open @p path for reading, spelling it the way the platform wants.
     ///
-    /// `_wfopen` on Windows, for `FileRaftStorage::OpenBinary`'s reason: a narrow path goes
+    /// `_wfsopen` on Windows, for `FileRaftStorage::OpenBinary`'s reason: a narrow path goes
     /// through the active code page, and a state directory holding a character that page
     /// cannot spell would fail to open for a reason that has nothing to do with the key.
+    /// There `path.c_str()` IS the wide string, so no temporary is built: a `wstring()`
+    /// temporary wraps the call in cleanups, and cppcoreguidelines-owning-memory then cannot
+    /// see an owner being created, however `_wfsopen` is listed.
     /// @param path The file.
     /// @param error Set to what the C library said when it could not.
     /// @return The stream, or null.
@@ -76,7 +80,7 @@ namespace
     {
         errno = 0;
 #if defined(_WIN32)
-        gsl::owner<std::FILE*> const opened = ::_wfopen(path.wstring().c_str(), L"rb");
+        gsl::owner<std::FILE*> const opened = ::_wfsopen(path.c_str(), L"rb", _SH_DENYNO);
 #else
         gsl::owner<std::FILE*> const opened = std::fopen(path.c_str(), "rb");
 #endif
@@ -98,7 +102,7 @@ namespace
     {
         errno = 0;
 #if defined(_WIN32)
-        gsl::owner<std::FILE*> const opened = ::_wfopen(path.wstring().c_str(), L"wbx");
+        gsl::owner<std::FILE*> const opened = ::_wfsopen(path.c_str(), L"wbx", _SH_DENYNO);
         error = errno;
         return FileHandle { opened, &std::fclose };
 #else

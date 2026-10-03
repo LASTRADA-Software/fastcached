@@ -212,6 +212,11 @@ option(FASTCACHED_BUILD_TUI "Build core-cpp's terminal UI (fastcache-cli live-st
 
 include(CompileCache)
 
+# No MSVC-style link in a debug-info configuration is incremental -- on every such build,
+# never only a launcher-fronted one. Here, before any dependency or target exists, so all
+# of them read it. Why: cmake/IncrementalLink.cmake.
+include(IncrementalLink)
+
 # Default install/runtime/library output directories.
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/target")
@@ -309,10 +314,19 @@ if(FASTCACHED_BUILD_TESTS)
     # reads the version below and refuses once it moves past the one that
     # mechanism was reasoned about, with the re-evaluation and the guard that has
     # to survive it spelled out in the refusal (#312).
+    #
+    # SYSTEM, for the reason libunicode and core-cpp are: third-party headers are not governed
+    # by this project's warning policy. Without it, the CPM route handed Catch2's headers to
+    # every test TU as an ordinary include, and clang-cl reported -Wmicrosoft-cast from
+    # `catch_tostring.hpp` under this project's /W4 -- sixteen times per clangcl-release build,
+    # which /WX turns into a failure in code this project does not own. The find_package route
+    # was already system (an IMPORTED target's include directories are), so this makes the two
+    # routes agree rather than adding a special case.
     CPMAddPackage(
         NAME Catch2
         GITHUB_REPOSITORY catchorg/Catch2
         VERSION 3.6.0
+        SYSTEM YES
     )
 
     # Locate the directory shipping Catch.cmake (providing catch_discover_tests)
@@ -519,6 +533,7 @@ include(Monocypher)
 # point, so yaml-cpp, Catch2 and Tracy are left uninstrumented rather than
 # instrumented and then filtered back out of the report.
 
+include(PedanticSuppressions)
 include(PedanticCompiler)
 include(Sanitizers)
 include(Coverage)

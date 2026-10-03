@@ -1080,6 +1080,63 @@ TEST_CASE("NodeConfig: --raft-peer takes a member's key after @, and a key that 
     CHECK(refused.error().context.contains("43 base64url characters"));
 }
 
+TEST_CASE("NodeConfig: every flag carrying a key refuses a small-order or non-canonical one by name",
+          "[node][config][identity][security]")
+{
+    // Five doors, one parser. The all-zero key is a perfectly formed 43 characters, and it is the
+    // key under which the all-zero signature verifies every message -- so a flag that admitted it
+    // would hand an identity to whoever cares to claim it. p + 3 is a second spelling of a point.
+    // Each is refused with the ROW's own spelling and the fault's own sentence; the control is a
+    // real key through the same five doors, so a refusal below is about the point and nothing else.
+    struct Door
+    {
+        std::string_view field;              ///< The row's own spelling, which the refusal names.
+        std::string_view shape;              ///< The argument, `{}` standing for the key's text.
+        std::vector<char const*> companions; ///< What else the argv needs to parse at all.
+    };
+    auto const doors = std::array {
+        Door { .field = "raft-peer",
+               .shape = "--raft-peer=n1=10.0.0.1:6680@{}",
+               .companions = { "--scheduler=s:1", "--toolchain=/usr/bin/cc" } },
+        Door {
+            .field = "cluster-admit", .shape = "--cluster-admit=n2=10.0.0.2:6680@{}", .companions = { "--scheduler=s:1" } },
+        Door { .field = "cluster-admit-learner",
+               .shape = "--cluster-admit-learner=n2=10.0.0.2:6680@{}",
+               .companions = { "--scheduler=s:1" } },
+        Door {
+            .field = "cluster-admit-worker", .shape = "--cluster-admit-worker=w1@{}", .companions = { "--scheduler=s:1" } },
+        Door { .field = "voter-key",
+               .shape = "--voter-key={}",
+               .companions = { "--scheduler=s:1", "--toolchain=/usr/bin/cc" } },
+    };
+    auto const argvOf = [](Door const& door, std::string const& keyText) {
+        auto flag = std::vformat(door.shape, std::make_format_args(keyText));
+        return std::pair { door.companions, std::move(flag) };
+    };
+
+    for (auto const& door: doors)
+    {
+        INFO("flag: " << door.field);
+        auto const control = FormatEd25519PublicKey(AVoterKey());
+        auto [companions, flag] = argvOf(door, control);
+        companions.push_back(flag.c_str());
+        REQUIRE(ParseNodeArgv(companions).has_value());
+
+        for (auto const& [text, fault]:
+             { std::pair { std::string { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, PublicKeyFault::SmallOrder },
+               std::pair { std::string { "8P_______________________________________38" }, PublicKeyFault::NonCanonical } })
+        {
+            INFO("key: " << text);
+            auto [argv, unusable] = argvOf(door, text);
+            argv.push_back(unusable.c_str());
+            auto const refused = ParseNodeArgv(argv);
+            REQUIRE_FALSE(refused.has_value());
+            CHECK(refused.error().field == door.field);
+            CHECK(refused.error().context.contains(DescribePublicKeyFault(fault)));
+        }
+    }
+}
+
 TEST_CASE("NodeConfig: --cluster-admit carries a key after @, and one that is not a key is refused as a key",
           "[node][consensus][policy][identity]")
 {

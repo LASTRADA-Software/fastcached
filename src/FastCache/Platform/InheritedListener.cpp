@@ -43,6 +43,7 @@ namespace
         return value;
     }
 
+#if !defined(_WIN32)
     /// Stop a descriptor from surviving an exec.
     ///
     /// systemd hands its descriptors over WITHOUT close-on-exec, deliberately, so
@@ -51,14 +52,16 @@ namespace
     /// a compiler holding the listening socket keeps the port alive after the
     /// worker exits, so the restart cannot bind and blames an address in use that
     /// nothing visible is using.
-    void MarkCloseOnExec([[maybe_unused]] int descriptor) noexcept
+    ///
+    /// POSIX only, like its one caller: Windows has no socket activation to adopt from, and
+    /// defining it there anyway left an unreferenced function (clang-cl's -Wunused-function).
+    void MarkCloseOnExec(int descriptor) noexcept
     {
-#if !defined(_WIN32)
         auto const flags = ::fcntl(descriptor, F_GETFD);
         if (flags >= 0)
             static_cast<void>(::fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC));
-#endif
     }
+#endif
 
     /// Remove the activation variables from this process's environment.
     void ClearActivationEnvironment() noexcept

@@ -394,8 +394,8 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     auto const port = probe->boundPort();
     probe.reset();
 
-    auto const scratch = Testing::UniqueScratchPath("consensus-forget-only-voter");
-    std::filesystem::create_directories(scratch);
+    Testing::ScratchDirectory const scratchDirectory { "consensus-forget-only-voter" };
+    auto const& scratch = scratchDirectory.Path();
     {
         auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
         key << std::string(32, 'k');
@@ -487,8 +487,8 @@ TEST_CASE("A lone voter endorses the roster it applied, under its own key, and r
     auto const port = probe->boundPort();
     probe.reset();
 
-    auto const scratch = Testing::UniqueScratchPath("consensus-endorse");
-    std::filesystem::create_directories(scratch);
+    Testing::ScratchDirectory const scratchDirectory { "consensus-endorse" };
+    auto const& scratch = scratchDirectory.Path();
     {
         auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
         key << std::string(32, 'k');
@@ -653,8 +653,12 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
     auto const port = probe->boundPort();
     probe.reset();
 
-    auto const scratch = Testing::UniqueScratchPath("consensus-unreadable-state");
-    std::filesystem::create_directories(scratch);
+    // Cleared first and removed after, which a bare `UniqueScratchPath` is not: its name is the
+    // pid and a counter, Windows reuses pids freely, and a directory an earlier run left behind
+    // under the same name holds a log `PlantConsensusState` cannot write over -- every section
+    // then failed at its `SaveLog`, in two runs of four on a host holding 2,933 such directories.
+    Testing::ScratchDirectory const scratchDirectory { "consensus-unreadable-state" };
+    auto const& scratch = scratchDirectory.Path();
     {
         auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
         key << std::string(32, 'k');
@@ -959,8 +963,8 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
     // follower that has not reached its leader yet; the leader reaches IT, below.
     auto const leaderPort = freePort();
 
-    auto const scratch = Testing::UniqueScratchPath("consensus-unreadable-install");
-    std::filesystem::create_directories(scratch);
+    Testing::ScratchDirectory const scratchDirectory { "consensus-unreadable-install" };
+    auto const& scratch = scratchDirectory.Path();
     {
         auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
         key << std::string(32, 'k');
