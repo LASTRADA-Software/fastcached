@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConfig.hpp"
+#include "NodeDefaults.hpp"
+#include "NodeFirewall.hpp"
+#include "NodeIdentity.hpp"
+#include "NodeKey.hpp"
 
 #include <FastCache/Cli/Options.hpp>
 
@@ -8,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -15,12 +20,16 @@
 #include <ranges>
 #include <regex>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <core/Ranges.hpp>
+#include <tests/FirewallFakes.hpp>
+#include <tests/HostNamingFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -122,25 +131,31 @@ constexpr std::array<ExcludedPage, 0> ExcludedPages {};
 /// A verb that ends the process before the startup gate is ever consulted.
 ///
 /// `main.cpp` handles these and `return`s: `--help` / `--version` before the
-/// configuration is even assembled, then `--print-surfaces` (:1563),
-/// `--install-service` / `--uninstall-service` (:1596, judged by the stricter
-/// `NodeInstallRejection` instead), `--migrate-cache` (:1637) and ALL FOUR
-/// `cluster.action` verbs (:1653) -- `--cluster-set` included, which is easy to
-/// leave out because it is the one of the four the admin prose demonstrates last.
-/// A command line naming one of them is not a *start*, so asking whether it would
-/// start is asking the wrong question of it.
+/// configuration is even assembled, then `--install-service` / `--uninstall-service`
+/// (judged by the stricter `NodeInstallRejection` instead), `--migrate-cache` and ALL
+/// FOUR `cluster.action` verbs -- `--cluster-set` included, which is easy to leave out
+/// because it is the one of the four the admin prose demonstrates last. A command line
+/// naming one of them is not a *start*, so asking whether it would start is asking the
+/// wrong question of it.
 ///
-/// `--print-surfaces` is the sharp case and the reason this table exists. Its
-/// short-circuit is deliberate -- an operator reaches for it *because* a port is
-/// wrong, and withholding the map until the configuration is valid withholds it
-/// exactly when it is wanted. The first draft of this check did not know that, so
-/// the documented example failed it, and five flags were added to the page one at a
-/// time to appease it. Each satisfied one more row of a gate the binary skips for
-/// that verb; not one changed a line of the output block beneath it; and the page
-/// ended up teaching that `--print-surfaces` demands a scheduler and a key file,
-/// which is false. The edit was reverted. **A fix that needs several rounds of
-/// appeasing a checker, against a page whose expected output never moves, is the
-/// checker asking the wrong question.**
+/// **`--print-surfaces` is NOT one of them any more, and its absence is deliberate.**
+/// It prints the map for ANY configuration -- an operator reaches for it *because* a
+/// port is wrong, and withholding the map then would withhold it exactly when it is
+/// wanted -- and its EXIT CODE is `StartupPolicyRejection`'s verdict (`ReportSurfaces`,
+/// #582): a configuration the node would refuse prints the whole map and then exits 2
+/// naming the rule. So a documented `--print-surfaces` example is judged here exactly
+/// as a start is, because that is the question its exit code answers.
+///
+/// It was a row, and the row was right when it was written (`git log -S"The edit was
+/// reverted"` on this file, f19375a54): the verb then printed and returned 0 whatever
+/// the configuration, so five flags added to a page one at a time to appease this
+/// check changed nothing the binary did, and that edit was reverted as teaching that
+/// `--print-surfaces` demands a scheduler, which was then false. #582 made it true of
+/// the exit code while the row stayed, and the row then hid a documented example that
+/// exited 2: `docs/tools/fastcache-compile-node.md`'s own, on the page this check was
+/// written for. **An exemption
+/// whose premise is a property of the binary goes stale when the binary changes, and
+/// nothing about the row says so.**
 ///
 /// Unlike `SkippedExamples`, a row here that matches nothing is NOT a failure, and
 /// the difference is where the row comes from: these are derived from what the
@@ -153,12 +168,13 @@ struct NonStartVerb
 };
 
 constexpr std::array NonStartVerbs {
-    NonStartVerb { .flag = "--print-surfaces",
-                   .why = "prints the resolved surface map and exits, deliberately ahead of the startup rules, "
-                          "because it is reached for when a port is wrong" },
+    // Judged by nothing here: since the zero-config defaults the state directory comes from the
+    // environment, so what refuses this verb -- `main`'s `NoStateDirectoryRefusal` on a machine
+    // whose environment names none, or a key file on disk -- is nothing a configuration can say.
     NonStartVerb { .flag = "--print-identity",
-                   .why = "prints this node's identity and exits, ahead of the startup rules for --print-surfaces' "
-                          "reason: it is reached for while the members' command lines are still being written" },
+                   .why = "prints this node's identity and exits, ahead of the startup rules: it is reached for while "
+                          "the members' command lines are still being written, and its exit code does not judge "
+                          "them" },
     NonStartVerb { .flag = "--install-service",
                    .why = "registers a service and exits; judged by NodeInstallRejection, which is stricter" },
     NonStartVerb { .flag = "--uninstall-service", .why = "removes a registration and exits" },
@@ -563,4 +579,235 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
     // summary nobody ever sees is the dead-INFO defect this file was itself written
     // to avoid one level down.
     CHECK(failures == 0);
+}
+
+namespace
+{
+
+/// The MSI's WiX fragment, `packaging/windows/service-actions.xml`, whole.
+/// @param root The repository root.
+/// @return Its text.
+[[nodiscard]] std::string MsiFragmentText(std::filesystem::path const& root)
+{
+    std::ifstream in { root / "packaging" / "windows" / "service-actions.xml", std::ios::binary };
+    REQUIRE(in.good());
+    // A sized read through the buffer, the tree's spelling (`istreambuf-iterator`).
+    std::ostringstream text;
+    text << in.rdbuf();
+    return std::move(text).str();
+}
+
+/// The command line the MSI runs to register the node, as `packaging/windows/service-actions.xml`
+/// spells it, with its one XML entity decoded and every `[PROPERTY]` still unformatted.
+/// @param root The repository root.
+/// @return The `ExeCommand` of the `FastCacheNodeInstallService` action.
+[[nodiscard]] std::string MsiNodeInstallCommand(std::filesystem::path const& root)
+{
+    auto const text = MsiFragmentText(root);
+    auto const action = text.find(R"(<CustomAction Id="FastCacheNodeInstallService")");
+    REQUIRE(action != std::string::npos);
+    constexpr std::string_view Attribute = R"(ExeCommand=")";
+    auto const attribute = text.find(Attribute, action);
+    REQUIRE(attribute != std::string::npos);
+    auto const valueStart = attribute + Attribute.size();
+    auto const valueEnd = text.find('"', valueStart);
+    REQUIRE(valueEnd != std::string::npos);
+    auto command = text.substr(valueStart, valueEnd - valueStart);
+    constexpr std::string_view Quote = "&quot;";
+    auto at = command.find(Quote);
+    while (at != std::string::npos)
+    {
+        command.replace(at, Quote.size(), "\"");
+        at = command.find(Quote, at + 1);
+    }
+    return command;
+}
+
+/// @p command with every `[property]` Windows Installer would format replaced by @p value.
+/// @param command An `ExeCommand`.
+/// @param property The property's name.
+/// @param value What the transaction set it to; empty for a property it did not set.
+/// @return The formatted command.
+[[nodiscard]] std::string Formatted(std::string command, std::string_view property, std::string_view value)
+{
+    auto const placeholder = std::format("[{}]", property);
+    auto at = command.find(placeholder);
+    while (at != std::string::npos)
+    {
+        command.replace(at, placeholder.size(), value);
+        at = command.find(placeholder, at + value.size());
+    }
+    return command;
+}
+
+/// A state directory that holds no formation record: the first start mints the solitary one.
+class NoKeptFormation final: public IKeptFormationReader
+{
+  public:
+    /// @copydoc IKeptFormationReader::Read
+    [[nodiscard]] std::expected<KeptFormation, std::string> Read() const override
+    {
+        return KeptFormation {};
+    }
+};
+
+/// @p arguments parsed as `main` parses a first start.
+/// @param arguments The flags, without the program name.
+/// @return The configuration, or the parse error.
+[[nodiscard]] std::expected<NodeConfig, ConfigError> ParsedFirstStart(std::span<std::string const> arguments)
+{
+    std::vector<char const*> argv;
+    argv.reserve(arguments.size());
+    for (auto const& argument: arguments)
+        argv.push_back(argument.c_str());
+    auto cfg = Testing::FirstStart(NodeConfig {});
+    auto const parsed = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg);
+    if (!parsed.has_value())
+        return std::unexpected { parsed.error() };
+    return cfg;
+}
+
+} // namespace
+
+TEST_CASE("The MSI's node registration installs with and without an advertised endpoint, and survives the round trip",
+          "[node][docs][service][msi]")
+{
+    // platform-service-and-config.md: whatever reaches a supervisor survives this project's own
+    // parser round trip, including the flags the INSTALLER adds. So the command is read out of
+    // the MSI source itself and run through the node's parser, its install rules and its
+    // registration, then the registration is parsed back -- in both shapes the MSI can produce.
+    // `FASTCACHE_NODE_ADVERTISE` is optional, and left out it must leave the registration with no
+    // `--advertise` at all, so the node advertises this machine's name at every start. And the
+    // MSI names no `--cluster-dir`, so the registration owns the machine-wide state directory and
+    // secludes it (`PathPrivacy::Private`) rather than baking a path that outranks the file.
+    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    auto const command = MsiNodeInstallCommand(root);
+    CHECK_FALSE(command.contains("--cluster-dir"));
+
+    struct Shape
+    {
+        std::string_view what;              ///< The transaction, as an operator types it.
+        std::string_view advertiseArgument; ///< What `SetFastCacheNodeAdvertiseArgument` leaves.
+        std::string_view advertised;        ///< The endpoint the registration must carry; empty for none.
+        std::string_view allowArgument;     ///< What `SetFastCacheFirewallAllowArgument` leaves.
+        std::string_view allowed;           ///< The firewall scope the install takes; empty for none.
+        std::string_view replyPort;         ///< `FASTCACHE_DISCOVERY_REPLY_PORT` after the MSI's default.
+        std::string_view replyRule;         ///< The discovery-reply rule the install must open.
+    };
+    // The package's default reply port, as the fragment's Property row spells it.
+    constexpr std::string_view PackagedReplyPort = "6682";
+    constexpr auto Shapes = std::to_array<Shape>({
+        { .what = "FASTCACHE_NODE_SCHEDULER only",
+          .advertiseArgument = "",
+          .advertised = "",
+          .allowArgument = "",
+          .allowed = "",
+          .replyPort = PackagedReplyPort,
+          .replyRule = "FastCacheCompileNode discovery-reply udp/6682" },
+        { .what = "FASTCACHE_NODE_SCHEDULER and FASTCACHE_NODE_ADVERTISE=worker-01.internal:6674",
+          .advertiseArgument = "--advertise=worker-01.internal:6674",
+          .advertised = "worker-01.internal:6674",
+          .allowArgument = "",
+          .allowed = "",
+          .replyPort = PackagedReplyPort,
+          .replyRule = "FastCacheCompileNode discovery-reply udp/6682" },
+        { .what = "FASTCACHE_NODE_SCHEDULER and FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8",
+          .advertiseArgument = "",
+          .advertised = "",
+          .allowArgument = "--firewall-allow=10.0.0.0/8",
+          .allowed = "10.0.0.0/8",
+          .replyPort = PackagedReplyPort,
+          .replyRule = "FastCacheCompileNode discovery-reply udp/6682" },
+        { .what = "FASTCACHE_NODE_SCHEDULER and FASTCACHE_DISCOVERY_REPLY_PORT=7000",
+          .advertiseArgument = "",
+          .advertised = "",
+          .allowArgument = "",
+          .allowed = "",
+          .replyPort = "7000",
+          .replyRule = "FastCacheCompileNode discovery-reply udp/7000" },
+    });
+    // The default the shapes assume is the one the fragment declares.
+    CHECK(std::filesystem::exists(root / "packaging" / "windows" / "service-actions.xml"));
+    CHECK(MsiFragmentText(root).contains(
+        std::format(R"(<Property Id="FASTCACHE_DISCOVERY_REPLY_PORT" Value="{}")", PackagedReplyPort)));
+
+    auto const machineWide = MachineWideNodeClusterDirectory(Testing::InstallerPathProbe());
+    REQUIRE(machineWide.has_value());
+
+    for (auto const& shape: Shapes)
+    {
+        INFO(shape.what);
+        auto formatted = Formatted(command, "INSTALL_ROOT", R"(C:\Program Files\fastcached\)");
+        formatted = Formatted(std::move(formatted), "FASTCACHE_NODE_SCHEDULER", "build-cache.internal:6675");
+        formatted = Formatted(std::move(formatted), "FastCacheNodeAdvertiseArgument", shape.advertiseArgument);
+        // Every property the transaction sets, the raw one too: a command that went back to
+        // spelling `--advertise=[FASTCACHE_NODE_ADVERTISE]` itself must reach the parser as the
+        // empty flag it would be, not stop at the bracket check below.
+        formatted = Formatted(std::move(formatted), "FASTCACHE_NODE_ADVERTISE", shape.advertised);
+        formatted = Formatted(std::move(formatted), "FastCacheFirewallAllowArgument", shape.allowArgument);
+        formatted = Formatted(std::move(formatted), "FASTCACHE_FIREWALL_ALLOW", shape.allowed);
+        formatted = Formatted(std::move(formatted),
+                              "FastCacheNodeDiscoveryReplyArgument",
+                              std::format("--discovery-reply-port={}", shape.replyPort));
+        formatted = Formatted(std::move(formatted), "FASTCACHE_DISCOVERY_REPLY_PORT", shape.replyPort);
+        INFO(formatted);
+        // A property this case does not format would reach the parser as text in brackets.
+        REQUIRE_FALSE(formatted.contains('['));
+
+        auto const arguments = SplitArguments(formatted);
+        REQUIRE(arguments.size() > 1);
+        auto const parsed = ParsedFirstStart(std::span { arguments }.subspan(1));
+        REQUIRE(parsed.has_value());
+        auto const& cfg = Testing::Unwrap(parsed);
+        REQUIRE(cfg.installService);
+        CHECK(cfg.advertiseExplicit == !shape.advertised.empty());
+        CHECK(cfg.firewallAllow
+              == (shape.allowed.empty() ? std::vector<std::string> {}
+                                        : std::vector<std::string> { std::string { shape.allowed } }));
+        auto const rejection = NodeInstallRejection(cfg);
+        INFO(rejection.value_or(std::string {}));
+        CHECK_FALSE(rejection.has_value());
+
+        auto const spec =
+            MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg, Testing::InstallerPathProbe());
+        CHECK(std::ranges::none_of(spec.arguments, [](std::string const& a) { return a.starts_with("--cluster-dir"); }));
+        // The scope is install-time only: it shapes the rules this install creates and is never
+        // replayed, so a registration that carried it would re-scope nothing at every start.
+        CHECK(std::ranges::none_of(spec.arguments, [](std::string const& a) { return a.starts_with("--firewall-allow"); }));
+        auto const advertiseArguments =
+            std::ranges::count_if(spec.arguments, [](std::string const& a) { return a.starts_with("--advertise"); });
+        CHECK(advertiseArguments == (shape.advertised.empty() ? 0 : 1));
+        // The rules the install opens, through the install's own derivation: the reply port is
+        // the flag's, so the discovery-reply rule names it and no rule admits any local port.
+        Testing::RecordingFirewall firewall;
+        NoKeptFormation const fresh;
+        auto const installed = InstallWithServiceFirewall(
+            [] { return ServiceControlResult { .outcome = ServiceControlOutcome::Done, .message = "installed" }; },
+            cfg,
+            // Absolute on every host: a rule whose program is not is refused before the firewall is asked.
+            std::filesystem::current_path() / "fastcache-compile-node",
+            cfg.serviceName,
+            fresh,
+            &firewall);
+        CHECK(installed.ExitCode() == 0);
+        auto const opened = firewall.NamesInGroup(FirewallGroupFor(cfg.serviceName));
+        REQUIRE(opened.has_value());
+        CHECK(std::ranges::contains(Testing::Unwrap(opened), std::string { shape.replyRule }));
+        CHECK(std::ranges::none_of(Testing::Unwrap(opened), [](std::string const& name) { return name.ends_with("/any"); }));
+
+        CHECK(std::ranges::contains(spec.ownedPaths,
+                                    OwnedPath { .path = Testing::Unwrap(machineWide),
+                                                .privacy = PathPrivacy::Private,
+                                                .credentialFiles = { std::filesystem::path { NodeKeyFileName } } }));
+
+        // And the registration comes back up as what was installed.
+        auto const reparsed = ParsedFirstStart(spec.arguments);
+        REQUIRE(reparsed.has_value());
+        CHECK(Testing::Unwrap(reparsed).schedulers == std::vector<std::string> { "build-cache.internal:6675" });
+        CHECK(Testing::Unwrap(reparsed).advertiseExplicit == !shape.advertised.empty());
+        // The pinned reply port is worker state: the registration replays it at every start.
+        CHECK(std::to_string(Testing::Unwrap(reparsed).discoveryReplyPort) == shape.replyPort);
+        if (!shape.advertised.empty())
+            CHECK(Testing::Unwrap(reparsed).advertise == shape.advertised);
+    }
 }

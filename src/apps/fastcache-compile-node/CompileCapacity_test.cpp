@@ -273,6 +273,38 @@ TEST_CASE("A cordon wakes the heartbeat's wait at once, and a stop wins over it"
         stop.request_stop();
         CHECK(capacity.WaitForHeartbeat(stop.get_token(), false, LongInterval) == HeartbeatWake::Stopped);
     }
+
+    SECTION("a host event ends a long wait as HostEvent, once")
+    {
+        capacity.WakeHeartbeat();
+        CHECK(capacity.WaitForHeartbeat(stop.get_token(), false, LongInterval) == HeartbeatWake::HostEvent);
+        // Consumed: the request does not wake the NEXT wait too.
+        CHECK(capacity.WaitForHeartbeat(stop.get_token(), false, std::chrono::milliseconds { 20 })
+              == HeartbeatWake::Elapsed);
+    }
+
+    SECTION("a host event from another thread ends a long wait")
+    {
+        auto const started = std::chrono::steady_clock::now();
+        auto waker = std::jthread { [&capacity] {
+            std::this_thread::sleep_for(std::chrono::milliseconds { 50 });
+            capacity.WakeHeartbeat();
+        } };
+        auto const wake = capacity.WaitForHeartbeat(stop.get_token(), false, LongInterval);
+        auto const waited = std::chrono::steady_clock::now() - started;
+        waker.join();
+        CHECK(wake == HeartbeatWake::HostEvent);
+        INFO("HANG GUARD, not the verdict (the wake reason is): the wait took "
+             << std::chrono::duration_cast<std::chrono::milliseconds>(waited).count() << " ms");
+        CHECK(waited < HangGuard);
+    }
+
+    SECTION("a stop wins over a host event")
+    {
+        capacity.WakeHeartbeat();
+        stop.request_stop();
+        CHECK(capacity.WaitForHeartbeat(stop.get_token(), false, LongInterval) == HeartbeatWake::Stopped);
+    }
 }
 
 TEST_CASE("A drain whose bound runs out abandons what is running, and says what it abandoned", "[node][capacity][drain]")

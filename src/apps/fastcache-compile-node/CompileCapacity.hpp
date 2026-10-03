@@ -44,16 +44,17 @@ enum class SlotAdmission : std::uint8_t
 
 /// How the heartbeat's wait between two rounds ended.
 ///
-/// Three answers, because the caller does something different for each: a stop ends
-/// the loop, and the other two start a round -- but only one of them is an event worth
+/// Four answers, because the caller does something different for each: a stop ends
+/// the loop, and the other three start a round -- but only the wakes are events worth
 /// asserting, since a heartbeat that merely came round again would announce a changed
-/// cordon too, a whole interval late.
+/// cordon too, a whole interval late, and a resumed machine an interval after it woke.
 ///
 /// Private to this process: nothing transmits or persists it.
 enum class HeartbeatWake : std::uint8_t
 {
     Elapsed,       ///< The interval passed and the cordon is still what was announced.
     CordonChanged, ///< The cordon moved away from what the last round announced.
+    HostEvent,     ///< A host event asked for a round now (resume, network change, suspend).
     Stopped,       ///< A stop was requested, before the wait or during it.
 };
 
@@ -227,12 +228,16 @@ class CompileCapacity
     /// @param stop Participates in the wait; a request ends it at once.
     /// @param announced The cordon the last round carried to the scheduler.
     /// @param interval How long to wait when nothing changes.
-    /// @return Which of the three ENDED it: a stop wins over a cordon that moved as well,
-    ///         and a cordon that moved without waking the wait before the interval ran
-    ///         out is `Elapsed`, since the interval is what ended it.
+    /// @return Which of them ENDED it: a stop wins over everything, a host event over a
+    ///         cordon that moved as well, and a cordon that moved without waking the wait
+    ///         before the interval ran out is `Elapsed`, since the interval is what ended it.
     [[nodiscard]] HeartbeatWake WaitForHeartbeat(std::stop_token const& stop,
                                                  bool announced,
                                                  std::chrono::milliseconds interval);
+
+    /// End the heartbeat's wait now, for a reason that is not the cordon -- a host event. The
+    /// request is consumed by the wait it ends.
+    void WakeHeartbeat() noexcept;
 
     /// Reserve @p want bytes of request payload.
     /// @param want How many bytes this request declared.
@@ -340,13 +345,16 @@ class CompileCapacity
 
     std::atomic<bool> _shuttingDown { false };
     std::atomic<bool> _cordoned { false };
+    /// Set by `WakeHeartbeat`, consumed by the `WaitForHeartbeat` it ends. Guarded by `_drainMutex`,
+    /// and beside the flags above rather than the mutex, where it costs no padding.
+    bool _wakeRequested { false };
     std::atomic<std::size_t> _bytesInFlight { 0 };
     std::atomic<std::size_t> _inFlight { 0 };
 
     std::mutex _drainMutex;
     std::condition_variable _drained;
-    /// Notified by `Cordon` whenever the cordon moves; waited on by `WaitForHeartbeat`.
-    /// `_any` because the wait takes a stop token.
+    /// Notified by `Cordon` whenever the cordon moves, and by `WakeHeartbeat`; waited on by
+    /// `WaitForHeartbeat`. `_any` because the wait takes a stop token.
     std::condition_variable_any _cordonMoved;
 };
 

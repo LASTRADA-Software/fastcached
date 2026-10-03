@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodePresenceTier.hpp"
 
+// Its own header FIRST and in a group of its own, for `WorkerLease.cpp`'s reason.
+#include "HostEventInbox.hpp"
+
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 
 #include <chrono>
@@ -16,8 +19,6 @@ namespace FastCache::Node
 namespace
 {
     namespace Wire = FastCache::CompileCacheWire;
-
-    constexpr std::chrono::milliseconds PresenceIoTimeout { 10'000 };
 
     /// What this machine says about itself: the endpoint, the capacity, the load and the
     /// history buckets nobody has taken yet.
@@ -189,8 +190,9 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _reachability { parts.reachability },
     _capacityWire { Distributed::CapacityToWire(parts.capacity) },
     _loadSampler { MakeHostLoadSampler(MakeSystemCounterSource()) },
-    _dialer { PresenceIoTimeout },
-    _link { std::move(link) }
+    _dialer { parts.dialer },
+    _link { std::move(link) },
+    _hostSubscription { parts.hostEvents, _presenceWake }
 {
 }
 
@@ -234,14 +236,41 @@ void NodePresence::Loop(std::stop_token const& stop)
 
 bool NodePresence::WaitOutInterval(std::stop_token const& stop)
 {
+    auto const interval = _roster != nullptr && _roster->Wanting()
+                              ? std::chrono::duration_cast<std::chrono::milliseconds>(RosterWantingInterval)
+                              : std::chrono::duration_cast<std::chrono::milliseconds>(NodeAnnounceInterval);
+    return _presenceWake.WaitOut(stop, interval) == PresenceWakeReason::Stopped;
+}
+
+void PresenceWake::OnHostEvent(HostEvent event)
+{
+    auto const& row = HostEventActionFor(event);
+    {
+        std::scoped_lock const lock { _mutex };
+        // A wake still pending is older than a suspend, and superseded by it; one posted after is
+        // owed as ever. See `HostEventActionRow::supersedesOlderWakes`.
+        if (row.supersedesOlderWakes)
+            _announceNow = false;
+        if (!row.wakesPresence)
+            return;
+        _announceNow = true;
+    }
+    _wake.notify_all();
+}
+
+PresenceWakeReason PresenceWake::WaitOut(std::stop_token const& stop, std::chrono::milliseconds interval)
+{
     // A named lock, because the stop-token `wait_for` takes it by non-const reference -- a
     // temporary does not bind, which is the compiler catching the lifetime question rather
     // than a style preference.
-    auto const interval = _roster != nullptr && _roster->Wanting()
-                              ? std::chrono::duration_cast<std::chrono::seconds>(RosterWantingInterval)
-                              : NodeAnnounceInterval;
-    std::unique_lock lock { _wakeMutex };
-    return _wake.wait_for(lock, stop, interval, [&stop] { return stop.stop_requested(); });
+    std::unique_lock lock { _mutex };
+    auto const woken = _wake.wait_for(lock, stop, interval, [this] { return _announceNow; });
+    if (stop.stop_requested())
+        return PresenceWakeReason::Stopped;
+    if (!woken)
+        return PresenceWakeReason::Elapsed;
+    _announceNow = false;
+    return PresenceWakeReason::HostEvent;
 }
 
 } // namespace FastCache::Node

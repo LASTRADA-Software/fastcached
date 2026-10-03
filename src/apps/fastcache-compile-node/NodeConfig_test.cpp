@@ -376,11 +376,13 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         // registration carrying it would re-seed at every start, which is the same
         // objection `--install-service` carries and the reason both are one-shot.
         "--seed-config",
-        "--service-scope", // install-time only; not a thing the worker runs with
-        "--service-name",  // emitted unconditionally, above the table
-        "--daemon",        // carried as ServiceSpec::daemonFlag, not an argument
-        "--help",          //
-        "--version",       //
+        "--service-scope",  // install-time only; not a thing the worker runs with
+        "--service-start",  // install-time only: the supervisor's record of how the job starts
+        "--firewall-allow", // install-time only: it scopes the rules the install creates
+        "--service-name",   // emitted unconditionally, above the table
+        "--daemon",         // carried as ServiceSpec::daemonFlag, not an argument
+        "--help",           //
+        "--version",        //
         // The one field with no safe representation in launch arguments: a
         // supervisor records them where every local account can read them, so
         // emitting the secret would publish it to exactly the accounts it exists
@@ -1386,6 +1388,11 @@ TEST_CASE("NodeConfig: a consensus node that names no dial address is refused be
     CHECK(ConsensusNamesNoDialAddressRefusal.starts_with("this node runs consensus"));
     CHECK(ConsensusNamesNoDialAddressRefusal.contains("give --raft-self=<host>"));
 
+    // And in the worksheet's words: the refusal and `--print-surfaces`' NOT STATED line are the
+    // two places an operator hears this rule, and they once named different ways out.
+    CHECK(Unwrap(StartupPolicyRejection(nameless)).contains(ConsensusDialRemedy));
+    CHECK(RenderSurfaces(nameless).contains(ConsensusDialRemedy));
+
     // A node that names where it is dialled is accepted.
     auto named = nameless;
     named.raftSelf = "10.0.0.1";
@@ -2026,14 +2033,31 @@ TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[
     auto const spec =
         MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg, Testing::InstallerPathProbe());
 
-    CHECK(std::ranges::contains(spec.ownedPaths, cfg.cacheDir));
-    CHECK(std::ranges::contains(spec.ownedPaths, cfg.clusterDir));
+    auto const privacyOf = [&spec](std::filesystem::path const& path) -> std::optional<PathPrivacy> {
+        auto const* const owned = core::findOrNull(spec.ownedPaths, path, &OwnedPath::path);
+        return owned != nullptr ? std::optional { owned->privacy } : std::nullopt;
+    };
+    // The cache holds objects the fleet already shares; the state directory holds the key this
+    // machine proves itself with, so it gets a list of its own -- asserted per path, because a
+    // spec marking BOTH private would pass a check that only one of them is.
+    CHECK(privacyOf(cfg.cacheDir) == std::optional { PathPrivacy::Shared });
+    CHECK(privacyOf(cfg.clusterDir) == std::optional { PathPrivacy::Private });
+    CHECK(spec.ownedPaths.size() == 2);
+
+    // The state directory names the identity key as a credential, so an exposed key is
+    // deleted and re-minted rather than told to /reset -- and the cache names none.
+    auto const credentialsOf = [&spec](std::filesystem::path const& path) {
+        auto const* const owned = core::findOrNull(spec.ownedPaths, path, &OwnedPath::path);
+        return owned != nullptr ? owned->credentialFiles : std::vector<std::filesystem::path> {};
+    };
+    CHECK(credentialsOf(cfg.clusterDir) == std::vector<std::filesystem::path> { std::filesystem::path { NodeKeyFileName } });
+    CHECK(credentialsOf(cfg.cacheDir).empty());
 
     // Only what the operator named, never a parent: handing over /var/cache would
     // reassign a directory shared with other services to an unprivileged compile
     // account, silently, under a message saying the service had been installed.
-    CHECK(std::ranges::none_of(spec.ownedPaths, [](std::filesystem::path const& owned) {
-        return owned == std::filesystem::path { "/var/cache" } || owned == std::filesystem::path { "/var/lib" };
+    CHECK(std::ranges::none_of(spec.ownedPaths, [](OwnedPath const& owned) {
+        return owned.path == std::filesystem::path { "/var/cache" } || owned.path == std::filesystem::path { "/var/lib" };
     }));
 
     // A worker given neither hands over the one directory its identity lives in -- the
@@ -2043,9 +2067,12 @@ TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[
     neither.clusterDir.clear();
     auto const machineWide = MachineWideNodeClusterDirectory(Testing::InstallerPathProbe());
     REQUIRE(machineWide.has_value());
+    // And Private, as a named --cluster-dir is: it holds the same key.
     CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, neither, Testing::InstallerPathProbe())
               .ownedPaths
-          == std::vector<std::filesystem::path> { Unwrap(machineWide) });
+          == std::vector<OwnedPath> { OwnedPath { .path = Unwrap(machineWide),
+                                                  .privacy = PathPrivacy::Private,
+                                                  .credentialFiles = { std::filesystem::path { NodeKeyFileName } } } });
 }
 
 TEST_CASE("A node says who it admits in the line an operator reads at startup", "[node][policy][membership]")
@@ -6535,4 +6562,21 @@ TEST_CASE("The over-ceiling refusal names the ceiling the constant holds, in a s
     auto const refused = ParseNodeArgv({ "--scheduler=s:1", past.c_str() });
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().context == AutoApproveSentence(AutoApproveRefusal::OverCeiling));
+}
+
+TEST_CASE("NodeConfig: --service-start reaches the spec and never the registered command line",
+          "[node][service][service-start]")
+{
+    auto const parsed = ParseNodeArgv({ "--install-service", "--service-start=manual" });
+    REQUIRE(parsed.has_value());
+    auto const spec =
+        MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, *parsed, Testing::InstallerPathProbe());
+    CHECK(spec.startMode == ServiceStart::Manual);
+    CHECK(std::ranges::none_of(spec.arguments, [](std::string const& arg) { return FlagMatches(arg, "--service-start"); }));
+
+    auto const defaulted = ParseNodeArgv({ "--install-service" });
+    REQUIRE(defaulted.has_value());
+    CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, *defaulted, Testing::InstallerPathProbe())
+              .startMode
+          == ServiceStart::Auto);
 }

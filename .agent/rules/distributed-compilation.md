@@ -1613,6 +1613,39 @@ Consequences that are each load-bearing:
     the leases were already released, the code said the opposite, and only one of them
     runs. A rule that misdescribes the code is worse than a missing one, because it is
     trusted at exactly the moment somebody is deciding whether a new caller is safe.
+- **A SUSPEND withdraws the worker's registrations, bounded to 1.5 s in all**
+  (`SuspendWithdrawBudget`), and recovery never waits on a host event. Windows allows about two
+  seconds for a suspend notification; the power-event handler posts to the heartbeat thread
+  through `HostEventInbox` -- the registrars are the heartbeat's alone -- and waits, measured
+  through the injected `IDrainWait`, for the withdrawal, returning at the budget whatever the
+  heartbeat is doing. A withdrawal the heartbeat had not TAKEN by then is dropped: it could only
+  run once the machine is awake again, withdrawing a machine that is back.
+  - The withdrawal is `WithdrawOnce`: ONE dial to the endpoint the link names, never a fallback
+    walk, a redirect or a registration. Only its CONNECT is bounded by `SuspendDialTimeout`; the
+    exchange after it rides the dialler's own I/O ceiling, which is safe because the handler stops
+    waiting at the budget regardless. Deliberately NOT through `SchedulerReachability`: a machine
+    going to sleep is not a scheduler outage.
+  - A resume or a network change runs the next round at once -- the heartbeat through
+    `CompileCapacity::WakeHeartbeat`, the presence round through `PresenceWake` -- on each loop's
+    own thread, never on the one that delivered. Which events do what is ONE table,
+    `HostEventActionFor`, read by both loops; its `supersedesOlderWakes` column makes a suspend
+    cancel every wake still pending from before it, in both.
+  - A Modern Standby PC may report neither the suspend nor the resume. After a suspend with no
+    resume, `RetireAllRegistrations` has left registrars carrying no worker id, so the first
+    ORDINARY round registers again (asserted with no event fired). With neither reported, a
+    sleep longer than the scheduler's heartbeat timeout is un-filed by its expiry and the next
+    heartbeat is told to register again; after a shorter one nothing was un-filed, the heartbeat
+    simply continues, and the worker may have been leased while it slept. A roster that lapsed
+    during sleep is renewed by the next ordinary presence round, also asserted with no event
+    fired. Where the registrations were withdrawn or expired, the cost is a gap of up to one
+    `NodeAnnounceInterval` (20 s) after a wake nobody reported, and it fails CLOSED: an
+    unregistered machine is leased nothing.
+  - Host events reach the node through `Platform/IHostEvents`: power events from the SCM
+    (`SERVICE_ACCEPT_POWEREVENT`, a table of `PBT_*`), so only a node running AS A SERVICE hears
+    them, and interface and address changes from `NotifyIpInterfaceChange` and
+    `NotifyUnicastIpAddressChange` through the pure `NetworkChangeDebouncer`, on Windows only.
+    Linux and macOS start no watcher and hear nothing, which the recovery above makes a
+    slower answer rather than a wrong one. `src/tests/ScriptedHostEvents.hpp` is the shared fake.
 - **A reloadable flag that feeds REGISTER is a claim, not a setting, and adopting one
   without telling the fleet is the silent failure the whole column exists to prevent**
   ([#403](https://github.com/LASTRADA-Software/fastcached/issues/403)). `--toolchain`

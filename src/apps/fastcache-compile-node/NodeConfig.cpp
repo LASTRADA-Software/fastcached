@@ -20,6 +20,7 @@
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Platform/Firewall.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
@@ -639,6 +640,24 @@ namespace
         // `--service-scope=user` from the daemon must not find the worker accepting a
         // different vocabulary.
         return ParseServiceScope(sv);
+    }
+
+    /// How the supervisor starts the registration, by name.
+    /// @param sv Text to parse.
+    /// @return The start mode, or why it is not one.
+    [[nodiscard]] std::expected<ServiceStart, ConfigError> ParseNodeServiceStart(std::string_view sv)
+    {
+        // The library's parser, for `ParseNodeServiceScope`'s reason: one vocabulary for both binaries.
+        return ParseServiceStart(sv);
+    }
+
+    /// One `--firewall-allow` scope.
+    /// @param sv Text to parse.
+    /// @return The scope as typed, or why it is not one.
+    [[nodiscard]] std::expected<std::string, ConfigError> ParseNodeFirewallScope(std::string_view sv)
+    {
+        // The library's parser, for `ParseNodeServiceScope`'s reason: one grammar for both binaries.
+        return ParseFirewallScope(sv);
     }
 
     /// Memory this node's cache tiers hold, and so cannot lend to a compile.
@@ -1707,6 +1726,24 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .apply = AssignFrom<&NodeConfig::serviceScope, ParseNodeServiceScope>(),
           .description = "which supervisor domain to register in (default system).\n"
                          "Ignored on Windows, which has only one." },
+        { .primary = "--service-start",
+          .arity = Arity::Value,
+          .operand = "=<auto|manual>",
+          .apply = AssignFrom<&NodeConfig::serviceStart, ParseNodeServiceStart>(),
+          .description = "how --install-service registers this worker (default\n"
+                         "auto): auto starts with the machine, manual waits to be\n"
+                         "started. Install-time only. On macOS a manual system\n"
+                         "job is restarted after a crash but not after a clean\n"
+                         "non-zero exit: launchd's keep-alive would also start it\n"
+                         "at boot" },
+        { .primary = "--firewall-allow",
+          .arity = Arity::Value,
+          .operand = "=<address[/prefix]>",
+          .apply = AppendFrom<&NodeConfig::firewallAllow, ParseNodeFirewallScope>(),
+          .description = "limit the firewall rules --install-service creates to\n"
+                         "these remote addresses (IPv4 or IPv6, with an optional\n"
+                         "/prefix; repeatable). Omit it to allow any address;\n"
+                         "/0 is refused. Install-time only" },
         { .primary = "--help",
           .alias = "-h",
           .arity = Arity::None,
@@ -1853,6 +1890,8 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           "the identity a registration is made under, read back from the file that "
           "registration points at -- so the name would come from the file the name found" },
         { "--service-scope", "the same circle as --service-name, for which supervisor the registration goes to" },
+        { "--service-start", "the same circle as --service-scope: how the supervisor starts the registration" },
+        { "--firewall-allow", "install-time only: it scopes the rules the registration creates" },
         { "--install-service", "registers and exits; a key would re-register at every start" },
         { "--uninstall-service", "removes the registration and exits; a key would remove it at every start" },
         { "--migrate-cache",
@@ -2432,6 +2471,8 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.push_back(std::format("--node-id={}", cfg.nodeId));
     emitIfExplicit("raft-self", cfg.raftSelf, cfg.raftSelfExplicit);
     emitIfExplicit("listen-raft", cfg.raftListen, cfg.raftListenExplicit);
+    // The TYPED directory only, never the resolved default: the service resolves its own again
+    // at every start, as the account it runs as (`stateDirectory` is never carried).
     emitPathIfSet("cluster-dir", cfg.clusterDir.string());
     emitIfExplicit("discovery", cfg.discoveryAddress, cfg.discoveryAddressExplicit);
     emitIfExplicit("discovery-reply-port", cfg.discoveryReplyPort, cfg.discoveryReplyPortExplicit);
@@ -2496,19 +2537,40 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // Only what the operator actually named, never a parent: `--cache-dir=/var/db/fc`
     // must not reassign /var/db, shared with other system services, to an
     // unprivileged compile account.
-    std::vector<std::filesystem::path> owned;
-    for (auto const& directory: { cfg.cacheDir, cfg.clusterDir })
-        if (!directory.empty())
-            owned.emplace_back(directory);
+    //
+    // And whether each keeps what it inherits. The cache holds objects the fleet already
+    // shares; the state directory holds the identity key this machine proves itself with,
+    // which the SERVICE mints at its first start -- so it is Private, and gets a list of its
+    // own rather than an entry added to `%ProgramData%`'s `BUILTIN\Users` read.
+    // A Private directory names the credential files inside it whose exposure is a
+    // re-mint rather than a reset: the identity key this node keeps in `--cluster-dir`.
+    struct OwnedDirectory
+    {
+        std::filesystem::path NodeConfig::* member;
+        PathPrivacy privacy;
+        std::vector<std::filesystem::path> credentialFiles;
+    };
+    auto OwnedDirectories = std::to_array<OwnedDirectory>({
+        OwnedDirectory { .member = &NodeConfig::cacheDir, .privacy = PathPrivacy::Shared, .credentialFiles = {} },
+        OwnedDirectory { .member = &NodeConfig::clusterDir,
+                         .privacy = PathPrivacy::Private,
+                         .credentialFiles = { std::filesystem::path { NodeKeyFileName } } },
+    });
+    std::vector<OwnedPath> owned;
+    for (auto& row: OwnedDirectories)
+        if (!(cfg.*row.member).empty())
+            owned.push_back(OwnedPath {
+                .path = cfg.*row.member, .privacy = row.privacy, .credentialFiles = std::move(row.credentialFiles) });
 
     // **A service keeps the MACHINE's identity, in a directory the install OWNS -- on every
     // platform.** A registration naming no `--cluster-dir` owns the machine-wide directory, so the
-    // install creates it and grants the service's account access to it (`GrantPathAccess`). That
-    // ADDS the account's entry and replaces nothing: on Windows `%ProgramData%`'s inherited read
-    // for every local user stays on the DIRECTORY, and the protected list is not this change's.
-    // What keeps the identity key -- a VOTER's, consensus being on by default -- to its owner is
-    // the KEY FILE: created owner-only whatever the directory grants, and never read from a
-    // directory other accounts may write in (`ResolveNodeKey`).
+    // install creates it and secludes it for the service's account: `Private`, exactly as a named
+    // `--cluster-dir` is above, because it is the same directory holding the same key. That
+    // REPLACES `%ProgramData%`'s inherited read for every local user with a protected list of its
+    // own (`SecureDirectoryForService`), and a list that does not take refuses the install. The
+    // KEY FILE keeps its own guarantee beside it -- created owner-only whatever the directory
+    // grants, and never read from a directory other accounts may write in (`ResolveNodeKey`) --
+    // and the two are defence in depth rather than alternatives.
     //
     // And on POSIX the account is not privileged, so left to itself it would take the per-user
     // default in its home. There the registration also hands the job the directory the way
@@ -2521,7 +2583,9 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     if (cfg.clusterDir.empty())
         if (auto const machineWide = MachineWideNodeClusterDirectory(probe); machineWide.has_value())
         {
-            owned.push_back(*machineWide);
+            owned.push_back(OwnedPath { .path = *machineWide,
+                                        .privacy = PathPrivacy::Private,
+                                        .credentialFiles = { std::filesystem::path { NodeKeyFileName } } });
             if (ServiceManagerHandsOverStateDirectory())
                 accountEnvironment.emplace_back(std::string { ServiceStateDirectoryVariable }, machineWide->string());
         }
@@ -2562,6 +2626,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          // "unrecognised argument" at every start, reported installed
                          // and dead at every boot.
                          .acceptedScopeDefaults = ScopeDefaults({ ScopeDefault::ConfigPath }),
+                         .startMode = cfg.serviceStart,
                          .configPath = absoluteOrAsWritten(cfg.configPath),
                          // Named since #396, and what that buys is the two things the
                          // empty name silently cost: the system-scope `--config=`

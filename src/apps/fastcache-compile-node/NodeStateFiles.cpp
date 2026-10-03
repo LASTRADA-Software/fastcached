@@ -363,4 +363,16 @@ HistoryPaths SetAsideForeignHistory(HistoryPaths paths, INodeKeyFileGuard& guard
     return paths;
 }
 
+std::expected<KeptFormation, std::string> ReadStateDirectoryFormation(std::filesystem::path const& stateDirectory)
+{
+    FileTrustNodeKeyGuard guard;
+    if (auto walked = JudgeStateDirectory(stateDirectory, guard); !walked.has_value())
+        return std::unexpected { std::move(walked).error().message };
+    Cluster::FileFormationStore const store { stateDirectory };
+    Cluster::FleetEndpointsFile endpoints { stateDirectory };
+    return ReadKeptFormation(store, endpoints).transform_error([&stateDirectory](std::string const& error) {
+        return error + StateFileUnreadableHint(stateDirectory / Cluster::FormationRecordFileName);
+    });
+}
+
 } // namespace FastCache::Node

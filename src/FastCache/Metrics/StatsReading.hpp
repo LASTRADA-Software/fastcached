@@ -986,7 +986,8 @@ inline constexpr std::array CounterSoleWriterTable {
 {
     auto named = std::array<bool, EnumeratorCount<IMetricsSink::Counter>> {};
     for (auto const& row: CounterSoleWriterTable)
-        named[static_cast<std::size_t>(row.counter)] = true;
+        if (auto const index = CounterIndex(row.counter); index.has_value())
+            named[*index] = true;
     return named;
 }
 

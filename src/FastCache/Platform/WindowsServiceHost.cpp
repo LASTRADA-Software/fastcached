@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
+#include <FastCache/Platform/HostEvents.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 
 #include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -18,7 +21,7 @@ namespace FastCache
 
 #if !defined(_WIN32)
 
-std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& /*serviceName*/)
+std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& /*serviceName*/, ServiceHostOptions /*options*/)
 {
     return nullptr; // unsupported on non-Windows
 }
@@ -37,6 +40,17 @@ namespace
     /// Service name the SCM dispatcher was started with; used by ServiceMain so
     /// a custom --service-name matches what was registered at install time.
     std::string registeredServiceName { "FastCached" };
+    /// What a stop reports; set by `WindowsServiceHost::Run` before the dispatcher starts.
+    StopPendingPlan stopPlan { StopPendingPlanFor(std::nullopt) };
+    /// Where a power event goes, or null when the service does not accept them; set by
+    /// `WindowsServiceHost::Run` before the dispatcher starts.
+    IHostEventSink* powerEvents { nullptr };
+    /// Set once the body has returned, which is what ends the progress reporter.
+    std::atomic<bool> bodyReturned { false };
+    /// Guards `stopReporter`, which the control handler starts and `ServiceMain` joins.
+    std::mutex reporterMutex;
+    /// Advances the stop checkpoint until the body returns; started by the first stop control.
+    std::jthread stopReporter;
 
     /// Guards `currentStatus` and the `SetServiceStatus` that publishes it.
     ///
@@ -67,7 +81,8 @@ namespace
     /// @param state The SCM state to report.
     /// @param waitHintMs How long a pending transition expects to take.
     /// @param bodyExitCode The daemon body's exit code; only read for SERVICE_STOPPED.
-    void ReportStatus(DWORD state, DWORD waitHintMs = 0, int bodyExitCode = 0)
+    /// @param checkPoint The stop checkpoint; zero outside STOP_PENDING.
+    void ReportStatus(DWORD state, DWORD waitHintMs = 0, int bodyExitCode = 0, DWORD checkPoint = 0)
     {
         std::scoped_lock const guard { statusMutex };
 
@@ -83,25 +98,56 @@ namespace
             currentStatus.dwServiceSpecificExitCode = 0;
         }
         currentStatus.dwWaitHint = waitHintMs;
+        currentStatus.dwCheckPoint = checkPoint;
         if (state == SERVICE_RUNNING)
-            currentStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PARAMCHANGE;
+            currentStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PARAMCHANGE
+                                               | (powerEvents != nullptr ? SERVICE_ACCEPT_POWEREVENT : 0);
         else
             currentStatus.dwControlsAccepted = 0;
         if (serviceStatus)
             SetServiceStatus(serviceStatus, &currentStatus);
     }
 
-    DWORD WINAPI ServiceCtrlHandlerEx(DWORD ctrl, DWORD /*evt*/, LPVOID /*evtData*/, LPVOID /*ctx*/)
+    DWORD WINAPI ServiceCtrlHandlerEx(DWORD ctrl, DWORD evt, LPVOID /*evtData*/, LPVOID /*ctx*/)
     {
         switch (ctrl)
         {
             case SERVICE_CONTROL_STOP:
-            case SERVICE_CONTROL_SHUTDOWN:
-                ReportStatus(SERVICE_STOP_PENDING, 10000);
+            case SERVICE_CONTROL_SHUTDOWN: {
                 DaemonControls::Instance().RequestStop();
+                std::scoped_lock const guard { reporterMutex };
+                // A second stop control -- `sc stop` followed by a system shutdown, say -- must
+                // change nothing: reporting the initial STOP_PENDING again would reset
+                // `dwCheckPoint` to zero mid-drain, which reads to the SCM as the stop having
+                // just started over. `stopReporter.joinable()` is the same "already stopping"
+                // fact `ReportStopProgress` itself watches, so this is the one gate rather than a
+                // second flag that could disagree with it.
+                if (!stopReporter.joinable())
+                {
+                    ReportStatus(SERVICE_STOP_PENDING, static_cast<DWORD>(stopPlan.waitHint.count()));
+                    stopReporter = std::jthread { [] {
+                        (void) ReportStopProgress(
+                            stopPlan,
+                            [] { return bodyReturned.load(std::memory_order_acquire); },
+                            [](std::uint32_t checkPoint, std::chrono::milliseconds hint) {
+                                ReportStatus(SERVICE_STOP_PENDING, static_cast<DWORD>(hint.count()), 0, checkPoint);
+                            },
+                            DefaultDrainWait());
+                    } };
+                }
                 return NO_ERROR;
+            }
             case SERVICE_CONTROL_PARAMCHANGE:
                 DaemonControls::Instance().RequestReload();
+                return NO_ERROR;
+            case SERVICE_CONTROL_POWEREVENT:
+                // Synchronous: the sink runs on this thread, and Windows allows about two
+                // seconds for a suspend notification, so whatever a suspend's sink says before
+                // the machine sleeps is bounded well inside that. Accepted only while RUNNING,
+                // so none arrives once the body is winding down.
+                if (powerEvents != nullptr)
+                    if (auto const event = HostEventForPowerBroadcast(evt))
+                        powerEvents->OnHostEvent(*event);
                 return NO_ERROR;
             case SERVICE_CONTROL_INTERROGATE:
                 return NO_ERROR;
@@ -122,14 +168,22 @@ namespace
         if (serviceBody)
             exitCode.store(serviceBody(), std::memory_order_release);
 
+        bodyReturned.store(true, std::memory_order_release);
+        {
+            std::scoped_lock const guard { reporterMutex };
+            if (stopReporter.joinable())
+                stopReporter.join();
+        }
+
         ReportStatus(SERVICE_STOPPED, 0, exitCode.load(std::memory_order_acquire));
     }
 
     class WindowsServiceHost final: public IDaemonHost
     {
       public:
-        explicit WindowsServiceHost(std::string name) noexcept:
-            _name { std::move(name) }
+        WindowsServiceHost(std::string name, ServiceHostOptions options) noexcept:
+            _name { std::move(name) },
+            _options { options }
         {
         }
 
@@ -137,11 +191,13 @@ namespace
         {
             serviceBody = std::move(body);
             registeredServiceName = _name;
+            stopPlan = _options.stop;
+            powerEvents = _options.hostEvents;
             // SERVICE_TABLE_ENTRYA takes a mutable char*; the SCM does not
             // modify the name but the API signature requires non-const.
             SERVICE_TABLE_ENTRYA table[] = {
-                { _name.data(), &ServiceMain },
-                { nullptr, nullptr },
+                { .lpServiceName = _name.data(), .lpServiceProc = &ServiceMain },
+                { .lpServiceName = nullptr, .lpServiceProc = nullptr },
             };
             if (!StartServiceCtrlDispatcherA(table))
                 return 1;
@@ -150,13 +206,14 @@ namespace
 
       private:
         std::string _name;
+        ServiceHostOptions _options;
     };
 
 } // namespace
 
-std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& serviceName)
+std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& serviceName, ServiceHostOptions options)
 {
-    return std::make_unique<WindowsServiceHost>(serviceName);
+    return std::make_unique<WindowsServiceHost>(serviceName, options);
 }
 
 #endif // _WIN32

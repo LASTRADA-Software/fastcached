@@ -76,9 +76,39 @@ $USER` if you want it running while you are not logged in.
 
 ### Windows
 
-Run the MSI. It installs both executables and registers `fastcached` as an
-auto-start Windows service, then starts it — clear the checkbox in the
-installer to register the service without starting it for now.
+Run the MSI and choose what this machine runs: **fastcached** (the cache daemon),
+**fastcache-cc** (the compiler launcher), **fastcache-compile-node** (the compile
+worker), and the command-line client, which is always installed. The installer
+registers the services that follow from the choice:
+
+| Installed | `FastCacheCompileNode` | `FastCached` |
+|---|---|---|
+| the node (with or without fastcached) | starts with Windows, started now | manual, stopped |
+| fastcached without the node | — | starts with Windows, started now (pass `FASTCACHED_START_SERVICE=0` to leave it stopped) |
+
+The node is registered only when the install also names its scheduler
+(`FASTCACHE_NODE_SCHEDULER`, described on the
+[fastcache-compile-node page](../tools/fastcache-compile-node.md#macos-and-windows)); without it
+fastcached is still made manual and nothing is started. The address clients reach the node at
+(`FASTCACHE_NODE_ADVERTISE`) is optional: left out, the node advertises this machine's fully
+qualified name. So is `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8`, which limits the firewall rules both
+registrations create to that remote range; left out, they admit any address. The package also
+pins the node's discovery reply port, `FASTCACHE_DISCOVERY_REPLY_PORT=6682` unless you pass another
+(or pass it empty), so its firewall opens UDP 6682 rather than every local UDP port. A node run by
+hand leaves that port to the kernel, because two nodes on one machine each need one of their own;
+the package installs one node per machine.
+
+A silent install names its features: `msiexec /i fastcached.msi /qn ADDLOCAL=CM_C_Cli,CM_C_Daemon,CM_C_Launcher`.
+Changing the selection later (Settings > Apps > Modify, or `msiexec /i fastcached.msi ADDLOCAL=CM_C_Node`
+and `REMOVE=CM_C_Node`) re-applies the table. An upgrade applies it too: it keeps the registration
+of every feature that stays installed, and removes the registration of a feature it no longer
+installs.
+
+**Upgrading from 0.3.0 or earlier is the exception.** Those installers delete both services when
+they are removed, and a major upgrade removes the old version first. The new installer registers
+`FastCached` again from the table, but it registers the node only when that upgrade passes
+`FASTCACHE_NODE_SCHEDULER` again (and `FASTCACHE_NODE_ADVERTISE`, if the node had one), so pass
+them on that one upgrade.
 
 ```powershell
 sc.exe query FastCached
@@ -96,7 +126,15 @@ sc.exe stop FastCached
 sc.exe start FastCached
 ```
 
-Uninstalling removes the service and leaves your configuration in place.
+Uninstalling removes the services and leaves your configuration in place.
+
+Registering a service also opens the Windows Firewall for whatever it listens on beyond
+loopback — nothing, for fastcached's default `127.0.0.1:6674` — and uninstalling, or
+deselecting a feature, removes its rules. An upgrade that drops a feature deletes its
+registration but leaves its rule group (`fastcached: <service>`) behind, inert, since it
+names a program that is no longer installed. What each binary opens is on its own page:
+[fastcached](../operations/deployment.md#windows-service) and
+[fastcache-compile-node](../tools/fastcache-compile-node.md#macos-and-windows).
 
 ### macOS
 

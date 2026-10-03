@@ -9,6 +9,7 @@
 #include <FastCache/Platform/DaemonControls.hpp>
 
 #include <algorithm>
+#include <expected>
 #include <format>
 #include <memory>
 #include <optional>
@@ -22,6 +23,64 @@ namespace FastCache::Node
 namespace
 {
     namespace Wire = FastCache::CompileCacheWire;
+
+    /// Send every queued withdrawal on @p client and clear the queue, whatever each answered.
+    /// @param round What to withdraw and where to log.
+    /// @param client A connected, proved scheduler.
+    /// @param endpoint Where `client` is connected, for the diagnostics.
+    /// @return How many the scheduler accepted.
+    std::size_t WithdrawQueued(HeartbeatRound const& round, core::net::ISocket& client, std::string_view endpoint)
+    {
+        // Cleared unconditionally: see `HeartbeatRound::withdrawals` for why a failure is not
+        // retried.
+        auto retired = std::size_t { 0 };
+        for (auto& retiring: round.withdrawals)
+        {
+            auto const done = retiring.Withdraw(client);
+            if (done.has_value())
+            {
+                ++retired;
+                continue;
+            }
+            // Logged and not acted on. Every refusal here -- an `UnknownOpcode` from a
+            // scheduler too old to know the verb, a `NotLeader`, an unreachable host --
+            // leaves the pre-existing expiry closing the window exactly as before, so
+            // this must never redirect the round, abort it, or count against it.
+            // Both halves of the registry's key, because since #1279 a withdrawal may
+            // name a fingerprint this worker still serves -- so the fingerprint alone
+            // reads as "it dropped a toolchain it is using" and names half an entry.
+            round.logger.Logf(LogLevel::Info,
+                              "scheduler {} did not retire {} at {}: {}; that registration will expire instead",
+                              endpoint,
+                              retiring.Fingerprint(),
+                              retiring.Endpoint(),
+                              done.error().reason);
+        }
+        round.withdrawals.clear();
+        return retired;
+    }
+
+    /// Prove this machine on @p client and seal it, or hand back why not. With no prover the
+    /// connection is returned as it is (a test's scripted fleet).
+    /// @param client A connected scheduler.
+    /// @param proof How this machine proves itself.
+    /// @return The connection every later frame travels on, or the attempt that failed.
+    [[nodiscard]] std::expected<std::unique_ptr<core::net::ISocket>, NodeProofAttempt> ProveConnection(
+        std::unique_ptr<core::net::ISocket> client, AnnounceProof const& proof)
+    {
+        if (proof.prover == nullptr)
+            return client;
+        auto sealed = std::make_unique<SealedFrameSocket>(
+            // No budget: a caller holds the replies to what it asked, one at a time.
+            std::move(client),
+            SealedFrameEnd::Caller,
+            CompileCacheWire::MaxSealedReplyPayload,
+            nullptr);
+        auto attempt = proof.prover->Prove(*sealed);
+        if (attempt.result != NodeProofResult::Proved)
+            return std::unexpected(std::move(attempt));
+        return std::unique_ptr<core::net::ISocket> { std::move(sealed) };
+    }
 } // namespace
 
 std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
@@ -184,27 +243,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
     // own rather than by inheritance: withdrawing first means the scheduler never holds
     // two live entries for one machine naming different addresses, one of which is
     // wrong. Registering first would make that window the normal case.
-    //
-    // Cleared unconditionally afterwards: see `HeartbeatRound::withdrawals` for why a
-    // failure is not retried.
-    for (auto& retiring: round.withdrawals)
-    {
-        if (auto const retired = retiring.Withdraw(client); !retired.has_value())
-            // Logged and not acted on. Every refusal here -- an `UnknownOpcode` from a
-            // scheduler too old to know the verb, a `NotLeader`, an unreachable host --
-            // leaves the pre-existing expiry closing the window exactly as before, so
-            // this must never redirect the round, abort it, or count against it.
-            // Both halves of the registry's key, because since #1279 a withdrawal may
-            // name a fingerprint this worker still serves -- so the fingerprint alone
-            // reads as "it dropped a toolchain it is using" and names half an entry.
-            round.logger.Logf(LogLevel::Info,
-                              "scheduler {} did not retire {} at {}: {}; that registration will expire instead",
-                              endpoint,
-                              retiring.Fingerprint(),
-                              retiring.Endpoint(),
-                              retired.error().reason);
-    }
-    round.withdrawals.clear();
+    (void) WithdrawQueued(round, client, endpoint);
 
     for (auto& registrar: round.registrars)
     {
@@ -358,33 +397,25 @@ std::size_t DialAndAnnounce(SchedulerLink& link,
         // Proved before anything is said, and sealed from then on (#178). A connection the proof did
         // not seal is one no joining verb can be heard on, so it counts as an endpoint that did not
         // answer: the next `--scheduler` is tried in this same round.
-        if (proof.prover != nullptr)
+        auto proved = ProveConnection(std::move(client), proof);
+        if (!proved.has_value())
         {
-            auto sealed = std::make_unique<SealedFrameSocket>(
-                // No budget: a caller holds the replies to what it asked, one at a time.
-                std::move(client),
-                SealedFrameEnd::Caller,
-                CompileCacheWire::MaxSealedReplyPayload,
-                nullptr);
-            auto const attempt = proof.prover->Prove(*sealed);
-            if (attempt.result != NodeProofResult::Proved)
-            {
-                // What each unproved outcome is called, and which machine it names to fix, is the
-                // `SchedulerOutcomeTable`'s proof rows; `Proved` never reaches this arm.
-                auto const unproved = link.Target();
-                auto const next = link.Lost();
-                auto const said =
-                    reachability.Failed(SchedulerOutcomeOfProof(attempt.result),
-                                        SchedulerFailure { .endpoint = unproved, .reason = attempt.reason, .next = next });
-                logger.Log(said.level, said.message);
-                if (!next.has_value())
-                    return 0;
-                continue;
-            }
+            // What each unproved outcome is called, and which machine it names to fix, is the
+            // `SchedulerOutcomeTable`'s proof rows; `Proved` never reaches this arm.
+            auto const unproved = link.Target();
+            auto const next = link.Lost();
+            auto const said = reachability.Failed(
+                SchedulerOutcomeOfProof(proved.error().result),
+                SchedulerFailure { .endpoint = unproved, .reason = proved.error().reason, .next = next });
+            logger.Log(said.level, said.message);
+            if (!next.has_value())
+                return 0;
+            continue;
+        }
+        if (proof.prover != nullptr)
             if (auto const back = reachability.Succeeded(AnnounceStage::Proof, link.Target()); back.has_value())
                 logger.Log(back->level, back->message);
-            client = std::move(sealed);
-        }
+        client = *std::move(proved);
 
         auto const outcome = announcement.Attempt(*client, link.Target());
         if (!outcome.leader.has_value())
@@ -416,6 +447,38 @@ std::size_t DialAndAnnounce(SchedulerLink& link,
             return 0;
         }
     }
+}
+
+std::size_t WithdrawOnce(HeartbeatRound const& round, SchedulerLink const& link, IEndpointDialer& dialer)
+{
+    // Nothing accepted, nothing to retire: a dial would spend up to a second of the machine's
+    // sleep saying nothing.
+    if (round.withdrawals.empty())
+        return 0;
+    auto const target = std::string { link.Target() };
+    auto client = dialer.Dial(target, core::net::DialOptions { .connectTimeout = SuspendDialTimeout });
+    if (client == nullptr)
+    {
+        round.logger.Logf(LogLevel::Info,
+                          "scheduler {} unreachable before this machine sleeps; {} registration(s) will expire instead",
+                          target,
+                          round.withdrawals.size());
+        round.withdrawals.clear();
+        return 0;
+    }
+    auto proved = ProveConnection(std::move(client), AnnounceProof { .prover = round.prover });
+    if (!proved.has_value())
+    {
+        round.logger.Logf(LogLevel::Info,
+                          "scheduler {} did not accept this machine's identity before it sleeps ({}); {} registration(s) "
+                          "will expire instead",
+                          target,
+                          proved.error().reason,
+                          round.withdrawals.size());
+        round.withdrawals.clear();
+        return 0;
+    }
+    return WithdrawQueued(round, **proved, target);
 }
 
 } // namespace FastCache::Node

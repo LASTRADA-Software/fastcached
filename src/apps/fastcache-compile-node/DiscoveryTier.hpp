@@ -5,6 +5,7 @@
 #include "ForeignFleetWatch.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeSurfaces.hpp"
 
 #include <FastCache/Cluster/DiscoveryService.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
@@ -316,5 +317,20 @@ class DiscoveryTier
     NodeConditions& conditions,
     IMetricsSink& metrics,
     ILogger& logger);
+
+/// What an operator is told when discovery's two sockets cannot be bound.
+///
+/// Both are named, because either can be the one that failed and the opener cannot tell which --
+/// a message blaming the beacon port alone sends an operator to look at a port that bound
+/// perfectly. The reply socket is spelled by its PORT KIND, as the worksheet spells it: its number
+/// when `--discovery-reply-port` pins it, `*` and "port chosen by the kernel at bind" when not --
+/// never decided a second time from the flag.
+/// @param beacon The shared socket beacons are heard on.
+/// @param reply The socket this node answers from.
+/// @param why What the socket layer said.
+/// @return One sentence, without a full stop.
+[[nodiscard]] std::string DiscoveryBindFailure(SurfaceEndpoint const& beacon,
+                                               SurfaceEndpoint const& reply,
+                                               std::string_view why);
 
 } // namespace FastCache::Node

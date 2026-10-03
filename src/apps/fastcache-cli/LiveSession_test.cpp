@@ -40,6 +40,7 @@
 #include <core/net/PlatformLoop.hpp>
 #include <core/net/testing/TestLoop.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/SteppedDrainWait.hpp>
 
 #if !defined(_WIN32)
     #include <csignal>
@@ -48,6 +49,7 @@
 using namespace FastCache;
 using namespace FastCache::Cli;
 using namespace FastCache::Cli::Testing;
+using FastCache::Testing::SteppedDrainWait;
 
 namespace
 {
@@ -497,47 +499,6 @@ void StepReads(Rig& rig, ScriptedSubscription const& subscription, std::size_t r
 constexpr auto SixelTerminal = TerminalCapabilities { .sixel = SixelAnswer::Advertised,
                                                       .encoding = TerminalTextEncoding::Utf8,
                                                       .cellPixels = CellPixelSize { .width = 10, .height = 20 } };
-
-/// A drain wait whose time passes only when the drain sleeps, and which can let the rig run
-/// after a chosen number of sleeps -- so a source drains for real, mid-drain.
-///
-/// **No real time passes**: the drain's ceiling is measured on this clock, so a five-second
-/// ceiling costs a loop of five hundred iterations and nothing else.
-class SteppedDrainWait final: public IDrainWait
-{
-  public:
-    /// @param settle The rig to settle after @p settleAfter sleeps; null to settle nothing.
-    /// @param settleAfter How many sleeps pass before it is.
-    explicit SteppedDrainWait(Rig* settle = nullptr, int settleAfter = 0) noexcept:
-        _settle { settle },
-        _settleAfter { settleAfter }
-    {
-    }
-
-    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
-    {
-        return _now;
-    }
-
-    void Sleep(std::chrono::milliseconds requested) noexcept override
-    {
-        _now += requested;
-        ++_sleeps;
-        if (_settle != nullptr && _sleeps == _settleAfter)
-            _settle->Settle();
-    }
-
-    [[nodiscard]] int Sleeps() const noexcept
-    {
-        return _sleeps;
-    }
-
-  private:
-    Rig* _settle;
-    int _settleAfter;
-    core::platform::SteadyTimePoint _now {};
-    int _sleeps { 0 };
-};
 
 /// The bound every drain case uses.
 constexpr auto Bound = DrainBound { .ceiling = std::chrono::seconds { 5 }, .poll = std::chrono::milliseconds { 10 } };
@@ -1273,7 +1234,12 @@ TEST_CASE("a dial that returns inside the bound drains and abandons nothing", "[
     rig.reactor.drain();
     source.Close();
 
-    auto wait = SteppedDrainWait { &rig, 3 };
+    // The rig settles on the third poll: a source that drains for real, mid-drain. The hook runs
+    // after each poll is counted, so its own call count is the poll count.
+    auto wait = SteppedDrainWait { [&rig, polls = 0]() mutable {
+        if (++polls == 3)
+            rig.Settle();
+    } };
     CHECK_FALSE(DrainSession(source, Bound, wait).has_value());
     CHECK(wait.Sleeps() == 3);
     CHECK(rig.subscription.Opens() == 1);

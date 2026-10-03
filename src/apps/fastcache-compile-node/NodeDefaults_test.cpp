@@ -9,6 +9,7 @@
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Platform/FileTrust.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -32,9 +33,11 @@
 #include <utility>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/HostNamingFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -217,8 +220,17 @@ TEST_CASE("The state directory is named with why it is that one, and asking befo
     CHECK(DescribeNodeStateDirectory(cfg).contains(Unwrap(ChosenStateDirectory(cfg)).path.string()));
     CHECK(DescribeNodeStateDirectory(cfg).contains(DescribeStateDirectoryOrigin(StateDirectoryOrigin::PerUser)));
 
+    // --print-identity says it too, on a line of its own: unelevated, the identity it prints is
+    // the account's, which the service never runs as.
+    auto const identityLine = DescribeIdentityOrigin(cfg);
+    CHECK(identityLine.starts_with("state-directory "));
+    CHECK(identityLine.ends_with("\n"));
+    CHECK(identityLine.contains(Unwrap(ChosenStateDirectory(cfg)).path.string()));
+    CHECK(identityLine.contains("per-user"));
+
     cfg.clusterDir = "cluster";
     CHECK(Unwrap(ChosenStateDirectory(cfg)).origin == StateDirectoryOrigin::Named);
+    CHECK(DescribeIdentityOrigin(cfg).contains("named by --cluster-dir"));
     CHECK(NodeStateDirectory(cfg) == std::filesystem::path { "cluster" });
     CHECK(DescribeNodeStateDirectory(cfg).contains(DescribeStateDirectoryOrigin(StateDirectoryOrigin::Named)));
 
@@ -750,7 +762,10 @@ TEST_CASE("A service registration owns the machine-wide state directory, and han
     CHECK(std::ranges::none_of(spec.arguments, [](std::string const& a) { return a.starts_with("--cluster-dir"); }));
     auto const machineWide = MachineWideNodeClusterDirectory(Testing::InstallerPathProbe());
     REQUIRE(machineWide.has_value());
-    CHECK(std::ranges::contains(spec.ownedPaths, Unwrap(machineWide)));
+    CHECK(std::ranges::contains(spec.ownedPaths,
+                                OwnedPath { .path = Unwrap(machineWide),
+                                            .privacy = PathPrivacy::Private,
+                                            .credentialFiles = { std::filesystem::path { NodeKeyFileName } } }));
 #if defined(_WIN32)
     CHECK(Unwrap(machineWide) == std::filesystem::path { R"(C:\ProgramData\fastcache-node)" });
     CHECK_FALSE(ServiceManagerHandsOverStateDirectory());
@@ -775,7 +790,10 @@ TEST_CASE("A service registration owns the machine-wide state directory, and han
     named.clusterDir = "/srv/node";
     auto const namedSpec = MakeNodeServiceSpec(exe, named, Testing::InstallerPathProbe());
     CHECK(namedSpec.serviceAccountEnvironment.empty());
-    CHECK(namedSpec.ownedPaths == std::vector<std::filesystem::path> { named.clusterDir });
+    CHECK(namedSpec.ownedPaths
+          == std::vector<OwnedPath> { OwnedPath { .path = named.clusterDir,
+                                                  .privacy = PathPrivacy::Private,
+                                                  .credentialFiles = { std::filesystem::path { NodeKeyFileName } } } });
 
     // And the plist carries the pairs beside the account.
     auto withEnvironment = spec;
@@ -786,3 +804,72 @@ TEST_CASE("A service registration owns the machine-wide state directory, and han
     CHECK(
         plist.contains("<key>STATE_DIRECTORY</key>\n        <string>/Library/Application Support/fastcache-node</string>"));
 }
+
+#if !defined(_WIN32)
+
+namespace
+{
+
+/// The POSIX handover's two calls with the account part left out: the scratch directory a case
+/// stands in for the machine-wide one already belongs to the account running the suite, and the
+/// subject is what `Seclude` does to the MODE.
+class ModeOnlyHandover final: public IOwnedPathHandover
+{
+  public:
+    /// @copydoc IOwnedPathHandover::Share
+    [[nodiscard]] std::optional<std::string> Share(std::filesystem::path const& /*path*/) override
+    {
+        ++shared;
+        return std::nullopt;
+    }
+
+    /// @copydoc IOwnedPathHandover::Seclude
+    [[nodiscard]] std::optional<std::string> Seclude(std::filesystem::path const& path,
+                                                     std::span<std::filesystem::path const> credentialLeaves) override
+    {
+        ++secluded;
+        auto const secured = SecureDirectoryForService(path, "ignored-on-posix", credentialLeaves);
+        return secured.has_value() ? std::nullopt : std::optional { secured.error() };
+    }
+
+    int shared { 0 };   ///< How many paths were handed over keeping what they inherit.
+    int secluded { 0 }; ///< How many were given a mode of their own.
+};
+
+} // namespace
+
+TEST_CASE("A service registration's defaulted state directory loses its group and other bits on POSIX",
+          "[node][formation][defaults][service]")
+{
+    // The chain from the registration to the mode, on the platform the Windows run cannot see:
+    // the spec marks the machine-wide directory Private, the handover routes a Private path to its
+    // seclusion, and the POSIX seclusion is `chmod go-rwx`. The real directory is
+    // /var/lib/fastcache-node, which a suite run unprivileged cannot touch, so the spec's own
+    // entry is re-pointed at a scratch directory and keeps every other field.
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" },
+                                          Testing::FirstStart(NodeConfig {}),
+                                          Testing::InstallerPathProbe());
+    auto const machineWide = MachineWideNodeClusterDirectory(Testing::InstallerPathProbe());
+    REQUIRE(machineWide.has_value());
+    auto const* const owned = core::findOrNull(spec.ownedPaths, Testing::Unwrap(machineWide), &OwnedPath::path);
+    REQUIRE(owned != nullptr);
+
+    Testing::ScratchDirectory const scratch { "node-default-state-mode" };
+    auto entry = *owned;
+    entry.path = scratch.Path() / "fastcache-node";
+    std::filesystem::create_directories(entry.path);
+    std::filesystem::permissions(entry.path, std::filesystem::perms::all, std::filesystem::perm_options::replace);
+
+    ModeOnlyHandover handover;
+    auto const handedOver = HandOverOwnedPaths(std::span<OwnedPath const> { &entry, 1 }, handover);
+    INFO(handedOver.refusal.value_or(std::string {}));
+    REQUIRE_FALSE(handedOver.refusal.has_value());
+    CHECK(handover.secluded == 1);
+    CHECK(handover.shared == 0);
+
+    auto const left = std::filesystem::status(entry.path).permissions();
+    CHECK((left & (std::filesystem::perms::group_all | std::filesystem::perms::others_all)) == std::filesystem::perms::none);
+    CHECK((left & std::filesystem::perms::owner_all) == std::filesystem::perms::owner_all);
+}
+
+#endif

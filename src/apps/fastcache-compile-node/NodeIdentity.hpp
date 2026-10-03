@@ -110,6 +110,16 @@ static_assert(MintedNodeIdLength <= CompileCacheWire::MaxIdBytes, "a minted node
 /// @return `<path> (<why>)`, or why there is none yet.
 [[nodiscard]] std::string DescribeNodeStateDirectory(NodeConfig const& cfg);
 
+/// The line `--print-identity` prints after the identity: where it is kept, and why there.
+///
+/// An unelevated run on Windows keeps a PER-USER identity under `%LOCALAPPDATA%`, which the
+/// service -- holding the machine's, under `%ProgramData%` -- never runs as; an operator who
+/// admitted that key would admit an identity no machine proves. The lines above it look the
+/// same either way, so this one says which.
+/// @param cfg The configuration, its state directory resolved.
+/// @return `state-directory <path> (<why>)`, ending in a newline.
+[[nodiscard]] std::string DescribeIdentityOrigin(NodeConfig const& cfg);
+
 /// Why a node refuses to start with no state directory.
 inline constexpr std::string_view NoStateDirectoryRefusal =
     "this node has no state directory to keep its identity in: no --cluster-dir was given, and the platform's "

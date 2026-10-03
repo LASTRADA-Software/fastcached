@@ -134,6 +134,29 @@ enum class ServiceScope : std::uint8_t
     System = 1,
 };
 
+/// How a registered service starts.
+///
+/// A vocabulary type living beside `ServiceScope` for that type's reason: it
+/// configures the installation, not the running daemon, and `CliResult` carries it
+/// -- which `Platform/ServiceControl.hpp` cannot be included to declare, since it
+/// includes the parser. Its rows (`ServiceStartTable`) live there.
+///
+/// **Private**: never transmitted and never persisted by this project -- the SCM start type
+/// and the launchd keys are written from the ROW, never from the enumerator's value, so the
+/// enumerators carry none.
+///
+/// There is no systemd column: this binary registers no systemd unit (`InstallService` answers
+/// "only on Windows and macOS" there), and the packaged units carry their own enable policy.
+enum class ServiceStart : std::uint8_t
+{
+    Auto, ///< Starts with the machine: SCM auto-start, launchd `RunAtLoad`.
+    /// Registered, and started only when somebody asks: SCM demand-start, no `RunAtLoad`.
+    /// On macOS a system-scope job is then not restarted after a clean non-zero exit,
+    /// since launchd's restart-on-any-exit also starts the job at load (see its row).
+    Manual,
+    Last
+};
+
 /// CPU-affinity policy for the reactor worker threads.
 enum class CpuAffinity : std::uint8_t
 {

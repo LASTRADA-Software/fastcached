@@ -298,23 +298,32 @@ TEST_CASE("Discovery binds the wildcard whatever address it announces to", "[nod
     auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.discoveryAddress = "255.255.255.255:6681";
 
-    auto const beaconOnly = RowFor(NodeSurface::Discovery).Resolve(cfg);
-    REQUIRE(beaconOnly.size() == 1);
+    auto const unpinned = RowFor(NodeSurface::Discovery).Resolve(cfg);
+    REQUIRE(unpinned.size() == 2);
     // NOT 255.255.255.255. The address is where beacons are sent; the socket binds
     // the wildcard unconditionally, and reading the announce address as a bind
     // address would put a broadcast address on a firewall worksheet.
-    CHECK(beaconOnly.front().host == "0.0.0.0");
-    CHECK(beaconOnly.front().port == 6681);
-    CHECK(beaconOnly.front().role == "beacon");
+    CHECK(unpinned.front().host == "0.0.0.0");
+    CHECK(unpinned.front().port == 6681);
+    CHECK(unpinned.front().portKind == SurfacePortKind::Fixed);
+    CHECK(unpinned.front().role == "beacon");
 
     // The second endpoint, which is why the row resolves to a list. A node answers
     // challenges on a port only it holds, so an operator who opened the beacon port
-    // and not this one hears every beacon and completes no handshake.
+    // and not this one hears every beacon and completes no handshake. It is there
+    // UNPINNED too, as a port the kernel chooses: left out, it was a socket no
+    // firewall rule and no worksheet line covered.
+    CHECK(unpinned[1].host == "0.0.0.0");
+    CHECK(unpinned[1].port == 0);
+    CHECK(unpinned[1].portKind == SurfacePortKind::KernelChosen);
+    CHECK(unpinned[1].role == "reply");
+
     cfg.discoveryReplyPort = 6682;
-    auto const both = RowFor(NodeSurface::Discovery).Resolve(cfg);
-    REQUIRE(both.size() == 2);
-    CHECK(both[1].port == 6682);
-    CHECK(both[1].role == "reply");
+    auto const pinned = RowFor(NodeSurface::Discovery).Resolve(cfg);
+    REQUIRE(pinned.size() == 2);
+    CHECK(pinned[1].port == 6682);
+    CHECK(pinned[1].portKind == SurfacePortKind::Fixed);
+    CHECK(pinned[1].role == "reply");
 }
 
 TEST_CASE("Discovery is the only surface that is not TCP", "[node][surfaces]")
@@ -957,4 +966,24 @@ TEST_CASE("Every node is attributed the shared-cache counters", "[node][surfaces
     // Every node builds the shared-cache component on its merged listener, dormant or serving, so
     // every node can move these -- a dormant one counts its not-serving refusals.
     CHECK(std::ranges::contains(NodeServedSurfacesFor(NodeConfig {}).Span(), MetricsSurface::NodeSharedCache));
+}
+
+TEST_CASE("The worksheet prints a kernel-chosen port as one nobody can name, never as port 0", "[node][surfaces]")
+{
+    // A `:0` on a worksheet is a port an operator would copy into a firewall rule, and a
+    // rule on port 0 admits nothing -- so the reply socket's line says whose port it is.
+    auto cfg = Testing::FirstStart(NodeConfig {});
+    cfg.discoveryAddress = "255.255.255.255:6681";
+
+    auto const unpinned = LineStarting(RenderSurfaces(cfg), "discovery reply ");
+    REQUIRE(unpinned.has_value());
+    CHECK(AddressColumnOf(Unwrap(unpinned), "discovery reply") == "0.0.0.0:*");
+    CHECK(Unwrap(unpinned).ends_with("UDP, port chosen by the kernel at bind"));
+
+    // Pinned, it is a port like any other, and the line says nothing more than the protocol.
+    cfg.discoveryReplyPort = 6682;
+    auto const pinned = LineStarting(RenderSurfaces(cfg), "discovery reply ");
+    REQUIRE(pinned.has_value());
+    CHECK(AddressColumnOf(Unwrap(pinned), "discovery reply") == "0.0.0.0:6682");
+    CHECK(Unwrap(pinned).ends_with("  UDP"));
 }

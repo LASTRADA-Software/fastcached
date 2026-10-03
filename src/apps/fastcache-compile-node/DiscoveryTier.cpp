@@ -163,8 +163,9 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     // and every wrong pairing still starts and still passes a test suite.
     // BOTH sockets come from this surface's row, not from a literal spelled here three
     // times and a reply port passed around it. The row resolves to exactly the two
-    // endpoints this opens -- beacon first, reply second when one is pinned -- so the
-    // addresses bound here and the ones `--print-surfaces` prints are one computation.
+    // endpoints this opens -- beacon first, reply second, whose port is 0 when its kind
+    // says the kernel chooses it, which is also how the opener asks the kernel for one --
+    // so the addresses bound here and the ones `--print-surfaces` prints are one computation.
     // Taking only the host from the row and re-deriving the ports would have left the
     // resolver dead code for its only production consumer, on the surface with two
     // endpoints, the only UDP one, and the one operators get wrong most.
@@ -175,24 +176,24 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     if (endpoints.empty())
         return std::unexpected { std::format("--discovery={} is not <address>:<port>", cfg.discoveryAddress) };
 
+    // Beacon first, reply second, always: the row resolves the reply socket whether or not
+    // a port is pinned, and says which by its port kind. Anything else is this binary's defect.
+    if (endpoints.size() != 2)
+        return std::unexpected { std::format(
+            "the discovery surface resolved {} endpoint(s) where it always resolves a beacon and a reply socket; "
+            "this is a defect in this binary rather than in the configuration",
+            endpoints.size()) };
     auto const& beaconSocket = endpoints.front();
+    auto const& replySocket = endpoints.back();
     auto const& bindHost = beaconSocket.host;
-    auto const replyPort = endpoints.size() > 1 ? endpoints[1].port : std::uint16_t { 0 };
 
-    auto opened = core::net::openSharedPortUdpSocket(bindHost, beaconSocket.port, replyPort);
+    auto opened = core::net::openSharedPortUdpSocket(bindHost, beaconSocket.port, replySocket.port);
     if (!opened.has_value())
     {
-        // Through the row (#352). Both ports are named because either can be the one
-        // that failed and this cannot tell which -- a message blaming the beacon port
-        // alone sends an operator to look at a port that bound perfectly.
-        auto judged = JudgeBindFailure(
-            RowFor(NodeSurface::Discovery),
-            std::format("cannot bind the UDP sockets discovery needs: {} to listen on, and {} to answer on ({})",
-                        FormatHostPort(bindHost, beaconSocket.port),
-                        cfg.discoveryReplyPort != 0 ? FormatHostPort(bindHost, cfg.discoveryReplyPort)
-                                                    : std::string { "a port of this node's own" },
-                        opened.error().toString()),
-            logger);
+        // Through the row (#352), naming both sockets (`DiscoveryBindFailure`).
+        auto judged = JudgeBindFailure(RowFor(NodeSurface::Discovery),
+                                       DiscoveryBindFailure(beaconSocket, replySocket, opened.error().toString()),
+                                       logger);
         if (!judged.has_value())
             return std::unexpected { std::move(judged).error() };
 
@@ -435,6 +436,16 @@ void DiscoveryTier::PublishAuthenticated()
 
     if (_onPeers && !members.empty())
         _onPeers(members);
+}
+
+std::string DiscoveryBindFailure(SurfaceEndpoint const& beacon, SurfaceEndpoint const& reply, std::string_view why)
+{
+    auto const& replyKind = SurfacePortKindRowOf(reply.portKind);
+    return std::format("cannot bind the UDP sockets discovery needs: {} to listen on, and {} to answer on{} ({})",
+                       FormatHostPort(beacon.host, beacon.port),
+                       FormatHostPort(reply.host, replyKind.portText(reply.port)),
+                       replyKind.trailer,
+                       why);
 }
 
 std::expected<std::unique_ptr<DiscoveryTier>, std::string> StartDiscoveryOrExplain(

@@ -1,0 +1,290 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The service table in packaging/windows/service-actions.xml, asserted element by
+# element.
+#
+# The MSI is the one artefact here whose behaviour only a Windows runner can
+# exercise, minutes into the slowest job in the matrix, and a condition that lost a
+# clause still builds a package. Two of the clauses are guards whose absence would
+# do damage rather than fail: the leftover removal deletes a SERVICE, so it must be
+# keyed on an upgrade, on the feature being gone, and on the registration pointing
+# into this install root (a service registered by hand from another directory is
+# not the installer's to delete). This check pins those clauses in the source,
+# where a change to them is a red test on every platform.
+#
+# What it asserts:
+#   1. every row of the table below: the element opening with `opener` exists
+#      exactly once, and the text up to its `terminator` contains `required`
+#      (entities decoded), or, for a `required` starting with `!`, does NOT;
+#   2. every Condition attribute that reads one of the 0-then-1 flags (which
+#      features are left installed, whether a registration is ours) compares it
+#      with "1". Those properties are written 0 and then 1, so a bare truth test
+#      reads "0" as true.
+#
+# What it does NOT see: whether Windows Installer evaluates a condition the way it
+# reads, and anything about sequencing beyond the After= values pinned below. The
+# `Package (Windows .msi)` job is the only thing that runs the package. This fails
+# CLOSED on a row whose opener is missing or repeated, and OPEN on a clause that is
+# present but wrong in a way no row names.
+#
+# Usage:
+#   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-wix-service-table.cmake
+
+cmake_minimum_required(VERSION 3.28)
+
+if(NOT DEFINED FASTCACHED_SOURCE_DIR)
+    message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
+endif()
+
+set(_file "${FASTCACHED_SOURCE_DIR}/packaging/windows/service-actions.xml")
+if(NOT EXISTS "${_file}")
+    message(FATAL_ERROR "check-wix-service-table: ${_file} does not exist")
+endif()
+
+# One row per line: opener | terminator | required. ONE bracket argument walked
+# line by line with FIND and SUBSTRING, never a CMake list: a row carries
+# `[INSTALL_ROOT]`, and a square bracket or a `;` in a list element merges or
+# drops elements in silence. A blank line is a separator and is skipped.
+set(_table [=[
+<Property Id="FASTCACHE_NODE_IMAGEPATH"|</Property>|Key="SYSTEM\CurrentControlSet\Services\FastCacheCompileNode"
+<Property Id="FASTCACHE_NODE_IMAGEPATH"|</Property>|Name="ImagePath"
+<Property Id="FASTCACHE_NODE_IMAGEPATH"|</Property>|Root="HKLM"
+<Property Id="FASTCACHED_IMAGEPATH"|</Property>|Key="SYSTEM\CurrentControlSet\Services\FastCached"
+<Property Id="FASTCACHED_IMAGEPATH"|</Property>|Name="ImagePath"
+<Property Id="FASTCACHED_IMAGEPATH"|</Property>|Root="HKLM"
+
+<CustomAction Id="FastCacheNodeDeleteLeftover"|/>|sc.exe" delete FastCacheCompileNode"
+<CustomAction Id="FastCacheNodeDeleteLeftover"|/>|Execute="deferred"
+<CustomAction Id="FastCacheNodeDeleteLeftover"|/>|Impersonate="no"
+<CustomAction Id="FastCacheNodeDeleteLeftover"|/>|Return="ignore"
+<CustomAction Id="FastCachedDeleteLeftover"|/>|sc.exe" delete FastCached"
+<CustomAction Id="FastCachedDeleteLeftover"|/>|Execute="deferred"
+<CustomAction Id="FastCachedDeleteLeftover"|/>|Impersonate="no"
+<CustomAction Id="FastCachedDeleteLeftover"|/>|Return="ignore"
+
+<Custom Action="FastCacheNodeDeleteLeftover"|/>|WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE
+<Custom Action="FastCacheNodeDeleteLeftover"|/>|NOT UPGRADINGPRODUCTCODE
+<Custom Action="FastCacheNodeDeleteLeftover"|/>|NOT (FASTCACHE_NODE_SELECTED = "1")
+<Custom Action="FastCacheNodeDeleteLeftover"|/>|FASTCACHE_NODE_REGISTERED_HERE = "1"
+<Custom Action="FastCacheNodeDeleteLeftover"|/>|!~><
+<Custom Action="FastCacheNodeDeleteLeftover"|/>|After="InstallFiles"
+<Custom Action="FastCachedDeleteLeftover"|/>|WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE
+<Custom Action="FastCachedDeleteLeftover"|/>|NOT UPGRADINGPRODUCTCODE
+<Custom Action="FastCachedDeleteLeftover"|/>|NOT (FASTCACHED_SELECTED = "1")
+<Custom Action="FastCachedDeleteLeftover"|/>|FASTCACHED_REGISTERED_HERE = "1"
+<Custom Action="FastCachedDeleteLeftover"|/>|!~><
+<Custom Action="FastCachedDeleteLeftover"|/>|After="FastCacheNodeDeleteLeftover"
+
+<CustomAction Id="FastCacheNodeInstallService"|/>|--scheduler=[FASTCACHE_NODE_SCHEDULER] [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument]"
+<CustomAction Id="FastCacheNodeInstallService"|/>|!--discovery-reply-port=
+<CustomAction Id="FastCachedInstallService"|/>|!DiscoveryReply
+<Property Id="FASTCACHE_DISCOVERY_REPLY_PORT"|/>|Value="6682"
+<CustomAction Id="FastCachedInstallService"|/>|--service-start=[FASTCACHED_START_MODE] [FastCacheFirewallAllowArgument]"
+<CustomAction Id="FastCachedInstallService"|/>|!--firewall-allow=
+<CustomAction Id="FastCacheNodeInstallService"|/>|!--firewall-allow=
+<CustomAction Id="FastCacheNodeInstallService"|/>|!--cluster-dir
+<CustomAction Id="FastCacheNodeInstallService"|/>|!--advertise=
+<Custom Action="FastCacheNodeInstallService"|/>|FASTCACHE_NODE_SELECTED = "1" AND FASTCACHE_NODE_SCHEDULER"
+<Custom Action="FastCacheNodeInstallService"|/>|!FASTCACHE_NODE_ADVERTISE
+<SetProperty Action="SetFastCacheNodeAdvertiseArgument"|/>|Id="FastCacheNodeAdvertiseArgument"
+<SetProperty Action="SetFastCacheNodeAdvertiseArgument"|/>|Value="--advertise=[FASTCACHE_NODE_ADVERTISE]"
+<SetProperty Action="SetFastCacheNodeAdvertiseArgument"|/>|Condition="FASTCACHE_NODE_ADVERTISE"
+<SetProperty Action="SetFastCacheNodeAdvertiseArgument"|/>|After="SetFastCachedStartAuto"
+<SetProperty Action="SetFastCacheFirewallAllowArgument"|/>|Id="FastCacheFirewallAllowArgument"
+<SetProperty Action="SetFastCacheFirewallAllowArgument"|/>|Value="--firewall-allow=[FASTCACHE_FIREWALL_ALLOW]"
+<SetProperty Action="SetFastCacheFirewallAllowArgument"|/>|Condition="FASTCACHE_FIREWALL_ALLOW"
+<SetProperty Action="SetFastCacheFirewallAllowArgument"|/>|After="SetFastCacheNodeAdvertiseArgument"
+<SetProperty Action="SetFastCacheNodeDiscoveryReplyArgument"|/>|Id="FastCacheNodeDiscoveryReplyArgument"
+<SetProperty Action="SetFastCacheNodeDiscoveryReplyArgument"|/>|Value="--discovery-reply-port=[FASTCACHE_DISCOVERY_REPLY_PORT]"
+<SetProperty Action="SetFastCacheNodeDiscoveryReplyArgument"|/>|Condition="FASTCACHE_DISCOVERY_REPLY_PORT"
+<SetProperty Action="SetFastCacheNodeDiscoveryReplyArgument"|/>|After="SetFastCacheFirewallAllowArgument"
+
+<SetProperty Action="SetFastCacheOwnImagePathPrefix"|/>|Value=""[INSTALL_ROOT]"
+<SetProperty Action="SetFastCacheOwnImagePathPrefix"|/>|After="CostFinalize"
+<SetProperty Action="SetFastCacheOwnImagePathPrefix"|/>|!Condition=
+<SetProperty Action="SetFastCacheOwnImagePathRawPrefix"|/>|Value="#%"[INSTALL_ROOT]"
+<SetProperty Action="SetFastCacheOwnImagePathRawPrefix"|/>|After="SetFastCacheOwnImagePathPrefix"
+<SetProperty Action="SetFastCacheOwnImagePathRawPrefix"|/>|!Condition=
+
+<SetProperty Action="ClearFastCacheNodeRegisteredHere"|/>|Value="0"
+<SetProperty Action="ClearFastCacheNodeRegisteredHere"|/>|After="SetFastCacheOwnImagePathRawPrefix"
+<SetProperty Action="ClearFastCacheNodeRegisteredHere"|/>|!Condition=
+<SetProperty Action="SetFastCacheNodeRegisteredHereQuoted"|/>|Condition="FASTCACHE_OWN_IMAGEPATH_PREFIX AND FASTCACHE_NODE_IMAGEPATH ~<< FASTCACHE_OWN_IMAGEPATH_PREFIX"
+<SetProperty Action="SetFastCacheNodeRegisteredHereQuoted"|/>|After="ClearFastCacheNodeRegisteredHere"
+<SetProperty Action="SetFastCacheNodeRegisteredHereRaw"|/>|Condition="FASTCACHE_OWN_IMAGEPATH_RAW_PREFIX AND FASTCACHE_NODE_IMAGEPATH ~<< FASTCACHE_OWN_IMAGEPATH_RAW_PREFIX"
+<SetProperty Action="SetFastCacheNodeRegisteredHereRaw"|/>|After="SetFastCacheNodeRegisteredHereQuoted"
+<SetProperty Action="ClearFastCachedRegisteredHere"|/>|Value="0"
+<SetProperty Action="ClearFastCachedRegisteredHere"|/>|After="SetFastCacheNodeRegisteredHereRaw"
+<SetProperty Action="ClearFastCachedRegisteredHere"|/>|!Condition=
+<SetProperty Action="SetFastCachedRegisteredHereQuoted"|/>|Condition="FASTCACHE_OWN_IMAGEPATH_PREFIX AND FASTCACHED_IMAGEPATH ~<< FASTCACHE_OWN_IMAGEPATH_PREFIX"
+<SetProperty Action="SetFastCachedRegisteredHereQuoted"|/>|After="ClearFastCachedRegisteredHere"
+<SetProperty Action="SetFastCachedRegisteredHereRaw"|/>|Condition="FASTCACHE_OWN_IMAGEPATH_RAW_PREFIX AND FASTCACHED_IMAGEPATH ~<< FASTCACHE_OWN_IMAGEPATH_RAW_PREFIX"
+<SetProperty Action="SetFastCachedRegisteredHereRaw"|/>|After="SetFastCachedRegisteredHereQuoted"
+
+<SetProperty Action="ClearFastCacheNodeSelected"|/>|Value="0"
+<SetProperty Action="ClearFastCacheNodeSelected"|/>|After="MigrateFeatureStates"
+<SetProperty Action="ClearFastCacheNodeSelected"|/>|!Condition=
+<SetProperty Action="SetFastCacheNodeSelected"|/>|After="ClearFastCacheNodeSelected"
+<SetProperty Action="ClearFastCachedSelected"|/>|Value="0"
+<SetProperty Action="ClearFastCachedSelected"|/>|After="SetFastCacheNodeSelected"
+<SetProperty Action="ClearFastCachedSelected"|/>|!Condition=
+<SetProperty Action="SetFastCachedSelected"|/>|After="ClearFastCachedSelected"
+
+<Custom Action="FastCacheNodeUninstallService"|/>|NOT UPGRADINGPRODUCTCODE
+<Custom Action="FastCachedUninstallService"|/>|NOT UPGRADINGPRODUCTCODE
+]=])
+
+# The 0-then-1 flags rule 2 is about. Each must be read by at least one condition, or
+# the rule is vacuous for it.
+set(_flagProperties FASTCACHE_NODE_SELECTED FASTCACHED_SELECTED FASTCACHE_NODE_REGISTERED_HERE
+    FASTCACHED_REGISTERED_HERE)
+
+file(READ "${_file}" _text)
+
+# Entities are decoded per extracted piece, never over the whole file: a decoded
+# `&quot;` would end the attribute value the walk below is delimiting.
+function(_fc_decode _in _out)
+    string(REPLACE "&quot;" "\"" _s "${_in}")
+    string(REPLACE "&gt;" ">" _s "${_s}")
+    string(REPLACE "&lt;" "<" _s "${_s}")
+    string(REPLACE "&amp;" "&" _s "${_s}")
+    set(${_out} "${_s}" PARENT_SCOPE)
+endfunction()
+
+set(_offences "")
+set(_rowCount 0)
+
+set(_tableCursor 0)
+string(LENGTH "${_table}" _tableLength)
+while(_tableCursor LESS _tableLength)
+    string(SUBSTRING "${_table}" ${_tableCursor} -1 _tableRest)
+    string(FIND "${_tableRest}" "\n" _lineEnd)
+    if(_lineEnd EQUAL -1)
+        string(LENGTH "${_tableRest}" _lineEnd)
+    endif()
+    string(SUBSTRING "${_tableRest}" 0 ${_lineEnd} _row)
+    math(EXPR _tableCursor "${_tableCursor} + ${_lineEnd} + 1")
+    if(_row STREQUAL "")
+        continue()
+    endif()
+
+    string(FIND "${_row}" "|" _bar1)
+    if(_bar1 EQUAL -1)
+        list(APPEND _offences "malformed table row (no |): ${_row}")
+        continue()
+    endif()
+    string(SUBSTRING "${_row}" 0 ${_bar1} _opener)
+    math(EXPR _after1 "${_bar1} + 1")
+    string(SUBSTRING "${_row}" ${_after1} -1 _rest)
+    string(FIND "${_rest}" "|" _bar2)
+    if(_bar2 EQUAL -1)
+        list(APPEND _offences "malformed table row (one |): ${_row}")
+        continue()
+    endif()
+    string(SUBSTRING "${_rest}" 0 ${_bar2} _terminator)
+    math(EXPR _after2 "${_bar2} + 1")
+    string(SUBSTRING "${_rest}" ${_after2} -1 _required)
+    math(EXPR _rowCount "${_rowCount} + 1")
+
+    string(FIND "${_text}" "${_opener}" _first)
+    string(FIND "${_text}" "${_opener}" _last REVERSE)
+    if(_first EQUAL -1)
+        list(APPEND _offences "missing: ${_opener}")
+        continue()
+    endif()
+    if(NOT _first EQUAL _last)
+        list(APPEND _offences "not unique: ${_opener}")
+        continue()
+    endif()
+
+    string(SUBSTRING "${_text}" ${_first} -1 _fromOpener)
+    string(FIND "${_fromOpener}" "${_terminator}" _end)
+    if(_end EQUAL -1)
+        list(APPEND _offences "never terminated by ${_terminator}: ${_opener}")
+        continue()
+    endif()
+    string(SUBSTRING "${_fromOpener}" 0 ${_end} _element)
+    _fc_decode("${_element}" _element)
+
+    if(_required MATCHES "^!")
+        string(SUBSTRING "${_required}" 1 -1 _forbidden)
+        string(FIND "${_element}" "${_forbidden}" _hit)
+        if(NOT _hit EQUAL -1)
+            list(APPEND _offences "${_opener} must not carry: ${_forbidden}")
+        endif()
+    else()
+        string(FIND "${_element}" "${_required}" _hit)
+        if(_hit EQUAL -1)
+            list(APPEND _offences "${_opener} lacks: ${_required}")
+        endif()
+    endif()
+endwhile()
+
+# Rule 2: a FIND/SUBSTRING walk over every Condition attribute, never a list split.
+set(_conditions 0)
+set(_readers "")
+set(_cursor 0)
+string(LENGTH "${_text}" _length)
+while(_cursor LESS _length)
+    string(SUBSTRING "${_text}" ${_cursor} -1 _tail)
+    string(FIND "${_tail}" "Condition=\"" _at)
+    if(_at EQUAL -1)
+        break()
+    endif()
+    math(EXPR _valueStart "${_cursor} + ${_at} + 11")
+    string(SUBSTRING "${_text}" ${_valueStart} -1 _valueTail)
+    string(FIND "${_valueTail}" "\"" _valueEnd)
+    if(_valueEnd EQUAL -1)
+        list(APPEND _offences "a Condition attribute is never closed")
+        break()
+    endif()
+    string(SUBSTRING "${_valueTail}" 0 ${_valueEnd} _condition)
+    _fc_decode("${_condition}" _condition)
+    math(EXPR _conditions "${_conditions} + 1")
+
+    foreach(_property IN LISTS _flagProperties)
+        set(_scan "${_condition}")
+        while(TRUE)
+            string(FIND "${_scan}" "${_property}" _p)
+            if(_p EQUAL -1)
+                break()
+            endif()
+            list(APPEND _readers "${_property}")
+            string(LENGTH "${_property}" _nameLength)
+            math(EXPR _next "${_p} + ${_nameLength}")
+            string(SUBSTRING "${_scan}" ${_next} -1 _scan)
+            string(FIND "${_scan}" " = \"1\"" _cmp)
+            if(NOT _cmp EQUAL 0)
+                list(APPEND _offences "a condition reads ${_property} without comparing it with \"1\": ${_condition}")
+                break()
+            endif()
+        endwhile()
+    endforeach()
+
+    math(EXPR _cursor "${_valueStart} + ${_valueEnd} + 1")
+endwhile()
+
+# Positive controls: a walk that found nothing reports nothing wrong about it.
+if(_conditions EQUAL 0)
+    message(FATAL_ERROR
+        "check-wix-service-table: found no Condition attribute in ${_file}, so rule 2 proved nothing rather than passing.")
+endif()
+foreach(_property IN LISTS _flagProperties)
+    if(NOT _property IN_LIST _readers)
+        list(APPEND _offences "no condition reads ${_property}, so rule 2 is vacuous for it")
+    endif()
+endforeach()
+
+if(_offences)
+    string(REPLACE ";" "\n  " _offenceText "${_offences}")
+    message(FATAL_ERROR
+        "check-wix-service-table: packaging/windows/service-actions.xml no longer carries the service "
+        "table this check pins.\n"
+        "  ${_offenceText}\n"
+        "If the change is deliberate, change the row in scripts/check-wix-service-table.cmake in the "
+        "same commit and say why there. A leftover-removal row lost its guard means the MSI can delete "
+        "a service it did not register.")
+endif()
+
+message(STATUS
+    "check-wix-service-table: ${_rowCount} row(s) and ${_conditions} condition(s) checked in service-actions.xml")

@@ -15,9 +15,10 @@
 # variables consumed below. This file only describes how the generators wrap
 # what is already installed.
 #
-# Linux and Windows ship a single Runtime component: the FastCache/CowTree
-# static libraries are deliberately not installed (see the comment in the
-# top-level CMakeLists.txt), so there is no SDK component to separate out.
+# Linux and macOS ship a single Runtime payload; Windows ships one component
+# per application, the MSI's features. The FastCache/CowTree static libraries
+# are deliberately not installed (see the comment in the top-level
+# CMakeLists.txt), so there is no SDK component to separate out.
 # macOS additionally splits the two launchd registrations into their own
 # components, because CPack maps one component to one installer choice and the
 # two are alternatives rather than both-or-neither.
@@ -131,11 +132,38 @@ else()
     endif()
 endif()
 
+get_property(_fcAppComponents GLOBAL PROPERTY FASTCACHED_APP_COMPONENTS)
 if(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
     set(CPACK_COMPONENTS_ALL Runtime LaunchAgent LaunchDaemon)
+elseif(WIN32)
+    set(CPACK_COMPONENTS_ALL ${_fcAppComponents} "${FASTCACHED_SHARED_COMPONENT}")
+    list(REMOVE_DUPLICATES CPACK_COMPONENTS_ALL)
 else()
     set(CPACK_COMPONENTS_ALL Runtime)
 endif()
+
+# A first-party install() naming a component no generator packages is a file every package
+# silently leaves out. Refused here, on every platform, because the per-app components are
+# a Windows arrangement and a mistake in the table would otherwise surface as a .deb missing a
+# binary on a release day.
+#
+# Blind spot, and it fails OPEN: the guard walks only the components that were REGISTERED in
+# FASTCACHED_FIRST_PARTY_COMPONENTS, never the install() rules themselves. An app whose row in
+# the src/apps table carries `-` as its component (the test client, the benchmarks) registers
+# nothing, so if it later gains an install() rule, whatever component that rule names is one
+# this loop never hears of. Its files are then left out of every package and the configure
+# still passes. Such an app gets a real component in its table row before it installs anything.
+get_property(_fcFirstParty GLOBAL PROPERTY FASTCACHED_FIRST_PARTY_COMPONENTS)
+list(REMOVE_DUPLICATES _fcFirstParty)
+foreach(_fcComponent IN LISTS _fcFirstParty)
+    if(NOT _fcComponent IN_LIST CPACK_COMPONENTS_ALL)
+        message(FATAL_ERROR
+            "install component '${_fcComponent}' is named by a first-party install() rule and packaged "
+            "by no generator, so its files would be left out of every package in silence. Add it to "
+            "CPACK_COMPONENTS_ALL in cmake/Packaging.cmake, or install those files under a component "
+            "that is packaged.")
+    endif()
+endforeach()
 
 # --- DEB (Debian / Ubuntu) -------------------------------------------------
 
@@ -296,19 +324,23 @@ if(WIN32)
     set(CPACK_WIX_PROPERTY_ARPHELPLINK     "${CPACK_PACKAGE_HOMEPAGE_URL}")
     set(CPACK_WIX_PROPERTY_ARPURLINFOABOUT "${CPACK_PACKAGE_HOMEPAGE_URL}")
 
+    # The feature tree is the dialog that lets an operator choose which applications to
+    # install, one feature per component declared below.
+    set(CPACK_WIX_UI_REF "WixUI_FeatureTree")
+
     # No Start Menu shortcuts: both binaries are console programs (a daemon and
     # a compiler launcher) invoked from a shell or by the service manager.
     set(CPACK_PACKAGE_EXECUTABLES "")
 
-    # Registers fastcached as an auto-start service and starts it unless the
-    # user opted out. See packaging/windows/service-actions.xml.
+    # The service table: which service each selected feature registers, with which
+    # start mode, and which is started. See packaging/windows/service-actions.xml.
     if(FASTCACHED_WIX_PATCH_FILE)
         set(CPACK_WIX_PATCH_FILE "${FASTCACHED_WIX_PATCH_FILE}")
     endif()
 
     # Pull in the redistributable VC++ runtime so the MSI can land on a clean
     # machine without a separate vcredist install. UCRT is on by default.
-    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT Runtime)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT "${FASTCACHED_SHARED_COMPONENT}")
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION "${CMAKE_INSTALL_BINDIR}")
     include(InstallRequiredSystemLibraries)
 endif()
@@ -397,11 +429,33 @@ endif()
 include(CPack)
 
 # Component declarations must come after include(CPack).
-cpack_add_component(Runtime
-    DISPLAY_NAME "fastcached"
-    DESCRIPTION  "The fastcached daemon and the fastcache-cc compiler launcher."
-    REQUIRED
-)
+if(WIN32)
+    # One MSI feature per installed application. Display text lives here, keyed by the app
+    # table's component column; a component the build did not produce declares nothing.
+    #   component | display name | description | required
+    set(FASTCACHED_WINDOWS_FEATURES
+        "Cli|Command-line client|fastcache-cli, and the files every other feature shares.|REQUIRED"
+        "Daemon|fastcached cache daemon|The memcached- and Redis-compatible cache, registered as the FastCached service.|"
+        "Launcher|fastcache-cc compiler launcher|The launcher a build system runs in place of the compiler.|"
+        "Node|fastcache-compile-node|The compile worker and fleet node, registered as the FastCacheCompileNode service.|"
+    )
+    foreach(_fcFeature IN LISTS FASTCACHED_WINDOWS_FEATURES)
+        string(REPLACE "|" ";" _fcFields "${_fcFeature}")
+        list(GET _fcFields 0 _fcName)
+        list(GET _fcFields 1 _fcDisplay)
+        list(GET _fcFields 2 _fcDescription)
+        list(GET _fcFields 3 _fcRequired)
+        if(_fcName IN_LIST CPACK_COMPONENTS_ALL)
+            cpack_add_component(${_fcName} DISPLAY_NAME "${_fcDisplay}" DESCRIPTION "${_fcDescription}" ${_fcRequired})
+        endif()
+    endforeach()
+else()
+    cpack_add_component(Runtime
+        DISPLAY_NAME "fastcached"
+        DESCRIPTION  "The fastcached daemon and the fastcache-cc compiler launcher."
+        REQUIRED
+    )
+endif()
 
 if(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
     # The two launchd registrations are alternatives: both bind 127.0.0.1:6674

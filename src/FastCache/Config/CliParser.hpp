@@ -11,6 +11,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache
 {
@@ -44,6 +45,15 @@ struct CliResult
     /// BuildServiceArgv bake a meaningless `--service-scope` into the job's own
     /// recorded arguments. Ignored on Windows, which has a single SCM domain.
     ServiceScope serviceScope { ServiceScope::User };
+
+    /// How `--install-service` registers the job. Outside `Config` for `serviceScope`'s reason:
+    /// it describes the registration, takes no part in the YAML merge and is never replayed.
+    ServiceStart serviceStart { ServiceStart::Auto };
+
+    /// `--firewall-allow` scopes: the remote addresses the firewall rules `--install-service`
+    /// creates admit; empty admits any address. Install-time only, outside `Config` for
+    /// `serviceScope`'s reason.
+    std::vector<std::string> firewallAllow;
 
     /// Template `--seed-config` copies to the machine-wide config location.
     ///

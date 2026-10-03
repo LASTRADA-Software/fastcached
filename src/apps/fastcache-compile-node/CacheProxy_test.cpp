@@ -751,9 +751,11 @@ TEST_CASE("A tier answers its own verb pair and refuses its twin's", "[node][cac
     Fixture fix { .profile = SharedTierProfile };
     CompileValue value;
     value.objectBlob = Bytes("OBJECT");
-    auto const request = Wire::StoreRequest {
-        .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = EncodeCompileValue(value)
-    };
+    // Named: `StoreRequest::value` is a span, so a temporary encoding would die with this
+    // declaration and the store below would read freed bytes.
+    auto const encoded = EncodeCompileValue(value);
+    auto const request =
+        Wire::StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = encoded };
     CHECK(StatusOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeStoreAs(Wire::FleetSharedCacheVerbs, request))))
           == Wire::Status::Ok);
     CHECK(StatusOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetchAs(Wire::FleetSharedCacheVerbs, "k"))))
@@ -875,8 +877,10 @@ TEST_CASE("The private tier refuses the shared tier's verbs as its twin's", "[no
     // CACHE-DROP, and a fleet verb reaching it is refused as served elsewhere, naming the other
     // tier -- never `UnimplementedVerb`, which a client reads as a build too old to know the verb.
     Fixture fix;
+    // Named for the shared-tier case's reason: `StoreRequest::value` is a span.
+    auto const object = Bytes("OBJECT");
     auto const request =
-        Wire::StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = Bytes("OBJECT") };
+        Wire::StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = object };
     for (auto const& frame: { Wire::EncodeStoreAs(Wire::FleetSharedCacheVerbs, request),
                               Wire::EncodeFetchAs(Wire::FleetSharedCacheVerbs, "k") })
     {

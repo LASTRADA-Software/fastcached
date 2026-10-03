@@ -13,6 +13,7 @@
 // target (#909), so the rule *replacing the served set retires what left it* could
 // only be checked by reading, at two call sites that must not diverge. This file is
 // what the extraction bought.
+#include "AnnounceTestFixture.hpp"
 #include "EndpointDialerTestUtils.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodePresenceTier.hpp"
@@ -47,37 +48,21 @@
 #include <vector>
 
 #include <core/platform/Clock.hpp>
+#include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
 using FastCache::Testing::Unwrap;
+using namespace FastCache::Node::AnnounceTesting;
 
 namespace
 {
 namespace Wire = FastCache::CompileCacheWire;
 
-/// The address a node in these cases advertises.
-inline constexpr std::string_view ThisNode = "10.0.0.2:6677";
-
 /// Where it ends up once it learns its external address.
 inline constexpr std::string_view MovedNode = "nat.example:7700";
-
-/// A registrar for @p fingerprint, optionally already accepted by a scheduler.
-///
-/// The id is what a withdrawal NAMES, so whether it is set is the whole of the
-/// second clause under test rather than incidental setup.
-/// @param fingerprint The toolchain it announces.
-/// @param endpoint The address it announces, defaulted because only the endpoint cases
-///        vary it -- and it is the other half of the key the adoption rule reads.
-/// @return The registrar, never registered.
-[[nodiscard]] Cc::WorkerRegistrar Registrar(std::string fingerprint, std::string_view endpoint = ThisNode)
-{
-    return Cc::WorkerRegistrar {
-        std::move(fingerprint), std::string { endpoint }, 1U, Wire::CodecList {}, Wire::CapacityFields {}
-    };
-}
 
 /// The fingerprints of a registrar list, in order, so a case can assert WHICH
 /// survived rather than how many.
@@ -352,112 +337,6 @@ TEST_CASE("The endpoint a heartbeat re-announces is the DERIVED one, not the fla
 namespace
 {
 
-/// A load sampler that reports nothing, so a round reads no host at all.
-class SilentLoadSampler final: public IHostLoadSampler
-{
-  public:
-    [[nodiscard]] HostLoad Sample() override
-    {
-        return HostLoad {};
-    }
-};
-
-/// Every framed request in @p sent, in order, by its declared length.
-/// @param sent What a scripted socket was written.
-/// @return One op byte and payload per whole frame.
-[[nodiscard]] std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> FramesIn(std::span<std::byte const> sent)
-{
-    std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> frames;
-    while (sent.size() >= Wire::RequestHeaderSize)
-    {
-        auto const header = Wire::DecodeRequestHeader(sent);
-        if (!header.has_value())
-            break;
-        auto const whole = Wire::RequestHeaderSize + std::size_t { header->payloadLength };
-        if (sent.size() < whole)
-            break;
-        auto const payload = sent.subspan(Wire::RequestHeaderSize, header->payloadLength);
-        frames.emplace_back(header->opRaw, std::vector<std::byte> { payload.begin(), payload.end() });
-        sent = sent.subspan(whole);
-    }
-    return frames;
-}
-
-/// One heartbeat round over a worker this case can cordon, announcing to a scripted
-/// scheduler.
-struct AnnounceFixture
-{
-    NodeConfig cfg;
-    AtomicMetricsSink metrics;
-    CapturingLogger logger;
-    core::platform::ManualClock clock;
-    NodeConditions conditions;
-    SchedulerReachability reachability { clock, &conditions };
-    SilentLoadSampler loadSampler;
-    /// What this machine answers on: one of each thing a report leaves out, a repeat, and two
-    /// routable addresses listed out of order.
-    Testing::ScriptedHostAddresses addresses {
-        { "127.0.0.1", "192.168.1.20", "::1", "fe80::1", "169.254.3.4", "10.8.0.7", "10.8.0.7" }
-    };
-    /// What the round reports FROM: the production oracle over `addresses`, as `main` builds it,
-    /// so a change to the machine reaches a report only at the oracle's refresh (`Moved`).
-    CachedLocalityOracle const locality { addresses, clock };
-    std::atomic<bool> addressCapNoticed { false };
-    // The process singleton wall clock, for the reason `NodeCredential_test` gives beside
-    // the same construction: the sampler keeps the ADDRESS and reads it from its own thread.
-    CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
-    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
-    std::vector<Cc::WorkerRegistrar> registrars;
-    std::vector<Cc::WorkerRegistrar> withdrawals;
-
-    /// The machine now answers on @p now, and the oracle's interval has passed, so its next
-    /// question refreshes -- as a VPN reconnect reaches a report in production.
-    /// @param now The machine's addresses from here on.
-    void Moved(std::vector<std::string> now)
-    {
-        addresses.Publish(std::move(now));
-        clock.advance(CachedLocalityOracle::DefaultRefreshInterval);
-    }
-
-    AnnounceFixture()
-    {
-        cfg.schedulers = { "scheduler.example:6676" };
-        registrars.push_back(Registrar("gcc-14"));
-    }
-
-    /// The round production builds, over this fixture's collaborators.
-    /// @return The round.
-    [[nodiscard]] HeartbeatRound Round()
-    {
-        return HeartbeatRound { .cfg = cfg,
-                                .registrars = registrars,
-                                .withdrawals = withdrawals,
-                                .capacity = capacity,
-                                .loadSampler = loadSampler,
-                                .locality = locality,
-                                .addressCapNoticed = addressCapNoticed,
-                                .cacheTier = nullptr,
-                                .metrics = metrics,
-                                // Nothing proves: every case in this file is about the announce
-                                // round itself, against a scripted fleet that serves no handshake
-                                // (#178). The proof is `FrameEndpoint_test`'s, over a real socket.
-                                .prover = nullptr,
-                                .lease = lease,
-                                .logger = logger,
-                                .reachability = reachability };
-    }
-
-    /// Announce once to a scheduler answering @p replies.
-    /// @param replies What the scheduler says, in order.
-    /// @return Every request the round sent.
-    [[nodiscard]] std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> AnnounceTo(std::vector<std::byte> replies)
-    {
-        Testing::ScriptedSocket scheduler { std::move(replies) };
-        (void) AnnounceOnce(Round(), scheduler, cfg.schedulers.front());
-        return FramesIn(scheduler.Sent());
-    }
-};
-
 /// A HEARTBEAT the scheduler accepted.
 /// @return The reply bytes.
 [[nodiscard]] std::vector<std::byte> HeartbeatOk()
@@ -502,16 +381,6 @@ constexpr auto HeartbeatOp = static_cast<std::uint8_t>(Wire::Op::Heartbeat);
     if (!decoded.has_value())
         return std::nullopt;
     return decoded->load.cordoned;
-}
-
-/// The link a worker configured with @p schedulers holds.
-/// @param schedulers A non-empty `--scheduler` list.
-/// @return The link; the case fails when none could be built.
-[[nodiscard]] SchedulerLink LinkOver(std::vector<std::string> const& schedulers)
-{
-    auto const link = SchedulerLink::For(schedulers);
-    REQUIRE(link.has_value());
-    return Unwrap(link);
 }
 
 /// How many lines @p logger captured at exactly @p level whose text contains @p phrase.
@@ -1102,7 +971,92 @@ struct CodeLine
            || (after.starts_with('(') && std::regex_search(before, std::regex { R"((^\s*(explicit\s+)?|~|::)$)" }));
 }
 
+/// Whether @p name is one of this directory's test-support headers, by the suffix they all carry.
+/// @param name A file name.
+/// @return True for `...TestFixture.hpp` and `...TestUtils.hpp`.
+[[nodiscard]] bool NamesTestSupportHeader(std::string_view name)
+{
+    return name.ends_with("TestFixture.hpp") || name.ends_with("TestUtils.hpp");
+}
+
+/// Whether the scan below skips @p name as test code: a case file, or a test-support header.
+/// @param name A file name.
+/// @return True when skipped.
+[[nodiscard]] bool IsTestCode(std::string_view name)
+{
+    return name.ends_with("_test.cpp") || NamesTestSupportHeader(name);
+}
+
+/// The header @p code includes, if it is an include, in either spelling and under any directory
+/// prefix. The ONE parse: the scan's count of includes read and its verdict both go through it.
+/// @param code One line of code, its comment cut.
+/// @return The header's file name, or nullopt when the line includes nothing.
+[[nodiscard]] std::optional<std::string> IncludedHeaderOf(std::string const& code)
+{
+    std::regex const include { R"(^\s*#\s*include\s*["<]([^">]*/)?([^">/]+)[">])" };
+    std::smatch included;
+    if (!std::regex_search(code, included, include))
+        return std::nullopt;
+    return included[2].str();
+}
+
+/// The test-support header @p code includes, if it includes one.
+/// @param code One line of code, its comment cut.
+/// @return The header's file name, or nullopt when the line includes none.
+[[nodiscard]] std::optional<std::string> TestSupportIncludeOf(std::string const& code)
+{
+    auto header = IncludedHeaderOf(code);
+    if (!header.has_value() || !NamesTestSupportHeader(*header))
+        return std::nullopt;
+    return header;
+}
+
+/// Every include of a test-support header in @p lines, as `line: code` -- what the scan below
+/// flags per file, and what its self-test drives over a planted one.
+/// @param lines A file's code lines, as `CodeLinesOf` read them.
+/// @return One entry per offending line.
+[[nodiscard]] std::vector<std::string> TestSupportIncludesIn(std::span<CodeLine const> lines)
+{
+    std::vector<std::string> found;
+    for (auto const& [number, code]: lines)
+        if (TestSupportIncludeOf(code).has_value())
+            found.push_back(std::format("{}: {}", number, code));
+    return found;
+}
+
 } // namespace
+
+TEST_CASE("The test-support include check fires on a planted include and passes production's",
+          "[node][announce][reachability]")
+{
+    // The self-test of the premise the one-tracker scan skips test-support headers on: a check that
+    // cannot be seen to fire proves nothing by staying quiet.
+    CHECK(TestSupportIncludeOf(R"(#include "AnnounceTestFixture.hpp")")
+          == std::optional<std::string> { "AnnounceTestFixture.hpp" });
+    CHECK(TestSupportIncludeOf(R"(  #  include <apps/fastcache-compile-node/EndpointDialerTestUtils.hpp>)")
+          == std::optional<std::string> { "EndpointDialerTestUtils.hpp" });
+    CHECK_FALSE(TestSupportIncludeOf(R"(#include "NodeAnnounce.hpp")").has_value());
+    CHECK_FALSE(TestSupportIncludeOf(R"(#include <tests/ScriptedSocket.hpp>)").has_value());
+    CHECK_FALSE(TestSupportIncludeOf(R"(auto const name = "WorkerTierTestFixture.hpp";)").has_value());
+    // The parse underneath both, which the scan's count of includes read goes through too.
+    CHECK(IncludedHeaderOf(R"(#include "NodeAnnounce.hpp")") == std::optional<std::string> { "NodeAnnounce.hpp" });
+    CHECK_FALSE(IncludedHeaderOf("auto const included = true;").has_value());
+
+    // And through the file reader the scan uses, over a planted production file: a commented-out
+    // include is no include, a live one is found at its line.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-test-support-include" };
+    auto const planted = scratch.Path() / "Planted.cpp";
+    {
+        // Binary, so the planted file is LF as every file in this tree is (`.gitattributes`); text mode
+        // would write CRLF on Windows and plant a `\r` no real source carries.
+        std::ofstream out { planted, std::ios::binary };
+        out << "#include \"NodeAnnounce.hpp\"\n"
+               "// #include \"WorkerTierTestFixture.hpp\"\n"
+               "#include \"WorkerTierTestFixture.hpp\"\n";
+    }
+    CHECK(TestSupportIncludesIn(CodeLinesOf(planted))
+          == std::vector<std::string> { R"(3: #include "WorkerTierTestFixture.hpp")" });
+}
 
 TEST_CASE("The node lends ONE SchedulerReachability to both announce loops", "[node][announce][reachability]")
 {
@@ -1122,6 +1076,13 @@ TEST_CASE("The node lends ONE SchedulerReachability to both announce loops", "[n
     // type's NAME at all -- `decltype(schedulerReachability)`, a deduced `auto` alias, a template
     // parameter -- leaves no `SchedulerReachability` token for `mention` to find, so this scan sees
     // nothing and reports clean. That failure is OPEN, the opposite of the one this test proves shut.
+    //
+    // A second blind spot, by NAME and failing open the same way: this directory's test-support
+    // headers (`...TestFixture.hpp`, `...TestUtils.hpp`) are test code, compiled into no production
+    // target, and a fixture holds a tracker of its own by design. A production header given one of
+    // those suffixes would be skipped too. The premise is ASSERTED rather than assumed: no file this
+    // scan reads includes such a header (`TestSupportIncludeOf`, self-tested above). Its reach is this
+    // directory, where the headers live.
     std::filesystem::path const nodeDir =
         std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node";
     REQUIRE(std::filesystem::is_directory(nodeDir));
@@ -1142,21 +1103,34 @@ TEST_CASE("The node lends ONE SchedulerReachability to both announce loops", "[n
     std::size_t scanned = 0;
     std::size_t harmless = 0;
     std::vector<std::string> mainLines;
+    std::vector<std::string> testSupport;
+    std::vector<std::string> productionIncludesOfTestSupport;
+    std::size_t includesRead = 0;
 
     for (auto const& entry: std::filesystem::directory_iterator { nodeDir })
     {
         auto const name = entry.path().filename().string();
         auto const extension = entry.path().extension().string();
-        if ((extension != ".cpp" && extension != ".hpp") || name.ends_with("_test.cpp"))
+        if (extension != ".cpp" && extension != ".hpp")
             continue;
+        if (IsTestCode(name))
+        {
+            testSupport.push_back(name);
+            continue;
+        }
         auto const lines = CodeLinesOf(entry.path());
         REQUIRE_FALSE(lines.empty());
         ++scanned;
         auto const definesTheType = name.starts_with("SchedulerReachability.");
+        // The skip's premise, through the self-tested helper, over the lines already read.
+        for (auto const& offending: TestSupportIncludesIn(lines))
+            productionIncludesOfTestSupport.push_back(std::format("{}:{}", name, offending));
         for (auto const& [number, code]: lines)
         {
             if (name == "main.cpp")
                 mainLines.push_back(code);
+            if (IncludedHeaderOf(code).has_value())
+                ++includesRead;
             if (!code.contains("SchedulerReachability"))
                 continue;
             auto const found = std::sregex_iterator { code.begin(), code.end(), mention };
@@ -1176,6 +1150,19 @@ TEST_CASE("The node lends ONE SchedulerReachability to both announce loops", "[n
     CHECK(scanned > 20);
     CHECK(harmless > 10);
     REQUIRE_FALSE(mainLines.empty());
+    // And the test-support rule matched the header that needed it, and left production alone.
+    CHECK(std::ranges::count(testSupport, std::string { "AnnounceTestFixture.hpp" }) == 1);
+    CHECK(std::ranges::count(testSupport, std::string { "NodeAnnounce.hpp" }) == 0);
+    // The skip's premise: nothing compiled into the node includes a test-support header. Measured over
+    // includes the verdict's own parse recognised, or an empty list would say nothing.
+    CHECK(includesRead > 50);
+    INFO("production files including a test-support header: " << [&] {
+        std::string joined;
+        for (auto const& offending: productionIncludesOfTestSupport)
+            joined += "\n  " + offending;
+        return joined;
+    }());
+    CHECK(productionIncludesOfTestSupport.empty());
 
     INFO("every mention of SchedulerReachability that is not a spelling that cannot make an instance: " << [&] {
         std::string joined;
@@ -1196,4 +1183,92 @@ TEST_CASE("The node lends ONE SchedulerReachability to both announce loops", "[n
     INFO("the one tracker is " << tracker);
     CHECK(linesMatching(std::regex { R"(->Launch\(.*\b)" + tracker + R"(\b)" }) == 1);
     CHECK(linesMatching(std::regex { R"(\.reachability\s*=\s*)" + tracker + R"(\b)" }) == 1);
+}
+
+namespace
+{
+constexpr auto WithdrawOp = static_cast<std::uint8_t>(Wire::Op::Withdraw);
+
+/// Register the fixture's one registrar for real, then retire everything as a suspend does.
+/// @param fix The fixture.
+void RegisterThenRetireForSuspend(AnnounceFixture& fix)
+{
+    Testing::ScriptedSocket scheduler { Testing::Replies({ RegisterOk("w-7") }) };
+    REQUIRE(fix.registrars.front().Register(scheduler, {}).has_value());
+
+    std::vector<Cc::WorkerRegistrar> rebuilt;
+    rebuilt.push_back(Registrar("gcc-14"));
+    RetireAllRegistrations(std::move(rebuilt), fix.registrars, fix.withdrawals);
+    REQUIRE(fix.withdrawals.size() == 1);
+    REQUIRE(fix.withdrawals.front().WorkerId() == "w-7");
+    REQUIRE(fix.registrars.front().WorkerId().empty());
+}
+} // namespace
+
+TEST_CASE("A suspend withdraws every registration in one short dial, and registers nothing", "[node][announce][host-events]")
+{
+    AnnounceFixture fix;
+    fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
+    auto link = LinkOver(fix.cfg.schedulers);
+    RegisterThenRetireForSuspend(fix);
+
+    SECTION("the endpoint the link names is dialled once, with the suspend's own connect bound")
+    {
+        Testing::ScriptedDialer dialer { { HeartbeatOk() } };
+        CHECK(WithdrawOnce(fix.Round(), link, dialer) == 1);
+        CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler } });
+        CHECK(dialer.OptionsOn(0).connectTimeout == SuspendDialTimeout);
+        CHECK(OpsSentOn(dialer, 0) == std::vector<std::uint8_t> { WithdrawOp });
+        CHECK(fix.withdrawals.empty());
+    }
+
+    SECTION("an unreachable scheduler is not walked past: one dial, and the withdrawals are dropped")
+    {
+        // The bound is the point: a fallback walk costs a connect timeout per configured
+        // scheduler, and the machine is going to sleep in two seconds.
+        Testing::ScriptedDialer dialer { { {} } };
+        CHECK(WithdrawOnce(fix.Round(), link, dialer) == 0);
+        CHECK(dialer.Dialed().size() == 1);
+        CHECK(fix.withdrawals.empty());
+    }
+}
+
+TEST_CASE("After a suspend, the next ORDINARY round registers again, with no host event at all",
+          "[node][announce][host-events]")
+{
+    // Recovery must not depend on any power event: a Modern Standby PC may never say it resumed.
+    // The retired registrars carry no id, so the first round after waking REGISTERS rather than
+    // heartbeating a dead entry.
+    AnnounceFixture fix;
+    auto link = LinkOver(fix.cfg.schedulers);
+    RegisterThenRetireForSuspend(fix);
+    Testing::ScriptedDialer before { { HeartbeatOk() } };
+    REQUIRE(WithdrawOnce(fix.Round(), link, before) == 1);
+
+    Testing::ScriptedDialer after { { RegisterOk("w-8") } };
+    CHECK(AnnounceRound(fix.Round(), link, after) == 1);
+    CHECK(OpsSentOn(after, 0) == std::vector<std::uint8_t> { RegisterOp });
+    CHECK(fix.registrars.front().WorkerId() == "w-8");
+    // WHAT registered, not only that something did: a set left in place after its registrars were
+    // moved onto the withdrawal queue holds husks with no id either, and would register them --
+    // under no fingerprint at all.
+    CHECK(fix.registrars.front().Fingerprint() == "gcc-14");
+    CHECK(fix.registrars.front().Endpoint() == ThisNode);
+}
+
+TEST_CASE("A suspend with nothing registered dials nobody", "[node][announce][host-events]")
+{
+    // A worker still surveying, or one whose scheduler never accepted it, has nothing to retire;
+    // a dial would spend up to a second of the machine's sleep saying nothing.
+    AnnounceFixture fix;
+    auto link = LinkOver(fix.cfg.schedulers);
+    std::vector<Cc::WorkerRegistrar> rebuilt;
+    rebuilt.push_back(Registrar("gcc-14"));
+    RetireAllRegistrations(std::move(rebuilt), fix.registrars, fix.withdrawals);
+    REQUIRE(fix.withdrawals.empty());
+
+    // An empty script: a dial is a FAIL in the fake's own voice, not a quiet failed connect.
+    Testing::ScriptedDialer dialer { {} };
+    CHECK(WithdrawOnce(fix.Round(), link, dialer) == 0);
+    CHECK(dialer.Dialed().empty());
 }

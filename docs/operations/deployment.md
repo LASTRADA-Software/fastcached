@@ -205,7 +205,9 @@ To remove it: `fastcached --uninstall-service --service-scope=<scope>`, or
 
 ## Windows service
 
-The MSI registers `fastcached` as an auto-start service and seeds
+The MSI registers `fastcached` as an auto-start service — a manual one, left
+stopped, when the fastcache-compile-node feature is installed too, since both answer
+on 6674 ([the MSI's service table](../getting-started/install.md#windows)) — and seeds
 `C:\ProgramData\fastcached\fastcached.yaml` from the template it ships, unless
 a config is already there. The registration passes **no** `--config`: the
 service resolves that path itself at every start, so editing the file is all it
@@ -258,10 +260,11 @@ If you add or move `storage_path` afterwards, grant it from an elevated prompt:
 icacls "D:\fastcached\cache" /grant "NT SERVICE\FastCached":(OI)(CI)F
 ```
 
-Note that re-running `--install-service` does **not** repair it: registering a
-service that already exists is refused before the handover happens, so the grant
-never runs. Either use `icacls`, or `--uninstall-service` first — which stops the
-service, so `icacls` is the less disruptive of the two.
+Re-running `--install-service` from an elevated prompt repairs it too: registering
+a service that already exists re-applies the registration — start type, command
+line, account, restart policy — and runs the handover again for the
+`storage_path` that install resolves. It does not restart a running service, so a
+changed command line takes effect at the next start.
 
 A daemon that cannot open its storage says so at startup and prints this command
 with your own paths and service name filled in; without `storage_path` it is
@@ -298,7 +301,29 @@ and makes path arguments absolute — a service starts with its
 working directory set to `C:\Windows\System32`, so a relative path captured
 at install time would resolve elsewhere at boot. It creates the service
 already set to auto-start but leaves it stopped, so the first start is
-explicit.
+explicit; `--service-start=manual` registers it to wait for somebody to start
+it instead. The start mode belongs to the registration, not to the command line
+the service runs with.
+
+### What it opens in the firewall
+
+Registering also opens the Windows Firewall for every cache listener that binds
+beyond loopback and, with `--metrics`, for a metrics endpoint that does — nothing
+at all for the default `127.0.0.1:6674`. Each gets one inbound rule, admitting
+`fastcached.exe` running as this service, on every network profile, in the group
+`fastcached: FastCached`; the install line lists them. `--firewall-allow=<address[/prefix]>`
+(IPv4 or IPv6, repeatable) limits which remote addresses they admit, and `/0` is
+refused: leave the flag out to allow any address.
+
+Running `--install-service` again replaces the group rather than adding to it, and
+`--uninstall-service` removes it once Windows accepts the delete — at once, even for
+a service that had not stopped within a minute and is only marked for deletion until
+it exits. A firewall that refuses
+never fails either command: it is reported as a warning, and an uninstall whose
+delete was refused leaves the rules in place, since the service may still be
+running. A listener bound to the name `localhost` is given a rule too, and the
+install says why — a name is whatever the resolver answers; bind `127.0.0.1` or
+`::1` to need none.
 
 ## Container
 

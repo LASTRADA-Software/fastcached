@@ -13,10 +13,13 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/HostEvents.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <stop_token>
@@ -48,7 +51,16 @@ struct NodePresenceParts
     NodeProofClient const* prover;
     /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
     SchedulerReachability& reachability;
+    /// How the loop's rounds reach a scheduler. Only the loop's own thread dials through it --
+    /// never the thread a host event arrives on.
+    IEndpointDialer& dialer;
+    /// Where the host's resume and network events arrive; either runs the next round at once.
+    IHostEvents& hostEvents;
 };
+
+/// Per-call send/recv ceiling on the presence loop's connection to a scheduler: the ceiling of
+/// the dialer `main` lends the loop.
+inline constexpr std::chrono::milliseconds PresenceIoTimeout { 10'000 };
 
 /// What one presence announcement is made of.
 ///
@@ -113,6 +125,42 @@ struct PresenceMessage
                                     IPresenceRoster* roster,
                                     SchedulerLink& link,
                                     IEndpointDialer& dialer);
+
+/// Why the wait between two presence rounds ended.
+///
+/// **Private**: never transmitted or persisted.
+enum class PresenceWakeReason : std::uint8_t
+{
+    Elapsed,   ///< The interval ran out.
+    HostEvent, ///< A resume or a network change asked for a round now.
+    Stopped,   ///< The node is stopping.
+};
+
+/// The wait between presence rounds, which a host event can end early.
+///
+/// Which events end it is `HostEventActionFor(event).wakesPresence`, and which cancel a wake still
+/// pending is `supersedesOlderWakes` -- the same table the worker heartbeat reads, so the two loops
+/// cannot disagree about what a resume or a suspend means.
+///
+/// **A sink that only records and wakes**: the round a wake asks for runs on the loop's thread,
+/// never on the one that delivered the event (`IHostEventSink`'s contract).
+class PresenceWake final: public IHostEventSink
+{
+  public:
+    /// @copydoc IHostEventSink::OnHostEvent
+    void OnHostEvent(HostEvent event) override;
+
+    /// Wait out @p interval, or less.
+    /// @param stop Ends the wait at once.
+    /// @param interval The longest wait.
+    /// @return What ended it; a host event is consumed by the wait it ends.
+    [[nodiscard]] PresenceWakeReason WaitOut(std::stop_token const& stop, std::chrono::milliseconds interval);
+
+  private:
+    std::mutex _mutex;                 ///< Guards `_announceNow`.
+    std::condition_variable_any _wake; ///< Notified when a wake is posted; `_any` because the wait takes a stop token.
+    bool _announceNow { false };       ///< A round is owed now. Under `_mutex`.
+};
 
 /// The loop that tells a scheduler this MACHINE exists, running on EVERY node.
 ///
@@ -200,12 +248,13 @@ class NodePresence
     /// renders as its dash rather than as a full disk.
     std::unique_ptr<IHostLoadSampler> _loadSampler;
 
-    BlockingEndpointDialer _dialer;
+    IEndpointDialer& _dialer;
     SchedulerLink _link;
 
-    /// The bounded, cancellable wait between rounds.
-    std::mutex _wakeMutex;
-    std::condition_variable_any _wake;
+    /// The bounded, cancellable wait between rounds, which a resume or a network change ends.
+    PresenceWake _presenceWake;
+    /// Listening from construction; destroyed before `_presenceWake` and after `_thread`.
+    HostEventSubscription _hostSubscription;
 
     /// **Declared LAST, and the order is load-bearing.** The thread's body touches every
     /// member above it, so they are all constructed before it can start and destroyed only

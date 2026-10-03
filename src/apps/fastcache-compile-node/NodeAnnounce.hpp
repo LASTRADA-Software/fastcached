@@ -296,6 +296,24 @@ inline void AdoptRegistrars(std::vector<Cc::WorkerRegistrar> rebuilt,
     current = std::move(rebuilt);
 }
 
+/// Retire EVERY registration this worker holds and start over with @p rebuilt.
+///
+/// The suspend's counterpart of `AdoptRegistrars`: that one keeps a registration the new set
+/// re-registers exactly, this one keeps none -- a sleeping machine is filed nowhere, and the
+/// first round after it wakes registers afresh (the rebuilt registrars carry no id).
+/// @param rebuilt Fresh registrars for the served set.
+/// @param current Registrars in force; replaced by @p rebuilt.
+/// @param withdrawals Where every accepted registrar is appended.
+inline void RetireAllRegistrations(std::vector<Cc::WorkerRegistrar> rebuilt,
+                                   std::vector<Cc::WorkerRegistrar>& current,
+                                   std::vector<Cc::WorkerRegistrar>& withdrawals)
+{
+    for (auto& registrar: current)
+        if (!registrar.WorkerId().empty())
+            withdrawals.push_back(std::move(registrar));
+    current = std::move(rebuilt);
+}
+
 /// Announce this machine to every scheduler entry it serves, once.
 ///
 /// Registration and heartbeating are one concern: a worker is registered exactly as
@@ -320,6 +338,13 @@ inline void AdoptRegistrars(std::vector<Cc::WorkerRegistrar> rebuilt,
 /// also what a retired first `--scheduler` costs every round that starts there, which
 /// is why a round's walk starts at the endpoint that last accepted (`SchedulerLink`).
 inline constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
+
+/// Per-call send/recv ceiling on the heartbeat's own connection to the scheduler.
+///
+/// Was ten seconds passed as BOTH the dial bound and the I/O bound, which is the
+/// collapse `Cc::DialEndpoint` used to make: ten seconds is a reasonable ceiling
+/// on an exchange and a very long time to wait for a TCP handshake.
+inline constexpr std::chrono::milliseconds HeartbeatIoTimeout { 10'000 };
 
 /// Announce this machine once, following `NotLeader` to wherever it points and falling
 /// back through the configured `--scheduler` list when an endpoint cannot be reached.
@@ -509,5 +534,30 @@ struct AnnounceProof
                                           AnnounceProof const& proof);
 
 [[nodiscard]] std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer);
+
+/// The connect bound of the one dial a suspend makes; inside `SuspendWithdrawBudget`.
+inline constexpr std::chrono::milliseconds SuspendDialTimeout { 1'000 };
+
+/// Withdraw what @p round queued, at the endpoint @p link names, in ONE dial. Never registers,
+/// heartbeats, follows a redirect or falls back: the machine is about to sleep. A failure is logged
+/// and the queue dropped -- expiry closes the rest. With nothing queued nothing is dialled.
+///
+/// **Only the CONNECT is bounded by `SuspendDialTimeout`.** The exchange after it -- the proof and
+/// the withdrawals -- is bounded by @p dialer's own I/O ceiling (`HeartbeatIoTimeout` on the
+/// heartbeat's), not by `SuspendWithdrawBudget`. That is safe rather than merely tolerated: the
+/// suspend handler stops waiting at its budget whatever this is doing, a withdrawal the sleep
+/// freezes leaves the entry to the scheduler's expiry exactly as before, and one that finishes
+/// after the machine wakes only un-files it until the next round, which registers afresh because
+/// the rebuilt registrars carry no id. `core::net::DialOptions` has no per-dial I/O bound, so a
+/// tighter one would need a second dialer.
+///
+/// **Deliberately NOT through `round.reachability`**: a machine going to sleep is not a
+/// scheduler outage. Counted there, a failed pre-sleep dial would spend that scheduler's Warn
+/// and then announce a false *reachable again* at wake, so both failures are said here at Info.
+/// @param round What to withdraw and where to log.
+/// @param link Names the endpoint; read, never advanced.
+/// @param dialer How the connection is made.
+/// @return How many registrations the scheduler retired.
+[[nodiscard]] std::size_t WithdrawOnce(HeartbeatRound const& round, SchedulerLink const& link, IEndpointDialer& dialer);
 
 } // namespace FastCache::Node

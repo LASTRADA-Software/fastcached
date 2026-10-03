@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -518,6 +519,52 @@ enum class DirectoryWriters : std::uint8_t
 /// @param writers What `DirectoryWritersOf` found; `OwnerOnly` yields an empty string.
 /// @return A sentence naming what was found and the remedy, or empty.
 [[nodiscard]] std::string DirectoryWritersHint(std::filesystem::path const& directory, DirectoryWriters writers);
+
+/// Give @p directory a protected access list of its own: SYSTEM and Administrators in full,
+/// @p account Modify, inherited by everything created inside; nothing inherited from its
+/// parent, its OWNER set to Administrators, and any owner held to reading the list.
+///
+/// For a directory holding a credential a SERVICE mints -- the node's identity key --
+/// where `SecureSecretFileForServices`' per-file list cannot help, because the file does
+/// not exist yet when the installer runs. Adding the account to what the directory
+/// inherits is not enough either: `%ProgramData%` grants `BUILTIN\Users` read
+/// inheritably, and an added entry leaves that in place.
+///
+/// It refuses rather than trusting an existing directory as-is, because a standard account
+/// can arrange one before the installer runs, with no privilege:
+///  - a reparse point (a junction or symlink) on the directory or any entry below it, which
+///    would redirect the service's key to a directory the planter controls;
+///  - an entry owned by anyone but SYSTEM, Administrators or @p account, which a planter
+///    still knows the contents of;
+///  - a non-directory entry with more than one hard link, which shares its access list with a
+///    file outside the directory the apply would then rewrite;
+///  - an entry that keeps an explicit broad grant of its own through the new list.
+///
+/// The owner is set to Administrators, and what is already inside is covered too: on Windows
+/// the directory's new list replaces every INHERITED entry below it. The structure checks run
+/// in a read-only pre-pass AND again after the list is applied: once the protected list and the
+/// Administrators owner are on, no NEW open by anybody else can create or change anything there.
+/// A handle opened BEFORE the apply keeps the access it was granted, since an access list is
+/// checked at open and not at each write, so a file that was broadly writable until then can
+/// still be written through such a handle; that residual is accepted, because refusing while
+/// other handles are open would refuse every re-apply with the service holding its key open. On
+/// POSIX it removes every group and other bit from the directory, which hides what is inside
+/// without visiting it.
+///
+/// @param directory An existing directory.
+/// @param account The service's account (`NT SERVICE\<name>`), which resolves only once
+///        the service exists; empty for a service running as LocalSystem, which the list
+///        names already. Unused on POSIX, where the caller has made it the owner.
+/// @param credentialLeaves Leaf names of files in @p directory that hold a credential this
+///        node minted (the identity key). An exposed one is refused with a DELETE remedy --
+///        following an `icacls /reset` would keep a disclosed key in service -- where any
+///        other state file is told to inherit the directory's list. Empty on POSIX.
+/// @return Nothing when nothing outside those accounts can read the directory or what it
+///         holds afterwards -- the property, read back -- else why not, naming the entry.
+[[nodiscard]] std::expected<void, std::string> SecureDirectoryForService(
+    std::filesystem::path const& directory,
+    std::string const& account,
+    std::span<std::filesystem::path const> credentialLeaves = {});
 
 /// The command that would make @p directory administrator-only writable,
 /// spelled for the platform this build targets.

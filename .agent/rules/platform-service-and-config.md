@@ -473,6 +473,132 @@ readable and silently ignored. Every rule below has already been one of them.
   booted out a job that was never there and reported success while the real one
   kept the port. `BootOutEverywhere` walks the whole `ScopeTraits::domains` row,
   and `fastcached-uninstall` mirrors it.
+- **How a registration STARTS is part of it.** `ServiceSpec::startMode`, one
+  `ServiceStartTable()` row per mode: the SCM start type (`auto` is 2, `manual` 3), launchd's
+  `RunAtLoad`, and whether a launchd install kickstarts the job at once. There is no systemd
+  column, because this project registers no systemd unit and the packaged units carry their own
+  enable policy. `--service-start` is install-time only and never replayed into the registered
+  command line: the start mode is the supervisor's record, and the running process never reads
+  it. A Windows install leaves the service STOPPED in either mode; only a launchd `auto` install
+  starts the job.
+- **Registering over an existing service RE-APPLIES it.** `CreateRefusalTable()` maps what
+  `CreateService` refused with to ONE step. 1073 (it exists) re-applies the registration through
+  `ChangeServiceConfig` -- start type, command line, account -- and the service then gets
+  everything a fresh install gives it: description, restart policy, SID type, the owned-path
+  handover, the event source and, from the binary's `main`, the firewall. 1072 (marked for
+  deletion) is waited out for `MarkedForDeletionCeiling`, asked every 250 ms. 1078 (another
+  service displays that name) and any error with no row are refused. A re-applied registration
+  takes effect at the service's next start, and the message says so rather than "start it now".
+  - An uninstall stops the service and waits, bounded by `UninstallStopCeiling`, for
+    `SERVICE_STOPPED`, and then deletes it WHATEVER the wait said: one still running is only
+    marked, goes when it exits, and the message says that. The wait is why the next install
+    rarely meets 1072; the 1072 row is why it survives one that does -- the row's own reason is
+    an older MSI that deleted without waiting for the stop.
+- **An MSI upgrade never deletes the registration of a feature it keeps.** Removal through the
+  binary's `--uninstall-service` runs only for a feature being removed AND outside the old
+  product's half of a major upgrade (`NOT UPGRADINGPRODUCTCODE`). The old product's
+  `ServiceControl Stop="both" Wait="yes"` rows stop each service, waiting, before its files are
+  replaced. CPack's own WiX template schedules `MajorUpgrade` `afterInstallInitialize` and this
+  project does not override it, so there is no slot before `RemoveExistingProducts` for a stop
+  of our own.
+  - A feature an upgrade no longer installs has its leftover registration deleted by the NEW
+    product (`sc delete`, the `DeleteLeftover` rows), because the old half never removes one and
+    the new product has no binary left to run `--uninstall-service` with. Only a registration
+    whose image path starts with this install root, quoted (`"[INSTALL_ROOT]`, in both spellings
+    the raw registry search returns), is ours to delete; any other shape fails the test CLOSED
+    and is left alone. That path removes neither the service's firewall group nor its event
+    source -- an accepted residual: the rules name a program that is no longer installed, so
+    they admit nothing, and a reinstall that registers the service replaces the group. For
+    fastcached every reinstall does; for the node only one that passes
+    `FASTCACHE_NODE_SCHEDULER`, since without it nothing is registered and the inert group stays.
+  - Deselecting a feature outside an upgrade (`REMOVE=CM_C_Node`, Settings > Apps > Modify, an
+    uninstall) removes its service through its own binary, firewall rules included.
+- **The MSI's service table decides every start mode**, and is applied on every transaction that
+  leaves a feature installed -- a first install, a repair, a feature change and an upgrade. With
+  the node installed, the node is registered `auto` and started, and fastcached `manual` and
+  stopped through `net stop`, which waits (both would answer on 6674); with fastcached alone it
+  is `auto` and started unless `FASTCACHED_START_SERVICE=0`. The node is re-registered only when
+  `FASTCACHE_NODE_SCHEDULER` is given, and started whether or not it was, since an upgrade keeps a
+  registration its `ServiceControl` row stopped. `FASTCACHE_NODE_ADVERTISE` is OPTIONAL and reaches
+  the command line only through the derived `FastCacheNodeAdvertiseArgument`, so an absent one is
+  no `--advertise` at all -- never an empty one -- and the node advertises its own name; the MSI
+  names no `--cluster-dir` either, since a registered value outranks the file's `cluster_dir`.
+  `DocumentedCommandLines_test`'s `[msi]` case reads the `ExeCommand` out of the fragment and
+  round-trips both shapes. The
+  inputs are `FASTCACHE_NODE_SELECTED` / `FASTCACHED_SELECTED`, derived once from the feature
+  states after `MigrateFeatureStates`, so no condition restates the feature-state expression.
+  NOT after `CostFinalize`: on a major upgrade `MigrateFeatureStates` runs later and carries the
+  old product's selection over, so a state read before it is the new package's default.
+- **A stop states its drain.** `StopPendingPlanFor(--drain-timeout)` is the wait hint -- the drain
+  plus `StopTeardownMargin`, clamped to what the SCM can carry -- and the checkpoint advances
+  every `StopCheckpointInterval` until the body returns. A fixed hint shorter than the drain reads
+  as a hung service to the SCM and to an MSI waiting on the stop. fastcached has no drain of its
+  own and passes none.
+- **Which ports an install OPENS follows the MERGED configuration, not the `ServiceSpec`**, which
+  carries no port and no rule. Each binary's `main` derives the rules from the configuration the
+  service will run with (`NodeFirewallRules`, `DaemonFirewallRules`) and hands them to
+  `WithRegistrationFirewall` beside the registration. On a registration that succeeded, that
+  replaces the service's firewall group (`FirewallGroupFor`, `fastcached: <service>`) with one
+  inbound allow rule per non-loopback endpoint the configuration binds -- the node's from
+  `NodeSurfaceTable()` rows, so a surface or a default that turns one on is opened by its row
+  alone; fastcached's from its listeners and, with `--metrics`, its metrics endpoint. Replace,
+  never append: a repair and an upgrade run the install again, and a surface that has since
+  become loopback must lose its rule. A surface bound to the NAME `localhost` gets a rule, since
+  `IsLoopbackHost` does not take a name to be loopback, and the install says why.
+  - Every network profile, scoped to the program AND the service SID (set `UNRESTRICTED` so the
+    condition matches): a VPN adapter is usually Public, and a Domain- or Private-scoped rule
+    never reaches the office's VPN population. `--firewall-allow` (IPv4 or IPv6, optional
+    `/prefix`, repeatable, install-time only) narrows the remote side; `/0` is refused by name,
+    because "any address" is spelled by omitting the flag.
+  - **A port the KERNEL chooses is an endpoint of its own kind, never a missing one.**
+    Discovery SENDS from an exclusive reply socket (a unicast to a shared port reaches only one
+    of the sockets sharing it, so answering from the beacon port breaks two co-hosted nodes),
+    and without `--discovery-reply-port` the kernel picks that port, so every challenge and
+    proof arrives where no port-scoped rule can reach. The discovery row therefore resolves the
+    reply endpoint on every configuration, as `SurfacePortKind::KernelChosen` when unpinned, and
+    `NodeFirewallRules` maps the kind through a table to `FirewallPortKind::Any`: inbound UDP on
+    every local port (`LocalPorts = "*"`, set explicitly, which is also what a new UDP rule reads
+    back), named `... discovery-reply udp/any`, scoped to the program AND the service and to
+    `--firewall-allow` like every other rule. What it exposes is only the UDP sockets this
+    program opens, which is discovery alone -- and `ctest -R udp-opener` is what keeps that true:
+    it refuses a second first-party UDP opener outside `DiscoveryTier.cpp`. A pinned port gets exactly that port and no
+    any-port rule. The uninstall removes it with the GROUP, never by re-deriving the rules.
+    **The MSI pins it and the node does not**: `FASTCACHE_DISCOVERY_REPLY_PORT` (default `6682`,
+    empty for the kernel's) reaches `--discovery-reply-port`, and the rule DERIVES from the
+    surface table given that flag -- never spelled in the fragment. The node's own default stays
+    kernel-chosen for the multi-instance rule (#126, consensus-and-cluster.md): two co-hosted
+    nodes need two reply ports, and the package installs one node per machine.
+  - **The rules are what the SERVICE opens at its next start, derived after the install secured
+    its state directory.** The formation decides whether consensus and discovery run, and `main`
+    HOLDS a record it cannot judge -- a 0.3.0 directory other accounts could write in, or any
+    directory the service wrote, judged from the INSTALLER's account -- leaving the configuration
+    unshaped, which opens the node port alone. So `InstallWithServiceFirewall` registers first,
+    then reads the record (`StateDirectoryFormationReader`, without the owner judgement whose
+    answer depends on who asks; the start judges again as the service), applies it as the start
+    will, JUDGES that configuration by the install's rules (`NodeInstallRejection` -- an unshaped
+    one runs no consensus, so the rows about an admitting node stay silent and the install would
+    pass what the start refuses), and only then derives the rules. A record still unreadable, or
+    a shaped configuration refused, REFUSES the install by name and opens nothing. `[firewall][install]`, and the MSI job's `Assert-NodeFirewall` after the
+    0.3.0 upgrade.
+  - "Any" is a KIND on `FirewallLocalPort`, never a port of 0 that one layer reads as every
+    port and the next as port 0: a `Fixed` rule on 0 and an `Any` rule carrying a number are
+    both refused before the firewall is touched, and the worksheet prints a kernel-chosen port
+    as `*`, never as `:0`, which an operator would copy into a rule that admits nothing.
+  - `--uninstall-service` always ATTEMPTS the delete, whatever the stop wait said, and removes
+    the group once the delete succeeded or found no service (`WithRemovalFirewall`) -- including
+    a service that had not stopped within `UninstallStopCeiling` and is only MARKED, whose rules
+    go while it runs on until it exits. After a delete Windows refused it touches no rule, since
+    that service is still registered and may be running, and says so: "any rules of this service
+    are left in place, since the service may still be registered; they are removed by an
+    uninstall that succeeds".
+  - A rule name that matches one OUTSIDE the group, ignoring case, is refused before anything
+    changes (`FirewallNameCollision`): the firewall removes rules by name, so the other rule
+    could be the one removed. And the firewall never decides an install's or an uninstall's exit
+    code: its refusal is appended as a warning to an outcome that stays the registration's.
+  - The seam is `Platform/IFirewall`, the fake `src/tests/FirewallFakes.hpp`. Only Windows has a
+    firewall this project manages; elsewhere `MakeSystemFirewall()` is null and the install
+    names the surfaces that need a rule of the operator's own. The real Windows Firewall is
+    asserted in the `package-windows` job.
 ## Finding and trusting a configuration file
 
 <!-- agent-tripwire: A machine-wide config is obeyed only when only an administrator could have written it -->
@@ -595,6 +721,56 @@ readable and silently ignored. Every rule below has already been one of them.
     installed file's access list — no broad principal may read, `S-1-5-6` may, and
     the list is protected. **Both directions**: a config nothing can read is not a
     fix, it is a daemon that silently starts on built-in defaults.
+- **A directory a SERVICE mints a credential in is secured by the INSTALL, and adding a
+  grant to it is not securing it.** The node's identity key is written by the service at
+  its first start, under its virtual account, into `--cluster-dir` -- so no per-file list
+  can be applied beforehand, and the directory's own list is the only place the answer can
+  live. `GrantPathAccess` ADDS the account to what the path already has, and what
+  `%ProgramData%\fastcache-node` already has is `BUILTIN\Users:(I)(OI)(CI)(RX)` (read on
+  a hand-deployed directory, 2026-09-26): the key inherited every local account's read,
+  and any local account could impersonate the machine to the fleet. So an owned path
+  carries a `PathPrivacy`, and `MakeNodeServiceSpec` marks the state directory `Private`.
+  - **A `Private` path gets a protected list of its own** (`SecureDirectoryForService`):
+    SYSTEM, Administrators and the service's SID, inherited by what is created inside,
+    nothing inherited from the parent -- and `OWNER RIGHTS` held to `READ_CONTROL`,
+    because `%ProgramData%` lets any account create the directory first, and an owner
+    keeps `WRITE_DAC` unless an OWNER RIGHTS entry says otherwise. Measured on this host:
+    a non-elevated owner of a file whose protected list named only SYSTEM and
+    Administrators granted itself full control with `icacls /grant`.
+  - **What is already inside is covered by inheritance, then CHECKED.** Setting a
+    directory's list recomputes the inherited entries of everything under it, and a key
+    the old service minted with default security carries only inherited entries -- the
+    upgrade from today's MSI. Each entry is then asked `SecretFileExposure`, because
+    Windows lets every account bypass traverse checking; one with an explicit broad grant
+    is NAMED with its `icacls /reset` remedy rather than rewritten, somebody's decision or
+    somebody's plant. POSIX removes the group and other bits, which hides the contents
+    without visiting them.
+  - **A failure REFUSES the install; it is never a warning** (`HandOverOwnedPaths`, one
+    rule for every supervisor), because a readable key is a credential exposure while a
+    `Shared` path that cannot be handed over is a service failing loudly at its first
+    write. On Windows the registration is already made by then -- the trustee resolves only
+    once the service exists -- and the MSI starts the node straight after
+    `--install-service` whatever it returned (`Return="ignore"`), so a registration THIS
+    install created is deleted again and a re-applied one is left and said to be
+    (`RefusedRegistration`). launchd refuses before the plist is written.
+  - **A directory that already exists is JUDGED before it is trusted**, because a standard
+    account can arrange one before the installer runs, with no privilege. Refused, naming the
+    entry: a reparse point (junction or symlink) on the directory or anywhere below it, which
+    would redirect the key; an entry owned by anybody but SYSTEM, Administrators or the service,
+    whose planter still knows its contents; a non-directory entry with a second hard link, whose
+    list is shared with a file outside; and an entry keeping an explicit broad grant of its own.
+    The owner becomes Administrators, and the checks run read-only BEFORE the list is applied and
+    again AFTER it, once no new open by anybody else can change anything there. An exposed
+    identity key is refused with a DELETE remedy rather than `icacls /reset`, which would keep a
+    disclosed key in service.
+  - **One residual is named, not hidden**: a handle opened BEFORE the apply keeps the access it
+    was granted, since an access list is checked at open and not at each write. Refusing while
+    other handles are open would refuse every re-apply with the service holding its key open.
+  - The evidence on a real install is the `package-windows` job's feature-change step:
+    after the node starts, no broad principal may read or plant in the directory or read
+    the key, the list is protected, OWNER RIGHTS holds nothing beyond reading the list, and
+    the service's SID still reaches its key. Windows Sandbox was not enabled on the host
+    this was written on, so no before-and-after of an MSI install was measured locally.
 - **A secret reached BY PATH is not provenance-gated, and which flags those are is a
   TABLE on both binaries.** #384's rule asks whether the `--requirepass` in force came
   out of the configuration file, because it can also arrive in argv — where the

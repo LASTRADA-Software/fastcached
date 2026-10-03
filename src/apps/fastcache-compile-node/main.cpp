@@ -17,6 +17,7 @@
 #include "ConsensusTier.hpp"
 #include "CordonCli.hpp"
 #include "DiscoveryTier.hpp"
+#include "EndpointDialer.hpp"
 #include "EnrollClient.hpp"
 #include "EnrollmentResponder.hpp"
 #include "EnrollmentWindow.hpp"
@@ -29,6 +30,7 @@
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "NodeFirewall.hpp"
 #include "NodeFormation.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIdentity.hpp"
@@ -65,6 +67,7 @@
 #include <FastCache/Config/SecretExposureWatcher.hpp>
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Config/YamlReader.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/ReadinessMarker.hpp>
@@ -78,6 +81,8 @@
 #include <FastCache/Platform/CpuAffinity.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/Firewall.hpp>
+#include <FastCache/Platform/HostEvents.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
@@ -86,6 +91,7 @@
 #include <FastCache/Platform/InheritedListener.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
+#include <FastCache/Platform/NetworkChangeWatcher.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Platform/WindowsEventLogger.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -527,10 +533,18 @@ using Node::NodeReloader;
     return key.transform([](Ed25519KeyPair const& pair) { return pair.PublicKey(); });
 }
 
+/// Everything the node runs, under whichever host runs it.
+/// @param cfg The configuration the node started with.
+/// @param identityKey The machine's identity key, or nothing.
+/// @param logger Where the node reports.
+/// @param reloader The live configuration; null with no file.
+/// @param hostEvents Where the host's suspend, resume and network events arrive.
+/// @return The process's exit status.
 [[nodiscard]] int WorkerBody(NodeConfig const& cfg,
                              std::optional<Ed25519KeyPair> const& identityKey,
                              ILogger& logger,
-                             NodeReloader* reloader)
+                             NodeReloader* reloader,
+                             IHostEvents& hostEvents)
 {
     // ONE origin for every uptime this process reports. `/healthz` and the `0xFC`
     // `NodeStatus` verb both answer *how long has this been serving*, and two
@@ -823,6 +837,9 @@ using Node::NodeReloader;
     // offers are what the tier built leaves (#167), and ABOVE the node surface, which
     // routes the compile family to it and is therefore destroyed first. Null on a node
     // started with `--slots=0` (#206): no pool thread, no validator, no heartbeat.
+    //
+    // Its heartbeat dials through `workerDialer`, declared above it so it outlives the tier.
+    Node::BlockingEndpointDialer workerDialer { Node::HeartbeatIoTimeout };
     auto workerOrRefusal =
         Node::WorkerTier::Start(Node::WorkerTierParts { .cfg = cfg,
                                                         .reloader = reloader,
@@ -839,7 +856,10 @@ using Node::NodeReloader;
                                                         .leaseRoster = nodeRoster->Lease(),
                                                         .metrics = metrics,
                                                         .logger = logger,
-                                                        .conditions = conditions },
+                                                        .conditions = conditions,
+                                                        .hostEvents = hostEvents,
+                                                        .suspendWait = DefaultDrainWait(),
+                                                        .schedulerDialer = workerDialer },
                                 &Node::MakeSystemWorkerMachine);
     if (!workerOrRefusal.has_value())
     {
@@ -1383,6 +1403,9 @@ using Node::NodeReloader;
     // That is the ordering rationale `WorkerHeartbeat` used to carry, and it moved here with
     // the history: this loop is now the only thing in the process that reads the sampler's
     // handover cursor.
+    //
+    // Its rounds dial through `presenceDialer`, declared just above it so it outlives the loop.
+    Node::BlockingEndpointDialer presenceDialer { Node::PresenceIoTimeout };
     auto const presence = Node::NodePresence::Start(Node::NodePresenceParts { .cfg = cfg,
                                                                               .capacity = capacity,
                                                                               .announced = announced,
@@ -1393,7 +1416,9 @@ using Node::NodeReloader;
                                                                               .conditions = conditions,
                                                                               .roster = nodeRoster.get(),
                                                                               .prover = AddressOrNull(prover),
-                                                                              .reachability = schedulerReachability });
+                                                                              .reachability = schedulerReachability,
+                                                                              .dialer = presenceDialer,
+                                                                              .hostEvents = hostEvents });
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.
@@ -1610,6 +1635,8 @@ struct EarlyVerbRow
 
     std::cout << Node::DescribeIdentity(
         cfg.nodeId, publicKey, dialAddress, RunsConsensus(cfg) ? Node::IdentityRole::Member : Node::IdentityRole::Worker);
+    // And where it is kept: an unelevated run prints a PER-USER identity the service never holds.
+    std::cout << Node::DescribeIdentityOrigin(cfg);
     return ExitOk;
 }
 
@@ -1655,7 +1682,12 @@ struct EarlyVerbRow
     // setup, where `--scheduler` and the toolchains come out of the packaged file. What
     // is baked in is still only what was typed, plus the `--config` path that supplies
     // the rest.
-    if (context.cfg.installService)
+    //
+    // Only a configuration the formation SHAPED is judged here. One whose record was held is
+    // unshaped -- it runs no consensus, so the rules about an admitting node stay silent -- and is
+    // judged after the registration has secured the directory, on the configuration the service
+    // starts with (`InstallWithServiceFirewall`).
+    if (context.cfg.installService && context.cfg.formation.has_value())
         if (auto const rejection = NodeInstallRejection(context.cfg))
         {
             context.logger.Logf(LogLevel::Error, "{}", *rejection);
@@ -1691,13 +1723,28 @@ struct EarlyVerbRow
     // path, so the service reads the current file at every start rather than a snapshot
     // of it.
     auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), context.cliOnly, context.pathProbe);
-    auto const result = context.cfg.installService ? InstallService(spec, context.cfg.serviceScope)
-                                                   : UninstallService(spec, context.cfg.serviceScope);
-    if (result.exitCode == 0)
+    // The firewall follows the registration: opened for what the SERVICE will open at its next
+    // start -- the merged configuration shaped by the formation record read AFTER the registration
+    // secured the state directory (`InstallWithServiceFirewall`) -- and closed on removal once the
+    // delete succeeded or found no registration, never after a refused one
+    // (`WithRemovalFirewall`), since a rule outliving its service admits nothing but misleads
+    // whoever reads the list.
+    auto const firewall = MakeSystemFirewall();
+    Node::StateDirectoryFormationReader const formation { context.cfg };
+    auto const result =
+        context.cfg.installService
+            ? Node::InstallWithServiceFirewall([&] { return InstallService(spec, context.cfg.serviceScope); },
+                                               context.cfg,
+                                               spec.exePath,
+                                               spec.serviceName,
+                                               formation,
+                                               firewall.get())
+            : WithRemovalFirewall(UninstallService(spec, context.cfg.serviceScope), firewall.get(), spec.serviceName);
+    if (result.ExitCode() == 0)
         std::cout << "fastcache-compile-node: " << result.message << '\n';
     else
         std::cerr << "fastcache-compile-node: " << result.message << '\n';
-    return result.exitCode;
+    return result.ExitCode();
 }
 
 /// Convert this node's disk tier to the format this build reads (`--migrate-cache`).
@@ -2039,27 +2086,19 @@ int main(int argc, char** argv)
     // this command line has been judged, as the identity's does.
     //
     // A record that cannot be read is held rather than refused here, so the verbs that write
-    // nothing -- an uninstall among them -- still run; the start refuses it by name below. So is
-    // a directory another account may write in or wrote into: its writers, then who owns each
-    // file, are asked before any is read (`JudgeStateDirectory`), as the key resolution asks again.
+    // nothing -- an uninstall among them -- still run; the start refuses it by name below, and an
+    // install reads it again once its handover has secured the directory, deriving the service's
+    // firewall rules from that (`InstallWithServiceFirewall`). So is a directory another account
+    // may write in or wrote into: its writers, then who owns each file, are asked before any is
+    // read (`ReadStateDirectoryFormation`), as the key resolution asks again.
     auto const formationDirectory = Node::ChosenStateDirectory(cfg);
     std::optional<Cluster::FileFormationStore> formationStore;
-    std::optional<Cluster::FleetEndpointsFile> endpointsFile;
     auto keptFormation = std::expected<Node::KeptFormation, std::string> { std::unexpected {
         std::string { "this node has no state directory to keep its formation record in" } } };
     if (formationDirectory.has_value())
     {
         formationStore.emplace(formationDirectory->path);
-        endpointsFile.emplace(formationDirectory->path);
-        Node::FileTrustNodeKeyGuard stateGuard;
-        if (auto walked = Node::JudgeStateDirectory(formationDirectory->path, stateGuard); !walked.has_value())
-            keptFormation = std::unexpected { std::move(walked).error().message };
-        else
-            keptFormation =
-                Node::ReadKeptFormation(*formationStore, *endpointsFile).transform_error([&](std::string const& error) {
-                    return error
-                           + Node::StateFileUnreadableHint(formationDirectory->path / Cluster::FormationRecordFileName);
-                });
+        keptFormation = Node::ReadStateDirectoryFormation(formationDirectory->path);
     }
     if (keptFormation.has_value())
     {
@@ -2345,6 +2384,18 @@ int main(int argc, char** argv)
     else
         ReportSecretExposure<NodeConfig>(cfg, secretFiles, report);
 
+    // The host's events: power through the SCM, network changes through the watcher. Declared
+    // here, above the host, because both outlive the body the host runs, and the watcher below
+    // the hub it delivers into. Started BEFORE a POSIX host forks, which is harmless only because
+    // no POSIX watcher exists: one that did would have to start inside the body, since a thread
+    // does not survive the fork. A watcher the OS refused is reported and not fatal, because no
+    // consumer may depend on a host event arriving (`HostEvent` says why).
+    HostEventHub hostEvents;
+    core::platform::SteadyClock networkClock;
+    auto const networkWatcher = StartNetworkChangeWatcher(hostEvents, networkClock, NetworkDebounce {});
+    if (!networkWatcher.has_value())
+        logger.Logf(LogLevel::Warn, "network changes will not be reported: {}", networkWatcher.error());
+
     // The host is chosen last, so everything that can be reported to a terminal
     // already has been. `--daemon` is what a SUPERVISOR THAT WANTS BACKGROUNDING
     // passes: the Windows SCM needs it, and systemd and launchd must not pass it,
@@ -2354,7 +2405,8 @@ int main(int argc, char** argv)
     if (cfg.daemon)
     {
 #if defined(_WIN32)
-        host = MakeWindowsServiceHost(cfg.serviceName);
+        host = MakeWindowsServiceHost(
+            cfg.serviceName, ServiceHostOptions { .stop = StopPendingPlanFor(cfg.drainTimeout), .hostEvents = &hostEvents });
 #else
         // **A worker states its own working directory, and it is not `/`** (#784).
         //
@@ -2397,6 +2449,7 @@ int main(int argc, char** argv)
         host = std::make_unique<ForegroundHost>();
 
     auto* const reloaderPtr = reloader.has_value() ? &*reloader : nullptr;
-    return host->Run(
-        [&cfg, &identityKey, &logger, reloaderPtr] { return WorkerBody(cfg, *identityKey, logger, reloaderPtr); });
+    return host->Run([&cfg, &identityKey, &logger, reloaderPtr, &hostEvents] {
+        return WorkerBody(cfg, *identityKey, logger, reloaderPtr, hostEvents);
+    });
 }

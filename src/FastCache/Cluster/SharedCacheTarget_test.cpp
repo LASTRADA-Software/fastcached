@@ -92,7 +92,13 @@ TEST_CASE("Each way the setting cannot be used resolves to its own answer", "[cl
     // A setting that outlived its machine: the forget took the member and revoked the key, and the
     // setting is left alone -- every node resolves it to "unknown" rather than to an address.
     auto forgotten = Named();
-    Apply(forgotten, Command { .kind = CommandKind::Forget, .key = "cache-c" });
+    Apply(forgotten,
+          Command { .kind = CommandKind::Forget,
+                    .key = "cache-c",
+                    .value = {},
+                    .schedulerEndpoint = {},
+                    .publicKey = std::nullopt,
+                    .role = std::nullopt });
     auto const gone = ResolveSharedCache(forgotten, "pc-7");
     CHECK(gone.resolution == SharedCacheResolution::UnknownMachine);
     CHECK(gone.machineId == "cache-c");

@@ -4,6 +4,7 @@
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
 #include "EndpointDialer.hpp"
+#include "HostEventInbox.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
@@ -15,16 +16,19 @@
 #include "ScratchClaim.hpp"
 #include "WorkerLease.hpp"
 
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/HostEvents.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -32,6 +36,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -123,9 +128,42 @@ struct WorkerTierParts
     /// written into a debug-prefix-map rule. Evaluated where the root is claimed, beside the
     /// warning that says the same thing at startup.
     NodeConditions& conditions;
+    /// Where the host's suspend, resume and network events arrive. The tier listens for as long
+    /// as it exists.
+    IHostEvents& hostEvents;
+    /// Where a suspend's bounded wait for its withdrawal blocks and reads time.
+    IDrainWait& suspendWait;
+    /// How the heartbeat reaches a scheduler -- its rounds and a suspend's one withdrawal. Only
+    /// the heartbeat thread dials through it, never the thread a host event arrives on.
+    IEndpointDialer& schedulerDialer;
 };
 
 class WorkerTier;
+
+/// Wait out one heartbeat interval, handling a suspend on the way.
+///
+/// **A suspend is withdrawn and then waited PAST**: announcing right after withdrawing would
+/// re-register a machine that is about to sleep. So the withdrawal runs, the suspend waiting on it
+/// is let go (`HostEventInbox::Settle`), and the wait goes on -- unless something else is pending
+/// beside it, a resume or a network change, which ends the wait so the round runs. Any other wake
+/// ends it too. Runs on the heartbeat's thread, which is what makes every dial the withdrawal makes
+/// one the delivering thread never makes.
+///
+/// A free function over the two objects rather than a `WorkerTier` member, because the heartbeat
+/// loop is reached by no test and this is the rule a suspend depends on.
+/// @param stop Ends the wait, and the heartbeat.
+/// @param capacity Whose wait is woken by a cordon and by a host event.
+/// @param inbox Where host events wait for this thread.
+/// @param announcedCordon The cordon the round that just ran carried.
+/// @param interval How long to wait when nothing happens.
+/// @param withdrawForSuspend Retires every registration and tells the scheduler.
+/// @return What ended the wait; `Stopped` ends the heartbeat.
+[[nodiscard]] HeartbeatWake AwaitNextRound(std::stop_token const& stop,
+                                           CompileCapacity& capacity,
+                                           HostEventInbox& inbox,
+                                           bool announcedCordon,
+                                           std::chrono::milliseconds interval,
+                                           std::function<void()> const& withdrawForSuspend);
 
 /// The heartbeat thread of a started worker, which stops and joins when destroyed.
 ///
@@ -302,7 +340,13 @@ class WorkerTier
     /// fleet holds another. That is the property a second reader of the configuration
     /// could not have.
     /// @param endpoint The new endpoint; non-empty, per `AdvertisedEndpointChange`.
-    void AnnounceAs(std::string endpoint);
+    /// @param statusClock What `node-status` stamps against, for the registrations this retires.
+    void AnnounceAs(std::string endpoint, core::platform::IClock const& statusClock);
+
+    /// Retire every registration and tell the scheduler, before the machine sleeps.
+    /// @param round What to withdraw and where to log.
+    /// @param statusClock What `node-status` stamps against.
+    void WithdrawForSuspend(HeartbeatRound const& round, core::platform::IClock const& statusClock);
 
     NodeConfig const& _cfg;
     NodeReloader const* _reloader;
@@ -337,10 +381,14 @@ class WorkerTier
     CompileCacheWire::CapacityFields _advertisedWire;
     std::vector<Cc::WorkerRegistrar> _registrars;
     std::vector<Cc::WorkerRegistrar> _withdrawals;
-    BlockingEndpointDialer _dialer;
+    IEndpointDialer& _dialer;
     SchedulerLink _link;
     std::atomic<bool> _surveyFoundNothing { false };
     std::atomic<bool> _addressCapNoticed { false };
+    /// Host events for the heartbeat thread. After `_capacity`, whose wake it calls.
+    HostEventInbox _hostInbox;
+    /// Listening, from construction to destruction. After `_hostInbox`, so it goes first.
+    HostEventSubscription _hostSubscription;
 };
 
 } // namespace FastCache::Node

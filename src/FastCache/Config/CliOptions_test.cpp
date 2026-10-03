@@ -88,6 +88,8 @@ constexpr auto Samples = std::to_array<FlagSample>({
     { .flag = "--install-service", .value = "" },
     { .flag = "--uninstall-service", .value = "" },
     { .flag = "--service-scope", .value = "system" },
+    { .flag = "--service-start", .value = "manual" },
+    { .flag = "--firewall-allow", .value = "10.0.0.0/8" },
     { .flag = "--healthcheck", .value = "" },
     { .flag = "--seed-config", .value = "template.yaml" },
     { .flag = "--migrate-storage", .value = "" },

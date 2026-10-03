@@ -236,10 +236,42 @@ set(surfaceProtocols "")
 set(surfaceFlagRows "")
 set(pendingName "")
 set(pendingFlags "")
+# The ROLES each surface's resolver gives its endpoints, as `name|role` rows in source
+# order. A surface with more than one endpoint prints one transcript row per role
+# (`discovery beacon`, `discovery reply`), and these rows are the only labels a
+# transcript may repeat a surface NAME under -- read off the resolver rather than
+# listed here, so a role added or renamed in the table moves the check with it.
+# `rowName` is the row being read and, unlike `pendingName`, is not cleared at
+# `.protocol`: the resolver that carries the roles comes after it.
+#
+# Roles are read INSIDE the table only: from the line opening `EnumTable<NodeSurface, ...>`
+# to the `};` at that line's own indentation. Read to the end of the file, a `.role`
+# literal anywhere after the table was credited to its last row -- a planted
+# `constexpr X x { .role = "gossip" };` made a `discovery gossip` transcript row pass, an
+# extra port admitted by the rule that exists to refuse one. A table whose opener or
+# closer the scan cannot find is a lost shape, refused below.
+set(surfaceRoleRows "")
+set(rowName "")
+set(tableState "before")
+set(tableIndent "")
 foreach(line IN LISTS surfaceLines)
+    if(tableState STREQUAL "before" AND line MATCHES "^([ \t]*).*EnumTable<NodeSurface,")
+        set(tableState "inside")
+        set(tableIndent "${CMAKE_MATCH_1}")
+    # `;` is blanked by the tokenising splitter, so the closer reads as a lone `}`.
+    elseif(tableState STREQUAL "inside" AND line MATCHES "^([ \t]*)}[ \t]*$")
+        if(CMAKE_MATCH_1 STREQUAL tableIndent)
+            set(tableState "after")
+            set(rowName "")
+        endif()
+    endif()
+
     if(line MATCHES "^[ \t]*\\.name[ \t]*=[ \t]*\"([a-z]+)\"")
         set(pendingName "${CMAKE_MATCH_1}")
+        set(rowName "${CMAKE_MATCH_1}")
         set(pendingFlags "")
+    elseif(tableState STREQUAL "inside" AND rowName AND line MATCHES "\\.role[ \t]*=[ \t]*\"([a-z]+)\"")
+        list(APPEND surfaceRoleRows "${rowName}|${CMAKE_MATCH_1}")
     elseif(line MATCHES "^[ \t]*\\.flags[ \t]*=[ \t]*\\{(.*)\\}")
         # EVERY flag in the row. `discovery` declares two and holding only the
         # first left `--discovery-reply-port` outside this guard entirely: it
@@ -280,6 +312,21 @@ foreach(line IN LISTS surfaceLines)
         endif()
     endif()
 endforeach()
+
+# The role reader's own lost-shape refusals. Each blames the SCAN, in the words the other
+# lost-shape refusals use, rather than letting every correct `discovery beacon` row be
+# reported as an undeclared role -- which is how somebody ends up editing correct prose to
+# match a broken scanner.
+set(rolesLost FALSE)
+if(NOT tableState STREQUAL "after")
+    set(rolesLost TRUE)
+    list(APPEND violations
+         "${FastCachedSurfaceSource}: the role reader did not find both the surface table's `EnumTable<NodeSurface, ...>` opener and the `};` closing it at the opener's indentation (it stopped `${tableState}` the table); this scan has lost the table's shape, so nothing it says about the documents is worth reading")
+elseif(NOT surfaceRoleRows)
+    set(rolesLost TRUE)
+    list(APPEND violations
+         "${FastCachedSurfaceSource}: no endpoint `.role` was extracted from the surface table, though a surface with two endpoints names each; this scan has lost the table's shape, so nothing it says about the documents is worth reading")
+endif()
 
 list(LENGTH surfaceNames surfaceCount)
 if(surfaceCount EQUAL 0)
@@ -421,6 +468,7 @@ foreach(docFile IN LISTS docFiles)
     # quadratic in line length and hands back UNSANITISED text.
     set(fenceState "")
     set(seenInFence "")
+    set(rowsSeenInFence "")
     set(rowsInFence 0)
     set(commandLine FALSE)
     foreach(line IN LISTS docLines)
@@ -483,6 +531,7 @@ foreach(docFile IN LISTS docFiles)
             if(commandLine AND line MATCHES "print-surfaces")
                 set(fenceState "transcript")
                 set(seenInFence "")
+                set(rowsSeenInFence "")
                 set(rowsInFence 0)
                 continue()
             endif()
@@ -498,7 +547,47 @@ foreach(docFile IN LISTS docFiles)
                         list(APPEND violations
                              "${docPath}: a `--print-surfaces` transcript has a `${label}` line, and ${FastCachedSurfaceSource} declares no such surface -- a reader cannot tell this from real output, and on a firewall worksheet an extra row reads as authorisation to open a port")
                     else()
-                        list(APPEND seenInFence "${label}")
+                        # A surface with two endpoints prints two ADJACENT rows under one
+                        # name, one per ROLE its resolver declares (`discovery beacon`,
+                        # `discovery reply`), and those fold into one surface for the
+                        # order rule. Only those: folding on the NAME alone admitted a
+                        # second `node` row, a duplicated one and a duplicated `discovery
+                        # beacon`, each an extra port on a firewall worksheet. So the
+                        # full label is judged first -- a role the table does not declare
+                        # for this surface, a label already printed, or a served role row
+                        # beside the surface's role-less `not served` row is refused --
+                        # and only then does an adjacent repeat of the name fold.
+                        string(STRIP "${CMAKE_MATCH_2}" role)
+                        set(fullLabel "${label}")
+                        if(NOT "${role}" STREQUAL "")
+                            set(fullLabel "${label} ${role}")
+                        endif()
+                        set(rowRefusal "")
+                        list(FIND surfaceRoleRows "${label}|${role}" declaredRole)
+                        list(FIND rowsSeenInFence "${label}|${role}" repeated)
+                        if(NOT "${role}" STREQUAL "" AND declaredRole EQUAL -1 AND NOT rolesLost)
+                            set(rowRefusal "has a `${label} ${role}` line, and ${FastCachedSurfaceSource} declares no `${role}` endpoint for the `${label}` surface")
+                        elseif(NOT repeated EQUAL -1)
+                            set(rowRefusal "prints the `${fullLabel}` row twice, and ${FastCachedSurfaceSource} resolves each endpoint once")
+                        elseif("${role}" STREQUAL "" AND "${rowsSeenInFence};" MATCHES "(^|;)${label}\\|[a-z]+;")
+                            set(rowRefusal "has a `${label}` row with no role beside the `${label}` rows that name one, and a surface is either served or not")
+                        elseif(NOT "${role}" STREQUAL "" AND "${label}|" IN_LIST rowsSeenInFence)
+                            set(rowRefusal "has a `${label} ${role}` row beside the `${label}` row with no role, and a surface is either served or not")
+                        endif()
+                        list(APPEND rowsSeenInFence "${label}|${role}")
+                        if(NOT rowRefusal STREQUAL "")
+                            list(APPEND violations
+                                 "${docPath}: a `--print-surfaces` transcript ${rowRefusal} -- a reader cannot tell this from real output, and on a firewall worksheet an extra row reads as authorisation to open a port")
+                        endif()
+
+                        list(LENGTH seenInFence seenCount)
+                        set(previousLabel "")
+                        if(seenCount GREATER 0)
+                            list(GET seenInFence -1 previousLabel)
+                        endif()
+                        if(NOT label STREQUAL previousLabel)
+                            list(APPEND seenInFence "${label}")
+                        endif()
                     endif()
                 endif()
                 continue()

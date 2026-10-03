@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
 #include "NodeConditions.hpp"
+#include "NodeIdentity.hpp"
 
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
@@ -1226,6 +1227,28 @@ TEST_CASE("The history path follows the directories a node already has", "[node]
     // a cluster member.
     cfg.clusterDir = "/var/lib/fastcache-cluster";
     CHECK(FleetHistoryPath(cfg) == std::filesystem::path { "/var/lib/fastcache-cluster" } / "fleet-history.bin");
+}
+
+TEST_CASE("A node started with no configuration keeps its history in the state directory its start resolved",
+          "[node][admin][fleethistory]")
+{
+    // No `--cluster-dir` and no `--cache-dir`: the default the start resolved is the only directory
+    // this node has, and every other state file lives there. Asked of the typed flag alone, the
+    // history went nowhere -- memory-only, on exactly the install that names nothing.
+    NodeConfig cfg;
+    cfg.stateDirectory = NodeStateDirectoryChoice { .path = "/home/user/.local/state/fastcache-node",
+                                                    .origin = StateDirectoryOrigin::PerUser };
+    auto const paths = HistoryPaths::For(cfg);
+    for (auto const& path: { paths.fleet, paths.node, paths.received })
+    {
+        INFO(path.string());
+        CHECK(path.parent_path() == NodeStateDirectory(cfg));
+    }
+    CHECK(paths.fleet.filename() == "fleet-history.bin");
+
+    // Beside a cache directory too: the state directory is where the node's own files are.
+    cfg.cacheDir = "/var/lib/fastcache";
+    CHECK(FleetHistoryPath(cfg).parent_path() == NodeStateDirectory(cfg));
 }
 
 namespace

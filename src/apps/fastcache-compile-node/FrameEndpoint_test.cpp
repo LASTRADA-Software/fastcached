@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "AnnounceTestFixture.hpp"
 #include "CacheProxy.hpp"
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
+#include "EndpointDialer.hpp"
 #include "EndpointWriters.hpp"
 #include "EnrollmentResponder.hpp"
 #include "EnrollmentWindow.hpp"
@@ -5085,4 +5087,155 @@ TEST_CASE("A node proves itself to the named machine and to no other", "[node][f
     }
     CHECK(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == acceptedBefore);
     CHECK(rig.Read(IMetricsSink::Counter::NodeProofsRejected) == 0);
+}
+
+// --- The round's proof, against a real node (#178) --------------------------------------------
+
+namespace
+{
+
+/// This machine's half of the proof, as a node holds it: its test key, a trust that states every
+/// server's standing outright, a random source of its own, and the client over them.
+struct ProvingClient
+{
+    /// @param standing What every server is to this machine.
+    explicit ProvingClient(ServerStanding standing):
+        trust { standing }
+    {
+    }
+
+    FixedServerTrust trust;                                                              ///< Whom it proves itself to.
+    Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };           ///< Its ephemeral draws.
+    Ed25519KeyPair const key = Testing::TestKeyPair(std::string { ProvingMachine });     ///< Its identity.
+    NodeProofClient const client { std::string { ProvingMachine }, key, trust, random }; ///< What a round proves with.
+};
+
+/// @param port A loopback port.
+/// @return The `--scheduler` value naming it.
+[[nodiscard]] std::string LoopbackScheduler(std::uint16_t port)
+{
+    return std::format("127.0.0.1:{}", port);
+}
+
+/// @param logger What a round logged into.
+/// @param phrase A substring.
+/// @return How many captured lines carry it, at any level.
+[[nodiscard]] std::ptrdiff_t LinesCarrying(CapturingLogger const& logger, std::string_view phrase)
+{
+    auto const records = logger.Snapshot();
+    return std::ranges::count_if(
+        records, [phrase](CapturingLogger::Record const& record) { return record.message.contains(phrase); });
+}
+
+} // namespace
+
+TEST_CASE("A heartbeat round to a real node proves this machine first, and registers it", "[node][announce][proof]")
+{
+    // The proving arm driven THROUGH `AnnounceRound` rather than beside it. A registration is
+    // `ProvenNodeOnly`, so a round whose connection skipped the proof is refused here -- which no
+    // scripted fleet can show, because a scripted fleet serves no handshake.
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    ProvingClient machine { ServerStanding::Voter };
+    AnnounceTesting::AnnounceFixture fix;
+    fix.cfg.schedulers = { LoopbackScheduler(port) };
+    fix.prover = &machine.client;
+    auto link = AnnounceTesting::LinkOver(fix.cfg.schedulers);
+    BlockingEndpointDialer dialer { HeartbeatIoTimeout };
+
+    CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
+    CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
+}
+
+TEST_CASE("A round whose proof does not seal says so in the proof's own words, and falls back", "[node][announce][proof]")
+{
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    AnnounceTesting::AnnounceFixture fix;
+    BlockingEndpointDialer dialer { HeartbeatIoTimeout };
+
+    SECTION("a server this machine will not prove itself to is that, not unreachable and not a refusal")
+    {
+        ProvingClient machine { ServerStanding::Revoked };
+        fix.cfg.schedulers = { LoopbackScheduler(port) };
+        fix.prover = &machine.client;
+        auto link = AnnounceTesting::LinkOver(fix.cfg.schedulers);
+
+        CHECK(AnnounceRound(fix.Round(), link, dialer) == 0);
+        CHECK(rig.fleet.service.Workers().LiveWorkers().empty());
+        // The proof row's sentence, through `reachability.Failed` -- the words a skipped proof or a
+        // proof outcome filed under another row could not produce.
+        CHECK(LinesCarrying(fix.logger, std::format("this machine will not prove itself to {}", LoopbackScheduler(port)))
+              == 1);
+        CHECK(LinesCarrying(fix.logger, "unreachable") == 0);
+        CHECK(LinesCarrying(fix.logger, "did not register") == 0);
+    }
+
+    SECTION("a first scheduler that serves no handshake is passed over for the next, in the same round")
+    {
+        Fleet plain;
+        MergedResponder plainMerged { SurfaceComponents { .scheduler = &plain.responder, .nodeProof = nullptr } };
+        auto const plainPort = FreePort();
+        auto plainEndpoint = FrameEndpoint::Start(plain.io,
+                                                  NodeSurface::Node,
+                                                  LoopbackFor(NodeSurface::Node, plainPort),
+                                                  plainMerged,
+                                                  plain.metrics,
+                                                  plain.logger);
+        REQUIRE(plainEndpoint.has_value());
+        plain.Serve();
+
+        ProvingClient machine { ServerStanding::Voter };
+        fix.cfg.schedulers = { LoopbackScheduler(plainPort), LoopbackScheduler(port) };
+        fix.prover = &machine.client;
+        auto link = AnnounceTesting::LinkOver(fix.cfg.schedulers);
+
+        CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
+        CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
+        CHECK(plain.service.Workers().LiveWorkers().empty());
+        CHECK(link.Target() == LoopbackScheduler(port));
+        CHECK(LinesCarrying(fix.logger, "serves no identity handshake") == 1);
+        CHECK(LinesCarrying(fix.logger, std::format("; trying {}", LoopbackScheduler(port))) == 1);
+    }
+}
+
+TEST_CASE("A suspend's withdrawal proves this machine too, and a refused identity stays out of the tracker",
+          "[node][announce][proof]")
+{
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    ProvingClient machine { ServerStanding::Voter };
+    AnnounceTesting::AnnounceFixture fix;
+    fix.cfg.schedulers = { LoopbackScheduler(port) };
+    fix.prover = &machine.client;
+    auto link = AnnounceTesting::LinkOver(fix.cfg.schedulers);
+    BlockingEndpointDialer dialer { HeartbeatIoTimeout };
+    REQUIRE(AnnounceRound(fix.Round(), link, dialer) == 1);
+    REQUIRE(rig.fleet.service.Workers().LiveWorkers().size() == 1);
+
+    std::vector<Cc::WorkerRegistrar> rebuilt;
+    rebuilt.push_back(AnnounceTesting::Registrar("gcc-14"));
+    RetireAllRegistrations(std::move(rebuilt), fix.registrars, fix.withdrawals);
+    REQUIRE(fix.withdrawals.size() == 1);
+
+    SECTION("proved, the scheduler retires the registration")
+    {
+        CHECK(WithdrawOnce(fix.Round(), link, dialer) == 1);
+        CHECK(rig.fleet.service.Workers().LiveWorkers().empty());
+    }
+
+    SECTION("refused, nothing is retired, it is said once, and not in the tracker's words")
+    {
+        ProvingClient revoked { ServerStanding::Revoked };
+        fix.prover = &revoked.client;
+
+        CHECK(WithdrawOnce(fix.Round(), link, dialer) == 0);
+        CHECK(fix.withdrawals.empty());
+        CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
+        CHECK(LinesCarrying(fix.logger, "did not accept this machine's identity before it sleeps") == 1);
+        // A machine going to sleep is not a scheduler setback: through `round.reachability` this
+        // would be the proof row's sentence, spending that scheduler's Warn.
+        CHECK(LinesCarrying(fix.logger, "will not prove itself") == 0);
+    }
 }

@@ -93,7 +93,7 @@ target_compile_definitions(fastcache-cli PRIVATE FASTCACHE_CLI_VERSION="${FASTCA
 
 install(TARGETS fastcache-cli
     RUNTIME DESTINATION "${FASTCACHED_INSTALL_BINDIR}"
-    COMPONENT Runtime
+    COMPONENT "${FASTCACHED_APP_COMPONENT}"
 )
 
 # The command line, the verb handlers, the formatters and the stats ladder's choice are

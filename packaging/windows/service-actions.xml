@@ -2,82 +2,110 @@
 <!--
     SPDX-License-Identifier: Apache-2.0
 
-    CPack WiX patch fragment: registers fastcached as an auto-start Windows
-    service at install time and removes it on uninstall.
+    CPack WiX patch fragment: the service table.
 
-    Rather than declaring a WiX ServiceInstall element, this drives the
-    daemon's own install-service / uninstall-service code path
-    (FastCache/Platform/ServiceControl.cpp). That keeps one implementation of
-    "how fastcached registers itself" shared with the command line, including
-    BuildServiceCommandLine's absolutization of the config path, which matters
-    because a service starts with its working directory set to
-    C:\Windows\System32, so a relative path captured at install time would
-    resolve somewhere else entirely at boot.
+    Each application is its own feature (cmake/Packaging.cmake). This fragment
+    decides, from which features the transaction leaves installed, how each
+    service is registered and whether it is started:
 
-    NOTE: XML forbids a double hyphen inside a comment, so the flag names are
-    spelled without their leading dashes here. CPack parses this file with a
-    strict reader that rejects the file outright otherwise.
+      Node installed               node auto and started (given its two properties below);
+                                   fastcached manual and stopped
+      Daemon installed, no Node    fastcached auto and started (FASTCACHED_START_SERVICE=0 skips the start)
 
-    Registration deliberately leaves the new service STOPPED, so starting it
-    is a separate action, conditioned on FASTCACHED_START_SERVICE so the user
-    can opt out in the installer UI.
+    It is applied on EVERY transaction that leaves a feature installed: a first
+    install, a repair, a feature change and an upgrade. The binaries' own
+    install-service flag re-applies an existing registration rather than failing
+    (Platform/ServiceControl, CreateRefusalTable), which is what makes that safe.
 
-    All actions are deferred with Impersonate="no": creating a service needs
-    the elevated context, which is only available to a deferred action running
-    as the install account.
+    An upgrade never deletes the registration of a feature it keeps. Removal
+    through the binary runs only when a feature is being removed AND this is not
+    the old product's half of a major upgrade (UPGRADINGPRODUCTCODE is set
+    there). A feature the upgrade no longer installs has its leftover
+    registration deleted by the new product instead (the DeleteLeftover rows).
+    The old product's ServiceControl rows stop its services, waiting, before any
+    file is replaced.
+
+    Installers up to and including 0.3.0 delete both services in their own
+    uninstall, which a major upgrade runs first; the table above registers them
+    again, the node only when its two properties are passed.
+
+    The registration drives each binary's own install-service and
+    uninstall-service code path rather than a WiX ServiceInstall element, so the
+    command line, the virtual account, the restart policy and the owned paths
+    have one implementation shared with the command line.
+
+    NOTE: XML forbids a double hyphen inside a comment, so flag names are
+    spelled without their leading dashes here; the wix-fragment check refuses
+    one. Every action is deferred with Impersonate="no": registering a service
+    needs the elevated context only a deferred action running as the install
+    account has.
 -->
 <CPackWiXPatch>
 
-  <!-- INSTALL_ROOT is what CPack's WiX generator names the install root
-       directory. It is NOT the WiX-default INSTALLFOLDER: referencing that
-       name yields an unrelated directory built from the vendor and product
-       ("C:\Program Files\LASTRADA Software fastcached\") rather than the
-       "C:\Program Files\fastcached\" the files actually land in, so the
-       action ran in a folder with no fastcached.exe in it and failed the
+  <!-- INSTALL_ROOT is CPack's name for the install root, NOT the WiX default
+       INSTALLFOLDER: that one resolves to a directory built from the vendor and
+       product, with no fastcached.exe in it, and an action run there fails the
        install with error 1721. -->
   <CPackWiXFragment Id="#PRODUCT">
 
-    <!-- Checkbox state, surfaced in the UI (see the exit dialog below).
-         1 = start the service when the installer finishes. -->
+    <!-- 1 = start fastcached when the install leaves it the only service. -->
     <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
 
-    <!-- Create the machine-wide config directory, and give it an ACL of its
-         own, BEFORE anything writes into it.
+    <!-- What the node registration is told. The scheduler is REQUIRED: a
+         worker names one to register at all, and without it the node is not
+         registered. The advertised endpoint is OPTIONAL: left out, the
+         registration carries none and the node advertises this machine's fully
+         qualified name on its port, resolved at every start, so a machine that
+         is renamed or moves network re-advertises without a reinstall. Given, it
+         is passed through. Secure="yes" so the values survive the elevation to
+         the deferred actions' own session. -->
+    <Property Id="FASTCACHE_NODE_SCHEDULER" Secure="yes" />
+    <Property Id="FASTCACHE_NODE_ADVERTISE" Secure="yes" />
 
-         This is not a nicety. C:\ProgramData grants BUILTIN\Users
-         (CI)(WD,AD,WEA,WA) — create files and folders — and that ACE is
-         inherited by every subdirectory. A directory left to inherit it lets
-         any standard user drop a fastcached.yaml into it, and that file
-         configures a service running as LocalSystem: storage_path alone makes
-         SYSTEM create directories and write files at a path the planter chose.
-         The previous machine-wide location was under C:\Program Files, where
-         only administrators can create files, so the exposure arrived with the
-         move to %ProgramData% and is closed here.
+    <!-- OPTIONAL, for every registration this install makes: the remote
+         addresses the firewall rules admit, one address with an optional
+         prefix (10.0.0.0/8). Left out, the rules admit any address, which on a
+         laptop on public Wi-Fi is everybody on that segment. -->
+    <Property Id="FASTCACHE_FIREWALL_ALLOW" Secure="yes" />
 
-         PermissionEx/@Sddl, not Permission/@User and not util:PermissionEx.
-         Permission and util:PermissionEx both take an account NAME, which is
-         resolved at install time and is therefore wrong on a non-English
-         Windows; util:PermissionEx additionally needs an extension package and
-         has no Sddl attribute at all (WIX0004 if you try). PermissionEx is
-         built in, writes MsiLockPermissionsEx (Windows Installer 5.0, i.e.
-         Windows 7 and later), and takes raw SDDL: SY / BA / BU are S-1-5-18,
-         S-1-5-32-544 and S-1-5-32-545, the same on every localisation. D:P
-         breaks inheritance — the entire point — and 0x1200a9 is
-         FILE_GENERIC_READ|FILE_GENERIC_EXECUTE.
+    <!-- The node's discovery reply port, PINNED by the package where a node
+         run by hand leaves it to the kernel. Peers send their challenges and
+         proofs to that port, so a kernel-chosen one needs a firewall rule on
+         every local UDP port; pinned, the install opens that one port. The
+         node's own default stays kernel-chosen on purpose: two nodes on one
+         machine each need a reply port of their own (the multi-instance rule
+         in consensus-and-cluster.md), and the package installs one node per
+         machine. Override it with another port, or pass it EMPTY to leave
+         the port to the kernel again. -->
+    <Property Id="FASTCACHE_DISCOVERY_REPLY_PORT" Value="6682" Secure="yes" />
 
-         CreateFolder runs in the CreateFolders standard action, which is
-         sequenced before InstallFiles and therefore before the seeding action
-         below: the directory is already locked down when the config lands in it.
+    <!-- Where each service's registration points, if there is one. AppSearch
+         runs before RemoveExistingProducts, so on an upgrade this reads the
+         registration the old product left, which the leftover removal below
+         needs. Type="raw" is documented to spell an expandable string's type in
+         front of it (#% and then the text); see the prefixes below for what it
+         was measured to return. -->
+    <Property Id="FASTCACHE_NODE_IMAGEPATH" Secure="yes">
+      <RegistrySearch Id="FastCacheNodeImagePathSearch" Root="HKLM"
+                      Key="SYSTEM\CurrentControlSet\Services\FastCacheCompileNode"
+                      Name="ImagePath" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="FASTCACHED_IMAGEPATH" Secure="yes">
+      <RegistrySearch Id="FastCachedImagePathSearch" Root="HKLM"
+                      Key="SYSTEM\CurrentControlSet\Services\FastCached"
+                      Name="ImagePath" Type="raw" Bitness="always64" />
+    </Property>
 
-         The Guid is explicit because WiX refuses an automatic one for a
-         component whose keypath is a directory rather than a file. Minted once
-         for this component; NEVER regenerate it, for the reason spelled out at
-         CPACK_WIX_UPGRADE_GUID in cmake/Packaging.cmake.
-
-         Permanent="yes" because uninstalling deliberately leaves the
-         operator's config in place: a directory removed out from under a file
-         that survives it, or an ACL handed back to inheritance while the file
-         is still there, would both be worse than never having secured it. -->
+    <!-- The machine-wide config directory, with an access list of its own,
+         created BEFORE anything writes into it. C:\ProgramData grants
+         BUILTIN\Users create-file, inherited by every subdirectory, and a
+         standard user must not be able to plant the configuration of a service.
+         PermissionEx/@Sddl because it takes raw SIDs that are the same on every
+         Windows language: SY, BA and BU are S-1-5-18, S-1-5-32-544 and
+         S-1-5-32-545; D:P breaks inheritance; 0x1200a9 is read and execute.
+         The Guid is explicit and must NEVER be regenerated (see
+         CPACK_WIX_UPGRADE_GUID). Permanent: the operator's config outlives the
+         package. -->
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="FastCachedProgramData" Name="fastcached">
         <Component Id="FastCachedProgramDataDir"
@@ -90,233 +118,291 @@
       </Directory>
     </StandardDirectory>
 
-    <!-- Put a default configuration at the machine-wide location the daemon
-         looks in when it is started with no config flag, but only when nothing
-         is there yet, so an upgrade never discards operator edits. The payload
-         under [INSTALL_ROOT] is only the replaceable template; the live file
-         lives in %ProgramData% and is deliberately not payload at all.
+    <!-- Which features this transaction leaves INSTALLED: being installed now
+         (action state 3), or installed already and not being removed (installed
+         state 3 and action state not 2). One property per feature, so every
+         condition below reads a name rather than restating the expression.
 
-         The daemon does the copying itself rather than a cmd.exe copy, so the
-         destination is decided by the same table the startup lookup walks and
-         the two cannot drift apart. -->
+         After MigrateFeatureStates, NOT after CostFinalize: on a major upgrade
+         that action runs after CostFinalize and carries the old product's
+         feature selection over, so a state read before it is the new package's
+         default (every feature local) rather than what the machine will have.
+
+         Each is written 0 first, unconditionally, and every condition compares
+         it with "1": a value passed on the command line is overwritten rather
+         than read as a selection. -->
+    <SetProperty Action="ClearFastCacheNodeSelected" Id="FASTCACHE_NODE_SELECTED" Value="0"
+                 After="MigrateFeatureStates" Sequence="execute" />
+    <SetProperty Action="SetFastCacheNodeSelected" Id="FASTCACHE_NODE_SELECTED" Value="1"
+                 After="ClearFastCacheNodeSelected" Sequence="execute"
+                 Condition="(&amp;CM_C_Node = 3) OR (!CM_C_Node = 3 AND NOT (&amp;CM_C_Node = 2))" />
+    <SetProperty Action="ClearFastCachedSelected" Id="FASTCACHED_SELECTED" Value="0"
+                 After="SetFastCacheNodeSelected" Sequence="execute" />
+    <SetProperty Action="SetFastCachedSelected" Id="FASTCACHED_SELECTED" Value="1"
+                 After="ClearFastCachedSelected" Sequence="execute"
+                 Condition="(&amp;CM_C_Daemon = 3) OR (!CM_C_Daemon = 3 AND NOT (&amp;CM_C_Daemon = 2))" />
+
+    <!-- What a registration of ours starts with, as the raw search above
+         returns it, so the leftover removal tests a PREFIX rather than
+         containment: containment also matches an executable elsewhere whose
+         ARGUMENTS name this root, which fails OPEN.
+
+         One registration shape, derived from what the binaries write:
+         BuildServiceCommandLine (Platform/ServiceControl.cpp) always quotes the
+         executable path, which is the absolute GetModuleFileName path the
+         installer launched it by, [INSTALL_ROOT]bin\...; and the SCM stores
+         what CreateService and ChangeServiceConfig are given as REG_EXPAND_SZ.
+         There is no unquoted form and no REG_SZ form to allow for.
+
+         Two SPELLINGS of that one shape, because the raw search's documented
+         and observed answers differ. Documented: #% in front of an expandable
+         string. Observed (Windows 11 build 26200, AppSearch over this package):
+         the bare text, starting at the quote. Both are prefixes anchored at our
+         own quoted executable path, so accepting both widens nothing. A
+         registration in any other shape, including one written by hand, fails
+         the test CLOSED and is left alone.
+
+         After CostFinalize, which resolves INSTALL_ROOT (on an upgrade, from the
+         old product's install location). Unconditional, and each test below
+         also asks that its prefix is not empty: every string starts with the
+         empty string, so an unset prefix would match any registration. -->
+    <SetProperty Action="SetFastCacheOwnImagePathPrefix" Id="FASTCACHE_OWN_IMAGEPATH_PREFIX"
+                 Value="&quot;[INSTALL_ROOT]"
+                 After="CostFinalize" Sequence="execute" />
+    <SetProperty Action="SetFastCacheOwnImagePathRawPrefix" Id="FASTCACHE_OWN_IMAGEPATH_RAW_PREFIX"
+                 Value="#%&quot;[INSTALL_ROOT]"
+                 After="SetFastCacheOwnImagePathPrefix" Sequence="execute" />
+
+    <!-- Whether each registration is one of ours, one row per spelling above:
+         written 0, then 1 when either prefix matches. A property rather than
+         the expression inline, because the Condition column holds at most 255
+         characters and the leftover conditions with both spellings spelled out
+         overflowed it (ICE03). -->
+    <SetProperty Action="ClearFastCacheNodeRegisteredHere" Id="FASTCACHE_NODE_REGISTERED_HERE" Value="0"
+                 After="SetFastCacheOwnImagePathRawPrefix" Sequence="execute" />
+    <SetProperty Action="SetFastCacheNodeRegisteredHereQuoted" Id="FASTCACHE_NODE_REGISTERED_HERE" Value="1"
+                 After="ClearFastCacheNodeRegisteredHere" Sequence="execute"
+                 Condition="FASTCACHE_OWN_IMAGEPATH_PREFIX AND FASTCACHE_NODE_IMAGEPATH ~&lt;&lt; FASTCACHE_OWN_IMAGEPATH_PREFIX" />
+    <SetProperty Action="SetFastCacheNodeRegisteredHereRaw" Id="FASTCACHE_NODE_REGISTERED_HERE" Value="1"
+                 After="SetFastCacheNodeRegisteredHereQuoted" Sequence="execute"
+                 Condition="FASTCACHE_OWN_IMAGEPATH_RAW_PREFIX AND FASTCACHE_NODE_IMAGEPATH ~&lt;&lt; FASTCACHE_OWN_IMAGEPATH_RAW_PREFIX" />
+    <SetProperty Action="ClearFastCachedRegisteredHere" Id="FASTCACHED_REGISTERED_HERE" Value="0"
+                 After="SetFastCacheNodeRegisteredHereRaw" Sequence="execute" />
+    <SetProperty Action="SetFastCachedRegisteredHereQuoted" Id="FASTCACHED_REGISTERED_HERE" Value="1"
+                 After="ClearFastCachedRegisteredHere" Sequence="execute"
+                 Condition="FASTCACHE_OWN_IMAGEPATH_PREFIX AND FASTCACHED_IMAGEPATH ~&lt;&lt; FASTCACHE_OWN_IMAGEPATH_PREFIX" />
+    <SetProperty Action="SetFastCachedRegisteredHereRaw" Id="FASTCACHED_REGISTERED_HERE" Value="1"
+                 After="SetFastCachedRegisteredHereQuoted" Sequence="execute"
+                 Condition="FASTCACHE_OWN_IMAGEPATH_RAW_PREFIX AND FASTCACHED_IMAGEPATH ~&lt;&lt; FASTCACHE_OWN_IMAGEPATH_RAW_PREFIX" />
+
+    <!-- The service table's start mode for fastcached, one row per case. -->
+    <SetProperty Action="SetFastCachedStartManual" Id="FASTCACHED_START_MODE" Value="manual"
+                 After="SetFastCachedSelected" Sequence="execute"
+                 Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+    <SetProperty Action="SetFastCachedStartAuto" Id="FASTCACHED_START_MODE" Value="auto"
+                 After="SetFastCachedStartManual" Sequence="execute"
+                 Condition="NOT (FASTCACHE_NODE_SELECTED = &quot;1&quot;)" />
+
+    <!-- The node registration's advertise argument: the flag and its value
+         when the property is given, and nothing at all when it is not, so the
+         one registration row below serves both shapes. An empty value is not
+         passed as an empty flag: that would be a typed, empty advertise rather
+         than the default. Private (mixed case), so it is derived here and not
+         taken from the command line. -->
+    <SetProperty Action="SetFastCacheNodeAdvertiseArgument" Id="FastCacheNodeAdvertiseArgument"
+                 Value="--advertise=[FASTCACHE_NODE_ADVERTISE]"
+                 After="SetFastCachedStartAuto" Sequence="execute"
+                 Condition="FASTCACHE_NODE_ADVERTISE" />
+
+    <!-- The firewall scope, the same way: the flag when the property is
+         given, nothing at all when it is not. Install-time only on both
+         binaries, so no registration replays it. -->
+    <SetProperty Action="SetFastCacheFirewallAllowArgument" Id="FastCacheFirewallAllowArgument"
+                 Value="--firewall-allow=[FASTCACHE_FIREWALL_ALLOW]"
+                 After="SetFastCacheNodeAdvertiseArgument" Sequence="execute"
+                 Condition="FASTCACHE_FIREWALL_ALLOW" />
+
+    <!-- The reply port, the same way. The firewall rule is NOT spelled here:
+         the node derives it from its surface table given this flag, so the
+         package and a hand-run node open the same rule for the same port. -->
+    <SetProperty Action="SetFastCacheNodeDiscoveryReplyArgument" Id="FastCacheNodeDiscoveryReplyArgument"
+                 Value="--discovery-reply-port=[FASTCACHE_DISCOVERY_REPLY_PORT]"
+                 After="SetFastCacheFirewallAllowArgument" Sequence="execute"
+                 Condition="FASTCACHE_DISCOVERY_REPLY_PORT" />
+
+    <!-- Seed each machine-wide config from its template, only when absent, so
+         an upgrade never discards operator edits. The binary seeds its OWN
+         file: the destination comes from its application name. Return="ignore":
+         a config already there is the ordinary upgrade.
+
+         Directory plus ExeCommand is a type 34 action, whose target must be the
+         FULL quoted path; a relative one cannot be launched (error 1721). -->
     <CustomAction Id="FastCachedSeedConfig"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --seed-config=&quot;[INSTALL_ROOT]etc\fastcached.yaml.default&quot;"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="ignore" />
-
-    <!-- The same for the worker, and it is the WORKER that runs it rather than
-         fastcached.exe with a different path. The seeding flag derives its
-         destination from the binary's own application name, so fastcached.exe can
-         only ever write the daemon's config wherever it is pointed. That is why
-         the MSI shipped no worker configuration at all until #397: there was no
-         second action to add, only a first one that could not be reused.
-
-         The flag is named in prose rather than spelled, because an XML comment
-         may not contain a double hyphen at all: writing it out makes this file
-         not well formed, and CPack's WiX step then fails with a parse error that
-         names the line and not the reason. The ExeCommand below carries the real
-         spelling, where it belongs.
-
-         Return="ignore" for the first action's reason: a machine that already has
-         a worker config is the ordinary upgrade. -->
+                  Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheNodeSeedConfig"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --seed-config=&quot;[INSTALL_ROOT]etc\fastcache-compile-node.yaml.default&quot;"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="ignore" />
+                  Execute="deferred" Impersonate="no" Return="ignore" />
 
-    <!-- Directory + ExeCommand is a type 34 custom action, whose Target must be
-         the FULL path to the executable, quoted when it contains spaces (it
-         does: "C:\Program Files\fastcached\"). Directory= is NOT a working
-         directory that makes a relative command resolve; a relative Target
-         simply cannot be launched, which is error 1721 ("a program required
-         for this install to complete could not be run").
-         See https://learn.microsoft.com/en-us/windows/win32/msi/custom-action-type-34
+    <!-- Registration. No config flag is passed: a path baked into the ImagePath
+         outranks the file for the life of the registration, so the daemon
+         resolves the machine-wide file at every start instead. The start mode
+         is the table's. Return="ignore": a machine with the files and no service
+         is recoverable by hand, one rolled back to nothing is not.
 
-         [INSTALL_ROOT] is safe here even though the action is deferred: the
-         Target of a type 34 action is formatted when the action is SCHEDULED,
-         in the immediate sequence, where properties are still available. It is
-         the deferred action's own session that cannot read properties, which
-         is a different thing.
-
-         No config flag is passed on purpose. A path baked into the service's
-         ImagePath outranks the file itself for the life of the registration,
-         and it would turn a seed that did not happen into a service that fails
-         at every start. Registering nothing lets the daemon resolve
-         %ProgramData%\fastcached\fastcached.yaml at each start, and fall back to
-         its built-in defaults if that file is genuinely absent.
-
-         Return="ignore": registering the service must never fail the whole
-         installation. It legitimately returns non-zero when the service is
-         already present (a repair, or a reinstall over a previous version),
-         and a machine with the files installed but the service unregistered is
-         far more recoverable than one rolled back to nothing: the operator can
-         simply re-run the install-service flag by hand. -->
+         A property in a deferred action's target is safe: the target of a type
+         34 action is formatted when the action is SCHEDULED, where properties
+         are readable, so FASTCACHED_START_MODE set earlier in the execute
+         sequence reaches it. It is the deferred session itself that cannot read
+         properties. -->
     <CustomAction Id="FastCachedInstallService"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --install-service"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="ignore" />
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --install-service --service-start=[FASTCACHED_START_MODE] [FastCacheFirewallAllowArgument]"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- fastcached made manual may still be running from before (an earlier
+         install, or a feature change adding the node). net.exe waits for the
+         stop, which sc.exe does not, so the node does not start into a port
+         fastcached still holds. -->
+    <CustomAction Id="FastCachedStopForNode"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]net.exe&quot; stop FastCached"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
 
     <CustomAction Id="FastCachedStartService"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[System64Folder]sc.exe&quot; start FastCached"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="ignore" />
+                  Execute="deferred" Impersonate="no" Return="ignore" />
 
-    <!-- Uninstall must not fail the removal if the service is already gone,
-         hence Return="ignore". It best-effort stops before deleting. -->
+    <!-- The state directory is neither a property nor an argument. The node's
+         own default for a service is %ProgramData%\fastcache-node, where it keeps
+         the identity key it mints at its first start, and the install secludes
+         that resolved directory itself. Spelling it here would bake a value into
+         the registration that outranks the configuration file's cluster_dir for
+         the life of the service. -->
+    <CustomAction Id="FastCacheNodeInstallService"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --service-start=auto --scheduler=[FASTCACHE_NODE_SCHEDULER] [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument]"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <CustomAction Id="FastCacheNodeStartService"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; start FastCacheCompileNode"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- A registration left behind by an upgrade that DESELECTED its feature.
+         The old product's half of an upgrade never removes a registration, and
+         the new product no longer has the binary whose uninstall-service flag
+         would, so sc.exe deletes it. The service is already stopped: the old
+         product's ServiceControl row stopped it, waiting, as its component was
+         removed. Only the registration goes; the node's state directory and the
+         identity key in it are left alone, as an uninstall leaves the
+         configuration, so reinstalling the feature is the same machine again.
+
+         Return="ignore" is load bearing, not a courtesy. On an upgrade from
+         0.3.0 or earlier the old uninstall has already deleted the service, the
+         ImagePath AppSearch read beforehand still fires this action, and sc.exe
+         answers 1060 (no such service). Return="check" would roll back every
+         such upgrade. -->
+    <CustomAction Id="FastCacheNodeDeleteLeftover"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; delete FastCacheCompileNode"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="FastCachedDeleteLeftover"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; delete FastCached"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Removal. It runs while the binary still exists (before RemoveFiles),
+         and Return="ignore" covers a registration that was never made. -->
     <CustomAction Id="FastCachedUninstallService"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --uninstall-service"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="ignore" />
-
-    <!-- The COMPILE WORKER, which this MSI previously installed as a binary and
-         never registered: the node refused to install without a toolchain named,
-         and an installer cannot know what a machine holds.
-
-         It can now. The worker surveys the machine at startup and serves what it
-         finds, so the per-machine half of the configuration is gone and the MSI
-         has a registration it can actually write.
-
-         What is left is genuinely site-specific and the installer still cannot
-         guess it: WHERE the scheduler is, and WHAT ADDRESS clients should use to
-         reach this worker. Neither has a defensible default. The advertise flag in
-         particular falls back to 0.0.0.0, which no client can dial, and such a
-         worker registers, heartbeats, is leased out and is never reached, with no
-         error at either end. So they are installer properties, and with neither
-         set nothing is registered at all:
-
-             msiexec /i fastcached.msi ^
-                 FASTCACHE_NODE_SCHEDULER=build-cache.internal:6675 ^
-                 FASTCACHE_NODE_ADVERTISE=worker-01.internal:6676
-
-         NOTE, as at the top of this file: XML forbids a double hyphen inside a
-         comment, so flag names are written without their leading dashes here.
-
-         Secure="yes" so the values survive the elevation to the deferred action's
-         own session, exactly as FASTCACHED_START_SERVICE does.
-
-         The state directory is NOT a property, because it has a defensible default
-         and the other two do not: %ProgramData%\fastcache-node. A worker proves an
-         identity key kept there on every connection to its scheduler (#178), so a
-         registration naming a scheduler and no state directory is refused, and
-         with Return="ignore" that refusal would be a worker the MSI silently never
-         registered. The registration hands the directory to the service account.
-         The cluster still has to admit the key the worker mints there on its first
-         start: its print-identity flag says what to admit. -->
-    <Property Id="FASTCACHE_NODE_SCHEDULER" Secure="yes" />
-    <Property Id="FASTCACHE_NODE_ADVERTISE" Secure="yes" />
-
-    <CustomAction Id="FastCacheNodeInstallService"
-                  Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --scheduler=[FASTCACHE_NODE_SCHEDULER] --advertise=[FASTCACHE_NODE_ADVERTISE] --cluster-dir=&quot;[CommonAppDataFolder]fastcache-node&quot;"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="ignore" />
-
+                  Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheNodeUninstallService"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --uninstall-service"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="ignore" />
+                  Execute="deferred" Impersonate="no" Return="ignore" />
 
     <InstallExecuteSequence>
-      <!-- Seed before registering, so the service finds its configuration the
-           first time it starts. Both run after the files are on disk
-           (InstallFiles), since they execute the installed binary. -->
-      <Custom Action="FastCachedSeedConfig" After="InstallFiles"
-              Condition="NOT REMOVE" />
+      <!-- Only on an upgrade (WIX_UPGRADE_DETECTED), only for a feature this
+           transaction does not leave installed, never in the old product's own
+           half, and only for a registration whose executable is in THIS
+           install root (a prefix test, case-insensitive): a service registered
+           by hand from another directory is not ours. -->
+      <Custom Action="FastCacheNodeDeleteLeftover" After="InstallFiles"
+              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE AND NOT (FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHE_NODE_REGISTERED_HERE = &quot;1&quot;" />
+      <Custom Action="FastCachedDeleteLeftover" After="FastCacheNodeDeleteLeftover"
+              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE AND NOT (FASTCACHED_SELECTED = &quot;1&quot;) AND FASTCACHED_REGISTERED_HERE = &quot;1&quot;" />
 
-      <!-- Register after the files are on disk (InstallFiles), since the
-           action executes the installed binary. NOT REMOVE keeps it off the
-           uninstall path; upgrades re-register with a refreshed command line. -->
-      <!-- Unconditional, unlike the worker's REGISTRATION below: seeding a
-           reference an operator can read costs nothing on a machine that will
-           never run a worker, and withholding it is how somebody who decides to
-           run one later has no annotated file to start from. The registration
-           still needs the two properties it cannot guess. -->
+      <Custom Action="FastCachedSeedConfig" After="FastCachedDeleteLeftover"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheNodeSeedConfig" After="FastCachedSeedConfig"
-              Condition="NOT REMOVE" />
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
       <Custom Action="FastCachedInstallService" After="FastCacheNodeSeedConfig"
-              Condition="NOT REMOVE" />
+              Condition="FASTCACHED_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCachedStopForNode" After="FastCachedInstallService"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCachedStartService" After="FastCachedStopForNode"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND NOT (FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHED_START_SERVICE = &quot;1&quot;" />
 
-      <Custom Action="FastCachedStartService" After="FastCachedInstallService"
-              Condition="NOT REMOVE AND FASTCACHED_START_SERVICE = &quot;1&quot;" />
+      <!-- The node is (re)registered only with its scheduler given, in ONE
+           clause on this row alone; the advertised endpoint is optional and
+           arrives through FastCacheNodeAdvertiseArgument. A property that was
+           not passed formats as the empty string, so the clause tests for a
+           value rather than for the property's existence.
 
-      <!-- The worker, registered only when the installer was told both of the two
-           things it cannot guess. Conditioned on BOTH rather than either: a
-           registration with a scheduler and no advertised endpoint bakes in
-           0.0.0.0, and that worker is leased out and never reached, which is the
-           worst shape this system has because it looks healthy from both ends.
-
-           A property that was not passed formats as the empty string, so the
-           condition tests for a non-empty value rather than for the property's
-           existence. -->
+           The start is NOT conditioned on them. The properties are not
+           remembered, so an upgrade, a repair or a feature change runs without
+           them: the registration it keeps must still be started, since the
+           ServiceControl row below stopped it before replacing its files. With
+           no registration at all the start simply fails, and is ignored. -->
       <Custom Action="FastCacheNodeInstallService" After="FastCachedStartService"
-              Condition="NOT REMOVE AND FASTCACHE_NODE_SCHEDULER AND FASTCACHE_NODE_ADVERTISE" />
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SCHEDULER" />
+      <Custom Action="FastCacheNodeStartService" After="FastCacheNodeInstallService"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
-      <!-- Deregister before the files are removed: the action needs
-           fastcached.exe to still exist. -->
-      <Custom Action="FastCachedUninstallService" Before="RemoveFiles"
-              Condition="REMOVE~=&quot;ALL&quot;" />
-
-      <!-- Unconditional on the way out, unlike the install: an uninstall merely
-           names a registration to remove, and refusing to remove one because the
-           properties were not passed a second time is how a stale registration
-           becomes permanent. Return="ignore" already covers the case where there
-           was none. -->
+      <!-- A feature being removed, and not the old product's half of an
+           upgrade: an upgrade keeps the registration and re-applies it. -->
       <Custom Action="FastCacheNodeUninstallService" Before="FastCachedUninstallService"
-              Condition="REMOVE~=&quot;ALL&quot;" />
+              Condition="(&amp;CM_C_Node = 2) AND (!CM_C_Node = 3) AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="FastCachedUninstallService" Before="RemoveFiles"
+              Condition="(&amp;CM_C_Daemon = 2) AND (!CM_C_Daemon = 3) AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
 
   </CPackWiXFragment>
 
   <!-- A component reaches the install only through a feature. #PRODUCTFEATURE
-       is CPack's name for the root one, which every other component of this
-       package already belongs to. -->
+       is CPack's name for the root one. -->
   <CPackWiXFragment Id="#PRODUCTFEATURE">
     <ComponentRef Id="FastCachedProgramDataDir" />
   </CPackWiXFragment>
 
-  <!-- Put the install's bin directory on the system PATH.
+  <!-- Stop each service, and WAIT for it, whenever its binary's component is
+       installed, upgraded or removed, so no file is replaced under a running
+       process. No Start and no Remove: starting follows the service table
+       above and removal is the binary's own uninstall-service.
 
-       Without this the MSI is the only one of the three platform packages that
-       leaves the executables unreachable by name: the .deb/.rpm land in
-       /usr/local/bin and the .pkg installs /etc/paths.d/fastcached, both already
-       on PATH, while a Windows install of fastcache-cc stays invisible to every
-       build system that looks it up as a bare command name.
+       CPack spells a component Id CM_CP_<cpack component>.<install path>, with
+       characters WiX forbids in an Id turned into underscores. A mismatched Id
+       fails the package ("Some XML patch fragments did not have matching IDs");
+       the authoritative list is the generated _CPack_Packages/win64/WIX/files.wxs. -->
+  <CPackWiXFragment Id="CM_CP_Daemon.bin.fastcached.exe">
+    <ServiceControl Id="FastCachedStopForFiles" Name="FastCached" Stop="both" Wait="yes" />
+  </CPackWiXFragment>
+  <CPackWiXFragment Id="CM_CP_Node.bin.fastcache_compile_node.exe">
+    <ServiceControl Id="FastCacheCompileNodeStopForFiles" Name="FastCacheCompileNode" Stop="both" Wait="yes" />
+  </CPackWiXFragment>
 
-       The Environment element must live inside a Component, so this patches the
-       component CPack generates for bin\fastcached.exe rather than #PRODUCT.
-       Tying the entry to a component makes removal automatic: it is installed
-       and uninstalled with the file, needing no custom action.
-
-       CPack builds that Id as CM_CP_<cpack component>.<install path>, so the
-       "Runtime" segment is the CPack component these files install under and
-       NOT a directory. Characters WiX forbids in an Id become underscores,
-       which is why the sibling component is CM_CP_Runtime.bin.fastcache_cc.exe
-       with a hyphen-free spelling. A mismatched Id is caught rather than
-       silently ignored: CPack fails with "Some XML patch fragments did not have
-       matching IDs". The authoritative list is the generated
-       _CPack_Packages/win64/WIX/files.wxs.
-
-       Part="last" appends rather than replaces. Permanent="no" is what lets the
-       uninstall take the entry back out again. System="yes" writes the machine
-       PATH, which this per-machine MSI is already elevated for.
-
-       Note this only affects processes started AFTER the install; an already
-       open shell keeps the environment block it was launched with. -->
-  <CPackWiXFragment Id="CM_CP_Runtime.bin.fastcached.exe">
+  <!-- The install's bin directory on the system PATH, on the REQUIRED Cli
+       feature's component: attached to fastcached.exe, deselecting the daemon
+       left every other binary unreachable by name. Part="last" appends;
+       Permanent="no" lets the uninstall take it back out; System="yes" writes
+       the machine PATH. Only processes started after the install see it. -->
+  <CPackWiXFragment Id="CM_CP_Cli.bin.fastcache_cli.exe">
     <Environment Id="FastCachedBinOnPath"
                  Name="PATH"
                  Value="[INSTALL_ROOT]bin"

@@ -506,9 +506,10 @@ class FleetSampler final: public IFleetHistoryView
 
 /// Where a node keeps its fleet history.
 ///
-/// The cluster directory first, because the history is a leader's record and a
-/// leader is a cluster member; the cache directory next, because a node given one
-/// has somewhere durable already; and otherwise nothing, which means memory-only.
+/// The node's state directory first (`ChosenStateDirectory`: `--cluster-dir`, or the
+/// default the start resolved), because the history is a leader's record and a leader
+/// is a cluster member; the cache directory next, for a node that resolved no state
+/// directory but was given one; and otherwise nothing, which means memory-only.
 /// No new flag: a third place to say "put state here" is a third place for an
 /// operator to point at the wrong disk.
 /// @param cfg The parsed configuration.

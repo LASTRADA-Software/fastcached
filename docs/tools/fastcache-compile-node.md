@@ -62,6 +62,7 @@ node              0.0.0.0:6675  TCP
 admin             -             not served; set --admin-listen
 raft              0.0.0.0:6680  TCP
 discovery beacon  0.0.0.0:6681  UDP
+discovery reply   0.0.0.0:*     UDP, port chosen by the kernel at bind
 
 dialled at:
   consensus endpoint  AT STARTUP  -- this machine's fully qualified name on the raft port, resolved when the node starts; give --raft-self to state it now
@@ -128,9 +129,10 @@ Several things on that table are easy to get wrong and expensive to get wrong:
   address in a firewall rule.
 - **The reply socket's port is kernel-chosen unless `--discovery-reply-port` names
   it.** Discovery takes a **second** port, the one peers unicast their challenges and
-  proofs to. Unnamed, the kernel picks it at every start, so a restrictive host
-  firewall has to let it in — **inbound**, by program rather than by port — and a node
-  that can hear beacons but not answer challenges completes no handshake.
+  proofs to: they ARRIVE there, not at the beacon port. Unnamed, the kernel picks it at
+  every start, so a restrictive host firewall has to let it in — **inbound**, by program
+  rather than by port — and a node that can hear beacons but not answer challenges
+  completes no handshake. `--print-surfaces` prints it as `discovery reply  0.0.0.0:*`.
 - **Unless you name `--discovery`, the node beacons its summary on every eligible
   subnet** — its cluster id, node id and consensus endpoint, to each up interface's
   *directed* broadcast on port 6681 (a `/24` at `192.168.86.24` sends to
@@ -1458,12 +1460,16 @@ as unreadable and prints the command that hands it over,
 node-id n1
 public-key 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
 cluster-admit n1=10.0.0.1:6680@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+state-directory C:\ProgramData\fastcache-node (machine-wide: this process runs privileged, so it is the machine's own node)
 ```
 
 The `cluster-admit` line is the value `--cluster-admit` takes to admit this node with its
 key, and the first start afterwards reads the same key back (`recorded`). A node that
 could name no address its peers dial yet prints no line rather than a guessed one. Without
-a state directory there is no identity to print, and it says so.
+a state directory there is no identity to print, and it says so. The `state-directory`
+line says whose identity this is: one that reads `per-user` was printed from a prompt that
+is not elevated, kept under that account's own directory, and is not the identity the
+service runs as -- admitting its key admits a machine nobody runs.
 
 **Removing a machine is revoking its key.** A revoked key is refused on every connection,
 the connections it proved close at their next message, and its redial is answered with a
@@ -2667,8 +2673,11 @@ worker takes neither flag, and a registration carrying one is a job that answers
 its own command line with `unrecognised argument` at every start. Everything the
 worker needs is on the `--install-service` command line itself.
 
-**Windows** registers an SCM service (auto-start, left stopped; `sc start
-FastCacheCompileNode`). The default service name is `FastCacheCompileNode`, not
+**Windows** registers an SCM service and leaves it stopped (`sc start
+FastCacheCompileNode`). It starts with Windows from then on; `--service-start=manual`
+registers it to wait for somebody to start it instead. The start mode is decided by
+the install and is not part of the command line the service runs with, so changing it
+means running `--install-service` again. The default service name is `FastCacheCompileNode`, not
 the daemon's `FastCached`, so a machine can run both without one install
 displacing the other.
 
@@ -2684,8 +2693,23 @@ the registration is kept, so you can repair it with `icacls` rather than being
 left with nothing. If you rename the service with `--service-name`, the account
 follows the new name.
 
-The MSI can do that registration for you, given the two things an installer
-cannot guess:
+The registration also opens the Windows Firewall for every surface this worker binds
+beyond loopback — `--listen-node`, `--listen-raft` and `--admin-listen` when they
+face the network, and, with `--discovery`, its UDP beacon port and its reply socket — that
+UDP port when `--discovery-reply-port` pins one, and otherwise a rule admitting any local UDP
+port (`discovery-reply udp/any`), since the kernel chooses the port and no port-scoped rule
+can name it. That rule exposes only the UDP sockets this program opens, which is discovery
+alone. One inbound rule each, admitting this program running as this service, on every network
+profile (a VPN adapter is usually *Public*). They sit in the group `fastcached:
+FastCacheCompileNode`, and the install line lists them. Narrow the remote side with
+`--firewall-allow=10.0.0.0/8` (IPv4 or IPv6, repeatable; `/0` is refused — leave the
+flag out to allow any address). Running `--install-service` again replaces the
+group, so a surface you have since moved to loopback loses its rule. A rule the
+firewall will not create is reported as a warning and the service stays registered;
+run the install again once the cause is fixed.
+
+The MSI can do that registration for you, given the one thing an installer
+cannot guess, the scheduler, and optionally the address clients reach this worker at:
 
 ```
 msiexec /i fastcached.msi ^
@@ -2693,15 +2717,99 @@ msiexec /i fastcached.msi ^
     FASTCACHE_NODE_ADVERTISE=worker-01.internal:6674
 ```
 
-Both are required together or nothing is registered: a registration naming a
-scheduler and no advertised endpoint bakes in `0.0.0.0`, and that worker is
-leased out and never reached. The state directory is not a property: the MSI
-registers `%ProgramData%\fastcache-node`, and the cluster admits the identity key
-the worker mints there on its first start.
+Select the **fastcache-compile-node** feature (silently: `ADDLOCAL=CM_C_Cli,CM_C_Node` on a
+first install, `ADDLOCAL=CM_C_Node` to add it to one that is there). On a
+machine that also runs fastcached, the MSI makes `FastCached` manual and stops it,
+because both would answer on 6674. The properties are not remembered. A repair, a
+feature change, or an upgrade from a release whose installer already works this way
+does not need them again: it keeps the registration it finds and starts it. **An
+upgrade from 0.3.0 or earlier does need them again**, because those installers delete
+the service when they are removed, and a major upgrade removes the old version before
+it installs the new one. Without `FASTCACHE_NODE_SCHEDULER`, that upgrade leaves the
+node unregistered.
+
+`FASTCACHE_NODE_SCHEDULER` is required: without it nothing is registered.
+`FASTCACHE_NODE_ADVERTISE` is optional. Left out, the registration carries no
+`--advertise`, and the node advertises this machine's fully qualified name on its
+`--listen-node` port, resolved at every start, so a renamed machine or a new VPN
+address needs no reinstall; given, it is registered as typed. `FASTCACHE_FIREWALL_ALLOW`
+is optional too: it is passed as `--firewall-allow` (one address with an optional
+`/prefix`) to this registration and to fastcached's, and left out the rules admit any
+address. `FASTCACHE_DISCOVERY_REPLY_PORT` defaults to `6682` and is passed as
+`--discovery-reply-port`, so the registration's firewall rule is `discovery-reply udp/6682`
+rather than the any-port rule above; pass another port to move it, or pass it empty to leave the
+port to the kernel. The package pins it and a node run by hand does not, for the multi-instance
+rule: the reply socket is each node's OWN (a unicast to a shared port reaches only one of the
+sockets sharing it), so two nodes on one machine need two ports, which a kernel-chosen default
+gives them with no configuration -- and the package installs one node per machine. The state directory is
+not a property and not an argument either: the registration names no `--cluster-dir`,
+which would outrank a `cluster_dir:` in the configuration file for the life of the
+service, and the node takes its service default, `%ProgramData%\fastcache-node`, where
+the cluster admits the identity key the worker mints on its first start.
+
+That key is how the machine proves itself to the fleet, so the install gives the
+state directory an access list of its own: SYSTEM, Administrators and the
+service's account, with nothing inherited from `%ProgramData%`, whose list lets
+every local account read. An upgrade covers a key already there the same way. An
+install that cannot set that list is refused, and says why, rather than leaving
+the key readable. `--print-identity` against that directory therefore runs from
+an elevated prompt.
+
+A directory that is already there is checked before it is trusted, because any
+local account can create one under `%ProgramData%` before the installer runs. The
+install refuses, naming the entry, a directory that is, or holds anywhere in it, a
+junction or a symbolic link, an entry owned by anybody but SYSTEM, Administrators or the
+service, a file with a second hard link, or an entry that keeps an explicit grant
+to a broad group of its own; it makes Administrators the directory's owner.
+An identity key other accounts could already read is refused with a remedy to
+delete it: the node then mints a fresh identity at its next start, which the
+cluster has to admit again, because a key that may have been copied must not stay
+in service. A registration this install created is removed again on
+any of these refusals, and one it was re-applying is left, and the message says
+which. One gap remains: a program that opened a file in that directory *before*
+the install set the list keeps the access it opened it with, until it closes it.
 
 Remove a registration with `--uninstall-service` (and the same
 `--service-scope`, on macOS: which domain a job lives in is decided at install
-time and re-probing would boot out one that was never there).
+time and re-probing would boot out one that was never there). On Windows it
+stops the service, waiting up to a minute, deletes it, and then removes its
+firewall rules. A service that has not stopped by then is only marked for deletion
+and goes when it exits; its rules are removed at once all the same. If Windows
+refuses the delete, the rules are left in place — the service is still registered
+and may be running — and the next uninstall that succeeds removes them.
+
+### When the machine sleeps
+
+A worker registered as a Windows service hears the machine's power events, and
+every node on Windows hears its network changes. It works without either: each
+only lets it act sooner.
+
+- **Before the machine sleeps** the worker withdraws its registrations, so no
+  client is leased a machine that is about to stop answering. It makes one
+  connection to the scheduler its last heartbeat round ended at — normally the one
+  that accepted it — and holds the machine for at most 1.5 s in all. A withdrawal
+  the worker had not started by then is dropped rather than made once the machine
+  is awake again; whatever did not get through, the scheduler's heartbeat timeout
+  retires as it always has.
+- **When the machine wakes, or an interface or address changes** (reported once
+  nothing new arrived for 2 s, or 10 s into a burst), the worker announces itself
+  at once rather than at the end of its 20-second interval, and so does the node's
+  presence announcement. Each runs on its own thread, never on the one Windows
+  delivered the event on. A suspend cancels any such wake still pending from
+  before it.
+- **A machine that sleeps without saying so** — Modern Standby can sleep and wake
+  without reporting either — recovers on its own schedule. The next ordinary
+  round registers it again, at most one announcement interval (20 s) after it
+  wakes. Until then a worker whose registrations were withdrawn, or expired while
+  it slept, is absent from the fleet: nothing is leased to it, and clients
+  compile elsewhere or locally.
+- **A roster that lapsed while the machine slept** (the voters' endorsement lasts
+  an hour) is renewed by the next ordinary presence round, again with no event
+  needed. Until it is, the worker refuses every grant it cannot verify.
+
+Only a service hears power events: a worker run in the foreground hears network
+changes alone, and on Linux and macOS the node hears neither and relies on its
+ordinary rounds.
 
 ## Reloading it
 

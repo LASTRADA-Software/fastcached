@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Platform/StopPending.hpp>
+
 #include <functional>
 #include <memory>
 #include <string>
@@ -8,6 +10,10 @@
 
 namespace FastCache
 {
+
+/// Declared, not included: `ServiceHostOptions` holds only a pointer to one, and every includer of
+/// this header would otherwise pull in the hub's threading headers.
+class IHostEventSink;
 
 /// Abstract host for the daemon body. Three implementations:
 ///   - ForegroundHost:       run body() inline (development, tests)
@@ -85,10 +91,22 @@ class ForegroundHost final: public IDaemonHost
 [[nodiscard]] std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& pidfile,
                                                                std::string const& workingDirectory);
 
+/// What the Windows service host needs beyond the service's name.
+struct ServiceHostOptions
+{
+    StopPendingPlan stop {}; ///< What a stop reports while the body winds down.
+
+    /// Where power events (suspend, resume) are delivered, or null to not accept them. Must
+    /// outlive `Run`. A hint only: see `HostEvent` for why nothing may depend on one arriving.
+    IHostEventSink* hostEvents { nullptr };
+};
+
 /// Construct a Windows Service host registered with the SCM. Returns
 /// nullptr on non-Windows platforms.
 /// @param serviceName Service name as registered with SCM.
+/// @param options How a stop is reported, and where power events go.
 /// @return Owning host or nullptr.
-[[nodiscard]] std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& serviceName);
+[[nodiscard]] std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& serviceName,
+                                                                  ServiceHostOptions options);
 
 } // namespace FastCache

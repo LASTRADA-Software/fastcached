@@ -696,6 +696,7 @@ node              0.0.0.0:6675  TCP
 admin             -             not served; set --admin-listen
 raft              0.0.0.0:6680  TCP
 discovery beacon  0.0.0.0:6681  UDP
+discovery reply   0.0.0.0:*     UDP, port chosen by the kernel at bind
 
 dialled at:
   consensus endpoint  10.0.0.7:6680  -- what peers DIAL; the raft row above is what this node BINDS
@@ -711,12 +712,14 @@ notes:
 
 !!! note "Why the invocation carries more than the surfaces it prints"
 
-    `--print-surfaces` runs the **startup policy rules** before it prints, so the
-    command has to be one the node would actually accept. The rules that apply to the
-    flags above each refuse a configuration that would start and silently not
-    work: consensus needs an address its peers dial (`--raft-self`, or this machine's
-    resolved name), membership needs an `--advertise` peers can dial, and a worker needs
-    a `--scheduler`. (`--listen-raft` needed a `--cluster-key-file` as well, and
+    `--print-surfaces` prints the map for any configuration and then judges it by the
+    **startup policy rules**: one the node would refuse exits 2, naming the rule, after
+    the map. So a transcript worth copying is a command the node would actually accept.
+    The rules that apply to the flags above each refuse a configuration that would start
+    and silently not work: consensus needs an address its peers dial (`--raft-self`, or
+    this machine's resolved name), membership needs an `--advertise` peers can dial, and a
+    worker needs a `--scheduler` (a node started with `--slots=0` runs no worker and needs
+    none). (`--listen-raft` needed a `--cluster-key-file` as well, and
     `--discovery` a key rule of its own, until
     [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) moved every proof to
     each node's identity key.) An earlier version of this transcript omitted the five that
@@ -733,6 +736,20 @@ activated worker is refused at startup rather than left listening on nothing —
 that `--discovery`'s address is where beacons are *sent* while its sockets bind the
 wildcard. [The node's own page](../tools/fastcache-compile-node.md#every-port-it-opens)
 carries the full four-surface table.
+
+**On Windows, `--install-service` opens them for you.** It creates one inbound rule
+per surface the registered configuration binds beyond loopback — the rows
+`--print-surfaces` prints, walked from the same table — admitting
+`fastcache-compile-node.exe` running as its service, on every network profile, and
+`--uninstall-service` removes them. The discovery reply socket always gets one: exactly
+its UDP port when `--discovery-reply-port` pins it, and otherwise — the default, a port
+the kernel chooses at bind — a rule admitting any local UDP port, named `… discovery-reply
+udp/any`. That rule is still scoped to the program and its service, so what it exposes is
+only the UDP sockets this program opens, which is discovery alone.
+`--firewall-allow=<address[/prefix]>` narrows who may connect, on that rule as on the others. `fastcached`'s own `--install-service` does the same for its cache listeners
+and metrics endpoint. On macOS the install opens nothing and names the surfaces that
+need a rule of your own; the tables below are that worksheet, and the one for any
+firewall between machines.
 
 The three shapes below are the *deployments*, in the order fleets tend to grow into
 them — what to open for each machine's role, rather than what a given command line
@@ -772,7 +789,7 @@ serves.
     |---|---|---|
     | Each consensus node | `--listen-raft` tcp | every other consensus node |
     | Each consensus node | the `--discovery` UDP port | the local segment, if discovery is on |
-    | Each consensus node | its `--discovery-reply-port` udp | the local segment, if pinned |
+    | Each consensus node | its `--discovery-reply-port` udp, or — unpinned — any UDP port, scoped to the program | the local segment, if discovery is on |
 
     Discovery peers that are *seen and never admitted* is the signature of a
     firewall passing the beacon port and dropping the reply port.
@@ -799,7 +816,7 @@ open.
 | A lease is granted, then the compile runs locally anyway | client → node | The worker refused the client `not-a-member`. Give that worker a roster (`--voter-key`), so it admits the machines the cluster admitted, or `--fleet-open`: membership gates its compile port, not only a scheduler's. The scheduler's counters stay correct and flat — the lease *was* granted — so look at the **worker**: its ready line names who it admits, and `fastcache_worker_jobs_refused_not_a_member_total` counts each turned-away client ([#235](https://github.com/LASTRADA-Software/fastcached/issues/235)) |
 | `no-worker`, though the toolchain looks identical | client → scheduler | Fingerprints must match byte for byte. Compare the node's `serving …` startup lines against the client's |
 | `/fleet` answers `503` | operator → dashboard | You are asking a follower. The reply names the leader |
-| Peers are seen but never authenticated | node → segment | The reply port is being dropped while the beacon port passes. Pin `--discovery-reply-port` and open it. If `fastcache_discovery_proofs_refused_unknown_key_total` climbs instead, the handshake completes and the key is one the cluster does not hold: discovery admits nobody, so enrol the machine or `--cluster-admit` it under the key the warning names |
+| Peers are seen but never authenticated | node → segment | The reply port is being dropped while the beacon port passes. Scope the rule to the program, or pin `--discovery-reply-port` and open that port; on Windows, run `--install-service` again, which opens it. If `fastcache_discovery_proofs_refused_unknown_key_total` climbs instead, the handshake completes and the key is one the cluster does not hold: discovery admits nobody, so enrol the machine or `--cluster-admit` it under the key the warning names |
 | The cluster elects, then re-elects, repeatedly | node → node | Consensus traffic is not getting through promptly, or a member is unreachable. The role-change log lines carry the term |
 | A consensus member never joins, and the others' `fastcache_raft_peer_connections_refused_proof_total` climbs | node → node | The key it proves is not the one the cluster records for it. Its own `fastcache_raft_peer_dials_ended_by_acceptor_total` climbs for the same connections. Compare its `--print-identity` with the cluster's record, and admit it under the key it holds -- `--enroll-from`, or `--cluster-admit ...@<key>` |
 | `fastcache_raft_peer_dials_refused_wrong_target_total` climbs | node → node | An address this node has for one member now answers as another: a node moved, or two swapped addresses. The log line names both ids; the other end counts `..._connections_refused_wrong_target_total` |

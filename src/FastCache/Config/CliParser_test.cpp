@@ -512,6 +512,7 @@ TEST_CASE("CliParser: a refusal names the row it was typed on, never a parser's 
         Row { .argument = "--storage-durability=sometimes", .field = "--storage-durability" },
         Row { .argument = "--log-level=loud", .field = "--log-level" },
         Row { .argument = "--service-scope=nope", .field = "--service-scope" },
+        Row { .argument = "--service-start=boot", .field = "--service-start" },
         Row { .argument = "--max-memory=5x", .field = "--max-memory" },
     };
     for (auto const& row: rows)

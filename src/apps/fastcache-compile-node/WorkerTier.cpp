@@ -13,6 +13,8 @@
 #include <chrono>
 #include <format>
 #include <functional>
+#include <optional>
+#include <stop_token>
 #include <utility>
 
 #include <CacheProtocol.hpp>
@@ -42,12 +44,9 @@ namespace
     /// a reinstalled compiler rejoins the fleet without anybody restarting a service.
     constexpr std::uint64_t SweepEveryBeats = 45;
 
-    /// Per-call send/recv ceiling on the heartbeat's own connection to the scheduler.
-    ///
-    /// Was ten seconds passed as BOTH the dial bound and the I/O bound, which is the
-    /// collapse `Cc::DialEndpoint` used to make: ten seconds is a reasonable ceiling
-    /// on an exchange and a very long time to wait for a TCP handshake.
-    constexpr std::chrono::milliseconds HeartbeatIoTimeout { 10'000 };
+    // The suspend's one dial must be able to fail and still leave the handler budget to return
+    // in: a connect bound at or past the budget spends all of it on a scheduler that is not there.
+    static_assert(SuspendDialTimeout < SuspendWithdrawBudget);
 
     /// Tell `node-status` what a finished survey concluded.
     ///
@@ -342,8 +341,10 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
                                   .served = 0,
                                   .discovered = static_cast<std::uint32_t>(_discovered.entries.size()) } },
     _advertisedWire { Distributed::CapacityToWire(parts.capacity) },
-    _dialer { HeartbeatIoTimeout },
-    _link { std::move(link) }
+    _dialer { parts.schedulerDialer },
+    _link { std::move(link) },
+    _hostInbox { [this] { _capacity.WakeHeartbeat(); }, parts.suspendWait },
+    _hostSubscription { parts.hostEvents, _hostInbox }
 {
     // Counted as well as logged because it is otherwise visible nowhere: a rise means
     // nodes are dying rather than stopping.
@@ -403,7 +404,7 @@ void WorkerTier::Serve(std::map<std::string, ServedToolchain> served)
     PublishToolchains(_runtime, _toolchains.size(), _discovered.entries.size());
 }
 
-void WorkerTier::AnnounceAs(std::string endpoint)
+void WorkerTier::AnnounceAs(std::string endpoint, core::platform::IClock const& statusClock)
 {
     // Published FIRST, so the registrars built below carry the new address and the lease
     // check moves in the same step. The old registrars still hold the address they
@@ -418,8 +419,9 @@ void WorkerTier::AnnounceAs(std::string endpoint)
 
     // Republished for `node-status`, because the registered count drops to zero until the
     // round that follows re-registers -- and a status still claiming those toolchains
-    // registered would be describing entries that were just withdrawn.
-    PublishToolchains(_runtime, _toolchains.size(), _discovered.entries.size());
+    // registered would be describing entries that were just withdrawn. Nothing was accepted,
+    // so the instant of the last acceptance is kept.
+    PublishRegistration(_runtime, statusClock, _registrars, 0);
 }
 
 WorkerHeartbeat WorkerTier::Launch(core::platform::IClock const& statusClock, SchedulerReachability& reachability)
@@ -520,7 +522,7 @@ void WorkerTier::Heartbeat(std::stop_token const& stop,
         if (auto moved = AdvertisedEndpointChange(_announced.Current(), snapshot))
         {
             _logger.Log(LogLevel::Warn, moved->announcement);
-            AnnounceAs(std::move(moved->endpoint));
+            AnnounceAs(std::move(moved->endpoint), statusClock);
         }
         auto const depth = RecheckDepthFor(reloaded, beat, SweepEveryBeats);
         auto const voice = SurveyVoiceFor(reloaded, depth);
@@ -545,10 +547,68 @@ void WorkerTier::Heartbeat(std::stop_token const& stop,
         PublishRegistration(_runtime, statusClock, _registrars, AnnounceRound(round, _link, _dialer));
 
         // A cordon, or its lifting, reaches the scheduler at once rather than a whole
-        // interval later (#1303); a stop ends the wait immediately.
-        if (_capacity.WaitForHeartbeat(stop, announcedCordon, NodeAnnounceInterval) == HeartbeatWake::Stopped)
+        // interval later (#1303), and so does a resume or a network change; a stop ends the
+        // wait immediately.
+        if (AwaitNextRound(stop,
+                           _capacity,
+                           _hostInbox,
+                           announcedCordon,
+                           NodeAnnounceInterval,
+                           [this, &round, &statusClock] { WithdrawForSuspend(round, statusClock); })
+            == HeartbeatWake::Stopped)
             break;
     }
+}
+
+void WorkerTier::WithdrawForSuspend(HeartbeatRound const& round, core::platform::IClock const& statusClock)
+{
+    RetireAllRegistrations(RegistrarsFor(_toolchains), _registrars, _withdrawals);
+    // Republished: node-status must not claim registrations that were just withdrawn. Nothing
+    // was accepted, so the instant of the last acceptance is kept.
+    PublishRegistration(_runtime, statusClock, _registrars, 0);
+    auto const retired = WithdrawOnce(round, _link, _dialer);
+    _logger.Logf(LogLevel::Info,
+                 "this machine is going to sleep: withdrew {} registration(s) so no client is leased it meanwhile",
+                 retired);
+}
+
+HeartbeatWake AwaitNextRound(std::stop_token const& stop,
+                             CompileCapacity& capacity,
+                             HostEventInbox& inbox,
+                             bool announcedCordon,
+                             std::chrono::milliseconds interval,
+                             std::function<void()> const& withdrawForSuspend)
+{
+    auto wake = capacity.WaitForHeartbeat(stop, announcedCordon, interval);
+    auto withdrew = false;
+    // Taken whatever woke the wait: an event can land as the interval runs out, and the round
+    // about to run answers it either way.
+    while (wake != HeartbeatWake::Stopped)
+    {
+        auto const action = inbox.Take();
+        if (action == std::optional { HostEventAction::WithdrawNow })
+        {
+            withdrawForSuspend();
+            // Settled here rather than by the callback, so no withdrawal can forget to let the
+            // suspend go and hold the machine for the whole budget.
+            inbox.Settle();
+            withdrew = true;
+            wake = inbox.HasPending() ? HeartbeatWake::HostEvent
+                                      : capacity.WaitForHeartbeat(stop, capacity.IsCordoned(), interval);
+            continue;
+        }
+        // A wake whose event was already taken: the posting thread sets the action BEFORE it wakes
+        // this one, so a suspend taken on another wake leaves its own wake request behind. After a
+        // withdrawal that request owes nothing, and a round for it would register the machine that
+        // is about to sleep -- so wait on.
+        if (withdrew && !action.has_value() && wake == HeartbeatWake::HostEvent)
+        {
+            wake = capacity.WaitForHeartbeat(stop, capacity.IsCordoned(), interval);
+            continue;
+        }
+        break;
+    }
+    return wake;
 }
 
 void WorkerTier::StopAndDrain()

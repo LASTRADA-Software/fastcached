@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
+#include "NodeIdentity.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/StateFiles.hpp>
@@ -826,8 +827,11 @@ std::string_view HistoryFileNameOf(HistoryFile which) noexcept
 std::filesystem::path HistoryPathFor(NodeConfig const& cfg, HistoryFile which)
 {
     auto const name = HistoryFileNameOf(which);
-    if (!cfg.clusterDir.empty())
-        return cfg.clusterDir / name;
+    // The state directory the node keeps, typed or the default its start resolved -- never the
+    // typed flag alone, which a node started with no configuration leaves empty while it keeps
+    // every other state file in the default. Its history went nowhere at all.
+    if (auto const chosen = ChosenStateDirectory(cfg); chosen.has_value())
+        return chosen->path / name;
     if (!cfg.cacheDir.empty())
         return cfg.cacheDir / name;
     return {};

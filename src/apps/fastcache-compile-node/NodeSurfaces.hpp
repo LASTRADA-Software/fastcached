@@ -126,6 +126,41 @@ enum class BindFailurePolicy : std::uint8_t
     Tolerate,
 };
 
+/// Who chooses the port an endpoint binds.
+///
+/// **Private**: never transmitted or persisted. A column of the resolved endpoint rather than a
+/// port of 0 each consumer interprets, because the consumers disagree about what 0 is: a socket
+/// API reads it as "the kernel chooses", a worksheet would print it as a port, and a firewall
+/// rule on port 0 admits nothing. Discovery's reply socket is the endpoint that needs it -- its
+/// port is the kernel's unless `--discovery-reply-port` names one, and an endpoint left out of
+/// the resolution because it had no number was a socket no firewall rule and no worksheet line
+/// covered.
+enum class SurfacePortKind : std::uint8_t
+{
+    /// The configuration names the port, and `SurfaceEndpoint::port` is it.
+    Fixed,
+    /// The kernel chooses it at bind: `SurfaceEndpoint::port` is 0, which is how a socket API is
+    /// asked for one, and the worksheet prints `*` in its place.
+    KernelChosen,
+    Last, ///< Count; never a kind.
+};
+
+/// One port kind, described once.
+struct SurfacePortKindRow
+{
+    SurfacePortKind kind {}; ///< Which kind; its own index.
+
+    /// How the worksheet spells the port: the number, or `*` for one nobody can name in advance.
+    std::string (*portText)(std::uint16_t port) = nullptr;
+
+    /// What the worksheet adds after the protocol; empty when the port says everything.
+    std::string_view trailer {};
+};
+
+/// @param kind A port kind.
+/// @return Its row.
+[[nodiscard]] SurfacePortKindRow const& SurfacePortKindRowOf(SurfacePortKind kind) noexcept;
+
 /// One endpoint a surface would actually bind.
 ///
 /// Owning, deliberately. `role` points into the static table and outlives any call;
@@ -134,8 +169,13 @@ enum class BindFailurePolicy : std::uint8_t
 /// announcing and this one is not.
 struct SurfaceEndpoint
 {
-    std::string host;         ///< The address that would be bound.
-    std::uint16_t port {};    ///< The port that would be bound.
+    std::string host;      ///< The address that would be bound.
+    std::uint16_t port {}; ///< The port that would be bound; 0 when `portKind` says the kernel chooses.
+
+    /// Whether `port` is the configuration's or the kernel's. Beside `port` rather than last, so
+    /// the one-byte field packs into the padding after it.
+    SurfacePortKind portKind { SurfacePortKind::Fixed };
+
     std::string_view role {}; ///< Empty for a surface's only endpoint; names the second when there is one.
 };
 

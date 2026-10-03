@@ -15,30 +15,44 @@
 // below differ in ONE thing -- the scheduler's reply -- and a round that always advanced, or
 // never did, fails exactly one of them. Neither alone tests anything.
 #include "EndpointDialerTestUtils.hpp"
+#include "HostEventInbox.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodePresenceTier.hpp"
+#include "NodeRoster.hpp"
 #include "SchedulerReachability.hpp"
 
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/HostEvents.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include <core/net/ISocket.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/BoundedWait.hpp>
 #include <tests/FleetHistoryFakes.hpp>
+#include <tests/ScriptedHostEvents.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -364,4 +378,229 @@ TEST_CASE("A presence refusal the scheduler actually answered never raises sched
     CHECK_FALSE(fixture.AnnounceThrough(dialer));
 
     CHECK(fixture.conditions.StateOf(NodeCondition::SchedulerUnreachable) == Wire::ConditionState::Clear);
+}
+
+// --- Host events (the presence round's half) --------------------------------------------------
+
+TEST_CASE("A resume or a network change ends the presence wait at once, and a suspend does not",
+          "[node][presence][host-events]")
+{
+    PresenceWake wake;
+    std::stop_source stop;
+
+    wake.OnHostEvent(HostEvent::Resumed);
+    CHECK(wake.WaitOut(stop.get_token(), std::chrono::seconds { 30 }) == PresenceWakeReason::HostEvent);
+
+    wake.OnHostEvent(HostEvent::NetworkChanged);
+    CHECK(wake.WaitOut(stop.get_token(), std::chrono::seconds { 30 }) == PresenceWakeReason::HostEvent);
+
+    // A suspend is the worker's to act on; the machine's presence row simply expires.
+    wake.OnHostEvent(HostEvent::Suspending);
+    CHECK(wake.WaitOut(stop.get_token(), std::chrono::milliseconds { 20 }) == PresenceWakeReason::Elapsed);
+
+    stop.request_stop();
+    CHECK(wake.WaitOut(stop.get_token(), std::chrono::seconds { 30 }) == PresenceWakeReason::Stopped);
+}
+
+TEST_CASE("A suspend supersedes a presence wake posted before it, and not one posted after", "[node][presence][host-events]")
+{
+    // Deliveries are serialised by the hub, so a wake still pending when a suspend is posted is
+    // older than the suspend. Run after it, the round would re-announce a machine about to sleep
+    // and keep its row alive through the sleep; the worker's inbox drops the same wake for the
+    // same reason, from the same table row.
+    PresenceWake wake;
+    std::stop_source stop;
+
+    wake.OnHostEvent(HostEvent::Resumed);
+    wake.OnHostEvent(HostEvent::Suspending);
+    CHECK(wake.WaitOut(stop.get_token(), std::chrono::milliseconds { 20 }) == PresenceWakeReason::Elapsed);
+
+    // The control: a wake posted after the suspend is owed as ever.
+    wake.OnHostEvent(HostEvent::Suspending);
+    wake.OnHostEvent(HostEvent::NetworkChanged);
+    CHECK(wake.WaitOut(stop.get_token(), std::chrono::seconds { 30 }) == PresenceWakeReason::HostEvent);
+}
+
+namespace
+{
+
+/// A dialer whose every dial fails -- production's spelling of an endpoint that is not there -- and
+/// which notes WHICH THREAD dialled, so a case can tell the loop's round from one run on the thread
+/// that delivered a host event. Safe to read while the loop dials.
+class ThreadNotingDialer final: public IEndpointDialer
+{
+  public:
+    /// @copydoc IEndpointDialer::Dial
+    [[nodiscard]] std::unique_ptr<core::net::ISocket> Dial(std::string_view /*endpoint*/,
+                                                           core::net::DialOptions /*options*/) override
+    {
+        std::scoped_lock const lock { _mutex };
+        _threads.push_back(std::this_thread::get_id());
+        return nullptr;
+    }
+
+    /// @return The thread of every dial so far, in order.
+    [[nodiscard]] std::vector<std::thread::id> Threads() const
+    {
+        std::scoped_lock const lock { _mutex };
+        return _threads;
+    }
+
+  private:
+    mutable std::mutex _mutex;
+    std::vector<std::thread::id> _threads;
+};
+
+/// The parts a presence loop borrows, over @p fix and a dialer and host of the case's.
+/// @param fix The fixture.
+/// @param capacity What this machine is.
+/// @param announced Where it answers.
+/// @param dialer How its rounds dial.
+/// @param events Where the host's events arrive.
+/// @param roster The roster half; null for none.
+/// @return The parts.
+[[nodiscard]] NodePresenceParts PartsOver(PresenceFixture& fix,
+                                          Distributed::NodeCapacity const& capacity,
+                                          AnnouncedEndpoint const& announced,
+                                          IEndpointDialer& dialer,
+                                          IHostEvents& events,
+                                          IPresenceRoster* roster = nullptr)
+{
+    return NodePresenceParts { .cfg = fix.cfg,
+                               .capacity = capacity,
+                               .announced = announced,
+                               .cacheTier = nullptr,
+                               .metrics = fix.metrics,
+                               .sampler = fix.sampler,
+                               .logger = fix.logger,
+                               .conditions = fix.conditions,
+                               .roster = roster,
+                               .prover = nullptr,
+                               .reachability = fix.reachability,
+                               .dialer = dialer,
+                               .hostEvents = events };
+}
+
+/// A roster that lapsed while its machine slept: it wants one until a scheduler offers it a
+/// certified roster, and endorses nothing. Safe to read while the loop offers.
+class LapsedRoster final: public IPresenceRoster
+{
+  public:
+    /// @copydoc IPresenceRoster::Endorsement
+    [[nodiscard]] std::vector<std::byte> Endorsement() const override
+    {
+        return {};
+    }
+
+    /// @copydoc IPresenceRoster::Offered
+    void Offered(std::span<std::byte const> certified) override
+    {
+        if (!certified.empty())
+            _recovered.store(true, std::memory_order_release);
+    }
+
+    /// @copydoc IPresenceRoster::Wanting
+    [[nodiscard]] bool Wanting() const override
+    {
+        return !Recovered();
+    }
+
+    /// @return Whether a scheduler has offered it a roster.
+    [[nodiscard]] bool Recovered() const noexcept
+    {
+        return _recovered.load(std::memory_order_acquire);
+    }
+
+  private:
+    std::atomic<bool> _recovered { false };
+};
+
+} // namespace
+
+TEST_CASE("With no host event at all the presence loop keeps running rounds until the roster recovers",
+          "[node][presence][host-events][roster]")
+{
+    // A sleep nobody reported -- a Modern Standby machine -- is one where no event will ever end the
+    // wait, so recovery must come from the loop's own schedule: its waits ELAPSE and it runs the next
+    // round anyway. The scheduler is unreachable for two rounds and answers the third with a
+    // certified roster; nothing is fired at `events`, so only two elapsed waits can get the loop
+    // there. A loop that ends, or waits for an event, after an elapsed wait never recovers.
+    PresenceFixture fix;
+    Testing::ScriptedHostEvents events;
+    auto const certified = std::vector<std::byte> { std::byte { 0xC0 }, std::byte { 0xDE } };
+    // Spare failures past the answering round, because a dial past the script would FAIL on the
+    // loop's thread, where no assertion may run.
+    Testing::ScriptedDialer dialer { { {}, {}, Wire::EncodeReply(Wire::Status::Ok, certified), {}, {} } };
+    LapsedRoster roster;
+    Distributed::NodeCapacity const capacity { .logicalCores = 4 };
+    AnnouncedEndpoint const announced { ThisMachine };
+    // The first round runs at once and each wait lasts `RosterWantingInterval` while the roster is
+    // wanting, so the answering round comes well inside this wait's bound.
+    static_assert(2 * RosterWantingInterval < Testing::WaitHangGuard);
+    {
+        auto const presence = NodePresence::Start(PartsOver(fix, capacity, announced, dialer, events, &roster));
+        REQUIRE(presence != nullptr);
+        CHECK(Testing::WaitUntil(
+            "the roster to recover with no host event",
+            [&roster] { return roster.Recovered(); },
+            [&roster] { return std::format("recovered: {}", roster.Recovered()); }));
+    }
+    // Three rounds: two that did not reach the scheduler, each followed by an elapsed wait, and the
+    // one that recovered. Read once the loop has joined.
+    CHECK(dialer.Dialed().size() == 3);
+}
+
+TEST_CASE("A presence loop hears the host's events for as long as it runs", "[node][presence][host-events]")
+{
+    PresenceFixture fix;
+    Testing::ScriptedHostEvents events;
+    ThreadNotingDialer dialer;
+    Distributed::NodeCapacity const capacity { .logicalCores = 4 };
+    AnnouncedEndpoint const announced { ThisMachine };
+    {
+        // Every dial fails at once, so the loop's first round is over quickly and it then waits,
+        // which is all this case needs of it.
+        auto const presence = NodePresence::Start(PartsOver(fix, capacity, announced, dialer, events));
+        REQUIRE(presence != nullptr);
+        CHECK(events.SubscriberCount() == 1);
+    }
+    CHECK(events.SubscriberCount() == 0);
+}
+
+TEST_CASE("A host event's presence round runs on the loop's thread and never on the one that delivered it",
+          "[node][presence][host-events]")
+{
+    // The sink contract (`IHostEventSink`): the delivering thread -- the SCM's handler, the network
+    // watcher's -- returns promptly and dials nobody. So the round a network change asks for is the
+    // LOOP's, and the case tells the two apart by the thread each dial ran on.
+    PresenceFixture fix;
+    Testing::ScriptedHostEvents events;
+    ThreadNotingDialer dialer;
+    Distributed::NodeCapacity const capacity { .logicalCores = 4 };
+    AnnouncedEndpoint const announced { ThisMachine };
+    auto const dials = [&dialer] {
+        return dialer.Threads().size();
+    };
+    {
+        auto const presence = NodePresence::Start(PartsOver(fix, capacity, announced, dialer, events));
+        REQUIRE(presence != nullptr);
+        REQUIRE(Testing::WaitUntil(
+            "the presence loop's first round",
+            [&dials] { return dials() >= 1; },
+            [&dials] { return std::format("{} dial(s)", dials()); }));
+
+        events.Fire(HostEvent::NetworkChanged);
+
+        // With no roster the loop waits `NodeAnnounceInterval`, longer than this wait's own bound,
+        // so a second dial inside it is the network change's round and nothing else.
+        static_assert(NodeAnnounceInterval > Testing::WaitHangGuard);
+        REQUIRE(Testing::WaitUntil(
+            "the round the network change asked for",
+            [&dials] { return dials() >= 2; },
+            [&dials] { return std::format("{} dial(s)", dials()); }));
+    }
+    auto const threads = dialer.Threads();
+    REQUIRE(threads.size() >= 2);
+    CHECK(std::ranges::count(threads, std::this_thread::get_id()) == 0);
+    CHECK(std::ranges::count(threads, threads.front()) == static_cast<std::ptrdiff_t>(threads.size()));
 }

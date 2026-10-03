@@ -90,6 +90,8 @@ target_sources(FastCache
         Platform/DaemonControls.cpp
         Platform/Environment.cpp
         Platform/FileTrust.cpp
+        Platform/Firewall.cpp
+        Platform/HostEvents.cpp
         Platform/HostInfo.cpp
         Platform/HostLoad.cpp
         Platform/HostMemory.cpp
@@ -97,13 +99,16 @@ target_sources(FastCache
         Platform/InheritedListener.cpp
         Platform/LocalAddresses.cpp
         Platform/NarrowText.cpp
+        Platform/NetworkChangeWatcher.cpp
         Platform/PosixDaemonHost.cpp
         Platform/Registry.cpp
         Platform/ServiceControl.cpp
         Platform/SrvResolver.cpp
+        Platform/StopPending.cpp
         Platform/StopSignal.cpp
         Platform/Terminal.cpp
         Platform/WindowsEventLogger.cpp
+        Platform/WindowsFirewall.cpp
         Platform/WindowsServiceHost.cpp
         Protocol/Framing/LineReader.cpp
         Protocol/CompileCacheHandler.cpp

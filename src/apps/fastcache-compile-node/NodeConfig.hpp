@@ -498,8 +498,10 @@ struct NodeConfig
     /// Durable by necessity rather than by preference: a node that answered a vote
     /// and forgot it would vote twice in one term after a restart, which is two
     /// leaders in one term. Empty is not "no directory": every node has one now, and
-    /// `stateDirectory` holds the default this one resolved. `NodeStateDirectory` is the
-    /// one reader of the two.
+    /// `stateDirectory` holds the default this one resolved. `ChosenStateDirectory` (and
+    /// `NodeStateDirectory` over it) is the one reader of the two for anything the node
+    /// keeps; this field alone answers only what the operator TYPED -- the option row, and
+    /// what a service registration replays and hands over.
     std::filesystem::path clusterDir;
 
     /// The state directory this process resolved for a node that names no `--cluster-dir`,
@@ -591,6 +593,11 @@ struct NodeConfig
     /// would make installing one silently displace the other.
     std::string serviceName { "FastCacheCompileNode" };
 
+    /// `--firewall-allow` scopes: the remote addresses the firewall rules `--install-service`
+    /// creates admit; empty admits any address. Install-time only, never replayed into the
+    /// registration. A vector, so it sits outside the byte-wide run below.
+    std::vector<std::string> firewallAllow;
+
     /// Where a POSIX daemonized run writes its pid, empty for none.
     std::string pidfile;
 
@@ -650,6 +657,9 @@ struct NodeConfig
 
     /// Which supervisor domain `--install-service` registers into.
     ServiceScope serviceScope { ServiceScope::System };
+
+    /// How `--install-service` registers this worker; never replayed into the registration.
+    ServiceStart serviceStart { ServiceStart::Auto };
 
     /// Whether `--cache-memory` was typed rather than derived.
     ///
@@ -1483,6 +1493,17 @@ inline constexpr std::string_view ThisMachineLoopbackHost = "127.0.0.1";
 /// operator deliberately exposed does.
 inline constexpr std::string_view AdminListenDefaultHost = "127.0.0.1";
 
+/// How an operator states the address peers dial a consensus node at: the remedy for a node that
+/// states none, worded ONCE.
+///
+/// Two texts tell an operator this rule -- the startup refusal below and `--print-surfaces`'
+/// `NOT STATED` line -- and they drifted once: the refusal named one way out while the worksheet
+/// named another, which sends an operator to a flag that does not fit. Since the zero-config
+/// defaults there is one way, `--raft-self` (the host another member dials; the port is
+/// `--listen-raft`'s), and both texts carry this phrase, with a `static_assert` beside each
+/// keeping them from drifting apart again.
+inline constexpr std::string_view ConsensusDialRemedy = "give --raft-self";
+
 /// Why a node running consensus that names no address its peers dial it at cannot work.
 ///
 /// A named constant rather than prose written into the policy row it fills, because
@@ -1506,6 +1527,9 @@ inline constexpr std::string_view ConsensusNamesNoDialAddressRefusal =
     "this node runs consensus and names no address its peers dial it at: give --raft-self=<host>, the host another "
     "member would dial (127.0.0.1 when none ever will); the port is --listen-raft's, and consensus cannot start "
     "without one";
+
+static_assert(ConsensusNamesNoDialAddressRefusal.contains(ConsensusDialRemedy),
+              "the startup refusal names the way to state the dial address, in the worksheet's words");
 
 /// Why a worker that could verify no lease is refused, when other machines can reach it (#178).
 ///

@@ -227,3 +227,42 @@ TEST_CASE("A worker whose remembered leader was deposed adopts the new leader's 
         CHECK(HeldVersion(worker) == std::optional<std::uint64_t> { 2 });
     }
 }
+
+TEST_CASE("A worker that slept past its roster's lifetime recovers on its next ordinary round", "[fleet][roster]")
+{
+    // Recovery must not depend on any power event. The office topology: ONE voter (the
+    // always-on office PC), and a worker that slept for more than an hour -- a Modern Standby
+    // laptop that never reported the suspend or the resume. Nothing here fires a host event:
+    // recovery must come from the round the worker runs anyway.
+    //
+    // RED when a re-endorsement of the SAME roster version that lasts longer is kept rather than
+    // adopted (`RosterTrust::Offer` answering `Kept` for "not newer" alone): the worker stays on
+    // its lapsed roster and the grant stays refused. GREEN under that break: the refusal before
+    // the round, which is the control.
+    FleetHarness fleet;
+    auto const formed = FleetHarness::StateOf({ SchedA }, {}, 1);
+    fleet.AddScheduler(SchedA);
+    fleet.SetClusterStateAt(SchedA, formed);
+    fleet.ElectLeader(SchedA);
+    fleet.RegisterWorker(SchedA, Worker, Toolchain, 4);
+    fleet.EndorseAt(SchedA, SchedA, formed);
+
+    FleetHarness::RosterWorker worker { fleet, Worker, { SchedA }, { SchedA } };
+    REQUIRE(worker.Announce());
+    REQUIRE(HeldVersion(worker) == std::optional<std::uint64_t> { 1 });
+
+    // Asleep for longer than the lifetime and the skew slack together.
+    fleet.Step(Cluster::RosterEndorsementLifetime + Distributed::LeaseTokenClockSkewSlack + std::chrono::hours { 1 });
+    // The voter never slept: it re-registers the worker's first heartbeat and re-endorses.
+    fleet.RegisterWorker(SchedA, Worker, Toolchain, 4);
+    fleet.EndorseAt(SchedA, SchedA, formed);
+
+    // Control: before the worker's first round, its lapsed roster refuses by name.
+    auto const refused = worker.Check(fleet.GrantAt(SchedA, Toolchain, "obj-asleep"), Toolchain);
+    REQUIRE(refused.has_value());
+    CHECK(Unwrap(refused).reason == Distributed::LeaseRefusalReason::RosterExpired);
+
+    // The first ORDINARY round after waking re-adopts the re-endorsed roster.
+    REQUIRE(worker.Announce());
+    CHECK_FALSE(worker.Check(fleet.GrantAt(SchedA, Toolchain, "obj-awake"), Toolchain).has_value());
+}

@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/IConnector.hpp>
 #include <core/net/testing/ParkingReadableSocket.hpp>
 #include <tests/ScriptedSocket.hpp>
 
@@ -59,8 +60,9 @@ class ScriptedDialer final: public Node::IEndpointDialer
 
     /// @copydoc Node::IEndpointDialer::Dial
     [[nodiscard]] std::unique_ptr<core::net::ISocket> Dial(std::string_view endpoint,
-                                                           core::net::DialOptions /*options*/) override
+                                                           core::net::DialOptions options) override
     {
+        _options.push_back(options);
         _dialed.emplace_back(endpoint);
         if (_next >= _replies.size())
         {
@@ -99,9 +101,19 @@ class ScriptedDialer final: public Node::IEndpointDialer
         return _sockets[index]->Sent();
     }
 
+    /// The options dial @p index was made with.
+    /// @param index Which dial, counting from zero.
+    /// @return Its options.
+    [[nodiscard]] core::net::DialOptions const& OptionsOn(std::size_t index) const
+    {
+        REQUIRE(index < _options.size());
+        return _options[index];
+    }
+
   private:
     std::vector<std::vector<std::byte>> _replies;
     std::vector<std::string> _dialed;
+    std::vector<core::net::DialOptions> _options; ///< One per dial, failed dials included.
     /// One per dial, null where the dial failed, so an index is a dial's index.
     std::vector<std::unique_ptr<ScriptedSocket>> _sockets;
     std::size_t _next { 0 };

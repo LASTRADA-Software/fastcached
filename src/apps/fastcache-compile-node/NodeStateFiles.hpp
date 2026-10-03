@@ -2,6 +2,7 @@
 #pragma once
 
 #include "AdminEndpoint.hpp"
+#include "NodeFormation.hpp"
 #include "NodeKey.hpp"
 
 #include <FastCache/Core/Logger.hpp>
@@ -105,6 +106,19 @@ struct NodeStateFileRow
 /// @param path The file, or a directory (then the command recurses).
 /// @return A clause to append, opening with its own separator, or empty.
 [[nodiscard]] std::string StateFileUnreadableHint(std::filesystem::path const& path);
+
+/// What @p stateDirectory holds about this node's formation, read the way a start reads it.
+///
+/// The directory's writers are judged first, then who owns each file (`JudgeStateDirectory`), and
+/// only then the record and the remembered endpoints (`ReadKeptFormation`), so a record another
+/// account could have written is never read. A refusal carries `StateFileUnreadableHint`'s remedy
+/// for the record. The one reading `main` makes for every invocation, judged from the account
+/// running it; `--install-service` reads the record again after its handover, without the owner
+/// judgement whose answer depends on that account (`StateDirectoryFormationReader`).
+/// @param stateDirectory The directory the node resolved (`ChosenStateDirectory`).
+/// @return What is kept, or why it cannot be read.
+[[nodiscard]] std::expected<KeptFormation, std::string> ReadStateDirectoryFormation(
+    std::filesystem::path const& stateDirectory);
 
 /// Set aside every history file another account owns, or other accounts may write, where the
 /// histories are read.

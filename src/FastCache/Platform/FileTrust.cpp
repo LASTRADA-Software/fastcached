@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Platform/FileTrust.hpp>
+#include <FastCache/Platform/FileTrustDetail.hpp>
 
 #include <cerrno>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <string>
@@ -10,6 +12,7 @@
 #if defined(_WIN32)
     #include <FastCache/Platform/NarrowText.hpp>
 
+    #include <algorithm>
     #include <array>
     #include <cstddef>
     #include <cstdint>
@@ -147,6 +150,135 @@ namespace
     /// entry's own list says.
     constexpr DWORD EntryPlantingRights = PlantingRights | FILE_DELETE_CHILD;
 
+    /// The access list a directory holding a credential a SERVICE mints should carry,
+    /// before the service's own entry is appended: SYSTEM and Administrators in full,
+    /// inherited by everything created inside, and `P` so `%ProgramData%`'s
+    /// `BUILTIN\Users` read cannot flow in.
+    ///
+    /// **And `OW` (OWNER RIGHTS, S-1-3-4) held to `RC`**, which is not decoration. An
+    /// owner keeps `READ_CONTROL` and `WRITE_DAC` whatever the entries say, unless an
+    /// OWNER RIGHTS entry names what it keeps instead -- and `%ProgramData%` lets any
+    /// standard account CREATE a subdirectory, so the state directory may be owned by
+    /// whoever made it first. With `WRITE_DAC` that account re-opens the directory,
+    /// deletes the key, and reads the one the node mints to replace it. Held to `RC`,
+    /// the owner may read the list and change nothing; every account that should
+    /// write here has an entry of its own. Inherited, so a file the service creates
+    /// holds its owner -- the service -- to the same, where its own entry grants the rest.
+    constexpr auto ServiceDirectoryDacl = L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;RC;;;OW)";
+
+    /// @param path Entry to inspect.
+    /// @return Whether its access list is protected from inheritance, nullopt when the
+    ///         descriptor would not say.
+    [[nodiscard]] std::optional<bool> DaclIsProtected(std::filesystem::path const& path)
+    {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (::GetNamedSecurityInfoW(
+                path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, nullptr, &descriptor)
+            != ERROR_SUCCESS)
+            return std::nullopt;
+
+        auto const owned = LocalBlock { descriptor };
+        SECURITY_DESCRIPTOR_CONTROL control {};
+        DWORD revision = 0;
+        if (::GetSecurityDescriptorControl(descriptor, &control, &revision) == FALSE)
+            return std::nullopt;
+        return (control & SE_DACL_PROTECTED) != 0;
+    }
+
+    /// The SDDL entry granting @p account full control, inheritably.
+    /// @param account An account name `LookupAccountName` resolves.
+    /// @return The entry, or why the account did not resolve.
+    [[nodiscard]] std::expected<std::wstring, std::string> ServiceAccountEntry(std::string const& account)
+    {
+        std::array<std::byte, SECURITY_MAX_SID_SIZE> sid {};
+        auto sidSize = static_cast<DWORD>(sid.size());
+        // The domain buffer is required by the call and read by nobody.
+        std::array<char, 256> domain {};
+        auto domainSize = static_cast<DWORD>(domain.size());
+        SID_NAME_USE use = SidTypeUnknown;
+        if (::LookupAccountNameA(nullptr, account.c_str(), sid.data(), &sidSize, domain.data(), &domainSize, &use) == FALSE)
+            return std::unexpected(std::format("the account '{}' did not resolve (error {})", account, ::GetLastError()));
+
+        LPWSTR text = nullptr;
+        if (::ConvertSidToStringSidW(sid.data(), &text) == FALSE)
+            return std::unexpected(
+                std::format("the account '{}' has a SID that could not be spelled (error {})", account, ::GetLastError()));
+        auto const owned = LocalBlock { text };
+        // `0x1301bf` is Modify: FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE
+        // | DELETE, and NOT `WRITE_DAC` or `WRITE_OWNER`. This process compiles input that
+        // arrived over the network, so it reads its key and writes its state but may not
+        // rewrite the list that protects them -- which `FA` (full control) would have let it,
+        // and an owner it does not have would be the only thing then stopping it re-opening
+        // the directory to every account.
+        return std::wstring { L"(A;OICI;0x1301bf;;;" } + text + L")";
+    }
+
+    /// Resolve @p account to its binary SID in @p buffer.
+    ///
+    /// The owner comparison needs the SID itself, not the string `ServiceAccountEntry`
+    /// spells; both come from one `LookupAccountName`, so this is called once and its answer
+    /// shared.
+    /// @param account The account name.
+    /// @param buffer Filled with the SID; large enough for any.
+    /// @return true when it resolved.
+    [[nodiscard]] bool ResolveAccountSid(std::string const& account, std::span<std::byte> buffer)
+    {
+        auto size = static_cast<DWORD>(buffer.size());
+        std::array<char, 256> domain {};
+        auto domainSize = static_cast<DWORD>(domain.size());
+        SID_NAME_USE use = SidTypeUnknown;
+        return ::LookupAccountNameA(nullptr, account.c_str(), buffer.data(), &size, domain.data(), &domainSize, &use)
+               != FALSE;
+    }
+
+    /// Is @p path a reparse point -- a junction or a symbolic link?
+    ///
+    /// Asked WITHOUT following it: `GetFileAttributesW` reports the link's own attributes, not
+    /// its target's. A junction needs no privilege to create, and
+    /// `SetNamedSecurityInfoW` on one writes the list onto the junction while its target -- a
+    /// directory the planter owns -- keeps its own, so a list applied to a junctioned state
+    /// directory secures nothing and the service mints its key where the planter can read it.
+    /// @param path Entry to inspect.
+    /// @return true when it is a reparse point, false when it is not, nullopt when its
+    ///         attributes could not be read.
+    [[nodiscard]] std::optional<bool> IsReparsePoint(std::filesystem::path const& path)
+    {
+        auto const attributes = ::GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES)
+            return std::nullopt;
+        return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    }
+
+    /// Does @p path have more than one hard link -- is it the same file as one elsewhere?
+    ///
+    /// A hard link is not a reparse point and shares its target's security descriptor, so a key
+    /// written into a file the planter can write but SYSTEM or Administrators owns, hard-linked
+    /// in as `node-key`, passes the owner and reparse checks -- and the apply then rewrites the
+    /// OUTSIDE file's inherited entries. `nNumberOfLinks` above one is the tell, read from a
+    /// handle opened WITHOUT following a reparse point.
+    /// @param path Entry to inspect.
+    /// @return true when it has more than one link, false when it has one, nullopt when the
+    ///         information could not be read.
+    [[nodiscard]] std::optional<bool> HasMultipleHardLinks(std::filesystem::path const& path)
+    {
+        HANDLE const handle = ::CreateFileW(path.c_str(),
+                                            FILE_READ_ATTRIBUTES,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                            nullptr,
+                                            OPEN_EXISTING,
+                                            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                            nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+            return std::nullopt;
+
+        BY_HANDLE_FILE_INFORMATION info {};
+        auto const read = ::GetFileInformationByHandle(handle, &info);
+        ::CloseHandle(handle);
+        if (read == FALSE)
+            return std::nullopt;
+        return info.nNumberOfLinks > 1;
+    }
+
     /// The principals a machine-wide directory may belong to. An owner keeps
     /// WRITE_DAC whatever the access list says, so a directory owned by a
     /// standard account is one that account can re-open at will — which makes
@@ -220,6 +352,38 @@ namespace
 
         auto const ownedSid = LocalBlock { trustedInstaller };
         return ::EqualSid(owner, trustedInstaller) == TRUE;
+    }
+
+    /// Is @p path owned by SYSTEM, Administrators or @p serviceSid?
+    ///
+    /// The owners a file the service or the installer wrote may have. Anything else -- a file
+    /// a standard account planted -- is refused: its owner keeps `READ_CONTROL` and, planted,
+    /// knows its contents, so a key adopted from it is a key the planter holds. `TrustedInstaller`
+    /// is deliberately NOT allowed here, unlike `IsAdministrativelyOwned`: nothing but this
+    /// directory's own service and the administrators should have written what is in it.
+    /// @param path Entry to inspect.
+    /// @param serviceSid The service's SID, or an empty span for a LocalSystem service.
+    /// @return true when an allowed account owns it, false when another does, nullopt when
+    ///         the owner could not be read.
+    [[nodiscard]] std::optional<bool> IsOwnedByServiceOrAdministrator(std::filesystem::path const& path,
+                                                                      std::span<std::byte const> serviceSid)
+    {
+        PSID owner = nullptr;
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (::GetNamedSecurityInfoW(
+                path.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, nullptr, nullptr, nullptr, &descriptor)
+            != ERROR_SUCCESS)
+            return std::nullopt;
+
+        auto const owned = LocalBlock { descriptor };
+        if (owner == nullptr)
+            return std::nullopt;
+
+        if (MatchesWellKnownSid(owner, AdministrativeOwners))
+            return true;
+        if (!serviceSid.empty() && ::EqualSid(owner, const_cast<std::byte*>(serviceSid.data())) == TRUE)
+            return true;
+        return false;
     }
 
     /// Is nothing in BroadPrincipals granted any of @p rights on @p path?
@@ -426,20 +590,23 @@ namespace
     /// @param path Existing file or directory; `SE_FILE_OBJECT` covers both.
     /// @param sddl The access list to apply, in SDDL.
     /// @param owner Owner to set, or nullptr to leave ownership alone.
-    /// @return true when the list was applied.
-    [[nodiscard]] bool ApplyProtectedDacl(std::filesystem::path const& path, wchar_t const* sddl, PSID owner)
+    /// @return `ERROR_SUCCESS` when the list was applied, else the failing call's error --
+    ///         a code rather than a `bool`, so a caller that must say WHY can.
+    [[nodiscard]] DWORD ApplyProtectedDacl(std::filesystem::path const& path, wchar_t const* sddl, PSID owner)
     {
         PSECURITY_DESCRIPTOR descriptor = nullptr;
         if (::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor, nullptr) == FALSE)
-            return false;
+            return ::GetLastError();
 
         auto const owned = LocalBlock { descriptor };
 
         BOOL present = FALSE;
         BOOL defaulted = FALSE;
         PACL dacl = nullptr;
-        if (::GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) == FALSE || present == FALSE)
-            return false;
+        if (::GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) == FALSE)
+            return ::GetLastError();
+        if (present == FALSE)
+            return ERROR_INVALID_SECURITY_DESCR;
 
         auto const what =
             static_cast<SECURITY_INFORMATION>(DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION)
@@ -447,7 +614,7 @@ namespace
 
         // SetNamedSecurityInfoW takes a mutable name, hence the owned copy.
         auto name = path.wstring();
-        return ::SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT, what, owner, nullptr, dacl, nullptr) == ERROR_SUCCESS;
+        return ::SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT, what, owner, nullptr, dacl, nullptr);
     }
 
 #else
@@ -664,7 +831,7 @@ bool SecureDirectoryForAdministrators(std::filesystem::path const& directory)
     if (::CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administrators.data(), &size) == FALSE)
         return false;
 
-    if (!ApplyProtectedDacl(directory, AdministratorOnlyDacl, administrators.data()))
+    if (ApplyProtectedDacl(directory, AdministratorOnlyDacl, administrators.data()) != ERROR_SUCCESS)
         return false;
 #else
     // Ownership is not something chmod can fix, and it does not need fixing:
@@ -692,7 +859,7 @@ bool SecureSecretFileForServices(std::filesystem::path const& file)
     // `IsAdministratorOnlyWritable` deliberately does not test a file's owner for
     // exactly that reason. Setting it here would be a second thing that can fail
     // for no property gained.
-    if (!ApplyProtectedDacl(file, SecretFileDacl, nullptr))
+    if (ApplyProtectedDacl(file, SecretFileDacl, nullptr) != ERROR_SUCCESS)
         return false;
 #else
     // Group as well as other. A group grant is only safe where an administrator
@@ -1065,6 +1232,206 @@ std::string DirectoryWritersHint(std::filesystem::path const& directory, Directo
         }
     }
     return {};
+}
+
+std::expected<void, std::string> SecureDirectoryForService(std::filesystem::path const& directory,
+                                                           std::string const& account,
+                                                           std::span<std::filesystem::path const> credentialLeaves)
+{
+    return Detail::SecureDirectoryForService(directory, account, credentialLeaves, {});
+}
+
+std::expected<void, std::string> Detail::SecureDirectoryForService(std::filesystem::path const& directory,
+                                                                   std::string const& account,
+                                                                   std::span<std::filesystem::path const> credentialLeaves,
+                                                                   std::function<void()> const& afterPreCheck)
+{
+#if defined(_WIN32)
+    // The remedy for a credential -- the identity key -- and for anything a planter owns:
+    // deletion, then a fresh identity. Following an `icacls /reset` on a disclosed key would
+    // leave that key in service; only re-minting it (which needs an ABSENT key file) undoes
+    // the disclosure.
+    auto const deleteRemedy = [](std::filesystem::path const& entry, std::string_view why) {
+        return std::format("{} {}; delete it (or the whole directory) so the node mints a fresh identity, then "
+                           "re-admit or re-enroll the node",
+                           entry.string(),
+                           why);
+    };
+
+    // A reparse point is refused before ANYTHING is written. `SetNamedSecurityInfoW` on a
+    // junction writes the list onto the junction and leaves its target -- a directory the
+    // planter owns and needed no privilege to point here -- untouched, so the service would
+    // mint its key there under a report of success. The directory's OWNER is not checked here:
+    // it may legitimately be whoever created it first, and the apply below sets it.
+    if (auto const reparse = IsReparsePoint(directory); reparse != std::optional { false })
+        return std::unexpected(
+            reparse.has_value() ? deleteRemedy(directory,
+                                               "is a reparse point (a junction or symlink), so a list applied to it "
+                                               "secures nothing and the service's state could be redirected elsewhere")
+                                : std::format("whether {} is a reparse point could not be determined", directory.string()));
+
+    // The account's SID, resolved once BEFORE anything is applied -- a list whose service
+    // entry could not be spelled would lock the service out of its own directory -- and kept
+    // to judge who owns what is already inside.
+    std::array<std::byte, SECURITY_MAX_SID_SIZE> serviceSidBuffer {};
+    std::span<std::byte const> serviceSid;
+    auto dacl = std::wstring { ServiceDirectoryDacl };
+    if (!account.empty())
+    {
+        auto const entry = ServiceAccountEntry(account);
+        if (!entry)
+            return std::unexpected(entry.error());
+        if (!ResolveAccountSid(account, serviceSidBuffer))
+            return std::unexpected(std::format("the account '{}' did not resolve (error {})", account, ::GetLastError()));
+        serviceSid = std::span<std::byte const> { serviceSidBuffer };
+        dacl += *entry;
+    }
+
+    // The structure of one entry: not a reparse point, owned by SYSTEM/Administrators/the
+    // service, and -- for a non-directory -- not a hard link to a file elsewhere. Shared by
+    // both passes, because the post-apply pass has to make exactly the pre-apply checks again.
+    auto const refuseEntryStructure = [&](std::filesystem::path const& entry) -> std::optional<std::string> {
+        if (auto const reparse = IsReparsePoint(entry); reparse != std::optional { false })
+            return reparse.has_value()
+                       ? deleteRemedy(entry, "is a reparse point (a junction or symlink) inside the state directory")
+                       : std::format("whether {} is a reparse point could not be determined", entry.string());
+
+        // Owned by anyone but SYSTEM, Administrators or the service is a plant: its owner
+        // keeps READ_CONTROL and, having created it, knows its contents, so a key adopted
+        // from it is a key that account holds.
+        if (auto const owned = IsOwnedByServiceOrAdministrator(entry, serviceSid); owned != std::optional { true })
+            return owned.has_value()
+                       ? deleteRemedy(entry, "is owned by an account other than the system, administrators or the service")
+                       : std::format("who owns {} could not be determined", entry.string());
+
+        // A hard link shares its target's security descriptor, so a key hard-linked in from an
+        // admin-owned file outside passes reparse and owner -- and the apply rewrites the
+        // outside file. A directory has no hard links to count (`nNumberOfLinks` counts its
+        // subdirectories), so this is asked of non-directories only.
+        auto const attributes = ::GetFileAttributesW(entry.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            if (auto const linked = HasMultipleHardLinks(entry); linked != std::optional { false })
+                return linked.has_value()
+                           ? deleteRemedy(entry,
+                                          "is a hard link to a file outside the state directory, which shares "
+                                          "its access list")
+                           : std::format("how many links {} has could not be determined", entry.string());
+        return std::nullopt;
+    };
+
+    // A read-only pre-pass over everything already inside, BEFORE the list is written: a
+    // reparse point, a foreign-owned entry or a hard link is refused without touching the tree,
+    // because the remedy is deletion and applying a list first would be a change to a structure
+    // about to be thrown away. The directory's own reparse was checked above; its owner is not,
+    // because the apply sets it.
+    std::error_code ec;
+    auto prePass = std::filesystem::recursive_directory_iterator { directory, ec };
+    while (!ec && prePass != std::filesystem::recursive_directory_iterator {})
+    {
+        if (auto const denial = refuseEntryStructure(prePass->path()))
+            return std::unexpected(*denial);
+        prePass.increment(ec);
+    }
+    if (ec)
+        return std::unexpected(std::format("what it holds could not be listed: {}", ec.message()));
+
+    // The race window this pass and the post-apply pass exist to close. Empty in production;
+    // a test mutates the tree here to prove the second pass catches what the first could not.
+    if (afterPreCheck)
+        afterPreCheck();
+
+    // The OWNER is set to Administrators, not only the list: an owner keeps `WRITE_DAC`
+    // whatever the entries say -- the OWNER RIGHTS entry holds a NAMED owner to reading, but
+    // the directory may currently be owned by whoever created it first, and setting the list
+    // without the owner would leave that account able to undo it. `AdministrativeOwners` and
+    // `SecureDirectoryHint` require the same. This is why the whole call needs the privileges
+    // an install has: setting an object's owner to a group is not a right a standard account
+    // holds.
+    std::array<std::byte, SECURITY_MAX_SID_SIZE> administrators {};
+    auto administratorsSize = static_cast<DWORD>(administrators.size());
+    if (::CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administrators.data(), &administratorsSize) == FALSE)
+        return std::unexpected("the Administrators SID could not be built");
+
+    // What is already inside is covered by the same call, and that is inheritance doing its
+    // job rather than a hope: setting a directory's list recomputes the INHERITED entries of
+    // everything under it. A key the service minted under the old list was created with
+    // default security, so every entry it carries is inherited -- the upgrade from today's
+    // MSI -- and after this it carries the new ones instead.
+    if (auto const rc = ApplyProtectedDacl(directory, dacl.c_str(), administrators.data()); rc != ERROR_SUCCESS)
+        return std::unexpected(std::format("its access list could not be replaced (error {})", rc));
+
+    // The property, not the syscall. Windows lets every account bypass traverse checking, so
+    // a closed directory does not hide a file whose own list lets anybody read it.
+    if (NoBroadPrincipalMay(directory, ReadingRights | PlantingRights) != std::optional { true })
+        return std::unexpected("it still lets a broad principal list or add to it, or would not say");
+    if (DaclIsProtected(directory) != std::optional { true })
+        return std::unexpected("its access list is still not protected from inheritance, or would not say");
+
+    auto const isCredential = [credentialLeaves](std::filesystem::path const& entry) {
+        return std::ranges::any_of(credentialLeaves,
+                                   [&entry](std::filesystem::path const& leaf) { return entry.filename() == leaf; });
+    };
+
+    // The FULL check again: between the pre-pass and the apply the planter still owned the
+    // directory and could add a child with a non-broad ACE, or rename the directory away and
+    // drop a junction in its place. Once the protected list and the Administrators owner are
+    // on, no NEW open can create or change anything here, so this pass sees the tree's final
+    // shape. One residual it cannot close, stated rather than implied away: an access check is
+    // made when a handle is OPENED, so a handle opened before the apply keeps the access it was
+    // granted -- a file that was broadly writable until now can still be written through one.
+    // Refusing to proceed while any other handle is open would refuse every re-apply with the
+    // service running, since it holds its own key open. The directory's own reparse and owner
+    // are re-checked first.
+    if (auto const denial = refuseEntryStructure(directory))
+        return std::unexpected(*denial);
+
+    auto postPass = std::filesystem::recursive_directory_iterator { directory, ec };
+    while (!ec && postPass != std::filesystem::recursive_directory_iterator {})
+    {
+        auto const entry = postPass->path();
+        if (auto const denial = refuseEntryStructure(entry))
+            return std::unexpected(*denial);
+
+        // An explicit broad grant of its own survives the recomputation above, so this is asked
+        // AFTER the apply -- an inherited grant is cured by it, a NAMED one is not. A CREDENTIAL
+        // gets the delete remedy -- a disclosed key stays disclosed after an `icacls /reset` --
+        // while any other state file is told to inherit the directory's list.
+        if (auto const exposure = SecretFileExposure(entry); exposure != SecretExposure::None)
+        {
+            if (exposure == SecretExposure::Undetermined)
+                return std::unexpected(std::format("who may read {} could not be determined", entry.string()));
+            if (isCredential(entry))
+                return std::unexpected(deleteRemedy(
+                    entry, "is a credential this node minted and it is readable by other accounts on this machine"));
+            return std::unexpected(
+                std::format("{0} keeps an access list of its own that lets every account on this machine read it; "
+                            "make it inherit the directory's with: icacls \"{0}\" /reset",
+                            entry.string()));
+        }
+        postPass.increment(ec);
+    }
+    if (ec)
+        return std::unexpected(std::format("what it holds could not be listed: {}", ec.message()));
+    return {};
+#else
+    (void) credentialLeaves;
+    (void) afterPreCheck;
+    // The account is the directory's owner by now -- the caller hands the path over
+    // first -- so the owner's bits are its bits. Nothing inside needs visiting: POSIX
+    // has no traverse bypass, so a directory nobody else may search hides every file
+    // in it whatever that file's own mode says.
+    (void) account;
+    if (!RemovePermissions(directory, std::filesystem::perms::group_all | std::filesystem::perms::others_all))
+        return std::unexpected(std::string { "its mode could not be changed" });
+
+    std::error_code ec;
+    auto const left = std::filesystem::status(directory, ec).permissions();
+    if (ec)
+        return std::unexpected(std::format("its mode could not be read back: {}", ec.message()));
+    if ((left & (std::filesystem::perms::group_all | std::filesystem::perms::others_all)) != std::filesystem::perms::none)
+        return std::unexpected(std::string { "its group and other bits are still set" });
+    return {};
+#endif
 }
 
 std::string SecureDirectoryHint(std::filesystem::path const& directory)

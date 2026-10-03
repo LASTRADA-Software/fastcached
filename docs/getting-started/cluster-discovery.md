@@ -111,7 +111,8 @@ rule scoped to `udp/<discovery-port>` alone does not, and the symptom is peers
 that are discovered and never authenticated. The answering port is kernel-chosen by
 default; `--discovery-reply-port` pins it where a site needs to name it — one port
 per node on the machine, since two nodes cannot share it. The startup line reports
-both addresses.
+both addresses. On Windows, `--install-service` creates the program-scoped rule
+itself (`… discovery-reply udp/any`), or a rule for the pinned port.
 
 ## The wire version, and why it moved
 

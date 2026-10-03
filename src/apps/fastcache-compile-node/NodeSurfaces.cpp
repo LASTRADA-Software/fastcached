@@ -34,6 +34,22 @@ namespace
     /// surface.
     constexpr std::string_view DiscoveryBindHost = "0.0.0.0";
 
+    constexpr auto PortKindRows = EnumTable<SurfacePortKind, SurfacePortKindRow> { {
+        { .kind = SurfacePortKind::Fixed,
+          .portText = [](std::uint16_t port) { return std::format("{}", port); },
+          .trailer = {} },
+        // `*` rather than the 0 the endpoint carries: a worksheet line reading `:0` is a port an
+        // operator would copy into a rule, and a rule on port 0 admits nothing.
+        { .kind = SurfacePortKind::KernelChosen,
+          .portText = [](std::uint16_t /*port*/) { return std::string { "*" }; },
+          .trailer = ", port chosen by the kernel at bind" },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(PortKindRows, [](SurfacePortKindRow const& row) { return row.kind; }),
+                  "every SurfacePortKind needs a row, at its own index");
+    static_assert(std::ranges::all_of(PortKindRows, [](SurfacePortKindRow const& row) { return row.portText != nullptr; }),
+                  "every SurfacePortKind row spells its port");
+
     /// Whether text names an address a beacon can be sent to.
     ///
     /// Exactly `ParseDialEndpoint`'s question, so it is asked through it: a host
@@ -245,13 +261,21 @@ namespace
                 // a port only it holds. An operator who opened the first and not the
                 // second gets a fleet that hears every beacon and completes no
                 // handshake.
-                SurfaceEndpoints out;
-                out.push_back(
-                    SurfaceEndpoint { .host = std::string { row.defaultHost }, .port = beacon->second, .role = "beacon" });
-                if (cfg.discoveryReplyPort != 0)
-                    out.push_back(SurfaceEndpoint {
-                        .host = std::string { row.defaultHost }, .port = cfg.discoveryReplyPort, .role = "reply" });
-                return out;
+                //
+                // The reply socket is ALWAYS here, pinned or not. It used to appear only
+                // when `--discovery-reply-port` named it, which left the default -- a port
+                // the kernel chooses -- out of the worksheet and out of the firewall
+                // rules, and every challenge and proof then arrived at a port no rule
+                // covered. Unpinned, it is an endpoint whose port nobody can name, and
+                // saying so is the port kind's job rather than a missing line's.
+                auto const pinned = cfg.discoveryReplyPort != 0;
+                return SurfaceEndpoints {
+                    SurfaceEndpoint { .host = std::string { row.defaultHost }, .port = beacon->second, .role = "beacon" },
+                    SurfaceEndpoint { .host = std::string { row.defaultHost },
+                                      .port = cfg.discoveryReplyPort,
+                                      .portKind = pinned ? SurfacePortKind::Fixed : SurfacePortKind::KernelChosen,
+                                      .role = "reply" },
+                };
             },
             .closedBecause = nullptr,
             .note = "UDP, and the only surface that is. The address you write is where beacons are SENT; the "
@@ -259,8 +283,9 @@ namespace
                     "directed broadcast on this port, re-read on an interval, never to the limited broadcast. "
                     "Without --discovery-reply-port the reply socket takes a kernel-chosen port, new at every start, "
                     "and peers send their challenges and proofs TO it: a restrictive firewall has to let it in, "
-                    "INBOUND, by program, since no port rule can name it. On by default, and beside consensus "
-                    "only: a node with an empty --listen-raft opens neither socket",
+                    "INBOUND, by program, since no port rule can name it. --discovery-reply-port pins one where a "
+                    "site must name it. On by default, and beside consensus only: a node with an empty "
+                    "--listen-raft opens neither socket",
         },
     };
 
@@ -453,6 +478,11 @@ std::string_view PrimaryFlag(SurfaceRow const& row) noexcept
     return row.flags[0];
 }
 
+SurfacePortKindRow const& SurfacePortKindRowOf(SurfacePortKind kind) noexcept
+{
+    return PortKindRows[static_cast<std::size_t>(kind)];
+}
+
 SurfaceRow const& RowFor(NodeSurface surface) noexcept
 {
     return Surfaces[static_cast<std::size_t>(surface)];
@@ -500,6 +530,8 @@ namespace
           .trailer = "(absent: this node dials its fleet's voters, and nobody dials it)" },
     } };
     static_assert(RowsInEnumeratorOrder(DialGapCells, &DialGapCell::gap));
+    static_assert(DialGapCells[static_cast<std::size_t>(ConsensusDialGap::Unstated)].trailer.contains(ConsensusDialRemedy),
+                  "the worksheet names every way to state the dial address, in the startup refusal's words");
 
     /// The address column and the trailer of the worksheet's dial line.
     /// @param dial What `ConsensusDialAddressOf` answered; must outlive the result.
@@ -543,14 +575,17 @@ std::string RenderSurfaces(NodeConfig const& cfg)
         }
 
         for (auto const& endpoint: endpoints)
-            lines.push_back(Line { .label = endpoint.role.empty() ? std::string { row.name }
-                                                                  : std::format("{} {}", row.name, endpoint.role),
-                                   // `FormatHostPort`, not a hand-rolled join: it brackets a v6
-                                   // host, so `--listen-node [2001:db8::1]:6674` comes back as an
-                                   // address that reads back rather than as `2001:db8::1:6674`.
-                                   // This is the surface whose whole purpose is being transcribed.
-                                   .address = FormatHostPort(endpoint.host, endpoint.port),
-                                   .trailer = row.protocol == SurfaceProtocol::Udp ? "UDP" : "TCP" });
+        {
+            auto const& portKind = SurfacePortKindRowOf(endpoint.portKind);
+            lines.push_back(Line {
+                .label = endpoint.role.empty() ? std::string { row.name } : std::format("{} {}", row.name, endpoint.role),
+                // `FormatHostPort`, not a hand-rolled join: it brackets a v6
+                // host, so `--listen-node [2001:db8::1]:6674` comes back as an
+                // address that reads back rather than as `2001:db8::1:6674`.
+                // This is the surface whose whole purpose is being transcribed.
+                .address = FormatHostPort(endpoint.host, portKind.portText(endpoint.port)),
+                .trailer = std::format("{}{}", row.protocol == SurfaceProtocol::Udp ? "UDP" : "TCP", portKind.trailer) });
+        }
     }
 
     // Widths over what is actually PRINTED -- every line, not only the served ones.

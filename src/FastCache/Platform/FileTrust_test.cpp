@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/StateFiles.hpp>
+#include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
+#include <FastCache/Platform/FileTrustDetail.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -19,6 +21,16 @@
 #include <tests/ScratchPath.hpp>
 
 #if defined(_WIN32)
+    #include <algorithm>
+    #include <cstddef>
+    #include <memory>
+
+    #include <windows.h>
+    // After windows.h, which all three depend on.
+    #include <aclapi.h>
+    #include <sddl.h>
+    #include <winioctl.h>
+
     #include <tests/AccessList.hpp>
 #else
     #include <sys/stat.h>
@@ -693,4 +705,548 @@ TEST_CASE("FileTrust: a link where a file is expected is refused as not a file, 
     REQUIRE_FALSE(followed.has_value());
     CHECK(followed.error().notRegular);
 }
+TEST_CASE("FileTrust: a service's private directory keeps nothing for the group or anyone else",
+          "[platform][filetrust][secret]")
+{
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-private-dir" };
+    auto const directory = scratch.Path() / "state";
+    std::filesystem::create_directories(directory);
+    std::filesystem::permissions(directory, std::filesystem::perms::all, std::filesystem::perm_options::replace);
+
+    auto const secured = FastCache::SecureDirectoryForService(directory, "ignored-on-posix");
+    INFO(secured.error_or(std::string {}));
+    REQUIRE(secured.has_value());
+
+    // The MODE, not only the answer: the function reads its own work back, so asserting
+    // its return alone is one function agreeing with itself.
+    auto const left = std::filesystem::status(directory).permissions();
+    CHECK((left & (std::filesystem::perms::group_all | std::filesystem::perms::others_all)) == std::filesystem::perms::none);
+    // And the owner keeps everything, which is the half that tells SECURED from BROKEN.
+    CHECK((left & std::filesystem::perms::owner_all) == std::filesystem::perms::owner_all);
+}
+
+#else
+
+namespace
+{
+/// Frees a `LocalAlloc`'d block, as the Win32 security calls hand them back.
+struct LocalFreeDeleter
+{
+    void operator()(void* block) const noexcept
+    {
+        ::LocalFree(block);
+    }
+};
+
+using LocalBlock = std::unique_ptr<void, LocalFreeDeleter>;
+
+/// The account this suite runs as, spelled `DOMAIN\user` as `LookupAccountName` resolves it.
+///
+/// The one account a test here can hand `SecureDirectoryForService` and still delete the
+/// scratch directory as afterwards: a service account would resolve only once a service
+/// exists, which a unit test must not create.
+[[nodiscard]] std::string CurrentAccountName()
+{
+    HANDLE token = nullptr;
+    REQUIRE(::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token) != FALSE);
+    alignas(TOKEN_USER) std::array<std::byte, 256> buffer {};
+    DWORD size = 0;
+    auto const read = ::GetTokenInformation(token, TokenUser, buffer.data(), static_cast<DWORD>(buffer.size()), &size);
+    ::CloseHandle(token);
+    REQUIRE(read != FALSE);
+
+    auto const* const user = reinterpret_cast<TOKEN_USER const*>(buffer.data());
+    std::array<char, 256> name {};
+    auto nameSize = static_cast<DWORD>(name.size());
+    std::array<char, 256> domain {};
+    auto domainSize = static_cast<DWORD>(domain.size());
+    SID_NAME_USE use = SidTypeUnknown;
+    REQUIRE(::LookupAccountSidA(nullptr, user->User.Sid, name.data(), &nameSize, domain.data(), &domainSize, &use) != FALSE);
+    return std::format("{}\\{}", domain.data(), name.data());
+}
+
+/// Grant `BUILTIN\Users` read on @p path, the way `%ProgramData%` does.
+/// @param path The entry.
+/// @param inheritance `SUB_CONTAINERS_AND_OBJECTS_INHERIT` for the directory the installer
+///        meets; `NO_INHERITANCE` for an entry carrying an explicit grant of its own.
+void GrantBroadRead(std::filesystem::path const& path, DWORD inheritance)
+{
+    PACL current = nullptr;
+    PSECURITY_DESCRIPTOR raw = nullptr;
+    REQUIRE(::GetNamedSecurityInfoW(
+                path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &current, nullptr, &raw)
+            == ERROR_SUCCESS);
+    LocalBlock const descriptor { raw };
+
+    std::array<std::byte, SECURITY_MAX_SID_SIZE> users {};
+    auto usersSize = static_cast<DWORD>(users.size());
+    REQUIRE(::CreateWellKnownSid(WinBuiltinUsersSid, nullptr, users.data(), &usersSize) != FALSE);
+
+    EXPLICIT_ACCESS_W entry {};
+    entry.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    entry.grfAccessMode = GRANT_ACCESS;
+    entry.grfInheritance = inheritance;
+    ::BuildTrusteeWithSidW(&entry.Trustee, users.data());
+
+    PACL updated = nullptr;
+    REQUIRE(::SetEntriesInAclW(1, &entry, current, &updated) == ERROR_SUCCESS);
+    LocalBlock const owned { updated };
+    auto name = path.wstring();
+    REQUIRE(
+        ::SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, updated, nullptr)
+        == ERROR_SUCCESS);
+}
+
+/// @param path The entry.
+/// @return Its access list in SDDL, `D:` and all.
+[[nodiscard]] std::string DaclText(std::filesystem::path const& path)
+{
+    PSECURITY_DESCRIPTOR raw = nullptr;
+    REQUIRE(::GetNamedSecurityInfoW(
+                path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, nullptr, &raw)
+            == ERROR_SUCCESS);
+    LocalBlock const descriptor { raw };
+    LPSTR text = nullptr;
+    REQUIRE(::ConvertSecurityDescriptorToStringSecurityDescriptorA(
+                raw, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &text, nullptr)
+            != FALSE);
+    LocalBlock const owned { text };
+    return std::string { text };
+}
+
+/// @param path The entry.
+/// @return Its owner's SID as a string, or empty when it could not be read.
+[[nodiscard]] std::string OwnerText(std::filesystem::path const& path)
+{
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR raw = nullptr;
+    if (::GetNamedSecurityInfoW(
+            path.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, nullptr, nullptr, nullptr, &raw)
+        != ERROR_SUCCESS)
+        return {};
+    LocalBlock const descriptor { raw };
+    LPSTR text = nullptr;
+    if (owner == nullptr || ::ConvertSidToStringSidA(owner, &text) == FALSE)
+        return {};
+    LocalBlock const owned { text };
+    return std::string { text };
+}
+
+/// Try to set @p path's owner to the SID @p sid spells; ignore failure.
+///
+/// Setting an arbitrary owner needs `SeRestorePrivilege`, which an elevated install has and a
+/// developer box does not -- so this lets a test plant a genuinely foreign owner where it can,
+/// and the caller checks what actually took.
+/// @param path The entry.
+/// @param sid The owner to attempt, in SDDL (e.g. `S-1-5-32-546` for Guests).
+void TrySetOwner(std::filesystem::path const& path, wchar_t const* sid)
+{
+    PSID owner = nullptr;
+    if (::ConvertStringSidToSidW(sid, &owner) == FALSE)
+        return;
+    LocalBlock const owned { owner };
+    auto name = path.wstring();
+    (void) ::SetNamedSecurityInfoW(
+        name.data(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, owner, nullptr, nullptr, nullptr);
+}
+
+/// Make @p link a directory junction (a mount-point reparse point) to @p target.
+///
+/// Through the reparse ioctl rather than `create_directory_symlink`, which needs a privilege a
+/// junction does not -- which is the whole point: an attacker arranges this with none -- and
+/// rather than spawning `mklink`, which would be a command processor. `REPARSE_DATA_BUFFER`'s
+/// mount-point shape is defined here because it lives in `ntifs.h`, which the SDK does not put
+/// on the ordinary include path.
+/// @param link The junction to create.
+/// @param target Where it points; made absolute.
+/// @return true when @p link is a reparse point afterwards.
+[[nodiscard]] bool MakeJunction(std::filesystem::path const& link, std::filesystem::path const& target)
+{
+    if (::CreateDirectoryW(link.c_str(), nullptr) == FALSE)
+        return false;
+
+    // `\??\<absolute target>`, the substitute-name form a mount point stores.
+    auto const substitute = LR"(\??\)" + std::filesystem::absolute(target).wstring();
+    auto const print = std::filesystem::absolute(target).wstring();
+
+    struct MountPointBuffer
+    {
+        ULONG reparseTag;
+        USHORT reparseDataLength;
+        USHORT reserved;
+        USHORT substituteNameOffset;
+        USHORT substituteNameLength;
+        USHORT printNameOffset;
+        USHORT printNameLength;
+        wchar_t path[MAX_PATH * 4];
+    };
+
+    MountPointBuffer buffer {};
+    buffer.reparseTag = IO_REPARSE_TAG_MOUNT_POINT;
+    buffer.substituteNameOffset = 0;
+    buffer.substituteNameLength = static_cast<USHORT>(substitute.size() * sizeof(wchar_t));
+    buffer.printNameOffset = static_cast<USHORT>((substitute.size() + 1) * sizeof(wchar_t));
+    buffer.printNameLength = static_cast<USHORT>(print.size() * sizeof(wchar_t));
+    std::ranges::copy(substitute, buffer.path);
+    std::ranges::copy(print, buffer.path + substitute.size() + 1);
+
+    auto const pathBytes = buffer.printNameOffset + ((print.size() + 1) * sizeof(wchar_t));
+    buffer.reparseDataLength =
+        static_cast<USHORT>(pathBytes + sizeof(buffer.substituteNameOffset) + sizeof(buffer.substituteNameLength)
+                            + sizeof(buffer.printNameOffset) + sizeof(buffer.printNameLength));
+
+    HANDLE const handle = ::CreateFileW(link.c_str(),
+                                        GENERIC_WRITE,
+                                        0,
+                                        nullptr,
+                                        OPEN_EXISTING,
+                                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+        return false;
+
+    DWORD returned = 0;
+    auto const controlBytes = static_cast<DWORD>(offsetof(MountPointBuffer, path) + pathBytes);
+    auto const set =
+        ::DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, &buffer, controlBytes, nullptr, 0, &returned, nullptr);
+    ::CloseHandle(handle);
+    if (set == FALSE)
+        return false;
+
+    auto const attributes = ::GetFileAttributesW(link.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+/// @return true when this run states that it is elevated (`FASTCACHED_EXPECT_ELEVATED=1`), so a
+///         case that needs elevation and cannot have it must FAIL rather than skip.
+[[nodiscard]] bool ExpectElevated()
+{
+    return FastCache::ReadEnvironmentVariable("FASTCACHED_EXPECT_ELEVATED") == std::optional<std::string> { "1" };
+}
+
+/// Enable `SeRestorePrivilege` so an elevated run can set an arbitrary owner.
+///
+/// A test that plants a genuinely foreign owner needs it; an install has it. An unelevated
+/// process does not hold it at all, and then `AdjustTokenPrivileges` SUCCEEDS while enabling
+/// nothing and reports that through `ERROR_NOT_ALL_ASSIGNED` -- so the return value alone is
+/// not the answer, and both are read.
+/// @return true when the privilege is enabled in this process's token.
+[[nodiscard]] bool EnableRestorePrivilege()
+{
+    HANDLE token = nullptr;
+    if (::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token) == FALSE)
+        return false;
+    TOKEN_PRIVILEGES privileges {};
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    auto enabled = false;
+    if (::LookupPrivilegeValueA(nullptr, SE_RESTORE_NAME, &privileges.Privileges[0].Luid) != FALSE)
+        enabled = ::AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr) != FALSE
+                  && ::GetLastError() != ERROR_NOT_ALL_ASSIGNED;
+    ::CloseHandle(token);
+    return enabled;
+}
+
+    /// Skip the calling case unless this process can set an object's owner to Administrators --
+    /// unless `FASTCACHED_EXPECT_ELEVATED=1`, when it FAILS instead.
+    ///
+    /// `SecureDirectoryForService` sets the state directory's owner, which is a right a standard
+    /// account -- even an unelevated administrator, whose Administrators SID is deny-only -- does
+    /// not hold. A developer box is not elevated, so the success path and the post-apply checks
+    /// skip here and run in the `windows` job's `ctest` step, which sets `FASTCACHED_EXPECT_ELEVATED=1`.
+    /// When that is set and the process is NOT elevated the case FAILS -- fail closed, so a runner
+    /// that is not elevated turns the first CI run red rather than the guard retiring silently. The
+    /// read-only pre-checks (reparse, foreign owner, hard link) need no such right and run everywhere.
+    #define REQUIRE_OWNER_SETTING()                                                                                     \
+        do                                                                                                              \
+        {                                                                                                               \
+            if (!FastCache::IsPrivilegedProcess())                                                                      \
+            {                                                                                                           \
+                if (ExpectElevated())                                                                                   \
+                    FAIL("FASTCACHED_EXPECT_ELEVATED=1 but this process is not elevated, so the ACL cases that set an " \
+                         "owner could not run -- the runner must be elevated");                                         \
+                SKIP("setting a directory's owner to Administrators needs the privileges an install has; the windows "  \
+                     "job's ctest step runs this path elevated");                                                       \
+            }                                                                                                           \
+        } while (false)
+} // namespace
+
+// The real access lists, on a scratch directory this case creates and owns. What a real
+// install produces -- a directory the SCM's installer made under `%ProgramData%` and a key a
+// virtual account minted -- is asserted by the `package-windows` CI job on an installed MSI.
+
+TEST_CASE("FileTrust: a service's private directory keeps nothing for a broad principal and covers what it held",
+          "[platform][filetrust][secret]")
+{
+    REQUIRE_OWNER_SETTING();
+
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-private-dir" };
+    auto const directory = scratch.Path() / "state";
+    std::filesystem::create_directories(directory);
+
+    // The state an upgrade from today's MSI meets: the directory inherits every account's
+    // read, and the key minted there under it inherited the same.
+    GrantBroadRead(directory, SUB_CONTAINERS_AND_OBJECTS_INHERIT);
+    scratch.Write("state/node-key", "identity seed");
+    auto const key = directory / "node-key";
+    REQUIRE(FastCache::SecretFileExposure(key) == SecretExposure::AnyLocalAccount);
+
+    std::array const credentialLeaves { std::filesystem::path { "node-key" } };
+    auto const secured = FastCache::SecureDirectoryForService(directory, CurrentAccountName(), credentialLeaves);
+    INFO(secured.error_or(std::string {}));
+    REQUIRE(secured.has_value());
+
+    CHECK(FastCache::SecretFileExposure(directory) == SecretExposure::None);
+    // The key already there, reached by the directory's list replacing its inherited entries.
+    CHECK(FastCache::SecretFileExposure(key) == SecretExposure::None);
+
+    // The LIST, not only the verdict: protected, no BUILTIN\Users, and the owner held to
+    // reading it -- the entry that keeps whoever created the directory first from re-opening it.
+    auto const dacl = DaclText(directory);
+    INFO(dacl);
+    CHECK(dacl.starts_with("D:P"));
+    CHECK_FALSE(dacl.contains(";;;BU)"));
+    CHECK(dacl.contains("(A;OICI;RC;;;OW)"));
+
+    // C1(b): the OWNER is Administrators (S-1-5-32-544), so whoever created the directory
+    // first no longer keeps WRITE_DAC over it.
+    CHECK(OwnerText(directory) == "S-1-5-32-544");
+
+    // M1: the service's own entry is Modify (0x1301bf), not full control -- it reads its key
+    // and writes its state but cannot rewrite the list, so it holds no WRITE_DAC/WRITE_OWNER.
+    CHECK(dacl.contains("0x1301bf"));
+    CHECK_FALSE(dacl.contains(std::format("(A;OICI;FA;;;{})", OwnerText(key))));
+
+    // And the account still reads what is there and what it writes next -- the half that tells
+    // SECURED from BROKEN: a node that cannot open its own key does not start.
+    std::ifstream probe { key };
+    CHECK(probe.is_open());
+    scratch.Write("state/minted-later", "second secret");
+    CHECK(FastCache::SecretFileExposure(scratch / "state/minted-later") == SecretExposure::None);
+}
+
+TEST_CASE("FileTrust: an exposed entry's remedy is per kind -- delete a credential and reset anything else",
+          "[platform][filetrust][secret]")
+{
+    // I1: an `icacls /reset` on a disclosed KEY would keep it in service, so a credential is
+    // told to be deleted and re-minted while an ordinary state file is told to reset.
+    REQUIRE_OWNER_SETTING();
+
+    std::array const credentialLeaves { std::filesystem::path { "node-key" } };
+
+    SECTION("the identity key is told to be deleted, not reset")
+    {
+        FastCache::Testing::ScratchDirectory const scratch { "fastcached-remedy-key" };
+        auto const directory = scratch.Path() / "state";
+        scratch.Write("state/node-key", "identity seed");
+        auto const key = directory / "node-key";
+        GrantBroadRead(key, NO_INHERITANCE);
+
+        auto const secured = FastCache::SecureDirectoryForService(directory, CurrentAccountName(), credentialLeaves);
+        REQUIRE_FALSE(secured.has_value());
+        INFO(secured.error());
+        CHECK(secured.error().contains(key.string()));
+        CHECK(secured.error().contains("re-admit or re-enroll"));
+        CHECK_FALSE(secured.error().contains("/reset"));
+    }
+
+    SECTION("an ordinary state file is told to inherit the directory's list")
+    {
+        FastCache::Testing::ScratchDirectory const scratch { "fastcached-remedy-state" };
+        auto const directory = scratch.Path() / "state";
+        scratch.Write("state/roster", "not a credential");
+        auto const roster = directory / "roster";
+        GrantBroadRead(roster, NO_INHERITANCE);
+
+        auto const secured = FastCache::SecureDirectoryForService(directory, CurrentAccountName(), credentialLeaves);
+        REQUIRE_FALSE(secured.has_value());
+        INFO(secured.error());
+        CHECK(secured.error().contains(roster.string()));
+        CHECK(secured.error().contains("/reset"));
+        CHECK_FALSE(secured.error().contains("re-admit or re-enroll"));
+    }
+}
+
+TEST_CASE("FileTrust: a junctioned or symlinked state directory is refused", "[platform][filetrust][secret]")
+{
+    // C1(a): `SetNamedSecurityInfoW` on a junction writes the list onto the junction and leaves
+    // its target -- a directory the planter owns -- untouched, so a list applied to one secures
+    // nothing. Refused before anything is written, which needs no owner-setting right.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-junction-dir" };
+    auto const target = scratch.Path() / "attacker";
+    std::filesystem::create_directories(target);
+    auto const directory = scratch.Path() / "state";
+    if (!MakeJunction(directory, target))
+        SKIP("could not create a directory junction on this host");
+
+    auto const secured = FastCache::SecureDirectoryForService(directory, CurrentAccountName());
+    REQUIRE_FALSE(secured.has_value());
+    INFO(secured.error());
+    CHECK(secured.error().contains("reparse point"));
+    CHECK(secured.error().contains(directory.string()));
+}
+
+TEST_CASE("FileTrust: a junctioned child inside the state directory is refused", "[platform][filetrust][secret]")
+{
+    // C1(a), the child case: the walk lists a junction without following it, and a key could be
+    // read through a link the planter still resolves. Refused in the read-only pre-pass.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-junction-child" };
+    auto const target = scratch.Path() / "attacker";
+    std::filesystem::create_directories(target);
+    auto const directory = scratch.Path() / "state";
+    std::filesystem::create_directories(directory);
+    if (!MakeJunction(directory / "link", target))
+        SKIP("could not create a directory junction on this host");
+
+    auto const secured = FastCache::SecureDirectoryForService(directory, CurrentAccountName());
+    REQUIRE_FALSE(secured.has_value());
+    INFO(secured.error());
+    CHECK(secured.error().contains("reparse point"));
+    CHECK(secured.error().contains((directory / "link").string()));
+    CHECK(secured.error().contains("re-admit or re-enroll"));
+}
+
+TEST_CASE("FileTrust: a foreign-owned entry is refused with the deletion remedy", "[platform][filetrust][secret]")
+{
+    // C1(c): a file a standard account planted is owned by that account, which still knows its
+    // contents, so a key adopted from it is a key the planter holds. The suite owns what it
+    // creates, so it hands a DIFFERENT resolvable account as the service, making its own
+    // ownership foreign -- and this is a read-only pre-pass check, so it needs no elevation.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-foreign-owner" };
+    auto const directory = scratch.Path() / "state";
+    scratch.Write("state/node-key", "planted");
+    auto const key = directory / "node-key";
+
+    // Elevated (CI) a file the suite creates is owned by Administrators, which IS allowed, so
+    // plant a genuinely foreign owner where the privilege exists; unelevated the suite's own
+    // user SID is already foreign to the service named below. Either way, confirm it took.
+    // Setting an arbitrary owner needs SeRestorePrivilege, which an elevated run can enable.
+    // A run that states it is elevated and cannot enable it FAILS: the elevated half of this case
+    // is exactly what it would otherwise skip in silence.
+    if (!EnableRestorePrivilege() && ExpectElevated())
+        FAIL("FASTCACHED_EXPECT_ELEVATED=1 but SeRestorePrivilege could not be enabled, so no foreign owner can "
+             "be planted");
+    TrySetOwner(key, L"S-1-5-32-546");
+    auto const owner = OwnerText(key);
+    if (owner == "S-1-5-18" || owner == "S-1-5-32-544" || owner == "S-1-5-19")
+    {
+        if (ExpectElevated())
+            FAIL(std::format("FASTCACHED_EXPECT_ELEVATED=1 but the planted key is still owned by {}, an allowed owner",
+                             owner));
+        SKIP("could not arrange a foreign owner for the planted key on this host");
+    }
+
+    std::array const credentialLeaves { std::filesystem::path { "node-key" } };
+    auto const secured = FastCache::SecureDirectoryForService(directory, "NT AUTHORITY\\LOCAL SERVICE", credentialLeaves);
+    REQUIRE_FALSE(secured.has_value());
+    INFO(secured.error());
+    CHECK(secured.error().contains(key.string()));
+    CHECK(secured.error().contains("owned by an account other than"));
+    CHECK(secured.error().contains("re-admit or re-enroll"));
+    // Read-only: the refusal is in the pre-pass, so the planted file's owner is untouched.
+    CHECK(OwnerText(key) == owner);
+}
+
+TEST_CASE("FileTrust: a hard-linked entry is refused with the deletion remedy", "[platform][filetrust][secret]")
+{
+    // B: a hard link is not a reparse point and shares its target's security descriptor, so a
+    // key hard-linked in from an admin-owned file outside would pass reparse and owner while the
+    // apply rewrote the outside file. `nNumberOfLinks > 1` catches it, in the read-only pre-pass,
+    // so this needs no elevation. The account is the suite's own so the LINK reason fires, not
+    // the owner one.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-hardlink" };
+    auto const directory = scratch.Path() / "state";
+    std::filesystem::create_directories(directory);
+    auto const outside = scratch.Path() / "outside";
+    scratch.Write("outside", "the real file");
+    auto const key = directory / "node-key";
+    if (::CreateHardLinkW(key.c_str(), outside.c_str(), nullptr) == FALSE)
+        SKIP("could not create a hard link on this host");
+
+    std::array const credentialLeaves { std::filesystem::path { "node-key" } };
+    auto const secured = FastCache::SecureDirectoryForService(directory, CurrentAccountName(), credentialLeaves);
+    REQUIRE_FALSE(secured.has_value());
+    INFO(secured.error());
+    CHECK(secured.error().contains(key.string()));
+    CHECK(secured.error().contains("hard link"));
+    CHECK(secured.error().contains("re-admit or re-enroll"));
+}
+
+TEST_CASE("FileTrust: a tree mutated between the pre-pass and the apply is caught by the post-pass",
+          "[platform][filetrust][secret]")
+{
+    // A: in the window between the read-only pre-pass and the apply the planter still owns the
+    // directory and can add a child. The seam mutates the tree there; the post-apply pass, which
+    // repeats the full structure check on the now-locked tree, must catch it. Reaching the
+    // post-pass needs the apply to succeed, so this runs elevated.
+    REQUIRE_OWNER_SETTING();
+
+    std::array const credentialLeaves { std::filesystem::path { "node-key" } };
+
+    SECTION("a child planted with an explicit broad grant is caught")
+    {
+        FastCache::Testing::ScratchDirectory const scratch { "fastcached-race-grant" };
+        auto const directory = scratch.Path() / "state";
+        std::filesystem::create_directories(directory);
+
+        auto const planted = directory / "node-key";
+        auto const mutate = [&] {
+            std::ofstream { planted } << "planted in the race window";
+            GrantBroadRead(planted, NO_INHERITANCE);
+        };
+        auto const secured =
+            FastCache::Detail::SecureDirectoryForService(directory, CurrentAccountName(), credentialLeaves, mutate);
+        REQUIRE_FALSE(secured.has_value());
+        INFO(secured.error());
+        CHECK(secured.error().contains(planted.string()));
+        // A credential planted in the window is still refused with the delete remedy.
+        CHECK(secured.error().contains("re-admit or re-enroll"));
+    }
+
+    SECTION("a hard link planted in the window is caught")
+    {
+        FastCache::Testing::ScratchDirectory const scratch { "fastcached-race-link" };
+        auto const directory = scratch.Path() / "state";
+        std::filesystem::create_directories(directory);
+        auto const outside = scratch.Path() / "outside";
+        std::ofstream { outside } << "the real file";
+        auto const planted = directory / "state-file";
+
+        auto const mutate = [&] {
+            (void) ::CreateHardLinkW(planted.c_str(), outside.c_str(), nullptr);
+        };
+        auto const secured =
+            FastCache::Detail::SecureDirectoryForService(directory, CurrentAccountName(), credentialLeaves, mutate);
+        REQUIRE_FALSE(secured.has_value());
+        INFO(secured.error());
+        CHECK(secured.error().contains("hard link"));
+    }
+}
+
+TEST_CASE("FileTrust: a service account that does not resolve applies nothing", "[platform][filetrust][secret]")
+{
+    // Resolved BEFORE the list is replaced: a protected list naming no service would lock the
+    // service out of its own directory, which is a worse state than the one refused.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-private-unresolved" };
+    auto const directory = scratch.Path() / "state";
+    std::filesystem::create_directories(directory);
+    GrantBroadRead(directory, SUB_CONTAINERS_AND_OBJECTS_INHERIT);
+    auto const before = DaclText(directory);
+
+    auto const account = std::format("NT SERVICE\\fastcached-no-such-service-{}", scratch.Path().filename().string());
+    auto const secured = FastCache::SecureDirectoryForService(directory, account);
+    REQUIRE_FALSE(secured.has_value());
+    CHECK(secured.error().contains(account));
+    CHECK(DaclText(directory) == before);
+}
+
 #endif
+
+TEST_CASE("FileTrust: a service's private directory that is not there is refused", "[platform][filetrust][secret]")
+{
+    // On both platforms, and for the reason `SecureSecretFileForServices` refuses an absent
+    // file: the answer is read back, and "I could not tell" must not arrive as "secured". No
+    // account, so on Windows the refusal is the list's rather than a name that did not resolve.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-private-absent" };
+    CHECK_FALSE(FastCache::SecureDirectoryForService(scratch / "absent", std::string {}).has_value());
+}

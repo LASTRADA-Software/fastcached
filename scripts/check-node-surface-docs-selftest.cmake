@@ -81,11 +81,13 @@ set(FastCachedSelftestDocRel "docs/operations/surfaces.md")
 # The synthesised ground truth: four surfaces, three TCP and one UDP, with the
 # `discovery` row carrying TWO flags. That second flag is not decoration -- it is
 # the shape that made `flags[0]` a defect, so a tree without it would let the
-# fixed extraction and the broken one produce identical output.
+# fixed extraction and the broken one produce identical output. Its resolver names
+# TWO endpoint roles on two lines, as the real one does: they are the only labels a
+# transcript may print a surface name under twice.
 set(baseSurfaceSource
-"NodeSurfaceTable()
+"namespace
 {
-    return {
+    constexpr auto Surfaces = EnumTable<NodeSurface, SurfaceRow> {
         NodeSurface {
             .name = \"node\",
             .flags = { \"--listen-node\", {} },
@@ -105,9 +107,16 @@ set(baseSurfaceSource
             .name = \"discovery\",
             .flags = { \"--discovery\", \"--discovery-reply-port\" },
             .protocol = SurfaceProtocol::Udp,
+            .resolve = [](SurfaceRow const& row, NodeConfig const& cfg) -> SurfaceEndpoints {
+                return SurfaceEndpoints {
+                    SurfaceEndpoint { .host = host, .port = beacon, .role = \"beacon\" },
+                    SurfaceEndpoint { .host = host,
+                                      .role = \"reply\" },
+                };
+            },
         },
     };
-}
+} // namespace
 ")
 
 set(baseSurfaceHeader
@@ -138,6 +147,7 @@ node              0.0.0.0:6675  TCP
 admin             -             not served
 raft              0.0.0.0:6680  TCP
 discovery beacon  0.0.0.0:6681  UDP
+discovery reply   0.0.0.0:*     UDP, port chosen by the kernel at bind
 
 notes:
   none
@@ -163,7 +173,9 @@ The beacon replies from --discovery-reply-port when one is set.
 # a `|`-separated list and an embedded newline in a row is a field this script
 # would have to parse around for no benefit.
 #
-# @param target `doc` or `src` -- which staged file the replacement applies to.
+# @param target `doc` or `src` -- which staged file the replacement applies to -- or
+#        `src+doc`, where @p from and @p to each hold the source half, `~~`, then the
+#        document half: a plant that only means anything beside a row that uses it.
 # @param from The text to replace. Asserted present, or the case reports nothing.
 # @param to The replacement.
 # @param outOutput Set to the check's combined output, whitespace collapsed.
@@ -182,7 +194,27 @@ function(fastcached_stage_and_run name target from to outOutput outApplied)
     endif()
 
     set(applied TRUE)
-    if(target STREQUAL "doc")
+    if(target STREQUAL "src+doc")
+        string(FIND "${from}" "~~" fromCut)
+        string(FIND "${to}" "~~" toCut)
+        if(fromCut EQUAL -1 OR toCut EQUAL -1)
+            message(FATAL_ERROR "case `${name}`: a `src+doc` mutation needs `~~` in both its from and its to")
+        endif()
+        string(SUBSTRING "${from}" 0 ${fromCut} sourceFrom)
+        math(EXPR fromRest "${fromCut} + 2")
+        string(SUBSTRING "${from}" ${fromRest} -1 docFrom)
+        string(SUBSTRING "${to}" 0 ${toCut} sourceTo)
+        math(EXPR toRest "${toCut} + 2")
+        string(SUBSTRING "${to}" ${toRest} -1 docTo)
+        string(FIND "${sourceText}" "${sourceFrom}" sourcePosition)
+        string(FIND "${docText}" "${docFrom}" docPosition)
+        if(sourcePosition EQUAL -1 OR docPosition EQUAL -1)
+            set(applied FALSE)
+        else()
+            string(REPLACE "${sourceFrom}" "${sourceTo}" sourceText "${sourceText}")
+            string(REPLACE "${docFrom}" "${docTo}" docText "${docText}")
+        endif()
+    elseif(target STREQUAL "doc")
         string(FIND "${docText}" "${from}" position)
         if(position EQUAL -1)
             set(applied FALSE)
@@ -268,6 +300,36 @@ set(FastCachedSurfaceSelftestCases
     # Same members, wrong order -- the edit somebody makes while tidying, which
     # changes nothing visible and is not output this binary produces.
     "reordered transcript|doc|admin             -             not served~n~raft              0.0.0.0:6680  TCP|raft              0.0.0.0:6680  TCP~n~admin             -             not served|the order and the membership both come from the table|-"
+
+    # A surface's second endpoint is an ADJACENT row under the same name, which the
+    # baseline's `discovery reply` row shows passing. The same name after ANOTHER
+    # surface is not a second endpoint -- it is a row out of table order, and the
+    # fold must not swallow it.
+    "repeat after another surface|doc|admin             -             not served|discovery reply   0.0.0.0:*     UDP~n~admin             -             not served|the order and the membership both come from the table|-"
+
+    # A surface's rows fold only under the ROLES its resolver declares. Folding on the
+    # NAME alone admitted each of the next three, and each is an extra port on a
+    # firewall worksheet: a second `node` row, a verbatim duplicate of one, and a
+    # duplicated `discovery beacon`.
+    "second node row|doc|node              0.0.0.0:6675  TCP~n~|node              0.0.0.0:6675  TCP~n~node              0.0.0.0:6699  TCP~n~|prints the `node` row twice|-"
+    "duplicated node row|doc|node              0.0.0.0:6675  TCP~n~|node              0.0.0.0:6675  TCP~n~node              0.0.0.0:6675  TCP~n~|prints the `node` row twice|-"
+    "duplicated role row|doc|discovery beacon  0.0.0.0:6681  UDP~n~|discovery beacon  0.0.0.0:6681  UDP~n~discovery beacon  0.0.0.0:6681  UDP~n~|prints the `discovery beacon` row twice|-"
+
+    # A `.role` literal AFTER the surface table is nobody's role. Read to the end of the
+    # file, it was credited to the last row, and this plant made the `discovery gossip`
+    # row beside it pass.
+    "role literal after the table|src+doc|} // namespace~~discovery beacon  0.0.0.0:6681  UDP~n~|} // namespace~n~constexpr RevL1 revL1 { .role = \"gossip\" }~~discovery beacon  0.0.0.0:6681  UDP~n~discovery gossip  0.0.0.0:6690  UDP~n~|declares no `gossip` endpoint for the `discovery` surface|-"
+
+    # Roles that did not extract at all are the SCAN losing the table, not the documents
+    # being wrong: every correct role row would otherwise be refused as undeclared.
+    "no role extracted|src|.role = \"|.endpointRole = \"|no endpoint `.role` was extracted from the surface table|declares no `beacon` endpoint"
+
+    # A role the table does not declare for the surface is not a second endpoint of it.
+    "undeclared role|doc|discovery beacon  0.0.0.0:6681  UDP~n~|discovery beacon  0.0.0.0:6681  UDP~n~discovery gossip  0.0.0.0:6690  UDP~n~|declares no `gossip` endpoint for the `discovery` surface|-"
+
+    # A surface's `not served` row carries no role, and is never beside the rows of it
+    # being served.
+    "unserved row beside served ones|doc|discovery beacon  0.0.0.0:6681  UDP~n~|discovery beacon  0.0.0.0:6681  UDP~n~discovery         -             not served~n~|with no role beside the `discovery` rows that name one|-"
 
     # A recognised phrasing whose number has gone stale.
     "stale word count|doc|four-surface table|seven-surface table|claims 7 where|-"

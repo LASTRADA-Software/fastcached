@@ -269,7 +269,7 @@ endif()
 
 install(TARGETS fastcache-cc
     RUNTIME DESTINATION "${FASTCACHED_INSTALL_BINDIR}"
-    COMPONENT Runtime
+    COMPONENT "${FASTCACHED_APP_COMPONENT}"
 )
 
 # Unit tests for the reusable launcher pieces (parsing, keying, statistics, and

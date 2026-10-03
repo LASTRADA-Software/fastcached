@@ -5,6 +5,7 @@
 // cases that start one, so the assembly `main` performs is spelled once for tests rather than once
 // per file that needs a worker (#1364 needed one to prove every condition row is evaluated).
 
+#include "EndpointDialerTestUtils.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeIoLoop.hpp"
@@ -19,9 +20,13 @@
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 
+#include <cstddef>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -31,6 +36,8 @@
 #include <ToolchainHost.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/ScriptedHostEvents.hpp>
+#include <tests/SteppedDrainWait.hpp>
 
 namespace FastCache::Node::WorkerTierTesting
 {
@@ -55,6 +62,25 @@ class CountingDiscovery final: public Cc::IToolchainDiscovery
     int& _calls;
 };
 
+/// A machine whose compilers cannot be started at all: every spawn answers `NotSpawned`, which is
+/// a probe that did not RUN. So a survey concludes *none could be asked* -- which is not fatal and
+/// leaves the heartbeat running, serving nothing -- rather than ending the node.
+class NeverSpawnsRunner final: public Cc::IProcessRunner
+{
+  public:
+    /// @return A run that never started.
+    [[nodiscard]] Cc::CompileRun RunCaptureCombined(std::span<std::string const> /*argv*/) override
+    {
+        return Cc::CompileRun {};
+    }
+
+    /// @return A run that never started.
+    [[nodiscard]] Cc::CompileRun RunCaptureSplit(std::span<std::string const> /*argv*/) override
+    {
+        return Cc::CompileRun {};
+    }
+};
+
 /// A worker naming one compiler and its own scheduler, so nothing is spawned to start it.
 [[nodiscard]] inline NodeConfig Worker()
 {
@@ -69,7 +95,7 @@ class CountingDiscovery final: public Cc::IToolchainDiscovery
 struct WorkerTierFixture
 {
     FastCache::Testing::ScratchDirectory scratch { "fc-worker-tier" };
-    NullLogger logger;
+    CapturingLogger logger;
     AtomicMetricsSink metrics;
     Distributed::OpenMembership membership;
     FastCache::Testing::ScriptedHostAddresses addresses;
@@ -95,6 +121,41 @@ struct WorkerTierFixture
     /// Where the machine claims its scratch root; empty for the scratch directory itself. A case
     /// sets it to a path no debug-prefix-map rule can spell to watch the worker say so.
     std::filesystem::path scratchBase {};
+    /// The host, scripted: a case fires what the OS would have.
+    FastCache::Testing::ScriptedHostEvents hostEvents;
+    /// Run at each poll of `suspendWait`; empty for none. A case whose heartbeat thread runs may block
+    /// here -- boundedly, on the case's own thread -- for something that thread does, so no REAL
+    /// deadline races it: the suspend's budget is measured on the stepped clock below.
+    ///
+    /// **A poll may never happen**: the drain tests its predicate before its first sleep, so a
+    /// heartbeat that settles first leaves the hook unrun. And what a case can observe from here --
+    /// a log line -- precedes the heartbeat's `Settle`, so the drain's own `Drained`/`Ceiling` still
+    /// races that gap and must not be asserted.
+    std::function<void()> suspendPoll;
+    /// Where a suspend's bounded wait runs; a case reads how long it took by this clock.
+    FastCache::Testing::SteppedDrainWait suspendWait { [this] {
+        if (suspendPoll)
+            suspendPoll();
+    } };
+    /// Whether the machine's compilers cannot be started (`NeverSpawnsRunner`) rather than asked
+    /// for real -- how a case launches a heartbeat that serves nothing without ending the node.
+    bool compilersCannotRun = false;
+    /// What the heartbeat's scheduler dials answer, one frame per dial, read by the first `Start`.
+    /// EMPTY by default: a case that launches no heartbeat expects no dial at all, so any is a
+    /// `FAIL` in the fake's own voice -- which is how a case asserts that a host event dialled nobody
+    /// on the thread that delivered it.
+    std::vector<std::vector<std::byte>> heartbeatReplies {};
+
+    /// The dialer `Dialer()` builds from `heartbeatReplies`; reached through it, never directly.
+    std::optional<FastCache::Testing::ScriptedDialer> builtDialer;
+
+    /// @return How the heartbeat reaches a scheduler; built from `heartbeatReplies` at the first `Start`.
+    [[nodiscard]] FastCache::Testing::ScriptedDialer& Dialer()
+    {
+        if (!builtDialer.has_value())
+            builtDialer.emplace(heartbeatReplies);
+        return *builtDialer;
+    }
 
     /// Start a tier for `cfg` on a machine of sixteen cores.
     [[nodiscard]] std::expected<std::unique_ptr<WorkerTier>, std::string> Start()
@@ -104,7 +165,8 @@ struct WorkerTierFixture
             if (machineThrows)
                 throw std::filesystem::filesystem_error("temp_directory_path",
                                                         std::make_error_code(std::errc::no_such_file_or_directory));
-            return WorkerMachine { .runner = Cc::MakeProcessRunner(),
+            return WorkerMachine { .runner =
+                                       compilersCannotRun ? std::make_unique<NeverSpawnsRunner>() : Cc::MakeProcessRunner(),
                                    .host = Cc::MakeToolchainHost(),
                                    .discovery = std::make_unique<CountingDiscovery>(discoveryCalls),
                                    .claimant = MakeLockFileScratchClaimant(),
@@ -128,7 +190,10 @@ struct WorkerTierFixture
                                                    .leaseRoster = nullptr,
                                                    .metrics = metrics,
                                                    .logger = logger,
-                                                   .conditions = conditions },
+                                                   .conditions = conditions,
+                                                   .hostEvents = hostEvents,
+                                                   .suspendWait = suspendWait,
+                                                   .schedulerDialer = Dialer() },
                                  makeMachine);
     }
 };

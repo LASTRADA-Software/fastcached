@@ -31,6 +31,7 @@
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
+#include <tests/SteppedDrainWait.hpp>
 #include <tests/TicketFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -654,29 +655,6 @@ TEST_CASE("A window with nothing waiting renders as a reading and not as an empt
 namespace
 {
 
-/// A wait that advances its own clock by exactly what was requested and never blocks.
-///
-/// The pause a loop REQUESTS is exact and host-independent, which is what makes this
-/// assertable where a real sleep would only be slow.
-class InstantWait final: public IDrainWait
-{
-  public:
-    /// @return The accumulated instant.
-    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
-    {
-        return _now;
-    }
-
-    /// @param requested Added to the clock rather than slept.
-    void Sleep(std::chrono::milliseconds requested) noexcept override
-    {
-        _now += requested;
-    }
-
-  private:
-    core::platform::SteadyTimePoint _now {};
-};
-
 /// A seed answering `NotLeader` and naming where to go instead.
 /// @param leader The endpoint the reply names.
 /// @return The framed refusal.
@@ -740,7 +718,7 @@ TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[
         Rejected(),
     } };
 
-    InstantWait wait;
+    Testing::SteppedDrainWait wait;
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
     auto const outcome = RunEnrollClient(cfg, random, keyGuard, wait, dialer);
@@ -794,7 +772,7 @@ TEST_CASE("A consecutive redirect chain is still bounded", "[enrollment][client]
         RedirectTo("10.0.0.1:7000"),
     } };
 
-    InstantWait wait;
+    Testing::SteppedDrainWait wait;
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
     auto const outcome = RunEnrollClient(cfg, random, keyGuard, wait, dialer);
@@ -879,7 +857,7 @@ TEST_CASE("A joiner asks under the key it minted and believes a roster that reco
     auto const roster = WorkerRosterWith(joiner.id, joiner.key);
 
     Testing::ScriptedDialer dialer { { Recorded(), ApprovedWith(roster) } };
-    InstantWait wait;
+    Testing::SteppedDrainWait wait;
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
     auto const admitted = RunEnrollClient(joiner.cfg, random, keyGuard, wait, dialer);
@@ -917,7 +895,7 @@ TEST_CASE("A joiner handed a roster naming it under another key is not admitted"
     auto const joiner = MintJoiner(scratch.Path());
 
     Testing::ScriptedDialer dialer { { ApprovedWith(WorkerRosterWith(joiner.id, KeyOf(0x99))) } };
-    InstantWait wait;
+    Testing::SteppedDrainWait wait;
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
     auto const refused = RunEnrollClient(joiner.cfg, random, keyGuard, wait, dialer);
@@ -978,8 +956,11 @@ TEST_CASE("An enrollment command that reached a scheduler is never sent to anoth
     Testing::ScriptedDialer dialer { { std::vector<std::byte> { std::byte { 0xFF } } } };
     Testing::PresentsNothing nothing;
 
-    auto const approved = RunEnrollAdmin(
-        cfg, EnrollCommand { .action = EnrollAction::Approve, .subject = "n9", .key = Ed25519PublicKey {} }, nothing, dialer);
+    auto const approved =
+        RunEnrollAdmin(cfg,
+                       EnrollCommand { .action = EnrollAction::Approve, .subject = "n9", .key = Ed25519PublicKey {} },
+                       nothing,
+                       dialer);
 
     REQUIRE_FALSE(approved.has_value());
     INFO("refusal: " << approved.error());

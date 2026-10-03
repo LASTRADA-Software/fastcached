@@ -4,6 +4,7 @@
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/CompressionValues.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Platform/Firewall.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -697,6 +698,26 @@ namespace
                          "user (default) = a LaunchAgent in ~/Library/LaunchAgents, started at\n"
                          "login as you; system = a LaunchDaemon in /Library/LaunchDaemons,\n"
                          "started at boot as _fastcached (needs sudo)" },
+        // Targets the CliResult for `--service-scope`'s reason: how the supervisor
+        // starts the registration is the supervisor's record, never the daemon's.
+        { .primary = "--service-start",
+          .arity = Arity::Value,
+          .operand = "=<auto|manual>",
+          .apply = AssignFrom<&CliResult::serviceStart, ParseServiceStart>(),
+          .description = "how --install-service registers the job (default auto): auto starts\n"
+                         "with the machine, manual waits to be started (Windows demand-start,\n"
+                         "launchd without RunAtLoad). Install-time only. On macOS a manual\n"
+                         "system job is restarted after a crash but not after a clean non-zero\n"
+                         "exit: launchd's keep-alive would also start it at boot" },
+        // Targets the CliResult for `--service-scope`'s reason: it scopes what the install
+        // creates, and the daemon never reads it.
+        { .primary = "--firewall-allow",
+          .arity = Arity::Value,
+          .operand = "=<address[/prefix]>",
+          .apply = AppendFrom<&CliResult::firewallAllow, ParseFirewallScope>(),
+          .description = "limit the firewall rules --install-service creates to these remote\n"
+                         "addresses (IPv4 or IPv6, with an optional /prefix; repeatable).\n"
+                         "Omit it to allow any address; /0 is refused. Install-time only" },
         { .primary = "--migrate-storage",
           .select = SelectOutcome<&CliResult::outcome, CliOutcome::MigrateStorage>(),
           .description = "convert the store named by --storage to this build's on-disk record\n"
@@ -761,6 +782,8 @@ namespace
         { "--install-service", "a one-shot verb; a file would re-register at every start" },
         { "--uninstall-service", "a one-shot verb; a file would deregister at every start" },
         { "--service-scope", "install-time only, and not Config state at all" },
+        { "--service-start", "install-time only, and not Config state at all" },
+        { "--firewall-allow", "install-time only: it scopes the rules the install creates" },
         { "--migrate-storage", "a one-shot verb; a file would re-run the conversion at every start" },
         { "--healthcheck", "a one-shot verb: probe and exit, instead of serving" },
         { "--seed-config", "a one-shot installer step, and it INSTALLS the file this would come from" },

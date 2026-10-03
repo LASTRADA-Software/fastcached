@@ -708,7 +708,10 @@ if(WIN32)
     #
     # bcrypt: BCryptGenRandom, behind Core/ISecureRandom -- where every handshake nonce
     # and every minted node id comes from (#1527). PUBLIC for the same reason.
-    target_link_libraries(FastCache PUBLIC ws2_32 iphlpapi bcrypt)
+    #
+    # ole32 + oleaut32: COM and BSTRs, behind Platform/WindowsFirewall -- the
+    # INetFwPolicy2 rules a service registration opens and an uninstall removes.
+    target_link_libraries(FastCache PUBLIC ws2_32 iphlpapi bcrypt ole32 oleaut32)
     target_compile_definitions(FastCache PUBLIC
         WIN32_LEAN_AND_MEAN
         NOMINMAX
@@ -724,6 +727,16 @@ add_subdirectory(src/FastCache)
 # that gates each one. The shipped binaries are fastcached and fastcache-cc;
 # compile-cache-testclient is test infrastructure and is off by default.
 
+# The component every package's SHARED payload installs under: the docs, the licence, the VC++
+# runtime. On Windows that is the required Cli feature, so an operator deselecting a service
+# never deselects the files every feature needs; elsewhere it is the one Runtime payload.
+if(WIN32)
+    set(FASTCACHED_SHARED_COMPONENT "Cli")
+else()
+    set(FASTCACHED_SHARED_COMPONENT "Runtime")
+endif()
+set_property(GLOBAL APPEND PROPERTY FASTCACHED_FIRST_PARTY_COMPONENTS "${FASTCACHED_SHARED_COMPONENT}")
+
 add_subdirectory(src/apps)
 
 # ----------------------------------------------------------------------------
@@ -737,7 +750,7 @@ install(FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
         "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
     DESTINATION "${FASTCACHED_INSTALL_DOCDIR}"
-    COMPONENT Runtime
+    COMPONENT "${FASTCACHED_SHARED_COMPONENT}"
 )
 
 # ----------------------------------------------------------------------------

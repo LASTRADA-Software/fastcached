@@ -182,6 +182,11 @@ std::string DescribeNodeStateDirectory(NodeConfig const& cfg)
     return std::format("{} ({})", chosen->path.string(), DescribeStateDirectoryOrigin(chosen->origin));
 }
 
+std::string DescribeIdentityOrigin(NodeConfig const& cfg)
+{
+    return std::format("state-directory {}\n", DescribeNodeStateDirectory(cfg));
+}
+
 IdentityNeed NodeIdentityNeed(NodeConfig const& cfg) noexcept
 {
     // Every node holds an identity key now, and the id travels with it (#178): a consensus

@@ -172,6 +172,29 @@ void Settle(Peer& a, Peer& b, int rounds)
 }
 } // namespace
 
+TEST_CASE("A discovery bind failure names the reply socket by its port kind", "[node][discovery]")
+{
+    // Both sockets named, since either can be the one that failed; the reply socket spelled as the
+    // worksheet spells it, never read back from the flag.
+    auto const beacon = SurfaceEndpoint { .host = "0.0.0.0", .port = 6681, .role = "beacon" };
+
+    auto const kernelChosen = DiscoveryBindFailure(
+        beacon,
+        SurfaceEndpoint { .host = "0.0.0.0", .port = 0, .portKind = SurfacePortKind::KernelChosen, .role = "reply" },
+        "address in use");
+    CHECK(kernelChosen
+          == "cannot bind the UDP sockets discovery needs: 0.0.0.0:6681 to listen on, and 0.0.0.0:* to answer on, "
+             "port chosen by the kernel at bind (address in use)");
+
+    auto const pinned = DiscoveryBindFailure(
+        beacon,
+        SurfaceEndpoint { .host = "0.0.0.0", .port = 6682, .portKind = SurfacePortKind::Fixed, .role = "reply" },
+        "address in use");
+    CHECK(pinned
+          == "cannot bind the UDP sockets discovery needs: 0.0.0.0:6681 to listen on, and 0.0.0.0:6682 to answer on "
+             "(address in use)");
+}
+
 TEST_CASE("Two nodes the roster knows find and prove each other", "[node][discovery]")
 {
     // The whole handshake, driven by hand: no threads, no sleeps, and a failure

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeIdentity.hpp"
 #include "NodeMembership.hpp"
 #include "NodeRoster.hpp"
 
@@ -292,6 +293,40 @@ TEST_CASE("A worker other machines can reach refuses to start holding no roster 
     // roster arrives, which is a state it can leave.
     cfg.voterKeys = Anchors();
     CHECK(NodeRoster::Build(cfg, clock, metrics, logger).has_value());
+}
+
+TEST_CASE("A worker started with no configuration reads the roster its enrollment kept in the default directory",
+          "[node][roster]")
+{
+    // An enrolled worker names no `--voter-key` and no `--cluster-dir`: the roster its enrollment
+    // kept, in the state directory the start resolved (`EnrollClient` saves it there), is its only
+    // trust root. Asked of the typed flag alone, nothing was read, and a worker other machines
+    // can reach was refused as holding no roster at all.
+    auto const scratch = Testing::ScratchDirectory { "node-roster-default-dir" };
+    auto cfg = NetworkFacingWorker();
+    REQUIRE(cfg.clusterDir.empty());
+    REQUIRE(cfg.voterKeys.empty());
+    cfg.stateDirectory = NodeStateDirectoryChoice { .path = scratch.Path(), .origin = StateDirectoryOrigin::PerUser };
+    core::platform::ManualWallClock const clock { Noon };
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+
+    // The control first: the same configuration with nothing kept is the refusal.
+    auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == RosterlessWorkerRefusal);
+
+    // Kept where an enrollment keeps it.
+    REQUIRE(Distributed::FileRosterStore { NodeStateDirectory(cfg) / Distributed::RosterFileName }
+                .Save(Cluster::PersistedRoster { .certificate = Certified(ThreeVoters(), 3, { "n1", "n2" }),
+                                                 .certifiedUntil = Noon + 1h })
+                .has_value());
+    auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
+    REQUIRE(roster.has_value());
+    auto& node = *Testing::Unwrap(roster);
+    REQUIRE(node.Lease() != nullptr);
+    CHECK(node.Lease()->Read(Noon).standing == Distributed::RosterStanding::Current);
+    CHECK(node.Lease()->KeysOf("n2").live == TestKeyPair("n2").PublicKey());
 }
 
 TEST_CASE("Whether a worker must hold a roster is its mode's row, under every mode", "[node][roster][formation][mode]")

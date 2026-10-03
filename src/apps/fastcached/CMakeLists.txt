@@ -6,5 +6,5 @@ target_link_libraries(fastcached PRIVATE FastCache)
 
 install(TARGETS fastcached
     RUNTIME DESTINATION "${FASTCACHED_INSTALL_BINDIR}"
-    COMPONENT Runtime
+    COMPONENT "${FASTCACHED_APP_COMPONENT}"
 )

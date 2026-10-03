@@ -66,12 +66,14 @@ add_executable(fastcache-compile-node
     SessionResponder.cpp
     ScratchClaim.cpp
     LocalCache.cpp
+    HostEventInbox.cpp
     NodeAnnounce.cpp
     NodePresenceTier.cpp
     NodeRoster.cpp
     NodeConditions.cpp
     NodeConfig.cpp
     NodeDefaults.cpp
+    NodeFirewall.cpp
     NodeFormation.cpp
     NodeReload.cpp
     NodeFrameSurface.cpp
@@ -115,7 +117,7 @@ endif()
 
 install(TARGETS fastcache-compile-node
     RUNTIME DESTINATION "${FASTCACHED_INSTALL_BINDIR}"
-    COMPONENT Runtime
+    COMPONENT "${FASTCACHED_APP_COMPONENT}"
 )
 
 # The node's own unit tests. AdminEndpoint and SchedulerEndpoint are
@@ -165,6 +167,8 @@ if(FASTCACHED_BUILD_TESTS)
         NodeProofResponder_test.cpp
         EnrollTrap_test.cpp
         ExchangeLog_test.cpp
+        HostEventInbox.cpp
+        HostEventInbox_test.cpp
         NodeAnnounce_test.cpp
         NodeAudience_test.cpp
         NodePresenceTier_test.cpp
@@ -217,6 +221,8 @@ if(FASTCACHED_BUILD_TESTS)
         NodeStateFiles.cpp
         NodeStateFiles_test.cpp
         RaftKeyRevocation_test.cpp
+        NodeFirewall.cpp
+        NodeFirewall_test.cpp
         NodeSurfaces.cpp
         NodeSurfaces_test.cpp
         NodeMembership_test.cpp

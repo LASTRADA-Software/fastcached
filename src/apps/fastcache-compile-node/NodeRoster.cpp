@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeIdentity.hpp"
 #include "NodeRoster.hpp"
 #include "NodeStateFiles.hpp"
 
@@ -25,12 +26,14 @@ std::expected<std::unique_ptr<NodeRoster>, std::string> NodeRoster::Build(NodeCo
 
     // What an earlier run adopted, when this node keeps a state directory. Read BEFORE the
     // anchors are considered: once a roster has been adopted it is the trust root, and the
-    // anchors are never read again.
+    // anchors are never read again. The directory is the one the node keeps, typed or the
+    // default its start resolved: an enrollment writes the roster there (`EnrollClient`), and a
+    // node started with no configuration that asked only the typed flag never read it back.
     auto kept = std::optional<Cluster::PersistedRoster> {};
     auto store = std::unique_ptr<Distributed::IRosterStore> {};
-    if (!cfg.clusterDir.empty())
+    if (auto const chosen = ChosenStateDirectory(cfg); chosen.has_value())
     {
-        auto const path = cfg.clusterDir / Distributed::RosterFileName;
+        auto const path = chosen->path / Distributed::RosterFileName;
         auto loaded = Distributed::LoadPersistedRoster(path);
         if (!loaded.has_value())
             return std::unexpected { std::format("{}{}", loaded.error(), StateFileUnreadableHint(path)) };

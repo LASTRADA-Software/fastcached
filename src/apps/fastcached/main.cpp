@@ -35,6 +35,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/Firewall.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
@@ -1439,23 +1440,38 @@ int main(int argc, char const* const* argv)
         // it -- so the handover is where that is refused, once, for every producer
         // of an owned path rather than for this one.
         if (!effective.storagePath.empty()
-            && !std::ranges::contains(spec.ownedPaths, std::filesystem::path { effective.storagePath }))
-            spec.ownedPaths.emplace_back(effective.storagePath);
+            && !std::ranges::contains(
+                spec.ownedPaths, std::filesystem::path { effective.storagePath }, &FastCache::OwnedPath::path))
+            spec.ownedPaths.push_back(FastCache::OwnedPath {
+                .path = effective.storagePath, .privacy = FastCache::PathPrivacy::Shared, .credentialFiles = {} });
+        // The firewall follows the registration: opened for what the MERGED configuration binds
+        // beyond loopback -- `effective`, for the storage handover's reason above: it adds rules,
+        // never a flag -- and closed on removal once the delete succeeded or found no
+        // registration, never after a refused one (`WithRemovalFirewall`). The registration is
+        // the argument, so it has happened before the firewall is asked.
+        auto const firewall = FastCache::MakeSystemFirewall();
         auto const result = parsed->outcome == FastCache::CliOutcome::InstallService
-                                ? FastCache::InstallService(spec, parsed->serviceScope)
-                                : FastCache::UninstallService(spec, parsed->serviceScope);
-        if (result.exitCode == 0)
+                                ? FastCache::WithRegistrationFirewall(
+                                      FastCache::InstallService(spec, parsed->serviceScope),
+                                      firewall.get(),
+                                      spec.serviceName,
+                                      FastCache::DaemonFirewallRules(effective, spec.exePath, parsed->firewallAllow))
+                                : FastCache::WithRemovalFirewall(FastCache::UninstallService(spec, parsed->serviceScope),
+                                                                 firewall.get(),
+                                                                 spec.serviceName);
+        if (result.ExitCode() == 0)
             std::println("fastcached: {}", result.message);
         else
             std::println(std::cerr, "fastcached: {}", result.message);
-        return result.exitCode;
+        return result.ExitCode();
     }
 
     std::unique_ptr<FastCache::IDaemonHost> host;
     if (effective.daemon)
     {
 #if defined(_WIN32)
-        host = FastCache::MakeWindowsServiceHost(effective.serviceName);
+        host = FastCache::MakeWindowsServiceHost(
+            effective.serviceName, FastCache::ServiceHostOptions { .stop = FastCache::StopPendingPlanFor(std::nullopt) });
 #else
         // `/`, stated rather than defaulted. This daemon executes nothing, so no
         // path-mapping rule is ever derived from its working directory and the

@@ -5,6 +5,8 @@
 #include <FastCache/Core/BoundedDrain.hpp>
 
 #include <chrono>
+#include <mutex>
+#include <utility>
 
 namespace FastCache::Node
 {
@@ -113,11 +115,23 @@ HeartbeatWake CompileCapacity::WaitForHeartbeat(std::stop_token const& stop,
     // calling it `CordonChanged` would credit a wake that never happened.
     auto const deadline = std::chrono::steady_clock::now() + interval;
     auto guard = std::unique_lock { _drainMutex };
-    auto const moved = _cordonMoved.wait_until(
-        guard, stop, deadline, [this, announced] { return _cordoned.load(std::memory_order_acquire) != announced; });
+    auto const woken = _cordonMoved.wait_until(guard, stop, deadline, [this, announced] {
+        return _cordoned.load(std::memory_order_acquire) != announced || _wakeRequested;
+    });
     if (stop.stop_requested())
         return HeartbeatWake::Stopped;
-    return moved && std::chrono::steady_clock::now() < deadline ? HeartbeatWake::CordonChanged : HeartbeatWake::Elapsed;
+    if (std::exchange(_wakeRequested, false))
+        return HeartbeatWake::HostEvent;
+    return woken && std::chrono::steady_clock::now() < deadline ? HeartbeatWake::CordonChanged : HeartbeatWake::Elapsed;
+}
+
+void CompileCapacity::WakeHeartbeat() noexcept
+{
+    {
+        std::scoped_lock const guard { _drainMutex };
+        _wakeRequested = true;
+    }
+    _cordonMoved.notify_all();
 }
 
 bool CompileCapacity::IsCordoned() const noexcept

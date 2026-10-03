@@ -2783,6 +2783,46 @@ set_tests_properties("wix-fragment" PROPERTIES
     TIMEOUT 60
 )
 
+# The same fragment's service table, element by element: the guards on the action
+# that deletes a leftover registration, the clear-then-set feature properties, and
+# that every condition reading one compares it with "1". Pinned in the source because
+# only the Windows packaging job ever runs the package, and a lost clause still builds.
+add_test(
+    NAME "wix-service-table"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-wix-service-table.cmake"
+)
+set_tests_properties("wix-service-table" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# What the Windows packaging job asserts that service table THROUGH: the expected rows,
+# the verdict on one service, the bounded wait, the package reader and the log checks
+# (scripts/lib/MsiServiceTable.psm1). Only that job runs a package, so a helper that
+# could not say "wrong" would pass every transaction there unseen. This drives each one
+# in both directions against the real service control manager and an MSI database it
+# creates, and installs nothing. Windows only: those two exist nowhere else.
+if(WIN32 AND FASTCACHED_PWSH)
+    add_test(
+        NAME "msi-service-table-selftest"
+        COMMAND "${FASTCACHED_PWSH}" -NoProfile -Command
+                "Import-Module '${CMAKE_SOURCE_DIR}/scripts/lib/MsiServiceTable.psm1'; Invoke-MsiServiceTableSelfTest"
+    )
+    set_tests_properties("msi-service-table-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+elseif(WIN32)
+    fastcached_register_skipped_test("msi-service-table-selftest"
+        "no PowerShell 7 interpreter found (pwsh, pwsh-preview), so the MSI service table helpers were not exercised on this host")
+else()
+    fastcached_register_skipped_test("msi-service-table-selftest"
+        "not Windows: the MSI service table helpers read the service control manager and Windows Installer")
+endif()
+
 # ---------------------------------------------------------------------------
 # The operator port docs against `NodeSurfaceTable()`. Fails when a document
 # claims a surface the table does not declare, omits one it does, or states a
@@ -5717,6 +5757,41 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-crypto-seam-selftest.cmake"
 )
 set_tests_properties("crypto-seam-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
+# Exactly one first-party file opens a UDP socket: `DiscoveryTier.cpp`. The compile node's
+# Windows firewall rule for a kernel-chosen discovery reply port admits EVERY local UDP port of
+# the program (`discovery-reply udp/any`), so "it exposes discovery alone" -- which the docs and
+# the rulebook say -- holds only while discovery is the only UDP socket there is. The permitted
+# row is the positive control: it must be seen opening one, or it is refused as stale.
+add_test(
+    NAME "udp-opener"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-udp-opener.cmake"
+)
+set_tests_properties("udp-opener" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And it must be SEEN to refuse a second opener through each primitive it names, to stay quiet
+# over a comment, a test file and a vendored file, and to refuse a stale row and an empty tree --
+# by directory walk and by a staged git index. It prints how many cases ran.
+add_test(
+    NAME "udp-opener-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/udp-opener-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-udp-opener-selftest.cmake"
+)
+set_tests_properties("udp-opener-selftest" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 180

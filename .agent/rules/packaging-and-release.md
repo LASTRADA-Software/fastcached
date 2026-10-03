@@ -44,10 +44,11 @@ installer pane, the version derivation, or the release job's asset list.
   13.3 (the floor at which the system libc++ has floating-point `std::to_chars`,
   which `std::format` needs) and must be set *before* `project()`.
 - **A new installed binary is not one CMake row: the three packaging jobs name
-  their build targets EXPLICITLY, and CPack installs the whole Runtime
-  component.** So a target carrying an `install()` rule that no packaging job
-  builds fails at INSTALL time rather than at build time, on every platform at
-  once:
+  their build targets EXPLICITLY, and CPack installs every packaged component --
+  on Windows one per application (the app table's COMPONENT column, each an MSI
+  feature), elsewhere every app in the one Runtime component.** So a target carrying an
+  `install()` rule that no packaging job builds fails at INSTALL time rather than
+  at build time, on every platform at once:
 
   ```
   file INSTALL cannot find ".../target/fastcache-cli": No such file or directory
@@ -76,6 +77,18 @@ installer pane, the version derivation, or the release job's asset list.
   packaging job's target list from the installed set is
   [#1202](https://github.com/LASTRADA-Software/fastcached/issues/1202); until it
   exists, the list above is the whole of it.
+- **One install component per application on Windows, one payload everywhere else.** The app
+  table in `src/apps/CMakeLists.txt` carries each app's COMPONENT; on Windows it is an MSI
+  feature (`CM_C_<component>`, declared from `FASTCACHED_WINDOWS_FEATURES`), and the shared
+  payload (docs, licence, VC++ runtime -- `FASTCACHED_SHARED_COMPONENT`) rides the REQUIRED Cli
+  feature, as does `PATH`, which attached to a deselectable feature left every binary
+  unreachable by name once it was deselected. Off Windows every app installs under Runtime, so
+  the .deb, .rpm and .pkg payloads are meant to be unchanged; a listing diff of each package
+  against the previous release's is what shows it. `cmake/Packaging.cmake` refuses a
+  first-party component no generator packages -- blind, and failing OPEN, to an app whose table
+  row carries `-` and later gains an `install()` rule. A silent first install names its
+  features, and the documented ones and the `package-windows` steps list `CM_C_Cli` beside what
+  they add.
 
 ## The version
 

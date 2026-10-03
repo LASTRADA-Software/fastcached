@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Markup.hpp>
 #include <FastCache/Core/PathKind.hpp>
 #include <FastCache/Core/Utf8.hpp>
+#include <FastCache/Platform/FileTrust.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <algorithm>
@@ -12,6 +15,7 @@
 #include <chrono>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <memory>
@@ -21,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <core/Ranges.hpp>
@@ -93,6 +98,31 @@ std::filesystem::path CurrentExecutablePath()
 
 namespace
 {
+    /// Every spelling a table accepts, joined the way a refusal lists them: `a or b`,
+    /// `a, b or c`.
+    ///
+    /// Read off the table rather than written into each message, so a row added later
+    /// is named by the refusal of the flag it widens without anybody editing the text.
+    /// @param rows The table.
+    /// @param name The member holding each row's spelling.
+    /// @return The joined spellings; empty for an empty table.
+    template <typename Rows, typename Row>
+    [[nodiscard]] std::string AcceptedSpellings(Rows const& rows, std::string_view Row::* name)
+    {
+        std::string joined;
+        auto remaining = std::ranges::size(rows);
+        for (auto const& row: rows)
+        {
+            joined += row.*name;
+            --remaining;
+            if (remaining > 1)
+                joined += ", ";
+            else if (remaining == 1)
+                joined += " or ";
+        }
+        return joined;
+    }
+
     /// CLI spelling of a LogLevel, matching the values ParseLogLevel accepts.
     [[nodiscard]] constexpr std::string_view LogLevelName(LogLevel level) noexcept
     {
@@ -392,9 +422,11 @@ ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, CliResul
     // argv[0] is the executable, which the spec holds in its own field.
     argv.erase(argv.begin());
 
-    std::vector<std::filesystem::path> owned;
+    // Shared, as it always was: what the daemon keeps there is its clients' data, not a
+    // credential it proves itself with.
+    std::vector<OwnedPath> owned;
     if (!cfg.storagePath.empty())
-        owned.emplace_back(cfg.storagePath);
+        owned.push_back(OwnedPath { .path = cfg.storagePath, .privacy = PathPrivacy::Shared, .credentialFiles = {} });
 
     return ServiceSpec { .serviceName = cfg.serviceName,
                          .exePath = exePath,
@@ -414,6 +446,7 @@ ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, CliResul
                          // service (#396). Named per default now, so the coincidence
                          // is written down rather than relied on.
                          .acceptedScopeDefaults = ScopeDefaults({ ScopeDefault::ConfigPath, ScopeDefault::StoragePath }),
+                         .startMode = cli.serviceStart,
                          .configPath = cfg.configPath,
                          // Where the daemon's own files are looked up: a machine-wide
                          // fastcached.yaml it probes at every start, and a per-user
@@ -850,11 +883,12 @@ std::expected<ServiceScope, ConfigError> ParseServiceScope(std::string_view text
     if (auto const* const traits = core::findOrNull(ScopeTable, text, &ScopeTraits::name))
         return traits->scope;
 
-    return std::unexpected(
-        ConfigError { .code = ConfigErrorCode::ParseError,
-                      .source = "argv",
-                      .field = {},
-                      .context = std::format("unknown service scope '{}'; expected user or system", text) });
+    return std::unexpected(ConfigError { .code = ConfigErrorCode::ParseError,
+                                         .source = "argv",
+                                         .field = {},
+                                         .context = std::format("unknown service scope '{}'; expected {}",
+                                                                text,
+                                                                AcceptedSpellings(ScopeTable, &ScopeTraits::name)) });
 }
 
 std::string_view ServiceScopeName(ServiceScope scope) noexcept
@@ -906,9 +940,14 @@ std::string BuildLaunchdPlist(ServiceSpec const& spec, ServiceScope scope, std::
     out += "<dict>\n";
     out += std::format("    <key>Label</key>\n    <string>{}</string>\n", EscapeMarkup(label));
     out += std::format("    <key>ProgramArguments</key>\n    <array>\n{}    </array>\n", arguments);
-    out += "    <key>RunAtLoad</key>\n    <true/>\n";
+    auto const& start = ServiceStartRowOf(spec.startMode);
+    out += std::format("    <key>RunAtLoad</key>\n    <{}/>\n", start.runAtLoad ? "true" : "false");
 
-    if (traits.alwaysKeepAlive)
+    // Both halves, and the second is `runAtLoad` rather than a column of its own:
+    // launchd starts an unconditionally kept-alive job the moment it is loaded, so
+    // `KeepAlive = true` IS run-at-load. A job that must wait to be started takes the
+    // restart-on-crash form even in a scope that would keep it alive unconditionally.
+    if (traits.alwaysKeepAlive && start.runAtLoad)
         out += "    <key>KeepAlive</key>\n    <true/>\n";
     else
         out += "    <key>KeepAlive</key>\n    <dict>\n"
@@ -1052,7 +1091,299 @@ namespace
 
     static_assert(RowsInEnumeratorOrder(ScopeDefaultRows, [](ScopeDefaultRow const& row) { return row.which; }),
                   "every ScopeDefault needs a row, at its own index");
+
+    /// Every start mode, one row per enumerator: what each supervisor records for it.
+    constexpr auto ServiceStartRows = EnumTable<ServiceStart, ServiceStartRow> { {
+        { .start = ServiceStart::Auto,
+          .name = "auto",
+          .scmStartType = 2,
+          .runAtLoad = true,
+          .startsAtInstall = true,
+          .described = "auto-start" },
+        // Manual costs one restart case on macOS, and it is the price of being manual:
+        // a system-scope job is not restarted after a CLEAN non-zero exit (a lost port,
+        // a refused configuration). Restarting on that needs `KeepAlive = true`, which
+        // launchd also reads as "start at load" -- the one thing this mode declines -- so
+        // the job keeps only the restart-on-crash form, which answers a signal alone.
+        // The SCM has no such coupling: its failure actions apply to either start type.
+        { .start = ServiceStart::Manual,
+          .name = "manual",
+          .scmStartType = 3,
+          .runAtLoad = false,
+          .startsAtInstall = false,
+          .described = "manual start" },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(ServiceStartRows, [](ServiceStartRow const& row) { return row.start; }),
+                  "every ServiceStart needs a row, at its own index");
+
+    /// Every `CreateService` error an install answers other than by reporting it, plus
+    /// the one it refuses on purpose. An error with no row is refused.
+    constexpr auto CreateRefusalRows = std::to_array<CreateRefusalRow>({
+        { .win32Error = 1073,
+          .step = CreateRefusalStep::Reconfigure,
+          .why = "an upgrade or a repair keeps the registration, so the next install meets it" },
+        { .win32Error = 1072,
+          .step = CreateRefusalStep::AwaitDeletion,
+          .why = "an older MSI deletes without waiting for the stop; the SCM finishes once the process exits" },
+        { .win32Error = 1078,
+          .step = CreateRefusalStep::Refuse,
+          .why = "another service displays this name; taking it over would rename somebody else's service" },
+    });
+
+    /// `ERROR_ACCESS_DENIED`, spelled as a number for the same reason the table's errors are.
+    constexpr std::uint32_t Win32AccessDenied = 5;
+
+    /// Standard "needs elevation" guidance reused across SCM error paths.
+    [[nodiscard]] std::string ElevationHint(std::string_view action)
+    {
+        return std::format("access denied {}; run from an elevated (Administrator) prompt", action);
+    }
 } // namespace
+
+#if defined(_WIN32)
+static_assert(SERVICE_AUTO_START == 2 && SERVICE_DEMAND_START == 3,
+              "ServiceStartRows spells the SCM start types as numbers so the table is portable");
+static_assert(ERROR_SERVICE_EXISTS == 1073 && ERROR_SERVICE_MARKED_FOR_DELETE == 1072 && ERROR_DUPLICATE_SERVICE_NAME == 1078
+                  && ERROR_ACCESS_DENIED == Win32AccessDenied,
+              "CreateRefusalRows spells the Win32 errors as numbers so the table is portable");
+#endif
+
+std::span<CreateRefusalRow const> CreateRefusalTable() noexcept
+{
+    return CreateRefusalRows;
+}
+
+CreateRefusalStep CreateRefusalStepFor(std::uint32_t win32Error) noexcept
+{
+    auto const* const row = core::findOrNull(CreateRefusalRows, win32Error, &CreateRefusalRow::win32Error);
+    return row != nullptr ? row->step : CreateRefusalStep::Refuse;
+}
+
+ScmRegistration RegisterWithScm(IScmRegistrar& registrar, IDrainWait& wait)
+{
+    auto error = registrar.Create();
+
+    // A registration still being deleted is waited out, never raced: the SCM finishes the
+    // delete when the old process exits, and until then CreateService answers 1072. The
+    // wait is timed by the seam that paces it, so the message can say what it cost.
+    std::optional<std::chrono::milliseconds> waited;
+    if (CreateRefusalStepFor(error) == CreateRefusalStep::AwaitDeletion)
+    {
+        auto const began = wait.Now();
+        (void) DrainWithin(
+            [&] {
+                error = registrar.Create();
+                return CreateRefusalStepFor(error) == CreateRefusalStep::AwaitDeletion;
+            },
+            MarkedForDeletionBound,
+            wait);
+        waited = std::chrono::duration_cast<std::chrono::milliseconds>(wait.Now() - began);
+    }
+
+    if (error == 0)
+        return { .outcome = ScmRegistrationOutcome::Created, .win32Error = 0, .deletionWaited = waited };
+
+    if (CreateRefusalStepFor(error) == CreateRefusalStep::Reconfigure)
+        error = registrar.Reapply();
+    auto const outcome = error != 0 ? ScmRegistrationOutcome::Failed : ScmRegistrationOutcome::Reapplied;
+    return { .outcome = outcome, .win32Error = error, .deletionWaited = waited };
+}
+
+std::string ScmRegistrationFailureMessage(ScmRegistration const& registration, std::string_view serviceName)
+{
+    if (registration.win32Error == Win32AccessDenied)
+        return ElevationHint("registering the service");
+
+    if (CreateRefusalStepFor(registration.win32Error) == CreateRefusalStep::AwaitDeletion)
+    {
+        // Only a wait that RAN is reported, at what it measured. A reconfigure can meet a
+        // deletion that began after its create looked, and then nothing was waited for.
+        auto const observed = registration.deletionWaited
+                                  ? std::format("was still being deleted after {:.1f} s",
+                                                std::chrono::duration<double> { *registration.deletionWaited }.count())
+                                  : std::string { "is being deleted" };
+        return std::format(
+            "service '{}' {}; stop the process that holds it and run the install again", serviceName, observed);
+    }
+
+    return std::format("registering service '{}' failed (error {})", serviceName, registration.win32Error);
+}
+
+std::string ScmInstallSuccessMessage(ScmRegistrationOutcome outcome,
+                                     std::string_view serviceName,
+                                     std::string_view startDescribed,
+                                     std::string_view warnings)
+{
+    // A re-applied service may be running the registration it replaced -- the SCM reads
+    // one only at a start -- so it is never told to "start it now" as if it were new.
+    if (outcome == ScmRegistrationOutcome::Reapplied)
+        return std::format("updated the registration of service '{0}' ({1}); it takes effect at the service's next "
+                           "start -- if it is running, restart it with: net stop {0} && net start {0}, otherwise "
+                           "start it with: sc start {0}{2}",
+                           serviceName,
+                           startDescribed,
+                           warnings);
+
+    return std::format(
+        "installed service '{0}' ({1}); start it now with: sc start {0}{2}", serviceName, startDescribed, warnings);
+}
+
+OwnedPathsHandedOver HandOverOwnedPaths(std::span<OwnedPath const> paths, IOwnedPathHandover& handover)
+{
+    OwnedPathsHandedOver result;
+    for (auto const& owned: paths)
+    {
+        if (owned.privacy == PathPrivacy::Shared)
+        {
+            if (auto const denial = handover.Share(owned.path))
+                result.warnings += std::format("\nwarning: {}", *denial);
+            continue;
+        }
+
+        // Nothing after a refusal is touched: the install is not going ahead, and a path
+        // handed over for a service that will not be registered is a change nobody asked for.
+        if (auto const denial = handover.Seclude(owned.path, owned.credentialFiles))
+        {
+            result.refusal = std::format("{} holds a credential the service mints, and it could not be given an "
+                                         "access list of its own: {}; other local accounts could read it, so the "
+                                         "install is refused",
+                                         owned.path.string(),
+                                         *denial);
+            break;
+        }
+    }
+    return result;
+}
+
+std::string RefusedInstallMessage(std::string_view refusal, std::string_view serviceName, RefusedRegistration registration)
+{
+    switch (registration)
+    {
+        case RefusedRegistration::NotMade:
+            return std::format("{}; nothing was registered -- resolve that and run the install again", refusal);
+        case RefusedRegistration::Removed:
+            return std::format("{}; the registration of service '{}' this install had created was removed again, so "
+                               "nothing starts it -- resolve that and run the install again",
+                               refusal,
+                               serviceName);
+        case RefusedRegistration::NotRemoved:
+            return std::format("{0}; the registration of service '{1}' this install had created could NOT be removed "
+                               "-- remove it before anything starts it, with: sc delete {1}",
+                               refusal,
+                               serviceName);
+        case RefusedRegistration::Kept:
+            return std::format("{0}; service '{1}' was registered before and its re-applied registration is left in "
+                               "place -- resolve that and run the install again before '{1}' next starts",
+                               refusal,
+                               serviceName);
+    }
+    return std::string { refusal };
+}
+
+std::vector<FirewallRule> DaemonFirewallRules(Config const& cfg,
+                                              std::filesystem::path const& program,
+                                              std::vector<std::string> const& allow)
+{
+    // The endpoints the daemon binds: its listener list, or the single bind it collapses to
+    // when there is none -- the collapse `main.cpp` makes before it serves.
+    auto const listeners =
+        cfg.binds.empty()
+            ? std::vector<BindConfig> { BindConfig { .address = cfg.bindAddress, .port = cfg.port, .tls = cfg.tlsEnabled } }
+            : cfg.binds;
+
+    /// One endpoint the daemon would open, and what a rule name calls it.
+    struct Opening
+    {
+        std::string_view surface; ///< How the rule name spells the surface.
+        std::string_view host;    ///< The address it binds.
+        std::uint16_t port {};    ///< The port it binds.
+    };
+    std::vector<Opening> openings;
+    openings.reserve(listeners.size() + 1);
+    for (auto const& bind: listeners)
+        openings.push_back(Opening { .surface = "cache", .host = bind.address, .port = bind.port });
+    if (cfg.metricsEnabled)
+        openings.push_back(Opening { .surface = "metrics", .host = cfg.metricsBindAddress, .port = cfg.metricsPort });
+
+    std::vector<FirewallRule> rules;
+    for (auto const& opening: openings)
+    {
+        // Brackets off first: `--bind=[::1]` keeps them, and `[::1]` is loopback spelled for a URL.
+        // A NAME is not stripped of anything and stays what `IsLoopbackHost` says it is -- not
+        // loopback, `localhost` included -- so it gets a rule, and the install's note says why.
+        if (IsLoopbackHost(HostOfEndpoint(opening.host)))
+            continue;
+        // Every listener here is bound to the port it was configured with.
+        auto const localPort = FirewallLocalPort { .kind = FirewallPortKind::Fixed, .number = opening.port };
+        rules.push_back(
+            FirewallRule { .name = FirewallRuleName(cfg.serviceName, opening.surface, FirewallProtocol::Tcp, localPort),
+                           .group = FirewallGroupFor(cfg.serviceName),
+                           .program = program,
+                           .serviceName = cfg.serviceName,
+                           .protocol = FirewallProtocol::Tcp,
+                           .localPort = localPort,
+                           .remoteAddresses = allow,
+                           .bindHost = std::string { opening.host } });
+    }
+    return rules;
+}
+
+ServiceControlResult WithRegistrationFirewall(ServiceControlResult registered,
+                                              IFirewall* firewall,
+                                              std::string_view serviceName,
+                                              std::span<FirewallRule const> rules)
+{
+    // A registration that failed leaves the firewall as it found it: there is no service for a
+    // rule to admit, and a failed install is re-run rather than half-kept.
+    if (registered.outcome != ServiceControlOutcome::Done)
+        return registered;
+    registered.message += RegistrationFirewallNote(firewall, serviceName, rules);
+    return registered;
+}
+
+ServiceControlResult WithRemovalFirewall(ServiceControlResult removed, IFirewall* firewall, std::string_view serviceName)
+{
+    // Only once no registration remains -- deleted now, or never there -- and never after a
+    // deletion that was refused: that service is still installed, and removing its rules (or
+    // telling the operator how to) closes the ports of a service that keeps running. The event
+    // source follows the same rule, removed only after `DeleteService` succeeded.
+    if (removed.outcome == ServiceControlOutcome::Failed)
+    {
+        if (firewall != nullptr)
+            removed.message += "\nfirewall: any rules of this service are left in place, since the service may still "
+                               "be registered; they are removed by an uninstall that succeeds";
+        return removed;
+    }
+    // Whatever the firewall answers, the exit code stays the deletion's: the operator asked for
+    // the service to go, and an MSI uninstall must not fail over a firewall rule. A rule
+    // outliving its service admits nothing -- and one the firewall would not remove is named.
+    removed.message += RemovalFirewallNote(firewall, serviceName);
+    return removed;
+}
+
+std::span<ServiceStartRow const> ServiceStartTable() noexcept
+{
+    return ServiceStartRows;
+}
+
+ServiceStartRow const& ServiceStartRowOf(ServiceStart start) noexcept
+{
+    return ServiceStartRows[static_cast<std::size_t>(start)];
+}
+
+std::expected<ServiceStart, ConfigError> ParseServiceStart(std::string_view text)
+{
+    if (auto const* const row = core::findOrNull(ServiceStartRows, text, &ServiceStartRow::name))
+        return row->start;
+
+    return std::unexpected(ConfigError {
+        .code = ConfigErrorCode::ParseError,
+        .source = "argv",
+        .field = {},
+        .context = std::format(
+            "unknown start mode '{}'; expected {}", text, AcceptedSpellings(ServiceStartRows, &ServiceStartRow::name)) });
+}
 
 std::span<ScopeDefaultRow const> ScopeDefaultTable() noexcept
 {
@@ -1145,7 +1476,7 @@ ServiceSpec WithScopeDefaults(ServiceSpec spec,
         // spelling.
         auto const storage = home / std::format("Library/Caches/{}/cache", spec.applicationName);
         spec.arguments.push_back(std::format("--storage={}", storage.string()));
-        spec.ownedPaths.emplace_back(storage);
+        spec.ownedPaths.push_back(OwnedPath { .path = storage, .privacy = PathPrivacy::Shared, .credentialFiles = {} });
     }
 
     // The daemon would find this file on its own -- it is the machine-wide
@@ -1306,12 +1637,6 @@ std::string LaunchctlStatusText(LaunchctlReadings const& readings)
 
 namespace
 {
-    /// Standard "needs elevation" guidance reused across SCM error paths.
-    [[nodiscard]] std::string ElevationHint(std::string_view action)
-    {
-        return std::format("access denied {}; run from an elevated (Administrator) prompt", action);
-    }
-
     /// Frees a `LocalAlloc`ed block, so the ACL paths below cannot leak one on an
     /// early return. There are two such blocks per call and four ways out.
     struct LocalDeleter
@@ -1389,35 +1714,20 @@ namespace
         return std::nullopt;
     }
 
-    /// Give @p account full control of @p target, creating it as a directory if
-    /// absent.
+    /// Create @p target as a directory when it is absent and not named as a file.
     ///
-    /// The Windows counterpart of the `chown` the launchd path does, and needed for
-    /// the same reason: a service that no longer runs as the machine's most
-    /// privileged identity cannot write a directory the installer created as an
-    /// administrator. LocalSystem never noticed because LocalSystem can write
-    /// anywhere.
-    ///
-    /// Created only when it is absent AND meant to be a directory; whatever is
-    /// already there is granted as-is. `SE_FILE_OBJECT` covers a file and a
-    /// directory alike, so the grant itself does not care -- the *create* does.
-    /// A `ServiceSpec::ownedPaths` entry may be one CoW file (`storage_path` is
+    /// The half both handovers share. Created only when it is absent AND meant to
+    /// be a directory; whatever is already there is left as-is. A
+    /// `ServiceSpec::ownedPaths` entry may be one CoW file (`storage_path` is
     /// allowed to name `cache.cow`), and an unconditional `create_directories`
     /// failed in both directions on it: on a fresh install it made a DIRECTORY the
     /// daemon then read as a directory of shards, and once the file existed it
     /// failed and skipped the grant -- on exactly the upgrade this exists for.
     ///
-    /// The entry is ADDED to the existing list rather than replacing it, so an
-    /// administrator keeps the access they had -- a replaced list is how a
-    /// directory becomes one only the service can repair.
-    ///
-    /// @param target Path to grant access to; created as a directory when absent
-    ///        and not named as a file.
-    /// @param account Trustee name, e.g. `NT SERVICE\FastCacheCompileNode`. It
-    ///        resolves only once the service exists, so call this after
-    ///        CreateService.
-    /// @return An explanatory message on failure, else nullopt.
-    [[nodiscard]] std::optional<std::string> GrantPathAccess(std::filesystem::path const& target, std::string const& account)
+    /// @param target The owned path.
+    /// @param account The trustee, named in the advice when @p target names a file.
+    /// @return An explanatory message when @p target is still absent, else nullopt.
+    [[nodiscard]] std::optional<std::string> CreateOwnedPath(std::filesystem::path const& target, std::string_view account)
     {
         std::error_code ec;
         if (!std::filesystem::exists(target, ec))
@@ -1439,6 +1749,36 @@ namespace
                                    target.string(),
                                    createEc ? createEc.message() : std::string { "it is still not there" });
         }
+        return std::nullopt;
+    }
+
+    /// Give @p account full control of @p target, creating it as a directory if
+    /// absent.
+    ///
+    /// The Windows counterpart of the `chown` the launchd path does, and needed for
+    /// the same reason: a service that no longer runs as the machine's most
+    /// privileged identity cannot write a directory the installer created as an
+    /// administrator. LocalSystem never noticed because LocalSystem can write
+    /// anywhere. `SE_FILE_OBJECT` covers a file and a directory alike, so the grant
+    /// itself does not care -- the *create* does, which is `CreateOwnedPath`'s.
+    ///
+    /// The entry is ADDED to the existing list rather than replacing it, so an
+    /// administrator keeps the access they had -- a replaced list is how a
+    /// directory becomes one only the service can repair. And so it also keeps
+    /// every read the path INHERITS, which is why a `PathPrivacy::Private` path is
+    /// never handed over through this: `%ProgramData%` grants `BUILTIN\Users` read
+    /// inheritably, and that survives the grant.
+    ///
+    /// @param target Path to grant access to; created as a directory when absent
+    ///        and not named as a file.
+    /// @param account Trustee name, e.g. `NT SERVICE\FastCacheCompileNode`. It
+    ///        resolves only once the service exists, so call this after
+    ///        CreateService.
+    /// @return An explanatory message on failure, else nullopt.
+    [[nodiscard]] std::optional<std::string> GrantPathAccess(std::filesystem::path const& target, std::string const& account)
+    {
+        if (auto const absent = CreateOwnedPath(target, account))
+            return absent;
 
         auto path = target.string();
 
@@ -1482,60 +1822,188 @@ namespace
 
         return std::nullopt;
     }
+
+    /// `IOwnedPathHandover` over access lists.
+    class Win32OwnedPathHandover final: public IOwnedPathHandover
+    {
+      public:
+        /// @param logonName The account, from `WindowsLogonName`; disengaged for LocalSystem.
+        explicit Win32OwnedPathHandover(std::optional<std::string> const& logonName):
+            _logonName { logonName }
+        {
+        }
+
+        [[nodiscard]] std::optional<std::string> Share(std::filesystem::path const& path) override
+        {
+            // LocalSystem writes anywhere, so there is nothing to hand over.
+            if (!_logonName)
+                return std::nullopt;
+            return GrantPathAccess(path, *_logonName);
+        }
+
+        [[nodiscard]] std::optional<std::string> Seclude(std::filesystem::path const& path,
+                                                         std::span<std::filesystem::path const> credentialLeaves) override
+        {
+            // Asked whatever the account, unlike `Share`: a service running as LocalSystem
+            // needs no grant, but the path still must not inherit `%ProgramData%`'s read.
+            // Its list then names SYSTEM and Administrators alone -- SYSTEM IS the account.
+            auto const account = _logonName.value_or(std::string {});
+            if (auto const absent = CreateOwnedPath(path, account))
+                return absent;
+            auto const secured = SecureDirectoryForService(path, account, credentialLeaves);
+            return secured.has_value() ? std::nullopt : std::optional { secured.error() };
+        }
+
+      private:
+        std::optional<std::string> const& _logonName;
+    };
+
+    /// What an install asks of the service manager, one bit per call it makes on it.
+    /// `SC_MANAGER_CREATE_SERVICE` is `CreateService`'s. `SC_MANAGER_CONNECT` is the
+    /// `OpenService` a re-apply makes; `OpenSCManager` happens to grant it to every
+    /// caller, and it is asked for here so the handle's rights are read, never inferred.
+    constexpr DWORD InstallManagerRights = SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE;
+
+    /// What an install asks of the service itself, created or opened alike: the same
+    /// handle then carries `ChangeServiceConfig` and `ChangeServiceConfig2`, and a
+    /// failure action that restarts needs `SERVICE_START` on it besides the config right.
+    constexpr DWORD InstallServiceRights = SERVICE_ALL_ACCESS;
+
+    /// `IScmRegistrar` over the real Service Control Manager. Holds the service handle
+    /// the successful call produced, for the configuration that follows.
+    class Win32ScmRegistrar final: public IScmRegistrar
+    {
+      public:
+        /// @param manager Opened with `InstallManagerRights`; not owned.
+        /// @param spec The registration.
+        /// @param commandLine The service's command line, from `BuildServiceCommandLine`.
+        /// @param logonName The account, from `WindowsLogonName`.
+        Win32ScmRegistrar(SC_HANDLE manager,
+                          ServiceSpec const& spec,
+                          std::string const& commandLine,
+                          std::optional<std::string> const& logonName):
+            _manager { manager },
+            _spec { spec },
+            _commandLine { commandLine },
+            _logonName { logonName },
+            _startType { ServiceStartRowOf(spec.startMode).scmStartType }
+        {
+        }
+
+        Win32ScmRegistrar(Win32ScmRegistrar const&) = delete;
+        Win32ScmRegistrar(Win32ScmRegistrar&&) = delete;
+        Win32ScmRegistrar& operator=(Win32ScmRegistrar const&) = delete;
+        Win32ScmRegistrar& operator=(Win32ScmRegistrar&&) = delete;
+
+        ~Win32ScmRegistrar() override
+        {
+            if (_service != nullptr)
+                CloseServiceHandle(_service);
+        }
+
+        [[nodiscard]] std::uint32_t Create() override
+        {
+            _service = CreateServiceA(_manager,
+                                      _spec.serviceName.c_str(),
+                                      _spec.serviceName.c_str(),
+                                      InstallServiceRights,
+                                      SERVICE_WIN32_OWN_PROCESS,
+                                      _startType,
+                                      SERVICE_ERROR_NORMAL,
+                                      _commandLine.c_str(),
+                                      nullptr,
+                                      nullptr,
+                                      nullptr,
+                                      // lpServiceStartName. Naming nobody is LocalSystem --
+                                      // the whole machine -- which fastcache-compile-node
+                                      // must not have: it compiles input that arrived
+                                      // over the network.
+                                      _logonName ? _logonName->c_str() : nullptr,
+                                      // No password. A virtual account has none, and
+                                      // LocalSystem takes none.
+                                      nullptr);
+            return _service != nullptr ? ERROR_SUCCESS : GetLastError();
+        }
+
+        [[nodiscard]] std::uint32_t Reapply() override
+        {
+            _service = OpenServiceA(_manager, _spec.serviceName.c_str(), InstallServiceRights);
+            if (_service == nullptr)
+                return GetLastError();
+
+            // ChangeServiceConfig reads a null account as "keep the one recorded", where
+            // CreateService reads it as LocalSystem. Re-applying has to mean the same
+            // account a fresh install would get, so LocalSystem is named here -- with the
+            // empty password it documents for that account -- and a virtual account keeps
+            // a null password, which it requires.
+            auto const account = _logonName.value_or("LocalSystem");
+            if (ChangeServiceConfigA(_service,
+                                     SERVICE_NO_CHANGE,
+                                     _startType,
+                                     SERVICE_NO_CHANGE,
+                                     _commandLine.c_str(),
+                                     nullptr,
+                                     nullptr,
+                                     nullptr,
+                                     account.c_str(),
+                                     _logonName ? nullptr : "",
+                                     _spec.serviceName.c_str())
+                != 0)
+                return ERROR_SUCCESS;
+
+            auto const error = GetLastError();
+            CloseServiceHandle(_service);
+            _service = nullptr;
+            return error;
+        }
+
+        /// @return The service handle the successful call produced, which the caller now
+        ///         owns; null when neither succeeded.
+        [[nodiscard]] SC_HANDLE Release() noexcept
+        {
+            return std::exchange(_service, nullptr);
+        }
+
+      private:
+        SC_HANDLE _manager;
+        ServiceSpec const& _spec;
+        std::string const& _commandLine;
+        std::optional<std::string> const& _logonName;
+        DWORD _startType;
+        SC_HANDLE _service = nullptr;
+    };
 } // namespace
 
 ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scope*/)
 {
     if (auto const rejection = ServiceRegistrationRejection(spec, SupervisorKind::Scm))
-        return { .exitCode = 1, .message = *rejection };
+        return { .outcome = ServiceControlOutcome::Failed, .message = *rejection };
 
     auto const exe = CurrentExecutablePath();
     if (exe.empty())
-        return { .exitCode = 1, .message = "could not determine the fastcached executable path" };
+        return { .outcome = ServiceControlOutcome::Failed, .message = "could not determine the fastcached executable path" };
 
     auto const commandLine = BuildServiceCommandLine(spec);
     auto const logonName = WindowsLogonName(spec);
+    auto const& start = ServiceStartRowOf(spec.startMode);
 
-    SC_HANDLE const manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+    SC_HANDLE const manager = OpenSCManagerA(nullptr, nullptr, InstallManagerRights);
     if (manager == nullptr)
     {
         auto const err = GetLastError();
         if (err == ERROR_ACCESS_DENIED)
-            return { .exitCode = 1, .message = ElevationHint("opening the service manager") };
-        return { .exitCode = 1, .message = std::format("OpenSCManager failed (error {})", err) };
+            return { .outcome = ServiceControlOutcome::Failed, .message = ElevationHint("opening the service manager") };
+        return { .outcome = ServiceControlOutcome::Failed, .message = std::format("OpenSCManager failed (error {})", err) };
     }
 
-    SC_HANDLE const service = CreateServiceA(manager,
-                                             spec.serviceName.c_str(),
-                                             spec.serviceName.c_str(),
-                                             SERVICE_ALL_ACCESS,
-                                             SERVICE_WIN32_OWN_PROCESS,
-                                             SERVICE_AUTO_START,
-                                             SERVICE_ERROR_NORMAL,
-                                             commandLine.c_str(),
-                                             nullptr,
-                                             nullptr,
-                                             nullptr,
-                                             // lpServiceStartName. Naming nobody is
-                                             // LocalSystem -- the whole machine --
-                                             // which fastcache-compile-node must
-                                             // not have: it compiles input that
-                                             // arrived over the network.
-                                             logonName ? logonName->c_str() : nullptr,
-                                             // No password. A virtual account has
-                                             // none, and LocalSystem takes none.
-                                             nullptr);
-    if (service == nullptr)
+    auto registrar = Win32ScmRegistrar { manager, spec, commandLine, logonName };
+    auto const registration = RegisterWithScm(registrar, DefaultDrainWait());
+    SC_HANDLE const service = registrar.Release();
+    if (registration.outcome == ScmRegistrationOutcome::Failed)
     {
-        auto const err = GetLastError();
         CloseServiceHandle(manager);
-        if (err == ERROR_SERVICE_EXISTS)
-            return { .exitCode = 1,
-                     .message = std::format("service '{}' already exists; remove it first with --uninstall-service",
-                                            spec.serviceName) };
-        if (err == ERROR_ACCESS_DENIED)
-            return { .exitCode = 1, .message = ElevationHint("creating the service") };
-        return { .exitCode = 1, .message = std::format("CreateService failed (error {})", err) };
+        return { .outcome = ServiceControlOutcome::Failed,
+                 .message = ScmRegistrationFailureMessage(registration, spec.serviceName) };
     }
 
     // Best-effort friendly description; failure here does not fail the install.
@@ -1595,42 +2063,64 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
                                       "{}); it will act on a crash only",
                                       GetLastError());
 
+    // The firewall rules an install creates are scoped to this service, and a rule scoped to a
+    // service matches only a process whose token carries the service's SID -- which the SCM puts
+    // there only for a service whose SID type is not NONE. Set on the created and the re-applied
+    // registration alike, because both reach this point, and whatever the account: the rule's
+    // scope does not depend on who the service logs on as.
+    // Not const: `ChangeServiceConfig2A` takes an untyped mutable pointer.
+    SERVICE_SID_INFO sidInfo { .dwServiceSidType = SERVICE_SID_TYPE_UNRESTRICTED };
+    if (ChangeServiceConfig2A(service, SERVICE_CONFIG_SERVICE_SID_INFO, &sidInfo) == 0)
+        policyWarnings += std::format("\nwarning: the service SID type could not be set (error {}); a firewall "
+                                      "rule scoped to this service may not match it",
+                                      GetLastError());
+
+    // Only now: `NT SERVICE\<name>` does not resolve until the service exists, so
+    // a grant attempted before CreateService fails to translate the trustee. And
+    // before the service handle is closed, which a refusal below still needs.
+    //
+    // A `Shared` path is reported rather than fatal, and the registration is left in
+    // place. A service that is registered and cannot write one directory is
+    // recoverable by an operator with `icacls`; one that was rolled back because of
+    // it leaves them nothing to repair. This mirrors the launchd path, where a chown
+    // that fails is `(void)`-discarded -- except that this says so.
+    //
+    // A `Private` path is the opposite case, and it REFUSES: it holds the credential
+    // the service mints at its first start, so a registration left in place is a
+    // service that writes that credential where every local account can read it --
+    // and the MSI starts the node straight after this, whatever this returned
+    // (`FastCacheNodeStartService`, `Return="ignore"`). So a registration THIS call
+    // created is deleted again, and one it merely re-applied is left, as it found it,
+    // with the message saying which.
+    auto handover = Win32OwnedPathHandover { logonName };
+    auto const handedOver = HandOverOwnedPaths(spec.ownedPaths, handover);
+    if (handedOver.refusal)
+    {
+        auto registrationLeft = RefusedRegistration::Kept;
+        if (registration.outcome == ScmRegistrationOutcome::Created)
+            registrationLeft = DeleteService(service) != 0 ? RefusedRegistration::Removed : RefusedRegistration::NotRemoved;
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        return { .outcome = ServiceControlOutcome::Failed,
+                 .message = RefusedInstallMessage(*handedOver.refusal, spec.serviceName, registrationLeft) };
+    }
+
     CloseServiceHandle(service);
     CloseServiceHandle(manager);
 
-    // Only now: `NT SERVICE\<name>` does not resolve until the service exists, so
-    // a grant attempted before CreateService fails to translate the trustee.
-    //
-    // Reported rather than fatal, and the registration is left in place. A service
-    // that is registered and cannot write one directory is recoverable by an
-    // operator with `icacls`; one that was rolled back because of it leaves them
-    // nothing to repair. This mirrors the launchd path, where a chown that fails
-    // is `(void)`-discarded -- except that this says so.
     std::string warnings { std::move(policyWarnings) };
 
     // A service with no console reports through the event log (#179), and this is
-    // what makes those records legible. Reported rather than fatal for the reason the
-    // grant below is: the events are written either way, and a registration an
+    // what makes those records legible. Reported rather than fatal for the reason a
+    // shared grant is: the events are written either way, and a registration an
     // operator can repair beats an install rolled back over presentation.
     if (auto const denial = RegisterEventSourceForService(spec.serviceName))
         warnings += std::format("\nwarning: {}", *denial);
 
-    if (logonName)
-        for (auto const& owned: spec.ownedPaths)
-            if (auto const denial = GrantPathAccess(owned, *logonName))
-                warnings += std::format("\nwarning: {}", *denial);
+    warnings += handedOver.warnings;
 
-    if (!warnings.empty())
-        return { .exitCode = 0,
-                 .message = std::format("installed service '{}' (auto-start); start it now with: sc start {}{}",
-                                        spec.serviceName,
-                                        spec.serviceName,
-                                        warnings) };
-
-    return { .exitCode = 0,
-             .message = std::format("installed service '{}' (auto-start); start it now with: sc start {}",
-                                    spec.serviceName,
-                                    spec.serviceName) };
+    return { .outcome = ServiceControlOutcome::Done,
+             .message = ScmInstallSuccessMessage(registration.outcome, spec.serviceName, start.described, warnings) };
 }
 
 ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope /*scope*/)
@@ -1638,15 +2128,15 @@ ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope /*sc
     // The name gates removal too: it selects which registration is addressed,
     // and one that could never have been installed cannot be removed either.
     if (auto const rejection = ServiceNameRejection(spec))
-        return { .exitCode = 1, .message = *rejection };
+        return { .outcome = ServiceControlOutcome::Failed, .message = *rejection };
 
     SC_HANDLE const manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (manager == nullptr)
     {
         auto const err = GetLastError();
         if (err == ERROR_ACCESS_DENIED)
-            return { .exitCode = 1, .message = ElevationHint("opening the service manager") };
-        return { .exitCode = 1, .message = std::format("OpenSCManager failed (error {})", err) };
+            return { .outcome = ServiceControlOutcome::Failed, .message = ElevationHint("opening the service manager") };
+        return { .outcome = ServiceControlOutcome::Failed, .message = std::format("OpenSCManager failed (error {})", err) };
     }
 
     SC_HANDLE const service = OpenServiceA(manager, spec.serviceName.c_str(), SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
@@ -1655,15 +2145,25 @@ ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope /*sc
         auto const err = GetLastError();
         CloseServiceHandle(manager);
         if (err == ERROR_SERVICE_DOES_NOT_EXIST)
-            return { .exitCode = 1, .message = std::format("no service named '{}' is installed", spec.serviceName) };
+            return { .outcome = ServiceControlOutcome::NotInstalled,
+                     .message = std::format("no service named '{}' is installed", spec.serviceName) };
         if (err == ERROR_ACCESS_DENIED)
-            return { .exitCode = 1, .message = ElevationHint("opening the service") };
-        return { .exitCode = 1, .message = std::format("OpenService failed (error {})", err) };
+            return { .outcome = ServiceControlOutcome::Failed, .message = ElevationHint("opening the service") };
+        return { .outcome = ServiceControlOutcome::Failed, .message = std::format("OpenService failed (error {})", err) };
     }
 
     // Best-effort stop before deletion; ignore failure (e.g. already stopped).
     SERVICE_STATUS status {};
     ControlService(service, SERVICE_CONTROL_STOP, &status);
+
+    // Waited for, bounded: deleting a running service only MARKS it, and the next install
+    // then meets 1072 (see CreateRefusalRows).
+    auto const stopped = DrainWithin(
+        [service] {
+            SERVICE_STATUS now {};
+            return QueryServiceStatus(service, &now) != 0 && now.dwCurrentState != SERVICE_STOPPED;
+        },
+        UninstallStopBound);
 
     auto const deleted = DeleteService(service) != 0;
     auto const deleteErr = deleted ? ERROR_SUCCESS : GetLastError();
@@ -1671,7 +2171,8 @@ ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope /*sc
     CloseServiceHandle(manager);
 
     if (!deleted)
-        return { .exitCode = 1, .message = std::format("DeleteService failed (error {})", deleteErr) };
+        return { .outcome = ServiceControlOutcome::Failed,
+                 .message = std::format("DeleteService failed (error {})", deleteErr) };
 
     // AFTER the deletion succeeded, never before it. A service that is still
     // installed and has lost its provider registration writes records that render as
@@ -1683,7 +2184,12 @@ ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope /*sc
     // one would describe a service that is genuinely gone as still present.
     RegDeleteKeyA(HKEY_LOCAL_MACHINE, EventSourceKeyPath(spec.serviceName).c_str());
 
-    return { .exitCode = 0, .message = std::format("uninstalled service '{}'", spec.serviceName) };
+    auto const pending =
+        stopped == DrainResult::Ceiling
+            ? std::format("; it had not stopped after {} s, so it is removed once it exits", UninstallStopCeiling.count())
+            : std::string {};
+    return { .outcome = ServiceControlOutcome::Done,
+             .message = std::format("uninstalled service '{}'{}", spec.serviceName, pending) };
 }
 
 #elif defined(__APPLE__)
@@ -1985,18 +2491,87 @@ namespace
                            path.string(),
                            path.string());
     }
+
+    /// `IOwnedPathHandover` over `chown` and mode bits, for a system-scope job whose
+    /// account is not root.
+    class LaunchdOwnedPathHandover final: public IOwnedPathHandover
+    {
+      public:
+        /// @param account The account the job runs as.
+        /// @param owner Its passwd entry, which exists.
+        LaunchdOwnedPathHandover(std::string const& account, struct passwd const& owner):
+            _account { account },
+            _uid { owner.pw_uid },
+            _gid { owner.pw_gid }
+        {
+        }
+
+        [[nodiscard]] std::optional<std::string> Share(std::filesystem::path const& target) override
+        {
+            // Created only when it is absent AND meant to be a directory; whatever is
+            // already there is chowned as-is. See the call site for why.
+            std::error_code probeEc;
+            auto const namesAFile = PathNamesAFile(target);
+            std::error_code createEc;
+            if (!std::filesystem::exists(target, probeEc) && !namesAFile)
+                std::filesystem::create_directories(target, createEc);
+            if (std::filesystem::exists(target, probeEc))
+            {
+                (void) ::chown(target.c_str(), _uid, _gid);
+                return std::nullopt;
+            }
+
+            // SAID, not skipped -- and the two ways of getting here are different
+            // facts, so they get different sentences. A path that NAMES A FILE is
+            // correctly not created (making a directory of it is the failure the call
+            // site records) but is then never chowned either, and the service account
+            // cannot create it inside a root-owned parent. A path that was meant to be
+            // a directory and is still absent failed to be created, and `createEc` is
+            // the reason.
+            //
+            // Left silent, either one let `--install-service` report success while
+            // launchd respawned the job forever. The Windows sibling has warned since
+            // it was written; this path told an operator nothing.
+            return namesAFile ? std::format("{} does not exist yet and names a file, so it was not created; grant "
+                                            "'{}' access to the directory that will hold it",
+                                            target.string(),
+                                            _account)
+                              : std::format("could not create {} for '{}': {}",
+                                            target.string(),
+                                            _account,
+                                            createEc ? createEc.message() : std::string { "it is still not there" });
+        }
+
+        [[nodiscard]] std::optional<std::string> Seclude(std::filesystem::path const& target,
+                                                         std::span<std::filesystem::path const> credentialLeaves) override
+        {
+            // Owned by the account first, then closed to everybody else: the mode bits
+            // left for the owner are only the account's once it IS the owner.
+            if (auto const denial = Share(target))
+                return denial;
+            auto const secured = SecureDirectoryForService(target, _account, credentialLeaves);
+            return secured.has_value() ? std::nullopt : std::optional { secured.error() };
+        }
+
+      private:
+        std::string const& _account;
+        ::uid_t _uid;
+        ::gid_t _gid;
+    };
 } // namespace
 
 ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
 {
     if (auto const rejection = ServiceRegistrationRejection(spec, SupervisorKind::Launchd))
-        return { .exitCode = 1, .message = *rejection };
+        return { .outcome = ServiceControlOutcome::Failed, .message = *rejection };
 
     if (spec.exePath.empty())
-        return { .exitCode = 1, .message = "could not determine the executable path to register" };
+        return { .outcome = ServiceControlOutcome::Failed,
+                 .message = "could not determine the executable path to register" };
 
     if (scope == ServiceScope::System && ::geteuid() != 0)
-        return { .exitCode = 1, .message = "installing a system LaunchDaemon requires root; re-run with sudo" };
+        return { .outcome = ServiceControlOutcome::Failed,
+                 .message = "installing a system LaunchDaemon requires root; re-run with sudo" };
 
     // The mirror guard, and not a nicety: a user agent is installed *for the
     // invoking account*, and CurrentHomeDirectory reads the real uid, which
@@ -2008,13 +2583,14 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // they can neither see nor remove. Which account they meant is genuinely
     // ambiguous, so ask rather than guess.
     if (scope == ServiceScope::User && ::geteuid() == 0)
-        return { .exitCode = 1,
+        return { .outcome = ServiceControlOutcome::Failed,
                  .message = "--service-scope=user installs an agent for the invoking account, so it must not run as "
                             "root. Re-run without sudo, or pass --service-scope=system for a machine-wide daemon." };
 
     auto const home = CurrentHomeDirectory();
     if (scope == ServiceScope::User && home.empty())
-        return { .exitCode = 1, .message = "could not determine the invoking user's home directory" };
+        return { .outcome = ServiceControlOutcome::Failed,
+                 .message = "could not determine the invoking user's home directory" };
 
     // A LaunchDaemon plist naming a UserName launchd cannot resolve is not
     // rejected at bootstrap: the job registers, `launchctl bootstrap` and
@@ -2023,7 +2599,7 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // The account is created by the .pkg postinstall, which is the only thing
     // that creates it, so a tarball or from-source install lands here.
     if (scope == ServiceScope::System && !spec.serviceAccount.empty() && ::getpwnam(spec.serviceAccount.c_str()) == nullptr)
-        return { .exitCode = 1,
+        return { .outcome = ServiceControlOutcome::Failed,
                  .message = std::format("the '{}' service account does not exist. It is created by the macOS "
                                         "installer package; for a manual install, create it first (see "
                                         "docs/operations/deployment.md) or use --service-scope=user.",
@@ -2059,17 +2635,18 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
 
     if (scope == ServiceScope::System && !effective.configPath.empty())
         if (auto const denial = ServiceAccountReadDenial(effective.serviceAccount, effective.configPath))
-            return { .exitCode = 1, .message = *denial };
+            return { .outcome = ServiceControlOutcome::Failed, .message = *denial };
 
     std::error_code ec;
     std::filesystem::create_directories(plistPath.parent_path(), ec);
     if (ec)
-        return { .exitCode = 1,
+        return { .outcome = ServiceControlOutcome::Failed,
                  .message = std::format("could not create {}: {}", plistPath.parent_path().string(), ec.message()) };
 
     std::filesystem::create_directories(logDirectory, ec);
     if (ec)
-        return { .exitCode = 1, .message = std::format("could not create {}: {}", logDirectory.string(), ec.message()) };
+        return { .outcome = ServiceControlOutcome::Failed,
+                 .message = std::format("could not create {}: {}", logDirectory.string(), ec.message()) };
 
     // The daemon drops to its service account, so directories root created for it
     // have to change hands or its first write fails with EACCES — which launchd
@@ -2088,56 +2665,33 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // made a DIRECTORY the daemon then read as a directory of shards, and once the
     // file existed it failed and skipped the chown — on exactly the upgrade this
     // handover is here for.
+    //
+    // A `Private` path is closed to every other account as well, and one that cannot
+    // be REFUSES the install -- before the plist is written, so nothing is registered.
+    // The rule is `HandOverOwnedPaths`'s, for every supervisor alike.
     std::string warnings;
     if (scope == ServiceScope::System && !effective.serviceAccount.empty())
         if (auto const* const pw = ::getpwnam(effective.serviceAccount.c_str()); pw != nullptr)
         {
-            std::vector<std::filesystem::path> owned { logDirectory };
-            for (auto const& target: effective.ownedPaths)
-            {
-                std::error_code probeEc;
-                auto const namesAFile = PathNamesAFile(target);
-                std::error_code createEc;
-                if (!std::filesystem::exists(target, probeEc) && !namesAFile)
-                    std::filesystem::create_directories(target, createEc);
-                if (std::filesystem::exists(target, probeEc))
-                {
-                    owned.emplace_back(target);
-                    continue;
-                }
-
-                // SAID, not skipped -- and the two ways of getting here are
-                // different facts, so they get different sentences. A path that
-                // NAMES A FILE is correctly not created (making a directory of it
-                // is the failure the comment above records) but is then never
-                // chowned either, and the service account cannot create it inside a
-                // root-owned parent. A path that was meant to be a directory and is
-                // still absent failed to be created, and `createEc` is the reason.
-                //
-                // Left silent, either one let `--install-service` report success
-                // while launchd respawned the job forever. The Windows sibling has
-                // warned since it was written; this path told an operator nothing.
-                warnings += namesAFile
-                                ? std::format("\nwarning: {} does not exist yet and names a file, so it was not "
-                                              "created; grant '{}' access to the directory that will hold it",
-                                              target.string(),
-                                              effective.serviceAccount)
-                                : std::format("\nwarning: could not create {} for '{}': {}",
-                                              target.string(),
-                                              effective.serviceAccount,
-                                              createEc ? createEc.message() : std::string { "it is still not there" });
-            }
-            for (auto const& path: owned)
-                (void) ::chown(path.c_str(), pw->pw_uid, pw->pw_gid);
+            (void) ::chown(logDirectory.c_str(), pw->pw_uid, pw->pw_gid);
+            auto handover = LaunchdOwnedPathHandover { effective.serviceAccount, *pw };
+            auto handedOver = HandOverOwnedPaths(effective.ownedPaths, handover);
+            if (handedOver.refusal)
+                return { .outcome = ServiceControlOutcome::Failed,
+                         .message = RefusedInstallMessage(
+                             *handedOver.refusal, effective.serviceName, RefusedRegistration::NotMade) };
+            warnings = std::move(handedOver.warnings);
         }
 
     {
         std::ofstream out { plistPath, std::ios::binary | std::ios::trunc };
         if (!out)
-            return { .exitCode = 1, .message = std::format("could not write {}", plistPath.string()) };
+            return { .outcome = ServiceControlOutcome::Failed,
+                     .message = std::format("could not write {}", plistPath.string()) };
         out << BuildLaunchdPlist(effective, scope, logDirectory);
         if (!out)
-            return { .exitCode = 1, .message = std::format("could not write {}", plistPath.string()) };
+            return { .outcome = ServiceControlOutcome::Failed,
+                     .message = std::format("could not write {}", plistPath.string()) };
     }
 
     auto const domain = DomainTarget(scope);
@@ -2149,10 +2703,10 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // domain, not just the one being bootstrapped into now — an earlier install
     // may have landed in the other one, and that job still holds the port.
     if (auto const stillRegistered = BootOutEverywhere(scope, label))
-        return { .exitCode = 1, .message = *stillRegistered };
+        return { .outcome = ServiceControlOutcome::Failed, .message = *stillRegistered };
 
     if (auto const rc = RunLaunchctl({ "bootstrap", domain, plistPath.string() }); !LaunchctlSucceeded(rc))
-        return { .exitCode = 1,
+        return { .outcome = ServiceControlOutcome::Failed,
                  .message = std::format("wrote {} but `launchctl bootstrap {}` {} ({})",
                                         plistPath.string(),
                                         domain,
@@ -2163,43 +2717,57 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // spawn as "pended nondemand spawn = speculative" and can leave it unstarted
     // indefinitely — this command reported success while `launchctl print` said
     // "state = not running" and nothing was listening on the port. kickstart
-    // forces the spawn, so the service really is up when this returns.
-    if (auto const rc = RunLaunchctl({ "kickstart", "-k", serviceTarget }); !LaunchctlSucceeded(rc))
+    // forces the spawn, so the service really is up when this returns. A manual job
+    // is left loaded and unstarted, which is what the operator asked for.
+    auto const startsAtInstall = ServiceStartRowOf(spec.startMode).startsAtInstall;
+    if (startsAtInstall)
     {
-        return { .exitCode = 1,
-                 .message = std::format("registered '{}' but `launchctl kickstart` {} ({})",
-                                        label,
-                                        LaunchctlFailureVerb(rc),
-                                        LaunchctlStatusText(rc)) };
+        if (auto const rc = RunLaunchctl({ "kickstart", "-k", serviceTarget }); !LaunchctlSucceeded(rc))
+        {
+            return { .outcome = ServiceControlOutcome::Failed,
+                     .message = std::format("registered '{}' but `launchctl kickstart` {} ({})",
+                                            label,
+                                            LaunchctlFailureVerb(rc),
+                                            LaunchctlStatusText(rc)) };
+        }
     }
 
-    return { .exitCode = 0,
-             .message = std::format("installed and started launchd job '{}' ({} scope, {}){}",
+    // A job left unstarted says how to start it, as the SCM install does: nothing
+    // else on this path names the launchctl target, and it is not the label alone.
+    auto const startHint =
+        startsAtInstall ? std::string {} : std::format("; start it with: launchctl kickstart {}", serviceTarget);
+
+    return { .outcome = ServiceControlOutcome::Done,
+             .message = std::format("installed{} launchd job '{}' ({} scope, {}){}{}",
+                                    startsAtInstall ? " and started" : "",
                                     label,
                                     ServiceScopeName(scope),
                                     plistPath.string(),
+                                    startHint,
                                     warnings) };
 }
 
 ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope scope)
 {
     if (auto const rejection = ServiceNameRejection(spec))
-        return { .exitCode = 1, .message = *rejection };
+        return { .outcome = ServiceControlOutcome::Failed, .message = *rejection };
 
     if (scope == ServiceScope::System && ::geteuid() != 0)
-        return { .exitCode = 1, .message = "removing a system LaunchDaemon requires root; re-run with sudo" };
+        return { .outcome = ServiceControlOutcome::Failed,
+                 .message = "removing a system LaunchDaemon requires root; re-run with sudo" };
 
     // Symmetric with the install guard: under sudo the home directory resolves
     // to root's, so this would look for an agent in /var/root and report the
     // operator's own as absent while leaving it running.
     if (scope == ServiceScope::User && ::geteuid() == 0)
-        return { .exitCode = 1,
+        return { .outcome = ServiceControlOutcome::Failed,
                  .message = "--service-scope=user removes the invoking account's agent, so it must not run as root. "
                             "Re-run without sudo, or pass --service-scope=system." };
 
     auto const home = CurrentHomeDirectory();
     if (scope == ServiceScope::User && home.empty())
-        return { .exitCode = 1, .message = "could not determine the invoking user's home directory" };
+        return { .outcome = ServiceControlOutcome::Failed,
+                 .message = "could not determine the invoking user's home directory" };
 
     auto const label = LaunchdLabel(spec);
     auto const plistPath = LaunchdPlistPath(spec, scope, home);
@@ -2210,28 +2778,33 @@ ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope scop
     // winding down, and reporting removal before launchd has let go would make
     // "uninstalled" a claim the very next command could contradict.
     if (auto const stillRegistered = BootOutEverywhere(scope, label))
-        return { .exitCode = 1, .message = *stillRegistered };
+        return { .outcome = ServiceControlOutcome::Failed, .message = *stillRegistered };
 
     std::error_code ec;
     auto const removed = std::filesystem::remove(plistPath, ec);
     if (ec)
-        return { .exitCode = 1, .message = std::format("could not remove {}: {}", plistPath.string(), ec.message()) };
+        return { .outcome = ServiceControlOutcome::Failed,
+                 .message = std::format("could not remove {}: {}", plistPath.string(), ec.message()) };
     if (!removed)
-        return { .exitCode = 1, .message = std::format("no launchd job installed at {}", plistPath.string()) };
+        return { .outcome = ServiceControlOutcome::NotInstalled,
+                 .message = std::format("no launchd job installed at {}", plistPath.string()) };
 
-    return { .exitCode = 0, .message = std::format("removed launchd job '{}' ({})", label, plistPath.string()) };
+    return { .outcome = ServiceControlOutcome::Done,
+             .message = std::format("removed launchd job '{}' ({})", label, plistPath.string()) };
 }
 
 #else
 
 ServiceControlResult InstallService(ServiceSpec const& /*spec*/, ServiceScope /*scope*/)
 {
-    return { .exitCode = 1, .message = "service control is only available on Windows (SCM) and macOS (launchd)" };
+    return { .outcome = ServiceControlOutcome::Failed,
+             .message = "service control is only available on Windows (SCM) and macOS (launchd)" };
 }
 
 ServiceControlResult UninstallService(ServiceSpec const& /*spec*/, ServiceScope /*scope*/)
 {
-    return { .exitCode = 1, .message = "service control is only available on Windows (SCM) and macOS (launchd)" };
+    return { .outcome = ServiceControlOutcome::Failed,
+             .message = "service control is only available on Windows (SCM) and macOS (launchd)" };
 }
 
 #endif // _WIN32 / __APPLE__
