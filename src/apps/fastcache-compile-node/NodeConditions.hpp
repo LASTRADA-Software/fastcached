@@ -12,6 +12,8 @@
 #include <string_view>
 #include <vector>
 
+#include <core/net/AcceptLoopHealth.hpp>
+
 /// @file NodeConditions.hpp
 /// What this node has detected that an operator must act on, as ONE table (#1364).
 ///
@@ -53,6 +55,8 @@ enum class NodeCondition : std::uint8_t
     MixedNodeVersions,              ///< The leader sees one wire served by more than one build.
     OwnRecordAwaited,               ///< Its own cluster has not recorded this node's key, so it announces to nobody.
     RefusedCompileArguments,        ///< The worker refused compiles over arguments it will not pass to its compiler.
+    SurfaceNotAccepting,            ///< A serving surface's accept loop has ended: its port listens and refuses.
+    SurfaceAcceptDegraded,          ///< A serving surface's accept loop is backing off on failures nothing classifies.
     Last,                           ///< Not a condition.
 };
 
@@ -280,7 +284,8 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "it: --enroll-from=<seed> here, or --cluster-admit=<id>=<host>:<port>@<key> on a member, with what "
                 "--print-identity prints. If the detail says its id is recorded under another key, restore that "
                 "node-key, or --cluster-forget=<id> and admit this key." },
-    // Live: an operator's reload of the allowlist is the fix landing, and the row clears there.
+    // Live: an operator's reload of the allowlist is the fix landing, and it re-judges the row --
+    // each argument the new list admits leaves, and the row clears once none is left.
     // A warning and not an alert, because nothing is WRONG with what a build produces -- each
     // refused compile runs on its own client -- only distribution is lost, which is what the
     // counter alone could say and never say which flag.
@@ -289,11 +294,34 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .persistence = CompileCacheWire::ConditionPersistence::Live,
       .severity = CompileCacheWire::ConditionSeverity::Warning,
       .scope = ConditionScope::Worker,
-      .remedy = "Builds are still correct: each refused compile ran on its own client, so only distribution was lost. "
-                "If a named argument runs no program and names no path, admit it on every worker with "
-                "--allow-compile-arg=<argument> (allow_compile_arg in the configuration file) and reload; the row "
-                "clears at that reload and returns only if a refusal follows. A flag every build of this kind "
-                "carries belongs in the built-in table: report it rather than configuring it everywhere." },
+      .remedy = "Builds stay correct: each refused compile ran on its own client, losing only distribution. Admit a "
+                "named argument that runs no program and names no path with --allow-compile-arg=<argument> on every "
+                "worker, then reload. The reload re-judges the row: each argument the list now admits leaves, and the "
+                "row clears once none is named. One still named was not admitted: check its spelling; the list never "
+                "overrides the built-in rules. Report a flag every build carries: it belongs in the built-in table." },
+    { .condition = NodeCondition::SurfaceNotAccepting,
+      .id = "surface-not-accepting",
+      .persistence = CompileCacheWire::ConditionPersistence::Latched,
+      .severity = CompileCacheWire::ConditionSeverity::Alert,
+      .scope = ConditionScope::Process,
+      .remedy = "Restart this node: the surfaces named here have stopped accepting connections and do not start "
+                "again by themselves, so their ports still listen and refuse every client -- builds compile cold, "
+                "and a scheduler named here hands out nothing. /healthz answers 503 while this is raised. The "
+                "reason is what the last accept answered; report it with this node's version, because only a "
+                "closed or vanished listener is meant to end a loop." },
+    // Live: the loop goes on accepting through its backoff, and the first accept that succeeds
+    // clears the row -- as does the surface being shut down, which leaves nothing degraded.
+    // An alert, as /healthz's 503 is: a surface that accepts little or nothing compiles cold.
+    { .condition = NodeCondition::SurfaceAcceptDegraded,
+      .id = "surface-accept-degraded",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Alert,
+      .scope = ConditionScope::Process,
+      .remedy = "The surfaces named here have failed to accept connections for longer than any transient explains, "
+                "on a failure this build does not classify; each backs off and accepts little or nothing, so builds "
+                "compile cold. /healthz answers 503 while this is raised, and the row clears by itself once an "
+                "accept succeeds. Check this host for exhausted file descriptors or memory, and report the reason "
+                "with this node's version so the failure can be classified." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");
@@ -427,5 +455,19 @@ void EvaluateProcessConditions(NodeConditions& conditions, IMetricsSink const& m
 /// @param items The items, in the order to name them.
 /// @return The detail.
 [[nodiscard]] std::string ListDetail(std::string_view lead, std::vector<std::string> const& items);
+
+/// Keep `surface-not-accepting` and `surface-accept-degraded` true to @p health for as long as this
+/// process runs.
+///
+/// Clears both rows now -- checked and benign, since nothing has stopped or degraded yet. Each
+/// change the registry records re-reads it: `surface-not-accepting` is raised, naming every surface
+/// that gave up and why, and stays raised, since a loop that gave up does not start again;
+/// `surface-accept-degraded` names every degraded surface, and clears once none is left. The ONE
+/// place that reads the node's accept-loop registry into a condition, so the rows and `/healthz`
+/// answer from the same registry. Safe from any number of loop threads at once: the read and the
+/// write it answers with are one step, so the last answer is from the newest record.
+/// @param health The node's registry; must outlive @p conditions' use of it.
+/// @param conditions Where the row is answered; must outlive @p health.
+void WatchAcceptLoops(core::net::AcceptLoopHealth& health, NodeConditions& conditions);
 
 } // namespace FastCache::Node

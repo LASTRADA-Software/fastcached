@@ -4516,6 +4516,30 @@ TEST_CASE("A LEASE carries the client's toolchain label", "[wire][lease]")
 static_assert(CarriedCacheTiers == static_cast<std::size_t>(StorageTier::Last),
               "CarriedCacheTiers must equal StorageTier's count, or the NODE-ANNOUNCE budget adds up the wrong worst case");
 
+// The condition list's bound is the most full rows its share holds, with no headroom: one row more
+// would overrun it. Both sides, so a share that grew stops pinning a bound nobody re-derived, and a
+// bound raised past the share fails here before any frame is built.
+static_assert(MaxNodeConditions * MaxNodeConditionRowBytes() <= ConditionPayloadShare,
+              "MaxNodeConditions full rows must fit the condition share");
+static_assert((MaxNodeConditions + 1) * MaxNodeConditionRowBytes() > ConditionPayloadShare,
+              "one row more than MaxNodeConditions must not fit the condition share: the bound is the share's");
+
+TEST_CASE("The condition list's bound is the most full rows its share holds, and one more does not fit",
+          "[wire][node-announce][conditions]")
+{
+    // The runtime side of the two assertions above, through the ENCODER at the worst-case row: what a
+    // node actually sends at the bound fits, and one row's encoding more does not.
+    NodeConditionFields row {};
+    for (auto const& column: ConditionFieldTable)
+        row.*column.member = std::string(column.maxBytes, 'c');
+    auto const full = EncodeNodeConditions(std::vector<NodeConditionFields>(MaxNodeConditions, row));
+    auto const one = EncodeNodeConditions(std::vector<NodeConditionFields>(1, row));
+    CHECK(full.size() == MaxNodeConditionListBytes);
+    CHECK(one.size() == MaxNodeConditionRowBytes());
+    CHECK(full.size() <= ConditionPayloadShare);
+    CHECK(full.size() + one.size() > ConditionPayloadShare);
+}
+
 TEST_CASE("The longest NODE-ANNOUNCE is exactly the budget its constants add up and it decodes", "[wire][node-announce]")
 {
     // The budget beside `MaxNodeAnnounceOtherBytes` is a sum of named ceilings; this builds the

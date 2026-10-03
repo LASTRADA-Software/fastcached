@@ -9,6 +9,7 @@
 #include <expected>
 #include <format>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -99,8 +100,17 @@ namespace
     }
 
     /// The OS errors a listener names, each with the code it answers as; anything else is
-    /// `SystemError`. A table, because the reader's question is "which code is which", not how a
-    /// chain of comparisons happens to be ordered.
+    /// `SystemError`, which every accept loop reads as UNCLASSIFIED (`core::net::AcceptErrorPolicy`):
+    /// it backs off on it, and a long enough run of it reports the loop degraded. A table, because
+    /// the reader's question is "which code is which", not how a chain of comparisons happens to be
+    /// ordered.
+    ///
+    /// **So a per-connection failure needs a row, or it costs the loop a backoff per connection.**
+    /// Without one a flood of resets reads as a failure nobody classified, each reset buys up to a
+    /// second of not accepting -- the failure mode the first cut of the accept policy had -- and a
+    /// long enough flood calls the surface degraded. Running out of descriptors, buffer space or
+    /// memory has rows of its own, `ResourceExhausted`, which a loop backs off on without ever
+    /// calling itself degraded: nothing is wrong with the listener, only with what it has left.
     struct SocketErrorRow
     {
         int osError;                  ///< The platform's error number.
@@ -115,14 +125,57 @@ namespace
         SocketErrorRow { .osError = WSAEWOULDBLOCK, .code = core::net::NetErrorCode::Timeout },
         SocketErrorRow { .osError = WSAEINTR, .code = core::net::NetErrorCode::Cancelled },
         SocketErrorRow { .osError = WSAENOTSOCK, .code = core::net::NetErrorCode::BadHandle },
+        // A queued connection its client reset or abandoned before this `accept()` took it: one
+        // connection's failure, never the listener's.
+        SocketErrorRow { .osError = WSAECONNRESET, .code = core::net::NetErrorCode::ConnReset },
+        SocketErrorRow { .osError = WSAECONNABORTED, .code = core::net::NetErrorCode::ConnReset },
+        // Out of descriptors, buffer space or memory: the process's, never the listener's.
+        SocketErrorRow { .osError = WSAEMFILE, .code = core::net::NetErrorCode::ResourceExhausted },
+        SocketErrorRow { .osError = WSAENOBUFS, .code = core::net::NetErrorCode::ResourceExhausted },
+        SocketErrorRow { .osError = WSA_NOT_ENOUGH_MEMORY, .code = core::net::NetErrorCode::ResourceExhausted },
     };
 #else
+    /// **`EINTR` is a signal, never a closed socket, and it answers `Timeout`.** POSIX does not wake
+    /// a parked `poll()` or `accept()` when another thread closes the socket (the class comment of
+    /// `BlockingListener`), so nothing here can mean *closed* by `EINTR` -- and a caught signal
+    /// interrupts a parked `poll()` whatever `SA_RESTART` says. Answered `Cancelled`, one SIGHUP
+    /// landing on the admin thread ended its accept loop and took `/healthz` with it while the
+    /// process lived. `Timeout` is what the poll would have answered a moment later: the caller
+    /// re-checks its own stop flag and polls again. Windows keeps `Cancelled` for `WSAEINTR`,
+    /// which there IS the close, measured.
     constexpr auto SocketErrors = std::array {
         SocketErrorRow { .osError = EAGAIN, .code = core::net::NetErrorCode::Timeout },
         SocketErrorRow { .osError = EWOULDBLOCK, .code = core::net::NetErrorCode::Timeout },
-        SocketErrorRow { .osError = EINTR, .code = core::net::NetErrorCode::Cancelled },
+        SocketErrorRow { .osError = EINTR, .code = core::net::NetErrorCode::Timeout },
         SocketErrorRow { .osError = EBADF, .code = core::net::NetErrorCode::BadHandle },
         SocketErrorRow { .osError = ENOTSOCK, .code = core::net::NetErrorCode::BadHandle },
+        // One connection's failure, each of them. `ECONNABORTED` is a queued connection its client
+        // abandoned; `EPERM` is Linux refusing that one connection by firewall rule; and the rest
+        // are accept(2)'s list of network errors already pending on the new connection, which
+        // Linux hands back from `accept()` itself and asks the caller to treat like `EAGAIN`.
+        SocketErrorRow { .osError = ECONNABORTED, .code = core::net::NetErrorCode::ConnReset },
+        SocketErrorRow { .osError = EPERM, .code = core::net::NetErrorCode::PermissionDenied },
+        SocketErrorRow { .osError = EPROTO, .code = core::net::NetErrorCode::ConnReset },
+        SocketErrorRow { .osError = ENOPROTOOPT, .code = core::net::NetErrorCode::ConnReset },
+        // On accept(2)'s pending-error list for TCP/IP as well, so one connection's failure. accept(2)
+        // also answers it, forever, for a listener that is not SOCK_STREAM; that one is refused where
+        // it is known, at `BlockingListener::Adopt`, since answered `Stop` here one connection could
+        // end the loop.
+        SocketErrorRow { .osError = EOPNOTSUPP, .code = core::net::NetErrorCode::ConnReset },
+        SocketErrorRow { .osError = ENETDOWN, .code = core::net::NetErrorCode::HostUnreach },
+        SocketErrorRow { .osError = ENETUNREACH, .code = core::net::NetErrorCode::HostUnreach },
+        SocketErrorRow { .osError = EHOSTDOWN, .code = core::net::NetErrorCode::HostUnreach },
+        SocketErrorRow { .osError = EHOSTUNREACH, .code = core::net::NetErrorCode::HostUnreach },
+    #if defined(ENONET)
+        // Linux only.
+        SocketErrorRow { .osError = ENONET, .code = core::net::NetErrorCode::HostUnreach },
+    #endif
+        // Out of descriptors -- the process's or the system's -- buffer space or memory: the
+        // process's, never the listener's.
+        SocketErrorRow { .osError = EMFILE, .code = core::net::NetErrorCode::ResourceExhausted },
+        SocketErrorRow { .osError = ENFILE, .code = core::net::NetErrorCode::ResourceExhausted },
+        SocketErrorRow { .osError = ENOBUFS, .code = core::net::NetErrorCode::ResourceExhausted },
+        SocketErrorRow { .osError = ENOMEM, .code = core::net::NetErrorCode::ResourceExhausted },
     };
 #endif
 
@@ -130,13 +183,7 @@ namespace
     [[nodiscard]] core::net::NetError SystemError(std::string_view context)
     {
         auto const osError = LastSocketError();
-        // A range-for rather than `std::ranges::find`: the iterator is a raw pointer in one
-        // standard library and a class in another, and no single spelling of it satisfies both
-        // the compilers and clang-tidy's qualified-auto rule.
-        for (auto const& row: SocketErrors)
-            if (row.osError == osError)
-                return core::net::makeNetError(row.code, osError, std::string { context });
-        return core::net::makeNetError(core::net::NetErrorCode::SystemError, osError, std::string { context });
+        return core::net::makeNetError(SocketErrorCode(osError), osError, std::string { context });
     }
 
     /// Set the receive and send timeouts of @p socket; a non-positive value leaves one alone.
@@ -159,7 +206,95 @@ namespace
         apply(SO_SNDTIMEO, send);
     }
 
+    /// A socket type an adopted descriptor may have, by the name an operator would search for.
+    struct SocketTypeName
+    {
+        int type;              ///< The `SO_TYPE` value.
+        std::string_view name; ///< Its constant's spelling.
+    };
+
+    /// The types a refusal names; any other is reported by number.
+    ///
+    /// Not `SOCK_DGRAM`: `udp-opener` reads every use of it in first-party source as opening a UDP
+    /// socket, which the compile node's any-port firewall rule would expose, and that guard is
+    /// closed on purpose rather than taught which uses are only names. A datagram descriptor is
+    /// reported by its number, which is what `SO_TYPE` answered.
+    constexpr auto SocketTypeNames = std::array {
+        SocketTypeName { .type = SOCK_STREAM, .name = "SOCK_STREAM" },
+        SocketTypeName { .type = SOCK_RAW, .name = "SOCK_RAW" },
+        SocketTypeName { .type = SOCK_SEQPACKET, .name = "SOCK_SEQPACKET" },
+    };
+
+    /// @param type An `SO_TYPE` value.
+    /// @return Its constant's spelling, or the number when no row names it.
+    [[nodiscard]] std::string SocketTypeText(int type)
+    {
+        for (auto const& row: SocketTypeNames)
+            if (row.type == type)
+                return std::string { row.name };
+        return std::format("socket type {}", type);
+    }
+
+    /// One integer `SOL_SOCKET` option of @p socket.
+    /// @param socket The descriptor to ask.
+    /// @param option The option, e.g. `SO_TYPE`.
+    /// @param what What the option is called in a refusal, e.g. "its socket type".
+    /// @return The value, or the refusal naming what could not be asked.
+    [[nodiscard]] std::expected<int, std::string> SocketOption(core::platform::NativeHandle socket,
+                                                               int option,
+                                                               std::string_view what)
+    {
+        int value = 0;
+        auto length = static_cast<AddrLen>(sizeof(value));
+        if (::getsockopt(ToSocket(socket), SOL_SOCKET, option, reinterpret_cast<char*>(&value), &length) != 0)
+            return std::unexpected { std::format(
+                "adopt: the descriptor could not be asked {} ({})", what, SystemError("getsockopt").toString()) };
+        return value;
+    }
+
+    /// Why @p socket cannot be an accept loop's listener, or nothing when it can.
+    ///
+    /// **A listener that is not a LISTENING `SOCK_STREAM` socket is a CONFIGURATION fact, and it is
+    /// refused where it is known.** accept(2) fails on either forever: `EOPNOTSUPP` on another type
+    /// and `EINVAL` on a stream socket nobody called listen() on. But `EOPNOTSUPP` is also a
+    /// network error already pending on ONE new TCP connection, which is why `SocketErrors`
+    /// classifies it as a per-connection failure the loop steps past, and anything unclassified
+    /// is backed off on and warned about, forever, and reported degraded. Classified as ending the
+    /// loop instead, one connection could end it -- the defect every accept loop here was fixed
+    /// for. So the descriptor is asked its type and whether it listens once, at adoption, and a
+    /// loop over the wrong kind never starts.
+    /// @param socket The descriptor being adopted.
+    /// @return The refusal, naming what is wrong, or nothing for a listening stream socket.
+    [[nodiscard]] std::optional<std::string> RefusalUnlessListeningStream(core::platform::NativeHandle socket)
+    {
+        auto const type = SocketOption(socket, SO_TYPE, "its socket type");
+        if (!type.has_value())
+            return type.error();
+        if (*type != SOCK_STREAM)
+            return std::format("adopt: the descriptor is {}, not SOCK_STREAM; accept() on it would fail "
+                               "forever, so it cannot be a listener",
+                               SocketTypeText(*type));
+        auto const listening = SocketOption(socket, SO_ACCEPTCONN, "whether it listens");
+        if (!listening.has_value())
+            return listening.error();
+        if (*listening == 0)
+            return std::string { "adopt: the descriptor is a SOCK_STREAM socket nobody called listen() on "
+                                 "(SO_ACCEPTCONN is 0); accept() on it would fail forever, so it cannot be a "
+                                 "listener" };
+        return std::nullopt;
+    }
 } // namespace
+
+core::net::NetErrorCode SocketErrorCode(int osError) noexcept
+{
+    // A range-for rather than `std::ranges::find`: the iterator is a raw pointer in one standard
+    // library and a class in another, and no single spelling of it satisfies both the compilers and
+    // clang-tidy's qualified-auto rule.
+    for (auto const& row: SocketErrors)
+        if (row.osError == osError)
+            return row.code;
+    return core::net::NetErrorCode::SystemError;
+}
 
 void CloseNativeSocket(core::platform::NativeHandle socket) noexcept
 {
@@ -346,6 +481,14 @@ std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptBoundList
     if (handle == core::platform::InvalidHandle)
         // Refused before anything touches it, and nothing to close.
         return std::unexpected(std::string { "adopt: not a socket" });
+    // Asked before core-cpp takes it, which does not ask: a descriptor a supervisor handed over, or
+    // a listener this process bound, that is not a LISTENING stream socket would otherwise start a
+    // reactor loop whose every accept fails, forever.
+    if (auto refusal = RefusalUnlessListeningStream(handle); refusal.has_value())
+    {
+        CloseNativeSocket(handle);
+        return std::unexpected(std::move(*refusal));
+    }
     // Made non-blocking and close-on-exec by core-cpp itself (`PosixListener::adopt`), which is
     // where the reactor's requirement lives; a second `fcntl` here was measured to change nothing
     // -- removed, every [adopt] and [consensus] case stayed green on Linux.
@@ -395,16 +538,24 @@ std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAd
 std::unique_ptr<BlockingListener> BlockingListener::Adopt(core::platform::NativeHandle handle)
 {
     auto listener = std::unique_ptr<BlockingListener> { new BlockingListener {} };
+    if (auto refusal = RefusalUnlessListeningStream(handle); refusal.has_value())
+    {
+        // Owned from the call on, refused or not, so the caller never closes it itself.
+        CloseNativeSocket(handle);
+        listener->_bindError = std::move(*refusal);
+        return listener;
+    }
     listener->_handle = handle;
     return listener;
 }
 
 BlockingListener::~BlockingListener()
 {
-    BlockingListener::close();
+    // Inside this destructor `close()` still reaches this class's own `doClose()`.
+    close();
 }
 
-void BlockingListener::close() noexcept
+void BlockingListener::doClose() noexcept
 {
     CloseNativeSocket(std::exchange(_handle, core::platform::InvalidHandle));
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <core/async/Task.hpp>
+#include <core/net/AcceptLoopHealth.hpp>
 #include <core/net/IListener.hpp>
 #include <core/net/ISocket.hpp>
 #include <core/platform/Clock.hpp>
@@ -280,6 +282,12 @@ class AdminHttpServer
     /// @param metrics Connection-level counter sink to expose.
     /// @param snapshotProvider Returns a fresh storage snapshot + uptime per scrape.
     /// @param logger Shared logger.
+    /// @param acceptLoops The process's accept-loop registry: this server's own loop reports to
+    ///        it, and `/healthz` answers from it -- `503` naming every surface that has stopped
+    ///        accepting or is degraded, where it used to answer `200` over a dead one. Required,
+    ///        because a probe that asks nothing is the confident wrong signal this exists to end.
+    /// @param backoffWait How the accept loop waits out a backoff: it owns its thread and its
+    ///        listener blocks, so there is no reactor timer to suspend on.
     /// @param routes Routes beyond `/metrics` and `/healthz`; copied.
     /// @param tls Server TLS context, or nullptr to serve plaintext.
     /// @param surfaces The metrics surfaces this process serves, for `/metrics`. Defaults to
@@ -289,6 +297,8 @@ class AdminHttpServer
                     SnapshotProvider snapshotProvider,
                     ILogger& logger,
                     core::platform::IClock& clock,
+                    core::net::AcceptLoopHealth& acceptLoops,
+                    IDrainWait& backoffWait,
                     std::vector<AdminRoute> routes = {},
                     core::net::ITlsContext* tls = nullptr,
                     std::span<MetricsSurface const> surfaces = EverySurface) noexcept;
@@ -333,6 +343,8 @@ class AdminHttpServer
     SnapshotProvider _snapshotProvider;
     ILogger& _logger;
     core::platform::IClock& _clock;
+    core::net::AcceptLoopHealth& _acceptLoops;
+    IDrainWait& _backoffWait;
     std::vector<AdminRoute> _routes;
     /// Server TLS context, or null for plaintext. Not owned.
     core::net::ITlsContext* _tls { nullptr };
@@ -366,11 +378,15 @@ class AdminHttpServer
 /// @param surfaces The metrics surfaces this process serves, for `/metrics`. Defaults to
 ///                 `EverySurface`, so the daemon is unchanged; a binary serving only some of
 ///                 them renders those rows absent rather than as a plausible zero (#1484).
+/// @param liveness What `/healthz` answers from: `503` naming every surface that stopped
+///                 accepting or is degraded, `200` while none is. Null only for a caller
+///                 exercising another route; `AdminHttpServer` always passes its registry.
 [[nodiscard]] core::async::Task<void> ServeAdminHttp(core::net::ISocket* socket,
                                                      IMetricsSink const* metrics,
                                                      AdminHttpServer::SnapshotProvider snapshotProvider,
                                                      core::platform::IClock* clock,
                                                      std::span<AdminRoute const> routes = {},
-                                                     std::span<MetricsSurface const> surfaces = EverySurface);
+                                                     std::span<MetricsSurface const> surfaces = EverySurface,
+                                                     core::net::AcceptLoopHealth const* liveness = nullptr);
 
 } // namespace FastCache

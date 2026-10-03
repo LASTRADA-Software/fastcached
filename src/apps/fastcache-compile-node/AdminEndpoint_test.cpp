@@ -195,7 +195,8 @@ TEST_CASE("An unparseable --admin-listen is refused, not guessed at", "[node][ad
     // And what the factory itself still refuses: a surface it was asked to serve
     // that resolves to no address. Naming the flag, because an operator has to know
     // which surface went unserved.
-    auto const started = AdminEndpoint::Start(NodeSurface::Admin, off, metrics, WorkerShapedSnapshot(), logger);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto const started = AdminEndpoint::Start(NodeSurface::Admin, off, metrics, WorkerShapedSnapshot(), logger, acceptLoops);
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains("--admin-listen"));
 }
@@ -226,7 +227,8 @@ TEST_CASE("A bare port binds loopback rather than the wildcard", "[node][admin]"
     auto cfg = Installable();
     cfg.adminListen = std::to_string(port);
 
-    auto const bare = AdminEndpoint::Start(NodeSurface::Admin, cfg, metrics, WorkerShapedSnapshot(), logger);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto const bare = AdminEndpoint::Start(NodeSurface::Admin, cfg, metrics, WorkerShapedSnapshot(), logger, acceptLoops);
     REQUIRE(bare.has_value());
     CHECK((*bare)->BoundEndpoint() == std::format("127.0.0.1:{}", port));
 }
@@ -247,8 +249,9 @@ TEST_CASE("An endpoint that cannot bind reports why", "[node][admin]")
     NullLogger logger;
 
     auto const unreachable = std::string { "192.0.2.1:6674" };
+    core::net::AcceptLoopHealth acceptLoops;
     auto const started =
-        AdminEndpoint::Start(NodeSurface::Admin, AdminOn(unreachable), metrics, WorkerShapedSnapshot(), logger);
+        AdminEndpoint::Start(NodeSurface::Admin, AdminOn(unreachable), metrics, WorkerShapedSnapshot(), logger, acceptLoops);
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains(unreachable));
 }
@@ -278,7 +281,8 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     // naming nothing, which this repository has already paid for once. It fails in
     // seconds instead, saying what it waited for.
     auto stopped = std::async(std::launch::async, [&] {
-        auto started = AdminEndpoint::Start(NodeSurface::Admin, cfg, metrics, WorkerShapedSnapshot(), logger);
+        core::net::AcceptLoopHealth acceptLoops;
+        auto started = AdminEndpoint::Start(NodeSurface::Admin, cfg, metrics, WorkerShapedSnapshot(), logger, acceptLoops);
         return started.has_value();
     });
 
@@ -763,8 +767,17 @@ TEST_CASE("An admin surface nobody asked for starts nothing at all", "[node][adm
     Node::NodeConditions conditions;
     NodeConfig cfg;
 
-    auto surface = Node::StartAdminSurfaceOrExplain(
-        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto surface = Node::StartAdminSurfaceOrExplain(cfg,
+                                                    scrapeHost,
+                                                    metrics,
+                                                    WorkerShapedSnapshot(),
+                                                    std::nullopt,
+                                                    nullptr,
+                                                    AdminCredential {},
+                                                    logger,
+                                                    conditions,
+                                                    acceptLoops);
     REQUIRE(surface.has_value());
     CHECK(surface->endpoint == nullptr);
     // A surface that never started answers nothing about its certificate: the row is left for
@@ -788,8 +801,17 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
         NodeConfig cfg;
         cfg.adminListen = "not-a-port";
 
-        auto const surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+        core::net::AcceptLoopHealth acceptLoops;
+        auto const surface = Node::StartAdminSurfaceOrExplain(cfg,
+                                                              scrapeHost,
+                                                              metrics,
+                                                              WorkerShapedSnapshot(),
+                                                              std::nullopt,
+                                                              nullptr,
+                                                              AdminCredential {},
+                                                              logger,
+                                                              conditions,
+                                                              acceptLoops);
         REQUIRE_FALSE(surface.has_value());
         CHECK(surface.error().reason.contains("--admin-listen"));
         CHECK(surface.error().cause == Node::NodeRefusalCause::Listener);
@@ -862,8 +884,17 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
 
     SECTION("with no scheduler, /fleet is not a route")
     {
-        auto surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+        core::net::AcceptLoopHealth acceptLoops;
+        auto surface = Node::StartAdminSurfaceOrExplain(cfg,
+                                                        scrapeHost,
+                                                        metrics,
+                                                        WorkerShapedSnapshot(),
+                                                        std::nullopt,
+                                                        nullptr,
+                                                        AdminCredential {},
+                                                        logger,
+                                                        conditions,
+                                                        acceptLoops);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
         CHECK(surface->endpoint->BoundEndpoint() == std::format("127.0.0.1:{}", port));
@@ -871,6 +902,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
 
     SECTION("with a scheduler, the surface starts and serves it")
     {
+        core::net::AcceptLoopHealth acceptLoops;
         auto surface = Node::StartAdminSurfaceOrExplain(
             cfg,
             scrapeHost,
@@ -880,7 +912,8 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
             nullptr,
             AdminCredential {},
             logger,
-            conditions);
+            conditions,
+            acceptLoops);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
     }
@@ -907,8 +940,17 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     cfg.adminListen = std::format("127.0.0.1:{}", port);
     cfg.tlsSelfSigned = true;
 
-    auto surface = Node::StartAdminSurfaceOrExplain(
-        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto surface = Node::StartAdminSurfaceOrExplain(cfg,
+                                                    scrapeHost,
+                                                    metrics,
+                                                    WorkerShapedSnapshot(),
+                                                    std::nullopt,
+                                                    nullptr,
+                                                    AdminCredential {},
+                                                    logger,
+                                                    conditions,
+                                                    acceptLoops);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
     REQUIRE(surface->tls != nullptr);
@@ -947,8 +989,17 @@ TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][adm
     NodeConfig cfg;
     cfg.adminListen = std::format("127.0.0.1:{}", port);
 
-    auto surface = Node::StartAdminSurfaceOrExplain(
-        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto surface = Node::StartAdminSurfaceOrExplain(cfg,
+                                                    scrapeHost,
+                                                    metrics,
+                                                    WorkerShapedSnapshot(),
+                                                    std::nullopt,
+                                                    nullptr,
+                                                    AdminCredential {},
+                                                    logger,
+                                                    conditions,
+                                                    acceptLoops);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
 #if defined(FC_TLS_ENABLED)

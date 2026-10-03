@@ -117,9 +117,8 @@ struct Link
         diallerIdentity { NodeId { shape.dialler },
                           Testing::TestKeyPair(shape.diallerMachine.empty() ? shape.dialler : shape.diallerMachine),
                           roster },
-        server { listener,       reactor,      sink,
-                 inbound,        logger,       serverMetrics,
-                 serverIdentity, serverRandom, PeerServerOptions { .handshakeBound = 0ms } }
+        server { listener,      reactor,        sink,         inbound,     logger,
+                 serverMetrics, serverIdentity, serverRandom, acceptLoops, PeerServerOptions { .handshakeBound = 0ms } }
     {
         [](RaftPeerServer* accepting) -> core::async::DetachedTask {
             co_await accepting->Run();
@@ -215,6 +214,7 @@ struct Link
     SystemSecureRandom serverRandom;
     SystemSecureRandom diallerRandom;
     Testing::NoInboundLinks inbound; ///< What the server attached; every dialler here is one-way.
+    core::net::AcceptLoopHealth acceptLoops;
     RaftPeerServer server;
     std::unique_ptr<RaftPeerTransport> transport;
 };
@@ -277,7 +277,7 @@ class ProbingListener final: public core::net::IListener
   public:
     /// @param inner Where connections really arrive; must outlive this.
     /// @param log Where each accepted socket's destruction is recorded; must outlive them.
-    ProbingListener(core::net::testing::InMemoryListener& inner, DestructionLog& log) noexcept:
+    ProbingListener(core::net::testing::InMemoryListener& inner, DestructionLog& log):
         _inner { inner },
         _log { log }
     {
@@ -299,16 +299,17 @@ class ProbingListener final: public core::net::IListener
         return _inner.boundPort();
     }
 
-    /// @copydoc IListener::close
-    void close() noexcept override
-    {
-        _inner.close();
-    }
-
     /// @return How many connections were accepted.
     [[nodiscard]] std::size_t Accepted() const noexcept
     {
         return _accepted.load(std::memory_order_relaxed);
+    }
+
+  protected:
+    /// @copydoc IListener::doClose
+    void doClose() noexcept override
+    {
+        _inner.close();
     }
 
   private:
@@ -537,6 +538,7 @@ struct LearnerLink
                                                         leaderMetrics,
                                                         leaderIdentity,
                                                         leaderRandom,
+                                                        leaderAcceptLoops,
                                                         PeerServerOptions { .handshakeBound = 0ms });
         [](RaftPeerServer* accepting) -> core::async::DetachedTask {
             co_await accepting->Run();
@@ -676,6 +678,7 @@ struct LearnerLink
     Testing::TestPeerIdentity const learnerIdentity;
     SystemSecureRandom leaderRandom;
     SystemSecureRandom learnerRandom;
+    core::net::AcceptLoopHealth leaderAcceptLoops; ///< Where the leader's server reports its accept loop.
 
     /// Every acceptor whose SIGNED verdict told the learner its own key was revoked, in order.
     std::vector<NodeId> ownKeyRevokedBy;

@@ -1138,29 +1138,62 @@ Every rule below has already been a bug.
     silently wrong on the other. It was open-coded at three sites in two subsystems;
     it is `Net::IsDeadlineExpiry` now, beside the enum, which is a dependency-free
     leaf and so costs nothing at the `net-boundary` line.
-    **`FrameEndpoint`'s accept loop tests `WouldBlock` ALONE and is right to** — that
-    listener arms no poll timeout, so `Timeout` cannot arrive there and the second
-    operand would be dead. A narrower test with a stated reason is not the same
-    finding as a narrower test by omission, and reading the first as the second is
-    the easy mistake here, because the grep looks identical. It was reported as a
-    defect by two reviewers and repeated once before anybody opened the file, so the
-    reason is now recorded AT the site as well as beside the predicate.
-    **The reason is REACHABILITY, and calling it semantic is a defect that was
-    written into this file and then had to be taken out again.** "On an accept,
-    `WouldBlock` is not a deadline expiring" sounds better — it survives a rewiring
-    where a reachability claim does not — and it is FALSE. The predicate's other two
-    callers are accept loops whose listeners *do* arm a poll timeout, and there
-    `WouldBlock` (POSIX) and `Timeout` (Winsock) are one event under two names: *the
-    poll ticked, re-check the stop flag, accept again*. Believe the semantic version
-    and the invited edit is to drop `WouldBlock` from `IsDeadlineExpiry` — which
-    makes `AdminHttpServer::Run` and `RaftPeerServer::Run` treat every POSIX poll
-    tick as a fatal accept error and `co_return`, so both surfaces stop accepting
-    about a quarter of a second after they start, with one `Debug` line as the only
-    symptom. **A reason that generalises further than the fact it was drawn from is
-    worse than the narrow one**, because it reads as licence somewhere it was never
-    measured. The maintenance cost of the true reason is real and is the price: give
-    that listener a poll timeout and the site must move to `IsDeadlineExpiry` in the
-    same change.
+    **No accept loop spells either code any more**: core-cpp's `core::net::AcceptErrorTable`
+    (`<core/net/AcceptPolicy.hpp>`, graduated from this tree at core-cpp 0.6.0) classifies
+    every `core::net::NetErrorCode` for all five loops, and
+    both poll codes are `PollTick` there -- *the poll ticked, re-check the stop flag, accept
+    again*. The history is kept because it is the trap the table closes. `FrameEndpoint`
+    once tested `WouldBlock` ALONE, correctly, for a REACHABILITY reason (that listener arms
+    no poll timeout); calling the reason semantic -- "on an accept, `WouldBlock` is not a
+    deadline expiring" -- was FALSE, and invited dropping `WouldBlock` from
+    `IsDeadlineExpiry`, which would have made `AdminHttpServer::Run` and
+    `RaftPeerServer::Run` treat every POSIX poll tick as fatal and stop accepting a quarter
+    of a second after they started. **A reason that generalises further than the fact it
+    was drawn from is worse than the narrow one.** A row in one table has no such reason to
+    get wrong.
+  - **A failed accept is almost never a failed LISTENER, so only a closed or vanished one
+    ends an accept loop** -- `Cancelled` (`Closed`) and `BadHandle` (`Dead`), the only two
+    dispositions that end one; a `Dead` listener is CLOSED by the loop, so its port refuses
+    rather than queues.
+    Every loop in the tree used to end on any code but the poll tick, at `Debug`, with the
+    listening socket left open: the backlog then fills and the kernel refuses every later
+    connect, for as long as the process runs. On Windows an `AcceptEx` completes with
+    `WSAECONNRESET` when a client resets its QUEUED connection -- a launcher killed
+    mid-exchange, or one whose 1 s budget ran out under load -- and that one event stopped
+    the installed node's 0xFC surface for nine hours while `/healthz` answered `200`.
+    Reproduced on a scratch node by flooding it with client resets: dark after 149
+    connections, `accept loop ended (connection reset (AcceptEx) [errno 10054])`.
+    - A failed CONNECTION is accepted past with a rate-limited `Warn`; an EXHAUSTION
+      (`ResourceExhausted`: `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` and their Winsock twins,
+      rows of `NativeListen`'s `SocketErrors` for the blocking listeners) waits a bounded
+      backoff first, on the loop's own timer (`WaitOutBackoff`: the reactor's, or the
+      injected blocking wait for a loop that owns its thread). A failure NOTHING classifies
+      (`SystemError`) is backed off on too, and a run of `UnclassifiedBeforeDegraded` of them
+      reports the loop DEGRADED -- in the registry until an accept succeeds or the loop
+      stops; and every `FailuresBeforeYield`
+      failed connections in a row the loop YIELDS for `FirstBackoff`, because a listener
+      whose accept fails without suspending would otherwise never yield its reactor. The
+      hang that found this was a FIXTURE answering `Eof` to end a loop.
+    - **A yield, never a backoff that grows, for failed CONNECTIONS**: each one consumed a
+      queued connection, so the loop is DRAINING a backlog, and slowing it is what keeps a
+      port refusing. Measured: the first cut doubled to a second per failure, and after a
+      15 s flood of resets the raft port refused connects until its backlog of dead
+      connections had drained at one a second. Backing off is for EXHAUSTION alone.
+    - A loop that ends while its surface is NOT shutting down says so at `Error` and in the
+      process's `core::net::AcceptLoopHealth`, which `/healthz` (`503` naming the surface) and
+      the node's `surface-not-accepting` condition both read; a DEGRADED loop is reported
+      there too, `503` naming it degraded and the LIVE `surface-accept-degraded` row. Every
+      loop carries the verdicts out through ONE `Transport/AcceptLoopReporter`, so the five
+      agree on the level and the record. **A listening port is not a
+      serving one**, and a liveness probe that asks nothing is the confident wrong signal.
+      The ADMIN loop is the one `/healthz` cannot report, since the thread that would answer
+      `503` is the one that ended -- a probe times out instead, measured -- so on the node its
+      end is carried by that condition row (`--node-status` and the fleet page, both over
+      other surfaces), and the daemon has only the `Error` line.
+    - A fixture that ends a loop by answering some error is now a fixture that SPINS: it
+      must answer `Cancelled`, the way a closed listener does. core-cpp's
+      `core::net::testing::FailingListener` is the shared fake for the opposite -- failures a
+      loop must survive.
   - **The reported shape cannot be asserted on, and its deterministic twin can.**
     *Connect, wait, then ask* is a RACE to observe: an unfixed server answers and
     closes at the deadline, the client's late write then draws an RST, and the RST

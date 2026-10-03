@@ -23,12 +23,14 @@
 #include <fstream>
 #include <optional>
 #include <ranges>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
+#include <tests/Unwrap.hpp>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -922,4 +924,143 @@ TEST_CASE("ParseLog defaults the timestamp to zero for pre-upgrade lines")
     auto const entries = ParseLog("");
     REQUIRE(entries.size() == 1);
     CHECK(entries.front().timestampUnixSeconds == 0);
+}
+
+namespace
+{
+
+/// Every line of the log, as written.
+/// @return The lines, newlines stripped.
+[[nodiscard]] std::vector<std::string> RawLogLines()
+{
+    std::ifstream in { LogPath(), std::ios::binary };
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line))
+        lines.push_back(line);
+    return lines;
+}
+
+/// The tab-separated fields of @p line.
+/// @param line The line. @return Its fields.
+[[nodiscard]] std::vector<std::string> FieldsOf(std::string const& line)
+{
+    std::vector<std::string> fields;
+    std::string field;
+    std::istringstream in { line };
+    while (std::getline(in, field, '\t'))
+        fields.push_back(field);
+    if (!line.empty() && line.back() == '\t')
+        fields.emplace_back();
+    return fields;
+}
+
+} // namespace
+
+TEST_CASE("A line this build writes names its format version and round-trips every column", "[stats][log-format]")
+{
+    // Reading one: the current format. The version is the first field, and every column after it
+    // comes back -- the exit code and the dispatch specifics included, which an unversioned reader
+    // would have had to find by counting.
+    ScopedStateDir const scoped;
+    auto record =
+        MakeDispatchRecord(DispatchOutcome::Declined, "a worker would not take an argument of this compile", "a.cpp");
+    record.dispatchSpecifics = "argument /volatile:iso is not on this worker's accepted-flag list";
+    record.timestampUnixSeconds = 1'790'000'000;
+    record.exitCode = 2;
+    AppendRecord(record);
+
+    auto const lines = RawLogLines();
+    REQUIRE(lines.size() == 1);
+    auto const fields = FieldsOf(lines.front());
+    CHECK(fields.front() == "v2");
+    CHECK(fields.size() == 16); // the marker and fifteen columns
+
+    auto const reading = ReadLog("");
+    CHECK(reading.unreadable == 0);
+    REQUIRE(reading.records.size() == 1);
+    auto const& read = reading.records.front();
+    CHECK(read.outcome == record.outcome);
+    CHECK(read.source == "a.cpp");
+    CHECK(read.dispatch == DispatchOutcome::Declined);
+    CHECK(read.dispatchDetail == record.dispatchDetail);
+    CHECK(read.dispatchSpecifics == record.dispatchSpecifics);
+    CHECK(read.timestampUnixSeconds == 1'790'000'000);
+    REQUIRE(read.exitCode.has_value());
+    CHECK(FastCache::Testing::Unwrap(read.exitCode) == 2);
+}
+
+TEST_CASE("A line without a version is read by arity as the launcher that wrote it meant", "[stats][log-format]")
+{
+    // Reading two: an older launcher's line, which carries no marker. Its columns are the ones
+    // that existed then, read by how many there are -- and the exit code, which did not exist,
+    // is ABSENT rather than a zero that would call every old compile a success.
+    ScopedStateDir const scoped;
+    AppendRawLine("MISS\tmain\t0\t10\ta.cpp\t\t0\t0\t0\t0\t1700000000\tDECLINED\tthe worker refused the job\targument -x");
+
+    auto const reading = ReadLog("main");
+    CHECK(reading.unreadable == 0);
+    REQUIRE(reading.records.size() == 1);
+    auto const& read = reading.records.front();
+    CHECK(read.outcome == Outcome::Miss);
+    CHECK(read.prefetchGroup == "main");
+    CHECK(read.timestampUnixSeconds == 1'700'000'000);
+    CHECK(read.dispatchSpecifics == "argument -x");
+    CHECK_FALSE(read.exitCode.has_value());
+}
+
+TEST_CASE("A line in a format this build does not know is skipped and counted and never read by position",
+          "[stats][log-format]")
+{
+    // Reading three: a later launcher appending to the same log, which is what a rolling upgrade
+    // looks like. Read by position, "v3" would be an outcome, its group a byte count, and a later
+    // column order would put one field's value into another's slot with nothing to notice.
+    ScopedStateDir const scoped;
+    AppendRawLine("v3\tHIT\tmain\t4096\t10\ta.cpp\t\t1\t2\t3\t0\t1700000000\tDISPATCHED\t\t\t0\tnew-column");
+    AppendRecord(MakeDispatchRecord(DispatchOutcome::Declined, "a reason", "b.cpp"));
+
+    auto const reading = ReadLog("");
+    CHECK(reading.unreadable == 1);
+    REQUIRE(reading.records.size() == 1);
+    CHECK(reading.records.front().source == "b.cpp");
+    // And the report says so, rather than showing a total one short with no reason.
+    CHECK(FormatReport("").contains("skipped      : 1 log line(s) in a format this launcher does not read"));
+}
+
+TEST_CASE("A current-format line whose columns do not add up is skipped rather than guessed at", "[stats][log-format]")
+{
+    // Reading four: the marker says version 2 and the columns say otherwise -- a torn append, or
+    // a hand edit. The version is a promise about the columns, so a line breaking it is refused
+    // whole rather than read as far as it goes.
+    ScopedStateDir const scoped;
+    AppendRawLine("v2\tHIT\tmain\t4096\t10");
+
+    auto const reading = ReadLog("");
+    CHECK(reading.unreadable == 1);
+    CHECK(reading.records.empty());
+}
+
+TEST_CASE("A record's timestamp comes from the injected wall clock", "[stats][log-format]")
+{
+    // Every line the installed launcher wrote had timestamp 0 -- nothing set it -- so the per-day
+    // chart had nothing to plot. The value now comes from a clock the caller hands in.
+    core::platform::ManualWallClock clock;
+    clock.setNow(std::chrono::system_clock::time_point { std::chrono::seconds { 1'790'000'123 } });
+    CHECK(RecordTimestamp(clock) == 1'790'000'123);
+}
+
+TEST_CASE("The report counts failed compiles only among records that carry an exit code", "[stats][log-format]")
+{
+    // A killed compiler and a cache that broke the build read identically in a log that kept no
+    // exit code. This separates them -- and a line from before the column counts as neither.
+    ScopedStateDir const scoped;
+    for (auto const code: { 0, 1, 0 })
+    {
+        auto record = MakeDispatchRecord(DispatchOutcome::NotAttempted, {}, "a.cpp");
+        record.exitCode = code;
+        AppendRecord(record);
+    }
+    AppendRawLine("MISS\tdefault\t0\t10\told.cpp\t\t0\t0\t0\t0\t1700000000\tNOT_ATTEMPTED\t\t");
+
+    CHECK(FormatReport("").contains("compile failed: 1 of 3 that recorded an exit code"));
 }

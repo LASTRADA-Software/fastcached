@@ -2926,13 +2926,16 @@ inline constexpr std::array ErrorTable {
                       .defaultMessage = "this host already has as many enrollment requests waiting as one host may; "
                                         "nothing was recorded",
                       .retry = RetryMayHelp,
-                      .retryWhy = "nothing about this machine was decided, and the host's rows drain as an operator decides" },
-    ErrorDescriptor { .code = ErrorCode::TicketRefused,
-                      .name = "ticket-refused",
-                      .defaultMessage = "this node did not accept the machine ticket presented; the reason is named in "
-                                        "the message",
-                      .retry = RetryWillNotHelp,
-                      .retryWhy = "the node judged what the ticket names, and judges the same machine the same way until its standing changes" },
+                      .retryWhy =
+                          "nothing about this machine was decided, and the host's rows drain as an operator decides" },
+    ErrorDescriptor {
+        .code = ErrorCode::TicketRefused,
+        .name = "ticket-refused",
+        .defaultMessage = "this node did not accept the machine ticket presented; the reason is named in "
+                          "the message",
+        .retry = RetryWillNotHelp,
+        .retryWhy =
+            "the node judged what the ticket names, and judges the same machine the same way until its standing changes" },
     ErrorDescriptor { .code = ErrorCode::IdentifiedCallerRequired,
                       .name = "identified-caller-required",
                       .defaultMessage = "an operator's control verb needs a caller this node can identify -- from this "
@@ -2940,12 +2943,13 @@ inline constexpr std::array ErrorTable {
                                         "nobody to it",
                       .retry = RetryWillNotHelp,
                       .retryWhy = "who the caller is does not change by asking again" },
-    ErrorDescriptor { .code = ErrorCode::NotSharedCache,
-                      .name = "not-shared-cache",
-                      .defaultMessage = "this machine is not the fleet's shared cache; the shared-cache setting names "
-                                        "another machine, or none",
-                      .retry = RetryWillNotHelp,
-                      .retryWhy = "the shared-cache setting is the cluster's, and names another machine until an operator changes it" },
+    ErrorDescriptor {
+        .code = ErrorCode::NotSharedCache,
+        .name = "not-shared-cache",
+        .defaultMessage = "this machine is not the fleet's shared cache; the shared-cache setting names "
+                          "another machine, or none",
+        .retry = RetryWillNotHelp,
+        .retryWhy = "the shared-cache setting is the cluster's, and names another machine until an operator changes it" },
     ErrorDescriptor { .code = ErrorCode::WorkerRejectedArgument,
                       .name = "worker-rejected-argument",
                       .defaultMessage = "this worker will not pass one of the job's arguments to its compiler",
@@ -2968,16 +2972,11 @@ static_assert(EveryRetryIsReasoned(), "every error code says why asking again ma
 /// the direction that costs is a transient refusal read as a decision, which gives up on a
 /// healthy cluster mid-election or mid-change.
 inline constexpr std::array RetriableErrorCodes {
-    ErrorCode::StorageWriteFailed,
-    ErrorCode::NoWorker,
-    ErrorCode::NoCapacity,
-    ErrorCode::AlreadyInFlight,
-    ErrorCode::Withdrawn,
-    ErrorCode::ClusterChangeInFlight,
-    ErrorCode::EndpointBusy,
-    ErrorCode::WorkerToolchainSurveyInFlight,
-    ErrorCode::EnrollmentFull,
-    ErrorCode::EnrollmentHostFull,
+    ErrorCode::StorageWriteFailed, ErrorCode::NoWorker,
+    ErrorCode::NoCapacity,         ErrorCode::AlreadyInFlight,
+    ErrorCode::Withdrawn,          ErrorCode::ClusterChangeInFlight,
+    ErrorCode::EndpointBusy,       ErrorCode::WorkerToolchainSurveyInFlight,
+    ErrorCode::EnrollmentFull,     ErrorCode::EnrollmentHostFull,
     ErrorCode::RosterExpired,
 };
 
@@ -5168,8 +5167,9 @@ struct LoadFields
 /// The part of `MaxControlPayload` a node's condition list may take: a THIRD.
 ///
 /// A third rather than a quarter so that every row keeps its words -- a remedy is what an operator
-/// reads, and the longest is 487 of its 512 bytes -- at sixteen rows. Lane 2a's second batch may
-/// add rows; `MaxNodeConditions` and this share are re-checked when it lands.
+/// reads, held to `MaxConditionRemedyBytes` -- at `MaxNodeConditions` rows, which this share holds
+/// and one row more does not. A further row needs a larger share, which the sum below decides, or
+/// shorter ceilings.
 inline constexpr std::size_t ConditionPayloadShare = MaxControlPayload / 3;
 
 static_assert(MaxNodeConditionListBytes <= ConditionPayloadShare,
@@ -5227,12 +5227,13 @@ inline constexpr std::size_t MaxNodeAnnounceOtherBytes =
     + Detail::FramedField(MaxLoadRecordFixedBytes) + Detail::FramedField(MaxRosterEndorsementBytes);
 
 /// ONE budget for the verb, summed, rather than two fractions each checked alone (which said
-/// nothing about whether the rest still fit). With the field ceilings above:
-///   history     its share 65536 / 2 = 32768 (a full batch is 128 x 112 = 14336),
-///   conditions  its share 65536 / 3 = 21845 (a full list is 16 x 1212 = 19392),
-///   the rest    5689 (endpoint 264 + capacity 2792 + load 2365 + endorsement 268),
-/// 32768 + 21845 + 5689 = 60302 <= 65536. `CompileCacheWire_test` encodes the worst case of all
-/// three, asserts its size is exactly what these constants say, and decodes it.
+/// nothing about whether the rest still fit). Every term is a constant, never a figure restated here:
+///   history     `HistoryPayloadShare`, which holds a full batch of
+///               `MaxHistoryBucketsPerHeartbeat` x `MaxHistoryBucketBytes`;
+///   conditions  `ConditionPayloadShare`, which holds `MaxNodeConditionListBytes`;
+///   the rest    `MaxNodeAnnounceOtherBytes`, every other field at its ceiling.
+/// `CompileCacheWire_test` encodes the worst case of all three, asserts its size is exactly what
+/// these constants say, and decodes it.
 static_assert(HistoryPayloadShare + ConditionPayloadShare + MaxNodeAnnounceOtherBytes <= MaxControlPayload,
               "a NODE-ANNOUNCE's history, conditions and everything else must fit one control payload together");
 

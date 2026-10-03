@@ -3430,6 +3430,12 @@ int main(int argc, char** argv)
             .cacheMs = record.cacheMs,
             .directMs = record.directMs,
             .directHit = record.directHit,
+            // Both were missing from every line this launcher wrote: the timestamp column read 0,
+            // so the per-day chart plotted nothing, and a compile that failed read exactly like a
+            // cache that failed -- which is how a night of `cl.exe` killed from outside was taken
+            // for a cache breaking the build.
+            .timestampUnixSeconds = Cc::RecordTimestamp(core::platform::defaultSystemWallClock()),
+            .exitCode = code,
         });
     }
     return code;

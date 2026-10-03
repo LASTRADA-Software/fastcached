@@ -10,6 +10,7 @@
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 #include <FastCache/Protocol/SealedFrameSocket.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
+#include <FastCache/Transport/AcceptLoopReporter.hpp>
 #include <FastCache/Transport/LingeringClose.hpp>
 #include <FastCache/Transport/NativeListen.hpp>
 
@@ -2766,36 +2767,34 @@ core::async::Task<void> FrameServer::Run()
     state->io.NoteLoopStarted();
     SweepOverdue(state);
 
+    // Per loop: the backoff and the warning rate limit are this surface's, not the process's.
+    AcceptLoopReporter acceptErrors { state->what, state->what, state->logger, state->io.AcceptLoops() };
     while (!state->shuttingDown.load(std::memory_order_acquire))
     {
         auto accepted = co_await state->listener.accept();
         if (!accepted.has_value())
         {
-            // `Close()` resolves a parked accept with Cancelled, which is how this
-            // loop learns it is done -- there is no poll timeout any more, so a stop
-            // is observed at once rather than after a quarter second.
-            //
-            // **`WouldBlock` alone, and NOT `Net::IsDeadlineExpiry`, deliberately.**
-            // This listener arms no poll timeout, so `Timeout` cannot arrive here at
-            // all and the second operand would be dead. That is a REACHABILITY
-            // reason: it is a fact about this listener, so an edit that gives it a
-            // poll timeout must switch this to `core::net::isDeadlineExpiry` in the same change.
-            //
-            // Not a semantic one. `WouldBlock` at an accept whose listener DOES arm a
-            // timeout is exactly a deadline expiring -- that is what the admin surface
-            // and the Raft peer server call `core::net::isDeadlineExpiry` for -- so "on an accept
-            // WouldBlock is not an expiry" is false in general and must not be carried
-            // back to those callers, which would stop accepting entirely.
-            //
-            // Recorded HERE because the note used to live only beside the predicate,
-            // where three reviewers in a row did not find it and filed the narrow test
-            // as a defect (#824).
-            auto const code = accepted.error().code;
-            if (code == core::net::NetErrorCode::WouldBlock)
-                continue;
-            state->logger.Logf(LogLevel::Debug, "{}: accept loop ended ({})", state->what, accepted.error().toString());
-            break;
+            // **A failed accept is almost never a failed listener**, and this loop used to end on
+            // any code but `WouldBlock`, at `Debug`, with the listener left open: a client that
+            // reset its queued connection -- `WSAECONNRESET` from `AcceptEx`, a launcher killed
+            // mid-exchange or out of budget -- stopped the node's 0xFC surface for nine hours
+            // while the port still listened. `core::net::AcceptErrorPolicy` decides now, for every
+            // loop in the tree: `close()` resolving the parked accept with `Cancelled` is still how
+            // this loop learns it is done, a dead listener is closed and ends it, and nothing a
+            // peer does can.
+            auto const step = acceptErrors.OnError(
+                accepted.error(), state->io.Reactor().clock().now(), state->shuttingDown.load(std::memory_order_acquire));
+            if (step.next == AcceptLoopNext::EndAndClose)
+                state->listener.close();
+            if (step.next != AcceptLoopNext::AcceptAgain)
+                break;
+            // Bounded (`core::net::AcceptErrorPolicy::MaxBackoff`), which is also how late a stop
+            // posted while this waits is observed; the reactor's clock, so a test loop drives it.
+            if (step.delay > std::chrono::milliseconds {})
+                co_await state->io.Reactor().delay(step.delay);
+            continue;
         }
+        acceptErrors.OnAccepted(state->io.Reactor().clock().now());
 
         auto socket = *std::move(accepted);
 
@@ -2809,6 +2808,7 @@ core::async::Task<void> FrameServer::Run()
             ServeConnection(state, std::move(socket));
     }
 
+    acceptErrors.OnLoopEnded();
     state->loopsAlive.fetch_sub(1, std::memory_order_acq_rel);
     co_return;
 }

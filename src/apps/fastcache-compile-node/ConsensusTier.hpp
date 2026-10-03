@@ -31,6 +31,7 @@
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Transport/NativeListen.hpp>
 
+#include <core/net/AcceptLoopHealth.hpp>
 #include <core/net/PlatformLoop.hpp>
 #include <core/platform/Clock.hpp>
 // For `ConsensusStatus`, which is the shape a scrape reports this node's own quorum
@@ -528,6 +529,17 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
         return _boundEndpoint;
     }
 
+    /// Whether the peer port's accept loop is degraded, or has stopped while this tier was not
+    /// shutting down.
+    ///
+    /// The tier's own, because it runs its own reactor; `main` forwards it into the node's one
+    /// registry (`core::net::AcceptLoopHealth::forward`), which the liveness probe and the condition read.
+    /// @return The registry the peer server reports to.
+    [[nodiscard]] core::net::AcceptLoopHealth& AcceptLoops() noexcept
+    {
+        return _acceptLoops;
+    }
+
   private:
     ConsensusTier(Cluster::ClusterMember self,
                   Consensus::FileRaftStorage storage,
@@ -746,6 +758,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     std::unique_ptr<Consensus::RaftDriver> _driver;
     std::unique_ptr<core::net::IListener> _listener;
     std::unique_ptr<Consensus::IRaftMessageSink> _sink;
+    core::net::AcceptLoopHealth _acceptLoops; ///< Declared before the server that reports to it.
     std::unique_ptr<Consensus::RaftPeerServer> _peerServer;
 
     RoleObserver _onRole;

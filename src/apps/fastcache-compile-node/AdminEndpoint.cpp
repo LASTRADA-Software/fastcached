@@ -1038,7 +1038,8 @@ std::expected<AdminSurface, NodeRefusal> StartAdminSurfaceOrExplain(NodeConfig c
                                                                     FleetSampler const* sampler,
                                                                     AdminCredential const& credential,
                                                                     ILogger& logger,
-                                                                    NodeConditions& conditions)
+                                                                    NodeConditions& conditions,
+                                                                    core::net::AcceptLoopHealth& acceptLoops)
 {
     AdminSurface surface;
 
@@ -1090,6 +1091,7 @@ std::expected<AdminSurface, NodeRefusal> StartAdminSurfaceOrExplain(NodeConfig c
                                         metrics,
                                         std::move(snapshot),
                                         logger,
+                                        acceptLoops,
                                         std::move(routes),
 #if defined(FC_TLS_ENABLED)
                                         surface.tls.get());
@@ -1149,6 +1151,7 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
                              AdminHttpServer::SnapshotProvider snapshot,
                              std::string boundEndpoint,
                              ILogger& logger,
+                             core::net::AcceptLoopHealth& acceptLoops,
                              std::vector<AdminRoute> routes,
                              core::net::ITlsContext* tls,
                              ServedSurfaces surfaces):
@@ -1165,6 +1168,9 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
         std::move(snapshot),
         logger,
         _clock,
+        acceptLoops,
+        // The loop owns its thread and its listener blocks, so a backoff blocks too.
+        DefaultDrainWait(),
         std::move(routes),
         tls,
         _surfaces.Span()) },
@@ -1200,6 +1206,7 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
                                                                                 IMetricsSink& metrics,
                                                                                 AdminHttpServer::SnapshotProvider snapshot,
                                                                                 ILogger& logger,
+                                                                                core::net::AcceptLoopHealth& acceptLoops,
                                                                                 std::vector<AdminRoute> routes,
                                                                                 core::net::ITlsContext* tls)
 {
@@ -1244,6 +1251,7 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
                                                                 std::move(snapshot),
                                                                 std::format("{}:{}", endpoint.host, endpoint.port),
                                                                 logger,
+                                                                acceptLoops,
                                                                 std::move(routes),
                                                                 tls,
                                                                 NodeServedSurfacesFor(cfg) } };

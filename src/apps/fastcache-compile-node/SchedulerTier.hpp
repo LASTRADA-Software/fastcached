@@ -65,8 +65,8 @@ struct SchedulerConditionInputs
 /// reads -- the leases refused no-worker, the machines that announced -- reaches the leader alone, and
 /// nothing another leader saw carries over a failover. So a leader that has led for less than the
 /// row's observation span reports `not-evaluated` rather than `clear` (`undecided` must not read as
-/// `clear`), while anything it does see is raised at once: a refusal observed is a fact whatever
-/// came before it.
+/// `clear`), with a detail saying WHEN the row decides ("decides in 14 min 30 s"), while anything it
+/// does see is raised at once: a refusal observed is a fact whatever came before it.
 /// @param conditions Where the answers go.
 /// @param inputs What they are read from.
 void EvaluateSchedulerConditions(NodeConditions& conditions, SchedulerConditionInputs const& inputs);

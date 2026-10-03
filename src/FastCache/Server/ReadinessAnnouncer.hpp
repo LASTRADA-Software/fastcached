@@ -116,7 +116,7 @@ class ReadinessAnnouncer
     ///
     /// Safe from any thread: exactly one caller observes the transition, so the
     /// readiness line is emitted once however many threads arm concurrently.
-    /// @param what Names the participant for the Debug line, e.g. `reactor 0 bind 1`.
+    /// @param what Names the participant for the Debug line, e.g. `cache 0.0.0.0:11211 on reactor 1`.
     void AcceptorArmed(std::string_view what);
 
     /// @return True once the readiness line has been emitted.

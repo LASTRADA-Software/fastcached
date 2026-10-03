@@ -113,7 +113,7 @@ class RelabelledPeerListener final: public core::net::IListener
   public:
     /// @param inner The bound listener (owned).
     /// @param host What every accepted connection's `peerAddress()` reports.
-    RelabelledPeerListener(std::unique_ptr<core::net::IListener> inner, std::string host) noexcept:
+    RelabelledPeerListener(std::unique_ptr<core::net::IListener> inner, std::string host):
         _inner { std::move(inner) },
         _host { std::move(host) }
     {
@@ -127,14 +127,15 @@ class RelabelledPeerListener final: public core::net::IListener
         co_return core::net::AcceptResult { std::make_unique<RelabelledPeerSocket>(std::move(*accepted), _host) };
     }
 
-    void close() noexcept override
-    {
-        _inner->close();
-    }
-
     [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return _inner->boundPort();
+    }
+
+  protected:
+    void doClose() noexcept override
+    {
+        _inner->close();
     }
 
   private:

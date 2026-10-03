@@ -572,6 +572,8 @@ class AdminEndpoint
     /// @param metrics The sink to render.
     /// @param snapshot What to report per scrape.
     /// @param logger Where to announce the bound address.
+    /// @param acceptLoops The node's accept-loop registry: what `/healthz` answers from, and
+    ///        where this surface's own loop reports if it stops. Must outlive the endpoint.
     /// @param routes Routes beyond `/metrics` and `/healthz`; may be empty.
     /// @param tls Server TLS context, or nullptr to serve plaintext.
     /// @return The running endpoint, or why it could not be served.
@@ -581,6 +583,7 @@ class AdminEndpoint
         IMetricsSink& metrics,
         AdminHttpServer::SnapshotProvider snapshot,
         ILogger& logger,
+        core::net::AcceptLoopHealth& acceptLoops,
         std::vector<AdminRoute> routes = {},
         core::net::ITlsContext* tls = nullptr);
 
@@ -618,6 +621,7 @@ class AdminEndpoint
                   AdminHttpServer::SnapshotProvider snapshot,
                   std::string boundEndpoint,
                   ILogger& logger,
+                  core::net::AcceptLoopHealth& acceptLoops,
                   std::vector<AdminRoute> routes,
                   core::net::ITlsContext* tls,
                   ServedSurfaces surfaces);
@@ -697,7 +701,8 @@ struct AdminSurface
     FleetSampler const* sampler,
     AdminCredential const& credential,
     ILogger& logger,
-    NodeConditions& conditions);
+    NodeConditions& conditions,
+    core::net::AcceptLoopHealth& acceptLoops);
 
 /// Read the dashboard credential `--dashboard-token-file` names, once, for every surface that
 /// guards the fleet with it.

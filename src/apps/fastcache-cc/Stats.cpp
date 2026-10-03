@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -21,9 +22,12 @@
 #include <format>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <ranges>
 #include <sstream>
+#include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -460,6 +464,8 @@ namespace
         std::uint64_t misses {};
         std::uint64_t uncacheable {};
         std::uint64_t unavailable {};
+        std::uint64_t exitCodes {};      ///< Records that carry an exit code at all.
+        std::uint64_t compilesFailed {}; ///< Of those, a non-zero one.
 
         // Full sample sets, not running sums: the point of the distribution is the
         // shape (a bimodal miss profile means something an average hides).
@@ -584,6 +590,163 @@ namespace
         return Outcome::Unavailable;
     }
 
+    /// The marker that opens every line written in an explicit format version: `v` and the number.
+    ///
+    /// An outcome token is an uppercase word, so no line from before the marker can begin with one.
+    constexpr std::string_view LogVersionPrefix = "v";
+
+    /// The format this build writes. **Bumped whenever `LogColumnTable` changes in any way** --
+    /// order, meaning, count -- because the version is the only thing a reader can check; the
+    /// arity that stood in for it is a count, and two formats can share a count.
+    constexpr unsigned CurrentLogVersion = 2;
+
+    /// One column of a version-2 line, in the order it is written.
+    ///
+    /// **Persisted: the enumerator values ARE the on-disk column order**, so they are spelled out,
+    /// and a change to them is a change to `CurrentLogVersion`.
+    enum class LogColumn : std::uint8_t
+    {
+        Outcome = 0,
+        PrefetchGroup = 1,
+        ValueBytes = 2,
+        ElapsedMs = 3,
+        Source = 4,
+        Detail = 5,
+        PreprocessMs = 6,
+        CacheMs = 7,
+        DirectMs = 8,
+        DirectHit = 9,
+        TimestampUnixSeconds = 10,
+        Dispatch = 11,
+        DispatchDetail = 12,
+        DispatchSpecifics = 13,
+        ExitCode = 14,
+        Last = 15,
+    };
+
+    /// How one column is written and read.
+    struct LogColumnRow
+    {
+        LogColumn column;                                       ///< Which column.
+        std::string_view name;                                  ///< What a reader of the file calls it.
+        void (*write)(Record const& record, std::string& line); ///< Appends the column's text.
+        void (*read)(std::string_view text, Record& record);    ///< Sets the record from it.
+    };
+
+    /// Parse a signed exit code; nothing for text that is not one.
+    [[nodiscard]] std::optional<std::int32_t> ParseExitCode(std::string_view text)
+    {
+        std::int32_t value = 0;
+        auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (text.empty() || error != std::errc {} || end != text.data() + text.size())
+            return std::nullopt;
+        return value;
+    }
+
+    /// Every column of the current format, in the order it is written: the ONE description of a
+    /// version-2 line, which the writer and the reader both walk.
+    constexpr EnumTable<LogColumn, LogColumnRow> LogColumnTable { {
+        { .column = LogColumn::Outcome,
+          .name = "outcome",
+          .write = [](Record const& r, std::string& l) { l += ToStringView(r.outcome); },
+          .read = [](std::string_view t, Record& r) { r.outcome = ParseOutcome(t); } },
+        { .column = LogColumn::PrefetchGroup,
+          .name = "prefetch-group",
+          .write = [](Record const& r, std::string& l) { l += Sanitize(r.prefetchGroup); },
+          .read = [](std::string_view t, Record& r) { r.prefetchGroup = std::string { t }; } },
+        { .column = LogColumn::ValueBytes,
+          .name = "value-bytes",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.valueBytes); },
+          .read = [](std::string_view t, Record& r) { r.valueBytes = ParseUnsigned(t); } },
+        { .column = LogColumn::ElapsedMs,
+          .name = "elapsed-ms",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.elapsedMs); },
+          .read = [](std::string_view t, Record& r) { r.elapsedMs = ParseUnsigned(t); } },
+        { .column = LogColumn::Source,
+          .name = "source",
+          .write = [](Record const& r, std::string& l) { l += Sanitize(r.source); },
+          .read = [](std::string_view t, Record& r) { r.source = std::string { t }; } },
+        { .column = LogColumn::Detail,
+          .name = "detail",
+          .write = [](Record const& r, std::string& l) { l += Sanitize(r.detail); },
+          .read = [](std::string_view t, Record& r) { r.detail = std::string { t }; } },
+        { .column = LogColumn::PreprocessMs,
+          .name = "preprocess-ms",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.preprocessMs); },
+          .read =
+              [](std::string_view t, Record& r) {
+                  r.preprocessMs = ParseUnsigned(t);
+                  r.hasPhaseColumns = true;
+              } },
+        { .column = LogColumn::CacheMs,
+          .name = "cache-ms",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.cacheMs); },
+          .read = [](std::string_view t, Record& r) { r.cacheMs = ParseUnsigned(t); } },
+        { .column = LogColumn::DirectMs,
+          .name = "direct-ms",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.directMs); },
+          .read = [](std::string_view t, Record& r) { r.directMs = ParseUnsigned(t); } },
+        { .column = LogColumn::DirectHit,
+          .name = "direct-hit",
+          .write = [](Record const& r, std::string& l) { l += r.directHit ? "1" : "0"; },
+          .read = [](std::string_view t, Record& r) { r.directHit = t == "1"; } },
+        { .column = LogColumn::TimestampUnixSeconds,
+          .name = "timestamp",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.timestampUnixSeconds); },
+          .read = [](std::string_view t, Record& r) { r.timestampUnixSeconds = ParseUnsigned(t); } },
+        { .column = LogColumn::Dispatch,
+          .name = "dispatch",
+          .write = [](Record const& r, std::string& l) { l += ToStringView(r.dispatch); },
+          .read = [](std::string_view t, Record& r) { r.dispatch = ParseDispatchOutcome(t); } },
+        { .column = LogColumn::DispatchDetail,
+          .name = "dispatch-detail",
+          .write = [](Record const& r, std::string& l) { l += Sanitize(r.dispatchDetail); },
+          .read = [](std::string_view t, Record& r) { r.dispatchDetail = std::string { t }; } },
+        { .column = LogColumn::DispatchSpecifics,
+          .name = "dispatch-specifics",
+          .write = [](Record const& r, std::string& l) { l += BoundedSpecifics(r.dispatchSpecifics); },
+          .read = [](std::string_view t, Record& r) { r.dispatchSpecifics = std::string { t }; } },
+        { .column = LogColumn::ExitCode,
+          .name = "exit-code",
+          .write =
+              [](Record const& r, std::string& l) {
+                  if (r.exitCode.has_value())
+                      l += std::to_string(*r.exitCode);
+              },
+          .read = [](std::string_view t, Record& r) { r.exitCode = ParseExitCode(t); } },
+    } };
+    static_assert(RowsInEnumeratorOrder(LogColumnTable, &LogColumnRow::column),
+                  "LogColumnTable must hold one row per LogColumn, in enumerator order -- which is the column order");
+
+    /// The format version a line's first field names, when it names one.
+    /// @param first The line's first field.
+    /// @return The version; nothing for a line from before versions were written (version 1).
+    [[nodiscard]] std::optional<unsigned> LineVersion(std::string_view first)
+    {
+        if (!first.starts_with(LogVersionPrefix) || first.size() == LogVersionPrefix.size())
+            return std::nullopt;
+        unsigned version = 0;
+        auto const digits = first.substr(LogVersionPrefix.size());
+        auto const [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), version);
+        if (error != std::errc {} || end != digits.data() + digits.size())
+            return std::nullopt;
+        return version;
+    }
+
+    /// Write one record as a current-format line, newline included.
+    /// @param record The record. @return The line.
+    [[nodiscard]] std::string EncodeLine(Record const& record)
+    {
+        auto line = std::format("{}{}", LogVersionPrefix, CurrentLogVersion);
+        for (auto const& row: LogColumnTable)
+        {
+            line += FieldSeparator;
+            row.write(record, line);
+        }
+        line += '\n';
+        return line;
+    }
+
     /// Rebuild a `Record` from one log line's already-split fields.
     ///
     /// Every trailing field predates the one before it in the log's history —
@@ -627,6 +790,34 @@ namespace
         // says nothing about which argument was refused, which is not the same as "none".
         if (fields.size() >= 14)
             record.dispatchSpecifics = std::string { fields[13] };
+        return record;
+    }
+
+    /// Read one log line's already-split fields, whichever format wrote it.
+    ///
+    /// Three readings and no fourth. A line that opens with a version marker is read by THAT
+    /// version's column table, and only when every column is there; a line without one was written
+    /// before versions were, and is read by arity as it always was (`DecodeFields`); a version this
+    /// build does not know is SKIPPED -- never read by position, which would take a later build's
+    /// columns for this one's and put an exit code where a byte count was.
+    /// @param fields The line's fields.
+    /// @return The record, or nothing for a line this build cannot read.
+    [[nodiscard]] std::optional<Record> DecodeLine(std::vector<std::string_view> const& fields)
+    {
+        if (fields.empty())
+            return std::nullopt;
+        auto const version = LineVersion(fields.front());
+        if (!version.has_value())
+        {
+            if (fields.size() < 4)
+                return std::nullopt;
+            return DecodeFields(fields);
+        }
+        if (*version != CurrentLogVersion || fields.size() != LogColumnTable.size() + 1)
+            return std::nullopt;
+        Record record;
+        for (auto const& row: LogColumnTable)
+            row.read(fields[static_cast<std::size_t>(row.column) + 1], record);
         return record;
     }
 
@@ -838,6 +1029,14 @@ namespace
                 out << "    " << Colorize(std::to_string(count) + "x", palette.bad, palette.reset) << "  " << reason << '\n';
         }
 
+        // Only over records that say: a line from before the exit code was recorded is not a success.
+        if (tally.exitCodes > 0)
+            out << "  compile failed: "
+                << Colorize(std::to_string(tally.compilesFailed),
+                            tally.compilesFailed > 0 ? palette.bad : palette.neutral,
+                            palette.reset)
+                << " of " << tally.exitCodes << " that recorded an exit code\n";
+
         AppendDispatchLines(out, tally, palette);
 
         if (!tally.hitMs.empty() || !tally.missMs.empty())
@@ -977,35 +1176,8 @@ void AppendRecord(Record const& record)
     if (path.empty())
         return;
 
-    std::string line;
-    line += ToStringView(record.outcome);
-    line += FieldSeparator;
-    line += Sanitize(record.prefetchGroup);
-    line += FieldSeparator;
-    line += std::to_string(record.valueBytes);
-    line += FieldSeparator;
-    line += std::to_string(record.elapsedMs);
-    line += FieldSeparator;
-    line += Sanitize(record.source);
-    line += FieldSeparator;
-    line += Sanitize(record.detail);
-    line += FieldSeparator;
-    line += std::to_string(record.preprocessMs);
-    line += FieldSeparator;
-    line += std::to_string(record.cacheMs);
-    line += FieldSeparator;
-    line += std::to_string(record.directMs);
-    line += FieldSeparator;
-    line += record.directHit ? "1" : "0";
-    line += FieldSeparator;
-    line += std::to_string(record.timestampUnixSeconds);
-    line += FieldSeparator;
-    line += ToStringView(record.dispatch);
-    line += FieldSeparator;
-    line += Sanitize(record.dispatchDetail);
-    line += FieldSeparator;
-    line += BoundedSpecifics(record.dispatchSpecifics);
-    line += '\n';
+    // Current format, from the one column table the reader walks too.
+    auto const line = EncodeLine(record);
 
 #if defined(_WIN32)
     // FILE_APPEND_DATA without FILE_WRITE_DATA makes each write atomically land
@@ -1038,7 +1210,7 @@ void AppendRecord(Record const& record)
 #endif
 }
 
-std::vector<Record> ParseLog(std::string_view groupFilter)
+LogReading ReadLog(std::string_view groupFilter)
 {
     auto const path = LogPath();
     if (path.empty())
@@ -1048,7 +1220,7 @@ std::vector<Record> ParseLog(std::string_view groupFilter)
     if (!input)
         return {};
 
-    std::vector<Record> records;
+    LogReading reading;
     std::string line;
     while (std::getline(input, line))
     {
@@ -1057,16 +1229,30 @@ std::vector<Record> ParseLog(std::string_view groupFilter)
         if (line.empty())
             continue;
 
-        auto const fields = SplitFields(line);
-        if (fields.size() < 4)
+        auto record = DecodeLine(SplitFields(line));
+        if (!record.has_value())
+        {
+            ++reading.unreadable;
             continue;
-
-        if (!groupFilter.empty() && fields[1] != groupFilter)
+        }
+        // Filtered on the DECODED group, never on a field position: the group is the second
+        // column of an unversioned line and the third of a versioned one.
+        if (!groupFilter.empty() && record->prefetchGroup != groupFilter)
             continue;
-
-        records.push_back(DecodeFields(fields));
+        reading.records.push_back(std::move(*record));
     }
-    return records;
+    return reading;
+}
+
+std::vector<Record> ParseLog(std::string_view groupFilter)
+{
+    return ReadLog(groupFilter).records;
+}
+
+std::uint64_t RecordTimestamp(core::platform::IWallClock const& clock) noexcept
+{
+    auto const sinceEpoch = clock.now().time_since_epoch();
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(sinceEpoch).count());
 }
 
 namespace
@@ -1087,6 +1273,12 @@ namespace
         {
             for (Tally* tally: { &folded.overall, &folded.byGroup[record.prefetchGroup] })
             {
+                if (record.exitCode.has_value())
+                {
+                    ++tally->exitCodes;
+                    if (record.exitCode.value_or(0) != 0)
+                        ++tally->compilesFailed;
+                }
                 switch (record.outcome)
                 {
                     case Outcome::Hit:
@@ -1157,10 +1349,11 @@ std::string FormatReport(std::string_view groupFilter, UsageColor color)
     if (!probe)
         return "fastcache-cc: no statistics recorded yet (" + path + ").\n";
 
-    auto const records = ParseLog(groupFilter);
+    auto const reading = ReadLog(groupFilter);
+    auto const& records = reading.records;
     auto const [overall, byGroup, neverCached] = FoldRecords(records);
 
-    if (overall.Total() == 0)
+    if (overall.Total() == 0 && reading.unreadable == 0)
     {
         if (groupFilter.empty())
             return "fastcache-cc: no statistics recorded yet (" + path + ").\n";
@@ -1175,6 +1368,9 @@ std::string FormatReport(std::string_view groupFilter, UsageColor color)
     else
         out << "prefetch group " << groupFilter << '\n';
     AppendTallyLines(out, overall, palette);
+    if (reading.unreadable > 0)
+        out << "  skipped      : " << reading.unreadable
+            << " log line(s) in a format this launcher does not read -- a later launcher wrote them\n";
 
     if (groupFilter.empty() && byGroup.size() > 1)
     {

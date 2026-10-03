@@ -6,6 +6,8 @@
 
 #include <cassert>
 #include <format>
+#include <memory>
+#include <mutex>
 #include <ranges>
 #include <utility>
 
@@ -142,6 +144,39 @@ std::string ListDetail(std::string_view lead, std::vector<std::string> const& it
         detail += candidate;
     }
     return detail;
+}
+
+void WatchAcceptLoops(core::net::AcceptLoopHealth& health, NodeConditions& conditions)
+{
+    conditions.Clear(NodeCondition::SurfaceNotAccepting);
+    conditions.Clear(NodeCondition::SurfaceAcceptDegraded);
+    // The registry calls a listener OUTSIDE its own lock, from whichever loop recorded the event, so
+    // two loops' listeners can run at once. Without this, one that snapshotted before the other's
+    // record can write after it -- a Recovered seen as "none degraded" landing last clears the row
+    // while another surface is degraded, and nothing re-raises it, since Degraded is said once per
+    // episode. Held across the snapshot AND the write: a body that runs after a record then reads
+    // the registry after it, so whichever body writes last wrote from the newest snapshot.
+    auto const serialised = std::make_shared<std::mutex>();
+    health.subscribe([&health, &conditions, serialised](core::net::AcceptLoopEvent const&) {
+        std::scoped_lock const lock { *serialised };
+        // Every surface, re-read rather than accumulated here: the registry is the one record, and
+        // a second list beside it would be a second answer to the same question.
+        std::vector<std::string> stopped;
+        std::vector<std::string> degraded;
+        for (auto const& surface: health.snapshot())
+            (surface.kind == core::net::AcceptLoopEventKind::Degraded ? degraded : stopped)
+                .push_back(std::format("{} ({})", surface.surface, surface.reason));
+        // Latched: a surface that gave up stays in the registry for good, so an empty list here
+        // only ever means none has yet.
+        if (!stopped.empty())
+            conditions.Raise(NodeCondition::SurfaceNotAccepting,
+                             ListDetail("surfaces that stopped accepting connections:", stopped));
+        if (degraded.empty())
+            conditions.Clear(NodeCondition::SurfaceAcceptDegraded);
+        else
+            conditions.Raise(NodeCondition::SurfaceAcceptDegraded,
+                             ListDetail("surfaces backing off on failed accepts:", degraded));
+    });
 }
 
 } // namespace FastCache::Node

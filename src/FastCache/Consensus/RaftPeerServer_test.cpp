@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -39,10 +40,14 @@
 #include <variant>
 #include <vector>
 
+#include <core/async/DetachedTask.hpp>
 #include <core/async/SyncRun.hpp>
+#include <core/net/AcceptPolicy.hpp>
 #include <core/net/PlatformLoop.hpp>
+#include <core/net/testing/FailingListener.hpp>
 #include <core/net/testing/InMemorySocket.hpp>
 #include <core/net/testing/TestLoop.hpp>
+#include <tests/BoundedWait.hpp>
 #include <tests/CountingConnector.hpp>
 #include <tests/HalfClose.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
@@ -287,6 +292,7 @@ struct Served
     /// a pointer for `metrics`' reason, so a `Served` can be returned.
     std::unique_ptr<Testing::NoInboundLinks> inbound { std::make_unique<Testing::NoInboundLinks>() };
 
+    std::unique_ptr<core::net::AcceptLoopHealth> acceptLoops { std::make_unique<core::net::AcceptLoopHealth>() };
     std::unique_ptr<RaftPeerServer> server;
 
     /// What the server wrote back: its challenge, then any verdict.
@@ -355,7 +361,7 @@ struct Served
     core::net::PlatformLoop reactor { clock };
     Testing::TestPeerIdentity const identity { NodeId { ServerId }, Testing::TestKeyPair(std::string { ServerId }), roster };
     served.server = std::make_unique<RaftPeerServer>(
-        listener, reactor, sink, *served.inbound, logger, *served.metrics, identity, random, options);
+        listener, reactor, sink, *served.inbound, logger, *served.metrics, identity, random, *served.acceptLoops, options);
 
     auto client = listener.connectClient();
     if (!wire.empty())
@@ -1142,9 +1148,9 @@ TEST_CASE("A connection that does not prove an id within the bound is closed and
                                                Roster() };
     Testing::ScriptedSecureRandom random { ServerScript() };
     Testing::NoInboundLinks inbound;
-    RaftPeerServer server { listener, reactor, sink,
-                            inbound,  logger,  metrics,
-                            identity, random,  PeerServerOptions { .handshakeBound = Bound } };
+    core::net::AcceptLoopHealth acceptLoops;
+    RaftPeerServer server { listener, reactor,  sink,   inbound,     logger,
+                            metrics,  identity, random, acceptLoops, PeerServerOptions { .handshakeBound = Bound } };
 
     auto accepting = [](RaftPeerServer* s) -> core::async::DetachedTask {
         co_await s->Run();
@@ -1255,18 +1261,12 @@ class ClosingThreadListener final: public core::net::IListener
         };
     }
 
-    void close() noexcept override
-    {
-        _closedOn.store(std::this_thread::get_id(), std::memory_order_release);
-        _closes.fetch_add(1, std::memory_order_acq_rel);
-    }
-
     [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return 0;
     }
 
-    /// @return How many times `close()` has been called.
+    /// @return How many times the listener's own close ran: at most once, whoever called `close()`.
     [[nodiscard]] std::size_t Closes() const noexcept
     {
         return _closes.load(std::memory_order_acquire);
@@ -1276,6 +1276,14 @@ class ClosingThreadListener final: public core::net::IListener
     [[nodiscard]] std::thread::id ClosedOn() const noexcept
     {
         return _closedOn.load(std::memory_order_acquire);
+    }
+
+  protected:
+    /// Records the thread; runs once per listener, however often `close()` is called.
+    void doClose() noexcept override
+    {
+        _closedOn.store(std::this_thread::get_id(), std::memory_order_release);
+        _closes.fetch_add(1, std::memory_order_acq_rel);
     }
 
   private:
@@ -1323,7 +1331,8 @@ TEST_CASE("Shutdown closes the peer listener on the reactor, not on the calling 
     REQUIRE_FALSE(loop.Get().isOnWorkerThread());
 
     Testing::NoInboundLinks inbound;
-    RaftPeerServer server { listener, loop.Get(), sink, inbound, logger, metrics, identity, random };
+    core::net::AcceptLoopHealth acceptLoops;
+    RaftPeerServer server { listener, loop.Get(), sink, inbound, logger, metrics, identity, random, acceptLoops };
 
     server.Shutdown();
 
@@ -1334,4 +1343,79 @@ TEST_CASE("Shutdown closes the peer listener on the reactor, not on the calling 
     INFO("the listener must have been closed on the reactor's worker thread, not on the thread that called Shutdown");
     CHECK(listener.ClosedOn() == loop.WorkerId());
     CHECK_FALSE(listener.ClosedOn() == std::this_thread::get_id());
+}
+
+TEST_CASE("A peer that reset its queued connection does not take this node out of its cluster",
+          "[consensus][raft][accept-loop]")
+{
+    // The peer server ended its accept loop on anything but a poll tick, at `Debug`, and a node
+    // whose peer port listens and refuses is a node its cluster stops hearing -- with nothing on
+    // it saying why. The connection queued BEHIND the failure getting its challenge is the whole
+    // assertion: a loop that stopped at the failure never reaches it.
+    RecordingSink sink;
+    CapturingLogger logger { LogLevel::Debug };
+    AtomicMetricsSink metrics;
+    core::net::AcceptLoopHealth acceptLoops;
+    core::net::testing::InMemoryListener inner;
+    core::net::testing::FailingListener listener {
+        inner, core::net::testing::repeatedFailures(core::net::NetErrorCode::ConnReset, 1)
+    };
+    // A reactor the case DRIVES, on a clock it moves, and never `syncRun` over one nothing runs: a
+    // policy that answers the failure with a backoff parks the loop on `delay()`, `syncRun` refuses
+    // the suspended task, and freeing its frame under the parked timer ended the case in a SIGSEGV
+    // naming no assertion. Driven, a backoff is time the step moves past and the case reports.
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
+    Testing::TestPeerIdentity const identity { NodeId { ServerId },
+                                               Testing::TestKeyPair(std::string { ServerId }),
+                                               Roster() };
+    Testing::ScriptedSecureRandom random { ServerScript() };
+    Testing::NoInboundLinks inbound;
+    RaftPeerServer server { listener, reactor,  sink,   inbound,     logger,
+                            metrics,  identity, random, acceptLoops, PeerServerOptions { .handshakeBound = 0ms } };
+
+    auto client = inner.connectClient();
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
+    // The listener drains queued connections before reporting itself closed.
+    inner.close();
+    auto ended = false;
+    auto accepting = [](RaftPeerServer* s, bool* done) -> core::async::DetachedTask {
+        co_await s->Run();
+        *done = true;
+    };
+    accepting(&server, &ended);
+    REQUIRE(FastCache::Testing::WaitUntil(
+        "the peer server's accept loop to end at the closed listener",
+        [&ended] { return ended; },
+        [&listener] { return std::format("{} failed accept(s) answered", listener.failuresAnswered()); },
+        FastCache::Testing::WaitOptions { .step =
+                                              [&clock, &reactor] {
+                                                  reactor.drain();
+                                                  clock.advance(core::net::AcceptErrorPolicy::MaxBackoff);
+                                              },
+                                          .context = {},
+                                          .bound = FastCache::Testing::WaitHangGuard,
+                                          .rest = FastCache::Testing::WaitRest }));
+
+    std::vector<std::byte> replied;
+    auto buffer = std::array<std::byte, 4096> {};
+    while (true)
+    {
+        // `syncRunWith`, retrieving the park: a loop that stopped at the failure never accepted this
+        // connection, so its read waits for bytes nobody will write, and that must report as a
+        // refused read rather than free a frame the socket still points into.
+        auto const got = core::async::syncRunWith(ReadSome(client.get(), buffer), [&client] { client->cancelRead(); });
+        if (got == 0)
+            break;
+        Append(replied, std::span<std::byte const> { buffer }.first(got));
+    }
+    CHECK(listener.failuresAnswered() == 1);
+    // The acceptor challenges first, so a served connection has been written to.
+    CHECK_FALSE(replied.empty());
+    CHECK(std::ranges::count_if(logger.Snapshot(),
+                                [](CapturingLogger::Record const& record) {
+                                    return record.level == LogLevel::Warn
+                                           && record.message.contains("raft: peer: an accept failed");
+                                })
+          == 1);
 }

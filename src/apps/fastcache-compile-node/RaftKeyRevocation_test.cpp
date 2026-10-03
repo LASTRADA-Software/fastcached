@@ -155,9 +155,8 @@ struct Network
 {
     /// @param acceptor Who n1 is.
     explicit Network(Consensus::IRaftPeerIdentity const& acceptor):
-        server { listener, reactor, sink,
-                 inbound,  logger,  metrics,
-                 acceptor, random,  Consensus::PeerServerOptions { .handshakeBound = 0ms } }
+        server { listener, reactor,  sink,   inbound,     logger,
+                 metrics,  acceptor, random, acceptLoops, Consensus::PeerServerOptions { .handshakeBound = 0ms } }
     {
         [](Consensus::RaftPeerServer* accepting) -> core::async::DetachedTask {
             co_await accepting->Run();
@@ -191,6 +190,7 @@ struct Network
     AtomicMetricsSink metrics;
     SystemSecureRandom random;
     Testing::NoInboundLinks inbound; ///< Every dialler here is one-way, so nothing is attached.
+    core::net::AcceptLoopHealth acceptLoops;
     Consensus::RaftPeerServer server;
 };
 

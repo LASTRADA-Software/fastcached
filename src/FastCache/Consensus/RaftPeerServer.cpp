@@ -7,6 +7,7 @@
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
+#include <FastCache/Transport/AcceptLoopReporter.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -461,6 +462,7 @@ RaftPeerServer::RaftPeerServer(core::net::IListener& listener,
                                IMetricsSink& metrics,
                                IRaftPeerIdentity const& identity,
                                ISecureRandom& random,
+                               core::net::AcceptLoopHealth& acceptLoops,
                                PeerServerOptions options):
     _listener { listener },
     _reactor { reactor },
@@ -470,6 +472,7 @@ RaftPeerServer::RaftPeerServer(core::net::IListener& listener,
     _metrics { metrics },
     _identity { identity },
     _random { random },
+    _acceptLoops { acceptLoops },
     _options { options }
 {
 }
@@ -561,19 +564,29 @@ void RaftPeerServer::NoteSessionEnd(SessionEnding const& ending, std::string_vie
 
 core::async::Task<void> RaftPeerServer::Run()
 {
+    // `core::net::AcceptErrorPolicy` decides, as it does for every accept loop in the tree, and
+    // `AcceptLoopReporter` says so: a poll timeout -- how this loop wakes to observe `Shutdown()` on
+    // POSIX, where closing the listening socket does not unblock a parked accept() -- is accepted
+    // past silently, a peer that reset its queued connection with a rate-limited warning, and only
+    // a closed or dead listener ends the loop. It used to end on anything but the poll tick, at
+    // `Debug`, taking this node out of its cluster while the port still listened.
+    AcceptLoopReporter acceptErrors { "raft: peer", "raft", _logger, _acceptLoops };
     while (!_shuttingDown.load(std::memory_order_acquire))
     {
         auto accepted = co_await _listener.accept();
         if (!accepted.has_value())
         {
-            // A poll timeout is how this loop wakes to observe Shutdown() on
-            // POSIX, where closing the listening socket does not unblock a
-            // parked accept(). Not a failure.
-            if (core::net::isDeadlineExpiry(accepted.error().code))
-                continue;
-            _logger.Log(LogLevel::Debug, std::format("raft: peer accept loop ended ({})", accepted.error().toString()));
-            co_return;
+            auto const step = acceptErrors.OnError(
+                accepted.error(), _reactor.clock().now(), _shuttingDown.load(std::memory_order_acquire));
+            if (step.next == AcceptLoopNext::EndAndClose)
+                _listener.close();
+            if (step.next != AcceptLoopNext::AcceptAgain)
+                co_return;
+            if (step.delay > std::chrono::milliseconds {})
+                co_await _reactor.delay(step.delay);
+            continue;
         }
+        acceptErrors.OnAccepted(_reactor.clock().now());
 
         auto const before = _active.fetch_add(1, std::memory_order_acq_rel);
         if (before >= _options.maxConnections)
@@ -593,6 +606,8 @@ core::async::Task<void> RaftPeerServer::Run()
         // peer ever, and a cluster that never hears from the rest.
         PeerServerAccess::ServePeer(this, std::move(*accepted));
     }
+    // Shut down between accepts: a loop that was degraded says it stopped.
+    acceptErrors.OnLoopEnded();
     co_return;
 }
 

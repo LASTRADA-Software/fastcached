@@ -133,6 +133,7 @@ target_sources(FastCache
         Server/ReactorServerLoop.cpp
         Server/ReadinessAnnouncer.cpp
         Server/Server.cpp
+        Transport/AcceptLoopReporter.cpp
         Transport/LingeringClose.cpp
         Transport/NativeListen.cpp
 )

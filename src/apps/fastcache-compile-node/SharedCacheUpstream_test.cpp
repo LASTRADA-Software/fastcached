@@ -892,11 +892,11 @@ TEST_CASE("The shared-cache condition follows an applied state, not only an oper
         a.upstream.StateApplied();
         CHECK(a.conditions.StateOf(NodeCondition::SharedCacheUnproven) == Wire::ConditionState::Clear);
     }
-    SECTION("another machine: cleared, and reported as not tried")
+    SECTION("another machine: not-evaluated, and reported as not tried -- never clear")
     {
         a.directory.Applied(NamingCacheD(gone));
         a.upstream.StateApplied();
-        CHECK(a.conditions.StateOf(NodeCondition::SharedCacheUnproven) == Wire::ConditionState::Clear);
+        CHECK(a.conditions.StateOf(NodeCondition::SharedCacheUnproven) == Wire::ConditionState::NotEvaluated);
         CHECK(a.upstream.Report().machineId == "cache-d");
         CHECK(a.upstream.Report().state == Wire::WireSharedCacheState::NotTried);
     }
@@ -942,7 +942,7 @@ TEST_CASE("A machine named before it could be reached is re-judged at the apply 
     // The report follows the directory on its own, before any apply hook runs.
     CHECK(a.upstream.Report().state == Wire::WireSharedCacheState::NotTried);
     a.upstream.StateApplied();
-    CHECK(a.conditions.StateOf(NodeCondition::SharedCacheUnproven) == Wire::ConditionState::Clear);
+    CHECK(a.conditions.StateOf(NodeCondition::SharedCacheUnproven) == Wire::ConditionState::NotEvaluated);
     CHECK(a.upstream.Report().state == Wire::WireSharedCacheState::NotTried);
     CHECK(a.connector.Ops().empty());
 }
@@ -966,7 +966,7 @@ TEST_CASE("An operation still running when an apply moves the setting says nothi
 
     CHECK(core::async::syncRun(a.upstream.Store("k", AStoredObject())) == UpstreamStore::Declined);
     REQUIRE(moved);
-    CHECK(a.conditions.StateOf(NodeCondition::SharedCacheUnproven) == Wire::ConditionState::Clear);
+    CHECK(a.conditions.StateOf(NodeCondition::SharedCacheUnproven) == Wire::ConditionState::NotEvaluated);
     CHECK(a.upstream.Report().machineId == "cache-d");
     CHECK(a.upstream.Report().state == Wire::WireSharedCacheState::NotTried);
 }
@@ -1041,10 +1041,10 @@ TEST_CASE("Each state the consensus tier applies re-judges the built fleet upstr
         node.Apply(Cluster::ClusterState {});
         CHECK(node.Unproven() == Wire::ConditionState::Clear);
     }
-    SECTION("a newly resolved machine: cleared at the apply, nothing tried there yet")
+    SECTION("a newly resolved machine: not-evaluated at the apply, nothing tried there yet")
     {
         node.Apply(NamingCacheD(gone));
-        CHECK(node.Unproven() == Wire::ConditionState::Clear);
+        CHECK(node.Unproven() == Wire::ConditionState::NotEvaluated);
     }
 }
 
@@ -1058,14 +1058,53 @@ TEST_CASE("A state naming a machine nobody can reach by key raises the built fle
     CHECK(node.Unproven() == Wire::ConditionState::Raised);
 }
 
-TEST_CASE("A machine that becomes reachable by key clears the built fleet upstream's condition at the apply",
+TEST_CASE("A machine that becomes reachable by key takes the built fleet upstream's condition out of raised",
           "[node][shared-cache][upstream][conditions][wiring]")
 {
+    // Out of raised at the apply, and not into clear: reachable is not reached, so the row is
+    // not-evaluated until an operation tries the machine.
     AppliedThroughListeners node;
     node.Apply(NamingUnannouncedCacheC());
     REQUIRE(node.Unproven() == Wire::ConditionState::Raised);
     node.Apply(NamingCacheC(1));
-    CHECK(node.Unproven() == Wire::ConditionState::Clear);
+    CHECK(node.Unproven() == Wire::ConditionState::NotEvaluated);
+}
+
+/// @return What @p conditions sends for `shared-cache-unproven`.
+[[nodiscard]] Wire::NodeConditionFields SentUnproven(NodeConditions const& conditions)
+{
+    auto const rows = conditions.Snapshot();
+    auto const found =
+        std::ranges::find(rows, RowFor(NodeCondition::SharedCacheUnproven).id, &Wire::NodeConditionFields::id);
+    REQUIRE(found != rows.end());
+    return *found;
+}
+
+TEST_CASE("A shared cache nobody has tried reads not-evaluated with its reason, never clear, until an operation decides",
+          "[node][shared-cache][upstream][conditions]")
+{
+    // Not tried is NEITHER failing to reach the named machine nor reaching it, so the row says so --
+    // with the reason an operator reads -- and only an operation moves it: here to clear, once the key
+    // is proven.
+    CacheMachine c { "cache-c" };
+    ClientNode a { "pc-7" };
+    a.directory.Applied(NamingCacheC(c.port));
+    a.upstream.StateApplied();
+    auto const untried = SentUnproven(a.conditions);
+    CHECK(untried.state == "not-evaluated");
+    CHECK(untried.detail.starts_with("not tried:"));
+    CHECK(untried.detail.contains("cache-c"));
+    CHECK(a.upstream.Report().state == Wire::WireSharedCacheState::NotTried);
+    CHECK(a.connector.Ops().empty());
+
+    // An upstream built while the setting already names the machine answers the same from the start,
+    // not only from the next apply.
+    NodeConditions fresh;
+    SharedCacheUpstream const late { a.directory, a.sessions, a.reactor, a.metrics, &fresh, a.logger, a.policy };
+    CHECK(fresh.StateOf(NodeCondition::SharedCacheUnproven) == Wire::ConditionState::NotEvaluated);
+
+    REQUIRE(core::async::syncRun(a.upstream.Store("k", AStoredObject())) == UpstreamStore::Stored);
+    CHECK(a.conditions.StateOf(NodeCondition::SharedCacheUnproven) == Wire::ConditionState::Clear);
 }
 
 TEST_CASE("The fleet's shared cache is built on one loop: its idle session is hung up there, before the sweep",

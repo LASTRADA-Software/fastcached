@@ -88,6 +88,7 @@
 #include <core/net/IListener.hpp>
 #include <core/net/ISocket.hpp>
 #include <core/net/Sockets.hpp>
+#include <core/net/testing/FailingListener.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
@@ -3082,7 +3083,7 @@ class TimelineListener final: public core::net::IListener
   public:
     /// @param inner The bound listener (owned).
     /// @param timeline Where its sockets note their operations.
-    TimelineListener(std::unique_ptr<core::net::IListener> inner, std::shared_ptr<ConnectionTimeline> timeline) noexcept:
+    TimelineListener(std::unique_ptr<core::net::IListener> inner, std::shared_ptr<ConnectionTimeline> timeline):
         _inner { std::move(inner) },
         _timeline { std::move(timeline) }
     {
@@ -3097,14 +3098,15 @@ class TimelineListener final: public core::net::IListener
         co_return core::net::AcceptResult { std::make_unique<TimelineSocket>(std::move(*accepted), _timeline) };
     }
 
-    void close() noexcept override
-    {
-        _inner->close();
-    }
-
     [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return _inner->boundPort();
+    }
+
+  protected:
+    void doClose() noexcept override
+    {
+        _inner->close();
     }
 
   private:
@@ -3220,7 +3222,7 @@ class WitnessListener final: public core::net::IListener
   public:
     /// @param reactor The reactor this listener belongs to; asked, never driven.
     /// @param witness Where the destructor reports. Must outlive the reactor's loop.
-    WitnessListener(core::net::EventLoop& reactor, std::shared_ptr<TeardownWitness> witness) noexcept:
+    WitnessListener(core::net::EventLoop& reactor, std::shared_ptr<TeardownWitness> witness):
         _reactor { reactor },
         _witness { std::move(witness) }
     {
@@ -3244,23 +3246,27 @@ class WitnessListener final: public core::net::IListener
     WitnessListener& operator=(WitnessListener const&) = delete;
     WitnessListener& operator=(WitnessListener&&) = delete;
 
-    /// Ends the accept loop at once, with an error that is not `WouldBlock`.
+    /// Ends the accept loop at once, the way a closed listener does: `Cancelled`.
     ///
     /// This case is about teardown; an accept that parked would add a wait to it and
-    /// change nothing, since `Shutdown()` waits for the sweeper either way.
+    /// change nothing, since `Shutdown()` waits for the sweeper either way. It used to answer
+    /// `Eof`, which ended the loop only because EVERY failed accept did -- the defect that kept
+    /// the installed node's 0xFC surface dark for nine hours. Only a closed or vanished listener
+    /// ends a loop now (core-cpp's `AcceptErrorTable`), so that is what this says.
     [[nodiscard]] core::async::Task<core::net::AcceptResult> accept() override
     {
         co_return core::net::AcceptResult {
-            std::unexpect, core::net::NetError { .code = core::net::NetErrorCode::Eof, .systemCode = 0, .context = {} }
+            std::unexpect, core::net::NetError { .code = core::net::NetErrorCode::Cancelled, .systemCode = 0, .context = {} }
         };
     }
-
-    void close() noexcept override {}
 
     [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return 0;
     }
+
+  protected:
+    void doClose() noexcept override {}
 
   private:
     core::net::EventLoop& _reactor;
@@ -5139,10 +5145,12 @@ struct ProvingClient
     {
     }
 
-    FixedServerTrust trust;                                                              ///< Whom it proves itself to.
-    Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };           ///< Its ephemeral draws.
-    Ed25519KeyPair const key = Testing::TestKeyPair(std::string { ProvingMachine });     ///< Its identity.
-    NodeProofClient const client { std::string { ProvingMachine }, key, trust, nullptr, nullptr, random }; ///< What a round proves with.
+    FixedServerTrust trust;                                                          ///< Whom it proves itself to.
+    Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };       ///< Its ephemeral draws.
+    Ed25519KeyPair const key = Testing::TestKeyPair(std::string { ProvingMachine }); ///< Its identity.
+    NodeProofClient const client {
+        std::string { ProvingMachine }, key, trust, nullptr, nullptr, random
+    }; ///< What a round proves with.
 };
 
 /// @param port A loopback port.
@@ -5377,8 +5385,9 @@ TEST_CASE("A node that schedules for itself does not announce before its own con
     CapturingLogger logger;
     Testing::ScriptedSecureRandom callerRandom { Testing::CallerHandshakeScript() };
     auto const trust = FixedServerTrust { ServerStanding::Unchecked };
-    auto const client =
-        NodeProofClient { std::string { SelfSchedulingMachine }, node.identity, trust, &node.oracle, &node.conditions, callerRandom };
+    auto const client = NodeProofClient {
+        std::string { SelfSchedulingMachine }, node.identity, trust, &node.oracle, &node.conditions, callerRandom
+    };
     auto const proof = AnnounceProof { .prover = &client };
     core::platform::ManualClock reachabilityClock;
     SchedulerReachability reachability { reachabilityClock };
@@ -5405,4 +5414,152 @@ TEST_CASE("A node that schedules for itself does not announce before its own con
     CHECK(LoggedAt(logger, LogLevel::Warn) == 0);
     // An ordinary hold, one ask long, raises nothing an operator must act on.
     CHECK(node.conditions.StateOf(NodeCondition::OwnRecordAwaited) == Wire::ConditionState::Clear);
+}
+
+namespace
+{
+
+/// `TryExchange` with the reply's read BOUNDED.
+///
+/// A surface whose accept loop has ended still completes the handshake -- the kernel queues the
+/// connection in a backlog nobody drains -- so an unbounded read waits forever, and the defect
+/// these cases exist for would turn a red into a hang. An empty reply is what it reads as.
+/// @param port Where the endpoint is listening. @param frame The request, header included.
+/// @return The reply; empty when none came within the bound; `nullopt` when no connection was made.
+[[nodiscard]] std::optional<std::vector<std::byte>> BoundedExchange(std::uint16_t port, std::span<std::byte const> frame)
+{
+    core::net::BlockingConnector connector;
+    auto socket =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
+    if (!socket.has_value())
+        return std::nullopt;
+    (*socket)->setReceiveDeadline(5s);
+    auto reply = core::async::syncRun(
+        [](core::net::ISocket* peer, std::vector<std::byte> request) -> core::async::Task<std::vector<std::byte>> {
+            auto const written = co_await peer->write(std::span<std::byte const> { request });
+            if (!written.has_value())
+                co_return std::vector<std::byte> {};
+            co_return co_await ReadOneReply(peer);
+        }((*socket).get(), std::vector<std::byte> { frame.begin(), frame.end() }));
+    (*socket)->close();
+    return reply;
+}
+
+/// How many captured lines at @p level contain @p needle.
+/// @param logger The capture. @param level The level. @param needle The text.
+/// @return The count.
+[[nodiscard]] std::size_t LinesAt(CapturingLogger const& logger, LogLevel level, std::string_view needle)
+{
+    return static_cast<std::size_t>(std::ranges::count_if(logger.Snapshot(), [&](CapturingLogger::Record const& record) {
+        return record.level == level && record.message.contains(needle);
+    }));
+}
+
+/// Start the node surface over a listener that fails its first accepts with @p failures.
+/// @param fleet The fixture; its reactor is started here.
+/// @param logger Where the endpoint logs.
+/// @param failures What the first accepts answer.
+/// @return The endpoint and the port a client dials.
+[[nodiscard]] std::pair<std::unique_ptr<FrameEndpoint>, std::uint16_t> StartFailingFirst(
+    Fleet& fleet, ILogger& logger, std::vector<core::net::NetErrorCode> const& failures)
+{
+    auto listened = core::net::listen(fleet.io.Reactor(), core::net::ListenOptions { .host = "127.0.0.1", .port = 0 });
+    REQUIRE(listened.has_value());
+    auto const port = (*listened)->boundPort();
+    auto errors = std::vector<core::net::NetError> {};
+    for (auto const code: failures)
+        errors.push_back(core::net::makeNetError(code, 0, "AcceptEx"));
+    auto endpoint = FrameEndpoint::StartWithListener(
+        fleet.io,
+        NodeSurface::Node,
+        std::make_unique<core::net::testing::FailingListener>(std::move(*listened), std::move(errors)),
+        std::format("127.0.0.1:{}", port),
+        fleet.responder,
+        fleet.metrics,
+        logger);
+    REQUIRE(endpoint != nullptr);
+    fleet.Serve();
+    return { std::move(endpoint), port };
+}
+
+} // namespace
+
+TEST_CASE("A connection a peer reset before it was accepted does not stop the surface", "[node][frame][accept-loop]")
+{
+    // The installed node's nine hours: one `WSAECONNRESET` out of `AcceptEx` ended this loop at
+    // `Debug`, the listener stayed open, and every later connect was refused. A client served
+    // AFTER the failures is the whole assertion; the warning and the empty health registry say
+    // the surface knew it failed a connection and did not think itself stopped.
+    Fleet fleet;
+    CapturingLogger logger { LogLevel::Debug };
+    auto const [endpoint, port] =
+        StartFailingFirst(fleet, logger, { core::net::NetErrorCode::ConnReset, core::net::NetErrorCode::ConnReset });
+
+    auto const lease = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+    auto const reply = BoundedExchange(port, lease);
+    REQUIRE(reply.has_value());
+    // Empty is a surface that took the connection into its backlog and never accepted it.
+    REQUIRE_FALSE(Unwrap(reply).empty());
+    CHECK(ErrorOf(Unwrap(reply)) == Wire::ErrorCode::NoWorker);
+
+    // Said once for the two, not once per failure: the second is inside the rate limit.
+    CHECK(LinesAt(logger, LogLevel::Warn, "an accept failed (connection reset") == 1);
+    CHECK(LinesAt(logger, LogLevel::Error, "accept loop ended") == 0);
+    CHECK(fleet.io.AcceptLoops().snapshot().empty());
+}
+
+TEST_CASE("An accept that ran out of something backs off and then serves", "[node][frame][accept-loop]")
+{
+    // `ResourceExhausted` stands for `EMFILE`, `ENOBUFS` and `WSA_NOT_ENOUGH_MEMORY`: accepting again
+    // at once would only spin, so the loop waits on the reactor's clock -- and must still serve after.
+    Fleet fleet;
+    CapturingLogger logger { LogLevel::Debug };
+    auto const [endpoint, port] = StartFailingFirst(
+        fleet, logger, { core::net::NetErrorCode::ResourceExhausted, core::net::NetErrorCode::ResourceExhausted });
+
+    auto const lease = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+    auto const reply = BoundedExchange(port, lease);
+    REQUIRE(reply.has_value());
+    // Empty is a surface that took the connection into its backlog and never accepted it.
+    REQUIRE_FALSE(Unwrap(reply).empty());
+    CHECK(ErrorOf(Unwrap(reply)) == Wire::ErrorCode::NoWorker);
+    CHECK(LinesAt(logger, LogLevel::Warn, "accepting again in 10 ms") == 1);
+    CHECK(fleet.io.AcceptLoops().snapshot().empty());
+}
+
+TEST_CASE("A surface whose listener is gone says it stopped at Error and to the health registry",
+          "[node][frame][accept-loop]")
+{
+    // The one way a loop may still end while serving: the listening handle is closed or invalid.
+    // That must never again be a `Debug` line -- it is the surface going dark -- so it is said at
+    // `Error` and recorded where the node's liveness probe reads.
+    Fleet fleet;
+    CapturingLogger logger { LogLevel::Debug };
+    auto const [endpoint, port] = StartFailingFirst(fleet, logger, { core::net::NetErrorCode::BadHandle });
+
+    REQUIRE(Testing::WaitUntil(
+        "the node surface's accept loop to report that it stopped",
+        [&fleet] { return !fleet.io.AcceptLoops().snapshot().empty(); },
+        [&fleet] { return std::format("{} surface(s) reported stopped", fleet.io.AcceptLoops().snapshot().size()); }));
+    auto const stopped = fleet.io.AcceptLoops().snapshot();
+    REQUIRE(stopped.size() == 1);
+    CHECK(stopped.front().surface == RowFor(NodeSurface::Node).name);
+    CHECK(stopped.front().reason.contains("AcceptEx"));
+    CHECK(LinesAt(logger, LogLevel::Error, "accept loop ended") == 1);
+}
+
+TEST_CASE("A surface shutting down ends its accept loop without calling itself stopped", "[node][frame][accept-loop]")
+{
+    // The control for the case above: the ordinary ending is a close, and it must not read as a
+    // surface gone dark, or every clean shutdown would raise the condition on its way out.
+    Fleet fleet;
+    CapturingLogger logger { LogLevel::Debug };
+    {
+        auto [endpoint, port] = StartFailingFirst(fleet, logger, {});
+        auto const lease =
+            Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+        REQUIRE(BoundedExchange(port, lease).has_value());
+    }
+    CHECK(fleet.io.AcceptLoops().snapshot().empty());
+    CHECK(LinesAt(logger, LogLevel::Error, "accept loop ended") == 0);
 }

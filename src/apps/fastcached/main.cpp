@@ -140,8 +140,11 @@ constexpr std::string_view ProgramVersion = FastCache::VersionString;
         return FastCache::RefusalExitCode(reader, stage);
     auto const& config = commandLine.config;
     auto const code = FastCache::ExitCodeFor(stage);
-    auto const host = config.daemon ? FastCache::MakeWindowsServiceHost(
-                                    config.serviceName, FastCache::ServiceHostOptions { .stop = FastCache::StopPendingPlanFor(std::nullopt) }) : nullptr;
+    auto const host =
+        config.daemon
+            ? FastCache::MakeWindowsServiceHost(
+                  config.serviceName, FastCache::ServiceHostOptions { .stop = FastCache::StopPendingPlanFor(std::nullopt) })
+            : nullptr;
     if (host == nullptr)
         return code;
     auto const eventLogger = FastCache::MakeWindowsEventLogger(config.serviceName, config.logLevel);
@@ -1082,6 +1085,9 @@ int DaemonBody(FastCache::Config const& effective,
     // reload subscriber against a freshly-destroyed notifier (UAF). Putting
     // them ahead of the thread guarantees the thread joins BEFORE these
     // objects are torn down.
+    // The accept loops' one registry: a bind whose loop ends says so here, and `/healthz` answers
+    // `503` from it rather than `200` over a port that listens and refuses.
+    core::net::AcceptLoopHealth acceptLoops;
     FastCache::ReactorServerOptions serverOpts;
     // Hand the reactors the very clock the engine reads, so their per-iteration
     // refresh is what keeps it current.
@@ -1250,8 +1256,8 @@ int DaemonBody(FastCache::Config const& effective,
             // pair, which is two places for one decision to drift.
             adminListener->SetTimeouts(FastCache::AdminHttpServer::AcceptPoll, FastCache::AdminHttpServer::RequestTimeout);
 
-            adminServer =
-                std::make_unique<FastCache::AdminHttpServer>(*adminListener, metrics, snapshotProvider, logger, steadyClock);
+            adminServer = std::make_unique<FastCache::AdminHttpServer>(
+                *adminListener, metrics, snapshotProvider, logger, steadyClock, acceptLoops, FastCache::DefaultDrainWait());
             adminThread = std::jthread { [&adminServer] {
                 CORE_THREAD_NAME("fc-admin");
                 core::async::syncRun(adminServer->Run());
@@ -1263,7 +1269,8 @@ int DaemonBody(FastCache::Config const& effective,
         }
     }
 
-    int const exitCode = FastCache::RunReactorServer(serverOpts, engine, logger, /*admission*/ nullptr, &metrics);
+    int const exitCode =
+        FastCache::RunReactorServer(serverOpts, engine, logger, acceptLoops, /*admission*/ nullptr, &metrics);
 
     if (adminServer)
     {

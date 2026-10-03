@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include <core/net/AcceptLoopHealth.hpp>
 #include <core/net/IConnector.hpp>
 #include <core/net/PlatformLoop.hpp>
 #include <core/net/ThreadedAddressResolver.hpp>
@@ -77,6 +78,17 @@ class NodeIoLoop final: public IReactorHome
     [[nodiscard]] core::net::IAsyncAddressResolver& Resolver() noexcept
     {
         return _resolver;
+    }
+
+    /// @return Which of the surfaces running on this loop are degraded or have stopped accepting.
+    ///
+    /// Here because every framed surface of the node runs on this loop and reports to it already
+    /// (`NoteLoopFinished`); ONE registry per loop, which the node's liveness probe and its
+    /// `surface-not-accepting` and `surface-accept-degraded` conditions all read, so they cannot
+    /// disagree.
+    [[nodiscard]] core::net::AcceptLoopHealth& AcceptLoops() noexcept
+    {
+        return _acceptLoops;
     }
 
     /// @return A connector whose sockets belong to `Reactor()`.
@@ -194,6 +206,9 @@ class NodeIoLoop final: public IReactorHome
 
     std::vector<FrameServer*> _loops;
     std::atomic<std::size_t> _loopsRunning { 0 };
+
+    core::net::AcceptLoopHealth
+        _acceptLoops; ///< The surfaces here that are degraded or stopped accepting; see `AcceptLoops()`.
 
     /// What `Retire` was handed, freed when this loop is.
     ///

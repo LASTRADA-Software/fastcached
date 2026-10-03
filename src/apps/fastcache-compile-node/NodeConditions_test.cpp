@@ -33,9 +33,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <functional>
+#include <latch>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <core/net/BlockingConnector.hpp>
@@ -166,18 +171,21 @@ TEST_CASE("Settle answers a component this node does not run, and names what not
     // `NotEvaluated` comes from the SCOPE's row, never from each place that decided not to build a
     // component remembering to say so -- and a row whose component RUNS and never said anything is
     // returned, and stays `undecided` rather than being dressed as a neighbour.
-    SECTION("nothing runs but the process, and the process row was never evaluated")
+    // Every process-scope row, in table order: derived, so a row added to the scope is asked here
+    // without this list being remembered.
+    auto processRows = std::vector<NodeCondition> {};
+    for (auto const& row: NodeConditionTable)
+        if (row.scope == ConditionScope::Process)
+            processRows.push_back(row.condition);
+    REQUIRE(processRows.size() >= 2); // counter-table-skew and surface-not-accepting at least
+
+    SECTION("nothing runs but the process, and the process rows were never evaluated")
     {
         NodeConditions conditions;
         auto const undecided = conditions.Settle(NoComponent);
-        // Every process row, in table order -- derived, so a process row joining the table is
-        // expected here without an edit.
-        auto processRows = std::vector<NodeCondition> {};
-        for (auto const& row: NodeConditionTable)
-            if (row.scope == ConditionScope::Process)
-                processRows.push_back(row.condition);
         CHECK(undecided == processRows);
-        CHECK(conditions.StateOf(NodeCondition::CounterTableSkew) == Wire::ConditionState::Undecided);
+        for (auto const condition: processRows)
+            CHECK(conditions.StateOf(condition) == Wire::ConditionState::Undecided);
 
         auto const rows = conditions.Snapshot();
         for (auto const& row: NodeConditionTable)
@@ -196,9 +204,8 @@ TEST_CASE("Settle answers a component this node does not run, and names what not
     SECTION("every component runs and none evaluated its rows")
     {
         NodeConditions conditions;
-        for (auto const& row: NodeConditionTable)
-            if (row.scope == ConditionScope::Process)
-                conditions.Clear(row.condition);
+        for (auto const condition: processRows)
+            conditions.Clear(condition);
         auto const undecided = conditions.Settle(EveryComponent);
         // Every scoped row, in table order: the wiring defect named row by row.
         auto expected = std::vector<NodeCondition> {};
@@ -411,8 +418,12 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     auto admin = Testing::FirstStart(NodeConfig {});
     admin.adminListen = std::format("127.0.0.1:{}", FreePort());
     auto const host = MakeSystemHostFacts();
+    // The node's accept-loop registry, watched the way `main` watches it: the process-scope row
+    // `surface-not-accepting` is answered by `WatchAcceptLoops`, and the admin surface reads it.
+    core::net::AcceptLoopHealth acceptLoops;
+    WatchAcceptLoops(acceptLoops, conditions);
     auto surface = StartAdminSurfaceOrExplain(
-        admin, *host, metrics, QuietSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+        admin, *host, metrics, QuietSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions, acceptLoops);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
 
@@ -473,4 +484,152 @@ TEST_CASE("Every surface renders every row the table holds, walking what arrived
         // The remedy is text the NODE sent, so it reaches the documents as written.
         CHECK(text.contains(row.remedy));
     }
+}
+
+TEST_CASE("A surface whose accept loop stops raises surface-not-accepting naming it", "[node][conditions][accept-loop]")
+{
+    // What an operator reads over the fleet page or `node-conditions` when a port listens and
+    // refuses -- the state the installed node sat in for nine hours with nothing saying so.
+    NodeConditions conditions;
+    core::net::AcceptLoopHealth acceptLoops;
+    WatchAcceptLoops(acceptLoops, conditions);
+    CHECK(conditions.StateOf(NodeCondition::SurfaceNotAccepting) == Wire::ConditionState::Clear);
+
+    acceptLoops.record(core::net::AcceptLoopEvent {
+        .surface = "node", .line = "bad handle (AcceptEx)", .error = {}, .kind = core::net::AcceptLoopEventKind::GaveUp });
+    acceptLoops.record(core::net::AcceptLoopEvent {
+        .surface = "raft", .line = "cancelled (accept)", .error = {}, .kind = core::net::AcceptLoopEventKind::GaveUp });
+
+    CHECK(conditions.StateOf(NodeCondition::SurfaceNotAccepting) == Wire::ConditionState::Raised);
+    auto const rows = conditions.Snapshot();
+    auto const* const row = RowNamed(rows, RowFor(NodeCondition::SurfaceNotAccepting).id);
+    REQUIRE(row != nullptr);
+    CHECK(row->detail.contains("node (bad handle (AcceptEx))"));
+    CHECK(row->detail.contains("raft (cancelled (accept))"));
+    // A loop that ended does not start again, so the row cannot clear while this process runs.
+    CHECK(row->persistence == "latched");
+    // And a surface that gave up is not a degraded one.
+    CHECK(conditions.StateOf(NodeCondition::SurfaceAcceptDegraded) == Wire::ConditionState::Clear);
+}
+
+TEST_CASE("A degraded accept loop raises surface-accept-degraded until it recovers", "[node][conditions][accept-loop]")
+{
+    // WHAT DISTINGUISHES: a degraded surface is LIVE -- it clears when an accept succeeds, which a
+    // stopped one never does -- so the two must be separate rows, and a recovery must clear this one
+    // while leaving a stopped surface's row raised.
+    NodeConditions conditions;
+    core::net::AcceptLoopHealth acceptLoops;
+    WatchAcceptLoops(acceptLoops, conditions);
+    auto const report = [&acceptLoops](std::string surface, core::net::AcceptLoopEventKind kind) {
+        acceptLoops.record(core::net::AcceptLoopEvent {
+            .surface = std::move(surface), .line = "32 accepts in a row failed", .error = {}, .kind = kind });
+    };
+
+    report("node", core::net::AcceptLoopEventKind::Degraded);
+    CHECK(conditions.StateOf(NodeCondition::SurfaceAcceptDegraded) == Wire::ConditionState::Raised);
+    CHECK(conditions.StateOf(NodeCondition::SurfaceNotAccepting) == Wire::ConditionState::Clear);
+    auto const rows = conditions.Snapshot();
+    auto const* const row = RowNamed(rows, RowFor(NodeCondition::SurfaceAcceptDegraded).id);
+    REQUIRE(row != nullptr);
+    CHECK(row->detail.contains("node (32 accepts in a row failed)"));
+    CHECK(row->persistence == "live");
+
+    report("raft", core::net::AcceptLoopEventKind::GaveUp);
+    report("node", core::net::AcceptLoopEventKind::Recovered);
+    CHECK(conditions.StateOf(NodeCondition::SurfaceAcceptDegraded) == Wire::ConditionState::Clear);
+    CHECK(conditions.StateOf(NodeCondition::SurfaceNotAccepting) == Wire::ConditionState::Raised);
+
+    // A degraded surface its owner shut down leaves nothing degraded either.
+    report("admin", core::net::AcceptLoopEventKind::Degraded);
+    REQUIRE(conditions.StateOf(NodeCondition::SurfaceAcceptDegraded) == Wire::ConditionState::Raised);
+    report("admin", core::net::AcceptLoopEventKind::Stopped);
+    CHECK(conditions.StateOf(NodeCondition::SurfaceAcceptDegraded) == Wire::ConditionState::Clear);
+}
+
+TEST_CASE("surface-accept-degraded stays raised while any surface is degraded, and clears with the last",
+          "[node][conditions][accept-loop]")
+{
+    // WHAT DISTINGUISHES: two surfaces degraded at once. A watcher that cleared on ANY Recovered, or
+    // that read only the event it was handed, passes every one-surface case and fails here.
+    NodeConditions conditions;
+    core::net::AcceptLoopHealth acceptLoops;
+    WatchAcceptLoops(acceptLoops, conditions);
+    auto const report = [&acceptLoops](std::string surface, core::net::AcceptLoopEventKind kind) {
+        acceptLoops.record(core::net::AcceptLoopEvent {
+            .surface = std::move(surface), .line = "32 accepts in a row failed", .error = {}, .kind = kind });
+    };
+    auto const detail = [&conditions] {
+        auto const rows = conditions.Snapshot();
+        auto const* const row = RowNamed(rows, RowFor(NodeCondition::SurfaceAcceptDegraded).id);
+        REQUIRE(row != nullptr);
+        return row->detail;
+    };
+
+    report("node", core::net::AcceptLoopEventKind::Degraded);
+    report("raft", core::net::AcceptLoopEventKind::Degraded);
+    report("node", core::net::AcceptLoopEventKind::Recovered);
+    CHECK(conditions.StateOf(NodeCondition::SurfaceAcceptDegraded) == Wire::ConditionState::Raised);
+    CHECK(detail().contains("raft ("));
+    CHECK_FALSE(detail().contains("node ("));
+
+    report("raft", core::net::AcceptLoopEventKind::Recovered);
+    CHECK(conditions.StateOf(NodeCondition::SurfaceAcceptDegraded) == Wire::ConditionState::Clear);
+}
+
+namespace
+{
+    /// How many rounds the two-loop case runs: each is one chance at the race, at its last events.
+    constexpr auto AcceptLoopRaceRounds = 400;
+    /// How many events each loop records per round.
+    constexpr auto AcceptLoopRaceFlips = 25;
+} // namespace
+
+TEST_CASE("Two loops reporting at once leave surface-accept-degraded as the registry finally reads",
+          "[node][conditions][accept-loop][concurrency]")
+{
+    // The registry calls its listeners outside its lock, from each loop's own thread. Two loops flip
+    // their surfaces between Degraded and Recovered at once; whatever order their listeners ran in,
+    // the row must end where the registry ends. Many short rounds rather than one long one: the
+    // race can only bite at a round's LAST events, so each round is one more chance at it.
+    auto wrong = std::vector<std::string> {};
+    for (auto const round: std::views::iota(0, AcceptLoopRaceRounds))
+    {
+        NodeConditions conditions;
+        core::net::AcceptLoopHealth acceptLoops;
+        WatchAcceptLoops(acceptLoops, conditions);
+        // Each loop's last event alternates by round, so every ending -- both degraded, one, none --
+        // is the answer some rounds must reach.
+        auto const flip = [&acceptLoops](std::string const& surface, bool endsDegraded, std::latch& start) {
+            start.arrive_and_wait();
+            for (auto const index: std::views::iota(0, AcceptLoopRaceFlips))
+            {
+                auto const degraded = (index % 2 == 0) == endsDegraded;
+                acceptLoops.record(core::net::AcceptLoopEvent { .surface = surface,
+                                                                .line = "failed accepts",
+                                                                .error = {},
+                                                                .kind = degraded
+                                                                            ? core::net::AcceptLoopEventKind::Degraded
+                                                                            : core::net::AcceptLoopEventKind::Recovered });
+            }
+        };
+        std::latch start { 2 };
+        {
+            std::jthread const a { flip, std::string { "node" }, round % 2 == 1, std::ref(start) };
+            std::jthread const b { flip, std::string { "raft" }, (round / 2) % 2 == 1, std::ref(start) };
+        }
+        auto const anyDegraded = std::ranges::any_of(acceptLoops.snapshot(), [](auto const& surface) {
+            return surface.kind == core::net::AcceptLoopEventKind::Degraded;
+        });
+        auto const state = conditions.StateOf(NodeCondition::SurfaceAcceptDegraded);
+        if (state != (anyDegraded ? Wire::ConditionState::Raised : Wire::ConditionState::Clear))
+            wrong.push_back(std::format("round {}: the registry {} a degraded surface, the row reads {}",
+                                        round,
+                                        anyDegraded ? "holds" : "holds no",
+                                        static_cast<int>(state)));
+    }
+    auto shown = std::string {};
+    for (auto const& line: wrong | std::views::take(5))
+        shown += line + "; ";
+    INFO("rounds that ended wrong: " << wrong.size() << " of " << AcceptLoopRaceRounds << ", the first: " << shown);
+    CHECK(wrong.empty());
 }

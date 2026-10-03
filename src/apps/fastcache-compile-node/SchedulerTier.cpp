@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <format>
 #include <memory>
@@ -38,6 +39,25 @@ namespace
         /// That span in words, for the `not-evaluated` detail a leader gives until it has watched it.
         std::string_view observationWords;
     };
+
+    /// How long until a row a leader has not watched long enough decides, in the words its
+    /// `not-evaluated` detail gives an operator: "14 min 30 s", rounded UP to the second so the row
+    /// never decides before the time it named. Relative rather than a clock time, which holds because
+    /// the watch re-answers every `SchedulerConditionInterval`, far below the second it is rounded to
+    /// in any reading an operator acts on.
+    /// @param remaining The part of the row's observation span this leadership has still to watch.
+    /// @return That duration in minutes and seconds, the zero part left out.
+    [[nodiscard]] std::string DecidesIn(core::platform::SteadyDuration remaining)
+    {
+        auto const total = std::chrono::ceil<std::chrono::seconds>(remaining);
+        auto const minutes = std::chrono::duration_cast<std::chrono::minutes>(total);
+        auto const seconds = total - minutes;
+        if (minutes.count() == 0)
+            return std::format("{} s", seconds.count());
+        if (seconds.count() == 0)
+            return std::format("{} min", minutes.count());
+        return std::format("{} min {} s", minutes.count(), seconds.count());
+    }
 
     /// What an operator calls @p toolchain: the client's label, else its fingerprint, marked.
     [[nodiscard]] std::string ToolchainName(Distributed::UnservedToolchain const& toolchain)
@@ -155,8 +175,9 @@ void EvaluateSchedulerConditions(NodeConditions& conditions, SchedulerConditionI
             conditions.Raise(row.condition, *detail);
         else if (*inputs.leadingFor < row.observation)
             conditions.NotEvaluated(row.condition,
-                                    std::format("this scheduler has led for less than {}, the span this row must watch "
-                                                "before it may read clear; nothing another leader saw carries over",
+                                    std::format("decides in {}, once this leadership has watched {}; nothing another "
+                                                "leader saw carries over",
+                                                DecidesIn(row.observation - *inputs.leadingFor),
                                                 row.observationWords));
         else
             conditions.Clear(row.condition);

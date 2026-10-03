@@ -642,7 +642,20 @@ Writes use an atomic append (`FILE_APPEND_DATA` / `O_APPEND`) so the hundreds of
 concurrent compilers in one build interleave whole lines instead of shredding
 each other's. Recording failures are swallowed: statistics never break a build.
 
-A line is tab-separated, and its last two columns are the distribution axis: the
+A line is tab-separated and names its own format first: `v2`, then fifteen columns in
+this order — `outcome`, `prefetch-group`, `value-bytes`, `elapsed-ms`, `source`,
+`detail`, `preprocess-ms`, `cache-ms`, `direct-ms`, `direct-hit`, `timestamp` (seconds
+since the Unix epoch), `dispatch`, `dispatch-detail`, `dispatch-specifics` and
+`exit-code`, the code the compile exited with. A line with no version was written by
+an older launcher and is read by how many columns it has, as it always was; its exit
+code is *absent*, never a zero that would call every old compile a success. A line
+naming a version this launcher does not know — a newer launcher appending to the same
+log during an upgrade — is skipped, and `--show-stats` says how many it skipped, rather
+than being read by position and misread. The report counts failed compiles only among
+records that carry an exit code, which is what tells a compiler killed from outside
+apart from a cache that broke the build.
+
+The two dispatch columns are the distribution axis: the
 fixed reason tallied under `why distribution did not help`, and then what to act on
 about it when the reason alone does not say — the argument a worker would not take,
 in the worker's own words, the ceiling a job went over, what one worker could not

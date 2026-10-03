@@ -83,8 +83,9 @@ class SharedCacheUpstream final: public ICacheUpstream, public ISharedCacheStatu
     /// `shared-cache-unproven` is a LIVE row, so it describes the state now, not the last
     /// operation: once the setting stops naming another machine it clears; a setting naming a
     /// machine this node cannot use raises it with the row's reason; and a newly resolved target --
-    /// another machine, or the same one now reachable, or at another endpoint -- clears it,
-    /// reported as not tried, until an operation tries it. Only a verdict about the very target
+    /// another machine, or the same one now reachable, or at another endpoint -- answers it
+    /// `not-evaluated`, reported as not tried, until an operation tries it: not tried is not clear.
+    /// Only a verdict about the very target
     /// the directory names now is kept. Counts nothing: an apply is not an operation, and
     /// `NodeSharedCacheUnresolved` counts operations.
     void StateApplied() override;

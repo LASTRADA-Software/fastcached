@@ -314,7 +314,10 @@ void InstallNodeStopHandlers()
     if (SelectsOneShotVerb(commandLine))
         return RefusalExitCode(ExitReader::Operator, stage);
     auto const code = ExitCodeFor(stage);
-    auto const host = commandLine.daemon ? MakeWindowsServiceHost(commandLine.serviceName, ServiceHostOptions { .stop = StopPendingPlanFor(std::nullopt) }) : nullptr;
+    auto const host = commandLine.daemon
+                          ? MakeWindowsServiceHost(commandLine.serviceName,
+                                                   ServiceHostOptions { .stop = StopPendingPlanFor(std::nullopt) })
+                          : nullptr;
     if (host == nullptr)
         return code;
     auto const eventLogger = MakeWindowsEventLogger(commandLine.serviceName, commandLine.logLevel);
@@ -723,6 +726,10 @@ using Node::NodeReloader;
     // It is NOT started yet. Every endpoint binds and adopts first, so that when the
     // thread does begin there is a listener behind every port a client might dial.
     Node::NodeIoLoop nodeIo;
+    // Before anything serves: a surface whose accept loop ends raises `surface-not-accepting`, one
+    // that degrades `surface-accept-degraded`, and either turns `/healthz` into a 503, all read
+    // from this one registry.
+    Node::WatchAcceptLoops(nodeIo.AcceptLoops(), conditions);
 
     // The two framed COMPONENTS this node may serve besides its worker port, each
     // owned as one object. Both are off unless asked for: handing out other machines'
@@ -1279,6 +1286,10 @@ using Node::NodeReloader;
     // tier is destroyed: the attachment is declared after it. A null tier attaches nothing.
     auto const consensusStandingAttached = consensusStanding.Attach(consensusTier.get());
 
+    // The consensus tier runs its own reactor and owns its own registry; the node reads one.
+    if (consensusTier != nullptr)
+        consensusTier->AcceptLoops().forward(nodeIo.AcceptLoops());
+
     // Discovery, when the operator configured it. Declared AFTER consensus and so
     // destroyed before it, because its observer pushes into the tier above: a
     // discovery loop outliving the thing it hands peers to is a dangling reference
@@ -1413,8 +1424,16 @@ using Node::NodeReloader;
                                                                                       Node::NodeServedSurfacesFor(cfg) } };
     auto const liveSourcesAttached = liveSources.Attach(nodeLiveSources);
 
-    auto surfaceOrRefusal = Node::StartAdminSurfaceOrExplain(
-        cfg, *host, metrics, std::move(snapshotProvider), fleetSources, &sampler, dashboardCredential, logger, conditions);
+    auto surfaceOrRefusal = Node::StartAdminSurfaceOrExplain(cfg,
+                                                             *host,
+                                                             metrics,
+                                                             std::move(snapshotProvider),
+                                                             fleetSources,
+                                                             &sampler,
+                                                             dashboardCredential,
+                                                             logger,
+                                                             conditions,
+                                                             nodeIo.AcceptLoops());
 
     // Fatal here and not in the daemon, which is a real difference between the two
     // binaries rather than a defect in either; the row says why
@@ -2253,11 +2272,10 @@ int main(int argc, char** argv)
     // The host's events hub is declared with it, since the Windows host is handed it here and
     // both outlive the body the host runs; the network watcher that feeds it starts below.
     HostEventHub hostEvents;
-    auto serviceHost =
-        cfg.daemon ? MakeWindowsServiceHost(
-                         cfg.serviceName,
-                         ServiceHostOptions { .stop = StopPendingPlanFor(cfg.drainTimeout), .hostEvents = &hostEvents })
-                   : nullptr;
+    auto serviceHost = cfg.daemon ? MakeWindowsServiceHost(cfg.serviceName,
+                                                           ServiceHostOptions { .stop = StopPendingPlanFor(cfg.drainTimeout),
+                                                                                .hostEvents = &hostEvents })
+                                  : nullptr;
     ForegroundHost foreground;
     IDaemonHost& startHost = serviceHost ? *serviceHost : static_cast<IDaemonHost&>(foreground);
 
@@ -2360,19 +2378,30 @@ int main(int argc, char** argv)
     // alone -- so nothing is written into a directory other accounts could have planted in.
     // The identity already saw the mode it runs in: the record, or the one this mints.
     if (!keptFormation.has_value())
-        return RefuseStart(startHost, logger, std::format("{}; refusing to start", keptFormation.error()), ExitCodeFor(StartStage::Formation));
+        return RefuseStart(startHost,
+                           logger,
+                           std::format("{}; refusing to start", keptFormation.error()),
+                           ExitCodeFor(StartStage::Formation));
     // Engaged whenever a record was read -- the store is what read it -- so this is the same
     // fact stated where the dereference can see it.
     if (!formationStore.has_value())
-        return RefuseStart(
-            startHost, logger, "no state directory keeps this node's formation record; refusing to start", ExitCodeFor(StartStage::Formation));
+        return RefuseStart(startHost,
+                           logger,
+                           "no state directory keeps this node's formation record; refusing to start",
+                           ExitCodeFor(StartStage::Formation));
     auto const formationRecord =
         Node::KeepFormation(*keptFormation, *formationStore, identityRandom, core::platform::defaultSystemWallClock());
     if (!formationRecord.has_value())
-        return RefuseStart(startHost, logger, std::format("{}; refusing to start", formationRecord.error()), ExitCodeFor(StartStage::Formation));
+        return RefuseStart(startHost,
+                           logger,
+                           std::format("{}; refusing to start", formationRecord.error()),
+                           ExitCodeFor(StartStage::Formation));
     for (auto* const shaped: { &cfg, &cliOnly })
         if (auto applied = Node::ApplyFormation(*shaped, *formationRecord, keptFormation->remembered); !applied.has_value())
-            return RefuseStart(startHost, logger, std::format("{}; refusing to start", applied.error()), ExitCodeFor(StartStage::Formation));
+            return RefuseStart(startHost,
+                               logger,
+                               std::format("{}; refusing to start", applied.error()),
+                               ExitCodeFor(StartStage::Formation));
     logger.Logf(LogLevel::Info, "{}, cluster {}", Node::DescribeFormationMode(cfg), cfg.clusterId);
 
     // Built only when there IS a file, and holding the SAME argv the startup parse

@@ -4,9 +4,11 @@
 #include <FastCache/Cache/NotifyingStorage.hpp>
 #include <FastCache/Cache/ReclaimLog.hpp>
 #include <FastCache/Cache/StorageTestUtils.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -17,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <format>
 #include <memory>
 #include <optional>
@@ -27,11 +30,33 @@
 #include <thread>
 #include <vector>
 
+#include <core/net/AcceptLoopHealth.hpp>
+#include <core/net/AcceptPolicy.hpp>
+#include <core/net/NetError.hpp>
 #include <core/net/testing/InMemorySocket.hpp>
 #include <core/net/testing/TestLoop.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
+
+namespace
+{
+
+/// Whether `RunReactorServer` can be called with @p Args after its options, engine and logger --
+/// dependent on a template parameter, so an ill-formed call is `false` rather than a hard error.
+template <typename... Args>
+constexpr bool RunnableWith = requires(FastCache::ReactorServerOptions const& options,
+                                       FastCache::CacheEngine& engine,
+                                       FastCache::ILogger& logger,
+                                       Args&... args) { FastCache::RunReactorServer(options, engine, logger, args...); };
+
+// The `/healthz` registry is a REQUIRED argument. It used to be `ReactorServerOptions::acceptLoops`,
+// null unless somebody set it, so a caller that forgot compiled and every accept loop's end reached
+// no `/healthz`. A default for it brings that back, and fails here.
+static_assert(!RunnableWith<>);
+static_assert(RunnableWith<core::net::AcceptLoopHealth>);
+
+} // namespace
 
 TEST_CASE("RunReactorServer rejects a TLS-flagged bind when no TLS context is configured",
           "[server][reactor-loop][tls-null-guard]")
@@ -62,7 +87,8 @@ TEST_CASE("RunReactorServer rejects a TLS-flagged bind when no TLS context is co
     options.tlsContext = nullptr;
     options.reactorThreads = 1;
 
-    auto const exitCode = FastCache::RunReactorServer(options, engine, logger);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto const exitCode = FastCache::RunReactorServer(options, engine, logger, acceptLoops);
     REQUIRE(exitCode == EXIT_FAILURE);
 }
 
@@ -454,8 +480,9 @@ void CheckReadinessComplete(std::vector<FastCache::CapturingLogger::Record> cons
     FastCache::CacheEngine engine { storage, clock };
     FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
 
+    core::net::AcceptLoopHealth acceptLoops;
     ServerRun run;
-    std::thread server { [&] { run.exitCode = FastCache::RunReactorServer(options, engine, logger); } };
+    std::thread server { [&] { run.exitCode = FastCache::RunReactorServer(options, engine, logger, acceptLoops); } };
 
     // Every 5 ms rather than the helper's default rest: each look copies the whole log.
     run.ready = FastCache::Testing::WaitUntilOutcome(
@@ -509,6 +536,12 @@ TEST_CASE("RunReactorServer announces readiness only after every accept loop is 
     // this figure is the same everywhere and is the endpoint summary rather than a
     // participant count.
     CHECK(run.log[ready.front()].message.contains("2 bind(s)"));
+    // Each loop armed under the name `RunReactorServer` gave its `Server` -- its bind's, which is
+    // what its warnings and the `/healthz` registry say too. This is the wiring the `Server` and
+    // `BindSurface` cases cannot see: a construction site passing any other name goes red here.
+    CHECK(std::ranges::all_of(armed, [&run](std::size_t index) {
+        return run.log[index].message.starts_with(std::format("{}: cache 127.0.0.1:0 (", ArmedMarker));
+    }));
 }
 
 TEST_CASE("RunReactorServer waits for every reactor's accept loops before announcing readiness",
@@ -550,6 +583,22 @@ TEST_CASE("RunReactorServer waits for every reactor's accept loops before announ
     // figure inside the helper above, never against a literal here.
     auto const ready = IndicesContaining(run.log, ReadyMarker);
     CHECK(run.log[ready.front()].message.contains("1 bind(s) x 2 reactors"));
+
+    // And the bind's loops armed under the names the multi-reactor path gave them -- the names their
+    // warnings and the `/healthz` registry use. POSIX runs one `Server` per (reactor, bind), each
+    // naming its reactor; Windows runs one acceptor thread per bind.
+    auto const armedAs = [&run](std::string_view surface) {
+        auto const prefix = std::format("{}: {} (", ArmedMarker, surface);
+        return std::ranges::count_if(run.log, [&prefix](FastCache::CapturingLogger::Record const& record) {
+            return record.message.starts_with(prefix);
+        });
+    };
+#if defined(_WIN32)
+    CHECK(armedAs("cache 127.0.0.1:0") == 1);
+#else
+    CHECK(armedAs("cache 127.0.0.1:0 on reactor 0") == 1);
+    CHECK(armedAs("cache 127.0.0.1:0 on reactor 1") == 1);
+#endif
 }
 
 TEST_CASE("The daemon's readiness marker keeps the exact bytes its out-of-tree waiters grep for",
@@ -597,7 +646,8 @@ TEST_CASE("RunReactorServer reports a bind it cannot make at Error and refuses t
     options.binds.push_back(FastCache::BindConfig { .address = "192.0.2.1", .port = 9, .tls = false });
     options.reactorThreads = 1;
 
-    CHECK(FastCache::RunReactorServer(options, engine, logger) == EXIT_FAILURE);
+    core::net::AcceptLoopHealth acceptLoops;
+    CHECK(FastCache::RunReactorServer(options, engine, logger, acceptLoops) == EXIT_FAILURE);
 
     auto const records = logger.Snapshot();
     auto const failures = IndicesContaining(records, "cannot bind");
@@ -638,14 +688,15 @@ TEST_CASE("Detail::ArmAcceptLoops does not count an accept loop that never armed
     second.close();
 
     std::vector<std::unique_ptr<FastCache::Server>> servers;
-    servers.push_back(std::make_unique<FastCache::Server>(first, engine, logger));
-    servers.push_back(std::make_unique<FastCache::Server>(second, engine, logger));
+    core::net::AcceptLoopHealth acceptLoops;
+    servers.push_back(std::make_unique<FastCache::Server>(first, engine, logger, acceptLoops, "cache first"));
+    servers.push_back(std::make_unique<FastCache::Server>(second, engine, logger, acceptLoops, "cache second"));
 
     FastCache::ReadinessAnnouncer announcer { logger, "2 bind(s)" };
     announcer.ExpectAcceptor();
     announcer.ExpectAcceptor();
     announcer.AcceptorsAllSpawned();
-    FastCache::Detail::ArmAcceptLoops(servers, "reactor 0", announcer, logger);
+    FastCache::Detail::ArmAcceptLoops(servers, announcer, logger);
 
     CHECK_FALSE(servers[0]->IsAccepting());
     CHECK_FALSE(servers[1]->IsAccepting());
@@ -669,6 +720,10 @@ TEST_CASE("Detail::ArmAcceptLoops does not count an accept loop that never armed
         CHECK(records[index].level == FastCache::LogLevel::Error);
         CHECK(records[index].message.contains("not being served"));
     }
+    // Each under its OWN loop's name -- the one its warnings and `/healthz` use -- so the line says
+    // which endpoint, rather than a position in a group.
+    CHECK(records[refused[0]].message.starts_with("cache first: "));
+    CHECK(records[refused[1]].message.starts_with("cache second: "));
 }
 
 TEST_CASE("The readiness ordering check holds for both platforms' participant shapes", "[server][reactor-loop][readiness]")
@@ -692,8 +747,8 @@ TEST_CASE("The readiness ordering check holds for both platforms' participant sh
     {
         // 2 reactors x 1 bind.
         CheckReadinessComplete({
-            record(FastCache::LogLevel::Debug, "acceptor armed: reactor 0 bind 0 (1/2)"),
-            record(FastCache::LogLevel::Debug, "acceptor armed: reactor 1 bind 0 (2/2)"),
+            record(FastCache::LogLevel::Debug, "acceptor armed: cache 127.0.0.1:11211 on reactor 0 (1/2)"),
+            record(FastCache::LogLevel::Debug, "acceptor armed: cache 127.0.0.1:11211 on reactor 1 (2/2)"),
             record(FastCache::LogLevel::Info, "ready, accepting connections (1 bind(s) x 2 reactors)"),
         });
     }
@@ -704,7 +759,7 @@ TEST_CASE("The readiness ordering check holds for both platforms' participant sh
         // literal. The reactors arm last here because their `Run()` is entered after
         // the acceptor threads are spawned.
         CheckReadinessComplete({
-            record(FastCache::LogLevel::Debug, "acceptor armed: acceptor thread 0 (1/3)"),
+            record(FastCache::LogLevel::Debug, "acceptor armed: cache 127.0.0.1:11211 (1/3)"),
             record(FastCache::LogLevel::Debug, "acceptor armed: reactor 1 (2/3)"),
             record(FastCache::LogLevel::Debug, "acceptor armed: reactor 0 (3/3)"),
             record(FastCache::LogLevel::Info, "ready, accepting connections (1 bind(s) x 2 reactors)"),
@@ -723,8 +778,9 @@ TEST_CASE("ArmProgressOf reads the announcer's own figures and refuses what it c
     CHECK(FastCache::Testing::Unwrap(good).expected == 8);
 
     // A participant name containing parentheses must not shift the reading: the
-    // progress is the LAST parenthesised group, and that is what `rfind` gives.
-    auto const awkward = ArmProgressOf("acceptor armed: reactor (odd) bind 0 (1/1)");
+    // progress is the LAST parenthesised group, and that is what `rfind` gives. A TLS
+    // bind's name is one (`Detail::BindSurface`).
+    auto const awkward = ArmProgressOf("acceptor armed: cache 0.0.0.0:6380 (TLS) (1/1)");
     REQUIRE(awkward.has_value());
     CHECK(FastCache::Testing::Unwrap(awkward).armed == 1);
     CHECK(FastCache::Testing::Unwrap(awkward).expected == 1);
@@ -733,4 +789,191 @@ TEST_CASE("ArmProgressOf reads the announcer's own figures and refuses what it c
     CHECK_FALSE(ArmProgressOf("acceptor armed: reactor 0 bind 0 (2)").has_value());
     CHECK_FALSE(ArmProgressOf("acceptor armed: reactor 0 bind 0 (x/y)").has_value());
     CHECK_FALSE(ArmProgressOf("ready, accepting connections (2 bind(s))").has_value());
+}
+
+namespace
+{
+
+/// The name the acceptor thread under test reports under, spelled the way `BindSurface` names a bind.
+constexpr std::string_view AcceptorSurface = "cache 127.0.0.1:11211";
+
+/// One accept's answer, as a scripted acceptor gives it.
+using RawAcceptAnswer = std::expected<FastCache::AcceptedSocket, core::net::NetError>;
+
+/// A failed accept answering @p code, the way `AcceptRaw` spells one.
+RawAcceptAnswer FailedAccept(core::net::NetErrorCode code)
+{
+    return std::unexpected(core::net::NetError { .code = code, .systemCode = 0, .context = "accept" });
+}
+
+/// What an acceptor thread's accepts answer, and how many it made.
+///
+/// Past the script the acceptor sets the thread's stop flag and answers `Cancelled` -- which is what
+/// the teardown's close does -- so a loop that wrongly outlives its script ends rather than spinning,
+/// and the count says it did.
+struct RawAcceptScript
+{
+    std::vector<RawAcceptAnswer> answers;
+    std::atomic<bool>& stopping;
+    std::size_t calls { 0 }; ///< Written on the acceptor thread, read after it is joined.
+};
+
+/// `Detail::IRawAcceptor` answering from a `RawAcceptScript` the case owns.
+class ScriptedRawAcceptor final: public FastCache::Detail::IRawAcceptor
+{
+  public:
+    explicit ScriptedRawAcceptor(RawAcceptScript& script) noexcept:
+        _script { script }
+    {
+    }
+
+    [[nodiscard]] RawAcceptAnswer Accept() override
+    {
+        auto const index = _script.calls++;
+        if (index < _script.answers.size())
+            return _script.answers[index];
+        _script.stopping.store(true, std::memory_order_release);
+        return FailedAccept(core::net::NetErrorCode::Cancelled);
+    }
+
+  private:
+    RawAcceptScript& _script;
+};
+
+/// A drain wait that records every backoff it is asked for and blocks for none of them.
+class RecordingDrainWait final: public FastCache::IDrainWait
+{
+  public:
+    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
+    {
+        return FastCache::DefaultDrainWait().Now();
+    }
+
+    void Sleep(std::chrono::milliseconds requested) noexcept override
+    {
+        _sleeps.push_back(requested);
+    }
+
+    /// @return Every backoff asked for, in order. Read after the thread that asked is joined.
+    [[nodiscard]] std::vector<std::chrono::milliseconds> const& Sleeps() const noexcept
+    {
+        return _sleeps;
+    }
+
+  private:
+    std::vector<std::chrono::milliseconds> _sleeps;
+};
+
+/// Everything one acceptor thread under test is handed, and what it did.
+struct AcceptorThreadFixture
+{
+    std::atomic<bool> stopping { false };
+    RawAcceptScript script { .answers = {}, .stopping = stopping };
+    FastCache::CapturingLogger logger;
+    core::net::AcceptLoopHealth acceptLoops;
+    RecordingDrainWait wait;
+    FastCache::ReadinessAnnouncer announcer { logger, "1 bind(s) x 1 reactors" };
+    std::vector<std::string> handedOff; ///< Peers the thread handed on, in order; read after the join.
+
+    /// Run the thread production runs over the script, to its end.
+    void RunToEnd()
+    {
+        announcer.ExpectAcceptor();
+        announcer.AcceptorsAllSpawned();
+        auto thread = FastCache::Detail::StartAcceptorThread(
+            FastCache::Detail::AcceptorThreadOptions { .surface = std::string { AcceptorSurface },
+                                                       .threadName = "fc-acceptor-0",
+                                                       .acceptor = std::make_unique<ScriptedRawAcceptor>(script),
+                                                       .logger = logger,
+                                                       .acceptLoops = acceptLoops,
+                                                       .wait = wait,
+                                                       .stopping = stopping,
+                                                       .announcer = announcer },
+            [this](FastCache::AcceptedSocket raw) { handedOff.push_back(std::move(raw.peer)); });
+        // Every script ends in a `Cancelled` the thread cannot outlive, so the join is bounded by the
+        // script's length rather than by a clock.
+        thread.join();
+    }
+
+    /// @return How many records were logged at @p level.
+    [[nodiscard]] std::size_t CountAt(FastCache::LogLevel level) const
+    {
+        return static_cast<std::size_t>(std::ranges::count(
+            logger.Snapshot(), level, [](FastCache::CapturingLogger::Record const& r) { return r.level; }));
+    }
+};
+
+} // namespace
+
+TEST_CASE("The Windows acceptor thread accepts past a reset and exhaustion and ends only on a closed listener",
+          "[server][reactor-loop][accept-loop]")
+{
+    // The thread `RunMultiReactorWindows` spawns for every bind, driven through its accept seam. It
+    // used to end on ANY failed accept, so one client resetting its queued connection -- a blocking
+    // `accept()` answering WSAECONNRESET, which `SocketErrorCode` reads as `ConnReset` -- stopped
+    // the bind while the port still listened, and every later connect was refused. Here the reset and the exhaustion must
+    // each be accepted past, the connection after them served, and only the closed listener end the thread.
+    AcceptorThreadFixture fixture;
+    fixture.script.answers = {
+        FailedAccept(core::net::NetErrorCode::ConnReset),
+        FailedAccept(core::net::NetErrorCode::ResourceExhausted),
+        RawAcceptAnswer {
+            FastCache::AcceptedSocket { .handle = core::platform::InvalidHandle, .peer = "198.51.100.7:40000" } },
+        FailedAccept(core::net::NetErrorCode::Cancelled),
+    };
+    fixture.RunToEnd();
+
+    // Four accepts and no fifth: it kept accepting after the reset and the exhaustion, and the
+    // Cancelled -- not the script running out -- ended it.
+    CHECK(fixture.script.calls == 4);
+    CHECK(fixture.handedOff == std::vector<std::string> { "198.51.100.7:40000" });
+    // Only the exhaustion backed off: one failed connection is not a run worth yielding to.
+    CHECK(fixture.wait.Sleeps() == std::vector { core::net::AcceptErrorPolicy::FirstBackoff });
+    CHECK(fixture.announcer.ArmedCount() == 1);
+    CHECK(fixture.CountAt(FastCache::LogLevel::Warn) >= 1);
+
+    // Nobody was stopping it, so the end is news: one Error line, and the registry `/healthz`
+    // answers from names the surface.
+    auto const cancelled =
+        core::net::NetError { .code = core::net::NetErrorCode::Cancelled, .systemCode = 0, .context = "accept" };
+    auto const endedLine = core::net::describeAcceptLoopEnded(AcceptorSurface, cancelled);
+    auto const records = fixture.logger.Snapshot();
+    CHECK(std::ranges::count_if(records,
+                                [&](FastCache::CapturingLogger::Record const& r) {
+                                    return r.level == FastCache::LogLevel::Error && r.message == endedLine;
+                                })
+          == 1);
+    auto const stopped = fixture.acceptLoops.snapshot();
+    REQUIRE(stopped.size() == 1);
+    // Under the thread's OWN name, which is its bind's: it used to be `cache` for every bind.
+    CHECK(stopped.front().surface == AcceptorSurface);
+    CHECK(stopped.front().reason == endedLine);
+    CHECK(stopped.front().kind == core::net::AcceptLoopEventKind::GaveUp);
+}
+
+TEST_CASE("The Windows acceptor thread ended by the teardown's close reports nothing", "[server][reactor-loop][accept-loop]")
+{
+    // The sibling: the same Cancelled, arriving after the teardown set `stopping`, is the ordinary
+    // end of a stopping daemon. It must neither log at Error nor mark the surface dead, or every
+    // clean shutdown would turn `/healthz` red on its way out.
+    AcceptorThreadFixture fixture;
+    fixture.script.answers = { FailedAccept(core::net::NetErrorCode::ConnReset) };
+    fixture.RunToEnd();
+
+    CHECK(fixture.script.calls == 2);
+    CHECK(fixture.handedOff.empty());
+    CHECK(fixture.CountAt(FastCache::LogLevel::Error) == 0);
+    CHECK(fixture.acceptLoops.snapshot().empty());
+}
+
+TEST_CASE("Each bind's accept loop reports under a name that says which bind it is", "[server][reactor-loop][accept-loop]")
+{
+    // Every loop reported as `cache`, so `/healthz` on a daemon with a plaintext and a TLS bind could
+    // say only that SOMETHING stopped. The name is the bind, so two binds never share one.
+    CHECK(FastCache::Detail::BindSurface(FastCache::BindConfig { .address = "0.0.0.0", .port = 11211, .tls = false })
+          == "cache 0.0.0.0:11211");
+    CHECK(FastCache::Detail::BindSurface(FastCache::BindConfig { .address = "0.0.0.0", .port = 6380, .tls = true })
+          == "cache 0.0.0.0:6380 (TLS)");
+    CHECK(FastCache::Detail::BindSurface(FastCache::BindConfig { .address = "::", .port = 11211, .tls = false })
+          == "cache [::]:11211");
 }

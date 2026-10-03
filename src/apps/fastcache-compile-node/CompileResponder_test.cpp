@@ -714,11 +714,13 @@ class IdleListener final: public core::net::IListener
             std::unexpect, core::net::NetError { .code = core::net::NetErrorCode::Eof, .systemCode = 0, .context = {} }
         };
     }
-    void close() noexcept override {}
     [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return 0;
     }
+
+  protected:
+    void doClose() noexcept override {}
 };
 
 /// A free loopback port, taken and released.

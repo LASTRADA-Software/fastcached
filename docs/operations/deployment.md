@@ -460,6 +460,12 @@ The image's `HEALTHCHECK` runs `fastcached --healthcheck`, which probes
 self-contained — no `curl`/`wget` in the image — but requires the daemon to run
 with `--metrics`.
 
+`/healthz` answers `503` once any bind's accept loop has ended while the daemon was not
+stopping, naming the bind and what its last accept answered: such a port still listens and
+refuses every client, so a probe that only saw the process alive would call it healthy.
+Only a closed listener ends a loop; a client that reset its queued connection is logged at
+`Warn` and accepted past.
+
 ## Authentication
 
 Set a shared secret to require clients to authenticate before any data command:
@@ -496,7 +502,7 @@ certificate (mutual TLS) auth is not yet implemented.
 ```sh
 fastcached --metrics --metrics-bind=0.0.0.0 --metrics-port=9259
 curl http://host:9259/metrics    # Prometheus text exposition
-curl http://host:9259/healthz    # 200 OK
+curl http://host:9259/healthz    # 200 OK; 503 naming any bind that stopped accepting
 ```
 
 If the endpoint cannot be bound the daemon **carries on serving the cache without

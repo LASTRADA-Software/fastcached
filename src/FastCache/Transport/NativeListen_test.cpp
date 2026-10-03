@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -21,13 +22,17 @@
 
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
+#include <core/net/AcceptPolicy.hpp>
 #include <core/net/IListener.hpp>
 #include <core/net/NetError.hpp>
 #include <core/net/PlatformLoop.hpp>
 #include <core/net/SocketAddress.hpp>
 #include <core/net/Sockets.hpp>
+#include <core/platform/Clock.hpp>
 #include <core/platform/Types.hpp>
 #include <core/platform/WinsockInit.hpp>
+#include <tests/BoundedWait.hpp>
+#include <tests/ScopedSignalHandler.hpp>
 #include <tests/Unwrap.hpp>
 
 #if defined(_WIN32)
@@ -36,6 +41,9 @@
     #include <ws2tcpip.h>
 #else
     #include <sys/socket.h>
+
+    #include <cerrno>
+    #include <csignal>
 
     #include <fcntl.h>
     #include <unistd.h>
@@ -542,4 +550,257 @@ TEST_CASE("closing a listening socket unblocks a parked AcceptRaw, and says whic
         INFO("AcceptRaw returned " << accepted.error().toString());
         CHECK(accepted.error().code == core::net::NetErrorCode::BadHandle);
     }
+}
+
+TEST_CASE("A signal that interrupts an armed accept's poll is a poll tick, not a closed listener",
+          "[net][socket][listener][signal]")
+{
+    // Both binaries install a SIGHUP handler that nothing blocks on other threads, and a caught
+    // signal interrupts a parked `poll()` with EINTR whatever SA_RESTART says. This row used to
+    // answer `Cancelled` -- a closed listener, to every accept loop -- so one SIGHUP landing on the
+    // admin thread ended its loop while the process lived. On POSIX a close never wakes the poll,
+    // so EINTR can only be a signal, and it must read as the tick the poll answers anyway.
+#if defined(_WIN32)
+    SKIP("no POSIX signal reaches a Windows thread, and WSAEINTR there is a closed socket -- the close case pins it");
+#else
+    FastCache::Testing::ScopedSignalHandler const handler { SIGUSR2 };
+    REQUIRE(handler.Installed());
+    auto listener = FastCache::BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(listener != nullptr);
+    if (!listener->IsBound())
+        SKIP("this platform would not bind a loopback listener");
+    // Far longer than the wait below, so the poll's own timeout cannot be what answers.
+    listener->SetTimeouts(60s, 1000ms);
+
+    std::promise<core::net::AcceptResult> outcome;
+    auto answered = outcome.get_future();
+    std::thread acceptor { [&listener, &outcome] { outcome.set_value(core::async::syncRun(AcceptOne(listener.get()))); } };
+    auto const native = acceptor.native_handle();
+    // Signalled on every poll until the accept answers: one landing before the thread is inside
+    // `poll()` is handled and lost, and a later one lands inside it.
+    auto const reached = FastCache::Testing::WaitUntil(
+        "the parked accept to answer a signal",
+        [&answered] { return answered.wait_for(0s) == std::future_status::ready; },
+        [] { return std::string { "signalling the acceptor thread on every poll" }; },
+        FastCache::Testing::WaitOptions { .step = [&handler, native] { handler.Interrupt(native); },
+                                          .context = {},
+                                          .bound = FastCache::Testing::WaitHangGuard,
+                                          .rest = FastCache::Testing::WaitRest });
+    // Joined before any assertion: the poll ends on its own within its timeout, so this is bounded.
+    acceptor.join();
+    REQUIRE(reached);
+
+    auto const accepted = answered.get();
+    REQUIRE_FALSE(accepted.has_value());
+    INFO("the interrupted accept answered " << accepted.error().toString());
+    // The signal answered, not the poll's timeout: that one carries no errno.
+    CHECK(accepted.error().systemCode == EINTR);
+    CHECK(core::net::acceptDispositionOf(accepted.error().code) == core::net::AcceptDisposition::PollTick);
+#endif
+}
+
+namespace
+{
+
+/// One OS error an accept can answer, and what an accept loop must do about it -- written here
+/// independently of `NativeListen.cpp`'s rows, so the two tables disagreeing is a failure.
+struct ExpectedAcceptError
+{
+    int osError;                              ///< The platform's error number.
+    std::string_view name;                    ///< Its spelling, for the failure message.
+    core::net::AcceptDisposition disposition; ///< What the loop must do.
+};
+
+using enum core::net::AcceptDisposition;
+
+#if defined(_WIN32)
+constexpr auto ExpectedAcceptErrors = std::array {
+    ExpectedAcceptError { .osError = WSAETIMEDOUT, .name = "WSAETIMEDOUT", .disposition = PollTick },
+    ExpectedAcceptError { .osError = WSAEWOULDBLOCK, .name = "WSAEWOULDBLOCK", .disposition = PollTick },
+    ExpectedAcceptError { .osError = WSAEINTR, .name = "WSAEINTR", .disposition = Closed },
+    ExpectedAcceptError { .osError = WSAENOTSOCK, .name = "WSAENOTSOCK", .disposition = Dead },
+    ExpectedAcceptError { .osError = WSAECONNRESET, .name = "WSAECONNRESET", .disposition = PeerFailed },
+    ExpectedAcceptError { .osError = WSAECONNABORTED, .name = "WSAECONNABORTED", .disposition = PeerFailed },
+    ExpectedAcceptError { .osError = WSAEMFILE, .name = "WSAEMFILE", .disposition = Exhausted },
+    ExpectedAcceptError { .osError = WSAENOBUFS, .name = "WSAENOBUFS", .disposition = Exhausted },
+    ExpectedAcceptError { .osError = WSA_NOT_ENOUGH_MEMORY, .name = "WSA_NOT_ENOUGH_MEMORY", .disposition = Exhausted },
+};
+#else
+constexpr auto ExpectedAcceptErrors = std::array {
+    ExpectedAcceptError { .osError = EAGAIN, .name = "EAGAIN", .disposition = PollTick },
+    ExpectedAcceptError { .osError = EWOULDBLOCK, .name = "EWOULDBLOCK", .disposition = PollTick },
+    ExpectedAcceptError { .osError = EINTR, .name = "EINTR", .disposition = PollTick },
+    ExpectedAcceptError { .osError = EBADF, .name = "EBADF", .disposition = Dead },
+    ExpectedAcceptError { .osError = ENOTSOCK, .name = "ENOTSOCK", .disposition = Dead },
+    ExpectedAcceptError { .osError = ECONNABORTED, .name = "ECONNABORTED", .disposition = PeerFailed },
+    ExpectedAcceptError { .osError = EPERM, .name = "EPERM", .disposition = PeerFailed },
+    ExpectedAcceptError { .osError = EPROTO, .name = "EPROTO", .disposition = PeerFailed },
+    ExpectedAcceptError { .osError = ENOPROTOOPT, .name = "ENOPROTOOPT", .disposition = PeerFailed },
+    ExpectedAcceptError { .osError = EOPNOTSUPP, .name = "EOPNOTSUPP", .disposition = PeerFailed },
+    ExpectedAcceptError { .osError = ENETDOWN, .name = "ENETDOWN", .disposition = PeerFailed },
+    ExpectedAcceptError { .osError = ENETUNREACH, .name = "ENETUNREACH", .disposition = PeerFailed },
+    ExpectedAcceptError { .osError = EHOSTDOWN, .name = "EHOSTDOWN", .disposition = PeerFailed },
+    ExpectedAcceptError { .osError = EHOSTUNREACH, .name = "EHOSTUNREACH", .disposition = PeerFailed },
+    #if defined(ENONET)
+    ExpectedAcceptError { .osError = ENONET, .name = "ENONET", .disposition = PeerFailed },
+    #endif
+    ExpectedAcceptError { .osError = EMFILE, .name = "EMFILE", .disposition = Exhausted },
+    ExpectedAcceptError { .osError = ENFILE, .name = "ENFILE", .disposition = Exhausted },
+    ExpectedAcceptError { .osError = ENOBUFS, .name = "ENOBUFS", .disposition = Exhausted },
+    ExpectedAcceptError { .osError = ENOMEM, .name = "ENOMEM", .disposition = Exhausted },
+};
+#endif
+
+} // namespace
+
+TEST_CASE("Every OS error an accept can answer reaches the accept loop as the disposition it deserves",
+          "[net][listener][accept-policy]")
+{
+    // `SocketErrorCode` is a second classifier in front of core-cpp's `AcceptErrorTable`, and a number
+    // it has no row for is `SystemError` -- unclassified, a backoff of up to a second and, if it
+    // persists, a surface reported degraded. It had no per-connection
+    // rows at all, so a flood of resets on the Windows acceptor threads, or of ECONNABORTED and
+    // firewall EPERM on a POSIX BlockingListener, read as a process out of descriptors. This binds
+    // the two tables together: each OS error, through both, must land where an accept loop steps
+    // past a failed connection, retries a tick, backs off, or stops.
+    //
+    // ONE assertion over every row, never one per row: rows sharing a code fail together when that
+    // code's disposition moves, four of them share one, and ctest scores a Catch2 exit of exactly 4
+    // as Skipped (#1152) -- so a per-row CHECK read "100% tests passed" for the very regression this
+    // case exists for (`ConnReset -> Exhausted`, measured). At most two assertions fail here.
+    std::vector<std::string> mismatches;
+    for (auto const& expected: ExpectedAcceptErrors)
+    {
+        auto const code = FastCache::SocketErrorCode(expected.osError);
+        auto const disposition = core::net::acceptDispositionOf(code);
+        if (disposition != expected.disposition)
+            mismatches.push_back(std::format("{} ({}) answers code {} -> disposition {}, expected {}",
+                                             expected.name,
+                                             expected.osError,
+                                             static_cast<int>(code),
+                                             static_cast<int>(disposition),
+                                             static_cast<int>(expected.disposition)));
+    }
+    std::string listing;
+    for (auto const& mismatch: mismatches)
+        listing += std::format("\n  {}", mismatch);
+    INFO("rows that land on the wrong disposition:" << listing);
+    CHECK(mismatches.empty());
+    // And a number no row names is unclassified, never an end: a code nobody thought of must not end
+    // a loop by default.
+    CHECK(FastCache::SocketErrorCode(-1) == core::net::NetErrorCode::SystemError);
+}
+
+TEST_CASE("Adopting a descriptor that is not a stream socket is refused by name", "[net][listener]")
+{
+    // accept(2) answers EOPNOTSUPP forever on a listener that is not SOCK_STREAM, and ALSO hands it
+    // back as a network error pending on one new TCP connection -- so the accept table must step
+    // past it, and a non-stream listener has to be refused where that fact is known: at adoption,
+    // before any loop runs over it.
+    core::platform::ensureWinsockInitialized();
+
+    // The control: a real listening stream socket is adopted and serves.
+    auto bound = BindLoopback(0);
+    REQUIRE(bound.has_value());
+    auto const stream = FastCache::BlockingListener::Adopt(bound->handle);
+    CHECK(stream->IsBound());
+    CHECK(stream->BindError().empty());
+
+#if defined(_WIN32)
+    auto* const datagram = reinterpret_cast<core::platform::NativeHandle>(::socket(AF_INET, SOCK_DGRAM, 0));
+#else
+    core::platform::NativeHandle const datagram = ::socket(AF_INET, SOCK_DGRAM, 0);
+#endif
+    REQUIRE(datagram != core::platform::InvalidHandle);
+    // Owned by `Adopt` from here, refused or not, so the case never closes it.
+    auto const refused = FastCache::BlockingListener::Adopt(datagram);
+    CHECK_FALSE(refused->IsBound());
+    INFO("the refusal was: " << refused->BindError());
+    CHECK(refused->BindError().contains(std::format("socket type {}", static_cast<int>(SOCK_DGRAM))));
+}
+
+TEST_CASE("A supervisor's descriptor that is not a stream socket is refused by name", "[net][listener]")
+{
+    // Socket activation reaches the node's reactor listener through `AdoptInheritedListener`, and
+    // core-cpp's `adoptListener` does not ask the type: a unit handing over a datagram socket would
+    // start an accept loop whose every accept fails, forever. Refused before core-cpp takes it.
+    core::platform::SteadyClock clock;
+    core::net::PlatformLoop loop { clock };
+#if defined(_WIN32)
+    // Windows has no socket activation, so every number is refused before anything touches it.
+    auto const refused = FastCache::AdoptInheritedListener(loop, 3);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().contains("not available on this platform"));
+#else
+    auto const datagram = ::socket(AF_INET, SOCK_DGRAM, 0);
+    REQUIRE(datagram >= 0);
+    // Owned by the call from here, refused or not.
+    auto const refused = FastCache::AdoptInheritedListener(loop, datagram);
+    REQUIRE_FALSE(refused.has_value());
+    INFO("the refusal was: " << refused.error());
+    CHECK(refused.error().contains(std::format("socket type {}", static_cast<int>(SOCK_DGRAM))));
+    // And closed, so a refusal leaks nothing.
+    CHECK(::fcntl(datagram, F_GETFD) == -1);
+#endif
+}
+
+namespace
+{
+
+/// A TCP socket bound to a loopback port and never listened on.
+/// @return Its handle, or `InvalidHandle` when it could not be made; the caller owns it.
+[[nodiscard]] core::platform::NativeHandle BoundUnlistenedStreamSocket()
+{
+    core::platform::ensureWinsockInitialized();
+#if defined(_WIN32)
+    using SockLen = int;
+    auto const raw = ::socket(AF_INET, SOCK_STREAM, 0);
+    auto* const handle = reinterpret_cast<core::platform::NativeHandle>(raw);
+#else
+    using SockLen = socklen_t;
+    auto const raw = ::socket(AF_INET, SOCK_STREAM, 0);
+    core::platform::NativeHandle const handle = raw;
+#endif
+    if (handle == core::platform::InvalidHandle)
+        return core::platform::InvalidHandle;
+    sockaddr_in loopback {};
+    loopback.sin_family = AF_INET;
+    loopback.sin_port = 0;
+    loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(raw, reinterpret_cast<sockaddr const*>(&loopback), static_cast<SockLen>(sizeof(loopback))) != 0)
+    {
+        FastCache::CloseNativeSocket(handle);
+        return core::platform::InvalidHandle;
+    }
+    return handle;
+}
+
+} // namespace
+
+TEST_CASE("Adopting a stream socket nobody listens on is refused by name", "[net][listener]")
+{
+    // accept(2) answers EINVAL forever on a stream socket that was bound but never listened on, and
+    // an accept loop reads that unclassified code as exhaustion -- a backoff and a warning, for as
+    // long as the process runs, over a port that serves nothing. Refused at adoption instead, by
+    // both doors: the blocking listener's and socket activation's.
+    core::platform::NativeHandle const unlistened = BoundUnlistenedStreamSocket();
+    REQUIRE(unlistened != core::platform::InvalidHandle);
+    // Owned by `Adopt` from here, refused or not.
+    auto const refused = FastCache::BlockingListener::Adopt(unlistened);
+    CHECK_FALSE(refused->IsBound());
+    INFO("the blocking listener's refusal was: " << refused->BindError());
+    CHECK(refused->BindError().contains("SO_ACCEPTCONN"));
+
+#if !defined(_WIN32)
+    // Socket activation's door. Windows refuses every descriptor there before asking anything,
+    // which the supervisor case asserts.
+    core::platform::SteadyClock clock;
+    core::net::PlatformLoop loop { clock };
+    auto const inherited = BoundUnlistenedStreamSocket();
+    REQUIRE(inherited != core::platform::InvalidHandle);
+    auto const adopted = FastCache::AdoptInheritedListener(loop, inherited);
+    REQUIRE_FALSE(adopted.has_value());
+    INFO("socket activation's refusal was: " << adopted.error());
+    CHECK(adopted.error().contains("SO_ACCEPTCONN"));
+#endif
 }

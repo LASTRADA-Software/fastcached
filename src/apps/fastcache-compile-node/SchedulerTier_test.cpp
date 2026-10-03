@@ -29,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <core/platform/Clock.hpp>
@@ -466,21 +467,35 @@ TEST_CASE("A new leader reads each fleet-wide row not-evaluated, never clear, un
     REQUIRE(tier.has_value());
 
     (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
-    for (auto const condition: { NodeCondition::UnservedToolchain, NodeCondition::MixedNodeVersions })
+    // The detail says WHEN each row decides, counted from this leadership's start: what an operator
+    // reading `not-evaluated` wants to know is how long to wait, not what the row watches.
+    for (auto const& [condition, when]: { std::pair { NodeCondition::UnservedToolchain, "decides in 15 min," },
+                                          std::pair { NodeCondition::MixedNodeVersions, "decides in 1 min 30 s," } })
     {
         INFO("condition " << RowFor(condition).id);
         auto const row = SentRow(fix.conditions, condition);
         CHECK(row.state == "not-evaluated");
-        CHECK(row.detail.contains("has led for less than"));
+        CHECK(row.detail.starts_with(when));
     }
 
     fix.clock.advance(Distributed::WorkerRegistry::DefaultHeartbeatTimeout);
     (*tier)->EvaluateConditions();
     CHECK(fix.conditions.StateOf(NodeCondition::MixedNodeVersions) == Wire::ConditionState::Clear);
     CHECK(fix.conditions.StateOf(NodeCondition::UnservedToolchain) == Wire::ConditionState::NotEvaluated);
-    CHECK(SentRow(fix.conditions, NodeCondition::UnservedToolchain).detail.contains("fifteen minutes"));
+    // The time left moves with the clock, and a part of a second still to watch rounds UP: the row
+    // never decides before the time it named.
+    auto const unserved = SentRow(fix.conditions, NodeCondition::UnservedToolchain).detail;
+    CHECK(unserved.starts_with("decides in 13 min 30 s,"));
+    CHECK(unserved.contains("fifteen minutes"));
+    fix.clock.advance(std::chrono::milliseconds { 500 });
+    (*tier)->EvaluateConditions();
+    CHECK(SentRow(fix.conditions, NodeCondition::UnservedToolchain).detail.starts_with("decides in 13 min 30 s,"));
+    fix.clock.advance(std::chrono::milliseconds { 500 });
+    (*tier)->EvaluateConditions();
+    CHECK(SentRow(fix.conditions, NodeCondition::UnservedToolchain).detail.starts_with("decides in 13 min 29 s,"));
 
-    fix.clock.advance(Distributed::UnservedToolchains::Window - Distributed::WorkerRegistry::DefaultHeartbeatTimeout);
+    fix.clock.advance(Distributed::UnservedToolchains::Window - Distributed::WorkerRegistry::DefaultHeartbeatTimeout
+                      - std::chrono::seconds { 1 });
     (*tier)->EvaluateConditions();
     CHECK(fix.conditions.StateOf(NodeCondition::UnservedToolchain) == Wire::ConditionState::Clear);
 }

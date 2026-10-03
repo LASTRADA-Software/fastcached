@@ -4,6 +4,7 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
+#include <FastCache/Transport/AcceptLoopReporter.hpp>
 
 #include <algorithm>
 #include <array>
@@ -621,7 +622,8 @@ core::async::Task<void> ServeAdminHttp(core::net::ISocket* socket,
                                        AdminHttpServer::SnapshotProvider snapshotProvider,
                                        core::platform::IClock* clock,
                                        std::span<AdminRoute const> routes,
-                                       std::span<MetricsSurface const> surfaces)
+                                       std::span<MetricsSurface const> surfaces,
+                                       core::net::AcceptLoopHealth const* liveness)
 {
     // TLS terminates here rather than in the accept loop, so a handshake failure
     // costs the same detached task a slow request does and never the loop. A
@@ -674,7 +676,26 @@ core::async::Task<void> ServeAdminHttp(core::net::ISocket* socket,
     }
     if (path == "/healthz")
     {
-        (void) co_await WriteResponse(socket, PlainRefusal("200 OK", "OK\n"));
+        // A listening port is not a serving one: a surface whose accept loop ended still shows
+        // `LISTENING` and refuses every connect. This used to answer `200` regardless, and did for
+        // nine hours over a node whose 0xFC surface was in exactly that state. A DEGRADED loop is
+        // one backing off on failures nothing classified, for longer than any transient explains:
+        // its port accepts little or nothing, so it fails the probe as well, named apart.
+        auto const unhealthy = liveness != nullptr ? liveness->snapshot() : std::vector<core::net::SurfaceCondition> {};
+        if (unhealthy.empty())
+        {
+            (void) co_await WriteResponse(socket, PlainRefusal("200 OK", "OK\n"));
+            co_return;
+        }
+        std::string body;
+        for (auto const& surface: unhealthy)
+            body += std::format("surface {} {}: {}\n",
+                                surface.surface,
+                                surface.kind == core::net::AcceptLoopEventKind::Degraded
+                                    ? "is degraded, backing off on failed accepts"
+                                    : "is not accepting connections",
+                                surface.reason);
+        (void) co_await WriteResponse(socket, PlainRefusal("503 Service Unavailable", body));
         co_return;
     }
 
@@ -709,6 +730,8 @@ AdminHttpServer::AdminHttpServer(core::net::IListener& listener,
                                  SnapshotProvider snapshotProvider,
                                  ILogger& logger,
                                  core::platform::IClock& clock,
+                                 core::net::AcceptLoopHealth& acceptLoops,
+                                 IDrainWait& backoffWait,
                                  std::vector<AdminRoute> routes,
                                  core::net::ITlsContext* tls,
                                  std::span<MetricsSurface const> surfaces) noexcept:
@@ -717,6 +740,8 @@ AdminHttpServer::AdminHttpServer(core::net::IListener& listener,
     _snapshotProvider { std::move(snapshotProvider) },
     _logger { logger },
     _clock { clock },
+    _acceptLoops { acceptLoops },
+    _backoffWait { backoffWait },
     _routes { std::move(routes) },
     _tls { tls },
     _surfaces { surfaces }
@@ -735,28 +760,38 @@ static core::async::DetachedTask ServeAdminConnection(std::unique_ptr<core::net:
                                                       core::platform::IClock* clock,
                                                       std::span<AdminRoute const> routes,
                                                       std::span<MetricsSurface const> surfaces,
+                                                      core::net::AcceptLoopHealth const* liveness,
                                                       std::atomic<std::size_t>* inFlight)
 {
-    co_await ServeAdminHttp(socket.get(), metrics, std::move(snapshotProvider), clock, routes, surfaces);
+    co_await ServeAdminHttp(socket.get(), metrics, std::move(snapshotProvider), clock, routes, surfaces, liveness);
     (void) co_await CloseLingering(socket.get(), nullptr, AdminHttpServer::Linger);
     inFlight->fetch_sub(1, std::memory_order_acq_rel);
 }
 
 core::async::Task<void> AdminHttpServer::Run()
 {
+    // `core::net::AcceptErrorPolicy` decides, as it does for every accept loop in the tree, and
+    // `AcceptLoopReporter` says so. A poll timeout -- how this loop wakes to observe Shutdown() on
+    // POSIX, where Close() does not unblock a parked accept() -- is accepted past silently; a peer
+    // that reset its queued connection with a rate-limited warning; and only a closed or dead
+    // listener ends the loop. It used to end on anything but the poll tick, at `Debug`, taking
+    // `/healthz` and `/metrics` with it.
+    AcceptLoopReporter acceptErrors { "admin", "admin", _logger, _acceptLoops };
     while (!_shuttingDown.load(std::memory_order_acquire))
     {
         auto accepted = co_await _listener.accept();
         if (!accepted.has_value())
         {
-            // A poll-timeout on the listening socket is how we wake to observe
-            // Shutdown() on POSIX (where Close() does not unblock a parked
-            // accept()); it is not a real failure, so loop and re-check the flag.
-            if (core::net::isDeadlineExpiry(accepted.error().code))
-                continue;
-            _logger.Logf(LogLevel::Debug, "admin: accept loop ended ({})", accepted.error().toString());
-            co_return;
+            auto const step =
+                acceptErrors.OnError(accepted.error(), _clock.now(), _shuttingDown.load(std::memory_order_acquire));
+            if (step.next == AcceptLoopNext::EndAndClose)
+                _listener.close();
+            if (step.next != AcceptLoopNext::AcceptAgain)
+                co_return;
+            co_await WaitOutBackoff(nullptr, &_backoffWait, step.delay);
+            continue;
         }
+        acceptErrors.OnAccepted(_clock.now());
         // Spawn the handler as a detached coroutine so a slow or hostile
         // client cannot tie up the accept loop and DoS /metrics and /healthz
         // for everyone else. The in-flight cap bounds peak memory: an
@@ -788,8 +823,11 @@ core::async::Task<void> AdminHttpServer::Run()
                              &_clock,
                              _routes,
                              _surfaces,
+                             &_acceptLoops,
                              &_inFlight);
     }
+    // Shut down between accepts: a loop that was degraded says it stopped.
+    acceptErrors.OnLoopEnded();
     co_return;
 }
 

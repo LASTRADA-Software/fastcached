@@ -4,6 +4,7 @@
 #include <FastCache/Server/Connection.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 #include <FastCache/Server/Server.hpp>
+#include <FastCache/Transport/AcceptLoopReporter.hpp>
 #include <FastCache/Transport/NativeListen.hpp>
 
 #include <algorithm>
@@ -12,11 +13,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <format>
 #include <memory>
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stop_token>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <tuple>
@@ -71,6 +75,7 @@ namespace
     int RunSingleReactor(ReactorServerOptions const& options,
                          CacheEngine& engine,
                          ILogger& logger,
+                         core::net::AcceptLoopHealth& acceptLoops,
                          core::net::IAdmissionControl* admission,
                          IMetricsSink* metrics)
     {
@@ -154,6 +159,8 @@ namespace
             servers.push_back(std::make_unique<Server>(*listeners.back(),
                                                        engine,
                                                        logger,
+                                                       acceptLoops,
+                                                       Detail::BindSurface(bind),
                                                        admission,
                                                        metrics,
                                                        session,
@@ -169,7 +176,7 @@ namespace
         // above the loop that starts the acceptors (#646) -- a marker naming a fact
         // weaker than the bind a caller already had. `ReadinessAnnouncer` emits it,
         // and it emits it only once every accept loop is parked in `Accept()`.
-        Detail::ArmAcceptLoops(servers, "reactor 0", announcer, logger);
+        Detail::ArmAcceptLoops(servers, announcer, logger);
 
         // **Declared BEFORE the reaper, and that ordering is the mechanism.** Locals
         // are destroyed in reverse, so `~ExpiryReaper` -- which cancels the cycle and
@@ -230,7 +237,6 @@ namespace
     }
 
 #if defined(_WIN32)
-
     /// Drive one accepted connection to completion on a specific reactor's
     /// thread. The connection is handed off from the acceptor thread: it first
     /// reschedules onto `reactor` (so the socket is adopted and all its I/O
@@ -241,47 +247,135 @@ namespace
     /// thread, after the hop, because that is its contract. It owns the handle from
     /// the call on, including when it refuses, and it leaves socket options alone --
     /// which is why `AcceptRaw` has already applied them.
+    ///
+    /// The collaborators arrive by POINTER because this frame is detached and outlives the call: a
+    /// reference parameter reads as borrowed for the call alone. Each outlives every reactor.
+    /// @param reactor The reactor that serves the connection; never null.
+    /// @param engine What the connection serves; never null.
+    /// @param logger Where the connection logs; never null.
     /// @param lease The connection's admission slot, held for as long as this frame lives.
-    core::async::DetachedTask RunHandedOffConnection(core::net::PlatformLoop& reactor,
+    core::async::DetachedTask RunHandedOffConnection(core::net::PlatformLoop* reactor,
                                                      AcceptedSocket raw,
-                                                     CacheEngine& engine,
-                                                     ILogger& logger,
+                                                     CacheEngine* engine,
+                                                     ILogger* logger,
                                                      std::optional<core::net::AdmissionLease> lease,
                                                      SessionContext session,
                                                      core::net::ITlsContext* tls,
                                                      LogSource logSource)
     {
-        co_await core::async::ResumeOn { reactor };
+        co_await core::async::ResumeOn { *reactor };
         // This connection now runs on `reactor`; pin pub/sub delivery to it so a
         // message published elsewhere wakes this subscriber via reactor.submit.
-        session.reactor = &reactor;
+        session.reactor = reactor;
         // Firewall: this is a DetachedTask (unhandled_exception -> std::terminate),
         // so a handler exception must drop only this connection, not the daemon.
         try
         {
-            auto socket = core::net::adoptSocket(reactor, raw.handle, std::move(raw.peer));
+            auto socket = core::net::adoptSocket(*reactor, raw.handle, std::move(raw.peer));
             if (!socket.has_value())
             {
                 // Refused -- the completion port would not take it, say -- and the handle is
                 // already closed by the refusal. Awaiting would hang the connection; drop it.
-                logger.Logf(
+                logger->Logf(
                     LogLevel::Error, "handed-off connection: adoption failed ({}); dropping", socket.error().toString());
             }
             else
             {
                 Connection connection {
-                    core::net::wrapTls(std::move(*socket), tls, reactor),
-                    ConnectionHoldings { .engine = engine, .logger = logger, .session = session, .logSource = logSource }
+                    core::net::wrapTls(std::move(*socket), tls, *reactor),
+                    ConnectionHoldings { .engine = *engine, .logger = *logger, .session = session, .logSource = logSource }
                 };
                 co_await connection.Run();
             }
         }
         catch (...)
         {
-            LogConnectionFirewallException(logger);
+            LogConnectionFirewallException(*logger);
         }
         static_cast<void>(lease);
         co_return;
+    }
+
+    /// `Detail::IRawAcceptor` over a blocking listening socket: `AcceptRaw`, which the teardown's close
+    /// wakes with `Cancelled`.
+    class ListeningSocketAcceptor final: public Detail::IRawAcceptor
+    {
+      public:
+        /// @param listening A bound, listening, blocking socket; not owned.
+        explicit ListeningSocketAcceptor(core::platform::NativeHandle listening) noexcept:
+            _listening { listening }
+        {
+        }
+
+        [[nodiscard]] std::expected<AcceptedSocket, core::net::NetError> Accept() override
+        {
+            return AcceptRaw(_listening);
+        }
+
+      private:
+        core::platform::NativeHandle _listening;
+    };
+
+    /// Where the Windows acceptor threads hand what they took. Every member outlives the threads.
+    struct ReactorHandOff
+    {
+        std::span<std::unique_ptr<core::net::PlatformLoop> const> reactors; ///< Round-robin targets.
+        std::atomic<std::size_t>& nextReactor;                              ///< Shared by every acceptor thread.
+        std::atomic<std::uint64_t>& accepted;                               ///< Connections admitted.
+        CacheEngine& engine;                                                ///< What each connection serves.
+        ILogger& logger;                                                    ///< Handed to each connection.
+        core::net::IAdmissionControl* admission { nullptr };                ///< Admission gate, or nullptr.
+        IMetricsSink* metrics { nullptr };                                  ///< Connection counters, or nullptr.
+        ReactorServerOptions const& options;                                ///< Session and log settings.
+    };
+
+    /// Count one connection: @p all always, @p overTls as well when it arrived on a TLS bind.
+    /// @param metrics The sink, or nullptr.
+    /// @param all The counter every connection moves.
+    /// @param overTls The counter only a TLS bind's connection moves.
+    /// @param tls Whether the connection arrived on a TLS bind.
+    void CountConnection(IMetricsSink* metrics, IMetricsSink::Counter all, IMetricsSink::Counter overTls, bool tls)
+    {
+        if (metrics == nullptr)
+            return;
+        metrics->Increment(all);
+        if (tls)
+            metrics->Increment(overTls);
+    }
+
+    /// Admit one accepted connection, count it and hand it to the next reactor -- or refuse it.
+    ///
+    /// Admitted and counted in one step, as `Server::Run` does it.
+    /// @param to The reactors and the collaborators each connection is handed.
+    /// @param raw The connection; owned from here on.
+    /// @param tls The bind's TLS context, or nullptr for a plaintext bind.
+    void HandOffToReactor(ReactorHandOff const& to, AcceptedSocket raw, core::net::ITlsContext* tls)
+    {
+        auto lease = to.admission != nullptr ? to.admission->tryAdmit() : std::nullopt;
+        if (to.admission != nullptr && !lease.has_value())
+        {
+            CountConnection(to.metrics,
+                            IMetricsSink::Counter::ConnectionsAdmissionRejected,
+                            IMetricsSink::Counter::ConnectionsAdmissionRejectedTls,
+                            tls != nullptr);
+            CloseNativeSocket(raw.handle);
+            return;
+        }
+        to.accepted.fetch_add(1, std::memory_order_relaxed);
+        CountConnection(
+            to.metrics, IMetricsSink::Counter::ConnectionsTotal, IMetricsSink::Counter::ConnectionsTotalTls, tls != nullptr);
+        auto const idx = to.nextReactor.fetch_add(1, std::memory_order_relaxed) % to.reactors.size();
+        // Per-bind copy for the same reason the other two platform paths make one: this connection
+        // carries its endpoint's role mask, not the daemon's.
+        auto session = to.options.session;
+        RunHandedOffConnection(to.reactors[idx].get(),
+                               std::move(raw),
+                               &to.engine,
+                               &to.logger,
+                               std::move(lease),
+                               session,
+                               tls,
+                               to.options.logSource ? LogSource::Yes : LogSource::No);
     }
 
     /// Windows multi-core: one blocking acceptor thread *per BindConfig*
@@ -292,6 +386,7 @@ namespace
     int RunMultiReactorWindows(ReactorServerOptions const& options,
                                CacheEngine& engine,
                                ILogger& logger,
+                               core::net::AcceptLoopHealth& acceptLoops,
                                core::net::IAdmissionControl* admission,
                                IMetricsSink* metrics,
                                unsigned reactorCount)
@@ -332,7 +427,7 @@ namespace
             if (!bound.has_value())
             {
                 logger.Logf(LogLevel::Error, "fastcached: cannot bind {}:{} : {}", bind.address, bind.port, bound.error());
-                for (auto const sock: listenSocks)
+                for (core::platform::NativeHandle const sock: listenSocks)
                     CloseNativeSocket(sock);
                 return EXIT_FAILURE;
             }
@@ -350,63 +445,30 @@ namespace
         // restores the round-robin contract the leading comment promises.
         std::atomic<std::size_t> nextReactor { 0 };
 
+        ReactorHandOff const handOff { .reactors = reactors,
+                                       .nextReactor = nextReactor,
+                                       .accepted = accepted,
+                                       .engine = engine,
+                                       .logger = logger,
+                                       .admission = admission,
+                                       .metrics = metrics,
+                                       .options = options };
         std::vector<std::jthread> acceptors;
         acceptors.reserve(options.binds.size());
         for (auto const bindIdx: std::views::iota(std::size_t { 0 }, options.binds.size()))
         {
             announcer.ExpectAcceptor();
-            acceptors.emplace_back([&, bindIdx](std::stop_token stopToken) {
-                // Hoist the formatted thread name into a stack local: Tracy's
-                // SetThreadName stores the const char* and reads it on later
-                // zone records, so a `std::format(...).c_str()` would dangle
-                // immediately after the full-expression's semicolon.
-                [[maybe_unused]] auto const threadName = std::format("fc-acceptor-{}", bindIdx);
-                CORE_THREAD_NAME(threadName.c_str());
-                auto const listenSock = listenSocks[bindIdx];
-                auto* const perBindTls = bindTls[bindIdx] ? options.tlsContext : nullptr;
-                // Armed the moment this thread is about to block in `AcceptRaw`.
-                announcer.AcceptorArmed(std::format("acceptor thread {}", bindIdx));
-                while (!stopping.load(std::memory_order_acquire) && !stopToken.stop_requested())
-                {
-                    auto raw = AcceptRaw(listenSock);
-                    if (!raw.has_value())
-                        break;
-                    // Admitted and counted in one step, as `Server::Run` does it.
-                    auto lease = admission != nullptr ? admission->tryAdmit() : std::nullopt;
-                    if (admission != nullptr && !lease.has_value())
-                    {
-                        if (metrics)
-                        {
-                            metrics->Increment(IMetricsSink::Counter::ConnectionsAdmissionRejected);
-                            if (perBindTls != nullptr)
-                                metrics->Increment(IMetricsSink::Counter::ConnectionsAdmissionRejectedTls);
-                        }
-                        CloseNativeSocket(raw->handle);
-                        continue;
-                    }
-                    accepted.fetch_add(1, std::memory_order_relaxed);
-                    if (metrics)
-                    {
-                        metrics->Increment(IMetricsSink::Counter::ConnectionsTotal);
-                        if (perBindTls != nullptr)
-                            metrics->Increment(IMetricsSink::Counter::ConnectionsTotalTls);
-                    }
-                    auto const idx = nextReactor.fetch_add(1, std::memory_order_relaxed) % reactorCount;
-                    auto& reactor = *reactors[idx];
-                    // Per-bind copy for the same reason the other two platform paths
-                    // make one: this connection carries its endpoint's role mask, not
-                    // the daemon's.
-                    auto session = options.session;
-                    RunHandedOffConnection(reactor,
-                                           std::move(*raw),
-                                           engine,
-                                           logger,
-                                           std::move(lease),
-                                           session,
-                                           perBindTls,
-                                           options.logSource ? LogSource::Yes : LogSource::No);
-                }
-            });
+            auto* const perBindTls = bindTls[bindIdx] ? options.tlsContext : nullptr;
+            acceptors.push_back(Detail::StartAcceptorThread(
+                Detail::AcceptorThreadOptions { .surface = Detail::BindSurface(options.binds[bindIdx]),
+                                                .threadName = std::format("fc-acceptor-{}", bindIdx),
+                                                .acceptor = std::make_unique<ListeningSocketAcceptor>(listenSocks[bindIdx]),
+                                                .logger = logger,
+                                                .acceptLoops = acceptLoops,
+                                                .wait = DefaultDrainWait(),
+                                                .stopping = stopping,
+                                                .announcer = announcer },
+                [&handOff, perBindTls](AcceptedSocket raw) { HandOffToReactor(handOff, std::move(raw), perBindTls); }));
         }
 
         // Both spawn loops have run, so the set is complete. The reactor arms land
@@ -454,7 +516,7 @@ namespace
             if (stopRun.test_and_set(std::memory_order_acq_rel))
                 return; // another caller already ran the teardown.
             stopping.store(true, std::memory_order_release);
-            for (auto const sock: listenSocks)
+            for (core::platform::NativeHandle const sock: listenSocks)
                 CloseNativeSocket(sock);
             for (auto& reactor: reactors)
                 reactor->stop();
@@ -514,6 +576,7 @@ namespace
     int RunMultiReactorPosix(ReactorServerOptions const& options,
                              CacheEngine& engine,
                              ILogger& logger,
+                             core::net::AcceptLoopHealth& acceptLoops,
                              core::net::IAdmissionControl* admission,
                              IMetricsSink* metrics,
                              unsigned reactorCount)
@@ -567,6 +630,8 @@ namespace
                 servers.push_back(std::make_unique<Server>(*listeners.back(),
                                                            engine,
                                                            logger,
+                                                           acceptLoops,
+                                                           std::format("{} on reactor {}", Detail::BindSurface(bind), i),
                                                            admission,
                                                            metrics,
                                                            session,
@@ -604,10 +669,8 @@ namespace
             // Arming happens on THIS thread and immediately before `Run()`, which is
             // why the readiness line cannot be emitted from the calling thread: it
             // would have to be emitted before the last reactor even started.
-            auto const group = std::format("reactor {}", index);
             Detail::ArmAcceptLoops(
                 std::span<std::unique_ptr<Server> const> { servers }.subspan(index * bindCount, bindCount),
-                group,
                 announcer,
                 logger);
             reactors[index]->run();
@@ -668,6 +731,7 @@ namespace
 int RunReactorServer(ReactorServerOptions const& options,
                      CacheEngine& engine,
                      ILogger& logger,
+                     core::net::AcceptLoopHealth& acceptLoops,
                      core::net::IAdmissionControl* admission,
                      IMetricsSink* metrics)
 {
@@ -678,17 +742,16 @@ int RunReactorServer(ReactorServerOptions const& options,
     }
     auto const reactorCount = std::max(1U, options.reactorThreads);
     if (reactorCount == 1)
-        return RunSingleReactor(options, engine, logger, admission, metrics);
+        return RunSingleReactor(options, engine, logger, acceptLoops, admission, metrics);
 #if defined(_WIN32)
-    return RunMultiReactorWindows(options, engine, logger, admission, metrics, reactorCount);
+    return RunMultiReactorWindows(options, engine, logger, acceptLoops, admission, metrics, reactorCount);
 #else
-    return RunMultiReactorPosix(options, engine, logger, admission, metrics, reactorCount);
+    return RunMultiReactorPosix(options, engine, logger, acceptLoops, admission, metrics, reactorCount);
 #endif
 }
 
 namespace Detail
 {
-
     std::unique_ptr<ExpiryReaper> StartExpiryCycle(core::net::EventLoop& reactor,
                                                    core::async::IExecutor& sweepOn,
                                                    CacheEngine& engine,
@@ -701,10 +764,7 @@ namespace Detail
         return reaper;
     }
 
-    void ArmAcceptLoops(std::span<std::unique_ptr<Server> const> servers,
-                        std::string_view group,
-                        ReadinessAnnouncer& announcer,
-                        ILogger& logger)
+    void ArmAcceptLoops(std::span<std::unique_ptr<Server> const> servers, ReadinessAnnouncer& announcer, ILogger& logger)
     {
         // A DetachedTask has a `suspend_never` initial suspend, so calling this runs
         // `Server::Run()` up to its first real suspension point -- which is the
@@ -716,9 +776,9 @@ namespace Detail
             co_return;
         };
 
-        for (auto const index: std::views::iota(std::size_t { 0 }, servers.size()))
+        for (auto const& owned: servers)
         {
-            auto* const server = servers[index].get();
+            auto* const server = owned.get();
             runAccept(server);
             if (!server->IsAccepting())
             {
@@ -726,11 +786,57 @@ namespace Detail
                 // is no acceptor here -- and a readiness line that counted it would
                 // be exactly the claim #646 is about, made one level deeper.
                 logger.Logf(
-                    LogLevel::Error, "{}: accept loop {} did not arm; this endpoint is not being served", group, index);
+                    LogLevel::Error, "{}: accept loop did not arm; this endpoint is not being served", server->Surface());
                 continue;
             }
-            announcer.AcceptorArmed(std::format("{} bind {}", group, index));
+            // Under the loop's own name, the one its warnings and `/healthz` use, so the
+            // three agree about which bind a line is about.
+            announcer.AcceptorArmed(server->Surface());
         }
+    }
+
+    std::jthread StartAcceptorThread(AcceptorThreadOptions options, AcceptedHandOff handOff)
+    {
+        return std::jthread { [options = std::move(options),
+                               handOff = std::move(handOff)](std::stop_token const& stopToken) {
+            // `options` lives as long as this thread, so the name Tracy keeps a pointer to does too.
+            CORE_THREAD_NAME(options.threadName.c_str());
+            // Armed the moment this thread is about to block in its first accept.
+            options.announcer.AcceptorArmed(options.surface);
+            AcceptLoopReporter acceptErrors { options.surface, options.surface, options.logger, options.acceptLoops };
+            auto const stopRequested = [&] {
+                return options.stopping.load(std::memory_order_acquire) || stopToken.stop_requested();
+            };
+            while (!stopRequested())
+            {
+                auto raw = options.acceptor->Accept();
+                if (raw.has_value())
+                {
+                    acceptErrors.OnAccepted(options.wait.Now());
+                    handOff(std::move(*raw));
+                    continue;
+                }
+                // A dead listener ends this thread as a closed one does. `EndAndClose` is NOT carried
+                // out here -- this thread does not own the listening socket, which is the teardown's
+                // to close once every acceptor thread has returned -- so a dead listener on a node
+                // that goes on serving stays open until then. Harmless while `BadHandle` is the only
+                // code the policy calls dead: a handle that is no socket queues no handshake.
+                auto const step = acceptErrors.OnError(raw.error(), options.wait.Now(), stopRequested());
+                if (step.next != AcceptLoopNext::AcceptAgain)
+                    return;
+                // There is no reactor timer on this thread to suspend on, so a backoff BLOCKS.
+                if (step.delay > std::chrono::milliseconds {})
+                    options.wait.Sleep(step.delay);
+            }
+            acceptErrors.OnLoopEnded();
+        } };
+    }
+
+    std::string BindSurface(BindConfig const& bind)
+    {
+        // An IPv6 literal is bracketed, or its colons run into the port's.
+        auto const host = bind.address.contains(':') ? std::format("[{}]", bind.address) : bind.address;
+        return std::format("cache {}:{}{}", host, bind.port, bind.tls ? " (TLS)" : "");
     }
 
     int VerifyTlsContextForTlsBinds(ReactorServerOptions const& options, ILogger& logger)

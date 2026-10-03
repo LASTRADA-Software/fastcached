@@ -681,7 +681,7 @@ std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
     // The transport is the server's inbound links: a learner's two-way session, accepted here,
     // is how the transport writes to that learner, which nobody dials. One reactor for both.
     _peerServer = std::make_unique<Consensus::RaftPeerServer>(
-        *_listener, _reactor, *_sink, *_transport, _logger, _metrics, _identity, _nonces);
+        *_listener, _reactor, *_sink, *_transport, _logger, _metrics, _identity, _nonces, _acceptLoops);
 
     // Both loops on ONE reactor, and neither through `core::async::syncRun`: that function
     // resumes a coroutine exactly once and throws when it is still suspended, so a

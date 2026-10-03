@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <core/async/Task.hpp>
+#include <core/net/AcceptLoopHealth.hpp>
 #include <core/net/EventLoop.hpp>
 #include <core/net/IListener.hpp>
 #include <core/platform/Clock.hpp>
@@ -162,6 +163,9 @@ class RaftPeerServer
     ///        verdicts are signed with, and what a peer's proof is checked against.
     /// @param random Where each connection's challenge nonce and ephemeral key come from. A
     ///        connection this node cannot draw them for is closed before it is challenged (#1527).
+    /// @param acceptLoops Told when the accept loop degrades, recovers or ends while this server is
+    ///        not shutting down, which is what a liveness probe reads. Required: a peer port that
+    ///        stops accepting is a node that silently leaves its cluster.
     /// @param options Frame, connection and handshake limits.
     RaftPeerServer(core::net::IListener& listener,
                    core::net::EventLoop& reactor,
@@ -171,6 +175,7 @@ class RaftPeerServer
                    IMetricsSink& metrics,
                    IRaftPeerIdentity const& identity,
                    ISecureRandom& random,
+                   core::net::AcceptLoopHealth& acceptLoops,
                    PeerServerOptions options = {});
 
     /// Accept loop; returns when the listener is closed via `Shutdown()`.
@@ -286,6 +291,7 @@ class RaftPeerServer
     IMetricsSink& _metrics;
     IRaftPeerIdentity const& _identity;
     ISecureRandom& _random;
+    core::net::AcceptLoopHealth& _acceptLoops;
     PeerServerOptions _options;
 
     OpenConnections _open;

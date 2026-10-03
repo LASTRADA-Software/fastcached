@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <format>
+#include <tuple>
 #include <utility>
 
 #include <core/net/SocketDeadline.hpp>
@@ -70,7 +71,8 @@ namespace
 
     /// Whether @p state means this node's builds are not reaching the shared cache.
     /// @param state A noted state.
-    /// @return True for every state but `Proven` and `NotTried`.
+    /// @return True for every state but `Proven` and `NotTried` -- the second of which is not
+    ///         `clear` either, but `not-evaluated` (`RecordLocked`).
     [[nodiscard]] bool Unproven(Wire::WireSharedCacheState state) noexcept
     {
         return state == Wire::WireSharedCacheState::WrongKey || state == Wire::WireSharedCacheState::Unreachable
@@ -95,9 +97,10 @@ SharedCacheUpstream::SharedCacheUpstream(ISharedCacheTargetSource const& targets
     // Silent, because nothing on this leg presents a credential for it to report ignored.
     _notice { Cc::CredentialNotice::Silent() }
 {
-    // Evaluated from the start: nothing has failed to reach a shared cache before anything tried.
-    if (_conditions != nullptr)
-        _conditions->Clear(NodeCondition::SharedCacheUnproven);
+    // Answered from the start, the way an apply answers it: out of the setting is clear, a machine
+    // named and not reachable by key is raised, and one that is reachable is not-evaluated until an
+    // operation tries it -- nothing has failed to reach it, and nothing has reached it either.
+    StateApplied();
 }
 
 bool SharedCacheUpstream::Dials(SharedCacheTarget const& target)
@@ -236,12 +239,8 @@ void SharedCacheUpstream::StateApplied()
             if (_reported == target.resolved)
                 return;
             // Another machine, the same one now reachable, or at another endpoint: nothing has tried
-            // it yet, and what came before says nothing about it.
-            _reported = target.resolved;
-            _state = Wire::WireSharedCacheState::NotTried;
-            _detail.clear();
-            if (_conditions != nullptr)
-                _conditions->Clear(NodeCondition::SharedCacheUnproven);
+            // it yet, and what came before says nothing about it. Not logged: nothing happened to it.
+            std::ignore = RecordLocked(target.resolved, Wire::WireSharedCacheState::NotTried, {});
             return;
         }
         // Named, and not reachable by key: said now, not at the next miss.
@@ -283,9 +282,17 @@ bool SharedCacheUpstream::RecordLocked(Cluster::ResolvedSharedCache const& targe
     _detail = detail;
     if (_conditions != nullptr)
     {
+        // Three answers, never two: `NotTried` is neither failing nor reaching the machine, and a
+        // `clear` for it would vouch for a shared cache no build has reached (undecided must not
+        // read as clear).
         if (Unproven(state))
             _conditions->Raise(NodeCondition::SharedCacheUnproven,
                                std::format("the shared cache {}: {}", target.machineId, detail));
+        else if (state == Wire::WireSharedCacheState::NotTried)
+            _conditions->NotEvaluated(NodeCondition::SharedCacheUnproven,
+                                      std::format("not tried: no build has needed the shared cache {} since the "
+                                                  "setting named it, and the first operation that does decides this row",
+                                                  target.machineId));
         else
             _conditions->Clear(NodeCondition::SharedCacheUnproven);
     }

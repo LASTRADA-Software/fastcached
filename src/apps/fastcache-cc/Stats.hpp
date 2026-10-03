@@ -7,9 +7,12 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Cc
 {
@@ -230,7 +233,31 @@ struct Record
     /// did not exist yet) or a caller that never set it — and is excluded from
     /// any time-bucketed view rather than plotted as an epoch-zero data point.
     std::uint64_t timestampUnixSeconds {};
+
+    /// What the compile this invocation ran exited with: the code the build saw.
+    ///
+    /// Disengaged for a line from before the column existed, which is NOT a success -- it is a
+    /// record that cannot say. The column exists because a fetch that failed and a compile that
+    /// failed were one line in this log: a night of `cl.exe` killed from outside read, record by
+    /// record, exactly like a cache that broke the build.
+    std::optional<std::int32_t> exitCode;
 };
+
+/// What reading the invocation log found.
+struct LogReading
+{
+    std::vector<Record> records; ///< Every line this build could read, in log order.
+    /// Lines skipped rather than read: a format version this build does not know -- a later
+    /// launcher appending to the same log is what a rolling upgrade looks like -- or a line of
+    /// the current version whose columns do not add up. Never read by position instead, which
+    /// is how a newer line would be misread as an older one.
+    std::uint64_t unreadable {};
+};
+
+/// When a record is written, from the injected wall clock.
+/// @param clock The clock to read; production passes `core::platform::defaultSystemWallClock()`.
+/// @return Seconds since the Unix epoch; `Record::timestampUnixSeconds`.
+[[nodiscard]] std::uint64_t RecordTimestamp(core::platform::IWallClock const& clock) noexcept;
 
 /// Append one record to the per-user log, creating it on first use.
 ///
@@ -295,6 +322,11 @@ void AppendRecord(Record const& record);
 /// @return The parsed records, in file order. Empty when the log is absent
 ///         or empty.
 [[nodiscard]] std::vector<Record> ParseLog(std::string_view groupFilter);
+
+/// `ParseLog`, and how many lines it could not read.
+/// @param groupFilter When non-empty, only records of this prefetch group.
+/// @return What was read, and what was skipped.
+[[nodiscard]] LogReading ReadLog(std::string_view groupFilter);
 
 /// Render the same data as `FormatReport`, as a self-contained HTML dashboard
 /// (inline CSS/JS, no network dependency): headline hit rate, per-outcome
