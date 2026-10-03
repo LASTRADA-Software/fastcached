@@ -1895,6 +1895,32 @@ the other. Three parts of that are each load-bearing:
   that one connect is all a dead cache costs: direct mode is on by default and asks
   for a manifest before the object fetch runs at all, so the ceiling is two either
   way, and `TryDirectMode` is what would have to change for it to be one.
+- **The carrying-on is guarded END TO END, in every shape a dead cache can be silent,
+  because no unit case can see it.** `main.cpp` is in no test target (#909), so the
+  seam cases in `ReactorExchange_test.cpp` pin every value `RunCached` reads and cannot
+  see a `return` added after the fetch. Measured: making a transport-failed fetch end the
+  invocation passed every `fastcache-cc-tests` case and the whole Windows launcher e2e,
+  and was caught on POSIX by one leg pointed at a refusing port. So both fixtures
+  (`run-launcher-e2e.ps1`, `compile-cache-e2e.sh`) compile against a peer that REFUSES,
+  one that LISTENS and never accepts, and one that ACCEPTS then RESETS. Each must exit 0
+  with the baseline's object inside an elapsed bound DERIVED PER SHAPE from the
+  launcher's own deadlines: the live-daemon baseline, plus the two exchanges above at
+  what ONE exchange against that shape can cost, plus HALF an exchange -- `total` for
+  the peer that never accepts (its handshake completes into the backlog, so it never
+  spends a connect), `connect` for the refusing and the resetting peer. The half is the
+  point: one exchange too many then overshoots by half an exchange of that shape. The
+  shared bound this replaced, connect plus total per exchange, left the silent shape a
+  whole exchange of slack, and a launcher that retried a failed fetch passed it on
+  Windows. A regression specific to one shape, a wait on the silent peer, is then a
+  named failure rather than the test's timeout.
+  - **A bound cannot count what costs nothing, so the RESET leg COUNTS**: every exchange
+    against it is a connection the fixture accepts, and there must be exactly two.
+  - **What neither reaches, and the direction it fails in:** a refusal on Linux costs
+    about nothing, so one extra exchange against the REFUSING peer is invisible there --
+    SILENT, which is open. It stays covered because an extra exchange runs through the
+    same launcher code whatever the peer's shape, and the reset count and the silent
+    bound both see it. On Windows a refused connect costs about the connect deadline, so
+    that leg's bound bites there too.
 
 **A premise can be correct when it is written and false when it is read, and
 nothing connects the two.** `CacheProxy`'s STORE handler ignored the roots the

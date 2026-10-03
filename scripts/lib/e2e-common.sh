@@ -2980,6 +2980,110 @@ run_bounded() {
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The one door every perl stand-in goes through, in every fixture
+# ---------------------------------------------------------------------------
+#
+# Run a perl program as THIS process, under a lifetime bound it cannot omit.
+#
+# In the LIBRARY, and not in `check-e2e-helpers.sh` where it was written, because a
+# door in one private file reaches no other script: `compile-cache-e2e.sh` grew a perl
+# peer of its own and had to spell the pair by hand, marker and all, because this was
+# out of its reach.
+#
+# ## What it owns, and why it is one function rather than a convention
+#
+# Every perl stand-in a fixture runs needs the same PAIR, and neither half is optional:
+#
+#   `exec`  -- `$!` for a backgrounded shell FUNCTION is the subshell bash forks,
+#              not the program that subshell goes on to run. Without it every
+#              `kill "$listener"` of one reaps a wrapper and leaves perl
+#              alive, reparented, still holding its LISTEN socket (#839).
+#   `alarm` -- no trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled
+#              CI job, and those are the paths a leak actually accumulates on.
+#              #839 measured what that costs: **1368 orphan listeners holding
+#              loopback ports, the oldest 30.5 hours old**, on a fixture in the
+#              DEFAULT ctest set on every platform CI builds. The expensive half
+#              was the PORTS -- these fixtures draw from below the ephemeral
+#              range, so the next run meets a port held by a process nobody knows
+#              about and fails somewhere else entirely.
+#
+# They are INDEPENDENT and a survivor count cannot tell you whether either works:
+# each alone drives the count to zero for a different reason, so a count reads as
+# "both arms fine" while one is dead. #839's arm-independence table is what shows
+# the third arm is doing real work rather than belt-and-braces, and it is quoted
+# in #843 rather than restated here.
+#
+# Three stand-ins each spelled that pair by hand, so a fix to one reached none of
+# the others (#1214) -- and the arm that can be reopened by omission is `alarm`,
+# because a stand-in written without `exec` fails LOUDLY the moment the existing
+# `kill` stops working. #843 is the ticket, and it happened rather than being
+# hypothetical: PR #834 added `_selftest_unprompted_listener` with no bound at
+# all, while the ticket about bounds was open and its diagnosis was written down.
+#
+# So the pair rides on the thing every stand-in must do anyway -- launching its
+# perl -- and there is no argument to pass an unbounded program to. This is the
+# same idiom as `Refuse` taking a row. The perl-bounds scan in
+# `scripts/check-e2e-helpers.sh` is what stops a new stand-in spelling `perl` for
+# itself and bypassing the door, and it also holds this door to THIS file: one
+# injector marker in the tree, here, and no marked invocation elsewhere that arms an
+# `alarm` of its own.
+#
+# ## How the bound is injected without touching the program
+#
+# `perl` accepts several `-e` chunks and joins them, in order, into ONE program.
+# So the bound is its own chunk and the caller's body is passed through verbatim:
+# the three bodies stay textually distinct, which is #1214's own constraint --
+# they model three different things and concatenating perl program text as
+# strings is the hazard the ticket exists to avoid, not the fix.
+#
+# Measured (perl 5.38.2, Linux): the two chunks compose in order, `@ARGV` after
+# `--` is exactly the caller's arguments, `alarm(0)` read from the SECOND chunk
+# reports 30 still pending, and a program that would run 60 s dies at 3 s with
+# status 142 when armed for 3. Control: the same program with no bound chunk
+# survives.
+#
+# ## Why the bodies wait with `select` and not `sleep`
+#
+# perldoc warns that `sleep` may be implemented with `alarm` on some systems, and
+# the two must not then overlap -- which is why `_selftest_listener` used to arm
+# its own alarm AFTER its delay rather than before. Arming here means arming
+# first, so that ordering is no longer available and the question has to be
+# closed rather than sequenced around.
+#
+# Measured on this platform it is a non-issue: `alarm 3; sleep 1; sleep 30` dies
+# at exactly 3.00 s over three runs, with both controls (alarm alone dies at
+# 3.00, no alarm survives). But macOS ships its own perl and cannot be measured
+# from here, so the bodies use `select(undef, undef, undef, N)` -- perldoc's own
+# alarm-safe spelling of a pause -- and the question does not arise on any
+# platform. Stated as MEASURED on Linux and INFERRED nowhere else, deliberately.
+#
+# @param 1 the lifetime bound in whole seconds; refused unless positive
+# @param 2 the perl program, single-quoted at the call site so the shell expands
+#          nothing in it
+# @param 3.. arguments, which the program reads from @ARGV
+e2e_bounded_perl() {
+    local seconds="$1" program="$2"
+    shift 2
+    # A bound is REQUIRED and must be a positive whole number. `alarm 0` is
+    # perl's spelling of *cancel the alarm*, so a `0` here would read at the call
+    # site as a bound and be the absence of one -- an escape hatch wearing the
+    # shape of the guard, which is the failure this whole door exists to close.
+    case "$seconds" in
+        ''|*[!0-9]*) fail "e2e_bounded_perl: '${seconds}' is not a whole number of seconds" ;;
+        0) fail "e2e_bounded_perl: a bound of 0 cancels the alarm; there is no unbounded spelling" ;;
+    esac
+    [ -n "$program" ] || fail "e2e_bounded_perl: no program given"
+    # The trailing marker is what `perl-bounds-scan` in check-e2e-helpers.sh reads.
+    # This is the one `perl` command position in the tree allowed to arm a bound for
+    # a program of its own, because it is the line every other one inherits -- so the
+    # scan cannot simply refuse every `perl`, and the claim has to be stated where it
+    # can be read back. The scan refuses this marker anywhere but here.
+    exec perl -e "alarm ${seconds};" -e "$program" -- "$@" # perl-lifetime: this line IS the injector
+}
+
+# ---------------------------------------------------------------------------
+
 # Reap every still-running background job of the CALLING shell: TERM, one shared
 # grace, then KILL the survivors. For a fixture's `cleanup`.
 #

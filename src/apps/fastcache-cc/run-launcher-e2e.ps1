@@ -540,6 +540,191 @@ function Invoke-LauncherBounded([string]$compiler, [string]$srcRoot, [string]$bu
     return @{ code = $p.ExitCode; stderr = $err; timedOut = $false }
 }
 
+# --- dead peers ---------------------------------------------------------------
+# A cache is an accelerator, so a cache that cannot answer must never end the compile. Every
+# other case here talks to a live daemon, which is why making a failed fetch end the
+# invocation went unnoticed by all of them. These legs point the launcher at a peer that
+# cannot answer in each of the three ways a dead cache can be silent, and the object must
+# still be built -- inside a bound, so a hang on one of them is a named failure rather than
+# the test's own timeout.
+
+# The launcher's two cache deadlines, set for the dead-peer legs alone. Short so a leg costs
+# seconds, and the bound is derived from them, so shortening them tightens it.
+$DeadPeerConnectMs = 1000
+$DeadPeerTotalMs   = 2000
+
+# How many cache exchanges one compile can spend on a dead peer before it compiles: direct
+# mode's manifest round trip, then the object fetch. Never the STORE, which a fetch the cache
+# did not serve skips. `fastcache-cc --help` says the same under FASTCACHE_TIMEOUT.
+$DeadPeerExchanges = 2
+
+# What ONE exchange can cost against each dead shape -- the deadline that ends it -- and so the
+# bound each shape is held to. A table, because the shapes spend different deadlines:
+#   never-accepting    the connect completes into the backlog, so the exchange runs out TOTAL
+#   refused            the dial fails: at once on Linux, after SYN retries on Windows, never past CONNECT
+#   accept-then-reset  the RST arrives at once; at most CONNECT
+# A shape's bound is baseline + N x cost + cost / 2: N exchanges fit with half an exchange to
+# spare, and ONE exchange more overshoots it by half an exchange of that shape. The shared
+# bound this replaces, baseline + N x (connect + total), left never-accepting -- which never
+# spends a connect -- exactly one whole exchange of slack, so a launcher retrying a failed
+# fetch once passed it (review I-1: green by 89 and 8 ms on Windows). A shape whose exchanges
+# cost NOTHING in practice -- the reset, and a refusal on Linux -- cannot be held to a count by
+# time at all; the reset leg counts its exchanges instead.
+$DeadPeerShapeCostMs = [ordered]@{
+    'refused'           = $DeadPeerConnectMs
+    'never-accepting'   = $DeadPeerTotalMs
+    'accept-then-reset' = $DeadPeerConnectMs
+}
+
+# The object's SHA-256 with the COFF header's TimeDateStamp (bytes 4-7) zeroed: every MSVC
+# driver stamps the clock there, so two compiles of one source differ there and nowhere else.
+function Get-ObjectDigest([string]$path) {
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    if ($bytes.Length -ge 8) { [Array]::Clear($bytes, 4, 4) }
+    return [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes))
+}
+
+# A loopback port nothing listens on: bound, read and released. What connects to it is refused.
+function Get-RefusedPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $port = $listener.LocalEndpoint.Port
+    $listener.Stop()
+    return $port
+}
+
+# A started loopback listener. Never accepted from, the kernel still completes every handshake
+# into its backlog, so a client connects, writes its request and waits for a reply nobody sends.
+function New-SilentListener {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    return $listener
+}
+
+# Run the launcher against $addr under the dead-peer deadlines, stopping it once $boundMs of a
+# MONOTONIC clock has passed. With $resetOn, every connection that listener takes while the
+# launcher runs is accepted and then reset (a zero linger turns the close into an RST).
+# Returns @{ code; stderr; elapsedMs; timedOut; resets }.
+function Invoke-LauncherDeadPeer([string]$compiler, [string]$srcRoot, [string]$buildTree, [string]$obj,
+                                 [string]$addr, [long]$boundMs, $resetOn) {
+    $env:FASTCACHE_ADDR            = $addr
+    $env:FASTCACHE_SOURCE_DIR      = $srcRoot
+    $env:FASTCACHE_BINARY_DIR      = $buildTree
+    $env:FASTCACHE_VERBOSE         = "1"
+    $env:FASTCACHE_CONNECT_TIMEOUT = "${DeadPeerConnectMs}ms"
+    $env:FASTCACHE_TIMEOUT         = "${DeadPeerTotalMs}ms"
+    $errFile = New-TemporaryFile
+    try {
+        $source = Join-Path $srcRoot "u.cpp"
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        # Unwaited, as in Invoke-LauncherBounded: the child took its environment when it
+        # started, and the wait below is the caller's.
+        $p = Use-E2ELauncherState $launcherState {
+            Start-Process -FilePath $Launcher `
+                -ArgumentList $compiler,"/nologo","/c","/Fo$obj",$source `
+                -NoNewWindow -PassThru -RedirectStandardError $errFile
+        }
+        # Read now, or an unwaited Start-Process leaves ExitCode empty once the process is gone.
+        $null = $p.Handle
+        $resets = 0
+        while (-not $p.HasExited -and $clock.ElapsedMilliseconds -lt $boundMs) {
+            if ($null -ne $resetOn -and $resetOn.Pending()) {
+                $client = $resetOn.AcceptTcpClient()
+                $client.Client.LingerState = [System.Net.Sockets.LingerOption]::new($true, 0)
+                $client.Close()
+                $resets++
+            } else {
+                $null = $p.WaitForExit(5)
+            }
+        }
+        $elapsed = $clock.ElapsedMilliseconds
+        $timedOut = -not $p.HasExited
+        if ($timedOut) {
+            try { $p.Kill($true) } catch { }
+            $null = $p.WaitForExit(10000)
+        }
+        $err = [string](Get-Content -Raw $errFile -ErrorAction SilentlyContinue)
+        $code = if ($timedOut) { -1 } else { $p.ExitCode }
+        return @{ code = $code; stderr = $err; elapsedMs = $elapsed; timedOut = $timedOut; resets = $resets }
+    } finally {
+        Remove-Item $errFile -ErrorAction SilentlyContinue
+        Remove-Item Env:\FASTCACHE_CONNECT_TIMEOUT, Env:\FASTCACHE_TIMEOUT -ErrorAction SilentlyContinue
+    }
+}
+
+# The dead-peer case for one compiler. The BASELINE is the same compile against the live
+# daemon, timed on the same clock: what a compile costs when the cache works. A dead peer may
+# add at most what its shape's deadline allows per exchange, so each shape's bound is derived
+# from `$DeadPeerShapeCostMs` and nothing is picked by hand -- no scheduler is configured, so
+# there is no dispatch budget to add.
+# Returns $true when every leg held.
+function Test-DeadPeers([string]$compiler) {
+    # The legs point FASTCACHE_ADDR at dead peers. Whatever runs after this case reads the address
+    # it had before, restored on every way out -- an early return included.
+    $savedAddr = $env:FASTCACHE_ADDR
+    try {
+        # Under $BoundTemp, the scratch root whose cases each own a tagged subdirectory: already a
+        # run tree for the launcher-state seam and already removed on every way out.
+        $root = Join-Path $BoundTemp "deadpeer-$compiler"
+        Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+        $src = New-Tree $root "deadpeer-$compiler"
+        $build = Join-Path $root "build"; New-Item -ItemType Directory -Force $build | Out-Null
+        $obj = Join-Path $build "u.obj"
+
+        $base = Invoke-LauncherDeadPeer $compiler $src $build $obj "127.0.0.1:$Port" 300000 $null
+        if ($base.code -ne 0 -or -not (Test-Path $obj)) {
+            Write-Host "  DEAD-PEER FAIL ($compiler): the live baseline did not compile (exit $($base.code), timed out $($base.timedOut))" -ForegroundColor Red
+            Write-Host $base.stderr
+            return $false
+        }
+        $expected = Get-ObjectDigest $obj
+        Write-Host "  baseline $($base.elapsedMs) ms against the live daemon"
+
+        $ok = $true
+        foreach ($shape in $DeadPeerShapeCostMs.Keys) {
+            $costMs = $DeadPeerShapeCostMs[$shape]
+            $boundMs = $base.elapsedMs + $DeadPeerExchanges * $costMs + [long]($costMs / 2)
+            Write-Host "  $shape : bound $boundMs ms = baseline + $DeadPeerExchanges x $costMs + $costMs / 2 ms"
+            Remove-Item $obj -Force -ErrorAction SilentlyContinue
+            $listener = $null
+            try {
+                $addr = switch ($shape) {
+                    'refused' { "127.0.0.1:$(Get-RefusedPort)" }
+                    default   { $listener = New-SilentListener; "127.0.0.1:$($listener.LocalEndpoint.Port)" }
+                }
+                $resetOn = if ($shape -eq 'accept-then-reset') { $listener } else { $null }
+                $r = Invoke-LauncherDeadPeer $compiler $src $build $obj $addr $boundMs $resetOn
+            } finally {
+                if ($listener) { $listener.Stop() }
+            }
+            # What tells this leg from one that never reached the peer: the launcher says it fell
+            # back. And on the reset leg, where every exchange is a connection this fixture accepts,
+            # it COUNTS them: exactly $DeadPeerExchanges, since a time bound cannot see one exchange
+            # too many on a shape whose exchanges cost nothing -- a launcher that retried a failed
+            # fetch once would pass every bound here and still fail this.
+            $fellBack = $r.stderr -match '\(fetch exchange failed\)'
+            $reached = ($shape -ne 'accept-then-reset') -or $r.resets -eq $DeadPeerExchanges
+            $built = (Test-Path $obj) -and ((Get-ObjectDigest $obj) -eq $expected)
+            if (-not $r.timedOut -and $r.code -eq 0 -and $built -and $fellBack -and $reached) {
+                Write-Host "  $shape : compiled locally in $($r.elapsedMs) ms (bound $boundMs), object matches the baseline: OK ($compiler)" -ForegroundColor Green
+                continue
+            }
+            $why = if ($r.timedOut) { "still running at the $boundMs ms bound, stopped" }
+                   elseif ($r.code -ne 0) { "exit $($r.code)" }
+                   elseif (-not $built) { "no object, or not the baseline's" }
+                   elseif (-not $fellBack) { "no 'fetch exchange failed' fall-back, so the peer was never asked" }
+                   else { "the reset peer accepted $($r.resets) connection(s), want exactly $DeadPeerExchanges -- one per exchange" }
+            Write-Host "  DEAD-PEER FAIL ($compiler, $shape): $why; $($r.elapsedMs) ms, $($r.resets) reset(s)" -ForegroundColor Red
+            Write-Host $r.stderr
+            $ok = $false
+        }
+        return $ok
+    } finally {
+        if ($null -eq $savedAddr) { Remove-Item Env:\FASTCACHE_ADDR -ErrorAction SilentlyContinue }
+        else { $env:FASTCACHE_ADDR = $savedAddr }
+    }
+}
+
 # Settled here, before the daemon starts and before anything reads
 # `FASTCACHE_ADDR`, which is the one real constraint on this fixture: the launcher
 # under test takes the address from the environment and several child processes
@@ -1504,6 +1689,15 @@ try {
                     Remove-Item -Recurse -Force $case -ErrorAction SilentlyContinue
                 }
             }
+        }
+
+        Write-Host "=== dead peers: a cache that cannot answer leaves the compile to go on ($cc) ==="
+        $addrBefore = $env:FASTCACHE_ADDR
+        if (-not (Test-DeadPeers $cc)) { $exit = 1 }
+        # Asserted, not assumed: every case after this one reads the address from the environment.
+        if ($env:FASTCACHE_ADDR -ne $addrBefore) {
+            Write-Host "  DEAD-PEER FAIL ($cc): FASTCACHE_ADDR was left at '$($env:FASTCACHE_ADDR)', not restored to '$addrBefore'" -ForegroundColor Red
+            $exit = 1
         }
     }
 

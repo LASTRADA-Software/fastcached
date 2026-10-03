@@ -870,6 +870,190 @@ FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cp
 cat "${workdir}/fallback.log"
 [[ -f "${proj}/build/fb.o" ]] || fail "fallback compile produced no object"
 
+# --- 8b: every way a dead cache can be silent, inside a bound -----------------
+# The leg above is one shape of a dead cache: a port that refuses. A peer that is LISTENING
+# but never accepts, and one that accepts and then resets, are the other two, and a
+# regression specific to one of them -- a launcher that waits forever on the silent one --
+# would pass the leg above. So each shape compiles here against a peer of its own, must exit
+# 0 with the object a working cache would have left, and must do it inside a BOUND: a hang is
+# then a named failure rather than the test's own timeout.
+#
+# The bound is DERIVED, never picked, and it is per SHAPE. The baseline is the same compile
+# against the live daemon, on the same monotonic clock: what a compile costs when the cache
+# works. One compile makes at most `dead_exchanges` exchanges before it gives up on the cache --
+# direct mode's manifest round trip, then the object fetch; never the STORE, which a fetch the
+# cache did not serve skips (`fastcache-cc --help` says the same under FASTCACHE_TIMEOUT). No
+# scheduler is configured, so there is no dispatch budget to add.
+#
+# What ONE exchange can cost is the deadline that ends it, which differs by shape -- the
+# `dead_shapes` table below:
+#   never-accepting    the connect completes into the backlog, so the exchange runs out TOTAL
+#   refused            the dial fails: at once here, after SYN retries on Windows, never past CONNECT
+#   accept-then-reset  the RST arrives at once; at most CONNECT
+# A shape's bound is baseline + N x cost + cost / 2: N exchanges fit with half an exchange to
+# spare, and ONE exchange more overshoots it by half an exchange of that shape. The shared bound
+# this replaces, baseline + N x (connect + total), left never-accepting -- which never spends a
+# connect -- exactly one whole exchange of slack, so a launcher retrying a failed fetch once
+# passed it on Windows and failed it here by 6 ms (review I-1). A shape whose exchanges cost
+# NOTHING in practice -- the reset, and a refusal on this platform -- cannot be held to a count by
+# time at all; the reset leg COUNTS its exchanges instead.
+#
+# The peers and the clock are perl, because bash can neither listen nor read a monotonic
+# clock (`SECONDS` is the wall clock, which this host steps). A missing perl, or a missing core
+# module, fails the run -- see below.
+dead_connect_ms=1000
+dead_total_ms=2000
+dead_exchanges=2
+# shape, then the NAME of the deadline one exchange against it can spend. The silent shape
+# LAST: this fixture stops at its first failure, and a hang there is the regression the bound
+# exists for, so the other two have reported by the time it can fire.
+dead_shapes="refused dead_connect_ms
+accept-then-reset dead_connect_ms
+never-accepting dead_total_ms"
+dead_peer_pid=""
+dead_launch_pid=""
+dead_ended_ms=0
+dead_accepts=""
+
+# Milliseconds on a monotonic clock.
+dead_now_ms() {
+    perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%d\n", clock_gettime(CLOCK_MONOTONIC) * 1000' # perl-lifetime: a foreground clock read; it exits at once and is never backgrounded
+}
+
+# A loopback peer that writes its port to @2 and then, for @1 `silent`, never accepts --
+# the kernel still completes every handshake into its backlog, so a client connects, writes
+# its request and waits for a reply nobody sends -- or, for `reset`, accepts each connection
+# and closes it with a zero linger, which is an RST, appending one line per accept to
+# `@2.accepts` BEFORE the reset, so the line exists by the time the launcher sees it. It lives
+# at most @3 seconds.
+dead_peer() {
+    # Run as `dead_peer ... &`, a SUBSHELL, which inherits this fixture's EXIT trap -- the run's
+    # cleanup. Cleared first thing, which closes the window from here until the `exec` into perl
+    # below replaces the shell (#1084). It cannot close the window BEFORE this line runs; the
+    # `kill -KILL` that ends the peer is what covers that one.
+    trap - EXIT TERM INT HUP
+    local program='
+        use IO::Socket::INET; use Socket qw(SOL_SOCKET SO_LINGER);
+        my ($mode, $portfile) = @ARGV;
+        my $listener = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 0, Listen => 16)
+            or die "listen: $!";
+        open(my $out, ">", "$portfile.tmp") or die "$portfile: $!";
+        print $out $listener->sockport, "\n";
+        close $out;
+        rename("$portfile.tmp", $portfile) or die "$portfile: $!";
+        if ($mode eq "silent") { select(undef, undef, undef, 3600) while 1; }
+        while (my $client = $listener->accept) {
+            open(my $log, ">>", "$portfile.accepts") or die "$portfile.accepts: $!";
+            print $log "accept\n";
+            close $log;
+            setsockopt($client, SOL_SOCKET, SO_LINGER, pack("ii", 1, 0));
+            close $client;
+        }'
+    e2e_bounded_perl "$3" "$program" "$1" "$2"
+}
+
+dead_peer_ready() { [[ -s "${workdir}/dead-peer.port" ]]; }
+
+# Readiness of the launcher run below: it has exited. Records when it was noticed.
+dead_launch_done() {
+    kill -0 "$dead_launch_pid" 2>/dev/null && return 1
+    dead_ended_ms="$(dead_now_ms)"
+}
+
+# One compile against @1, in the background, bounded by @2 ms. Leaves the exit status in
+# `dead_status` and the elapsed monotonic time in `dead_elapsed_ms`.
+dead_compile() {
+    local addr="$1" bound_ms="$2" what="$3" started
+    rm -f "${dead}/build/d.o"
+    started="$(dead_now_ms)"
+    FASTCACHE_ADDR="$addr" FASTCACHE_CONNECT_TIMEOUT="${dead_connect_ms}ms" FASTCACHE_TIMEOUT="${dead_total_ms}ms" \
+        "$launcher" "$compiler" -std=c++23 -c "${dead}/d.cpp" -o "${dead}/build/d.o" 2> "${workdir}/dead.log" &
+    dead_launch_pid=$!
+    # Whole seconds for the wait, rounded UP; the millisecond bound is judged below.
+    wait_until dead_launch_done "$what, within the ${bound_ms} ms bound" "-" "${workdir}/dead.log" \
+        $(( (bound_ms + 999) / 1000 ))
+    dead_status=0
+    wait "$dead_launch_pid" || dead_status=$?
+    dead_launch_pid=""
+    dead_elapsed_ms=$(( dead_ended_ms - started ))
+}
+
+# perl and its two modules are REQUIRED, not optional: a missing one FAILS the run, naming what
+# is missing. `IO::Socket::INET` and `Time::HiRes` ship with perl itself, so their absence is a
+# broken environment rather than a platform without them, and a skip here printed a line nobody
+# reads while the run still ended in `compile-cache E2E OK` -- a skip that read as a pass, over
+# the three shapes this section exists for (review M-2). Every host this fixture runs on ships
+# perl.
+command -v perl >/dev/null 2>&1 \
+    || fail "dead peers: no perl on PATH, so the never-accepting and reset peers and the elapsed bounds cannot run -- every host this fixture runs on ships perl"
+for dead_module in IO::Socket::INET Time::HiRes; do
+    perl -M"$dead_module" -e1 >/dev/null 2>&1 || fail "dead peers: perl cannot load ${dead_module}, which ships with perl itself -- a broken perl installation, not a platform without it" # perl-lifetime: a foreground availability probe; it exits at once and is never backgrounded
+done
+echo "== dead peers: a cache that cannot answer leaves the compile to go on =="
+dead="${workdir}/deadproj"
+mkdir -p "${dead}/build"
+echo 'char const* tag() { return "dead-peer"; } int main() { return 0; }' > "${dead}/d.cpp"
+export FASTCACHE_SOURCE_DIR="$dead" FASTCACHE_BINARY_DIR="${dead}/build"
+
+dead_compile "127.0.0.1:${port}" $(( 300 * 1000 )) "the baseline compile against the live daemon"
+[[ "$dead_status" -eq 0 && -f "${dead}/build/d.o" ]] \
+    || { cat "${workdir}/dead.log" >&2; fail "dead peers: the live baseline did not compile (exit ${dead_status})"; }
+cp "${dead}/build/d.o" "${workdir}/dead-expected.o"
+dead_baseline_ms="$dead_elapsed_ms"
+echo "   baseline ${dead_baseline_ms} ms against the live daemon"
+
+# fd 3, so nothing the body runs can read the table as its stdin.
+while read -r shape dead_cost_name <&3; do
+    dead_cost_ms="${!dead_cost_name}"
+    dead_bound_ms=$(( dead_baseline_ms + dead_exchanges * dead_cost_ms + dead_cost_ms / 2 ))
+    echo "   ${shape}: bound ${dead_bound_ms} ms = baseline + ${dead_exchanges} x ${dead_cost_ms} + ${dead_cost_ms} / 2 ms"
+    rm -f "${workdir}/dead-peer.port" "${workdir}/dead-peer.port.accepts"
+    case "$shape" in
+        refused)
+            addr="127.0.0.1:$(free_port)" ;;
+        accept-then-reset|never-accepting)
+            mode=reset; [[ "$shape" = never-accepting ]] && mode=silent
+            dead_peer "$mode" "${workdir}/dead-peer.port" $(( 2 * ((dead_bound_ms + 999) / 1000) )) &
+            dead_peer_pid=$!
+            wait_until dead_peer_ready "the ${shape} peer to listen" "$dead_peer_pid" - 10
+            addr="127.0.0.1:$(cat "${workdir}/dead-peer.port")" ;;
+        *)
+            fail "dead peers: no peer for the shape '${shape}'" ;;
+    esac
+    dead_compile "$addr" "$dead_bound_ms" "the launcher against the ${shape} peer to finish"
+    if [[ -n "$dead_peer_pid" ]]; then
+        # KILL, never TERM: it covers the window the `trap -` inside `dead_peer` cannot -- a
+        # subshell signalled between its fork and its first command still holds the fixture's
+        # EXIT trap, and a catchable signal would run the run's cleanup from inside it (#1084).
+        # KILL runs no trap, whichever side of that line the peer is on.
+        kill -KILL "$dead_peer_pid" 2>/dev/null || true
+        wait "$dead_peer_pid" 2>/dev/null || true
+        dead_peer_pid=""
+    fi
+    [[ "$dead_status" -eq 0 ]] \
+        || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the compile exited ${dead_status}"; }
+    [[ "$dead_elapsed_ms" -le "$dead_bound_ms" ]] \
+        || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: ${dead_elapsed_ms} ms, over the ${dead_bound_ms} ms bound"; }
+    # What tells this leg from one that never reached the peer: the launcher says it fell back.
+    grep -qF "(fetch exchange failed)" "${workdir}/dead.log" \
+        || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: no 'fetch exchange failed' fall-back, so the peer was never asked"; }
+    # And on the reset leg, where every exchange is a connection the peer accepts, the COUNT:
+    # exactly `dead_exchanges`. Its exchanges cost nothing, so no time bound can see one too
+    # many -- a launcher that retried a failed fetch once passes every bound and fails this.
+    if [[ "$shape" = accept-then-reset ]]; then
+        # No file is no accept at all -- a count of 0, not a fixture fault.
+        dead_accepts=0
+        [[ ! -e "${workdir}/dead-peer.port.accepts" ]] \
+            || dead_accepts="$(count_lines "${workdir}/dead-peer.port.accepts")"
+        [[ "$dead_accepts" -eq "$dead_exchanges" ]] \
+            || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the peer accepted ${dead_accepts} connection(s), want exactly ${dead_exchanges} -- one per exchange"; }
+    fi
+    cmp -s "${workdir}/dead-expected.o" "${dead}/build/d.o" \
+        || fail "dead peers: ${shape}: no object, or not the one the live baseline compiled"
+    echo "   ${shape}: compiled locally in ${dead_elapsed_ms} ms (bound ${dead_bound_ms}), object matches the baseline${dead_accepts:+, ${dead_accepts} exchange(s) counted}"
+    dead_accepts=""
+done 3<<< "$dead_shapes"
+
 # --- 9: forms the launcher must decline to cache ----------------------------
 # A compile with no -o defaults its output to ./a.o, a path the launcher cannot
 # reconstruct. It must pass straight through rather than claim the compile and

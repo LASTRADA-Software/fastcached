@@ -2264,100 +2264,6 @@ run_case() {
     esac
 }
 
-# ---------------------------------------------------------------------------
-# The one door every perl stand-in goes through
-# ---------------------------------------------------------------------------
-#
-# Run a perl program as THIS process, under a lifetime bound it cannot omit.
-#
-# ## What it owns, and why it is one function rather than a convention
-#
-# Every stand-in below needs the same PAIR, and neither half is optional:
-#
-#   `exec`  -- `$!` for a backgrounded shell FUNCTION is the subshell bash forks,
-#              not the program that subshell goes on to run. Without it every
-#              `kill "$listener"` in this file reaps a wrapper and leaves perl
-#              alive, reparented, still holding its LISTEN socket (#839).
-#   `alarm` -- no trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled
-#              CI job, and those are the paths a leak actually accumulates on.
-#              #839 measured what that costs: **1368 orphan listeners holding
-#              loopback ports, the oldest 30.5 hours old**, on a fixture in the
-#              DEFAULT ctest set on every platform CI builds. The expensive half
-#              was the PORTS -- these fixtures draw from below the ephemeral
-#              range, so the next run meets a port held by a process nobody knows
-#              about and fails somewhere else entirely.
-#
-# They are INDEPENDENT and a survivor count cannot tell you whether either works:
-# each alone drives the count to zero for a different reason, so a count reads as
-# "both arms fine" while one is dead. #839's arm-independence table is what shows
-# the third arm is doing real work rather than belt-and-braces, and it is quoted
-# in #843 rather than restated here.
-#
-# Three stand-ins each spelled that pair by hand, so a fix to one reached none of
-# the others (#1214) -- and the arm that can be reopened by omission is `alarm`,
-# because a stand-in written without `exec` fails LOUDLY the moment the existing
-# `kill` stops working. #843 is the ticket, and it happened rather than being
-# hypothetical: PR #834 added `_selftest_unprompted_listener` with no bound at
-# all, while the ticket about bounds was open and its diagnosis was written down.
-#
-# So the pair rides on the thing every stand-in must do anyway -- launching its
-# perl -- and there is no argument to pass an unbounded program to. This is the
-# same idiom as `Refuse` taking a row. `check-e2e-perl-bounds` (further down) is
-# what stops a new stand-in
-# spelling `perl` for itself and bypassing the door.
-#
-# ## How the bound is injected without touching the program
-#
-# `perl` accepts several `-e` chunks and joins them, in order, into ONE program.
-# So the bound is its own chunk and the caller's body is passed through verbatim:
-# the three bodies stay textually distinct, which is #1214's own constraint --
-# they model three different things and concatenating perl program text as
-# strings is the hazard the ticket exists to avoid, not the fix.
-#
-# Measured (perl 5.38.2, Linux): the two chunks compose in order, `@ARGV` after
-# `--` is exactly the caller's arguments, `alarm(0)` read from the SECOND chunk
-# reports 30 still pending, and a program that would run 60 s dies at 3 s with
-# status 142 when armed for 3. Control: the same program with no bound chunk
-# survives.
-#
-# ## Why the bodies wait with `select` and not `sleep`
-#
-# perldoc warns that `sleep` may be implemented with `alarm` on some systems, and
-# the two must not then overlap -- which is why `_selftest_listener` used to arm
-# its own alarm AFTER its delay rather than before. Arming here means arming
-# first, so that ordering is no longer available and the question has to be
-# closed rather than sequenced around.
-#
-# Measured on this platform it is a non-issue: `alarm 3; sleep 1; sleep 30` dies
-# at exactly 3.00 s over three runs, with both controls (alarm alone dies at
-# 3.00, no alarm survives). But macOS ships its own perl and cannot be measured
-# from here, so the bodies use `select(undef, undef, undef, N)` -- perldoc's own
-# alarm-safe spelling of a pause -- and the question does not arise on any
-# platform. Stated as MEASURED on Linux and INFERRED nowhere else, deliberately.
-#
-# @param 1 the lifetime bound in whole seconds; refused unless positive
-# @param 2 the perl program, single-quoted at the call site so the shell expands
-#          nothing in it
-# @param 3.. arguments, which the program reads from @ARGV
-_selftest_bounded_perl() {
-    local seconds="$1" program="$2"
-    shift 2
-    # A bound is REQUIRED and must be a positive whole number. `alarm 0` is
-    # perl's spelling of *cancel the alarm*, so a `0` here would read at the call
-    # site as a bound and be the absence of one -- an escape hatch wearing the
-    # shape of the guard, which is the failure this whole door exists to close.
-    case "$seconds" in
-        ''|*[!0-9]*) fail "_selftest_bounded_perl: '${seconds}' is not a whole number of seconds" ;;
-        0) fail "_selftest_bounded_perl: a bound of 0 cancels the alarm; there is no unbounded spelling" ;;
-    esac
-    [ -n "$program" ] || fail "_selftest_bounded_perl: no program given"
-    # The trailing marker is what `perl-bounds-scan` further down reads. This is
-    # the one `perl` command position in the tree allowed to name a program of
-    # its own, because it is the line that ARMS the bound every other one
-    # inherits -- so the scan cannot simply refuse every `perl`, and the claim
-    # has to be stated where it can be read back.
-    exec perl -e "alarm ${seconds};" -e "$program" -- "$@" # perl-lifetime: this line IS the injector
-}
 
 # The bound every stand-in below runs under, in seconds. One number, because
 # nothing here has measured a reason to differ and a per-stand-in constant is a
@@ -2384,7 +2290,7 @@ _selftest_perl_lifetime=30
 #          headers and PART of a body, promises more, and then holds the socket
 #          open -- which is a response our own read bound must end
 _selftest_listener() {
-    # `exec` and the `alarm` bound both come from `_selftest_bounded_perl`, which
+    # `exec` and the `alarm` bound both come from `e2e_bounded_perl`, which
     # is where the whole argument for them lives. What stays here is the one part
     # that is about THIS stand-in.
     #
@@ -2400,7 +2306,7 @@ _selftest_listener() {
     # that cannot fire everywhere is worse than a comment, because it reads as
     # enforcement. A rule nothing can express is a rule nothing can be held to,
     # so this one is written down instead of pretended at.
-    _selftest_bounded_perl "$_selftest_perl_lifetime" '
+    e2e_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $delay, $logfile, $mode) = @ARGV;
         $mode = "complete" unless defined $mode and length $mode;
@@ -2410,7 +2316,7 @@ _selftest_listener() {
         # `select` rather than `sleep`: the bound is already armed by the time
         # this program starts, and perldoc warns that `sleep` may be implemented
         # with `alarm` on some systems. The reasoning, and what was measured, is
-        # at `_selftest_bounded_perl`.
+        # at `e2e_bounded_perl`.
         select(undef, undef, undef, $delay) if $delay;
         # The bound is a TIME and deliberately not a connection count.
         # `port_answers` is `/dev/tcp`, so every `free_port` draw and every
@@ -2490,12 +2396,12 @@ _selftest_listener() {
 #
 # Its lifetime pair -- `exec` and the `alarm` bound, why neither closes the other's
 # hole, and why a survivor COUNT cannot tell you whether either works -- is
-# `_selftest_bounded_perl`'s, which every stand-in here goes through since #1214.
+# `e2e_bounded_perl`'s, which every stand-in here goes through since #1214.
 # This one is the reason that ticket was filed: #834 added it with no bound at all
 # while #843 was open, and its `hold` mode is the worst of the three to leak, since
 # it accumulates accepted CLIENT sockets as well as the listening port.
 _selftest_unprompted_listener() {
-    _selftest_bounded_perl "$_selftest_perl_lifetime" '
+    e2e_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $mode, $logfile) = @ARGV;
         my $srv = IO::Socket::INET->new(
@@ -2546,7 +2452,7 @@ _selftest_unprompted_listener() {
 # saying the process was making progress beside a COUNTER finding saying what
 # actually went wrong. A stand-in that logged nothing would collapse the two.
 #
-# `exec` and the lifetime bound come from `_selftest_bounded_perl`. This is the
+# `exec` and the lifetime bound come from `e2e_bounded_perl`. This is the
 # FOURTH stand-in and the one that made #1214 a ticket rather than a tidy-up: it
 # was added by a branch in flight while the door was being written on another, so
 # it spelled the pair by hand and nothing but a scan could have said so. That the
@@ -2561,7 +2467,7 @@ _selftest_unprompted_listener() {
 # @param 2 mode: rise | flat | absent
 # @param 3 the log to append one line per request to
 _selftest_metrics() {
-    _selftest_bounded_perl "$_selftest_perl_lifetime" '
+    e2e_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $mode, $logfile) = @ARGV;
         my $srv = IO::Socket::INET->new(
@@ -2626,11 +2532,11 @@ _selftest_metrics() {
 # @param 3 the log to write it to
 # @param 4 the marker text to log, e.g. `$E2eNodeReadyMarker`
 _selftest_node() {
-    # `exec` and the `alarm` bound come from `_selftest_bounded_perl`. Only ever
+    # `exec` and the `alarm` bound come from `e2e_bounded_perl`. Only ever
     # called with `&`, since the door `exec`s: `$!` must be this perl and not the
     # subshell bash forks for a backgrounded function, or the `kill "$staged"` at
     # the call site signals a wrapper and leaves this process holding its port.
-    _selftest_bounded_perl "$_selftest_perl_lifetime" '
+    e2e_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $delay, $logfile, $marker) = @ARGV;
         my $srv = IO::Socket::INET->new(
@@ -3950,8 +3856,11 @@ rm -rf "$canary_dir"
 # runs, and every scan reports by basename, so nothing a scan says changes. The
 # walk-scope check further down still asks the TREE (`git ls-files`), because its
 # question is about the tree.
+#
+# @param 1 the tree whose `scripts/` is walked; the snapshot when omitted. The door-home
+#          canary passes its staged trees, so the one walk is the one it tests.
 _shell_scripts() {
-    find "${scan_root}/scripts" -type f -name '*.sh' 2>/dev/null | LC_ALL=C sort
+    find "${1:-$scan_root}/scripts" -type f -name '*.sh' 2>/dev/null | LC_ALL=C sort
 }
 
 scan_root="$(mktemp -d)" && cp -R "${source_dir}/scripts" "${scan_root}/" || {
@@ -4527,7 +4436,7 @@ fi
 
 # --- every perl invocation is bounded, or SAYS why it is not ----------------
 #
-# `_selftest_bounded_perl` makes the `exec` + `alarm` pair impossible to omit for
+# `e2e_bounded_perl` makes the `exec` + `alarm` pair impossible to omit for
 # anything that goes through it. Nothing makes a new stand-in go through it, and
 # that is exactly the gap #843 is about: **a rule stated in the files that obey it
 # reaches no file that does not** (#970). The three stand-ins here now carry the
@@ -4545,7 +4454,7 @@ fi
 # TWO spellings, each a claim, which is `Refuse` / `RefuseWithoutCounter` in a
 # shell script:
 #
-#   * route through `_selftest_bounded_perl` -- bounded, nothing to say;
+#   * route through `e2e_bounded_perl` -- bounded, nothing to say;
 #   * carry `# perl-lifetime: <reason>` on the invocation line -- deliberately
 #     unbounded, and WHY.
 #
@@ -4556,13 +4465,18 @@ fi
 #
 # ## The census, and why it is a check rather than a sentence
 #
-# Measured on this tree, two constructions with a positive control: `perl` in a
-# COMMAND position appears in exactly one tracked shell script -- this one -- and
-# `git grep -c -i perl` over every tracked file agrees that no other script
-# mentions it at all. A scan whose subject has left the tree reports every file
-# clean, and that reads identically to complete coverage, so the tally below
-# REFUSES at zero rather than passing. Finding one instance by other means before
-# believing a zero is what that clause is.
+# The injector -- the one line that arms the bound -- lives in `lib/e2e-common.sh`,
+# where every fixture can reach it; it was written in this file and moved, because
+# a door in one private file reaches no other script and `compile-cache-e2e.sh` had
+# already grown a second one, marker and all. A scan whose subject has left the
+# tree reports every file clean, and that reads identically to complete coverage,
+# so the tally below REFUSES at zero rather than passing.
+#
+# And the scan knows WHERE the door is, because a marker is a claim anyone can
+# write: exactly one line in the tree may carry the injector's marker, and it must
+# be in `lib/e2e-common.sh`; a marked invocation anywhere else that arms its OWN
+# `alarm` is a private door, refused even though it states a reason -- that was
+# `compile-cache-e2e.sh`'s shape before it routed through the library.
 #
 # ## Why this reads through a declared region and the other scans' canaries do not
 #
@@ -4636,7 +4550,7 @@ CANARY
 # could have been written too wide: a routed stand-in, a marked invocation, `perl`
 # as an ARGUMENT rather than a command, the word inside a string, and a comment.
 cat > "${canary_dir}/must-not-catch.sh" <<'CANARY'
-_selftest_bounded_perl 30 "print 1" "$@"
+e2e_bounded_perl 30 "print 1" "$@"
 perl -e "exit 0" # perl-lifetime: a probe, and here is the reason
 command -v perl >/dev/null 2>&1 || skip "no perl"
 echo "SKIPPED: perl with IO::Socket::INET is not available"
@@ -4647,6 +4561,91 @@ _scan_canary "perl-bounds-canary" _perl_unmarked_invocations \
     "${canary_dir}/must-catch.sh" "${canary_dir}/must-not-catch.sh" \
     6 "invocations" "a routed, marked, argument-position, quoted or commented mention of perl"
 rm -rf "$canary_dir"
+
+perl_door_home="scripts/lib/e2e-common.sh"
+
+# The door's two rules over one tree, as FINDINGS rather than verdicts, so the staged trees
+# below and the real one are judged by the same code: `injector <path>:<line>` for every
+# marked invocation carrying the injector's marker, and `private <path>:<line>` for a marked
+# invocation OUTSIDE the library that arms an `alarm` of its own -- a second door, whatever
+# reason its marker states.
+# @param 1 the tree root; its `scripts/` is walked
+_perl_door_findings() {
+    local root="$1" script relative row
+    while IFS= read -r script; do
+        [ -n "$script" ] || continue
+        relative="${script#"${root}"/}"
+        while IFS= read -r row; do
+            [ -n "$row" ] || continue
+            case "$row" in
+                *"# perl-lifetime: this line IS the injector"*)
+                    echo "injector ${relative}:${row%%:*}" ;;
+                *alarm*)
+                    [ "$relative" = "$perl_door_home" ] || echo "private ${relative}:${row%%:*}" ;;
+            esac
+        done <<EOF
+$(_perl_marked_invocations "$script")
+EOF
+    done < <(_shell_scripts "$root")
+}
+
+# Where the door is, from `_perl_door_findings`: `home` (exactly one injector, in the
+# library), `more than one`, `none`, or `elsewhere`. Four answers, because each is a
+# different fault: a second door, a door whose marker changed, and a door that moved.
+# @param 1 the findings
+_perl_door_verdict() {
+    local injectors
+    injectors="$(printf '%s\n' "$1" | sed -n 's/^injector //p' | tr '\n' ' ')"
+    injectors="${injectors% }"
+    case "$injectors" in
+        *" "*)                      echo "more than one" ;;
+        "${perl_door_home}:"[0-9]*) echo "home" ;;
+        "")                         echo "none" ;;
+        *)                          echo "elsewhere" ;;
+    esac
+}
+
+# The canary for both rules, over COMMITTED staged trees -- the same two halves as the
+# perl-bounds canary above. Must-not-catch: the door at home, a routed stand-in and a marked
+# foreground probe. Must-catch, one tree each: a second door (a marked invocation arming its own
+# alarm), more than one injector marker, the marker only elsewhere, and no marker at all. A rule
+# nobody has watched fire on a planted violation is not known to work, and a rule nobody has
+# watched ACCEPT is not either.
+# perl-scan: data-begin
+door_canary="$(mktemp -d)"
+_stage_door() { # tree, the library's text, the fixture's text
+    mkdir -p "$1/scripts/lib"
+    printf '%s\n' "$2" > "$1/scripts/lib/e2e-common.sh"
+    printf '%s\n' "$3" > "$1/scripts/fixture.sh"
+}
+door_injector='    exec perl -e "alarm ${seconds};" -e "$program" -- "$@" # perl-lifetime: this line IS the injector'
+_stage_door "${door_canary}/home" "$door_injector" 'e2e_bounded_perl 30 "print 1" "$@"
+perl -MTime::HiRes -e1 # perl-lifetime: a foreground probe that exits at once'
+_stage_door "${door_canary}/second-door" "$door_injector" 'exec perl -e "alarm $3;" -e "$program" -- "$1" # perl-lifetime: bounded by the alarm chunk before its program'
+_stage_door "${door_canary}/more-than-one" "$door_injector" "$door_injector"
+_stage_door "${door_canary}/elsewhere" 'e2e_bounded_perl() { :; }' "$door_injector"
+_stage_door "${door_canary}/none" '    exec perl -e "alarm ${seconds};" -e "$program" -- "$@" # perl-lifetime: the injector' 'e2e_bounded_perl 30 "print 1"'
+# perl-scan: data-end
+_door_canary_case() { # tree, the verdict wanted, whether a private door is wanted (yes|no)
+    local findings verdict private
+    ran=$(( ran + 1 ))
+    findings="$(_perl_door_findings "${door_canary}/$1")"
+    verdict="$(_perl_door_verdict "$findings")"
+    case "$findings" in *"private "*) private=yes ;; *) private=no ;; esac
+    if [ "$verdict" != "$2" ] || [ "$private" != "$3" ]; then
+        echo "FAIL perl-bounds-door-home-canary: the staged '$1' tree gave door '${verdict}' and a" >&2
+        echo "     private door '${private}', want '$2' and '$3' -- so the rule cannot be trusted" >&2
+        echo "     on the real tree in that direction." >&2
+        printf '%s\n' "$findings" | sed 's/^/     | /' >&2
+        note_failure "perl-bounds-door-home-canary"
+    fi
+}
+_door_canary_case home          "home"          no
+_door_canary_case second-door   "home"          yes
+_door_canary_case more-than-one "more than one" no
+_door_canary_case elsewhere     "elsewhere"     no
+_door_canary_case none          "none"          no
+rm -rf "$door_canary"
 
 perl_scanned=0
 perl_marked_total=0
@@ -4668,7 +4667,7 @@ while IFS= read -r script; do
         echo "     A stand-in needs 'exec' (or the kill at its call site reaps a wrapper)" >&2
         echo "     and a lifetime bound (or nothing reaps it under SIGKILL, ctest --timeout" >&2
         echo "     or a cancelled job) -- #839 measured 1368 orphan listeners holding ports." >&2
-        echo "     Use _selftest_bounded_perl <seconds> '<program>' <args...>, or state a" >&2
+        echo "     Use e2e_bounded_perl <seconds> '<program>' <args...> from scripts/lib/e2e-common.sh, or state a" >&2
         echo "     reason on the line as '# perl-lifetime: why this one needs no bound'." >&2
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
         note_failure "perl-bounds-scan"
@@ -4696,15 +4695,40 @@ fi
 ran=$(( ran + 1 ))
 if [ "$perl_marked_total" -lt 1 ]; then
     echo "FAIL perl-bounds-scan: not one perl invocation was found anywhere under scripts/." >&2
-    echo "     The injector in _selftest_bounded_perl carries a '# perl-lifetime:' marker," >&2
+    echo "     The injector in e2e_bounded_perl carries a '# perl-lifetime:' marker," >&2
     echo "     so zero means the pattern has stopped matching rather than that the tree is" >&2
     echo "     clean -- which is the reading that passes over everything." >&2
     note_failure "perl-bounds-scan"
+fi
+# The door's HOME: one injector, in the library. Zero means the door moved or its
+# marker changed, and the scan above would still pass every routed stand-in; two
+# means a fixture grew a private door and marked it like the real one.
+perl_door_findings="$(_perl_door_findings "$scan_root")"
+perl_injectors="$(printf '%s\n' "$perl_door_findings" | sed -n 's/^injector //p' | tr '\n' ' ')"
+perl_injectors="${perl_injectors% }"
+while IFS= read -r perl_private; do
+    [ -n "$perl_private" ] || continue
+    ran=$(( ran + 1 ))
+    echo "FAIL perl-bounds-door-home: ${perl_private} arms an alarm of its own -- a" >&2
+    echo "     second door. Its marker states a reason, but the bound is the door's to" >&2
+    echo "     inject, in ${perl_door_home}, where one fix reaches every fixture." >&2
+    echo "     Call e2e_bounded_perl <seconds> '<program>' <args...> instead." >&2
+    note_failure "perl-bounds-door-home"
+done <<EOF
+$(printf '%s\n' "$perl_door_findings" | sed -n 's/^private //p')
+EOF
+ran=$(( ran + 1 ))
+perl_door_verdict="$(_perl_door_verdict "$perl_door_findings")"
+if [ "$perl_door_verdict" != "home" ]; then
+    echo "FAIL perl-bounds-door-home: the injector marker must be on exactly one line, in" >&2
+    echo "     ${perl_door_home} (e2e_bounded_perl); found ${perl_door_verdict}: ${perl_injectors:-<nowhere>}." >&2
+    note_failure "perl-bounds-door-home"
 fi
 # Reported, not merely tolerated: a region nobody can see added is this mechanism's
 # own way of becoming an exemption, which is the bash-3.2 scan's argument for the
 # same line.
 echo "   perl bounds: scanned ${perl_scanned} script(s) under scripts/ (walked, not listed)"
+echo "   perl bounds: the door is at ${perl_injectors:-<nowhere>}"
 echo "   perl bounds: declared data region(s) in: ${perl_regions:-none}"
 echo "   perl bounds: a tracked *.sh outside scripts/ is refused by shell-walk-scope, below"
 
@@ -4719,24 +4743,43 @@ echo "   perl bounds: a tracked *.sh outside scripts/ is refused by shell-walk-s
 # killed everything would pass the refusing half alone.
 if command -v perl >/dev/null 2>&1; then
     ran=$(( ran + 1 ))
-    bounded_out="$( ( _selftest_bounded_perl 2 'select(undef, undef, undef, 60); print "SURVIVED\n";' ) 2>/dev/null )"
+    bounded_out="$( ( . "$library"; e2e_bounded_perl 2 'select(undef, undef, undef, 60); print "SURVIVED\n";' ) 2>/dev/null )"
     bounded_status=$?
     if [ "$bounded_status" -ne 142 ] || [ -n "$bounded_out" ]; then
         echo "FAIL perl-bounds-door: a program that would run 60s under a 2s bound exited" >&2
         echo "     ${bounded_status} (want 142 = 128 + SIGALRM) and printed '${bounded_out}'." >&2
-        echo "     _selftest_bounded_perl is not arming the alarm, so every stand-in that" >&2
+        echo "     e2e_bounded_perl is not arming the alarm, so every stand-in that" >&2
         echo "     goes through it is unbounded while the scan above reports clean." >&2
         note_failure "perl-bounds-door"
     fi
 
     ran=$(( ran + 1 ))
-    alive_out="$( ( _selftest_bounded_perl 30 'print "ALIVE:", join(",", @ARGV), "\n";' one two ) 2>/dev/null )"
+    alive_out="$( ( . "$library"; e2e_bounded_perl 30 'print "ALIVE:", join(",", @ARGV), "\n";' one two ) 2>/dev/null )"
     alive_status=$?
     if [ "$alive_status" -ne 0 ] || [ "$alive_out" != "ALIVE:one,two" ]; then
         echo "FAIL perl-bounds-door: the ACCEPTING direction. A short program under a 30s" >&2
         echo "     bound exited ${alive_status} and printed '${alive_out}', want 0 and" >&2
         echo "     'ALIVE:one,two'. A guard nobody has watched accept is not known to work," >&2
         echo "     and the arguments after -- are what every stand-in reads from @ARGV." >&2
+        note_failure "perl-bounds-door"
+    fi
+
+    # The REFUSING direction of the door's own argument check: `alarm 0` is perl's
+    # spelling of cancel, so a 0 must be refused before anything runs. In a process
+    # of its OWN, because the refusal is `fail`, which signals `_e2e_top_pid` -- the
+    # `$$` of whoever sourced the library, which inside a subshell is this driver.
+    ran=$(( ran + 1 ))
+    zero_out="$(bash -c '. "$1"; e2e_bounded_perl 0 "print qq(RAN\n);"' _ "$library" 2>&1)" && zero_status=0 || zero_status=$?
+    case "$zero_out" in
+        *RAN*) zero_verdict="ran the program" ;;
+        *"a bound of 0 cancels the alarm"*) zero_verdict="refused" ;;
+        *) zero_verdict="neither ran nor said why" ;;
+    esac
+    if [ "$zero_status" -eq 0 ] || [ "$zero_verdict" != "refused" ]; then
+        echo "FAIL perl-bounds-door: a bound of 0 -- perl's spelling of NO alarm -- exited" >&2
+        echo "     ${zero_status} and ${zero_verdict}, want a non-zero refusal naming it: '${zero_out}'." >&2
+        echo "     A 0 that reads as a bound at the call site and is the absence of one is the" >&2
+        echo "     escape hatch e2e_bounded_perl exists to close." >&2
         note_failure "perl-bounds-door"
     fi
 else

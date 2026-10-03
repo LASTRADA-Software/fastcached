@@ -5,6 +5,7 @@
 // Every case here uses a `core::net::testing::TestLoop` and a scripted connector, so the rules --
 // the budget, an unreachable endpoint, a peer that accepts and goes quiet -- are
 // asserted with no socket and no clock of the machine's.
+#include "CacheDecision.hpp"
 #include "ReactorExchange.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
@@ -17,6 +18,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -261,9 +263,9 @@ class ScriptedConnector final: public core::net::IConnector
         _dials += 1;
         _lastHost = std::move(host);
         _lastPort = port;
-        if (_refuse)
-            co_return std::unexpected(core::net::NetError {
-                .code = core::net::NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" });
+        if (_dialFailure.has_value())
+            co_return std::unexpected(
+                core::net::NetError { .code = *_dialFailure, .systemCode = 0, .context = "scripted dial failure" });
 
         auto peer = std::make_unique<ScriptedPeer>(_reply, _log, _dribble, _die, _clock, _advanceOnRead);
         co_return peer;
@@ -271,7 +273,14 @@ class ScriptedConnector final: public core::net::IConnector
 
     void Refuse() noexcept
     {
-        _refuse = true;
+        FailDial(core::net::NetErrorCode::ConnRefused);
+    }
+
+    /// Fail every dial with @p code: a refusal, or a connect that never completed.
+    /// @param code What the connector reports.
+    void FailDial(core::net::NetErrorCode code) noexcept
+    {
+        _dialFailure = code;
     }
 
     void Reply(std::vector<std::byte> bytes)
@@ -345,7 +354,7 @@ class ScriptedConnector final: public core::net::IConnector
     std::uint16_t _lastPort { 0 };
     core::platform::ManualClock* _clock { nullptr };
     std::chrono::milliseconds _advanceOnRead { 0 };
-    bool _refuse { false };
+    std::optional<core::net::NetErrorCode> _dialFailure;
     bool _dribble { false };
     bool _die { false };
 };
@@ -854,4 +863,127 @@ TEST_CASE("Every transport failure has words of its own")
 
     std::ranges::sort(phrases);
     CHECK(std::ranges::adjacent_find(phrases) == phrases.end());
+}
+
+TEST_CASE("A cache whose accept loop is dead leaves the compile to go on, whatever shape its silence takes", "[fallback]")
+{
+    // The launcher's FETCH path, end to end below `main`: the exchange `RunOneExchange` runs, then
+    // the two questions `main` asks of it -- `CacheIsServing`, and `DecideCacheAction` over
+    // `ObserveFetch`, spelled here as `main` spells it. A node whose accept loop has died still
+    // LISTENS, so what a launcher meets depends on the backlog: a refusal once it is full, a dial
+    // that lands in it and is never read, a connect that never completes, a reset. Every one must
+    // leave the compile to go on, offering the result to the cache afterwards, and none may serve
+    // anything.
+    //
+    // Recorded after a report that compiles through the local launcher exited 1 while the
+    // installed node's accept loop was dead. It did not reproduce: the compiles that failed ran
+    // under a pause enforcer that killed `cl.exe` (`taskkill /T /F`, exit 1), and the launcher
+    // passes a compiler's own exit code through. This case holds the property the report
+    // questioned, at the seam the suite can reach.
+    constexpr Cc::ExchangeBudget Budget {};
+    struct DeadShape
+    {
+        std::string_view why;
+        void (*arrange)(ScriptedConnector&, core::platform::ManualClock&);
+        Cc::TransportFailure failure;
+    };
+    auto const shapes = std::to_array<DeadShape>({
+        { .why = "the backlog is full, so the dial is refused",
+          .arrange = [](ScriptedConnector& connector, core::platform::ManualClock&) { connector.Refuse(); },
+          .failure = Cc::TransportFailure::Unreached },
+        { .why = "the connect never completes and runs out its own bound",
+          .arrange = [](ScriptedConnector& connector,
+                        core::platform::ManualClock&) { connector.FailDial(core::net::NetErrorCode::Timeout); },
+          .failure = Cc::TransportFailure::Unreached },
+        { .why = "the dial lands in the backlog and nothing ever reads it",
+          .arrange =
+              [](ScriptedConnector& connector, core::platform::ManualClock& clock) {
+                  connector.Reply({});
+                  connector.AdvanceOnFirstRead(clock, Cc::ExchangeBudget {}.total * 4);
+              },
+          .failure = Cc::TransportFailure::Expired },
+        { .why = "the connection resets mid-exchange",
+          .arrange =
+              [](ScriptedConnector& connector, core::platform::ManualClock&) {
+                  connector.Reply({});
+                  connector.DieMidExchange();
+              },
+          .failure = Cc::TransportFailure::PeerLost },
+    });
+
+    for (auto const& shape: shapes)
+    {
+        INFO(shape.why);
+        core::platform::ManualClock clock;
+        core::net::testing::TestLoop reactor { clock };
+        ScriptedConnector connector;
+        shape.arrange(connector, clock);
+
+        Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
+        auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Budget);
+
+        // A transport failure, of the shape it is, and nothing thrown.
+        CHECK(outcome.kind == Cc::CacheOutcomeKind::Transport);
+        CHECK(outcome.transportFailure == shape.failure);
+        CHECK_FALSE(outcome.IsHit());
+
+        // What `main` asks next: the cache is not serving, so nothing is served from it, and the
+        // flow goes on to compile -- and to offer the object to whoever answers next time.
+        CHECK_FALSE(Cc::CacheIsServing(outcome.kind));
+        auto const observed = Cc::ObserveFetch(outcome.kind, outcome.IsHit(), false, Cc::HitDisposition::Served);
+        CHECK(observed == Cc::FetchObservation::NotServing);
+        CHECK(Cc::DecideCacheAction(observed) == Cc::CacheAction::CompileAndStore);
+    }
+}
+
+TEST_CASE("A STORE that fails after the compile is an answer, never a throw", "[fallback]")
+{
+    // The other half of the report's shapes: the compile went on, and offering its object back
+    // fails -- the cache refuses the write, or is as dead as it was at the FETCH. Either is an
+    // outcome the launcher notes and drops; `main` reads nothing from it that decides the exit,
+    // and `main` is in no test target (#909), so what this can hold is that the exchange ANSWERS.
+    std::array<std::byte, 4> const value { std::byte { 1 }, std::byte { 2 }, std::byte { 3 }, std::byte { 4 } };
+    auto const store = Wire::EncodeStore(
+        Wire::StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = value });
+
+    struct StoreShape
+    {
+        std::string_view why;
+        void (*arrange)(ScriptedConnector&, core::platform::ManualClock&);
+        Cc::CacheOutcomeKind kind;
+    };
+    auto const shapes = std::to_array<StoreShape>({
+        { .why = "the cache refuses the write",
+          .arrange =
+              [](ScriptedConnector& connector, core::platform::ManualClock&) {
+                  connector.Reply(Wire::EncodeErrorReply(Wire::ErrorCode::StorageWriteFailed, "the store failed"));
+              },
+          .kind = Cc::CacheOutcomeKind::Rejected },
+        { .why = "the cache is still refusing connections",
+          .arrange = [](ScriptedConnector& connector, core::platform::ManualClock&) { connector.Refuse(); },
+          .kind = Cc::CacheOutcomeKind::Transport },
+        { .why = "the cache takes the request and never answers",
+          .arrange =
+              [](ScriptedConnector& connector, core::platform::ManualClock& clock) {
+                  connector.Reply({});
+                  connector.AdvanceOnFirstRead(clock, Cc::ExchangeBudget {}.total * 4);
+              },
+          .kind = Cc::CacheOutcomeKind::Transport },
+    });
+
+    for (auto const& shape: shapes)
+    {
+        INFO(shape.why);
+        core::platform::ManualClock clock;
+        core::net::testing::TestLoop reactor { clock };
+        ScriptedConnector connector;
+        shape.arrange(connector, clock);
+
+        Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
+        auto const outcome = exchange.Run("127.0.0.1:6674", store, {}, Cc::ExchangeBudget {});
+
+        CHECK(outcome.kind == shape.kind);
+        CHECK_FALSE(outcome.IsHit());
+        CHECK_FALSE(Cc::CacheIsServing(outcome.kind));
+    }
 }
