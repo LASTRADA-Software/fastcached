@@ -14,7 +14,16 @@
 namespace FastCache::Node
 {
 
+class CacheTier;
+class EnrollmentResponder;
+class FleetSummaryResponder;
+class FleetTextResponder;
+class LiveStatsResponder;
 class NodeIoLoop;
+class NodeProofResponder;
+class NodeStatusResponder;
+class SchedulerTier;
+class WorkerTier;
 struct NodeConfig;
 
 /// This node's one `0xFC` listener, and the router in front of it.
@@ -111,7 +120,7 @@ class NodeFrameSurface
 /// What stays here is what the row cannot say: #290 stage 3 is why the question is
 /// open at all. A taken DEFAULT port used to be tolerated, on reasoning that was
 /// sound while the worker had a compile port of its OWN to fall back to. There is one
-/// 0xFC port now, so `nodeListenExplicit` and `--serve-scheduler` stopped deciding
+/// 0xFC port now, so `nodeListenExplicit` and serving the scheduler stopped deciding
 /// this -- both were answering "is this port load-bearing". The provenance bit is
 /// still what `--install-service` emits on, which is where #286 needed it.
 ///
@@ -140,5 +149,34 @@ class NodeFrameSurface
     IMetricsSink& metrics,
     ILogger& logger,
     ToolchainNamer namer = {});
+
+/// Every component a node built for its `0xFC` surface, composed ONCE: what `main` routes, and what
+/// the wiring test routes.
+///
+/// A function rather than a designated initialiser at `main`, because a designated initialiser
+/// that OMITS a member compiles: the member is null, its family is refused at the door as served
+/// nowhere, and no test goes red -- the wiring test composed its own. Here every component is a
+/// REQUIRED parameter of its own TYPE, so leaving one out, or passing two in each other's place,
+/// fails the build at `main`; and the wiring test calls THIS, so a member this body drops is red
+/// there. Null is the ORDINARY answer for a tier or an optional component a node does not run.
+/// @param cache The cache tier, or nullptr when this node holds none.
+/// @param scheduler The scheduler tier, or nullptr when this node does not schedule.
+/// @param worker The worker tier, or nullptr when this node runs no worker.
+/// @param node The operator verbs' responder; every node has one.
+/// @param enrollment The enrollment responder, or nullptr when this node serves no window.
+/// @param live The live-stats responder; every node has one.
+/// @param fleet The fleet-text responder; every node has one.
+/// @param nodeProof The identity prover, or nullptr when this node runs no consensus.
+/// @param formation The fleet-summary responder, or nullptr when this node holds no identity key.
+/// @return The components, each family's owner where `MergedResponder` reads it.
+[[nodiscard]] SurfaceComponents ComposeSurfaceComponents(CacheTier* cache,
+                                                         SchedulerTier* scheduler,
+                                                         WorkerTier* worker,
+                                                         NodeStatusResponder& node,
+                                                         EnrollmentResponder* enrollment,
+                                                         LiveStatsResponder& live,
+                                                         FleetTextResponder& fleet,
+                                                         NodeProofResponder* nodeProof,
+                                                         FleetSummaryResponder* formation) noexcept;
 
 } // namespace FastCache::Node

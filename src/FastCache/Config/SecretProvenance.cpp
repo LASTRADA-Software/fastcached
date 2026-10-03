@@ -13,10 +13,30 @@
 namespace FastCache
 {
 
+namespace
+{
+    /// @p files, each told the way a file services read is told.
+    /// @param files The files.
+    /// @return The subjects.
+    [[nodiscard]] std::vector<SecretFileSubject> ServicesReadSubjects(std::span<std::filesystem::path const> files)
+    {
+        std::vector<SecretFileSubject> subjects;
+        subjects.reserve(files.size());
+        for (auto const& path: files)
+            subjects.push_back(SecretFileSubject { .path = path, .hint = &SecretExposureHint });
+        return subjects;
+    }
+} // namespace
+
 std::vector<SecretFileFinding> SecretFileExposures(std::span<std::filesystem::path const> files)
 {
+    return SecretFileExposures(ServicesReadSubjects(files));
+}
+
+std::vector<SecretFileFinding> SecretFileExposures(std::span<SecretFileSubject const> files)
+{
     std::vector<SecretFileFinding> findings;
-    for (auto const& path: files)
+    for (auto const& [path, hint]: files)
     {
         if (path.empty())
             continue;
@@ -48,16 +68,21 @@ std::vector<SecretFileFinding> SecretFileExposures(std::span<std::filesystem::pa
         if (exposure == SecretExposure::None)
             continue;
 
-        findings.push_back(SecretFileFinding { .path = path, .exposure = exposure });
+        findings.push_back(SecretFileFinding { .path = path, .exposure = exposure, .hint = hint });
     }
     return findings;
 }
 
 std::vector<std::string> SecretFileWarnings(std::span<std::filesystem::path const> files)
 {
+    return SecretFileWarnings(ServicesReadSubjects(files));
+}
+
+std::vector<std::string> SecretFileWarnings(std::span<SecretFileSubject const> files)
+{
     std::vector<std::string> warnings;
     for (auto const& finding: SecretFileExposures(files))
-        warnings.push_back(SecretExposureHint(finding.path, finding.exposure));
+        warnings.push_back(finding.hint(finding.path, finding.exposure));
     return warnings;
 }
 
@@ -68,7 +93,7 @@ std::span<SecretFileRow<Config, std::string> const> DaemonSecretFileTable() noex
         // local account can impersonate this daemon to its clients or decrypt a
         // captured session -- and `--requirepass` travels over that same connection,
         // so this exposure composes with the one #384 was written about.
-        { .flag = "--tls-key", .path = [](Config const& config) { return config.tlsKeyPath; } },
+        { .flag = "--tls-key", .path = [](Config const& config) { return config.tlsKeyPath; }, .hint = &SecretExposureHint },
     });
     return table;
 }
@@ -102,6 +127,14 @@ std::span<PublicPathFlag const> DaemonPublicPathFlags() noexcept
 std::vector<std::filesystem::path> DaemonSecretFiles(Config const& cfg, bool secretNamedOnCommandLine)
 {
     std::vector<std::filesystem::path> files;
+    for (auto& subject: DaemonSecretFileSubjects(cfg, secretNamedOnCommandLine))
+        files.push_back(std::move(subject.path));
+    return files;
+}
+
+std::vector<SecretFileSubject> DaemonSecretFileSubjects(Config const& cfg, bool secretNamedOnCommandLine)
+{
+    std::vector<SecretFileSubject> files;
 
     // First, because it is the one an operator most often has open. This half alone
     // is provenance-gated: `--requirepass` typed in argv is a `ps` exposure, which is
@@ -122,14 +155,14 @@ std::vector<std::filesystem::path> DaemonSecretFiles(Config const& cfg, bool sec
             // than warning about a file nothing read.
             .fileWasRead = !cfg.configPath.empty(),
         }))
-        files.emplace_back(cfg.configPath);
+        files.push_back(SecretFileSubject { .path = cfg.configPath, .hint = &SecretExposureHint });
 
     // Not gated at all, and that is #752's rule rather than an omission of #384's:
     // the path is not the secret and the file is, so a world-readable private key is
     // exposed whether its path was typed or read out of a configuration file.
     for (auto const& row: DaemonSecretFileTable())
         if (auto path = row.path(cfg); !path.empty())
-            files.emplace_back(std::move(path));
+            files.push_back(SecretFileSubject { .path = path, .hint = row.hint });
 
     return files;
 }

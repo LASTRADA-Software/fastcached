@@ -67,6 +67,10 @@ class SecretExposureWatcher
     ///         the one the operator was last handed.
     [[nodiscard]] std::vector<std::string> Observe(std::span<std::filesystem::path const> files);
 
+    /// @copydoc Observe(std::span<std::filesystem::path const>)
+    /// Each file's sentence is its subject's own `hint`.
+    [[nodiscard]] std::vector<std::string> Observe(std::span<SecretFileSubject const> files);
+
     /// The memory rule alone, over findings somebody else acquired.
     ///
     /// **Published so the rule is testable where `chmod` is not.** `Observe` is this
@@ -118,7 +122,7 @@ using SecretExposureReport = std::function<void(std::string_view)>;
 /// daemon overload below points at them rather than restating them.
 /// @tparam ConfigT The configuration this executable reloads.
 template <typename ConfigT>
-using SecretSubjectFiles = std::function<std::vector<std::filesystem::path>(ConfigT const&)>;
+using SecretSubjectFiles = std::function<std::vector<SecretFileSubject>(ConfigT const&)>;
 
 /// Report @p reloader's current snapshot's secret-file exposure now, and again at
 /// every reload.

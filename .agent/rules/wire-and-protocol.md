@@ -537,6 +537,20 @@ Every rule below has already been a bug.
     pre-auth verb cannot reopen the hole by omission rather than by decision. The
     refusal names the verb whose ceiling it hit, because "exceeds cap 268435456" tells
     an operator nothing about a 4 KiB limit.
+  - **A REPLY is read from a stranger too, so it has the mirror column.** A client that
+    dials a seed a DNS answer named -- or anything answering at that address -- reads from
+    a peer that proved nothing, and a reply header declares its length in a `u32`: sized
+    by it before a byte arrives, five bytes committed 512 MiB in a fleet probe (measured,
+    16 -> 526 MiB peak working set), and 200000 `Progress` pulses on a verb that never
+    pulses were waited through. So every `OpTable` row states `maxReply` (`ReplyCap`, whose
+    default constructor is deleted as `PayloadCap`'s is), `PreAuthRepliesAreBounded()` and
+    `BoundedRepliesHoldARefusal()` are `static_assert`ed, and `Cc`'s ONE reply reader asks
+    the verb it SENT -- read off its own frame -- before it allocates: a status the verb's
+    EXISTING `legalStatuses` column does not admit, and a declared length over `maxReply`,
+    end the exchange as a transport failure. `ReplyCarriesArtefact` is for FETCH and COMPILE
+    alone. And a probe of a stranger is bounded by ONE deadline over connect and exchange on
+    the injected clock (`Transport/TotalDeadlineSocket`, every read re-armed to the time
+    left) -- never by the per-call `SO_RCVTIMEO` a dribbling peer outlasts one byte at a time.
   - **Adding a verb must not break the fleet that does not have it, and that is a
     property of the CLIENT.** `Op::Auth` deliberately did not bump `CurrentVersion` —
     the framing exists so a receiver steps over a verb it does not know — so a daemon

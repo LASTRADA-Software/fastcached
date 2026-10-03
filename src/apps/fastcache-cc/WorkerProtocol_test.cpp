@@ -2263,10 +2263,10 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
 
     SECTION("registered into a fleet that names none still compiles, and only for grants naming none")
     {
-        // The control. A scheduler with no `--cluster-id` sends an empty identity, and
-        // an engaged-but-empty pin is a fleet that names none -- which is why this is
-        // an optional rather than a string. A change that refused it would pass both
-        // SECTIONs above and break every single-machine install.
+        // The control. An engaged-but-empty pin is a registration, not the absence of
+        // one -- which is why this is an optional rather than a string. No node sends an
+        // empty identity now (the formation record mints one), but the codec carries it, and
+        // equality must still pair it with a grant that names none and nothing else.
         Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
         lease.fleet.Pin(std::string {});
         MovingEndpoint const endpoint { ThisWorker };

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cluster/RosterCertificate.hpp>
+#include <FastCache/Core/StateFiles.hpp>
 
 #include <expected>
 #include <filesystem>
@@ -37,7 +38,7 @@ class IRosterStore
 };
 
 /// The file a state directory keeps its roster in.
-inline constexpr std::string_view RosterFileName = "roster";
+inline constexpr std::string_view RosterFileName = StateFileName(StateFile::Roster);
 
 /// The roster kept in one file, replaced indivisibly on every save.
 class FileRosterStore final: public IRosterStore

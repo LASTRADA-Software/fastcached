@@ -35,7 +35,7 @@ different program.
 | Role | Program | What it does |
 |------|---------|--------------|
 | **Client** | `fastcache-cc` | Fronts each compile. Checks the cache, and on a miss asks for a worker. |
-| **Scheduler** | `fastcache-compile-node --serve-scheduler` | Tracks the fleet's workers and hands one out. Exactly one node at a time. |
+| **Scheduler** | `fastcache-compile-node` | Tracks the fleet's workers and hands one out. Exactly one node at a time: whichever leads the cluster. |
 | **Worker** | `fastcache-compile-node` | Compiles what it is sent. Also holds a cache tier of its own, unless you turn it off. |
 | **Shared cache** | `fastcached` | Optional, and *not* the scheduler. Where objects end up so other machines get them. |
 
@@ -194,13 +194,12 @@ digest as well.
 
 ### The scheduler
 
-The scheduler is a **compile node**, not the cache. Pick one machine and give it
-`--serve-scheduler`:
+The scheduler is a **compile node**, not the cache. Pick one machine and start it:
 
 ```sh
 fastcache-compile-node \
-    --serve-scheduler --listen-node=0.0.0.0:6675 \
-    --listen-raft=6680 --raft-self=scheduler.internal \
+    --listen-node=0.0.0.0:6675 \
+    --raft-self=scheduler.internal \
     --fleet-member=worker-01.internal \
     --fleet-member=worker-02.internal \
     --fleet-member=dev-01.internal \
@@ -212,9 +211,12 @@ fastcache-compile-node \
 ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). It signs every
 lease with its own identity key, and it hands its workers a *roster* — the cluster's
 voters and their keys — that a majority of those voters certify, so it holds
-replicated state and runs consensus to keep it: `--listen-raft` turns consensus on,
+replicated state and runs consensus to keep it. No flag asks for either: its first
+start mints a cluster of one into its state directory, which it leads, and whose mode
+serves the scheduler. Consensus is on by default (`--listen-raft` defaults to `6680`),
 and `--raft-self` states the host another member would dial it at (`127.0.0.1` when
-none ever will). One started without `--listen-raft` is refused, by name. Its identity
+none ever will; this machine's name when it is not given). A node whose consensus is
+turned off with an empty `--listen-raft=` serves no scheduler. Its identity
 is minted into its state directory on first start, and the same command line with
 `--print-identity` added prints it without serving — the `public-key` line is what
 every worker's `--voter-key` names.
@@ -253,7 +255,7 @@ running none of those is refused too. Until
 and history still read 0 slots.
 
 ```sh
-fastcache-compile-node --serve-scheduler --slots=0 \
+fastcache-compile-node --slots=0 \
     --listen-node=0.0.0.0:6674 --fleet-member=10.0.0.21 ...
 ```
 
@@ -262,8 +264,8 @@ not among the fleet page's **machines**, which are built from worker registratio
 its own history is not handed to a leader either ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
 
 Once several nodes schedule, exactly one of them may at a time, which is what the
-same consensus decides once it has more than one member — `--raft-peer` naming each
-of them, each with its identity key. See
+same consensus decides once it has more than one member: one machine founds the
+cluster, every other one joins it and is admitted by its identity key. See
 [a cluster, and who leads it](../tools/fastcache-compile-node.md#a-cluster-and-who-leads-it).
 
 #### Who may use the fleet
@@ -460,7 +462,7 @@ dispatched anyway. The `FASTCACHE_ADDR=` opt-out above is different, and turns
 both off — it is how a build says it wants no launcher at all.
 
 `FASTCACHE_SCHEDULER` is the **scheduler**, which is the `--listen-node` port of
-some node running `--serve-scheduler`. Unset it and every miss compiles
+some node that serves it. Unset it and every miss compiles
 locally again — the behaviour without this feature, and the way to turn it off
 for one build.
 
@@ -782,14 +784,14 @@ counts that cache twice.
 
 ### The whole fleet on one page
 
-`--dashboard`, on a leader that already has `--admin-listen` and
-`--serve-scheduler`, serves `/fleet` and `/fleet.json` — every member's
+`--dashboard`, on a leader that already has `--admin-listen`, serves `/fleet` and
+`/fleet.json` — every member's
 hostname, endpoint, software version, capacity and cache, plus charts of the last
 24 hours or 7 days:
 
 ```sh
 fastcache-compile-node ... \
-    --serve-scheduler --listen-node=6675 --fleet-member=10.0.0.2 \
+    --listen-node=6675 --fleet-member=10.0.0.2 \
     --admin-listen=6677 \
     --dashboard --dashboard-token-file=/etc/fastcached/dashboard.token
 ```
@@ -981,7 +983,7 @@ key, see [Raft peer authentication](../operations/cluster-communication.md#raft-
 — the fleet's own traffic is unauthenticated, so treat its boundary as **network
 reachability plus membership** and size the network accordingly.
 
-So: keep `--serve-scheduler` off any network you would not run a compiler for,
+So: keep a scheduling node's port off any network you would not run a compiler for,
 and put mTLS in front of every port for anything beyond a trusted build network.
 The two remaining credentials in this system are real and unaffected —
 `--dashboard-token-file` guards the fleet page and the live-stats fleet stream, and `fastcached`'s own

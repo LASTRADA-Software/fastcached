@@ -204,8 +204,8 @@ LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
         // this validator is built at startup and the identity arrives later, in the
         // REGISTER reply (#401). Absent means this worker has not registered, and a
         // worker that does not know its fleet honours no grant -- which is the window
-        // the ticket closes. An engaged but EMPTY identity is a scheduler that names
-        // no cluster, is legal, and expects a grant that names none either.
+        // the ticket closes. An engaged but EMPTY identity is a reply that named an
+        // empty fleet, which no node sends; it matches only a grant that names none.
         auto const cluster = lease.fleet.Pinned();
         //
         // Answered BEFORE the MAC, and that is not the oracle the MAC-first rule
@@ -662,12 +662,11 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocke
     _workerId = std::move(reply->workerId);
     _clusterId = std::move(reply->clusterId);
     _epoch = reply->epoch;
-    // An EMPTY fleet identity is not refused, and that is deliberate. It is what a
-    // scheduler with no `--cluster-id` sends, which is the one-machine deployment --
-    // `SchedulerService`'s own contract says empty is legal and that a verifier
-    // naming none expects none. Refusing it here would close #401's window by
-    // breaking every single-machine install, which is the shape #303 is about.
-    // "Registered" is what pins a worker; the identity is what it pins TO.
+    // An EMPTY fleet identity is not refused here. No node sends one -- every node's
+    // formation record mints a cluster id -- and the lease check compares for
+    // equality, so a worker pinned to one honours only a grant that names no cluster
+    // either: it fails closed without a refusal of its own. "Registered" is what pins a
+    // worker; the identity is what it pins TO.
     if (_workerId.empty())
         // Accepted and unusable: every later heartbeat needs the id, so a worker
         // that kept going here would heartbeat nothing into a fleet that thinks it

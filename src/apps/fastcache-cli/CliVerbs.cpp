@@ -989,10 +989,10 @@ namespace
     {
         switch (state)
         {
-            case CompileCacheWire::WireEnrollmentState::Closed:
-                return "closed";
-            case CompileCacheWire::WireEnrollmentState::Open:
-                return "open";
+            case CompileCacheWire::WireEnrollmentState::Manual:
+                return "manual";
+            case CompileCacheWire::WireEnrollmentState::AutoApprove:
+                return "auto-approve";
         }
         // Unreachable for `NameOfSchedulerRole`'s reason: `DecodeNodeRuntime` leaves a
         // state this build has no name for disengaged rather than passing it through.
@@ -1087,12 +1087,12 @@ namespace
         record.push_back({ .name = "version", .value = TextCell(fields.version) });
 
         // **Absent, not empty.** A node running no consensus has no minted identity, and
-        // an empty string renders as a value somebody could paste into `--raft-peer`.
+        // an empty string renders as a value somebody could paste into `--cluster-admit`.
         record.push_back({ .name = "node-id", .value = fields.nodeId.empty() ? AbsentCell() : TextCell(fields.nodeId) });
 
         // **The key this node proves who it is with** (#178), WHOLE, through the one encoder:
         // it is the string an operator holds against a roster or types after `@` in a
-        // `--raft-peer` token, and an abbreviation would be a display form somebody compares.
+        // `--cluster-admit` token, and an abbreviation would be a display form somebody compares.
         // Absent for node-id's reason one field along: a node with no state directory holds no
         // key, and an empty cell would read as a key nobody could type.
         record.push_back({ .name = "public-key",
@@ -1190,9 +1190,19 @@ namespace
         // since a state with no count invites the reading that nobody is waiting.
         if (fields.runtime.enrollment.has_value())
         {
-            record.push_back({ .name = "enrollment",
-                               .value = TextCell(std::string { NameOfEnrollmentState(*fields.runtime.enrollment) }) });
+            // An armed deadline says how long it has left beside its name, because that is the
+            // number an operator who armed it and walked away needs; the seconds travel as a
+            // number of their own for whatever reads the record.
+            auto enrollment = std::string { NameOfEnrollmentState(*fields.runtime.enrollment) };
+            if (*fields.runtime.enrollment == CompileCacheWire::WireEnrollmentState::AutoApprove
+                && fields.runtime.enrollmentAutoApproveSecondsLeft.has_value())
+                enrollment =
+                    std::format("{} ({} min left)", enrollment, *fields.runtime.enrollmentAutoApproveSecondsLeft / 60);
+            record.push_back({ .name = "enrollment", .value = TextCell(std::move(enrollment)) });
             AddOptionalNumber(record, "enrollment-pending", fields.runtime.enrollmentPending);
+            if (fields.runtime.enrollmentAutoApproveSecondsLeft.has_value())
+                record.push_back({ .name = "enrollment-auto-approve-seconds-left",
+                                   .value = NumberCell(*fields.runtime.enrollmentAutoApproveSecondsLeft) });
         }
 
         // **Where peers DIAL this node's consensus port** (#1328) -- the half of
@@ -1204,6 +1214,15 @@ namespace
         if (fields.runtime.consensusEndpoint.has_value())
             record.push_back({ .name = std::string { CompileCacheWire::ConsensusEndpointField },
                                .value = TextCell(*fields.runtime.consensusEndpoint) });
+
+        // **Where the node keeps its identity, and why there.** One machine can hold two --
+        // the service's machine-wide directory and a hand-started node's per-user one -- so the
+        // reason travels beside the path, in the node's own words. Absent from a node too old
+        // to say, for the enrollment state's reason.
+        if (fields.runtime.stateDirectory.has_value())
+            record.push_back({ .name = "state-directory", .value = TextCell(*fields.runtime.stateDirectory) });
+        if (fields.runtime.stateDirectoryReason.has_value())
+            record.push_back({ .name = "state-directory-reason", .value = TextCell(*fields.runtime.stateDirectoryReason) });
 
         // **Which set consensus counts this node in** (#1449): `voter`, `learner`, or --
         // on a node waiting to be admitted -- `no-cluster`. A learner and a following
@@ -1715,13 +1734,16 @@ namespace
             // RECORD, which consensus moves towards one change at a time. What a node is
             // counted as right now is its own `consensus-standing` under `node`.
             //
+            // `raft` is ABSENT for a learner recorded with none: it dials in, so nobody needs
+            // its address, and an empty text cell would be a blank rather than an absence.
+            //
             // `key` is the member's identity key WHOLE (#178), through the one encoder, and
             // ABSENT for a member that has not stated one -- which is not a key anybody could
             // type after `@`.
             rows.push_back(
                 { TextCell(member.id),
                   TextCell(std::string { Cluster::MemberSeatName(member.seat) }),
-                  TextCell(member.raftEndpoint),
+                  member.raftEndpoint.empty() ? AbsentCell() : TextCell(member.raftEndpoint),
                   member.schedulerEndpoint.empty() ? AbsentCell() : TextCell(member.schedulerEndpoint),
                   TextCell(std::string { Cluster::SchedulerEndpointStateName(member) }),
                   member.publicKey.has_value() ? TextCell(FormatEd25519PublicKey(*member.publicKey)) : AbsentCell() });

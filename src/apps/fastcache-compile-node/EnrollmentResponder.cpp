@@ -2,10 +2,12 @@
 #include "EnrollmentResponder.hpp"
 #include "MembershipGate.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
@@ -14,6 +16,8 @@
 #include <format>
 #include <utility>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Node
 {
@@ -34,12 +38,12 @@ namespace
     /// something happened*, and the answer is the same for both.
     constexpr std::string_view ShapeRefusalRationale =
         "a size or opcode refusal says the peer is confused about the framing, not about this cluster; summed into "
-        "the enrollment series it would bury the two refusals that mean somebody is trying an open window";
+        "the enrollment series it would bury the two refusals that mean somebody is trying to join uninvited";
 
     /// Why the endpoint's byte budget is not this surface's to count.
     constexpr std::string_view ByteBudgetRationale =
         "the byte budget says this surface is momentarily full, which the peer sees and retries; summed into a "
-        "series read as somebody probing an open window it is what makes that series unreadable";
+        "series read as somebody probing the enrollment list it is what makes that series unreadable";
 
     /// Why a credential refusal here belongs to the scheduler.
     constexpr std::string_view CredentialIsTheSchedulersRationale =
@@ -198,11 +202,11 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
         return Cc::Refuse(_metrics,
                           { .code = Wire::ErrorCode::MalformedFrame,
                             .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed },
-                          "an enroll request names an id, a consensus endpoint, a role this build knows and a "
-                          "32-byte identity key");
+                          "an enroll request names an id, an endpoint, a role this build knows and a 32-byte "
+                          "identity key");
 
     auto const nodeId = Wire::AsStringView(fields->nodeId);
-    auto const raftEndpoint = Wire::AsStringView(fields->raftEndpoint);
+    auto const nodeEndpoint = Wire::AsStringView(fields->nodeEndpoint);
     auto const& role = EnrollRoleRowFor(fields->role);
 
     // Text, or the fleet refuses it: this id is copied into `ClusterState` on approval
@@ -210,22 +214,33 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
     // makes that document unparseable for the whole fleet. Refused where it ENTERS,
     // which is here -- a consensus entry is applied after it is committed, with nobody
     // left to refuse it. The endpoint travels the same way and is checked the same way.
-    if (!IsValidUtf8(nodeId) || !IsValidUtf8(raftEndpoint))
+    if (!IsValidUtf8(nodeId) || !IsValidUtf8(nodeEndpoint))
         return Cc::Refuse(_metrics,
                           { .code = Wire::ErrorCode::MalformedFrame,
                             .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed },
                           "a joiner must name itself and its endpoint in UTF-8");
 
+    // Held to the one id bound where it ENTERS, as every id this fleet carries is. Past it, the
+    // row would be one `--enroll-reject` refuses to name -- it takes an id through that same
+    // bound -- so only `--enroll-clear`, which drops every honest row with it, could remove it.
+    if (nodeId.size() > Wire::MaxIdBytes)
+        return Cc::Refuse(_metrics,
+                          { .code = Wire::ErrorCode::MalformedFrame,
+                            .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedIdTooLong },
+                          std::format("a joiner's id is at most {} bytes, as every id this fleet carries is; this one "
+                                      "is {}",
+                                      Wire::MaxIdBytes,
+                                      nodeId.size()));
+
     // An empty id, or an endpoint that does not suit the role, is refused here rather than at
     // the approval, because the list is what a PERSON reads and a row they cannot act on is
-    // one they should never be shown. A member with no endpoint is the member
-    // `Cluster::ClusterMember` exists to make unrepresentable; a worker WITH one is claiming an
-    // address the principal it becomes has nowhere to keep.
-    if (nodeId.empty() || role.statesEndpoint == raftEndpoint.empty())
+    // one they should never be shown. Neither live role states one, so an endpoint here is a
+    // claim the record it becomes has nowhere to keep.
+    if (nodeId.empty() || role.statesEndpoint == nodeEndpoint.empty())
         return Cc::Refuse(_metrics,
                           { .code = Wire::ErrorCode::MalformedFrame,
                             .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed },
-                          std::format("an enroll request names an id, and a {} {} a consensus endpoint",
+                          std::format("an enroll request names an id, and a {} {} an endpoint",
                                       role.name,
                                       role.statesEndpoint ? "must name" : "names no"));
 
@@ -256,26 +271,53 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
                                       "aside so it mints a new identity, and enrol that",
                                       FormatEd25519PublicKey(fields->publicKey)));
 
+    // **A machine the cluster already records under exactly this key and role, and this list holds
+    // no row for, is answered the roster.** The admission was decided and replicated; the list is
+    // one leader's memory, forgotten at a restart or a change of leader. A row this list DOES hold
+    // decides as it always has, so a rejection still stops the roster being handed over. Without this, a joiner
+    // admitted just before the leader changed would be recorded afresh here, and its approval
+    // refused as *already a member* -- a machine the cluster admitted, polling forever. Nothing
+    // is handed out that the approval did not already make every member's: a roster is public
+    // keys (#178).
+    auto const recorded = [&] {
+        if (_window.Find(nodeId).has_value())
+            return false;
+        auto const state = _scheduler.AdministeredState();
+        return state.has_value()
+               && RosterRecordsJoiner(Cluster::ProjectRoster(*state), nodeId, fields->publicKey, fields->role);
+    }();
+
     auto const claim =
-        JoinerClaim { .nodeId = nodeId, .raftEndpoint = raftEndpoint, .role = fields->role, .publicKey = fields->publicKey };
-    switch (_window.Offer(claim, peer))
+        JoinerClaim { .nodeId = nodeId, .nodeEndpoint = nodeEndpoint, .role = fields->role, .publicKey = fields->publicKey };
+    switch (recorded ? EnrollDecision::Approved : _window.Offer(claim, peer))
     {
-        case EnrollDecision::Closed:
-            return Cc::Refuse(_metrics,
-                              { .code = Wire::ErrorCode::EnrollmentClosed,
-                                .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedClosed },
-                              "no enrollment window is open on this node");
         case EnrollDecision::Full:
             return Cc::Refuse(
                 _metrics,
                 { .code = Wire::ErrorCode::EnrollmentFull, .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedFull },
-                std::format("the enrollment window already holds {} request(s) and records no more", MaxPendingEnrollments));
+                std::format("the enrollment list already holds {} request(s) and records no more", MaxPendingEnrollments));
+        case EnrollDecision::HostFull:
+            // The host in the spelling the bound counts and the list shows (`first from`), which is
+            // not necessarily where those rows' machines ask from NOW: a refusal naming rows the
+            // operator cannot find on the list is a claim nobody can check.
+            return Cc::Refuse(_metrics,
+                              { .code = Wire::ErrorCode::EnrollmentHostFull,
+                                .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedHostCap },
+                              std::format("{} already has {} undecided request(s) on the enrollment list, as many as "
+                                          "one host may; they are counted by the address each FIRST asked from, which "
+                                          "--enroll-list shows as 'first from {}'. This one is recorded once one of "
+                                          "those is decided",
+                                          UnmappedHost(peer),
+                                          MaxPendingEnrollmentsPerHost,
+                                          UnmappedHost(peer)));
         case EnrollDecision::Pending:
             // No roster, and the encoder is what makes that a length rather than a
             // convention -- see `EncodeEnrollReply`.
             return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Pending, {}));
         case EnrollDecision::Rejected:
             return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Rejected, {}));
+        case EnrollDecision::AutoApprove:
+            return AnswerAutoApprove(nodeId);
         case EnrollDecision::Approved:
             break;
     }
@@ -311,6 +353,66 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
     return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Approved, roster, certificate));
 }
 
+std::vector<std::byte> EnrollmentResponder::AnswerClear(PeerIdentity const& peer)
+{
+    // Counted and SAID, because it forgets machines nobody decided about on one operator's word:
+    // the log is where the ids are, and the counter is how a dashboard sees it happened.
+    auto const cleared = _window.ClearPending();
+    _metrics.Increment(IMetricsSink::Counter::EnrollmentRequestsCleared, cleared.size());
+    auto ids = std::string {};
+    for (auto const& id: cleared)
+        ids += std::format("{}{}", ids.empty() ? "" : ", ", id);
+    _logger.Logf(LogLevel::Warn,
+                 "enrollment: an operator at {} cleared {} request(s) nobody had decided about{}{}; approved and "
+                 "rejected rows are kept, and a machine still asking is recorded again at its next poll",
+                 peer.host,
+                 cleared.size(),
+                 cleared.empty() ? "" : ": ",
+                 ids);
+    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollmentReport(_window.Report()));
+}
+
+std::vector<std::byte> EnrollmentResponder::AnswerAutoApprove(std::string_view nodeId)
+{
+    // Pending, whatever happens here: the roster is not applied yet, so the joiner's next poll
+    // is the one answered `Approved` -- the ordering a manual approval already has.
+    auto const pending = Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Pending, {}));
+    auto const entry = _window.Find(nodeId);
+    if (!entry.has_value())
+        return pending;
+
+    // An id the cluster already seats is not a newcomer, and a deadline admits newcomers: the
+    // same rule as a person's approval, and it stays waiting for a person to see it.
+    if (auto const seat = RecordedSeatOf(nodeId); seat.has_value())
+    {
+        _logger.Logf(LogLevel::Warn,
+                     "enrollment: not auto-approving {}: it is already a member as {}, and an approval does not "
+                     "change a member's seat",
+                     nodeId,
+                     *seat);
+        return pending;
+    }
+
+    // On the LEADER's own authority: nobody asked on this connection but the joiner, and the
+    // decision was the operator's when they armed the deadline.
+    auto const reply = AdmitRow(*entry, Distributed::SelfCaller());
+    auto const satisfied = reply.error == Wire::ErrorCode::ClusterChangeNotNeeded;
+    if (reply.status != Wire::Status::Ok && !satisfied)
+    {
+        // Not decided, so it stays waiting and the next poll asks the deadline again: a
+        // change the cluster could not take right now is taken on a later ask, or by a person.
+        _logger.Logf(LogLevel::Warn, "enrollment: auto-approving {} was refused: {}", nodeId, reply.message);
+        return pending;
+    }
+
+    if (_window.Decide(nodeId, Wire::EnrollmentDecision::Approved) == EnrollControlOutcome::Done)
+    {
+        _window.MarkAutoApproved(nodeId);
+        _metrics.Increment(IMetricsSink::Counter::EnrollmentApprovalsAuto);
+    }
+    return pending;
+}
+
 std::vector<std::byte> EnrollmentResponder::AnswerControl(std::span<std::byte const> payload, PeerIdentity const& peer)
 {
     auto const fields = Wire::DecodeEnrollControlPayload(payload);
@@ -318,8 +420,8 @@ std::vector<std::byte> EnrollmentResponder::AnswerControl(std::span<std::byte co
         return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCode::MalformedFrame,
                                           .rationale = "a member sent a control frame this build cannot read, which "
                                                        "is a version mismatch between two machines one operator "
-                                                       "installed; the enrollment series is read for strangers at an "
-                                                       "open window and this is not one" },
+                                                       "installed; the enrollment series is read for strangers "
+                                                       "asking to join and this is not one" },
                                         "an enroll-control request names a verb, and a subject exactly when the verb "
                                         "takes one");
 
@@ -331,51 +433,88 @@ std::vector<std::byte> EnrollmentResponder::AnswerControl(std::span<std::byte co
 
     switch (fields->verb)
     {
-        case Wire::EnrollControlVerb::Open: {
-            auto const outcome = _window.Open();
-            if (outcome == EnrollControlOutcome::AlreadyInForce)
-                return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCode::ClusterChangeNotNeeded,
-                                                  .rationale = "an operator ran a verb twice; idempotence is not an "
-                                                               "event and counting it would report one rollout as "
-                                                               "several" },
-                                                "the enrollment window is already open");
-            _metrics.Increment(IMetricsSink::Counter::EnrollmentWindowsOpened);
-            return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollmentReport(_window.Report()));
-        }
-        case Wire::EnrollControlVerb::Close: {
-            auto const outcome = _window.Close();
-            if (outcome == EnrollControlOutcome::AlreadyInForce)
-                return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCode::ClusterChangeNotNeeded,
-                                                  .rationale = "an operator ran a verb twice; idempotence is not an "
-                                                               "event" },
-                                                "the enrollment window is already closed");
-            return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollmentReport(_window.Report()));
-        }
         case Wire::EnrollControlVerb::List:
             return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollmentReport(_window.Report()));
         case Wire::EnrollControlVerb::Approve:
         case Wire::EnrollControlVerb::Reject:
-            return AnswerDecision(fields->verb, Wire::AsStringView(fields->subject), peer);
+            return AnswerDecision(fields->verb, Wire::AsStringView(fields->subject), fields->key, peer);
+        case Wire::EnrollControlVerb::AutoApprove: {
+            // The decoder guarantees a duration on this verb; the RULES are judged here, from the
+            // table the CLI judged it by, because a peer may send anything.
+            auto const armed = _window.ArmAutoApprove(fields->duration.value_or(std::chrono::seconds::zero()));
+            if (!armed.has_value())
+                return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCode::InvalidClusterChange,
+                                                  .rationale = "an operator's duration typo is read off the reply and "
+                                                               "says nothing about the fleet" },
+                                                AutoApproveSentence(armed.error()));
+            return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollmentReport(_window.Report()));
+        }
+        case Wire::EnrollControlVerb::AutoApproveOff:
+            // Answered with the report either way: ending a window that is already shut leaves
+            // exactly what the operator wanted, and the report says so.
+            (void) _window.DisarmAutoApprove();
+            return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollmentReport(_window.Report()));
+        case Wire::EnrollControlVerb::Clear:
+            return AnswerClear(peer);
     }
 
     // Unreachable: `DecodeEnrollControlPayload` refuses a verb byte this build cannot
-    // name, so every value reaching here is one of the five above.
+    // name, so every value reaching here is one of the six above.
     return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCode::MalformedFrame,
                                       .rationale = "unreachable: the decoder refuses a verb this build cannot name" },
                                     "unknown enroll-control verb");
 }
 
-std::vector<std::byte> EnrollmentResponder::AnswerDecision(Wire::EnrollControlVerb verb,
-                                                           std::string_view subject,
-                                                           PeerIdentity const& peer)
+Distributed::SchedulerReply EnrollmentResponder::AdmitRow(Wire::EnrollmentPendingEntry const& entry,
+                                                          Distributed::CallerContext const& caller)
+{
+    auto const& role = EnrollRoleRowFor(entry.role);
+    if (role.principal.has_value())
+        return _scheduler.AdmitPrincipal(caller, entry.nodeId, entry.publicKey, *role.principal);
+    return _scheduler.ClusterAdmit(
+        caller, entry.nodeId, entry.nodeEndpoint, FormatEd25519PublicKey(entry.publicKey), role.seat);
+}
+
+std::optional<std::string_view> EnrollmentResponder::RecordedSeatOf(std::string_view subject) const
+{
+    auto const state = _scheduler.AdministeredState();
+    if (!state.has_value())
+        return std::nullopt;
+    auto const* const member = core::findOrNull(state->members, subject, &Cluster::ClusterMember::id);
+    if (member == nullptr)
+        return std::nullopt;
+    return Cluster::MemberSeatTable[static_cast<std::size_t>(member->seat)].name;
+}
+
+std::vector<std::byte> EnrollmentResponder::AnswerDecision(
+    Wire::EnrollControlVerb verb,
+    std::string_view subject,
+    std::optional<std::array<std::byte, Wire::IdentityPublicKeyBytes>> const& key,
+    PeerIdentity const& peer)
 {
     auto const entry = _window.Find(subject);
     if (!entry.has_value())
         return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCode::InvalidClusterChange,
                                           .rationale = "an operator named an id that is not waiting -- a typo, or a "
-                                                       "row that went when somebody closed the window; both are read "
+                                                       "row forgotten after its machine stopped asking; both are read "
                                                        "off the reply and neither is a fleet event" },
                                         std::format("no machine named {} is waiting to enrol", subject));
+
+    // **The key the operator named is the key the row holds, or nothing is admitted.** A row is
+    // replaced when its machine stops asking and another asks under the same id, so an id alone
+    // would admit a machine nobody compared. Counted, because the likeliest cause is exactly
+    // that substitution; asked before anything else, so no answer about the row's state is
+    // given for a key that is not the one it holds. The decoder guarantees a key on `Approve`.
+    if (verb == Wire::EnrollControlVerb::Approve && key != std::optional { entry->publicKey })
+        return Cc::Refuse(_metrics,
+                          { .code = Wire::ErrorCode::InvalidClusterChange,
+                            .counter = IMetricsSink::Counter::EnrollmentApprovalsRefusedKeyMismatch },
+                          std::format("{} is waiting under key {}, not {}: the machine asking under that id now is "
+                                      "not the one whose key was compared, so nothing was admitted; compare again "
+                                      "with --enroll-list",
+                                      subject,
+                                      FormatEd25519PublicKey(entry->publicKey),
+                                      key.has_value() ? FormatEd25519PublicKey(*key) : std::string { "no key" }));
 
     auto const decided =
         verb == Wire::EnrollControlVerb::Approve ? Wire::EnrollmentDecision::Approved : Wire::EnrollmentDecision::Rejected;
@@ -394,6 +533,18 @@ std::vector<std::byte> EnrollmentResponder::AnswerDecision(Wire::EnrollControlVe
 
     if (verb == Wire::EnrollControlVerb::Approve)
     {
+        // **An approval admits a newcomer; it never changes a member's seat** (#1449). A
+        // member that asks again under its own key is answered the roster without anybody
+        // approving it, so the row an operator is approving here is one for an id the cluster
+        // already seats -- and approving it must not read as demoting a voter to a learner, nor
+        // as succeeding while changing nothing. Named, with the seat it holds.
+        if (auto const seat = RecordedSeatOf(subject); seat.has_value())
+            return Cc::RefuseWithoutCounter(
+                { .code = Wire::ErrorCode::InvalidClusterChange,
+                  .rationale = "an operator approved an id the cluster already seats; read off the reply, and "
+                               "nothing about the fleet changed" },
+                std::format("{} is already a member as {}; an approval does not change a member's seat", subject, *seat));
+
         // The cluster is asked FIRST and the window is marked only once it agreed.
         //
         // The other order is the tempting one and is worse: a window marked approved while
@@ -403,19 +554,15 @@ std::vector<std::byte> EnrollmentResponder::AnswerDecision(Wire::EnrollControlVe
         // and removable by name.
         //
         // Through the one `SchedulerService` entry point each role has -- `ClusterAdmit` for a
-        // member, which `--cluster-admit` reaches, and `AdmitPrincipal` for a worker: one gate,
+        // learner, which `--cluster-admit` reaches, and `AdmitPrincipal` for a worker: one gate,
         // one validation, one mapping from a consensus refusal onto a wire code.
         //
         // UNDER THE KEY THE ROW HOLDS (#178), which is the key the operator was shown: the
-        // first key this id asked with, never refreshed. A member with no opinion about its
-        // seat (#1449) keeps whatever it holds, so an approval cannot promote a machine the
-        // operator demoted to a learner.
-        auto const& role = EnrollRoleRowFor(entry->role);
-        auto const reply =
-            role.principal.has_value()
-                ? _scheduler.AdmitPrincipal(Context(peer), subject, entry->publicKey, *role.principal)
-                : _scheduler.ClusterAdmit(
-                      Context(peer), subject, entry->raftEndpoint, FormatEd25519PublicKey(entry->publicKey), std::nullopt);
+        // first key this id asked with, never refreshed.
+        //
+        // A learner is admitted in the LEARNER seat with no consensus endpoint -- it dials in,
+        // and holds no vote until an operator promotes it.
+        auto const reply = AdmitRow(*entry, Context(peer));
 
         // **Already recorded exactly this way is `Satisfied`, not a failure**: the machine was
         // admitted by another route -- an operator's `--cluster-admit` naming this key -- and
@@ -428,17 +575,19 @@ std::vector<std::byte> EnrollmentResponder::AnswerDecision(Wire::EnrollControlVe
                                               .rationale = "counted at the decision, in SchedulerService::Refuse, "
                                                            "which triages every code it can produce" },
                                             reply.message);
+        // Once the cluster agreed, and not before: a refused approval admitted nobody.
+        _metrics.Increment(IMetricsSink::Counter::EnrollmentApprovalsManual);
     }
 
     if (auto const outcome = _window.Decide(subject, decided); outcome != EnrollControlOutcome::Done)
-        // The window moved under this decision: somebody closed it, or the row went.
+        // The list moved under this decision: the row was forgotten between the read and now.
         // Reported rather than retried, because a retry would race the same way and an
         // operator re-reading the list is the one action that settles it.
         return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCode::InvalidClusterChange,
-                                          .rationale = "the window changed between the read and the decision, which "
+                                          .rationale = "the list changed between the read and the decision, which "
                                                        "one operator re-reading the list settles; it says nothing "
                                                        "about the fleet" },
-                                        std::format("the enrollment window changed while {} was being decided; "
+                                        std::format("the enrollment list changed while {} was being decided; "
                                                     "read the list again",
                                                     subject));
 

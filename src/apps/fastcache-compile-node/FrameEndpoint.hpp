@@ -266,6 +266,15 @@ struct FrameReply
 
     /// What stays held until the reply has been written or abandoned; null for nothing.
     std::unique_ptr<IReplyHold> hold;
+
+    /// Whether this answer is the connection's LAST: the endpoint writes it, then closes.
+    ///
+    /// For a verb answered once per connection by design -- FLEET-SUMMARY, whose every answer is a
+    /// signature a stranger asked for -- so that pipelining questions on one connection cannot keep
+    /// a reactor signing: each signature then costs a handshake and a slot of the port's pool. The
+    /// close LINGERS, so a request pipelined behind this one is drained rather than answered by a
+    /// reset that could destroy this reply in the peer's receive queue.
+    bool endsConnection { false };
 };
 
 /// Serves one subscription for as long as it lasts.

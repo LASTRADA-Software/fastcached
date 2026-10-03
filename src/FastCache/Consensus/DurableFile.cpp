@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Consensus/DurableFile.hpp>
+#include <FastCache/Platform/FileTrust.hpp>
 
 #include <cerrno>
 #include <cstddef>
@@ -95,21 +96,31 @@ std::expected<std::optional<std::vector<std::byte>>, ConsensusError> ReadFileIfP
     return std::optional { std::move(into) };
 }
 
-std::expected<void, ConsensusError> ReplaceFileAtomically(std::filesystem::path const& path, std::span<std::byte const> body)
+std::expected<void, ConsensusError> ReplaceFileAtomically(std::filesystem::path const& path,
+                                                          std::span<std::byte const> body,
+                                                          StateFile which)
 {
-    auto const temporary = std::filesystem::path { path }.concat(".tmp");
+    auto const temporary = std::filesystem::path { path }.concat(ReplacementSuffix);
 
-    errno = 0;
-    gsl::owner<std::FILE*> const file = OpenBinary(temporary, "wb");
-    if (file == nullptr)
+    // Created exclusively and unshared, so no handle another account opened on a temporary it
+    // could reach keeps writing to the file after the rename -- and with the access its row
+    // gives it (`CreateStateFile`): integrity, not secrecy, for every file written this way, so
+    // on Windows the directory's list, which carries a service account's grant when an elevated
+    // operator wrote it, and on POSIX exactly the row's mode. A temporary a crash left behind is
+    // cleared first -- it holds nothing anybody trusts.
+    auto stale = std::error_code {};
+    std::filesystem::remove(temporary, stale);
+    auto created = CreateStateFile(temporary, which);
+    if (!created.has_value())
         return std::unexpected { FastCache::StorageFailure(
-            std::format("cannot open {}: {}", temporary.string(), std::generic_category().message(errno))) };
+            std::format("cannot open {}: {}", temporary.string(), created.error().message())) };
+    auto stream = *std::move(created);
 
     errno = 0;
-    auto const wrote = body.empty() || std::fwrite(body.data(), 1, body.size(), file) == body.size();
-    auto const flushed = wrote && FlushToDisk(file);
+    auto const wrote = body.empty() || std::fwrite(body.data(), 1, body.size(), stream.get()) == body.size();
+    auto const flushed = wrote && FlushToDisk(stream.get());
     auto const failure = errno;
-    (void) std::fclose(file);
+    stream.reset();
 
     if (!flushed)
     {

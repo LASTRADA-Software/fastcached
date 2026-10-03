@@ -83,6 +83,7 @@ identitySeed|the seed a node identity key is derived from, drawn when it is mint
 keyFileBytes|the contents of a node-key file, which carry that seed (NodeKey, #178)
 _secret|the shared secret a credential holder keeps -- AuthPolicy, AdminCredential, and the credential-source fakes that stand in for them (Auth/AuthPolicy, Server/AdminCredential, #1125)
 requirePass|the client-authentication secret of the daemon, which ConfigReloader multiplies by every retained snapshot (Config/Config, #1125)
+cookieKey|the key every discovery challenge cookie is MACed under, drawn per epoch: whoever holds it can mint a challenge this node will believe it issued (Cluster/ChallengeCookies)
 '
 # The rows are the per-node identity's (#178): the table's claim is "these names hold key
 # material", and a node's signing key and a session's derived keys are exactly that. Each name is
@@ -370,6 +371,7 @@ SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
 SecureString _secret;
 SecureString requirePass;
+SecureByteBuffer cookieKey;
 std::array<std::byte, 32> publicKey;
 
 EOF
@@ -407,6 +409,7 @@ SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureString _secret;
 SecureString requirePass;
+SecureByteBuffer cookieKey;
 EOF
     verdict=$(bash "$0" --root "$tmp/blind" 2>&1)
     if grep -q "identifier 'keyFileBytes' matches nothing" <<< "$verdict"; then
@@ -453,6 +456,7 @@ SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
 SecureString _secret;
 SecureString requirePass;
+SecureByteBuffer cookieKey;
 inline std::string SealWith(std::span<std::byte const> sharedSecret, int claims);
 bool Authenticate(std::span<std::byte const> sharedSecret, std::string_view token);
 EOF

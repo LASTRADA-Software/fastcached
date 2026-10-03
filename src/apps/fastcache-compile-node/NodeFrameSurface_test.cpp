@@ -1,16 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProxy.hpp"
+#include "CacheTier.hpp"
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
+#include "DiscoveryTier.hpp"
+#include "EndpointDialer.hpp"
+#include "EnrollmentResponder.hpp"
+#include "EnrollmentWindow.hpp"
+#include "FleetProbe.hpp"
+#include "FleetSummaryResponder.hpp"
+#include "FleetTextResponder.hpp"
+#include "LiveStatsResponder.hpp"
 #include "NodeConfig.hpp"
+#include "NodeFormation.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeProofResponder.hpp"
+#include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 #include "Responders.hpp"
+#include "SchedulerTier.hpp"
+#include "WorkerTierTestFixture.hpp"
 
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -19,7 +35,9 @@
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
+#include <FastCache/Server/AdminCredential.hpp>
 #include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -58,6 +76,9 @@
 #include <vector>
 
 #include <tests/HalfClose.hpp>
+#include <tests/MembershipFakes.hpp>
+#include <tests/NodeFormationFakes.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
@@ -800,6 +821,8 @@ TEST_CASE("The listener binds for a surface holding any one component, the fleet
     CHECK(AnswersAnyFamily(SurfaceComponents { .enrollment = &owner }));
     CHECK(AnswersAnyFamily(SurfaceComponents { .live = &owner }));
     CHECK(AnswersAnyFamily(SurfaceComponents { .fleet = &owner }));
+    CHECK(AnswersAnyFamily(SurfaceComponents { .nodeProof = &owner }));
+    CHECK(AnswersAnyFamily(SurfaceComponents { .formation = &owner }));
 }
 
 TEST_CASE("A node with no component at all opens no 0xFC port", "[node][node-surface]")
@@ -837,7 +860,7 @@ TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[nod
     auto [cfg, port] = BaseConfig();
     cfg.cacheMemoryBytes = 0; // nowhere to keep objects, so no tier is built
     cfg.cacheDir.clear();
-    REQUIRE_FALSE(cfg.serveScheduler);
+    REQUIRE_FALSE(ServesScheduler(cfg));
     REQUIRE_FALSE(cfg.nodeListen.empty());
 
     auto surface =
@@ -869,7 +892,7 @@ TEST_CASE("A node running only consensus opens the 0xFC port it is watched throu
     cfg.slots = 0;
     cfg.cacheMemoryBytes = 0;
     cfg.cacheDir.clear();
-    REQUIRE_FALSE(cfg.serveScheduler);
+    REQUIRE_FALSE(ServesScheduler(cfg));
 
     // What `--print-surfaces` names for this configuration.
     auto const named = RowFor(NodeSurface::Node).Resolve(cfg);
@@ -968,6 +991,218 @@ TEST_CASE("A node running only consensus still answers its status with every liv
 
     std::vector<std::unique_ptr<core::net::ISocket>> reads;
     CHECK(exchange(reads, Wire::Op::FleetText) == "fleet");
+}
+
+namespace
+{
+/// The three responders every node builds, over nothing wired: what `main` passes
+/// `ComposeSurfaceComponents` for the families no node may lack.
+struct EveryNodeResponders
+{
+    /// @param cfg The node's configuration; must outlive this.
+    /// @param io The loop the live-stats stream runs on; must outlive this.
+    /// @param metrics Where a refusal is counted; must outlive this.
+    EveryNodeResponders(NodeConfig const& cfg, NodeIoLoop& io, IMetricsSink& metrics):
+        status { cfg, clock, clock.now(), "test", "n-office", NodeComponents {} },
+        node { status, sources, membership, metrics },
+        live { sources, membership, AdminCredential {}, io.Reactor(), metrics },
+        fleet { sources, membership, AdminCredential {}, metrics }
+    {
+    }
+
+    core::platform::ManualClock clock;
+    LiveStatsSourceSlot sources;
+    Testing::ListedMembership membership { { "127.0.0.1" }, Distributed::MembershipParticipant::FleetMemberList };
+    ConfiguredNodeStatus status;
+    NodeStatusResponder node;
+    LiveStatsResponder live;
+    FleetTextResponder fleet;
+};
+} // namespace
+
+TEST_CASE("The surface main composes routes each family to the component it was handed, and nowhere else",
+          "[node][node-surface][summary]")
+{
+    // `ComposeSurfaceComponents` is the one place `main` names each family's owner, so a member it
+    // drops is a family refused at the door as served nowhere on every node. Asked of the router's
+    // own table: each component the function was handed owns exactly its family, and a component
+    // it was handed as absent owns none. The tiers and the two consensus components are passed
+    // absent here -- building them is each one's own test's business -- so what this case holds is
+    // the every-node families and `formation`.
+    NodeIoLoop io;
+    AtomicMetricsSink metrics;
+    auto const cfg = BaseConfig().first;
+    FixedFleetSummary const answered { Wire::FleetSummary { .clusterId = "c-office", .nodeId = "n-office" } };
+    auto const identity = Testing::TestKeyPair("n-office");
+    FleetSummaryResponder formation { answered, identity };
+    EveryNodeResponders every { cfg, io, metrics };
+
+    auto const components = ComposeSurfaceComponents(
+        nullptr, nullptr, nullptr, every.node, nullptr, every.live, every.fleet, nullptr, &formation);
+
+    struct Expected
+    {
+        Wire::VerbFamily family;
+        IFrameResponder const* owner;
+    };
+    auto const expected = std::array {
+        Expected { .family = Wire::VerbFamily::Session, .owner = nullptr },
+        Expected { .family = Wire::VerbFamily::Cache, .owner = nullptr },
+        Expected { .family = Wire::VerbFamily::Scheduler, .owner = nullptr },
+        Expected { .family = Wire::VerbFamily::Compile, .owner = nullptr },
+        Expected { .family = Wire::VerbFamily::Node, .owner = &every.node },
+        Expected { .family = Wire::VerbFamily::Enrollment, .owner = nullptr },
+        Expected { .family = Wire::VerbFamily::Live, .owner = &every.live },
+        Expected { .family = Wire::VerbFamily::Fleet, .owner = &every.fleet },
+        Expected { .family = Wire::VerbFamily::NodeProof, .owner = nullptr },
+        Expected { .family = Wire::VerbFamily::Formation, .owner = &formation },
+    };
+    for (auto const& row: expected)
+    {
+        INFO("family " << static_cast<int>(row.family));
+        CHECK(FamilyOwner(components, row.family) == row.owner);
+    }
+}
+
+TEST_CASE("With every component present, the surface main composes routes each family to the one it was handed",
+          "[node][node-surface][summary]")
+{
+    // The half the case above cannot show: there the tiers and the two consensus-only components
+    // are absent, so a pass-through `ComposeSurfaceComponents` dropped for one of them -- or filled
+    // from the wrong argument -- would still read as null. Here every one exists, each started the
+    // way its own tests start it, so a dropped member is a family owned by NOBODY and a crossed one a
+    // family owned by somebody else.
+    WorkerTierTesting::WorkerTierFixture fix;
+    auto worker = fix.Start();
+    REQUIRE(worker.has_value());
+    REQUIRE(*worker != nullptr);
+
+    auto const nodeCfg = BaseConfig().first;
+    auto cache = StartCacheTierOrExplain(fix.io, nodeCfg, fix.credential, fix.locality, fix.clock, fix.metrics, fix.logger);
+    REQUIRE(cache.has_value());
+    REQUIRE(*cache != nullptr);
+
+    auto schedulerCfg = Testing::FirstStart(NodeConfig {});
+    schedulerCfg.schedulers = { "127.0.0.1:6675" };
+    schedulerCfg.nodeId = "n1";
+    schedulerCfg.raftListen = "127.0.0.1:6680";
+    core::platform::ManualWallClock wallClock;
+    std::optional<Ed25519KeyPair> const identityKey { Testing::TestKeyPair("n1") };
+    auto scheduler =
+        SchedulerTier::Start(schedulerCfg, fix.membership, fix.clock, wallClock, fix.metrics, fix.logger, identityKey);
+    REQUIRE(scheduler.has_value());
+    REQUIRE(*scheduler != nullptr);
+
+    EnrollmentWindow window { fix.clock };
+    EnrollmentResponder enrollment { window, (*scheduler)->ServiceForSurfaces(), fix.membership, fix.metrics, fix.logger };
+    SystemSecureRandom random;
+    NodeProofResponder nodeProof { "n1", *identityKey, fix.membership, random, fix.metrics, fix.logger };
+    FixedFleetSummary const answered { Wire::FleetSummary { .clusterId = "c-office", .nodeId = "n1" } };
+    FleetSummaryResponder formation { answered, *identityKey };
+    EveryNodeResponders every { nodeCfg, fix.io, fix.metrics };
+
+    auto const components = ComposeSurfaceComponents(cache->get(),
+                                                     scheduler->get(),
+                                                     worker->get(),
+                                                     every.node,
+                                                     &enrollment,
+                                                     every.live,
+                                                     every.fleet,
+                                                     &nodeProof,
+                                                     &formation);
+
+    struct Expected
+    {
+        Wire::VerbFamily family;
+        IFrameResponder const* owner;
+    };
+    IFrameResponder const* const schedulerResponder = &(*scheduler)->Responder();
+    auto const expected = std::array {
+        Expected { .family = Wire::VerbFamily::Session, .owner = schedulerResponder },
+        Expected { .family = Wire::VerbFamily::Cache, .owner = &(*cache)->Responder() },
+        Expected { .family = Wire::VerbFamily::Scheduler, .owner = schedulerResponder },
+        Expected { .family = Wire::VerbFamily::Compile, .owner = &(*worker)->Responder() },
+        Expected { .family = Wire::VerbFamily::Node, .owner = &every.node },
+        Expected { .family = Wire::VerbFamily::Enrollment, .owner = &enrollment },
+        Expected { .family = Wire::VerbFamily::Live, .owner = &every.live },
+        Expected { .family = Wire::VerbFamily::Fleet, .owner = &every.fleet },
+        Expected { .family = Wire::VerbFamily::NodeProof, .owner = &nodeProof },
+        Expected { .family = Wire::VerbFamily::Formation, .owner = &formation },
+    };
+    for (auto const& row: expected)
+    {
+        INFO("family " << static_cast<int>(row.family));
+        REQUIRE(row.owner != nullptr);
+        CHECK(FamilyOwner(components, row.family) == row.owner);
+    }
+}
+
+TEST_CASE("A node's port answers FLEET-SUMMARY over the probe's own nonce and only once per connection",
+          "[node][node-surface][summary]")
+{
+    // The wiring, asserted rather than checked live: the formation component, placed where `main`
+    // places it, behind a REAL bound port, asked by the production probe over the production
+    // dialer -- and the answer verifies over the nonce THAT probe drew. Then the M-1 half: two
+    // questions pipelined on one connection are answered once, and the connection closes, so a
+    // stranger's second signature costs it a second handshake.
+    NodeIoLoop io;
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    auto [cfg, port] = BaseConfig();
+    cfg.slots = 0;
+    cfg.cacheMemoryBytes = 0;
+    cfg.cacheDir.clear();
+
+    FixedFleetSummary const answered { Wire::FleetSummary { .clusterId = "c-office",
+                                                            .state = Wire::FleetState::Established,
+                                                            .nodeId = "n-office",
+                                                            .raftEndpoint = "office.example:6680" } };
+    auto const identity = Testing::TestKeyPair("n-office");
+    FleetSummaryResponder formation { answered, identity };
+    // Beside the families every node builds, composed by the function `main` composes with.
+    EveryNodeResponders every { cfg, io, metrics };
+    auto surface = StartNodeSurfaceOrExplain(
+        io,
+        cfg,
+        ComposeSurfaceComponents(
+            nullptr, nullptr, nullptr, every.node, nullptr, every.live, every.fleet, nullptr, &formation),
+        std::nullopt,
+        metrics,
+        logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+    io.Start();
+
+    BlockingEndpointDialer dialer { std::chrono::seconds { 5 } };
+    SystemSecureRandom random;
+    core::platform::SteadyClock clock;
+    DialledFleetProbe probe { dialer, random, clock };
+    auto const fleet =
+        probe.Ask({ .endpoint = std::format("127.0.0.1:{}", port), .source = Cluster::SeedSource::FleetSeedFlag });
+    INFO((fleet.has_value() ? std::string {} : fleet.error()));
+    REQUIRE(fleet.has_value());
+    CHECK(fleet->Summary() == answered.Current());
+    CHECK(fleet->Key() == identity.PublicKey());
+
+    // Two questions, pipelined, then this side's write half closed: one answer comes back, and then
+    // the end of the stream -- no second signature.
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    REQUIRE(socket.has_value());
+    auto const question = Wire::EncodeFleetSummaryRequest(std::array<std::byte, Wire::NodeChallengeBytes> {});
+    auto twice = question;
+    twice.insert(twice.end(), question.begin(), question.end());
+    REQUIRE(core::async::syncRun(core::net::sendAll(socket->get(), twice)));
+    REQUIRE(Testing::ShutdownWrite(**socket).has_value());
+
+    auto const head = core::async::syncRun(core::net::receiveExactly(socket->get(), Wire::ReplyHeaderSize));
+    REQUIRE(head.has_value());
+    auto const header = Wire::DecodeReplyHeader(Unwrap(head));
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).status == Wire::Status::Ok);
+    REQUIRE(core::async::syncRun(core::net::receiveExactly(socket->get(), Unwrap(header).payloadLength)).has_value());
+    CHECK_FALSE(core::async::syncRun(core::net::receiveExactly(socket->get(), Wire::ReplyHeaderSize)).has_value());
 }
 
 TEST_CASE("An emptied --listen-node closes the port and says so", "[node][node-surface]")
@@ -1149,22 +1384,23 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
     // every client meets a failed connection and compiles locally, which is silent by
     // design.
     //
-    // Driven as a table over both flags that used to decide it, because the claim is
-    // that NEITHER does any more and a case per combination would be the same
+    // Driven as a table over both things that used to decide it -- whether the address was
+    // named, and whether the node serves a scheduler (its MODE, since the flag went) -- because
+    // the claim is that NEITHER does any more and a case per combination would be the same
     // assertion written four times. `nodeListenExplicit` is still live elsewhere --
     // `--install-service` emits on it (#286) -- so this is the bit ceasing to decide
     // one thing, not the bit going away.
     struct Shape
     {
         bool explicitAddress;
-        bool serveScheduler;
+        bool servesScheduler;
         std::string_view what;
     };
     static constexpr auto shapes = std::to_array<Shape>({
-        { .explicitAddress = false, .serveScheduler = false, .what = "a defaulted address on a plain worker" },
-        { .explicitAddress = true, .serveScheduler = false, .what = "an address the operator named" },
-        { .explicitAddress = false, .serveScheduler = true, .what = "a defaulted address on a scheduler" },
-        { .explicitAddress = true, .serveScheduler = true, .what = "a named address on a scheduler" },
+        { .explicitAddress = false, .servesScheduler = false, .what = "a defaulted address on a plain worker" },
+        { .explicitAddress = true, .servesScheduler = false, .what = "an address the operator named" },
+        { .explicitAddress = false, .servesScheduler = true, .what = "a defaulted address on a scheduler" },
+        { .explicitAddress = true, .servesScheduler = true, .what = "a named address on a scheduler" },
     });
 
     for (auto const& shape: shapes)
@@ -1179,7 +1415,10 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
 
         auto [cfg, port] = BaseConfig();
         cfg.nodeListenExplicit = shape.explicitAddress;
-        cfg.serveScheduler = shape.serveScheduler;
+        // A scheduler is a node the formation makes one: a solitary node running consensus.
+        if (shape.servesScheduler)
+            Testing::ShapeAsFirstStart(cfg);
+        REQUIRE(ServesScheduler(cfg) == shape.servesScheduler);
 
         auto holder = BlockingListener::Bind("127.0.0.1", port);
         REQUIRE(holder);
@@ -1188,7 +1427,7 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
         auto refused = StartNodeSurfaceOrExplain(
             io,
             cfg,
-            SurfaceComponents { .cache = &cache, .scheduler = shape.serveScheduler ? &scheduler : nullptr },
+            SurfaceComponents { .cache = &cache, .scheduler = shape.servesScheduler ? &scheduler : nullptr },
             std::nullopt,
             metrics,
             logger);

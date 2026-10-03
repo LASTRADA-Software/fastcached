@@ -2943,7 +2943,7 @@ set_tests_properties("tsan-scope-selftest" PROPERTIES
 # asserts nothing about the tree it runs in and works from an exported tarball --
 # and, unlike `repository-hygiene`, needs no readable git worktree of its own.
 #
-# `if(NOT WIN32)` for the reason `cluster-e2e` carries the same guard: the script
+# `if(NOT WIN32)` for the reason `fleet-dashboard-e2e` carries the same guard: the script
 # is POSIX and a Windows counterpart would be a translation rather than new
 # coverage. The rule it protects is platform-independent and the Linux jobs run it.
 if(NOT WIN32)
@@ -3191,6 +3191,30 @@ add_test(
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-walk-sole.sh" --self-test
 )
 set_tests_properties("workflow-walk-sole-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
+# Every fixture that starts `fastcache-compile-node` names `--cluster-dir` and turns off the
+# default fleet features it does not test (`--listen-raft=`, or `--discovery=` on a consensus
+# node). A node with no flags is a fleet member on shared default ports, keeping its identity in
+# the real per-user state directory; the rule stated in the files that obey it reaches no file
+# that does not, so this is the scan. Its header carries the pattern and what it cannot see.
+add_test(
+    NAME "node-fixture-starts"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-node-fixture-starts.sh"
+)
+set_tests_properties("node-fixture-starts" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+add_test(
+    NAME "node-fixture-starts-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-node-fixture-starts.sh" --self-test
+)
+set_tests_properties("node-fixture-starts-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
@@ -4478,7 +4502,7 @@ endif()
 if(NOT TARGET fastcache-compile-node)
     message(STATUS "fleet-dashboard-e2e: compile node not built — skipping")
 elseif(WIN32)
-    # POSIX-only for now, the way `cluster-e2e` records for itself: the fixture is
+    # POSIX-only for now: the fixture is
     # `/dev/tcp` and bash, and a PowerShell twin is a translation rather than new
     # coverage.
     message(STATUS "fleet-dashboard-e2e: POSIX-only fixture — skipping on Windows")
@@ -4868,7 +4892,7 @@ else()
     # once and a case inside the suite could only print a line and let the run go
     # green.
     #
-    # POSIX-only for now, the way `cluster-e2e` records for itself: the property is
+    # POSIX-only for now, the way `fleet-dashboard-e2e` records for itself: the property is
     # platform-independent and the fixture is not, and `dist-compile-e2e.ps1`
     # carries no such mode, so a Windows entry would be a translation rather than
     # new coverage.
@@ -4899,7 +4923,7 @@ else()
             TIMEOUT 600
         )
     else()
-        # Said out loud, the way `cluster-e2e` and `fleet-dashboard-e2e` say it. A
+        # Said out loud, the way `fleet-dashboard-e2e` says it. A
         # platform guard with no `else()` is a test that does not exist on that
         # platform with nothing in the configure log to say so.
         message(STATUS "dist-compile-membership-e2e: POSIX-only — skipping")
@@ -4968,51 +4992,6 @@ else()
     else()
         fastcached_register_skipped_test("dist-compile-e2e-selftest"
             "no PowerShell 7 interpreter found (pwsh, pwsh-preview), so the object-comparison decision table was not exercised on this host")
-    endif()
-endif()
-
-# ---------------------------------------------------------------------------
-# A three-node cluster, elected and administered for real.
-#
-# Every consensus rule this repository has is asserted against a simulated
-# cluster in one process, which is the right place for them -- a scripted
-# partition is not something three real processes can be made to reproduce. What
-# a simulation cannot reach is the wire, the transport, the timers and the
-# operator's own command line all having their first say at once, and this is
-# where those meet: three processes elect a leader, a follower's refusal names an
-# endpoint that a client then successfully dials, a setting replicates, and the
-# cluster re-forms after its leader is killed.
-#
-# POSIX only for now. The properties are platform-independent and the fixture is
-# not -- it wants a shell, `/dev/tcp` and process control -- so a Windows
-# counterpart is a translation rather than new coverage, and the unit tests carry
-# the rules on both.
-#
-# Registered here rather than beside the node for the reason dist-compile-e2e is:
-# `src/apps` walks its app table in order, so a test registered next to one
-# binary cannot name one that comes later -- and a `$<TARGET_FILE:>` guard on a
-# target that does not exist yet does not fail, it silently skips the test
-# forever.
-if(NOT WIN32)
-    # `fastcache-cli` as well since #1308: section 1b reads the nodes' refusal counters
-    # with `node-metrics`, over the port they already serve.
-    if(NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cli)
-        message(STATUS "cluster-e2e: compile node or fastcache-cli not built — skipping")
-    else()
-        add_test(
-            NAME "cluster-e2e"
-            COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/cluster-e2e.sh"
-                --node "$<TARGET_FILE:fastcache-compile-node>"
-                --cli "$<TARGET_FILE:fastcache-cli>"
-        )
-        # Starts three nodes that hold six ports between them and drives an
-        # election, so it must not race the other server-starting smoke tests.
-        set_tests_properties("cluster-e2e" PROPERTIES
-            LABELS "smoke"
-            SKIP_RETURN_CODE 77
-            RUN_SERIAL TRUE
-            TIMEOUT 300
-        )
     endif()
 endif()
 
@@ -7773,8 +7752,8 @@ if(TARGET FastCacheTest)
         # the assertion that could not have failed while this ticket was open: 69
         # cases ran, and 69 is non-zero.
         #
-        # 169 = 119 (CompileCacheWire) + 23 (RaftWire) + 16 (ClusterState)
-        #     + 9 (DiscoveryWire) + 1 (RaftTypes) + 1 (SchedulerService).
+        # 192 = 131 (CompileCacheWire) + 25 (RaftWire) + 16 (ClusterState)
+        #     + 18 (DiscoveryWire) + 1 (RaftTypes) + 1 (SchedulerService).
         # The first four files are wholly wire subject and are the scan's table; the
         # last two carry wire cases among others, which is why the scan cannot cover
         # them and why this number is the only thing that watches them.
@@ -7789,7 +7768,7 @@ if(TARGET FastCacheTest)
         # anything matches nothing. No `SKIP_RETURN_CODE` here -- Catch2's exit code
         # is its failed-assertion count clamped at 255 (#1152), and the pattern has
         # already replaced the status.
-        PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in 169 test cases[)]"
+        PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in 192 test cases[)]"
         LABELS "hygiene"
         TIMEOUT 300
     )

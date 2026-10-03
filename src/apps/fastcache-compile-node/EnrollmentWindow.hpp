@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "EnrollAutoApprove.hpp"
 #include "NodeConditions.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
+#include <FastCache/Distributed/SchedulerService.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
@@ -12,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -26,11 +30,11 @@ namespace FastCache::Node
 /// How many machines may be waiting at once.
 ///
 /// **A refusal past this, never an eviction**, and that is the decision the bound
-/// exists to express rather than an arbitrary size. An open window is ungated by
-/// design -- the explicit approve is the gate -- so anybody who can reach the port can
-/// add rows; evicting to make room would let a flooder push the real joiner off the
-/// list the operator is reading, which is silent from both ends and undetectable
-/// afterwards. A full list refuses by name, counts, and is visible.
+/// exists to express rather than an arbitrary size. The list is ungated by design --
+/// the explicit approve is the gate -- so anybody who can reach the port can add rows;
+/// evicting to make room would let a flooder push the real joiner off the list the
+/// operator is reading, which is silent from both ends and undetectable afterwards. A
+/// full list refuses by name, counts, and is visible.
 ///
 /// Sixty-four rather than a number scaled to the fleet, because the list is what a
 /// PERSON reads before deciding, and a list longer than a terminal is a list nobody
@@ -38,26 +42,57 @@ namespace FastCache::Node
 /// is what an operator does anyway.
 inline constexpr std::size_t MaxPendingEnrollments = 64;
 
-/// How often an open window says so again.
+/// How many rows nobody has decided about one source HOST may hold on the list at once.
 ///
-/// **Repeating rather than one line at open**, because a one-shot line scrolls away
-/// and this is the one state in which anybody who can reach this machine may put a row
-/// on the list an operator approves from. Sixty seconds is short enough that a window left open over a
-/// lunch break is unmissable in the log and long enough that it is not itself noise.
+/// **Without it one peer that keeps polling holds every row forever**, and every legitimate
+/// joiner is refused `Full` until the leader restarts: the refusal-not-eviction rule above is
+/// what keeps a flooder from pushing a real joiner OFF the list, and this is what keeps one
+/// from filling it in the first place. Enrollment is TCP, so the host is the kernel's and not
+/// a claim the peer chose.
+///
+/// Four, because the honest case for several machines behind ONE address is NAT or a host
+/// running a few VMs, which is a handful rather than dozens, and a larger rollout from one
+/// address is approved a few at a time as its rows are decided -- a decided row stops counting
+/// at once. It is a sixteenth of the list, so a flooder needs sixteen hosts to fill it, and an
+/// operator who meets that has `--enroll-clear`.
+///
+/// Counted by the address a row was CREATED from (`EnrollmentPendingEntry::firstPeerId`), which
+/// a later poll never changes, and with an IPv4-mapped IPv6 address folded to its IPv4 form. **Not grouped by IPv6 /64**: an
+/// office LAN is one /64, and twenty machines asking from it on the day it goes live are twenty legitimate joiners, which a
+/// /64 bound would refuse after four.
+inline constexpr std::size_t MaxPendingEnrollmentsPerHost = 4;
+
+/// How often a leader with machines waiting says so again.
+///
+/// **Repeating rather than one line when the first one asks**, because a one-shot line
+/// scrolls away, and a machine waiting for a person is waiting for somebody who may not be
+/// looking. Sixty seconds is short enough that a joiner left waiting over a lunch break is
+/// unmissable in the log and long enough that it is not itself noise.
 inline constexpr std::chrono::seconds EnrollmentWarningInterval { 60 };
+
+/// How long a request row is kept without a poll: how a leader forgets a joiner that went away.
+///
+/// A joiner polls every couple of seconds while it waits, so ten minutes of silence is a
+/// machine that stopped asking -- switched off, or given up -- and not one between polls. The
+/// row goes, counted if nobody had decided about it (`EnrollmentRequestsExpired`), and the
+/// machine's next poll, if one ever comes, records it again as a new row: the list an operator
+/// reads is the machines that are still asking.
+inline constexpr std::chrono::minutes PendingRowLifetime { 10 };
 
 /// What the window decided about one `Enroll`.
 ///
 /// A private enum: nothing transmits or persists these ordinals. The wire's answer is
 /// `CompileCacheWire::EnrollOutcome` for the three that are replies and an
-/// `ErrorCode` for the two that are refusals, and the mapping is the responder's.
+/// `ErrorCode` for the one that is a refusal, and the mapping is the responder's. There is
+/// no `Closed`: nothing has to be opened before a machine may ask.
 enum class EnrollDecision : std::uint8_t
 {
-    Closed,   ///< No window is open. Refused.
-    Full,     ///< The list is full and this id is not already on it. Refused, nothing recorded.
-    Pending,  ///< Recorded and waiting for a person -- or asked under a key nobody decided about.
-    Approved, ///< A person approved exactly this claim; the caller hands over the roster.
-    Rejected, ///< A person refused it.
+    Full,        ///< The list is full and this id is not already on it. Refused, nothing recorded.
+    Pending,     ///< Recorded and waiting for a person -- or asked under a key nobody decided about.
+    Approved,    ///< A person approved exactly this claim; the caller hands over the roster.
+    Rejected,    ///< A person refused it.
+    AutoApprove, ///< An armed deadline had not passed: the caller admits it on the leader's own authority.
+    HostFull,    ///< This host already holds `MaxPendingEnrollmentsPerHost` undecided rows. Refused, nothing recorded.
 };
 
 /// What an enrollment ROLE means on this node (#178).
@@ -66,14 +101,19 @@ struct EnrollRoleRow
     CompileCacheWire::EnrollRole role; ///< The wire role.
     std::string_view name;             ///< Its one spelling in a list and in a sentence.
 
-    /// Whether a request in this role states a consensus endpoint: a member must, because an
-    /// id with no address is a member the cluster counts and cannot reach, and a worker must
-    /// NOT, because a principal has no address anybody dials.
+    /// Whether a request in this role states an endpoint. Neither live role does: a learner
+    /// dials the leader rather than being dialled, and a principal has no address anybody
+    /// dials.
     bool statesEndpoint;
 
-    /// The principal role an approval records, or absent for a member, which `ClusterAdmit`
-    /// records instead.
+    /// The principal role an approval records, or absent for a learner, which `ClusterAdmit`
+    /// records as a member instead.
     std::optional<Cluster::PrincipalRole> principal;
+
+    /// The seat `ClusterAdmit` records a MEMBER role in, or absent for a principal. A learner's
+    /// is `Learner`: it dials in, so it is admitted with no consensus endpoint, and it holds no
+    /// vote until an operator promotes it.
+    std::optional<Cluster::MemberSeat> seat;
 };
 
 /// One row per role this build implements.
@@ -81,12 +121,16 @@ struct EnrollRoleRow
 /// A plain array rather than an `EnumTable`, for `KnownEnrollmentDecisions`' reason: a WIRE enum
 /// carries no `Last`. Completeness is asserted against `KnownEnrollRoles` instead.
 inline constexpr std::array EnrollRoleTable {
-    EnrollRoleRow {
-        .role = CompileCacheWire::EnrollRole::Member, .name = "member", .statesEndpoint = true, .principal = std::nullopt },
+    EnrollRoleRow { .role = CompileCacheWire::EnrollRole::Learner,
+                    .name = "learner",
+                    .statesEndpoint = false,
+                    .principal = std::nullopt,
+                    .seat = Cluster::MemberSeat::Learner },
     EnrollRoleRow { .role = CompileCacheWire::EnrollRole::Worker,
                     .name = "worker",
                     .statesEndpoint = false,
-                    .principal = Cluster::PrincipalRole::Worker },
+                    .principal = Cluster::PrincipalRole::Worker,
+                    .seat = std::nullopt },
 };
 
 /// Whether every role this build knows has exactly one row.
@@ -134,9 +178,9 @@ static_assert(EveryEnrollRoleHasARow(), "every enrollment role needs one EnrollR
 /// strings at a call site are two a caller can silently transpose.
 struct JoinerClaim
 {
-    std::string_view nodeId;       ///< The identity it claims.
-    std::string_view raftEndpoint; ///< The consensus address it claims; empty for a worker.
-    CompileCacheWire::EnrollRole role { CompileCacheWire::EnrollRole::Member };   ///< What it asks to be.
+    std::string_view nodeId;                                                      ///< The identity it claims.
+    std::string_view nodeEndpoint;                                                ///< The `0xFC` endpoint it claims.
+    CompileCacheWire::EnrollRole role { CompileCacheWire::EnrollRole::Learner };  ///< What it asks to be.
     std::array<std::byte, CompileCacheWire::IdentityPublicKeyBytes> publicKey {}; ///< The key it asks under.
 };
 
@@ -147,27 +191,22 @@ struct JoinerClaim
 enum class EnrollControlOutcome : std::uint8_t
 {
     Done,           ///< Applied.
-    AlreadyInForce, ///< Nothing to do: the window was already open, or the id already decided this way.
+    AlreadyInForce, ///< Nothing to do: the id was already decided this way.
     UnknownSubject, ///< No pending entry carries that id.
-    Closed,         ///< A decision was asked for while no window is open.
 };
 
-/// The runtime enrollment window: who is asking to join, and what a person decided.
+/// The leader's list of machines asking to join, and what a person decided about each.
 ///
 /// **In memory, not a flag and not replicated, and each of those is a decision.**
 ///
-/// Not a flag, because `--install-service` registers a command line and replays it
-/// forever: a permanently-open window baked into forty unit files is worse than the
-/// hand-placement of forty keys it exists to replace.
+/// Nothing opens it: every machine that asks is recorded, bounded by `MaxPendingEnrollments`,
+/// because since #178 no secret crosses and the APPROVAL is the gate. A window in front of the
+/// approval only made a machine joining over the LAN need a person twice.
 ///
-/// Not replicated, because the window is one machine's willingness to answer a
-/// question for the next few minutes, while the ADMISSION it leads to is replicated
-/// through the existing `ClusterAdmit` path and outlives everything. Committing the
-/// window would make a forgotten one survive every reboot of every member.
-///
-/// **A restart therefore closes it, and that is the absence of persistence rather than
-/// a second closing mechanism.** The log line at open says so, because an operator who
-/// does not know it will look for a way to close a window that is already shut.
+/// Not replicated, because the list is one leader's record of who asked it in the last few
+/// minutes, while the ADMISSION it leads to is replicated through the existing `ClusterAdmit`
+/// path and outlives everything. A restart forgets it, and a machine still asking is recorded
+/// again at its next poll.
 ///
 /// Thread-safe: the responder reaches it from a reactor thread and the warning ticker
 /// from its own, so every method takes the lock. The decisions are pure with respect to
@@ -177,17 +216,30 @@ class EnrollmentWindow
 {
   public:
     /// @param clock Where "now" comes from; must outlive this.
-    /// @param conditions Where an open window is RAISED and a closed one cleared (#1364), or null on
-    ///        a node that serves no window -- whose row its scope then answers, rather than this
-    ///        object reporting a reassuring `clear` for a window nothing can open. Must outlive this.
-    explicit EnrollmentWindow(core::platform::IClock const& clock, NodeConditions* conditions = nullptr):
+    /// @param conditions Where waiting machines are RAISED and cleared (#1364), or null on a node
+    ///        that serves no enrollment -- whose rows its scope then answers, rather than this
+    ///        object reporting a reassuring `clear` for a list nothing can reach. Must outlive this.
+    /// @param metrics Where a row forgotten before anybody decided about it is counted, or null
+    ///        where nothing counts it. Must outlive this.
+    /// @param wallClock Where the absolute instants an armed window's condition names come from;
+    ///        the system's unless a test pins one. Read ONLY to spell them: every decision reads
+    ///        @p clock. Must outlive this.
+    explicit EnrollmentWindow(core::platform::IClock const& clock,
+                              NodeConditions* conditions = nullptr,
+                              IMetricsSink* metrics = nullptr,
+                              core::platform::WallClockRef wallClock = core::platform::defaultSystemWallClock()):
         _clock { clock },
-        _conditions { conditions }
+        _conditions { conditions },
+        _metrics { metrics },
+        _wallClock { wallClock }
     {
-        // Closed at construction, and checked rather than assumed: a window is held in memory
-        // and nowhere else, so a process starts with none open.
+        // Clear at construction, and checked rather than assumed: the list is held in memory and
+        // nowhere else, so a process starts with nobody waiting.
         if (_conditions != nullptr)
+        {
             _conditions->Clear(NodeCondition::EnrollmentWindowOpen);
+            _conditions->Clear(NodeCondition::EnrollmentRequestsWaiting);
+        }
     }
 
     EnrollmentWindow(EnrollmentWindow const&) = delete;
@@ -195,24 +247,6 @@ class EnrollmentWindow
     EnrollmentWindow& operator=(EnrollmentWindow const&) = delete;
     EnrollmentWindow& operator=(EnrollmentWindow&&) = delete;
     ~EnrollmentWindow() = default;
-
-    /// Start accepting requests.
-    ///
-    /// Opening an open window changes nothing and says so, rather than restarting its
-    /// age: an operator who runs the verb twice has not asked for the warning clock to
-    /// be reset, and resetting it would let a window be held open indefinitely without
-    /// its age ever growing.
-    /// @return `Done`, or `AlreadyInForce` when it was already open.
-    [[nodiscard]] EnrollControlOutcome Open();
-
-    /// Stop accepting requests, and forget everything that was waiting.
-    ///
-    /// **The pending list goes with it**, which is the same statement the restart makes:
-    /// the list is a record of who asked during one window, and carrying it into the
-    /// next one would let a request made before an operator was watching be approved
-    /// after they stopped.
-    /// @return `Done`, or `AlreadyInForce` when it was already closed.
-    [[nodiscard]] EnrollControlOutcome Close();
 
     /// Record a request, or answer the decision already taken about it.
     ///
@@ -230,6 +264,9 @@ class EnrollmentWindow
     ///
     /// No answer here is spent: an approved claim is answered `Approved` on every poll,
     /// because what it leads to is a roster, which is no secret (#178).
+    ///
+    /// Rows nobody polled for `PendingRowLifetime` are forgotten FIRST, so a machine that went
+    /// away and came back is recorded afresh rather than answered from a stale row.
     /// @param claim What the joiner claims about itself.
     /// @param peerId The host the kernel says the request came from.
     /// @return What to answer.
@@ -261,11 +298,55 @@ class EnrollmentWindow
     /// @return What happened.
     [[nodiscard]] EnrollControlOutcome Decide(std::string_view nodeId, CompileCacheWire::EnrollmentDecision decision);
 
+    /// Arm the auto-approve deadline `now + duration`, or re-arm it from now.
+    ///
+    /// **A DEADLINE, not a mode**: nothing wakes when it passes. Every `Offer` compares
+    /// `now < deadline` when it arrives, and a lapsed one is cleared at the next call. It lives
+    /// here and nowhere else -- never replicated, never persisted -- so a restart ends it, and a
+    /// demotion ends it (`OnRoleChanged`): the operator armed a window on a LEADER, not on a
+    /// cluster.
+    /// @param duration How long from now; judged by `JudgeAutoApprove`.
+    /// @return Nothing, or the rule that refuses the duration.
+    [[nodiscard]] std::expected<void, AutoApproveRefusal> ArmAutoApprove(std::chrono::seconds duration);
+
+    /// End the auto-approve deadline.
+    /// @return `Done`, or `AlreadyInForce` when nothing was armed.
+    [[nodiscard]] EnrollControlOutcome DisarmAutoApprove();
+
+    /// Drop every row nobody has decided about: what `--enroll-clear` asks.
+    ///
+    /// Approved and rejected rows stay, because each is a RECORD of what a person decided -- the
+    /// list an operator reads afterwards still says who was admitted and who was refused. A
+    /// machine still asking is recorded again at its next poll, so this makes room rather than
+    /// banning anybody: the per-host cap is what bounds a host that keeps asking.
+    /// @return The ids dropped, in list order, for the caller to count and to log.
+    [[nodiscard]] std::vector<std::string> ClearPending();
+
+    /// How long the armed deadline has left.
+    /// @return The whole seconds left, or nothing when none is armed or it has lapsed.
+    [[nodiscard]] std::optional<std::chrono::seconds> AutoApproveLeft() const;
+
+    /// Record on @p nodeId's row that it was admitted by the armed window, and when that window was
+    /// armed, which is what `--enroll-list` shows beside it.
+    /// @param nodeId Who was admitted.
+    void MarkAutoApproved(std::string_view nodeId);
+
+    /// Follow this node's scheduler role: any role but `Leader` ends an armed window and forgets
+    /// the list, lowering `enrollment-requests-waiting`.
+    ///
+    /// **At DEMOTION**, so a leader that loses leadership and regains it inside the deadline does
+    /// not resume admitting -- a new leader never had a deadline, and this one was a new leader
+    /// the moment it lost. The list goes for the same reason: a demoted node answers every
+    /// enrollment verb `NotLeader`, so its rows are ones nobody can decide about. One method for `main` and for a test to
+    /// call, so the wiring a test drives is the wiring that ships.
+    /// @param role The role this node now holds.
+    void OnRoleChanged(Distributed::SchedulerRole role);
+
     /// The window and everything waiting, as the wire reports it.
     /// @return The report, oldest entry first.
     [[nodiscard]] CompileCacheWire::EnrollmentReport Report() const;
 
-    /// Whether the window is open, and how many are waiting -- for `NodeStatus`.
+    /// How the window decides a joiner, and how many are waiting -- for `NodeStatus`.
     ///
     /// Separate from `Report()` because the status path wants two numbers and not a
     /// copy of every row: `NodeStatus` is answered on every operator poll, and a node
@@ -273,7 +354,7 @@ class EnrollmentWindow
     /// @return The state and the pending count.
     [[nodiscard]] std::pair<CompileCacheWire::WireEnrollmentState, std::uint32_t> Summary() const;
 
-    /// The warning this window owes right now, if any, consuming it.
+    /// The warning this list owes right now, if any, consuming it.
     ///
     /// **Pure and pulled rather than a thread of its own inside this class**, so the
     /// whole repeating-warning property is exercisable against a `core::platform::ManualClock`: a test
@@ -281,9 +362,10 @@ class EnrollmentWindow
     /// often to ask; asking more often than `EnrollmentWarningInterval` costs a lock and
     /// a comparison and answers nothing.
     ///
-    /// The first warning is due at the moment the window OPENS, not one interval later:
-    /// the open itself is the thing worth saying, and an operator who opens a window and
-    /// watches the log for a minute before seeing anything concludes it did not work.
+    /// Owed while any machine is WAITING -- undecided -- and not otherwise. The first is due
+    /// the moment one starts waiting, not one interval later: a machine asking is the thing
+    /// worth saying, and a person who started a join and watches the log for a minute before
+    /// seeing anything concludes it did not work.
     /// @return The line to log, or nothing when none is due.
     [[nodiscard]] std::optional<std::string> TakeDueWarning();
 
@@ -293,6 +375,36 @@ class EnrollmentWindow
     /// @return A pointer into `_pending`, or nullptr.
     [[nodiscard]] CompileCacheWire::EnrollmentPendingEntry* FindLocked(std::string_view nodeId) noexcept;
 
+    /// Keep exactly the rows at @p kept, in that order, rebuilding every parallel list from them so
+    /// they stay parallel. Caller holds `_mutex`.
+    /// @param kept Indices into `_pending`, ascending.
+    void KeepLocked(std::vector<std::size_t> const& kept) const;
+
+    /// Forget every row nobody polled for `PendingRowLifetime`, counting each that nobody had
+    /// decided about, and report the waiting rows again if any went. Caller holds `_mutex`.
+    ///
+    /// `const`, and over `mutable` rows, because a READ is where a lapse is noticed: `Report`
+    /// and `Summary` answer an operator, and a list that still showed a machine that stopped
+    /// asking an hour ago would be the stale answer this exists to prevent.
+    void SweepLocked() const;
+
+    /// Raise `EnrollmentRequestsWaiting` naming who waits, or clear it when nobody does.
+    /// Caller holds `_mutex`.
+    void ReportWaitingLocked() const;
+
+    /// Clear an auto-approve deadline that has passed, and its condition. Caller holds `_mutex`.
+    /// `const` over `mutable` state for `SweepLocked`'s reason: a read is where a lapse is noticed.
+    void LapseLocked() const;
+
+    /// Whether an armed deadline has not passed. Caller holds `_mutex`, and has lapsed it.
+    /// @return True while `now < deadline`.
+    [[nodiscard]] bool AutoApprovingLocked() const noexcept;
+
+    /// Whole seconds until the armed deadline, zero when none is armed or it has passed. Caller
+    /// holds `_mutex`.
+    /// @return The seconds left.
+    [[nodiscard]] std::uint32_t SecondsUntilLocked() const noexcept;
+
     /// Seconds from @p since to now, floored at zero.
     /// @param since The earlier instant.
     /// @return The elapsed whole seconds.
@@ -300,22 +412,27 @@ class EnrollmentWindow
 
     core::platform::IClock const& _clock;
 
-    /// Where the window's state is reported as a condition; null on a node that serves none.
-    /// Written under `_mutex`, so a racing open and close cannot report in the other order.
+    /// Where the list's state is reported as conditions; null on a node that serves none.
+    /// Written under `_mutex`, so two racing changes cannot report in the other order.
     NodeConditions* _conditions;
+
+    /// Where a row forgotten undecided is counted; null where nothing counts it.
+    IMetricsSink* _metrics;
+
+    /// Where the instants an armed window's condition names come from. A `WallClockRef`, which
+    /// refuses a temporary, never a raw pointer to one (#1032, `ctest -R wall-clock-borrow`).
+    core::platform::WallClockRef _wallClock;
 
     mutable std::mutex _mutex;
 
-    /// Whether the window is taking requests. Guarded by `_mutex`.
-    bool _open { false };
+    /// Whether the warning is armed: a machine has been waiting since the last time nobody was.
+    /// Guarded by `_mutex`.
+    bool _warning { false };
 
-    /// When it was opened; meaningless while closed. Guarded by `_mutex`.
-    core::platform::SteadyTimePoint _openedAt {};
-
-    /// When the next warning falls due. Guarded by `_mutex`.
+    /// When the next warning falls due; meaningless while `_warning` is false. Guarded by `_mutex`.
     core::platform::SteadyTimePoint _warnDueAt {};
 
-    /// Who is waiting, oldest first. Guarded by `_mutex`.
+    /// Who asked, oldest first. Guarded by `_mutex`; `mutable` for `SweepLocked`.
     ///
     /// A vector rather than a map, and insertion order rather than a sort: 64 rows is
     /// nothing to scan, and the ORDER is what the operator reads -- oldest first, so the
@@ -323,7 +440,7 @@ class EnrollmentWindow
     ///
     /// It holds the entries in the same shape the wire reports them, minus the ages,
     /// which are computed at render time because a duration on a report is not a state.
-    std::vector<CompileCacheWire::EnrollmentPendingEntry> _pending;
+    mutable std::vector<CompileCacheWire::EnrollmentPendingEntry> _pending;
 
     /// When each entry first asked, parallel to `_pending`. Guarded by `_mutex`.
     ///
@@ -331,7 +448,23 @@ class EnrollmentWindow
     /// the WIRE's and carries an age in seconds: a `core::platform::SteadyTimePoint` on it would be an instant
     /// on a report, which is the shape this project refuses -- a receiver differences it
     /// against its own clock, which is a different clock.
-    std::vector<core::platform::SteadyTimePoint> _firstSeen;
+    mutable std::vector<core::platform::SteadyTimePoint> _firstSeen;
+
+    /// When each entry last asked, parallel to `_pending`, for `PendingRowLifetime`. Guarded by
+    /// `_mutex`, and beside the list for `_firstSeen`'s reason.
+    mutable std::vector<core::platform::SteadyTimePoint> _lastSeen;
+
+    /// When the window that admitted each entry was armed, parallel to `_pending`; absent for a
+    /// row nobody's deadline admitted. Guarded by `_mutex`, beside the list for `_firstSeen`'s
+    /// reason.
+    mutable std::vector<std::optional<core::platform::SteadyTimePoint>> _autoApprovedArmedAt;
+
+    /// The armed auto-approve deadline, or nothing. Guarded by `_mutex`; `mutable` for `LapseLocked`.
+    mutable std::optional<core::platform::SteadyTimePoint> _autoApproveUntil;
+
+    /// When the armed deadline was armed; meaningful only while `_autoApproveUntil` is. Guarded by
+    /// `_mutex`.
+    core::platform::SteadyTimePoint _autoApproveArmedAt {};
 };
 
 } // namespace FastCache::Node

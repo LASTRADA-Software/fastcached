@@ -34,9 +34,9 @@ TEST_CASE("A replaced file reads back whole, and replacing it again leaves only 
     auto const path = scratch / "state";
 
     auto const first = std::vector<std::byte>(64, std::byte { 0xAA });
-    REQUIRE(ReplaceFileAtomically(path, first).has_value());
+    REQUIRE(ReplaceFileAtomically(path, first, StateFile::Formation).has_value());
     auto const second = WireFields::AsBytes("short");
-    REQUIRE(ReplaceFileAtomically(path, second).has_value());
+    REQUIRE(ReplaceFileAtomically(path, second, StateFile::Formation).has_value());
 
     auto const read = ReadFileIfPresent(path);
     REQUIRE(read.has_value());

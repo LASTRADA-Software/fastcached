@@ -488,19 +488,17 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerToolchainSurveyInFlight, .cause = DeclineCause::Withdrawn },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::RequestDeadlineExceeded, .cause = DeclineCause::Withdrawn },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::ForeignValueGeneration, .cause = DeclineCause::ProtocolMismatch },
-    // Enrollment, which no compile reaches either: a LAUNCHER meeting one of these has
-    // reached a surface it did not think it was talking to, exactly as the cluster rows
-    // above have. Rows so that neither arrives `Unrecognised`, which reads as a peer
-    // from the future while really being this build forgetting an entry.
+    // Enrollment, which no compile reaches either: a LAUNCHER meeting it has reached a
+    // surface it did not think it was talking to, exactly as the cluster rows above have.
+    // A row so that it does not arrive `Unrecognised`, which reads as a peer from the
+    // future while really being this build forgetting an entry.
     //
-    // `NotPermitted` rather than `Withdrawn` for both, and the difference is what a
-    // launcher DOES: withdrawn means retry somewhere else in a moment, and neither of
-    // these clears without a person. The joiner that legitimately meets them is
-    // `--enroll-from`, which does not go through this table at all -- it reads the same
-    // codes through `ReadEnrollReply`, where a closed window is a WAIT rather than a
-    // refusal, because that client is the one thing in the tree with a reason to keep
-    // asking.
-    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentClosed, .cause = DeclineCause::NotPermitted },
+    // `NotPermitted` rather than `Withdrawn`, and the difference is what a launcher DOES:
+    // withdrawn means retry somewhere else in a moment, and this does not clear without a
+    // person. The joiner that legitimately meets it is `--enroll-from`, which does not go
+    // through this table at all -- it reads the same code through `ReadEnrollReply`, where
+    // a full list is a WAIT rather than a refusal, because that client is the one thing in
+    // the tree with a reason to keep asking.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentFull, .cause = DeclineCause::NotPermitted },
     // A fleet read, which no compile reaches: the same reasoning as the enrollment rows above.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownFleetSelector, .cause = DeclineCause::NotPermitted },
@@ -515,6 +513,8 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeKeyUnknown, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeKeyRevoked, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeIdentityRequired, .cause = DeclineCause::NotPermitted },
+    // Enrollment's, for `EnrollmentFull`'s reason above.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentHostFull, .cause = DeclineCause::NotPermitted },
     // A worker that can verify nobody's grant (#178): ONE machine declining the job it was
     // handed, and the machine is where the cause is -- cut off from the leader whose roster
     // it would need, or only reaching an ex-leader that withholds it. Not `NotPermitted`,

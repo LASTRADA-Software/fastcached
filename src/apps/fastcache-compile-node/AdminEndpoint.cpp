@@ -3,6 +3,7 @@
 #include "CacheTier.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/StateFiles.hpp>
 #include <FastCache/Core/StopAwareWait.hpp>
 
 #include <core/async/SyncRun.hpp>
@@ -744,7 +745,7 @@ EnumTable<Distributed::FleetMetric, std::uint64_t> NodeSampleFrom(IMetricsSink c
     return values;
 }
 
-std::filesystem::path HistoryPathFor(NodeConfig const& cfg, HistoryFile which)
+std::string_view HistoryFileNameOf(HistoryFile which) noexcept
 {
     // One row per file, in enumerator order, so a fourth file is a row rather than a
     // path spelled somewhere nobody looks. The fleet file keeps the name it always
@@ -761,12 +762,17 @@ std::filesystem::path HistoryPathFor(NodeConfig const& cfg, HistoryFile which)
     // share a format, since each would then load the other's readings without
     // complaint.
     static constexpr EnumTable<HistoryFile, FileNameRow> fileNames {
-        FileNameRow { .which = HistoryFile::Node, .name = "node-history.bin" },
-        FileNameRow { .which = HistoryFile::Fleet, .name = "fleet-history.bin" },
-        FileNameRow { .which = HistoryFile::Received, .name = "received-history.bin" },
+        FileNameRow { .which = HistoryFile::Node, .name = StateFileName(StateFile::NodeHistory) },
+        FileNameRow { .which = HistoryFile::Fleet, .name = StateFileName(StateFile::FleetHistory) },
+        FileNameRow { .which = HistoryFile::Received, .name = StateFileName(StateFile::ReceivedHistory) },
     };
     static_assert(RowsInEnumeratorOrder(fileNames, &FileNameRow::which));
-    auto const name = fileNames[static_cast<std::size_t>(which)].name;
+    return fileNames[static_cast<std::size_t>(which)].name;
+}
+
+std::filesystem::path HistoryPathFor(NodeConfig const& cfg, HistoryFile which)
+{
+    auto const name = HistoryFileNameOf(which);
     if (!cfg.clusterDir.empty())
         return cfg.clusterDir / name;
     if (!cfg.cacheDir.empty())
@@ -806,19 +812,19 @@ FleetSampler::FleetSampler(std::optional<Distributed::FleetSources> sources,
     _stores { Store { .path = std::move(paths.fleet),
                       .what = "fleet",
                       .load = [this](auto const& at) { return _fleet.Load(at); },
-                      .save = [this](auto const& at) { return _fleet.Save(at); },
+                      .save = [this](auto const& at) { return _fleet.Save(at, StateFile::FleetHistory); },
                       .readOnly = [this] { return _fleet.ReadOnly(); },
                       .worthWriting = [this] { return !_fleet.Empty(); } },
               Store { .path = std::move(paths.node),
                       .what = "node",
                       .load = [this](auto const& at) { return _node.Load(at); },
-                      .save = [this](auto const& at) { return _node.Save(at); },
+                      .save = [this](auto const& at) { return _node.Save(at, StateFile::NodeHistory); },
                       .readOnly = [this] { return _node.ReadOnly(); },
                       .worthWriting = [this] { return !_node.Empty(); } },
               Store { .path = std::move(paths.received),
                       .what = "received",
                       .load = [this](auto const& at) { return _received.Load(at); },
-                      .save = [this](auto const& at) { return _received.Save(at); },
+                      .save = [this](auto const& at) { return _received.Save(at, StateFile::ReceivedHistory); },
                       .readOnly = [this] { return _received.ReadOnly(); },
                       .worthWriting = [this] { return _received.Count() > 0; } } },
     _logger { logger }

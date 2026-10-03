@@ -14,6 +14,7 @@
 #include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Cluster/RosterKeys.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
+#include <FastCache/Consensus/ForwardingSink.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
@@ -55,15 +56,26 @@
 namespace FastCache::Node
 {
 
+/// Why a consensus tier cannot start without this node's id.
+///
+/// Every Raft message is addressed by member id, so a node with none could never be voted for.
+/// **No configuration reaches it**: the start mints the id into the state directory before this
+/// tier exists, so it names the caller that skipped that, rather than a flag to change. It ends
+/// without a full stop for `ConsensusNamesNoDialAddressRefusal`'s reason.
+inline constexpr std::string_view ConsensusNeedsNodeIdRefusal =
+    "consensus needs this node's id and was started without one: every Raft message is addressed by member id, so a "
+    "node without one could never be voted for. The start mints it into the state directory before consensus "
+    "exists, so this is a caller that skipped that";
+
 /// Why a consensus tier cannot start without this node's identity key (#178).
 ///
 /// Every Raft peer connection proves each end's OWN key, so a node without one could neither
 /// be heard nor hear anybody -- and running consensus unauthenticated instead is the
 /// per-connection fallback #1308 refused, one key later. **No configuration reaches it**: a
-/// node running consensus always has a state directory (`HoldsNodeKey`), and the start resolves
+/// node always has a state directory (`NodeStateDirectory`), and the start resolves
 /// the key there -- or refuses, naming the file -- before this tier exists. So it names the
 /// caller that skipped that, rather than a flag to change. It ends without a full stop for
-/// `ConsensusNamesNoSelfPeerRefusal`'s reason.
+/// `ConsensusNamesNoDialAddressRefusal`'s reason.
 inline constexpr std::string_view ConsensusNeedsIdentityKeyRefusal =
     "consensus needs this node's identity key and was started without one: every Raft peer connection proves each "
     "end's own key, so a node without one could neither be heard nor hear anybody. The start resolves it out of the "
@@ -86,6 +98,47 @@ inline constexpr std::string_view ConsensusNeedsIdentityKeyRefusal =
 ///        none.
 /// @return The endpoint to advertise, empty when there is nothing to advertise.
 [[nodiscard]] std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::string_view schedulerBound);
+
+/// This node's own member record, which consensus runs as and announces.
+///
+/// Its entry among the members the formation starts with, or -- where they name it with no
+/// endpoint yet -- one built from the address consensus runs under (`ConsensusDialAddressOf`).
+/// A mode that dials in (a learner, whose row closes the Raft port) is its entry as recorded,
+/// endpoint or none, and is built with NO endpoint where it is absent: nobody dials it, so it is
+/// never refused for lacking an address. Any other mode that names no address is refused: a
+/// member nobody can reach could never win a vote and could never be voted for.
+///
+/// Exposed rather than hidden in `Start` for the reason `AdvertisedSchedulerEndpoint` is: which
+/// mode may start without an address is a rule, and `Start` needs a whole tier to reach it.
+/// @param cfg The resolved configuration, with its identity and formation applied.
+/// @param members The members the formation starts consensus with (`BootstrapMembersOf`).
+/// @return The record, or `ConsensusNeedsNodeIdRefusal` / `ConsensusNamesNoDialAddressRefusal`.
+[[nodiscard]] std::expected<Cluster::ClusterMember, std::string> ConsensusSelfMemberOf(
+    NodeConfig const& cfg, std::span<Cluster::ClusterMember const> members);
+
+/// Where a member's consensus port answers, as a log line says it.
+///
+/// A learner dials in, so the cluster may record it with no consensus endpoint, and a line
+/// interpolating the empty string reads `recorded laptop at , scheduler ...` -- a blank where
+/// the renderers say absent. Exposed for the reason `AdvertisedSchedulerEndpoint` is.
+/// @param raftEndpoint The recorded endpoint, possibly empty.
+/// @return `at <endpoint>`, or `with no consensus endpoint` when it is empty.
+[[nodiscard]] std::string DescribeConsensusEndpoint(std::string_view raftEndpoint);
+
+/// Every peer that reaches this node by dialling in, which the transport places as such.
+///
+/// Read through the one column two ways, and both are needed. The RECORD's seats
+/// (`Cluster::LinkOfSeat`) name every learner the cluster agreed on; the CONFIGURATION's
+/// standings (`Consensus::Membership::StandingOf`, then `TraitsOf(...).link`) name the ones
+/// consensus counts right now -- which after a restart includes a learner whose admission sits in
+/// the log tail, applied only once this node has led and committed again, while the leader sends
+/// to it from the moment it leads. Placing from the record alone counted every such drop as a
+/// peer nothing can reach.
+/// @param state The applied state.
+/// @param configuration The configuration consensus holds.
+/// @return The ids, sorted, each once.
+[[nodiscard]] std::vector<Consensus::NodeId> DialInPeers(Cluster::ClusterState const& state,
+                                                         Consensus::Configuration const& configuration);
 
 /// What one read of the driver says about this node's own cluster.
 ///
@@ -557,6 +610,10 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// replicates to it, and every other member sends it votes. A follower that
     /// waited to become leader before learning an address would be a follower whose
     /// votes go nowhere.
+    ///
+    /// It also tells the transport which members dial in rather than being dialled, read from
+    /// each member's seat through the link column (`Cluster::LinkOfSeat`), so a message for a
+    /// learner with no session is counted as that and never as a peer nothing can reach.
     /// @param state The cluster's state as this node last applied it.
     /// @param desired What this node believes should be present, snapshotted once
     ///        by the caller: taking it twice in one pass would let discovery land
@@ -664,6 +721,12 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// carries the election timers. Declared after `_reactor` and `_resolver`
     /// because it references both.
     std::unique_ptr<core::net::IConnector> _connector;
+
+    /// Where the transport delivers what an acceptor writes back on a two-way session. The
+    /// transport is built before the driver it delivers into, so this is bound to `_sink` once
+    /// that exists, before the transport starts. Declared before `_transport`, which holds it.
+    Consensus::ForwardingSink _inbound;
+
     std::unique_ptr<Consensus::RaftPeerTransport> _transport;
     Cluster::ClusterStateMachine _application;
     std::unique_ptr<Consensus::RaftDriver> _driver;
@@ -691,7 +754,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// What an endorsement's lapse is read from.
     core::platform::WallClockRef _wallClock;
 
-    /// The fleet every endorsement names: `--cluster-id`.
+    /// The fleet every endorsement names: the formation record's cluster id.
     std::string _clusterId;
 
     /// Told every endorsement this node signs; may be empty.
@@ -756,7 +819,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// rebuilt from live members only, so a fleet restarted after a removal would
     /// count a forgotten member forever.
     ///
-    /// Empty for a node started with `--raft-join`, which asserts nothing about who
+    /// Empty for a node that joined a fleet, which asserts nothing about who
     /// is a member -- so every member of the cluster it joins is one it may later be
     /// told to forget.
     std::vector<Consensus::NodeId> _bootstrapIds;

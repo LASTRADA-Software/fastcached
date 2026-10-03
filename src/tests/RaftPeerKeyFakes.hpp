@@ -124,9 +124,9 @@ class RosterPeerKeys final: public Consensus::IRaftPeerKeys
         return _own.PublicKey();
     }
 
-    [[nodiscard]] Ed25519Signature SignAsSelf(std::span<std::byte const> message) const override
+    [[nodiscard]] Ed25519Signature SignAsSelf(LabelledMessage const& message) const override
     {
-        return _own.Sign(message);
+        return SignLabelled(_own, message);
     }
 
     [[nodiscard]] Consensus::PeerKeys KeysOf(Consensus::NodeId const& peer) const override

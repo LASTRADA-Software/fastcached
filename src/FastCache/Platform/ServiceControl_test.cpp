@@ -970,7 +970,8 @@ TEST_CASE("ServiceControl: an unknown service scope is rejected", "[platform][se
         REQUIRE(!FastCache::ParseServiceScope(bad).has_value());
 
     auto const err = FastCache::ParseServiceScope("nope").error();
-    REQUIRE(err.field == "service-scope");
+    // No field: `--service-scope` stamps its own spelling (CliParser_test asks the row).
+    REQUIRE(err.field.empty());
     REQUIRE(err.context.contains("nope"));
 }
 
@@ -1100,8 +1101,8 @@ TEST_CASE("ServiceControl: a TLS listener's kind survives the registration", "[p
     // thing forever.
     //
     // This case used to assert the same property for `--listen-dispatch`. That flag
-    // is gone -- the fleet's scheduler moved to `fastcache-compile-node
-    // --serve-scheduler` -- and the property it was guarding is the general one:
+    // is gone -- the fleet's scheduler moved to `fastcache-compile-node` -- and the
+    // property it was guarding is the general one:
     // whichever listener flag an endpoint was spelled with is the one it comes back
     // as. TLS is the surviving second kind, so it inherits the guard rather than
     // leaving `ListenFlagFor` with no test at all.

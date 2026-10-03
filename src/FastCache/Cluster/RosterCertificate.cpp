@@ -84,20 +84,20 @@ namespace
     }
 } // namespace
 
-std::vector<std::byte> EndorsementMessage(RosterEndorsement const& endorsement)
+LabelledMessage EndorsementMessage(RosterEndorsement const& endorsement)
 {
     auto const version = WireFields::ToBigEndian<std::uint64_t>(endorsement.version);
     auto const notAfter = InstantBytes(endorsement.notAfter);
-    return WireFields::Encode({ WireFields::AsBytes(RosterEndorsementLabel),
-                                WireFields::AsBytes(endorsement.clusterId),
-                                std::span<std::byte const> { version },
-                                std::span<std::byte const> { endorsement.rosterDigest },
-                                std::span<std::byte const> { notAfter },
-                                WireFields::AsBytes(endorsement.endorser) });
+    return LabelledMessage::Of(IdentityKeyPurpose::RosterEndorsement,
+                               { WireFields::AsBytes(endorsement.clusterId),
+                                 std::span<std::byte const> { version },
+                                 std::span<std::byte const> { endorsement.rosterDigest },
+                                 std::span<std::byte const> { notAfter },
+                                 WireFields::AsBytes(endorsement.endorser) });
 }
 
 RosterEndorsement SignEndorsement(RosterEndorsement claims,
-                                  std::function<Ed25519Signature(std::span<std::byte const>)> const& sign)
+                                  std::function<Ed25519Signature(LabelledMessage const&)> const& sign)
 {
     claims.signature = sign(EndorsementMessage(claims));
     return claims;
@@ -105,7 +105,7 @@ RosterEndorsement SignEndorsement(RosterEndorsement claims,
 
 bool VerifyEndorsement(RosterEndorsement const& endorsement, Ed25519PublicKey const& key)
 {
-    return Ed25519Verify(key, EndorsementMessage(endorsement), endorsement.signature);
+    return VerifyLabelled(key, EndorsementMessage(endorsement), endorsement.signature);
 }
 
 std::vector<std::byte> EncodeEndorsement(RosterEndorsement const& endorsement)

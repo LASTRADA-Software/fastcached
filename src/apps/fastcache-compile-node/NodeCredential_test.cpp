@@ -381,7 +381,6 @@ TEST_CASE("Site 3: a registration presents the secret in force NOW", "[node][cre
     SilentLoadSampler loadSampler;
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
-    std::atomic<bool> fleetMismatch { false };
 
     Cc::CredentialNotice notice = Cc::CredentialNotice::Silent();
     std::vector<Cc::WorkerRegistrar> registrars;
@@ -406,7 +405,6 @@ TEST_CASE("Site 3: a registration presents the secret in force NOW", "[node][cre
                                  // (#178). The proof is `FrameEndpoint_test`'s, over a real socket.
                                  .prover = nullptr,
                                  .lease = lease,
-                                 .fleetMismatch = fleetMismatch,
                                  .logger = logger };
 
     auto const authFor = [](std::string_view secret) {

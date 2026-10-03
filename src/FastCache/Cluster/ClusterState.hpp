@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Consensus/RaftTypes.hpp>
+#include <FastCache/Consensus/Standing.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/ConsensusError.hpp>
@@ -77,11 +78,13 @@ struct ClusterMember
 {
     Consensus::NodeId id; ///< Stable identity; what consensus counts.
 
-    /// host:port this member's consensus port answers on.
+    /// host:port this member's consensus port answers on, or empty for a learner.
     ///
-    /// Always present -- a member with no address is the thing this struct exists to
-    /// make impossible -- and always dialable, because it is what every other member
-    /// opens a socket to.
+    /// Present and dialable wherever the seat is DIALLED (`SeatNeedsEndpoint`) -- a voter
+    /// with no address is the thing this struct exists to make impossible, because it is
+    /// what every other member opens a socket to. A learner is reached over the session it
+    /// dials in on (`Consensus::PeerLink::DialsIn`), so nobody opens a socket to it and its
+    /// endpoint may be empty; `Validate` is where the one is required and the other is not.
     std::string raftEndpoint;
 
     /// host:port clients reach the fleet on while this member LEADS; may be empty.
@@ -245,8 +248,8 @@ static_assert(RowsInEnumeratorOrder(SchedulerEndpointStateTable, &SchedulerEndpo
 /// Parse one `<id>=<host>:<port>[@<key>]` member specification.
 ///
 /// The grammar an operator types, in the one place the type it produces lives. It
-/// has two callers that must not disagree — `--raft-peer` names a member at
-/// startup and `--cluster-admit` names one at runtime, and the documentation tells
+/// has two callers that must not disagree — `--print-identity` prints a member's
+/// `cluster-admit` line and `--cluster-admit` reads it, and the documentation tells
 /// an operator to copy the same token between them — so a second implementation
 /// would be two flags accepting different token sets for one concept, with only one
 /// of them being what the transport actually dials.
@@ -273,9 +276,8 @@ static_assert(RowsInEnumeratorOrder(SchedulerEndpointStateTable, &SchedulerEndpo
 /// when a key is recorded.
 ///
 /// The inverse, beside the parser, for the reason the key's own two functions are a pair:
-/// a service registration re-renders every `--raft-peer` from its parsed form, and a
-/// rendering that dropped the key would install a node whose next start no longer knows
-/// what its own operator typed.
+/// `--print-identity` renders the `cluster-admit` line an operator copies, and a
+/// rendering that dropped the key would admit a member nobody could verify.
 /// @param member The member.
 /// @return The token.
 [[nodiscard]] std::string FormatMemberSpec(ClusterMember const& member);
@@ -625,7 +627,9 @@ struct ClusterState
     /// The Raft one rather than the scheduler one, because this feeds
     /// `Distributed::ClusterMembership`, which matches on the HOST part and admits a
     /// peer whatever port it dialed from. Both endpoints name the same host, and only
-    /// this one is guaranteed to be there at all.
+    /// this one is guaranteed to be there for every member that is dialled. A learner's
+    /// is empty (it dials in), and an empty host matches nothing (`SameHost`), so a
+    /// learner recorded with no endpoint admits no host through this list.
     /// @return The endpoints, which is what `Distributed::ClusterMembership` takes.
     [[nodiscard]] std::vector<std::string> Endpoints() const;
 
@@ -698,7 +702,7 @@ enum class CommandKind : std::uint8_t
     ///
     /// **One act, because an operator removing a machine has one intention.** The two
     /// halves apart are a state nobody asked for: a record gone and its key live is a
-    /// machine every node whose `--raft-peer` still types that key goes on accepting --
+    /// machine every node whose bootstrap roster still names that key goes on accepting --
     /// removal failing OPEN -- and a key revoked under a record that stays is a member the
     /// configuration goes on counting, so on the consensus wire the revocation never takes
     /// effect. So there is no verb for either half alone.
@@ -708,9 +712,9 @@ enum class CommandKind : std::uint8_t
     /// replaced between the proposal and the commit is the one revoked. A member leaves a
     /// tombstone for its host too; a principal has no host. Beside that, the command may
     /// carry the key the proposing LEADER holds live for the id (`PrepareForget`): the one
-    /// thing the state cannot derive, because a member a `--raft-peer` line typed with its
-    /// key is recorded without one, or not at all, and its key lives only on the command
-    /// lines that type it. Never another id's key -- refused at the proposal, skipped at
+    /// thing the state cannot derive, because a bootstrap member named with its key is
+    /// recorded without one, or not at all, and its key lives only in the rosters that
+    /// name it. Never another id's key -- refused at the proposal, skipped at
     /// commit.
     ///
     /// The ordinal is `RemoveMember`'s, and the verb is that one widened rather than a new
@@ -775,6 +779,12 @@ struct MemberSeatRow
     /// can dial it: a member counted before its votes can arrive is a quorum that has
     /// grown and cannot be satisfied.
     bool counted;
+
+    /// The consensus standing a member in this seat holds once consensus has caught up.
+    ///
+    /// What `LinkOfSeat` reads the seat's `PeerLink` from, so how a member is reached is
+    /// `Consensus::StandingTable`'s column and is stated nowhere here a second time.
+    Consensus::Standing standing;
 };
 
 /// One row per `MemberSeat`, in enumerator order.
@@ -787,16 +797,45 @@ inline constexpr EnumTable<MemberSeat, MemberSeatRow> MemberSeatTable { {
       .name = "voter",
       .admittedBy = CommandKind::AddMember,
       .set = &Consensus::Configuration::voters,
-      .counted = true },
+      .counted = true,
+      .standing = Consensus::Standing::Voter },
     { .seat = MemberSeat::Learner,
       .name = "learner",
       .admittedBy = CommandKind::AddLearner,
       .set = &Consensus::Configuration::learners,
-      .counted = false },
+      .counted = false,
+      .standing = Consensus::Standing::Learner },
 } };
 
 static_assert(RowsInEnumeratorOrder(MemberSeatTable, &MemberSeatRow::seat),
               "MemberSeatTable must hold one row per MemberSeat, in enumerator order");
+
+static_assert(std::ranges::all_of(MemberSeatTable,
+                                  [](MemberSeatRow const& row) {
+                                      return Consensus::TraitsOf(row.standing).votes == row.counted;
+                                  }),
+              "a seat a quorum counts must be a standing that votes, and the reverse: the two tables say who is "
+              "counted, and a seat and its standing that disagreed would count a member that cannot vote");
+
+/// How a member recorded in `seat` is reached by the others.
+///
+/// `Consensus::StandingTable`'s `link` column, read through the seat's standing, so every
+/// site that asks -- `Validate`, the reconciler's additions, the transport's view of who
+/// dials in -- reads the one column rather than branching on the seat.
+/// @param seat A seat.
+/// @return Its standing's link.
+[[nodiscard]] constexpr Consensus::PeerLink LinkOfSeat(MemberSeat seat) noexcept
+{
+    return Consensus::TraitsOf(MemberSeatTable[static_cast<std::size_t>(seat)].standing).link;
+}
+
+/// Whether a member recorded in `seat` must have a consensus endpoint every member can dial.
+/// @param seat A seat.
+/// @return True exactly where the seat is `Consensus::PeerLink::Dialled`.
+[[nodiscard]] constexpr bool SeatNeedsEndpoint(MemberSeat seat) noexcept
+{
+    return LinkOfSeat(seat) == Consensus::PeerLink::Dialled;
+}
 
 /// The seat `kind` admits a member into, if it admits one at all.
 /// @param kind A verb.

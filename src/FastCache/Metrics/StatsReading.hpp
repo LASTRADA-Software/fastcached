@@ -136,7 +136,7 @@ struct ConsensusStatus
     /// learners, each in whatever order consensus holds them (#1449).
     ///
     /// Both sets empty means this node holds no configuration — the legitimate
-    /// waiting state of a `--raft-join` node, and a fatal one for any other. That is
+    /// waiting state of a node that joined a fleet, and a fatal one for any other. That is
     /// `HasCluster()`, which is why no separate boolean is carried: a second field
     /// saying the same thing is a second thing to be wrong. Where THIS node sits in
     /// it is `Consensus::Membership::StandingOf`, asked with the node's own id, which
@@ -421,7 +421,7 @@ enum class MetricsSurface : std::uint8_t
     ConsensusPeerWire,
 
     /// The fleet scheduler: `Distributed/SchedulerService.cpp`, `SchedulerProtocol.cpp` and
-    /// `FleetView.hpp`. Only a node started with `--serve-scheduler` builds one.
+    /// `FleetView.hpp`. Only a node whose mode serves the scheduler builds one.
     CompileScheduler,
 
     /// The compile worker, on both sides of the dispatch: `fastcache-cc`'s `WorkerProtocol.cpp`
@@ -449,6 +449,11 @@ enum class MetricsSurface : std::uint8_t
     /// these, and reporting them as zeroes there would be a plausible wrong answer.
     NodeDiscovery,
 
+    /// Zero-config formation, the node's `FormationController.cpp`: the decisions that move a node
+    /// between modes. Served where `main` constructs a controller -- which it does not yet -- so
+    /// until then no process moves these.
+    NodeFormation,
+
     /// Enumerator count. Not a surface.
     Last
 };
@@ -464,7 +469,7 @@ inline constexpr std::array EverySurface {
     MetricsSurface::CacheAcceptPath,   MetricsSurface::CacheStorage,      MetricsSurface::CacheCompileSurface,
     MetricsSurface::LiveStats,         MetricsSurface::ConsensusPeerWire, MetricsSurface::CompileScheduler,
     MetricsSurface::CompileWorker,     MetricsSurface::NodeEnrollment,    MetricsSurface::NodeCacheTier,
-    MetricsSurface::NodeFrameEndpoint, MetricsSurface::NodeDiscovery,
+    MetricsSurface::NodeFrameEndpoint, MetricsSurface::NodeDiscovery,     MetricsSurface::NodeFormation,
 };
 
 static_assert(EverySurface.size() == static_cast<std::size_t>(MetricsSurface::Last),
@@ -482,7 +487,7 @@ struct CounterSoleWriter
 /// row ABSENT rather than as a plausible zero.
 ///
 /// **One row per (counter, surface) PAIR, and a counter may have several.** A set-valued field
-/// would be a fixed-size array carrying exactly one element for 170 of 171 counters, to serve
+/// would be a fixed-size array carrying exactly one element for 181 of 182 counters, to serve
 /// the single row -- `LiveSubscriptionsRevoked` -- written from two components. Two rows say
 /// the same thing with no arithmetic, and `CounterHasAWriterIn` folds them.
 ///
@@ -505,21 +510,21 @@ struct CounterSoleWriter
 /// a row silently absent from the attribution and indistinguishable from one nobody had
 /// considered, cannot recur by omission ([#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)).
 ///
-/// **How the 171 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 46
-/// of them and would have rendered the other 125 absent -- the same defect as the bug, three
+/// **How the 183 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 49
+/// of them and would have rendered the other 134 absent -- the same defect as the bug, three
 /// times larger. The rows are written by four mechanisms, and reading only `SurfaceRefusal`
-/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 114 of the 125 and
+/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 123 of the 134 and
 /// leaves eleven looking unwritten:
 ///
 /// | mechanism | rows |
 /// |---|---|
-/// | a `SurfaceRefusal` row, spent by `Refuse(row)` | 115 |
+/// | a `SurfaceRefusal` row, spent by `Refuse(row)` | 124 |
 /// | a `LeaseToken.hpp` outcome row's `workerCounter` | 10 |
 /// | returned by a classifier for its caller to spend | 4 |
-/// | `Increment(Counter::X)` directly | 46 |
+/// | `Increment(Counter::X)` directly | 49 |
 ///
-/// The column sums past 171 because four rows are written two ways -- and the 114 above is not
-/// the 115 here: 115 rows HAVE a refusal row, and 114 of those have no increment site, which is
+/// The column sums past 183 because four rows are written two ways -- and the 123 above is not
+/// the 124 here: 124 rows HAVE a refusal row, and 123 of those have no increment site, which is
 /// what a `SurfaceRefusal`-only reading would reach. Two figures one apart, measuring different
 /// things, is exactly how a census comes to be quoted wrong, so both are asserted.
 ///
@@ -729,8 +734,6 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::NodeFrameEndpoint },
     CounterSoleWriter { .counter = IMetricsSink::Counter::FramePeerWatchDeparturesAbortive,
                         .surface = MetricsSurface::NodeFrameEndpoint },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedClosed,
-                        .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedFull,
                         .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed,
@@ -741,8 +744,6 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentControlRefusedUnauthenticated,
                         .surface = MetricsSurface::NodeEnrollment },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentWindowsOpened,
-                        .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRostersServed,
                         .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey,
@@ -750,6 +751,12 @@ inline constexpr std::array CounterSoleWriterTable {
     CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedRevokedKey,
                         .surface = MetricsSurface::NodeDiscovery },
     CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedForged,
+                        .surface = MetricsSurface::NodeDiscovery },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryBeaconsOverBound,
+                        .surface = MetricsSurface::NodeDiscovery },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryRepliesWithheld,
+                        .surface = MetricsSurface::NodeDiscovery },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryProofChecksWithheld,
                         .surface = MetricsSurface::NodeDiscovery },
     CounterSoleWriter { .counter = IMetricsSink::Counter::LiveSubscriptionsOpened, .surface = MetricsSurface::LiveStats },
     CounterSoleWriter { .counter = IMetricsSink::Counter::LiveSnapshotsRendered, .surface = MetricsSurface::LiveStats },
@@ -800,6 +807,12 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerFramesRefusedSender,
                         .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerFramesRefusedUnreadable,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerFramesRefusedOverCap,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerFramesRefusedBadMagic,
+                        .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedFull,
                         .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedTimeout,
@@ -830,6 +843,22 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedKeyWithdrawn,
                         .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameTag,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameSender,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameUnreadable,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameOverCap,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameBadMagic,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftSendsDroppedNoSession,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftSendsDroppedUnknownPeer,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftInboundSessionsSuperseded,
+                        .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster,
                         .surface = MetricsSurface::CompileWorker },
     CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired,
@@ -854,6 +883,25 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::NodeFrameEndpoint },
     CounterSoleWriter { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedNodeIdentityRequired,
                         .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsExpired,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentApprovalsManual,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentApprovalsAuto,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedHostCap,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsCleared,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentApprovalsRefusedKeyMismatch,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedIdTooLong,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::FormationYields, .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::FormationJoinsAbandoned,
+                        .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::FormationAdmissionsRefused,
+                        .surface = MetricsSurface::NodeFormation },
 };
 
 /// Whether every catalogue row has at least one surface attributed to it.
@@ -864,7 +912,7 @@ inline constexpr std::array CounterSoleWriterTable {
 /// says it does. A measurement of that moment, so it does not move with the catalogue.
 ///
 /// A `consteval` fold rather than a size comparison, because `CounterSoleWriterTable.size()`
-/// counts (counter, surface) PAIRS: it is 172 for 171 counters today, and a row duplicated
+/// counts (counter, surface) PAIRS: it is 183 for 182 counters today, and a row duplicated
 /// while another went missing would leave any arithmetic on the size perfectly consistent.
 ///
 /// @return True when no enumerator is missing from the table.

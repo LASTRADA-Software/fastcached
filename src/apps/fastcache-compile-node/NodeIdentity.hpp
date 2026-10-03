@@ -6,6 +6,8 @@
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
+#include <FastCache/Core/StateFiles.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstdint>
 #include <expected>
@@ -64,7 +66,10 @@ struct NodeIdentity
 /// Beside the Raft log deliberately: a node IS its state directory. Two nodes on one
 /// machine already need two of them, because two Raft logs cannot share a directory,
 /// so the identity needs no discriminator that the state does not already force.
-inline constexpr std::string_view NodeIdentityFileName = "node-id";
+inline constexpr std::string_view NodeIdentityFileName = StateFileName(StateFile::Identity);
+
+/// What a new id is written to first, beside `NodeIdentityFileName`, and renamed into place.
+inline constexpr std::string_view NodeIdentityReplacementSuffix = ".new";
 
 /// How many hex characters a minted identity carries.
 ///
@@ -74,17 +79,52 @@ inline constexpr std::string_view NodeIdentityFileName = "node-id";
 /// display form, and this project has already paid for one that was compared.
 inline constexpr std::size_t MintedNodeIdLength = 32;
 
-/// Where this node's consensus state lives.
+// A minted id is one every reader of an id accepts: the summary's codec and the member grammar
+// both refuse one past the one id bound.
+static_assert(MintedNodeIdLength <= CompileCacheWire::MaxIdBytes, "a minted node id must fit the one id bound");
+
+/// Where this node keeps its state, and why there: `--cluster-dir` when given, else the
+/// default `ApplyNodeStateDirectory` resolved.
+/// @param cfg The configuration.
+/// @return The directory and its origin, or nothing before the default has been resolved (or
+///         when none could be).
+[[nodiscard]] std::optional<NodeStateDirectoryChoice> ChosenStateDirectory(NodeConfig const& cfg);
+
+/// Where this node's identity and consensus state live.
 ///
-/// **One author of the default**, which `ConsensusTier::Start` used to be a second
-/// of. It also had to CHANGE at #1024: the default was
-/// `fastcache-cluster/<node-id>`, and an identity read out of the state directory
-/// cannot name the directory it is read from. The discriminator it supplied is not
-/// lost -- two nodes on one machine need two Raft logs, so they need two directories
-/// whatever they are called.
-/// @param cfg The parsed configuration.
-/// @return `--cluster-dir` when given, else the built-in default.
+/// **One author of the directory**, which `ConsensusTier::Start` used to be a second of. Two
+/// nodes on one machine need two Raft logs and two identities, so they need two directories:
+/// `--cluster-dir` for the second, or one privileged and one not, which the default already
+/// separates.
+///
+/// **A precondition, not a fallback**: asked before the default is resolved it throws
+/// `std::logic_error` rather than answer a relative path, because every caller WRITES there --
+/// an identity minted in the working directory is `System32` under a service. The start
+/// resolves the default before anything reaches this, and refuses by name when none resolves.
+/// @param cfg The configuration, with its state directory resolved.
+/// @return `--cluster-dir` when given, else the resolved default.
 [[nodiscard]] std::filesystem::path NodeStateDirectory(NodeConfig const& cfg);
+
+/// What `--print-surfaces` and `--node-status` say about the state directory.
+/// @param cfg The configuration.
+/// @return `<path> (<why>)`, or why there is none yet.
+[[nodiscard]] std::string DescribeNodeStateDirectory(NodeConfig const& cfg);
+
+/// Why a node refuses to start with no state directory.
+inline constexpr std::string_view NoStateDirectoryRefusal =
+    "this node has no state directory to keep its identity in: no --cluster-dir was given, and the platform's "
+    "default could not be derived because the variable it comes from (ProgramData or LOCALAPPDATA on Windows, "
+    "XDG_STATE_HOME or HOME elsewhere) is unset, empty or not an absolute path. Name --cluster-dir=<dir>";
+
+/// Why this invocation must not go on, when it has no state directory and would write there.
+///
+/// **Only an invocation that writes there is refused** (`NodeIdentityNeed`). `--print-surfaces`,
+/// the one-shot cluster verbs and `--uninstall-service` write nothing into it, and the last is the
+/// recovery an operator reaches for when the configuration is already wrong -- refusing it for a
+/// directory it would never touch would leave them nothing to reach for.
+/// @param cfg The configuration, with the platform's default applied.
+/// @return `NoStateDirectoryRefusal`, or nothing when there is a directory or no need for one.
+[[nodiscard]] std::optional<std::string_view> StateDirectoryRefusal(NodeConfig const& cfg);
 
 /// Whether this invocation needs an identity, and may write one.
 ///
@@ -137,6 +177,15 @@ enum class IdentityNeed : std::uint8_t
                                                                            std::string_view configured,
                                                                            ISecureRandom& random);
 
+/// The id recorded in @p stateDirectory, read and never minted.
+///
+/// For a sentence that has to name this node before its identity is resolved -- a refusal of its
+/// key, which is judged first. Nothing when there is no file, or one `ResolveNodeIdentity` would
+/// refuse: the sentence then names the file instead of a value it cannot vouch for.
+/// @param stateDirectory Where the node keeps its state.
+/// @return The id, or nothing.
+[[nodiscard]] std::optional<std::string> RecordedNodeId(std::filesystem::path const& stateDirectory);
+
 /// Draw a fresh identity.
 ///
 /// Exposed so a test can drive it against a scripted source rather than observing it
@@ -155,36 +204,12 @@ enum class IdentityNeed : std::uint8_t
 /// @return `MintedNodeIdLength` lowercase hex characters, or why none could be drawn.
 [[nodiscard]] std::expected<std::string, SecureRandomError> MintNodeId(ISecureRandom& random);
 
-/// Whether this node's own `--raft-peer` names a key other than the one it holds (#178).
-///
-/// A startup refusal, asked once the key is resolved. `@<key>` on this node's own entry is
-/// the operator's claim about the machine they are typing on, and a claim that disagrees with
-/// the key in its state directory is one of two mistakes -- a token copied from another node,
-/// or a state directory that is not the one the operator thinks -- and running on with it
-/// would announce a key to the cluster that the node does not hold. Both are the operator's
-/// to resolve, so the node refuses rather than choosing.
-/// @param cfg The configuration, with its identity applied.
-/// @param held The key this node holds, or nothing on a node that holds none -- which
-///        nothing can contradict.
-/// @return Why this node refuses to start, or nullopt when there is no contradiction.
-[[nodiscard]] std::optional<std::string> SelfKeyContradiction(NodeConfig const& cfg,
-                                                              std::optional<Ed25519PublicKey> const& held);
-
-/// Why `--print-identity` has nothing to print (#178).
-///
-/// A node with no state directory holds no key (`HoldsNodeKey`), so there is no identity a
-/// peer could be told about -- and minting one somewhere it would not survive a restart would
-/// hand the operator a key the next start does not hold.
-inline constexpr std::string_view PrintIdentityNeedsStateDirectory =
-    "--print-identity needs a state directory to find or mint the identity in: this node runs no consensus and "
-    "names no --cluster-dir. Pass the flags the node runs with";
-
 /// What a node holding an identity is, for what `--print-identity` tells its operator to type.
 ///
 /// **PRIVATE: persisted and transmitted nowhere.**
 enum class IdentityRole : std::uint8_t
 {
-    Member, ///< Runs consensus: admitted with `--raft-peer` / `--cluster-admit`.
+    Member, ///< Runs consensus: admitted with `--cluster-admit`, or by enrollment.
     Worker, ///< Runs none: admitted with `--cluster-admit-worker` or `--enroll-from`.
 };
 
@@ -192,15 +217,15 @@ enum class IdentityRole : std::uint8_t
 /// `fastcache-cli node` reports under.
 ///
 /// Pure, and apart from the verb, so what an operator copies into the other members'
-/// command lines is asserted rather than eyeballed: the `raft-peer` line is the token
-/// `--raft-peer` parses back into this very member, key included.
+/// command lines is asserted rather than eyeballed: the `cluster-admit` line is the token
+/// `--cluster-admit` parses back into this very member, key included.
 /// @param id The node's id; empty on a node that runs no consensus and was named none, which
 ///        prints no `node-id` line and no token.
 /// @param key Its public key, shown whole.
 /// @param dialAddress Where its peers dial it, when this configuration says; without one the
 ///        token cannot be written and is left out rather than guessed.
-/// @param role What the node IS (#178): a consensus MEMBER prints the `raft-peer` token the other
-///        members type, a WORKER the `cluster-admit-worker` token an operator types on a member --
+/// @param role What the node IS (#178): a consensus MEMBER prints the `cluster-admit` token an
+///        operator types on a member, a WORKER the `cluster-admit-worker` token --
 ///        the one line a worker's admission needs, spelled the way the flag parses it.
 /// @return The lines, each ending in a newline.
 [[nodiscard]] std::string DescribeIdentity(std::string_view id,
@@ -208,12 +233,9 @@ enum class IdentityRole : std::uint8_t
                                            std::optional<std::string> const& dialAddress,
                                            IdentityRole role);
 
-/// Put a resolved identity into a configuration, including this node's own peer entry.
-///
-/// **Both halves, in one function, because a derived identity is unusable without the
-/// second.** `--raft-peer=<id>=<host>:<port>` cannot be typed for an id nobody typed,
-/// and a node that names no member of its own configuration is refused -- so
-/// `--raft-self` states the address and this is where it becomes a member.
+/// Put a resolved identity into a configuration: the id and the key this node runs as. Its
+/// member entry is the formation's (`BootstrapMembersOf`), built from these and the address
+/// `ConsensusDialAddressOf` derives.
 ///
 /// Applied at the START and again to every RELOAD candidate, through the one
 /// function, for the reason `AssembleEffectiveConfig` is a required argument to the
@@ -221,9 +243,7 @@ enum class IdentityRole : std::uint8_t
 /// unreloadable field that has changed, so every reload would be refused by name.
 ///
 /// The key reaches the configuration here too (#178), and before the id: a node that runs
-/// no consensus has no id and may still hold a key. This node's own entry gets it when the
-/// entry names none, so the record a leader announces carries the key it holds; an entry
-/// that names a DIFFERENT one is left as typed and refused by `SelfKeyContradiction`.
+/// no consensus has no id and may still hold a key.
 /// @param cfg The configuration to complete.
 /// @param identity What this node runs as.
 void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity);

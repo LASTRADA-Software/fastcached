@@ -58,7 +58,7 @@ std::expected<int, ConfigError> ParseCompressionLevel(std::string_view sv)
 
 std::expected<std::size_t, ConfigError> ParseCompressionMinBytes(std::string_view sv)
 {
-    return ParseByteSize(sv, {});
+    return ParseByteSize(sv);
 }
 
 } // namespace FastCache

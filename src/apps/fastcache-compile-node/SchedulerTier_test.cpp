@@ -7,6 +7,7 @@
 // turning -- and then only once an election completes. So "before consensus exists"
 // understates the window: it lasts until a leader is elected, which on a restarting
 // fleet is an election timeout rather than an instant.
+#include "NodeFormation.hpp"
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
 
@@ -20,6 +21,7 @@
 #include <string>
 
 #include <core/platform/Clock.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -59,9 +61,8 @@ struct TierFixture
 /// @return The config.
 [[nodiscard]] NodeConfig ClusteredNode()
 {
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.schedulers = { "127.0.0.1:6675" };
-    cfg.serveScheduler = true;
     cfg.nodeId = "n1";
     cfg.raftListen = "127.0.0.1:6680";
     return cfg;
@@ -114,29 +115,28 @@ TEST_CASE("Consensus reporting leadership is what makes a clustered scheduler le
     CHECK((*tier)->Service().Role() == Distributed::SchedulerRole::Leader);
 }
 
-TEST_CASE("A scheduler that runs no consensus is refused before it could lead alone", "[node][scheduler]")
+TEST_CASE("A node whose consensus is closed serves no scheduler, whatever its mode says", "[node][scheduler]")
 {
     // #178, owner decision 3. A scheduler signs every grant with its identity key and hands its
-    // workers a roster its cluster's voters certify, so it holds replicated state -- which is
-    // consensus, even on one machine. The standalone leadership a node with no `--listen-raft`
-    // used to take at term 0 is gone, and the configuration that asked for it is refused BY
-    // NAME at startup rather than run as a scheduler nothing could ever elect.
+    // workers the cluster's state, so it holds replicated state -- which is consensus, even on
+    // one machine. The standalone leadership a node with no consensus used to take at term 0 is
+    // gone. Since the mode decides the scheduler duty, a mode that serves one on a node whose
+    // consensus is CLOSED (an empty `--listen-raft=`) serves none: there is no flag left to
+    // refuse, and nothing starts that nothing could elect.
     //
-    // WHAT DISTINGUISHES: the same node given `--listen-raft` is accepted, so the rule is about
-    // consensus and not about scheduling.
-    NodeConfig lone;
+    // WHAT DISTINGUISHES: the same node with consensus open serves one, so the fold is about
+    // consensus and not about the mode.
+    auto lone = Testing::FirstStart(NodeConfig {});
     lone.schedulers = { "127.0.0.1:6675" };
-    lone.serveScheduler = true;
-    CHECK(Testing::Unwrap(StartupPolicyRejection(lone)) == SchedulerNeedsConsensusRefusal);
+    lone.raftListen.clear();
+    lone.raftListenExplicit = true;
+    REQUIRE_FALSE(RunsConsensus(lone));
+    CHECK_FALSE(ServesScheduler(lone));
 
     auto clustered = lone;
     clustered.raftListen = "127.0.0.1:6680";
-    CHECK(StartupPolicyRejection(clustered)
-          != std::optional<std::string> { std::string { SchedulerNeedsConsensusRefusal } });
-
-    // And the refusal says how to run one machine: a cluster of one.
-    CHECK(SchedulerNeedsConsensusRefusal.contains("--listen-raft"));
-    CHECK(SchedulerNeedsConsensusRefusal.contains("cluster of one"));
+    REQUIRE(RunsConsensus(clustered));
+    CHECK(ServesScheduler(clustered));
 }
 
 TEST_CASE("A scheduler holding no identity key is refused, never run unsigned", "[node][scheduler][lease]")

@@ -20,7 +20,7 @@ FileRosterStore::FileRosterStore(std::filesystem::path path):
 std::expected<void, std::string> FileRosterStore::Save(Cluster::PersistedRoster const& roster)
 {
     auto const bytes = Cluster::EncodePersistedRoster(roster);
-    auto const replaced = Consensus::ReplaceFileAtomically(_path, bytes);
+    auto const replaced = Consensus::ReplaceFileAtomically(_path, bytes, StateFile::Roster);
     if (!replaced.has_value())
         return std::unexpected { replaced.error().context };
     return {};

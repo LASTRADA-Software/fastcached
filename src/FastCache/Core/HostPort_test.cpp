@@ -164,6 +164,42 @@ TEST_CASE("Loopback still answers for every spelling a kernel produces", "[core]
     CHECK_FALSE(IsLoopbackHost("128.0.0.1"));
     CHECK_FALSE(IsLoopbackHost(""));
 
+    // And the NAME stays out of it: a resolver's answer is not a security decision.
+    CHECK_FALSE(IsLoopbackHost("localhost"));
+}
+
+TEST_CASE("A name every machine resolves to itself is told apart from one a peer can dial", "[core][hostport]")
+{
+    // RFC 6761: `localhost` and every name under it resolve to loopback everywhere, so a peer told
+    // to dial one reaches ITSELF. The loopback literals are the same fact spelled as an address.
+    for (auto const* const host: { "localhost",
+                                   "LOCALHOST",
+                                   "localhost.",
+                                   "build.localhost",
+                                   "a.b.LocalHost.",
+                                   "127.0.0.1",
+                                   "127.0.1.1",
+                                   "::1",
+                                   "::ffff:127.0.0.1" })
+    {
+        INFO(host);
+        CHECK(NamesOnlyThisMachine(host));
+    }
+
+    // A name that merely CONTAINS the word is a name, and so is RHEL's `localhost.localdomain`
+    // -- which the placeholder-domain rule reduces to `localhost` first, where it is caught.
+    for (auto const* const host: { "notlocalhost",
+                                   "localhost.example",
+                                   "localhost.localdomain",
+                                   ".localhost-x",
+                                   "worker-01.corp.example",
+                                   "10.0.0.1",
+                                   "" })
+    {
+        INFO(host);
+        CHECK_FALSE(NamesOnlyThisMachine(host));
+    }
+
     // Whatever a resolver says it is, which is not something a security decision may
     // depend on.
     CHECK_FALSE(IsLoopbackHost("localhost"));

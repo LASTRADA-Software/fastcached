@@ -129,6 +129,9 @@ std::string RenderClusterState(Cluster::ClusterState const& state)
         // admit it can lead what is counted. `--node-status` on the member says which
         // set it is counted in now.
         //
+        // A learner dials in, so it may be recorded with no consensus endpoint: the dash,
+        // never an empty `raft=`.
+        //
         // The key WHOLE (#178), in the one spelling `--node-status` prints on the member, so
         // an operator compares two identical strings from two machines. Absent is a member
         // that has not stated one, which is not a key anybody could type.
@@ -137,7 +140,7 @@ std::string RenderClusterState(Cluster::ClusterState const& state)
                         member.id,
                         IdColumn,
                         Cluster::MemberSeatName(member.seat),
-                        member.raftEndpoint,
+                        member.raftEndpoint.empty() ? std::string { Absent } : member.raftEndpoint,
                         scheduler,
                         member.publicKey.has_value() ? FormatEd25519PublicKey(*member.publicKey) : std::string { Absent });
     }

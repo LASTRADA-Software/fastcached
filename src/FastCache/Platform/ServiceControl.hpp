@@ -16,6 +16,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace FastCache
@@ -248,6 +249,18 @@ struct ServiceSpec
     /// `chown` and a DACL apply to a file just as well, so only the *create* has
     /// to care, and it is refused in the handover rather than in each producer.
     std::vector<std::filesystem::path> ownedPaths;
+
+    /// Environment the job is started with when it runs as `serviceAccount`, as name/value pairs.
+    ///
+    /// Tied to the account rather than to the job, because what it exists for is a property of
+    /// running unprivileged: `fastcache-compile-node` keeps its identity in a per-user directory
+    /// when it is not privileged, and its launchd daemon runs as an unprivileged account whose
+    /// home is not where the machine's identity belongs -- so the registration hands it the
+    /// machine-wide directory the way systemd's `StateDirectory=` hands one over
+    /// (`STATE_DIRECTORY`). Emitted wherever `UserName` is, and nowhere else: a per-user agent
+    /// runs as its user and keeps that user's state, and the Windows SCM logs a service on
+    /// with a token that is privileged already.
+    std::vector<std::pair<std::string, std::string>> serviceAccountEnvironment;
 
     /// Whether a secret was typed on the installing command line.
     InlineCredential inlineCredential { InlineCredential::Absent };

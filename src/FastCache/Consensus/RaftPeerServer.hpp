@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Consensus/IRaftInboundLinks.hpp>
 #include <FastCache/Consensus/IRaftMessageSink.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftPeerRefusals.hpp>
+#include <FastCache/Consensus/RaftSessionReader.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
@@ -99,6 +101,15 @@ struct OpenConnections
 /// another: a push would be a close from the wrong thread, and a Raft peer is never quiet
 /// for long.
 ///
+/// ## A two-way session is handed to the transport
+///
+/// A dialler whose signed proof asks for `SessionDirection::TwoWay` -- a learner, which nobody can
+/// dial -- is attached to `IRaftInboundLinks` for as long as its session lasts, and the transport
+/// writes to it there (`RaftSessionLink`). This server only reads such a socket once its verdict
+/// is written, so each socket has one reader and one writer. The link is detached on every way
+/// the session ends, before the socket is closed. A one-way session is never attached: a voter's
+/// replies ride the other voter's own dial.
+///
 /// ## What closes a connection and what does not
 ///
 /// - A frame whose **type** this build does not know is *skipped*, once its tag has
@@ -143,6 +154,8 @@ class RaftPeerServer
     ///        `Shutdown()` posts its closes there rather than performing them on
     ///        the calling thread, and the handshake bound is armed on it.
     /// @param sink Where decoded messages go.
+    /// @param links Where a proven two-way session is attached for writing, and detached from
+    ///        when it ends. Must run on `reactor` too.
     /// @param logger Where refusals are reported.
     /// @param metrics Where refusals are counted.
     /// @param identity Who this node is -- the member a dialler must have meant -- what its
@@ -153,6 +166,7 @@ class RaftPeerServer
     RaftPeerServer(core::net::IListener& listener,
                    core::net::EventLoop& reactor,
                    IRaftMessageSink& sink,
+                   IRaftInboundLinks& links,
                    ILogger& logger,
                    IMetricsSink& metrics,
                    IRaftPeerIdentity const& identity,
@@ -243,6 +257,15 @@ class RaftPeerServer
                            std::string_view dialler,
                            std::string_view detail);
 
+    /// Map a proven session's ending onto its own counter, when it has one, and its own log
+    /// line -- the table `PeerServerAccess::Serve` walks so the acceptor's judgement of a
+    /// `RaftSessionReader` ending is one row per ending rather than a `switch` repeating what
+    /// the reader already decided.
+    /// @param ending Why `ReadProvenSession` ended the session.
+    /// @param peer The address the connection came from.
+    /// @param dialler The member the connection proved.
+    void NoteSessionEnd(SessionEnding const& ending, std::string_view peer, NodeId const& dialler);
+
     /// Say that a connection was closed unchallenged because no nonce could be drawn, at most
     /// once per `PreAuthReportInterval`.
     ///
@@ -258,6 +281,7 @@ class RaftPeerServer
     core::net::IListener& _listener;
     core::net::EventLoop& _reactor;
     IRaftMessageSink& _sink;
+    IRaftInboundLinks& _links;
     ILogger& _logger;
     IMetricsSink& _metrics;
     IRaftPeerIdentity const& _identity;

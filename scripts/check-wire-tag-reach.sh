@@ -53,7 +53,7 @@ Ran=0
 WireFiles=(
     "src/FastCache/Protocol/CompileCacheWire_test.cpp|the 0xFC framing and its field grammars; the file is nothing but the wire"
     "src/FastCache/Consensus/RaftWire_test.cpp|the Raft peer wire: handshake, framing, tag trailer"
-    "src/FastCache/Cluster/DiscoveryWire_test.cpp|the LAN beacon datagram grammar and its PSK challenge"
+    "src/FastCache/Cluster/DiscoveryWire_test.cpp|the LAN discovery datagram grammar: beacon, challenge and signed proof"
     "src/FastCache/Consensus/RaftTypes_test.cpp|the one case here pins a transmitted enumerator's byte"
 )
 

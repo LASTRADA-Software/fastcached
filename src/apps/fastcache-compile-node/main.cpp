@@ -20,6 +20,7 @@
 #include "EnrollClient.hpp"
 #include "EnrollmentResponder.hpp"
 #include "EnrollmentWindow.hpp"
+#include "FleetSummaryResponder.hpp"
 #include "FleetTextResponder.hpp"
 #include "LiveStatsResponder.hpp"
 #include "LiveStatsSources.hpp"
@@ -27,6 +28,7 @@
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "NodeFormation.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeIoLoop.hpp"
@@ -37,6 +39,7 @@
 #include "NodeProofResponder.hpp"
 #include "NodeReload.hpp"
 #include "NodeRoster.hpp"
+#include "NodeStateFiles.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
@@ -72,6 +75,7 @@
 #include <FastCache/Platform/HostInfo.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
+#include <FastCache/Platform/HostNaming.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/InheritedListener.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
@@ -374,7 +378,7 @@ template <typename T>
 /// what invites shortening it to buy responsiveness it does not buy.
 constexpr std::chrono::seconds EnrollmentWarningTick { 1 };
 
-/// Log the enrollment window's due warning until asked to stop.
+/// Log the enrollment list's due warning -- machines waiting for a person -- until asked to stop.
 ///
 /// Split out of `WorkerBody` for `AnnounceOnce`'s two reasons below, the second being
 /// the load-bearing one: a `while` holding an `if` costs that function more
@@ -392,7 +396,7 @@ constexpr std::chrono::seconds EnrollmentWarningTick { 1 };
 /// @param window The window to ask.
 /// @param logger Where a due warning is written.
 /// @param stop Participates in the wait, so a requested stop ends it immediately.
-void WarnWhileWindowIsOpen(Node::EnrollmentWindow& window, ILogger& logger, std::stop_token const& stop)
+void WarnWhileJoinersWait(Node::EnrollmentWindow& window, ILogger& logger, std::stop_token const& stop)
 {
     while (!stop.stop_requested())
     {
@@ -486,22 +490,22 @@ using Node::NodeReloader;
 /// reading of one file rather than two that a replaced file could make disagree.
 /// @param cfg The resolved configuration.
 /// @param random Where a minted key's seed comes from.
+/// @param keyGuard Who may read the key file, asked and established.
 /// @param logger Where the key, or its absence, is reported.
 /// @return The key pair, DISENGAGED on a node that holds none, or why there is none.
 [[nodiscard]] std::expected<std::optional<Ed25519KeyPair>, std::string> AdoptNodeKey(NodeConfig const& cfg,
                                                                                      ISecureRandom& random,
+                                                                                     Node::INodeKeyFileGuard& keyGuard,
                                                                                      ILogger& logger)
 {
-    auto nodeKey = Node::ResolveNodeKeyFor(cfg, random);
+    auto nodeKey = Node::ResolveNodeKeyFor(cfg, random, keyGuard);
     if (!nodeKey.has_value())
         return std::unexpected { std::move(nodeKey).error().message };
-    if (!nodeKey->has_value())
-    {
-        logger.Logf(LogLevel::Info, "{}", Node::NoNodeKeySentence);
-        return std::optional<Ed25519KeyPair> {};
-    }
 
-    auto& held = **nodeKey;
+    // Every node holds one now: every node has a state directory (`NodeStateDirectory`). The
+    // result stays optional because the tiers that take it still model a node holding none,
+    // which no configuration reaches any more.
+    auto& held = *nodeKey;
     logger.Logf(LogLevel::Info,
                 "identity key {} ({})",
                 FormatEd25519PublicKey(held.pair.PublicKey()),
@@ -600,6 +604,7 @@ using Node::NodeReloader;
     // catalogue and sink agree is fixed before the process serves anything.
     Node::NodeConditions conditions;
     Node::EvaluateProcessConditions(conditions, metrics);
+    Node::EvaluateHostNameCondition(conditions, cfg);
 
     // One policy for all THREE surfaces -- the compile port here, the scheduler and
     // the cache below -- and it outlives every one of them. A node that answered "is
@@ -676,7 +681,7 @@ using Node::NodeReloader;
     core::platform::SystemWallClock const schedulerWallClock;
 
     std::unique_ptr<Node::SchedulerTier> schedulerTier;
-    if (cfg.serveScheduler)
+    if (Node::ServesScheduler(cfg))
     {
         auto started = Node::SchedulerTier::Start(
             cfg, membership.Oracle(), schedulerClock, schedulerWallClock, metrics, logger, identityKey);
@@ -685,7 +690,7 @@ using Node::NodeReloader;
             // Fatal for the same reason the admin endpoint's is: an operator who asked
             // for this is relying on it, and a node that started without it looks
             // healthy to everything that would otherwise have noticed.
-            logger.Logf(LogLevel::Error, "--serve-scheduler {}; refusing to start", started.error());
+            logger.Logf(LogLevel::Error, "the scheduler {}; refusing to start", started.error());
             return ExitUsage;
         }
         schedulerTier = std::move(*started);
@@ -865,7 +870,7 @@ using Node::NodeReloader;
     // `ConsensusStandingSlot`. Declared before the status that reads it, so destroyed after.
     Node::ConsensusStandingSlot consensusStanding;
 
-    // The runtime enrollment window, and the key source it hands over from.
+    // The enrollment list: who asked to join, and what an operator decided.
     //
     // Held whatever this node runs, because it is two words of state and a mutex, and
     // declared here so it outlives both the surface that mutates it and the status
@@ -874,13 +879,16 @@ using Node::NodeReloader;
     // consensus tier itself asks so the surface and the tier cannot disagree about
     // whether this node has a cluster, AND a scheduler tier, without which the responder
     // has no references to hold. A node missing either leaves the component null and the
-    // whole family is refused at the door: a window that could never admit anybody
-    // should not be openable, and one nothing serves should not be reported.
+    // whole family is refused at the door: a list that could never admit anybody
+    // should not record requests, and one nothing serves should not be reported.
     //
-    // It reports itself as a condition only where it can be opened at all: `servesEnrollment`
-    // above, so a node with no window reports that row NOT EVALUATED rather than a reassuring
-    // `clear` for a window nothing can open (#1364).
-    Node::EnrollmentWindow enrollmentWindow { statusClock, AddressWhen(servesEnrollment, conditions) };
+    // It reports itself as a condition only where it is reachable at all: `servesEnrollment`
+    // above, so a node with no list reports those rows NOT EVALUATED rather than a reassuring
+    // `clear` for a list nothing can reach (#1364). A row forgotten undecided is counted in the
+    // node's own sink.
+    Node::EnrollmentWindow enrollmentWindow {
+        statusClock, AddressWhen(servesEnrollment, conditions), &metrics, rosterWallClock
+    };
 
     Node::ConfiguredNodeStatus const nodeStatus {
         cfg,
@@ -997,7 +1005,7 @@ using Node::NodeReloader;
     // against the cluster's applied roster -- members, enrolled principals and revoked keys --
     // which only a consensus member holds, and it is asked of `membership`, whose `ExplainKey` is
     // the one door to that answer for the proof and for every later verb alike. A consensus node
-    // always holds an identity key (`HoldsNodeKey`).
+    // holds an identity key, as every node does.
     //
     // The credential is the SCHEDULER's, for the reason the enrollment surface holds the same
     // object: `AUTH` is a `Session` verb and routes there, so a node with a token file must gate
@@ -1013,38 +1021,42 @@ using Node::NodeReloader;
                                    logger,
                                    schedulerTier != nullptr ? schedulerTier->Policy() : nullptr);
 
-    auto nodeSurfaceOrRefusal = Node::StartNodeSurfaceOrExplain(
-        nodeIo,
-        cfg,
-        // Designated, so the NAME travels with each pointer. Four bare
-        // `IFrameResponder*` arguments are four a call site can silently transpose,
-        // and a transposed pair routes every cache verb to the scheduler -- which
-        // answers *served nowhere* for traffic this node is holding a tier for.
-        Node::SurfaceComponents { .cache = cacheTier != nullptr ? &cacheTier->Responder() : nullptr,
-                                  .scheduler = schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
-                                  // Absent on a node running no worker (#206): the router then
-                                  // answers the compile family's refusal for a node without one.
-                                  .compile = workerTier != nullptr ? &workerTier->Responder() : nullptr,
-                                  .node = &nodeStatusResponder,
-                                  .enrollment = AddressOrNull(enrollmentResponder),
-                                  .live = &liveStatsResponder,
-                                  .fleet = &fleetTextResponder,
-                                  // Absent on a node running no consensus: the router then
-                                  // answers the node-proof family `NoCluster`.
-                                  .nodeProof = AddressOrNull(nodeProofResponder) },
-        activated,
-        metrics,
-        logger,
-        // Asked of the RUNNER rather than of a captured copy of the map, so a
-        // re-survey that replaces the set is reflected in the very next line
-        // (#238). The tier outlives the surface -- declared above it, destroyed
-        // after -- which is what makes the pointer safe to hold.
-        [worker = workerTier.get()](std::string_view fingerprint) {
-            return worker != nullptr ? worker->CompilerFor(fingerprint) : std::string {};
-        });
+    // Which fleet this node is in, answered to anybody who asks: every node holds an identity key,
+    // and one that runs no consensus answers `NoCluster` itself rather than leaving the family
+    // missing at the door. The summary is fixed for the process, and it is the ONE this node
+    // announces: the discovery tier below is handed the same object, never a second derivation.
+    Node::FixedFleetSummary answeredSummary { Node::AnsweredFleetSummary(cfg) };
+    std::optional<Node::FleetSummaryResponder> fleetSummaryResponder;
+    if (identityKey.has_value())
+        fleetSummaryResponder.emplace(answeredSummary, *identityKey);
+
+    auto nodeSurfaceOrRefusal =
+        Node::StartNodeSurfaceOrExplain(nodeIo,
+                                        cfg,
+                                        // Composed where the wiring test composes it: every component a required parameter
+                                        // of its own type, so one left out, or two transposed, fails the build here.
+                                        Node::ComposeSurfaceComponents(cacheTier.get(),
+                                                                       schedulerTier.get(),
+                                                                       workerTier.get(),
+                                                                       nodeStatusResponder,
+                                                                       AddressOrNull(enrollmentResponder),
+                                                                       liveStatsResponder,
+                                                                       fleetTextResponder,
+                                                                       AddressOrNull(nodeProofResponder),
+                                                                       AddressOrNull(fleetSummaryResponder)),
+                                        activated,
+                                        metrics,
+                                        logger,
+                                        // Asked of the RUNNER rather than of a captured copy of the map, so a
+                                        // re-survey that replaces the set is reflected in the very next line
+                                        // (#238). The tier outlives the surface -- declared above it, destroyed
+                                        // after -- which is what makes the pointer safe to hold.
+                                        [worker = workerTier.get()](std::string_view fingerprint) {
+                                            return worker != nullptr ? worker->CompilerFor(fingerprint) : std::string {};
+                                        });
     if (!nodeSurfaceOrRefusal.has_value())
     {
-        // No flag prefix: this can fail over --listen-node or over --serve-scheduler,
+        // No flag prefix: this can fail over --listen-node or over the scheduler,
         // and only `StartNodeSurfaceOrExplain` knows which, so it names the flag.
         logger.Logf(LogLevel::Error, "{}; refusing to start", nodeSurfaceOrRefusal.error());
         return ExitUsage;
@@ -1055,14 +1067,13 @@ using Node::NodeReloader;
     // above rather than as a null. See `BindFailurePolicy` in NodeSurfaces.hpp.
     auto const nodeSurface = std::move(*nodeSurfaceOrRefusal);
 
-    // Says, once a minute and for as long as it is open, that this node is holding an
-    // enrollment window.
+    // Says, once a minute and for as long as any is waiting, that machines have asked to join
+    // and nobody has decided about them.
     //
-    // **Repeating rather than one line at open, and that is the whole of #1298's
-    // observability half.** A single line scrolls away, and this is the one state in
-    // which this machine will hand its cluster's key to a stranger that asked and was
-    // approved. An operator who opened a window and was called away has the log and
-    // `NodeStatus`, and only one of those reaches somebody who is not already looking.
+    // **Repeating rather than one line when the first asks**, because a single line scrolls away
+    // and a machine waiting for a person is waiting for somebody who may not be looking. The
+    // condition `enrollment-requests-waiting` carries the same fact to somebody who is not
+    // reading this log.
     //
     // A thread of its own rather than a ride on the heartbeat, because the heartbeat
     // belongs to the WORKER and this belongs to the leader -- a scheduler holding no
@@ -1071,7 +1082,7 @@ using Node::NodeReloader;
     // starts no thread.
     //
     // The DECISION is `TakeDueWarning`, which is pure over an injected clock and is
-    // tested against a `core::platform::ManualClock`. The driver is `WarnWhileWindowIsOpen` above,
+    // tested against a `core::platform::ManualClock`. The driver is `WarnWhileJoinersWait` above,
     // split out of this function exactly as `AnnounceOnce` was and for the same two
     // reasons -- it took `WorkerBody` past the cognitive-complexity ceiling the build
     // enforces, and a loop with a decision in it is more behaviour than belongs in the
@@ -1081,10 +1092,10 @@ using Node::NodeReloader;
     // which is what this was: that spelling STARTED a thread on every node in the fleet
     // and made the sentence above ("a node with no cluster starts no thread") false by
     // one word. The condition is `servesEnrollment`, so the thread and the surface
-    // cannot disagree about whether there is a window to watch.
+    // cannot disagree about whether there is a list to watch.
     std::optional<std::jthread> enrollmentWatch;
     if (servesEnrollment)
-        enrollmentWatch.emplace([&](std::stop_token const& stop) { WarnWhileWindowIsOpen(enrollmentWindow, logger, stop); });
+        enrollmentWatch.emplace([&](std::stop_token const& stop) { WarnWhileJoinersWait(enrollmentWindow, logger, stop); });
 
     // Consensus, when the operator configured a cluster -- which every scheduler has, even a
     // lone one (#178). It is what gives the scheduler tier a role at all: without it every
@@ -1108,7 +1119,7 @@ using Node::NodeReloader;
     if (!consensusOrRefusal.has_value())
     {
         // No flag prefix here, for the reason the cache tier's line below has none:
-        // consensus fails over --node-id, --raft-peer, --listen-raft or
+        // consensus fails over --node-id, --raft-self, --listen-raft or
         // --cluster-dir, and only the tier knows which, so its message names the
         // flag. It used to prefix `--node-id `, which rendered the peer refusal as
         // "--node-id --node-id=n1 names no --raft-peer" -- and that message is now
@@ -1128,7 +1139,10 @@ using Node::NodeReloader;
     // destroyed before it, because its observer pushes into the tier above: a
     // discovery loop outliving the thing it hands peers to is a dangling reference
     // that only fires while a node is shutting down.
-    auto discoveryOrRefusal = Node::StartDiscoveryOrExplain(cfg, consensusTier, metrics, logger);
+    // `answeredSummary` is the one summary the FLEET-SUMMARY responder signs, so a beacon and an
+    // answer from this node are one derivation.
+    auto discoveryOrRefusal =
+        Node::StartDiscoveryOrExplain(cfg, consensusTier, answeredSummary, conditions, metrics, logger);
     if (!discoveryOrRefusal.has_value())
     {
         // Fatal; why is `RowFor(NodeSurface::Discovery).bindFailureReason` (#352).
@@ -1137,8 +1151,8 @@ using Node::NodeReloader;
         logger.Logf(LogLevel::Error, "--discovery {}; refusing to start", discoveryOrRefusal.error());
         return ExitUsage;
     }
-    // May legitimately be null: no `--discovery` means the cluster is the
-    // `--raft-peer` list an operator typed, which is the ordinary deployment.
+    // May legitimately be null: no `--discovery` means the cluster is the members
+    // an operator admitted, which is an ordinary deployment.
     auto const discoveryTier = std::move(*discoveryOrRefusal);
 
     // The admin endpoint, when the operator asked for one. Off by default and on
@@ -1215,7 +1229,13 @@ using Node::NodeReloader;
     // Declared AFTER the tiers it reads and BEFORE the surface that reads it, which
     // is what makes both sets of pointers safe: locals are destroyed in reverse.
     static core::platform::SystemWallClock const wall;
-    Node::FleetSampler sampler { fleetSources, metrics, snapshotProvider, wall, Node::HistoryPaths::For(cfg), logger };
+    Node::FileTrustNodeKeyGuard historyGuard;
+    Node::FleetSampler sampler { fleetSources,
+                                 metrics,
+                                 snapshotProvider,
+                                 wall,
+                                 Node::SetAsideForeignHistory(Node::HistoryPaths::For(cfg), historyGuard, logger),
+                                 logger };
 
     // Wired here because this is the one scope holding both: the scheduler tier is
     // built before the sampler that receives for it, so the sink cannot be a
@@ -1325,7 +1345,7 @@ using Node::NodeReloader;
     // The endpoint this node actually LISTENS on, which since #290 stage 3 is the one
     // 0xFC surface -- there is no second port to disambiguate and no config value that
     // describes a socket this process did not open.
-    auto const listeningOn = Node::AdvertisedEndpoint(cfg);
+    auto const listeningOn = Node::DescribeListeningEndpoint(cfg, activated.has_value());
     // The admission policy is part of this line, and that is #235's second half: a
     // worker given no policy starts, binds the wildcard, registers, is leased out
     // and refuses every dispatched compile -- and until this said so, the one line
@@ -1340,7 +1360,9 @@ using Node::NodeReloader;
                 "{} on {}, advertising {}, {}, {}",
                 ReadinessMarkerText(ReadinessMarker::CompileNode),
                 listeningOn,
-                advertise,
+                // Named even when there is none: a withheld name reads `withheld (localhost)`,
+                // never the empty field `advertising ,` that says nothing about why.
+                Node::DescribeAdvertisedEndpoint(cfg),
                 // The toolchain count this node is BRINGING UP, not the count it is
                 // serving: the survey runs on the heartbeat thread and has almost
                 // certainly not finished when this prints (#365) -- and a ready line is a
@@ -1368,7 +1390,7 @@ using Node::NodeReloader;
         // this call publishes a new configuration and says so, and the next beat picks
         // it up on its own.
         if (DaemonControls::Instance().TakeReloadRequest())
-            Node::ApplyReloadRequest(reloader, membership, logger);
+            Node::ApplyReloadRequest(reloader, membership, conditions, logger);
         std::this_thread::sleep_for(StopPollInterval);
     }
     logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");
@@ -1439,6 +1461,10 @@ struct EarlyVerbContext
     /// Where a refusal goes. Still the CONSOLE logger, because every verb here answers
     /// an operator at a terminal; the switch to an event log happens below them all.
     ILogger& logger;
+
+    /// Where the environment and this process's privilege are read -- the machine-wide state
+    /// directory a service registration owns among them.
+    IConfigPathProbe const& pathProbe;
 };
 
 /// One verb that answers an operator and exits, ahead of the startup table.
@@ -1482,33 +1508,25 @@ struct EarlyVerbRow
 /// (`--print-identity`, #178).
 ///
 /// **Minting is the point, not a side effect**, which is what separates this verb from every
-/// other one in `EarlyVerbs`: a cluster's members each need every other member's key on their
-/// `--raft-peer` before any of them starts, and the key does not exist until something mints
-/// it. The start that follows reads the same files back as `Recorded`. Through the resolvers
-/// the start uses, so an id or a key this prints is the one that start will run as -- and a
-/// key file that is there and cannot be used is refused here exactly as it is there.
+/// other one in `EarlyVerbs`: an operator admitting a member needs its key before it is
+/// admitted, and the key does not exist until something mints it. The start that follows reads the same files back as
+/// `Recorded`. Through the resolvers the start uses, so an id or a key this prints is the one that start will run as -- and
+/// a key file that is there and cannot be used is refused here exactly as it is there.
 /// @param context The configuration and the console logger.
 /// @return `ExitOk` once printed; `ExitUsage` for a node with nowhere to keep an identity, or
 ///         one whose identity could not be read or minted.
 [[nodiscard]] int RunPrintIdentity(EarlyVerbContext const& context)
 {
     auto& cfg = context.cfg;
-    if (!Node::HoldsNodeKey(cfg))
-    {
-        context.logger.Logf(LogLevel::Error, "{}", Node::PrintIdentityNeedsStateDirectory);
-        return ExitUsage;
-    }
-
     SystemSecureRandom random;
-    auto key = Node::ResolveNodeKeyFor(cfg, random);
-    if (!key.has_value() || !key->has_value())
+    Node::FileTrustNodeKeyGuard keyGuard;
+    auto key = Node::ResolveNodeKeyFor(cfg, random, keyGuard);
+    if (!key.has_value())
     {
-        context.logger.Logf(LogLevel::Error,
-                            "{}",
-                            key.has_value() ? std::string { Node::PrintIdentityNeedsStateDirectory } : key.error().message);
+        context.logger.Logf(LogLevel::Error, "{}", key.error().message);
         return ExitUsage;
     }
-    auto const publicKey = (*key)->pair.PublicKey();
+    auto const publicKey = key->pair.PublicKey();
 
     // The id travels with the key (#178): a consensus member is admitted under it, and a worker
     // with a `--cluster-dir` proves it on every connection to a scheduler -- and is admitted under
@@ -1609,7 +1627,7 @@ struct EarlyVerbRow
     // service, and nothing changes. What the registration does carry is the `--config`
     // path, so the service reads the current file at every start rather than a snapshot
     // of it.
-    auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), context.cliOnly);
+    auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), context.cliOnly, context.pathProbe);
     auto const result = context.cfg.installService ? InstallService(spec, context.cfg.serviceScope)
                                                    : UninstallService(spec, context.cfg.serviceScope);
     if (result.exitCode == 0)
@@ -1672,8 +1690,10 @@ struct EarlyVerbRow
 [[nodiscard]] int RunEnrollFrom(EarlyVerbContext const& context)
 {
     SystemSecureRandom enrollRandom;
+    Node::FileTrustNodeKeyGuard keyGuard;
     Node::ConfiguredCredential const credential { context.cfg, nullptr };
-    return ReportOneShotVerb(Node::RunEnrollClient(context.cfg, credential, enrollRandom), "fastcache-compile-node: ");
+    return ReportOneShotVerb(Node::RunEnrollClient(context.cfg, credential, enrollRandom, keyGuard),
+                             "fastcache-compile-node: ");
 }
 
 /// The verbs that answer an operator and exit, in the order they are asked.
@@ -1823,7 +1843,7 @@ int main(int argc, char** argv)
     // explicit bit -- which is the shape the daemon has, and which has shipped a
     // flag that parsed but never merged four times.
     NodeConfig cliOnly;
-    auto const flow = ParseOptionsInto(NodeOptions(), argvSpan.subspan(1), cliOnly);
+    auto const flow = ParseNodeCommandLine(argvSpan.subspan(1), cliOnly);
     if (!flow.has_value())
     {
         // The FIELD as well as the reason. Without it an unrecognised argument reads
@@ -1879,7 +1899,8 @@ int main(int argc, char** argv)
     // there. `EffectiveConfigPath` owns that rule -- a named path is strict and a
     // discovered one is skipped when it is absent, unreadable or untrusted -- and
     // it is the same rule and the same code the daemon's lookup uses.
-    auto const lookup = EffectiveConfigPath(cliOnly.configPath, SystemConfigPathProbe {}, NodeApplicationName);
+    SystemConfigPathProbe const pathProbe;
+    auto const lookup = EffectiveConfigPath(cliOnly.configPath, pathProbe, NodeApplicationName);
 
     // A file that is there and readable and was passed over anyway has to say so.
     // Silence would leave an operator editing a file this worker has quietly
@@ -1932,6 +1953,59 @@ int main(int argc, char** argv)
         // also the ordinary no-file case, where `cliOnly` is already the answer.
         cfg = cliOnly;
 
+    // **Where this node keeps its identity, before any verb can ask** -- an install mints the id
+    // there and `--print-surfaces` names it. From this process's privilege and environment,
+    // through the probe the config lookup used, into both configurations as `ApplyNodeIdentity`
+    // writes the id. An invocation that would write there and has none refuses here, by name;
+    // one that writes nothing -- an uninstall among them -- goes on (`StateDirectoryRefusal`).
+    Node::ApplyNodeStateDirectory(cfg, pathProbe);
+    Node::ApplyNodeStateDirectory(cliOnly, pathProbe);
+    if (auto const refusal = Node::StateDirectoryRefusal(cfg); refusal.has_value())
+    {
+        std::cerr << "fastcache-compile-node: " << *refusal << '\n';
+        return ExitUsage;
+    }
+
+    // **The formation record, READ before any verb or rule is asked** -- a mode is the state held
+    // in the cluster dir, and it decides whether this node runs consensus, opens the Raft port and
+    // serves a scheduler. Read and never written here: an install, a `--print-surfaces` and the
+    // startup rules below are judged by the mode the node WILL run in, which before a first start
+    // is the solitary record that start mints (`ProspectiveRecord`). The mint itself waits until
+    // this command line has been judged, as the identity's does.
+    //
+    // A record that cannot be read is held rather than refused here, so the verbs that write
+    // nothing -- an uninstall among them -- still run; the start refuses it by name below. So is
+    // a directory another account may write in or wrote into: its writers, then who owns each
+    // file, are asked before any is read (`JudgeStateDirectory`), as the key resolution asks again.
+    auto const formationDirectory = Node::ChosenStateDirectory(cfg);
+    std::optional<Cluster::FileFormationStore> formationStore;
+    std::optional<Cluster::FleetEndpointsFile> endpointsFile;
+    auto keptFormation = std::expected<Node::KeptFormation, std::string> { std::unexpected {
+        std::string { "this node has no state directory to keep its formation record in" } } };
+    if (formationDirectory.has_value())
+    {
+        formationStore.emplace(formationDirectory->path);
+        endpointsFile.emplace(formationDirectory->path);
+        Node::FileTrustNodeKeyGuard stateGuard;
+        if (auto walked = Node::JudgeStateDirectory(formationDirectory->path, stateGuard); !walked.has_value())
+            keptFormation = std::unexpected { std::move(walked).error().message };
+        else
+            keptFormation =
+                Node::ReadKeptFormation(*formationStore, *endpointsFile).transform_error([&](std::string const& error) {
+                    return error
+                           + Node::StateFileUnreadableHint(formationDirectory->path / Cluster::FormationRecordFileName);
+                });
+    }
+    if (keptFormation.has_value())
+    {
+        auto const prospect = Node::ProspectiveRecord(*keptFormation);
+        auto applied = Node::ApplyFormation(cfg, prospect, keptFormation->remembered).and_then([&] {
+            return Node::ApplyFormation(cliOnly, prospect, keptFormation->remembered);
+        });
+        if (!applied.has_value())
+            keptFormation = std::unexpected { std::move(applied).error() };
+    }
+
     // The admin verbs below answer an operator at a terminal, so they report to one
     // -- even under `--daemon`, which the registered command line carries and which
     // is therefore exactly what somebody copies out of `sc qc` to try by hand. Their
@@ -1954,7 +2028,7 @@ int main(int argc, char** argv)
     //
     // The order is `EarlyVerbs`' order, and each row carries the reason it sits where it
     // does.
-    EarlyVerbContext const verbContext { .cfg = cfg, .cliOnly = cliOnly, .logger = *consoleLogger };
+    EarlyVerbContext const verbContext { .cfg = cfg, .cliOnly = cliOnly, .logger = *consoleLogger, .pathProbe = pathProbe };
     for (auto const& verb: EarlyVerbs)
         if (verb.applies(cfg))
             return verb.run(verbContext);
@@ -2009,6 +2083,26 @@ int main(int argc, char** argv)
         return ExitUsage;
     }
 
+    // **This machine's names, BOUNDED** (`HostNamingBound`), after the refusal above so a typo
+    // is not kept waiting on DNS, and before the identity, because the member entry this node
+    // synthesises for itself dials the name. The bare host name stands in when the lookup does
+    // not answer in time, and the warning says so -- peers may not resolve it. Nothing serves
+    // yet, which is why this is a bound rather than a wait behind serving.
+    Node::ThreadedHostNamingLookup namingLookup { [] { return MakeSystemHostNaming(); } };
+    auto const names = Node::ResolveHostNames(namingLookup, QueryHostFacts().hostName, Node::HostNamingBound);
+    if (auto const warning = Node::HostNamingWarning(names); warning.has_value())
+        logger.Logf(LogLevel::Warn, "{}", *warning);
+    Node::ApplyHostNames(cfg, names.names);
+    Node::ApplyHostNames(cliOnly, names.names);
+
+    // Asked again of the names, because a rule over an address derived from them answered the
+    // awaited name above as "supplied at startup", and it is supplied now.
+    if (auto const rejection = StartupPolicyRejection(cfg))
+    {
+        logger.Logf(LogLevel::Error, "{}", *rejection);
+        return ExitUsage;
+    }
+
     // **This node's identity, resolved once and applied to every configuration this
     // process builds** (#1024). It is minted into `--cluster-dir` on the first start
     // and read back on every one after, so a fleet is built without inventing a name
@@ -2031,9 +2125,10 @@ int main(int argc, char** argv)
     // node's own member entry and its key into the configuration together -- and every
     // reload candidate after it. Read, or minted into the state directory when there is
     // none there; a key file that is there and cannot be used is a refusal, never a re-mint.
-    // A node with no state directory holds none, and says so.
     SystemSecureRandom identityRandom;
-    auto const identityKey = AdoptNodeKey(cfg, identityRandom, logger);
+
+    Node::FileTrustNodeKeyGuard identityKeyGuard;
+    auto const identityKey = AdoptNodeKey(cfg, identityRandom, identityKeyGuard, logger);
     if (!identityKey.has_value())
     {
         logger.Logf(LogLevel::Error, "{}; refusing to start", identityKey.error());
@@ -2048,13 +2143,38 @@ int main(int argc, char** argv)
         return ExitUsage;
     }
 
-    // An `@<key>` this node's own `--raft-peer` states is a claim about the machine it is
-    // typed on, so one that is not the key it holds is refused rather than announced.
-    if (auto const contradiction = Node::SelfKeyContradiction(cfg, publicKey); contradiction.has_value())
+    // **The formation record this node runs by**, kept -- minted and SAVED when the state
+    // directory holds none -- before any tier starts. After the table above for the identity's
+    // reason: a configuration the node refuses must not leave a record behind. And after the
+    // KEY, whose resolution is what judges the state directory -- and creates it, its owner's
+    // alone -- so nothing is written into a directory other accounts could have planted in.
+    // The identity already saw the mode it runs in: the record, or the one this mints.
+    if (!keptFormation.has_value())
     {
-        logger.Logf(LogLevel::Error, "{}; refusing to start", *contradiction);
+        logger.Logf(LogLevel::Error, "{}; refusing to start", keptFormation.error());
         return ExitUsage;
     }
+    // Engaged whenever a record was read -- the store is what read it -- so this is the same
+    // fact stated where the dereference can see it.
+    if (!formationStore.has_value())
+    {
+        logger.Logf(LogLevel::Error, "no state directory keeps this node's formation record; refusing to start");
+        return ExitUsage;
+    }
+    auto const formationRecord =
+        Node::KeepFormation(*keptFormation, *formationStore, identityRandom, core::platform::defaultSystemWallClock());
+    if (!formationRecord.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}; refusing to start", formationRecord.error());
+        return ExitUsage;
+    }
+    for (auto* const shaped: { &cfg, &cliOnly })
+        if (auto applied = Node::ApplyFormation(*shaped, *formationRecord, keptFormation->remembered); !applied.has_value())
+        {
+            logger.Logf(LogLevel::Error, "{}; refusing to start", applied.error());
+            return ExitUsage;
+        }
+    logger.Logf(LogLevel::Info, "{}, cluster {}", Node::DescribeFormationMode(cfg), cfg.clusterId);
 
     // Built only when there IS a file, and holding the SAME argv the startup parse
     // used -- so a reload reproduces the startup order exactly: a fresh configuration,
@@ -2070,31 +2190,17 @@ int main(int argc, char** argv)
     // `Run()`: every startup warning has to be emitted before that.
     std::optional<NodeReloader> reloader;
     if (!lookup.path.empty())
-        reloader.emplace(
-            cfg,
-            lookup.path,
-            [argvSpan, identity = identity->value_or(Node::NodeIdentity {})](
-                std::filesystem::path const& path) -> std::expected<NodeConfig, ConfigError> {
-                // A FRESH configuration, never the live one. A file that fails halfway
-                // is then discarded whole rather than leaving the running worker
-                // holding part of a document nobody wrote.
-                NodeConfig candidate;
-                auto const loaded =
-                    ReadYamlSettings(path).and_then([&candidate, &path, argvSpan](std::vector<YamlSetting> const& settings) {
-                        return ApplyNodeConfiguration(settings, path, argvSpan.subspan(1), candidate);
-                    });
-                if (!loaded.has_value())
-                    return std::unexpected(loaded.error());
-                // The identity again, through the same function the start used. A
-                // candidate rebuilt without it holds an empty `--node-id`, which is an
-                // unreloadable field that has CHANGED -- so every reload would be
-                // refused by name, on a worker whose configuration was perfectly
-                // valid. Resolved once at startup and applied here, never re-resolved:
-                // this runs on a signal, and a reload must not be able to mint.
-                Node::ApplyNodeIdentity(candidate, identity);
-                return candidate;
-            },
-            &ValidateNodeReloadable);
+        reloader.emplace(cfg,
+                         lookup.path,
+                         Node::ReloadCandidateReader(argvSpan.subspan(1),
+                                                     Node::ReloadBasis {
+                                                         .stateDirectory = cfg.stateDirectory,
+                                                         .hostNames = names.names,
+                                                         .formation = *formationRecord,
+                                                         .remembered = keptFormation->remembered,
+                                                         .identity = identity->value_or(Node::NodeIdentity {}),
+                                                     }),
+                         &ValidateNodeReloadable);
 
     // A secret is only as private as the file holding it, and this worker has one per
     // row of `NodeSecretFileTable()` beside its configuration file, where the daemon has
@@ -2159,7 +2265,7 @@ int main(int argc, char** argv)
     // same fact this expression already reads, one column and one bool later.
     SecretSubjectFiles<NodeConfig> const secretFiles =
         [configFile = lookup.path, argvNamedSecret = !cliOnly.requirePass.empty()](NodeConfig const& live) {
-            return NodeSecretFiles(live, configFile, argvNamedSecret);
+            return NodeSecretFileSubjects(live, configFile, argvNamedSecret);
         };
     SecretExposureReport report = [&logger](std::string_view warning) {
         logger.Logf(LogLevel::Warn, "{}", warning);

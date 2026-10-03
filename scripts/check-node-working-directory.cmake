@@ -55,6 +55,25 @@
 # at worst, and "add a WorkingDirectory=" is a one-line change that takes the
 # service down if the path is wrong.
 #
+# AND THE STATE DIRECTORY A NODE'S IDENTITY LIVES IN
+#
+# A second question about the same units, asked here because it reads the same
+# directives with the same parser. The compile node keeps its identity key in a state
+# directory, and when no `--cluster-dir` names one it takes the platform's default --
+# machine-wide for a PRIVILEGED process, the account's own otherwise. The packaged unit
+# runs as `User=fastcache-node`, which is not privileged and whose home sysusers gives
+# as `/`, so left to itself the machine's service would keep its identity under
+# `/.local/state`, which `ProtectSystem=strict` leaves read-only. What makes it the
+# machine's directory is `StateDirectory=<name>`: systemd creates it and hands the
+# service `STATE_DIRECTORY`, which the node takes -- but only an entry named what
+# `NodeStateDirectoryName` says, read out of the source rather than restated here, so a
+# rename on either side is refused rather than silently handing over a directory the
+# node ignores.
+#
+#   no StateDirectory=         the service keeps its identity in its account's home
+#   a different name           systemd hands one over and the node declines it
+#   a later empty assignment   RESETS the list, so nothing is handed over
+#
 # Runs as `cmake -P`, for the reasons check-repository-hygiene.cmake states at
 # length: it compares strings and reports, so a .sh + .ps1 pair would be two
 # implementations of one rule differing only in syntax, and cmake is the one tool
@@ -96,6 +115,21 @@ set(FastCachedUnitWorkingDirectories
     "linux/fastcached.service|no|The cache daemon. It executes nothing at all, so no prefix-map rule is ever derived from its directory and a working directory of / costs it nothing but a busy mount point."
     "linux/fastcached-user.service|no|The per-user cache daemon. Executes nothing, exactly as the system daemon does not."
 )
+
+# One row per shipped unit whose program keeps a NODE IDENTITY and runs unprivileged:
+#
+#   <path under packaging/>|<why it needs the directory handed over>
+#
+# A unit named here that does not exist is a failure, for the table above's reason.
+set(FastCachedUnitNodeStateDirectories
+    "linux/fastcache-compile-node.service|The compile node, running as the unprivileged fastcache-node account: without StateDirectory= naming its directory it would keep the machine's identity in that account's home, / under sysusers and read-only under ProtectSystem=strict."
+)
+
+# Where the node's own name for its state directory is spelled, and the pattern that
+# reads it. Read rather than restated: a second spelling here is how the unit and the
+# binary would come to disagree with every check green.
+set(FastCachedNodeDefaultsHeader "src/apps/fastcache-compile-node/NodeDefaults.hpp")
+set(FastCachedNodeStateNamePattern "NodeStateDirectoryName = \"([A-Za-z0-9._-]+)\"")
 
 # systemd's own directory roots, so `RuntimeDirectory=x` is checked against the
 # path it actually creates. Both are fixed for a SYSTEM unit, which every row
@@ -300,6 +334,85 @@ foreach(row IN LISTS FastCachedUnitWorkingDirectories)
 endforeach()
 
 # ---------------------------------------------------------------------------
+# The state directory a node's identity lives in.
+
+set(stateViolations "")
+set(nodeStateName "")
+if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${FastCachedNodeDefaultsHeader}")
+    list(APPEND stateViolations
+        "  ${FastCachedNodeDefaultsHeader}\n      does not exist, so the node's own name for its state directory was never read")
+else()
+    file(READ "${FASTCACHED_SOURCE_DIR}/${FastCachedNodeDefaultsHeader}" defaultsText)
+    string(REGEX MATCH "${FastCachedNodeStateNamePattern}" found "${defaultsText}")
+    if(found STREQUAL "")
+        list(APPEND stateViolations
+            "  ${FastCachedNodeDefaultsHeader}\n      spells no NodeStateDirectoryName this check can read, so no unit could be judged against it")
+    else()
+        set(nodeStateName "${CMAKE_MATCH_1}")
+    endif()
+endif()
+
+if(NOT nodeStateName STREQUAL "")
+    foreach(row IN LISTS FastCachedUnitNodeStateDirectories)
+        string(REPLACE "|" ";" fields "${row}")
+        list(GET fields 0 unit)
+        set(path "${FASTCACHED_SOURCE_DIR}/packaging/${unit}")
+        if(NOT EXISTS "${path}")
+            list(APPEND stateViolations
+                "  packaging/${unit}\n      is named by the state-directory table and does not exist, so nothing was scanned")
+            continue()
+        endif()
+        file(READ "${path}" content)
+        fastcached_unit_directive("${content}" "StateDirectory" declarations)
+
+        # The list in force: an empty assignment RESETS it, every other one appends.
+        set(inForce "")
+        set(assignedAny FALSE)
+        foreach(declaration IN LISTS declarations)
+            set(assignedAny TRUE)
+            if(declaration STREQUAL "")
+                set(inForce "")
+            else()
+                string(REGEX REPLACE "[ \t]+" ";" names "${declaration}")
+                list(APPEND inForce ${names})
+            endif()
+        endforeach()
+
+        if(NOT nodeStateName IN_LIST inForce)
+            if(NOT assignedAny)
+                list(APPEND stateViolations
+                    "  packaging/${unit}\n      declares no StateDirectory=, so systemd hands the node no STATE_DIRECTORY and it keeps the machine's identity in its account's home")
+            else()
+                list(JOIN inForce " " inForceText)
+                list(APPEND stateViolations
+                    "  packaging/${unit}\n      declares StateDirectory= '${inForceText}' in force, not '${nodeStateName}' (NodeStateDirectoryName): systemd hands a directory over and the node declines it, so it keeps the machine's identity in its account's home")
+            endif()
+        endif()
+    endforeach()
+endif()
+
+if(NOT stateViolations STREQUAL "")
+    list(JOIN stateViolations "\n" stateReport)
+    set(stateRulebook "")
+    foreach(row IN LISTS FastCachedUnitNodeStateDirectories)
+        string(REPLACE "|" ";" fields "${row}")
+        list(GET fields 0 unit)
+        list(GET fields 1 reason)
+        string(APPEND stateRulebook "  packaging/${unit}\n      ${reason}\n")
+    endforeach()
+    # SEND_ERROR, not FATAL_ERROR: the working-directory verdict below still runs, so a unit
+    # wrong both ways is reported both ways -- the verdict is the output's `CMake Error`.
+    message(SEND_ERROR
+        "Shipped systemd unit(s) would not hand the node its state directory:\n${stateReport}\n\n"
+        "A unit whose program keeps a node identity and runs as an unprivileged account declares "
+        "StateDirectory=<NodeStateDirectoryName>. The node takes the directory systemd hands over "
+        "in STATE_DIRECTORY -- but only one named for it -- and without it falls back to the "
+        "account's own state directory, which is a second identity at best and read-only at worst.\n\n"
+        "${stateRulebook}"
+        "The table lives in ${CMAKE_CURRENT_LIST_FILE}.")
+endif()
+
+# ---------------------------------------------------------------------------
 if(NOT violations STREQUAL "")
     list(JOIN violations "\n" report)
 
@@ -325,5 +438,10 @@ if(NOT violations STREQUAL "")
         "The table lives in ${CMAKE_CURRENT_LIST_FILE}.")
 endif()
 
+if(NOT stateViolations STREQUAL "")
+    return()
+endif()
 list(LENGTH FastCachedUnitWorkingDirectories unitCount)
-message(STATUS "unit working directories: ${unitCount} shipped unit(s) start where they should")
+list(LENGTH FastCachedUnitNodeStateDirectories stateUnitCount)
+message(STATUS "unit working directories: ${unitCount} shipped unit(s) start where they should, "
+               "${stateUnitCount} hand the node its state directory")

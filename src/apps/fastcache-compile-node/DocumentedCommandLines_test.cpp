@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <core/Ranges.hpp>
+#include <tests/NodeFormationFakes.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -168,17 +169,18 @@ constexpr std::array NonStartVerbs {
     NonStartVerb { .flag = "--cluster-forget", .why = "a cluster admin verb: proposes a removal and exits" },
     NonStartVerb { .flag = "--cluster-admit-client", .why = "a cluster admin verb: proposes a client host and exits" },
     NonStartVerb { .flag = "--cluster-forget-client", .why = "a cluster admin verb: proposes a client removal and exits" },
-    // The enrollment verbs. The five operator ones are the cluster-admin rows above in
+    // The enrollment verbs. The three operator ones are the cluster-admin rows above in
     // every respect that matters here -- ask the window's holder one question, print
     // the answer, exit -- and they are listed rather than left out because leaving them
     // out is not neutral: each one carries a `--scheduler` and would therefore be
     // JUDGED as a serving configuration and pass, so the check would be asking the
     // wrong question about them and reporting that it had asked the right one.
-    NonStartVerb { .flag = "--enroll-open", .why = "an enrollment verb: opens the window and exits" },
-    NonStartVerb { .flag = "--enroll-close", .why = "an enrollment verb: closes the window and exits" },
     NonStartVerb { .flag = "--enroll-list", .why = "an enrollment verb: prints what is pending and exits" },
     NonStartVerb { .flag = "--enroll-approve", .why = "an enrollment verb: admits one pending id and exits" },
     NonStartVerb { .flag = "--enroll-reject", .why = "an enrollment verb: refuses one pending id and exits" },
+    NonStartVerb { .flag = "--enroll-auto-approve",
+                   .why = "an enrollment verb: arms or ends the leader's deadline and exits" },
+    NonStartVerb { .flag = "--enroll-clear", .why = "an enrollment verb: drops the undecided requests and exits" },
     // Not a cluster verb but a one-shot JOIN: it asks a member to enrol this machine,
     // polls until somebody decides, keeps what it was handed and exits. It is judged by
     // its own refusal on that path and NOT by `StartupPolicyRejection`, which asks what
@@ -484,7 +486,7 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
 
         // **Every non-template command line is PARSED, whether or not it starts a
         // node.** A non-start verb short-circuits the STARTUP GATE and nothing else:
-        // `--cluster-admit` and `--enroll-open` have an argv exactly as parseable as a
+        // `--cluster-admit` and `--enroll-list` have an argv exactly as parseable as a
         // serving node's, and a flag that does not exist is a documentation defect on
         // either. This test ran the two skips together until the enrollment verbs were
         // added, which is when it mattered enough to measure -- a typo in any of the
@@ -501,7 +503,8 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
                      | std::views::transform([](std::string const& argument) { return argument.c_str(); });
         std::vector<char const*> argv { flags.begin(), flags.end() };
 
-        NodeConfig cfg;
+        // Shaped as `main` shapes a first start before judging it: the record that start mints.
+        auto cfg = Testing::FirstStart(NodeConfig {});
         auto const parsed = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg);
         if (!parsed.has_value())
         {

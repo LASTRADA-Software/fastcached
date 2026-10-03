@@ -501,15 +501,15 @@ struct NodeRuntimeSources
     /// `Undecided`, a reading that would claim this node is in an election.
     Distributed::SchedulerService const* scheduler { nullptr };
 
-    /// This node's enrollment window; null on a node that runs no consensus.
+    /// This node's enrollment list; null on a node that runs no consensus.
     ///
-    /// Null is ABSENT and not `Closed`, for the reason every member here is nullable:
-    /// a node with no cluster has no window to report on, and a `Closed` there is a
+    /// Null is ABSENT and not `Manual`, for the reason every member here is nullable:
+    /// a node with no cluster has no list to report on, and a `Manual` there is a
     /// reassuring claim about a thing that does not exist. The distinction is worth
     /// more here than anywhere else in this record, because the state an operator is
-    /// scanning for is `Open` -- a minute in which this machine hands the fleet's key
-    /// to a stranger it approves -- and a false `Closed` is exactly the reading that
-    /// stops them looking.
+    /// scanning for is `AutoApprove` -- a deadline during which this machine admits
+    /// whoever asks with nobody comparing a key -- and a false `Manual` is exactly the
+    /// reading that stops them looking.
     EnrollmentWindow const* enrollment { nullptr };
 
     /// This node's admission oracle, for the count of client tombstones it has applied;

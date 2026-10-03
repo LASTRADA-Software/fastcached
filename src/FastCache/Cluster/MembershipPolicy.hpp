@@ -26,12 +26,17 @@ namespace FastCache::Cluster
 /// written into it would undo the operator's next promotion or demotion one interval
 /// after it committed -- the defect #1449 closed for this node's own record, reached
 /// from discovery's. And the fact a source cannot know is the one that decides: a
-/// `--raft-peer` member is counted by the configuration and recorded nowhere in the
+/// bootstrap member is counted by the configuration and recorded nowhere in the
 /// state, so a source that called every unrecorded peer a newcomer would demote it.
 struct DesiredMember
 {
-    Consensus::NodeId id;     ///< Stable identity; what consensus counts.
-    std::string raftEndpoint; ///< Where its consensus port answers.
+    Consensus::NodeId id; ///< Stable identity; what consensus counts.
+
+    /// Where its consensus port answers; empty for a member whose seat is not dialled.
+    ///
+    /// A learner dials in (`SeatNeedsEndpoint`), so an empty endpoint is its whole record.
+    /// Empty for a seat that IS dialled is half a record, which `MembershipProposals` drops.
+    std::string raftEndpoint;
 
     /// Where clients reach it while it leads; absent when this node has no opinion.
     ///
@@ -118,8 +123,8 @@ struct MembershipPlan
 /// **A seat something else placed.** A recorded member keeps the seat the operator's
 /// verb wrote, so neither this node's own record nor a rediscovered peer promotes a
 /// demotion back or demotes a promotion. One recorded nowhere but counted by @p active
-/// -- a `--raft-peer` member, which nothing puts in the state -- is recorded in the set
-/// consensus already counts it in, so recording a typed voter never demotes it. Only a
+/// -- a bootstrap member, which nothing puts in the state -- is recorded in the set
+/// consensus already counts it in, so recording a bootstrap voter never demotes it. Only a
 /// member neither places is a newcomer, and it joins as `NewcomerSeat`: a learner, which
 /// an operator promotes (#1535).
 ///
@@ -245,7 +250,7 @@ struct QuorumPlan
 /// to promote -- that is the operator's (#1535) -- only about WHEN the promotion may
 /// take effect. A member waiting for it is named in `QuorumPlan::catchingUp`.
 ///
-/// **A learner is never removed for being absent**, which is the property `--raft-peer`
+/// **A learner is never removed for being absent**, which is the property bootstrap
 /// members already have below, and for the same reason: nothing here asks whether a
 /// member ANSWERS. Only a member the operator forgot -- gone from the state, admitted
 /// at runtime -- is removed, whichever set it is in.
@@ -299,9 +304,9 @@ struct QuorumPlan
 /// and is removed on the terms below, as it always was.
 ///
 /// **The removal of a bootstrap member.** This is the one that is not obvious, and
-/// getting it wrong shrinks a healthy cluster to one node: `--raft-peer` puts a
+/// getting it wrong shrinks a healthy cluster to one node: the bootstrap set puts a
 /// member in the *configuration* and nothing puts it in the *state*, so on a cluster
-/// whose peers were typed rather than discovered, `state.members` holds the leader's
+/// whose members were bootstrapped rather than admitted, `state.members` holds the leader's
 /// own record and nothing else. Read as "everybody else was forgotten", that
 /// proposes removing every peer, one per commit, until the leader is alone and
 /// refuses the others as strangers — which is what it did, exactly once, before
@@ -309,9 +314,8 @@ struct QuorumPlan
 ///
 /// So absence means removal only for a member that was **admitted at runtime**,
 /// which is what tells "the operator forgot it" apart from "nobody ever wrote it
-/// down". A member an operator typed into `--raft-peer` is a member by that
-/// operator's own assertion, and taking it out of the quorum is their decision to
-/// make by editing that line.
+/// down". A bootstrap member is a member by the record it was started from, and
+/// taking it out of the quorum is an operator's decision -- a forget, never absence.
 ///
 /// The bootstrap set rather than a record of what this process has observed, and
 /// the difference is a restart. An observation is rebuilt from live members only, so
@@ -322,7 +326,7 @@ struct QuorumPlan
 ///
 /// **A node given no bootstrap set removes no member merely for being absent**, which
 /// is the same rule read at its limit rather than an exception to it -- a FORGOTTEN one
-/// it removes, above. A `--raft-join` node was
+/// it removes, above. A node that joined a fleet was
 /// told nothing about the cluster's shape, so every member is equally unexplained to
 /// it — and once such a node is elected it would otherwise remove all of them, one
 /// per commit, which is the identical failure the parameter exists to prevent
@@ -356,13 +360,13 @@ struct QuorumPlan
 /// on counting the member, and its host would be refused by every surface while it
 /// led. Refused by NAME instead, while the operator who typed `--cluster-forget` is
 /// reading the answer. Against the configuration consensus holds rather than the state:
-/// which members are COUNTED is the question, and a typed `--raft-peer` voter is counted
+/// which members are COUNTED is the question, and a bootstrap voter is counted
 /// while recorded nowhere.
 ///
 /// **Which key the forget revokes beyond its record's.** `Apply` revokes whatever key the
 /// record holds, and a member the state records without one -- or not at all, which is
-/// every member a `--raft-peer` line typed -- would keep a key that line states live on
-/// every node that types it: the forgotten machine goes on proving itself there, which is
+/// every bootstrap member -- would keep a key its bootstrap roster states live on
+/// every node started from it: the forgotten machine goes on proving itself there, which is
 /// removal failing OPEN. The proposer states the key it holds live for the id, and the
 /// replicated revocation then outranks every command line that types it
 /// (`RosterKeys::KeysOf`).

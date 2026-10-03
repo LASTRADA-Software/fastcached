@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeFormation.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Cli/Options.hpp>
@@ -17,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -34,14 +36,19 @@ namespace
 /// worker that names a scheduler with nowhere to keep its identity is the shape a
 /// `StartupPolicyRejection` row now refuses. Every other field is present.
 /// @return The config.
-[[nodiscard]] NodeConfig WorkerWithoutIdentity()
+[[nodiscard]] NodeConfig WorkerAdmittingTwoWays()
 {
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeListen = "0.0.0.0:6674";
     cfg.schedulers = { "scheduler.internal:6675" };
     cfg.advertise = "worker-01.internal:6674";
     cfg.advertiseExplicit = true;
     cfg.toolchains = { "/usr/bin/g++" };
+    cfg.clusterDir = "cluster";
+    // `--fleet-open` beside `--fleet-member`: a contradiction the startup table refuses, and
+    // one that opens no port, so the worksheet cannot differ between it and its repair.
+    cfg.fleetOpen = true;
+    cfg.fleetMembers = { "10.0.0.1:6676" };
     return cfg;
 }
 
@@ -88,7 +95,7 @@ TEST_CASE("Every surface's spec reaches a real field", "[node][surfaces]")
         auto const argument = std::string { flag } + "=10.11.12.13:6699";
         std::vector<char const*> const argv { argument.c_str() };
 
-        NodeConfig cfg;
+        auto cfg = Testing::FirstStart(NodeConfig {});
         auto const flow = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg);
         REQUIRE(flow.has_value());
         CHECK(cfg.*row.spec == "10.11.12.13:6699");
@@ -134,21 +141,18 @@ TEST_CASE("A surface resolving from its own spec has a default host to resolve a
     for (auto const& row: NodeSurfaceTable())
     {
         INFO("surface: " << row.name);
-        if (row.defaultHost.empty())
-            // Two rows, and for opposite reasons. The compile port's host is `--bind`
-            // -- a flag an operator sets, never a fallback a bare port takes -- so an
-            // empty column is the honest answer. The node port HAS a default and it
-            // depends on the configuration (loopback on a worker, the wildcard on a
-            // scheduler), which one constant cannot hold: `NodeListenDefaultHost`
-            // decides it, and a value here would be a second author of that rule.
-            CHECK(row.surface == NodeSurface::Node);
+        // Every row has one now. The node port's used to depend on the configuration --
+        // loopback on a worker, the wildcard on a scheduler -- and was left empty for a
+        // function to decide; since every node is a fleet participant it is the wildcard.
+        CHECK_FALSE(row.defaultHost.empty());
     }
 
-    CHECK(RowFor(NodeSurface::Node).defaultHost.empty());
+    CHECK(RowFor(NodeSurface::Node).defaultHost == NodeSurfaceDefaultHost);
     CHECK_FALSE(RowFor(NodeSurface::Discovery).defaultHost.empty());
 }
 
-TEST_CASE("A default configuration serves the two surfaces that are on", "[node][surfaces]")
+TEST_CASE("A node with no flags listens on the wildcard node port and the raft port and runs discovery",
+          "[node][surfaces][formation][defaults]")
 {
     // Asked of the resolver rather than of a column restating it. A `presence`
     // column was written and deleted: it said what `resolve(NodeConfig{})` already
@@ -156,23 +160,30 @@ TEST_CASE("A default configuration serves the two surfaces that are on", "[node]
     // and still get no port. The named surfaces are spelled out here so the case
     // fails if a row's default changes, rather than comparing the resolver against
     // a second copy of its own answer.
-    NodeConfig const cfg;
+    auto const cfg = Testing::FirstStart(NodeConfig {});
 
     std::vector<std::string_view> served;
     for (auto const& row: NodeSurfaceTable())
         if (!row.Resolve(cfg).empty())
             served.push_back(row.name);
 
-    // ONE protocol surface on a default configuration, where there were two. The
-    // dedicated compile port is gone and its verbs arrive here (#290 stage 3).
-    CHECK(served == std::vector<std::string_view> { "node" });
+    // The node port, consensus and discovery: a node with no flags is a one-voter cluster
+    // of itself that beacons on its segment. The dedicated compile port is gone and its
+    // verbs arrive on the node port (#290 stage 3).
+    CHECK(served == std::vector<std::string_view> { "node", "raft", "discovery" });
 
-    // The default an operator reads off the startup line, and the address
+    // The default an operator reads off the startup line: the wildcard, on the port
     // `fastcache-cc` looks for when nobody sets `FASTCACHE_ADDR`.
     auto const node = RowFor(NodeSurface::Node).Resolve(cfg);
     REQUIRE(node.size() == 1);
-    CHECK(node.front().host == "127.0.0.1");
-    CHECK(node.front().port == 6674);
+    CHECK(node.front().host == "0.0.0.0");
+    CHECK(node.front().port == DefaultNodePort);
+    CHECK(cfg.raftListen == DefaultRaftListen);
+    CHECK(cfg.discoveryAddress == DefaultDiscoveryAddress);
+    auto const raft = RowFor(NodeSurface::Raft).Resolve(cfg);
+    REQUIRE(raft.size() == 1);
+    CHECK(raft.front().host == "0.0.0.0");
+    CHECK(raft.front().port == DefaultRaftPort);
 }
 
 TEST_CASE("A bare port takes its own surface's default host", "[node][surfaces]")
@@ -182,7 +193,7 @@ TEST_CASE("A bare port takes its own surface's default host", "[node][surfaces]"
     // this machine's entire build output served to strangers. A worksheet that got
     // this backwards would tell an operator a surface is loopback-only when it is
     // open to the network.
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeListen = "6699";
     cfg.adminListen = "6699";
     cfg.raftListen = "6699";
@@ -194,30 +205,29 @@ TEST_CASE("A bare port takes its own surface's default host", "[node][surfaces]"
         return endpoints.front().host;
     };
 
-    CHECK(hostOf(NodeSurface::Node) == "127.0.0.1");
+    CHECK(hostOf(NodeSurface::Node) == "0.0.0.0");
     CHECK(hostOf(NodeSurface::Admin) == "127.0.0.1");
     CHECK(hostOf(NodeSurface::Raft) == "0.0.0.0");
 }
 
-TEST_CASE("The node port's default host follows whether this node schedules", "[node][surfaces]")
+TEST_CASE("The node port's default host is the wildcard whether or not this node schedules", "[node][surfaces]")
 {
-    // The asymmetry SURVIVED the merge rather than being resolved by it (#290), and
-    // this is where. Two surfaces pulled one address in opposite directions -- a
-    // scheduler no peer can dial does nothing, a cache every host can dial is this
-    // machine's whole build output served to strangers -- so the one listener keeps
-    // both answers and picks between them on `--serve-scheduler`.
-    //
-    // A worksheet that got this backwards would tell an operator a port is
-    // loopback-only when it faces the network, which is a security misstatement
-    // rather than an untidy one.
-    NodeConfig worker;
+    // The asymmetry the merge kept (#290) -- loopback on a worker, the wildcard on a
+    // scheduler -- went with the zero-config defaults: every node is a fleet participant,
+    // and a worker bound to loopback advertises an address nobody else can dial. What keeps
+    // a cache this machine's alone is admission, not the socket (#287).
+    auto worker = Testing::FirstStart(NodeConfig {});
     worker.nodeListen = "6699";
+    worker.raftListen.clear();
+    worker.raftListenExplicit = true;
+    REQUIRE_FALSE(ServesScheduler(worker));
     auto const workerEndpoints = RowFor(NodeSurface::Node).Resolve(worker);
     REQUIRE(workerEndpoints.size() == 1);
-    CHECK(workerEndpoints.front().host == "127.0.0.1");
+    CHECK(workerEndpoints.front().host == "0.0.0.0");
 
-    auto scheduling = worker;
-    scheduling.serveScheduler = true;
+    auto scheduling = Testing::FirstStart(NodeConfig {});
+    scheduling.nodeListen = "6699";
+    REQUIRE(ServesScheduler(scheduling));
     auto const schedulingEndpoints = RowFor(NodeSurface::Node).Resolve(scheduling);
     REQUIRE(schedulingEndpoints.size() == 1);
     CHECK(schedulingEndpoints.front().host == "0.0.0.0");
@@ -243,10 +253,12 @@ TEST_CASE("Every node that runs binds the 0xFC port", "[node][surfaces]")
     // What that older case protected is still protected, one layer down: a node with no
     // cache tier builds no tier, and its FETCH verbs are refused by the component that
     // owns them rather than by the socket being absent.
-    NodeConfig worker;
+    auto worker = Testing::FirstStart(NodeConfig {});
     worker.cacheMemoryBytes = 0;
     worker.cacheDir.clear();
-    REQUIRE_FALSE(worker.serveScheduler);
+    worker.raftListen.clear();
+    worker.raftListenExplicit = true;
+    REQUIRE_FALSE(ServesScheduler(worker));
     CHECK(RowFor(NodeSurface::Node).Resolve(worker).size() == 1);
 
     // And neither component changes the answer any more, which is the whole point:
@@ -256,7 +268,9 @@ TEST_CASE("Every node that runs binds the 0xFC port", "[node][surfaces]")
     CHECK(RowFor(NodeSurface::Node).Resolve(caching).size() == 1);
 
     auto scheduling = worker;
-    scheduling.serveScheduler = true;
+    scheduling.raftListen = std::string { DefaultRaftListen };
+    scheduling.raftListenExplicit = false;
+    REQUIRE(ServesScheduler(scheduling));
     CHECK(RowFor(NodeSurface::Node).Resolve(scheduling).size() == 1);
 
     // The one remaining way to serve no 0xFC port: no address to bind. That is an
@@ -270,7 +284,7 @@ TEST_CASE("Discovery binds the wildcard whatever address it announces to", "[nod
 {
     // The row that is neither one endpoint nor one flag, and the one an operator is
     // least likely to get right unaided.
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.discoveryAddress = "255.255.255.255:6681";
 
     auto const beaconOnly = RowFor(NodeSurface::Discovery).Resolve(cfg);
@@ -313,15 +327,17 @@ TEST_CASE("Raft binds exactly when --listen-raft is given", "[node][surfaces]")
     // BOTH directions, because the row's gate moved rather than went away: it used to
     // return nothing unless `--node-id` was given, and a test that only drove the
     // fully-configured node would pass under either gate.
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.raftListen = "0.0.0.0:6680";
     CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).size() == 1);
 
     // An id with no port names a node in a cluster this process is not opening a door
     // for, so nothing is bound and the worksheet says so. Under the old gate this was
-    // the served case, which is what makes it the one worth asserting.
-    NodeConfig named;
+    // the served case, which is what makes it the one worth asserting. The port is named
+    // empty, since it is on by default.
+    auto named = Testing::FirstStart(NodeConfig {});
     named.nodeId = "n1";
+    named.raftListen.clear();
     CHECK(RowFor(NodeSurface::Raft).Resolve(named).empty());
 }
 
@@ -333,16 +349,17 @@ TEST_CASE("The worksheet describes this configuration, not the defaults", "[node
     // `--print-surfaces --listen-node=6675` print a node that was never configured
     // -- a worksheet silently describing a different machine from the one the operator
     // asked about.
-    std::vector<char const*> const argv { "--print-surfaces", "--serve-scheduler", "--listen-node=6675" };
+    std::vector<char const*> const argv { "--print-surfaces", "--listen-node=6675" };
 
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     auto const flow = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg);
     REQUIRE(flow.has_value());
     CHECK(cfg.printSurfaces);
     CHECK(cfg.nodeListen == "6675");
 
-    // The wildcard rather than loopback, which is the second flag doing its other job:
-    // it decides where a bare port lands as well as whether the verbs are served.
+    // The wildcard rather than loopback, because this node's mode serves a scheduler: that
+    // decides where a bare port lands as well as whether the verbs are served.
+    REQUIRE(ServesScheduler(cfg));
     CHECK(RenderSurfaces(cfg).contains("0.0.0.0:6675"));
 }
 
@@ -352,7 +369,7 @@ TEST_CASE("The worksheet never prints an announce address as a bind address", "[
     // is an ordinary thing to write, and reading its host as the bind address would
     // put a BROADCAST address on a firewall worksheet -- in the row an operator is
     // least likely to question, because it is also the only UDP one.
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.discoveryAddress = "255.255.255.255:6681";
     cfg.discoveryReplyPort = 6682;
 
@@ -377,9 +394,9 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
 
     SECTION("a configuration that would not start is printed AND refused")
     {
-        // The documented worker line, minus `--cluster-dir`: a node that names a scheduler
-        // with nowhere to keep the identity it proves -- a `StartupPolicyRejection` row.
-        auto cfg = WorkerWithoutIdentity();
+        // The documented worker line, admitting both everybody and a list -- a
+        // `StartupPolicyRejection` row.
+        auto cfg = WorkerAdmittingTwoWays();
 
         auto const report = ReportSurfaces(cfg);
 
@@ -391,7 +408,7 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
 
         // And refused, which is what the exit code follows from.
         REQUIRE(report.refusal.has_value());
-        CHECK(Unwrap(report.refusal) == SchedulerNeedsIdentityRefusal);
+        CHECK(Unwrap(report.refusal).starts_with("--fleet-open and --fleet-member contradict each other"));
 
         // **The table's own words, byte for byte.** A second phrasing here would be a
         // second thing to be wrong, and an operator who met one sentence from this flag
@@ -404,8 +421,8 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
     {
         // The control, and the ticket names it explicitly: without it, a flag that
         // always fails satisfies the section above.
-        auto cfg = WorkerWithoutIdentity();
-        cfg.clusterDir = "cluster";
+        auto cfg = WorkerAdmittingTwoWays();
+        cfg.fleetMembers.clear();
 
         auto const report = ReportSurfaces(cfg);
         CHECK(report.text.contains("0.0.0.0:6674")); // the RESOLVED endpoint, which is what the flag exists to print
@@ -417,12 +434,12 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
         // The map does not change shape according to the verdict: judging and rendering
         // are two answers about one configuration, and a reader comparing a broken run
         // with a fixed one should see the map differ only where the configuration does.
-        auto broken = WorkerWithoutIdentity();
+        auto broken = WorkerAdmittingTwoWays();
         auto fixed = broken;
-        fixed.clusterDir = "cluster";
+        fixed.fleetMembers.clear();
 
-        // `--cluster-dir` opens no port on a node running no consensus, so it appears in no
-        // surface row -- which is what makes this comparison exact rather than approximate.
+        // Admission opens no port, so it appears in no surface row -- which is what makes this
+        // comparison exact rather than approximate.
         CHECK(ReportSurfaces(broken).text == ReportSurfaces(fixed).text);
     }
 }
@@ -431,7 +448,7 @@ TEST_CASE("A surface that is off is named, with what would turn it on", "[node][
 {
     // Omitting it would read as a surface this build does not have, which an operator
     // cannot tell from one they simply did not switch on.
-    auto const sheet = RenderSurfaces(NodeConfig {});
+    auto const sheet = RenderSurfaces(Testing::FirstStart(NodeConfig {}));
     CHECK(sheet.contains("--admin-listen"));
 
     // And the compile port's caveat travels with the sheet rather than living only in
@@ -442,7 +459,10 @@ TEST_CASE("A surface that is off is named, with what would turn it on", "[node][
     // The PRIMARY flag alone, never every flag the row carries. Discovery is the row
     // where that matters: `--discovery-reply-port` is optional, and printing it beside
     // `--discovery` reads as two flags an operator must set to hear a beacon at all.
-    CHECK(sheet.contains("not served; set --discovery\n"));
+    // Discovery is on by default, so it is turned off to be asked.
+    auto quiet = Testing::FirstStart(NodeConfig {});
+    quiet.discoveryAddress.clear();
+    CHECK(RenderSurfaces(quiet).contains("not served; set --discovery\n"));
 }
 
 TEST_CASE("A surface that is configured and still off is not answered 'set the flag'", "[node][surfaces]")
@@ -458,25 +478,28 @@ TEST_CASE("A surface that is configured and still off is not answered 'set the f
     // configuration now SERVES. Asserting the served endpoint rather than deleting the
     // case is what keeps the old behaviour from coming back unremarked -- the wrong
     // answer and the right one differ by one row's `resolve`.
-    NodeConfig raft;
+    auto raft = Testing::FirstStart(NodeConfig {});
     raft.raftListen = "6680";
 
     auto const waiting = RenderSurfaces(raft);
     CHECK_FALSE(waiting.contains("set --listen-raft"));
     CHECK_FALSE(waiting.contains("see the raft note below"));
     CHECK(waiting.contains("0.0.0.0:6680"));
-    // And the note names the switch, which is now this row's own flag.
-    CHECK(RowFor(NodeSurface::Raft).note.contains("turns consensus ON"));
+    // And the note names the switch, which is the formation record's mode rather than this row's
+    // flag -- the flag only says where, and an empty one closes the port.
+    CHECK(RowFor(NodeSurface::Raft).note.contains("mode opens the port"));
+    CHECK(RowFor(NodeSurface::Raft).note.contains("an empty --listen-raft= closes it"));
 
     // A row with no spec text at all still gets the first answer, which is the one
     // that IS right for it.
-    NodeConfig silent;
+    auto silent = Testing::FirstStart(NodeConfig {});
+    silent.raftListen.clear();
     CHECK(RenderSurfaces(silent).contains("set --listen-raft"));
 
     // A malformed value is echoed in the shape the row advertises -- the same sentence
     // `StartupPolicyRejection` produces from the same columns a moment later, rather
     // than an instruction to set a flag that is already set.
-    NodeConfig typo;
+    auto typo = Testing::FirstStart(NodeConfig {});
     typo.nodeListen = "not-a-port";
 
     auto const wrong = RenderSurfaces(typo);
@@ -678,7 +701,7 @@ namespace
 /// @return The configuration.
 [[nodiscard]] NodeConfig WildcardBoundWithRaftSelf()
 {
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.raftListen = "6680";
     cfg.raftSelf = "10.0.0.4";
     return cfg;
@@ -769,8 +792,9 @@ TEST_CASE("A node running no consensus prints its dial address as ABSENT, not as
     // `RunsConsensus` is false iff `--listen-raft` does not resolve, and that is a real
     // deployment: a plain worker. Absent is not zero -- an empty address column would read
     // as "the node dials nowhere", which is a different fact from "there is no consensus".
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.raftSelf = "10.0.0.4"; // named, and still nothing to dial: no consensus port
+    cfg.raftListen.clear();
 
     auto const dial = ConsensusDialAddressOf(cfg);
     REQUIRE_FALSE(dial.has_value());
@@ -783,44 +807,17 @@ TEST_CASE("A node running no consensus prints its dial address as ABSENT, not as
     CHECK_FALSE(Unwrap(line).contains("10.0.0.4"));
 }
 
-TEST_CASE("The dial address is the node's own member entry, which a typed --raft-peer states", "[node][surfaces][consensus]")
-{
-    // The pair consensus runs under and `EnrollClaim` sends. No `--raft-self` here, so a
-    // derivation that asked `RaftSelfEndpoint` alone would report nothing.
-    NodeConfig cfg;
-    cfg.raftListen = "6680";
-    cfg.nodeId = "n1";
-    cfg.raftPeers = { Cluster::ClusterMember {
-                          .id = "n1", .raftEndpoint = "10.0.0.7:6680", .schedulerEndpoint = {}, .publicKey = std::nullopt },
-                      Cluster::ClusterMember { .id = "n2",
-                                               .raftEndpoint = "10.0.0.8:6680",
-                                               .schedulerEndpoint = {},
-                                               .publicKey = std::nullopt } };
-
-    auto const dial = ConsensusDialAddressOf(cfg);
-    REQUIRE(dial.has_value());
-    CHECK(*dial == "10.0.0.7:6680");
-
-    SECTION("and it wins over a --raft-self that contradicts it, which is the entry consensus would run under")
-    {
-        // The startup table refuses this pair (`NodeIdentity_test.cpp` asserts which rule);
-        // the worksheet still has to print it, and it prints the address the refusal is about.
-        auto contradicted = cfg;
-        contradicted.raftSelf = "10.0.0.4";
-        auto const reported = ConsensusDialAddressOf(contradicted);
-        REQUIRE(reported.has_value());
-        CHECK(*reported == "10.0.0.7:6680");
-    }
-}
-
 TEST_CASE("A consensus node that names itself neither way prints NOT STATED and the flags that would state it",
           "[node][surfaces][consensus]")
 {
     // `--print-surfaces` prints a configuration the node refuses, which is its point, so it
     // has to be able to say that nobody stated this address -- neither an address nor an
-    // absence would be true.
-    NodeConfig cfg;
+    // absence would be true. "Neither way" is a host name that RESOLVED to nothing; before
+    // it resolves the address is awaited, which is its own line.
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.raftListen = "6680";
+    auto awaiting = cfg;
+    ApplyHostNames(cfg, NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = {} });
 
     auto const dial = ConsensusDialAddressOf(cfg);
     REQUIRE_FALSE(dial.has_value());
@@ -830,6 +827,11 @@ TEST_CASE("A consensus node that names itself neither way prints NOT STATED and 
     REQUIRE(line.has_value());
     CHECK(Unwrap(line).contains("NOT STATED"));
     CHECK(Unwrap(line).contains("--raft-self"));
+
+    auto const pending = LineStarting(RenderSurfaces(awaiting), DialLabel());
+    REQUIRE(pending.has_value());
+    CHECK(Unwrap(pending).contains("AT STARTUP"));
+    CHECK_FALSE(Unwrap(pending).contains("NOT STATED"));
 }
 
 TEST_CASE("the metrics surfaces a node serves follow the components it was told to run", "[node][surfaces][metrics]")
@@ -849,9 +851,9 @@ TEST_CASE("the metrics surfaces a node serves follow the components it was told 
         // executor, so these cannot move at any traffic level ever -- which is #1484's finding.
         // Asserted against a RICH configuration rather than a default one: a default `NodeConfig`
         // serves little, so a case built on one passes for the wrong reason.
-        NodeConfig rich;
+        auto rich = Testing::FirstStart(NodeConfig {});
         rich.slots = 4;
-        rich.serveScheduler = true;
+        REQUIRE(ServesScheduler(rich));
         rich.cacheMemoryBytes = 8 * 1024 * 1024;
         rich.nodeListen = "127.0.0.1:1";
 
@@ -869,32 +871,44 @@ TEST_CASE("the metrics surfaces a node serves follow the components it was told 
         // BOTH directions, because a build that never served `CompileWorker` would pass the
         // `--slots=0` half on its own -- and that is the direction this feature could plausibly
         // break, since it renders a real figure as `-`.
-        NodeConfig withWorker;
+        auto withWorker = Testing::FirstStart(NodeConfig {});
         withWorker.slots = 2;
         REQUIRE(RunsWorker(withWorker));
         CHECK(serves(withWorker, MetricsSurface::CompileWorker));
 
-        NodeConfig withoutWorker;
+        auto withoutWorker = Testing::FirstStart(NodeConfig {});
         withoutWorker.slots = 0;
         REQUIRE_FALSE(RunsWorker(withoutWorker));
         CHECK_FALSE(serves(withoutWorker, MetricsSurface::CompileWorker));
     }
 
-    SECTION("the scheduler follows --serve-scheduler, and enrollment needs consensus BESIDE it")
+    SECTION("the scheduler follows the mode, and enrollment needs the scheduler BESIDE consensus")
     {
-        // `ServesEnrollment` is `RunsConsensus(cfg) && a started scheduler tier`, so a scheduler
+        // `ServesEnrollment` is `RunsConsensus(cfg) && a started scheduler tier`, so consensus
         // alone must NOT bring the enrollment surface with it. That conjunction is the one thing
-        // here a single predicate would have got wrong.
-        NodeConfig schedulerOnly;
-        schedulerOnly.serveScheduler = true;
-        REQUIRE_FALSE(RunsConsensus(schedulerOnly));
-        CHECK(serves(schedulerOnly, MetricsSurface::CompileScheduler));
-        CHECK_FALSE(serves(schedulerOnly, MetricsSurface::NodeEnrollment));
-        CHECK_FALSE(serves(schedulerOnly, MetricsSurface::ConsensusPeerWire));
+        // here a single predicate would have got wrong -- and a LEARNER is the node it separates:
+        // it runs consensus and its mode serves no scheduler.
+        auto scheduling = Testing::FirstStart(NodeConfig {});
+        REQUIRE(ServesScheduler(scheduling));
+        CHECK(serves(scheduling, MetricsSurface::CompileScheduler));
+        CHECK(serves(scheduling, MetricsSurface::NodeEnrollment));
 
-        NodeConfig neither;
+        auto learner = Testing::FirstStart(NodeConfig {});
+        REQUIRE(learner.formation.has_value());
+        if (learner.formation.has_value())
+            learner.formation->mode = Cluster::NodeMode::Learner;
+        REQUIRE(RunsConsensus(learner));
+        REQUIRE_FALSE(ServesScheduler(learner));
+        CHECK_FALSE(serves(learner, MetricsSurface::CompileScheduler));
+        CHECK_FALSE(serves(learner, MetricsSurface::NodeEnrollment));
+
+        auto neither = Testing::FirstStart(NodeConfig {});
+        neither.raftListen.clear();
+        neither.raftListenExplicit = true;
+        REQUIRE_FALSE(RunsConsensus(neither));
         CHECK_FALSE(serves(neither, MetricsSurface::CompileScheduler));
         CHECK_FALSE(serves(neither, MetricsSurface::NodeEnrollment));
+        CHECK_FALSE(serves(neither, MetricsSurface::ConsensusPeerWire));
     }
 
     SECTION("a default-constructed ServedSurfaces means NOT NARROWED, so it holds every surface")
@@ -909,4 +923,21 @@ TEST_CASE("the metrics surfaces a node serves follow the components it was told 
         for (auto const surface: EverySurface)
             CHECK(std::ranges::find(notNarrowed.Span(), surface) != notNarrowed.Span().end());
     }
+}
+
+TEST_CASE("Discovery on a node running no consensus is not served, and the worksheet says why",
+          "[node][surfaces][formation][defaults]")
+{
+    // Discovery is on by default and runs beside consensus only, so a worker that turns
+    // consensus off with an empty --listen-raft opens no discovery socket -- and a worksheet
+    // or a --node-status reporting one would name a port nothing bound.
+    auto worker = Testing::FirstStart(NodeConfig {});
+    worker.raftListen.clear();
+    REQUIRE_FALSE(worker.discoveryAddress.empty());
+    CHECK(RowFor(NodeSurface::Discovery).Resolve(worker).empty());
+    CHECK(RenderSurfaces(worker).contains("not served; see the discovery note below"));
+    CHECK(RowFor(NodeSurface::Discovery).note.contains("beside consensus only"));
+
+    // The control: the same address beside consensus is served.
+    CHECK_FALSE(RowFor(NodeSurface::Discovery).Resolve(Testing::FirstStart(NodeConfig {})).empty());
 }

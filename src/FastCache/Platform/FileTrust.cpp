@@ -1,20 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Platform/FileTrust.hpp>
 
+#include <cerrno>
 #include <filesystem>
 #include <format>
 #include <string>
 #include <system_error>
 
 #if defined(_WIN32)
+    #include <FastCache/Platform/NarrowText.hpp>
+
     #include <array>
     #include <cstddef>
+    #include <cstdint>
     #include <memory>
     #include <optional>
     #include <ranges>
     #include <span>
+    #include <type_traits>
+    #include <vector>
 
     #include <windows.h>
+
+    #include <fcntl.h>
+    #include <io.h>
     // After windows.h: both depend on its types, and WIN32_LEAN_AND_MEAN (set
     // on the target) keeps them from arriving on their own.
     #include <aclapi.h>
@@ -22,6 +31,7 @@
 #else
     #include <sys/stat.h>
 
+    #include <fcntl.h>
     #include <unistd.h>
 #endif
 
@@ -111,6 +121,31 @@ namespace
     /// single arbiter both are judged by, so a drift between them shows up as a
     /// warning naming the file rather than as a silently weaker list.
     constexpr auto SecretFileDacl = L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;SU)";
+
+    /// The access list a secret held by ONE account should carry: SYSTEM and
+    /// Administrators in full, the file's owner in full, and nobody else.
+    ///
+    /// `SecretFileDacl` without its service grant, and with the owner in its place:
+    /// a node's identity key is read by the process that minted it and by nothing
+    /// else, so a grant to every service on the machine would be read access handed
+    /// to principals that have no business with it. `OW` is OWNER RIGHTS
+    /// (S-1-3-4), which follows the file's owner rather than naming an account, so
+    /// the list is the same whether a user, a virtual service account or SYSTEM
+    /// created the file -- and it replaces the owner's implicit rights rather than
+    /// adding to them, which `FA` makes moot. Protected, for `SecretFileDacl`'s
+    /// reason: the directory's list is not consulted.
+    constexpr auto OwnerOnlySecretFileDacl = L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)";
+
+    /// The access list a directory ONE account keeps its secrets in should carry: the entries of
+    /// `OwnerOnlySecretFileDacl`, inherited by every file and subdirectory created in it. Protected,
+    /// so the permissive entries a parent like `%ProgramData%` grants never flow in.
+    constexpr auto OwnerOnlyDirectoryDacl = L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)";
+
+    /// The rights that let a principal put a different file in a DIRECTORY, or take one away:
+    /// `PlantingRights` (whose `FILE_WRITE_DATA` and `FILE_APPEND_DATA` ARE add-file and
+    /// add-subdirectory on a directory) and delete-child, which removes an entry whatever the
+    /// entry's own list says.
+    constexpr DWORD EntryPlantingRights = PlantingRights | FILE_DELETE_CHILD;
 
     /// The principals a machine-wide directory may belong to. An owner keeps
     /// WRITE_DAC whatever the access list says, so a directory owned by a
@@ -208,15 +243,16 @@ namespace
     /// @param path Entry to inspect.
     /// @param rights The mask an entry must grant to count.
     /// @return true when no broad principal is granted any of them, false when
-    ///         one is, nullopt when the access list would not say.
-    [[nodiscard]] std::optional<bool> NoBroadPrincipalMay(std::filesystem::path const& path, DWORD rights)
+    ///         one is, and the error when the access list would not say -- carried
+    ///         rather than dropped, so a caller that refuses on it can name why.
+    [[nodiscard]] std::expected<bool, std::error_code> NoBroadPrincipalMay(std::filesystem::path const& path, DWORD rights)
     {
         PACL dacl = nullptr;
         PSECURITY_DESCRIPTOR descriptor = nullptr;
-        if (::GetNamedSecurityInfoW(
-                path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &descriptor)
-            != ERROR_SUCCESS)
-            return std::nullopt;
+        if (auto const status = ::GetNamedSecurityInfoW(
+                path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &descriptor);
+            status != ERROR_SUCCESS)
+            return std::unexpected { std::error_code { static_cast<int>(status), std::system_category() } };
 
         auto const owned = LocalBlock { descriptor };
 
@@ -228,13 +264,13 @@ namespace
 
         ACL_SIZE_INFORMATION size {};
         if (::GetAclInformation(dacl, &size, sizeof(size), AclSizeInformation) == FALSE)
-            return std::nullopt;
+            return std::unexpected { std::error_code { static_cast<int>(::GetLastError()), std::system_category() } };
 
-        for (auto const index: std::views::iota(DWORD { 0 }, DWORD { size.AceCount }))
+        for (auto const index: std::views::iota(DWORD { 0 }, size.AceCount))
         {
             void* entry = nullptr;
             if (::GetAce(dacl, index, &entry) == FALSE)
-                return std::nullopt;
+                return std::unexpected { std::error_code { static_cast<int>(::GetLastError()), std::system_category() } };
 
             // Only allow entries carry a grant; deny entries and the auditing
             // types can subtract from one but never add.
@@ -262,6 +298,74 @@ namespace
     [[nodiscard]] bool NoBroadPrincipalMayWrite(std::filesystem::path const& path)
     {
         return NoBroadPrincipalMay(path, PlantingRights).value_or(false);
+    }
+
+    /// Closes a kernel handle.
+    struct HandleCloser
+    {
+        void operator()(HANDLE handle) const noexcept
+        {
+            ::CloseHandle(handle);
+        }
+    };
+
+    /// The owning handle for a kernel object.
+    using OwnedHandle = std::unique_ptr<std::remove_pointer_t<HANDLE>, HandleCloser>;
+
+    /// Is @p sid the account this process runs as?
+    /// @param sid The SID to test.
+    /// @return True when it is the token's user.
+    [[nodiscard]] bool IsThisProcessUser(PSID sid)
+    {
+        HANDLE raw = nullptr;
+        if (::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &raw) == FALSE)
+            return false;
+        auto const token = OwnedHandle { raw };
+
+        DWORD size = 0;
+        (void) ::GetTokenInformation(token.get(), TokenUser, nullptr, 0, &size);
+        if (size == 0)
+            return false;
+        std::vector<std::byte> buffer(size);
+        if (::GetTokenInformation(token.get(), TokenUser, buffer.data(), size, &size) == FALSE)
+            return false;
+        auto const* const user = reinterpret_cast<TOKEN_USER const*>(buffer.data());
+        return ::EqualSid(user->User.Sid, sid) == TRUE;
+    }
+
+    /// @p sid as an operator reads it: `DOMAIN\name`, or the SID itself when it names no account.
+    /// @param sid The SID.
+    /// @return Its name.
+    [[nodiscard]] std::string AccountNameOf(PSID sid)
+    {
+        std::array<wchar_t, 256> name {};
+        std::array<wchar_t, 256> domain {};
+        auto nameSize = static_cast<DWORD>(name.size());
+        auto domainSize = static_cast<DWORD>(domain.size());
+        SID_NAME_USE use = SidTypeUnknown;
+        if (::LookupAccountSidW(nullptr, sid, name.data(), &nameSize, domain.data(), &domainSize, &use) != FALSE)
+        {
+            auto const account =
+                domainSize == 0 ? std::wstring { name.data() } : std::format(L"{}\\{}", domain.data(), name.data());
+            if (auto utf8 = Utf8FromWideText(account); utf8.has_value())
+                return *std::move(utf8);
+        }
+        wchar_t* text = nullptr;
+        if (::ConvertSidToStringSidW(sid, &text) == FALSE)
+            return "an account this machine cannot name";
+        auto const owned = LocalBlock { text };
+        return Utf8FromWideText(text).value_or("an account this machine cannot name");
+    }
+
+    /// Build a security descriptor from @p sddl, for a create that applies it from the first instant.
+    /// @param sddl The access list.
+    /// @return The descriptor, owned, or the error that refused it.
+    [[nodiscard]] std::expected<LocalBlock, std::error_code> DescriptorOf(wchar_t const* sddl)
+    {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor, nullptr) == FALSE)
+            return std::unexpected { std::error_code { static_cast<int>(::GetLastError()), std::system_category() } };
+        return LocalBlock { descriptor };
     }
 
 #else
@@ -525,6 +629,26 @@ std::string SecretExposureHint(std::filesystem::path const& path, SecretExposure
     return {};
 }
 
+std::string OwnerOnlySecretExposureHint(std::filesystem::path const& path, SecretExposure exposure)
+{
+    if (exposure == SecretExposure::None || exposure == SecretExposure::Undetermined)
+        return SecretExposureHint(path, exposure);
+#if defined(_WIN32)
+    // `OwnerOnlySecretFileDacl` in icacls's grammar, raw SIDs for `SecretExposureHint`'s reason:
+    // inheritance cut, `BroadPrincipals` removed in the order they are declared, then SYSTEM,
+    // Administrators and OWNER RIGHTS granted in place of whatever they held.
+    auto const command = std::format(R"(icacls "{}" /inheritance:r /remove:g *S-1-1-0 *S-1-5-11 *S-1-5-32-545 )"
+                                     R"(*S-1-5-4 *S-1-5-32-546 /grant:r *S-1-5-18:F *S-1-5-32-544:F *S-1-3-4:F)",
+                                     path.string());
+#else
+    auto const command = std::format("chmod go-rwx {}", path.string());
+#endif
+    return std::format("{} can be read by accounts other than its owner, so the secret in it is not protected; "
+                       "restrict it to its owner with: {}",
+                       path.string(),
+                       command);
+}
+
 bool SecureDirectoryForAdministrators(std::filesystem::path const& directory)
 {
 #if defined(_WIN32)
@@ -586,6 +710,361 @@ bool SecureSecretFileForServices(std::filesystem::path const& file)
     // "secured" means. `Undetermined` fails here, deliberately: a list that would
     // not be read back is not one this claimed to have set.
     return SecretFileExposure(file) == SecretExposure::None;
+}
+
+SecretExposure SecureSecretFileForOwner(std::filesystem::path const& file)
+{
+    // Whether the apply call succeeded is deliberately not the answer: a filesystem
+    // with no permissions refuses the call AND reads back `Undetermined`, which the
+    // caller decides on, while a call that "succeeded" on a list somebody else then
+    // widened is caught only by asking again.
+#if defined(_WIN32)
+    (void) ApplyProtectedDacl(file, OwnerOnlySecretFileDacl, nullptr);
+#else
+    (void) RemovePermissions(file, std::filesystem::perms::group_all | std::filesystem::perms::others_all);
+#endif
+    return SecretFileExposure(file);
+}
+
+#if defined(_WIN32)
+namespace
+{
+    /// Create @p file NEW, unshared, with @p attributes' descriptor or -- null -- its directory's.
+    /// The one create both public functions share, so they differ in the list and nothing else.
+    [[nodiscard]] std::expected<SecretFileStream, std::error_code> CreateNewUnshared(std::filesystem::path const& file,
+                                                                                     SECURITY_ATTRIBUTES* attributes)
+    {
+        // Share mode 0: no other open of this file succeeds while this handle lives, so nothing
+        // can be holding one when the contents arrive -- a list alone would refuse only later
+        // opens. `CREATE_NEW` is the exclusive create, with nothing in front of it.
+        HANDLE const handle =
+            ::CreateFileW(file.c_str(), GENERIC_WRITE, 0, attributes, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+            return std::unexpected { std::error_code { static_cast<int>(::GetLastError()), std::system_category() } };
+
+        auto const descriptorNumber = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(handle), _O_WRONLY | _O_BINARY);
+        if (descriptorNumber == -1)
+        {
+            auto const error = errno;
+            ::CloseHandle(handle);
+            return std::unexpected { std::error_code { error, std::generic_category() } };
+        }
+        auto* const stream = ::_fdopen(descriptorNumber, "wb");
+        if (stream == nullptr)
+        {
+            auto const error = errno;
+            ::_close(descriptorNumber);
+            return std::unexpected { std::error_code { error, std::generic_category() } };
+        }
+        return SecretFileStream { stream, &std::fclose };
+    }
+} // namespace
+#else
+namespace
+{
+    /// Create @p file NEW with EXACTLY @p mode, never through a link.
+    ///
+    /// The create's own mode is narrowed by the umask and never widened, so it is created owner-only
+    /// and then set to @p mode on the descriptor: a permissive umask cannot widen it and a strict one
+    /// cannot narrow it. A mode that cannot be set removes the empty file rather than leaving one
+    /// with the umask's.
+    [[nodiscard]] std::expected<SecretFileStream, std::error_code> CreateNewUnshared(std::filesystem::path const& file,
+                                                                                     ::mode_t mode)
+    {
+        auto const descriptorNumber =
+            ::open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+        if (descriptorNumber < 0)
+            return std::unexpected { std::error_code { errno, std::generic_category() } };
+        if (::fchmod(descriptorNumber, mode) != 0)
+        {
+            auto const error = errno;
+            ::close(descriptorNumber);
+            ::unlink(file.c_str());
+            return std::unexpected { std::error_code { error, std::generic_category() } };
+        }
+        auto* const stream = ::fdopen(descriptorNumber, "wb");
+        if (stream == nullptr)
+        {
+            auto const error = errno;
+            ::close(descriptorNumber);
+            return std::unexpected { std::error_code { error, std::generic_category() } };
+        }
+        return SecretFileStream { stream, &std::fclose };
+    }
+} // namespace
+#endif
+
+std::expected<SecretFileStream, std::error_code> CreateStateFile(std::filesystem::path const& file, StateFile which)
+{
+#if defined(_WIN32)
+    if (StateFileAccessOf(which) == StateFileAccess::OthersRead)
+        return CreateNewUnshared(file, nullptr);
+    auto const descriptor = DescriptorOf(OwnerOnlySecretFileDacl);
+    if (!descriptor.has_value())
+        return std::unexpected { descriptor.error() };
+    auto attributes = SECURITY_ATTRIBUTES { .nLength = sizeof(SECURITY_ATTRIBUTES),
+                                            .lpSecurityDescriptor = descriptor->get(),
+                                            .bInheritHandle = FALSE };
+    return CreateNewUnshared(file, &attributes);
+#else
+    return CreateNewUnshared(file, static_cast<::mode_t>(StateFilePosixMode(which)));
+#endif
+}
+
+FileOwner FileOwnerOf(std::filesystem::path const& path)
+{
+#if defined(_WIN32)
+    // Opened as ITSELF (`FILE_FLAG_OPEN_REPARSE_POINT`): `GetNamedSecurityInfoW` on a path follows
+    // a link to its target. `BACKUP_SEMANTICS` so a directory opens too; READ_CONTROL alone reads
+    // the owner, and every share mode so a file somebody holds open is still asked.
+    HANDLE const handle = ::CreateFileW(path.c_str(),
+                                        READ_CONTROL,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr,
+                                        OPEN_EXISTING,
+                                        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                                        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+        return FileOwner {};
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    auto const read = ::GetSecurityInfo(
+        handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, nullptr, nullptr, nullptr, &descriptor);
+    ::CloseHandle(handle);
+    if (read != ERROR_SUCCESS)
+        return FileOwner {};
+    auto const owned = LocalBlock { descriptor };
+    if (owner == nullptr)
+        return FileOwner {};
+
+    auto name = AccountNameOf(owner);
+    if (IsThisProcessUser(owner))
+        return FileOwner { .standing = FileOwnerStanding::ThisProcess, .name = std::move(name) };
+    if (MatchesWellKnownSid(owner, AdministrativeOwners))
+        return FileOwner { .standing = FileOwnerStanding::Administrative, .name = std::move(name) };
+    return FileOwner { .standing = FileOwnerStanding::Another, .name = std::move(name) };
+#else
+    struct ::stat info {};
+
+    // `lstat`: the entry, never what a link points at.
+    if (::lstat(path.c_str(), &info) != 0)
+        return FileOwner {};
+    auto name = std::format("uid {}", info.st_uid);
+    if (info.st_uid == ::geteuid())
+        return FileOwner { .standing = FileOwnerStanding::ThisProcess, .name = std::move(name) };
+    if (info.st_uid == 0)
+        return FileOwner { .standing = FileOwnerStanding::Administrative, .name = std::move(name) };
+    return FileOwner { .standing = FileOwnerStanding::Another, .name = std::move(name) };
+#endif
+}
+
+bool IsLinkEntry(std::filesystem::path const& path)
+{
+#if defined(_WIN32)
+    auto const attributes = ::GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+    struct ::stat info {};
+
+    return ::lstat(path.c_str(), &info) == 0 && S_ISLNK(info.st_mode);
+#endif
+}
+
+DirectoryWriters DirectoryWritersOf(std::filesystem::path const& directory)
+{
+    // The owner first on both platforms: an owner can re-grant itself anything, so a list that
+    // looks narrow says nothing about a directory somebody else owns.
+    switch (FileOwnerOf(directory).standing)
+    {
+        case FileOwnerStanding::Undetermined:
+        case FileOwnerStanding::Last:
+            return DirectoryWriters::Undetermined;
+        case FileOwnerStanding::Another:
+            return DirectoryWriters::ForeignOwner;
+        case FileOwnerStanding::ThisProcess:
+        case FileOwnerStanding::Administrative:
+            break;
+    }
+#if defined(_WIN32)
+    auto const nobody = NoBroadPrincipalMay(directory, EntryPlantingRights);
+    if (!nobody.has_value())
+        return DirectoryWriters::Undetermined;
+    return *nobody ? DirectoryWriters::OwnerOnly : DirectoryWriters::Others;
+#else
+    struct ::stat info {};
+
+    if (::stat(directory.c_str(), &info) != 0)
+        return DirectoryWriters::Undetermined;
+    // A group or other write bit is others writing, the sticky bit NOT excepted: sticky stops
+    // them removing or renaming an entry that is there, and not creating a name that is not --
+    // a state file before its first write, or a temporary. `/tmp` is shared on purpose; a
+    // directory a process keeps its own state in has no reason to be.
+    auto const othersWrite = (info.st_mode & static_cast<::mode_t>(S_IWGRP | S_IWOTH)) != 0;
+    return othersWrite ? DirectoryWriters::Others : DirectoryWriters::OwnerOnly;
+#endif
+}
+
+std::expected<bool, std::error_code> OthersMayWrite(std::filesystem::path const& path)
+{
+#if defined(_WIN32)
+    return NoBroadPrincipalMay(path, PlantingRights).transform([](bool nobody) { return !nobody; });
+#else
+    struct ::stat info {};
+
+    if (::lstat(path.c_str(), &info) != 0)
+        return std::unexpected { std::error_code { errno, std::generic_category() } };
+    return (info.st_mode & static_cast<::mode_t>(S_IWGRP | S_IWOTH)) != 0;
+#endif
+}
+
+std::expected<SecretFileStream, RegularFileRefusal> OpenRegularFile(std::filesystem::path const& path)
+{
+#if defined(_WIN32)
+    HANDLE const handle = ::CreateFileW(path.c_str(),
+                                        GENERIC_READ,
+                                        FILE_SHARE_READ,
+                                        nullptr,
+                                        OPEN_EXISTING,
+                                        // `BACKUP_SEMANTICS` so a DIRECTORY opens too, and is refused
+                                        // below as what it is rather than as a denied open.
+                                        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                                        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        auto const error = ::GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+            return std::unexpected { RegularFileRefusal {
+                .error = std::make_error_code(std::errc::no_such_file_or_directory), .notRegular = false } };
+        return std::unexpected { RegularFileRefusal {
+            .error = std::error_code { static_cast<int>(error), std::system_category() }, .notRegular = false } };
+    }
+    auto information = BY_HANDLE_FILE_INFORMATION {};
+    auto const regular = ::GetFileType(handle) == FILE_TYPE_DISK
+                         && ::GetFileInformationByHandle(handle, &information) != FALSE
+                         && (information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+    if (!regular)
+    {
+        ::CloseHandle(handle);
+        return std::unexpected { RegularFileRefusal { .error = std::make_error_code(std::errc::invalid_argument),
+                                                      .notRegular = true } };
+    }
+    auto const descriptorNumber = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(handle), _O_RDONLY | _O_BINARY);
+    if (descriptorNumber == -1)
+    {
+        auto const error = errno;
+        ::CloseHandle(handle);
+        return std::unexpected { RegularFileRefusal { .error = std::error_code { error, std::generic_category() },
+                                                      .notRegular = false } };
+    }
+    auto* const stream = ::_fdopen(descriptorNumber, "rb");
+#else
+    auto const descriptorNumber = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (descriptorNumber < 0)
+    {
+        // `O_NOFOLLOW` answers a link with `ELOOP`: there IS an entry, and it is not a file.
+        auto const error = errno;
+        return std::unexpected { RegularFileRefusal { .error = std::error_code { error, std::generic_category() },
+                                                      .notRegular = error == ELOOP } };
+    }
+    struct ::stat info {};
+
+    if (::fstat(descriptorNumber, &info) != 0 || !S_ISREG(info.st_mode))
+    {
+        auto const error = errno;
+        ::close(descriptorNumber);
+        return std::unexpected { RegularFileRefusal { .error = S_ISREG(info.st_mode)
+                                                                   ? std::error_code { error, std::generic_category() }
+                                                                   : std::make_error_code(std::errc::invalid_argument),
+                                                      .notRegular = !S_ISREG(info.st_mode) } };
+    }
+    auto* const stream = ::fdopen(descriptorNumber, "rb");
+#endif
+    if (stream == nullptr)
+    {
+        auto const error = errno;
+#if defined(_WIN32)
+        ::_close(descriptorNumber);
+#else
+        ::close(descriptorNumber);
+#endif
+        return std::unexpected { RegularFileRefusal { .error = std::error_code { error, std::generic_category() },
+                                                      .notRegular = false } };
+    }
+    return SecretFileStream { stream, &std::fclose };
+}
+
+std::expected<void, std::error_code> CreateOwnerOnlyDirectory(std::filesystem::path const& directory)
+{
+    if (auto const parent = directory.parent_path(); !parent.empty())
+    {
+        auto failure = std::error_code {};
+        std::filesystem::create_directories(parent, failure);
+        if (failure)
+            return std::unexpected { failure };
+    }
+#if defined(_WIN32)
+    auto const descriptor = DescriptorOf(OwnerOnlyDirectoryDacl);
+    if (!descriptor.has_value())
+        return std::unexpected { descriptor.error() };
+    auto attributes = SECURITY_ATTRIBUTES { .nLength = sizeof(SECURITY_ATTRIBUTES),
+                                            .lpSecurityDescriptor = descriptor->get(),
+                                            .bInheritHandle = FALSE };
+    if (::CreateDirectoryW(directory.c_str(), &attributes) == FALSE && ::GetLastError() != ERROR_ALREADY_EXISTS)
+        return std::unexpected { std::error_code { static_cast<int>(::GetLastError()), std::system_category() } };
+#else
+    if (::mkdir(directory.c_str(), S_IRWXU) != 0 && errno != EEXIST)
+        return std::unexpected { std::error_code { errno, std::generic_category() } };
+#endif
+    return {};
+}
+
+std::vector<std::string> OthersMayWriteRemedy(std::filesystem::path const& path)
+{
+#if defined(_WIN32)
+    // Inheritance CONVERTED rather than cut, so every entry that is not a broad principal -- the
+    // service account's grant among them -- is kept; then every principal `BroadPrincipals` scans
+    // for is removed, in a command of its own (see `DirectoryWritersRemedy` for why one is not
+    // enough).
+    return { std::format(R"(icacls "{}" /inheritance:d)", path.string()),
+             std::format(R"(icacls "{}" /remove:g *S-1-1-0 *S-1-5-11 *S-1-5-32-545 *S-1-5-4 *S-1-5-32-546)",
+                         path.string()) };
+#else
+    return { std::format("chmod go-w '{}'", path.string()) };
+#endif
+}
+
+std::vector<std::string> DirectoryWritersRemedy(std::filesystem::path const& directory, DirectoryWriters writers)
+{
+    if (writers != DirectoryWriters::Others)
+        return {};
+    return OthersMayWriteRemedy(directory);
+}
+
+std::string DirectoryWritersHint(std::filesystem::path const& directory, DirectoryWriters writers)
+{
+    switch (writers)
+    {
+        case DirectoryWriters::OwnerOnly:
+        case DirectoryWriters::Last:
+            return {};
+        case DirectoryWriters::Undetermined:
+            return std::format("could not determine who may create or delete entries in {}", directory.string());
+        case DirectoryWriters::ForeignOwner:
+            return std::format("{} is owned by an account that is neither this process's nor an administrator's, which "
+                               "can grant itself anything in it: another account created it. Remove it, with what is "
+                               "in it, and this node creates its own, its owner's alone",
+                               directory.string());
+        case DirectoryWriters::Others: {
+            auto commands = std::string {};
+            for (auto const& command: DirectoryWritersRemedy(directory, writers))
+                commands += std::format("{}{}", commands.empty() ? "" : " and THEN, as a second command, ", command);
+            return std::format("{} lets other accounts on this machine create or delete entries in it, so a file "
+                               "this node trusts could have been put there by one of them; restrict it with: {}",
+                               directory.string(),
+                               commands);
+        }
+    }
+    return {};
 }
 
 std::string SecureDirectoryHint(std::filesystem::path const& directory)

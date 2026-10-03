@@ -28,7 +28,7 @@ namespace FastCache::Node
 {
 
 /// @file EnrollmentResponder.hpp
-/// The runtime enrollment window's front door.
+/// The leader's enrollment list's front door.
 ///
 /// ## Why this is a component of its own
 ///
@@ -64,7 +64,7 @@ namespace FastCache::Node
 /// `UnimplementedVerb` -- *this node serves no component for that verb family*. That
 /// is the same shape every other optional component takes here, and it is better than
 /// an enrollment surface that accepts requests and answers `NoCluster` to every
-/// decision: a window that can never admit anybody should not be openable.
+/// decision: a list that can never admit anybody should not record requests.
 
 /// Serves `Enroll` and `EnrollControl`.
 class EnrollmentResponder final: public IFrameResponder
@@ -79,12 +79,18 @@ class EnrollmentResponder final: public IFrameResponder
     /// @param policy The credential this surface requires, or nullptr for none. Shared
     ///        rather than referenced because "there is no credential" has to be
     ///        representable, and a null reference is not.
+    ///
+    /// **It wires the window to leadership**, here rather than in `main`, so a test that
+    /// builds this surface drives the wiring that ships: every role the scheduler is told
+    /// reaches `EnrollmentWindow::OnRoleChanged`, which ends an armed auto-approve deadline at
+    /// demotion. The observer captures the WINDOW, which must outlive the scheduler's last
+    /// `SetRole` -- consensus, which calls it, is torn down first.
     EnrollmentResponder(EnrollmentWindow& window,
                         Distributed::SchedulerService& scheduler,
                         Distributed::IMembershipOracle const& membership,
                         IMetricsSink& metrics,
                         ILogger& logger,
-                        std::shared_ptr<AuthPolicy const> policy = nullptr) noexcept:
+                        std::shared_ptr<AuthPolicy const> policy = nullptr):
         _window { window },
         _scheduler { scheduler },
         _membership { membership },
@@ -92,6 +98,7 @@ class EnrollmentResponder final: public IFrameResponder
         _logger { logger },
         _policy { std::move(policy) }
     {
+        _scheduler.ObserveRole([&window](Distributed::SchedulerRole role) { window.OnRoleChanged(role); });
     }
 
     /// @copydoc IFrameResponder::Answer
@@ -106,12 +113,13 @@ class EnrollmentResponder final: public IFrameResponder
     /// opens.** The machine asking is on no list and holds no key this cluster knows --
     /// it is a fresh install -- so a membership test here would refuse exactly the
     /// population the verb exists for. What stands in place of the credential is a
-    /// person: the window is closed by default, closes again on restart, and admits
-    /// nobody at all until an operator approves a named id.
+    /// person: a request is recorded, bounded and forgotten when its machine stops asking,
+    /// and admits nobody at all until an operator approves a named id under the key it
+    /// listed.
     ///
     /// `EnrollControl` is refused to a non-member, before a payload is read, and
     /// counted. That refusal is the one carrying the security argument for the pair: a
-    /// peer reaching it has found an open window and gone on to ask for the decision.
+    /// peer reaching it has asked to join and gone on to ask for the decision as well.
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t opRaw) const override;
 
@@ -198,10 +206,10 @@ class EnrollmentResponder final: public IFrameResponder
     /// responder's own honest answer and nothing more; it is a pure virtual, so it
     /// cannot simply be dropped.
     ///
-    /// **What actually bounds an unauthenticated peer's exposure here is that the window
-    /// is CLOSED by default**, opened only by a deliberate operator act, held in memory
-    /// and forgotten on restart -- plus `Op::Enroll`'s own per-verb payload cap. No
-    /// number in this class bounds it.
+    /// **What actually bounds an unauthenticated peer's exposure here is the list's own
+    /// bound** -- `MaxPendingEnrollments` rows, refused past it, held in memory, forgotten
+    /// when unpolled and on restart -- and that nothing is admitted without a person, plus
+    /// `Op::Enroll`'s own per-verb payload cap. No number in this class bounds it.
     [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         return 2 * MaxPendingEnrollments;
@@ -266,6 +274,21 @@ class EnrollmentResponder final: public IFrameResponder
     }
 
   private:
+    /// Admit @p entry as its role says, on @p caller's authority -- the one admission a manual
+    /// approval and an armed deadline share, so the two cannot come to record a joiner
+    /// differently.
+    /// @param entry The row, holding the key the joiner asked with first.
+    /// @param caller Who is admitting: the operator's context, or `Distributed::SelfCaller()`.
+    /// @return The scheduler's reply.
+    [[nodiscard]] Distributed::SchedulerReply AdmitRow(CompileCacheWire::EnrollmentPendingEntry const& entry,
+                                                       Distributed::CallerContext const& caller);
+
+    /// The seat the cluster records @p subject in, by its one spelling, or nothing when it seats
+    /// no member by that id.
+    /// @param subject The joiner's id.
+    /// @return The seat's name from `Cluster::MemberSeatTable`, or nothing.
+    [[nodiscard]] std::optional<std::string_view> RecordedSeatOf(std::string_view subject) const;
+
     /// Answer one `Enroll`.
     /// @param payload The request payload.
     /// @param peer The host the kernel reports.
@@ -278,14 +301,27 @@ class EnrollmentResponder final: public IFrameResponder
     /// @return The encoded reply.
     [[nodiscard]] std::vector<std::byte> AnswerControl(std::span<std::byte const> payload, PeerIdentity const& peer);
 
+    /// Admit a joiner the armed auto-approve deadline answered for, and record that it did.
+    /// @param nodeId The joiner's id.
+    /// @return `Pending`, admitted or not: the joiner's next poll is answered from the roster.
+    [[nodiscard]] std::vector<std::byte> AnswerAutoApprove(std::string_view nodeId);
+
+    /// Drop every request nobody decided about, count and log what went, and answer the report.
+    /// @param peer Who asked, named in the log line.
+    /// @return The report as it stands afterwards.
+    [[nodiscard]] std::vector<std::byte> AnswerClear(PeerIdentity const& peer);
+
     /// Apply one operator decision to one waiting id.
     /// @param verb `Approve` or `Reject`.
     /// @param subject Who it is about.
+    /// @param key The key an `Approve` names, which must be the row's; nothing for a `Reject`.
     /// @param peer Who asked; `ClusterAdmit` gates on the membership `Context` folds from it.
     /// @return The encoded reply.
-    [[nodiscard]] std::vector<std::byte> AnswerDecision(CompileCacheWire::EnrollControlVerb verb,
-                                                        std::string_view subject,
-                                                        PeerIdentity const& peer);
+    [[nodiscard]] std::vector<std::byte> AnswerDecision(
+        CompileCacheWire::EnrollControlVerb verb,
+        std::string_view subject,
+        std::optional<std::array<std::byte, CompileCacheWire::IdentityPublicKeyBytes>> const& key,
+        PeerIdentity const& peer);
 
     /// Who is asking, as both the door and `ClusterAdmit` need it.
     ///

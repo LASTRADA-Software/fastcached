@@ -37,13 +37,17 @@ namespace FastCache::Node
 /// lists the rows in.
 enum class NodeCondition : std::uint8_t
 {
-    CounterTableSkew = 0,     ///< The metrics catalogue names counters this build's sink has no slot for (#1362).
-    ScratchRootUnmappable,    ///< The worker's scratch root cannot be written into a debug-prefix-map rule (#810).
-    GeneratedTlsCertificate,  ///< The admin surface serves a certificate generated at startup.
-    EnrollmentWindowOpen,     ///< A stranger that asks can be admitted to the cluster (#1298).
-    ForgottenFleetMember,     ///< `--fleet-member` names a host the cluster has forgotten (#1309).
-    UnreadableLeaderSnapshot, ///< This build cannot read the snapshot its leader sends, so it stays behind (#1552).
-    Last,                     ///< Not a condition.
+    CounterTableSkew = 0,           ///< The metrics catalogue names counters this build's sink has no slot for (#1362).
+    ScratchRootUnmappable,          ///< The worker's scratch root cannot be written into a debug-prefix-map rule (#810).
+    GeneratedTlsCertificate,        ///< The admin surface serves a certificate generated at startup.
+    EnrollmentWindowOpen,           ///< An armed auto-approve window admits whoever asks, unexamined (#1298).
+    ForgottenFleetMember,           ///< `--fleet-member` names a host the cluster has forgotten (#1309).
+    UnreadableLeaderSnapshot,       ///< This build cannot read the snapshot its leader sends, so it stays behind (#1552).
+    UnqualifiedHostName,            ///< Peers are told to dial a host name with no domain.
+    HostNameReachesOnlyThisMachine, ///< This machine's name reaches only itself, so nothing offers it.
+    EnrollmentRequestsWaiting,      ///< Machines have asked to join and nobody has decided about them.
+    ForeignFleetVisible,            ///< Another established fleet proves itself on this segment; neither will merge.
+    Last,                           ///< Not a condition.
 };
 
 /// Which of this node's components evaluates a row.
@@ -55,7 +59,7 @@ enum class ConditionScope : std::uint8_t
 {
     Process = 0,  ///< Every process: evaluated at startup, before any component is built.
     Worker,       ///< The worker tier; absent with `--slots=0`.
-    Scheduler,    ///< The scheduler tier; absent without `--serve-scheduler`.
+    Scheduler,    ///< The scheduler tier; absent unless the node's mode serves one (`ServesScheduler`).
     AdminSurface, ///< The admin HTTP surface; absent without `--admin-listen`.
     Enrollment,   ///< The enrollment window; served only by a consensus node that also schedules.
     Consensus,    ///< Consensus and the cluster state it replicates; absent without `--listen-raft`.
@@ -92,14 +96,14 @@ inline constexpr EnumTable<ConditionScope, ConditionScopeRow> ConditionScopeTabl
       .notEvaluated = "this node runs no worker (--slots=0)" },
     { .scope = ConditionScope::Scheduler,
       .present = &PresentComponents::scheduler,
-      .notEvaluated = "this node runs no scheduler (no --serve-scheduler)" },
+      .notEvaluated = "this node runs no scheduler (its mode serves none, or its consensus is closed)" },
     { .scope = ConditionScope::AdminSurface,
       .present = &PresentComponents::adminSurface,
       .notEvaluated = "this node serves no admin surface (no --admin-listen)" },
     { .scope = ConditionScope::Enrollment,
       .present = &PresentComponents::enrollment,
       .notEvaluated = "this node serves no enrollment window: that takes consensus (--listen-raft) and a scheduler "
-                      "(--serve-scheduler)" },
+                      "(its mode)" },
     { .scope = ConditionScope::Consensus,
       .present = &PresentComponents::consensus,
       .notEvaluated = "this node runs no consensus (no --listen-raft), so no cluster state reaches it" },
@@ -158,9 +162,9 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .persistence = CompileCacheWire::ConditionPersistence::Live,
       .severity = CompileCacheWire::ConditionSeverity::Alert,
       .scope = ConditionScope::Enrollment,
-      .remedy = "Close it with --enroll-close once the machines you meant to admit have joined; check who is waiting "
-                "with --enroll-list before approving anyone, because approving hands that machine this cluster's key. "
-                "A restart closes it too." },
+      .remedy = "Check who got in with --enroll-list, which marks each auto-approved row with when the window was "
+                "armed, and compare each key with the one its machine printed. --enroll-auto-approve=off ends the "
+                "window; so does a restart or a change of leader, since it is held in the leader's memory alone." },
     { .condition = NodeCondition::ForgottenFleetMember,
       .id = "forgotten-fleet-member",
       .persistence = CompileCacheWire::ConditionPersistence::Live,
@@ -179,6 +183,44 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "members, settings, forgets -- until it can. It catches up by itself once it reads the leader's "
                 "snapshot; nothing needs moving aside. A fleet upgrades as one: see "
                 "docs/operations/upgrading-a-fleet.md." },
+    { .condition = NodeCondition::UnqualifiedHostName,
+      .id = "unqualified-host-name",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Process,
+      .remedy = "Set --advertise (advertise in the configuration file; a reload applies it) and --raft-self (raft_self; "
+                "a restart applies it) to a name every peer resolves, or to an address; or give this machine a DNS "
+                "domain and restart the node, since the name is read once at startup. Until then a peer whose DNS "
+                "search list does not complete the name cannot reach this node, which registers and answers nobody "
+                "there." },
+    { .condition = NodeCondition::HostNameReachesOnlyThisMachine,
+      .id = "host-name-reaches-only-this-machine",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Process,
+      .remedy = "Set --raft-self (raft_self in the configuration file; a restart applies it) and, to be announced to "
+                "a scheduler, --advertise (advertise; a reload applies it) to an address or a name other machines "
+                "resolve; or give this machine a real host name and restart the node, since the name is read once at "
+                "startup. Until then this node serves this machine alone: every peer resolves its name to itself, so "
+                "it runs no consensus or discovery and is announced to no scheduler." },
+    { .condition = NodeCondition::EnrollmentRequestsWaiting,
+      .id = "enrollment-requests-waiting",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Notice,
+      .scope = ConditionScope::Enrollment,
+      .remedy = "Run --enroll-list and compare each machine's key with the one that machine printed; admit one with "
+                "--enroll-approve=<id>@<key>, which admits exactly the key named, or refuse it with --enroll-reject=<id>. "
+                "A machine that stops asking for ten minutes is forgotten." },
+    { .condition = NodeCondition::ForeignFleetVisible,
+      .id = "foreign-fleet-visible",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Consensus,
+      .remedy = "Decide which fleet each machine named here belongs to, and --cluster-forget it from the other: two "
+                "established fleets that share no member never merge on their own, so their machines keep building "
+                "apart and caching twice. If both fleets are meant to stay, nothing is wrong and this clears on its "
+                "own a few minutes after the other fleet stops being heard; put them on separate segments to stop "
+                "hearing it." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");

@@ -57,6 +57,16 @@ std::expected<ClusterMember, std::string> ParseMemberSpec(std::string_view spec)
     if (id.empty() || endpoint.empty())
         return notASpec();
 
+    // The one id bound, here because every door that takes a member passes through this grammar:
+    // `--cluster-admit` and its siblings, and the leader re-parsing what it was sent. A member id past
+    // it is one every peer's fleet summary decoder refuses, so a leader it names is refused too.
+    if (id.size() > CompileCacheWire::MaxIdBytes)
+        return std::unexpected { std::format("{} names a member id of {} bytes, longer than the {} an id may be: "
+                                             "every peer refuses a fleet summary naming a longer one",
+                                             spec,
+                                             id.size(),
+                                             CompileCacheWire::MaxIdBytes) };
+
     // Both halves of the question a dialer asks. A split alone is not enough:
     // `10.0.0.4:0` splits and names no port anybody can connect to, so a member
     // accepted on that basis is one the cluster counts and never reaches.
@@ -70,7 +80,7 @@ std::expected<ClusterMember, std::string> ParseMemberSpec(std::string_view spec)
     // with `{}` rather than leaving it out is what keeps a field added to the
     // middle of the struct from becoming a silent zero here.
     //
-    // A voter, because that is what `--raft-peer` bootstraps and what `--cluster-admit`
+    // A voter, because that is what a bootstrap set holds and what `--cluster-admit`
     // records; the learner spelling is a different flag rather than a different token,
     // so the one grammar an operator copies between them stays one grammar.
     return ClusterMember { .id = std::string { id },
@@ -276,6 +286,10 @@ namespace
     /// @param host The host to record.
     void InsertHost(std::vector<std::string>& hosts, std::string_view host)
     {
+        // An empty host names no machine, and two of them are never `SameHost`, so recording one
+        // would add a blank entry per call that no admission can ever match.
+        if (host.empty())
+            return;
         if (std::ranges::any_of(hosts, [host](std::string const& entry) { return SameHost(entry, host); }))
             return;
         hosts.emplace_back(host);
@@ -773,7 +787,9 @@ namespace
                     // (#1309): a node whose own `--fleet-member` list still names that machine is
                     // then refused it, rather than serving a decommissioned member until every
                     // list is edited. Never for loopback, which is always this machine's own and a
-                    // tombstone could never narrow -- the key is what reaches a member there.
+                    // tombstone could never narrow -- the key is what reaches a member there. A
+                    // learner recorded with no endpoint names no host, and `InsertHost` records
+                    // none: the revoked key is the whole of its forget.
                     auto host = std::string { HostOfEndpoint(it->raftEndpoint) };
                     if (it->publicKey.has_value())
                         revoked.push_back(*it->publicKey);
@@ -790,7 +806,7 @@ namespace
 
                 // And the key the proposing leader held live for the id (`PrepareForget`), which
                 // reaches a member the state records without one or not at all -- one a
-                // `--raft-peer` line typed with its key. Never a key another id now holds: that
+                // bootstrap member named with its key. Never a key another id now holds: that
                 // one was admitted since, and revoking it would forget a machine nobody named.
                 if (command.publicKey.has_value() && !state.HolderOf(*command.publicKey).has_value())
                     revoked.push_back(*command.publicKey);
@@ -1087,12 +1103,16 @@ std::expected<void, ConsensusError> Validate(Command const& command)
     {
         case CommandKind::AddMember:
         case CommandKind::AddLearner:
-            // An endpoint is required, and this is the check that closes the recorded
-            // residual: a member the cluster agreed to admit but cannot reach is worse
-            // than one it refused, because the fleet counts it towards quorum and
-            // routes to it.
-            if (command.value.empty())
-                return std::unexpected(InvalidConfiguration("a member must be admitted with an endpoint"));
+            // An endpoint is required exactly where the seat is DIALLED, and this is the
+            // check that closes the recorded residual: a voter the cluster agreed to admit
+            // but cannot reach is worse than one it refused, because the fleet counts it
+            // towards quorum and routes to it. A learner is the other link -- it dials in,
+            // and nobody opens a socket to it -- so it is admitted with none. The seat's
+            // column decides (`SeatNeedsEndpoint`), never the verb: a promotion is an
+            // `AddMember`, so a learner that never had an address is refused it by name.
+            if (command.value.empty() && SeatNeedsEndpoint(SeatAdmittedBy(command.kind).value_or(MemberSeat::Voter)))
+                return std::unexpected(
+                    InvalidConfiguration("a voter must be admitted with an endpoint every member can dial"));
             return {};
 
         case CommandKind::Forget:
@@ -1236,7 +1256,7 @@ std::expected<void, ConsensusError> ValidateAgainst(ClusterState const& state, C
         case CommandKind::Forget:
             // The key the proposer holds live for the id must not be ANOTHER id's, or the
             // forget would revoke a machine nobody named. Held by this id, or by nobody -- a
-            // member a `--raft-peer` line typed, recorded nowhere -- is the key it means.
+            // bootstrap member, recorded nowhere -- is the key it means.
             if (command.publicKey.has_value())
                 if (auto const holder = state.HolderOf(*command.publicKey); holder.has_value() && *holder != command.key)
                     return std::unexpected(InvalidConfiguration(

@@ -198,6 +198,11 @@ enum class HistoryFile : std::uint8_t
     Last
 };
 
+/// What one of a node's history files is called, in whatever directory holds it.
+/// @param which Which file.
+/// @return Its name.
+[[nodiscard]] std::string_view HistoryFileNameOf(HistoryFile which) noexcept;
+
 /// Where one of a node's history files lives.
 ///
 /// One row per file, so a fourth is a row here rather than a path spelled somewhere

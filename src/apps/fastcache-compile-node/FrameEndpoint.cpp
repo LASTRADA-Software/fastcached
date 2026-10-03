@@ -2463,6 +2463,14 @@ namespace
                 // whose peer did nothing wrong.
                 if (co_await SettleWatch(&state->io.Reactor(), watch) == AfterWatch::EndConnection)
                     break;
+
+                // Last, once the reply is written and the watch has settled -- so no read is parked
+                // when the linger reads -- for a verb answered once per connection.
+                if (reply.endsConnection)
+                {
+                    (void) co_await CloseLingering(socket.get(), nullptr, RefusalLinger(state->responder.MaxRequestBytes()));
+                    break;
+                }
             }
         }
         catch (...)

@@ -185,6 +185,11 @@ inline constexpr std::array ExchangeLogTable {
                               "which is the only place a VPN worker's changing address is reconciled with a "
                               "stable identity; once per connection, and a refusal here is the line an operator "
                               "reads when a node's identity key was never admitted, or was revoked" },
+    VerbLogRow { .code = CompileCacheWire::Op::FleetSummary,
+                 .level = LogLevel::Debug,
+                 .rationale = "a read that changes nothing, which a machine looking for a fleet asks of every seed "
+                              "it knows on every round until it joins one; at Info an office of such machines would "
+                              "look like traffic, and what an operator wants is the enrollment it leads to" },
 };
 
 /// Whether every verb this build serves states a log level.

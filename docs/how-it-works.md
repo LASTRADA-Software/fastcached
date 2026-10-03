@@ -461,32 +461,29 @@ member holds.
 
 ### Joining an existing cluster
 
-A machine being added to a running fleet is started with **`--raft-join`**, and
-that flag is not optional. Without it the node bootstraps a cluster *of itself*:
-it elects itself, takes a term and a log, and afterwards refuses every leader its
-own configuration does not name. Two clusters cannot be merged by any local rule,
-so a joining node must never form one.
+A machine being added to a running fleet is **admitted**, never configured: no flag
+names the cluster it joins. It starts, as every node does, as a cluster of one, and that
+is why joining is a change of state rather than a startup option. A node that bootstrapped
+a cluster has elected itself, taken a term and a log, and refuses every leader its own
+configuration does not name, and two clusters cannot be merged by any local rule. So a
+joiner **dissolves** its own cluster before it adopts the fleet's roster, and its
+formation record says so from then on.
 
-The sequence, and what you see at each step:
+The sequence:
 
-1. Start the joiner with `--raft-join` and the cluster's key. It names itself in
-   `--raft-peer` plus enough existing members to reach one. (With a different key it
-   is never replicated to: every member refuses its connections, and each counts
-   `fastcache_raft_peer_connections_refused_proof_total`.) It logs
-   `no cluster yet; waiting to be admitted` and then waits. That line is how you
-   know the flag took effect — a node that says `1 member(s)` instead has
-   bootstrapped a cluster of itself and must be stopped, its state directory
-   removed, and started again.
-2. Tell any member to admit it: `--cluster-admit=n4=10.0.0.4:6680`. The leader
-   logs `cluster: proposing a quorum of 4 member(s) at index …`.
-3. The leader starts replicating to the joiner, which refuses at first — its log
-   is empty — and the leader walks back to the beginning. This is why the joiner
-   must be reachable *before* it is admitted.
-4. The joiner logs `consensus: this node is now a follower in term N of …`, and
-   the admitting side logs `cluster: recorded n4 at 10.0.0.4:6680`.
-5. From then on membership is a **replicated log entry**, so the new node survives
+1. The joiner asks a member to admit it
+   ([enrollment](tools/fastcache-compile-node.md#enrolling-a-machine-instead-of-typing-it)), and an operator there
+   approves its identity key.
+2. The joiner dissolves its cluster of one, records itself a **learner** of the fleet's,
+   and starts from an empty configuration, which it learns from the leader. It reaches
+   the fleet's voters itself.
+3. The leader starts replicating to the joiner, which refuses at first — its log is
+   empty — and the leader walks back to the beginning. This is why the joiner must
+   reach the fleet before it can be counted.
+4. From then on membership is a **replicated log entry**, so the new node survives
    its own restart and everybody else's without anyone editing a file on the other
-   machines.
+   machines. It stays a learner, counted by no quorum, until an operator promotes it
+   with `--cluster-admit`.
 
 Nothing about the existing members changes. They are not restarted and their
 command lines are not edited.

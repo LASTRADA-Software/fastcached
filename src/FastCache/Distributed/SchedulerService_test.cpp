@@ -2383,7 +2383,7 @@ namespace
                                      .notAfter = notAfter,
                                      .endorser = voter,
                                      .signature = {} },
-        [&key](std::span<std::byte const> message) { return key.Sign(message); });
+        [&key](LabelledMessage const& message) { return SignLabelled(key, message); });
 }
 } // namespace
 

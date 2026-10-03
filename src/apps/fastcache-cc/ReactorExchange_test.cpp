@@ -652,7 +652,10 @@ TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting i
     auto const start = clock.now();
     dribble(&reactor, &clock, &connector.Log(), PerByte, Turns);
 
-    auto const outcome = exchange.Run("127.0.0.1:6676", Wire::EncodeFetch("k"), {}, Budget);
+    // COMPILE, the one verb that pulses: a pulse on any other is a transport failure, read off the
+    // verb's `legalStatuses`.
+    auto const outcome =
+        exchange.Run("127.0.0.1:6676", Wire::Detail::EncodeRequest(Wire::CurrentVersion, Wire::Op::Compile, {}), {}, Budget);
 
     // Drained after the exchange stopped the reactor, so the driver reaches its own
     // `co_return` and frees its frame -- the same reason the dribble case above drains.

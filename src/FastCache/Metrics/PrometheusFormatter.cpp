@@ -374,8 +374,9 @@ static void AppendConsensusMetrics(std::string& out, ConsensusStatus const& stat
            Metric { .name = "fastcache_node_consensus_members",
                     .help = "Members in the configuration this node's consensus operates under, voters and learners "
                             "alike. 0 is a reading, not an absence: the node holds no configuration, so it campaigns "
-                            "in no election and grants no vote. That is the ordinary waiting state of a --raft-join "
-                            "node and a fault for any other. A process running no consensus renders none of these "
+                            "in no election and grants no vote. That is the ordinary waiting state of a node that "
+                            "joined a fleet and is not admitted yet, and a fault for any other. A process running no "
+                            "consensus renders none of these "
                             "series at all.",
                     .type = Gauge,
                     .value = static_cast<std::uint64_t>(configuration.voters.size() + configuration.learners.size()) });

@@ -110,6 +110,57 @@ TEST_CASE("A member is admitted with an endpoint, never without one", "[cluster]
     CHECK_FALSE(Validate(Cmd(CommandKind::AddMember, "", "10.0.0.1:6675")).has_value());
 }
 
+TEST_CASE("A learner may be admitted with no endpoint and a voter may not", "[cluster][state][learner][formation]")
+{
+    // The seat's link decides it, not the verb: a learner dials in, so nobody needs an
+    // address for it, while a voter is dialled by every member and one recorded without
+    // an address is counted by a quorum whose votes can never arrive.
+    CHECK(Validate(Keyed(CommandKind::AddLearner, "laptop", KeyOf(7))).has_value());
+
+    auto const voter = Validate(Keyed(CommandKind::AddMember, "laptop", KeyOf(7)));
+    REQUIRE_FALSE(voter.has_value());
+    CHECK(voter.error().code == ConsensusErrorCode::InvalidConfiguration);
+    CHECK(voter.error().context.contains("endpoint"));
+}
+
+TEST_CASE("Promoting a learner that has no endpoint is refused by name", "[cluster][state][learner][formation]")
+{
+    // A promotion is a re-admission through `AddMember`, so it is judged as one: the seat it
+    // moves the member INTO is dialled, and a learner that never needed an address has none.
+    auto state = ClusterState {};
+    Apply(state, Keyed(CommandKind::AddLearner, "laptop", KeyOf(7)));
+    REQUIRE(state.members.size() == 1);
+    CHECK(state.members[0].raftEndpoint.empty());
+
+    auto const refusal = RefusedAgainst(state, Cmd(CommandKind::AddMember, "laptop"));
+    CHECK(refusal.code == ConsensusErrorCode::InvalidConfiguration);
+    CHECK(refusal.context.contains("endpoint"));
+}
+
+TEST_CASE("Forgetting a learner recorded with no endpoint revokes its key and tombstones no host",
+          "[cluster][state][learner][formation]")
+{
+    // A learner that dials in names no host, so its forget has none to tombstone: an empty entry
+    // matches nothing (`SameHost`), and since two empty hosts are not the same machine either,
+    // every such forget would add another -- a `forgotten-clients` count of blanks. The revoked
+    // key is what makes it FORGOTTEN (#1555), and here it is the only fact left.
+    auto state = ClusterState {};
+    Apply(state, Keyed(CommandKind::AddLearner, "laptop", KeyOf(7)));
+    Apply(state, Keyed(CommandKind::AddLearner, "tablet", KeyOf(8)));
+    Apply(state, Cmd(CommandKind::Forget, "laptop"));
+    Apply(state, Cmd(CommandKind::Forget, "tablet"));
+
+    CHECK(state.members.empty());
+    CHECK(state.forgotten.empty());
+    CHECK(state.IsRevoked(KeyOf(7)));
+    CHECK(state.IsRevoked(KeyOf(8)));
+
+    // The control: a member that HAD a host still leaves its tombstone.
+    Apply(state, Keyed(CommandKind::AddMember, "desk", KeyOf(9), "10.0.0.9:6675"));
+    Apply(state, Cmd(CommandKind::Forget, "desk"));
+    CHECK(state.forgotten == std::vector<std::string> { "10.0.0.9" });
+}
+
 TEST_CASE("A member the cluster records has to be one it can name", "[cluster][state]")
 {
     // #159. Everything `AddMember` records becomes a `ClusterMember` and is read back
@@ -119,8 +170,8 @@ TEST_CASE("A member the cluster records has to be one it can name", "[cluster][s
     // resort, but a leader whose state holds bytes nobody can name has a member
     // nobody can name.
     // All three, and the field is named because they send an operator to three
-    // different places: an id is typed into `--cluster-admit`, a consensus endpoint
-    // into `--raft-peer`, and a scheduler endpoint is announced by the member itself.
+    // different places: an id and a consensus endpoint are typed into `--cluster-admit`,
+    // and a scheduler endpoint is announced by the member itself.
     CHECK(Refused(Cmd(CommandKind::AddMember, "n\x80", "10.0.0.1:6675")).contains("a member id"));
     CHECK(Refused(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675\xE2\x82")).contains("consensus endpoint"));
     CHECK(Refused(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000\xFF")).contains("scheduler endpoint"));
@@ -673,6 +724,16 @@ TEST_CASE("A peer is an identity and an address, in one token", "[cluster][state
     CHECK(Unwrap(peer).raftEndpoint == "10.0.0.1:6680");
 }
 
+TEST_CASE("A member id past the one id bound is refused by the grammar every door shares", "[cluster][state]")
+{
+    // `--cluster-admit` and its siblings and the leader re-reading what it was sent all parse here,
+    // so the bound held here holds at every door; at the bound the member is accepted.
+    CHECK(ParseMemberSpec(std::string(CompileCacheWire::MaxIdBytes, 'n') + "=10.0.0.1:6680").has_value());
+    auto const refused = ParseMemberSpec(std::string(CompileCacheWire::MaxIdBytes + 1, 'n') + "=10.0.0.1:6680");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().contains(std::format("names a member id of {} bytes", CompileCacheWire::MaxIdBytes + 1)));
+}
+
 TEST_CASE("A peer specification splits at the first separator", "[cluster][state]")
 {
     // The endpoint may contain an `=` and the identity may not. Splitting at the LAST
@@ -969,8 +1030,9 @@ TEST_CASE("The verb that admits a member decides its seat, and re-admitting move
     CHECK(state.members[0].seat == MemberSeat::Learner);
     CHECK(state.members[0].raftEndpoint == "10.0.0.10:6675");
 
-    // And the rules both verbs share: no endpoint, no member; and what it records is text.
-    CHECK(Refused(Cmd(CommandKind::AddLearner, "laptop")).contains("endpoint"));
+    // And the rule both verbs share: what it records is text. The endpoint rule is the
+    // SEAT's rather than the verb's -- a learner dials in and may have none -- and has a
+    // case of its own ("A learner may be admitted with no endpoint and a voter may not").
     CHECK(Refused(Cmd(CommandKind::AddLearner, "laptop\x80", "10.0.0.9:6675")).contains("member id"));
 }
 
@@ -1179,7 +1241,7 @@ TEST_CASE("Forgetting an id removes it from whichever list records it and revoke
 TEST_CASE("A forget revokes the key the proposer holds for an id the state records without one, and never another's",
           "[cluster][state][identity][forget]")
 {
-    // #1555: a member a `--raft-peer` line typed WITH its key is recorded without one, or not
+    // #1555: a bootstrap member named WITH its key is recorded without one, or not
     // at all, so the record alone cannot say which key to revoke. The proposing leader states
     // the key it holds live (`PrepareForget`), and that is revoked beside the record's.
     ClusterState state;
@@ -1412,7 +1474,7 @@ TEST_CASE("A peer's key rides the same token after an @, and a key that is not o
     CHECK(Unwrap(peer).raftEndpoint == "10.0.0.1:6680");
     CHECK(Unwrap(peer).publicKey == std::optional { KeyOf(0xC1) });
 
-    // The inverse, which a service registration re-renders every `--raft-peer` through.
+    // The inverse, which `--print-identity`'s `cluster-admit` line is rendered through.
     CHECK(FormatMemberSpec(Unwrap(peer)) == spec);
     CHECK(FormatMemberSpec(Unwrap(ParseMemberSpec("n2=10.0.0.2:6680"))) == "n2=10.0.0.2:6680");
     CHECK_FALSE(Unwrap(ParseMemberSpec("n2=10.0.0.2:6680")).publicKey.has_value());

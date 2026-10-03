@@ -55,7 +55,7 @@ namespace FastCache
 /// Encode bytes as URL-safe base64 (RFC 4648 §5), never padded.
 ///
 /// The spelling of a node's PUBLIC KEY (#178), and the reason it is not the standard
-/// one is where the key is typed: inside a `--raft-peer=<id>=<host>:<port>@<key>`
+/// one is where the key is typed: inside a `--cluster-admit=<id>=<host>:<port>@<key>`
 /// token, a unit file and a shell line. `/` and `+` mean something in two of those,
 /// and `=` is the token's own separator -- so the key's alphabet is the one of the
 /// two that holds none of the three, and an unpadded one, because padding would put

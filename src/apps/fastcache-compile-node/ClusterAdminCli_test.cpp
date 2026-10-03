@@ -452,7 +452,7 @@ TEST_CASE("A member can be admitted, which is what --cluster-forget had no count
 {
     // Nothing anywhere could put a member INTO the replicated state without
     // `--discovery`, so a fleet with a typed peer list could shrink and never grow:
-    // adding a machine meant editing `--raft-peer` on every other machine and
+    // adding a machine meant editing the peer list on every other machine and
     // restarting them, which is the cost this whole change exists to remove.
     FakeCluster cluster;
     Fixture fixture;
@@ -470,11 +470,11 @@ TEST_CASE("A member can be admitted, which is what --cluster-forget had no count
     CHECK(cluster.proposed[0].schedulerEndpoint.empty());
 }
 
-TEST_CASE("Admitting takes the same token --raft-peer does", "[node][clusteradmin]")
+TEST_CASE("Admitting takes one token, an id and the address it is dialled at", "[node][clusteradmin]")
 {
     // One grammar for "this member, at this address", because a second spelling of
     // one thing is a second thing to get wrong -- and the operator has already
-    // typed this one into `--raft-peer` on the machine being added.
+    // copied this one from the `cluster-admit` line the machine being added prints.
     auto const cfg = ParsedFrom({ "--cluster-admit=n4=10.0.0.4:6680" });
     CHECK(cfg.cluster.action == ClusterAction::Admit);
     CHECK(cfg.cluster.key == "n4");
@@ -859,6 +859,20 @@ TEST_CASE("A status report names the seat each member was admitted into", "[node
     CHECK(rendered.contains("seat=learner raft=10.0.0.9:6680"));
     CHECK(rendered.contains("seat=voter raft=10.0.0.1:6680"));
     CHECK(rendered.contains("seat=voter raft=10.0.0.2:6680"));
+}
+
+TEST_CASE("A status report shows a learner recorded with no consensus endpoint as the absent dash",
+          "[node][clusteradmin][learner]")
+{
+    // A learner dials in and is recorded with no endpoint, which is the dash every absent field
+    // here is -- never an empty `raft=` an operator reads as a rendering fault.
+    auto state = Agreed();
+    Apply(state, Cmd(Cluster::CommandKind::AddLearner, "laptop", ""));
+
+    auto const rendered = RenderClusterState(state);
+    CHECK(rendered.contains("seat=learner raft=- "));
+    CHECK_FALSE(rendered.contains("raft= "));
+    CHECK(rendered.contains("seat=voter raft=10.0.0.1:6680"));
 }
 
 TEST_CASE("A status report shows each member's key, the principals and the revoked keys", "[node][clusteradmin][identity]")

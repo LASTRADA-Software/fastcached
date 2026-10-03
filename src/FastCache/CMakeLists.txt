@@ -41,6 +41,7 @@ target_sources(FastCache
         Consensus/RaftPeerServer.cpp
         Consensus/RaftPeerSession.cpp
         Consensus/RaftPeerTransport.cpp
+        Consensus/RaftSessionReader.cpp
         Core/CpuFeatures.cpp
         Core/Crc32c.cpp
         Core/Ed25519.cpp
@@ -52,14 +53,19 @@ target_sources(FastCache
         Core/SessionSeal.cpp
         Core/Sha256.cpp
         Core/X25519.cpp
+        Cluster/BeaconDestinations.cpp
         Cluster/ClusterState.cpp
         Cluster/ClusterStateMachine.cpp
+        Cluster/ChallengeCookies.cpp
         Cluster/DiscoveryService.cpp
+        Cluster/FleetEndpoints.cpp
+        Cluster/FormationRecord.cpp
         Cluster/MembershipPolicy.cpp
         Cluster/PeerDirectory.cpp
         Cluster/Roster.cpp
         Cluster/RosterCertificate.cpp
         Cluster/RosterKeys.cpp
+        Cluster/SeedSources.cpp
         Core/Logger.cpp
         Distributed/LeaseTable.cpp
         Distributed/WorkerRegistry.cpp
@@ -85,12 +91,14 @@ target_sources(FastCache
         Platform/HostInfo.cpp
         Platform/HostLoad.cpp
         Platform/HostMemory.cpp
+        Platform/HostNaming.cpp
         Platform/InheritedListener.cpp
         Platform/LocalAddresses.cpp
         Platform/NarrowText.cpp
         Platform/PosixDaemonHost.cpp
         Platform/Registry.cpp
         Platform/ServiceControl.cpp
+        Platform/SrvResolver.cpp
         Platform/StopSignal.cpp
         Platform/Terminal.cpp
         Platform/WindowsEventLogger.cpp
@@ -117,6 +125,11 @@ target_sources(FastCache
         Transport/LingeringClose.cpp
         Transport/NativeListen.cpp
 )
+
+# The DNS SRV lookup behind Platform/SrvResolver: DnsQueryEx lives in dnsapi on Windows, and
+# res_nquery with the ns_* parser in libresolv on Linux and macOS. PRIVATE because only
+# SrvResolver.cpp calls either; a static library still carries it to every executable's link.
+target_link_libraries(FastCache PRIVATE $<$<PLATFORM_ID:Windows>:dnsapi> $<$<PLATFORM_ID:Linux,Darwin>:resolv>)
 
 # The macOS package prefix, handed to the code that has to agree with it.
 # ServiceControl's launchd install picks the system job's storage and log

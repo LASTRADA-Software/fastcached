@@ -711,6 +711,7 @@ if ! node_log="$(sudo "${PREFIX}/bin/fastcache-compile-node" --install-service -
         --advertise=127.0.0.1:${node_port} \
         --scheduler=127.0.0.1:6675 \
         --cluster-dir="${PREFIX}/var/fastcache-node" \
+        --listen-raft= \
         --toolchain=/usr/bin/cc 2>&1)"; then
     # **Ask launchd what it did with the job before giving up on the reading.**
     #

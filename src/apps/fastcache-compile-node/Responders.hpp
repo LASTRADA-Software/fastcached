@@ -950,6 +950,13 @@ struct SurfaceComponents
     /// at the door -- `NoCluster` rather than `UnimplementedVerb`, because a caller told the latter
     /// goes off to upgrade a node that is already current.
     IFrameResponder* nodeProof { nullptr };
+
+    /// Answers `FleetSummary`: which fleet this node is in, signed over the asker's nonce.
+    ///
+    /// Like `node`, **never null on a built node**: a joiner probing a seed must be answered
+    /// whatever the seed runs. A node with no fleet to offer says so in the component's own
+    /// refusal (`NoCluster`), not as a family missing at the door.
+    IFrameResponder* formation { nullptr };
 };
 
 /// Whether a verb family's owner is there on a built node. In-process only, never
@@ -1049,6 +1056,15 @@ inline constexpr EnumTable<CompileCacheWire::VerbFamily, FamilyRoute> FamilyRout
     { .family = CompileCacheWire::VerbFamily::NodeProof,
       .owner = &SurfaceComponents::nodeProof,
       .presence = FamilyPresence::WhenItsComponentRuns,
+      .ceilings = SessionCeilings::NotRead },
+    // For `Node`'s reason: a joiner asks a seed which fleet it is in whatever the seed runs, and a
+    // seed with none to offer says so itself. Its ceilings are NOT read, for `Enrollment`'s
+    // reason: the verb carries one nonce under its own `OpTable` ceiling, and a ceiling folded in
+    // would widen nothing today and every surface on the port after a later raise. Its connection
+    // allowance ADDS to the other every-node owners', since they coexist on every port.
+    { .family = CompileCacheWire::VerbFamily::Formation,
+      .owner = &SurfaceComponents::formation,
+      .presence = FamilyPresence::OnEveryBuiltNode,
       .ceilings = SessionCeilings::NotRead },
 } };
 

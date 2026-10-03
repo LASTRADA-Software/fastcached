@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeMembership.hpp"
 #include "NodeRoster.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/FormationRecord.hpp>
+#include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -10,6 +13,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <optional>
@@ -17,7 +21,9 @@
 #include <string>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
@@ -36,9 +42,11 @@ constexpr auto Noon = std::chrono::system_clock::time_point { std::chrono::hours
 /// A worker with no consensus: its fleet, and nothing reaching it but this machine.
 [[nodiscard]] NodeConfig Worker()
 {
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.schedulers = { "127.0.0.1:6674" };
     cfg.clusterId = "fleet";
+    // A worker that runs no consensus -- the only kind that holds a roster of its own.
+    cfg.raftListen.clear();
     return cfg;
 }
 
@@ -82,7 +90,7 @@ constexpr auto Noon = std::chrono::system_clock::time_point { std::chrono::hours
                                                                   .notAfter = notAfter,
                                                                   .endorser = endorser,
                                                                   .signature = {} },
-                                     [&key](std::span<std::byte const> message) { return key.Sign(message); }));
+                                     [&key](LabelledMessage const& message) { return SignLabelled(key, message); }));
     }
     return certified;
 }
@@ -254,22 +262,6 @@ TEST_CASE("A kept roster this machine cannot use refuses the start, never falls 
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().contains(Distributed::RosterFileName));
     }
-
-    SECTION("another fleet's roster, where --cluster-id asserts this one")
-    {
-        auto store = Distributed::FileRosterStore { scratch / Distributed::RosterFileName };
-        auto other = Certified(ThreeVoters(), 1, { "n1", "n2" });
-        other.clusterId = "elsewhere";
-        REQUIRE(store.Save(Cluster::PersistedRoster { .certificate = other, .certifiedUntil = Noon + 1h }).has_value());
-        cfg.clusterIdExplicit = true;
-        auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
-        REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().contains("elsewhere"));
-
-        // The control: the same kept roster where nothing was asserted is adopted as held.
-        cfg.clusterIdExplicit = false;
-        CHECK(NodeRoster::Build(cfg, clock, metrics, logger).has_value());
-    }
 }
 
 TEST_CASE("A worker other machines can reach refuses to start holding no roster and no anchor", "[node][roster]")
@@ -294,6 +286,78 @@ TEST_CASE("A worker other machines can reach refuses to start holding no roster 
     CHECK(NodeRoster::Build(cfg, clock, metrics, logger).has_value());
 }
 
+TEST_CASE("Whether a worker must hold a roster is its mode's row, under every mode", "[node][roster][formation][mode]")
+{
+    // Walked over the mode TABLE, each mode reaching the roster decision itself. A worker whose
+    // mode says other machines are, or are about to be, members admits them -- so with no
+    // consensus, a wildcard node port and nothing kept, it has nothing to check their leases
+    // against and is refused by name. A mode that dials in runs consensus whatever its flags say,
+    // so its roster is the state it applies. A solitary node is this machine alone: it starts
+    // checking nothing, and admits nobody else for it to have to.
+    //
+    // The expectation is STATED per mode rather than read off the column it tests: a case that
+    // derived it from `members` would agree with any value the column held.
+    struct Expected
+    {
+        Cluster::NodeMode mode;
+        bool joined;
+    };
+    constexpr auto Joined = std::to_array<Expected>({
+        { .mode = Cluster::NodeMode::Solitary, .joined = false },
+        { .mode = Cluster::NodeMode::Pending, .joined = true },
+        { .mode = Cluster::NodeMode::Learner, .joined = true },
+        { .mode = Cluster::NodeMode::Voter, .joined = true },
+    });
+    for (auto const& row: Cluster::NodeModeTable)
+    {
+        INFO(row.name);
+        auto const* const expected = core::findIfOrNull(Joined, [&row](Expected const& e) { return e.mode == row.mode; });
+        REQUIRE(expected != nullptr);
+        auto const scratch = Testing::ScratchDirectory { "node-roster-mode" };
+        auto record = Cluster::FormationRecord { .mode = row.mode,
+                                                 .own = { .clusterId = "own-c", .createdAtUnixSeconds = 100 },
+                                                 .joining = std::nullopt,
+                                                 .fleet = std::nullopt,
+                                                 .archivePending = std::nullopt,
+                                                 .rejectedBy = std::nullopt,
+                                                 .askedJoins = {} };
+        if (row.consensus == Cluster::ConsensusScope::Fleet && row.raftListener == Cluster::RaftListenerState::Closed)
+            record.fleet = Cluster::FleetMembership { .clusterId = "fleet-c",
+                                                      .roster = Cluster::EncodeRoster(ThreeVoters()),
+                                                      .createdAtUnixSeconds = 0 };
+        auto cfg = NodeConfig {};
+        cfg.schedulers = { "127.0.0.1:6674" };
+        cfg.raftListen.clear();
+        cfg.nodeListen = "0.0.0.0:6674";
+        cfg.clusterDir = scratch.Path();
+        REQUIRE(ApplyFormation(cfg, record, {}).has_value());
+        core::platform::ManualWallClock const clock { Noon };
+        AtomicMetricsSink metrics;
+        NullLogger logger;
+
+        auto const joined = expected->joined;
+        CHECK((row.members == Cluster::FleetReach::Beyond) == joined);
+        CHECK(AdmitsRemotePeers(cfg) == joined);
+        auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
+        if (RunsConsensus(cfg))
+        {
+            CHECK(row.raftListener == Cluster::RaftListenerState::Closed);
+            REQUIRE(roster.has_value());
+            CHECK(Testing::Unwrap(roster)->Lease() != nullptr);
+        }
+        else if (joined)
+        {
+            REQUIRE_FALSE(roster.has_value());
+            CHECK(roster.error() == RosterlessWorkerRefusal);
+        }
+        else
+        {
+            REQUIRE(roster.has_value());
+            CHECK(Testing::Unwrap(roster)->Lease() == nullptr);
+        }
+    }
+}
+
 TEST_CASE("A node carries the endorsement it last signed, and counts a roster it cannot read", "[node][roster]")
 {
     auto cfg = Worker();
@@ -314,7 +378,7 @@ TEST_CASE("A node carries the endorsement it last signed, and counts a roster it
                                                               .notAfter = Noon + 1h,
                                                               .endorser = "n1",
                                                               .signature = {} },
-                                 [&key](std::span<std::byte const> message) { return key.Sign(message); });
+                                 [&key](LabelledMessage const& message) { return SignLabelled(key, message); });
     node.Endorsed(endorsement);
     CHECK(node.Endorsement() == Cluster::EncodeEndorsement(endorsement));
 

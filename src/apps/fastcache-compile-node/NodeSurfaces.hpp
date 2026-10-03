@@ -35,8 +35,8 @@ namespace FastCache::Node
 enum class NodeSurface : std::uint8_t
 {
     /// This node's own `0xFC` port: the cache verbs `fastcache-cc` on this machine
-    /// reads and writes through, the compiles clients dispatch to it, and -- with
-    /// `--serve-scheduler` -- the verbs the fleet asks this node for capacity with
+    /// reads and writes through, the compiles clients dispatch to it, and -- where its
+    /// mode serves them -- the verbs the fleet asks this node for capacity with
     /// while it leads.
     ///
     /// **One surface where there were three** (#290). They were separated by the port
@@ -277,6 +277,15 @@ struct SurfaceRow
     /// can gate on `--node-id` and then delegate rather than re-spelling the fallback.
     /// Call it through `Resolve`.
     SurfaceEndpoints (*resolve)(SurfaceRow const&, NodeConfig const&) = nullptr;
+
+    /// Why `resolve` answered nothing, when the reason is this row's own rather than its flag's.
+    ///
+    /// Null for a row whose only way to go unserved is its flag, which `WhyNotServed` answers.
+    /// The Raft row's port is opened by the formation record's MODE, and "set --listen-raft" is
+    /// the wrong answer for a learner that dials the leader: the row says so itself, rather than
+    /// `WhyNotServed` naming the row.
+    /// @return The trailing column, or nothing when the reason is not this row's.
+    std::optional<std::string> (*closedBecause)(NodeConfig const&) = nullptr;
 
     /// What an operator has to know about this row that the columns cannot say.
     ///

@@ -521,9 +521,11 @@ std::chrono::milliseconds SchedulerService::AgreedLeaseLifetime() const
 
 void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch)
 {
+    auto observer = std::function<void(SchedulerRole)> {};
     {
         std::scoped_lock const guard { _leaderMutex };
         _leaderEndpoint.assign(leaderEndpoint);
+        observer = _roleObserver;
     }
     // Before the role, for the reason the endpoint is: a thread that has seen
     // `Leader` must already be able to see the term it leads under, or the first
@@ -532,6 +534,15 @@ void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoi
     // Published after the endpoint it describes, so a reader that sees `Leader`
     // has already been able to see the address that came with it.
     _role.store(role, std::memory_order_release);
+    // After the role is published, and outside the lock, so an observer may read this service.
+    if (observer)
+        observer(role);
+}
+
+void SchedulerService::ObserveRole(std::function<void(SchedulerRole)> observer)
+{
+    std::scoped_lock const guard { _leaderMutex };
+    _roleObserver = std::move(observer);
 }
 
 SchedulerReply SchedulerService::Offer(Cluster::Command const& command)

@@ -292,7 +292,6 @@ TEST_CASE("A node running no worker is never leased, and a worker beside it stil
 
     Node::NodeConfig schedulerOnly;
     schedulerOnly.slots = 0;
-    schedulerOnly.serveScheduler = true;
     // A small always-on box, so that if it WERE registered it would still lose every
     // pick to the worker below -- which is what keeps the second section from going red
     // for the first section's reason.

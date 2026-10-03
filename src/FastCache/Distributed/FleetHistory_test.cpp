@@ -256,7 +256,7 @@ TEST_CASE("A history file's words are big-endian, and not only self-consistent",
     clock.Advance(std::chrono::minutes { 1 });
     history.Record(Reading(23));
     REQUIRE(history.Generation() == 2);
-    REQUIRE(history.Save(file));
+    REQUIRE(history.Save(file, StateFile::FleetHistory));
 
     auto const raw = ReadFile(file);
     REQUIRE(raw.size() > 21);
@@ -288,7 +288,7 @@ TEST_CASE("History survives a save and reload", "[distributed][fleethistory]")
         clock.Advance(std::chrono::minutes { 1 });
         history.Record(Reading(23));
         generation = history.Generation();
-        REQUIRE(history.Save(file));
+        REQUIRE(history.Save(file, StateFile::FleetHistory));
     }
 
     FleetHistory restored { clock };
@@ -330,7 +330,7 @@ TEST_CASE("A history file that cannot be trusted starts empty rather than throwi
         {
             FleetHistory good { clock };
             good.Record(Reading(3));
-            REQUIRE(good.Save(file));
+            REQUIRE(good.Save(file, StateFile::FleetHistory));
         }
         // Flip a byte well past the header, so the checksum is what catches it.
         {
@@ -534,7 +534,7 @@ TEST_CASE("A version 1 history is inflated forward rather than discarded", "[dis
 
     // And it saves forward, in the current format.
     auto const upgraded = scratch.Path() / "v2.bin";
-    REQUIRE(history.Save(upgraded));
+    REQUIRE(history.Save(upgraded, StateFile::FleetHistory));
     FleetHistory again { clock };
     REQUIRE(again.Load(upgraded));
     CHECK(GrantedOf(again.Buckets(FleetRange::Day).back()) == 11);
@@ -557,7 +557,7 @@ TEST_CASE("A history newer than this build is kept, and never written over", "[d
     {
         FleetHistory writer { clock };
         writer.Record(Reading(5));
-        REQUIRE(writer.Save(file));
+        REQUIRE(writer.Save(file, StateFile::FleetHistory));
     }
     auto bytes = ReadFile(file);
     REQUIRE(bytes.size() > 4);
@@ -574,7 +574,7 @@ TEST_CASE("A history newer than this build is kept, and never written over", "[d
     history.Record(Reading(9));
     CHECK_FALSE(history.Empty());
 
-    CHECK_FALSE(history.Save(file));
+    CHECK_FALSE(history.Save(file, StateFile::FleetHistory));
     CHECK(ReadFile(file) == before);
 }
 
@@ -590,7 +590,7 @@ TEST_CASE("A history older than every reader is not treated as newer", "[distrib
     {
         FleetHistory writer { clock };
         writer.Record(Reading(5));
-        REQUIRE(writer.Save(file));
+        REQUIRE(writer.Save(file, StateFile::FleetHistory));
     }
     auto bytes = ReadFile(file);
     bytes[4] = static_cast<char>(0);
@@ -599,7 +599,7 @@ TEST_CASE("A history older than every reader is not treated as newer", "[distrib
     FleetHistory history { clock };
     CHECK_FALSE(history.Load(file));
     CHECK_FALSE(history.ReadOnly());
-    CHECK(history.Save(file));
+    CHECK(history.Save(file, StateFile::FleetHistory));
 }
 
 TEST_CASE("A gap in sampling is not folded in as a peak", "[distributed][fleethistory]")
@@ -663,7 +663,7 @@ TEST_CASE("A restart keeps when a bucket was sampled, not when its window opened
         FleetHistory history { clock };
         history.Record(Reading(7));
         sampled = history.Buckets(FleetRange::Week).back().sampleMillis;
-        REQUIRE(history.Save(file));
+        REQUIRE(history.Save(file, StateFile::FleetHistory));
     }
 
     FleetHistory restored { clock };
@@ -902,7 +902,7 @@ TEST_CASE("A leader's record of the other machines survives a restart", "[distri
         REQUIRE(received.AcceptHistory("a:1", batchA) == 4);
         REQUIRE(received.AcceptHistory("b:1", nodeB.ClosedBucketsAfter(-1, 100)) == 4);
         highA = received.HighWaterFor("a:1");
-        REQUIRE(received.Save(file));
+        REQUIRE(received.Save(file, StateFile::ReceivedHistory));
     }
 
     FleetNodeHistories restored { clock };
@@ -952,7 +952,7 @@ TEST_CASE("A received-history file that cannot be trusted starts empty", "[distr
         {
             FleetHistory own { clock };
             own.Record(Reading(3));
-            REQUIRE(own.Save(file));
+            REQUIRE(own.Save(file, StateFile::FleetHistory));
         }
         FleetNodeHistories received { clock };
         CHECK_FALSE(received.Load(file));
@@ -968,7 +968,7 @@ TEST_CASE("A received-history file that cannot be trusted starts empty", "[distr
             clock.Advance(std::chrono::minutes { 1 });
             FleetNodeHistories received { clock };
             REQUIRE(received.AcceptHistory("a:1", node.ClosedBucketsAfter(-1, 100)) == 1);
-            REQUIRE(received.Save(file));
+            REQUIRE(received.Save(file, StateFile::ReceivedHistory));
         }
         {
             std::fstream patch { file, std::ios::binary | std::ios::in | std::ios::out };

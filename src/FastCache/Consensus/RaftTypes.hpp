@@ -140,7 +140,7 @@ struct Configuration
 /// Separate from `Role` because a role is what `Tick` moves a node between and a
 /// standing is what the configuration says about it: a learner is a follower whose
 /// standing forbids the two things a follower may otherwise do -- stand, and vote
-/// (`RaftNode.hpp`'s `StandingTable`).
+/// (`Standing.hpp`'s `StandingTable`).
 enum class Standing : std::uint8_t
 {
     NoCluster, ///< The configuration names nobody: waiting to be admitted.

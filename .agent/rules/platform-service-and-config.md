@@ -841,13 +841,18 @@ readable and silently ignored. Every rule below has already been one of them.
     returns before a toolchain is ever resolved, bakes the command line into a
     registration, and replays it at every boot with nobody watching.
 
-- **A value parser does not know which flag it was reached through, so it must not
+- **A value parser does not know which flag it was reached through, so it CANNOT
   name one.** It is a free function shared by every row that uses it, and a
-  hand-written field is one that drifts when a flag is renamed. `ApplyOneOption`
-  stamps the row's own `primary` into an error whose `field` the parser left empty;
-  a parser with something more specific to say — the node's log-level parser, its
-  cluster appliers — keeps saying it. Without the stamp a refusal names nothing,
-  which is what the node's own report used to do for an unrecognised argument.
+  hand-written field is one that drifts when a flag is renamed. That used to be a
+  convention -- `ApplyOneOption` stamped only an EMPTY field -- and a dozen parsers in
+  both binaries broke it: `bind` for a bad host inside `--listen`, which the operator
+  never typed, and `raft-peer`, `max-memory`, `log-level` without the dashes every row
+  carries. **Now it is structural**: `ArgvError` takes no field parameter, so a literal
+  one does not compile, and `ApplyOneOption` stamps the row's `primary` UNCONDITIONALLY,
+  so a field a parser builds by hand into a `ConfigError` is overwritten rather than
+  trusted. The one constructor that still names a field, `UnrowedArgvError`, is for a
+  refusal about NO row -- an argument that matched none, a sub-command -- and every call
+  is a row of `Options_test`'s census. A configuration file stamps its key, as before.
 
 - **A flag rename is not a no-op when the flag's DEFAULT was doing the work**, and
   the rename is silent precisely where prose depended on the value rather than the

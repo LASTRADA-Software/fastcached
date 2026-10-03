@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -146,8 +147,11 @@ constexpr std::string_view JoinerAddress = "198.51.100.4";
 constexpr std::string_view OperatorAddress = "10.0.0.7";
 
 /// What a joiner claims about itself.
+///
+/// A WORKER, stating no endpoint: the role the one-shot `--enroll-from` asks as. A learner's
+/// admission has cases of its own below.
 constexpr std::string_view JoinerId = "joiner-a";
-constexpr std::string_view JoinerEndpoint = "198.51.100.4:7100";
+constexpr Wire::EnrollRole JoinerRole = Wire::EnrollRole::Worker;
 
 /// The leader's own member record, which every roster it hands out carries.
 constexpr std::string_view LeaderId = "leader";
@@ -185,7 +189,10 @@ struct Seed
     // hole as correct. The route is named HERE rather than defaulted in the shared fake,
     // because which route admits is this case's fact to state (#1497).
     ListedMembership membership { { std::string { OperatorAddress } }, Distributed::MembershipParticipant::FleetMemberList };
-    EnrollmentWindow window { clock };
+    NodeConditions conditions;
+    // Bound as `main` binds it: the node's own sink and the wall clock the scheduler reads, never
+    // the defaults a fixture finds more convenient.
+    EnrollmentWindow window { clock, &conditions, &metrics, wallClock };
     EnrollmentResponder responder { window, service, membership, metrics, logger };
 };
 
@@ -228,9 +235,19 @@ struct Seed
     return Unwrap(refusal).first;
 }
 
+/// The sentence a refusal carries, copied out.
+/// @param reply The whole reply frame, a refusal.
+/// @return Its sentence.
+[[nodiscard]] std::string RefusalSentenceIn(std::span<std::byte const> reply)
+{
+    auto const refusal = Wire::DecodeErrorPayload(PayloadOf(reply));
+    REQUIRE(refusal.has_value());
+    return std::string { Unwrap(refusal).second };
+}
+
 /// An `Enroll` frame.
 /// @param id The identity claimed.
-/// @param endpoint The consensus endpoint claimed; empty for a worker.
+/// @param endpoint The endpoint claimed; empty for every live role.
 /// @param role What it asks to be.
 /// @param key The key it asks under.
 /// @return The frame.
@@ -240,33 +257,62 @@ struct Seed
                                                  Ed25519PublicKey const& key)
 {
     return Wire::EncodeEnroll(
-        Wire::EnrollRequest { .nodeId = id, .raftEndpoint = endpoint, .role = role, .publicKey = key });
+        Wire::EnrollRequest { .nodeId = id, .nodeEndpoint = endpoint, .role = role, .publicKey = key });
 }
 
-/// One `Enroll` from the joiner, as a member under its own key.
+/// One `Enroll` from the joiner, in its role and under its own key.
 /// @param seed The wired fixture.
 /// @return The encoded reply.
 [[nodiscard]] std::vector<std::byte> Enroll(Seed& seed)
 {
-    return AnswerNow(
-        seed.responder, EnrollFrame(JoinerId, JoinerEndpoint, Wire::EnrollRole::Member, JoinerKey()), JoinerAddress);
+    return AnswerNow(seed.responder, EnrollFrame(JoinerId, "", JoinerRole, JoinerKey()), JoinerAddress);
+}
+
+/// One approval from the operator, naming @p id and @p key.
+/// @param seed The wired fixture.
+/// @param id Who it is about.
+/// @param key The key it names.
+/// @return The encoded reply.
+[[nodiscard]] std::vector<std::byte> ApproveUnder(Seed& seed, std::string_view id, Ed25519PublicKey const& key)
+{
+    return AnswerNow(seed.responder, Wire::EncodeEnrollApprove(id, key), OperatorAddress);
 }
 
 /// One `EnrollControl` from the operator.
+///
+/// An `Approve` names the key the row under @p subject holds -- what an operator pasting the line
+/// `--enroll-list` prints sends -- or no row's key when there is no row. A case about the key
+/// itself calls `ApproveUnder`.
 /// @param seed The wired fixture.
 /// @param verb What to do.
 /// @param subject Who it is about.
 /// @return The encoded reply.
 [[nodiscard]] std::vector<std::byte> Control(Seed& seed, Wire::EnrollControlVerb verb, std::string_view subject = {})
 {
+    if (verb == Wire::EnrollControlVerb::Approve)
+        return ApproveUnder(
+            seed,
+            subject,
+            seed.window.Find(subject)
+                .transform([](Wire::EnrollmentPendingEntry const& row) { return Ed25519PublicKey { row.publicKey }; })
+                .value_or(Ed25519PublicKey {}));
     return AnswerNow(seed.responder, Wire::EncodeEnrollControl(verb, subject), OperatorAddress);
 }
 
-/// Open the window, record the joiner, and approve it.
+/// One `Enroll` from a machine asking to join as a LEARNER, under @p key.
 /// @param seed The wired fixture.
-void OpenAndApprove(Seed& seed)
+/// @param id The identity it claims.
+/// @param key The key it asks under.
+/// @return The encoded reply.
+[[nodiscard]] std::vector<std::byte> LearnerRequest(Seed& seed, std::string_view id, Ed25519PublicKey const& key)
 {
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
+    return AnswerNow(seed.responder, EnrollFrame(id, "", Wire::EnrollRole::Learner, key), JoinerAddress);
+}
+
+/// Record the joiner, and approve it.
+/// @param seed The wired fixture.
+void RecordAndApprove(Seed& seed)
+{
     REQUIRE(RefusalIn(Enroll(seed)) == std::nullopt);
     REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, JoinerId)) == std::nullopt);
 }
@@ -308,31 +354,9 @@ void OpenAndApprove(Seed& seed)
 
 } // namespace
 
-TEST_CASE("A closed window refuses enrollment by name and moves the counter that says so", "[enrollment][responder]")
+TEST_CASE("A joiner is recorded under its key and answered with no roster bytes", "[enrollment][responder]")
 {
     Seed seed;
-
-    // The default state, and the one every probe of this port meets. Asserting only
-    // that it was refused would pass under a build that refused for any reason at all;
-    // the CODE is what a client acts on and the COUNTER is what an operator watches,
-    // and the ticket asks for both because a refusal nothing counts is a probed port
-    // that looks unused.
-    auto const reply = Enroll(seed);
-    CHECK(RefusalIn(reply) == Wire::ErrorCode::EnrollmentClosed);
-    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedClosed) == 1);
-
-    // And nothing else moved. A counter rising somewhere is not the same fact as THIS
-    // counter rising, and a fixture that only asserts its own row cannot tell the two
-    // apart on a surface that shares wire codes with three others.
-    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedFull) == 0);
-    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == 0);
-    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRostersServed) == 0);
-}
-
-TEST_CASE("An open window records a joiner under its key and answers it with no roster bytes", "[enrollment][responder]")
-{
-    Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
 
     auto const reply = Enroll(seed);
     auto const decoded = Wire::DecodeEnrollReply(PayloadOf(reply));
@@ -348,44 +372,12 @@ TEST_CASE("An open window records a joiner under its key and answers it with no 
     auto const row = seed.window.Find(JoinerId);
     REQUIRE(row.has_value());
     CHECK(Unwrap(row).publicKey == JoinerKey());
-    CHECK(Unwrap(row).role == Wire::EnrollRole::Member);
-}
-
-TEST_CASE("Approving a member records it under its key AND hands it a roster that says so", "[enrollment][responder]")
-{
-    Seed seed;
-    OpenAndApprove(seed);
-
-    // Half one: the cluster records the joiner, under exactly the key the row holds. Both
-    // halves are asserted because either alone is green under half the defect: a roster
-    // handed to a machine the cluster never recorded is a joiner told it was admitted, and
-    // a member recorded with no roster handed over is one that cannot tell who its peers are.
-    auto const state = seed.cluster.ClusterState();
-    auto const recorded = std::ranges::find(state.members, JoinerId, &Cluster::ClusterMember::id);
-    REQUIRE(recorded != state.members.end());
-    CHECK(recorded->raftEndpoint == JoinerEndpoint);
-    CHECK(recorded->publicKey == JoinerKey());
-
-    // Half two: the reply is the roster, and the roster records the joiner.
-    auto const reply = Enroll(seed);
-    auto const decoded = Wire::DecodeEnrollReply(PayloadOf(reply));
-    REQUIRE(decoded.has_value());
-    CHECK(Unwrap(decoded).outcome == Wire::EnrollOutcome::Approved);
-    auto const roster = Cluster::DecodeRoster(Unwrap(decoded).roster);
-    REQUIRE(roster.has_value());
-    CHECK(RosterRecordsJoiner(roster.value(), JoinerId, JoinerKey(), Wire::EnrollRole::Member));
-    CHECK(RosterRecordsJoiner(roster.value(), LeaderId, Filled(0x01), Wire::EnrollRole::Member));
-    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRostersServed) == 1);
-
-    // And the fingerprint of what was SENT is on the row, over the very bytes the joiner
-    // received -- which is what makes the two strings an operator compares comparable.
-    CHECK(Unwrap(seed.window.Find(JoinerId)).rosterFingerprint == Cluster::DigestOfRoster(Unwrap(decoded).roster));
+    CHECK(Unwrap(row).role == JoinerRole);
 }
 
 TEST_CASE("Approving a worker admits a principal, never a member", "[enrollment][responder]")
 {
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
 
     auto const workerKey = Filled(0x77);
     auto const ask = [&] {
@@ -411,23 +403,134 @@ TEST_CASE("Approving a worker admits a principal, never a member", "[enrollment]
     auto const roster = Cluster::DecodeRoster(Unwrap(decoded).roster);
     REQUIRE(roster.has_value());
     CHECK(RosterRecordsJoiner(roster.value(), "worker-a", workerKey, Wire::EnrollRole::Worker));
+    CHECK(RosterRecordsJoiner(roster.value(), LeaderId, Filled(0x01), Wire::EnrollRole::Learner));
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRostersServed) == 1);
+
+    // And the fingerprint of what was SENT is on the row, over the very bytes the joiner
+    // received -- which is what makes the two strings an operator compares comparable.
+    CHECK(Unwrap(seed.window.Find("worker-a")).rosterFingerprint == Cluster::DigestOfRoster(Unwrap(decoded).roster));
 }
 
 TEST_CASE("A role that does not suit the endpoint is refused before it reaches the list", "[enrollment][responder]")
 {
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
 
-    // A member with no endpoint is a member the cluster counts and cannot reach; a worker
-    // with one claims an address the principal it becomes has nowhere to keep. Both are
-    // refused where they enter, because the list is what a person reads.
-    CHECK(RefusalIn(AnswerNow(seed.responder, EnrollFrame("m", "", Wire::EnrollRole::Member, JoinerKey()), JoinerAddress))
+    // Neither live role states an endpoint: a learner dials the leader rather than being
+    // dialled, and a worker's principal record has nowhere to keep one. Both are refused
+    // where they enter, because the list is what a person reads.
+    CHECK(RefusalIn(AnswerNow(
+              seed.responder, EnrollFrame("l", "10.0.0.9:6674", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
           == Wire::ErrorCode::MalformedFrame);
     CHECK(RefusalIn(AnswerNow(
               seed.responder, EnrollFrame("w", "10.0.0.9:7100", Wire::EnrollRole::Worker, JoinerKey()), JoinerAddress))
           == Wire::ErrorCode::MalformedFrame);
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == 2);
     CHECK(seed.window.Summary().second == 0);
+
+    // The control: the same learner stating none is recorded, so the refusal above is about
+    // the endpoint and not about the role.
+    CHECK(RefusalIn(AnswerNow(seed.responder, EnrollFrame("l", "", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
+          == std::nullopt);
+    CHECK(seed.window.Summary().second == 1);
+}
+
+TEST_CASE("Approving a learner admits it as a learner with no endpoint under the key it asked with",
+          "[enrollment][responder][formation]")
+{
+    Seed seed;
+    auto const laptopKey = Filled(0x6C);
+    REQUIRE(RefusalIn(LearnerRequest(seed, "laptop", laptopKey)) == std::nullopt);
+    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, "laptop")) == std::nullopt);
+
+    // What was PROPOSED, which is what distinguishes the seat: a member proposed as a voter
+    // with no endpoint is refused by the cluster, and one proposed as a voter WITH none would
+    // be counted by a quorum it can never answer.
+    auto const& proposed = seed.cluster.Proposed();
+    REQUIRE(proposed.size() == 1);
+    CHECK(proposed[0].kind == Cluster::CommandKind::AddLearner);
+    CHECK(proposed[0].key == "laptop");
+    CHECK(proposed[0].value.empty());
+    CHECK(proposed[0].publicKey == std::optional { laptopKey });
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentApprovalsManual) == 1);
+
+    // And the cluster RECORDS it so, which is what the joiner's next poll is answered from.
+    auto const state = seed.cluster.ClusterState();
+    auto const member = std::ranges::find(state.members, "laptop", &Cluster::ClusterMember::id);
+    REQUIRE(member != state.members.end());
+    CHECK(member->seat == Cluster::MemberSeat::Learner);
+    CHECK(member->raftEndpoint.empty());
+    auto const reply = LearnerRequest(seed, "laptop", laptopKey);
+    CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(reply))).outcome == Wire::EnrollOutcome::Approved);
+}
+
+TEST_CASE("Approving an id the cluster already seats is refused by name and changes no seat",
+          "[enrollment][responder][formation]")
+{
+    // A learner row under the VOTER's id, asked under another key: an approval of it must neither
+    // demote the voter nor read as succeeding while it changes nothing (#1449).
+    Seed seed;
+    REQUIRE(RefusalIn(LearnerRequest(seed, LeaderId, Filled(0x5E))) == std::nullopt);
+    auto const reply = Control(seed, Wire::EnrollControlVerb::Approve, LeaderId);
+    CHECK(RefusalIn(reply) == Wire::ErrorCode::InvalidClusterChange);
+    auto const refusal = Wire::DecodeErrorPayload(PayloadOf(reply));
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).second
+          == std::format("{} is already a member as voter; an approval does not change a member's seat", LeaderId));
+
+    auto const state = seed.cluster.ClusterState();
+    auto const leader = std::ranges::find(state.members, LeaderId, &Cluster::ClusterMember::id);
+    REQUIRE(leader != state.members.end());
+    CHECK(leader->seat == Cluster::MemberSeat::Voter);
+    CHECK(seed.cluster.Proposed().empty());
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentApprovalsManual) == 0);
+    CHECK(Unwrap(seed.window.Find(LeaderId)).decision == Wire::EnrollmentDecision::Pending);
+}
+
+TEST_CASE("A machine the cluster already records is answered the roster with no row to approve",
+          "[enrollment][responder][formation]")
+{
+    // The list is one leader's memory and the admission is replicated: a joiner admitted just
+    // before the leader changed asks the new one, which holds no row for it.
+    Seed seed;
+    auto state = seed.cluster.ClusterState();
+    state.members.push_back(
+        Cluster::ClusterMember { .id = "laptop",
+                                 .raftEndpoint = {},
+                                 .schedulerEndpoint = {},
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                 .seat = Cluster::MemberSeat::Learner,
+                                 .publicKey = Filled(0x6C) });
+    seed.cluster.SetState(std::move(state));
+
+    auto const reply = LearnerRequest(seed, "laptop", Filled(0x6C));
+    CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(reply))).outcome == Wire::EnrollOutcome::Approved);
+    CHECK_FALSE(seed.window.Find("laptop").has_value());
+
+    // The control: the same id under ANOTHER key is recorded and waits for a person -- and
+    // "another" is exact: a key one bit away from the recorded one is another key.
+    auto nearMiss = Filled(0x6C);
+    nearMiss.back() ^= std::byte { 0x01 };
+    auto const other = LearnerRequest(seed, "laptop", nearMiss);
+    CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(other))).outcome == Wire::EnrollOutcome::Pending);
+    REQUIRE(seed.window.Find("laptop").has_value());
+    CHECK(Unwrap(seed.window.Find("laptop")).publicKey == nearMiss);
+
+    // And once that row exists it decides, whatever the cluster records: the recorded key asking
+    // again is ANOTHER MACHINE to this row, counted in `claimsChanged` and answered `Pending`.
+    auto const recordedAgain = LearnerRequest(seed, "laptop", Filled(0x6C));
+    CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(recordedAgain))).outcome == Wire::EnrollOutcome::Pending);
+    CHECK(Unwrap(seed.window.Find("laptop")).claimsChanged == 1);
+}
+
+TEST_CASE("A refused approval is not counted as one", "[enrollment][responder][formation]")
+{
+    Seed seed;
+    REQUIRE(RefusalIn(Enroll(seed)) == std::nullopt);
+    seed.cluster.RefuseWith(ConsensusError { .code = ConsensusErrorCode::ConfigurationChangeInFlight,
+                                             .context = "another change is committing",
+                                             .knownLeader = std::nullopt });
+    CHECK(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, JoinerId)) != std::nullopt);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentApprovalsManual) == 0);
 }
 
 TEST_CASE("The approve reply carries no private key, and a planted one IS found by the same scan",
@@ -463,7 +566,7 @@ TEST_CASE("The approve reply carries no private key, and a planted one IS found 
     state.settings.push_back(Cluster::Setting { .name = "upstream", .value = Base64Encode(secrets[2]) });
     seed.cluster.SetState(state);
 
-    OpenAndApprove(seed);
+    RecordAndApprove(seed);
     auto const reply = Enroll(seed);
     auto const decoded = Wire::DecodeEnrollReply(PayloadOf(reply));
     REQUIRE(decoded.has_value());
@@ -499,7 +602,6 @@ TEST_CASE("The cluster is asked BEFORE the window is marked, so a refused change
           "[enrollment][responder]")
 {
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
     REQUIRE(RefusalIn(Enroll(seed)) == std::nullopt);
 
     // A leader that cannot accept the change right now, which is what a healthy cluster
@@ -531,7 +633,7 @@ TEST_CASE("An approved joiner is answered on every poll, so a lost reply strands
     // roster is no secret, so it is answered every time, and the second and third answers
     // are the ones that tell the two designs apart.
     Seed seed;
-    OpenAndApprove(seed);
+    RecordAndApprove(seed);
 
     for (auto const poll: std::views::iota(1, 4))
     {
@@ -554,7 +656,6 @@ TEST_CASE("An approval is answered only once the leader's own roster records the
     // entry -- which is exactly what the joiner is told to refuse, so it would report a
     // healthy approval as a roster somebody else produced.
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
     REQUIRE(RefusalIn(Enroll(seed)) == std::nullopt);
     seed.cluster.HoldApplies();
     REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, JoinerId)) == std::nullopt);
@@ -583,10 +684,9 @@ TEST_CASE("A poll under the approved id with another key is told nothing", "[enr
     // asking under an approved id with its own key is answered `Pending` and handed no
     // roster -- it is not admitted, and telling it so would be telling it who is.
     Seed seed;
-    OpenAndApprove(seed);
+    RecordAndApprove(seed);
 
-    auto const impostor = AnswerNow(
-        seed.responder, EnrollFrame(JoinerId, JoinerEndpoint, Wire::EnrollRole::Member, Filled(0x99)), JoinerAddress);
+    auto const impostor = AnswerNow(seed.responder, EnrollFrame(JoinerId, "", JoinerRole, Filled(0x99)), JoinerAddress);
     auto const decoded = Wire::DecodeEnrollReply(PayloadOf(impostor));
     REQUIRE(decoded.has_value());
     CHECK(Unwrap(decoded).outcome == Wire::EnrollOutcome::Pending);
@@ -602,21 +702,20 @@ TEST_CASE("A poll under the approved id with another key is told nothing", "[enr
 
 TEST_CASE("Approving a machine already recorded under its key is satisfied rather than refused", "[enrollment][responder]")
 {
-    // An operator's `--cluster-admit` recorded the machine first, naming the same key. The
+    // An operator's admission recorded the machine first, naming the same key. The
     // cluster answers *already in force*, which is a `Satisfied` refusal: the approval
     // changes nothing but what this window answers, and with no secret at stake answering
     // the roster on that earlier decision hands out nothing it had not already made public.
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
     REQUIRE(RefusalIn(Enroll(seed)) == std::nullopt);
     auto state = seed.cluster.ClusterState();
     Cluster::Apply(state,
-                   Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                   Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
                                       .key = std::string { JoinerId },
-                                      .value = std::string { JoinerEndpoint },
+                                      .value = {},
                                       .schedulerEndpoint = {},
                                       .publicKey = JoinerKey(),
-                                      .role = std::nullopt });
+                                      .role = Cluster::PrincipalRole::Worker });
     seed.cluster.SetState(state);
 
     CHECK(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, JoinerId)) == std::nullopt);
@@ -627,7 +726,6 @@ TEST_CASE("Approving a machine already recorded under its key is satisfied rathe
 TEST_CASE("A rejected joiner is told so and stays rejected until somebody changes their mind", "[enrollment][responder]")
 {
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
     REQUIRE(RefusalIn(Enroll(seed)) == std::nullopt);
     REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Reject, JoinerId)) == std::nullopt);
 
@@ -638,22 +736,24 @@ TEST_CASE("A rejected joiner is told so and stays rejected until somebody change
     CHECK(Unwrap(decoded).roster.empty());
 
     // Rejecting proposes NOTHING: a machine refused at the door must not appear in the
-    // cluster's member record under any reading.
+    // cluster's record under any reading.
     CHECK(seed.cluster.Proposed().empty());
     CHECK(std::ranges::none_of(seed.cluster.ClusterState().members,
                                [](Cluster::ClusterMember const& m) { return m.id == JoinerId; }));
+    CHECK(std::ranges::none_of(seed.cluster.ClusterState().principals,
+                               [](Cluster::ClusterPrincipal const& p) { return p.id == JoinerId; }));
 }
 
 TEST_CASE("The pending list fills, refuses the next machine by name, and keeps the first", "[enrollment][responder]")
 {
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
 
+    // Each from a host of its own, so the list's bound is what is reached and not a host's.
     for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollments))
     {
         auto const id = std::format("crowd-{}", index);
-        REQUIRE(RefusalIn(AnswerNow(
-                    seed.responder, EnrollFrame(id, "10.0.0.1:1", Wire::EnrollRole::Member, Filled(0x66)), JoinerAddress))
+        auto const host = std::format("203.0.113.{}", index);
+        REQUIRE(RefusalIn(AnswerNow(seed.responder, EnrollFrame(id, "", Wire::EnrollRole::Learner, Filled(0x66)), host))
                 == std::nullopt);
     }
 
@@ -703,7 +803,6 @@ TEST_CASE("A follower answers enrollment with the leader's endpoint rather than 
           "[enrollment][responder]")
 {
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
     seed.service.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.1:7000", Distributed::StandaloneSchedulerTerm);
 
     // Both verbs, because a follower whose LIST still answered would show an operator an
@@ -728,7 +827,6 @@ TEST_CASE("A follower answers enrollment with the leader's endpoint rather than 
 TEST_CASE("A joiner that names itself in bytes that are not text is refused where it enters", "[enrollment][responder]")
 {
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
 
     // One byte that belongs to no UTF-8 sequence. Refused HERE rather than at the
     // approval, because an id copied into `ClusterState` is read back out of
@@ -737,8 +835,8 @@ TEST_CASE("A joiner that names itself in bytes that are not text is refused wher
     auto const reply = AnswerNow(seed.responder,
                                  EnrollFrame("joiner-\xff"
                                              "a",
-                                             JoinerEndpoint,
-                                             Wire::EnrollRole::Member,
+                                             "",
+                                             Wire::EnrollRole::Learner,
                                              JoinerKey()),
                                  JoinerAddress);
     CHECK(RefusalIn(reply) == Wire::ErrorCode::MalformedFrame);
@@ -751,28 +849,127 @@ TEST_CASE("A joiner that names itself in bytes that are not text is refused wher
     CHECK(Unwrap(report).pending.empty());
 }
 
-TEST_CASE("Opening counts once and re-opening does not", "[enrollment][responder]")
+TEST_CASE("A joiner's id is held to the one id bound where it enters", "[enrollment][responder]")
+{
+    // An id past the bound would make a row `--enroll-reject` refuses to name, removable only by
+    // `--enroll-clear`, which drops every honest row with it. So it is never recorded.
+    Seed seed;
+    auto const atBound = std::string(Wire::MaxIdBytes, 'a');
+    auto const pastBound = std::string(Wire::MaxIdBytes + 1, 'b');
+
+    auto const accepted = LearnerRequest(seed, atBound, Filled(0x41));
+    REQUIRE(RefusalIn(accepted) == std::nullopt);
+    auto const reply = Wire::DecodeEnrollReply(PayloadOf(accepted));
+    REQUIRE(reply.has_value()); // a default reply reads Pending, so an undecodable one must not pass as one
+    CHECK(Unwrap(reply).outcome == Wire::EnrollOutcome::Pending);
+
+    auto const refused = LearnerRequest(seed, pastBound, Filled(0x42));
+    CHECK(RefusalIn(refused) == Wire::ErrorCode::MalformedFrame);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedIdTooLong) == 1);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == 0); // its own row
+
+    // The list holds the row at the bound, and nothing an operator could not name.
+    auto const listing = Control(seed, Wire::EnrollControlVerb::List);
+    auto const report = Wire::DecodeEnrollmentReport(PayloadOf(listing));
+    REQUIRE(report.has_value());
+    REQUIRE(Unwrap(report).pending.size() == 1);
+    CHECK(Unwrap(report).pending[0].nodeId == atBound);
+}
+
+TEST_CASE("An armed window admits a learner as the leader and counts it apart from manual approvals",
+          "[enrollment][auto-approve][formation]")
 {
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
-    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentWindowsOpened) == 1);
+    auto const laptopKey = Filled(0x6C);
+    REQUIRE(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(std::chrono::minutes { 10 }), OperatorAddress))
+            == std::nullopt);
 
-    // The audit trail counts WINDOWS rather than commands: an operator who types the
-    // verb twice has opened one window, and a counter that read two would report a
-    // second minute of exposure that never happened.
-    CHECK(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == Wire::ErrorCode::ClusterChangeNotNeeded);
-    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentWindowsOpened) == 1);
+    // Admitted on the leader's own authority, and answered `Pending`: the roster is not applied
+    // yet on a real leader, and the joiner's next poll is the one answered `Approved`.
+    seed.cluster.HoldApplies();
+    auto const first = LearnerRequest(seed, "laptop", laptopKey);
+    CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(first))).outcome == Wire::EnrollOutcome::Pending);
+    REQUIRE(seed.cluster.Proposed().size() == 1);
+    CHECK(seed.cluster.Proposed()[0].kind == Cluster::CommandKind::AddLearner);
+    CHECK(seed.cluster.Proposed()[0].publicKey == std::optional { laptopKey });
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentApprovalsAuto) == 1);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentApprovalsManual) == 0);
+
+    seed.cluster.CommitHeld();
+    auto const second = LearnerRequest(seed, "laptop", laptopKey);
+    CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(second))).outcome == Wire::EnrollOutcome::Approved);
+
+    // The audit line: the row says the window admitted it, and when the window was armed.
+    auto const report = Wire::DecodeEnrollmentReport(PayloadOf(Control(seed, Wire::EnrollControlVerb::List)));
+    REQUIRE(report.has_value());
+    CHECK(Unwrap(report).state == Wire::WireEnrollmentState::AutoApprove);
+    REQUIRE(Unwrap(report).pending.size() == 1);
+    CHECK(Unwrap(report).pending[0].autoApprovedArmedSecondsAgo.has_value());
+    CHECK(Unwrap(report).pending[0].decision == Wire::EnrollmentDecision::Approved);
+}
+
+TEST_CASE("A demoted leader's window is disarmed and stays disarmed when it leads again",
+          "[enrollment][auto-approve][formation]")
+{
+    // Through the scheduler's SetRole, which is the call consensus makes and the wiring the
+    // responder installs: a leader that loses and regains leadership inside the deadline must
+    // not resume admitting (RF-4).
+    Seed seed;
+    REQUIRE(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(std::chrono::minutes { 10 }), OperatorAddress))
+            == std::nullopt);
+    seed.service.SetRole(Distributed::SchedulerRole::Follower, LeaderEndpoint, Distributed::StandaloneSchedulerTerm);
+    seed.service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+
+    auto const reply = LearnerRequest(seed, "laptop", Filled(0x6C));
+    CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(reply))).outcome == Wire::EnrollOutcome::Pending);
+    CHECK(seed.cluster.Proposed().empty());
+    CHECK(seed.window.Summary().first == Wire::WireEnrollmentState::Manual);
+}
+
+TEST_CASE("The leader refuses a zero or over-ceiling duration with the table's sentence",
+          "[enrollment][auto-approve][formation]")
+{
+    Seed seed;
+    for (auto const& [duration, refusal]:
+         { std::pair { std::chrono::seconds { 0 }, AutoApproveRefusal::Zero },
+           std::pair { std::chrono::seconds { AutoApproveCeiling } + std::chrono::seconds { 1 },
+                       AutoApproveRefusal::OverCeiling } })
+    {
+        INFO(duration.count());
+        auto const reply = AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(duration), OperatorAddress);
+        auto const header = Wire::DecodeReplyHeader(reply);
+        REQUIRE(header.has_value());
+        REQUIRE(Unwrap(header).status == Wire::Status::Error);
+        auto const refused = Wire::DecodeErrorPayload(PayloadOf(reply));
+        REQUIRE(refused.has_value());
+        CHECK(Unwrap(refused).first == Wire::ErrorCode::InvalidClusterChange);
+        CHECK(Unwrap(refused).second == AutoApproveSentence(refusal));
+    }
+    CHECK(seed.window.Summary().first == Wire::WireEnrollmentState::Manual);
+}
+
+TEST_CASE("Off ends an armed window, and ending one that is not armed is answered all the same",
+          "[enrollment][auto-approve][formation]")
+{
+    Seed seed;
+    REQUIRE(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(std::chrono::minutes { 10 }), OperatorAddress))
+            == std::nullopt);
+    CHECK(seed.window.Summary().first == Wire::WireEnrollmentState::AutoApprove);
+    CHECK(RefusalIn(Control(seed, Wire::EnrollControlVerb::AutoApproveOff)) == std::nullopt);
+    CHECK(seed.window.Summary().first == Wire::WireEnrollmentState::Manual);
+    CHECK(RefusalIn(Control(seed, Wire::EnrollControlVerb::AutoApproveOff)) == std::nullopt);
+    CHECK(seed.cluster.Proposed().empty());
 }
 
 TEST_CASE("A control frame naming a subject the verb does not take is refused", "[enrollment][responder]")
 {
     Seed seed;
 
-    // The decoder's arity rule reaching the surface: `Close` names nobody and `Approve`
+    // The decoder's arity rule reaching the surface: `List` names nobody and `Approve`
     // must. Answering either by ignoring the mismatch is how an operator comes to
     // believe they approved somebody.
-    CHECK(RefusalIn(AnswerNow(
-              seed.responder, Wire::EncodeEnrollControl(Wire::EnrollControlVerb::Close, JoinerId), OperatorAddress))
+    CHECK(RefusalIn(
+              AnswerNow(seed.responder, Wire::EncodeEnrollControl(Wire::EnrollControlVerb::List, JoinerId), OperatorAddress))
           == Wire::ErrorCode::MalformedFrame);
     CHECK(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollControl(Wire::EnrollControlVerb::Approve), OperatorAddress))
           == Wire::ErrorCode::MalformedFrame);
@@ -805,8 +1002,7 @@ TEST_CASE("A node with no enrollment component refuses the whole family at the d
         CHECK(RefusalIn(Unwrap(refused)) == Wire::ErrorCode::NoCluster);
         CHECK(RefusalIn(Unwrap(refused)) != Wire::UnimplementedVerb);
 
-        CHECK(RefusalIn(AnswerNow(
-                  merged, EnrollFrame(JoinerId, JoinerEndpoint, Wire::EnrollRole::Member, JoinerKey()), JoinerAddress))
+        CHECK(RefusalIn(AnswerNow(merged, EnrollFrame(JoinerId, "", JoinerRole, JoinerKey()), JoinerAddress))
               == Wire::ErrorCode::NoCluster);
     }
 
@@ -826,28 +1022,32 @@ TEST_CASE("Rejecting a machine that was already approved says the cluster still 
     // right -- nothing was committed, so nothing needs removing.** But
     // `EnrollmentWindow::Decide` permits `Approved -> Rejected`, which is the path an
     // operator correcting a mis-approval takes, and there the approval has already
-    // committed the member. The reject stops the roster being handed over -- worth having,
+    // committed the machine. The reject stops the roster being handed over -- worth having,
     // which is why it is not refused outright -- and leaves the machine in `ClusterState`,
-    // counted towards quorum, while `--enroll-reject`'s help text promised *"a machine
-    // refused here was never a member and needs no --cluster-forget"*.
+    // holding its key, while `--enroll-reject`'s help text promised *"a machine refused here
+    // was never a member and needs no --cluster-forget"*.
     Seed seed;
     CapturingLogger logger { LogLevel::Trace };
     EnrollmentResponder responder { seed.window, seed.service, seed.membership, seed.metrics, logger };
 
     auto const control = [&](Wire::EnrollControlVerb verb, std::string_view subject = {}) {
+        // An approval names the key the row holds, as the line `--enroll-list` prints does.
+        if (verb == Wire::EnrollControlVerb::Approve)
+            return AnswerNow(responder,
+                             Wire::EncodeEnrollApprove(
+                                 subject, seed.window.Find(subject).value_or(Wire::EnrollmentPendingEntry {}).publicKey),
+                             OperatorAddress);
         return AnswerNow(responder, Wire::EncodeEnrollControl(verb, subject), OperatorAddress);
     };
 
-    REQUIRE(RefusalIn(control(Wire::EnrollControlVerb::Open)) == std::nullopt);
-    REQUIRE(RefusalIn(AnswerNow(
-                responder, EnrollFrame(JoinerId, JoinerEndpoint, Wire::EnrollRole::Member, JoinerKey()), JoinerAddress))
+    REQUIRE(RefusalIn(AnswerNow(responder, EnrollFrame(JoinerId, "", JoinerRole, JoinerKey()), JoinerAddress))
             == std::nullopt);
     REQUIRE(RefusalIn(control(Wire::EnrollControlVerb::Approve, JoinerId)) == std::nullopt);
 
     // The approval really did commit it, or the rest of this case would be asserting
     // a warning about a state the cluster is not in.
-    REQUIRE(std::ranges::any_of(seed.cluster.ClusterState().members,
-                                [](Cluster::ClusterMember const& m) { return m.id == JoinerId; }));
+    REQUIRE(std::ranges::any_of(seed.cluster.ClusterState().principals,
+                                [](Cluster::ClusterPrincipal const& p) { return p.id == JoinerId; }));
 
     REQUIRE(RefusalIn(control(Wire::EnrollControlVerb::Reject, JoinerId)) == std::nullopt);
 
@@ -860,9 +1060,9 @@ TEST_CASE("Rejecting a machine that was already approved says the cluster still 
     // own description believes there is nothing left to do.
     CHECK(warned->message.contains("--cluster-forget=joiner-a"));
 
-    // And the member IS still there, so the warning is true rather than defensive.
-    CHECK(std::ranges::any_of(seed.cluster.ClusterState().members,
-                              [](Cluster::ClusterMember const& m) { return m.id == JoinerId; }));
+    // And the machine IS still there, so the warning is true rather than defensive.
+    CHECK(std::ranges::any_of(seed.cluster.ClusterState().principals,
+                              [](Cluster::ClusterPrincipal const& p) { return p.id == JoinerId; }));
 }
 
 TEST_CASE("Rejecting an approved WORKER names the forget that removes it", "[enrollment][responder][security]")
@@ -874,10 +1074,15 @@ TEST_CASE("Rejecting an approved WORKER names the forget that removes it", "[enr
     CapturingLogger logger { LogLevel::Trace };
     EnrollmentResponder responder { seed.window, seed.service, seed.membership, seed.metrics, logger };
     auto const control = [&](Wire::EnrollControlVerb verb, std::string_view subject = {}) {
+        // An approval names the key the row holds, as the line `--enroll-list` prints does.
+        if (verb == Wire::EnrollControlVerb::Approve)
+            return AnswerNow(responder,
+                             Wire::EncodeEnrollApprove(
+                                 subject, seed.window.Find(subject).value_or(Wire::EnrollmentPendingEntry {}).publicKey),
+                             OperatorAddress);
         return AnswerNow(responder, Wire::EncodeEnrollControl(verb, subject), OperatorAddress);
     };
 
-    REQUIRE(RefusalIn(control(Wire::EnrollControlVerb::Open)) == std::nullopt);
     REQUIRE(
         RefusalIn(AnswerNow(responder, EnrollFrame("worker-a", "", Wire::EnrollRole::Worker, JoinerKey()), JoinerAddress))
         == std::nullopt);
@@ -907,7 +1112,6 @@ TEST_CASE("A forgotten worker's key is revoked: its next enrollment is refused a
         return AnswerNow(seed.responder, EnrollFrame(id, "", Wire::EnrollRole::Worker, workerKey), JoinerAddress);
     };
 
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
     REQUIRE(RefusalIn(enroll("worker-a")) == std::nullopt);
     REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, "worker-a")) == std::nullopt);
 
@@ -966,17 +1170,15 @@ TEST_CASE("A joiner asking under a small-order or non-canonical key is refused a
         return key;
     }();
     Seed seed;
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
 
     auto refusals = std::uint64_t { 0 };
-    for (auto const& [role, endpoint]: { std::pair { Wire::EnrollRole::Member, JoinerEndpoint },
-                                         std::pair { Wire::EnrollRole::Worker, std::string_view {} } })
+    for (auto const role: { Wire::EnrollRole::Learner, Wire::EnrollRole::Worker })
     {
         for (auto const& [key, fault]: { std::pair { Ed25519PublicKey {}, PublicKeyFault::SmallOrder },
                                          std::pair { nonCanonical, PublicKeyFault::NonCanonical } })
         {
             INFO("role " << static_cast<int>(role) << ", key " << FormatEd25519PublicKey(key));
-            auto const refused = AnswerNow(seed.responder, EnrollFrame("joiner-x", endpoint, role, key), JoinerAddress);
+            auto const refused = AnswerNow(seed.responder, EnrollFrame("joiner-x", "", role, key), JoinerAddress);
             CHECK(RefusalIn(refused) == Wire::ErrorCode::MalformedFrame);
             auto const message = Unwrap(Wire::DecodeErrorPayload(PayloadOf(refused))).second;
             CHECK(message.contains(DescribePublicKeyFault(fault)));
@@ -986,8 +1188,8 @@ TEST_CASE("A joiner asking under a small-order or non-canonical key is refused a
         }
     }
 
-    auto const control = AnswerNow(
-        seed.responder, EnrollFrame("joiner-x", JoinerEndpoint, Wire::EnrollRole::Member, Filled(0x59)), JoinerAddress);
+    auto const control =
+        AnswerNow(seed.responder, EnrollFrame("joiner-x", "", Wire::EnrollRole::Learner, Filled(0x59)), JoinerAddress);
     CHECK(RefusalIn(control) == std::nullopt);
     CHECK(seed.window.Find("joiner-x").has_value());
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == refusals);
@@ -1002,7 +1204,6 @@ TEST_CASE("A machine nobody forgot enrolls as before, beside a revoked key", "[e
     state.revokedKeys.push_back(Cluster::RevokedKey { .id = "gone", .publicKey = Filled(0x58) });
     seed.cluster.SetState(std::move(state));
 
-    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
     auto const reply = Enroll(seed);
     CHECK(RefusalIn(reply) == std::nullopt);
     CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(reply))).outcome == Wire::EnrollOutcome::Pending);
@@ -1022,12 +1223,16 @@ TEST_CASE("Rejecting a machine that was only waiting says nothing, so the warnin
     EnrollmentResponder responder { seed.window, seed.service, seed.membership, seed.metrics, logger };
 
     auto const control = [&](Wire::EnrollControlVerb verb, std::string_view subject = {}) {
+        // An approval names the key the row holds, as the line `--enroll-list` prints does.
+        if (verb == Wire::EnrollControlVerb::Approve)
+            return AnswerNow(responder,
+                             Wire::EncodeEnrollApprove(
+                                 subject, seed.window.Find(subject).value_or(Wire::EnrollmentPendingEntry {}).publicKey),
+                             OperatorAddress);
         return AnswerNow(responder, Wire::EncodeEnrollControl(verb, subject), OperatorAddress);
     };
 
-    REQUIRE(RefusalIn(control(Wire::EnrollControlVerb::Open)) == std::nullopt);
-    REQUIRE(RefusalIn(AnswerNow(
-                responder, EnrollFrame(JoinerId, JoinerEndpoint, Wire::EnrollRole::Member, JoinerKey()), JoinerAddress))
+    REQUIRE(RefusalIn(AnswerNow(responder, EnrollFrame(JoinerId, "", JoinerRole, JoinerKey()), JoinerAddress))
             == std::nullopt);
 
     // Straight to `Reject`, so the row never left `Pending`.
@@ -1058,4 +1263,206 @@ TEST_CASE("A node that runs enrollment routes both verbs to it and nothing else"
         auto const isEnrollment = Wire::FamilyOf(byte) == Wire::VerbFamily::Enrollment;
         CHECK((merged.OwnerOf(byte) == &seed.responder) == isEnrollment);
     }
+}
+
+TEST_CASE("One host past its cap is refused by its own code and counter while another host enrolls",
+          "[enrollment][responder][security]")
+{
+    Seed seed;
+    constexpr std::string_view Flooder = "203.0.113.7";
+    for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollmentsPerHost))
+        REQUIRE(RefusalIn(AnswerNow(seed.responder,
+                                    EnrollFrame(std::format("junk-{}", index), "", Wire::EnrollRole::Learner, Filled(0x66)),
+                                    Flooder))
+                == std::nullopt);
+
+    auto const refused =
+        AnswerNow(seed.responder, EnrollFrame("junk-more", "", Wire::EnrollRole::Learner, Filled(0x66)), Flooder);
+    CHECK(RefusalIn(refused) == Wire::ErrorCode::EnrollmentHostFull);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedHostCap) == 1);
+    // Not the full list's: the two send an operator to different places.
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedFull) == 0);
+
+    // The genuine joiner, from its own host, still gets a row.
+    CHECK(RefusalIn(Enroll(seed)) == std::nullopt);
+    CHECK(seed.window.Find(JoinerId).has_value());
+}
+
+TEST_CASE("The clear verb drops the undecided rows, keeps an approved one, and counts what it dropped",
+          "[enrollment][responder][security]")
+{
+    Seed seed;
+    RecordAndApprove(seed);
+    for (auto const index: std::views::iota(0, 3))
+        REQUIRE(RefusalIn(AnswerNow(seed.responder,
+                                    EnrollFrame(std::format("junk-{}", index), "", Wire::EnrollRole::Learner, Filled(0x66)),
+                                    std::format("203.0.113.{}", index)))
+                == std::nullopt);
+
+    auto const reply = Control(seed, Wire::EnrollControlVerb::Clear);
+    REQUIRE(RefusalIn(reply) == std::nullopt);
+    auto const report = Wire::DecodeEnrollmentReport(PayloadOf(reply));
+    REQUIRE(report.has_value());
+    REQUIRE(Unwrap(report).pending.size() == 1);
+    CHECK(Unwrap(report).pending[0].nodeId == JoinerId);
+    CHECK(Unwrap(report).pending[0].decision == Wire::EnrollmentDecision::Approved);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsCleared) == 3);
+
+    // Leader-only, like every enrollment control verb.
+    seed.service.SetRole(Distributed::SchedulerRole::Follower, LeaderEndpoint, Distributed::StandaloneSchedulerTerm);
+    CHECK(RefusalIn(Control(seed, Wire::EnrollControlVerb::Clear)) == Wire::ErrorCode::NotLeader);
+}
+
+TEST_CASE("An approval naming the key of a row that lapsed is refused once another machine took its id",
+          "[enrollment][responder][security]")
+{
+    // The operator compared `first`; that machine stopped asking, its row lapsed, and another
+    // machine asked under the same id with `second`. An approval naming `first` must admit
+    // nothing -- by id alone it would have admitted `second`, which nobody compared.
+    Seed seed;
+    auto const first = Filled(0x6A);
+    auto const second = Filled(0x6B);
+    REQUIRE(RefusalIn(LearnerRequest(seed, "laptop", first)) == std::nullopt);
+    seed.clock.advance(PendingRowLifetime + std::chrono::seconds { 1 });
+    REQUIRE(RefusalIn(LearnerRequest(seed, "laptop", second)) == std::nullopt);
+    REQUIRE(Unwrap(seed.window.Find("laptop")).publicKey == second);
+
+    auto const refused = ApproveUnder(seed, "laptop", first);
+    CHECK(RefusalIn(refused) == Wire::ErrorCode::InvalidClusterChange);
+    auto const refusal = Wire::DecodeErrorPayload(PayloadOf(refused));
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).second.contains(FormatEd25519PublicKey(first)));
+    CHECK(Unwrap(refusal).second.contains(FormatEd25519PublicKey(second)));
+    CHECK(Unwrap(refusal).second.contains("nothing was admitted"));
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentApprovalsRefusedKeyMismatch) == 1);
+    CHECK(seed.cluster.Proposed().empty());
+    CHECK(Unwrap(seed.window.Find("laptop")).decision == Wire::EnrollmentDecision::Pending);
+
+    // The control: the key the row DOES hold is admitted.
+    CHECK(RefusalIn(ApproveUnder(seed, "laptop", second)) == std::nullopt);
+    REQUIRE(seed.cluster.Proposed().size() == 1);
+    CHECK(seed.cluster.Proposed()[0].publicKey == std::optional { second });
+}
+
+TEST_CASE("A demoted leader forgets its list, lowers the waiting condition and sends a poll to the new leader",
+          "[enrollment][responder][formation]")
+{
+    Seed seed;
+    REQUIRE(RefusalIn(Enroll(seed)) == std::nullopt);
+    REQUIRE(seed.conditions.StateOf(NodeCondition::EnrollmentRequestsWaiting) == Wire::ConditionState::Raised);
+
+    seed.service.SetRole(Distributed::SchedulerRole::Follower, LeaderEndpoint, Distributed::StandaloneSchedulerTerm);
+    CHECK(seed.conditions.StateOf(NodeCondition::EnrollmentRequestsWaiting) == Wire::ConditionState::Clear);
+    CHECK(seed.window.Report().pending.empty());
+
+    auto const poll = Enroll(seed);
+    CHECK(RefusalIn(poll) == Wire::ErrorCode::NotLeader);
+    auto const refusal = Wire::DecodeErrorPayload(PayloadOf(poll));
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).second == LeaderEndpoint);
+
+    // Leading again brings nothing back: the list was this leadership's.
+    seed.service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+    CHECK(seed.window.Report().pending.empty());
+}
+
+TEST_CASE("A revoked key never qualifies for the recorded-joiner answer, even while a record names it",
+          "[enrollment][responder][forget]")
+{
+    // The revocation is asked FIRST: a record that still names a revoked key -- which `Apply`
+    // does not produce, and a store from elsewhere might -- is refused at the door, never answered
+    // the roster.
+    Seed seed;
+    auto state = seed.cluster.ClusterState();
+    state.members.push_back(
+        Cluster::ClusterMember { .id = "laptop",
+                                 .raftEndpoint = {},
+                                 .schedulerEndpoint = {},
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                 .seat = Cluster::MemberSeat::Learner,
+                                 .publicKey = Filled(0x6C) });
+    state.revokedKeys.push_back(Cluster::RevokedKey { .id = "laptop", .publicKey = Filled(0x6C) });
+    seed.cluster.SetState(std::move(state));
+
+    auto const reply = LearnerRequest(seed, "laptop", Filled(0x6C));
+    CHECK(RefusalIn(reply) == Wire::ErrorCode::InvalidClusterChange);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey) == 1);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRostersServed) == 0);
+    CHECK_FALSE(seed.window.Find("laptop").has_value());
+}
+
+TEST_CASE("A joiner admitted just before a change of leader is answered the roster, not stranded",
+          "[enrollment][responder][formation]")
+{
+    // The strand this answer exists to prevent: approved and recorded, then the leader changes
+    // and drops its list before the joiner's next poll. Without the recorded-joiner answer that
+    // poll would be recorded afresh, and approving it refused as *already a member* -- a machine
+    // the cluster admitted, polling forever.
+    Seed seed;
+    auto const key = Filled(0x6C);
+    REQUIRE(RefusalIn(LearnerRequest(seed, "laptop", key)) == std::nullopt);
+    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, "laptop")) == std::nullopt);
+    REQUIRE(std::ranges::any_of(seed.cluster.ClusterState().members,
+                                [](Cluster::ClusterMember const& member) { return member.id == "laptop"; }));
+
+    seed.service.SetRole(Distributed::SchedulerRole::Follower, LeaderEndpoint, Distributed::StandaloneSchedulerTerm);
+    seed.service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+    REQUIRE_FALSE(seed.window.Find("laptop").has_value());
+
+    auto const poll = LearnerRequest(seed, "laptop", key);
+    REQUIRE(RefusalIn(poll) == std::nullopt);
+    auto const decoded = Wire::DecodeEnrollReply(PayloadOf(poll));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).outcome == Wire::EnrollOutcome::Approved);
+    CHECK_FALSE(Unwrap(decoded).roster.empty());
+    // Nothing waits for an approval that would be refused.
+    CHECK_FALSE(seed.window.Find("laptop").has_value());
+}
+
+TEST_CASE("A machine that re-polls its rows from a second address is still refused at its first address's cap",
+          "[enrollment][responder][security]")
+{
+    Seed seed;
+    for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollmentsPerHost))
+    {
+        auto const frame = EnrollFrame(std::format("junk-{}", index), "", Wire::EnrollRole::Learner, Filled(0x66));
+        REQUIRE(RefusalIn(AnswerNow(seed.responder, frame, "198.51.100.7")) == std::nullopt);
+        REQUIRE(RefusalIn(AnswerNow(seed.responder, frame, "2001:db8::7")) == std::nullopt);
+    }
+    auto const again =
+        AnswerNow(seed.responder, EnrollFrame("junk-more", "", Wire::EnrollRole::Learner, Filled(0x66)), "198.51.100.7");
+    CHECK(RefusalIn(again) == Wire::ErrorCode::EnrollmentHostFull);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedHostCap) == 1);
+
+    // And the operator can find the rows the refusal is about: it names the host as the list
+    // shows it on each of them, `first from`, although every one now shows the second address.
+    auto const sentence = RefusalSentenceIn(again);
+    CHECK(sentence.contains("198.51.100.7 already has 4 undecided request(s)"));
+    CHECK(sentence.contains("first from 198.51.100.7"));
+    auto const listed = seed.window.Report().pending;
+    REQUIRE(listed.size() == MaxPendingEnrollmentsPerHost);
+    for (auto const& row: listed)
+    {
+        INFO(row.nodeId);
+        CHECK(row.peerId == "2001:db8::7");
+        CHECK(row.firstPeerId == "198.51.100.7");
+    }
+}
+
+TEST_CASE("A host refused at its cap is named as the list shows it, an IPv4-mapped spelling folded",
+          "[enrollment][responder][security]")
+{
+    // A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`. The bound folds that, so
+    // the refusal names the folded host -- the spelling on the rows it counts.
+    Seed seed;
+    for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollmentsPerHost))
+        REQUIRE(RefusalIn(AnswerNow(seed.responder,
+                                    EnrollFrame(std::format("m-{}", index), "", Wire::EnrollRole::Learner, Filled(0x66)),
+                                    "198.51.100.9"))
+                == std::nullopt);
+    auto const refused =
+        AnswerNow(seed.responder, EnrollFrame("m-more", "", Wire::EnrollRole::Learner, Filled(0x66)), "::ffff:198.51.100.9");
+    REQUIRE(RefusalIn(refused) == Wire::ErrorCode::EnrollmentHostFull);
+    CHECK(RefusalSentenceIn(refused).starts_with("198.51.100.9 already has"));
+    CHECK_FALSE(RefusalSentenceIn(refused).contains("::ffff:"));
 }

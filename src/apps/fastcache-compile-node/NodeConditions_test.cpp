@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
 #include "ConsensusTier.hpp"
+#include "DiscoveryTier.hpp"
 #include "EnrollmentWindow.hpp"
 #include "NodeConditions.hpp"
+#include "NodeDefaults.hpp"
 #include "NodeMembership.hpp"
 #include "NodeStatusText.hpp"
 #include "SchedulerTier.hpp"
@@ -31,6 +33,7 @@
 
 #include <core/net/BlockingSocket.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SkewedMetricsSink.hpp>
@@ -157,7 +160,13 @@ TEST_CASE("Settle answers a component this node does not run, and names what not
     {
         NodeConditions conditions;
         auto const undecided = conditions.Settle(NoComponent);
-        CHECK(undecided == std::vector { NodeCondition::CounterTableSkew });
+        // Every process row, in table order -- derived, so a process row joining the table is
+        // expected here without an edit.
+        auto processRows = std::vector<NodeCondition> {};
+        for (auto const& row: NodeConditionTable)
+            if (row.scope == ConditionScope::Process)
+                processRows.push_back(row.condition);
+        CHECK(undecided == processRows);
         CHECK(conditions.StateOf(NodeCondition::CounterTableSkew) == Wire::ConditionState::Undecided);
 
         auto const rows = conditions.Snapshot();
@@ -177,7 +186,9 @@ TEST_CASE("Settle answers a component this node does not run, and names what not
     SECTION("every component runs and none evaluated its rows")
     {
         NodeConditions conditions;
-        conditions.Clear(NodeCondition::CounterTableSkew);
+        for (auto const& row: NodeConditionTable)
+            if (row.scope == ConditionScope::Process)
+                conditions.Clear(row.condition);
         auto const undecided = conditions.Settle(EveryComponent);
         // Every scoped row, in table order: the wiring defect named row by row.
         auto expected = std::vector<NodeCondition> {};
@@ -282,19 +293,20 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     NullLogger logger;
     AtomicMetricsSink metrics;
 
-    // The process scope.
+    // The process scope: the catalogue, and the host name this node is dialled at -- evaluated
+    // where `main` evaluates them, the second over the configuration it runs.
     EvaluateProcessConditions(conditions, metrics);
+    EvaluateHostNameCondition(conditions, Testing::FirstStart(NodeConfig {}));
 
     // The consensus scope: the membership a consensus node builds, with the registry.
-    NodeConfig clustered;
+    auto clustered = Testing::FirstStart(NodeConfig {});
     clustered.fleetMembers = { "10.0.0.7:6674" };
     NodeMembership membership { clustered, membershipLog, &conditions };
 
     // The scheduler scope: a scheduler, signing with its identity key (#178). It answers no row
     // of its own since unsigned grants went; it is started so a row joining its scope later is
     // asked here.
-    NodeConfig scheduling;
-    scheduling.serveScheduler = true;
+    auto scheduling = Testing::FirstStart(NodeConfig {});
     scheduling.nodeId = "n1";
     core::platform::ManualClock schedulerClock;
     core::platform::ManualWallClock wallClock;
@@ -309,17 +321,17 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
 
     // The enrollment scope.
     core::platform::ManualClock windowClock;
-    EnrollmentWindow window { windowClock, &conditions };
+    EnrollmentWindow window { windowClock, &conditions, &metrics, wallClock };
 
     // The consensus scope's own tier (#1552): one voter over a state directory of its own,
     // started the way `main` starts it and with the registry, because it answers
     // `unreadable-leader-snapshot` as its driver starts.
     FastCache::Testing::ScratchDirectory consensusState { "conditions-consensus" };
     auto const raftPort = FreePort();
-    NodeConfig clusteredNode;
+    auto clusteredNode = Testing::FirstStart(NodeConfig {});
     clusteredNode.nodeId = "n1";
     clusteredNode.raftListen = std::format("127.0.0.1:{}", raftPort);
-    clusteredNode.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", raftPort))) };
+    clusteredNode.raftSelf = "127.0.0.1";
     clusteredNode.clusterDir = consensusState / "state";
     auto const consensus = ConsensusTier::Start(
         clusteredNode,
@@ -334,8 +346,15 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
         &conditions);
     REQUIRE(consensus.has_value());
 
+    // Discovery, started beside consensus the way `main` starts it: it answers
+    // `foreign-fleet-visible` -- here as not evaluated, since this consensus port is loopback and
+    // is never announced, which is a component answering its row rather than one forgetting it.
+    FixedFleetSummary const answered { AnsweredFleetSummary(clusteredNode) };
+    auto const discovery = StartDiscoveryOrExplain(clusteredNode, *consensus, answered, conditions, metrics, logger);
+    REQUIRE(discovery.has_value());
+
     // The admin surface.
-    NodeConfig admin;
+    auto admin = Testing::FirstStart(NodeConfig {});
     admin.adminListen = std::format("127.0.0.1:{}", FreePort());
     auto const host = MakeSystemHostFacts();
     auto surface = StartAdminSurfaceOrExplain(

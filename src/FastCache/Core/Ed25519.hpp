@@ -214,7 +214,7 @@ static_assert(RowsInEnumeratorOrder(PublicKeyFaults, &PublicKeyFaultRow::fault),
 /// Spell @p key the way an operator reads and types it: 43 characters of unpadded base64url.
 ///
 /// **The one encoder**, and `ParseEd25519PublicKey` is the one parser: the startup log,
-/// `--node-status`, `--cluster-status`, a service registration and `--raft-peer` all go through
+/// `--node-status`, `--cluster-status`, `--print-identity` and `--cluster-admit` all go through
 /// these two, so the string one prints is always one the other reads.
 /// @param key The public key.
 /// @return Its text form, exactly `Ed25519PublicKeyTextLength` characters.

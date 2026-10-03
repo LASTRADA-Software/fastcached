@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConditions.hpp"
 
-#include <FastCache/Core/Utf8.hpp>
+#include <FastCache/Core/PeerText.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 
 #include <cassert>
@@ -16,55 +16,12 @@ namespace
 {
     namespace Wire = CompileCacheWire;
 
-    /// What a clamped detail ends with, so a reader can tell it was cut.
-    constexpr std::string_view Clamped = "...";
-
-    /// @p raw as TEXT: every byte that belongs to no UTF-8 sequence written `\xNN`.
-    /// @param raw What a component observed; a path may be in any encoding its host chose.
-    /// @return Well-formed UTF-8.
-    [[nodiscard]] std::string AsText(std::string_view raw)
-    {
-        std::string text;
-        text.reserve(raw.size());
-        while (!raw.empty())
-        {
-            auto const length = Utf8SequenceLength(raw);
-            if (length == 0)
-            {
-                text += std::format("\\x{:02X}", static_cast<unsigned>(static_cast<unsigned char>(raw.front())));
-                raw.remove_prefix(1);
-                continue;
-            }
-            text.append(raw.substr(0, length));
-            raw.remove_prefix(length);
-        }
-        return text;
-    }
-
-    /// @p text cut to @p ceiling bytes on a code-point boundary, marked when it was cut.
-    /// @param text Well-formed UTF-8.
-    /// @param ceiling The most bytes it may take.
-    /// @return The text, or a prefix of it ending in `Clamped`.
-    [[nodiscard]] std::string ClampedTo(std::string text, std::size_t ceiling)
-    {
-        if (text.size() <= ceiling)
-            return text;
-        auto cut = ceiling - Clamped.size();
-        // Back off a continuation byte at a time, so the cut never splits a sequence -- a split
-        // one would be the very non-text this clamp runs after `AsText` to avoid.
-        while (cut > 0 && (static_cast<unsigned char>(text[cut]) & Utf8ContinuationMask) == Utf8ContinuationMark)
-            --cut;
-        text.resize(cut);
-        text += Clamped;
-        return text;
-    }
-
     /// A detail as a row carries it: text, and inside the ceiling.
     /// @param raw What was observed.
     /// @return The detail.
     [[nodiscard]] std::string DetailOf(std::string_view raw)
     {
-        return ClampedTo(AsText(raw), Wire::MaxConditionDetailBytes);
+        return BoundedPeerText(raw, Wire::MaxConditionDetailBytes);
     }
 } // namespace
 
@@ -179,7 +136,7 @@ std::string ListDetail(std::string_view lead, std::vector<std::string> const& it
         // Room for this item AND for the count of whatever follows it, so the list is never cut
         // with no room left to say how much was left out.
         auto const tail = rest == 0 ? std::string {} : std::format(" and {} more", rest);
-        auto const candidate = std::format("{}{}", separator, AsText(items[index]));
+        auto const candidate = std::format("{}{}", separator, EscapeNonUtf8(items[index]));
         if (detail.size() + candidate.size() + tail.size() > Wire::MaxConditionDetailBytes)
             return detail + std::format(" and {} more", items.size() - index);
         detail += candidate;

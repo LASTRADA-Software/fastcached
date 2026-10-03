@@ -198,7 +198,7 @@ void ClearListsNamedOn(std::span<OptionSpec<Result> const> table, std::span<char
             // leaves an attached one alone. Its outcome is discarded because a missing
             // value was already refused by that same earlier parse.
             if (row->arity == Arity::Value)
-                (void) TakeValue(args, i, row->primary);
+                (void) TakeValue(args, i);
 
             if (row->clear != nullptr)
                 (void) (*row->clear)(result, {});

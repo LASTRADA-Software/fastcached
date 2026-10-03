@@ -19,7 +19,7 @@ namespace FastCache::Cluster
 ///
 /// ## Two sources, and which one wins
 ///
-/// - **The bootstrap members** -- `--raft-peer id=host:port@<key>` -- are what a node knows
+/// - **The bootstrap members** -- the roster its formation record starts it from -- are what a node knows
 ///   before the cluster has told it anything. They are the only keys a cluster that has not
 ///   yet elected can verify, so a fresh cluster whose members were given none cannot form, and
 ///   says so in its refusal counters rather than trusting whoever answers first.
@@ -84,7 +84,7 @@ class RosterKeys final: public Consensus::IRaftPeerKeys
 
     [[nodiscard]] Ed25519PublicKey OwnPublicKey() const override;
 
-    [[nodiscard]] Ed25519Signature SignAsSelf(std::span<std::byte const> message) const override;
+    [[nodiscard]] Ed25519Signature SignAsSelf(LabelledMessage const& message) const override;
 
     [[nodiscard]] Consensus::PeerKeys KeysOf(Consensus::NodeId const& peer) const override;
 

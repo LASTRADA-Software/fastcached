@@ -771,7 +771,7 @@ TEST_CASE("The daemon refuses a fleet read by name and sends it to the fleet's s
     auto const error = ErrorOf(reply);
     REQUIRE(error.present);
     CHECK(error.code == Wire::ErrorCode::DispatchNotPermitted);
-    CHECK(error.message.contains("--serve-scheduler"));
+    CHECK(error.message.contains("the fleet's scheduler, a fastcache-compile-node"));
 }
 
 TEST_CASE("The daemon refuses an admission explanation by name and sends it to a compile node", "[compile-cache][handler]")
@@ -793,6 +793,22 @@ TEST_CASE("The daemon refuses an admission explanation by name and sends it to a
     CHECK(error.code != Wire::ErrorCode::NoCluster);
     // The WORDS, for the fleet case's reason: a relocated verb with no row is refused with the
     // same code and names no destination, so the code alone cannot tell the two apart.
+    CHECK(error.message.contains("fastcache-compile-node"));
+}
+
+TEST_CASE("The daemon refuses a fleet summary by name and sends it to a compile node", "[compile-cache][handler][formation]")
+{
+    // WHICH refusal, not merely that there was one. `NoCluster` with the enrollment rows: a fleet
+    // summary asks which fleet a machine is in, and this daemon belongs to none. `UnimplementedVerb`
+    // would send a joiner off to upgrade a daemon that is current.
+    CcFixture fix;
+    auto const reply =
+        SoleReply(Exchange(fix, Wire::EncodeFleetSummaryRequest(std::array<std::byte, Wire::NodeChallengeBytes> {})));
+    REQUIRE(reply.present);
+    auto const error = ErrorOf(reply);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::NoCluster);
+    CHECK(error.code != Wire::UnimplementedVerb);
     CHECK(error.message.contains("fastcache-compile-node"));
 }
 
@@ -1265,7 +1281,7 @@ TEST_CASE("A gated verb keeps the operator's cap, not the AUTH ceiling", "[compi
 TEST_CASE("The cache refuses every scheduling verb, and says where they went", "[compile-cache][handler][distributed]")
 {
     // `fastcached` is a cache and nothing else. The fleet's scheduler moved to
-    // `fastcache-compile-node --serve-scheduler`, because handing out capacity is a
+    // `fastcache-compile-node`, because handing out capacity is a
     // decision only one node may make at a time and nothing here can establish which
     // node that is.
     //

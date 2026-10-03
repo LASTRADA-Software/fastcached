@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/StateFiles.hpp>
 #include <FastCache/Distributed/FleetSample.hpp>
 
 #include <algorithm>
@@ -330,8 +331,9 @@ class FleetHistory
     /// Refuses, leaving the file untouched, when `Load` found one a later build
     /// wrote -- see `ReadOnly`.
     /// @param path Where to write.
+    /// @param which Which state file it is, and so who may read it (`CreateStateFile`).
     /// @return True on success.
-    bool Save(std::filesystem::path const& path) const;
+    bool Save(std::filesystem::path const& path, StateFile which) const;
 
     /// Whether this history refuses to write, because the file on disk is newer.
     ///
@@ -482,8 +484,9 @@ class FleetNodeHistories final: public IFleetHistorySink
     /// would leave those windows a gap for as long as the rings hold them -- which is
     /// the failure this whole phase removes, reintroduced by a restart.
     /// @param path Where to write.
+    /// @param which Which state file it is, and so who may read it (`CreateStateFile`).
     /// @return True on success.
-    [[nodiscard]] bool Save(std::filesystem::path const& path) const;
+    [[nodiscard]] bool Save(std::filesystem::path const& path, StateFile which) const;
 
   private:
     core::platform::WallClockRef _wall;

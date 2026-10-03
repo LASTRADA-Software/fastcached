@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeConditions.hpp"
+#include "NodeFormation.hpp"
 #include "NodeReload.hpp"
 
 #include <FastCache/Config/YamlReader.hpp>
@@ -39,6 +41,7 @@ namespace
 FastCache::NullLogger membershipLog;
 }
 using namespace FastCache::Node;
+namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
@@ -75,12 +78,17 @@ constexpr std::string_view Stranger = "10.0.0.99";
 constexpr std::string_view StateDirectory = "node-state";
 
 /// Write @p body to a worker's configuration file this case owns.
+///
+/// The worker these cases are about runs NO consensus -- the kind a reload may not widen
+/// admission on without a `--voter-key` -- so the file says so: consensus is on by default,
+/// and an empty `listen_raft` is how a file turns it off.
 /// @param dir Scratch directory.
-/// @param body The keys this case is about; the scheduler and state-directory lines are added.
+/// @param body The keys this case is about; the scheduler, state-directory and consensus lines are added.
 /// @return The path written.
 [[nodiscard]] std::filesystem::path WriteConfig(std::filesystem::path const& dir, std::string_view body)
 {
-    return WriteFile(dir, std::format("scheduler: {}\ncluster_dir: {}\n{}", SelfScheduler, StateDirectory, body));
+    return WriteFile(
+        dir, std::format("scheduler: {}\ncluster_dir: {}\nlisten_raft: \"\"\n{}", SelfScheduler, StateDirectory, body));
 }
 
 /// Read @p path into a fresh configuration, exactly as the worker's reloader does.
@@ -106,6 +114,7 @@ constexpr std::string_view StateDirectory = "node-state";
     NodeConfig cfg;
     cfg.schedulers = { std::string { SelfScheduler } };
     cfg.clusterDir = StateDirectory;
+    cfg.raftListen.clear(); // as `WriteConfig`'s file says
     cfg.fleetMembers = std::move(members);
     cfg.fleetOpen = open;
     return cfg;
@@ -130,6 +139,58 @@ constexpr std::string_view StateDirectory = "node-state";
 
 } // namespace
 
+TEST_CASE("A reload candidate is shaped by the formation, the names and the identity the start resolved",
+          "[node][reload][formation]")
+{
+    // Through the reader `main` hands the reloader, so a shaping step dropped from it is a red
+    // here rather than a declined SIGHUP in production. The formation is the one that decides
+    // most: a candidate shaped by no record runs no consensus and serves no scheduler, while the
+    // running node does both.
+    Testing::ScratchDirectory const scratch { "node-reload-shape" };
+    auto const path =
+        WriteFile(scratch.Path(),
+                  std::format("scheduler: {}\ncluster_dir: {}\n", SelfScheduler, (scratch / "state").generic_string()));
+    auto const record = Cluster::FormationRecord { .mode = Cluster::NodeMode::Solitary,
+                                                   .own = { .clusterId = "own-c", .createdAtUnixSeconds = 100 },
+                                                   .joining = std::nullopt,
+                                                   .fleet = std::nullopt,
+                                                   .archivePending = std::nullopt,
+                                                   .rejectedBy = std::nullopt,
+                                                   .askedJoins = {} };
+    auto const identity = NodeIdentity { .id = "n1",
+                                         .origin = NodeIdentityOrigin::Recorded,
+                                         .publicKey = Testing::TestKeyPair("n1").PublicKey() };
+    auto const stateDirectory =
+        NodeStateDirectoryChoice { .path = scratch / "state", .origin = StateDirectoryOrigin::Named };
+    auto const read = ReloadCandidateReader(
+        {},
+        ReloadBasis {
+            .stateDirectory = stateDirectory,
+            .hostNames = NodeHostNames { .fqdn = "box.corp.example", .dnsSuffix = "corp.example", .withheld = {} },
+            .formation = record,
+            .remembered = {},
+            .identity = identity,
+        });
+
+    auto const candidate = read(path);
+    REQUIRE(candidate.has_value());
+    CHECK(candidate->stateDirectory == std::optional { stateDirectory });
+    CHECK(Testing::Unwrap(candidate->hostNames).fqdn == "box.corp.example");
+    CHECK(Testing::Unwrap(candidate->formation).mode == Cluster::NodeMode::Solitary);
+    CHECK(candidate->clusterId == "own-c");
+    CHECK(RunsConsensus(*candidate));
+    CHECK(ServesScheduler(*candidate));
+    CHECK(candidate->nodeId == "n1");
+    CHECK(candidate->identityPublicKey == identity.publicKey);
+
+    // And a reload of the running node that read the same file is accepted: nothing the start
+    // resolved reads as a field the reload changed.
+    NodeReloader reloader { *candidate, path, read, &ValidateNodeReloadable };
+    auto const reloaded = reloader.Reload();
+    INFO((reloaded.has_value() ? std::string {} : reloaded.error().context));
+    CHECK(reloaded.has_value());
+}
+
 TEST_CASE("A member removed from the file is refused after the reload", "[node][membership][reload][revocation]")
 {
     // **The acceptance clause, and the direction nothing would otherwise report.**
@@ -151,7 +212,8 @@ TEST_CASE("A member removed from the file is refused after the reload", "[node][
     REQUIRE(Admits(oracle, Revoked));
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
-    ApplyReloadRequest(&reloader, membership, logger);
+    NodeConditions conditions;
+    ApplyReloadRequest(&reloader, membership, conditions, logger);
 
     CHECK_FALSE(Admits(oracle, Revoked));
     // The control, and it is not decoration: an `Adopt` that published an EMPTY list
@@ -186,7 +248,8 @@ TEST_CASE("A member added to the file is admitted after the reload", "[node][mem
     REQUIRE(Admits(oracle, "10.0.0.8"));
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
-    ApplyReloadRequest(&reloader, membership, logger);
+    NodeConditions conditions;
+    ApplyReloadRequest(&reloader, membership, conditions, logger);
 
     CHECK(Admits(oracle, Revoked));
     CHECK(Admits(oracle, "10.0.0.8"));
@@ -211,7 +274,8 @@ TEST_CASE("Dropping fleet_open closes the node again", "[node][membership][reloa
     REQUIRE(Admits(oracle, Stranger));
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
-    ApplyReloadRequest(&reloader, membership, logger);
+    NodeConditions conditions;
+    ApplyReloadRequest(&reloader, membership, conditions, logger);
 
     CHECK_FALSE(Admits(oracle, Stranger));
     // And this machine is still admitted, which is the rule that survives every
@@ -244,7 +308,8 @@ TEST_CASE("A reload may not widen admission on a node that cannot check a lease"
     ConsoleLogger logger { sink, LogLevel::Info, LogTimestamps::No };
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
-    ApplyReloadRequest(&reloader, membership, logger);
+    NodeConditions conditions;
+    ApplyReloadRequest(&reloader, membership, conditions, logger);
 
     CHECK_FALSE(Admits(oracle, Revoked));
     // **WHICH refusal, not that one happened.** The startup table's lease row and this
@@ -295,7 +360,7 @@ TEST_CASE("A widening refusal names every setting that may not change", "[node][
     //
     // Asserted on WHICH refusal, never on the fact of one: BOTH orderings refuse this
     // save, so a case checking `has_value()` alone passes under the defect. That is not
-    // hypothetical here -- the first version of this case used a `--raft-peer` candidate
+    // hypothetical here -- the first version of this case used a peer-list candidate
     // and passed under both orderings, because `StartupPolicyRejection` refuses that one
     // before either check runs. It was the neuter that said so, not the reading.
     Testing::ScratchDirectory const scratch { "node-reload-widen-diagnosis" };
@@ -337,7 +402,8 @@ TEST_CASE("Narrowing is allowed on a keyless node, which is the direction that c
     REQUIRE(Admits(oracle, Revoked));
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
-    ApplyReloadRequest(&reloader, membership, logger);
+    NodeConditions conditions;
+    ApplyReloadRequest(&reloader, membership, conditions, logger);
 
     CHECK_FALSE(Admits(oracle, Revoked));
 }
@@ -415,7 +481,8 @@ TEST_CASE("A reload never revokes what the cluster agreed", "[node][membership][
     REQUIRE(Admits(oracle, "10.0.0.50"));
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
-    ApplyReloadRequest(&reloader, membership, logger);
+    NodeConditions conditions;
+    ApplyReloadRequest(&reloader, membership, conditions, logger);
 
     // The operator's list emptied, and the cluster's survived it.
     CHECK_FALSE(Admits(oracle, Revoked));
@@ -477,4 +544,43 @@ TEST_CASE("A node that binds its own network-facing port is closed by the reload
     auto anchoredCandidate = *candidate;
     anchoredCandidate.voterKeys = anchored.voterKeys;
     CHECK(ValidateNodeReloadable(anchored, anchoredCandidate).has_value());
+}
+
+TEST_CASE("A reload that gives --advertise clears unqualified-host-name, and one that does not leaves it",
+          "[node][reload][conditions][formation][defaults]")
+{
+    // `--advertise` is reloadable, so whether peers are still told to dial a bare host name
+    // is asked again of the configuration an accepted reload puts in force. The candidate
+    // carries the names the start resolved, as `main`'s reload lambda hands them on.
+    auto const named = [](std::filesystem::path const& path) -> std::expected<NodeConfig, ConfigError> {
+        return Reparse(path).transform([](NodeConfig candidate) {
+            ApplyHostNames(candidate, NodeHostNames { .fqdn = "laptop", .dnsSuffix = {}, .withheld = {} });
+            return candidate;
+        });
+    };
+    Testing::ScratchDirectory const scratch { "node-reload-host-name" };
+    auto initial = RunningNode();
+    ApplyHostNames(initial, NodeHostNames { .fqdn = "laptop", .dnsSuffix = {}, .withheld = {} });
+    NodeMembership membership { initial, membershipLog };
+    NullLogger logger;
+    NodeConditions conditions;
+    EvaluateHostNameCondition(conditions, initial);
+    REQUIRE(conditions.StateOf(NodeCondition::UnqualifiedHostName) == Wire::ConditionState::Raised);
+
+    SECTION("a file that still names no --advertise leaves the row raised")
+    {
+        auto const path = WriteConfig(scratch.Path(), "log_level: info\n");
+        NodeReloader reloader { initial, path, named, &ValidateNodeReloadable };
+        ApplyReloadRequest(&reloader, membership, conditions, logger);
+        CHECK(conditions.StateOf(NodeCondition::UnqualifiedHostName) == Wire::ConditionState::Raised);
+    }
+
+    SECTION("a file that names one clears it")
+    {
+        auto const path = WriteConfig(scratch.Path(), "advertise: 10.0.0.5:6674\n");
+        NodeReloader reloader { initial, path, named, &ValidateNodeReloadable };
+        ApplyReloadRequest(&reloader, membership, conditions, logger);
+        REQUIRE(reloader.Current()->advertise == "10.0.0.5:6674");
+        CHECK(conditions.StateOf(NodeCondition::UnqualifiedHostName) == Wire::ConditionState::Clear);
+    }
 }

@@ -352,7 +352,7 @@ One further port, **off unless you ask for it**:
 
 | Port | What | Default |
 |------|------|---------|
-| **6675** | The fleet scheduler | off; enable with `fastcache-compile-node --serve-scheduler`, which answers on that node's `--listen-node` rather than on a port of its own. Not served by `fastcached` |
+| **6675** | The fleet scheduler | a convention, not a default: every `fastcache-compile-node` serves the scheduler on its own `--listen-node` rather than on a port of its own, so a scheduling node given `--listen-node=6675` answers there. Not served by `fastcached` |
 
 A worker needs no port of its own. Dispatched compiles arrive on the **same
 `--listen-node` surface** that carries the node's cache verbs, so a worker opens one

@@ -207,16 +207,13 @@ struct HeartbeatRound
     /// How this machine proves WHICH machine it is on every connection the round dials (#178),
     /// or null where nothing proves -- a test whose scripted fleet serves no handshake.
     ///
-    /// Never null on a node that announces itself for real: a node naming `--scheduler` with no
-    /// identity is a startup refusal (`SchedulerNeedsIdentityRefusal`), because every verb a
-    /// joining machine sends is refused without one.
+    /// Never null on a node that announces itself for real: every node holds an identity key
+    /// in its state directory (`NodeStateDirectory`), and every verb a joining machine sends
+    /// is refused without one.
     NodeProofClient const* prover;
     /// Where the fleet this node was admitted to is recorded, so the lease check can
     /// read it. Registration is the only place that fact arrives (#401).
     Distributed::WorkerLeaseState& lease;
-    /// Raised when a scheduler registers this node into a fleet other than the one
-    /// `--cluster-id` asserts. Never lowered: the answer will not change by itself.
-    std::atomic<bool>& fleetMismatch;
     ILogger& logger; ///< Where a refusal is named.
 };
 

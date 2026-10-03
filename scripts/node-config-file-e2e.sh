@@ -125,6 +125,29 @@ expect_ok "a setting in the file takes effect" "0.0.0.0:6699" "--config=$WORK/go
 expect_ok "the command line wins over the file" "0.0.0.0:6698" \
     "--config=$WORK/good.yaml" "--listen-node=0.0.0.0:6698"
 
+# --- the map opens with the MODE ---------------------------------------------
+#
+# The recorded mode, not a flag, decides whether consensus runs and which ports open, so
+# it is the first thing the map says. Before a first start has minted a record it is the
+# solitary one that start will mint -- and `--print-surfaces` writes nothing, so it stays
+# that way across calls.
+out="$("$NODE" "$SCHEDULER_FOR_STARTUP" "$STATE_FOR_STARTUP" --print-surfaces 2>&1)"
+first="${out%%$'\n'*}"
+first="${first%$'\r'}"
+case "$first" in
+    "mode: solitary (no cluster minted yet; the first start mints one)") echo "ok: the map opens with the node's mode" ;;
+    *)
+        echo "FAIL: the map opens with the node's mode"
+        report "first line: $first"
+        ;;
+esac
+if [ -e "$WORK/state/formation" ]; then
+    echo "FAIL: --print-surfaces minted no formation record"
+    report "found $WORK/state/formation"
+else
+    echo "ok: --print-surfaces minted no formation record"
+fi
+
 # --- absent ------------------------------------------------------------------
 #
 # Named and not there is FILE NOT FOUND, not a parse error: an operator who

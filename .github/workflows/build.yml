@@ -3552,7 +3552,7 @@ jobs:
 
           # --listen-node is NAMED, and it has to be since #290 stage 3.
           #
-          # A node opens exactly one 0xFC port, defaulting to 127.0.0.1:6674 -- and
+          # A node opens exactly one 0xFC port, defaulting to 0.0.0.0:6674 -- and
           # the step above leaves a `fastcached` serving on 6674 for the rest of the
           # job, where the Linux packaging job stops its daemon before installing the
           # worker. Left defaulted, the worker's only port is a port it cannot have,

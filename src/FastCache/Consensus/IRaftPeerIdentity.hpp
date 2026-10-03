@@ -5,19 +5,25 @@
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace FastCache::Consensus
 {
 
 /// Which signature a Raft peer handshake is asking for (#178).
 ///
-/// **Private: never transmitted, never persisted.** Each value is mapped to a LABEL, and it is
-/// the label that goes into what is signed -- so the ordinals carry no explicit values and an
-/// insertion shifts nothing anything outside this process has seen.
+/// **Private: never transmitted, never persisted.** Each value is mapped to an identity-key
+/// construction, whose LABEL goes into what is signed -- so the ordinals carry no explicit values
+/// and an insertion shifts nothing anything outside this process has seen. An enum of its own
+/// rather than `IdentityKeyPurpose`, so `IRaftPeerIdentity` cannot be handed a lease's purpose.
 enum class RaftPeerSignature : std::uint8_t
 {
     /// The dialler's proof: who it is, whom it dialled, and both ends' fresh values.
@@ -30,48 +36,38 @@ enum class RaftPeerSignature : std::uint8_t
     Last, ///< Not a signature, and has no row: the length of a table keyed by one.
 };
 
-/// What one signature is labelled with.
+/// Which identity-key construction one Raft peer signature is.
 struct RaftPeerSignatureLabel
 {
-    RaftPeerSignature purpose; ///< The signature this row describes.
-    std::string_view label;    ///< The bytes signed ahead of the transcript.
+    RaftPeerSignature purpose;       ///< The signature this row describes.
+    IdentityKeyPurpose construction; ///< The construction it is signed as, and so its label.
 };
 
 /// One row per `RaftPeerSignature`, in enumerator order.
 ///
-/// A label of its own per purpose, so a proof reflected back as a verdict -- or the reverse --
-/// is a signature over a different message and verifies as nothing. Versioned because it is
-/// signed: changing one retires every handshake in flight, which is a stated act. `v2` because
-/// the `v1` names were the pre-shared key's MAC labels (#1308), retired with it.
+/// A construction of its own per purpose, so a proof reflected back as a verdict -- or the reverse
+/// -- is a signature over a different message and verifies as nothing. The labels themselves, and
+/// the retired ones, are `IdentityKeyLabels`' and `RetiredIdentityKeyLabels`'.
 inline constexpr EnumTable<RaftPeerSignature, RaftPeerSignatureLabel> RaftPeerSignatureLabels { {
-    { .purpose = RaftPeerSignature::DiallerProof, .label = "fastcache-raft-proof-v2" },
-    { .purpose = RaftPeerSignature::AcceptorVerdict, .label = "fastcache-raft-verdict-v2" },
+    { .purpose = RaftPeerSignature::DiallerProof, .construction = IdentityKeyPurpose::RaftDiallerProof },
+    { .purpose = RaftPeerSignature::AcceptorVerdict, .construction = IdentityKeyPurpose::RaftAcceptorVerdict },
 } };
 
 static_assert(RowsInEnumeratorOrder(RaftPeerSignatureLabels, &RaftPeerSignatureLabel::purpose),
               "RaftPeerSignatureLabels must hold one row per RaftPeerSignature, in enumerator order");
+static_assert(EachRowItsOwnConstruction(RaftPeerSignatureLabels, &RaftPeerSignatureLabel::construction),
+              "each RaftPeerSignature needs a construction, and so a label, of its own");
 
-/// Whether every label is present and no two are the same.
+/// What a Raft peer signature for @p purpose is over: its construction's label as the FIRST field,
+/// then the transcript, as one encoded message.
 ///
-/// The two halves the pre-shared key's `SigningDomainTable` asserted of its MAC labels until #178
-/// retired it, for signatures: an empty label separates
-/// nothing, and a copied row -- a new purpose added by duplicating the line above it -- would make
-/// one signature verify as the other.
-/// @return True when the labels separate every purpose.
-[[nodiscard]] consteval bool RaftPeerSignatureLabelsSeparate() noexcept
-{
-    for (auto const& row: RaftPeerSignatureLabels)
-    {
-        if (row.label.empty())
-            return false;
-        for (auto const& other: RaftPeerSignatureLabels)
-            if (other.purpose != row.purpose && other.label == row.label)
-                return false;
-    }
-    return true;
-}
-
-static_assert(RaftPeerSignatureLabelsSeparate(), "each RaftPeerSignature needs a label of its own");
+/// Public so the one test asking every identity-key construction where its label sits
+/// (`NodeProof_test`) reaches THIS builder rather than a copy of it: the label is what keeps a
+/// signature made here from verifying as another construction's under the same key.
+/// @param purpose Which signature.
+/// @param transcript The handshake's fields, in wire order.
+/// @return The message.
+[[nodiscard]] LabelledMessage RaftPeerSignedMessage(RaftPeerSignature purpose, WireFields::FieldList transcript);
 
 /// What a signature check concluded about the member that claims to have signed.
 ///

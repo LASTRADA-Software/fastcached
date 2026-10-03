@@ -211,7 +211,7 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     // window in which one that has verified nothing accepts whichever fleet reaches it
     // first. That was never so: the worker was TOLD its fleet, and `VerifyLeaseToken`
     // compared it before anything else. What has changed is WHERE it is told -- since
-    // #401 the identity comes from the REGISTER reply rather than from `--cluster-id`,
+    // #401 the identity comes from the REGISTER reply rather than from the node's own cluster id,
     // so this case pins it the way a completed registration round does. The property
     // under test is unchanged: having verified NO grant is not the same as being
     // unpinned, and a worker that has verified nothing still refuses a foreign fleet.
@@ -387,42 +387,4 @@ TEST_CASE("A socket-activated worker that admits remote peers and holds no roste
                                    state.metrics,
                                    state.logger)
               .has_value());
-}
-
-TEST_CASE("The --cluster-id flag asserts the fleet rather than choosing it", "[node][lease][fleet]")
-{
-    using FastCache::Node::FleetAssertionHolds;
-
-    // The flag is an ASSERTION since #401: registration decides which fleet this node
-    // serves, and `--cluster-id` says which one the operator expected to be admitted
-    // to. The three rows below are the whole contract.
-
-    SECTION("nothing asserted, so nothing to check")
-    {
-        // The default is a real fleet name (`fastcache`), so this is asked on
-        // PROVENANCE and not by comparing against it -- an operator who types the
-        // default has still asserted it, and one who types nothing has not.
-        CHECK(FleetAssertionHolds(/*asserted=*/false, "fastcache", "some-other-fleet"));
-        CHECK(FleetAssertionHolds(/*asserted=*/false, "", "some-other-fleet"));
-    }
-
-    SECTION("asserted and agreed, so the node serves")
-    {
-        CHECK(FleetAssertionHolds(/*asserted=*/true, "fleet-a", "fleet-a"));
-        // A scheduler that names no fleet, asserted as such. This is the one-machine
-        // deployment and must keep working.
-        CHECK(FleetAssertionHolds(/*asserted=*/true, "", ""));
-    }
-
-    SECTION("asserted and contradicted, so the node refuses")
-    {
-        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "fleet-a", "fleet-b"));
-        // The two asymmetric cases, which are the ones a substring or prefix test
-        // would let through: asserted a fleet and got none, asserted none and got one.
-        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "fleet-a", ""));
-        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "", "fleet-a"));
-        // And the default is not special: a node left on `fastcache` that is admitted
-        // to a fleet naming itself is exactly the cross-fleet accept #401 closes.
-        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "fastcache", "production"));
-    }
 }

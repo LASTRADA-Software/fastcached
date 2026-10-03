@@ -14,6 +14,9 @@
 #include <string>
 #include <vector>
 
+#include <tests/NodeFlagNames.hpp>
+#include <tests/NodeFormationFakes.hpp>
+#include <tests/NodeKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -61,7 +64,7 @@ TEST_CASE("A state directory that has never run consensus reports no history", "
     Testing::ScratchDirectory scratch { "enroll-trap-fresh" };
 
     // **The case a wrong predicate breaks, and the reason this is not a startup rule.**
-    // A joiner started with `--raft-join` bootstraps EMPTY, so it never campaigns and
+    // A node that joined a fleet bootstraps EMPTY, so it never campaigns and
     // writes nothing -- which is indistinguishable from a machine that has never run at
     // all. Both may enrol, and a predicate that refused either would refuse the whole
     // population this mode exists for.
@@ -95,14 +98,15 @@ TEST_CASE("A node whose state directory has run consensus is refused at enrol ti
     Testing::ScratchDirectory scratch { "enroll-trap-refusal" };
     StageSelfElected(scratch.Path(), "node-a");
 
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.enrollFrom = "10.0.0.1:7000";
     cfg.clusterDir = scratch.Path();
     cfg.raftListen = "7100";
     cfg.raftSelf = "198.51.100.4";
 
     SystemSecureRandom random;
-    auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random);
+    auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
+    auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, keyGuard);
     REQUIRE(!refused.has_value());
 
     // **Assert what DISTINGUISHES.** Every refusal this mode can produce is a
@@ -119,8 +123,10 @@ TEST_CASE("A node whose state directory has run consensus is refused at enrol ti
     // it, and the other -- a node already in a cluster being pointed at another -- is
     // equally consistent with the same bytes. A confident wrong signal is worse than a
     // vague right one, and here they share a remedy so naming both costs nothing.
-    CHECK(refused.error().contains("without --raft-join"));
-    CHECK(refused.error().contains("already a member"));
+    CHECK(refused.error().contains("founds a cluster of one at its first start"));
+    CHECK(refused.error().contains("already admitted to"));
+    // And it names no step this build lacks: every flag it prints parses.
+    CHECK(Testing::FlagsNoNodeRowAccepts(refused.error()).empty());
 
     // And it says why clearing only the log is NOT the fix: that leaves this node's
     // minted identity in place, holding a vote record for the cluster it led. A wiped
@@ -138,14 +144,14 @@ TEST_CASE("The same state directory is fine at ordinary startup, which is why th
           "[enrollment][trap]")
 {
     // **The case a suite skips, and the one that decides whether this ticket helps or
-    // breaks every one-machine deployment.** A single node with `--listen-raft` and no
-    // `--raft-join` bootstraps a cluster of itself ON PURPOSE, and its state directory
+    // breaks every one-machine deployment.** A single node's first start founds a cluster
+    // of itself ON PURPOSE, and its state directory
     // is byte-for-byte the shape the case above refuses. If this predicate had gone into
     // `StartupPolicyRejection`, that node would be refused at every boot.
     Testing::ScratchDirectory scratch { "enroll-trap-startup" };
     StageSelfElected(scratch.Path(), "node-a");
 
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.clusterDir = scratch.Path();
     cfg.raftListen = "7100";
     cfg.raftSelf = "198.51.100.4";
@@ -163,5 +169,6 @@ TEST_CASE("The same state directory is fine at ordinary startup, which is why th
     // alone reads as a predicate that happens to answer correctly once.
     cfg.enrollFrom = "10.0.0.1:7000";
     SystemSecureRandom random;
-    CHECK(!RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random).has_value());
+    auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
+    CHECK(!RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, keyGuard).has_value());
 }

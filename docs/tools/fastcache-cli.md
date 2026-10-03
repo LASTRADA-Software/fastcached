@@ -981,9 +981,9 @@ Stated so it is not rediscovered:
   cursor on the storage engine first.
 - **No enrollment verbs, and no `--print-surfaces`.** The fleet tables (`fleet`)
   and the cluster verbs (`cluster-*`) are here; these are not.
-  - Opening an enrollment window, and listing, approving or rejecting what waits
-    at it, are `fastcache-compile-node --enroll-open`, `--enroll-list`,
-    `--enroll-approve`, `--enroll-reject` and `--enroll-close`.
+  - Listing, approving or rejecting the machines waiting to join are
+    `fastcache-compile-node --enroll-list`, `--enroll-approve` and
+    `--enroll-reject`.
   - Joining a cluster is `--enroll-from`, run on the machine that is joining.
   - The ports a node's configuration would open are `--print-surfaces`.
 

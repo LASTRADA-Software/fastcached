@@ -3,6 +3,7 @@
 #include <FastCache/Cluster/RosterKeys.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -224,19 +225,19 @@ TEST_CASE("A roster signs as its own key and nothing else", "[cluster][roster]")
     RosterKeys const roster { TestKeyPair("n1"), bootstrap };
 
     CHECK(roster.OwnPublicKey() == KeyOf("n1"));
-    auto const message = WireFields::AsBytes("a transcript");
+    auto const message = LabelledMessage::Of(IdentityKeyPurpose::RaftDiallerProof, { WireFields::AsBytes("a transcript") });
     auto const signature = roster.SignAsSelf(message);
-    CHECK(Ed25519Verify(KeyOf("n1"), message, signature));
-    CHECK_FALSE(Ed25519Verify(KeyOf("n2"), message, signature));
+    CHECK(VerifyLabelled(KeyOf("n1"), message, signature));
+    CHECK_FALSE(VerifyLabelled(KeyOf("n2"), message, signature));
 }
 
-TEST_CASE("An applied forget withdraws the key from every session it proved, though --raft-peer still types it",
+TEST_CASE("An applied forget withdraws the key from every session it proved, though the bootstrap roster still names it",
           "[cluster][roster][revocation][forget]")
 {
     // The whole chain a session re-asks before each frame: the replicated command, the roster
     // adopting the state it produced, and the identity answering from the roster.
     //
-    // #1555: n3 is TYPED into this node's `--raft-peer` with its key, which is what makes the
+    // #1555: n3 is in this node's bootstrap roster with its key, which is what makes the
     // revocation load-bearing. Removing the record alone leaves the typed key standing -- the
     // state states no key for n3 any more, so the roster falls back to the command line -- and
     // the forgotten machine goes on proving itself here for as long as it runs.

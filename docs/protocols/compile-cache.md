@@ -108,8 +108,8 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x1f` | cluster-change-in-flight | One membership change is already uncommitted, so this one must wait. The one **retriable** code in the cluster-administration range: the cluster could accept the change and will, shortly. Not `invalid-cluster-change`, which would send an operator to correct a record that is already correct. |
 | `0x20` | cluster-change-not-needed | The change asked for is already in force, so nothing was recorded — `--cluster-admit` naming a member the cluster already has. Idempotence rather than a mistake, and a code rather than a success because no entry was appended and there is no index to name. |
 | `0x21` | worker-compiler-unclassified | The worker ran the program its own `--toolchain` names and cannot tell what it is, so it cannot build a command line for it. Split from `worker-spawn-failed`, which says the program could not be run at all. |
-| `0x22` | enrollment-closed | This node runs no enrollment window right now. The **default** answer to an enrollment request — the window is closed unless an operator has just opened it — and counted, since a rise with nobody at a terminal is somebody trying the door. |
-| `0x23` | enrollment-full | The window is open and its pending list is full, so the request was not recorded. A refusal rather than an eviction, so a flood cannot push the real joiner off the list the operator is reading. |
+| `0x22` | *(reserved)* | Never sent. Was `enrollment-closed`, the answer a closed enrollment window gave; since zero-config formation a joiner's request is always recorded and the approval is the gate. The number is burnt. |
+| `0x23` | enrollment-full | The pending list is full, so the request was not recorded. A refusal rather than an eviction, so a flood cannot push the real joiner off the list the operator is reading. |
 | `0x24` | *(reserved)* | Never sent. Was `enrollment-already-collected`, which made a key hand-over spendable once; an approved enrollment no longer carries a secret ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). The number is burnt. |
 | `0x25` | unknown-fleet-selector | A fleet read named a section or a range this build does not serve. The message lists the ones it does. |
 | `0x26` | node-proof-unchallenged | A node proof arrived with no challenge outstanding on this connection — never asked for one, or already spent it. The exchange was got wrong, so ask for a challenge; not a statement about the key. |
@@ -118,6 +118,7 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x29` | node-key-unknown | A node proof verified, under a key this cluster does not hold for the id it named: a machine nobody admitted, or one presenting a key other than the one admitted under its id. The remedy is an admission, not a new key. |
 | `0x2a` | node-key-revoked | A node proof verified under a key the cluster has **revoked** — the forgotten machine itself. The connection is kept and marked, and every later verb on it is refused as the forgotten machine's, even from a host `--fleet-member` still names. |
 | `0x2b` | node-identity-required | A verb only a machine that **proved** its identity may send — REGISTER, NODE-ANNOUNCE, HEARTBEAT, WITHDRAW — arrived on a connection that has not. An address admits a client; it no longer admits a machine into the fleet, loopback included. |
+| `0x2c` | enrollment-host-full | The request came from an address that already has as many enrollment requests waiting as one host may hold, counted by the address each request first came from, so it was not recorded. Its own code rather than enrollment-full, because one address asking a lot and many machines waiting are different problems; a joiner treats both as a wait. |
 
 Every one of these is a **refusal the client answers by compiling locally**,
 never by failing. They are distinct codes rather than one "no" because they mean
@@ -162,9 +163,9 @@ arity does not depend on which credential style a client uses.
 ## Distributed execution
 
 Five more verbs turn the same wire into a scheduler and a worker protocol. None
-of them is served by `fastcached`: the scheduler is `fastcache-compile-node
---serve-scheduler` and the worker is the same binary serving compiles, both
-answering on its one `--listen-node`.
+of them is served by `fastcached`: the scheduler is a `fastcache-compile-node` whose
+mode serves it, and the worker is the same binary serving compiles, both answering on
+its one `--listen-node`.
 
 A scheduling verb arriving at a cache listener is answered `dispatch-not-permitted`
 with a message naming where the scheduler went. It is a **reply**, not a dropped
@@ -183,7 +184,7 @@ and the pool behaves as one rather than advertising N times the machine.
 four cluster-administration verbs (`CLUSTER-STATUS` `0x08`, `CLUSTER-SET` `0x09`,
 `CLUSTER-FORGET` `0x0a`, `CLUSTER-ADMIT` `0x0b`), which the **leader** answers and
 only to a member. `COMPILE` goes to a worker on the **same** `--listen-node` port
-that carries its cache verbs and, with `--serve-scheduler`, the scheduler's:
+that carries its cache verbs and, where the node's mode serves them, the scheduler's:
 [#290](https://github.com/LASTRADA-Software/fastcached/issues/290) merged what were
 three ports into one `0xFC` surface, so the listener is no longer the policy. Which
 caller is admitted to which verb is a property of the **verb**, asked of the

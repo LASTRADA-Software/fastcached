@@ -1932,6 +1932,17 @@ TEST_CASE("Standing traits cover every standing exactly once", "[consensus][raft
         CHECK(TraitsOf(row.standing).standing == row.standing);
 }
 
+TEST_CASE("Only a learner is reached by dialling in", "[consensus][raft][learner][formation]")
+{
+    // A learner sits behind NAT, a VPN or a laptop lid, so nobody dials it: it dials in,
+    // and that is why it may be recorded with no endpoint at all. A voter is dialled by
+    // every member. A node counted nowhere is reached by nobody.
+    CHECK(TraitsOf(Standing::Learner).link == PeerLink::DialsIn);
+    CHECK(TraitsOf(Standing::Voter).link == PeerLink::Dialled);
+    CHECK(TraitsOf(Standing::NoCluster).link == PeerLink::NotReached);
+    CHECK(TraitsOf(Standing::Outsider).link == PeerLink::NotReached);
+}
+
 TEST_CASE("A node knows its own standing in its configuration", "[consensus][raft][learner]")
 {
     ScriptedRandomSource random { { 0 } };

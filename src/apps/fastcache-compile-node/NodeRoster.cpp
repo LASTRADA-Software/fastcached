@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeRoster.hpp"
+#include "NodeStateFiles.hpp"
 
 // Its own header FIRST and in a group of its own, for `WorkerLease.cpp`'s reason.
 #include "NodeMembership.hpp"
@@ -32,15 +33,8 @@ std::expected<std::unique_ptr<NodeRoster>, std::string> NodeRoster::Build(NodeCo
         auto const path = cfg.clusterDir / Distributed::RosterFileName;
         auto loaded = Distributed::LoadPersistedRoster(path);
         if (!loaded.has_value())
-            return std::unexpected { std::move(loaded).error() };
+            return std::unexpected { std::format("{}{}", loaded.error(), StateFileUnreadableHint(path)) };
         kept = *std::move(loaded);
-        if (kept.has_value() && cfg.clusterIdExplicit && kept->certificate.clusterId != cfg.clusterId)
-            return std::unexpected { std::format(
-                "{} holds the roster of cluster '{}', and --cluster-id asserts '{}': this machine was adopted by "
-                "another fleet. Move the file aside only if it should now trust its --voter-key anchors instead",
-                path.string(),
-                kept->certificate.clusterId,
-                cfg.clusterId) };
         store = std::make_unique<Distributed::FileRosterStore>(path);
     }
 
@@ -54,9 +48,10 @@ std::expected<std::unique_ptr<NodeRoster>, std::string> NodeRoster::Build(NodeCo
         return std::unique_ptr<NodeRoster> { new NodeRoster { wallClock, nullptr, nullptr, nullptr, metrics, logger } };
     }
 
-    auto asserted = cfg.clusterIdExplicit ? std::optional { cfg.clusterId } : std::nullopt;
+    // No cluster is ASSERTED: `--cluster-id` is gone, and the formation record is the one author
+    // of this node's cluster.
     auto trust = std::make_unique<Distributed::RosterTrust>(
-        std::move(asserted), cfg.voterKeys, std::move(kept), store.get(), metrics, logger);
+        std::nullopt, cfg.voterKeys, std::move(kept), store.get(), metrics, logger);
     return std::unique_ptr<NodeRoster> { new NodeRoster {
         wallClock, nullptr, std::move(store), std::move(trust), metrics, logger } };
 }

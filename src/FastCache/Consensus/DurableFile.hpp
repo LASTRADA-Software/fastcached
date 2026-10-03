@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 #include <FastCache/Core/Owner.hpp>
+#include <FastCache/Core/StateFiles.hpp>
 
 #include <cstddef>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <filesystem>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 /// @file DurableFile.hpp
@@ -58,15 +60,24 @@ namespace FastCache::Consensus
 [[nodiscard]] std::expected<std::optional<std::vector<std::byte>>, ConsensusError> ReadFileIfPresent(
     std::filesystem::path const& path);
 
+/// What `ReplaceFileAtomically` appends to a file's name for the temporary it writes first, and
+/// renames into place. A crash between the two leaves one behind, so a directory holding such a
+/// file names its temporaries through this rather than through a literal of its own.
+inline constexpr std::string_view ReplacementSuffix = ".tmp";
+
 /// Replace `path` with `body`, indivisibly.
 ///
 /// Written beside the target and renamed over it: rename is the only single
 /// filesystem operation that replaces a file's contents in one step, so a
-/// crash leaves either the whole previous file or the whole new one.
+/// crash leaves either the whole previous file or the whole new one. The new file is created with
+/// the access @p which's row of the state-file table gives it (`CreateStateFile`), so its mode is
+/// that row's whatever the umask says.
 /// @param path What to replace.
 /// @param body The new contents.
+/// @param which Which state file it is, and so who may read it.
 /// @return Nothing, or why it could not be replaced.
 [[nodiscard]] std::expected<void, ConsensusError> ReplaceFileAtomically(std::filesystem::path const& path,
-                                                                        std::span<std::byte const> body);
+                                                                        std::span<std::byte const> body,
+                                                                        StateFile which);
 
 } // namespace FastCache::Consensus

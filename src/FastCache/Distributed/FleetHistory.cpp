@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Core/ByteAppender.hpp>
 #include <FastCache/Core/Crc32c.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
+#include <FastCache/Platform/FileTrust.hpp>
 
 #include <algorithm>
 #include <array>
@@ -269,8 +271,12 @@ namespace
     /// @param path Where the file belongs.
     /// @param envelope What to stamp.
     /// @param file The whole file: header space, then the body.
+    /// @param which Which state file it is, and so who may read it.
     /// @return True when the rename succeeded.
-    [[nodiscard]] bool WriteFramed(std::filesystem::path const& path, FileEnvelope const& envelope, std::string& file)
+    [[nodiscard]] bool WriteFramed(std::filesystem::path const& path,
+                                   FileEnvelope const& envelope,
+                                   std::string& file,
+                                   StateFile which)
     {
         std::string_view const body { file.data() + EnvelopeSize, file.size() - EnvelopeSize };
 
@@ -284,13 +290,17 @@ namespace
 
         // Temp then rename: a crash between the two leaves the previous file whole
         // rather than half of this one.
-        auto const temp = std::filesystem::path { path }.concat(".tmp");
+        // Created exclusively, after a temporary a crash left is cleared, with the access its row
+        // gives it (`CreateStateFile`), as every state file is.
+        auto const temp = std::filesystem::path { path }.concat(Consensus::ReplacementSuffix);
         {
-            std::ofstream out { temp, std::ios::binary | std::ios::trunc };
-            if (!out)
+            auto stale = std::error_code {};
+            std::filesystem::remove(temp, stale);
+            auto created = CreateStateFile(temp, which);
+            if (!created.has_value())
                 return false;
-            out.write(file.data(), static_cast<std::streamsize>(file.size()));
-            if (!out)
+            auto const stream = *std::move(created);
+            if (std::fwrite(file.data(), 1, file.size(), stream.get()) != file.size() || std::fflush(stream.get()) != 0)
                 return false;
         }
 
@@ -858,7 +868,7 @@ bool FleetHistory::ReadBody(std::string_view body)
     return true;
 }
 
-bool FleetHistory::Save(std::filesystem::path const& path) const
+bool FleetHistory::Save(std::filesystem::path const& path, StateFile which) const
 {
     // Refused BEFORE a byte is composed, and the file is left exactly as it was. A
     // node rolled back to an older build read a history it could not understand;
@@ -870,7 +880,7 @@ bool FleetHistory::Save(std::filesystem::path const& path) const
 
     auto file = FramedBuffer();
     AppendBody(file);
-    return WriteFramed(path, RingFile, file);
+    return WriteFramed(path, RingFile, file, which);
 }
 
 bool FleetHistory::Load(std::filesystem::path const& path)
@@ -1015,7 +1025,7 @@ void FleetNodeHistories::BackfillInto(std::vector<FleetBucket>& into, FleetRange
     }
 }
 
-bool FleetNodeHistories::Save(std::filesystem::path const& path) const
+bool FleetNodeHistories::Save(std::filesystem::path const& path, StateFile which) const
 {
     // The same refusal `FleetHistory::Save` makes, and for the same reason: a build
     // that cannot read this file must not replace it with one it can.
@@ -1053,7 +1063,7 @@ bool FleetNodeHistories::Save(std::filesystem::path const& path) const
         entry->history->AppendBody(file);
         WriteU64(file, lengthAt, file.size() - bodyAt);
     }
-    return WriteFramed(path, NodeStoreFile, file);
+    return WriteFramed(path, NodeStoreFile, file, which);
 }
 
 bool FleetNodeHistories::Load(std::filesystem::path const& path)

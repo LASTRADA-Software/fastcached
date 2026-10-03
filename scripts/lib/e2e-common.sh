@@ -1646,44 +1646,6 @@ counter_value() {
     metric_value "$body" "$name"
 }
 
-# The same counters through the OTHER door: a node's `0xFC` port, as
-# `fastcache-cli node-metrics --format=kv` prints them (#1308).
-#
-# A sibling of `metric_value` rather than a mode of it, because the grammars differ in
-# the one character that decides a match -- `name value` against `name=value` -- and a
-# reader that accepted both would read a Prometheus body's `name=...` that is not a
-# series. The rules are `metric_value`'s: the WHOLE name, a number and nothing else,
-# the last reading wins, and nothing on stdout means ABSENT, never zero.
-#
-# @param 1 a whole `node-metrics --format=kv` output
-# @param 2 the counter's name
-# @return echoes the reading, or nothing when the counter is absent
-node_metric_value() {
-    local body="$1" name="$2"
-    sed -n "s/^${name}=\([0-9][0-9]*\)\$/\1/p" <<< "$body" | tail -1
-}
-
-# How long one `node-metrics` exchange may take before it counts as unanswered.
-_e2e_node_metrics_seconds=5
-
-# Read one counter off a node's `0xFC` port with `fastcache-cli`.
-#
-# `counter_value`'s contract over the other door: a non-zero return is "the client got
-# no answer at all", an empty echo with status zero is "it answered and names no such
-# counter". Bounded, because a node that accepts and never answers would otherwise hang
-# the wait that polls this.
-#
-# @param 1 path to fastcache-cli
-# @param 2 the node's 0xFC endpoint, host:port
-# @param 3 the counter's name
-# @return echoes the reading; returns 1 if the client got no answer
-node_counter_value() {
-    local cli="$1" endpoint="$2" name="$3" body=""
-    body="$(run_bounded "$_e2e_node_metrics_seconds" "$cli" node-metrics --addr="$endpoint" --format=kv --quiet)" ||
-        return 1
-    node_metric_value "$body" "$name"
-}
-
 # Which of the three ways a counter wait can end badly this one was.
 #
 # PURE: it reads no clock, opens no socket and touches no process. Everything it
@@ -1711,7 +1673,7 @@ node_counter_value() {
 # @param 2 the last reading, or "" when the series was never present
 # @param 3 the floor the reading had to reach
 # @param 4 the series name
-# @param 5 optional: the door that was asked, `/metrics` (the default) or `node-metrics`
+# @param 5 optional: the door that was asked, `/metrics` (the default)
 # @param 6 optional: the status the LAST failing read returned, or `-` if none did.
 #          Rendered only for the `/metrics` door, whose statuses are `http_get`'s.
 _e2e_counter_finding() {
@@ -1740,8 +1702,7 @@ _e2e_counter_finding() {
     echo "  COUNTER: ${name} was read and never reached ${floor}; the last reading was ${value}."
 }
 
-# What the last `wait_for_counter` or `wait_for_node_counter` read, and the only way
-# either hands one back.
+# What the last `wait_for_counter` read, and the only way it hands one back.
 #
 # A global rather than a value on stdout, and the reason is not style. `wait_until`
 # announces its own success on stdout -- `waited 0s (3 polls) for ...` -- so a wait
@@ -1817,35 +1778,11 @@ wait_for_counter() {
     _e2e_counter_wait "/metrics" "$name" "$floor" "$pid" "$what" "$logfile" "$seconds"
 }
 
-# `wait_for_counter` through a node's `0xFC` port rather than an admin surface (#1308).
+# The counter wait. The caller defines `_e2e_counter_read`, which echoes a reading and
+# returns non-zero when nothing answered; this owns the rest -- the reading handed back,
+# the three findings and the verdict.
 #
-# The same wait with the same three terminal states and the same verdict, reading with
-# `node_counter_value`: a fixture whose nodes open no admin surface -- `cluster-e2e`'s
-# do not -- asks the port they already serve instead of opening one for the test.
-#
-# @param 1 path to fastcache-cli
-# @param 2 the node's 0xFC endpoint, host:port
-# @param 3 the counter's name
-# @param 4 the floor the reading must reach
-# @param 5 pid to watch, or "-"; the rules on `wait_until` apply unchanged
-# @param 6 what it is, for the messages
-# @param 7 the log to dump when it does not get there, or "-"
-# @param 8 optional bound in seconds; defaults to `e2e_wait_seconds`
-# @return sets `E2eCounterReading`; never returns on failure
-wait_for_node_counter() {
-    local cli="$1" endpoint="$2" name="$3" floor="$4" pid="$5" what="$6" logfile="$7"
-    local seconds="${8:-$_e2e_wait_seconds}"
-
-    _e2e_counter_read() { node_counter_value "$cli" "$endpoint" "$name" 2>/dev/null; }
-    _e2e_counter_wait "node-metrics" "$name" "$floor" "$pid" "$what" "$logfile" "$seconds"
-}
-
-# The counter wait both doors share. The caller defines `_e2e_counter_read`, which
-# echoes a reading and returns non-zero when nothing answered; this owns the rest --
-# the reading handed back, the three findings and the verdict -- so the two doors
-# cannot come to disagree about what absent MEANS.
-#
-# @param 1 the door, for the finding: `/metrics` or `node-metrics`
+# @param 1 the door, for the finding: `/metrics`
 # @param 2 the counter's name
 # @param 3 the floor
 # @param 4 pid to watch, or "-"
@@ -2992,43 +2929,4 @@ reap_background_jobs() {
         wait "$leftover" 2>/dev/null || true
     done
     return 0
-}
-
-# Put a command to whoever leads NOW, and assert what comes back.
-#
-# Generalised from `cluster-e2e.sh`'s `submit_setting`, which was this logic with
-# the verb hard-coded to `--cluster-set`. The name changed with it: that one was
-# already wrong before the generalisation, because it is also what asserts a
-# REFUSAL (a typo'd setting refused by name), so it never only submitted settings.
-#
-# The caller supplies `cluster`, `find_leader` and `$leader_endpoint`; bash binds
-# them late, so this stays a pure control-flow helper and the selftest can drive
-# it with stubs. That is the whole reason it lives here rather than in the fixture:
-# `cluster-e2e.sh` defines its functions BETWEEN executable sections, so sourcing
-# it to test one helper would run three sections of a real cluster first.
-#
-# Why the retry is on "the answer is not what the caller asserts" rather than on a
-# recognised "not the leader" refusal: that refusal has TWO spellings, one for
-# "somebody else leads" and one for "an election is in progress", and a fixture
-# matching them stops retrying the day either sentence is reworded -- silently.
-# Inherited verbatim from `submit_setting`, where it was learned the hard way.
-#
-# `$leader_endpoint` is pinned when a section derives it, and leadership may
-# legitimately move before that section finishes: a slow enough runner blows any
-# election timeout, and the rulebook's own note is that a cluster which has ELECTED
-# is not one that has FORMED. So a command put to the endpoint that led a moment
-# ago is a command put to a node that now answers "ask somebody else" (#117, #172).
-#
-# @param 1 the `--cluster-*` argument to send
-# @param 2 the substring an answer carries when the command did what was asked --
-#          which for a refusal-asserting caller is the refusal's own wording
-# @param 3 what to report when it never does
-ask_leader() {
-    local answer
-    answer="$(cluster "$leader_endpoint" "$1")"
-    if [[ "$answer" != *"$2"* ]]; then
-        find_leader "whoever leads now, to re-offer a command the previous leader did not take"
-        answer="$(cluster "$leader_endpoint" "$1")"
-    fi
-    [[ "$answer" == *"$2"* ]] || fail "$3 (asked ${leader_endpoint}): ${answer}"
 }

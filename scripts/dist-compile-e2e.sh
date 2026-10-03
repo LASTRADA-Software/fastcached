@@ -268,7 +268,7 @@ readonly SKIP=77
 [[ -n "$node"       && -x "$node"       ]] || { echo "fastcache-compile-node not found: '$node'; skipping"; exit "$SKIP"; }
 
 # Every node below except the cache-tier case turns its own cache port OFF.
-# `--listen-node` defaults to 127.0.0.1:6674 -- where `fastcache-cc` looks --
+# `--listen-node` defaults to 0.0.0.0:6674 -- 6674 being where `fastcache-cc` looks --
 # which is right for the one node per machine a real deployment runs and wrong
 # here, where several share a host and would race for it. Said explicitly rather
 # than left to the default's warn-and-continue, so a node that failed to bind for
@@ -508,7 +508,11 @@ started_port=""
 #          mapping from one to the other
 # @param 2 host to bind, advertise and probe
 # @param 3 port to bind, advertise and probe
-# @param 4.. every flag that differs between the nodes this fixture starts
+# @param 4.. every flag that differs between the nodes this fixture starts, and
+#          `scheduler-node` -- this fixture's word, never passed on -- for the node that
+#          serves the fleet's scheduler. No flag says that any more: a node's mode does,
+#          and a first start's serves one while it runs consensus, so the word is what
+#          gives this node the consensus every other node here turns off.
 start_node() {
     local tag="$1" host="$2" port="$3"
     shift 3
@@ -523,15 +527,26 @@ start_node() {
     # roster its workers check those signatures against. Its consensus port is bound to
     # loopback, where nothing dials it.
     local consensus=()
+    # Every other node runs NO consensus, and says so: consensus is on by default, so a node
+    # naming no `--listen-raft` would be a one-voter cluster of itself on the default port --
+    # and the second one this fixture starts would be refused that port.
+    local solo=(--listen-raft=)
+    # What reaches the node: every argument but this fixture's own word.
+    local forwarded=()
     for arg in ${@+"$@"}; do
+        [ "$arg" = "scheduler-node" ] || forwarded+=("$arg")
         case "$arg" in
             --slots=0)
                 drain=()
                 worker=""
                 ;;
-            --serve-scheduler)
+            scheduler-node)
+                # And no discovery, which is on beside consensus by default: this fixture
+                # names every peer, and a beacon on the shared port would reach every other
+                # fixture running on this machine.
                 consensus=(--listen-raft="127.0.0.1:$(free_port)" --raft-self=127.0.0.1
-                    --cluster-dir="${workdir}/${tag}.state")
+                    --cluster-dir="${workdir}/${tag}.state" --discovery=)
+                solo=()
                 ;;
             --scheduler=*)
                 voterKeyFile="${workdir}/scheduler-${arg##*:}.key"
@@ -565,17 +580,22 @@ start_node() {
     # directory -- the start refuses one that names a scheduler without -- and, when this
     # fixture started that scheduler, is admitted there BEFORE it starts, or its first rounds
     # are refused and it registers a heartbeat interval late.
+    #
+    # And EVERY node keeps its state in this fixture's directory, scheduler or not: a node
+    # naming no `--cluster-dir` keeps its identity in the platform's default, which for this
+    # process is the account's own -- real state this fixture must not touch, and one
+    # identity every such node would share.
     local state=()
-    if [ -n "$schedulerAt" ] && [ -z "${consensus[*]+x}" ]; then
+    if [ -z "${consensus[*]+x}" ]; then
         state=(--cluster-dir="${workdir}/${tag}.state")
-        if [ -f "$voterKeyFile" ]; then
-            admit_worker "$tag" "$schedulerAt" "$log" "${state[@]}"
+        if [ -n "$schedulerAt" ] && [ -f "$voterKeyFile" ]; then
+            admit_worker "$tag" "$schedulerAt" "$log" "${solo[@]}" "${state[@]}"
         fi
     fi
     "$node" ${drain[@]+"${drain[@]}"} \
         --listen-node="${host}:${port}" --advertise="${host}:${port}" \
-        ${consensus[@]+"${consensus[@]}"} ${voter[@]+"${voter[@]}"} ${state[@]+"${state[@]}"} \
-        ${@+"$@"} >> "$log" 2>&1 &
+        ${consensus[@]+"${consensus[@]}"} ${solo[@]+"${solo[@]}"} ${voter[@]+"${voter[@]}"} \
+        ${state[@]+"${state[@]}"} ${forwarded[@]+"${forwarded[@]}"} >> "$log" 2>&1 &
     pid=$!
     started_pid="$pid"
     started_log="$log"
@@ -970,7 +990,7 @@ if [[ "$mode" == "membership" ]]; then
         # test and it names no `--scheduler` of its own to register with (#206).
         start_node "$tag" "$lan_address" "$dispatch" \
             "$no_local_cache" \
-            --serve-scheduler \
+            scheduler-node \
             --fleet-member="$lan_address" \
             --slots=0 --log-level=debug
         wait_for_log "scheduling for the fleet" "$started_pid" "$tag" "$started_log"
@@ -1420,7 +1440,7 @@ dispatch_port="$(free_port)"
 
 start_node "scheduler" 127.0.0.1 "$dispatch_port" \
     "$no_local_cache" \
-    --serve-scheduler --fleet-open \
+    scheduler-node --fleet-open \
     --slots=0 --log-level=debug
 scheduler_pid="$started_pid"
 
@@ -1606,7 +1626,7 @@ iso_daemon_pid="$started_pid"
 
 start_node "iso-scheduler" 127.0.0.1 "$iso_dispatch_port" \
     "$no_local_cache" \
-    --serve-scheduler --fleet-open \
+    scheduler-node --fleet-open \
     --slots=0 --log-level=debug
 
 iso_worker_port="$(free_port)"
@@ -1702,7 +1722,7 @@ cap_daemon_pid="$started_pid"
 # this fleet two slots when the whole point of the case is that it has one.
 start_node "cap-scheduler" 127.0.0.1 "$cap_dispatch_port" \
     "$no_local_cache" \
-    --serve-scheduler --fleet-open \
+    scheduler-node --fleet-open \
     --slots=0 --log-level=debug
 
 cap_worker_port="$(free_port)"

@@ -1110,51 +1110,6 @@ run_case() {
         echo "the counter finding named all three terminal states"
         ;;
 
-    # --- `wait_for_node_counter`, against a stub client -----------------------
-    #
-    # The `0xFC` door (#1308). Its acquisition is a CLIENT, not a listener, so the
-    # stand-in is a script that prints what `fastcache-cli node-metrics --format=kv`
-    # prints -- no perl, no port -- and each terminal state is one stub. The wait is
-    # the one `wait_for_counter` uses, so what these add is that the reader and the
-    # door name reach it: `node-metrics` in the finding, never `/metrics`.
-    node-counter-rises|node-counter-flat|node-counter-absent|node-counter-never-answered)
-        log="${scratch}/node-counter.log"
-        : > "$log"
-        stub="${scratch}/fastcache-cli-stub"
-        case "$name" in
-            node-counter-rises) printf '#!/bin/sh\nprintf "other_total=9\\nstaged_counter_total=1\\n"\n' > "$stub" ;;
-            node-counter-flat) printf '#!/bin/sh\nprintf "staged_counter_total=0\\n"\n' > "$stub" ;;
-            node-counter-absent) printf '#!/bin/sh\nprintf "other_total=3\\n"\n' > "$stub" ;;
-            node-counter-never-answered) printf '#!/bin/sh\nexit 3\n' > "$stub" ;;
-        esac
-        chmod +x "$stub"
-        sleep 30 >/dev/null 2>&1 &
-        staged=$!
-        wait_for_node_counter "$stub" 127.0.0.1:1 staged_counter_total 1 "$staged" "a stub node" "$log"
-        [ "$E2eCounterReading" = "1" ] \
-            || fail "E2eCounterReading is '${E2eCounterReading}', not the reading 1"
-        echo "wait_for_node_counter returned and handed back the reading 1"
-        ;;
-
-    # The `name=value` grammar under it: `metric_value`'s rules over the other
-    # separator, each one a way a reading goes wrong quietly.
-    node-metric-value-grammar)
-        body=$'fastcache_a_total=7\nfastcache_a_refused_total=0\n'
-        [ "$(node_metric_value "$body" fastcache_a_total)" = "7" ] \
-            || fail "a counter was not read by its exact name"
-        [ -z "$(node_metric_value "$body" fastcache_b_total)" ] \
-            || fail "an absent counter did not read empty"
-        [ "$(node_metric_value "$body" fastcache_a_refused_total)" = "0" ] \
-            || fail "a real zero did not read zero"
-        [ -z "$(node_metric_value "$body" fastcache_a)" ] \
-            || fail "a prefix of a counter name matched something"
-        [ -z "$(node_metric_value $'fastcache_a_total 7\n' fastcache_a_total)" ] \
-            || fail "a Prometheus line was read as a node-metrics one"
-        [ "$(node_metric_value $'c=1\nc=4\n' c)" = "4" ] \
-            || fail "the last reading of a repeated counter did not win"
-        echo "the node-metrics grammar refused a prefix, a Prometheus line and an absent counter"
-        ;;
-
     # --- the Prometheus grammar, against staged bodies ------------------------
     #
     # `metric_value` is pure and its grammar was driven by nothing: #643 moved it
@@ -2058,89 +2013,6 @@ run_case() {
             *REFUSED*) fail "e2e_http_outcome called a truncation a refusal: '${said}'" ;;
         esac
         echo "http_get reported the response CUT SHORT and said so"
-        ;;
-
-    # --- `ask_leader` asks whoever leads NOW ---------------------------------
-    #
-    # `$leader_endpoint` is pinned when a section derives it, and leadership can
-    # legitimately move before that section finishes. A command put to the node
-    # that led a moment ago then gets "ask somebody else", and the fixture
-    # reported that as the cluster refusing a legitimate command (#117, #172).
-    #
-    # Driven with a stubbed `cluster` because the real failure cannot be summoned:
-    # it needs an election to land inside one call. Stubbing the answer places the
-    # interleaving instead of waiting for it, which is the only way this fix can be
-    # shown to bite at all.
-    #
-    # `ask_leader` binds `cluster`, `find_leader` and `$leader_endpoint` late,
-    # which is exactly why it lives in the library and not in the fixture.
-    ask-leader-*)
-        leader_endpoint="127.0.0.1:1111"
-        calls="${scratch}/calls"
-        rederived="${scratch}/rederived"
-        : > "$calls"
-
-        find_leader() {
-            printf '%s\n' "re-derived: $1" >> "$rederived"
-            leader_endpoint="127.0.0.1:2222"
-        }
-
-        # Answers come from a queue, one per call, so a case states the sequence
-        # it is exercising rather than a predicate over the argument.
-        answers=()
-        cluster() {
-            local n
-            n="$(wc -l < "$calls" | tr -d ' ')"
-            printf 'x\n' >> "$calls"
-            printf '%s\n' "${answers[$n]}"
-        }
-
-        case "$name" in
-        ask-leader-first-answer)
-            answers=("accepted: done")
-            ask_leader "--cluster-set=k=v" "accepted" "should not be reported"
-            echo "took the first answer, asked $(wc -l < "$calls" | tr -d ' ') time(s)"
-            # An `if`, not `[ ... ] && ...`: the good path is the file being ABSENT,
-            # and a bare test returning 1 under the `set -e` this harness deliberately
-            # keeps would fail the case for passing.
-            if [ -e "$rederived" ]; then echo "BUG: re-derived the leader when the first answer was fine"; fi
-            ;;
-
-        # THE CASE THIS TICKET EXISTS FOR. Without the retry this fails.
-        ask-leader-retries)
-            answers=("rejected (not-leader): this node does not lead the cluster" "accepted: done")
-            ask_leader "--cluster-admit=n4=127.0.0.1:9" "accepted" "the leader refused to admit a member"
-            echo "recovered after a moved leadership, asked $(wc -l < "$calls" | tr -d ' ') time(s)"
-            cat "$rederived"
-            ;;
-
-        # The SECOND spelling of the same refusal. A fixture that retried on a
-        # recognised "not the leader" wording would have to know both, and would
-        # stop retrying the day either is reworded. This one matches neither --
-        # it retries because the answer is not what the caller asserts.
-        ask-leader-election)
-            answers=("the cluster has no leader right now; try again shortly" "accepted: done")
-            ask_leader "--cluster-forget=n3" "accepted" "the leader refused to forget a member"
-            echo "recovered from an election in progress, asked $(wc -l < "$calls" | tr -d ' ') time(s)"
-            ;;
-
-        # A refusal can BE the assertion: the typo case asserts that an unknown
-        # setting is refused BY NAME, so the substring is the typo. Proof that the
-        # contract is "the answer carries this", never "the command succeeded".
-        ask-leader-refusal-is-the-assertion)
-            answers=("rejected: unknown setting 'upsteam'")
-            ask_leader "--cluster-set=upsteam=typo" "upsteam" "a typo'd setting was not refused by name"
-            echo "a refusal naming the typo satisfied the assertion"
-            if [ -e "$rederived" ]; then echo "BUG: retried an answer that was already what the caller asserted"; fi
-            ;;
-
-        # Two chances and no more: it reports the caller's sentence and the answer.
-        ask-leader-never)
-            answers=("rejected (not-leader): nope" "rejected (not-leader): still nope")
-            ask_leader "--cluster-admit=n4=127.0.0.1:9" "accepted" "the leader refused to admit a member"
-            echo "BUG: reached the line after a failing ask_leader"
-            ;;
-        esac
         ;;
 
     # --- the two canaries for `--case`'s own verdict ------------------------
@@ -3135,13 +3007,6 @@ cases=(
     # `metric_value` into the library and left its decisions asserted on no tree
     # (#597, which found the same gap on the fixture side before the move).
     "metric-value-grammar|0|the Prometheus grammar refused a prefix, a label and an absent series|!BUG:"
-    # The `0xFC` door (#1308): one stub client per terminal state, and the finding names
-    # the door that was asked, so `!/metrics` is the half that distinguishes.
-    "node-counter-rises|0|wait_for_node_counter returned and handed back the reading 1|!BUG:"
-    "node-counter-flat|1|of a 1s budget|never reached 1; the last reading was 0|!BUG:"
-    "node-counter-absent|1|of a 1s budget|node-metrics answered and exports no staged_counter_total series at all|!/metrics|!BUG:"
-    "node-counter-never-answered|1|of a 1s budget|nothing ever answered a node-metrics request|!/metrics|!BUG:"
-    "node-metric-value-grammar|0|the node-metrics grammar refused a prefix, a Prometheus line and an absent counter|!BUG:"
     "bounded-returns-status|0|run_bounded said 'carried' with status 3"
     "bounded-missing-command|0|a missing command: outcome=unstartable|!BUG:"
     "bounded-outcome-survives-capture|0|two subshells down, the outcome reads unstartable"
@@ -3156,11 +3021,6 @@ cases=(
     "bounded-outlasts-a-trapped-term|0|a TERM-ignoring child exited 124"
     "reap-takes-what-nothing-recorded|0|escalated=1, still alive: none|!BUG:"
     "ancestry-bound-fires|0|at the default bound a real child is a descendant|the ancestry bound gave up rather than walking on|!BUG:"
-    "ask-leader-first-answer|0|asked 1 time(s)|!BUG:"
-    "ask-leader-retries|0|recovered after a moved leadership|asked 2 time(s)|re-derived: whoever leads now|!BUG:"
-    "ask-leader-election|0|recovered from an election in progress|asked 2 time(s)|!BUG:"
-    "ask-leader-refusal-is-the-assertion|0|a refusal naming the typo satisfied the assertion|!BUG:"
-    "ask-leader-never|1|the leader refused to admit a member|still nope|!BUG:"
 )
 
 # Perl is what stages a real listener. Where it is absent those cases are
@@ -5135,17 +4995,12 @@ seconds_exempt="tsan-canary-rate.sh:computes a delta and echoes it. It reports t
 #     monotonic co-timers, so what is left of them here is the realtime figure they
 #     PRINT beside it -- the first kind, arrived at from the second.
 #
-# `cluster-e2e.sh` has no file-level exemption any more: its eight waits are armed
-# co-timers, so the only reads left in it are the two below, which feed prose.
-#
 seconds_reported=(
     'local started="$SECONDS" grewAt="$SECONDS"|wait_until: the two origins for the durations it REPORTS'
     'grewAt="$SECONDS"|wait_until: when the log last grew, for the stall reading'
     'elapsed=$(( SECONDS - started ))|the elapsed a verdict PRINTS, so it is measured rather than assumed'
     'stall=$(( SECONDS - grewAt ))|how long since the log grew, a reported reading'
     'local started="$SECONDS" elapsed=0 armed dpid dmark|stop_and_require_exit: the origin for the duration it reports'
-    'local started="$SECONDS"|cluster-e2e.sh: the origin for firstNamedAt, which feeds diagnostic prose only'
-    'firstNamedAt=$(( SECONDS - started ))|cluster-e2e.sh: how long until a leader was first named, printed in the formation diagnosis'
     'before=$SECONDS|_http_drain_fd3: the observation #1048 left with no reader'
     '_http_drain_elapsed=$(( SECONDS - before ))|_http_drain_fd3: that same observation, marked not to be read'
     'clock_started="$SECONDS"|check-e2e-helpers.sh: the realtime origin wait-clock-bound PRINTS; its verdict is the monotonic co-timer'

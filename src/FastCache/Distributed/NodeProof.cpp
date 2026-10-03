@@ -68,20 +68,6 @@ namespace
                  std::span<std::byte const> { clientKey } };
     }
 
-    /// What is signed for @p purpose: its label, then the transcript, as one encoded message.
-    /// @param purpose Which signature.
-    /// @param transcript The handshake's fields, in wire order.
-    /// @return The message.
-    [[nodiscard]] std::vector<std::byte> SignedMessage(NodeProofSignature purpose,
-                                                       std::span<std::span<std::byte const> const> transcript)
-    {
-        std::vector<std::span<std::byte const>> labelled;
-        labelled.reserve(transcript.size() + 1);
-        labelled.push_back(WireFields::AsBytes(NodeProofSignatureLabels[static_cast<std::size_t>(purpose)].label));
-        labelled.insert(labelled.end(), transcript.begin(), transcript.end());
-        return WireFields::Encode(WireFields::FieldList { labelled });
-    }
-
     /// One session key for one direction.
     /// @param shared The X25519 output.
     /// @param salt Both nonces.
@@ -110,6 +96,11 @@ namespace
     }
 } // namespace
 
+LabelledMessage NodeProofSignedMessage(NodeProofSignature purpose, std::span<std::span<std::byte const> const> transcript)
+{
+    return LabelledMessage::Of(NodeProofSignatureLabels[static_cast<std::size_t>(purpose)].construction, transcript);
+}
+
 std::expected<NodeEphemeral, SecureRandomError> DrawNodeEphemeral(ISecureRandom& random)
 {
     SecureByteBuffer secret(X25519KeyBytes);
@@ -134,7 +125,7 @@ Wire::NodeChallengeReply AnswerNodeChallenge(Ed25519KeyPair const& identity,
     std::ranges::copy(hello.nonce, reply.nonce.begin());
     std::ranges::copy(hello.ephemeral, reply.ephemeral.begin());
     auto const transcript = ChallengeTranscript(request, reply);
-    auto const signature = identity.Sign(SignedMessage(NodeProofSignature::ServerChallenge, transcript));
+    auto const signature = SignLabelled(identity, NodeProofSignedMessage(NodeProofSignature::ServerChallenge, transcript));
     std::ranges::copy(signature, reply.signature.begin());
     return reply;
 }
@@ -146,7 +137,7 @@ bool VerifyNodeChallengeReply(Wire::NodeChallengeRequest const& request, Wire::N
     std::ranges::copy(reply.serverKey, key.begin());
     auto signature = Ed25519Signature {};
     std::ranges::copy(reply.signature, signature.begin());
-    return Ed25519Verify(key, SignedMessage(NodeProofSignature::ServerChallenge, transcript), signature);
+    return VerifyLabelled(key, NodeProofSignedMessage(NodeProofSignature::ServerChallenge, transcript), signature);
 }
 
 Wire::ProveNodeRequest MintNodeProof(Ed25519KeyPair const& identity,
@@ -157,7 +148,7 @@ Wire::ProveNodeRequest MintNodeProof(Ed25519KeyPair const& identity,
     auto proof = Wire::ProveNodeRequest { .nodeId = std::string { clientId }, .publicKey = {}, .signature = {} };
     std::ranges::copy(identity.PublicKey(), proof.publicKey.begin());
     auto const transcript = ProofTranscript(request, reply, clientId, identity.PublicKey());
-    auto const signature = identity.Sign(SignedMessage(NodeProofSignature::NodeProof, transcript));
+    auto const signature = SignLabelled(identity, NodeProofSignedMessage(NodeProofSignature::NodeProof, transcript));
     std::ranges::copy(signature, proof.signature.begin());
     return proof;
 }
@@ -171,7 +162,7 @@ bool VerifyNodeProof(Wire::NodeChallengeRequest const& request,
     auto signature = Ed25519Signature {};
     std::ranges::copy(proof.signature, signature.begin());
     auto const transcript = ProofTranscript(request, reply, proof.nodeId, key);
-    return Ed25519Verify(key, SignedMessage(NodeProofSignature::NodeProof, transcript), signature);
+    return VerifyLabelled(key, NodeProofSignedMessage(NodeProofSignature::NodeProof, transcript), signature);
 }
 
 std::optional<NodeSessionKeys> DeriveNodeSessionKeys(SecureByteBuffer const& ownSecret,

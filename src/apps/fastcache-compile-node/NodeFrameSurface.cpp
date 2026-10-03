@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CacheTier.hpp"
+#include "EnrollmentResponder.hpp"
+#include "FleetSummaryResponder.hpp"
+#include "FleetTextResponder.hpp"
+#include "LiveStatsResponder.hpp"
 #include "NodeConfig.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeProofResponder.hpp"
+#include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
+#include "SchedulerTier.hpp"
+#include "WorkerTier.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
 
@@ -12,6 +21,34 @@
 
 namespace FastCache::Node
 {
+
+SurfaceComponents ComposeSurfaceComponents(CacheTier* cache,
+                                           SchedulerTier* scheduler,
+                                           WorkerTier* worker,
+                                           NodeStatusResponder& node,
+                                           EnrollmentResponder* enrollment,
+                                           LiveStatsResponder& live,
+                                           FleetTextResponder& fleet,
+                                           NodeProofResponder* nodeProof,
+                                           FleetSummaryResponder* formation) noexcept
+{
+    // Designated, so the NAME travels with each pointer: two of these are one family's owner
+    // placed in another's slot otherwise, and a transposed pair routes every cache verb to the
+    // scheduler -- which answers *served nowhere* for traffic this node holds a tier for.
+    return SurfaceComponents { .cache = cache != nullptr ? &cache->Responder() : nullptr,
+                               .scheduler = scheduler != nullptr ? &scheduler->Responder() : nullptr,
+                               // Absent on a node running no worker (#206): the router then answers
+                               // the compile family's refusal for a node without one.
+                               .compile = worker != nullptr ? &worker->Responder() : nullptr,
+                               .node = &node,
+                               .enrollment = enrollment,
+                               .live = &live,
+                               .fleet = &fleet,
+                               // Absent on a node running no consensus: the router then answers
+                               // the node-proof family `NoCluster`.
+                               .nodeProof = nodeProof,
+                               .formation = formation };
+}
 
 std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
                                                         NodeConfig const& cfg,
@@ -26,12 +63,12 @@ std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
     // process can already observe.
     //
     // On the ordinary path: the surface, not an address. Where a bare port lands is
-    // the row's answer -- loopback on a worker, the wildcard on a node that schedules
-    // -- so the address bound here, the one an install-time refusal judges and the one
-    // `--print-surfaces` prints are one computation rather than three that agree
-    // today. Under activation there is no such computation to do: the unit bound the
-    // port, and `--advertise` -- mandatory there, and refused at startup when absent
-    // -- is the only thing that can say where clients should go.
+    // the row's answer -- the wildcard, on every node -- so the address bound here, the
+    // one an install-time refusal judges and the one `--print-surfaces` prints are one
+    // computation rather than three that agree today. Under activation there is no such
+    // computation to do: the unit bound the port, and `--advertise` -- mandatory there,
+    // and refused at startup when absent -- is the only thing that can say where
+    // clients should go.
     auto started = inherited.has_value()
                        ? FrameEndpoint::StartAdopted(io,
                                                      NodeSurface::Node,
@@ -113,8 +150,8 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     // tolerated, and correctly: the worker had a compile port of its own to fall back
     // to, so what was lost was a cache tier nobody had asked for. #290 stage 3 retired
     // that port, which deleted the branch's PREMISE rather than showing the branch
-    // wrong -- so the provenance bit stopped deciding this and `--serve-scheduler`
-    // stopped being the one flag that escalated it. Both were answering "is this port
+    // wrong -- so the provenance bit stopped deciding this and serving the scheduler
+    // stopped being the one thing that escalated it. Both were answering "is this port
     // load-bearing", and since the merge the answer is yes unconditionally.
     //
     // And the sentence below, which names the REMEDY rather than the diagnosis:

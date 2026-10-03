@@ -1,12 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeDefaults.hpp"
+#include "NodeFormation.hpp"
 #include "NodeReload.hpp"
 
+#include <FastCache/Config/YamlReader.hpp>
+
 #include <utility>
+#include <vector>
 
 namespace FastCache::Node
 {
 
-void ApplyReloadRequest(NodeReloader* reloader, NodeMembership& membership, ILogger& logger)
+NodeReloader::Reparse ReloadCandidateReader(std::span<char const* const> args, ReloadBasis basis)
+{
+    return [args, basis = std::move(basis)](std::filesystem::path const& path) -> std::expected<NodeConfig, ConfigError> {
+        // A FRESH configuration, never the live one. A file that fails halfway is then discarded
+        // whole rather than leaving the running worker holding part of a document nobody wrote.
+        NodeConfig candidate;
+        auto const loaded =
+            ReadYamlSettings(path).and_then([&candidate, &path, args](std::vector<YamlSetting> const& settings) {
+                return ApplyNodeConfiguration(settings, path, args, candidate);
+            });
+        if (!loaded.has_value())
+            return std::unexpected(loaded.error());
+
+        // The state directory and the names first, carried rather than resolved again: the
+        // identity dials the names.
+        candidate.stateDirectory = basis.stateDirectory;
+        ApplyHostNames(candidate, basis.hostNames);
+
+        // The formation, from the record the start kept: a candidate shaped by no record would
+        // run no consensus the running node does.
+        if (auto applied = ApplyFormation(candidate, basis.formation, basis.remembered); !applied.has_value())
+            return std::unexpected(ConfigError { .code = ConfigErrorCode::ParseError,
+                                                 .source = "formation",
+                                                 .line = 0,
+                                                 .field = {},
+                                                 .context = applied.error() });
+
+        // The identity again, through the function the start used. A candidate rebuilt without it
+        // holds an empty `--node-id`, an unreloadable field that has CHANGED -- so every reload
+        // would be refused by name, on a worker whose configuration was perfectly valid.
+        ApplyNodeIdentity(candidate, basis.identity);
+        return candidate;
+    };
+}
+
+void ApplyReloadRequest(NodeReloader* reloader, NodeMembership& membership, NodeConditions& conditions, ILogger& logger)
 {
     if (reloader == nullptr)
     {
@@ -42,6 +82,10 @@ void ApplyReloadRequest(NodeReloader* reloader, NodeMembership& membership, ILog
     // `AdmissionAnnouncement`, which is pure and tested; what decides whether anything
     // takes effect is nothing at all.
     membership.Adopt(*current);
+
+    // `--advertise` is reloadable, so whether a bare host name is still what peers are told to
+    // dial is asked of the configuration now in force; unconditional for `Adopt`'s reason.
+    EvaluateHostNameCondition(conditions, *current);
 
     // At WARN, which is the level a credential change is logged at, and for the same
     // reason: this is the setting that decides which machines this worker will spend

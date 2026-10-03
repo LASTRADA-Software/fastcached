@@ -18,7 +18,14 @@ namespace
 {
     /// What binds a session key to this wire and this construction. Versioned for the reason the
     /// signature labels are: changing it retires every session in flight, which is a stated act.
-    constexpr std::string_view SessionKeyLabel = "fastcache-raft-session-v2";
+    /// `v3` because the construction became one key per direction, bound to the signed direction.
+    constexpr std::string_view SessionKeyLabel = "fastcache-raft-session-v3";
+
+    /// What the HKDF info names each direction's key with. Distinct, or the two keys are one.
+    constexpr std::string_view DiallerToAcceptorLabel = "dialler-to-acceptor";
+    constexpr std::string_view AcceptorToDiallerLabel = "acceptor-to-dialler";
+    static_assert(DiallerToAcceptorLabel != AcceptorToDiallerLabel,
+                  "the two directions need labels of their own, or they derive one key");
 
     /// The fields a dialler's proof signs, in wire order: everything the handshake has carried
     /// up to the proof's own signature.
@@ -30,40 +37,56 @@ namespace
     ///
     /// The spans BORROW from every argument, so the result is consumed inside the full
     /// expression that built it -- the shape `.agent/rules/wire-and-protocol.md` records as
-    /// having been a use-after-free twice.
+    /// having been a use-after-free twice. The direction's byte is an argument for that reason:
+    /// the caller owns it, so it outlives the expression rather than dying inside this call.
     /// @param challenge The acceptor's challenge.
     /// @param proof The dialler's proof; its signature is not among the fields.
+    /// @param direction The proof's direction, as `DirectionByte` writes it.
     /// @return The fields.
-    [[nodiscard]] std::array<std::span<std::byte const>, 6> ProofTranscript(RaftWire::ChallengeFrame const& challenge,
-                                                                            RaftWire::ProofFrame const& proof) noexcept
+    [[nodiscard]] std::array<std::span<std::byte const>, 7> ProofTranscript(
+        RaftWire::ChallengeFrame const& challenge,
+        RaftWire::ProofFrame const& proof,
+        std::array<std::byte, 1> const& direction) noexcept
     {
         return { std::span<std::byte const> { challenge.nonce },
                  std::span<std::byte const> { challenge.ephemeral },
                  WireFields::AsBytes(proof.dialler),
                  WireFields::AsBytes(proof.target),
+                 std::span<std::byte const> { direction },
                  std::span<std::byte const> { proof.nonce },
                  std::span<std::byte const> { proof.ephemeral } };
+    }
+
+    /// The one byte a proof's direction travels as.
+    /// @param direction The direction.
+    /// @return Its byte, as `RaftWire::EncodeProof` writes it.
+    [[nodiscard]] std::array<std::byte, 1> DirectionByte(RaftWire::SessionDirection direction) noexcept
+    {
+        return RaftWire::Detail::EnumField(direction);
     }
 
     /// The fields an acceptor's verdict signs, in wire order: the whole proof transcript, the
     /// proof's own signature, then the verdict. Borrows, as `ProofTranscript`.
     /// @param challenge The acceptor's challenge.
     /// @param proof The dialler's proof, signature included.
+    /// @param direction The proof's direction byte; borrowed, as `ProofTranscript`'s.
     /// @param verdict The verdict's one byte.
     /// @param acceptor Which member answered.
     /// @return The fields.
-    [[nodiscard]] std::array<std::span<std::byte const>, 9> VerdictTranscript(RaftWire::ChallengeFrame const& challenge,
-                                                                              RaftWire::ProofFrame const& proof,
-                                                                              std::array<std::byte, 1> const& verdict,
-                                                                              std::string_view acceptor) noexcept
+    [[nodiscard]] std::array<std::span<std::byte const>, 10> VerdictTranscript(RaftWire::ChallengeFrame const& challenge,
+                                                                               RaftWire::ProofFrame const& proof,
+                                                                               std::array<std::byte, 1> const& direction,
+                                                                               std::array<std::byte, 1> const& verdict,
+                                                                               std::string_view acceptor) noexcept
     {
-        auto const head = ProofTranscript(challenge, proof);
+        auto const head = ProofTranscript(challenge, proof, direction);
         return { head[0],
                  head[1],
                  head[2],
                  head[3],
                  head[4],
                  head[5],
+                 head[6],
                  std::span<std::byte const> { proof.signature },
                  std::span<std::byte const> { verdict },
                  WireFields::AsBytes(acceptor) };
@@ -77,20 +100,22 @@ namespace
         return RaftWire::Detail::EnumField(verdict);
     }
 
-    /// The session key both ends derive, or nothing when no secret could be agreed.
+    /// The session keys both ends derive, or nothing when no secret could be agreed.
     ///
-    /// Salted with both nonces and bound to both ephemeral keys AND both ids, so a key agreed
-    /// in one exchange is the key of no other -- even one that somehow reused an ephemeral key.
+    /// Salted with both nonces and bound to both ephemeral keys, both ids AND the signed
+    /// direction, so a key agreed in one exchange is the key of no other -- even one that somehow
+    /// reused an ephemeral key. One HKDF call per direction, each naming its way, so the two keys
+    /// are independent outputs rather than one key two senders count positions under.
     /// @param ownSecret This end's ephemeral secret.
     /// @param peerEphemeral The other end's ephemeral public key.
     /// @param challenge The acceptor's challenge.
     /// @param proof The dialler's proof.
-    /// @return The key, or nothing: a low-order peer key fixes the "shared" secret to a value
+    /// @return The keys, or nothing: a low-order peer key fixes the "shared" secret to a value
     ///         everybody knows, and `X25519SharedSecret` refuses it.
-    [[nodiscard]] std::optional<SessionKey> AgreeSessionKey(SecureByteBuffer const& ownSecret,
-                                                            X25519PublicKey const& peerEphemeral,
-                                                            RaftWire::ChallengeFrame const& challenge,
-                                                            RaftWire::ProofFrame const& proof)
+    [[nodiscard]] std::optional<SessionKeys> AgreeSessionKeys(SecureByteBuffer const& ownSecret,
+                                                              X25519PublicKey const& peerEphemeral,
+                                                              RaftWire::ChallengeFrame const& challenge,
+                                                              RaftWire::ProofFrame const& proof)
     {
         auto const shared = X25519SharedSecret(ownSecret, peerEphemeral);
         if (!shared.has_value())
@@ -100,15 +125,22 @@ namespace
         std::ranges::copy(challenge.nonce, salt.begin());
         std::ranges::copy(proof.nonce, salt.begin() + NonceBytes);
 
-        auto const info = WireFields::Encode({ WireFields::AsBytes(SessionKeyLabel),
-                                               std::span<std::byte const> { challenge.ephemeral },
-                                               std::span<std::byte const> { proof.ephemeral },
-                                               WireFields::AsBytes(proof.dialler),
-                                               WireFields::AsBytes(proof.target) });
-        auto key = DeriveSessionKey(*shared, salt, info);
-        if (!key.has_value())
+        auto const direction = DirectionByte(proof.direction);
+        auto const keyFor = [&](std::string_view way) {
+            auto const info = WireFields::Encode({ WireFields::AsBytes(SessionKeyLabel),
+                                                   WireFields::AsBytes(way),
+                                                   std::span<std::byte const> { direction },
+                                                   std::span<std::byte const> { challenge.ephemeral },
+                                                   std::span<std::byte const> { proof.ephemeral },
+                                                   WireFields::AsBytes(proof.dialler),
+                                                   WireFields::AsBytes(proof.target) });
+            return DeriveSessionKey(*shared, salt, info);
+        };
+        auto forward = keyFor(DiallerToAcceptorLabel);
+        auto reverse = keyFor(AcceptorToDiallerLabel);
+        if (!forward.has_value() || !reverse.has_value())
             return std::nullopt;
-        return *std::move(key);
+        return SessionKeys { .diallerToAcceptor = *std::move(forward), .acceptorToDialler = *std::move(reverse) };
     }
 
     /// A fresh ephemeral key pair.
@@ -228,7 +260,12 @@ RaftWire::ChallengeFrame const& AcceptorHandshake::Challenge() const noexcept
 AcceptorHandshake::Judgement AcceptorHandshake::Judge(RaftWire::ProofFrame const& proof)
 {
     auto const refused = [](ProofOutcome outcome) {
-        return Judgement { .outcome = outcome, .verdict = std::nullopt, .dialler = {}, .provenKey = {}, .session = {} };
+        return Judgement { .outcome = outcome,
+                           .verdict = std::nullopt,
+                           .dialler = {},
+                           .provenKey = {},
+                           .session = {},
+                           .direction = RaftWire::SessionDirection::OneWay };
     };
 
     // Spent before anything else, whatever happens next: a challenge that could answer twice is
@@ -240,8 +277,9 @@ AcceptorHandshake::Judgement AcceptorHandshake::Judge(RaftWire::ProofFrame const
     // below name what the proof claimed, and a claim is unauthenticated until its signature
     // checks out. The claimed id does choose WHICH key to check under -- there is no other way
     // to ask -- and so `UnknownKey` is answered with nothing rather than signed.
+    auto const direction = DirectionByte(proof.direction);
     auto const signer = _identity.Verify(
-        RaftPeerSignature::DiallerProof, proof.dialler, ProofTranscript(_challenge, proof), proof.signature);
+        RaftPeerSignature::DiallerProof, proof.dialler, ProofTranscript(_challenge, proof, direction), proof.signature);
     if (signer.check != SignerCheck::Verified && signer.check != SignerCheck::Revoked)
         return refused(RefusalFor(signer.check));
 
@@ -251,10 +289,10 @@ AcceptorHandshake::Judgement AcceptorHandshake::Judge(RaftWire::ProofFrame const
     // Agreed BEFORE the verdict is signed, so an Accepted verdict is never sent for a session
     // this end cannot open. A proven member whose ephemeral key is low-order sent something no
     // honest dialler does; it is refused as a proof that did not hold up.
-    auto session = std::optional<SessionKey> {};
+    auto session = std::optional<SessionKeys> {};
     if (outcome == ProofOutcome::Accepted)
     {
-        session = AgreeSessionKey(_ephemeralSecret, proof.ephemeral, _challenge, proof);
+        session = AgreeSessionKeys(_ephemeralSecret, proof.ephemeral, _challenge, proof);
         if (!session.has_value())
             return refused(ProofOutcome::Forged);
     }
@@ -263,20 +301,22 @@ AcceptorHandshake::Judgement AcceptorHandshake::Judge(RaftWire::ProofFrame const
     auto const decided = VerdictByte(verdict);
     return Judgement {
         .outcome = outcome,
-        .verdict =
-            RaftWire::VerdictFrame { .verdict = verdict,
-                                     .acceptor = self,
-                                     .signature = _identity.Sign(RaftPeerSignature::AcceptorVerdict,
-                                                                 VerdictTranscript(_challenge, proof, decided, self)) },
+        .verdict = RaftWire::VerdictFrame { .verdict = verdict,
+                                            .acceptor = self,
+                                            .signature = _identity.Sign(
+                                                RaftPeerSignature::AcceptorVerdict,
+                                                VerdictTranscript(_challenge, proof, direction, decided, self)) },
         .dialler = outcome == ProofOutcome::RevokedKey ? NodeId {} : proof.dialler,
         .provenKey =
             outcome == ProofOutcome::Accepted || outcome == ProofOutcome::RevokedKey ? signer.key : Ed25519PublicKey {},
         .session = std::move(session),
+        .direction = proof.direction,
     };
 }
 
 std::expected<DiallerHandshake, SecureRandomError> DiallerHandshake::Create(IRaftPeerIdentity const& identity,
                                                                             NodeId target,
+                                                                            RaftWire::SessionDirection direction,
                                                                             ISecureRandom& random)
 {
     auto nonce = DrawNonce(random);
@@ -285,16 +325,20 @@ std::expected<DiallerHandshake, SecureRandomError> DiallerHandshake::Create(IRaf
     auto ephemeral = DrawEphemeral(random);
     if (!ephemeral.has_value())
         return std::unexpected { ephemeral.error() };
-    return DiallerHandshake { identity, std::move(target), *nonce, std::move(ephemeral->first), ephemeral->second };
+    return DiallerHandshake {
+        identity, std::move(target), direction, *nonce, std::move(ephemeral->first), ephemeral->second
+    };
 }
 
 DiallerHandshake::DiallerHandshake(IRaftPeerIdentity const& identity,
                                    NodeId target,
+                                   RaftWire::SessionDirection direction,
                                    Nonce const& nonce,
                                    SecureByteBuffer ephemeralSecret,
                                    X25519PublicKey const& ephemeral):
     _identity { identity },
     _target { std::move(target) },
+    _direction { direction },
     _nonce { nonce },
     _ephemeralSecret { std::move(ephemeralSecret) },
     _ephemeral { ephemeral }
@@ -320,10 +364,14 @@ std::expected<RaftWire::ProofFrame, std::string> DiallerHandshake::Answer(RaftWi
             _target.size(),
             RaftWire::MaxHandshakeIdBytes) };
 
-    auto proof = RaftWire::ProofFrame {
-        .dialler = self, .target = _target, .nonce = _nonce, .ephemeral = _ephemeral, .signature = {}
-    };
-    proof.signature = _identity.Sign(RaftPeerSignature::DiallerProof, ProofTranscript(challenge, proof));
+    auto proof = RaftWire::ProofFrame { .dialler = self,
+                                        .target = _target,
+                                        .direction = _direction,
+                                        .nonce = _nonce,
+                                        .ephemeral = _ephemeral,
+                                        .signature = {} };
+    auto const direction = DirectionByte(proof.direction);
+    proof.signature = _identity.Sign(RaftPeerSignature::DiallerProof, ProofTranscript(challenge, proof, direction));
 
     _challenge = challenge;
     _proof = proof;
@@ -341,12 +389,15 @@ DiallerHandshake::Conclusion DiallerHandshake::Conclude(RaftWire::VerdictFrame c
         return forged(VerdictOutcome::Forged);
 
     auto const decided = VerdictByte(verdict.verdict);
+    auto const direction = DirectionByte(_proof->direction);
 
     // The signature first, for the acceptor's reason: what the verdict says is a claim until
-    // then. The id it names chooses the key, as the proof's did.
+    // then. The id it names chooses the key, as the proof's did. The direction is the one THIS
+    // end signed, so a verdict over a proof whose direction changed in transit verifies as
+    // nothing.
     auto const signer = _identity.Verify(RaftPeerSignature::AcceptorVerdict,
                                          verdict.acceptor,
-                                         VerdictTranscript(*_challenge, *_proof, decided, verdict.acceptor),
+                                         VerdictTranscript(*_challenge, *_proof, direction, decided, verdict.acceptor),
                                          verdict.signature);
     switch (signer.check)
     {
@@ -387,7 +438,7 @@ DiallerHandshake::Conclusion DiallerHandshake::Conclude(RaftWire::VerdictFrame c
     if (verdict.acceptor != _target)
         return answered(VerdictOutcome::WrongTarget);
 
-    auto session = AgreeSessionKey(_ephemeralSecret, _challenge->ephemeral, *_challenge, *_proof);
+    auto session = AgreeSessionKeys(_ephemeralSecret, _challenge->ephemeral, *_challenge, *_proof);
     if (!session.has_value())
         return forged(VerdictOutcome::Forged);
 

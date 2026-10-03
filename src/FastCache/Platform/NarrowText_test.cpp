@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <format>
 #include <optional>
 #include <string>
@@ -113,6 +114,36 @@ TEST_CASE("Text that is not UTF-8 is decoded through the code page named", "[pla
     CHECK_FALSE(Utf8FromNarrowText(UmlautCp1252, 1252U).has_value());
 #endif
 }
+
+#if defined(_WIN32)
+TEST_CASE("UTF-16 a Windows API wrote converts to UTF-8 and back, and malformed text is refused", "[platform][narrowtext]")
+{
+    constexpr auto UmlautWide = L"gr\u00FCn"sv;
+
+    CHECK(Utf8FromWideText(UmlautWide) == std::string { UmlautUtf8 });
+    CHECK(WideTextFromUtf8(UmlautUtf8) == std::wstring { UmlautWide });
+
+    // A code point past the BMP is a surrogate PAIR in UTF-16 and four bytes in UTF-8: U+1F600.
+    constexpr auto EmojiWide = std::array<wchar_t, 2> { static_cast<wchar_t>(0xD83D), static_cast<wchar_t>(0xDE00) };
+    constexpr auto EmojiUtf8 = "\xF0\x9F\x98\x80"sv;
+    CHECK(Utf8FromWideText(std::wstring_view { EmojiWide.data(), EmojiWide.size() }) == std::string { EmojiUtf8 });
+    CHECK(WideTextFromUtf8(EmojiUtf8) == std::wstring { EmojiWide.data(), EmojiWide.size() });
+
+    // Empty is an answer, not a failure: a machine with no DNS domain reports an empty
+    // suffix, and that must not read as the conversion having refused it.
+    CHECK(Utf8FromWideText(L""sv) == std::string {});
+    CHECK(WideTextFromUtf8(""sv) == std::wstring {});
+
+    // A lone surrogate and bytes that are not UTF-8 are refusals, never a U+FFFD
+    // substituted into a name.
+    constexpr auto loneSurrogate = std::array<wchar_t, 3> { L'a', static_cast<wchar_t>(0xD800), L'b' };
+    CHECK_FALSE(Utf8FromWideText(std::wstring_view { loneSurrogate.data(), loneSurrogate.size() }).has_value());
+    // A LOW surrogate with no high one before it is as malformed as a high one with nothing after.
+    constexpr auto loneLowSurrogate = std::array<wchar_t, 3> { L'a', static_cast<wchar_t>(0xDC00), L'b' };
+    CHECK_FALSE(Utf8FromWideText(std::wstring_view { loneLowSurrogate.data(), loneLowSurrogate.size() }).has_value());
+    CHECK_FALSE(WideTextFromUtf8(UmlautCp1252).has_value());
+}
+#endif
 
 TEST_CASE("The host policy separates this process from a tool it runs", "[platform][narrowtext]")
 {

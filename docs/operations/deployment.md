@@ -386,7 +386,7 @@ omitted from the exposition instead of reported as `0`.
 
 The same reading applies inside the daemon's own namespace: the
 `fastcached_dispatch_*` block below is the fleet scheduler's, and the scheduler is
-`fastcache-compile-node --serve-scheduler`. The `fastcached_` prefix on it is
+`fastcache-compile-node`. The `fastcached_` prefix on it is
 historical.
 
 #### Command traffic
@@ -487,7 +487,7 @@ node's reads a fleet mid-upgrade as one that has converged.
 #### Fleet dispatch
 
 The fleet scheduler's series. `fastcached` runs no scheduler, so **on a daemon these
-are flat at zero**; they move on `fastcache-compile-node --serve-scheduler`, and
+are flat at zero**; they move on a `fastcache-compile-node` that serves the scheduler, and
 [Distributed compilation](../getting-started/distributed-compilation.md#confirming-it-works)
 is where they are explained one by one.
 

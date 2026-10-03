@@ -448,7 +448,6 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, core::platform::IClock c
                                  .notice = _registrarNotice,
                                  .prover = _prover,
                                  .lease = *_leaseState,
-                                 .fleetMismatch = _fleetAssertionFailed,
                                  .logger = _logger };
 
     // The configuration snapshot this thread last surveyed against, so a reload is

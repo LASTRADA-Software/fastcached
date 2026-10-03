@@ -393,7 +393,6 @@ struct AnnounceFixture
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
     ConfiguredCredential credential { cfg, nullptr };
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
-    std::atomic<bool> fleetMismatch { false };
     Cc::CredentialNotice notice = Cc::CredentialNotice::Silent();
     std::vector<Cc::WorkerRegistrar> registrars;
     std::vector<Cc::WorkerRegistrar> withdrawals;
@@ -422,7 +421,6 @@ struct AnnounceFixture
                                 // (#178). The proof is `FrameEndpoint_test`'s, over a real socket.
                                 .prover = nullptr,
                                 .lease = lease,
-                                .fleetMismatch = fleetMismatch,
                                 .logger = logger };
     }
 

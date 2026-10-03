@@ -55,14 +55,14 @@ enum class RosterOfferOutcome : std::uint8_t
 /// first roster it adopts is one a strict majority of its anchors -- the keys typed on
 /// `--voter-key` -- endorse. From then on the roster it holds certifies its successor
 /// (`Cluster::CertifyRoster`), and the anchors are not consulted again, as the replicated state
-/// wins over `--raft-peer`'s typed keys: a revoked ex-leader named on an old command line must
-/// not get a say back by being typed.
+/// wins over a bootstrap roster's keys: a revoked ex-leader named in an old roster must
+/// not get a say back by being named.
 ///
 /// Thread-safe: the presence loop offers rosters while every compile reads.
 class RosterTrust final: public ILeaseRoster
 {
   public:
-    /// @param assertedClusterId The fleet `--cluster-id` NAMED, when it named one: a first
+    /// @param assertedClusterId The fleet a caller ASSERTS, when it asserts one: a first
     ///        roster naming another is refused. Without one, the fleet is whichever the first
     ///        roster names -- the anchors signed that name, so it is theirs to choose -- and every
     ///        later roster must name the fleet the held one does.

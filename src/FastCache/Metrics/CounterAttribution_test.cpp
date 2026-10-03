@@ -96,6 +96,8 @@ constexpr std::array WriterFiles {
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-compile-node/WorkerTier.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::ConsensusPeerWire,
                         .path = "src/FastCache/Consensus/RaftPeerRefusals.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::ConsensusPeerWire,
+                        .path = "src/FastCache/Consensus/RaftPeerTransport.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::LiveStats, .path = "src/FastCache/Protocol/LiveStream.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::LiveStats,
                         .path = "src/apps/fastcache-compile-node/LiveStatsResponder.cpp" },
@@ -104,6 +106,8 @@ constexpr std::array WriterFiles {
     SurfaceWriterFile { .surface = MetricsSurface::NodeDiscovery, .path = "src/FastCache/Cluster/DiscoveryService.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeEnrollment,
                         .path = "src/apps/fastcache-compile-node/EnrollmentResponder.cpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeEnrollment,
+                        .path = "src/apps/fastcache-compile-node/EnrollmentWindow.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
                         .path = "src/apps/fastcache-compile-node/FleetTextResponder.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
@@ -116,6 +120,8 @@ constexpr std::array WriterFiles {
                         .path = "src/apps/fastcache-compile-node/NodeStatusResponder.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
                         .path = "src/apps/fastcache-compile-node/Responders.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeFormation,
+                        .path = "src/apps/fastcache-compile-node/FormationController.cpp" },
 };
 
 /// A production file that names a counter and writes none.
@@ -547,8 +553,8 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // tracked its own subject would silently re-attribute a real measurement to conditions it
     // was never taken under. Drift is a red build, which is what the previous "106 of 144" --
     // a sentence with nothing watching it -- did not get.
-    CHECK(incremented.size() == 46);
-    CHECK(refusalRow.size() == 115);
+    CHECK(incremented.size() == 56);
+    CHECK(refusalRow.size() == 127);
     CHECK(outcomeRow.size() == 10);
     CHECK(returned.size() == 4);
 
@@ -559,9 +565,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // No catalogue row is written by none of the four. The check for that is the whole
     // catalogue, not a count: a row nobody writes is a row whose surface was guessed.
     CHECK(anyWriter.size() == spellings.size());
-    CHECK(spellings.size() - incremented.size() == 125);
+    CHECK(spellings.size() - incremented.size() == 137);
 
-    // 115 rows have a refusal row; 114 of them have no increment site. Two figures one apart
+    // 127 rows have a refusal row; 126 of them have no increment site. Two figures one apart
     // measuring different things is how a census gets quoted wrong -- the first draft of the
     // comment beside `CounterSoleWriterTable` said 101 for both -- so the REACH of a
     // SurfaceRefusal-only reading is asserted separately from the row count.
@@ -569,9 +575,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     for (auto const& name: refusalRow)
         if (!incremented.contains(name))
             reachedByRefusalRowsAlone.insert(name);
-    CHECK(reachedByRefusalRowsAlone.size() == 114);
+    CHECK(reachedByRefusalRowsAlone.size() == 126);
 
-    // And four rows are written two ways, which is why the column sums to 175 over 171 rows.
+    // And four rows are written two ways, which is why the column sums to 197 over 193 rows.
     CHECK(incremented.size() + refusalRow.size() + outcomeRow.size() + returned.size() == spellings.size() + 4);
 }
 

@@ -191,7 +191,7 @@ TEST_CASE("`node` renders an absent surface as an absent FIELD, never a zero por
 
     SECTION("a node with no minted identity reports node-id ABSENT, not empty")
     {
-        // An empty string renders as a value somebody could paste into `--raft-peer`.
+        // An empty string renders as a value somebody could paste into `--cluster-admit`.
         CHECK(RequiredCell(answer, "node-id").kind == CellKind::Absent);
     }
 
@@ -375,9 +375,9 @@ TEST_CASE("`node` renders the enrollment window, and says nothing where there is
     // carry a distinction the counters cannot. Both enrollment series are rendered by
     // every node and read zero on a machine that has no window at all, so *no window
     // here* and *a window nothing has come through* are the same number. ABSENT
-    // against `closed` is where those part company, which is why a case asserting only
+    // against `manual` is where those part company, which is why a case asserting only
     // the open reading would leave the field's whole purpose untested.
-    SECTION("an open window names itself and says how many are waiting")
+    SECTION("an armed auto-approve window names itself and says how many are waiting")
     {
         ScriptedNodeExchange node { { StatusReply(
             { .version = "1.2.3",
@@ -386,17 +386,17 @@ TEST_CASE("`node` renders the enrollment window, and says nothing where there is
               .surfaces = {},
               .components = Cc::NodeComponentBit::Scheduler | Cc::NodeComponentBit::Consensus,
               .runtime = { .schedulerRole = Cc::WireSchedulerRole::Leader,
-                           .enrollment = Cc::WireEnrollmentState::Open,
+                           .enrollment = Cc::WireEnrollmentState::AutoApprove,
                            .enrollmentPending = 3 } }) } };
 
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Affirmative);
-        CHECK(RequiredCell(answer, "enrollment").lexical == "open");
+        CHECK(RequiredCell(answer, "enrollment").lexical == "auto-approve");
         CHECK(RequiredCell(answer, "enrollment-pending").lexical == "3");
         CHECK(RequiredCell(answer, "enrollment-pending").kind == CellKind::Number);
     }
 
-    SECTION("a shut window on a node that HAS one is reported shut, not omitted")
+    SECTION("an armed window that says how long it has says so beside its name")
     {
         ScriptedNodeExchange node { { StatusReply(
             { .version = "1.2.3",
@@ -405,18 +405,37 @@ TEST_CASE("`node` renders the enrollment window, and says nothing where there is
               .surfaces = {},
               .components = Cc::NodeComponentBit::Scheduler | Cc::NodeComponentBit::Consensus,
               .runtime = { .schedulerRole = Cc::WireSchedulerRole::Leader,
-                           .enrollment = Cc::WireEnrollmentState::Closed,
+                           .enrollment = Cc::WireEnrollmentState::AutoApprove,
+                           .enrollmentPending = 0,
+                           .enrollmentAutoApproveSecondsLeft = 900 } }) } };
+
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(RequiredCell(answer, "enrollment").lexical == "auto-approve (15 min left)");
+        CHECK(RequiredCell(answer, "enrollment-auto-approve-seconds-left").lexical == "900");
+        CHECK(RequiredCell(answer, "enrollment-auto-approve-seconds-left").kind == CellKind::Number);
+    }
+
+    SECTION("a manual window on a node that HAS one is reported manual and not omitted")
+    {
+        ScriptedNodeExchange node { { StatusReply(
+            { .version = "1.2.3",
+              .nodeId = "node-a",
+              .uptimeSeconds = 90,
+              .surfaces = {},
+              .components = Cc::NodeComponentBit::Scheduler | Cc::NodeComponentBit::Consensus,
+              .runtime = { .schedulerRole = Cc::WireSchedulerRole::Leader,
+                           .enrollment = Cc::WireEnrollmentState::Manual,
                            .enrollmentPending = 0 } }) } };
 
         auto const answer = RunNodeVerb("node", node);
-        CHECK(RequiredCell(answer, "enrollment").lexical == "closed");
+        CHECK(RequiredCell(answer, "enrollment").lexical == "manual");
 
         // Zero pending is a READING on a node that has a window, so it is a number
         // rather than a missing field -- the counters' zero is what cannot say this.
         CHECK(RequiredCell(answer, "enrollment-pending").lexical == "0");
     }
 
-    SECTION("a node that runs no consensus says NOTHING rather than a reassuring closed")
+    SECTION("a node that runs no consensus says NOTHING rather than a reassuring manual")
     {
         ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
                                                     .nodeId = "node-a",
@@ -1037,6 +1056,42 @@ TEST_CASE("cluster-members says which absence a scheduler endpoint is: never ann
     CHECK(rows[1][scheduler].kind == CellKind::Absent);
     CHECK(rows[0][schedulerState].lexical == "never-announced");
     CHECK(rows[1][schedulerState].lexical == "cleared");
+}
+
+TEST_CASE("cluster-members reports a learner recorded with no consensus endpoint as ABSENT", "[cli][node][cluster][learner]")
+{
+    // A learner dials in, so the cluster records it with no consensus endpoint at all -- and an
+    // empty text cell is a blank, which a TSV reader collapses and shifts every field after it.
+    // Both rows, so a column rendering every row alike cannot pass.
+    Cluster::ClusterState state;
+    Apply(state,
+          Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                             .key = "office",
+                             .value = "10.0.0.7:6675",
+                             .schedulerEndpoint = {},
+                             .publicKey = std::nullopt,
+                             .role = std::nullopt });
+    Apply(state,
+          Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
+                             .key = "laptop",
+                             .value = {},
+                             .schedulerEndpoint = {},
+                             .publicKey = std::nullopt,
+                             .role = std::nullopt });
+    ScriptedNodeExchange node { { ClusterStatusReply(state) } };
+
+    auto const answer = RunNodeVerb("cluster-members", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+
+    auto const& rows = RowsOf(answer);
+    REQUIRE(rows.size() == 2);
+    auto const id = ColumnOf(answer, "id");
+    auto const raft = ColumnOf(answer, "raft");
+
+    CHECK(rows[0][id].lexical == "laptop");
+    CHECK(rows[0][raft].kind == CellKind::Absent);
+    CHECK(rows[1][id].lexical == "office");
+    CHECK(rows[1][raft].lexical == "10.0.0.7:6675");
 }
 
 TEST_CASE("cluster-members shows each member's key whole, and absent for one that stated none",

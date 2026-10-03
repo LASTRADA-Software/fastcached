@@ -355,7 +355,87 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    // Moved by #178's node identity handshake: five counters joined the catalogue -- a proof whose
+    // Moved when a pending node began refusing an admission its proven fleet did not vouch for: one
+    // counter joined the catalogue (`formation_admissions_refused`). Clients and nodes upgrade
+    // together, as below.
+    //
+    // Moved when the enroll door began holding a joiner's id to the one id bound: one counter joined
+    // the catalogue, for a request refused because its id is longer than `MaxIdBytes`
+    // (`enrollment_requests_refused_id_too_long`). Clients and nodes upgrade together, as below.
+    //
+    // Moved when zero-config formation gained its controller: two counters joined the catalogue --
+    // the joins a solitary node decided to ask for (`formation_yields`) and the ones it gave up on
+    // when the fleet stopped answering (`formation_joins_abandoned`) -- which changes which cells
+    // every live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when an approval began naming the key it admits: one counter joined the catalogue, for
+    // an approval refused because its key is not the row's (`enrollment_approvals_refused_key_mismatch`),
+    // which changes which cells every live-stats reading carries. Clients and nodes upgrade
+    // together, as below.
+    //
+    // Moved when the enrollment list became bounded per source host: two counters joined the
+    // catalogue -- a request refused because its host already held its share
+    // (`enrollment_requests_refused_host_cap`), and the rows `--enroll-clear` dropped
+    // (`enrollment_requests_cleared`) -- which changes which cells every live-stats reading
+    // carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when a leader could arm an auto-approve deadline: one counter joined the catalogue,
+    // for the joiners it admitted with nobody comparing a key (`enrollment_approvals_auto`), which
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together,
+    // as below.
+    //
+    // Moved when a leader began recording every joiner without an open window: two counters
+    // joined the catalogue -- a request forgotten after its machine stopped asking before anybody
+    // decided about it (`enrollment_requests_expired`), and a joiner an operator admitted by name
+    // (`enrollment_approvals_manual`) -- which changes which cells every live-stats reading
+    // carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when discovery began budgeting its signature checks: one counter joined the catalogue
+    // for a proof answering a live challenge whose signature was not checked, past the check budget
+    // (`discovery_proof_checks_withheld`). That changes which cells every live-stats reading
+    // carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when discovery stopped replying with more than it was sent and began rate-limiting its
+    // answers: one counter joined the catalogue for a challenge or a proof withheld, larger than
+    // the datagram that provoked it or past the answer budget (`discovery_replies_withheld`). That
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together, as
+    // below.
+    //
+    // Moved when discovery began challenging other fleets: one counter joined the catalogue for a
+    // beacon dropped at a bound, a new node past the outstanding challenges or a new fleet past
+    // the ones remembered (`discovery_beacons_over_bound`). That changes which cells every
+    // live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when a member's seat began saying how it is reached: the no-session drop split in
+    // two, and one counter joined the catalogue for a message to a peer the transport can place
+    // nowhere, neither dialled nor dialling in (`raft_sends_dropped_unknown_peer`), apart from a
+    // learner that dials in and has no session attached (`raft_sends_dropped_no_session`). That
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together,
+    // as below.
+    //
+    // Moved when a learner's transport began reading what the leader writes on the session it
+    // dialled: eight counters joined the catalogue for a frame the reading end cannot use. Five are
+    // the dialler's, for the direction only it reads -- a tag that does not verify
+    // (`raft_peer_dials_ended_frame_tag`), a message naming another member (`_frame_sender`), a
+    // frame this build cannot read (`_frame_unreadable`), one over the cap (`_frame_over_cap`) and
+    // one that is not this wire (`_frame_bad_magic`) -- and three are the acceptor's endings that
+    // had been logged and never counted (`raft_peer_frames_refused_unreadable`, `_over_cap`,
+    // `_bad_magic`). That changes which cells every live-stats reading carries. Clients and nodes
+    // upgrade together, as below.
+    //
+    // Moved when a leader began writing to a learner on the session the learner dialled: two
+    // counters joined the catalogue -- a message dropped for a peer this node neither dials nor
+    // holds a session from (`raft_sends_dropped_no_session`), and a session a newer one from the
+    // same id superseded (`raft_inbound_sessions_superseded`) -- which changes which cells every
+    // live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved by zero-config formation: two counters left the catalogue with the enrollment window
+    // an operator opened -- `enrollment_requests_refused_closed`, since every request is now
+    // recorded, and `enrollment_windows_opened`, since there is nothing left to open -- which
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together,
+    // as below.
+    //
+    // Moved by #178's node identity handshake before that: five counters joined the catalogue -- a proof whose
     // key the cluster does not hold or has revoked (`node_proofs_refused_unknown_key`,
     // `_revoked_key`), a request refused on a connection a revoked key marked
     // (`node_requests_refused_key_revoked`), a sealed frame that failed its tag
@@ -409,7 +489,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved by #1484 before that: the counter cells carry a second bitmap saying WHICH absence
     // each absent cell is, so `StatsReadingWire::Grammar` went to `-4`.
-    CHECK(StatsReadingLayout == 0x901eb685752f8f7aULL);
+    CHECK(StatsReadingLayout == 0xb6513d2c510314eaULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

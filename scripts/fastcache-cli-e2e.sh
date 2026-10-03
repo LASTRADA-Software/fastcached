@@ -570,13 +570,14 @@ else
     nodeLog="$WORK/node-$nodePort.log"
     # A node that runs no worker (`--slots=0`, #206) and names no scheduler, so it
     # surveys no compiler -- the include-tree walk is over 300 s cold and measures
-    # nothing this case is about -- and holds NO identity. That last is the point
-    # since #178 PR 6: a node that names a scheduler must keep an identity key in a
-    # `--cluster-dir` and so always has one minted, and the absent-identity case
-    # below needs a node that has none. A worker used to be started here, naming
-    # itself as its scheduler to satisfy the startup rule.
+    # nothing this case is about. It runs no consensus either, named since consensus is
+    # on by default, and keeps its state in this fixture's directory: every node holds an
+    # identity now, and one naming no `--cluster-dir` would mint it in the account's own
+    # state directory -- real state no fixture may touch.
     "$NODE" --listen-node="127.0.0.1:$nodePort" \
             --admin-listen="127.0.0.1:$nodeAdminPort" \
+            --listen-raft= \
+            --cluster-dir="$WORK/node-state" \
             --slots=0 > "$nodeLog" 2>&1 &
     nodePid=$!
     _CLI_E2E_PIDS="$_CLI_E2E_PIDS $nodePid"
@@ -598,12 +599,13 @@ else
     expect_stdout "components" "the node reports which components it runs"
     expect_stdout_line "^admin-port +$nodeAdminPort\$" "the reported admin port is the one it bound"
 
-    # **Absent is not zero, end to end.** This node runs no consensus and keeps no
-    # state directory, so it has no minted identity -- and the JSON must carry `null`
-    # rather than an empty string somebody could paste into `--raft-peer`.
+    # Every node holds an identity now, and says where it keeps it and why there: one
+    # machine can hold two (the service's and a hand-started node's), and the reason is
+    # what tells an operator which this is.
     run_node node --format=json
     expect_status 0 "node renders as JSON"
-    expect_stdout '"node-id":null' "an unminted identity is null, not an empty string"
+    refute_stdout '"node-id":null' "every node has a minted identity"
+    expect_stdout '"state-directory-reason":"named by --cluster-dir"' "the node says why its state is where it is"
 
     # A surface it does not run gets NO field. Discovery is off here, so a
     # `discovery-port` of any value -- including 0 -- is the defect.
@@ -618,8 +620,9 @@ else
 
     echo "==> case 11b: a cluster verb against a node that runs no scheduler"
 
-    # This node was started with no `--serve-scheduler` and no `--listen-raft`, so it
-    # runs neither the scheduler tier nor consensus and cannot answer a cluster verb.
+    # This node was started with an empty `--listen-raft`, so it runs no consensus -- and a
+    # mode serves a scheduler only beside consensus -- so it runs neither the scheduler tier
+    # nor consensus and cannot answer a cluster verb.
     # **The point is that it says so.** A verb the endpoint does not implement is
     # refused BY NAME, which is the whole of what `fastcache-cli` gained in #1275 -- a
     # client that reported *the server closed the connection without answering* was

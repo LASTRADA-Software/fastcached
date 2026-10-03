@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <format>
@@ -207,6 +208,39 @@ namespace FastCache
     // unchanged, which is why the equality still holds.
     auto const bare = UnmappedHost(host);
     return bare == "::1" || bare.starts_with(V4Prefix);
+}
+
+/// Whether a host NAME reaches this machine and no other, wherever it is resolved.
+///
+/// **A different question from `IsLoopbackHost`, and deliberately a second predicate rather than
+/// a wider first one.** That one decides who is ADMITTED, from what a kernel reports, and must not
+/// take a name a resolver answers. This one decides what this node may TELL A PEER to dial, and
+/// there a name matters precisely because the peer resolves it: `localhost` and every name under
+/// `.localhost` resolve to the loopback address on every machine (RFC 6761, section 6.3), so a
+/// peer told to dial one reaches ITSELF -- confidently, with no error at either end. The loopback
+/// literals `IsLoopbackHost` knows are included.
+///
+/// Compared without regard to ASCII case, and a single trailing root dot is ignored.
+/// @param host A host, without a port or brackets.
+/// @return True when every machine resolving @p host reaches itself.
+[[nodiscard]] inline bool NamesOnlyThisMachine(std::string_view host) noexcept
+{
+    if (IsLoopbackHost(host))
+        return true;
+    if (host.ends_with('.'))
+        host.remove_suffix(1);
+
+    constexpr std::string_view Localhost = "localhost";
+    auto const lower = [](char c) {
+        return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    auto const sameText = [&lower](std::string_view a, std::string_view b) {
+        return std::ranges::equal(a, b, {}, lower, lower);
+    };
+    if (sameText(host, Localhost))
+        return true;
+    return host.size() > Localhost.size() + 1 && host[host.size() - Localhost.size() - 1] == '.'
+           && sameText(host.substr(host.size() - Localhost.size()), Localhost);
 }
 
 /// Split an endpoint that may name only a port.

@@ -37,6 +37,7 @@
 #include <core/net/testing/InMemorySocket.hpp>
 #include <core/net/testing/TestLoop.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/CountingConnector.hpp>
 #include <tests/ListenerConnector.hpp>
 #include <tests/ScratchPath.hpp>
 
@@ -81,7 +82,8 @@ class RecordingSink final: public Consensus::IRaftMessageSink
 [[nodiscard]] Ed25519KeyPair MintKey(std::filesystem::path const& stateDirectory)
 {
     SystemSecureRandom random;
-    auto resolved = ResolveNodeKey(stateDirectory, random);
+    FileTrustNodeKeyGuard guard;
+    auto resolved = ResolveNodeKey(stateDirectory, random, guard);
     REQUIRE(resolved.has_value());
     REQUIRE(resolved->origin == NodeKeyOrigin::Minted);
     return std::move(resolved->pair);
@@ -147,8 +149,9 @@ struct Network
 {
     /// @param acceptor Who n1 is.
     explicit Network(Consensus::IRaftPeerIdentity const& acceptor):
-        server { listener, reactor,  sink,   logger,
-                 metrics,  acceptor, random, Consensus::PeerServerOptions { .handshakeBound = 0ms } }
+        server { listener, reactor, sink,
+                 inbound,  logger,  metrics,
+                 acceptor, random,  Consensus::PeerServerOptions { .handshakeBound = 0ms } }
     {
         [](Consensus::RaftPeerServer* accepting) -> core::async::DetachedTask {
             co_await accepting->Run();
@@ -181,6 +184,7 @@ struct Network
     NullLogger logger;
     AtomicMetricsSink metrics;
     SystemSecureRandom random;
+    Testing::NoInboundLinks inbound; ///< Every dialler here is one-way, so nothing is attached.
     Consensus::RaftPeerServer server;
 };
 
@@ -195,6 +199,7 @@ struct Dialler
         transport { std::vector { Consensus::PeerEndpoint { .id = "n1", .host = "in-memory", .port = 1 } },
                     network.reactor,
                     network.connector,
+                    inbound,
                     logger,
                     metrics,
                     view.identity,
@@ -241,6 +246,7 @@ struct Dialler
     }
 
     Network& net;                           ///< Where it dials.
+    RecordingSink inbound;                  ///< What a two-way session would deliver; this one is one-way.
     NullLogger logger;                      ///< Where it reports.
     AtomicMetricsSink metrics;              ///< What it counted.
     SystemSecureRandom random;              ///< Its handshakes' randomness.
@@ -332,7 +338,8 @@ TEST_CASE("After --cluster-forget=n3, n3's session closes and its redial is refu
     {
         CAPTURE(machine->id);
         SystemSecureRandom random;
-        auto const restarted = ResolveNodeKey(machine->stateDirectory, random);
+        FileTrustNodeKeyGuard guard;
+        auto const restarted = ResolveNodeKey(machine->stateDirectory, random, guard);
         REQUIRE(restarted.has_value());
         CHECK(restarted->origin == NodeKeyOrigin::Recorded);
         CHECK(restarted->pair.PublicKey() == machine->PublicKey());

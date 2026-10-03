@@ -6,6 +6,7 @@
 #include <FastCache/Consensus/RaftLog.hpp>
 #include <FastCache/Consensus/RaftOutput.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
+#include <FastCache/Consensus/Standing.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 
@@ -25,16 +26,6 @@
 
 namespace FastCache::Consensus
 {
-
-/// Which timer governs a node.
-///
-/// **Private: never transmitted or persisted**, so the enumerators carry no values.
-enum class TimerKind : std::uint8_t
-{
-    Election,  ///< Time until this node stands for election.
-    Heartbeat, ///< Time until this node next sends heartbeats.
-    None,      ///< Nothing falls due: this node never stands (#1449).
-};
 
 /// The per-role facts the state machine reads rather than branches on.
 struct RoleTraits
@@ -78,61 +69,6 @@ static_assert(RowsInEnumeratorOrder(RoleTable, &RoleTraits::role),
 [[nodiscard]] constexpr RoleTraits const& TraitsOf(Role role) noexcept
 {
     return RoleTable[static_cast<std::size_t>(role)];
-}
-
-/// The per-standing facts the state machine reads rather than branches on.
-struct StandingTraits
-{
-    Standing standing {};  ///< The standing this row describes.
-    std::string_view name; ///< For log lines, test failure messages and a status report.
-
-    /// What a follower or candidate in this standing waits on.
-    ///
-    /// `Election` for a node that stands, `None` for one that never does. It governs
-    /// only the roles whose own timer is `Election`: a LEADER that has been demoted or
-    /// removed is still owed its heartbeats until the change that did it commits, and
-    /// only it can commit that change.
-    TimerKind timer {};
-
-    /// Whether it grants a vote or a pre-vote when asked.
-    ///
-    /// A refusal decided HERE is `VoteRefusal::CastsNoVote`, which is what "a learner
-    /// refuses by row" means: the node answers, and the row is the reason.
-    bool votes {};
-};
-
-/// Behaviour that varies by standing, as data.
-///
-/// The learner row is the point (#1449), and `NoCluster` is its oldest instance: a node
-/// waiting to be admitted was already a node that neither stands nor votes, spelled as
-/// a special case in `NextDeadline` and as an accident of `IsMember` finding nobody. It
-/// is the same two columns, so it is the same kind of row.
-///
-/// `Outsider` keeps what such a node always did -- it stands and it votes -- because
-/// nothing here asked for that to change. It cannot win for itself (a node counts its
-/// own vote only while it is a VOTER), and a voter it asks refuses it by the candidate's
-/// own row, so its campaigning costs a message per timeout and decides nothing.
-inline constexpr EnumTable<Standing, StandingTraits> StandingTable { {
-    { .standing = Standing::NoCluster, .name = "no cluster", .timer = TimerKind::None, .votes = false },
-    { .standing = Standing::Voter, .name = "voter", .timer = TimerKind::Election, .votes = true },
-    { .standing = Standing::Learner, .name = "learner", .timer = TimerKind::None, .votes = false },
-    { .standing = Standing::Outsider, .name = "outsider", .timer = TimerKind::Election, .votes = true },
-} };
-
-static_assert(RowsInEnumeratorOrder(StandingTable, &StandingTraits::standing),
-              "StandingTable must hold one row per Standing, in enumerator order");
-
-static_assert(std::ranges::none_of(StandingTable,
-                                   [](StandingTraits const& row) { return row.timer == TimerKind::Heartbeat; }),
-              "a standing decides whether a node STANDS; heartbeats are a role's, and a standing that asked for "
-              "them would have a follower broadcasting as though it led");
-
-/// The row describing `standing`.
-/// @param standing The standing to look up.
-/// @return Its traits.
-[[nodiscard]] constexpr StandingTraits const& TraitsOf(Standing standing) noexcept
-{
-    return StandingTable[static_cast<std::size_t>(standing)];
 }
 
 /// Whether this node's application can take on the state a leader's snapshot carries.

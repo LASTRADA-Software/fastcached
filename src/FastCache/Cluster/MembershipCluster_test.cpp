@@ -49,7 +49,7 @@ namespace
 constexpr std::array<char const*, 5> EveryMachine { "n1", "n2", "n3", "n4", "n5" };
 
 /// One PRODUCTION roster per machine, each over every machine typed with its key -- what
-/// `--raft-peer id=host:port@<key>` on every command line gives each node's `RosterKeys`.
+/// a bootstrap roster naming every member with its key gives each node's `RosterKeys`.
 ///
 /// Production rather than `Testing::SharedRoster`, and that is the point (#1555): a roster
 /// that never adopts the state was MORE permissive than any node, so a forget that revoked
@@ -133,7 +133,7 @@ class Fleet
     Fleet& operator=(Fleet&&) = delete;
     ~Fleet() = default;
 
-    /// Start @p id, a machine no member names yet, as `--raft-join` starts one.
+    /// Start @p id, a machine no member names yet, as a joiner starts: with no bootstrap set.
     /// @param id The machine.
     void Join(Consensus::NodeId const& id)
     {
@@ -431,7 +431,7 @@ TEST_CASE("A cluster that forgets a follower keeps its leader, and takes the fol
           "[consensus][cluster][membership][forget]")
 {
     // The control for the case above: the forgotten member is not the leader, so the leader
-    // stays. Every member here was typed into every other's `--raft-peer`, so the leader's
+    // stays. Every member here is in every other's bootstrap set, so the leader's
     // bootstrap set names the follower -- an operator's assertion, which kept a forgotten
     // follower counted until its forget revoked its key (#1555). Counted, it keeps that key
     // for itself, so a forgotten follower nobody removed would go on voting: it leaves the
@@ -469,7 +469,7 @@ TEST_CASE("A cluster that forgets a follower keeps its leader, and takes the fol
 TEST_CASE("Forgetting a running voter and losing the leader straight after does not wedge the cluster",
           "[consensus][cluster][membership][forget]")
 {
-    // #1555. Four voters, each typed into every other's `--raft-peer`. An operator forgets a
+    // #1555. Four voters, each in every other's bootstrap set. An operator forgets a
     // follower that is still running, and the leader is lost before any reconcile pass has
     // taken the follower out of the configuration. Cut off at the revocation, the forgotten
     // follower would leave two of four: no majority, so nobody could ever propose the removal
@@ -619,5 +619,53 @@ TEST_CASE("Admitting a voter that is not up does not stall the cluster's commits
     fleet.Reconcile(40);
     CHECK(fleet.Cluster().At("n1").driver->Node().ActiveConfiguration()
           == Consensus::Configuration { .voters = { "n1", "n2" }, .learners = {} });
+    RequireNoViolations(fleet.Cluster());
+}
+
+TEST_CASE("A setting the leader commits reaches every member", "[consensus][cluster][membership][settings]")
+{
+    // The replicated settings are the reason a cluster carries state at all, so the
+    // property is that a committed one is APPLIED everywhere -- asserted on every member's
+    // own applied log, never on the leader's answer that it accepted the write.
+    Fleet fleet { { "n1", "n2", "n3" } };
+    REQUIRE(SettleOnLeader(fleet.Cluster()));
+    REQUIRE(fleet.Cluster().ProposeOnLeader(SettingWrite("20min")).has_value());
+    fleet.Cluster().Run(StepsPerPass * 4);
+    for (auto const* const id: { "n1", "n2", "n3" })
+    {
+        INFO(id);
+        CHECK(fleet.StateAt(id).SettingOf("lease-lifetime") == std::optional<std::string> { "20min" });
+    }
+    RequireNoViolations(fleet.Cluster());
+}
+
+TEST_CASE("A one-member cluster commits a setting alone", "[consensus][cluster][membership][settings]")
+{
+    // Every node's first start is a cluster of one, and it has to be a WORKING one: its
+    // quorum is itself, so a write commits with nobody else present.
+    Fleet fleet { { "n1" } };
+    REQUIRE(SettleOnLeader(fleet.Cluster()));
+    REQUIRE(fleet.Cluster().ProposeOnLeader(SettingWrite("25min")).has_value());
+    fleet.Cluster().Run(StepsPerPass);
+    CHECK(fleet.StateAt("n1").SettingOf("lease-lifetime") == std::optional<std::string> { "25min" });
+    RequireNoViolations(fleet.Cluster());
+}
+
+TEST_CASE("A cluster keeps committing when its quorum grows from one to two", "[consensus][cluster][membership][settings]")
+{
+    // A second machine joins with no bootstrap set, an operator records it as a voter, and the
+    // reconcile promotes it once it has caught up (#1537). The two-voter precondition is what
+    // makes the last two checks mean "the quorum GREW": a write committed by n1 alone would
+    // pass them as well while n2 was still a learner.
+    Fleet fleet { { "n1" } };
+    REQUIRE(SettleOnLeader(fleet.Cluster()));
+    fleet.Join("n2");
+    REQUIRE(fleet.Admit("n2"));
+    fleet.Reconcile(20);
+    REQUIRE(fleet.Cluster().At("n1").driver->Node().ActiveConfiguration().voters.size() == 2);
+    REQUIRE(fleet.Cluster().ProposeOnLeader(SettingWrite("30min")).has_value());
+    fleet.Cluster().Run(StepsPerPass * 4);
+    CHECK(fleet.StateAt("n1").SettingOf("lease-lifetime") == std::optional<std::string> { "30min" });
+    CHECK(fleet.StateAt("n2").SettingOf("lease-lifetime") == std::optional<std::string> { "30min" });
     RequireNoViolations(fleet.Cluster());
 }

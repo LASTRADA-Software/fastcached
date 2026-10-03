@@ -55,9 +55,9 @@ Ed25519PublicKey RosterKeys::OwnPublicKey() const
     return _own.PublicKey();
 }
 
-Ed25519Signature RosterKeys::SignAsSelf(std::span<std::byte const> message) const
+Ed25519Signature RosterKeys::SignAsSelf(LabelledMessage const& message) const
 {
-    return _own.Sign(message);
+    return SignLabelled(_own, message);
 }
 
 Consensus::PeerKeys RosterKeys::KeysOf(Consensus::NodeId const& peer) const

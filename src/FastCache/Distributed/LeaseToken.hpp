@@ -4,6 +4,7 @@
 #include <FastCache/Core/Base64.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -134,9 +135,10 @@ struct LeaseClaims
     /// signed by a voter's own identity key now, and the same outcome survives one layer
     /// down: a state directory copied to a second site copies the node, key included.
     ///
-    /// Empty is legal and means a node with no `--cluster-id`, which is the
-    /// one-machine deployment. A verifier that has none expects none: two nodes that
-    /// have both declined to name a cluster are not thereby in different ones.
+    /// Never empty from a node: its formation record mints a cluster id at the first start,
+    /// so a one-machine deployment carries one like any other. The codec
+    /// still carries an empty one, and the check is equality, so an empty id matches an
+    /// empty expectation and nothing else.
     std::string clusterId;
 
     /// The scheduler term this grant was issued under.
@@ -365,16 +367,6 @@ struct LeaseRefusal
 /// rather than read.
 inline constexpr std::uint8_t LeaseTokenVersion = 3;
 
-/// The label a grant's signature is made under (#178).
-///
-/// Its own label, beside the grant it signs, as every construction signed by a member's own key
-/// carries one: a label distinct from every other is what keeps a signature made for one from
-/// verifying as another. Versioned
-/// with the token, so a signature over a version-2 claim list could never verify as a
-/// version-3 one even under the same key. `fastcache-lease-v1`, the HMAC label, is retired
-/// and never reused.
-inline constexpr std::string_view LeaseSignatureLabel = "fastcache-lease-v3";
-
 /// Who signs a grant: the issuing scheduler's identity (#178).
 ///
 /// A seam rather than a key pair, so the private key stays wherever the node keeps it --
@@ -397,10 +389,10 @@ class ILeaseSigner
     ///         this scheduler is verified under.
     [[nodiscard]] virtual Ed25519PublicKey PublicKey() const = 0;
 
-    /// Sign @p message with this node's identity key.
+    /// Sign @p message with this node's identity key: a labelled message, and nothing else.
     /// @param message What is signed.
     /// @return The signature.
-    [[nodiscard]] virtual Ed25519Signature Sign(std::span<std::byte const> message) const = 0;
+    [[nodiscard]] virtual Ed25519Signature Sign(LabelledMessage const& message) const = 0;
 };
 
 /// What a verifier's roster says about the keys one signer id may sign a grant with.
@@ -563,14 +555,14 @@ namespace Detail
         });
     }
 
-    /// What a grant's signature is over: its label, then the claims AS PACKED -- one field,
-    /// so a verifier signs over the bytes a peer sent rather than a re-encoding of them.
-    /// One function for the minter and the verifier, for `PackClaims`' reason.
+    /// What a grant's signature is over: its label (`IdentityKeyPurpose::Lease`), then the claims
+    /// AS PACKED -- one field, so a verifier signs over the bytes a peer sent rather than a
+    /// re-encoding of them. One function for the minter and the verifier, for `PackClaims`' reason.
     /// @param packed The packed claims.
     /// @return The signed message.
-    [[nodiscard]] inline std::vector<std::byte> SignedLeaseMessage(std::span<std::byte const> packed)
+    [[nodiscard]] inline LabelledMessage SignedLeaseMessage(std::span<std::byte const> packed)
     {
-        return WireFields::Encode({ WireFields::AsBytes(LeaseSignatureLabel), packed });
+        return LabelledMessage::Of(IdentityKeyPurpose::Lease, { packed });
     }
 
     /// How many fields a token's outer envelope holds: the claims, and the signature.
@@ -671,12 +663,12 @@ namespace Detail
     std::ranges::copy(signatureField, presented.begin());
     auto const message = Detail::SignedLeaseMessage(packed);
     auto const keys = signers.KeysOf(WireFields::AsStringView((*fields)[8]));
-    if (!keys.live.has_value() || !Ed25519Verify(*keys.live, message, presented))
+    if (!keys.live.has_value() || !VerifyLabelled(*keys.live, message, presented))
     {
         // Only a signature that VERIFIES under a revoked key is reported as one, so
         // `SignerRevoked` is a statement about who signed rather than about the claim.
         auto const byRevoked = std::ranges::any_of(
-            keys.revoked, [&](Ed25519PublicKey const& revoked) { return Ed25519Verify(revoked, message, presented); });
+            keys.revoked, [&](Ed25519PublicKey const& revoked) { return VerifyLabelled(revoked, message, presented); });
         return std::unexpected { byRevoked ? LeaseRefusalReason::SignerRevoked : LeaseRefusalReason::Unauthorized };
     }
 
@@ -1025,13 +1017,13 @@ class SchedulerTermRegressionNotice
 
 /// The fleet a worker was told it serves, learned once at registration.
 ///
-/// **An `optional`, and that is the entire point of the type.** Three states have to
-/// stay apart here and a bare string can only hold two: *never registered*, *registered
-/// into a fleet that names itself*, and *registered into one that names none*. The last
-/// is the one-machine deployment and is legal -- `SchedulerService`'s constructor says
-/// so -- while the first must honour no grant at all. A bare string spells the first and
-/// the third identically, which is how "harden the fleet check" becomes "every
-/// single-machine install stops compiling" (#303's shape, #401's window).
+/// **An `optional`, and that is the entire point of the type.** *Never registered* must
+/// honour no grant at all, and a bare string would spell it as the empty string -- a value
+/// the REGISTER reply's codec still carries, even though no node sends it now that
+/// every node's formation record mints a cluster id. Reading "not registered" out of a string is how
+/// "harden the fleet check" became "every single-machine install stops compiling" (#303's
+/// shape, #401's window); an engaged empty pin is a registration like any other, and the
+/// equality check lets it honour only a grant that names no cluster either.
 ///
 /// Mutex-guarded rather than atomic for the reason `KnownSchedulerTerm` is: the value is
 /// a string, it is written by the heartbeat thread on registration and read by every
@@ -1044,7 +1036,7 @@ class PinnedFleet
     /// Idempotent and last-writer-wins: a worker that re-registers -- which it does
     /// after any refused heartbeat, not only after a restart -- adopts whatever the
     /// scheduler that accepted it says now.
-    /// @param clusterId The fleet named, which may legally be empty.
+    /// @param clusterId The fleet named; empty only if the reply carried an empty one.
     void Pin(std::string clusterId)
     {
         std::scoped_lock const guard { _mutex };
@@ -1052,7 +1044,8 @@ class PinnedFleet
     }
 
     /// @return The fleet this worker registered with, or nullopt when it has not
-    ///         registered. An engaged but EMPTY string is a fleet that names none.
+    ///         registered. An engaged but EMPTY string is a registration whose reply
+    ///         named an empty fleet, which no node sends.
     [[nodiscard]] std::optional<std::string> Pinned() const
     {
         std::scoped_lock const guard { _mutex };
@@ -1102,12 +1095,12 @@ struct LeaseExpectation
     std::string_view endpoint;    ///< The endpoint this worker registered under.
     std::string_view fingerprint; ///< The toolchain this worker is about to run.
 
-    /// The cluster this verifier belongs to; empty when it names none.
+    /// The cluster this verifier belongs to, as its registration named it.
     ///
-    /// Compared for EQUALITY rather than for presence, so two nodes that have both
-    /// declined to name a cluster still agree -- that is the one-machine deployment
-    /// and it must keep working -- while a node that names one refuses a grant from a
-    /// fleet that names another, or none.
+    /// Compared for EQUALITY rather than for presence, so a grant from a fleet that names
+    /// another cluster, or none, is refused. A one-machine deployment names its own minted
+    /// cluster id on both sides, which is why it agrees; an empty id matches only an
+    /// empty one, and no node has that.
     std::string_view clusterId;
 };
 

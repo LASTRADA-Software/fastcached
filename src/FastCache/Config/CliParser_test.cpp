@@ -48,7 +48,7 @@ TEST_CASE("CliParser: --max-memory rejects unknown suffix", "[config][cli]")
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-    REQUIRE(result.error().field == "max-memory");
+    REQUIRE(result.error().field == "--max-memory");
 }
 
 TEST_CASE("CliParser: --log-timestamps sets the value and the explicit-override flag", "[config][cli]")
@@ -325,7 +325,7 @@ TEST_CASE("CliParser: --storage-max-value rejects nonsense", "[config][cli][stor
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-    REQUIRE(result.error().field == "storage-max-value");
+    REQUIRE(result.error().field == "--storage-max-value");
 }
 
 TEST_CASE("CliParser: --execution-model is no longer a recognised flag", "[config][cli]")
@@ -493,6 +493,37 @@ TEST_CASE("CliParser: --bind accepts IPv6 literals and hostnames verbatim (resol
     }
 }
 
+TEST_CASE("CliParser: a refusal names the row it was typed on, never a parser's guess", "[config][cli]")
+{
+    // The parsers these reach used to name a field by hand: `bind` for a bad host inside
+    // `--listen`, which the operator never typed, and dashless spellings no row carries. Each row
+    // here reaches a parser shared with another row, or one that wrote its own name.
+    struct Row
+    {
+        char const* argument; ///< A literal, so what argv holds is NUL-terminated.
+        std::string_view field;
+    };
+    auto const rows = std::array {
+        Row { .argument = "--listen=host with spaces:11211", .field = "--listen" },
+        Row { .argument = "--listen-tls=host:notaport", .field = "--listen-tls" },
+        Row { .argument = "--port=http", .field = "--port" },
+        Row { .argument = "--threads=many", .field = "--threads" },
+        Row { .argument = "--expiry-scan=0", .field = "--expiry-scan" },
+        Row { .argument = "--storage-durability=sometimes", .field = "--storage-durability" },
+        Row { .argument = "--log-level=loud", .field = "--log-level" },
+        Row { .argument = "--service-scope=nope", .field = "--service-scope" },
+        Row { .argument = "--max-memory=5x", .field = "--max-memory" },
+    };
+    for (auto const& row: rows)
+    {
+        INFO(row.argument);
+        auto const args = std::array<char const*, 1> { row.argument };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().field == row.field);
+    }
+}
+
 TEST_CASE("CliParser: --bind rejects syntactically invalid addresses", "[config][cli][bind]")
 {
     SECTION("empty value")
@@ -501,7 +532,7 @@ TEST_CASE("CliParser: --bind rejects syntactically invalid addresses", "[config]
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-        REQUIRE(result.error().field == "bind");
+        REQUIRE(result.error().field == "--bind");
     }
     SECTION("embedded whitespace")
     {
@@ -509,7 +540,7 @@ TEST_CASE("CliParser: --bind rejects syntactically invalid addresses", "[config]
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-        REQUIRE(result.error().field == "bind");
+        REQUIRE(result.error().field == "--bind");
     }
 }
 

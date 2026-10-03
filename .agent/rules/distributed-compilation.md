@@ -3129,16 +3129,44 @@ cordoned machine whose disk also filled sends an operator to the wrong fix. The 
 cordoned worker answers is `NoCapacity` on the wire -- the client compiles locally either
 way -- and its own counter, because a stop ends by itself and a cordon does not.
 
-## The enrollment window (#1298, #1299; on keys since #178)
+## Enrollment (#1298, #1299; on keys since #178; without a window since zero-config formation)
 
 <!-- agent-tripwire: An enrollment window is served by a node that runs consensus (`ServesEnrollment`) -->
 
-`--enroll-open` puts a node into the one interval in which a machine this cluster has
-never heard of can put itself on the list an operator approves from. Until #178 what an
-approval handed back was the pre-shared key; it now hands back the ROSTER -- every
-member's PUBLIC key -- and nothing secret crosses in either direction. Everything below
-is a property that shipped WRONG in a draft of this feature and was found by review
-rather than by a test, so each one is a rule with a bug behind it.
+A leader records every machine that asks, up to `MaxPendingEnrollments`, refusing past
+it rather than evicting, and forgets a row nobody polled for `PendingRowLifetime`. There
+is no window to open: since #178 nothing secret crosses, so the APPROVAL is the gate,
+and a window in front of it only made the zero-config join need a person twice.
+`enrollment-requests-waiting` is raised while rows wait.
+
+**An ungated list is bounded per SOURCE HOST as well as in total, or one peer holds it
+forever.** Refusing rather than evicting keeps a flooder from pushing a real joiner OFF the
+list; it does nothing about one that FILLS it, and one peer polling under fresh ids held all
+sixty-four rows until the leader restarted -- a denial of service against zero-config
+formation that no restart-free remedy reached. So a host holds at most
+`MaxPendingEnrollmentsPerHost` UNDECIDED rows (a decided row is a record, and stops
+counting), past which it is refused `EnrollmentHostFull` and counted apart from `Full` --
+the two send an operator to different places, one address asking a lot against many
+machines waiting. The host is the kernel's: enrollment is TCP, so it is not a claim the
+peer chose. The HOST's bound is asked first, so `Full` keeps meaning many hosts.
+
+**The bound counts a row by the address it was CREATED from, never the one a later poll
+shows.** A re-poll from another address may refresh the displayed `peerId`, but the row keeps the
+address it was created from (`EnrollmentPendingEntry::firstPeerId`). `--enroll-list` shows that
+address on every row as `first from`, and MARKS a row asked since from elsewhere, as #242
+settled: shown, never gated. `EnrollmentHostFull` names the host in that same spelling, so the
+rows a refusal counts can be found on the list. Moving the row between bounds let one dual-stack machine add four rows from
+its IPv4 address, re-poll them from its IPv6 one, and repeat: sixteen undecided rows were
+measured against a cap of four, with nothing short of the global bound to stop it. An
+IPv4-mapped address folds to its IPv4 form (`UnmappedHost`). IPv6 is **not** grouped by /64,
+because an office LAN is one /64 and twenty machines asking from it on go-live day are twenty
+legitimate joiners. **The accepted residual, and its direction:** a host that rotates through
+the addresses of an allocated /64 buys four rows per address, up to the global 64, so the
+bound fails OPEN for an attacker inside a network that can reach the leader; the remedy is
+`--enroll-clear` and the firewall in front of the enrollment port. And an
+operator has `--enroll-clear`, a row of `EnrollControlVerbTable`, leader-only like its
+siblings, which drops every undecided row, keeps approved and rejected ones, and is counted
+and logged: it makes room and bans nobody, since a machine still asking is recorded again.
 
 **No secret crosses, and a test proves it against the whole frame.** The joiner sends
 its role and its public key; `Approved` carries `Cluster::EncodeRoster(ProjectRoster(state))`
@@ -3165,7 +3193,39 @@ MACHINE: counted in `claimsChanged`, answered `Pending`, never recorded. Refresh
 which the ADDRESS fields still do while a row is pending, because those are display --
 would let whoever polled last swap a key in the minutes between `--enroll-list` and
 `--enroll-approve`, which are the minutes an operator's comparison is supposed to cover.
-A joiner that genuinely re-minted (a wiped state directory) enrolls again after a close.
+A joiner that genuinely re-minted (a wiped state directory) enrolls again once its old row
+is forgotten.
+
+**And the approval NAMES the key it admits** (`--enroll-approve=<id>@<key>`, verb `0x09`;
+`0x04`, the id alone, is retired). Keeping the first key covers a row that lives; it does
+not cover a row that LAPSED, after which the next machine to ask under the id is recorded
+under ITS key and an approval by id would admit it unseen. The leader refuses a key that is
+not the row's by name, before anything else about the row, and counts it
+(`EnrollmentApprovalsRefusedKeyMismatch`); `--enroll-list` prints the paste-ready line.
+
+**An approval admits a newcomer and never changes a member's seat**: an id the cluster
+already seats is refused by name, by a person's approval and by an armed deadline alike. A
+machine the cluster already records under the key it asks with, and the list holds no row
+for, is answered the roster with no approval -- the list is one leader's memory, and a
+demoted leader DROPS it (lowering `enrollment-requests-waiting`), so without that answer a
+joiner admitted just before a change of leader would poll forever against an approval
+refused as *already a member*. A row the list does hold still decides, so a rejection keeps
+the roster back.
+
+**Auto-approve is a DEADLINE, not a mode.** `--enroll-auto-approve=<duration>` sets
+`now + duration` on the LEADER's `EnrollmentWindow`, against the injected clock, and every
+`Enroll` compares `now < deadline` when it arrives; nothing wakes on a timer. It is
+never replicated and never persisted, so a restart ends it, and a DEMOTION ends it (a
+leader that loses and regains leadership inside the deadline must not resume admitting:
+the operator armed a window on a leader, not on a cluster). Zero and anything above
+`AutoApproveCeiling` (24 h) are refused BY NAME from one table, at the CLI and again at
+the leader. An auto-approved row is marked in `--enroll-list` with when the window was
+armed, the condition `enrollment-window-open` names the mode and the minutes left, and
+`EnrollmentApprovalsAuto` counts apart from `EnrollmentApprovalsManual`, because the
+audit question after a window is *who got in while nobody was looking*. It is the one
+exception to *the key an operator compared*: a bounded, delegated comparison, audited.
+The key admitted is still the key the joiner FIRST asked with, and a `claimsChanged` row
+is never auto-approved.
 
 **`Approved` means the leader's roster RECORDS the joiner, not that a person typed
 approve.** `ClusterAdmit` returns at the APPEND, and a joiner polling in between would be
@@ -3274,13 +3334,17 @@ is sent, and they are `IdentityRequirement::ProvenNodeOnly`, a COLUMN of `OpTabl
 `JoiningVerbsNeedAnIdentity`, refused `NodeIdentityRequired` and counted
 (`SchedulerRequestsRefusedNodeIdentityRequired`). Loopback is NOT exempt: a process on the
 scheduler's own host could otherwise register an endpoint of its choosing and be leased the
-fleet's jobs. Every node naming `--scheduler` therefore needs a key to prove, so the startup
-table refuses one that runs no consensus and names no `--cluster-dir`
-(`SchedulerNeedsIdentityRefusal`) -- a registration that would be refused forever, found at
-startup rather than in a heartbeat log. So every PACKAGED registration carries a state
-directory too -- the Linux unit's `StateDirectory=fastcache-node`, the MSI's
-`%ProgramData%\fastcache-node` -- or a packaged worker is refused at its first start, and
-under the MSI's `Return="ignore"` that refusal is a worker silently never registered. A client
+fleet's jobs. Every node naming `--scheduler` therefore needs a key to prove -- and every node
+has one since the zero-config defaults gave every node a state directory: `--cluster-dir`, or
+the platform's default, machine-wide for a privileged process or a service and per-user
+otherwise (`DefaultNodeClusterDirectory`). The refusal that guarded a node with nowhere to keep
+a key (`SchedulerNeedsIdentityRefusal`) went with the case. What a PACKAGED registration must
+still get right is WHICH directory: a POSIX service runs as an unprivileged account, so the
+Linux unit's `StateDirectory=fastcache-node` hands it `STATE_DIRECTORY` and a launchd
+registration states the same variable (`ServiceSpec::serviceAccountEnvironment`), or the
+service would take the per-user default in its account's home -- a second identity, or on the
+packaged unit (`ProtectSystem=strict`, home `/`) an unwritable one. The Windows service is
+privileged by its service SID and takes `%ProgramData%\fastcache-node` by itself. A client
 asking for a lease or a cache entry proves nothing and is admitted exactly as before.
 
 **A proof is worth nothing unless every frame after it is SEALED.** Without the seal, a machine on

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "MembershipGate.hpp"
+#include "NodeIdentity.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 
@@ -457,11 +458,11 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     }
 
     // The one state in this record an operator may act on within seconds of reading it:
-    // while it is `Open`, any machine that can route to this node's 0xFC port may ask to
-    // join, and approving one hands it this cluster's key in cleartext. Reported here
-    // rather than left to the repeating log line, because that line reaches only
-    // whoever is reading THIS node's log -- and an operator who opened a window and
-    // walked away has no other way to find out.
+    // while an auto-approve window is armed, any machine that can route to this node's 0xFC
+    // port and asks is admitted as a learner under the key it asks with, with nobody
+    // comparing it. Reported here rather than left to the condition's log line, because that
+    // line reaches only whoever is reading THIS node's log -- and an operator who armed a
+    // window and walked away has no other way to find out.
     //
     // Both halves together, and both absent on a node that runs no window: a count with
     // no state beside it cannot say whether a zero means nobody has found the window yet
@@ -471,6 +472,10 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
         auto const [state, pending] = _sources.enrollment->Summary();
         fields.runtime.enrollment = state;
         fields.runtime.enrollmentPending = pending;
+        // The seconds an armed auto-approve deadline has left, and absent when none is armed --
+        // never a zero, which would read as a window that ends this instant.
+        fields.runtime.enrollmentAutoApproveSecondsLeft = _sources.enrollment->AutoApproveLeft().transform(
+            [](std::chrono::seconds left) { return static_cast<std::uint64_t>(left.count()); });
     }
 
     // How many client tombstones this node is ENFORCING (#1471). Absent on a node with no
@@ -491,6 +496,16 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     // it -- and were it, absent is the honest reading of an address nobody stated.
     if (auto dial = ConsensusDialAddressOf(_cfg); dial.has_value())
         fields.runtime.consensusEndpoint = std::move(*dial);
+
+    // Where this node keeps its identity, and why there. One machine can hold two identities --
+    // the service's in the machine-wide directory and a hand-started node's in the account's
+    // own -- and an operator who finds both needs the reason beside each path to tell them
+    // apart. Both or neither, like the fields say.
+    if (auto chosen = ChosenStateDirectory(_cfg); chosen.has_value())
+    {
+        fields.runtime.stateDirectory = chosen->path.string();
+        fields.runtime.stateDirectoryReason = std::string { DescribeStateDirectoryOrigin(chosen->origin) };
+    }
 
     // Where this node sits in the configuration consensus holds (#1449): a learner and a
     // following voter are one role and one component mask, and only one of them stands

@@ -47,7 +47,14 @@ add_executable(fastcache-compile-node
     CordonCli.cpp
     DiscoveryTier.cpp
     EndpointDialer.cpp
+    FleetProbe.cpp
+    FleetSummaryResponder.cpp
+    ForeignFleetWatch.cpp
+    EnrollChannel.cpp
     EnrollClient.cpp
+    FormationController.cpp
+    FormationEffects.cpp
+    RaftStoreArchiver.cpp
     EnrollmentResponder.cpp
     EnrollmentWindow.cpp
     NodeProofClient.cpp
@@ -61,10 +68,13 @@ add_executable(fastcache-compile-node
     NodeRoster.cpp
     NodeConditions.cpp
     NodeConfig.cpp
+    NodeDefaults.cpp
+    NodeFormation.cpp
     NodeReload.cpp
     NodeFrameSurface.cpp
     NodeIdentity.cpp
     NodeKey.cpp
+    NodeStateFiles.cpp
     NodeSurfaces.cpp
     NodeToolchains.cpp
     RemoteUpstream.cpp
@@ -117,8 +127,22 @@ if(FASTCACHED_BUILD_TESTS)
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
         EndpointDialer.cpp
+        FleetProbe.cpp
+        FleetProbe_test.cpp
+        FleetSummaryResponder.cpp
+        FleetSummaryResponder_test.cpp
+        ForeignFleetWatch.cpp
+        ForeignFleetWatch_test.cpp
+        EnrollChannel.cpp
+        EnrollChannel_test.cpp
         EnrollClient.cpp
         EnrollClient_test.cpp
+        FormationController.cpp
+        FormationController_test.cpp
+        FormationEffects.cpp
+        FormationEffects_test.cpp
+        RaftStoreArchiver.cpp
+        RaftStoreArchiver_test.cpp
         FleetForgetPropagation_test.cpp
         EnrollmentResponder.cpp
         EnrollmentResponder_test.cpp
@@ -160,10 +184,16 @@ if(FASTCACHED_BUILD_TESTS)
         FleetRoster_test.cpp
         FleetLeaseRouting_test.cpp
         NodeConfig_test.cpp
+        NodeDefaults.cpp
+        NodeDefaults_test.cpp
+        NodeFormation.cpp
+        NodeFormation_test.cpp
         NodeIdentity.cpp
         NodeIdentity_test.cpp
         NodeKey.cpp
         NodeKey_test.cpp
+        NodeStateFiles.cpp
+        NodeStateFiles_test.cpp
         RaftKeyRevocation_test.cpp
         NodeSurfaces.cpp
         NodeSurfaces_test.cpp

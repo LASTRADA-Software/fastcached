@@ -43,6 +43,12 @@ using namespace FastCache::Consensus;
 namespace
 {
 
+/// The direction every case dials in unless it is about the direction: the one every voter uses.
+constexpr auto OneWay = RaftWire::SessionDirection::OneWay;
+
+/// The direction a member nobody dials uses, so the acceptor writes to it on the same connection.
+constexpr auto TwoWay = RaftWire::SessionDirection::TwoWay;
+
 /// The members every case's roster names, each under its own key.
 [[nodiscard]] std::shared_ptr<SharedRoster> Roster()
 {
@@ -119,11 +125,14 @@ struct Handshake
     DiallerHandshake::Conclusion conclusion;
 };
 
-/// Run a whole handshake: @p dialler dials @p target at @p acceptor.
-[[nodiscard]] Handshake Run(Side& acceptor, Side& dialler, NodeId const& target)
+/// Run a whole handshake: @p dialler dials @p target at @p acceptor, asking for @p direction.
+[[nodiscard]] Handshake Run(Side& acceptor,
+                            Side& dialler,
+                            NodeId const& target,
+                            RaftWire::SessionDirection direction = OneWay)
 {
     auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
-    auto dialling = DiallerHandshake::Create(dialler.identity, target, dialler.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.identity, target, direction, dialler.random).value();
 
     auto judgement = accepting.Judge(ProofFor(dialling, accepting.Challenge()));
 
@@ -132,11 +141,14 @@ struct Handshake
     return Handshake { .judgement = std::move(judgement), .conclusion = std::move(conclusion) };
 }
 
-/// The bytes of a session key, for comparing two ends' copies.
-[[nodiscard]] std::vector<std::byte> BytesOf(std::optional<SessionKey> const& key)
+/// The bytes of one of a handshake's session keys, for comparing two ends' copies.
+/// @param keys What one end agreed; required to exist.
+/// @param way Which direction's key: the dialler's unless a case says otherwise.
+[[nodiscard]] std::vector<std::byte> BytesOf(std::optional<SessionKeys> const& keys,
+                                             SessionKey SessionKeys::* way = &SessionKeys::diallerToAcceptor)
 {
-    REQUIRE(key.has_value());
-    auto const bytes = Unwrap(key).Bytes();
+    REQUIRE(keys.has_value());
+    auto const bytes = (Unwrap(keys).*way).Bytes();
     return { bytes.begin(), bytes.end() };
 }
 
@@ -187,7 +199,7 @@ TEST_CASE("Each end's nonce and ephemeral key are the bytes its random seam drew
     ScriptedSecureRandom diallerRandom { ScriptedSecureRandom::Ascending(NonceBytes + X25519KeyBytes, 100) };
 
     auto accepting = AcceptorHandshake::Create(acceptorIdentity, acceptorRandom).value();
-    auto dialling = DiallerHandshake::Create(diallerIdentity, "n2", diallerRandom).value();
+    auto dialling = DiallerHandshake::Create(diallerIdentity, "n2", OneWay, diallerRandom).value();
     auto const proof = ProofFor(dialling, accepting.Challenge());
 
     auto const scripted = [](std::uint8_t first, std::size_t skip, std::size_t count) {
@@ -219,7 +231,7 @@ TEST_CASE("A handshake that cannot draw is not begun, at either end", "[consensu
         REQUIRE_FALSE(accepting.has_value());
         CHECK(accepting.error().primitive == ScriptedSecureRandom::DeniedFailure().primitive);
 
-        auto const dialling = DiallerHandshake::Create(identity, "n2", denied);
+        auto const dialling = DiallerHandshake::Create(identity, "n2", OneWay, denied);
         REQUIRE_FALSE(dialling.has_value());
         CHECK(dialling.error().primitive == ScriptedSecureRandom::DeniedFailure().primitive);
 
@@ -240,7 +252,7 @@ TEST_CASE("A handshake that cannot draw is not begun, at either end", "[consensu
 
         ScriptedSecureRandom alsoStops { ScriptedSecureRandom::Ascending(NonceBytes) };
         alsoStops.DenyAfter(1, ScriptedSecureRandom::DeniedFailure());
-        auto const dialling = DiallerHandshake::Create(identity, "n2", alsoStops);
+        auto const dialling = DiallerHandshake::Create(identity, "n2", OneWay, alsoStops);
         REQUIRE_FALSE(dialling.has_value());
         CHECK(alsoStops.FillCount() == 2);
     }
@@ -280,7 +292,7 @@ TEST_CASE("n3, holding every byte it ever held, cannot prove n2's id", "[consens
     Side n3 { "n3", roster };
     Side n2 { "n2", roster };
     auto recordedAt = AcceptorHandshake::Create(n3.identity, n3.random).value();
-    auto n2Dialling = DiallerHandshake::Create(n2.identity, "n3", n2.random).value();
+    auto n2Dialling = DiallerHandshake::Create(n2.identity, "n3", OneWay, n2.random).value();
     auto const recorded = ProofFor(n2Dialling, recordedAt.Challenge());
     REQUIRE(recordedAt.Judge(recorded).outcome == ProofOutcome::Accepted);
 
@@ -323,7 +335,7 @@ TEST_CASE("A recorded proof cannot answer a later challenge", "[consensus][raft]
     Side dialler { "n1", roster };
 
     auto first = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
-    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", dialler.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", OneWay, dialler.random).value();
     auto const recorded = ProofFor(dialling, first.Challenge());
     REQUIRE(first.Judge(recorded).outcome == ProofOutcome::Accepted);
 
@@ -341,7 +353,7 @@ TEST_CASE("A handshake judges one proof, even a genuine second one", "[consensus
     Side dialler { "n1", roster };
 
     auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
-    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", dialler.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", OneWay, dialler.random).value();
     auto const proof = ProofFor(dialling, accepting.Challenge());
 
     CHECK(accepting.Judge(proof).outcome == ProofOutcome::Accepted);
@@ -360,7 +372,7 @@ TEST_CASE("The proof's signature covers every field of the transcript", "[consen
     Side dialler { "n1", roster };
 
     auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
-    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", dialler.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", OneWay, dialler.random).value();
     auto const challenge = accepting.Challenge();
 
     // A key pair nobody at either end holds: what an attacker substitutes.
@@ -401,6 +413,18 @@ TEST_CASE("The proof's signature covers every field of the transcript", "[consen
         CHECK(accepting.Judge(proof).outcome == ProofOutcome::Forged);
     }
 
+    SECTION("the session direction it asked for")
+    {
+        // Uncovered, a relay could make an acceptor write on a connection the dialler only ever
+        // writes on -- or starve a dialler that asked to be written to.
+        auto proof = ProofFor(dialling, challenge);
+        REQUIRE(proof.direction == OneWay);
+        proof.direction = TwoWay;
+        auto const judgement = accepting.Judge(proof);
+        CHECK(judgement.outcome == ProofOutcome::Forged);
+        CHECK_FALSE(judgement.session.has_value());
+    }
+
     SECTION("the dialler's nonce")
     {
         auto proof = ProofFor(dialling, challenge);
@@ -436,7 +460,7 @@ TEST_CASE("The verdict's signature covers what it decided and the exchange it de
         Side removed { "n3", roster };
 
         auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
-        auto dialling = DiallerHandshake::Create(removed.identity, "n1", removed.random).value();
+        auto dialling = DiallerHandshake::Create(removed.identity, "n1", OneWay, removed.random).value();
         auto const refusal = accepting.Judge(ProofFor(dialling, accepting.Challenge()));
         REQUIRE(refusal.verdict.has_value());
         REQUIRE(dialling.Conclude(Unwrap(refusal.verdict)).outcome == VerdictOutcome::OwnKeyRevoked);
@@ -455,11 +479,11 @@ TEST_CASE("The verdict's signature covers what it decided and the exchange it de
         Side dialler { "n1", roster };
 
         auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
-        auto first = DiallerHandshake::Create(dialler.identity, "n2", dialler.random).value();
+        auto first = DiallerHandshake::Create(dialler.identity, "n2", OneWay, dialler.random).value();
         auto const recorded = accepting.Judge(ProofFor(first, accepting.Challenge()));
         REQUIRE(recorded.verdict.has_value());
 
-        auto second = DiallerHandshake::Create(dialler.identity, "n2", dialler.random).value();
+        auto second = DiallerHandshake::Create(dialler.identity, "n2", OneWay, dialler.random).value();
         std::ignore = ProofFor(second, accepting.Challenge());
         CHECK(second.Conclude(Unwrap(recorded.verdict)).outcome == VerdictOutcome::Forged);
     }
@@ -472,7 +496,7 @@ TEST_CASE("A signature from one half of the handshake does not verify as the oth
     Side dialler { "n1", roster };
 
     auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
-    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", dialler.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", OneWay, dialler.random).value();
     auto const proof = ProofFor(dialling, accepting.Challenge());
     auto const judgement = accepting.Judge(proof);
     REQUIRE(judgement.verdict.has_value());
@@ -543,7 +567,7 @@ TEST_CASE("A verdict the dialler cannot authenticate is refused, and says why", 
     Side dialler { "n1", roster };
 
     auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
-    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", dialler.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", OneWay, dialler.random).value();
     auto const proof = ProofFor(dialling, accepting.Challenge());
     auto const genuine = accepting.Judge(proof);
     REQUIRE(genuine.verdict.has_value());
@@ -575,7 +599,7 @@ TEST_CASE("A verdict the dialler cannot authenticate is refused, and says why", 
 
     SECTION("a verdict for a challenge this dialler never answered")
     {
-        auto unasked = DiallerHandshake::Create(dialler.identity, "n2", dialler.random).value();
+        auto unasked = DiallerHandshake::Create(dialler.identity, "n2", OneWay, dialler.random).value();
         CHECK(unasked.Conclude(Unwrap(genuine.verdict)).outcome == VerdictOutcome::Forged);
     }
 }
@@ -593,8 +617,10 @@ TEST_CASE("The handshake signatures and the session key are the documented const
     ScriptedSecureRandom acceptorRandom { acceptorScript };
     ScriptedSecureRandom diallerRandom { diallerScript };
 
+    // Two-way, so the direction byte is the one that is NOT a zeroed buffer's: a construction that
+    // dropped it, or signed a constant in its place, is told apart from one that signed it.
     auto accepting = AcceptorHandshake::Create(acceptorIdentity, acceptorRandom).value();
-    auto dialling = DiallerHandshake::Create(diallerIdentity, "n2", diallerRandom).value();
+    auto dialling = DiallerHandshake::Create(diallerIdentity, "n2", TwoWay, diallerRandom).value();
     auto const proof = ProofFor(dialling, accepting.Challenge());
     auto const judgement = accepting.Judge(proof);
     REQUIRE(judgement.verdict.has_value());
@@ -604,18 +630,22 @@ TEST_CASE("The handshake signatures and the session key are the documented const
     auto const ephA = std::span<std::byte const> { challenge.ephemeral };
     auto const nonceD = std::span<std::byte const> { proof.nonce };
     auto const ephD = std::span<std::byte const> { proof.ephemeral };
+    // The direction's byte, spelled as the number it is rather than through the enumerator.
+    auto const twoWayByte = std::array { std::byte { 0x01 } };
+    auto const dir = std::span<std::byte const> { twoWayByte };
 
     CHECK(Ed25519Verify(TestKeyPair("n1").PublicKey(),
-                        Signed("fastcache-raft-proof-v2", { nonceA, ephA, Text("n1"), Text("n2"), nonceD, ephD }),
+                        Signed("fastcache-raft-proof-v3", { nonceA, ephA, Text("n1"), Text("n2"), dir, nonceD, ephD }),
                         proof.signature));
 
     auto const accepted = std::array { std::byte { static_cast<std::uint8_t>(RaftWire::HandshakeVerdict::Accepted) } };
     CHECK(Ed25519Verify(TestKeyPair("n2").PublicKey(),
-                        Signed("fastcache-raft-verdict-v2",
+                        Signed("fastcache-raft-verdict-v3",
                                { nonceA,
                                  ephA,
                                  Text("n1"),
                                  Text("n2"),
+                                 dir,
                                  nonceD,
                                  ephD,
                                  std::span<std::byte const> { proof.signature },
@@ -623,17 +653,21 @@ TEST_CASE("The handshake signatures and the session key are the documented const
                                  Text("n2") }),
                         Unwrap(judgement.verdict).signature));
 
-    // The session key: HKDF over the X25519 output, salted with both nonces, bound to the label,
-    // both ephemeral keys and both ids. The acceptor's ephemeral secret is the scripted bytes
-    // after its nonce.
+    // The session keys: one HKDF call per direction over the X25519 output, salted with both
+    // nonces, bound to the label, the way, the direction, both ephemeral keys and both ids. The
+    // acceptor's ephemeral secret is the scripted bytes after its nonce.
     auto const acceptorSecret = std::span<std::byte const> { acceptorScript }.subspan(NonceBytes);
     auto const shared = Unwrap(X25519SharedSecret(acceptorSecret, proof.ephemeral));
     std::vector<std::byte> salt { nonceA.begin(), nonceA.end() };
     salt.insert(salt.end(), nonceD.begin(), nonceD.end());
-    auto const info = WireFields::Encode({ Text("fastcache-raft-session-v2"), ephA, ephD, Text("n1"), Text("n2") });
-    auto const expected = DeriveSessionKey(shared, salt, info).value();
-    auto const expectedBytes = std::vector<std::byte>(expected.Bytes().begin(), expected.Bytes().end());
-    CHECK(BytesOf(judgement.session) == expectedBytes);
+    auto const expectedFor = [&](std::string_view way) {
+        auto const info =
+            WireFields::Encode({ Text("fastcache-raft-session-v3"), Text(way), dir, ephA, ephD, Text("n1"), Text("n2") });
+        auto const key = DeriveSessionKey(shared, salt, info).value();
+        return std::vector<std::byte>(key.Bytes().begin(), key.Bytes().end());
+    };
+    CHECK(BytesOf(judgement.session, &SessionKeys::diallerToAcceptor) == expectedFor("dialler-to-acceptor"));
+    CHECK(BytesOf(judgement.session, &SessionKeys::acceptorToDialler) == expectedFor("acceptor-to-dialler"));
 }
 
 TEST_CASE("A signed acceptance naming a member other than the one dialled is not acted on", "[consensus][raft][session]")
@@ -645,16 +679,18 @@ TEST_CASE("A signed acceptance naming a member other than the one dialled is not
     Side n3 { "n3", roster };
 
     auto challenging = AcceptorHandshake::Create(n3.identity, n3.random).value();
-    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", dialler.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", OneWay, dialler.random).value();
     auto const& challenge = challenging.Challenge();
     auto const proof = ProofFor(dialling, challenge);
 
     auto const accepted = std::array { std::byte { static_cast<std::uint8_t>(RaftWire::HandshakeVerdict::Accepted) } };
+    auto const oneWay = std::array { std::byte { static_cast<std::uint8_t>(OneWay) } };
     auto const signature = n3.identity.Sign(RaftPeerSignature::AcceptorVerdict,
                                             WireFields::AsFields({ std::span<std::byte const> { challenge.nonce },
                                                                    std::span<std::byte const> { challenge.ephemeral },
                                                                    Text("n1"),
                                                                    Text("n2"),
+                                                                   std::span<std::byte const> { oneWay },
                                                                    std::span<std::byte const> { proof.nonce },
                                                                    std::span<std::byte const> { proof.ephemeral },
                                                                    std::span<std::byte const> { proof.signature },
@@ -679,14 +715,19 @@ TEST_CASE("A proven dialler whose ephemeral key is low-order agrees no session",
 
     auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
     auto const& challenge = accepting.Challenge();
-    auto proof = RaftWire::ProofFrame {
-        .dialler = "n1", .target = "n2", .nonce = DrawNonce(acceptor.random).value(), .ephemeral = {}, .signature = {}
-    };
+    auto proof = RaftWire::ProofFrame { .dialler = "n1",
+                                        .target = "n2",
+                                        .direction = OneWay,
+                                        .nonce = DrawNonce(acceptor.random).value(),
+                                        .ephemeral = {},
+                                        .signature = {} };
+    auto const oneWay = std::array { std::byte { static_cast<std::uint8_t>(OneWay) } };
     proof.signature = member.Sign(RaftPeerSignature::DiallerProof,
                                   WireFields::AsFields({ std::span<std::byte const> { challenge.nonce },
                                                          std::span<std::byte const> { challenge.ephemeral },
                                                          Text("n1"),
                                                          Text("n2"),
+                                                         std::span<std::byte const> { oneWay },
                                                          std::span<std::byte const> { proof.nonce },
                                                          std::span<std::byte const> { proof.ephemeral } }));
 
@@ -705,13 +746,13 @@ TEST_CASE("A dialler whose id no handshake can carry refuses to send a proof", "
     TestPeerIdentity const tooLongIdentity { std::string(RaftWire::MaxHandshakeIdBytes + 1, 'x'),
                                              TestKeyPair("n1"),
                                              roster };
-    auto tooLong = DiallerHandshake::Create(tooLongIdentity, "n2", random).value();
+    auto tooLong = DiallerHandshake::Create(tooLongIdentity, "n2", OneWay, random).value();
     auto const refused = tooLong.Answer(challenge);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("this node's id"));
 
     TestPeerIdentity const atTheBoundIdentity { std::string(RaftWire::MaxHandshakeIdBytes, 'x'), TestKeyPair("n1"), roster };
-    auto atTheBound = DiallerHandshake::Create(atTheBoundIdentity, "n2", random).value();
+    auto atTheBound = DiallerHandshake::Create(atTheBoundIdentity, "n2", OneWay, random).value();
     CHECK(atTheBound.Answer(challenge).has_value());
 }
 
@@ -724,7 +765,7 @@ TEST_CASE("Session frames open in order, once, on their own session only", "[con
     REQUIRE(session.conclusion.session.has_value());
     REQUIRE(session.judgement.session.has_value());
 
-    FrameSealer sealer { Unwrap(session.conclusion.session) };
+    FrameSealer sealer { Unwrap(session.conclusion.session).diallerToAcceptor };
     auto const first = Heartbeat(1);
     auto const second = Heartbeat(2);
     auto const firstTag = SealWhole(sealer, first);
@@ -732,27 +773,27 @@ TEST_CASE("Session frames open in order, once, on their own session only", "[con
 
     SECTION("in order, every frame opens at the other end")
     {
-        FrameOpener opener { Unwrap(session.judgement.session) };
+        FrameOpener opener { Unwrap(session.judgement.session).diallerToAcceptor };
         CHECK(OpenWhole(opener, first, firstTag));
         CHECK(OpenWhole(opener, second, secondTag));
     }
 
     SECTION("a frame replayed on its own session is refused")
     {
-        FrameOpener opener { Unwrap(session.judgement.session) };
+        FrameOpener opener { Unwrap(session.judgement.session).diallerToAcceptor };
         REQUIRE(OpenWhole(opener, first, firstTag));
         CHECK_FALSE(OpenWhole(opener, first, firstTag));
     }
 
     SECTION("a frame out of order is refused: the one before it was dropped or delayed")
     {
-        FrameOpener opener { Unwrap(session.judgement.session) };
+        FrameOpener opener { Unwrap(session.judgement.session).diallerToAcceptor };
         CHECK_FALSE(OpenWhole(opener, second, secondTag));
     }
 
     SECTION("a frame whose bytes changed is refused")
     {
-        FrameOpener opener { Unwrap(session.judgement.session) };
+        FrameOpener opener { Unwrap(session.judgement.session).diallerToAcceptor };
         auto tampered = first;
         tampered.back() ^= std::byte { 0x01 };
         CHECK_FALSE(OpenWhole(opener, tampered, firstTag));
@@ -765,7 +806,187 @@ TEST_CASE("Session frames open in order, once, on their own session only", "[con
         // tag is now apart by construction.
         auto const other = Run(acceptor, dialler, "n2");
         REQUIRE(BytesOf(other.judgement.session) != BytesOf(session.judgement.session));
-        FrameOpener opener { Unwrap(other.judgement.session) };
+        FrameOpener opener { Unwrap(other.judgement.session).diallerToAcceptor };
         CHECK_FALSE(OpenWhole(opener, first, firstTag));
     }
+}
+
+TEST_CASE("A two-way handshake agrees two different keys and both ends hold the same pair",
+          "[consensus][raft][session][handshake][formation]")
+{
+    auto const roster = Roster();
+    Side acceptor { "n2", roster };
+    Side dialler { "n1", roster };
+
+    auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", TwoWay, dialler.random).value();
+
+    auto const proof = ProofFor(dialling, accepting.Challenge());
+    CHECK(proof.direction == TwoWay);
+    auto judgement = accepting.Judge(proof);
+    REQUIRE(judgement.outcome == ProofOutcome::Accepted);
+    CHECK(judgement.direction == TwoWay);
+    REQUIRE(judgement.verdict.has_value());
+    auto conclusion = dialling.Conclude(Unwrap(judgement.verdict));
+    REQUIRE(conclusion.outcome == VerdictOutcome::Accepted);
+
+    CHECK(BytesOf(judgement.session, &SessionKeys::diallerToAcceptor)
+          == BytesOf(conclusion.session, &SessionKeys::diallerToAcceptor));
+    CHECK(BytesOf(judgement.session, &SessionKeys::acceptorToDialler)
+          == BytesOf(conclusion.session, &SessionKeys::acceptorToDialler));
+    // One key per direction.
+    CHECK(BytesOf(judgement.session, &SessionKeys::diallerToAcceptor)
+          != BytesOf(judgement.session, &SessionKeys::acceptorToDialler));
+}
+
+TEST_CASE("A one-way handshake reports the direction its dialler signed", "[consensus][raft][session][handshake][formation]")
+{
+    auto const roster = Roster();
+    Side acceptor { "n2", roster };
+    Side dialler { "n1", roster };
+
+    auto const result = Run(acceptor, dialler, "n2", OneWay);
+    REQUIRE(result.judgement.outcome == ProofOutcome::Accepted);
+    CHECK(result.judgement.direction == OneWay);
+    REQUIRE(result.conclusion.outcome == VerdictOutcome::Accepted);
+}
+
+TEST_CASE("A session direction changed in transit is refused as a forged proof, either way",
+          "[consensus][raft][session][handshake][formation]")
+{
+    // The acceptor's reading of the direction is what the proof SAYS; what the dialler SIGNED is
+    // the only direction that verifies. A relay turning one into the other is a forgery whichever
+    // way it turns it, refused with no verdict and no session -- never an accepted connection of
+    // the shape the relay chose.
+    auto const roster = Roster();
+    Side acceptor { "n2", roster };
+    Side dialler { "n1", roster };
+
+    auto const refusedWhenTurned = [&](RaftWire::SessionDirection signedAs, RaftWire::SessionDirection arrivesAs) {
+        auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
+        auto dialling = DiallerHandshake::Create(dialler.identity, "n2", signedAs, dialler.random).value();
+        auto proof = ProofFor(dialling, accepting.Challenge());
+        REQUIRE(proof.direction == signedAs);
+        proof.direction = arrivesAs;
+        return accepting.Judge(proof);
+    };
+
+    SECTION("signed one-way, arriving as two-way")
+    {
+        auto const judgement = refusedWhenTurned(OneWay, TwoWay);
+        CHECK(judgement.outcome == ProofOutcome::Forged);
+        CHECK_FALSE(judgement.verdict.has_value());
+        CHECK_FALSE(judgement.session.has_value());
+    }
+
+    SECTION("signed two-way, arriving as one-way")
+    {
+        auto const judgement = refusedWhenTurned(TwoWay, OneWay);
+        CHECK(judgement.outcome == ProofOutcome::Forged);
+        CHECK_FALSE(judgement.verdict.has_value());
+        CHECK_FALSE(judgement.session.has_value());
+    }
+
+    SECTION("the control: each direction arriving as it was signed is accepted")
+    {
+        CHECK(refusedWhenTurned(OneWay, OneWay).outcome == ProofOutcome::Accepted);
+        CHECK(refusedWhenTurned(TwoWay, TwoWay).outcome == ProofOutcome::Accepted);
+    }
+}
+
+TEST_CASE("A verdict over another direction than the one the dialler signed is refused as forged",
+          "[consensus][raft][session][handshake][formation]")
+{
+    // The dialler's side of the same property: its verdict check re-derives the transcript from
+    // the proof IT sent, direction included. So an acceptor that accepted a two-way proof from
+    // this member -- same nonce, same ephemeral key, genuinely signed -- has signed a verdict this
+    // one-way dialler cannot verify. The two-way proof is signed by hand with the member's own
+    // key, which is the only way one exists beside a one-way proof over the same fresh values.
+    auto const roster = Roster();
+    Side acceptor { "n2", roster };
+    Side dialler { "n1", roster };
+
+    auto accepting = AcceptorHandshake::Create(acceptor.identity, acceptor.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.identity, "n2", OneWay, dialler.random).value();
+    auto const& challenge = accepting.Challenge();
+    auto turned = ProofFor(dialling, challenge);
+    turned.direction = TwoWay;
+    auto const twoWay = std::array { std::byte { static_cast<std::uint8_t>(TwoWay) } };
+    turned.signature = dialler.identity.Sign(RaftPeerSignature::DiallerProof,
+                                             WireFields::AsFields({ std::span<std::byte const> { challenge.nonce },
+                                                                    std::span<std::byte const> { challenge.ephemeral },
+                                                                    Text("n1"),
+                                                                    Text("n2"),
+                                                                    std::span<std::byte const> { twoWay },
+                                                                    std::span<std::byte const> { turned.nonce },
+                                                                    std::span<std::byte const> { turned.ephemeral } }));
+
+    auto const judgement = accepting.Judge(turned);
+    REQUIRE(judgement.outcome == ProofOutcome::Accepted);
+    REQUIRE(judgement.direction == TwoWay);
+    REQUIRE(judgement.verdict.has_value());
+
+    auto const conclusion = dialling.Conclude(Unwrap(judgement.verdict));
+    CHECK(conclusion.outcome == VerdictOutcome::Forged);
+    CHECK_FALSE(conclusion.session.has_value());
+}
+
+TEST_CASE("A frame sealed for one direction does not open in the other", "[consensus][raft][session][handshake][formation]")
+{
+    // Both ends count positions from zero. Under one shared key the acceptor's first frame and the
+    // dialler's first frame would be sealed at the same position under the same key, so a frame
+    // reflected back at the end that sent it would open there as the other end's. Each direction
+    // has its own key, so it does not.
+    auto const roster = Roster();
+    Side acceptor { "n2", roster };
+    Side dialler { "n1", roster };
+    auto const session = Run(acceptor, dialler, "n2", TwoWay);
+    REQUIRE(session.judgement.outcome == ProofOutcome::Accepted);
+    REQUIRE(session.conclusion.outcome == VerdictOutcome::Accepted);
+    auto const& atAcceptor = Unwrap(session.judgement.session);
+    auto const& atDialler = Unwrap(session.conclusion.session);
+
+    auto const frame = Heartbeat(1, "n2");
+
+    SECTION("the acceptor's frame, reflected back to the acceptor")
+    {
+        FrameSealer acceptorWrites { atAcceptor.acceptorToDialler };
+        auto const tag = SealWhole(acceptorWrites, frame);
+        FrameOpener acceptorReads { atAcceptor.diallerToAcceptor };
+        CHECK_FALSE(OpenWhole(acceptorReads, frame, tag));
+    }
+
+    SECTION("the dialler's frame, reflected back to the dialler")
+    {
+        FrameSealer diallerWrites { atDialler.diallerToAcceptor };
+        auto const tag = SealWhole(diallerWrites, frame);
+        FrameOpener diallerReads { atDialler.acceptorToDialler };
+        CHECK_FALSE(OpenWhole(diallerReads, frame, tag));
+    }
+
+    SECTION("the control: each direction's frame opens at the other end")
+    {
+        FrameSealer acceptorWrites { atAcceptor.acceptorToDialler };
+        FrameOpener diallerReads { atDialler.acceptorToDialler };
+        CHECK(OpenWhole(diallerReads, frame, SealWhole(acceptorWrites, frame)));
+
+        FrameSealer diallerWrites { atDialler.diallerToAcceptor };
+        FrameOpener acceptorReads { atAcceptor.diallerToAcceptor };
+        CHECK(OpenWhole(acceptorReads, frame, SealWhole(diallerWrites, frame)));
+    }
+}
+
+TEST_CASE("The Raft signature labels moved to v3 and no retired label is live",
+          "[consensus][raft][session][handshake][formation]")
+{
+    // The transcript gained a field, which is another construction, and a label names one. So the
+    // labels moved, and the ones they replaced are retired rather than free for a later reuse.
+    // That no live label is a retired one is `IdentityKeyLabelsSeparate`'s, a build failure.
+    for (auto const& row: RaftPeerSignatureLabels)
+    {
+        CAPTURE(LabelOf(row.construction));
+        CHECK(LabelOf(row.construction).ends_with("-v3"));
+    }
+    CHECK(std::ranges::contains(RetiredIdentityKeyLabels, std::string_view { "fastcache-raft-proof-v2" }));
+    CHECK(std::ranges::contains(RetiredIdentityKeyLabels, std::string_view { "fastcache-raft-verdict-v2" }));
 }

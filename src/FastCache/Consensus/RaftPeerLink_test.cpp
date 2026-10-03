@@ -9,30 +9,57 @@
 // refusal one end signs and the other reads as a key mismatch. So this file wires the real
 // transport to the real server over one in-memory link and asserts what each end COUNTED,
 // because a refusal pinned at one end only is half of a diagnosis.
+//
+// And a learner's link, which runs both ways on one connection: the learner's transport dials
+// TWO-WAY, and the ACCEPTOR writes back on it.
 #include <FastCache/Consensus/RaftPeerRefusals.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
+#include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
+#include <FastCache/Consensus/RaftSessionReader.hpp>
+#include <FastCache/Consensus/RaftWire.hpp>
+#include <FastCache/Core/Errors/ConsensusError.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <ranges>
+#include <span>
+#include <stop_token>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include <core/async/AsyncQueue.hpp>
+#include <core/async/ResumeOn.hpp>
 #include <core/async/Task.hpp>
+#include <core/net/IConnector.hpp>
+#include <core/net/IListener.hpp>
+#include <core/net/ISocket.hpp>
 #include <core/net/testing/InMemorySocket.hpp>
+#include <core/net/testing/SocketDecorator.hpp>
 #include <core/net/testing/TestLoop.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/BoundedWait.hpp>
+#include <tests/CountingConnector.hpp>
 #include <tests/ListenerConnector.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 
@@ -90,8 +117,9 @@ struct Link
         diallerIdentity { NodeId { shape.dialler },
                           Testing::TestKeyPair(shape.diallerMachine.empty() ? shape.dialler : shape.diallerMachine),
                           roster },
-        server { listener,      reactor,        sink,         logger,
-                 serverMetrics, serverIdentity, serverRandom, PeerServerOptions { .handshakeBound = 0ms } }
+        server { listener,       reactor,      sink,
+                 inbound,        logger,       serverMetrics,
+                 serverIdentity, serverRandom, PeerServerOptions { .handshakeBound = 0ms } }
     {
         [](RaftPeerServer* accepting) -> core::async::DetachedTask {
             co_await accepting->Run();
@@ -101,6 +129,7 @@ struct Link
             std::vector { PeerEndpoint { .id = NodeId { shape.target }, .host = "in-memory", .port = 1 } },
             reactor,
             connector,
+            returned,
             logger,
             diallerMetrics,
             diallerIdentity,
@@ -172,6 +201,7 @@ struct Link
     std::string target;               ///< The id the transport dials.
     std::string dialler;              ///< The id the transport is.
     RecordingSink sink;               ///< What the server delivered.
+    RecordingSink returned;           ///< What the one-way transport read back: never anything.
     AtomicMetricsSink serverMetrics;  ///< What the server counted.
     AtomicMetricsSink diallerMetrics; ///< What the transport counted.
     core::platform::ManualClock clock;
@@ -184,8 +214,477 @@ struct Link
     Testing::TestPeerIdentity const diallerIdentity;
     SystemSecureRandom serverRandom;
     SystemSecureRandom diallerRandom;
+    Testing::NoInboundLinks inbound; ///< What the server attached; every dialler here is one-way.
     RaftPeerServer server;
     std::unique_ptr<RaftPeerTransport> transport;
+};
+
+/// Which threads destroyed the sockets a `ProbingListener` handed out, in order.
+class DestructionLog
+{
+  public:
+    /// Record that a socket was destroyed on the calling thread.
+    void Record()
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        _threads.push_back(std::this_thread::get_id());
+    }
+
+    /// @return Every destruction's thread, in order.
+    [[nodiscard]] std::vector<std::thread::id> Threads() const
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        return _threads;
+    }
+
+  private:
+    mutable std::mutex _mutex;
+    std::vector<std::thread::id> _threads;
+};
+
+/// An accepted socket that says which thread destroyed it, and is otherwise the socket it owns.
+class ProbedSocket final: public core::net::testing::SocketDecorator
+{
+  public:
+    /// @param owned The accepted socket; owned from here on.
+    /// @param log Where the destruction is recorded; must outlive this.
+    ProbedSocket(std::unique_ptr<core::net::ISocket> owned, DestructionLog& log):
+        SocketDecorator { *owned },
+        _owned { std::move(owned) },
+        _log { log }
+    {
+    }
+
+    ProbedSocket(ProbedSocket const&) = delete;
+    ProbedSocket(ProbedSocket&&) = delete;
+    ProbedSocket& operator=(ProbedSocket const&) = delete;
+    ProbedSocket& operator=(ProbedSocket&&) = delete;
+
+    ~ProbedSocket() override
+    {
+        _log.Record();
+    }
+
+  private:
+    std::unique_ptr<core::net::ISocket> _owned;
+    DestructionLog& _log;
+};
+
+/// A listener whose every accepted socket is a `ProbedSocket` over the one `inner` accepted, and
+/// which counts them.
+class ProbingListener final: public core::net::IListener
+{
+  public:
+    /// @param inner Where connections really arrive; must outlive this.
+    /// @param log Where each accepted socket's destruction is recorded; must outlive them.
+    ProbingListener(core::net::testing::InMemoryListener& inner, DestructionLog& log) noexcept:
+        _inner { inner },
+        _log { log }
+    {
+    }
+
+    /// @copydoc IListener::accept
+    [[nodiscard]] core::async::Task<core::net::AcceptResult> accept() override
+    {
+        auto accepted = co_await _inner.accept();
+        if (!accepted.has_value())
+            co_return accepted;
+        _accepted.fetch_add(1, std::memory_order_relaxed);
+        co_return std::unique_ptr<core::net::ISocket> { std::make_unique<ProbedSocket>(*std::move(accepted), _log) };
+    }
+
+    /// @copydoc IListener::boundPort
+    [[nodiscard]] std::uint16_t boundPort() const noexcept override
+    {
+        return _inner.boundPort();
+    }
+
+    /// @copydoc IListener::close
+    void close() noexcept override
+    {
+        _inner.close();
+    }
+
+    /// @return How many connections were accepted.
+    [[nodiscard]] std::size_t Accepted() const noexcept
+    {
+        return _accepted.load(std::memory_order_relaxed);
+    }
+
+  private:
+    core::net::testing::InMemoryListener& _inner;
+    DestructionLog& _log;
+    std::atomic<std::size_t> _accepted { 0 };
+};
+
+/// Counts what a learner is delivered, for a case that floods it.
+class CountingSink final: public IRaftMessageSink
+{
+  public:
+    /// @copydoc IRaftMessageSink::Deliver
+    void Deliver(RaftMessage message) override
+    {
+        std::ignore = message;
+        ++delivered;
+    }
+
+    std::size_t delivered { 0 }; ///< How many messages arrived.
+};
+
+class SeveringConnector;
+
+/// A client socket a `SeveringConnector` handed out, and can close from outside its transport.
+class SeverableSocket final: public core::net::testing::SocketDecorator
+{
+  public:
+    /// @param owned The client end; owned from here on.
+    /// @param owner The connector that can sever it; must outlive this.
+    SeverableSocket(std::unique_ptr<core::net::ISocket> owned, SeveringConnector& owner);
+
+    SeverableSocket(SeverableSocket const&) = delete;
+    SeverableSocket(SeverableSocket&&) = delete;
+    SeverableSocket& operator=(SeverableSocket const&) = delete;
+    SeverableSocket& operator=(SeverableSocket&&) = delete;
+
+    /// Leaves the connector's list, so a sever never reaches a socket its transport destroyed.
+    ~SeverableSocket() override;
+
+  private:
+    std::unique_ptr<core::net::ISocket> _owned;
+    SeveringConnector& _owner;
+};
+
+/// Dials the leader's listener, and can drop every connection it made at once.
+///
+/// What a learner's network going away looks like from its transport: the connection closes under
+/// it, synchronously, on this thread -- which the transport's own `RequestStop` cannot stand in
+/// for, because that closes on the reactor's NEXT turn, and a leader whose outbox another thread
+/// keeps full over an `InMemorySocket` (whose writes complete inline) never yields that turn.
+class SeveringConnector final: public core::net::IConnector
+{
+  public:
+    /// @param listener Where every dial arrives; must outlive the connector.
+    explicit SeveringConnector(core::net::testing::InMemoryListener& listener) noexcept:
+        _listener { listener }
+    {
+    }
+
+    /// @copydoc IConnector::Connect
+    [[nodiscard]] core::async::Task<core::net::SocketResult> connect(std::string host,
+                                                                     std::uint16_t port,
+                                                                     core::net::DialOptions options) override
+    {
+        std::ignore = host;
+        std::ignore = port;
+        std::ignore = options;
+        auto socket = std::make_unique<SeverableSocket>(_listener.connectClient(), *this);
+        _live.push_back(socket.get());
+        co_return std::unique_ptr<core::net::ISocket> { std::move(socket) };
+    }
+
+    /// Close every connection this connector made that is still open. Each is taken off the list
+    /// BEFORE it is closed: a close completes parked operations inline, which may end the session
+    /// and destroy the socket, and nothing here touches it after.
+    void Sever() noexcept
+    {
+        while (!_live.empty())
+        {
+            auto* const socket = _live.back();
+            _live.pop_back();
+            socket->close();
+        }
+    }
+
+    /// @param socket A socket being destroyed.
+    void Forget(SeverableSocket const* socket) noexcept
+    {
+        std::erase(_live, socket);
+    }
+
+  private:
+    core::net::testing::InMemoryListener& _listener;
+    std::vector<SeverableSocket*> _live; ///< Open connections; reactor-thread only.
+};
+
+SeverableSocket::SeverableSocket(std::unique_ptr<core::net::ISocket> owned, SeveringConnector& owner):
+    SocketDecorator { *owned },
+    _owned { std::move(owned) },
+    _owner { owner }
+{
+}
+
+SeverableSocket::~SeverableSocket()
+{
+    _owner.Forget(this);
+}
+
+/// Whether a learner's transport is started as it is built. Private: never transmitted or persisted.
+enum class LearnerStart : std::uint8_t
+{
+    Idle,     ///< Built only; the case's first send starts it.
+    Dialling, ///< Started, so it dials at the next drain.
+};
+
+/// A learner: its own connector and a two-way transport over it, stopped and drained on the
+/// case's thread when it goes.
+///
+/// The waiting `Stop()` in the transport's destructor must not wait on senders only this thread
+/// can advance, so they are asked to stop and drained here first -- `~Link`'s reason, carried by
+/// the object so a case that lets one go out of scope cannot forget it.
+class LearnerEnd
+{
+  public:
+    /// Builds the learner's transport over this end's own connector.
+    using Builder = std::function<std::unique_ptr<RaftPeerTransport>(core::net::IConnector&)>;
+
+    /// @param reactor The loop its senders run on, drained here.
+    /// @param listener The leader's port, which its connector dials.
+    /// @param build Makes its transport over the connector it is handed.
+    LearnerEnd(core::net::testing::TestLoop& reactor, core::net::testing::InMemoryListener& listener, Builder const& build):
+        _reactor { reactor },
+        _connector { listener },
+        _transport { build(_connector) }
+    {
+    }
+
+    LearnerEnd(LearnerEnd const&) = delete;
+    LearnerEnd(LearnerEnd&&) = delete;
+    LearnerEnd& operator=(LearnerEnd const&) = delete;
+    LearnerEnd& operator=(LearnerEnd&&) = delete;
+
+    ~LearnerEnd()
+    {
+        Reset();
+    }
+
+    /// @return The transport.
+    [[nodiscard]] RaftPeerTransport* operator->() const noexcept
+    {
+        return _transport.get();
+    }
+
+    /// The learner goes away: its connection drops under it at once, and its process stops.
+    void GoAway()
+    {
+        _connector.Sever();
+        _transport->RequestStop();
+    }
+
+    /// Stop the transport, drain its senders, and destroy it. Idempotent.
+    void Reset()
+    {
+        if (_transport == nullptr)
+            return;
+        _transport->RequestStop();
+        _reactor.drain();
+        _reactor.drain();
+        _transport.reset();
+    }
+
+  private:
+    core::net::testing::TestLoop& _reactor;
+    SeveringConnector _connector; ///< Declared before the transport, which dials through it.
+    std::unique_ptr<RaftPeerTransport> _transport;
+};
+
+/// How many messages the leader queues for one learner in these cases.
+///
+/// Small on purpose: the cross-thread case floods 1 MiB snapshots at a learner while its session
+/// ends, and the transport's default bound (256) would let one cycle hold 256 MiB. No case here
+/// queues more than one message between drains, so the bound only ever caps the flood.
+constexpr std::size_t LearnerQueueBound = 4;
+
+/// @param records What a logger captured.
+/// @param level The lowest level counted.
+/// @return How many records were at @p level or above.
+[[nodiscard]] std::size_t CountAtOrAbove(std::vector<CapturingLogger::Record> const& records, LogLevel level)
+{
+    return static_cast<std::size_t>(
+        std::ranges::count_if(records, [level](CapturingLogger::Record const& record) { return record.level >= level; }));
+}
+
+/// A leader (server + transport, one reactor) and a learner that dials it TWO-WAY.
+///
+/// The leader's transport knows NO peer and dials through a counter, so any dial it makes shows.
+/// Its server's inbound links are that transport, as `ConsensusTier` wires them. The learner is a
+/// real `RaftPeerTransport` in `TwoWay` mode whose one peer is the leader; it is built here and
+/// started by its first `LearnerSends`, so a case that never sends has a learner that never dials.
+struct LearnerLink
+{
+    /// @param sharedRoster What both ends believe about everybody's keys.
+    explicit LearnerLink(std::shared_ptr<Testing::SharedRoster> sharedRoster = Testing::SharedRoster::Of({ "office",
+                                                                                                           "laptop" })):
+        roster { std::move(sharedRoster) },
+        leaderIdentity { NodeId { "office" }, Testing::TestKeyPair("office"), roster },
+        learnerIdentity { NodeId { "laptop" }, Testing::TestKeyPair("laptop"), roster }
+    {
+        leaderTransport = std::make_unique<RaftPeerTransport>(std::vector<PeerEndpoint> {},
+                                                              reactor,
+                                                              leaderConnector,
+                                                              leaderReturned,
+                                                              leaderLogger,
+                                                              leaderMetrics,
+                                                              leaderIdentity,
+                                                              leaderRandom,
+                                                              PeerTransportOptions { .reconnectBackoff = ReconnectBackoff,
+                                                                                     .maxQueuedPerPeer = LearnerQueueBound,
+                                                                                     .handshakeBound = 0ms });
+        leaderServer = std::make_unique<RaftPeerServer>(probing,
+                                                        reactor,
+                                                        leaderSink,
+                                                        *leaderTransport,
+                                                        leaderLogger,
+                                                        leaderMetrics,
+                                                        leaderIdentity,
+                                                        leaderRandom,
+                                                        PeerServerOptions { .handshakeBound = 0ms });
+        [](RaftPeerServer* accepting) -> core::async::DetachedTask {
+            co_await accepting->Run();
+        }(leaderServer.get());
+        leaderTransport->Start();
+
+        // Placed the way production places it: the node's `LearnMembers` reads the laptop's
+        // seat's link out of the state and tells the transport it dials in.
+        leaderTransport->LearnDialsIn({ NodeId { "laptop" } });
+
+        learnerTransport->ObserveOwnKeyRevoked([this](NodeId const& acceptor) { ownKeyRevokedBy.push_back(acceptor); });
+        reactor.drain();
+    }
+
+    LearnerLink(LearnerLink const&) = delete;
+    LearnerLink(LearnerLink&&) = delete;
+    LearnerLink& operator=(LearnerLink const&) = delete;
+    LearnerLink& operator=(LearnerLink&&) = delete;
+
+    /// The learner goes first, then the leader's transport, then its listener -- each drained on
+    /// this thread, as `~Link` does.
+    ~LearnerLink()
+    {
+        learnerTransport.Reset();
+        leaderTransport->RequestStop();
+        reactor.drain();
+        clock.advance(50ms);
+        reactor.drain();
+        listener.close();
+        reactor.drain();
+        leaderServer.reset();
+        leaderTransport.reset();
+    }
+
+    /// How a learner's transport is made: under the learner's identity, dialling the leader
+    /// two-way, and not started.
+    /// @param sink Where what the leader writes to it lands.
+    /// @param start Whether it is started, so it dials at the next drain.
+    /// @return The builder `LearnerEnd` runs over its own connector.
+    [[nodiscard]] LearnerEnd::Builder LearnerBuilder(IRaftMessageSink& sink, LearnerStart start)
+    {
+        return [this, &sink, start](core::net::IConnector& connector) {
+            auto transport = BuildLearner(connector, sink);
+            if (start == LearnerStart::Dialling)
+                transport->Start();
+            return transport;
+        };
+    }
+
+    /// @param connector How the learner dials.
+    /// @param sink Where what the leader writes to it lands.
+    /// @return A learner's transport, not started.
+    [[nodiscard]] std::unique_ptr<RaftPeerTransport> BuildLearner(core::net::IConnector& connector, IRaftMessageSink& sink)
+    {
+        return std::make_unique<RaftPeerTransport>(
+            std::vector { PeerEndpoint { .id = NodeId { "office" }, .host = "in-memory", .port = 1 } },
+            reactor,
+            connector,
+            sink,
+            learnerLogger,
+            learnerMetrics,
+            learnerIdentity,
+            learnerRandom,
+            PeerTransportOptions { .handshakeBound = 0ms, .direction = RaftWire::SessionDirection::TwoWay });
+    }
+
+    /// Another learner end under the same identity: the same machine, dialling again.
+    /// @param sink Where what the leader writes to it lands.
+    /// @return It, dialling at the next drain.
+    [[nodiscard]] LearnerEnd NewLearner(IRaftMessageSink& sink)
+    {
+        return LearnerEnd { reactor, listener, LearnerBuilder(sink, LearnerStart::Dialling) };
+    }
+
+    /// Hand the leader's transport one AppendEntries for the learner, and let it go.
+    /// @param term The message's term, so two deliveries are distinguishable.
+    void LeaderSends(std::uint64_t term)
+    {
+        leaderTransport->Send(NodeId { "laptop" }, LeaderMessage(term));
+        reactor.drain();
+    }
+
+    /// Hand the learner one AppendEntries answer for the leader, and let it go. The first call
+    /// starts the learner's transport, which dials.
+    /// @param term The message's term.
+    void LearnerSends(std::uint64_t term)
+    {
+        learnerTransport->Start();
+        learnerTransport->Send(NodeId { "office" }, LearnerMessage(term));
+        reactor.drain();
+    }
+
+    /// @param term The term.
+    /// @return What the leader sends: an AppendEntries naming the leader.
+    [[nodiscard]] static RaftMessage LeaderMessage(std::uint64_t term)
+    {
+        return RaftMessage { AppendEntriesRequest { .term = Term { .value = term },
+                                                    .leaderId = NodeId { "office" },
+                                                    .prevLogIndex = LogIndex {},
+                                                    .prevLogTerm = Term {},
+                                                    .entries = {},
+                                                    .leaderCommit = LogIndex {} } };
+    }
+
+    /// @param term The term.
+    /// @return What the learner sends: an AppendEntries answer naming the learner.
+    [[nodiscard]] static RaftMessage LearnerMessage(std::uint64_t term)
+    {
+        return RaftMessage { AppendEntriesResponse { .term = Term { .value = term },
+                                                     .result = AppendResult::Accepted,
+                                                     .matchIndex = LogIndex {},
+                                                     .followerId = NodeId { "laptop" } } };
+    }
+
+    /// @param refusal An acceptor refusal.
+    /// @return How many times the leader counted it.
+    [[nodiscard]] std::uint64_t Refused(AcceptorRefusal refusal) const
+    {
+        return leaderMetrics.Read(RowFor(refusal).counter);
+    }
+
+    std::shared_ptr<Testing::SharedRoster> roster;
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
+    core::net::testing::InMemoryListener listener;   ///< The leader's Raft port.
+    DestructionLog destroyed;                        ///< Which thread destroyed each accepted socket.
+    ProbingListener probing { listener, destroyed }; ///< What the leader's server accepts through.
+    Testing::CountingConnector leaderConnector;      ///< Connects nowhere; counts every attempt.
+    RecordingSink leaderSink;                        ///< What the leader's server delivered.
+    RecordingSink leaderReturned;                    ///< What the leader's one-way transport read back: nothing.
+    RecordingSink learnerSink;                       ///< What the learner's transport read from the leader.
+    AtomicMetricsSink leaderMetrics;
+    AtomicMetricsSink learnerMetrics;
+    CapturingLogger leaderLogger; ///< Everything the leader's transport and server said.
+    NullLogger learnerLogger;
+    Testing::TestPeerIdentity const leaderIdentity;
+    Testing::TestPeerIdentity const learnerIdentity;
+    SystemSecureRandom leaderRandom;
+    SystemSecureRandom learnerRandom;
+
+    /// Every acceptor whose SIGNED verdict told the learner its own key was revoked, in order.
+    std::vector<NodeId> ownKeyRevokedBy;
+
+    std::unique_ptr<RaftPeerTransport> leaderTransport; ///< Peers {}; declared before the server that borrows it.
+    std::unique_ptr<RaftPeerServer> leaderServer;       ///< Its inbound links are `*leaderTransport`.
+
+    /// The learner's end: built with everything above, and started by `LearnerSends`.
+    LearnerEnd learnerTransport { reactor, listener, LearnerBuilder(learnerSink, LearnerStart::Idle) };
 };
 
 } // namespace
@@ -328,4 +827,356 @@ TEST_CASE("A key revoked mid-session closes that session, and the redial is refu
         CHECK(link.Connected() == 1);
         CHECK(link.AnyRefusals() == 0);
     }
+}
+
+// A learner nobody can dial: it dials the leader TWO-WAY, the leader's server attaches that
+// session to the leader's transport, and the transport writes to the learner there -- and never
+// dials it, whatever it has to send.
+
+TEST_CASE("A leader sends to a learner over the session the learner dialled and never dials it",
+          "[consensus][raft][learner][formation]")
+{
+    LearnerLink link;
+    link.LearnerSends(1); // the learner's first frame opens the session
+    REQUIRE(link.leaderSink.received.size() == 1);
+    REQUIRE(link.leaderTransport->InboundLinks() == 1);
+
+    link.LeaderSends(7);
+    REQUIRE(link.learnerSink.received.size() == 1);
+    CHECK(std::get<AppendEntriesRequest>(link.learnerSink.received[0]).term.value == 7);
+    CHECK(link.leaderConnector.Attempts() == 0); // the leader never dialled anybody
+    CHECK(link.leaderTransport->DroppedNoSession() == 0);
+
+    // The control for the redial case: one session is one session, and supersedes nothing.
+    CHECK(link.leaderMetrics.Read(IMetricsSink::Counter::RaftInboundSessionsSuperseded) == 0);
+}
+
+TEST_CASE("A leader with no session to a learner drops its message counted and dials nobody",
+          "[consensus][raft][learner][formation]")
+{
+    LearnerLink link; // the learner has sent nothing, so nothing is attached
+    link.LeaderSends(7);
+    CHECK(link.learnerSink.received.empty());
+    CHECK(link.leaderTransport->DroppedNoSession() == 1);
+    CHECK(link.leaderMetrics.Read(IMetricsSink::Counter::RaftSendsDroppedNoSession) == 1);
+    CHECK(link.leaderConnector.Attempts() == 0);
+
+    // A peer that dials in and has no session yet is PLACED, so it is not the unknown-peer row.
+    CHECK(link.leaderTransport->DroppedUnknownPeer() == 0);
+    CHECK(link.leaderMetrics.Read(IMetricsSink::Counter::RaftSendsDroppedUnknownPeer) == 0);
+}
+
+TEST_CASE("A message for a peer the transport cannot place is dropped on a row of its own and dials nobody",
+          "[consensus][raft][learner][formation]")
+{
+    // Neither dialled nor dialling in: a member recorded with no address in a seat that is
+    // dialled, or an id nothing told this node about. Not the no-session row, which says a
+    // learner is offline -- a confident wrong signal about a machine that may not exist.
+    LearnerLink link;
+    link.leaderTransport->Send(NodeId { "desk" }, LearnerLink::LeaderMessage(7));
+    link.reactor.drain();
+
+    CHECK(link.leaderTransport->DroppedUnknownPeer() == 1);
+    CHECK(link.leaderMetrics.Read(IMetricsSink::Counter::RaftSendsDroppedUnknownPeer) == 1);
+    CHECK(link.leaderTransport->DroppedNoSession() == 0);
+    CHECK(link.leaderMetrics.Read(IMetricsSink::Counter::RaftSendsDroppedNoSession) == 0);
+    CHECK(link.leaderTransport->DroppedMessages() == 1);
+    CHECK(link.leaderConnector.Attempts() == 0);
+}
+
+TEST_CASE("A peer the transport is no longer told dials in is no longer placed", "[consensus][raft][learner][formation]")
+{
+    // Each call REPLACES what the last one said, because the caller hands over the whole
+    // state on every pass: a learner promoted to voter, or forgotten, stops dialling in.
+    LearnerLink link;
+    link.leaderTransport->LearnDialsIn({});
+    link.LeaderSends(7);
+
+    CHECK(link.leaderTransport->DroppedUnknownPeer() == 1);
+    CHECK(link.leaderTransport->DroppedNoSession() == 0);
+}
+
+TEST_CASE("A one-way session is never written on by the acceptor", "[consensus][raft][learner][formation]")
+{
+    // The control: the classic voter link. The acceptor's transport must not attach it.
+    Link link { LinkShape {} };
+    link.SendVote(1);
+    REQUIRE(link.sink.received.size() == 1);
+    // Link's server gets NoInboundLinks, which counts attaches; the one-way session made none.
+    CHECK(link.inbound.Attaches() == 0);
+}
+
+TEST_CASE("A learner's session detaches when it closes and the next send is a counted drop",
+          "[consensus][raft][learner][formation]")
+{
+    LearnerLink link;
+    link.LearnerSends(1);
+    REQUIRE(link.leaderTransport->InboundLinks() == 1);
+    link.learnerTransport->RequestStop();
+    link.reactor.drain();
+    link.clock.advance(50ms);
+    link.reactor.drain();
+    CHECK(link.leaderTransport->InboundLinks() == 0);
+    link.LeaderSends(8);
+    CHECK(link.leaderTransport->DroppedNoSession() == 1);
+    CHECK(link.leaderMetrics.Read(IMetricsSink::Counter::RaftSendsDroppedNoSession) == 1);
+    CHECK(link.leaderTransport->DroppedUnknownPeer() == 0);
+}
+
+TEST_CASE("A learner that goes away while the leader is writing to it leaves no link and no sender behind",
+          "[consensus][raft][learner][formation]")
+{
+    LearnerLink link;
+    link.LearnerSends(1);
+    REQUIRE(link.leaderTransport->InboundLinks() == 1);
+    REQUIRE(link.leaderTransport->InboundSendersRunning() == 1);
+
+    // Queued and not yet written: the learner's socket closes before the leader's sender runs,
+    // so the write goes to a connection whose other end has gone.
+    link.leaderTransport->Send(NodeId { "laptop" }, LearnerLink::LeaderMessage(8));
+    link.learnerTransport.GoAway();
+    link.reactor.drain();
+
+    CHECK(link.learnerSink.received.empty());
+    CHECK(link.leaderTransport->InboundLinks() == 0);
+    CHECK(link.leaderTransport->InboundSendersRunning() == 0);
+
+    // And the transport holds nothing a later send could reach.
+    link.LeaderSends(9);
+    CHECK(link.leaderTransport->DroppedNoSession() == 1);
+    CHECK(link.leaderConnector.Attempts() == 0);
+}
+
+TEST_CASE("A leader's transport stopping ends its learners' sessions and leaves no link behind",
+          "[consensus][raft][learner][formation]")
+{
+    LearnerLink link;
+    link.LearnerSends(1);
+    REQUIRE(link.leaderTransport->InboundLinks() == 1);
+
+    link.leaderTransport->RequestStop();
+    link.reactor.drain();
+
+    // The stop's `CloseSockets` closed the session's socket, which ended the server's reader and
+    // so detached the link; the sender ended because the stop closed its outbox.
+    CHECK(link.leaderTransport->InboundSendersRunning() == 0);
+    CHECK(link.leaderTransport->InboundLinks() == 0);
+
+    // A learner dialling in after the stop is served, but not attached: no sender starts that
+    // `Stop()` has already stopped waiting for.
+    RecordingSink lateSink;
+    auto late = link.NewLearner(lateSink);
+    late->Send(NodeId { "office" }, LearnerLink::LearnerMessage(2));
+    link.reactor.drain();
+    CHECK(link.leaderSink.received.size() == 2);
+    CHECK(link.leaderTransport->InboundLinks() == 0);
+    CHECK(link.leaderTransport->InboundSendersRunning() == 0);
+}
+
+TEST_CASE("A learner that redials replaces its old session, and the old one's end leaves the new one attached",
+          "[consensus][raft][learner][formation]")
+{
+    LearnerLink link;
+    link.LearnerSends(1);
+    REQUIRE(link.leaderTransport->InboundLinks() == 1);
+
+    // The same machine dials again -- a laptop waking with a new socket before the old one's
+    // close has reached the leader.
+    RecordingSink secondSink;
+    auto second = link.NewLearner(secondSink);
+    second->Send(NodeId { "office" }, LearnerLink::LearnerMessage(2));
+    link.reactor.drain();
+    REQUIRE(link.leaderSink.received.size() == 2);
+    REQUIRE(link.leaderTransport->InboundLinks() == 1);
+    CHECK(link.leaderTransport->InboundSendersRunning() == 1); // the replaced one's sender ended
+    CHECK(link.leaderMetrics.Read(IMetricsSink::Counter::RaftInboundSessionsSuperseded) == 1);
+
+    // The superseded session was closed by the leader, so what the old socket carries no longer
+    // arrives -- and that close, which ended the old session's reader and so its detach, did not
+    // take the new session with it.
+    link.LearnerSends(3);
+    CHECK(link.leaderSink.received.size() == 2);
+    CHECK(link.leaderTransport->InboundLinks() == 1);
+
+    link.LeaderSends(7);
+    REQUIRE(secondSink.received.size() == 1);
+    CHECK(std::get<AppendEntriesRequest>(secondSink.received[0]).term.value == 7);
+    CHECK(link.learnerSink.received.empty());
+    CHECK(link.leaderTransport->DroppedNoSession() == 0);
+}
+
+TEST_CASE("A learner whose key is withdrawn is closed at the leader's next send, counted once as the acceptor's",
+          "[consensus][raft][learner][formation][revocation]")
+{
+    LearnerLink link;
+    link.LearnerSends(1);
+    REQUIRE(link.leaderTransport->InboundLinks() == 1);
+
+    link.roster->Revoke("laptop");
+    link.LeaderSends(7);
+
+    // The sender asks the roster before sealing, so nothing reaches the learner; it closes the
+    // socket, the server's reader sees only that close, and the one count is the acceptor's row.
+    CHECK(link.learnerSink.received.empty());
+    CHECK(link.Refused(AcceptorRefusal::KeyWithdrawn) == 1);
+    CHECK(link.leaderTransport->InboundLinks() == 0);
+    CHECK(link.leaderTransport->InboundSendersRunning() == 0);
+    CHECK(link.leaderConnector.Attempts() == 0);
+}
+
+TEST_CASE("A learner's socket is destroyed on the reactor even while another thread is sending to it",
+          "[consensus][raft][learner][formation]")
+{
+    // `Send` runs on any thread -- the driver's, the reconciler's, a proposal's -- and holds what
+    // it looked up across the encode. Had it held the session's entry, a session ending meanwhile
+    // would leave `Send`'s copy the LAST owner of the link, and the accepted socket would be
+    // destroyed on the sending thread while the reactor ran. It holds only the outbox now, so
+    // every destruction is on this thread, the one that drives the reactor.
+    //
+    // A race, so it is run over many sessions with a thread sending throughout each ending, and
+    // what it sends is a snapshot large enough that the helper spends most of its time inside
+    // `Send`'s encode: with the fix no cycle can destroy the socket anywhere but here, and
+    // without it a cycle does so whenever the sender lets go while that encode is running.
+    constexpr auto Cycles = 256;
+    constexpr auto SnapshotBytes = std::size_t { 1024 } * 1024;
+    static_assert(SnapshotBytes < PeerServerOptions {}.maxFrameBytes, "the snapshot must be one the learner reads");
+    LearnerLink link;
+    auto const reactorThread = std::this_thread::get_id();
+    auto const snapshot = RaftMessage { InstallSnapshotRequest {
+        .term = Term { .value = 1 },
+        .leaderId = NodeId { "office" },
+        .lastIncludedIndex = LogIndex {},
+        .lastIncludedTerm = Term {},
+        .configuration = Configuration { .voters = { NodeId { "office" } }, .learners = { NodeId { "laptop" } } },
+        .state = std::vector<std::byte>(SnapshotBytes, std::byte { 0x5A }) } };
+
+    for (auto const cycle: std::views::iota(0, Cycles))
+    {
+        CountingSink sink;
+        auto learner = link.NewLearner(sink);
+        learner->Send(NodeId { "office" }, LearnerLink::LearnerMessage(static_cast<std::uint64_t>(cycle) + 1));
+        link.reactor.drain();
+        REQUIRE(link.leaderTransport->InboundLinks() == 1);
+
+        {
+            // RAII: stopped and joined on every way out of this scope, a failed REQUIRE included.
+            std::atomic<std::size_t> sent { 0 };
+            std::jthread const sending { [&link, &snapshot, &sent](std::stop_token const& stop) {
+                while (!stop.stop_requested())
+                {
+                    link.leaderTransport->Send(NodeId { "laptop" }, snapshot);
+                    sent.fetch_add(1, std::memory_order_relaxed);
+                }
+            } };
+
+            // Ended only once the helper is sending, or the session could end before its first
+            // lookup and the case would test nothing.
+            REQUIRE(Testing::WaitUntil(
+                "the helper thread to have sent twice",
+                [&sent] { return sent.load(std::memory_order_relaxed) >= 2; },
+                [&sent] { return std::format("{} sent", sent.load(std::memory_order_relaxed)); }));
+            learner.GoAway();
+            link.reactor.drain();
+        }
+        link.reactor.drain();
+        learner.Reset();
+    }
+
+    auto const threads = link.destroyed.Threads();
+    CHECK(threads.size() == static_cast<std::size_t>(Cycles));
+    CHECK(std::ranges::count(threads, reactorThread) == static_cast<std::ptrdiff_t>(threads.size()));
+}
+
+// The learner's half of the same link, now a real transport dialling two-way: it reads what the
+// leader writes on the connection it dialled, and hears -- signed -- when its own key is revoked.
+
+TEST_CASE("A learner's session reads what the leader sends and replies on the same connection",
+          "[consensus][raft][learner][formation]")
+{
+    LearnerLink link;
+    link.LearnerSends(1);
+    link.LeaderSends(2);
+    link.LearnerSends(3);
+    REQUIRE(link.leaderSink.received.size() == 2);
+    REQUIRE(link.learnerSink.received.size() == 1);
+    CHECK(link.learnerTransport->ConnectedPeers() == 1);
+    CHECK(link.probing.Accepted() == 1); // one connection carried both directions
+}
+
+TEST_CASE("A revoked learner key closes the two-way session in both directions at the next frame",
+          "[consensus][raft][learner][formation]")
+{
+    LearnerLink link;
+    link.LearnerSends(1);
+    link.LeaderSends(2);
+    REQUIRE(link.learnerSink.received.size() == 1);
+
+    link.roster->Revoke("laptop");
+    link.LeaderSends(3); // the leader's sender re-asks StillProves before sealing, and ends the session
+    CHECK(link.learnerSink.received.size() == 1);
+    CHECK(link.leaderMetrics.Read(RowFor(AcceptorRefusal::KeyWithdrawn).counter) == 1);
+    CHECK(link.leaderTransport->InboundLinks() == 0);
+
+    // The redial is refused SIGNED, and the learner hears that its own key was revoked.
+    link.clock.advance(std::chrono::seconds { 1 });
+    link.reactor.drain();
+    CHECK(link.learnerMetrics.Read(RowFor(DiallerRefusal::OwnKeyRevoked).counter) == 1);
+    CHECK(link.ownKeyRevokedBy == std::vector<NodeId> { "office" });
+}
+
+TEST_CASE("A leader whose key is withdrawn is closed by the learner at the leader's next frame, on the dialler's row",
+          "[consensus][raft][learner][formation][revocation]")
+{
+    // The other direction of the case above: the key withdrawn is the ACCEPTOR's, so the end that
+    // notices is the learner's reader -- the loop the acceptor runs, pulling `StillProves` on
+    // every frame -- and the count is the dialler's own row.
+    LearnerLink link;
+    link.LearnerSends(1);
+    link.LeaderSends(2);
+    REQUIRE(link.learnerSink.received.size() == 1);
+    REQUIRE(link.learnerTransport->ConnectedPeers() == 1);
+
+    link.roster->Revoke("office");
+    link.LeaderSends(3);
+    CHECK(link.learnerSink.received.size() == 1);
+    CHECK(link.learnerMetrics.Read(RowFor(DiallerRefusal::KeyWithdrawn).counter) == 1);
+    CHECK(link.learnerTransport->ConnectedPeers() == 0);
+    CHECK(link.leaderTransport->InboundLinks() == 0);
+
+    // Counted once, by the end that noticed: the leader saw only a closed connection.
+    CHECK(link.leaderMetrics.Read(RowFor(AcceptorRefusal::KeyWithdrawn).counter) == 0);
+}
+
+TEST_CASE("A two-way dialler backs off from one second doubling to thirty", "[consensus][raft][learner][formation]")
+{
+    auto delay = DialBackoffOf(RaftWire::SessionDirection::TwoWay).initial;
+    auto const expected = std::array { 1000ms, 2000ms, 4000ms, 8000ms, 16000ms, 30000ms, 30000ms };
+    for (auto const want: expected)
+    {
+        CHECK(delay == want);
+        delay = NextBackoff(RaftWire::SessionDirection::TwoWay, delay);
+    }
+    CHECK(NextBackoff(RaftWire::SessionDirection::OneWay, 250ms) == 250ms);
+}
+
+TEST_CASE("An offline learner's leader logs nothing per retransmission and dials nobody",
+          "[consensus][raft][learner][formation]")
+{
+    // What an offline learner costs the leader is nothing: no dial, since nobody can reach a
+    // learner, and no Info line per retransmission, since a learner may be away for hours and
+    // Raft retransmits every heartbeat.
+    LearnerLink link; // the learner never dials
+    for ([[maybe_unused]] auto const round: std::views::iota(0, 40))
+    {
+        link.LeaderSends(1);
+        link.clock.advance(std::chrono::milliseconds { 250 });
+        link.reactor.drain();
+    }
+    CHECK(link.leaderConnector.Attempts() == 0);
+    CHECK(CountAtOrAbove(link.leaderLogger.Snapshot(), LogLevel::Info) == 0);
+
+    // The control that makes the zero mean something: the same logger does record what the leader
+    // says at Info, once a learner has actually dialled in.
+    link.LearnerSends(1);
+    CHECK(CountAtOrAbove(link.leaderLogger.Snapshot(), LogLevel::Info) > 0);
 }

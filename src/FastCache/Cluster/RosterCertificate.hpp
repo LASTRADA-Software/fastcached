@@ -6,6 +6,7 @@
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/ConsensusError.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -43,13 +44,6 @@
 namespace FastCache::Cluster
 {
 
-/// The label a roster endorsement is signed under.
-///
-/// Its own label beside the construction it signs, as the Raft handshake's, the lease's and the
-/// node proof's are: each is signed by a member's OWN key, and a label distinct from every other
-/// is what keeps a signature made for one from verifying as another.
-inline constexpr std::string_view RosterEndorsementLabel = "fastcache-roster-endorsement-v1";
-
 /// How long one endorsement vouches for a roster: one hour (owner decision 4, #178).
 ///
 /// The longer it is, the longer a worker cut off from its leader keeps compiling -- and the
@@ -67,7 +61,7 @@ inline constexpr std::chrono::seconds RosterEndorsementRefresh { std::chrono::mi
 /// One voter's signed statement that a roster is the cluster's (#178).
 struct RosterEndorsement
 {
-    std::string clusterId;                             ///< The fleet, as `--cluster-id` names it.
+    std::string clusterId;                             ///< The fleet, as its formation record names it.
     std::uint64_t version {};                          ///< `ClusterState::rosterVersion`.
     RosterDigest rosterDigest {};                      ///< SHA-256 of the roster's encoding.
     std::chrono::system_clock::time_point notAfter {}; ///< When this endorsement stops vouching.
@@ -77,18 +71,19 @@ struct RosterEndorsement
     [[nodiscard]] friend bool operator==(RosterEndorsement const&, RosterEndorsement const&) = default;
 };
 
-/// What an endorsement's signature is over: its label and every claim but the signature,
-/// length-prefixed. One function for the signer and every verifier.
+/// What an endorsement's signature is over: its label (`IdentityKeyPurpose::RosterEndorsement`)
+/// and every claim but the signature, length-prefixed. One function for the signer and every
+/// verifier.
 /// @param endorsement The endorsement; its signature is not read.
 /// @return The signed message.
-[[nodiscard]] std::vector<std::byte> EndorsementMessage(RosterEndorsement const& endorsement);
+[[nodiscard]] LabelledMessage EndorsementMessage(RosterEndorsement const& endorsement);
 
 /// Sign an endorsement.
 /// @param claims Everything but the signature, which is ignored.
 /// @param sign Signs with the endorser's identity key.
 /// @return The endorsement, signed.
 [[nodiscard]] RosterEndorsement SignEndorsement(RosterEndorsement claims,
-                                                std::function<Ed25519Signature(std::span<std::byte const>)> const& sign);
+                                                std::function<Ed25519Signature(LabelledMessage const&)> const& sign);
 
 /// Whether @p endorsement's signature verifies under @p key.
 /// @param endorsement The endorsement.

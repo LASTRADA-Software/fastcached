@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/StateFiles.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cstdio>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <optional>
 #include <string>
+#include <system_error>
+#include <vector>
 
+#include <tests/ScopedUmask.hpp>
 #include <tests/ScratchPath.hpp>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    #include <tests/AccessList.hpp>
+#else
     #include <sys/stat.h>
 
     #include <unistd.h>
@@ -129,6 +140,36 @@ TEST_CASE("FileTrust: every exposure names its own remedy", "[platform][filetrus
 
     // Nothing to say about a file that is fit.
     CHECK(SecretExposureHint(path, SecretExposure::None).empty());
+}
+
+TEST_CASE("FileTrust: a secret one account holds is restricted to that account, not to every service",
+          "[platform][filetrust][secret]")
+{
+    // The remedy for an identity key. `SecretExposureHint`'s Windows line names no owner, so a
+    // node run by a user that followed it could no longer read its own key: the remedy has to
+    // set the list `SecureSecretFileForOwner` sets, and name the file.
+    std::filesystem::path const path { "/var/lib/fastcache-node/node-key" };
+
+    for (auto const exposure: { SecretExposure::AnyLocalAccount, SecretExposure::OwnersOwnGroup })
+    {
+        CAPTURE(exposure);
+        auto const hint = FastCache::OwnerOnlySecretExposureHint(path, exposure);
+        INFO("hint: " << hint);
+        CHECK(hint.contains(path.string()));
+        CHECK(hint.contains("restrict it to its owner"));
+#if defined(_WIN32)
+        // OWNER RIGHTS granted, the service grant absent, and inheritance cut.
+        CHECK(hint.contains("*S-1-3-4:F"));
+        CHECK_FALSE(hint.contains("S-1-5-6"));
+        CHECK(hint.contains("/inheritance:r"));
+#else
+        CHECK(hint.contains("chmod go-rwx"));
+#endif
+    }
+
+    CHECK(FastCache::OwnerOnlySecretExposureHint(path, SecretExposure::None).empty());
+    CHECK(FastCache::OwnerOnlySecretExposureHint(path, SecretExposure::Undetermined)
+          == SecretExposureHint(path, SecretExposure::Undetermined));
 }
 
 #if !defined(_WIN32)
@@ -299,4 +340,357 @@ TEST_CASE("FileTrust: securing a file that is not there fails rather than claimi
     CHECK_FALSE(FastCache::SecureSecretFileForServices(scratch / "absent.yaml"));
 }
 
+TEST_CASE("FileTrust: securing a secret for its owner takes read away from group and other", "[platform][filetrust][secret]")
+{
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-secure-owner" };
+
+    // Group- AND world-readable, so the case cannot pass on a function that removed only one.
+    auto const path = SecretFileAtMode(scratch, "node-key", S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    REQUIRE(FastCache::SecretFileExposure(path) == SecretExposure::AnyLocalAccount);
+
+    CHECK(FastCache::SecureSecretFileForOwner(path) == SecretExposure::None);
+
+    // The MODE, for the reason the services case gives: the verdict alone is the function
+    // agreeing with itself.
+    struct ::stat info {};
+
+    REQUIRE(::stat(path.c_str(), &info) == 0);
+    CHECK((info.st_mode & static_cast<::mode_t>(S_IRWXG | S_IRWXO)) == 0);
+    CHECK((info.st_mode & static_cast<::mode_t>(S_IRUSR | S_IWUSR)) == static_cast<::mode_t>(S_IRUSR | S_IWUSR));
+}
+
+#endif
+
+TEST_CASE("FileTrust: securing an absent secret for its owner answers that it could not tell",
+          "[platform][filetrust][secret]")
+{
+    // `Undetermined`, never `None`: a caller that minted nothing must not be told it secured something.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-secure-owner-absent" };
+    CHECK(FastCache::SecureSecretFileForOwner(scratch / "absent") == SecretExposure::Undetermined);
+}
+
+#if defined(_WIN32)
+
+TEST_CASE("FileTrust: securing a secret for its owner replaces a broad access list with an owner-only one",
+          "[platform][filetrust][secret]")
+{
+    // The real access-list walk on the platform it is for. A test process owns what it creates,
+    // so it may rewrite the list -- which is also why OWNER RIGHTS is what keeps it able to read
+    // the file back afterwards.
+    //
+    // The file starts UNPROTECTED, carrying entries INHERITED from its directory -- `BUILTIN\Users`
+    // read, which is what a file inherits under `%ProgramData%` -- so only a list applied WITH
+    // protection drops them: one applied without it keeps every inherited entry beside its own.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-secure-owner-dacl" };
+    auto const directory = scratch / "inheriting";
+    std::filesystem::create_directories(directory);
+    REQUIRE(FastCache::Testing::ApplyAccessList(directory, L"D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FR;;;BU)"));
+    {
+        std::ofstream { directory / "node-key" } << "secret";
+    }
+    auto const path = directory / "node-key";
+    REQUIRE(FastCache::Testing::AccessListOf(path).contains("ID;"));
+    REQUIRE(FastCache::SecretFileExposure(path) == SecretExposure::AnyLocalAccount);
+
+    CHECK(FastCache::SecureSecretFileForOwner(path) == SecretExposure::None);
+
+    // The LIST, not only the verdict: the verdict asks only whether a broad principal may read,
+    // and the services list would answer `None` too while granting every service on the machine.
+    // `P` is the protection against the parent's entries; `AI` is what `SetNamedSecurityInfo`
+    // stamps on every list it applies.
+    CHECK(FastCache::Testing::AccessListOf(path) == "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)");
+
+    // And the owner still reads it, the half that tells SECURED from BROKEN.
+    std::ifstream probe { path };
+    CHECK(probe.is_open());
+}
+
+#endif
+
+TEST_CASE("FileTrust: a file others may write is told apart from one only its owner may", "[platform][filetrust][secret]")
+{
+    // The question the state directory's walk asks of every entry: whoever OWNS a file, one another
+    // account can rewrite holds contents that account chose. Both directions, on the real
+    // filesystem, and the remedy names the entry.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-others-may-write" };
+    auto const path = scratch / "formation";
+    auto created = FastCache::CreateStateFile(path, FastCache::StateFile::Formation);
+    REQUIRE(created.has_value());
+    created->reset();
+#if defined(_WIN32)
+    REQUIRE(FastCache::Testing::ApplyAccessList(path, L"D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"));
+    CHECK(FastCache::OthersMayWrite(path) == std::expected<bool, std::error_code> { false });
+    REQUIRE(FastCache::Testing::ApplyAccessList(path, L"D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)(A;;FW;;;BU)"));
+    CHECK(FastCache::OthersMayWrite(path) == std::expected<bool, std::error_code> { true });
+    CHECK(FastCache::OthersMayWriteRemedy(path).back().contains("/remove:g"));
+#else
+    CHECK(FastCache::OthersMayWrite(path) == std::expected<bool, std::error_code> { false });
+    std::filesystem::permissions(path, std::filesystem::perms::group_write, std::filesystem::perm_options::add);
+    CHECK(FastCache::OthersMayWrite(path) == std::expected<bool, std::error_code> { true });
+    std::filesystem::permissions(path, std::filesystem::perms::group_write, std::filesystem::perm_options::remove);
+    std::filesystem::permissions(path, std::filesystem::perms::others_write, std::filesystem::perm_options::add);
+    CHECK(FastCache::OthersMayWrite(path) == std::expected<bool, std::error_code> { true });
+    CHECK(FastCache::OthersMayWriteRemedy(path)
+          == std::vector<std::string> { std::format("chmod go-w '{}'", path.string()) });
+#endif
+    CHECK(FastCache::OthersMayWriteRemedy(path).front().contains(path.string()));
+}
+
+TEST_CASE("FileTrust: a regular file is opened, and anything else is refused without blocking",
+          "[platform][filetrust][secret]")
+{
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-open-regular" };
+    auto const file = scratch / "node-key";
+    {
+        auto stream = std::ofstream { file, std::ios::binary };
+        stream << "key";
+    }
+    auto const opened = FastCache::OpenRegularFile(file);
+    REQUIRE(opened.has_value());
+    auto buffer = std::array<char, 4> {};
+    CHECK(std::fread(buffer.data(), 1, buffer.size(), opened->get()) == 3);
+
+    // Absent is its own answer, which is the one a caller may mint on.
+    auto const absent = FastCache::OpenRegularFile(scratch / "absent");
+    REQUIRE_FALSE(absent.has_value());
+    CHECK(absent.error().error == std::errc::no_such_file_or_directory);
+    CHECK_FALSE(absent.error().notRegular);
+
+    // An entry that is not a file is refused as that, never read.
+    auto const directory = FastCache::OpenRegularFile(scratch.Path());
+    REQUIRE_FALSE(directory.has_value());
+    CHECK(directory.error().notRegular);
+}
+
+#if defined(_WIN32)
+
+TEST_CASE("FileTrust: a secret created owner-only is protected from its first instant and opened by nobody else",
+          "[platform][filetrust][secret]")
+{
+    // Access is decided at OPEN: a list applied after the create would leave readable every handle
+    // opened in between. So the list is part of the create, and on Windows so is share mode 0.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-owner-only-create" };
+    auto const directory = scratch / "inheriting";
+    std::filesystem::create_directories(directory);
+    REQUIRE(FastCache::Testing::ApplyAccessList(directory, L"D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FR;;;BU)"));
+    auto const path = directory / "node-key";
+
+    auto created = FastCache::CreateStateFile(path, FastCache::StateFile::Key);
+    REQUIRE(created.has_value());
+    // Before a byte is written, and while the creating handle is held: nothing inherited, and a
+    // second open refused outright.
+    auto const list = FastCache::Testing::AccessListOf(path);
+    CHECK(list.starts_with("D:P"));
+    CHECK_FALSE(list.contains("ID;"));
+    CHECK_FALSE(list.contains("BU"));
+    CHECK(FastCache::SecretFileExposure(path) == SecretExposure::None);
+    {
+        std::ifstream racer { path };
+        CHECK_FALSE(racer.is_open());
+    }
+    created->reset();
+
+    // Exclusive: a file that is there is refused, never truncated.
+    auto const again = FastCache::CreateStateFile(path, FastCache::StateFile::Key);
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error() == std::errc::file_exists);
+}
+
+TEST_CASE("FileTrust: a directory other accounts may add to is not its owner's alone", "[platform][filetrust][secret]")
+{
+    // `BUILTIN\Users` add-file and add-subdirectory: the list measured on this project's own
+    // `%ProgramData%\fastcache-node`, and exactly the directory a planted key would be put in.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-directory-writers" };
+    auto const directory = scratch / "state";
+    std::filesystem::create_directories(directory);
+    REQUIRE(FastCache::Testing::ApplyAccessList(directory, L"D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;0x1200af;;;BU)"));
+    CHECK(FastCache::DirectoryWritersOf(directory) == FastCache::DirectoryWriters::Others);
+
+    // And the remedy names the directory in TWO commands, the conversion first, and prints them in
+    // that order; every principal `DirectoryWritersOf` scans for is in the removal. Whether they
+    // WORK is the next case's, on the inherited list where one command did not.
+    auto const hint = FastCache::DirectoryWritersHint(directory, FastCache::DirectoryWriters::Others);
+    auto const remedy = FastCache::DirectoryWritersRemedy(directory, FastCache::DirectoryWriters::Others);
+    REQUIRE(remedy.size() == 2);
+    CHECK(remedy[0] == std::format(R"(icacls "{}" /inheritance:d)", directory.string()));
+    CHECK(remedy[1].starts_with(std::format(R"(icacls "{}" /remove:g)", directory.string())));
+    CHECK(hint.find(remedy[0]) < hint.find(remedy[1]));
+    CHECK(hint.contains(remedy[1]));
+    for (auto const* const broad: { "*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545", "*S-1-5-4", "*S-1-5-32-546" })
+        CHECK(remedy[1].contains(broad));
+}
+
+TEST_CASE("FileTrust: the printed directory remedy, run as printed, restricts a directory that INHERITS its grants",
+          "[platform][filetrust][secret]")
+{
+    // The live shape: `C:\ProgramData\fastcache-node\cluster` holds no grant of its own and
+    // inherits `%ProgramData%`'s -- `Users` read and execute, and `Users` create-files and
+    // create-folders on the containers. One `icacls /inheritance:d /remove:g` reported success
+    // there and removed nothing (the removal ran before the conversion made the entries
+    // explicit), so the next start refused with the same line: a loop. Built here the same way,
+    // the remedy is RUN exactly as printed, and the directory judged afterwards.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-inherited-remedy" };
+    auto const programData = scratch / "programdata";
+    std::filesystem::create_directories(programData);
+    REQUIRE(FastCache::Testing::ApplyAccessList(programData,
+                                                L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)"
+                                                L"(A;OICIIO;FA;;;CO)(A;OICI;0x1200a9;;;BU)(A;CI;0x116;;;BU)"));
+    auto const directory = programData / "cluster";
+    std::filesystem::create_directories(directory);
+    scratch.Write("programdata/cluster/node-key", "x");
+    REQUIRE(FastCache::Testing::AccessListOf(directory).contains("ID;"));
+    REQUIRE(FastCache::DirectoryWritersOf(directory) == FastCache::DirectoryWriters::Others);
+    REQUIRE(FastCache::SecretFileExposure(directory / "node-key") != FastCache::SecretExposure::None);
+
+    for (auto const& command: FastCache::DirectoryWritersRemedy(directory, FastCache::DirectoryWriters::Others))
+    {
+        CAPTURE(command);
+        CHECK(FastCache::Testing::RunCommandLine(command) == std::optional<DWORD> { 0 });
+    }
+    CAPTURE(FastCache::Testing::AccessListOf(directory));
+    CHECK(FastCache::DirectoryWritersOf(directory) == FastCache::DirectoryWriters::OwnerOnly);
+    CHECK_FALSE(FastCache::Testing::AccessListOf(directory).contains("BU"));
+
+    // And WHY a caller holding a secret there must speak first: the removal propagates, and takes
+    // the read away from the file too -- so after the remedy nothing shows it was ever exposed.
+    CHECK(FastCache::SecretFileExposure(directory / "node-key") == FastCache::SecretExposure::None);
+}
+
+TEST_CASE("FileTrust: a directory that lets other accounts only DELETE its entries is not its owner's alone",
+          "[platform][filetrust][secret]")
+{
+    // The deletion half of planting: `FILE_DELETE_CHILD` alone lets `BUILTIN\Users` remove the key,
+    // and a node that then finds none mints a new identity and falls out of its cluster, saying
+    // only `minted`. No add-file right is granted, so only delete-child can make this `Others`.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-directory-delete-child" };
+    auto const directory = scratch / "state";
+    std::filesystem::create_directories(directory);
+    REQUIRE(FastCache::Testing::ApplyAccessList(directory, L"D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;;0x40;;;BU)"));
+    CHECK(FastCache::DirectoryWritersOf(directory) == FastCache::DirectoryWriters::Others);
+
+    // The control: the same list without the delete-child grant is the owner's alone.
+    REQUIRE(FastCache::Testing::ApplyAccessList(directory, L"D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"));
+    CHECK(FastCache::DirectoryWritersOf(directory) == FastCache::DirectoryWriters::OwnerOnly);
+}
+
+#endif
+
+TEST_CASE("FileTrust: a file this process created is its own, and so is its scratch directory",
+          "[platform][filetrust][secret]")
+{
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-file-owner" };
+    scratch.Write("mine", "x");
+    CHECK(FastCache::FileOwnerOf(scratch / "mine").standing == FastCache::FileOwnerStanding::ThisProcess);
+    CHECK_FALSE(FastCache::FileOwnerOf(scratch / "mine").name.empty());
+    CHECK(FastCache::FileOwnerOf(scratch / "absent").standing == FastCache::FileOwnerStanding::Undetermined);
+    CHECK(FastCache::DirectoryWritersOf(scratch.Path()) == FastCache::DirectoryWriters::OwnerOnly);
+    CHECK(FastCache::DirectoryWritersOf(scratch / "absent") == FastCache::DirectoryWriters::Undetermined);
+}
+
+TEST_CASE("FileTrust: a link is judged as itself, never as what it points at", "[platform][filetrust][secret]")
+{
+    // A DANGLING link is where the two readings disagree: following it finds nothing and answers
+    // `Undetermined`, while the entry itself is this process's -- so an owner read through the
+    // link is caught here even though this account owns both ends of any link it can make.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-link-entry" };
+    scratch.Write("file", "x");
+    auto const link = scratch / "link";
+    auto failure = std::error_code {};
+    std::filesystem::create_symlink(scratch / "absent-target", link, failure);
+    if (failure)
+        SKIP("this account cannot create a symbolic link here (" << failure.message() << ")");
+
+    CHECK(FastCache::IsLinkEntry(link));
+    CHECK(FastCache::FileOwnerOf(link).standing == FastCache::FileOwnerStanding::ThisProcess);
+    CHECK_FALSE(FastCache::IsLinkEntry(scratch / "file"));
+    CHECK_FALSE(FastCache::IsLinkEntry(scratch / "absent"));
+}
+
+TEST_CASE("FileTrust: a directory created owner-only is, and one already there is left alone",
+          "[platform][filetrust][secret]")
+{
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-owner-only-directory" };
+    auto const directory = scratch / "parent" / "state";
+    REQUIRE(FastCache::CreateOwnerOnlyDirectory(directory).has_value());
+    CHECK(FastCache::DirectoryWritersOf(directory) == FastCache::DirectoryWriters::OwnerOnly);
+#if defined(_WIN32)
+    CHECK(FastCache::Testing::AccessListOf(directory) == "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)");
+#else
+    CHECK((std::filesystem::status(directory).permissions() & std::filesystem::perms::all)
+          == std::filesystem::perms::owner_all);
+
+    // Already there: not re-created and not re-permissioned -- judging it is `DirectoryWritersOf`'s.
+    std::filesystem::permissions(directory, std::filesystem::perms::all);
+    REQUIRE(FastCache::CreateOwnerOnlyDirectory(directory).has_value());
+    CHECK(FastCache::DirectoryWritersOf(directory) == FastCache::DirectoryWriters::Others);
+
+    // The sticky bit is no exception: it stops others removing an entry, not creating one that is
+    // not there yet -- a state file before its first write, or a temporary.
+    std::filesystem::permissions(directory, std::filesystem::perms::all | std::filesystem::perms::sticky_bit);
+    CHECK(FastCache::DirectoryWritersOf(directory) == FastCache::DirectoryWriters::Others);
+    std::filesystem::permissions(directory, std::filesystem::perms::all);
+    CHECK(FastCache::DirectoryWritersHint(directory, FastCache::DirectoryWriters::Others).contains("chmod go-w"));
+#endif
+}
+
+#if !defined(_WIN32)
+namespace
+{
+/// The permission bits of @p path.
+/// @param path An existing entry.
+/// @return Its mode's low nine bits.
+[[nodiscard]] unsigned ModeOf(std::filesystem::path const& path)
+{
+    struct ::stat info {};
+
+    REQUIRE(::lstat(path.c_str(), &info) == 0);
+    return static_cast<unsigned>(info.st_mode) & 0777U;
+}
+} // namespace
+
+TEST_CASE("FileTrust: every state file is created with exactly its row's mode, whatever the umask",
+          "[platform][filetrust][secret]")
+{
+    // A permissive umask must not WIDEN a state file -- under umask 000 a create's 0666 would let
+    // every account rewrite what the node acts on -- and a strict one must not narrow one the
+    // service's account has to read. So the mode is the row's, set on the descriptor, under each.
+    for (auto const mask: { 0000U, 0002U, 0022U, 0077U })
+    {
+        CAPTURE(mask);
+        FastCache::Testing::ScopedUmask const scoped { static_cast<::mode_t>(mask) };
+        FastCache::Testing::ScratchDirectory const scratch { "fastcached-state-file-modes" };
+        for (auto const file: FastCache::Enumerators<FastCache::StateFile>())
+        {
+            auto const path = scratch / FastCache::StateFileName(file);
+            CAPTURE(path.string());
+            auto created = FastCache::CreateStateFile(path, file);
+            REQUIRE(created.has_value());
+            CHECK(ModeOf(path) == FastCache::StateFilePosixMode(file));
+            created->reset();
+        }
+    }
+    // The key alone is its owner's; nothing may be written by anybody else.
+    CHECK(FastCache::StateFilePosixMode(FastCache::StateFile::Key) == 0600U);
+    for (auto const file: FastCache::Enumerators<FastCache::StateFile>())
+        CHECK((FastCache::StateFilePosixMode(file) & 0022U) == 0U);
+}
+
+TEST_CASE("FileTrust: a link where a file is expected is refused as not a file, never followed",
+          "[platform][filetrust][secret]")
+{
+    // The FIFO half of the same rule -- an entry that would BLOCK an ordinary open -- is the node
+    // key case's, which bounds its wait and releases a blocked reader; asserted here it would hang
+    // the whole binary the day the open blocks again.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-open-link" };
+    auto const target = scratch / "target";
+    {
+        auto stream = std::ofstream { target };
+        stream << "x";
+    }
+    auto const link = scratch / "link";
+    std::filesystem::create_symlink(target, link);
+    auto const followed = FastCache::OpenRegularFile(link);
+    REQUIRE_FALSE(followed.has_value());
+    CHECK(followed.error().notRegular);
+}
 #endif

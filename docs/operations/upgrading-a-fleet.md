@@ -84,8 +84,11 @@ cannot.** Check the servers.
 **#178 made every consensus connection prove each member's OWN identity key**, where it
 proved the cluster's shared key, so the peer wire moved from version 3 to 4 and the two
 cannot talk: an older peer proves only the shared key, and accepting it would be the
-fallback the handshake exists to refuse. Upgrade a cluster's consensus members together,
-and before you do, give each member's `--raft-peer` list every other member's key:
+fallback the handshake exists to refuse. Upgrade a cluster's consensus members together.
+The steps below are for moving onto the build that introduced version 4, whose members
+still named one another with `--raft-peer`; that flag is gone since
+[the formation record decides a cluster's shape](#the-flags-that-carried-a-clusters-shape),
+and before you upgraded, you gave each member's `--raft-peer` list every other member's key:
 
 1. On each member, run `fastcache-compile-node --print-identity` with the flags it runs
    with, as the account it runs as. It prints the member's `raft-peer` token, key included.
@@ -98,6 +101,22 @@ A member left out of step 2 is refused by the others as a key never given
 key -- which the leader does for itself when it leads, and which `--cluster-admit` with
 `@<key>` does for anybody else. A mixed cluster shows as
 `fastcache_raft_peer_connections_refused_no_handshake_total` on the new nodes.
+
+## The flags that carried a cluster's shape
+
+`--raft-peer`, `--raft-join`, `--cluster-id` and `--serve-scheduler` are **gone**, with
+their configuration-file keys `raft_peer`, `raft_join`, `cluster_id` and
+`serve_scheduler`. Which cluster a node is in, whether it founded that cluster or joined
+it, and whether it serves the scheduler are the node's **formation record**, kept in its
+state directory beside its identity and written by the node itself — its first start mints
+a cluster of one — so a flag carrying any of them would be a second author that could
+disagree with the record.
+
+A node that names one refuses to start, by name, and so does a service registration that
+replays one: remove them from every command line, configuration file and registration
+before upgrading. A member upgraded from a build that had them starts as a cluster of one,
+and rejoins its fleet by admission, as any machine does — see
+[adding a machine to a running cluster](../tools/fastcache-compile-node.md#adding-a-machine-to-a-running-cluster).
 
 ## Signed leases and the certified roster
 
@@ -144,18 +163,18 @@ tombstones). Either way the directory is intact; what an operator does is:
 
 1. Stop the node.
 2. Move `raft-state`, `raft-log` and `raft-snapshot` out of its `--cluster-dir`,
-   **leaving `node-id` and `node-key` where they are** — the identity lives in the same
-   directory, and a wiped identity is a different node, which the cluster would have to
-   admit while it went on counting the old one.
-3. If its cluster is **already running on this build**, start it again with
-   `--raft-join` added and its `--raft-peer` list unchanged. It waits to be admitted
-   instead of bootstrapping a cluster of itself — which a node whose bootstrap set names
-   only itself would otherwise do — and a cluster that still counts it catches it up from
-   the leader; one that has forgotten it admits it again with `--cluster-admit` (or
-   `--cluster-admit-learner`). It keeps its identity, so it needs no `--enroll-from`.
-4. If **every** member was moved aside together, start them as they were. They come back
-   with empty logs under their bootstrap configuration (`--raft-peer`), or waiting to be
-   admitted if they were started with `--raft-join`.
+   **leaving `node-id`, `node-key` and `formation` where they are** — the identity and the
+   record of how the node formed live in the same directory, and a wiped identity is a
+   different node, which the cluster would have to admit while it went on counting the
+   old one.
+3. If the node **joined** its fleet, start it again: its formation record says so, and it
+   waits to be admitted instead of bootstrapping a cluster of itself. A cluster that still
+   counts it catches it up from the leader; one that has forgotten it admits it again with
+   `--cluster-admit` (or `--cluster-admit-learner`). It keeps its identity, so it needs no
+   `--enroll-from`.
+4. The node that **founded** its fleet bootstraps it again, alone, so move its state aside
+   only when every member's was moved aside together. Start it first, admit the others
+   again from it, and make again every `--cluster-*` change made since the fleet formed.
 
 A RUNNING member offered a snapshot by a leader on another state format does not stop: it
 refuses the snapshot and stays behind, raising the `unreadable-leader-snapshot` condition

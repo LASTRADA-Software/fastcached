@@ -17,6 +17,7 @@
 #include <fstream>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -995,4 +996,37 @@ TEST_CASE("A store this build wrote opens, and damage to it is still damage", "[
     auto const damaged = OpenAndLoad(scratch.Path());
     REQUIRE(damaged.has_value());
     CHECK(Unwrap(damaged).code == ConsensusErrorCode::StorageFailure);
+}
+
+TEST_CASE("The store names every file it writes", "[consensus][raft][storage]")
+{
+    // What archives a store moves exactly `StoreFileNames()` out of the directory, so a file the
+    // store writes and the list does not name would stay behind in the root -- and a learner
+    // starting there would open the solitary log it was meant to have put away.
+    ScratchDirectory scratch { "raft-store-files" };
+    {
+        auto store = OpenStore(scratch.Path());
+        REQUIRE(store.SaveState(PersistentState { .currentTerm = Term { .value = 3 }, .votedFor = "n1" }).has_value());
+        REQUIRE(store
+                    .SaveLog(LogAppend { .fromIndex = LogIndex { .value = 1 },
+                                         .entries = { Entry(1, "a"), Entry(2, "b"), Entry(3, "c") } })
+                    .has_value());
+        REQUIRE(store
+                    .SaveSnapshot(RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 2 },
+                                                 .lastIncludedTerm = Term { .value = 2 },
+                                                 .configuration = { .voters = { "n1" }, .learners = {} },
+                                                 .state = FastCache::BytesFromString("applied") })
+                    .has_value());
+    }
+
+    auto written = std::set<std::string> {};
+    for (auto const& entry: std::filesystem::directory_iterator { scratch.Path() })
+        if (entry.is_regular_file())
+            written.insert(entry.path().filename().string());
+    auto named = std::set<std::string> {};
+    for (auto const name: FileRaftStorage::StoreFileNames())
+        named.emplace(name);
+
+    REQUIRE_FALSE(written.empty()); // a store that wrote nothing would pass the equality below vacuously
+    CHECK(written == named);
 }

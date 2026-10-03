@@ -4,6 +4,7 @@
 #include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "NodeKey.hpp"
 
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Ed25519.hpp>
@@ -64,6 +65,22 @@ inline constexpr std::chrono::milliseconds EnrollPollInterval { 2'000 };
 /// re-run and never a wrong state.
 inline constexpr std::chrono::milliseconds EnrollTotalBound { std::chrono::minutes { 10 } };
 
+/// How long a single enrollment exchange may take to connect.
+///
+/// Generous for `ClusterAdminCli::DialTimeout`'s reason: the seed answers from memory, so anything
+/// slower than this is a network problem rather than a busy leader. One constant for the one-shot
+/// `--enroll-from`, the operator's enrollment verbs and a formation controller's poll.
+inline constexpr std::chrono::milliseconds EnrollDialTimeout { 10'000 };
+
+/// How many CONSECUTIVE `NotLeader` redirects an enrollment follows before it goes back to where it
+/// started.
+///
+/// Bounded because two nodes each holding a stale `_knownLeader` can name each other forever -- the
+/// same reason the worker's heartbeat bounds its own following. Three is a cluster in the middle of
+/// an election, which settles. A chain bound, never a total: a node that answered on its own behalf
+/// resets it. One constant for `RunEnrollClient`, `RunEnrollAdmin` and a formation controller.
+inline constexpr int MaxEnrollRedirects = 3;
+
 /// What one exchange with the seed said, once the wire's vocabulary has been mapped
 /// onto what this client does next.
 ///
@@ -123,10 +140,10 @@ enum class ConsensusHistory : std::uint8_t
 {
     /// Nothing has ever been recorded -- term zero, no vote, no log, no snapshot.
     ///
-    /// A machine that has never run consensus, and also a machine started with
-    /// `--raft-join` that has not been admitted yet: a node whose bootstrap set is
-    /// EMPTY never stands for election, so it writes nothing. Those two are one state
-    /// deliberately, because both may enrol.
+    /// A machine that has never run consensus, and also a node that joined a fleet and has
+    /// not been admitted yet: a node whose bootstrap set is EMPTY never stands for
+    /// election, so it writes nothing. Those two are one state deliberately, because both
+    /// may enrol.
     None,
 
     /// A term, a vote, a log entry or a snapshot is present.
@@ -136,16 +153,16 @@ enum class ConsensusHistory : std::uint8_t
 /// What `--cluster-dir` says about this node's consensus past.
 ///
 /// **This is #1299, and its whole difficulty is WHERE it is asked rather than what it
-/// asks.** A node started without `--raft-join` bootstraps a cluster of itself, elects
-/// itself, and can never afterwards be admitted to anybody else's -- a one-way mistake
-/// a forty-machine rollout offers thirty-nine times, and a silent one: the node comes
-/// up, leads a cluster of one, and looks healthy on every surface.
+/// asks.** A node that runs consensus founds a cluster of one at its first start, elects
+/// itself, and cannot afterwards be admitted to anybody else's as it stands -- it would
+/// refuse every leader but its own -- and silently: the node comes up, leads a cluster of
+/// one, and looks healthy on every surface.
 ///
 /// **It is deliberately not a `StartupPolicyRejection` row**, and the reason is the
 /// whole of why the obvious implementation would be worse than the bug. A one-machine
-/// deployment with `--listen-raft` and no `--raft-join` bootstraps a cluster of itself
-/// ON PURPOSE and correctly, and it is indistinguishable on disk from the trapped node
-/// -- same self-election, same records. What separates them is not the state, it is
+/// deployment is exactly that cluster of one, ON PURPOSE and correctly, and it is
+/// indistinguishable on disk from the node asking to join -- same self-election, same
+/// records. What separates them is not the state, it is
 /// what the operator is trying to do RIGHT NOW, and only the enrol path knows that: a
 /// node running `--enroll-from` is by definition asking to join somebody else's
 /// cluster. In the startup table this predicate would refuse a legitimate single-node
@@ -180,9 +197,9 @@ enum class ConsensusHistory : std::uint8_t
 struct JoinerIdentity
 {
     std::string nodeId;       ///< The id it minted.
-    std::string raftEndpoint; ///< Where its consensus port answers; empty for a worker.
-    CompileCacheWire::EnrollRole role { CompileCacheWire::EnrollRole::Member }; ///< What it asks to be.
-    Ed25519PublicKey publicKey {};                                              ///< The key it asks under.
+    std::string nodeEndpoint; ///< The `0xFC` endpoint it states; empty while no live role states one.
+    CompileCacheWire::EnrollRole role { CompileCacheWire::EnrollRole::Learner }; ///< What it asks to be.
+    Ed25519PublicKey publicKey {};                                               ///< The key it asks under.
 };
 
 /// What to tell the operator once a roster has been handed over, or why it cannot be believed.
@@ -193,14 +210,16 @@ struct JoinerIdentity
 /// another machine's key for this id. Either way nothing it names can be trusted, and saying
 /// "admitted" over it would be a confident wrong signal.
 ///
-/// Pure, so what an admitted machine is told -- the fingerprint to compare, and the
-/// `--raft-peer` tokens its next start needs -- is pinned by a test rather than reachable only
-/// through a dial loop.
+/// Pure, so what an admitted machine is told -- the fingerprint to compare, what approval
+/// recorded, and where this machine wrote what it kept -- is pinned by a test rather than
+/// reachable only through a dial loop. It names no step this build does not have.
 /// @param self Who this node asked to be admitted as.
 /// @param roster The roster's bytes, as received.
+/// @param stateDirectory Where this node minted the identity it asked under.
 /// @return The text to print, or why the roster is refused.
 [[nodiscard]] std::expected<std::string, std::string> DescribeAdmission(JoinerIdentity const& self,
-                                                                        std::span<std::byte const> roster);
+                                                                        std::span<std::byte const> roster,
+                                                                        std::filesystem::path const& stateDirectory);
 
 /// Keep the leader's certified roster as an admitted worker's trust root, and say what happened.
 ///
@@ -239,10 +258,10 @@ struct JoinerIdentity
 /// would only be reachable through one.
 /// @param report What the leader answered.
 /// @return The text to print, ending in a newline.
-[[nodiscard]] std::string RenderEnrollmentReport(CompileCacheWire::EnrollmentReport const& report);
+[[nodiscard]] std::string RenderEnrollmentReport(CompileCacheWire::EnrollmentReport const& report,
+                                                 std::string_view scheduler);
 
-/// Run one `--enroll-open`/`--enroll-close`/`--enroll-list`/`--enroll-approve`/
-/// `--enroll-reject` and report what the seed said.
+/// Run one `--enroll-list`/`--enroll-approve`/`--enroll-reject` and report what the seed said.
 ///
 /// The OPERATOR's half of this pair. It asks `--scheduler`, like every other cluster
 /// verb -- the first of them that connects, as `DialFirstReachable` decides -- follows
@@ -264,6 +283,8 @@ struct JoinerIdentity
 ///        read.
 /// @param credential What to present to the seed, read where it is presented.
 /// @param random Where a minted identity's bits come from, the id's and the key's alike.
+/// @param keyGuard Who may read the identity key file, asked of one that is there and
+///        established on one minted here.
 /// @param wait How the poll loop spends the gap between two asks, and how it measures
 ///        the bound it is spending -- the seam `DrainWithin` takes, for the reason it
 ///        takes one: a loop that counts its requested sleeps states a bound and
@@ -276,6 +297,7 @@ struct JoinerIdentity
     NodeConfig const& cfg,
     ICredentialSource const& credential,
     ISecureRandom& random,
+    INodeKeyFileGuard& keyGuard,
     IDrainWait& wait = DefaultDrainWait(),
     IEndpointDialer& dialer = DefaultOneShotDialer(),
     core::platform::IWallClock const& wallClock = core::platform::defaultSystemWallClock());

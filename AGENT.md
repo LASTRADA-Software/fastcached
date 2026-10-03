@@ -462,8 +462,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   (#1552): `CanRestore` first, answered `Rejected`, staying BEHIND rather than stopping the tier.
 - A seeded draw must be identical on every standard library — `UniformInRange`, never
   `std::uniform_int_distribution`.
-- A node being admitted must never have bootstrapped a cluster of itself, so `RaftConfig::voters`
-  and `learners` may legally both be **empty**. Who a node dials is not who it counts.
+- A node must have DISSOLVED its solitary cluster (its store ARCHIVED, never deleted) before it adopts a
+  roster, so `RaftConfig::voters` and `learners` may both be **empty**. Who a node dials is not who it counts.
 - **Voting is a property of the CONFIGURATION, never of a role (#1449)** — a `StandingTable` row
   through `Membership::StandingOf`, never a fifth `Role`, and a learner refuses a vote by ROW.
   Every quorum read counts VOTERS through `Membership::QuorumOf`; replication reaches both sets.

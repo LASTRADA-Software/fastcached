@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/MembershipPolicy.hpp>
+#include <FastCache/Cluster/SelfForgotten.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 
@@ -290,12 +291,31 @@ TEST_CASE("A half-record is dropped rather than proposed", "[cluster][membership
     // `Validate` would refuse it at the leader anyway, so proposing it would cost a
     // refusal per interval and change nothing -- and the diagnostic would name the
     // reconciler rather than whatever produced the half-record.
-    ClusterState const state;
+    //
+    // A record with no consensus endpoint is half a record only where its seat is DIALLED:
+    // `n2` is recorded a voter, so the desire that would re-admit it without an address is
+    // dropped. A learner's empty endpoint is a whole record, and has a case of its own below.
+    auto const state = StateOf({ Member("n2", "10.0.0.2:6675") });
     auto const proposals =
         Proposals(state, { Desire("", "10.0.0.1:6675"), Desire("n2", ""), Desire("n3", "10.0.0.3:6675") });
 
     REQUIRE(proposals.size() == 1);
     CHECK(proposals[0].key == "n3");
+}
+
+TEST_CASE("A learner's own empty endpoint is desired as it is and not skipped", "[cluster][membership][learner][formation]")
+{
+    // A learner dials in, so its record carries no consensus endpoint -- and the desire
+    // that moves its scheduler endpoint must not be mistaken for a half-record and dropped,
+    // or the learner's announcement never lands.
+    auto const state = StateOf({ Learner("laptop", "") });
+    auto const plan = Plan(state, { Desire("laptop", "", "laptop:6674") }, Voters({ "office" }));
+
+    REQUIRE(plan.proposals.size() == 1);
+    CHECK(plan.proposals[0].kind == CommandKind::AddLearner);
+    CHECK(plan.proposals[0].value.empty());
+    CHECK(plan.proposals[0].schedulerEndpoint == "laptop:6674");
+    CHECK(plan.forgotten.empty());
 }
 
 TEST_CASE("A quorum that already matches the state proposes nothing", "[cluster][membership][quorum]")
@@ -361,8 +381,8 @@ TEST_CASE("A member the cluster forgot is removed from the quorum", "[cluster][m
 TEST_CASE("A member an operator typed is never proposed for removal", "[cluster][membership][quorum]")
 {
     // The defect this parameter exists for, and it took a running cluster to find:
-    // `--raft-peer` puts a member in the CONFIGURATION and nothing puts it in the
-    // STATE, so on a cluster whose peers were typed rather than discovered the
+    // the bootstrap set puts a member in the CONFIGURATION and nothing puts it in the
+    // STATE, so on a cluster whose members were bootstrapped rather than admitted the
     // leader's own record is all the state holds. Read as "everybody else was
     // forgotten", that proposed removing every peer, one per commit, until a healthy
     // three-node cluster was one node counting only itself -- with the other two
@@ -404,6 +424,22 @@ TEST_CASE("A member with no dialable address is not counted", "[cluster][members
     CHECK_FALSE(QuorumChange(state, { "n1" }).has_value());
 }
 
+TEST_CASE("A learner with no endpoint is added to the configuration and a voter with none is not",
+          "[cluster][membership][quorum][learner][formation]")
+{
+    // Whether an addition waits for an address is the SEAT's link: a learner dials in, so
+    // replication reaches it over the session it opens and it needs none; a member recorded
+    // a voter is dialled, and one with no address would join and never catch up -- so it is
+    // never added, and so never promoted.
+    auto const learner = StateOf({ Member("office", "10.0.0.1:6675"), Learner("laptop", "") });
+    auto const added = QuorumChange(learner, Voters({ "office" }), "office");
+    REQUIRE(added.has_value());
+    CHECK(Unwrap(added) == Configured({ "office" }, { "laptop" }));
+
+    auto const voter = StateOf({ Member("office", "10.0.0.1:6675"), Member("desk", "") });
+    CHECK_FALSE(QuorumChange(voter, Voters({ "office" }), "office").has_value());
+}
+
 TEST_CASE("A counted member is not dropped for an unreadable address", "[cluster][membership][quorum]")
 {
     // The asymmetry is the point. Refusing to ADD an undialable member costs
@@ -416,7 +452,7 @@ TEST_CASE("A counted member is not dropped for an unreadable address", "[cluster
 
 TEST_CASE("A node given no bootstrap set proposes no removal", "[cluster][membership][quorum]")
 {
-    // A `--raft-join` node was told nothing about the cluster's shape, so every
+    // A node that joined a fleet was told nothing about the cluster's shape, so every
     // member is equally unexplained to it -- and once elected it would otherwise
     // remove all of them, one per commit, which is the identical failure the
     // bootstrap comparison exists to prevent reached through the one path that has
@@ -459,13 +495,13 @@ TEST_CASE("A member the cluster forgot leaves the quorum whoever typed it, becau
     RevokeUnder(state, "n3", 0x33);
     auto const typed = std::vector<Consensus::NodeId> { "n1", "n2", "n3" };
 
-    // Typed into this node's own `--raft-peer`, and removed anyway. n2 -- typed, absent and
+    // In this node's own bootstrap set, and removed anyway. n2 -- typed, absent and
     // never forgotten -- is the control beside it, and stays.
     auto const change = QuorumChange(state, { "n1", "n2", "n3" }, "n1", typed);
     REQUIRE(change.has_value());
     CHECK(Unwrap(change) == Voters({ "n1", "n2" }));
 
-    // On a `--raft-join` node, which has no bootstrap set to compare against: removed too, and
+    // On a joined node, which has no bootstrap set to compare against: removed too, and
     // this is the successor that has to do it when the forgotten member was the LEADER -- cut
     // off by its revoked key before the removal it proposes for itself could commit.
     auto const joined = QuorumChange(state, { "n1", "n2", "n3" }, "n1", std::vector<Consensus::NodeId> {});
@@ -755,7 +791,7 @@ struct Leader
 
 /// A leader that bootstrapped alone and admitted `n2` and `n3` because discovery proved them.
 ///
-/// The shape `--discovery` builds: one machine names only itself in `--raft-peer`, so
+/// The shape formation builds: one machine bootstraps only itself, so
 /// every other member was admitted at runtime -- which is what makes it removable.
 /// @return The leader, settled: a pass proposes nothing.
 [[nodiscard]] Leader DiscoveredCluster()
@@ -991,7 +1027,7 @@ TEST_CASE("A machine recorded as a voter and discovered again stays a voter", "[
         CHECK(leader.active == Voters({ "n1", "n2" }));
     }
 
-    SECTION("typed into --raft-peer, so counted by the configuration and recorded nowhere")
+    SECTION("in the bootstrap set, so counted by the configuration and recorded nowhere")
     {
         // The case a desire's source cannot see: nothing puts a typed member in the state,
         // so to anything reading only the state it looks exactly like a newcomer.
@@ -1085,7 +1121,7 @@ TEST_CASE("The last voter is never removed, and forgetting it is refused by name
     CHECK(PrepareForget(Voters({ "n1" }), "n9", std::nullopt).has_value());
 
     // And the forget names the key this node holds live for the id (#1555), which is what
-    // revokes a member a `--raft-peer` line typed with its key. None held, none named.
+    // revokes a bootstrap member named with its key. None held, none named.
     auto typed = Ed25519PublicKey {};
     typed.fill(std::byte { 0x29 });
     auto const keyed = PrepareForget(Voters({ "n1", "n2" }), "n2", typed);
@@ -1201,4 +1237,34 @@ TEST_CASE("A node's own key reaches the roster, and no opinion about a peer's le
         Apply(applied, moved[0]);
         CHECK(applied.members[0].publicKey == std::optional { key });
     }
+}
+
+TEST_CASE("A node is forgotten only when its record is gone and its key is revoked or its host tombstoned",
+          "[cluster][membership][formation]")
+{
+    // #1539's reading, public: a formation controller asks it of the state it applies, and a leader
+    // asks it before proposing a forgotten member's removal. One reading, so the two cannot disagree.
+    auto state = ClusterState {};
+    CHECK_FALSE(IsSelfForgotten(state, "n2", "10.0.0.2")); // a fresh state has recorded nothing: never a forget
+
+    auto revoked = Ed25519PublicKey {};
+    revoked.fill(std::byte { 0x22 });
+    state.revokedKeys.push_back(RevokedKey { .id = "n2", .publicKey = revoked });
+    CHECK(IsSelfForgotten(state, "n2", "10.0.0.2"));
+    CHECK_FALSE(IsSelfForgotten(state, "n3", "10.0.0.3")); // somebody else's revocation is not this node's
+
+    state.members.push_back(ClusterMember { .id = "n2",
+                                            .raftEndpoint = "",
+                                            .schedulerEndpoint = {},
+                                            .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
+                                            .seat = MemberSeat::Learner,
+                                            .publicKey = std::nullopt });
+    CHECK_FALSE(IsSelfForgotten(state, "n2", "10.0.0.2")); // re-admitted under a new key: a member
+
+    // A tombstone for its host, with its record gone, is a forget too; a tombstone alone beside a
+    // record is not, since a client forget may name a member's host.
+    auto tombstoned = ClusterState {};
+    tombstoned.forgotten.emplace_back("10.0.0.4");
+    CHECK(IsSelfForgotten(tombstoned, "n4", "10.0.0.4"));
+    CHECK_FALSE(IsSelfForgotten(tombstoned, "n4", "")); // a learner that names no host is judged by its key alone
 }

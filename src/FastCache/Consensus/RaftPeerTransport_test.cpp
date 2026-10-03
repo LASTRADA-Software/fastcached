@@ -9,18 +9,24 @@
 // choosing, answers with a verdict, and then checks every frame's tag under the session it
 // agreed before recording it -- so "a frame reached the peer" still means what it meant, on a
 // connection whose two ends proved their ids.
+#include <FastCache/Consensus/IRaftMessageSink.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
+#include <FastCache/Consensus/RaftSessionReader.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
+#include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -32,12 +38,16 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
 
+#include <core/async/DetachedTask.hpp>
+#include <core/async/ResumeOn.hpp>
 #include <core/net/SleepUntil.hpp>
 #include <core/net/testing/InMemorySocket.hpp>
 #include <core/net/testing/TestLoop.hpp>
@@ -147,12 +157,89 @@ class RecordingSocket final: public core::net::ISocket
 
         /// Seeds each connection's nonce, so no two connections share one.
         std::uint64_t nextSeed { 1 };
+
+        /// A message the acceptor writes, sealed, right behind an accepting verdict -- in the same
+        /// bytes, so the dialler's next read returns both at once.
+        std::optional<RaftMessage> writeBehindVerdict;
+
+        /// Once a session is accepted, park a read with nothing to return rather than report EOF,
+        /// as a live acceptor with nothing to say does -- so a two-way session stays open until
+        /// one end closes it.
+        bool holdSessionOpen { false };
+
+        /// The loop a parked session read names, so `WriteToDialler` SETTLES it at once and the
+        /// reader resumes LATER, in that loop's drain -- as a real socket completes a read (G2).
+        /// Null keeps the fake's inline resume. What lets a case place a writer's queued wake AHEAD
+        /// of a read that has already completed, which an inline resume can never produce.
+        core::net::EventLoop* deferCompletionsThrough { nullptr };
+
+        /// Writes the transport attempted on a connection already closed. Each is refused, as a
+        /// real socket refuses it; counted so a case can tell "never tried" from "tried and failed".
+        std::size_t writesAfterClose { 0 };
+
+        /// The bytes queued behind the proof on the last connection: its verdict, and whatever
+        /// was written behind it.
+        std::size_t queuedAfterProof { 0 };
+
+        /// Every read that returned bytes, by how many it returned, in order.
+        std::vector<std::size_t> readSizes;
+
+        /// The connection now open, or null: what `Harness::AcceptorWrites` speaks through.
+        RecordingSocket* current { nullptr };
+    };
+
+    /// How a frame the acceptor writes mid-session is sealed. Private: a test fixture's.
+    enum class SealAs : std::uint8_t
+    {
+        Sealed,       ///< Under the session's acceptor-to-dialler key, at its next position.
+        TagCorrupted, ///< Sealed, then one bit of the tag flipped.
+        Unsealed,     ///< As given: for a frame the dialler refuses before it reads any tag.
     };
 
     /// @param record Where to append; must outlive the socket.
     explicit RecordingSocket(std::shared_ptr<Record> const& record):
         RecordingSocket { record, record->NextConnection() }
     {
+        std::scoped_lock const guard { _record->mutex };
+        _record->current = this;
+    }
+
+    RecordingSocket(RecordingSocket const&) = delete;
+    RecordingSocket(RecordingSocket&&) = delete;
+    RecordingSocket& operator=(RecordingSocket const&) = delete;
+    RecordingSocket& operator=(RecordingSocket&&) = delete;
+
+    /// Leaves the record, so a case never speaks through a connection the transport destroyed.
+    ~RecordingSocket() override
+    {
+        std::scoped_lock const guard { _record->mutex };
+        if (_record->current == this)
+            _record->current = nullptr;
+    }
+
+    /// Write @p frame to the dialler as the acceptor would mid-session, and hand it to a read
+    /// parked for it -- inline, as `Close()` completes one.
+    /// @param frame A frame as `RaftWire::Encode` produced it, possibly altered by the case.
+    /// @param seal How it is sealed.
+    void WriteToDialler(std::vector<std::byte> frame, SealAs seal)
+    {
+        if (seal != SealAs::Unsealed && _sealer.has_value())
+        {
+            auto const bytes = std::span<std::byte const> { frame };
+            auto tag = _sealer->Seal(bytes.first(RaftWire::HeaderSize), bytes.subspan(RaftWire::HeaderSize));
+            if (seal == SealAs::TagCorrupted)
+                tag.front() ^= std::byte { 0x01 };
+            frame.insert(frame.end(), tag.begin(), tag.end());
+        }
+        _inbound.insert(_inbound.end(), frame.begin(), frame.end());
+
+        auto* const parked = std::exchange(_parkedRead, nullptr);
+        if (parked == nullptr)
+            return;
+        auto const count = std::min(_parkedBuffer.size(), _inbound.size());
+        std::copy_n(_inbound.begin(), count, _parkedBuffer.begin());
+        _inbound.erase(_inbound.begin(), _inbound.begin() + static_cast<std::ptrdiff_t>(count));
+        parked->complete(core::net::IoResult { count });
     }
 
     /// @param record Where to append; must outlive the socket.
@@ -198,15 +285,31 @@ class RecordingSocket final: public core::net::ISocket
             auto const count = std::min(buffer.size(), _inbound.size());
             std::copy_n(_inbound.begin(), count, buffer.begin());
             _inbound.erase(_inbound.begin(), _inbound.begin() + static_cast<std::ptrdiff_t>(count));
+            {
+                std::scoped_lock const guard { _record->mutex };
+                _record->readSizes.push_back(count);
+            }
             return core::net::IoAwaitable { core::net::IoResult { count } };
         }
 
         // An acceptor that says nothing: parked until `Close()`, which is what the
-        // handshake bound does to it.
-        if (_script == AcceptorScript::NeverChallenges)
+        // handshake bound does to it -- or a session held open with nothing more to say.
+        auto holdOpen = false;
         {
+            std::scoped_lock const guard { _record->mutex };
+            holdOpen = _record->holdSessionOpen && _opener.has_value();
+            _deferThrough = _opener.has_value() ? _record->deferCompletionsThrough : nullptr;
+        }
+        if (_script == AcceptorScript::NeverChallenges || holdOpen)
+        {
+            _parkedBuffer = buffer;
             return core::net::IoAwaitable {
-                [](void* owner, core::net::IoAwaitable& self) { static_cast<RecordingSocket*>(owner)->_parkedRead = &self; },
+                [](void* owner, core::net::IoAwaitable& self) {
+                    auto* const socket = static_cast<RecordingSocket*>(owner);
+                    socket->_parkedRead = &self;
+                    if (socket->_deferThrough != nullptr)
+                        self.cancelThrough(*socket->_deferThrough, core::net::ParkId::invalid());
+                },
                 [](void* owner, void* awaitable) noexcept {
                     auto* const socket = static_cast<RecordingSocket*>(owner);
                     if (socket->_parkedRead == awaitable)
@@ -228,8 +331,14 @@ class RecordingSocket final: public core::net::ISocket
         // dropped -- and "the peer moved, so its connection was closed" is a case
         // whose whole observable consequence is the write that then fails.
         if (_closed)
+        {
+            {
+                std::scoped_lock const guard { _record->mutex };
+                ++_record->writesAfterClose;
+            }
             return core::net::IoAwaitable { std::unexpected { core::net::NetError {
                 .code = core::net::NetErrorCode::ConnReset, .systemCode = 0, .context = "socket closed" } } };
+        }
 
         if (!_opener.has_value())
             return AnswerProof(buffer);
@@ -337,9 +446,11 @@ class RecordingSocket final: public core::net::ISocket
             return core::net::IoAwaitable { core::net::IoResult { buffer.size() } };
 
         NodeId self;
+        auto behind = std::optional<RaftMessage> {};
         {
             std::scoped_lock const guard { _record->mutex };
             self = _record->acceptorId.value_or(proof->target);
+            behind = _record->writeBehindVerdict;
         }
 
         Testing::ScriptedSecureRandom random { ConnectionNonceScript(_seed) };
@@ -352,7 +463,26 @@ class RecordingSocket final: public core::net::ISocket
             _inbound.insert(_inbound.end(), verdict.begin(), verdict.end());
         }
         if (judgement.outcome == ProofOutcome::Accepted && judgement.session.has_value())
-            _opener.emplace(*std::move(judgement.session));
+        {
+            _opener.emplace(std::move(judgement.session->diallerToAcceptor));
+            _sealer.emplace(std::move(judgement.session->acceptorToDialler));
+
+            // Sealed as the acceptor's transport seals it, at position zero of its own direction,
+            // and appended to the SAME bytes as the verdict. Whatever the proof's direction, so a
+            // one-way dialler is shown not to read it rather than simply never being sent it.
+            if (behind.has_value())
+            {
+                auto frame = RaftWire::Encode(*behind);
+                auto const bytes = std::span<std::byte const> { frame };
+                auto const tag = _sealer->Seal(bytes.first(RaftWire::HeaderSize), bytes.subspan(RaftWire::HeaderSize));
+                frame.insert(frame.end(), tag.begin(), tag.end());
+                _inbound.insert(_inbound.end(), frame.begin(), frame.end());
+            }
+        }
+        {
+            std::scoped_lock const guard { _record->mutex };
+            _record->queuedAfterProof = _inbound.size();
+        }
         return core::net::IoAwaitable { core::net::IoResult { buffer.size() } };
     }
 
@@ -363,10 +493,15 @@ class RecordingSocket final: public core::net::ISocket
     std::uint64_t _seed { 0 };
     std::deque<std::byte> _inbound;
     std::optional<FrameOpener> _opener;
+    std::optional<FrameSealer> _sealer; ///< What this acceptor writes under, once it has accepted.
     core::net::IoAwaitable* _parkedWrite { nullptr };
     core::net::IoAwaitable* _parkedRead { nullptr };
+    std::span<std::byte> _parkedBuffer;              ///< The parked read's buffer, which `WriteToDialler` fills.
+    core::net::EventLoop* _deferThrough { nullptr }; ///< The loop a parked session read names, or none.
     bool _closed { false };
 };
+
+using SealAs = RecordingSocket::SealAs;
 
 /// A connector under the test's control: it can refuse, or hand out sockets
 /// that record what the transport wrote.
@@ -469,6 +604,22 @@ class ScriptedConnector final: public core::net::IConnector
     return { PeerEndpoint { .id = "n2", .host = "unused", .port = 1 } };
 }
 
+/// Records what a two-way session delivers.
+class RecordingSink final: public IRaftMessageSink
+{
+  public:
+    /// @copydoc IRaftMessageSink::Deliver
+    void Deliver(RaftMessage message) override
+    {
+        if (throwOnDeliver)
+            throw std::runtime_error { "a sink that throws" };
+        received.push_back(std::move(message));
+    }
+
+    std::vector<RaftMessage> received; ///< In arrival order; the reactor is this thread.
+    bool throwOnDeliver { false };     ///< Throw instead of recording: a driver that failed.
+};
+
 /// Clock, reactor and transport, wired the way production wires them.
 ///
 /// Every wall-clock wait has left this file. The senders run on a `core::net::testing::TestLoop`
@@ -485,6 +636,7 @@ struct Harness
     CapturingLogger logger;
     AtomicMetricsSink metrics;
     SystemSecureRandom random;
+    RecordingSink sink; ///< What an acceptor wrote back on a two-way session.
 
     /// What the transport believes about everybody's keys. A case may replace it, or revoke
     /// from it, before `Build`; revoking after is a key withdrawn from an open session.
@@ -499,9 +651,54 @@ struct Harness
 
     std::unique_ptr<RaftPeerTransport> transport;
 
+    Harness() = default;
+    Harness(Harness const&) = delete;
+    Harness(Harness&&) = delete;
+    Harness& operator=(Harness const&) = delete;
+    Harness& operator=(Harness&&) = delete;
+
+    /// Stops the senders on this thread, whichever way the case left: a failing `REQUIRE` unwinds
+    /// past a case's own `RequestStopAndDrain`, and the transport's waiting `Stop()` must not run
+    /// on the thread that drives its reactor. A second stop after the case's own is a no-op.
+    ~Harness()
+    {
+        if (transport != nullptr)
+            RequestStopAndDrain();
+    }
+
+    /// Make the acceptor write @p frame on the connection now open, handed to a read parked for it.
+    /// @param frame A frame as `RaftWire::Encode` produced it, possibly altered by the case.
+    /// @param seal How it is sealed.
+    void AcceptorWrites(std::vector<std::byte> frame, SealAs seal) const
+    {
+        RecordingSocket* socket = nullptr;
+        {
+            std::scoped_lock const guard { record->mutex };
+            socket = record->current;
+        }
+        REQUIRE(socket != nullptr);
+        socket->WriteToDialler(std::move(frame), seal);
+    }
+
+    /// `AcceptorWrites`, run by the loop in its next turn rather than now.
+    ///
+    /// Posted from the case's thread, so it lands in the loop's inbound queue in the order posted: a
+    /// `Send` made after this queues the writer's wake BEHIND it. The write then settles the parked
+    /// read inside that turn, and a read naming the loop (`deferCompletionsThrough`) resumes its
+    /// reader at the back of the ready queue -- behind that writer.
+    /// @param frame A frame as `RaftWire::Encode` produced it.
+    /// @param seal How it is sealed.
+    void AcceptorWritesNextTurn(std::vector<std::byte> frame, SealAs seal)
+    {
+        [](Harness* harness, std::vector<std::byte> bytes, SealAs sealAs) -> core::async::DetachedTask {
+            co_await core::async::ResumeOn { harness->reactor };
+            harness->AcceptorWrites(std::move(bytes), sealAs);
+        }(this, std::move(frame), seal);
+    }
+
     /// Make the peer's socket refuse or accept writes.
     /// @param fail Whether writes should fail.
-    void FailWrites(bool fail)
+    void FailWrites(bool fail) const
     {
         std::scoped_lock const guard { record->mutex };
         record->failWrites = fail;
@@ -517,8 +714,8 @@ struct Harness
     void Build(PeerTransportOptions options = {})
     {
         identity = Testing::TestPeerIdentity::Honest("n1", roster);
-        transport =
-            std::make_unique<RaftPeerTransport>(OnePeer(), reactor, connector, logger, metrics, *identity, *nonces, options);
+        transport = std::make_unique<RaftPeerTransport>(
+            OnePeer(), reactor, connector, sink, logger, metrics, *identity, *nonces, options);
     }
 
     /// Build the transport over one peer and start its sender.
@@ -660,10 +857,11 @@ TEST_CASE("A message for this node itself is not sent anywhere", "[consensus][ra
     AtomicMetricsSink metrics;
     auto const identity = Testing::TestPeerIdentity::Honest("n1", Roster());
     SystemSecureRandom random;
+    RecordingSink sink;
 
     std::vector<PeerEndpoint> peers { PeerEndpoint { .id = "n1", .host = "self", .port = 1 },
                                       PeerEndpoint { .id = "n2", .host = "unused", .port = 2 } };
-    RaftPeerTransport transport { std::move(peers), reactor, connector, logger, metrics, *identity, random };
+    RaftPeerTransport transport { std::move(peers), reactor, connector, sink, logger, metrics, *identity, random };
     transport.Start();
     reactor.drain();
 
@@ -896,8 +1094,9 @@ TEST_CASE("Stop is idempotent and safe before Start", "[consensus][raft][transpo
     AtomicMetricsSink metrics;
     auto const identity = Testing::TestPeerIdentity::Honest("n1", Roster());
     SystemSecureRandom random;
+    RecordingSink sink;
 
-    RaftPeerTransport transport { OnePeer(), reactor, connector, logger, metrics, *identity, random };
+    RaftPeerTransport transport { OnePeer(), reactor, connector, sink, logger, metrics, *identity, random };
     transport.Stop();
     transport.Stop();
     CHECK(transport.SendersRunning() == 0);
@@ -1327,4 +1526,452 @@ TEST_CASE("An acceptor that opens with a Raft message is not a challenge", "[con
     CHECK(harness.transport->ConnectedPeers() == 0);
 
     harness.RequestStopAndDrain();
+}
+
+// A learner's transport dials TWO-WAY: the acceptor writes back on the connection, and this end
+// reads what arrives there through the reader its handshake used.
+
+namespace
+{
+
+/// What the scripted acceptor writes back on a two-way session: an AppendEntries naming it.
+/// @param term The message's term, so two deliveries are distinguishable.
+/// @return The message.
+[[nodiscard]] RaftMessage LeaderAppend(std::uint64_t term)
+{
+    return RaftMessage { AppendEntriesRequest { .term = Term { .value = term },
+                                                .leaderId = NodeId { "n2" },
+                                                .prevLogIndex = LogIndex {},
+                                                .prevLogTerm = Term {},
+                                                .entries = {},
+                                                .leaderCommit = LogIndex {} } };
+}
+
+/// The dial counts either side of a backoff's end.
+struct DialsAround
+{
+    std::size_t before { 0 }; ///< One millisecond before the wait elapsed.
+    std::size_t after { 0 };  ///< Once it had.
+};
+
+/// Advance the clock to one millisecond short of @p wait and then to it, and report the dials
+/// counted at each point -- so a case asserts the redial happened AT the wait, not merely after.
+/// @param harness The transport under test.
+/// @param wait The backoff the sender is expected to be taking.
+/// @return The dial counts either side.
+[[nodiscard]] DialsAround StepThrough(Harness& harness, std::chrono::milliseconds wait)
+{
+    harness.clock.advance(wait - 1ms);
+    harness.reactor.drain();
+    auto const before = harness.connector.Attempts();
+    harness.clock.advance(1ms);
+    harness.reactor.drain();
+    return DialsAround { .before = before, .after = harness.connector.Attempts() };
+}
+
+} // namespace
+
+TEST_CASE("A two-way dialler reads the frame an acceptor wrote in the same read as its verdict",
+          "[consensus][raft][transport][learner]")
+{
+    // The acceptor writes its first session frame right behind its verdict, and the two arrive
+    // in ONE read -- so a reader built for the handshake alone and dropped at the verdict would
+    // take the frame with it, silently. The arrangement is asserted as well as the delivery, or
+    // a fake that happened to split the bytes would pass without testing anything.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->writeBehindVerdict = LeaderAppend(5);
+    }
+    harness.Start(PeerTransportOptions { .reconnectBackoff = 10s, .direction = RaftWire::SessionDirection::TwoWay });
+
+    REQUIRE(harness.sink.received.size() == 1);
+    CHECK(std::get<AppendEntriesRequest>(harness.sink.received[0]).term.value == 5);
+
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        auto const frameBytes = RaftWire::Encode(LeaderAppend(5)).size() + RaftWire::TagSize;
+        CHECK(harness.record->queuedAfterProof > frameBytes); // the verdict AND the frame
+        REQUIRE_FALSE(harness.record->readSizes.empty());
+        CHECK(harness.record->readSizes.back() == harness.record->queuedAfterProof);
+    }
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A one-way dialler never reads past the verdict", "[consensus][raft][transport][learner]")
+{
+    // The control for the case above: the same acceptor writing the same frame behind its
+    // verdict, and a transport that proves one-way. It reads nothing after the verdict, so the
+    // frame is never delivered and its sender is unaffected.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->writeBehindVerdict = LeaderAppend(5);
+    }
+    harness.Start(PeerTransportOptions { .reconnectBackoff = 10s });
+    harness.transport->Send("n2", Vote(1));
+    harness.reactor.drain();
+
+    CHECK(harness.Writes() == 1);
+    CHECK(harness.sink.received.empty());
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A two-way dialler that cannot connect waits one second, doubling to thirty",
+          "[consensus][raft][transport][learner]")
+{
+    Harness harness;
+    harness.connector.Refuse(true);
+    harness.Start(PeerTransportOptions { .direction = RaftWire::SessionDirection::TwoWay });
+    REQUIRE(harness.connector.Attempts() == 1);
+
+    auto dials = std::size_t { 1 };
+    for (auto const wait: { 1000ms, 2000ms, 4000ms, 8000ms, 16000ms, 30000ms, 30000ms })
+    {
+        auto const around = StepThrough(harness, wait);
+        CHECK(around.before == dials);
+        CHECK(around.after == dials + 1);
+        dials = around.after;
+    }
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A one-way dialler that cannot connect waits a flat quarter second", "[consensus][raft][transport]")
+{
+    Harness harness;
+    harness.connector.Refuse(true);
+    harness.Start();
+    REQUIRE(harness.connector.Attempts() == 1);
+
+    auto dials = std::size_t { 1 };
+    for ([[maybe_unused]] auto const round: std::views::iota(0, 6))
+    {
+        auto const around = StepThrough(harness, 250ms);
+        CHECK(around.before == dials);
+        CHECK(around.after == dials + 1);
+        dials = around.after;
+    }
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A two-way session that carried a frame each way starts the backoff again from one second",
+          "[consensus][raft][transport][learner]")
+{
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->writeBehindVerdict = LeaderAppend(3);
+        harness.record->holdSessionOpen = true;
+    }
+    harness.connector.Refuse(true);
+    harness.Start(PeerTransportOptions { .direction = RaftWire::SessionDirection::TwoWay });
+
+    // Two refusals grow the wait to four seconds.
+    CHECK(StepThrough(harness, 1000ms).after == 2);
+    CHECK(StepThrough(harness, 2000ms).after == 3);
+
+    // The third redial is answered: a frame arrives, and one goes out.
+    harness.connector.Refuse(false);
+    REQUIRE(StepThrough(harness, 4000ms).after == 4);
+    REQUIRE(harness.sink.received.size() == 1);
+    harness.transport->Send("n2", Vote(1));
+    harness.reactor.drain();
+    REQUIRE(harness.Writes() == 1);
+    REQUIRE(harness.transport->ConnectedPeers() == 1);
+
+    // The session breaks; the peer was up, so the next dial is one second away, not eight.
+    harness.FailWrites(true);
+    harness.transport->Send("n2", Vote(2));
+    harness.reactor.drain();
+    REQUIRE(harness.transport->ConnectedPeers() == 0);
+    auto const around = StepThrough(harness, 1000ms);
+    CHECK(around.before == 4);
+    CHECK(around.after == 5);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A two-way session the acceptor ends wakes its idle writer", "[consensus][raft][transport][learner]")
+{
+    // The reader ends first, with nothing queued: only the zero-length frame it pushes wakes the
+    // writer parked on the outbox, and without it the session would sit half-closed -- counted as
+    // connected, and never redialled -- until the next message came.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->writeBehindVerdict = LeaderAppend(4);
+    }
+    harness.Start(PeerTransportOptions { .reconnectBackoff = 100ms, .direction = RaftWire::SessionDirection::TwoWay });
+
+    // The scripted acceptor reports EOF once its frame is read, so the session ends at once --
+    // and ends WHOLE, the writer included, with no message ever sent.
+    REQUIRE(harness.sink.received.size() == 1);
+    CHECK(harness.transport->ConnectedPeers() == 0);
+
+    harness.clock.advance(100ms);
+    harness.reactor.drain();
+    CHECK(harness.connector.Attempts() == 2);
+    CHECK(harness.sink.received.size() == 2);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A wake left behind by one two-way session does not end the next", "[consensus][raft][transport][learner]")
+{
+    // A message is queued before the first session, so its writer is busy with it -- a write on a
+    // socket the reader has just closed -- when the reader ends and pushes its zero-length frame.
+    // Nobody pops that frame in the first session; the SECOND session's writer finds it first,
+    // and must step over it, since that session's reader is alive.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->writeBehindVerdict = LeaderAppend(4);
+    }
+    harness.Build(PeerTransportOptions { .reconnectBackoff = 100ms, .direction = RaftWire::SessionDirection::TwoWay });
+    harness.transport->Send("n2", Vote(8));
+    harness.transport->Start();
+    harness.reactor.drain();
+
+    REQUIRE(harness.sink.received.size() == 1);
+    CHECK(harness.Writes() == 0); // the queued vote went to a closed socket, and was dropped
+    CHECK(harness.transport->ConnectedPeers() == 0);
+
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->holdSessionOpen = true;
+    }
+    harness.clock.advance(100ms);
+    harness.reactor.drain();
+    REQUIRE(harness.connector.Attempts() == 2);
+    CHECK(harness.transport->ConnectedPeers() == 1);
+
+    harness.transport->Send("n2", Vote(9));
+    harness.reactor.drain();
+    CHECK(harness.Writes() == 1);
+    CHECK(harness.transport->ConnectedPeers() == 1);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A withdrawn acceptor key the reader counted is not counted again by the writer",
+          "[consensus][raft][transport][learner][revocation]")
+{
+    // The interleaving is placed, not waited for: a `Send` posts the writer's wake, and before the
+    // reactor turns, the acceptor's frame reaches the parked reader -- which finds the acceptor's
+    // key withdrawn, counts it and ends the session. Only then does the writer pop the vote. It must
+    // not judge that vote against the roster a second time: the session is already over.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->holdSessionOpen = true;
+    }
+    harness.Start(PeerTransportOptions { .reconnectBackoff = 10s, .direction = RaftWire::SessionDirection::TwoWay });
+    REQUIRE(harness.transport->ConnectedPeers() == 1);
+
+    harness.roster->Revoke("n2");
+    harness.transport->Send("n2", Vote(1));
+    harness.AcceptorWrites(RaftWire::Encode(LeaderAppend(7)), SealAs::Sealed);
+    harness.reactor.drain();
+
+    CHECK(harness.Refused(DiallerRefusal::KeyWithdrawn) == 1);
+    CHECK(harness.Writes() == 0); // the vote popped after the ending went nowhere
+    CHECK(harness.sink.received.empty());
+    CHECK(harness.transport->ConnectedPeers() == 0);
+}
+
+TEST_CASE("A frame popped after the reader ended is dropped, never written to the socket the reader closed",
+          "[consensus][raft][transport][learner]")
+{
+    // The reader ends on a frame whose tag fails, closes the socket and wakes the writer -- behind a
+    // vote a `Send` had already queued. That vote is dropped with the session. Judging it instead
+    // would find the key still good, seal it, and write it to a socket the reader had closed: a write
+    // a real socket refuses too, so only the ATTEMPT tells the two apart.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->holdSessionOpen = true;
+    }
+    harness.Start(PeerTransportOptions { .reconnectBackoff = 10s, .direction = RaftWire::SessionDirection::TwoWay });
+    REQUIRE(harness.transport->ConnectedPeers() == 1);
+
+    harness.transport->Send("n2", Vote(1));
+    harness.AcceptorWrites(RaftWire::Encode(LeaderAppend(7)), SealAs::TagCorrupted);
+    harness.reactor.drain();
+
+    CHECK(harness.Refused(DiallerRefusal::FrameTag) == 1);
+    CHECK(harness.Writes() == 0);
+    CHECK(harness.transport->DroppedMessages() == 1);
+    std::scoped_lock const guard { harness.record->mutex };
+    CHECK(harness.record->writesAfterClose == 0);
+}
+
+TEST_CASE("A withdrawn acceptor key the writer counted is not counted again by the reader",
+          "[consensus][raft][transport][learner][revocation]")
+{
+    // The mirror of the case above. A real socket settles a read when its data arrives and resumes
+    // the reader later, in the loop's drain, behind whatever is already ready. So the writer can run
+    // FIRST -- the roster refuses it, it counts the withdrawal and ends the session -- and the reader
+    // then resumes with an acceptor frame that had already arrived, and finds the same withdrawn key.
+    //
+    // Placed, not waited for: the acceptor's write is posted first and the `Send` second, so in the
+    // next turn the write settles the read while the writer's wake is already ready, and the reader's
+    // resumption files in behind it. Neither half's own check can stop the second count here -- the
+    // reader has not ended when the writer counts, and the writer has when the reader does -- so
+    // only the session's once-only count can.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->holdSessionOpen = true;
+        harness.record->deferCompletionsThrough = &harness.reactor;
+    }
+    harness.Start(PeerTransportOptions { .reconnectBackoff = 10s, .direction = RaftWire::SessionDirection::TwoWay });
+    REQUIRE(harness.transport->ConnectedPeers() == 1);
+
+    harness.roster->Revoke("n2");
+    harness.AcceptorWritesNextTurn(RaftWire::Encode(LeaderAppend(7)), SealAs::Sealed);
+    harness.transport->Send("n2", Vote(1));
+    harness.reactor.drain();
+
+    CHECK(harness.Refused(DiallerRefusal::KeyWithdrawn) == 1);
+    CHECK(harness.Writes() == 0);
+    CHECK(harness.sink.received.empty());
+    CHECK(harness.transport->ConnectedPeers() == 0);
+}
+
+TEST_CASE("A frame the acceptor writes that the dialler cannot use ends the session on the dialler's own row",
+          "[consensus][raft][transport][learner]")
+{
+    // Only the dialler reads this direction, so a frame it refuses here is counted nowhere else.
+    // One row per `SessionEnd` but a close, and the case asserts WHICH moved: the named one, once,
+    // and no other dialler row at all. A row whose refusal went missing from `DiallerSessionEndRows`
+    // fails here under its own name.
+    struct Row
+    {
+        std::string_view what;
+        SessionEnd end;
+        DiallerRefusal expected;
+        SealAs seal;
+        std::vector<std::byte> (*frame)();
+        void (*arrange)(Harness&) { nullptr };
+    };
+    auto const rows = std::array {
+        Row { .what = "a key withdrawn before the acceptor's frame",
+              .end = SessionEnd::KeyWithdrawn,
+              .expected = DiallerRefusal::KeyWithdrawn,
+              .seal = SealAs::Sealed,
+              .frame = [] { return RaftWire::Encode(LeaderAppend(1)); },
+              .arrange = [](Harness& harness) { harness.roster->Revoke("n2"); } },
+        Row { .what = "a tag that does not verify",
+              .end = SessionEnd::BadTag,
+              .expected = DiallerRefusal::FrameTag,
+              .seal = SealAs::TagCorrupted,
+              .frame = [] { return RaftWire::Encode(LeaderAppend(1)); } },
+        Row { .what = "a verified message naming another member",
+              .end = SessionEnd::WrongSender,
+              .expected = DiallerRefusal::FrameSender,
+              .seal = SealAs::Sealed,
+              .frame =
+                  [] {
+                      return RaftWire::Encode(RaftMessage { AppendEntriesRequest { .term = Term { .value = 1 },
+                                                                                   .leaderId = NodeId { "n3" },
+                                                                                   .prevLogIndex = LogIndex {},
+                                                                                   .prevLogTerm = Term {},
+                                                                                   .entries = {},
+                                                                                   .leaderCommit = LogIndex {} } });
+                  } },
+        Row { .what = "a verified frame at another wire version",
+              .end = SessionEnd::Unreadable,
+              .expected = DiallerRefusal::FrameUnreadable,
+              .seal = SealAs::Sealed,
+              .frame =
+                  [] {
+                      auto frame = RaftWire::Encode(LeaderAppend(1));
+                      frame[1] = std::byte { 0x7F };
+                      return frame;
+                  } },
+        Row {
+            .what = "a frame declaring more than the dialler buffers",
+            .end = SessionEnd::OverCap,
+            .expected = DiallerRefusal::FrameOverCap,
+            .seal = SealAs::Unsealed,
+            .frame =
+                [] {
+                    auto frame = RaftWire::Encode(LeaderAppend(1));
+                    WireFields::PutBigEndian<std::uint32_t>(
+                        frame, WireFrame::LengthOffset, static_cast<std::uint32_t>(SessionReadLimits {}.maxFrameBytes + 1));
+                    return frame;
+                } },
+        Row { .what = "a frame that is not this wire",
+              .end = SessionEnd::BadMagic,
+              .expected = DiallerRefusal::FrameBadMagic,
+              .seal = SealAs::Unsealed,
+              .frame =
+                  [] {
+                      auto frame = RaftWire::Encode(LeaderAppend(1));
+                      frame[0] ^= std::byte { 0xFF };
+                      return frame;
+                  } },
+    };
+
+    // Every ending but a close has a row here, so a new `SessionEnd` cannot go uncounted unnoticed.
+    for (auto const ending: Enumerators<SessionEnd>())
+    {
+        INFO("SessionEnd " << static_cast<int>(ending));
+        auto const covered = std::ranges::any_of(rows, [ending](Row const& row) { return row.end == ending; });
+        CHECK(covered == (ending != SessionEnd::PeerClosed));
+    }
+
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        Harness harness;
+        {
+            std::scoped_lock const guard { harness.record->mutex };
+            harness.record->holdSessionOpen = true;
+        }
+        harness.Start(PeerTransportOptions { .reconnectBackoff = 10s, .direction = RaftWire::SessionDirection::TwoWay });
+        REQUIRE(harness.transport->ConnectedPeers() == 1);
+
+        if (row.arrange != nullptr)
+            row.arrange(harness);
+        harness.AcceptorWrites(row.frame(), row.seal);
+        harness.reactor.drain();
+
+        CHECK(harness.sink.received.empty());
+        CHECK(harness.transport->ConnectedPeers() == 0);
+        for (auto const& refusal: DiallerRefusals)
+            CHECK(harness.Refused(refusal.refusal) == (refusal.refusal == row.expected ? 1U : 0U));
+    }
+}
+
+TEST_CASE("A two-way session whose reader throws ends whole rather than stranding its writer",
+          "[consensus][raft][transport][learner]")
+{
+    // `whenAll` waits for both halves, and the writer ends only when the reader tells it to. A reader
+    // that threw and skipped that would leave the writer parked on an empty outbox for good: the
+    // peer counted as connected, and nothing reading its connection.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->writeBehindVerdict = LeaderAppend(2);
+        harness.record->holdSessionOpen = true;
+    }
+    harness.sink.throwOnDeliver = true;
+    harness.Start(PeerTransportOptions { .reconnectBackoff = 10s, .direction = RaftWire::SessionDirection::TwoWay });
+
+    CHECK(harness.transport->ConnectedPeers() == 0);
+    auto const lines = harness.logger.Snapshot();
+    CHECK(std::ranges::any_of(lines, [](CapturingLogger::Record const& record) {
+        return record.level == LogLevel::Error && record.message.contains("sender threw");
+    }));
+
+    // And the sender lives on: it redials at the backoff, as after any ended session.
+    harness.sink.throwOnDeliver = false;
+    harness.clock.advance(10s);
+    harness.reactor.drain();
+    CHECK(harness.connector.Attempts() == 2);
+    CHECK(harness.sink.received.size() == 1);
 }

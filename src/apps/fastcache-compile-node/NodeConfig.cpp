@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "EnrollAutoApprove.hpp"
 #include "NodeConfig.hpp"
 #include "NodeKey.hpp"
 #include "NodeMembership.hpp"
@@ -8,6 +9,8 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/ProvenFleet.hpp>
+#include <FastCache/Cluster/SeedSources.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CompressionValues.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
@@ -15,7 +18,7 @@
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Core/Utf8.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
 #include <array>
@@ -39,6 +42,33 @@ namespace FastCache::Node
 
 namespace
 {
+    /// Why an id is refused for its length: the sentence every door that takes one says.
+    /// @param bytes How long the id was.
+    /// @return The reason, naming the bound.
+    [[nodiscard]] std::string IdTooLong(std::size_t bytes)
+    {
+        return std::format("is {} bytes, longer than the {} an id may be: every peer refuses a fleet summary naming "
+                           "a longer one",
+                           bytes,
+                           CompileCacheWire::MaxIdBytes);
+    }
+
+    /// An id typed on this command line -- this node's own, or the machine an enrollment verb names --
+    /// held to the ONE bound every reader of an id holds it to (`CompileCacheWire::MaxIdBytes`), and
+    /// to being text.
+    ///
+    /// Refused here, by name, because past it the id is no less valid to this node: it is every
+    /// PEER that refuses the fleet summary carrying it, silently, as malformed. Empty passes: an
+    /// empty `--node-id` is how a node asks to mint one.
+    /// @param sv The value text.
+    /// @return The id, or why it is too long or not text.
+    [[nodiscard]] std::expected<std::string, ConfigError> ParseId(std::string_view sv)
+    {
+        if (sv.size() > CompileCacheWire::MaxIdBytes)
+            return std::unexpected(ArgvError(ConfigErrorCode::ParseError, std::format("value {}", IdTooLong(sv.size()))));
+        return ParseUtf8Text(sv);
+    }
+
     /// CLI spelling of a LogLevel, matching what ParseNodeLogLevel accepts.
     ///
     /// The inverse of that parser, and the pair is what makes a log level survive
@@ -75,7 +105,7 @@ namespace
         auto const* const end = std::next(begin, static_cast<std::ptrdiff_t>(sv.size()));
         auto const [ptr, ec] = std::from_chars(begin, end, value);
         if (ec != std::errc {} || ptr != end || value == 0 || value > 65535)
-            return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "port", std::format("not a port: {}", sv)));
+            return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, std::format("not a port: {}", sv)));
         return static_cast<std::uint16_t>(value);
     }
 
@@ -93,7 +123,7 @@ namespace
         auto const* const end = std::next(begin, static_cast<std::ptrdiff_t>(sv.size()));
         auto const [ptr, ec] = std::from_chars(begin, end, value);
         if (ec != std::errc {} || ptr != end)
-            return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "slots", std::format("not a slot count: {}", sv)));
+            return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, std::format("not a slot count: {}", sv)));
         return std::optional<std::uint32_t> { value };
     }
 
@@ -119,8 +149,8 @@ namespace
                 accepted += ", ";
             accepted += row.name;
         }
-        return std::unexpected(ArgvError(
-            ConfigErrorCode::OutOfRange, "node-class", std::format("not a node class: {} (expected {})", sv, accepted)));
+        return std::unexpected(
+            ArgvError(ConfigErrorCode::OutOfRange, std::format("not a node class: {} (expected {})", sv, accepted)));
     }
 
     /// A core reserve, which may legitimately be zero.
@@ -138,8 +168,7 @@ namespace
         auto const* const end = std::next(begin, static_cast<std::ptrdiff_t>(sv.size()));
         auto const [ptr, ec] = std::from_chars(begin, end, value);
         if (ec != std::errc {} || ptr != end)
-            return std::unexpected(
-                ArgvError(ConfigErrorCode::OutOfRange, "reserve-cores", std::format("not a core count: {}", sv)));
+            return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, std::format("not a core count: {}", sv)));
         return std::optional<std::uint32_t> { value };
     }
 
@@ -180,23 +209,55 @@ namespace
         return [](auto& result, [[maybe_unused]] std::string_view value) -> std::expected<void, ConfigError> {
             auto& request = TargetOf<&NodeConfig::enroll>(result);
             request.action = Action;
+            // No verb this applier selects carries a duration, so one an earlier
+            // `--enroll-auto-approve` left goes with the verb it belonged to.
+            request.duration = std::chrono::seconds::zero();
+            request.key.reset();
 
-            if constexpr (Action == EnrollAction::Approve || Action == EnrollAction::Reject)
+            if constexpr (Action == EnrollAction::Approve)
+            {
+                // `<id>@<key>`, split at the LAST `@` as `--cluster-admit-worker` splits it: a key
+                // is base64url and holds none. The key is REQUIRED: an id alone names a row, and a
+                // row whose machine stopped asking is replaced by the next machine to ask under
+                // that id -- which an approval by id would admit, unseen.
+                auto const at = value.rfind('@');
+                if (at == std::string_view::npos)
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError,
+                                                     "is <id>@<key>: paste the approve line --enroll-list prints for "
+                                                     "the row, which names the key you compared"));
+                auto const id = value.substr(0, at);
+                if (id.empty())
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "names no machine"));
+                // The one id bound and the text rule every door that takes an id holds (`ParseId`):
+                // this id is what the leader commits, so one past the bound is a member every peer's
+                // fleet summary decoder would refuse.
+                auto bounded = ParseId(id);
+                if (!bounded.has_value())
+                    return std::unexpected(std::move(bounded).error());
+                auto key = ParseEd25519PublicKey(value.substr(at + 1));
+                if (!key.has_value())
+                    return std::unexpected(
+                        ArgvError(ConfigErrorCode::ParseError, std::string { DescribePublicKeyFault(key.error()) }));
+                request.subject = *std::move(bounded);
+                request.key = *key;
+            }
+            else if constexpr (Action == EnrollAction::Reject)
             {
                 if (value.empty())
-                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, {}, "names no machine"));
-                if (!IsValidUtf8(value))
-                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, {}, "is not valid UTF-8"));
-                request.subject = std::string { value };
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "names no machine"));
+                auto bounded = ParseId(value);
+                if (!bounded.has_value())
+                    return std::unexpected(std::move(bounded).error());
+                request.subject = *std::move(bounded);
             }
             else
             {
                 // **Cleared, because last-flag-wins has to move BOTH halves.** These
                 // flags are one-shot verbs that overwrite each other, so
-                // `--enroll-approve=n4 --enroll-open` must mean `Open`. Leaving the
-                // subject behind sent `EnrollControl(Open, "n4")`, which the decoder
-                // refuses on its arity rule -- `EnrollControlNamesSubject(Open)` is
-                // false while the subject is non-empty -- and the operator was answered
+                // `--enroll-approve=n4 --enroll-list` must mean `List`. Leaving the
+                // subject behind sent `EnrollControl(List, "n4")`, which the decoder
+                // refuses on its arity rule -- `EnrollControlSubjectOf(List)` is `None`
+                // while the subject is non-empty -- and the operator was answered
                 // *a control frame this build cannot read*: a VERSION-MISMATCH sentence
                 // for a flag-combination mistake, which sends somebody comparing builds
                 // across the fleet. The action and its operand are one decision and are
@@ -204,6 +265,35 @@ namespace
                 request.subject.clear();
             }
 
+            return {};
+        };
+    }
+
+    /// The applier for `--enroll-auto-approve=<duration>|off`.
+    ///
+    /// `off` ends the deadline; anything else is a duration, judged by the ONE table the leader
+    /// judges it by (`AutoApproveRefusals`), so the operator hears the same sentence here, before
+    /// anything is sent, as a peer that sent it anyway would be answered with. The subject is
+    /// cleared for `SelectEnrollAction`'s reason: the action and its operand are one decision.
+    /// @return The applier, usable as an OptionSpec::apply in a `constexpr` table.
+    [[nodiscard]] constexpr auto SelectEnrollAutoApprove() noexcept
+    {
+        return [](auto& result, std::string_view value) -> std::expected<void, ConfigError> {
+            auto& request = TargetOf<&NodeConfig::enroll>(result);
+            request.subject.clear();
+            request.duration = std::chrono::seconds::zero();
+            if (value == "off")
+            {
+                request.action = EnrollAction::AutoApproveOff;
+                return {};
+            }
+            auto const duration = ParseDurationValue<std::chrono::seconds>(value);
+            if (!duration.has_value())
+                return std::unexpected(duration.error());
+            if (auto const refusal = JudgeAutoApprove(*duration); refusal.has_value())
+                return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, AutoApproveSentence(*refusal)));
+            request.action = EnrollAction::AutoApprove;
+            request.duration = *duration;
             return {};
         };
     }
@@ -251,14 +341,14 @@ namespace
                 auto assignment = ParseSettingAssignment(value);
                 if (!assignment.has_value())
                     return std::unexpected(
-                        ArgvError(ConfigErrorCode::ParseError, "cluster-set", std::format("not <name>=<value>: {}", value)));
+                        ArgvError(ConfigErrorCode::ParseError, std::format("not <name>=<value>: {}", value)));
                 request.key = std::move(assignment->first);
                 request.value = std::move(assignment->second);
             }
             else if constexpr (Action == ClusterAction::Forget)
             {
                 if (value.empty())
-                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "cluster-forget", "names no member"));
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "names no member"));
                 request.key = std::string { value };
             }
             else if constexpr (Action == ClusterAction::AdmitClient || Action == ClusterAction::ForgetClient)
@@ -275,25 +365,21 @@ namespace
                 // `Cluster::Validate` -- where the replicated entry is refused for every
                 // route into it, rather than at whichever flag happened to be typed.
                 if (value.empty())
-                    return std::unexpected(
-                        ArgvError(ConfigErrorCode::ParseError,
-                                  Action == ClusterAction::AdmitClient ? "cluster-admit-client" : "cluster-forget-client",
-                                  "names no host"));
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "names no host"));
                 request.key = std::string { value };
             }
             else if constexpr (Action == ClusterAction::Admit || Action == ClusterAction::AdmitLearner)
             {
-                // The same grammar `--raft-peer` takes, through the same function:
+                // The same grammar `--print-identity`'s line spells, through the same function:
                 // an operator adding a member types the token they would have put in
                 // that flag, the documentation tells them so, and a second
                 // implementation would be two flags accepting different token sets
                 // for one concept -- with only one of them being what the transport
                 // actually dials. The learner flag takes it too (#1449): which set a
                 // member is admitted into is the flag, never a second grammar.
-                auto const* const flag = Action == ClusterAction::Admit ? "cluster-admit" : "cluster-admit-learner";
                 auto member = Cluster::ParseMemberSpec(value);
                 if (!member.has_value())
-                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, flag, member.error()));
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, member.error()));
 
                 // `@<key>` rides the request as its third field (#178), already PARSED --
                 // so a key that is not one is refused here, in `ParseMemberSpec`'s own
@@ -312,13 +398,13 @@ namespace
                 auto const at = value.rfind('@');
                 if (at == std::string_view::npos || at == 0)
                     return std::unexpected(ArgvError(ConfigErrorCode::ParseError,
-                                                     "cluster-admit-worker",
                                                      "is <id>@<key>, the two lines the worker's --print-identity prints"));
                 auto key = ParseEd25519PublicKey(value.substr(at + 1));
                 if (!key.has_value())
-                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError,
-                                                     "cluster-admit-worker",
-                                                     std::string { DescribePublicKeyFault(key.error()) }));
+                    return std::unexpected(
+                        ArgvError(ConfigErrorCode::ParseError, std::string { DescribePublicKeyFault(key.error()) }));
+                if (at > CompileCacheWire::MaxIdBytes)
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError, std::format("id {}", IdTooLong(at))));
                 request.key = std::string { value.substr(0, at) };
                 request.value.clear();
                 request.publicKey = *key;
@@ -475,7 +561,7 @@ namespace
         // own default is stated in. A default an operator cannot spell is one they
         // cannot adjust by a little: without this, "a quarter of RAM, but half"
         // means working out the bytes for every machine by hand.
-        auto const parsed = ParseByteSize(sv, "cache-memory", QueryHostTotalMemoryBytes());
+        auto const parsed = ParseByteSize(sv, QueryHostTotalMemoryBytes());
         if (!parsed.has_value())
             return std::unexpected(parsed.error());
         return static_cast<std::uint64_t>(*parsed);
@@ -490,43 +576,28 @@ namespace
     /// @return The size in bytes, or why it is not one.
     [[nodiscard]] std::expected<std::uint64_t, ConfigError> ParseCacheDiskBytes(std::string_view sv)
     {
-        auto const parsed = ParseByteSize(sv, "cache-disk");
+        auto const parsed = ParseByteSize(sv);
         if (!parsed.has_value())
             return std::unexpected(parsed.error());
         return static_cast<std::uint64_t>(*parsed);
     }
 
-    /// One cluster member, from the `<id>=<host>:<port>` an operator typed.
+    /// One fleet seed, from the `<host>` or `<host>:<port>` an operator typed.
     ///
-    /// Through `Cluster::ParseMemberSpec`, which is the grammar `--cluster-admit`
-    /// already takes: the documentation tells an operator to copy the same token
-    /// between the two flags, so a second implementation would be two flags
-    /// accepting different token sets for one concept -- with only one of them being
-    /// what the transport actually dials.
-    ///
-    /// Here rather than in the tier that consumes it, because the parser is the one
-    /// place on every path and the only one that can name the offending token --
-    /// see `NodeConfig::raftPeers` for what that cost while it was not (#168).
+    /// Through `Cluster::NormalizeSeed`, the one grammar a seed has whichever source it came
+    /// from, so a typed seed and a remembered one normalize to the same token and are tried
+    /// once. Text first: the seed is written into the remembered-fleet file and every log line
+    /// about the walk, both of which other tools read.
     /// @param sv Text to parse.
-    /// @return The member, or why the token is not one.
-    [[nodiscard]] std::expected<Cluster::ClusterMember, ConfigError> ParseRaftPeer(std::string_view sv)
+    /// @return The seed as `host:port`, or why the text is not one.
+    [[nodiscard]] std::expected<std::string, ConfigError> ParseFleetSeed(std::string_view sv)
     {
-        // Text FIRST, and over the whole token, because both halves of it are
-        // published: the id is a member's identity in `ClusterState` and the address
-        // is what every peer is told to dial. A value that is not valid UTF-8 is
-        // refused by `SchedulerService::Register` on every heartbeat forever, with
-        // the operator's only recovery being to rename the thing -- so it is refused
-        // here, where they typed it and the flag can be named (issue #155). See
-        // `ParseUtf8Text`, and `NodeOptions()` for the other rows in this column.
         if (auto const text = ParseUtf8Text(sv); !text.has_value())
             return std::unexpected(text.error());
-
-        // The key an `@<key>` suffix names is refused in the grammar's own sentence (#178),
-        // which says what a key looks like -- never read as part of the endpoint.
-        auto member = Cluster::ParseMemberSpec(sv);
-        if (!member.has_value())
-            return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "raft-peer", member.error()));
-        return *std::move(member);
+        auto seed = Cluster::NormalizeSeed(sv);
+        if (!seed.has_value())
+            return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "is not <host> or <host>:<port>"));
+        return *std::move(seed);
     }
 
     /// A voter's identity key, in the one spelling a key has (#178).
@@ -537,7 +608,7 @@ namespace
         auto key = ParseEd25519PublicKey(sv);
         if (!key.has_value())
             return std::unexpected(
-                ArgvError(ConfigErrorCode::ParseError, "voter-key", std::string { DescribePublicKeyFault(key.error()) }));
+                ArgvError(ConfigErrorCode::ParseError, std::string { DescribePublicKeyFault(key.error()) }));
         return *key;
     }
 
@@ -574,7 +645,7 @@ namespace
         for (auto const& [name, level]: levels)
             if (name == sv)
                 return level;
-        return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "log-level", std::format("unknown level: {}", sv)));
+        return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, std::format("unknown level: {}", sv)));
     }
 
     /// The supervisor domain to register into, by name.
@@ -692,7 +763,7 @@ std::expected<void, ConfigError> ApplyNodeConfiguration(std::vector<YamlSetting>
                                                         NodeConfig& result)
 {
     if (auto applied = ApplyFileSettings(NodeOptions(), settings, path, result); !applied.has_value())
-        return applied;
+        return std::unexpected(ExplainRetiredNodeOption(std::move(applied).error()));
 
     // A repeatable row's applier APPENDS, so a `--toolchain` on the command line
     // would otherwise EXTEND the file's list rather than replace it. Replacement is
@@ -709,6 +780,80 @@ std::expected<void, ConfigError> ApplyNodeConfiguration(std::vector<YamlSetting>
     // was read at all.
     (void) ParseOptionsInto(NodeOptions(), args, result);
     return {};
+}
+
+std::span<RetiredNodeFlag const> RetiredNodeFlags() noexcept
+{
+    // Each step names only what this build has. Appended to, never reordered.
+    static constexpr auto rows = std::to_array<RetiredNodeFlag>({
+        { .flag = "--raft-peer",
+          .fileKey = "raft_peer",
+          .step = "remove it: the members consensus starts with are the formation record's, kept in the state "
+                  "directory -- this node alone where it founded its cluster, the fleet's roster where it joined "
+                  "one" },
+        { .flag = "--raft-join",
+          .fileKey = "raft_join",
+          .step = "remove it: whether this node founded its cluster or joined one is the formation record's, kept "
+                  "in the state directory, and a first start founds a cluster of one" },
+        { .flag = "--cluster-id",
+          .fileKey = "cluster_id",
+          .step = "remove it: the cluster id is the formation record's, minted at this node's first start, or the "
+                  "fleet's once it has joined one" },
+        { .flag = "--serve-scheduler",
+          .fileKey = "serve_scheduler",
+          .step = "remove it: a node whose mode serves the scheduler serves it while it runs consensus -- a "
+                  "solitary node and a voter do, a learner does not" },
+    });
+    return rows;
+}
+
+namespace
+{
+    /// Where a retired spelling was found, and what an operator does about that place.
+    struct RetiredSpelling
+    {
+        std::string_view RetiredNodeFlag::* spelling; ///< Which column the refused name matched.
+        std::string_view where;                       ///< What keeps refusing it until it is removed.
+    };
+
+    /// One row per place a retired name can arrive from: the command line, and a config file.
+    ///
+    /// The refusal names the spelling the operator actually WROTE, in the place they wrote it --
+    /// a config file's `raft_join` answered as `--raft-join` and "a service registration" sends
+    /// them looking for a command line that does not carry it.
+    constexpr auto RetiredSpellings = std::to_array<RetiredSpelling>({
+        { .spelling = &RetiredNodeFlag::flag,
+          .where = "A service registration that replays it fails at every boot, so remove it there as well" },
+        { .spelling = &RetiredNodeFlag::fileKey,
+          .where = "The config file that carries it is refused at every start and every reload, so remove it "
+                   "there" },
+    });
+} // namespace
+
+ConfigError ExplainRetiredNodeOption(ConfigError error)
+{
+    if (error.code != ConfigErrorCode::UnknownKey)
+        return error;
+
+    // The spelling before any `=`, so `--raft-peer=n1=host:6680` is the `--raft-peer` row.
+    auto const named = std::string_view { error.field }.substr(0, error.field.find('='));
+    for (auto const& place: RetiredSpellings)
+    {
+        auto const* const row = core::findIfOrNull(RetiredNodeFlags(), [named, &place](RetiredNodeFlag const& retired) {
+            return named == retired.*place.spelling;
+        });
+        if (row == nullptr)
+            continue;
+        error.context = std::format(
+            "{} was retired; {}. {}. See {}", row->*place.spelling, row->step, place.where, RetiredNodeFlagsGuide);
+        return error;
+    }
+    return error;
+}
+
+std::expected<ParseFlow, ConfigError> ParseNodeCommandLine(std::span<char const* const> args, NodeConfig& result)
+{
+    return ParseOptionsInto(NodeOptions(), args, result).transform_error(&ExplainRetiredNodeOption);
 }
 
 std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
@@ -774,12 +919,14 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::advertise, ParseUtf8Text>(),
             .explicitBit = &NodeConfig::advertiseExplicit,
             .description = "host:port CLIENTS should use to reach this worker.\n"
-                           "Defaults to --listen-node, which binds loopback unless\n"
-                           "widened: the scheduler hands this string to clients\n"
-                           "verbatim, so a worker that advertises an address only it\n"
-                           "can reach is leased and then never answers. Reloadable:\n"
-                           "a node that learns its address late re-registers under\n"
-                           "the new one and retires the old entry.",
+                           "Defaults to this machine's fully qualified name on the\n"
+                           "--listen-node port while that binds the wildcard, and\n"
+                           "to --listen-node itself otherwise: the scheduler hands\n"
+                           "this string to clients verbatim, so a worker that\n"
+                           "advertises an address only it can reach is leased and\n"
+                           "then never answers. Reloadable: a node that learns its\n"
+                           "address late re-registers under the new one and\n"
+                           "retires the old entry.",
             .yamlKey = "advertise",
             // Reloadable since #1279, and it is the flag the third classification list
             // exists for. `AddressReloadableFlags`: the registration has to move, the
@@ -948,7 +1095,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .primary = "--node-id",
             .arity = Arity::Value,
             .operand = "=<id>",
-            .apply = AssignFrom<&NodeConfig::nodeId, ParseUtf8Text>(),
+            .apply = AssignFrom<&NodeConfig::nodeId, ParseId>(),
             // **No `explicitBit`, alone among the value flags, and its removal is the
             // point rather than an omission.** A provenance bit exists so a
             // registration does not bake in a DEFAULT that a later build might change
@@ -969,12 +1116,10 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .operand = "=[<address>:]<port>",
             .apply = AssignFrom<&NodeConfig::raftListen, ParseText>(),
             .explicitBit = &NodeConfig::raftListenExplicit,
-            .description = "where peers reach this node's consensus port. Giving\n"
-                           "it turns consensus ON. A scheduler needs this flag\n"
-                           "too, even on one machine: it is a cluster of one.\n"
-                           "Without this flag\n"
-                           "the node runs no consensus, which is right for a pure\n"
-                           "worker and is the default. A bare port binds the\n"
+            .description = "where peers reach this node's consensus port; 6680\n"
+                           "unless given. The port is what turns consensus ON, so\n"
+                           "a node with no flags is a cluster of one, and an\n"
+                           "empty --listen-raft= runs none. A bare port binds the\n"
                            "WILDCARD: peers are on other machines by definition,\n"
                            "so loopback would silently not work.",
             .yamlKey = "listen_raft",
@@ -987,45 +1132,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::raftSelf, ParseText>(),
             .explicitBit = &NodeConfig::raftSelfExplicit,
             .description = "the host this node's peers dial it at; the port comes\n"
-                           "from --listen-raft. How a node names ITSELF when its\n"
-                           "identity was derived rather than typed, since\n"
-                           "--raft-peer=<id>=... needs an id somebody wrote. A\n"
-                           "bare --listen-raft binds the wildcard, so what this\n"
+                           "from --listen-raft. This machine's fully qualified\n"
+                           "name unless given. How a node names ITSELF when its\n"
+                           "identity was derived rather than typed. A bare\n"
+                           "--listen-raft binds the wildcard, so what this\n"
                            "node binds is usually not what a peer can dial.",
             .yamlKey = "raft_self",
             .same = FieldEq<&NodeConfig::raftSelf>(),
-        },
-        {
-            .primary = "--raft-peer",
-            .arity = Arity::Value,
-            .operand = "=<id>=<host>:<port>[@<key>]",
-            .apply = AppendFrom<&NodeConfig::raftPeers, ParseRaftPeer>(),
-            .description = "a cluster member and where it answers; repeatable.\n"
-                           "Both halves in one token because a member id with\n"
-                           "no address is a node counted towards quorum and\n"
-                           "unreachable. This is the BOOTSTRAP set only:\n"
-                           "membership is replicated once the cluster runs.\n"
-                           "@<key> states the member's identity key, as its\n"
-                           "--node-status prints it; on this node's own entry\n"
-                           "it must be the key this node holds.",
-            .yamlKey = "raft_peer",
-            .same = FieldEq<&NodeConfig::raftPeers>(),
-            .clear = ClearList<&NodeConfig::raftPeers>(),
-        },
-        {
-            .primary = "--raft-join",
-            .arity = Arity::None,
-            .apply = SetTrue<&NodeConfig::raftJoin>(),
-            .description = "start with NO cluster and wait to be admitted to one.\n"
-                           "--raft-peer then lists nodes this one can REACH rather\n"
-                           "than a cluster it belongs to -- itself, and whoever\n"
-                           "will admit it, because a joiner has to be able to\n"
-                           "answer the leader before it can learn where that\n"
-                           "leader is. Without this flag a node bootstraps a\n"
-                           "cluster of itself, elects itself, and can never\n"
-                           "afterwards be admitted to anybody else's.",
-            .yamlKey = "raft_join",
-            .same = FieldEq<&NodeConfig::raftJoin>(),
         },
         {
             .primary = "--cluster-dir",
@@ -1037,9 +1150,10 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "A node that answered a vote and forgot it votes\n"
                            "twice in one term after a restart, which is two\n"
                            "leaders; a node that lost it is a new identity.\n"
-                           "REQUIRED of a worker, and of any node naming\n"
-                           "--scheduler that runs no consensus: the key kept\n"
-                           "here is what it proves to join the fleet.",
+                           "Unless given: the machine's (%ProgramData%, /var/lib or\n"
+                           "/Library/Application Support, /fastcache-node) for a\n"
+                           "privileged process or a service, the account's own\n"
+                           "(%LOCALAPPDATA% or ~/.local/state) otherwise.",
             .yamlKey = "cluster_dir",
             .same = FieldEq<&NodeConfig::clusterDir>(),
         },
@@ -1073,13 +1187,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .operand = "=<id>=<host>:<port>[@<key>]",
           .apply = SelectClusterAction<ClusterAction::Admit>(),
           .description = "add a member to the cluster and exit, or record that\n"
-                         "one has moved. Both halves in one token for the\n"
-                         "reason --raft-peer takes both: an id with no address\n"
-                         "is counted towards quorum and never reached. The\n"
-                         "member itself must have been started with\n"
-                         "--raft-join. A VOTER: counted by every quorum. On a\n"
+                         "one has moved. Both halves in one token, because an\n"
+                         "id with no address is counted towards quorum and\n"
+                         "never reached. The member itself must be waiting to\n"
+                         "be admitted, never the founder of a cluster of its\n"
+                         "own. A VOTER: counted by every quorum. On a\n"
                          "learner this promotes it. @<key> records the\n"
-                         "member's identity key, as its --node-status prints\n"
+                         "member's identity key, as its --print-identity prints\n"
                          "it; without one, a key already recorded stays." },
         { .primary = "--cluster-admit-learner",
           .arity = Arity::Value,
@@ -1094,7 +1208,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "redirects writes to it as any follower does.\n"
                          "--cluster-admit on it promotes it; the same token\n"
                          "as --cluster-admit, and the member must likewise\n"
-                         "have been started with --raft-join." },
+                         "be waiting to be admitted." },
         { .primary = "--cluster-admit-worker",
           .arity = Arity::Value,
           .operand = "=<id>@<key>",
@@ -1144,25 +1258,17 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "--cluster-admit-client is how it comes back. A port is\n"
                          "ignored here too, for the same reason." },
         {
-            .primary = "--cluster-id",
-            .arity = Arity::Value,
-            .operand = "=<name>",
-            .apply = AssignFrom<&NodeConfig::clusterId, ParseUtf8Text>(),
-            .explicitBit = &NodeConfig::clusterIdExplicit,
-            .description = "which fleet this node belongs to. Plain text in every\n"
-                           "beacon and NOT a credential: what it buys is that two\n"
-                           "unrelated fleets on one segment ignore each other.",
-            .yamlKey = "cluster_id",
-            .same = FieldEq<&NodeConfig::clusterId>(),
-        },
-        {
             .primary = "--discovery",
             .arity = Arity::Value,
             .operand = "=<address>:<port>",
             .apply = AssignFrom<&NodeConfig::discoveryAddress, ParseText>(),
             .explicitBit = &NodeConfig::discoveryAddressExplicit,
             .description = "announce this node on the segment and listen for peers\n"
-                           "here; off unless given. Needs --listen-raft. A peer\n"
+                           "here. Unless given, beacons go to every up interface's\n"
+                           "directed broadcast on port 6681 -- never the limited\n"
+                           "broadcast, which leaves by one guessed interface; a\n"
+                           "named address is used exactly, and empty turns it\n"
+                           "off. Runs beside consensus only. A peer\n"
                            "counts only when it proves the key the cluster holds\n"
                            "for it, and joins as a learner, counted by no quorum;\n"
                            "--cluster-admit promotes it. Any other key is\n"
@@ -1184,6 +1290,23 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "named ports only -- one per node on the machine.",
             .yamlKey = "discovery_reply_port",
             .same = FieldEq<&NodeConfig::discoveryReplyPort>(),
+        },
+        {
+            .primary = "--fleet-seed",
+            .arity = Arity::Value,
+            .operand = "=<host[:port]>",
+            // Repeatable, and no provenance bit, for `--scheduler`'s reason: a list's default
+            // is empty, so every value present is one the operator typed.
+            .apply = AppendFrom<&NodeConfig::fleetSeeds, ParseFleetSeed>(),
+            .description = "a machine in the fleet to ask, across a VPN where no\n"
+                           "beacon reaches; repeatable. A name or name:port (the\n"
+                           "node port, 6674, when none). Tried after the fleet\n"
+                           "this node remembers and before DNS SRV\n"
+                           "_fastcache._tcp.<domain>. Asked only while this node\n"
+                           "is alone; a fleet it finds is joined by approval.",
+            .yamlKey = "fleet_seed",
+            .same = FieldEq<&NodeConfig::fleetSeeds>(),
+            .clear = ClearList<&NodeConfig::fleetSeeds>(),
         },
         {
             .primary = "--scheduler-token-file",
@@ -1271,24 +1394,6 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .description = "private key for --tls-cert. Both or neither.",
             .yamlKey = "tls_key",
             .same = FieldEq<&NodeConfig::tlsKeyFile>(),
-        },
-        {
-            .primary = "--serve-scheduler",
-            .arity = Arity::None,
-            .apply = SetTrue<&NodeConfig::serveScheduler>(),
-            .description = "serve the fleet's scheduler verbs; off unless given.\n"
-                           "Answered on --listen-node, beside the cache verbs,\n"
-                           "and only while this node LEADS the cluster; a\n"
-                           "follower redirects to the leader and an election in\n"
-                           "progress refuses, both of which a client answers by\n"
-                           "compiling locally. Needs --listen-raft even alone:\n"
-                           "a scheduler signs leases with its identity key and\n"
-                           "hands workers a roster its voters certify, so it is\n"
-                           "a cluster of one. It also decides where a bare\n"
-                           "--listen-node binds: the wildcard here, because\n"
-                           "peers have to reach it, and loopback without it.",
-            .yamlKey = "serve_scheduler",
-            .same = FieldEq<&NodeConfig::serveScheduler>(),
         },
         {
             .primary = "--fleet-member",
@@ -1480,15 +1585,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::nodeListen, ParseText>(),
             .explicitBit = &NodeConfig::nodeListenExplicit,
             .description = "this node's 0xFC port: cache verbs, and the\n"
-                           "scheduler verbs with --serve-scheduler (default\n"
+                           "scheduler verbs where its mode serves them (default\n"
                            "port 6674, where fastcache-cc already looks; empty\n"
-                           "closes it). A bare port binds LOOPBACK on a worker\n"
-                           "-- a cache any host can dial is this machine's\n"
-                           "whole build output served to strangers -- and the\n"
-                           "wildcard with --serve-scheduler, whose peers are\n"
-                           "elsewhere by definition. Widening it admits nobody\n"
+                           "closes it). Binds the wildcard unless given, because\n"
+                           "every node is a fleet participant. That admits nobody\n"
                            "new to the cache: those verbs answer this machine\n"
-                           "alone whatever this is bound to.",
+                           "alone whatever this is bound to, and every other verb\n"
+                           "refuses a caller that is not a member.",
             .yamlKey = "listen_node",
             .same = FieldEq<&NodeConfig::nodeListen>(),
         },
@@ -1685,12 +1788,12 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::printIdentity>(),
           .description = "print this node's id, its identity key and the\n"
-                         "--raft-peer token its peers type, and exit. Mints\n"
+                         "--cluster-admit line that admits it, and exit. Mints\n"
                          "the id and the key into the state directory when it\n"
-                         "holds none yet, which is how a cluster's members\n"
-                         "learn each other's keys before any of them starts:\n"
-                         "run it as the account the node runs as, with the\n"
-                         "flags it runs with." },
+                         "holds none yet, which is how an operator learns a\n"
+                         "member's key before it is admitted: run it as the\n"
+                         "account the node runs as, with the flags it runs\n"
+                         "with." },
         { .primary = "--print-surfaces",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::printSurfaces>(),
@@ -1710,28 +1813,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "its cluster, then exit. Opens no port. Mints this\n"
                            "node's identity and identity key into its state\n"
                            "directory, PRINTS the key, asks, and waits for an\n"
-                           "operator there to approve it -- as a member when it\n"
+                           "operator there to approve it -- as a learner when it\n"
                            "runs consensus, a worker principal when it does not.\n"
                            "No secret crosses: once admitted it prints the\n"
                            "roster's fingerprint to compare with --enroll-list,\n"
-                           "and the --raft-peer list its next start needs.",
+                           "what the seed recorded, and where this machine\n"
+                           "wrote what it kept.",
         },
-        { .primary = "--enroll-open",
-          .arity = Arity::None,
-          .apply = SelectEnrollAction<EnrollAction::Open>(),
-          .description = "open an enrollment window on the cluster at\n"
-                         "--scheduler, then exit. While it is open ANY machine\n"
-                         "that can reach that node may ask to join under the\n"
-                         "key it minted; approving one admits exactly that\n"
-                         "key. The window is held in memory: a restart\n"
-                         "closes it, and so does --enroll-close." },
-        { .primary = "--enroll-close",
-          .arity = Arity::None,
-          .apply = SelectEnrollAction<EnrollAction::Close>(),
-          .description = "close the enrollment window and forget everything\n"
-                         "waiting at it, then exit. A request made while\n"
-                         "nobody was watching must not be approvable after\n"
-                         "they stopped, so the list goes with the window." },
         { .primary = "--enroll-list",
           .arity = Arity::None,
           .apply = SelectEnrollAction<EnrollAction::List>(),
@@ -1744,12 +1832,14 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "DNS, NAT and multi-homing all produce it." },
         { .primary = "--enroll-approve",
           .arity = Arity::Value,
-          .operand = "=<node-id>",
+          .operand = "=<node-id>@<key>",
           .apply = SelectEnrollAction<EnrollAction::Approve>(),
           .description = "admit the named machine to the cluster under the key\n"
-                         "--enroll-list shows for it, then exit. Compare that\n"
-                         "key with the one the machine printed first: the\n"
-                         "comparison is the whole of what makes this safe." },
+                         "named with it, then exit. Compare that key with the\n"
+                         "one the machine printed first: the comparison is the\n"
+                         "whole of what makes this safe. --enroll-list prints\n"
+                         "this line for every waiting row; a row whose key is\n"
+                         "not the one named is refused, and nothing admitted." },
         { .primary = "--enroll-reject",
           .arity = Arity::Value,
           .operand = "=<node-id>",
@@ -1761,6 +1851,28 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "different matter: the approval committed it, so this\n"
                          "stops it being handed the roster but does NOT remove\n"
                          "it, and --cluster-forget is what does." },
+        { .primary = "--enroll-clear",
+          .arity = Arity::None,
+          .apply = SelectEnrollAction<EnrollAction::Clear>(),
+          .description = "drop every request on the leader's enrollment list\n"
+                         "that nobody has decided about, then exit. Approved\n"
+                         "and rejected rows stay, and a machine still asking\n"
+                         "is recorded again at its next poll: this makes room\n"
+                         "on a list somebody filled, it bans nobody." },
+        { .primary = "--enroll-auto-approve",
+          .arity = Arity::Value,
+          .operand = "=<duration>|off",
+          .apply = SelectEnrollAutoApprove(),
+          .description = "arm the leader's auto-approve window for this long\n"
+                         "from now, then exit: until it ends, any machine that\n"
+                         "asks is admitted under the key it asks with, with\n"
+                         "nobody comparing it, and --enroll-list marks it. At\n"
+                         "most 24h; running it again re-arms from now, and\n"
+                         "=off ends it. A restart or a change of leader ends\n"
+                         "it too: it is held in the leader's memory alone. It\n"
+                         "admits rows already waiting as well, at their next\n"
+                         "poll: a row that must not be admitted is rejected\n"
+                         "first." },
         { .primary = "--version",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::version>(),
@@ -1821,13 +1933,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { "--enroll-from",
           "asks a seed to admit this machine and exits; a key would re-ask at every start, on a "
           "machine that is already a member" },
-        { "--enroll-open",
-          "opens a window any machine can ask to join through, and exits; a key would re-open it at every "
-          "start, which is a window nobody ever closes" },
-        { "--enroll-close", "closes the window and exits" },
         { "--enroll-list", "prints what is waiting and exits" },
         { "--enroll-approve", "admits one machine and exits; a key would re-admit it at every start" },
         { "--enroll-reject", "refuses one machine and exits" },
+        { "--enroll-auto-approve", "arms or ends the auto-approve window and exits" },
+        { "--enroll-clear", "drops the undecided requests and exits" },
         { "--help", "prints usage and exits" },
         { "--version", "prints the version and exits" },
     });
@@ -2121,14 +2231,13 @@ std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previo
     // change` pins.
     //
     // A second reason exists and is deliberately stated as UNREACHABLE rather than as
-    // motivation, because it is: `AdmitsRemotePeers` reads four fields and only two are
-    // reloadable, so `--raft-join` and `--raft-peer` move it too, and ahead of the
+    // motivation, because it is: `AdmitsRemotePeers` reads the formation record as well as
+    // the two membership flags, and a record that moved would move it too, so ahead of the
     // immutability check such a candidate would be refused by the rule below naming
-    // `--fleet-member` -- a flag nobody edited. It cannot happen today, because a
-    // candidate carrying either raft field without `--node-id` is refused by
-    // `StartupPolicyRejection` above and one carrying `--node-id` cannot reach here with
-    // it changed. Written down because the ordering is what keeps it unreachable, and a
-    // future startup row that stops catching it would otherwise reopen it silently.
+    // `--fleet-member` -- a flag nobody edited. It cannot happen today, because no edit to a
+    // file or a command line moves the record: the candidate is shaped by the same one.
+    // Written down because that is what keeps it unreachable, and a future reload that
+    // re-reads the record would otherwise reopen it silently.
     struct PairRule
     {
         /// The component this rule is about, asked of `previous`; see `ConfigRule::scope`.
@@ -2238,7 +2347,7 @@ Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg,
                                        .cache = cache };
 }
 
-ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig const& cfg)
+ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig const& cfg, IConfigPathProbe const& probe)
 {
     std::vector<std::string> argv;
 
@@ -2350,8 +2459,6 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.emplace_back("--tls-self-signed");
     emitPathIfSet("tls-cert", cfg.tlsCertFile.string());
     emitPathIfSet("tls-key", cfg.tlsKeyFile.string());
-    if (cfg.serveScheduler)
-        argv.emplace_back("--serve-scheduler");
     emitIfExplicit("cache-memory", cfg.cacheMemoryBytes, cfg.cacheMemoryExplicit);
     emitIfExplicit("cache-disk", cfg.cacheDiskBytes, cfg.cacheDiskBytesExplicit);
     // Codecs by NAME: `emitIfExplicit` formats its value, and a `CompressionCodec`
@@ -2387,27 +2494,18 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfExplicit("raft-self", cfg.raftSelf, cfg.raftSelfExplicit);
     emitIfExplicit("listen-raft", cfg.raftListen, cfg.raftListenExplicit);
     emitPathIfSet("cluster-dir", cfg.clusterDir.string());
-    emitIfExplicit("cluster-id", cfg.clusterId, cfg.clusterIdExplicit);
     emitIfExplicit("discovery", cfg.discoveryAddress, cfg.discoveryAddressExplicit);
     emitIfExplicit("discovery-reply-port", cfg.discoveryReplyPort, cfg.discoveryReplyPortExplicit);
-    // Repeatable, so one token per peer rather than one joined value -- for the
-    // reason the toolchains are: a service that came back knowing fewer members than
-    // it was installed with would present as a cluster that stopped forming quorum,
-    // not as a packaging bug. Re-rendered rather than echoed, because the list is
-    // stored parsed; it is the same token either way, since `ParseMemberSpec` splits
-    // at the FIRST `=` and keeps the endpoint verbatim -- and `FormatMemberSpec` is its
-    // inverse, `@<key>` included, so a key the operator typed is not dropped from the
-    // command line a supervisor replays (#178).
-    for (auto const& peer: cfg.raftPeers)
-        argv.push_back(std::format("--raft-peer={}", Cluster::FormatMemberSpec(peer)));
     emitIfExplicit("upstream", cfg.upstream, cfg.upstreamExplicit);
     emitPathIfSet("cache-dir", cfg.cacheDir.string());
-    if (cfg.raftJoin)
-        argv.emplace_back("--raft-join");
     if (cfg.fleetOpen)
         argv.emplace_back("--fleet-open");
     for (auto const& member: cfg.fleetMembers)
         argv.push_back(std::format("--fleet-member={}", member));
+    // One token per seed, `--fleet-member`'s shape: stored normalized, so what is replayed is
+    // the same token the parser produces from it.
+    for (auto const& seed: cfg.fleetSeeds)
+        argv.push_back(std::format("--fleet-seed={}", seed));
     emitIfExplicit("drain-timeout", FormatDuration(cfg.drainTimeout), cfg.drainTimeoutExplicit);
     emitIfExplicit("log-level", LogLevelName(cfg.logLevel), cfg.logLevelExplicit);
 
@@ -2466,6 +2564,31 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         if (!directory.empty())
             owned.emplace_back(directory);
 
+    // **A service keeps the MACHINE's identity, in a directory the install OWNS -- on every
+    // platform.** A registration naming no `--cluster-dir` owns the machine-wide directory, so the
+    // install creates it and grants the service's account access to it (`GrantPathAccess`). That
+    // ADDS the account's entry and replaces nothing: on Windows `%ProgramData%`'s inherited read
+    // for every local user stays on the DIRECTORY, and the protected list is not this change's.
+    // What keeps the identity key -- a VOTER's, consensus being on by default -- to its owner is
+    // the KEY FILE: created owner-only whatever the directory grants, and never read from a
+    // directory other accounts may write in (`ResolveNodeKey`).
+    //
+    // And on POSIX the account is not privileged, so left to itself it would take the per-user
+    // default in its home. There the registration also hands the job the directory the way
+    // systemd's `StateDirectory=` hands the packaged unit one (`STATE_DIRECTORY`): an
+    // environment variable rather than a baked `--cluster-dir`, because a command-line value
+    // outranks the configuration file for the life of the registration, and an operator who
+    // later sets `cluster_dir:` in the file would be silently overridden. Windows has no such
+    // row: its service token is privileged and takes the machine-wide default by itself.
+    std::vector<std::pair<std::string, std::string>> accountEnvironment;
+    if (cfg.clusterDir.empty())
+        if (auto const machineWide = MachineWideNodeClusterDirectory(probe); machineWide.has_value())
+        {
+            owned.push_back(*machineWide);
+            if (ServiceManagerHandsOverStateDirectory())
+                accountEnvironment.emplace_back(std::string { ServiceStateDirectoryVariable }, machineWide->string());
+        }
+
     return ServiceSpec { .serviceName = cfg.serviceName,
                          .exePath = exePath,
                          .arguments = std::move(argv),
@@ -2484,6 +2607,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          // case anyway: a user agent runs as the invoking account.
                          .serviceAccount = "fastcache-node",
                          .ownedPaths = std::move(owned),
+                         .serviceAccountEnvironment = std::move(accountEnvironment),
                          .inlineCredential = cfg.requirePass.empty() ? InlineCredential::Absent : InlineCredential::Present,
                          // What the operator named, so InlineCredentialRejection can
                          // say where the secret belongs instead of merely that it
@@ -2526,12 +2650,6 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          .windowsLogon = WindowsLogonAccount::VirtualAccount };
 }
 
-Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
-{
-    auto const self = std::ranges::find(cfg.raftPeers, cfg.nodeId, &Cluster::ClusterMember::id);
-    return self != cfg.raftPeers.end() ? std::to_address(self) : nullptr;
-}
-
 bool RunsWorker(NodeConfig const& cfg) noexcept
 {
     return cfg.slots != 0U;
@@ -2564,31 +2682,47 @@ std::optional<std::uint32_t> WorkerSlotsOf(NodeConfig const& cfg, Distributed::N
 
 bool RunsConsensus(NodeConfig const& cfg) noexcept
 {
-    // The consensus PORT, and it must stay the same expression
-    // `StartConsensusOrExplain` uses to decide whether to start a driver at all: the
-    // scheduler asks this to know whether a role is COMING, and if the two ever
-    // disagreed one of them would be wrong about the other (#613).
+    // It must stay the same expression `StartConsensusOrExplain` uses to decide whether to start
+    // a driver at all: the scheduler asks this to know whether a role is COMING, and if the two
+    // ever disagreed one of them would be wrong about the other (#613).
     //
-    // It read `--node-id` until #1022, which is what made the id undefaultable: any
-    // default makes `nodeId.empty()` false forever, and the one-machine deployment
-    // -- which names no `--raft-peer` -- would then be refused at every boot. Asked
-    // of the surface row rather than of `cfg.raftListen`, so this and
-    // `--print-surfaces` cannot disagree about whether the port is served.
+    // The MODE first, because the record is what decides (#1022's lesson, one level up): no
+    // record, no consensus. A mode that dials in needs no port; one that listens runs consensus
+    // when the surface row opens its port, which is where the empty flag and the localhost
+    // stand-down close it.
+    if (!cfg.formation.has_value())
+        return false;
+    if (!ModeOpensRaftPort(cfg.formation->mode))
+        return true;
     return !RowFor(NodeSurface::Raft).Resolve(cfg).empty();
 }
 
 std::string RaftSelfEndpoint(NodeConfig const& cfg)
 {
-    if (cfg.raftSelf.empty())
-        return {};
-
     // The PORT off the surface row, never off `cfg.raftListen`: a bare `--listen-raft`
-    // takes the row's own default host and the row is where that is decided. The HOST
-    // is the flag's, because what this node BINDS is routinely the wildcard.
+    // takes the row's own default host and the row is where that is decided.
     auto const bound = RowFor(NodeSurface::Raft).Resolve(cfg);
     if (bound.empty())
         return {};
-    return FormatHostPort(cfg.raftSelf, bound.front().port);
+    auto const& bindHost = bound.front().host;
+    auto const port = bound.front().port;
+
+    // The flag's host whenever it was given.
+    if (!cfg.raftSelf.empty())
+        return FormatHostPort(cfg.raftSelf, port);
+
+    // Otherwise exactly `AdvertisedEndpoint`'s rule, for the same reason: **this machine's name
+    // stands in only for a WILDCARD bind**, which is wrong by construction on every other machine
+    // and which the name is what it means to a peer. Any other bind is advertised as bound -- a
+    // loopback one is a one-machine cluster, an address is what the operator bound -- because the
+    // name would resolve to an interface that bind never answers, and every peer's dial would go
+    // unanswered with nothing at either end saying why. Before the names are resolved there is no
+    // name to give.
+    if (!IsWildcardHost(bindHost))
+        return FormatHostPort(bindHost, port);
+    if (cfg.hostNames.has_value() && !cfg.hostNames->fqdn.empty())
+        return FormatHostPort(cfg.hostNames->fqdn, port);
+    return {};
 }
 
 std::expected<std::string, ConsensusDialGap> ConsensusDialAddressOf(NodeConfig const& cfg)
@@ -2596,15 +2730,20 @@ std::expected<std::string, ConsensusDialGap> ConsensusDialAddressOf(NodeConfig c
     if (!RunsConsensus(cfg))
         return std::unexpected { ConsensusDialGap::NoConsensus };
 
-    // The entry exactly as `ClusterSelfMember` answers it, with no test of its own: every
-    // other reader of that entry takes it as found, and a second opinion here would be two
-    // answers for one configuration.
-    if (auto const* const self = ClusterSelfMember(cfg); self != nullptr)
-        return self->raftEndpoint;
+    // Asked of the mode's row before any address: a mode that binds no Raft port is dialled by
+    // nobody, so an address it named would be one no peer ever uses. `RunsConsensus` held, so
+    // the node is formed; the engagement is asked again only where the dereference can see it.
+    if (cfg.formation.has_value() && !ModeOpensRaftPort(cfg.formation->mode))
+        return std::unexpected { ConsensusDialGap::DialsIn };
 
     if (auto endpoint = RaftSelfEndpoint(cfg); !endpoint.empty())
         return endpoint;
 
+    // Not stated yet rather than unstated: the host name it falls back to is resolved at
+    // startup, and a parse or an install has not got there. Only a RESOLVED empty name is a
+    // node that names itself neither way.
+    if (cfg.raftSelf.empty() && !cfg.hostNames.has_value())
+        return std::unexpected { ConsensusDialGap::AwaitingHostName };
     return std::unexpected { ConsensusDialGap::Unstated };
 }
 
@@ -2623,13 +2762,117 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     // registration still succeeds.
     //
     // Resolved through the surface row rather than read off `nodeListen`, because a
-    // bare port's host depends on the configuration (`NodeListenDefaultHost`) and the
-    // row is where that is decided. Reading the flag directly would be the second
-    // author this function was written to delete.
+    // bare port takes the row's default host and the row is where that is decided.
+    // Reading the flag directly would be the second author this function was written to
+    // delete.
     auto const node = RowFor(NodeSurface::Node).Resolve(cfg);
     if (node.empty())
         return {};
+
+    // **A wildcard bind is advertised under this machine's name**, because the wildcard is
+    // wrong by construction on every other machine -- a client dialling it reaches itself --
+    // and the name is what a wildcard bind MEANS to a peer. Only the wildcard: a loopback bind
+    // is a single-machine fleet and an address is what the operator bound, and both are
+    // advertised as bound, as they always were. Before the names are resolved the wildcard is
+    // answered as bound, and `AdvertisedNameAwaited` says that is not the answer yet.
+    //
+    // A name that reaches only this machine is withheld (`AdvertisedNameWithheld`), and then
+    // NOTHING is advertised: the wildcard would send a client to itself, and so would the name.
+    if (IsWildcardHost(node.front().host) && cfg.hostNames.has_value() && !cfg.hostNames->fqdn.empty())
+        return FormatHostPort(cfg.hostNames->fqdn, node.front().port);
+
+    // A withheld name is offered to no peer. A scheduler on THIS machine reaches the wildcard
+    // bind at loopback, so that is what it is told; one elsewhere is told nothing, and the start
+    // refuses it by name (`WorkerNameReachesOnlyThisMachineRefusal`).
+    if (AdvertisedNameWithheld(cfg))
+        return SchedulerIsRemote(cfg) ? std::string {} : FormatHostPort(ThisMachineLoopbackHost, node.front().port);
     return FormatHostPort(node.front().host, node.front().port);
+}
+
+bool AdvertisedNameWithheld(NodeConfig const& cfg)
+{
+    if (!cfg.advertise.empty() || !cfg.hostNames.has_value() || cfg.hostNames->withheld.empty())
+        return false;
+    auto const node = RowFor(NodeSurface::Node).Resolve(cfg);
+    return !node.empty() && IsWildcardHost(node.front().host);
+}
+
+std::string DescribeListeningEndpoint(NodeConfig const& cfg, bool socketHandedOver)
+{
+    if (socketHandedOver)
+        return "the socket its supervisor handed it";
+    auto described = std::string {};
+    for (auto const& endpoint: RowFor(NodeSurface::Node).Resolve(cfg))
+        described += std::format("{}{}", described.empty() ? "" : " and ", FormatHostPort(endpoint.host, endpoint.port));
+    return described.empty() ? std::string { "nothing" } : described;
+}
+
+std::string DescribeAdvertisedEndpoint(NodeConfig const& cfg)
+{
+    if (auto endpoint = AdvertisedEndpoint(cfg); !endpoint.empty())
+        return endpoint;
+    if (AdvertisedNameWithheld(cfg) && cfg.hostNames.has_value())
+        return std::format("withheld ({})", cfg.hostNames->withheld);
+    return "nothing";
+}
+
+bool ConsensusNameWithheld(NodeConfig const& cfg)
+{
+    if (!cfg.raftSelf.empty() || !cfg.hostNames.has_value() || cfg.hostNames->withheld.empty())
+        return false;
+
+    // Only a WILDCARD bind would have taken the name (`RaftSelfEndpoint`). Parsed off the row's
+    // own spec and default host rather than through its resolver, which asks this predicate.
+    auto const& row = RowFor(NodeSurface::Raft);
+    auto const bind = ParseEndpoint(cfg.*row.spec, row.defaultHost);
+    return bind.has_value() && IsWildcardHost(bind->first);
+}
+
+std::span<ConsensusPeerAsk const> ConsensusPeerAsks() noexcept
+{
+    // `--discovery` when TYPED: the default is on, and stands down with consensus.
+    static constexpr auto rows = std::to_array<ConsensusPeerAsk>({
+        { .setting = "--listen-raft", .asks = [](NodeConfig const& c) { return c.raftListenExplicit; } },
+        { .setting = "--discovery",
+          .asks = [](NodeConfig const& c) { return c.discoveryAddressExplicit && !c.discoveryAddress.empty(); } },
+        { .setting = "recorded mode",
+          .asks =
+              [](NodeConfig const& c) { return c.formation.has_value() && ModeServesConsensusToPeers(c.formation->mode); } },
+    });
+    return rows;
+}
+
+bool AsksPeersToReachConsensus(NodeConfig const& cfg)
+{
+    return std::ranges::any_of(ConsensusPeerAsks(), [&cfg](ConsensusPeerAsk const& row) { return row.asks(cfg); });
+}
+
+bool ConsensusPastALoopbackBind(NodeConfig const& cfg)
+{
+    auto const bound = RowFor(NodeSurface::Raft).Resolve(cfg);
+    if (bound.empty() || !IsLoopbackHost(bound.front().host))
+        return false;
+    auto const dial = ConsensusDialAddressOf(cfg);
+    return dial.has_value() && !NamesOnlyThisMachine(HostOfEndpoint(*dial));
+}
+
+bool DiscoveryAnnouncesOnlyThisMachine(NodeConfig const& cfg)
+{
+    if (!cfg.discoveryAddressExplicit || cfg.discoveryAddress.empty())
+        return false;
+    auto const dial = ConsensusDialAddressOf(cfg);
+    // Asked through the one predicate the discovery service holds at its door, over the summary
+    // field it would carry, so the refusal and the guarantee cannot disagree about what "reaches
+    // only this machine" means.
+    return dial.has_value() && Cluster::AnnouncesOnlyThisMachine(CompileCacheWire::FleetSummary { .raftEndpoint = *dial });
+}
+
+bool AdvertisedNameAwaited(NodeConfig const& cfg)
+{
+    if (!cfg.advertise.empty() || cfg.hostNames.has_value())
+        return false;
+    auto const node = RowFor(NodeSurface::Node).Resolve(cfg);
+    return !node.empty() && IsWildcardHost(node.front().host);
 }
 
 /// Whether the endpoint this node would advertise names no host a client can dial.
@@ -2652,19 +2895,18 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     // REFUSAL, so a copy of the rule would let it pass a configuration whose advertised
     // endpoint differs from the one it judged -- and that endpoint is what every lease's
     // MAC is taken over. See `AdvertisedEndpoint`.
+    //
+    // A wildcard the start will replace with this machine's name is not one: before the names
+    // are resolved -- a parse, an install -- it stands in the endpoint only because nothing
+    // else can yet, and refusing it would refuse every node that names no `--advertise`.
+    if (AdvertisedNameAwaited(cfg))
+        return false;
     auto const advertised = AdvertisedEndpoint(cfg);
 
     // `HostOfEndpoint` rather than `SplitHostPort` plus a fallback: an endpoint that
     // will not split is a bare host rather than a parse failure, and that rule is
     // spelled once in `Core/HostPort` for every caller that needs it.
-    auto const host = HostOfEndpoint(advertised);
-
-    // The two spellings of "every interface", plus the empty host -- which reaches
-    // `getaddrinfo` as nullptr under AI_PASSIVE and is therefore the wildcard as
-    // well, the same third case `--listen-node=:6674` is refused for. The bracketed
-    // spelling needs no row of its own: `HostOfEndpoint` strips the brackets whether
-    // or not a port follows, so `[::]` and `[::]:6676` both arrive here as `::`.
-    return host.empty() || host == "0.0.0.0" || host == "::";
+    return IsWildcardHost(HostOfEndpoint(advertised));
 }
 
 /// Whether the endpoint this node would advertise names only this machine.
@@ -2682,7 +2924,9 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// @return Whether peers would be told to dial a loopback address.
 [[nodiscard]] bool AdvertisedHostIsLoopback(NodeConfig const& cfg)
 {
-    return IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg)));
+    // `NamesOnlyThisMachine`, not `IsLoopbackHost`: this is what peers are TOLD, and `localhost`
+    // sends every one of them to itself as surely as `127.0.0.1` does.
+    return NamesOnlyThisMachine(HostOfEndpoint(AdvertisedEndpoint(cfg)));
 }
 
 /// Why this node must not advertise the PORT it would advertise, or nullopt.
@@ -2763,8 +3007,8 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     // against a port an operator wrote.
     //
     // Asked of `nodeListenExplicit` and NOT of the value, because `nodeListen` carries
-    // a non-empty default (`127.0.0.1:6674`) and `--listen-node=127.0.0.1:6674` is a
-    // promise whose value equals it. Provenance is recorded by the parse and cannot be
+    // a non-empty default (`DefaultNodeListen`, `0.0.0.0:6674`) and
+    // `--listen-node=0.0.0.0:6674` is a promise whose value equals it. Provenance is recorded by the parse and cannot be
     // recovered by comparing against the default -- that bit exists for exactly this
     // question (#286), and reaching for `.empty()` here would have been the same defect
     // one flag along. Measured: `.empty()` left the packaged worker still refused,
@@ -2857,12 +3101,12 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// once had to ask two. `--bind` was the whole answer until the compile verbs gained a
 /// second door on the merged `0xFC` listener, and for one release the question was the
 /// disjunction: asking either half alone let an open surface pass this table --
-/// `--bind 127.0.0.1 --serve-scheduler --fleet-open` with nothing to check a grant against
+/// a scheduler with `--bind 127.0.0.1 --fleet-open` and nothing to check a grant against
 /// looked local, passed, and served unauthenticated compiles on a wildcard-bound port
 /// with every `worker_jobs_refused_lease_*` counter reading zero. #290 stage 3 retires
 /// the dedicated port, so the surface row is the whole answer again -- and it is the
-/// row rather than `--listen-node`, because a bare port's host is decided by
-/// `NodeListenDefaultHost`.
+/// row rather than `--listen-node`, because a bare port's host is the row's default
+/// (`NodeSurfaceDefaultHost`).
 ///
 /// The node surface is asked of its own ROW rather than re-deriving the host here,
 /// which is the rule the dashboard credential rule below already follows: that row's
@@ -2876,10 +3120,11 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 ///
 /// The wildcard's sibling, and the shape #290 stage 3 newly made the default. The
 /// advertised endpoint used to fall back to `{--bind}:{--port}`, whose bind defaults to
-/// the wildcard; it now falls back to the `Node` surface, whose host defaults to
-/// LOOPBACK on a node that does not schedule. Both are unreachable from another
-/// machine and both fail the same silent way -- the worker registers, heartbeats, is
-/// leased out, and every remote client dials something that is not this worker.
+/// the wildcard; it now falls back to the `Node` surface, which a node binds to LOOPBACK
+/// only when told to (the default is the wildcard, advertised under this machine's name).
+/// A loopback advertise is unreachable from another machine as a wildcard one is, and
+/// both fail the same silent way -- the worker registers, heartbeats, is leased out,
+/// and every remote client dials something that is not this worker.
 ///
 /// **The bind must DISAGREE with the advertise, and that clause is the whole rule.**
 /// An earlier draft refused a loopback advertise outright, on the reasoning that
@@ -2952,8 +3197,8 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
         return false;
 
     // The row is asked rather than `nodeListen` read, for the reason
-    // `AdvertisedEndpoint` gives: a bare port's host is decided by
-    // `NodeListenDefaultHost`, and the row is where that lives.
+    // `AdvertisedEndpoint` gives: a bare port's host is the row's default, and the row is
+    // where that lives.
     auto const bound = RowFor(NodeSurface::Node).Resolve(cfg);
     return std::ranges::any_of(bound, [](SurfaceEndpoint const& endpoint) { return IsLoopbackHost(endpoint.host); });
 }
@@ -2973,7 +3218,7 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// the `--scheduler` half, because `SchedulerIsRemote` asks something stronger.
 ///
 /// It is deliberately NOT `AdmitsRemotePeers`, which excludes a loopback-only member
-/// list and includes `--raft-join`. These rows are about whether the operator asked for
+/// list and includes any node in, or asking into, a fleet. These rows are about whether the operator asked for
 /// peers to dial this worker; that one is about whether any of them is on another
 /// machine. Both questions are real and they are not the same one.
 /// @param cfg The parsed configuration.
@@ -3058,57 +3303,8 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 {
     return std::ranges::any_of(cfg.schedulers, [](std::string const& scheduler) {
         auto const endpoint = SplitHostPort(scheduler);
-        return endpoint.has_value() && !IsLoopbackHost(endpoint->first) && endpoint->first != "localhost";
+        return endpoint.has_value() && !NamesOnlyThisMachine(endpoint->first);
     });
-}
-
-/// Whether a worker registers an address only its own machine can reach, with a
-/// scheduler that is not on that machine.
-///
-/// **The fourth cell of the reachability rule, and the one an operator reaches by
-/// typing NOTHING.** Its three siblings all need a flag to have been written: the
-/// wildcard and the loopback-past-a-network-bind rows judge an `--advertise` somebody
-/// typed, and `AdvertisesPastALoopbackBind` judges a `--listen-node` they did not
-/// widen after being told to name `--advertise`. A fleet worker started with neither
-/// flag reaches none of them -- `--advertise` falls back to the `Node` surface, which
-/// is loopback on a worker, so the advertise and the bind AGREE and the rule about
-/// their disagreement has nothing to say. That configuration registers `127.0.0.1`
-/// with a scheduler on another machine, heartbeats, is leased out, and every client
-/// dials its own machine: the silent shape all four rows exist to refuse, arrived at
-/// by leaving both flags off, which is precisely the line an operator omits (#463).
-///
-/// **What separates it from the single-machine fleet is WHERE THE SCHEDULER IS**, and
-/// nothing else can. Loopback-bind-plus-loopback-advertise is a correct configuration
-/// -- `dist-compile-e2e.sh` runs whole fleets that way -- so the bind cannot decide
-/// this and neither can the advertise. A scheduler on another machine is the one part
-/// of such a configuration that cannot also be true of a fleet living on this host.
-///
-/// Ordered after its siblings, which are more specific about the configurations they
-/// share with it: a loopback advertise over a WIDE bind is answered by
-/// `AdvertisesLoopbackFromAReachableBind`, whose message names the two flags that
-/// disagree. This one answers what is left, where the two flags agree and both are
-/// wrong for the fleet they were pointed at.
-/// @param cfg The parsed configuration.
-/// @return Whether a remote scheduler is handed an endpoint only this machine can dial.
-/// Whether `--raft-self` and a `--raft-peer` for this node name different addresses.
-///
-/// A named predicate beside its siblings rather than a lambda in the row, for the
-/// reason they are: written inline it pushed `StartupPolicyRejection` past
-/// clang-tidy's cognitive-complexity limit, and a rule with a branch in it reads
-/// better with a name on it than with a comment.
-///
-/// **The peer `ApplyNodeIdentity` synthesises is not a second answer, it is the same
-/// one**, and it has to be recognised as such: the reload path judges a candidate the
-/// identity has already been applied to, so a rule that refused any self peer beside
-/// `--raft-self` would accept a node at startup and refuse every reload of it by name.
-/// @param cfg The parsed configuration.
-/// @return True when both name this node's consensus port, differently.
-[[nodiscard]] bool RaftSelfContradictsItsOwnPeer(NodeConfig const& cfg)
-{
-    if (cfg.raftSelf.empty())
-        return false;
-    auto const* const self = ClusterSelfMember(cfg);
-    return self != nullptr && self->raftEndpoint != RaftSelfEndpoint(cfg);
 }
 
 [[nodiscard]] bool AdvertisesLoopbackToARemoteScheduler(NodeConfig const& cfg)
@@ -3197,18 +3393,12 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
           .message = "--toolchain is required alongside --no-toolchain-discovery: with both, a worker has nothing to "
                      "serve, so it would register and then refuse every job the scheduler sends it. Drop "
                      "--no-toolchain-discovery to let the machine answer at boot instead." },
-        { .scope = &WorkerComponent,
-          .refuses = [](NodeConfig const& c) { return c.advertise.empty(); },
-          .message = "--advertise is required to install a service: without it the registration bakes in "
-                     "whatever --listen-node resolves to, which defaults to loopback on a worker and is not an "
-                     "address another machine can dial. Such a worker "
-                     "registers, heartbeats, is leased out, and is never reached -- with no error at either end." },
-        { .refuses = [](NodeConfig const& c) { return !c.raftListen.empty() && c.clusterDir.empty(); },
-          .message = "--listen-raft needs --cluster-dir to install a service: consensus state otherwise lands in "
-                     "`fastcache-cluster/<node-id>` relative to the working directory, and a service does not "
-                     "inherit the installing shell's. It resolves under C:\\Windows\\System32 for the SCM and under "
-                     "/ for launchd -- writable only by the very privileges a worker is deliberately not given, so "
-                     "the job registers and then fails to open its own state at every start." },
+        // Two rows went with the zero-config defaults. `--advertise` is no longer required: a
+        // worker that names none advertises this machine's fully qualified name, resolved by
+        // the service at every start rather than baked in here. And `--listen-raft` no longer
+        // needs `--cluster-dir`: the directory that rule feared -- relative to a service's
+        // working directory -- is gone, and the default is the platform's machine-wide one,
+        // resolved by the service as the process it runs as (`DefaultNodeClusterDirectory`).
     });
 
     return FirstRefusal(Rules, cfg);
@@ -3219,24 +3409,30 @@ std::span<NodeSecretFile const> NodeSecretFileTable() noexcept
     static constexpr auto table = std::to_array<NodeSecretFile>({
         // What this node REQUIRES of its own callers. A leak makes membership -- a
         // host list, not a credential -- the only gate left on the scheduler verbs.
-        { .flag = "--scheduler-token-file", .path = [](NodeConfig const& cfg) { return cfg.schedulerTokenFile; } },
+        { .flag = "--scheduler-token-file",
+          .path = [](NodeConfig const& cfg) { return cfg.schedulerTokenFile; },
+          .hint = &SecretExposureHint },
         // The admin credential. The dashboard's own rules are REFUSALS about a
         // MISSING one; this is a warning about an EXPOSED one, and the two
         // deliberately differ in kind about one file for #384's stated reason:
         // refusing a missing credential fails closed and breaks nothing that worked,
         // while refusing an exposed one breaks a deployment that is running today.
-        { .flag = "--dashboard-token-file", .path = [](NodeConfig const& cfg) { return cfg.dashboardTokenFile; } },
+        { .flag = "--dashboard-token-file",
+          .path = [](NodeConfig const& cfg) { return cfg.dashboardTokenFile; },
+          .hint = &SecretExposureHint },
         // A TLS private key, which #752's own list does not name. As severe as the identity
         // key below: anything holding it can terminate this node's admin surface.
-        { .flag = "--tls-key", .path = [](NodeConfig const& cfg) { return cfg.tlsKeyFile; } },
+        { .flag = "--tls-key", .path = [](NodeConfig const& cfg) { return cfg.tlsKeyFile; }, .hint = &SecretExposureHint },
         // The node's IDENTITY key (#178), which the flag does not name: it names the
         // state directory, and the key is the file inside it this node minted. A row of
         // this table rather than a public one, because the directory stopped being "Raft
         // state, no credential" the moment it held the key a machine proves itself with --
         // and a row whose path is DERIVED, because the file is found where the start put
         // it (`NodeKeyPath`), never re-spelled here. Empty on a node that holds no key,
-        // which the loop below skips like any unnamed file.
-        { .flag = "--cluster-dir", .path = &NodeKeyPath },
+        // which the loop below skips like any unnamed file. Told the OWNER-ONLY remedy: the
+        // node minted it and nothing else reads it, and the services remedy grants no owner --
+        // a node run by a user that followed it could no longer read its own key.
+        { .flag = "--cluster-dir", .path = &NodeKeyPath, .hint = &OwnerOnlySecretExposureHint },
     });
     return table;
 }
@@ -3269,6 +3465,16 @@ std::vector<std::filesystem::path> NodeSecretFiles(NodeConfig const& cfg,
                                                    bool secretNamedOnCommandLine)
 {
     std::vector<std::filesystem::path> files;
+    for (auto& subject: NodeSecretFileSubjects(cfg, configFile, secretNamedOnCommandLine))
+        files.push_back(std::move(subject.path));
+    return files;
+}
+
+std::vector<SecretFileSubject> NodeSecretFileSubjects(NodeConfig const& cfg,
+                                                      std::filesystem::path const& configFile,
+                                                      bool secretNamedOnCommandLine)
+{
+    std::vector<SecretFileSubject> files;
 
     // First, because it is the one an operator most often has open. Gated on the
     // shared provenance rule rather than a second copy of it: `--requirepass` typed
@@ -3278,11 +3484,11 @@ std::vector<std::filesystem::path> NodeSecretFiles(NodeConfig const& cfg,
             .namedOnCommandLine = secretNamedOnCommandLine,
             .fileWasRead = !configFile.empty(),
         }))
-        files.push_back(configFile);
+        files.push_back(SecretFileSubject { .path = configFile, .hint = &SecretExposureHint });
 
     for (auto const& row: NodeSecretFileTable())
         if (auto path = row.path(cfg); !path.empty())
-            files.push_back(std::move(path));
+            files.push_back(SecretFileSubject { .path = std::move(path), .hint = row.hint });
 
     return files;
 }
@@ -3515,6 +3721,36 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         return UnrunComponentRefusal(*unrun);
 
     constexpr auto Rules = std::to_array<ConfigRule>({
+        // **A name that reaches only this machine is never offered to a peer** -- and a feature the
+        // operator ASKED for that would have to offer it is refused by name, first, so the answer
+        // is its cause rather than a downstream symptom (`--discovery needs --listen-raft`,
+        // with consensus standing down, would send the operator to add a flag already in force).
+        // A DEFAULTED feature stands down instead and the node serves this machine alone
+        // (`host-name-reaches-only-this-machine`). Both read the RESOLVED names, so a parse or an
+        // install, which has not got there, is never refused for a name it has not seen.
+        //
+        // What counts as ASKED is what needs other machines to reach this one: a worker leased out
+        // by a scheduler elsewhere (one on this machine reaches it at loopback), and consensus
+        // other members dial -- every row of `ConsensusPeerAsks()`, a recorded mode that serves
+        // consensus to peers (`ModeServesConsensusToPeers`) among them. A solitary or pending
+        // node's port serves no peer yet and a learner dials out, so those stand down instead.
+        { .scope = &WorkerComponent,
+          .refuses = [](NodeConfig const& c) { return AdvertisedNameWithheld(c) && SchedulerIsRemote(c); },
+          .message = WorkerNameReachesOnlyThisMachineRefusal },
+        { .refuses = [](NodeConfig const& c) { return ConsensusNameWithheld(c) && AsksPeersToReachConsensus(c); },
+          .message = ConsensusNameReachesOnlyThisMachineRefusal },
+        // The consensus twin of `AdvertisesPastALoopbackBind`: peers told to dial a host that
+        // resolves off this machine, at a port bound to loopback, are never answered -- and a
+        // peer that cannot be dialled is counted in a quorum it is absent from. It was refused
+        // by accident once, when a loopback bind with no `--raft-self` had no address at all;
+        // now that such a bind names itself as bound, the case left is a stated address that
+        // contradicts the bind, and it is refused on purpose.
+        { .refuses = [](NodeConfig const& c) { return ConsensusPastALoopbackBind(c); },
+          .message = ConsensusPastALoopbackBindRefusal },
+        // A consensus address that reaches only this machine is never announced: a typed
+        // discovery asking to beacon one is refused here, and a defaulted one stands down.
+        { .refuses = [](NodeConfig const& c) { return DiscoveryAnnouncesOnlyThisMachine(c); },
+          .message = DiscoveryAnnouncesOnlyThisMachineRefusal },
         // Only when the machine will not be asked. With discovery on, "no toolchain"
         // is not yet a fact -- it is a question this node answers once its survey
         // lands -- and refusing here would refuse every worker installed by a package.
@@ -3582,8 +3818,6 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // Since #178 a scheduler IS a consensus member, so the non-clustered scheduler this row
         // used to ask about -- one with no member set to admit anybody by -- no longer exists:
         // it is refused by name, and consensus supplies its member set.
-        { .refuses = [](NodeConfig const& c) { return c.serveScheduler && !RunsConsensus(c); },
-          .message = SchedulerNeedsConsensusRefusal },
         { .refuses = [](NodeConfig const& c) { return c.fleetOpen && !c.fleetMembers.empty(); },
           .message = "--fleet-open and --fleet-member contradict each other: one admits everybody and the other "
                      "admits a list. Silently preferring either would make the narrower of the two a no-op an "
@@ -3714,10 +3948,9 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // tables to delete.
         //
         // #463 asked instead whether `--listen-node` should widen itself for a fleet
-        // participant so the case stops arising. The answer is no and the argument is
-        // on `NodeListenDefaultHost`, where the default itself lives -- not restated
-        // here, because a decision written down twice is a decision that will be
-        // revised in one place.
+        // participant so the case stops arising. The zero-config defaults answered yes for
+        // every node (`NodeSurfaceDefaultHost`), so what still reaches this row is a
+        // loopback bind TYPED beside a remote scheduler.
         //
         // The admission gate is its three siblings' for the reason they give. Their
         // `!c.schedulers.empty()` half is not repeated: `SchedulerIsRemote` asks a
@@ -3746,17 +3979,6 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "dial ITSELF -- the worker registers, heartbeats, is leased out and is never reached, with no "
                      "error at either end. Give --listen-node=0.0.0.0:6674 and --advertise=<this host>:6674. (A "
                      "fleet that really is one machine names --scheduler on loopback too, and is fine.)" },
-        { .refuses = [](NodeConfig const& c) { return c.raftJoin && !RunsConsensus(c); },
-          .message = "--raft-join waits to be admitted to a cluster, and --listen-raft is what turns consensus ON "
-                     "and where the leader that admits this node dials it. Without it nothing binds, no admission "
-                     "could ever reach this node, and it would wait forever." },
-        { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.raftPeers.empty(); },
-          .message = "--raft-join needs --raft-peer: at least this node's own address, which is the half only it "
-                     "knows, and normally the cluster's as well. A joiner cannot answer the leader that admits it "
-                     "without one, and it cannot learn any address until it has answered." },
-        // After the two `--raft-join` rows, which say the same thing about a joiner
-        // more precisely: first match wins, so putting this one ahead of them would
-        // answer in their place and leave both stating a rule nothing reaches.
         // `ConsensusTier::Start` decided this from inside the tier, which the install
         // path returns long before reaching -- so a registration naming no reachable
         // self was written happily and then died at every boot (#168).
@@ -3766,9 +3988,8 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // must name itself" is true whichever flag turns the mode on.
         { .refuses =
               [](NodeConfig const& c) {
-                  // `--raft-self` is the other way to say it (#1024), and it is what a
-                  // node whose identity was MINTED has: `--raft-peer=<id>=<host>:<port>`
-                  // needs an id somebody typed, and a derived one is not.
+                  // `--raft-self` is how a node says it (#1024): its identity is MINTED,
+                  // and nothing else names where its peers dial it.
                   //
                   // Asked of the config as PARSED, before `ApplyNodeIdentity` turns the
                   // flag into a member -- which is what keeps this rule a pure function
@@ -3781,41 +4002,13 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                   auto const dial = ConsensusDialAddressOf(c);
                   return !dial.has_value() && dial.error() == ConsensusDialGap::Unstated;
               },
-          .message = ConsensusNamesNoSelfPeerRefusal },
-        // Two ways to say one thing. `--raft-self` exists because a MINTED identity
-        // cannot be typed into `--raft-peer`; an operator who typed the id has already
-        // said where this node answers, and a second answer would have to be ranked
-        // against the first with nothing to rank it by.
-        { .refuses = RaftSelfContradictsItsOwnPeer,
-          .message = "--raft-self and a --raft-peer for this node's own --node-id name DIFFERENT addresses for "
-                     "this node's consensus port, and only one of them can be the one its peers dial. "
-                     "--raft-self is for the node whose identity was derived rather than typed, since "
-                     "--raft-peer=<id>=... needs an id somebody wrote. Drop one." },
+          .message = ConsensusNamesNoDialAddressRefusal },
         // A host with no port is not an endpoint, and the port is the half this flag
         // deliberately does not carry.
         { .refuses = [](NodeConfig const& c) { return !c.raftSelf.empty() && !RunsConsensus(c); },
           .message = "--raft-self names the host this node's peers dial, and the port comes from --listen-raft, "
                      "which is also what turns consensus ON. Without it there is no port to pair the host with "
                      "and no consensus for the pair to name a member of." },
-        // The reverse, and it INVERTED at #1022 rather than moving. `--node-id` used
-        // to be the switch, so a node that gave it and no `--listen-raft` was refused
-        // for having no port; now `--listen-raft` is the switch, so a node that gives
-        // the id and no port has named an identity nothing will ever use -- the same
-        // silent no-op, reached from the other side.
-        //
-        // Not folded into the row below: an operator who typed `--node-id` is telling
-        // this node who it is, and one who typed `--raft-peer` is telling it who else
-        // there is. Those are different mistakes and the remedy sentence differs.
-        //
-        // Since #178 the id is used wherever an identity KEY is held -- a worker with a
-        // `--cluster-dir` proves it on every connection to a scheduler -- so the question is
-        // `HoldsNodeKey`, the one predicate for that.
-        { .refuses = [](NodeConfig const& c) { return !c.nodeId.empty() && !HoldsNodeKey(c); },
-          .message = "--node-id names this node inside a cluster, and this node holds no identity key to prove it "
-                     "with: --listen-raft is what turns consensus ON, and this node gives neither it nor a "
-                     "--cluster-dir, so the id is never used, never proved and never voted for. Nothing would say "
-                     "so, which is the silent no-op this list exists to refuse. Give --cluster-dir, or --listen-raft "
-                     "to run consensus, or drop --node-id." },
         // The other half of the same flag group: the cluster's addresses given with
         // the switch that turns consensus on left off. `--cluster-dir` is deliberately
         // NOT here -- `FleetHistoryPath` reads it for the dashboard's history file, so
@@ -3824,34 +4017,17 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // `--listen-raft` is gone from this predicate rather than kept, because it is
         // now the switch: naming it with no `--node-id` is the ORDINARY case #1022
         // exists to make possible, not a mistake.
-        { .refuses = [](NodeConfig const& c) { return !c.raftPeers.empty() && !RunsConsensus(c); },
-          .message = "--raft-peer names the cluster this node belongs to, and --listen-raft is what turns "
-                     "consensus ON: without it this node runs none, so the peers are never dialled and no vote "
-                     "could arrive. Nothing would say so, which is the silent no-op this list exists to refuse. "
-                     "Give --listen-raft, or drop them." },
-        { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && !RunsConsensus(c); },
+        // On provenance, since discovery is on by default: a node that turns consensus off with
+        // an empty `--listen-raft=` turns the defaulted discovery off with it (discovery starts only
+        // beside consensus), and refusing it for an address it never typed would describe the wrong
+        // problem. A TYPED `--discovery` on such a node is the silent no-op this row exists for.
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return c.discoveryAddressExplicit && !c.discoveryAddress.empty() && !RunsConsensus(c);
+              },
           .message = "--discovery needs --listen-raft: discovery finds peers for a CLUSTER, and without a "
                      "consensus port this node is not in one. It would broadcast, be answered, prove its identity "
                      "and have nowhere to put the answer." },
-        // A node that announces itself to a fleet must hold an identity to prove (#178): every
-        // verb a machine joins the fleet with is refused on a connection that proved none, so a
-        // node naming `--scheduler` with nowhere to keep an identity key would start, dial, and be
-        // refused every round. A STARTUP refusal, decided from the configuration alone --
-        // `HoldsNodeKey` is the one predicate for *this node keeps a key*, which the start asks
-        // again of the directory itself when it resolves the key.
-        //
-        // It is also the configuration's half of the LEASE rule (#282): a worker that admits
-        // other machines must be able to check the grants they present, and a node naming a
-        // scheduler keeps its roster in the state directory its identity lives in. Whether that
-        // directory HOLDS a roster -- or `--voter-key` roots one -- only the directory can say,
-        // so `NodeRoster::Build` asks it at startup and refuses a worker other machines can reach
-        // with nothing to check against (`RosterlessWorkerRefusal`). A startup refusal rather
-        // than a per-request fallback, because "no roster, so no check" decided per request is a
-        // compile port open to everybody with every refusal counter at zero. The row that asked
-        // it of the configuration went at #178 PR 6: every worker names `--scheduler`, so this
-        // row answered first for every configuration that one could refuse.
-        { .refuses = [](NodeConfig const& c) { return !c.schedulers.empty() && !HoldsNodeKey(c); },
-          .message = SchedulerNeedsIdentityRefusal },
         { .refuses = [](NodeConfig const& c) { return RunsConsensus(c) && !c.voterKeys.empty(); },
           .message = VoterKeyOnConsensusNodeRefusal },
         { .refuses = [](NodeConfig const& c) { return c.discoveryReplyPort != 0 && c.discoveryAddress.empty(); },
@@ -3875,26 +4051,27 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // closes the port the scheduler would have been reached on. Before the merge
         // these were two flags naming two ports and neither could cancel the other; now
         // one can, and a node would start, log a scheduler, and answer nobody.
-        { .refuses = [](NodeConfig const& c) { return c.serveScheduler && c.nodeListen.empty(); },
-          .message = "--serve-scheduler needs --listen-node: the scheduler verbs are answered on the node's 0xFC "
-                     "port, beside the cache verbs, and an empty --listen-node closes it. There would be nothing "
-                     "left for a peer to dial." },
+        { .refuses = [](NodeConfig const& c) { return ServesScheduler(c) && c.nodeListen.empty(); },
+          .message = "this node's mode serves the fleet's scheduler, and --listen-node is empty: the scheduler verbs "
+                     "are answered on the node's 0xFC port, beside the cache verbs, and an empty --listen-node "
+                     "closes it. There would be nothing left for a peer to dial." },
         { .refuses = [](NodeConfig const& c) { return c.dashboard && c.adminListen.empty(); },
           .message = "--dashboard needs --admin-listen: the dashboard is served on the admin surface, and "
                      "without one there is no port for it to answer on. It would start, log nothing wrong, "
                      "and serve the page to nobody." },
-        { .refuses = [](NodeConfig const& c) { return c.dashboard && !c.serveScheduler; },
-          .message = "--dashboard needs --serve-scheduler: a node that runs no scheduler never leads a fleet, "
-                     "so the page could only ever say it is not the leader. The fleet-wide facts live where "
-                     "leadership does." },
+        { .refuses = [](NodeConfig const& c) { return c.dashboard && !ServesScheduler(c); },
+          .message = "--dashboard needs a node that serves the fleet's scheduler -- which its mode does, and only "
+                     "while it runs consensus: a node that runs no scheduler never leads a fleet, so the page could "
+                     "only ever say it is not the leader. The fleet-wide facts live where leadership does." },
         // The fleet's two readers are the dashboard page and the live-stats fleet stream, and both are served
         // only by a node that runs the scheduler -- `--dashboard` already requires it. Keyed on the scheduler
         // rather than on `--dashboard`, which was right until the stream arrived (#1399) and then refused the
         // one way a leader with no admin surface can admit a remote watcher.
-        { .refuses = [](NodeConfig const& c) { return !c.dashboardTokenFile.empty() && !c.serveScheduler; },
+        { .refuses = [](NodeConfig const& c) { return !c.dashboardTokenFile.empty() && !ServesScheduler(c); },
           .message = "--dashboard-token-file guards the fleet -- the dashboard and the live-stats fleet stream -- "
-                     "and this node runs no --serve-scheduler, so it serves neither. A secret an operator "
-                     "provisioned, being read by nobody, is the silent no-op this list exists to refuse." },
+                     "and this node serves no scheduler (its mode does only while it runs consensus), so it serves "
+                     "neither. A secret an operator provisioned, being read by nobody, is the silent no-op this "
+                     "list exists to refuse." },
         { .refuses = [](NodeConfig const& c) { return c.tlsSelfSigned && !c.tlsCertFile.empty(); },
           .message = "--tls-self-signed and --tls-cert contradict each other: one generates a certificate and "
                      "the other names one. Silently preferring either would serve an identity the operator did "
@@ -3936,7 +4113,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // the tier's own question, and `RunsConsensus` the consensus tier's.
         { .refuses =
               [](NodeConfig const& c) {
-                  return !RunsWorker(c) && !c.serveScheduler && !RunsConsensus(c) && !ConfiguresCacheTier(c);
+                  return !RunsWorker(c) && !ServesScheduler(c) && !RunsConsensus(c) && !ConfiguresCacheTier(c);
               },
           .message = NodeRunsNothingRefusal },
         // **LAST, and the position is a decision rather than an appending.** An empty
@@ -3974,9 +4151,9 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // would let a hand-started node run with no scheduler at all -- the refusal
         // removed by the change meant to protect it.
         //
-        // Required of every WORKER, one beside `--serve-scheduler` included: a scheduler's
+        // Required of every WORKER, one beside a scheduler included: a scheduler's
         // own worker registers with it, which is what the documented command line does
-        // (`--serve-scheduler ... --scheduler=127.0.0.1:6675`). A node running no worker
+        // (`--scheduler=127.0.0.1:6675` on the scheduling node). A node running no worker
         // (#206) registers nothing and may omit it.
         { .scope = &WorkerComponent,
           .refuses = [](NodeConfig const& c) { return c.schedulers.empty(); },

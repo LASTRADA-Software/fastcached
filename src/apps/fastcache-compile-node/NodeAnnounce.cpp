@@ -36,11 +36,12 @@ std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
 
     // An empty candidate is not a change, it is an answer nothing can be registered
     // under -- so the previous value stays in force and the worker goes on being
-    // reachable. Unreachable today, since `--listen-node` is not reloadable and the
-    // fallback therefore cannot become empty on a node where it resolved at startup;
-    // stated because the alternative is a withdrawal followed by a registration under
-    // no address at all, which is a node that disappears from the fleet with every
-    // counter reading normal.
+    // reachable. It arises only where a name that reaches only this machine is withheld
+    // (`AdvertisedNameWithheld`), and the startup table refuses that for a worker -- at a
+    // reload too, which is judged by the same table -- so a worker never reaches it; kept
+    // because the alternative is a withdrawal followed by a registration under no address
+    // at all, which is a node that disappears from the fleet with every counter reading
+    // normal.
     if (candidate.empty() || candidate == inForce)
         return std::nullopt;
 
@@ -179,32 +180,6 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
         // member of, a leader that has moved.
         if (auto const registered = registrar.Register(client, round.credential.Current()); registered.has_value())
         {
-            // `--cluster-id` is an ASSERTION, not a source and not an override. The
-            // identity comes from registration; the flag, when the operator NAMED one,
-            // says which fleet they expected to be admitted to. Disagreement is a
-            // provisioning fault -- this node is serving a fleet somebody did not mean
-            // -- so it is fatal and names both sides rather than silently preferring
-            // either. Preferring the config would put configuration back above
-            // registration and reopen the default-`fastcache` cross-fleet accept;
-            // preferring the registration silently would make the flag a lie.
-            //
-            // Asked on `clusterIdExplicit` rather than on the VALUE, because the
-            // default is a real fleet name and comparing against it cannot see the
-            // operator who typed it. That is the option table's own provenance rule.
-            if (!FleetAssertionHolds(round.cfg.clusterIdExplicit, round.cfg.clusterId, registrar.ClusterId()))
-            {
-                round.logger.Logf(LogLevel::Error,
-                                  "scheduler {} registered this node into fleet '{}', but --cluster-id asserts "
-                                  "'{}'. Refusing to serve a fleet that was not asked for: correct the flag or "
-                                  "the scheduler this node is pointed at",
-                                  endpoint,
-                                  registrar.ClusterId(),
-                                  round.cfg.clusterId);
-                round.fleetMismatch = true;
-                DaemonControls::Instance().RequestStop();
-                return AnnounceOutcome { .accepted = accepted, .leader = std::move(leader) };
-            }
-
             // The fleet the scheduler named, adopted here rather than configured. Until
             // this runs the worker is unpinned and refuses every grant, which is the
             // window #401 closes; from here it refuses every grant naming another fleet.

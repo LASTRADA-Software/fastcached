@@ -18,12 +18,16 @@
 #include <filesystem>
 #include <format>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <CacheProtocol.hpp>
+#include <tests/NodeFlagNames.hpp>
+#include <tests/NodeFormationFakes.hpp>
+#include <tests/NodeKeyFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
@@ -132,12 +136,13 @@ TEST_CASE("An approval carrying no roster is a fault rather than an admission", 
     CHECK(reading.detail.contains("no roster"));
 }
 
-TEST_CASE("A closed or full window is a wait, and a seed too old to know the verb is not", "[enrollment][client]")
+TEST_CASE("A full list or no leader is a wait and a seed too old to know the verb is not", "[enrollment][client]")
 {
-    // Three refusals a client answers by asking again: two say *not yet* and the third
-    // says *ask in a moment, somebody is being elected*. Collapsing any of them into
-    // the fatal arm would make a joiner give up on a fleet that was about to admit it.
-    for (auto const code: { Wire::ErrorCode::EnrollmentClosed, Wire::ErrorCode::EnrollmentFull, Wire::ErrorCode::NotLeader })
+    // Two refusals a client answers by asking again: one says *not yet* and the other
+    // says *ask in a moment, somebody is being elected*. Collapsing either into the
+    // fatal arm would make a joiner give up on a fleet that was about to admit it.
+    for (auto const code:
+         { Wire::ErrorCode::EnrollmentFull, Wire::ErrorCode::EnrollmentHostFull, Wire::ErrorCode::NotLeader })
         CHECK(ReadEnrollReply(Refused(code)).progress == EnrollProgress::Closed);
 
     // And the one that says the SEED is the problem rather than this machine or this
@@ -213,7 +218,7 @@ TEST_CASE("A seed that could not be reached, or answered a body this build canno
 
 TEST_CASE("What a joiner claims is derived from the configuration it will actually run as", "[enrollment][client]")
 {
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
 
     // A node that names no consensus member of its own has nothing to be admitted AS,
     // and the refusal says which two flags supply the halves rather than reporting an
@@ -238,60 +243,93 @@ TEST_CASE("What a joiner claims is derived from the configuration it will actual
     CHECK(claim->second == "198.51.100.4:7100");
 }
 
+TEST_CASE("An admission says what the seed recorded and where this machine wrote it, and names no step it lacks",
+          "[enrollment][client][learner][formation]")
+{
+    // What is TRUE on this build: the seed recorded the key, and this machine kept the identity it
+    // asked under -- and, for a member, nothing else. It names no step the binary does not have:
+    // every `--flag` it prints must parse, which is how a `--raft-join` instruction outlived the
+    // flag it named.
+    auto const where = std::filesystem::path { "state" } / "node-a";
+    auto state = Cluster::ClusterState {};
+    state.members.push_back(Member("leader", "10.0.0.1:7100", KeyOf(0x01)));
+    auto laptop = Member("joiner-a", "", KeyOf(0x42));
+    laptop.seat = Cluster::MemberSeat::Learner;
+    state.members.push_back(laptop);
+    state.principals.push_back(
+        Cluster::ClusterPrincipal { .id = "worker-a", .publicKey = KeyOf(0x77), .role = Cluster::PrincipalRole::Worker });
+    auto const roster = Cluster::EncodeRoster(Cluster::ProjectRoster(state));
+
+    auto const member = DescribeAdmission(
+        JoinerIdentity {
+            .nodeId = "joiner-a", .nodeEndpoint = {}, .role = Wire::EnrollRole::Learner, .publicKey = KeyOf(0x42) },
+        roster,
+        where);
+    REQUIRE(member.has_value());
+    CHECK(member->contains("as a learner"));
+    CHECK(member->contains(where.string()));
+    CHECK(member->contains("nothing else"));
+    CHECK(Testing::FlagsNoNodeRowAccepts(*member).empty());
+
+    auto const worker = DescribeAdmission(
+        JoinerIdentity {
+            .nodeId = "worker-a", .nodeEndpoint = {}, .role = Wire::EnrollRole::Worker, .publicKey = KeyOf(0x77) },
+        roster,
+        where);
+    REQUIRE(worker.has_value());
+    CHECK(worker->contains("as a worker"));
+    CHECK(worker->contains(where.string()));
+    CHECK(worker->contains("joins no consensus"));
+    CHECK(Testing::FlagsNoNodeRowAccepts(*worker).empty());
+}
+
 TEST_CASE("An admission is believed only when the roster records this machine under its own key",
           "[enrollment][client][security]")
 {
     auto const self = JoinerIdentity {
-        .nodeId = "joiner-a", .raftEndpoint = "198.51.100.4:7100", .role = Wire::EnrollRole::Member, .publicKey = KeyOf(0x42)
+        .nodeId = "joiner-a", .nodeEndpoint = {}, .role = Wire::EnrollRole::Learner, .publicKey = KeyOf(0x42)
     };
 
-    // The honest roster: the joiner is told what to compare and what to start with.
+    // The honest roster: the joiner is told what to compare and what was recorded.
     auto const roster = RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x42)));
-    auto const admitted = DescribeAdmission(self, roster);
+    auto const admitted = DescribeAdmission(self, roster, "state");
     REQUIRE(admitted.has_value());
     CHECK(admitted->contains(Cluster::RenderRosterFingerprint(Cluster::DigestOfRoster(roster))));
-
-    // Every member's token, key included, because a joiner checks each peer's proof against
-    // the key its command line typed until the replicated state says otherwise.
-    CHECK(admitted->contains(
-        std::format("--raft-peer={}", Cluster::FormatMemberSpec(Member("leader", "10.0.0.1:7100", KeyOf(0x01))))));
-    CHECK(admitted->contains(
-        std::format("--raft-peer={}", Cluster::FormatMemberSpec(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x42))))));
-    CHECK(admitted->contains("--raft-join"));
+    CHECK(admitted->contains("The seed recorded"));
 
     // **The refusal, and it is the one that makes the roster worth checking.** The same id
     // under ANOTHER key is either an operator who approved the wrong row or a reply somebody
     // rewrote -- and in both, every key the roster names is untrustworthy, so nothing it
     // says is printed as advice.
-    auto const swapped = DescribeAdmission(self, RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x99))));
+    auto const swapped = DescribeAdmission(self, RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x99))), "state");
     REQUIRE_FALSE(swapped.has_value());
     CHECK(swapped.error().contains("does not record"));
     CHECK(swapped.error().contains(FormatEd25519PublicKey(KeyOf(0x42))));
-    CHECK_FALSE(swapped.error().contains("--raft-peer"));
+    CHECK_FALSE(swapped.error().contains("The seed recorded"));
 
     // And bytes that are not a roster are refused as that, never as an admission.
     auto const garbage = std::vector<std::byte> { std::byte { 0x01 }, std::byte { 0x02 } };
-    CHECK_FALSE(DescribeAdmission(self, garbage).has_value());
+    CHECK_FALSE(DescribeAdmission(self, garbage, "state").has_value());
 }
 
 TEST_CASE("A worker is admitted as a principal, and a member row does not stand in for one", "[enrollment][client]")
 {
     auto const self = JoinerIdentity {
-        .nodeId = "worker-a", .raftEndpoint = {}, .role = Wire::EnrollRole::Worker, .publicKey = KeyOf(0x77)
+        .nodeId = "worker-a", .nodeEndpoint = {}, .role = Wire::EnrollRole::Worker, .publicKey = KeyOf(0x77)
     };
 
     auto state = Cluster::ClusterState {};
     state.members.push_back(Member("leader", "10.0.0.1:7100", KeyOf(0x01)));
     state.principals.push_back(
         Cluster::ClusterPrincipal { .id = "worker-a", .publicKey = KeyOf(0x77), .role = Cluster::PrincipalRole::Worker });
-    auto const admitted = DescribeAdmission(self, Cluster::EncodeRoster(Cluster::ProjectRoster(state)));
+    auto const admitted = DescribeAdmission(self, Cluster::EncodeRoster(Cluster::ProjectRoster(state)), "state");
     REQUIRE(admitted.has_value());
     CHECK(admitted->contains("worker"));
-    CHECK_FALSE(admitted->contains("--raft-peer"));
+    CHECK(admitted->contains("joins no consensus"));
 
     // The same id and key as a MEMBER is not what this machine asked to be: a worker counted
     // towards quorum is a vote nobody can collect.
-    CHECK_FALSE(DescribeAdmission(self, RosterWith(Member("worker-a", "10.0.0.9:7100", KeyOf(0x77)))).has_value());
+    CHECK_FALSE(DescribeAdmission(self, RosterWith(Member("worker-a", "10.0.0.9:7100", KeyOf(0x77))), "state").has_value());
 }
 
 TEST_CASE("An admission asks the joiner to place nothing by hand", "[enrollment][client]")
@@ -300,13 +338,14 @@ TEST_CASE("An admission asks the joiner to place nothing by hand", "[enrollment]
     // this moment; PR 6 retired the key, so the admission is the whole of joining. A sentence
     // still naming the flag would send an operator after a file nothing reads.
     auto const member = JoinerIdentity {
-        .nodeId = "joiner-a", .raftEndpoint = "198.51.100.4:7100", .role = Wire::EnrollRole::Member, .publicKey = KeyOf(0x42)
+        .nodeId = "joiner-a", .nodeEndpoint = {}, .role = Wire::EnrollRole::Learner, .publicKey = KeyOf(0x42)
     };
-    auto const admitted = DescribeAdmission(member, RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x42))));
+    auto const admitted =
+        DescribeAdmission(member, RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x42))), "state");
     REQUIRE(admitted.has_value());
     CHECK_FALSE(admitted->contains("--cluster-key-file"));
     // The control: the admission is really there, so the absence above is not an empty string's.
-    CHECK(admitted->contains("--raft-join"));
+    CHECK(admitted->contains("The seed recorded"));
 }
 
 namespace
@@ -351,7 +390,7 @@ constexpr auto EnrolledAt = std::chrono::system_clock::time_point { std::chrono:
                                                                   .notAfter = EnrolledAt + std::chrono::hours { 1 },
                                                                   .endorser = endorser,
                                                                   .signature = {} },
-                                     [&key](std::span<std::byte const> message) { return key.Sign(message); }));
+                                     [&key](LabelledMessage const& message) { return SignLabelled(key, message); }));
     }
     return Cluster::EncodeCertifiedRoster(certified);
 }
@@ -374,6 +413,8 @@ TEST_CASE("An enrolled worker keeps the leader's certified roster, certified aga
 
     auto const said = KeepEnrolledRoster(compared, certificate, EnrolledAt, store);
     CHECK(said.contains("version 5"));
+    CHECK(said.contains(Distributed::RosterFileName));
+    CHECK(Testing::FlagsNoNodeRowAccepts(said).empty());
 
     auto const kept = Distributed::LoadPersistedRoster(path);
     REQUIRE(kept.has_value());
@@ -425,27 +466,6 @@ TEST_CASE("A certificate the compared roster's voters did not endorse is not kep
     CHECK_FALSE(Unwrap(kept).has_value());
 }
 
-TEST_CASE("Enrolling a node that keeps no identity key is refused before anything is asked of anybody",
-          "[enrollment][client]")
-{
-    // The mode's own precondition, refused by name at its own door rather than through
-    // the startup table -- which judges a configuration this node will SERVE with, and
-    // this one serves nothing. `RunClusterAdmin` refuses its own `--scheduler` the same
-    // way and for the same reason.
-    //
-    // A node that runs no consensus keeps its key only in `--cluster-dir`, and enrolling is
-    // asking to be admitted UNDER that key -- so a node with nowhere to keep one has nothing
-    // to ask with (#178).
-    NodeConfig cfg;
-    cfg.enrollFrom = "10.0.0.1:7000";
-
-    SystemSecureRandom random;
-    auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random);
-    REQUIRE(!refused.has_value());
-    CHECK(refused.error().contains("--cluster-dir"));
-    CHECK(refused.error().contains("Nothing has been changed"));
-}
-
 TEST_CASE("A seed address that is not an address to dial is refused before any state is written", "[enrollment][client]")
 {
     // **A reachability fix, not a second opinion.** `--enroll-from` has a
@@ -456,12 +476,13 @@ TEST_CASE("A seed address that is not an address to dial is refused before any s
     // reported it only AFTER this node had minted its identity into `--cluster-dir`, so
     // a typo wrote durable state.
     Testing::ScratchDirectory scratch { "enroll-shape" };
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.clusterDir = scratch.Path();
     cfg.enrollFrom = "10.0.0.1";
 
     SystemSecureRandom random;
-    auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random);
+    auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
+    auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, keyGuard);
     REQUIRE(!refused.has_value());
     CHECK(refused.error().contains("--enroll-from"));
 
@@ -487,41 +508,47 @@ TEST_CASE("The pending list marks a row whose two addresses disagree, and leaves
     // would make the mark worthless at exactly forty rows -- which is the size at which
     // an operator stops reading and starts scanning for the marker.
     Wire::EnrollmentReport const report {
-        .state = Wire::WireEnrollmentState::Open,
-        .openForSeconds = 42,
+        .state = Wire::WireEnrollmentState::AutoApprove,
+        .autoApproveSecondsLeft = 42 * 60,
         .pending = { Wire::EnrollmentPendingEntry { .nodeId = "honest",
-                                                    .raftEndpoint = "10.0.0.9:7100",
+                                                    .nodeEndpoint = "10.0.0.9:6674",
                                                     .peerId = "10.0.0.9",
                                                     .firstSeenSecondsAgo = 3,
                                                     .attempts = 2,
                                                     .claimsChanged = 0,
                                                     .decision = Wire::EnrollmentDecision::Pending,
-                                                    .role = Wire::EnrollRole::Member,
+                                                    .role = Wire::EnrollRole::Learner,
                                                     .publicKey = KeyOf(0x11),
-                                                    .rosterFingerprint = std::nullopt },
+                                                    .rosterFingerprint = std::nullopt,
+                                                    .autoApprovedArmedSecondsAgo = std::nullopt,
+                                                    .firstPeerId = "10.0.0.9" },
                      Wire::EnrollmentPendingEntry { .nodeId = "elsewhere",
-                                                    .raftEndpoint = "10.0.0.9:7100",
+                                                    .nodeEndpoint = "10.0.0.9:6674",
                                                     .peerId = "203.0.113.7",
                                                     .firstSeenSecondsAgo = 9,
                                                     .attempts = 5,
                                                     .claimsChanged = 0,
                                                     .decision = Wire::EnrollmentDecision::Pending,
-                                                    .role = Wire::EnrollRole::Member,
+                                                    .role = Wire::EnrollRole::Learner,
                                                     .publicKey = KeyOf(0x22),
-                                                    .rosterFingerprint = std::nullopt },
+                                                    .rosterFingerprint = std::nullopt,
+                                                    .autoApprovedArmedSecondsAgo = std::nullopt,
+                                                    .firstPeerId = "203.0.113.7" },
                      Wire::EnrollmentPendingEntry { .nodeId = "drifted",
-                                                    .raftEndpoint = "10.0.0.4:6680",
+                                                    .nodeEndpoint = "10.0.0.4:6674",
                                                     .peerId = "10.0.0.4",
                                                     .firstSeenSecondsAgo = 60,
                                                     .attempts = 30,
                                                     .claimsChanged = 4,
                                                     .decision = Wire::EnrollmentDecision::Approved,
-                                                    .role = Wire::EnrollRole::Member,
+                                                    .role = Wire::EnrollRole::Learner,
                                                     .publicKey = KeyOf(0x33),
                                                     .rosterFingerprint = Cluster::DigestOfRoster(
-                                                        RosterWith(Member("drifted", "10.0.0.4:6680", KeyOf(0x33)))) },
+                                                        RosterWith(Member("drifted", "10.0.0.4:6680", KeyOf(0x33)))),
+                                                    .autoApprovedArmedSecondsAgo = std::nullopt,
+                                                    .firstPeerId = "10.0.0.4" },
                      Wire::EnrollmentPendingEntry { .nodeId = "worker-w",
-                                                    .raftEndpoint = {},
+                                                    .nodeEndpoint = {},
                                                     .peerId = "10.0.0.5",
                                                     .firstSeenSecondsAgo = 1,
                                                     .attempts = 1,
@@ -529,15 +556,17 @@ TEST_CASE("The pending list marks a row whose two addresses disagree, and leaves
                                                     .decision = Wire::EnrollmentDecision::Pending,
                                                     .role = Wire::EnrollRole::Worker,
                                                     .publicKey = KeyOf(0x44),
-                                                    .rosterFingerprint = std::nullopt } }
+                                                    .rosterFingerprint = std::nullopt,
+                                                    .autoApprovedArmedSecondsAgo = std::nullopt,
+                                                    .firstPeerId = "10.0.0.5" } }
     };
 
-    auto const text = RenderEnrollmentReport(report);
+    auto const text = RenderEnrollmentReport(report, "10.0.0.1:6675");
 
-    // The window's own state, because a list of rows with no heading is one an operator
-    // can read while the window is shut and act on as though it were open.
-    CHECK(text.contains("OPEN"));
-    CHECK(text.contains("42"));
+    // The window's own mode, because a list of rows with no heading is one an operator
+    // can read while a deadline admits machines and act on as though a person decided each.
+    CHECK(text.contains("auto-approve"));
+    CHECK(text.contains("42 min left"));
 
     // Every row is present and carries BOTH addresses. The claimed endpoint and the
     // observed host are the comparison this list exists to make, so a renderer that
@@ -548,7 +577,7 @@ TEST_CASE("The pending list marks a row whose two addresses disagree, and leaves
         CHECK(text.contains(row.nodeId));
         CHECK(text.contains(row.peerId));
     }
-    CHECK(text.contains("10.0.0.9:7100"));
+    CHECK(text.contains("10.0.0.9:6674"));
 
     // The marks, per row and in both directions. `honest` and `elsewhere` claim the
     // SAME endpoint and differ only in where the request came from, so a renderer
@@ -603,20 +632,22 @@ TEST_CASE("The pending list marks a row whose two addresses disagree, and leaves
     CHECK_FALSE(lineFor("worker-w").contains("does not match"));
 }
 
-TEST_CASE("A closed window with nothing waiting renders as a reading, not as an empty page", "[enrollment][client]")
+TEST_CASE("A window with nothing waiting renders as a reading and not as an empty page", "[enrollment][client]")
 {
     // Absent is not zero, at the surface a person reads: a list that rendered nothing
-    // for a shut window and nothing for an open empty one would make an operator who
-    // forgot to open it believe nobody has asked.
-    auto const shut = RenderEnrollmentReport(Wire::EnrollmentReport {});
-    CHECK(shut.contains("closed"));
-    CHECK(shut.contains("nothing waiting"));
+    // for a manual window and nothing for an armed empty one would make an operator who
+    // armed a deadline believe it had not taken.
+    auto const manual = RenderEnrollmentReport(Wire::EnrollmentReport {}, "10.0.0.1:6675");
+    CHECK(manual.contains("enrollment: manual"));
+    CHECK(manual.contains("nothing waiting"));
 
-    auto const openAndEmpty = RenderEnrollmentReport(
-        Wire::EnrollmentReport { .state = Wire::WireEnrollmentState::Open, .openForSeconds = 7, .pending = {} });
-    CHECK(openAndEmpty.contains("OPEN"));
-    CHECK(openAndEmpty.contains("nothing waiting"));
-    CHECK(openAndEmpty != shut);
+    auto const armedAndEmpty = RenderEnrollmentReport(
+        Wire::EnrollmentReport {
+            .state = Wire::WireEnrollmentState::AutoApprove, .autoApproveSecondsLeft = 7 * 60, .pending = {} },
+        "10.0.0.1:6675");
+    CHECK(armedAndEmpty.contains("enrollment: auto-approve (7 min left)"));
+    CHECK(armedAndEmpty.contains("nothing waiting"));
+    CHECK(armedAndEmpty != manual);
 }
 
 namespace
@@ -672,7 +703,7 @@ class InstantWait final: public IDrainWait
 TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[enrollment][client]")
 {
     // **The property #1348 exists for, and it was untestable until the dial became a
-    // seam.** `MaxRedirects` bounds a CONSECUTIVE chain -- the loop two nodes with a
+    // seam.** `MaxEnrollRedirects` bounds a CONSECUTIVE chain -- the loop two nodes with a
     // stale `_knownLeader` make by naming each other -- and NOT the whole run. This
     // mode waits up to ten minutes for a person, which is hundreds of polls, so a
     // budget accumulated across the run would abort a healthy enrolment after three
@@ -682,7 +713,7 @@ TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[
     // Four redirects with a `Waiting` in the middle: two, then an answer on the
     // seed's own behalf, then two more. Neither run reaches the bound.
     //
-    // **Two rather than three on each side, deliberately.** `MaxRedirects` is 3 and
+    // **Two rather than three on each side, deliberately.** `MaxEnrollRedirects` is 3 and
     // the guard is `>=`, so three consecutive redirects are still followed and the
     // fourth aborts -- a post-reset run of three would pass on the last value that
     // still works, with zero margin. An off-by-one anywhere else, the bound moving or
@@ -690,13 +721,12 @@ TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[
     // broken*: a true failure carrying a false diagnosis. The bound itself is pinned
     // by the case below, which is named for it.
     Testing::ScratchDirectory scratch { "enroll-redirect-chain" };
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.clusterDir = scratch.Path();
     cfg.enrollFrom = "10.0.0.1:7000";
 
-    // A consensus identity of its own, because a joiner asks to be admitted AS a
-    // member the cluster can dial -- `EnrollClaim` refuses without it, before any
-    // dial. The same pair `EnrollTrap_test` stages for the same reason.
+    // A consensus port of its own, so it asks as a LEARNER: the role follows from what
+    // the node runs. The same pair `EnrollTrap_test` stages.
     cfg.raftListen = "7100";
     cfg.raftSelf = "198.51.100.4";
 
@@ -711,7 +741,8 @@ TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[
 
     InstantWait wait;
     SystemSecureRandom random;
-    auto const outcome = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, wait, dialer);
+    auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
+    auto const outcome = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, keyGuard, wait, dialer);
 
     REQUIRE(!outcome.has_value());
 
@@ -743,16 +774,15 @@ TEST_CASE("A consecutive redirect chain is still bounded", "[enrollment][client]
     // The control, and the direction the reset could have broken: the anti-loop
     // property has to survive the fix. Four back-to-back redirects with nothing
     // answering on its own behalf, so the count never resets and the bound bites.
-    // Without this case, deleting `MaxRedirects` entirely would leave the case above
+    // Without this case, deleting `MaxEnrollRedirects` entirely would leave the case above
     // green.
     Testing::ScratchDirectory scratch { "enroll-redirect-loop" };
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.clusterDir = scratch.Path();
     cfg.enrollFrom = "10.0.0.1:7000";
 
-    // A consensus identity of its own, because a joiner asks to be admitted AS a
-    // member the cluster can dial -- `EnrollClaim` refuses without it, before any
-    // dial. The same pair `EnrollTrap_test` stages for the same reason.
+    // A consensus port of its own, so it asks as a LEARNER: the role follows from what
+    // the node runs. The same pair `EnrollTrap_test` stages.
     cfg.raftListen = "7100";
     cfg.raftSelf = "198.51.100.4";
 
@@ -765,7 +795,8 @@ TEST_CASE("A consecutive redirect chain is still bounded", "[enrollment][client]
 
     InstantWait wait;
     SystemSecureRandom random;
-    auto const outcome = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, wait, dialer);
+    auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
+    auto const outcome = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, keyGuard, wait, dialer);
 
     REQUIRE(!outcome.has_value());
 
@@ -797,15 +828,30 @@ namespace
 struct MintedJoiner
 {
     NodeConfig cfg;
-    Cluster::ClusterMember self;
+    std::string id;
+    Ed25519PublicKey key {};
 };
 
-/// Mint a member joiner's identity and key into @p stateDirectory.
+/// A roster in which the leader is a member and @p id a WORKER principal under @p key: what a seed
+/// hands a machine the one-shot `--enroll-from` admitted, since it asks as a worker.
+/// @param id The principal's id.
+/// @param key Its key.
+/// @return The encoded roster.
+[[nodiscard]] std::vector<std::byte> WorkerRosterWith(std::string_view id, Ed25519PublicKey const& key)
+{
+    auto state = Cluster::ClusterState {};
+    state.members.push_back(Member("leader", "10.0.0.1:7100", KeyOf(0x01)));
+    state.principals.push_back(
+        Cluster::ClusterPrincipal { .id = std::string { id }, .publicKey = key, .role = Cluster::PrincipalRole::Worker });
+    return Cluster::EncodeRoster(Cluster::ProjectRoster(state));
+}
+
+/// Mint a joiner's identity and key into @p stateDirectory.
 /// @param stateDirectory Its `--cluster-dir`.
-/// @return The configuration and the member record the seed would hold for it.
+/// @return The configuration, and the id and key the seed would record it under.
 [[nodiscard]] MintedJoiner MintJoiner(std::filesystem::path const& stateDirectory)
 {
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.clusterDir = stateDirectory;
     cfg.enrollFrom = "10.0.0.1:7000";
     cfg.raftListen = "7100";
@@ -816,12 +862,10 @@ struct MintedJoiner
     REQUIRE(identity.has_value());
     auto resolved = cfg;
     ApplyNodeIdentity(resolved, *identity);
-    auto key = ResolveNodeKeyFor(resolved, random);
+    auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
+    auto key = ResolveNodeKeyFor(resolved, random, keyGuard);
     REQUIRE(key.has_value());
-    REQUIRE(key->has_value());
-    auto const claim = EnrollClaim(resolved);
-    REQUIRE(claim.has_value());
-    return MintedJoiner { .cfg = cfg, .self = Member(claim->first, claim->second, Unwrap(key.value()).pair.PublicKey()) };
+    return MintedJoiner { .cfg = cfg, .id = resolved.nodeId, .key = key->pair.PublicKey() };
 }
 
 } // namespace
@@ -831,12 +875,14 @@ TEST_CASE("A joiner asks under the key it minted and believes a roster that reco
 {
     Testing::ScratchDirectory scratch { "enroll-admitted" };
     auto const joiner = MintJoiner(scratch.Path());
-    auto const roster = RosterWith(joiner.self);
+    auto const roster = WorkerRosterWith(joiner.id, joiner.key);
 
     Testing::ScriptedDialer dialer { { Recorded(), ApprovedWith(roster) } };
     InstantWait wait;
     SystemSecureRandom random;
-    auto const admitted = RunEnrollClient(joiner.cfg, ConfiguredCredential { joiner.cfg, nullptr }, random, wait, dialer);
+    auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
+    auto const admitted =
+        RunEnrollClient(joiner.cfg, ConfiguredCredential { joiner.cfg, nullptr }, random, keyGuard, wait, dialer);
 
     INFO("result: " << admitted.value_or(admitted.error_or("")));
     REQUIRE(admitted.has_value());
@@ -852,8 +898,11 @@ TEST_CASE("A joiner asks under the key it minted and believes a roster that reco
         REQUIRE(header.has_value());
         auto const request = Wire::DecodeEnrollPayload(sent.subspan(Wire::RequestHeaderSize));
         REQUIRE(request.has_value());
-        CHECK(Unwrap(request).publicKey == joiner.self.publicKey);
-        CHECK(Unwrap(request).role == Wire::EnrollRole::Member);
+        CHECK(Unwrap(request).publicKey == joiner.key);
+        // A WORKER, even on a node that runs consensus: a member joins through its formation,
+        // and the one-shot verb admits a worker by its key. It states no endpoint.
+        CHECK(Unwrap(request).role == Wire::EnrollRole::Worker);
+        CHECK(Unwrap(request).nodeEndpoint.empty());
     }
 }
 
@@ -863,13 +912,13 @@ TEST_CASE("A joiner handed a roster naming it under another key is not admitted"
     // KEY in the roster differs, so this failing and that passing is the self check.
     Testing::ScratchDirectory scratch { "enroll-swapped" };
     auto const joiner = MintJoiner(scratch.Path());
-    auto swapped = joiner.self;
-    swapped.publicKey = KeyOf(0x99);
 
-    Testing::ScriptedDialer dialer { { ApprovedWith(RosterWith(swapped)) } };
+    Testing::ScriptedDialer dialer { { ApprovedWith(WorkerRosterWith(joiner.id, KeyOf(0x99))) } };
     InstantWait wait;
     SystemSecureRandom random;
-    auto const refused = RunEnrollClient(joiner.cfg, ConfiguredCredential { joiner.cfg, nullptr }, random, wait, dialer);
+    auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
+    auto const refused =
+        RunEnrollClient(joiner.cfg, ConfiguredCredential { joiner.cfg, nullptr }, random, keyGuard, wait, dialer);
 
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("does not record"));
@@ -880,9 +929,9 @@ namespace
 constexpr std::string_view FirstScheduler = "10.0.0.1:7000";
 constexpr std::string_view SecondScheduler = "10.0.0.2:7000";
 
-/// A leader answering `--enroll-list` with a shut window.
+/// A leader answering `--enroll-list` with a manual window and nothing waiting.
 /// @return The framed reply.
-[[nodiscard]] std::vector<std::byte> ShutWindow()
+[[nodiscard]] std::vector<std::byte> QuietWindow()
 {
     return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollmentReport(Wire::EnrollmentReport {}));
 }
@@ -891,7 +940,7 @@ constexpr std::string_view SecondScheduler = "10.0.0.2:7000";
 /// @return The configuration.
 [[nodiscard]] NodeConfig TwoSchedulers()
 {
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
     return cfg;
 }
@@ -904,14 +953,14 @@ TEST_CASE("An enrollment command asks the next --scheduler when the first cannot
     // WHICH endpoint was sent the request, because a verb that asked only the first
     // passes every case whose first entry answers.
     auto const cfg = TwoSchedulers();
-    Testing::ScriptedDialer dialer { { {}, ShutWindow() } };
+    Testing::ScriptedDialer dialer { { {}, QuietWindow() } };
 
     auto const listed = RunEnrollAdmin(
         cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, ConfiguredCredential { cfg, nullptr }, dialer);
 
     INFO("result: " << listed.value_or(listed.error_or("")));
     REQUIRE(listed.has_value());
-    CHECK(listed->contains("closed"));
+    CHECK(listed->contains("manual"));
     CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler }, std::string { SecondScheduler } });
     CHECK(dialer.SentOn(0).empty());
     CHECK_FALSE(dialer.SentOn(1).empty());
@@ -926,10 +975,11 @@ TEST_CASE("An enrollment command that reached a scheduler is never sent to anoth
     auto const cfg = TwoSchedulers();
     Testing::ScriptedDialer dialer { { std::vector<std::byte> { std::byte { 0xFF } } } };
 
-    auto const approved = RunEnrollAdmin(cfg,
-                                         EnrollCommand { .action = EnrollAction::Approve, .subject = "n9" },
-                                         ConfiguredCredential { cfg, nullptr },
-                                         dialer);
+    auto const approved =
+        RunEnrollAdmin(cfg,
+                       EnrollCommand { .action = EnrollAction::Approve, .subject = "n9", .key = Ed25519PublicKey {} },
+                       ConfiguredCredential { cfg, nullptr },
+                       dialer);
 
     REQUIRE_FALSE(approved.has_value());
     INFO("refusal: " << approved.error());
@@ -955,11 +1005,119 @@ TEST_CASE("A NotLeader sends an enrollment command to the leader it names, not d
     // A redirect is an instruction. Consulting the list for it would send the request
     // to `SecondScheduler`, which the first has just said does not lead.
     auto const cfg = TwoSchedulers();
-    Testing::ScriptedDialer dialer { { RedirectTo("10.0.0.9:7000"), ShutWindow() } };
+    Testing::ScriptedDialer dialer { { RedirectTo("10.0.0.9:7000"), QuietWindow() } };
 
     auto const listed = RunEnrollAdmin(
         cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, ConfiguredCredential { cfg, nullptr }, dialer);
 
     REQUIRE(listed.has_value());
     CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler }, "10.0.0.9:7000" });
+}
+
+TEST_CASE("The enrollment list marks a row an armed window admitted, with when it was armed",
+          "[enrollment][client][auto-approve]")
+{
+    auto row = Wire::EnrollmentPendingEntry { .nodeId = "laptop",
+                                              .nodeEndpoint = {},
+                                              .peerId = "10.1.2.3",
+                                              .firstSeenSecondsAgo = 40,
+                                              .attempts = 3,
+                                              .claimsChanged = 0,
+                                              .decision = Wire::EnrollmentDecision::Approved,
+                                              .role = Wire::EnrollRole::Learner,
+                                              .publicKey = KeyOf(0x42),
+                                              .rosterFingerprint = std::nullopt,
+                                              .autoApprovedArmedSecondsAgo = 120,
+                                              .firstPeerId = "10.1.2.3" };
+    auto const rendered = RenderEnrollmentReport(Wire::EnrollmentReport { .state = Wire::WireEnrollmentState::AutoApprove,
+                                                                          .autoApproveSecondsLeft = 480,
+                                                                          .pending = { row } },
+                                                 "10.0.0.1:6675");
+    CHECK(rendered.contains("enrollment: auto-approve (8 min left)"));
+    CHECK(rendered.contains("auto-approved (window armed 120s ago)"));
+
+    // The control: a row a person approved carries no such line.
+    row.autoApprovedArmedSecondsAgo = std::nullopt;
+    CHECK_FALSE(
+        RenderEnrollmentReport(Wire::EnrollmentReport { .pending = { row } }, "10.0.0.1:6675").contains("auto-approved"));
+}
+
+TEST_CASE("The list prints the approval of each waiting row, ready to paste, naming its key", "[enrollment][client]")
+{
+    auto waiting = Wire::EnrollmentPendingEntry { .nodeId = "laptop",
+                                                  .nodeEndpoint = {},
+                                                  .peerId = "10.1.2.3",
+                                                  .firstSeenSecondsAgo = 5,
+                                                  .attempts = 2,
+                                                  .claimsChanged = 0,
+                                                  .decision = Wire::EnrollmentDecision::Pending,
+                                                  .role = Wire::EnrollRole::Learner,
+                                                  .publicKey = KeyOf(0x42),
+                                                  .rosterFingerprint = std::nullopt,
+                                                  .autoApprovedArmedSecondsAgo = std::nullopt,
+                                                  .firstPeerId = "10.1.2.3" };
+    auto decided = waiting;
+    decided.nodeId = "desk";
+    decided.decision = Wire::EnrollmentDecision::Approved;
+
+    auto const rendered =
+        RenderEnrollmentReport(Wire::EnrollmentReport { .pending = { waiting, decided } }, "10.0.0.1:6675");
+    auto const line = std::format("fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-approve=laptop@{}",
+                                  FormatEd25519PublicKey(KeyOf(0x42)));
+    CHECK(rendered.contains(line));
+    // Only a row nobody decided about: a decided one needs no approval.
+    CHECK_FALSE(rendered.contains("--enroll-approve=desk@"));
+
+    // And the line is one this binary PARSES back into the approval it names.
+    auto const flag = std::format("--enroll-approve=laptop@{}", FormatEd25519PublicKey(KeyOf(0x42)));
+    auto cfg = Testing::FirstStart(NodeConfig {});
+    auto const argv = std::vector<char const*> { "--scheduler=10.0.0.1:6675", flag.c_str() };
+    REQUIRE(ParseNodeCommandLine(std::span<char const* const> { argv }, cfg).has_value());
+    CHECK(cfg.enroll.subject == "laptop");
+    CHECK(cfg.enroll.key == std::optional { KeyOf(0x42) });
+}
+
+TEST_CASE("The list shows where each row first asked from and marks a row asked since from another address",
+          "[enrollment][client][security]")
+{
+    // The per-host cap counts a row by the address it FIRST asked from, and a refusal names that
+    // host. So every row shows it, and a row whose machine has since asked from somewhere else is
+    // marked: otherwise a host's rows hide under another host's name, and the refusal names rows
+    // nobody can find.
+    auto const row = [](std::string_view id, std::string_view peer, std::string_view first) {
+        return Wire::EnrollmentPendingEntry { .nodeId = std::string { id },
+                                              .nodeEndpoint = {},
+                                              .peerId = std::string { peer },
+                                              .firstSeenSecondsAgo = 5,
+                                              .attempts = 2,
+                                              .claimsChanged = 0,
+                                              .decision = Wire::EnrollmentDecision::Pending,
+                                              .role = Wire::EnrollRole::Learner,
+                                              .publicKey = KeyOf(0x42),
+                                              .rosterFingerprint = std::nullopt,
+                                              .autoApprovedArmedSecondsAgo = std::nullopt,
+                                              .firstPeerId = std::string { first } };
+    };
+    auto const text = RenderEnrollmentReport(
+        Wire::EnrollmentReport { .pending = { row("moved", "2001:db8::7", "198.51.100.7"),
+                                              row("stayed", "198.51.100.8", "198.51.100.8"),
+                                              row("mapped", "::ffff:198.51.100.9", "198.51.100.9") } },
+        "10.0.0.1:6675");
+    auto const lineFor = [&text](std::string_view id) {
+        auto const at = text.find(std::format("  {}  ", id));
+        REQUIRE(at != std::string::npos);
+        auto const end = text.find('\n', at);
+        return text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    };
+
+    // Every row shows its first address, beside the current one.
+    CHECK(lineFor("moved").contains("from 2001:db8::7  first from 198.51.100.7"));
+    CHECK(lineFor("stayed").contains("from 198.51.100.8  first from 198.51.100.8"));
+
+    // Marked in one direction only: a renderer marking every row would pass a case that checked
+    // the moved one alone. An IPv4-mapped spelling of the same address is no move, as the cap
+    // folds it.
+    CHECK(lineFor("moved").contains("asked since from another address"));
+    CHECK_FALSE(lineFor("stayed").contains("asked since from another address"));
+    CHECK_FALSE(lineFor("mapped").contains("asked since from another address"));
 }

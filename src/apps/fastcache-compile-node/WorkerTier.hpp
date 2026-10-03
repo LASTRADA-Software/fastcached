@@ -256,11 +256,11 @@ class WorkerTier
     void StopAndDrain();
 
     /// Whether the worker ended in a way a supervisor must read as a failure: a survey
-    /// that found nothing to serve, or a fleet that is not the one `--cluster-id` names.
+    /// that found nothing to serve.
     /// @return True when the process should exit non-zero.
     [[nodiscard]] bool EndedInRefusal() const noexcept
     {
-        return _surveyFoundNothing || _fleetAssertionFailed;
+        return _surveyFoundNothing;
     }
 
   private:
@@ -334,7 +334,6 @@ class WorkerTier
     BlockingEndpointDialer _dialer;
     SchedulerLink _link;
     std::atomic<bool> _surveyFoundNothing { false };
-    std::atomic<bool> _fleetAssertionFailed { false };
 };
 
 } // namespace FastCache::Node

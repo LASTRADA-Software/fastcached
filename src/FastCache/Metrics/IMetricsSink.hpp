@@ -672,13 +672,14 @@ class IMetricsSink
         /// to "is this happening to me".
         ///
         /// That last sentence stopped being the whole story when the cache and
-        /// scheduler surfaces merged (#290). A node running `--serve-scheduler` binds
-        /// the wildcard, so peers reach the same port the cache verbs arrive on and a
-        /// rise there is ORDINARY rather than a signal -- it is the tightening working.
-        /// A **worker** still defaults to loopback and a rise there still means what it
-        /// always did. The counter is the same fact either way; which reading applies
-        /// is a property of the node, and the help text says so rather than promising
-        /// a zero the merge made false.
+        /// scheduler surfaces merged (#290), and stopped being true at all when the
+        /// zero-config defaults bound EVERY node's port to the wildcard. On a node
+        /// clients are pointed at for the scheduler, peers reach the same port the
+        /// cache verbs arrive on and a rise is ORDINARY rather than a signal -- it is
+        /// the tightening working; anywhere else a rise means something off-box is
+        /// asking. The counter is the same fact either way; which reading applies is a
+        /// property of the node, and the help text says so rather than promising a
+        /// zero the defaults made false.
         NodeCacheRequestsRefusedNotLocal,
         NodeStatusRequestsRefusedNotAMember,
 
@@ -1187,22 +1188,6 @@ class IMetricsSink
         /// `WatchPeer` keeps those two arms apart for exactly this reason.
         FramePeerWatchDeparturesAbortive,
 
-        /// ENROLL requests refused because this node runs no window right now.
-        ///
-        /// **The only pre-auth refusal series this protocol has, and the reason
-        /// `Op::Enroll` is counted at all.** Every other verb requires a credential, so a
-        /// stranger reaching for one is already visible as an authentication refusal.
-        /// This verb is deliberately reachable by anybody who can route to the port, and
-        /// the window is closed except for the minutes an operator spends admitting
-        /// machines -- so a rise here with nobody at a terminal is somebody trying the
-        /// door, and it is the only place that shows.
-        ///
-        /// Zero on a node that nobody has probed, which is the common case and is not
-        /// evidence the refusal works. What says the mechanism is live is
-        /// `EnrollmentWindowsOpened` beside it: a fleet that has enrolled machines has
-        /// moved that one.
-        EnrollmentRequestsRefusedClosed,
-
         /// ENROLL requests refused because the pending list was full, so nothing was
         /// recorded.
         ///
@@ -1266,19 +1251,6 @@ class IMetricsSink
         /// is the only gate on it.
         EnrollmentControlRefusedUnauthenticated,
 
-        /// Enrollment windows opened on this node.
-        ///
-        /// **An audit trail, and the only durable one.** The window lives in memory and a
-        /// restart closes it, the warning it emits reaches only whoever reads this node's
-        /// log, and the open STATE is a snapshot field that says nothing about how often
-        /// it has been open. This is what a scrape can alert on: any rise is a minute in
-        /// which anybody who could reach this machine could ask to be admitted to the fleet.
-        ///
-        /// A tally rather than a gauge, which is what keeps it and the snapshot from
-        /// being two spellings of one fact: this counts events and zero is the truth
-        /// about a node whose window has never been opened.
-        EnrollmentWindowsOpened,
-
         /// Rosters handed to an admitted joiner (#178).
         ///
         /// **The event the feature exists to perform**: a machine an operator approved by
@@ -1290,9 +1262,6 @@ class IMetricsSink
         /// No secret crosses with it, which is why it replaced a counter of cluster keys handed
         /// over rather than keeping that name: the roster is every member's PUBLIC key.
         ///
-        /// Read beside `EnrollmentWindowsOpened`: rosters served without an open is impossible
-        /// and would be a bug report, and opens without any is the ordinary shape of a window
-        /// somebody opened and closed again.
         EnrollmentRostersServed,
 
         /// Discovery proofs that verified under a key this node's roster does not record for
@@ -1320,6 +1289,39 @@ class IMetricsSink
         /// it presented. A healthy segment produces none, so a rise is somebody forging, or a
         /// build that signs a different message -- which the version byte should have refused.
         DiscoveryProofsRefusedForged,
+
+        /// Discovery beacons that reached a bound (`Cluster::DiscoveryBounds`): an entry nothing
+        /// vouches for displaced -- the least recently heard unrostered peer, the oldest fleet that
+        /// proved nothing -- or a new fleet dropped because every remembered fleet has proven
+        /// itself. A challenge is held by no table (`Cluster::ChallengeCookies`), so none is here.
+        ///
+        /// A beacon is unauthenticated, so every table it grows is one anything on the segment can
+        /// try to fill by inventing ids; each overflow is counted here rather than logged, since
+        /// logging would hand the same datagram a disk to fill. One series for every bound: the
+        /// count says a flood is under way, not which table it reached. A healthy segment produces
+        /// none; a rise is somebody flooding the beacon port, or a segment far larger than one
+        /// broadcast domain should carry.
+        DiscoveryBeaconsOverBound,
+
+        /// Discovery replies not sent: a challenge or a proof that would have been larger than
+        /// the datagram that provoked it, or a proof past the answer budget (`Cluster::WorkBudgets`,
+        /// the source host's share and then everybody's).
+        ///
+        /// A reply goes to whatever address its request came FROM, which the sender typed, so a
+        /// reply larger than its request would be an amplifier and an unlimited one a signing
+        /// oracle. Counted rather than logged, since anything on the segment can provoke it. Two
+        /// builds of this project never produce the size case against each other; a rise is
+        /// somebody sending challenges by hand, a flood of them, or -- once per change, and gone by
+        /// the next beacon round -- a node whose summary grew between its beacon and its answer.
+        DiscoveryRepliesWithheld,
+
+        /// Discovery proofs whose signature was not checked: each answered a challenge this node
+        /// issued and had not spent, but the check budget (`Cluster::WorkBudgets`, the source
+        /// host's share and then everybody's) was spent, or the challenge had already failed
+        /// `Cluster::MaxForgeriesPerChallenge` checks. A forgery spends no challenge, so without
+        /// these one live challenge bought a signature check per datagram. The next beacon round
+        /// asks again.
+        DiscoveryProofChecksWithheld,
 
         /// A live-stats stream this node granted and began pushing to. (#1399)
         LiveSubscriptionsOpened,
@@ -1375,6 +1377,12 @@ class IMetricsSink
         RaftPeerFramesRefusedTag,
         /// A verified Raft message naming a sender other than the connection's proven dialler. (#1308)
         RaftPeerFramesRefusedSender,
+        /// A verified Raft frame this build cannot read, which ends the connection.
+        RaftPeerFramesRefusedUnreadable,
+        /// A Raft frame declaring more payload than this node buffers, which ends the connection.
+        RaftPeerFramesRefusedOverCap,
+        /// A Raft frame whose header did not decode, which ends the connection.
+        RaftPeerFramesRefusedBadMagic,
         /// A Raft peer connection closed because the listener already serves its maximum. (#1308)
         RaftPeerConnectionsRefusedFull,
         /// A Raft dial whose acceptor did not challenge or answer within the handshake bound. (#1308)
@@ -1410,6 +1418,25 @@ class IMetricsSink
         RaftPeerDialsRefusedOwnKeyRevoked,
         /// A proven Raft dial this node ended because the cluster no longer holds the acceptor's key. (#178)
         RaftPeerDialsEndedKeyWithdrawn,
+        /// A two-way Raft session this node dialled, ended because a frame the acceptor wrote failed its tag.
+        RaftPeerDialsEndedFrameTag,
+        /// A two-way Raft session this node dialled, ended because a verified message named another sender.
+        RaftPeerDialsEndedFrameSender,
+        /// A two-way Raft session this node dialled, ended on a verified frame this build cannot read.
+        RaftPeerDialsEndedFrameUnreadable,
+        /// A two-way Raft session this node dialled, ended on a frame declaring more than this node buffers.
+        RaftPeerDialsEndedFrameOverCap,
+        /// A two-way Raft session this node dialled, ended on a frame whose header did not decode.
+        RaftPeerDialsEndedFrameBadMagic,
+        /// A Raft message dropped for a peer that dials in (a learner, by its seat's link) and has
+        /// no session attached: offline, or not yet dialled.
+        RaftSendsDroppedNoSession,
+        /// A Raft message dropped for a peer this node can place nowhere: it neither dials it nor
+        /// was told it dials in.
+        RaftSendsDroppedUnknownPeer,
+        /// A two-way Raft session closed because the same id proved a newer one: a learner that
+        /// reconnected, or -- at a steady rate -- two machines sharing one identity key.
+        RaftInboundSessionsSuperseded,
 
         /// A grant refused because this worker holds no roster its trust anchors certify. (#178)
         WorkerJobsRefusedLeaseNoRoster,
@@ -1442,6 +1469,43 @@ class IMetricsSink
         /// A verb only a machine that proved its identity may send -- REGISTER, NODE-ANNOUNCE,
         /// HEARTBEAT, WITHDRAW -- refused on a connection that proved none that is live. (#178)
         SchedulerRequestsRefusedNodeIdentityRequired,
+        /// Enrollment requests the leader forgot because the machine stopped asking for
+        /// `PendingRowLifetime` before anybody decided about it. A machine switched off or given up
+        /// while waiting; one that asks again is recorded afresh.
+        EnrollmentRequestsExpired,
+        /// Joiners an operator admitted by name with `--enroll-approve`, counted once the cluster
+        /// agreed to record them.
+        EnrollmentApprovalsManual,
+        /// Joiners an armed `--enroll-auto-approve` deadline admitted, counted apart from the
+        /// manual ones because the audit question after a window is *who got in while nobody was
+        /// looking*.
+        EnrollmentApprovalsAuto,
+        /// ENROLL requests refused because their source host already held
+        /// `MaxPendingEnrollmentsPerHost` undecided rows. Apart from the full-list row because the
+        /// cause is one address asking a lot rather than many machines waiting, which is what a
+        /// flood looks like.
+        EnrollmentRequestsRefusedHostCap,
+        /// Rows `--enroll-clear` dropped: requests nobody had decided about, forgotten on an
+        /// operator's word.
+        EnrollmentRequestsCleared,
+        /// Approvals refused because the key they named is not the key the row holds: the
+        /// machine asking under that id now is not the one the operator compared -- most often
+        /// because the compared one stopped asking and another took its id.
+        EnrollmentApprovalsRefusedKeyMismatch,
+        /// ENROLL requests refused because the id they named is longer than `MaxIdBytes`, the bound
+        /// every id this fleet carries is held to. Refused where the id ENTERS: a row holding one is
+        /// a row `--enroll-reject` cannot name, removable only by clearing every honest row with it.
+        EnrollmentRequestsRefusedIdTooLong,
+        /// Times this node decided to ask another fleet to admit it: a solitary node that proved an
+        /// older or established fleet it yields to, and recorded the join before asking.
+        FormationYields,
+        /// Joins this node gave up because the fleet it asked stopped answering for
+        /// `PendingGiveUpAfter`. It stays in its own cluster and may ask again.
+        FormationJoinsAbandoned,
+        /// Admissions a pending node did not believe: the roster it was handed does not record it
+        /// under its own key, or records no member under the key that proved the fleet it asked. No
+        /// dissolve follows; the node stays in its own cluster.
+        FormationAdmissionsRefused,
 
         Last,
     };

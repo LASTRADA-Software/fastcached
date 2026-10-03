@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
+#include "NodeFormation.hpp"
 #include "NodeIdentity.hpp"
+#include "NodeStateFiles.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Cluster/Roster.hpp>
@@ -13,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <format>
@@ -238,6 +241,55 @@ std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::stri
     return FormatHostPort(consensus->first, scheduler->second);
 }
 
+std::expected<Cluster::ClusterMember, std::string> ConsensusSelfMemberOf(NodeConfig const& cfg,
+                                                                         std::span<Cluster::ClusterMember const> members)
+{
+    if (cfg.nodeId.empty())
+        return std::unexpected { std::string { ConsensusNeedsNodeIdRefusal } };
+
+    // A mode that dials in is its recorded entry whatever it holds: its endpoint is one nobody
+    // dials, so an empty one is the ordinary case rather than a gap.
+    auto dial = ConsensusDialAddressOf(cfg);
+    auto const dialsIn = !dial.has_value() && dial.error() == ConsensusDialGap::DialsIn;
+    for (auto const& member: members)
+        if (member.id == cfg.nodeId && (dialsIn || !member.raftEndpoint.empty()))
+            return member;
+
+    if (!dialsIn && !dial.has_value())
+        return std::unexpected { std::string { ConsensusNamesNoDialAddressRefusal } };
+
+    // A mode nobody dials holds a learner's seat, the one seat that needs no endpoint
+    // (`Cluster::SeatNeedsEndpoint`); every other is the voter it founded or was promoted to.
+    return Cluster::ClusterMember { .id = cfg.nodeId,
+                                    .raftEndpoint = dial.value_or(std::string {}),
+                                    .schedulerEndpoint = {},
+                                    .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                    .seat = dialsIn ? Cluster::MemberSeat::Learner : Cluster::MemberSeat::Voter,
+                                    .publicKey = cfg.identityPublicKey };
+}
+
+std::string DescribeConsensusEndpoint(std::string_view raftEndpoint)
+{
+    return raftEndpoint.empty() ? std::string { "with no consensus endpoint" } : std::format("at {}", raftEndpoint);
+}
+
+std::vector<Consensus::NodeId> DialInPeers(Cluster::ClusterState const& state, Consensus::Configuration const& configuration)
+{
+    auto peers = std::vector<Consensus::NodeId> {};
+    for (auto const& member: state.members)
+        if (Cluster::LinkOfSeat(member.seat) == Consensus::PeerLink::DialsIn)
+            peers.push_back(member.id);
+    for (auto const& row: Cluster::MemberSeatTable)
+        for (auto const& id: configuration.*row.set)
+            if (Consensus::TraitsOf(Consensus::Membership::StandingOf(configuration, id)).link
+                == Consensus::PeerLink::DialsIn)
+                peers.push_back(id);
+    std::ranges::sort(peers);
+    auto const duplicates = std::ranges::unique(peers);
+    peers.erase(duplicates.begin(), duplicates.end());
+    return peers;
+}
+
 ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              Consensus::FileRaftStorage storage,
                              Ed25519KeyPair identityKey,
@@ -304,45 +356,39 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     ILogger& logger,
     NodeConditions* conditions)
 {
-    // The bootstrap set, and this node must be in it. A node whose own id names no
-    // member could never win a vote and could never be voted for -- it would stand
-    // for election forever against a cluster that has never heard of it, which from
-    // the outside is a node that simply never becomes ready.
-    //
-    // Neither half is decided here any more. The grammar belongs to the option
-    // table, so `cfg.raftPeers` holds members or the command line was refused where
-    // it was typed; and the rule below is `StartupPolicyRejection`'s, asked through
-    // its predicate and answered in its words. That table is what makes an operator
-    // hear it while they are watching -- an install consults it too -- and this is
-    // the same answer arriving for a `NodeConfig` nobody parsed from an argv (#168).
-    auto const& members = cfg.raftPeers;
+    // The members the FORMATION starts consensus with (`BootstrapMembersOf`): this node alone
+    // where it runs its own cluster, the fleet's roster where it joined one -- never both. No
+    // flag carries them any more: the record decides, and a flag would be a second author that
+    // could disagree with it.
+    auto const members = BootstrapMembersOf(cfg);
 
-    auto const* const self = ClusterSelfMember(cfg);
-    if (self == nullptr)
-        return std::unexpected { std::string { ConsensusNamesNoSelfPeerRefusal } };
+    // This node's own record (`ConsensusSelfMemberOf`). A node whose id names no member it can be
+    // reached at could never win a vote and could never be voted for: it would stand for election
+    // forever against a cluster that has never heard of it, which from the outside is a node that
+    // simply never becomes ready.
+    auto self = ConsensusSelfMemberOf(cfg, members);
+    if (!self.has_value())
+        return std::unexpected { std::move(self).error() };
 
     // The identity key, before anything is bound or dialled (#178). Every peer connection
     // proves each end's OWN key, so there is no unauthenticated consensus to fall back to --
     // #1308's rule, carried from the pre-shared key to the key that replaced it on this wire.
-    // A consensus node always has a state directory (`HoldsNodeKey`) and the start resolves
+    // Every node has a state directory (`NodeStateDirectory`) and the start resolves
     // the key there before this tier exists, so this is the answer to a caller that did not.
     if (!identityKey.has_value())
         return std::unexpected { std::string { ConsensusNeedsIdentityKeyRefusal } };
 
-    // `--raft-join` takes the SAME tokens and means something else by them: these
-    // are the nodes this one can REACH, not the cluster it is a member of. So the
-    // bootstrap set is empty and the node waits to be admitted -- which is the only
-    // shape a cluster can admit, because a node that bootstrapped itself has
-    // elected itself and afterwards refuses every leader its own configuration does
-    // not name.
+    // Only a node that FOUNDED its cluster bootstraps it. One that joined another's starts with
+    // an empty bootstrap set and waits to be admitted -- the only shape a cluster can admit,
+    // because a node that bootstrapped itself has elected itself and afterwards refuses every
+    // leader its own configuration does not name.
     //
-    // It still dials all of them, and that is not an optimization: the leader
-    // admitting a joiner starts replicating at its own last index, the joiner's log
-    // is empty, and the leader only walks back to the beginning when the joiner
-    // REFUSES. A joiner that could not send that refusal is admitted, dialled, and
-    // permanently silent -- which is what the end-to-end case found the first time
-    // this was tried with a one-entry list.
-    auto const bootstrap = cfg.raftJoin ? std::vector<Cluster::ClusterMember> {} : members;
+    // It still dials every member, and that is not an optimization: the leader admitting a
+    // joiner starts replicating at its own last index, the joiner's log is empty, and the leader
+    // only walks back to the beginning when the joiner REFUSES. A joiner that could not send
+    // that refusal is admitted, dialled, and permanently silent.
+    auto const foundedHere = cfg.formation.has_value() && cfg.formation->foundedHere;
+    auto const bootstrap = foundedHere ? members : std::vector<Cluster::ClusterMember> {};
 
     // The wildcard for a bare port, like the scheduler's and unlike the cache's:
     // peers are on other machines by definition, so a loopback default would be one
@@ -375,7 +421,10 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     auto const stateDirectory = NodeStateDirectory(cfg);
     auto storage = Consensus::FileRaftStorage::Open(stateDirectory);
     if (!storage.has_value())
-        return std::unexpected { std::format("cannot open {}: {}", stateDirectory.string(), storage.error().context) };
+        return std::unexpected { std::format("cannot open {}: {}{}",
+                                             stateDirectory.string(),
+                                             storage.error().context,
+                                             StateFileUnreadableHint(stateDirectory)) };
 
     // The record this node announces about itself, and the only place both of its
     // addresses are known at once: the consensus one is what an operator typed and
@@ -490,7 +539,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     auto ids = _bootstrapIds;
 
     _transport = std::make_unique<Consensus::RaftPeerTransport>(
-        std::move(peers), _reactor, *_connector, _logger, _metrics, _identity, _nonces);
+        std::move(peers), _reactor, *_connector, _inbound, _logger, _metrics, _identity, _nonces);
 
     auto recovered = _storage.Load();
     if (!recovered.has_value())
@@ -564,8 +613,13 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     Republish();
 
     _sink = std::make_unique<DriverSink>(*_driver, _logger);
-    _peerServer =
-        std::make_unique<Consensus::RaftPeerServer>(*_listener, _reactor, *_sink, _logger, _metrics, _identity, _nonces);
+    // Bound here, before `_transport->Start()` below: the transport delivers into the driver it
+    // was built before, and a message arriving unbound would be dropped.
+    _inbound.Bind(*_sink);
+    // The transport is the server's inbound links: a learner's two-way session, accepted here,
+    // is how the transport writes to that learner, which nobody dials. One reactor for both.
+    _peerServer = std::make_unique<Consensus::RaftPeerServer>(
+        *_listener, _reactor, *_sink, *_transport, _logger, _metrics, _identity, _nonces);
 
     // Both loops on ONE reactor, and neither through `core::async::syncRun`: that function
     // resumes a coroutine exactly once and throws when it is still suspended, so a
@@ -595,6 +649,9 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // dialling begins. Nothing called it, which is a defect with no diagnostic at
     // all: every node came up, listened, ticked its own timers and sent NOTHING,
     // so three nodes sat at `undecided` forever with no error anywhere.
+    // The sink the transport delivers into must be bound by now: one left unbound drops every
+    // message a two-way session carries, and the learner behind it never catches up.
+    assert(_inbound.Bound() && "the transport's inbound sink must be bound before it starts");
     _transport->Start();
 
     serve(_peerServer.get(), this);
@@ -660,7 +717,7 @@ std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluste
     // A forget is PREPARED here first, by the one node that can (#1539, #1555): against
     // the configuration consensus holds, so forgetting the only voter is refused by name
     // while the operator who typed it is reading the answer; and with the key THIS node
-    // holds live for the id, so a member its own `--raft-peer` line typed with a key --
+    // holds live for the id, so a member its own bootstrap roster names with a key --
     // recorded nowhere, or recorded without one -- has that key revoked too.
     auto proposal = command;
     if (command.kind == Cluster::CommandKind::Forget)
@@ -793,7 +850,7 @@ void ConsensusTier::Reconcile()
     // whoever is discovering peers behind whoever is writing to a disk.
     //
     // With the configuration consensus holds, because a member the state does not
-    // record may still be counted there -- every `--raft-peer` member is -- and
+    // record may still be counted there -- every bootstrap member is -- and
     // recording one as the newcomer it is not would demote it (#1535).
     auto const plan = Cluster::MembershipProposals(state, _driver->CurrentProgress().configuration, desired);
     ReportForgottenDesires(state, plan.forgotten);
@@ -820,7 +877,7 @@ void ConsensusTier::Reconcile()
             // half of the trap #159 records, and nothing in this build can produce
             // one any more -- discovery will not remember a peer it cannot name
             // (`PeerDirectory::NoteBeacon`), and the option table refuses a
-            // `--node-id` or `--raft-peer` that is not text before this process
+            // `--node-id` or `--cluster-admit` that is not text before this process
             // starts (`ParseUtf8Text`, #155). Which is exactly why it is worth
             // being loud rather than fatal.
             if (SubjectOf(proposed.error().code) == RefusalSubject::Moment)
@@ -853,9 +910,9 @@ void ConsensusTier::Reconcile()
         }
 
         _logger.Logf(LogLevel::Info,
-                     "cluster: recorded {} at {}{}",
+                     "cluster: recorded {} {}{}",
                      command.key,
-                     command.value,
+                     DescribeConsensusEndpoint(command.value),
                      command.schedulerEndpoint.empty() ? std::string {}
                                                        : std::format(", scheduler {}", command.schedulerEndpoint));
     }
@@ -884,9 +941,9 @@ void ConsensusTier::ReportForgottenDesires(Cluster::ClusterState const& state,
         auto const forgot =
             state.HasForgotten(host) ? std::format("host {}", host) : std::format("{} and revoked its key", member.id);
         _logger.Logf(LogLevel::Info,
-                     "cluster: not recording {} at {}: the cluster forgot {}, and only --cluster-admit undoes a forget",
+                     "cluster: not recording {} {}: the cluster forgot {}, and only --cluster-admit undoes a forget",
                      member.id,
-                     member.raftEndpoint,
+                     DescribeConsensusEndpoint(member.raftEndpoint),
                      forgot);
     }
 
@@ -918,6 +975,13 @@ void ConsensusTier::LearnMembers(Cluster::ClusterState const& state, std::span<C
 
     for (auto const& member: state.members)
         learn(member.id, member.raftEndpoint);
+
+    // Which members reach this node by dialling in is the link column's, read from the record's
+    // seats AND the configuration's standings (`DialInPeers`) and never decided here -- so the
+    // transport counts a message for a learner with no session attached as exactly that, and one
+    // for a peer it cannot place as the other. The whole set on every pass, since a promotion or
+    // a forget takes one out.
+    _transport->LearnDialsIn(DialInPeers(state, _driver->CurrentProgress().configuration));
 
     // And what discovery has proved, which the state may not hold yet -- or ever,
     // on a node that is not the leader and so proposes nothing. A peer that has
@@ -972,7 +1036,7 @@ void ConsensusTier::ReportQuorum()
 
     if (Consensus::Membership::IsEmpty(_reportedConfiguration))
     {
-        // Said out loud, because it is a legitimate state for a `--raft-join` node
+        // Said out loud, because it is a legitimate state for a node that joined a fleet
         // and a fatal one for any other -- and the two are told apart by which node
         // logged it, not by the line.
         _logger.Log(LogLevel::Info, "consensus: this node counts no cluster of its own; it is waiting to be admitted");
@@ -1188,7 +1252,7 @@ void ConsensusTier::Endorse(Cluster::ClusterState const& state)
                                                               .notAfter = now + Cluster::RosterEndorsementLifetime,
                                                               .endorser = _self.id,
                                                               .signature = {} },
-                                 [this](std::span<std::byte const> message) { return _roster.SignAsSelf(message); });
+                                 [this](LabelledMessage const& message) { return _roster.SignAsSelf(message); });
     if (_onEndorsement)
         _onEndorsement(*_endorsement);
 }

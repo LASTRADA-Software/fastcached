@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -523,9 +525,9 @@ enum class Op : std::uint8_t
     /// refused by the digest the encoding starts with rather than misreading it.
     NodeMetrics = 0x0F,
 
-    // Runtime enrollment. A window an operator opens on the seed so a fresh install can ask
-    // to join under the identity key it minted, and be told who else is in the cluster,
-    // instead of every member's key being typed onto forty machines by hand
+    // Runtime enrollment. A fresh install asks the leader to join under the identity key it
+    // minted, and is told who else is in the cluster once a person -- or a deadline a person
+    // armed -- approves it, instead of every member's key being typed onto forty machines by hand
     // ([#1298](https://github.com/LASTRADA-Software/fastcached/issues/1298), #178). **No
     // secret crosses this exchange in either direction**: the request carries a public key
     // and the approved reply carries the roster, which is public too.
@@ -548,9 +550,9 @@ enum class Op : std::uint8_t
     /// It has to be pre-auth. The machine asking is by construction the one that holds
     /// no secret of this cluster -- that is the entire problem being solved -- so a
     /// credential gate here would refuse exactly the population the verb exists for.
-    /// What replaces the credential is a person: the window is closed by default, is
-    /// opened by an operator for a moment, and admits nobody until that operator
-    /// approves a named id.
+    /// What replaces the credential is a person: a request is recorded on a bounded list
+    /// and admits nobody until an operator approves the named id under the key it asked
+    /// with, or asks inside a deadline an operator armed with `EnrollControlVerb::AutoApprove`.
     ///
     /// Answered by the LEADER only. A follower redirects with `NotLeader`, carrying the
     /// leader's endpoint, exactly as every other fleet-changing verb does.
@@ -562,7 +564,8 @@ enum class Op : std::uint8_t
     /// inside this surface for as long as the operator took to read the list.
     Enroll = 0x10,
 
-    /// An operator opens, closes, inspects or decides the enrollment window.
+    /// An operator inspects the joiners waiting, decides one, or arms or ends an auto-approve
+    /// deadline -- one `EnrollControlVerbTable` row each.
     ///
     /// Gated exactly as `ClusterAdmit` is -- leadership, membership, and the credential
     /// when one is configured -- because it decides who joins the fleet. It is the half
@@ -765,6 +768,17 @@ enum class Op : std::uint8_t
     /// only to approve the one request it expects. Answered with `ClusterAdmitReceipt`, the
     /// endpoint field empty: a principal has no consensus endpoint.
     ClusterAdmitWorker = 0x1D,
+
+    /// Ask a node what fleet it is in: its cluster id, whether anybody but its founder was ever
+    /// admitted, when it was created, and where its leader takes enrollment. Pre-auth, because a
+    /// joiner asks a SEED before it is anybody's member; the reply is signed by the answering node
+    /// over the asker's nonce, so it is fresh and attributable, and it carries nothing secret.
+    ///
+    /// Its own family, `VerbFamily::Formation`, for `Enroll`'s reason: it is `OpenBeforeAuth`, and
+    /// no family that holds a gated verb could take it without changing what that family's gate
+    /// answers. `0x1E` is held for another verb, so this byte sits above a gap exactly as
+    /// `CacheDrop`'s once did; `EveryOpcodeIsDistinct` is what makes that safe.
+    FleetSummary = 0x1F,
 };
 
 /// Reply status, the first byte of every reply.
@@ -1145,28 +1159,14 @@ enum class ErrorCode : std::uint8_t
     /// the clients that meet it are by definition of another generation.
     ForeignValueGeneration = 0x1E,
 
-    /// This node runs no enrollment window right now, so nobody may join through it.
-    ///
-    /// **The DEFAULT answer to `Enroll`, and the one a healthy fleet gives all day.**
-    /// The window is closed unless an operator has just opened it, and a restart closes
-    /// it -- so this is what every probe of the port gets, which is exactly why it is
-    /// counted: the verb is reachable before authentication, so a rise here with no
-    /// operator at a terminal is the only evidence that somebody is trying the door.
-    ///
-    /// Emphatically NOT `NotLeader`, which says *ask a different machine* and names
-    /// one. This says the machine is right and the moment is wrong, and the remedy is a
-    /// person running `--enroll-open` rather than a redirect a client can follow.
-    ///
-    /// Numbered after `WorkerCompilerUnclassified = 0x21` rather than at `0x1F`,
-    /// because a code's VALUE is a wire contract, the low bytes are long since spent,
-    /// and this enum is not dense and does not need to be.
-    EnrollmentClosed = 0x22,
+    // 0x22 was `EnrollmentClosed`. Since zero-config formation a joiner's request is always
+    // recorded and the approval is the gate; #178 already made the window guard no secret. The
+    // byte is RETIRED and never reused -- see `RetiredErrorCodes`.
 
-    /// The window is open and its pending list is full, so this request was not
-    /// recorded.
+    /// The pending list is full, so this request was not recorded.
     ///
     /// A refusal rather than an eviction, and that is the decision the bound exists to
-    /// express. The window is ungated by design -- the explicit approve is the gate --
+    /// express. Recording is ungated by design -- the explicit approve is the gate --
     /// so anybody who can reach the port can fill the list; evicting to make room would
     /// let a flooder push the real joiner off the list the operator is reading, which
     /// is silent and undetectable from either end. A full list is visible, and this
@@ -1259,6 +1259,15 @@ enum class ErrorCode : std::uint8_t
     /// scheduler's own host could otherwise register an endpoint of its choosing and be leased the
     /// fleet's jobs. `OpDescriptor::identity` is the table the refusal is decided from.
     NodeIdentityRequired = 0x2B,
+
+    /// This source host already has as many enrollment requests waiting as one host may hold.
+    ///
+    /// **Its own code rather than `EnrollmentFull`**, because the two send an operator to
+    /// different places: a full list is many machines waiting for a decision, and this is ONE
+    /// address asking for more rows than a handful of machines behind it would -- a NAT or a VM
+    /// host at worst, and a flood at best. A joiner reads it as the same wait: its row is
+    /// recorded once one of its host's rows is decided.
+    EnrollmentHostFull = 0x2C,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -1370,6 +1379,60 @@ class PayloadCap
 /// an object file, COMPILE carries a preprocessed translation unit -- and never for a
 /// verb reachable before authentication, which `PreAuthVerbsAreBounded` refuses.
 inline constexpr PayloadCap SessionCapGoverns { 0 };
+
+/// The largest reply a verb may be ANSWERED with, stated rather than defaulted.
+///
+/// `PayloadCap`'s mirror on the other direction, and for the reverse population: a request is read
+/// by a server from whoever connected, a reply by a client from whoever it dialled -- and a client
+/// that dials a seed a DNS answer named, or anything answering at that address, is reading from a
+/// stranger just as surely. A reply header declares its length in a `u32`, and a reader that sizes
+/// its buffer by that before a byte of the payload arrives lets five bytes take four GiB. So a
+/// reader refuses a declared length above its verb's ceiling BEFORE it allocates
+/// (`Cc::RecvReply`), and the ceiling is a column so that no verb can be added without one: the
+/// default constructor is deleted, as `PayloadCap`'s is.
+class ReplyCap
+{
+  public:
+    /// Deleted on purpose: a row must state its reply ceiling. See the class comment.
+    ReplyCap() = delete;
+
+    /// @param bytes The ceiling, or 0 for "the frame's own length governs".
+    constexpr explicit ReplyCap(std::size_t bytes) noexcept:
+        _bytes { bytes }
+    {
+    }
+
+    /// @return The declared ceiling in bytes; 0 means the frame's own length governs.
+    [[nodiscard]] constexpr std::size_t Bytes() const noexcept
+    {
+        return _bytes;
+    }
+
+    /// @return True when this verb's replies declare a bound of their own.
+    [[nodiscard]] constexpr bool IsBounded() const noexcept
+    {
+        return _bytes != 0;
+    }
+
+  private:
+    std::size_t _bytes;
+};
+
+/// This verb's reply carries a build artefact -- a FETCH hit, a COMPILE result -- whose size is the
+/// object file's, so nothing below the frame's own length bounds it.
+///
+/// Legitimate for exactly those two, and asked of a server the caller chose and, for both, one it
+/// authenticated to: never for a verb reachable before authentication, which
+/// `PreAuthRepliesAreBounded` refuses.
+inline constexpr ReplyCap ReplyCarriesArtefact { 0 };
+
+/// This verb's replies are bounded.
+/// @param bytes The ceiling.
+/// @return The cap to put in the row.
+[[nodiscard]] constexpr ReplyCap ReplyBoundedTo(std::size_t bytes) noexcept
+{
+    return ReplyCap { bytes };
+}
 
 /// Who may send a verb: any caller its surface admits, or only a machine that PROVED its identity
 /// on this connection (#178).
@@ -1518,6 +1581,18 @@ enum class VerbFamily : std::uint8_t
     /// old* and acts on by upgrading a machine that is already current.
     NodeProof,
 
+    /// Says which fleet this node is in, to a machine that is nobody's member yet (zero-config
+    /// formation).
+    ///
+    /// Its own family for `Enrollment`'s reason: its one verb is `OpenBeforeAuth`, and a component
+    /// answers for a family -- whether the peer is admitted, whether a credential is required -- so
+    /// folding it into a gated family would either put a verb that must answer strangers behind
+    /// the answer that refuses them, or relax that answer for every verb beside it. Meant for every
+    /// built node, whatever components it runs, since a seed is asked which fleet it is in before
+    /// anybody knows what it serves; while no component owns it, the merged listener refuses it as
+    /// it refuses every family nobody answers (`FamilyRoutes`).
+    Formation,
+
     /// The count, not a family: what sizes a table with one row per family
     /// (`Core/EnumTable.hpp`), so appending a family fails the build of every such table
     /// until it has a row. Never in `OpTable`, which `EveryVerbHasAFamily` would not catch
@@ -1556,6 +1631,13 @@ struct OpDescriptor
     /// file, and by the time it is read the peer has authenticated, so the
     /// operator's own cap is the right bound.
     PayloadCap maxPayload;
+
+    /// Largest reply this verb may be answered with, whatever its status; see `ReplyCap`.
+    ///
+    /// `ReplyCarriesArtefact` or `ReplyBoundedTo(n)`, never omitted. A verb reachable before
+    /// authentication MUST declare a real bound (`PreAuthRepliesAreBounded`): its client is the
+    /// one most likely to be talking to a stranger.
+    ReplyCap maxReply;
 
     /// Which verb family this belongs to; never `Unset`.
     ///
@@ -1730,6 +1812,20 @@ inline constexpr std::size_t NodeEphemeralKeyBytes = 32;
 /// How many bytes a node-handshake signature carries: one Ed25519 signature.
 inline constexpr std::size_t NodeSignatureBytes = 64;
 
+/// Payload ceiling for `FleetSummary`: one nonce and its length prefix.
+///
+/// Its own constant, and the tightest on the table, for `MaxEnrollPayload`'s reason: the verb is
+/// pre-auth, so this bounds what anybody who can route to the port may make the node read per
+/// frame, and the request is one fixed-width field with nothing a person types in it.
+inline constexpr std::size_t MaxFleetSummaryPayload = 64;
+
+// The one field has to FIT, or the verb's own cap refuses every well-formed request and the
+// refusal names a payload ceiling rather than the encoding that cannot meet it.
+static_assert(MaxFleetSummaryPayload >= NodeChallengeBytes + WireFields::FieldPrefixSize,
+              "the fleet summary ceiling must hold one nonce and its length prefix");
+static_assert(MaxFleetSummaryPayload < MaxEnrollPayload,
+              "a request of one fixed-width field must be bounded more tightly than one carrying typed text");
+
 /// How many bytes the tag after every sealed frame carries: one HMAC-SHA256 output.
 ///
 /// NOT counted in the frame's declared length. The header still states the payload alone, so a
@@ -1762,6 +1858,57 @@ static_assert(MaxNodeProofPayload > (3 * sizeof(std::uint32_t)) + IdentityPublic
 /// so this bounds how much a sealing reader buffers before it can check a tag, rather than any
 /// reply a joining machine is owed. A certified roster for a fleet of hundreds is tens of kilobytes.
 inline constexpr std::size_t MaxSealedReplyPayload = 4U * 1024U * 1024U;
+
+/// The largest refusal a client reads: an `Error` reply's code and its sentence.
+///
+/// Every verb may be refused, so every BOUNDED reply ceiling holds one (`BoundedRepliesHoldARefusal`)
+/// -- a ceiling below this would turn a server's explanation into a transport failure. Generous
+/// against any sentence this project writes, and nothing a stranger can scale.
+inline constexpr std::size_t MaxRefusalReply = 64 * 1024;
+
+/// The largest report a client reads from a gated verb: a node's status, its metrics, the fleet
+/// document, a cluster's state, the enrollment list.
+///
+/// These grow with the fleet, and each is read from a server the caller chose and authenticated to,
+/// so the ceiling is generous rather than snug; what it forbids is a five-byte header committing
+/// four GiB, which no fleet's report comes near.
+inline constexpr std::size_t MaxReportReply = 64U * 1024U * 1024U;
+
+/// The largest FLEET-SUMMARY reply a client reads.
+///
+/// The one reply here read from a STRANGER by design -- a seed a DNS SRV record named, or anything
+/// answering at a remembered address -- so it is the tightest on the table: the largest summary
+/// (`MaxFleetSummaryTextBytes` per text field, asserted beside the codec by
+/// `LargestFleetSummaryReply`) plus the key and the signature fits well inside it, and so does a
+/// refusal.
+inline constexpr std::size_t MaxFleetSummaryReply = MaxRefusalReply;
+
+/// The longest text field a fleet summary carries: an id, an endpoint, a leader.
+///
+/// A bound rather than whatever a `u32` prefix allows, because the summary is read from strangers
+/// -- in a beacon and in a FLEET-SUMMARY reply -- and `MaxFleetSummaryReply` has to hold the
+/// largest one. A DNS name is at most 253 bytes and a minted id 32; 1 KiB is `RaftWire`'s id bound
+/// and generous against both. `DecodeFleetSummaryFields` refuses a longer field.
+inline constexpr std::size_t MaxFleetSummaryTextBytes = 1024;
+
+/// The longest an ID may be -- a cluster's or a node's -- wherever one enters: ONE bound for both.
+///
+/// Tighter than every other text field, because an id is what the fleet's own messages carry
+/// most: a cluster id rides every discovery CHALLENGE, which must fit the beacon it answers or is
+/// not sent, so an unbounded cluster id was a node that silently challenged nobody
+/// (`Cluster::DiscoveryWire` asserts that an honest challenge under this bound always fits); and
+/// a node id past what a summary carries was a node every peer silently refused. Ids are minted,
+/// 32 hex characters, so this is twice what any node of this build names.
+///
+/// Refused by name where an id ENTERS: the option rows that take one (`--node-id`, the enrollment
+/// verbs' `<id>`, and the member grammar `--cluster-admit` and its siblings share), a fleet summary
+/// read from the wire, and a formation record read from disk. A cluster's id is minted, never typed.
+inline constexpr std::size_t MaxIdBytes = 64;
+
+static_assert(MaxIdBytes <= MaxFleetSummaryTextBytes, "an id is a fleet summary's text, and bounded tighter");
+
+static_assert(MaxRefusalReply <= MaxSealedReplyPayload && MaxSealedReplyPayload <= MaxReportReply,
+              "a refusal fits every reply ceiling, and a sealed reply fits a report's");
 
 /// How long a scheduler's lease lives, and therefore how long a client waits.
 ///
@@ -1900,6 +2047,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = SessionCapGoverns, // an object file; bounded by the operator's cap
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Cache,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::Fetch,
@@ -1909,6 +2057,7 @@ inline constexpr std::array OpTable {
                        static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = SessionCapGoverns,
+                   .maxReply = ReplyCarriesArtefact,
                    .family = VerbFamily::Cache,
                    .identity = IdentityRequirement::AddressAdmits },
     // `Miss` is legal and is not a failure: see `Op::CacheDrop`. Bounded rather than left to
@@ -1921,6 +2070,7 @@ inline constexpr std::array OpTable {
                        static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Cache,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::Auth,
@@ -1929,6 +2079,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = OpenBeforeAuth,
                    .maxPayload = BoundedTo(MaxAuthPayload),
+                   .maxReply = ReplyBoundedTo(MaxRefusalReply),
                    .family = VerbFamily::Session,
                    .identity = IdentityRequirement::AddressAdmits },
 
@@ -1941,6 +2092,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxNodeProofPayload),
+                   .maxReply = ReplyBoundedTo(MaxSealedReplyPayload),
                    .family = VerbFamily::NodeProof,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ProveNode,
@@ -1949,6 +2101,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxNodeProofPayload),
+                   .maxReply = ReplyBoundedTo(MaxSealedReplyPayload),
                    .family = VerbFamily::NodeProof,
                    .identity = IdentityRequirement::AddressAdmits },
 
@@ -1960,6 +2113,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::NodeAnnounce,
@@ -1971,6 +2125,7 @@ inline constexpr std::array OpTable {
                    // gate admits, so requiring it refuses nobody.
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::Heartbeat,
@@ -1979,6 +2134,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::Lease,
@@ -1987,6 +2143,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::Release,
@@ -1995,6 +2152,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::AddressAdmits },
     // `Ok | Error` and no third status, which is what keeps `MinSupportedVersion`
@@ -2011,6 +2169,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::ClusterStatus,
@@ -2019,6 +2178,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterSet,
@@ -2027,6 +2187,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterForget,
@@ -2035,6 +2196,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterAdmit,
@@ -2043,6 +2205,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterAdmitLearner,
@@ -2051,6 +2214,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterAdmitWorker,
@@ -2059,6 +2223,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterAdmitClient,
@@ -2067,6 +2232,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterForgetClient,
@@ -2075,6 +2241,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::NodeStatus,
@@ -2083,6 +2250,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Node,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ExplainAdmission,
@@ -2095,6 +2263,7 @@ inline constexpr std::array OpTable {
                    // forgotten, so it sits behind the same gate every other node verb does.
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Node,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::NodeMetrics,
@@ -2103,6 +2272,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Node,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::Compile,
@@ -2119,6 +2289,7 @@ inline constexpr std::array OpTable {
                                                               | StatusBit(Status::Progress)),
                    .preAuth = RequiresAuth,
                    .maxPayload = SessionCapGoverns, // carries a preprocessed TU; the operator's cap governs
+                   .maxReply = ReplyCarriesArtefact,
                    .family = VerbFamily::Compile,
                    .identity = IdentityRequirement::AddressAdmits },
 
@@ -2128,7 +2299,7 @@ inline constexpr std::array OpTable {
     // comment a reviewer reads to understand this table's security posture.
     OpDescriptor { .code = Op::Enroll,
                    .name = "enroll",
-                   .fieldCount = 4, // nodeId, raftEndpoint, role, publicKey
+                   .fieldCount = 4, // nodeId, nodeEndpoint, role, publicKey
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    // The second such row this table has ever held, and the first that is
                    // not AUTH. `PreAuthVerbsAreBounded` is what keeps the ceiling below
@@ -2136,6 +2307,7 @@ inline constexpr std::array OpTable {
                    // that assertion discriminate anything.
                    .preAuth = OpenBeforeAuth,
                    .maxPayload = BoundedTo(MaxEnrollPayload),
+                   .maxReply = ReplyBoundedTo(MaxSealedReplyPayload),
                    .family = VerbFamily::Enrollment,
                    .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::EnrollControl,
@@ -2144,7 +2316,22 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Enrollment,
+                   .identity = IdentityRequirement::AddressAdmits },
+
+    // Fleet formation, beside enrollment and for its reason: the row is pre-auth, so it stays out
+    // of the distributed-execution block whose section comment says none of it is.
+    OpDescriptor { .code = Op::FleetSummary,
+                   .name = "fleet-summary",
+                   .fieldCount = 1, // the asker's nonce
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   // The third pre-auth row. A seed answers machines that are members of nothing yet,
+                   // and the answer is public: a signed statement of what a beacon already shouts.
+                   .preAuth = OpenBeforeAuth,
+                   .maxPayload = BoundedTo(MaxFleetSummaryPayload),
+                   .maxReply = ReplyBoundedTo(MaxFleetSummaryReply),
+                   .family = VerbFamily::Formation,
                    .identity = IdentityRequirement::AddressAdmits },
 
     // Live stats (#1399). Not pre-auth: a dashboard reads the fleet, which is exactly what
@@ -2158,6 +2345,7 @@ inline constexpr std::array OpTable {
                        static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error) | StatusBit(Status::Push)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Live,
                    .identity = IdentityRequirement::AddressAdmits },
 
@@ -2169,6 +2357,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Compile,
                    .identity = IdentityRequirement::AddressAdmits },
 
@@ -2180,6 +2369,7 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Fleet,
                    .identity = IdentityRequirement::AddressAdmits },
 };
@@ -2200,6 +2390,54 @@ inline constexpr std::array OpTable {
 }
 
 static_assert(ProgressIsCompileOnly(), "a progress pulse turns a reply into a stream; only COMPILE is long enough to");
+
+/// Whether every verb reachable before authentication bounds its replies.
+///
+/// `PreAuthVerbsAreBounded`'s mirror: those verbs are the ones a client asks of a machine it has
+/// no reason to trust yet, so their replies must never be sized by what the other end declares.
+/// @return True when no pre-auth row is `ReplyCarriesArtefact`.
+[[nodiscard]] constexpr bool PreAuthRepliesAreBounded() noexcept
+{
+    return std::ranges::all_of(OpTable,
+                               [](OpDescriptor const& row) { return !row.preAuth.Allowed() || row.maxReply.IsBounded(); });
+}
+
+static_assert(PreAuthRepliesAreBounded(), "a verb a stranger may be asked must bound the reply it reads");
+
+/// Whether every bounded reply ceiling holds a refusal, so a server's explanation is never read as
+/// a transport failure.
+/// @return True when every bounded ceiling is at least `MaxRefusalReply`.
+[[nodiscard]] constexpr bool BoundedRepliesHoldARefusal() noexcept
+{
+    return std::ranges::all_of(OpTable, [](OpDescriptor const& row) {
+        return !row.maxReply.IsBounded() || row.maxReply.Bytes() >= MaxRefusalReply;
+    });
+}
+
+static_assert(BoundedRepliesHoldARefusal(), "every verb may be refused, so every reply ceiling holds a refusal");
+
+/// Whether a reply of @p status may answer @p op at all, read off the verb's `legalStatuses`.
+///
+/// What refuses a `Status::Progress` on a verb that does not pulse, and a `Miss` on one that cannot
+/// miss: the column already says which statuses each verb may be answered with, so a reader asks
+/// it rather than keeping a list of its own.
+/// @param op The verb that was asked.
+/// @param status The status the reply carries.
+/// @return True when the status is one this verb may be answered with.
+[[nodiscard]] constexpr bool StatusLegalFor(OpDescriptor const& op, Status status) noexcept
+{
+    return (op.legalStatuses & StatusBit(status)) != 0;
+}
+
+/// Whether a reply declaring @p declared payload bytes may answer @p op -- asked BEFORE the payload
+/// is allocated.
+/// @param op The verb that was asked.
+/// @param declared The payload length the reply header declares.
+/// @return True when the verb's `maxReply` admits it.
+[[nodiscard]] constexpr bool ReplyFits(OpDescriptor const& op, std::uint32_t declared) noexcept
+{
+    return !op.maxReply.IsBounded() || declared <= op.maxReply.Bytes();
+}
 
 /// Whether `Status::Push` is confined to the one verb whose answer is a stream.
 ///
@@ -2386,12 +2624,9 @@ inline constexpr std::array ErrorTable {
                       .name = "foreign-value-generation",
                       .defaultMessage = "stored value names a canonicalization generation this build does not "
                                         "implement" },
-    ErrorDescriptor { .code = ErrorCode::EnrollmentClosed,
-                      .name = "enrollment-closed",
-                      .defaultMessage = "this node is not accepting enrollments" },
     ErrorDescriptor { .code = ErrorCode::EnrollmentFull,
                       .name = "enrollment-full",
-                      .defaultMessage = "the enrollment window is full; nothing was recorded" },
+                      .defaultMessage = "the enrollment list is full; nothing was recorded" },
     ErrorDescriptor { .code = ErrorCode::UnknownFleetSelector,
                       .name = "unknown-fleet-selector",
                       .defaultMessage = "this build serves no fleet section or range by that name" },
@@ -2414,6 +2649,10 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::NodeIdentityRequired,
                       .name = "node-identity-required",
                       .defaultMessage = "only a node that has proved its identity on this connection may send that verb" },
+    ErrorDescriptor { .code = ErrorCode::EnrollmentHostFull,
+                      .name = "enrollment-host-full",
+                      .defaultMessage = "this host already has as many enrollment requests waiting as one host may; "
+                                        "nothing was recorded" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.
@@ -2429,7 +2668,10 @@ inline constexpr std::array ErrorTable {
 /// A row here rather than a comment for the reason `PreAuthVerbsAreBounded` is a
 /// `static_assert`: getting it wrong is silent everywhere it matters and visible
 /// nowhere, so the build is the only place it can be caught.
-inline constexpr std::array<std::uint8_t, 2> RetiredErrorCodes { 0x06, 0x24 };
+///
+/// 0x22 was EnrollmentClosed. Since zero-config formation a joiner's request is always recorded
+/// and the approval is the gate; #178 already made the window guard no secret.
+inline constexpr std::array<std::uint8_t, 3> RetiredErrorCodes { 0x06, 0x22, 0x24 };
 
 /// Whether the error table has kept clear of every retired byte.
 ///
@@ -2448,8 +2690,8 @@ inline constexpr std::array<std::uint8_t, 2> RetiredErrorCodes { 0x06, 0x24 };
 
 static_assert(NoRetiredErrorCodeIsReused(),
               "a retired wire code must never be reassigned -- a peer built against an older header still reports it "
-              "under its old name (0x06 was canonicalization-failed, see issues #59 and #69; 0x24 was "
-              "enrollment-already-collected, see #178)");
+              "under its old name (0x06 was canonicalization-failed, see issues #59 and #69; 0x22 was "
+              "enrollment-closed; 0x24 was enrollment-already-collected, see #178)");
 
 /// What a compile-family verb is told at an endpoint that runs no compile worker.
 ///
@@ -5165,21 +5407,56 @@ enum class WireSchedulerRole : std::uint8_t
     Leader = 0x03,    ///< This node leads and may hand out capacity.
 };
 
-/// Whether the enrollment window is taking requests.
+/// How the enrollment window decides a joiner: by a person, or by a deadline a person armed.
 ///
-/// A tri-state where it is reported -- `Open`, `Closed`, and DISENGAGED on a node that
-/// runs no enrollment surface at all -- for `ToolchainState`'s reason: absent is not
-/// closed. A worker with no scheduler has no window to report on, and a `Closed` there
-/// is a claim about a thing that does not exist. It is the one state in this record an
+/// A tri-state where it is reported -- `Manual`, `AutoApprove`, and DISENGAGED on a node
+/// that runs no enrollment surface at all -- for `ToolchainState`'s reason: absent is not
+/// manual. A worker with no scheduler has no window to report on, and a `Manual` there is a
+/// claim about a thing that does not exist. `AutoApprove` is the one state in this record an
 /// operator may act on within seconds of reading it, which is why it is reported at all
-/// rather than left to the metrics: the window hands the fleet's key to a stranger.
+/// rather than left to the metrics: while it lasts, a machine that asks is admitted under the
+/// key it asked with, with nobody comparing that key.
 ///
-/// Explicit values because these bytes are transmitted.
+/// **TRANSMITTED**: explicit values, append-only, and a retired value is never reused --
+/// see `RetiredEnrollmentStates`.
 enum class WireEnrollmentState : std::uint8_t
 {
-    Closed = 0x01, ///< Serving the verb and refusing every request. The default, and a restart's answer.
-    Open = 0x02,   ///< Accepting requests right now.
+    // 0x01 was `Closed` and 0x02 was `Open`: a window an operator opened for a moment. Since
+    // zero-config formation every request is recorded, so neither describes anything. RETIRED.
+
+    Manual = 0x03,      ///< Every request waits for a person. The default, and a restart's answer.
+    AutoApprove = 0x04, ///< A deadline is armed, and a request made before it is admitted.
 };
+
+/// Every enrollment state this build implements, as ONE list, for `KnownEnrollRoles`' reason:
+/// both decoders refuse or skip a byte outside it, and a retired byte is never in it.
+inline constexpr std::array KnownEnrollmentStates { WireEnrollmentState::Manual, WireEnrollmentState::AutoApprove };
+
+/// Enrollment-state bytes that once meant something and must never mean anything again, for
+/// `RetiredErrorCodes`' reason: a peer built before the retirement still names the byte, and
+/// would render a new state under it as the old one.
+inline constexpr std::array<std::uint8_t, 2> RetiredEnrollmentStates { 0x01, 0x02 };
+
+/// Whether the state list has kept clear of every retired byte.
+/// @return True when no known state claims a retired byte.
+[[nodiscard]] consteval bool NoRetiredEnrollmentStateIsReused() noexcept
+{
+    return std::ranges::none_of(KnownEnrollmentStates, [](WireEnrollmentState state) {
+        return std::ranges::contains(RetiredEnrollmentStates, static_cast<std::uint8_t>(state));
+    });
+}
+
+static_assert(NoRetiredEnrollmentStateIsReused(),
+              "0x01 was closed and 0x02 was open; a retired enrollment-state byte is never reassigned");
+
+/// Whether @p raw names an enrollment state this build understands.
+/// @param raw The state byte, as received.
+/// @return True when it names one.
+[[nodiscard]] constexpr bool IsKnownEnrollmentState(std::uint8_t raw) noexcept
+{
+    return std::ranges::any_of(KnownEnrollmentStates,
+                               [raw](WireEnrollmentState state) { return static_cast<std::uint8_t>(state) == raw; });
+}
 
 /// Whether this node's worker is taking new compiles (#1303).
 ///
@@ -5379,28 +5656,26 @@ struct NodeRuntimeFields
     /// clock, which is a different clock.
     std::optional<std::uint64_t> lastRegistrationSecondsAgo {};
 
-    /// Whether this node's enrollment window is open, or disengaged on a node that runs
+    /// How this node's enrollment window decides a joiner, or disengaged on a node that runs
     /// no enrollment surface.
     ///
-    /// **The one state in this record where a stranger can put itself on the list an
-    /// operator approves from**, so it is reported here rather than left to the logs: an
-    /// operator who opened a
-    /// window and walked away has no other way to find out, and the repeating warning
-    /// that exists for the same reason only reaches whoever is reading that node's log.
+    /// **`AutoApprove` is the one state in this record in which a stranger is admitted with
+    /// nobody comparing its key**, so it is reported here rather than left to the logs: an
+    /// operator who armed a deadline and walked away has no other way to find out, and the
+    /// repeating warning that exists for the same reason only reaches whoever is reading that
+    /// node's log.
     ///
     /// A STATE, and therefore in the snapshot rather than exported as a gauge: the
-    /// metrics tally the events -- windows opened, rosters served -- because a counter
-    /// is a tally and a synthetic gauge built out of one would be a second spelling of
-    /// this field that can disagree with it.
+    /// metrics tally the events -- approvals, rosters served -- because a counter is a
+    /// tally and a synthetic gauge built out of one would be a second spelling of this
+    /// field that can disagree with it.
     std::optional<WireEnrollmentState> enrollment {};
 
     /// How many joiners are waiting for a decision.
     ///
     /// Disengaged and zero are different answers, which is the whole reason this is an
-    /// optional: a node that runs no enrollment surface says nothing, and one with an
-    /// open window that nobody has found yet says zero. Read beside `enrollment` --
-    /// a non-zero count under `Closed` is what a window closed with people still
-    /// waiting would look like, and there is no such state, so it is a bug report.
+    /// optional: a node that runs no enrollment surface says nothing, and one that nobody
+    /// has asked yet says zero.
     std::optional<std::uint32_t> enrollmentPending {};
 
     /// Whether the worker is cordoned, and if so whether it has drained (#1303); disengaged
@@ -5432,7 +5707,7 @@ struct NodeRuntimeFields
     /// it runs no consensus, so there is nothing for a forget to have reached. Zero says *the
     /// cluster has agreed no forgets*. A `0` standing in for absent is a reassuring claim about
     /// a set that does not exist, which is the same reason `enrollment` above is absent rather
-    /// than `Closed` on a node with no window.
+    /// than `Manual` on a node with no window.
     ///
     /// It also answers the harder question, which is whether a forget has PROPAGATED: a node
     /// that has not yet applied the entry reports a LOWER count than the leader, and both report
@@ -5477,6 +5752,30 @@ struct NodeRuntimeFields
     /// holds none -- one no other machine can reach, which checks no grant -- or on one too old
     /// to say.
     std::optional<NodeRosterFields> roster {};
+
+    /// How many whole seconds the armed auto-approve deadline has left, or disengaged when none
+    /// is armed -- a `Manual` window, a node that runs no enrollment surface, or a sender too
+    /// old to say.
+    ///
+    /// **Absent is not zero.** Engaged exactly beside `enrollment == AutoApprove`, and a `0`
+    /// there is a deadline in its last second, which still admits; a `Manual` window sends
+    /// nothing rather than a zero that would read as a deadline that just lapsed.
+    std::optional<std::uint64_t> enrollmentAutoApproveSecondsLeft {};
+
+    /// Where this node keeps its identity and consensus state, or disengaged from a sender too
+    /// old to say.
+    ///
+    /// **Beside `stateDirectoryReason`, and never without it**: a node run by hand keeps its
+    /// state in the account's own directory and the machine's service in the machine's, so one
+    /// machine can hold two identities -- and the path alone does not say which of the two an
+    /// operator is looking at. Never legally empty when engaged, like `consensusEndpoint`.
+    std::optional<std::string> stateDirectory {};
+
+    /// Why the state directory is that one -- named, handed over by the service manager,
+    /// machine-wide because the process is privileged, or per-user because it is not -- in the
+    /// words the node chose, so no reader restates the list. Engaged exactly beside
+    /// `stateDirectory`.
+    std::optional<std::string> stateDirectoryReason {};
 };
 
 /// What an operator reads `NodeRuntimeFields::consensusEndpoint` under, as prose: the
@@ -5648,6 +5947,12 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
                                        : std::span<std::byte const> {};
     // Absent as zero length; an engaged roster is never empty -- see `EncodeNodeRoster`.
     auto const roster = runtime.roster.has_value() ? EncodeNodeRoster(*runtime.roster) : std::vector<std::byte> {};
+    auto const autoApproveLeft = Detail::OptionalBigEndian(runtime.enrollmentAutoApproveSecondsLeft);
+    // Absent as zero length; an engaged directory and reason are never empty -- see the members.
+    auto const stateDirectory =
+        runtime.stateDirectory.has_value() ? AsBytes(*runtime.stateDirectory) : std::span<std::byte const> {};
+    auto const stateDirectoryReason =
+        runtime.stateDirectoryReason.has_value() ? AsBytes(*runtime.stateDirectoryReason) : std::span<std::byte const> {};
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -5669,7 +5974,10 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
                                 consensusStanding,
                                 conditions,
                                 identityPublicKey,
-                                roster });
+                                roster,
+                                autoApproveLeft,
+                                stateDirectory,
+                                stateDirectoryReason });
 }
 
 /// Read a runtime record back.
@@ -5740,7 +6048,10 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
         || !Detail::ReadOptionalBigEndian(at(8), out.registrarsTotal)
         || !Detail::ReadOptionalBigEndian(at(9), out.lastRegistrationSecondsAgo)
         || !Detail::ReadOptionalBigEndian(at(11), out.enrollmentPending)
-        || !Detail::ReadOptionalBigEndian(at(14), out.forgottenClients))
+        || !Detail::ReadOptionalBigEndian(at(14), out.forgottenClients)
+        // Field 19, appended behind the roster. Empty is ABSENT, and so is a record from a
+        // build before it: no deadline armed, which is `Manual`'s reading.
+        || !Detail::ReadOptionalBigEndian(at(19), out.enrollmentAutoApproveSecondsLeft))
         return std::nullopt;
 
     if (auto const role = at(5); !role.empty())
@@ -5770,17 +6081,11 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
         // an older client meeting a newer node reports what it understands. Leaving it
         // disengaged reads as *this node said nothing about a window*, which is the
         // honest answer to a byte this build cannot name -- and is safe in the one
-        // direction that matters, because the alarming state is `Open` and an older
-        // client that cannot see it also cannot report a reassuring `Closed`.
-        switch (static_cast<WireEnrollmentState>(enrollment[0]))
-        {
-            case WireEnrollmentState::Closed:
-            case WireEnrollmentState::Open:
-                out.enrollment = static_cast<WireEnrollmentState>(enrollment[0]);
-                break;
-            default:
-                break;
-        }
+        // direction that matters, because the alarming state is `AutoApprove` and a
+        // client that cannot see it also cannot report a reassuring `Manual`. A RETIRED
+        // byte is one this build cannot name, so it is skipped the same way.
+        if (IsKnownEnrollmentState(static_cast<std::uint8_t>(enrollment[0])))
+            out.enrollment = static_cast<WireEnrollmentState>(enrollment[0]);
     }
 
     if (auto const cordon = at(12); !cordon.empty())
@@ -5850,6 +6155,21 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
     // Field 18 (#178 PR 5). Empty is ABSENT, and so is a record from a build before it.
     if (!ReadNodeRoster(at(18), out.roster))
         return std::nullopt;
+
+    // Fields 20 and 21, appended behind the auto-approve deadline. Empty is ABSENT, as for the
+    // consensus endpoint: an engaged directory is never empty. **Both or neither**: a path
+    // without its reason cannot be told from the machine's other identity, and a reason without
+    // a path names nothing -- so a record carrying one alone is a shape this build does not know,
+    // and is refused for the rule every field above follows rather than read as half an answer.
+    auto const directory = at(20);
+    auto const reason = at(21);
+    if (directory.empty() != reason.empty())
+        return std::nullopt;
+    if (!directory.empty())
+    {
+        out.stateDirectory = std::string { AsStringView(directory) };
+        out.stateDirectoryReason = std::string { AsStringView(reason) };
+    }
 
     return out;
 }
@@ -6179,22 +6499,44 @@ enum class EnrollOutcome : std::uint8_t
 
 /// What a joiner asks to be admitted as (#178).
 ///
-/// Explicit values because these bytes are transmitted.
+/// **TRANSMITTED**: explicit values, append-only, and a retired value is never reused -- see
+/// `RetiredEnrollRoles`.
 enum class EnrollRole : std::uint8_t
 {
-    /// A consensus member: it states the endpoint its consensus port answers on, and an
-    /// approval records it as a member holding the key it asked with.
-    Member = 0x01,
+    // 0x01 was `Member`: a joiner that stated the endpoint its consensus port answers on and
+    // was recorded as a voter. A zero-config joiner is recorded as a LEARNER and states no
+    // consensus endpoint, so the byte is RETIRED and never reused.
 
     /// A worker principal: a machine that never joins consensus -- a roaming worker whose
     /// address a VPN reassigns -- admitted by its key alone. It states NO endpoint, because it
     /// has none anybody dials.
     Worker = 0x02,
+
+    /// A consensus learner: an approval records it as a member in the learner seat, holding the
+    /// key it asked with. It states no CONSENSUS endpoint -- a learner dials the leader rather
+    /// than being dialled -- and becomes a voter only when an operator promotes it.
+    Learner = 0x03,
 };
 
 /// Every role this build implements, as ONE list, for `KnownEnrollmentDecisions`' reason: the
 /// decoder refuses a byte outside it and the renderer asserts a label for every member.
-inline constexpr std::array KnownEnrollRoles { EnrollRole::Member, EnrollRole::Worker };
+inline constexpr std::array KnownEnrollRoles { EnrollRole::Learner, EnrollRole::Worker };
+
+/// Role bytes that once meant something and must never mean anything again, for
+/// `RetiredErrorCodes`' reason: a peer built before the retirement still names the byte, and
+/// would admit a new role under it as the old one.
+inline constexpr std::array<std::uint8_t, 1> RetiredEnrollRoles { 0x01 };
+
+/// Whether the role list has kept clear of every retired byte.
+/// @return True when no known role claims a retired byte.
+[[nodiscard]] consteval bool NoRetiredEnrollRoleIsReused() noexcept
+{
+    return std::ranges::none_of(KnownEnrollRoles, [](EnrollRole role) {
+        return std::ranges::contains(RetiredEnrollRoles, static_cast<std::uint8_t>(role));
+    });
+}
+
+static_assert(NoRetiredEnrollRoleIsReused(), "0x01 was member; a retired enrollment-role byte is never reassigned");
 
 /// Whether @p raw names a role this build understands.
 /// @param raw The role byte, as received.
@@ -6213,14 +6555,66 @@ inline constexpr std::size_t RosterFingerprintBytes = 32;
 
 /// What an operator is asking of the window.
 ///
-/// Explicit values because these bytes are transmitted.
+/// **TRANSMITTED**: explicit values, append-only, and a retired value is never reused -- see
+/// `RetiredEnrollControlVerbs`.
 enum class EnrollControlVerb : std::uint8_t
 {
-    Open = 0x01,    ///< Start accepting requests. Names no subject.
-    Close = 0x02,   ///< Stop accepting them, and forget what was pending. Names no subject.
-    List = 0x03,    ///< Report the window and everything waiting. Names no subject.
-    Approve = 0x04, ///< Admit the named id, under the key it asked with, and hand it the roster.
-    Reject = 0x05,  ///< Refuse the named id.
+    // 0x01 was `Open` and 0x02 was `Close`: a window an operator opened for a moment. Since
+    // zero-config formation every request is recorded, so there is nothing to open. RETIRED.
+
+    List = 0x03, ///< Report the window and everything waiting. Names no subject.
+
+    // 0x04 was `Approve` naming an id ALONE, which admitted whatever key the row under that id
+    // held when the approval arrived -- after an expiry, a machine the operator never saw. RETIRED:
+    // the approval names the key it means (`Approve`, below).
+
+    Reject = 0x05,         ///< Refuse the named id.
+    AutoApprove = 0x06,    ///< Arm, or re-arm from now, a deadline before which a joiner is admitted.
+    AutoApproveOff = 0x07, ///< End the armed deadline. Names no subject.
+    Clear = 0x08,          ///< Drop every request nobody decided about. Names no subject.
+    Approve = 0x09,        ///< Admit the named id under the key named WITH it, and hand it the roster.
+};
+
+/// Verb bytes that once meant something and must never mean anything again, for
+/// `RetiredErrorCodes`' reason: a peer built before the retirement still sends the byte, and
+/// would be answered as though it had asked for the new verb.
+inline constexpr std::array<std::uint8_t, 3> RetiredEnrollControlVerbs { 0x01, 0x02, 0x04 };
+
+/// What a verb's second field carries.
+///
+/// A private enum: never transmitted, never persisted. It is a column of
+/// `EnrollControlVerbTable`, and no byte of it reaches a wire.
+enum class EnrollSubject : std::uint8_t
+{
+    None,         ///< An empty field.
+    NodeId,       ///< A pending id: non-empty.
+    Seconds,      ///< A duration: a non-empty run of ASCII digits, whole seconds.
+    NodeIdAndKey, ///< A pending id, then the `IdentityPublicKeyBytes` of the key it is approved under.
+};
+
+/// One live enroll-control verb.
+struct EnrollControlVerbRow
+{
+    EnrollControlVerb verb; ///< The wire verb.
+    std::string_view name;  ///< Its one spelling in a sentence.
+    EnrollSubject subject;  ///< What its second field carries.
+};
+
+/// One row per verb this build implements.
+///
+/// **The table is what the decoder judges a request by**: whether the byte is known, and what
+/// its second field must hold, are one row, so the encoder, the decoder and the surface cannot
+/// come to disagree about which requests are well formed. A plain array rather than an
+/// `EnumTable`, for `KnownEnrollmentDecisions`' reason: a WIRE enum carries no `Last`.
+inline constexpr std::array EnrollControlVerbTable {
+    EnrollControlVerbRow { .verb = EnrollControlVerb::List, .name = "list", .subject = EnrollSubject::None },
+    EnrollControlVerbRow { .verb = EnrollControlVerb::Approve, .name = "approve", .subject = EnrollSubject::NodeIdAndKey },
+    EnrollControlVerbRow { .verb = EnrollControlVerb::Reject, .name = "reject", .subject = EnrollSubject::NodeId },
+    EnrollControlVerbRow {
+        .verb = EnrollControlVerb::AutoApprove, .name = "auto-approve", .subject = EnrollSubject::Seconds },
+    EnrollControlVerbRow {
+        .verb = EnrollControlVerb::AutoApproveOff, .name = "auto-approve-off", .subject = EnrollSubject::None },
+    EnrollControlVerbRow { .verb = EnrollControlVerb::Clear, .name = "clear", .subject = EnrollSubject::None },
 };
 
 /// Whether a byte names an `EnrollControlVerb` this build implements.
@@ -6232,25 +6626,34 @@ enum class EnrollControlVerb : std::uint8_t
 /// @return True when it names a verb.
 [[nodiscard]] constexpr bool IsKnownEnrollControlVerb(std::uint8_t raw) noexcept
 {
-    constexpr std::array Known { EnrollControlVerb::Open,
-                                 EnrollControlVerb::Close,
-                                 EnrollControlVerb::List,
-                                 EnrollControlVerb::Approve,
-                                 EnrollControlVerb::Reject };
-    return std::ranges::any_of(Known, [raw](EnrollControlVerb verb) { return static_cast<std::uint8_t>(verb) == raw; });
+    return std::ranges::any_of(EnrollControlVerbTable, [raw](EnrollControlVerbRow const& row) {
+        return static_cast<std::uint8_t>(row.verb) == raw;
+    });
 }
 
-/// Whether a verb names one entry of the pending list, as against the window itself.
-///
-/// A column rather than a second list: *does this verb take a subject* and *what does
-/// this verb do* are one fact, and a surface that answered them separately would be
-/// free to disagree with the encoder about which requests are well formed.
-/// @param verb The verb.
-/// @return True for `Approve` and `Reject`.
-[[nodiscard]] constexpr bool EnrollControlNamesSubject(EnrollControlVerb verb) noexcept
+/// What @p verb's second field carries.
+/// @param verb A verb the decoder accepted.
+/// @return Its row's subject; `None` for a value no row names, which `IsKnownEnrollControlVerb`
+///         keeps from reaching here.
+[[nodiscard]] constexpr EnrollSubject EnrollControlSubjectOf(EnrollControlVerb verb) noexcept
 {
-    return verb == EnrollControlVerb::Approve || verb == EnrollControlVerb::Reject;
+    for (auto const& row: EnrollControlVerbTable)
+        if (row.verb == verb)
+            return row.subject;
+    return EnrollSubject::None;
 }
+
+/// Whether the verb table has kept clear of every retired byte.
+/// @return True when no row claims a retired byte.
+[[nodiscard]] consteval bool NoRetiredEnrollControlVerbIsReused() noexcept
+{
+    return std::ranges::none_of(EnrollControlVerbTable, [](EnrollControlVerbRow const& row) {
+        return std::ranges::contains(RetiredEnrollControlVerbs, static_cast<std::uint8_t>(row.verb));
+    });
+}
+
+static_assert(NoRetiredEnrollControlVerbIsReused(),
+              "0x01 was open and 0x02 was close; a retired verb byte is never reassigned");
 
 /// A machine asking to be let in, under the identity it minted.
 ///
@@ -6259,10 +6662,14 @@ enum class EnrollControlVerb : std::uint8_t
 /// is that the key the leader lists is the one the joiner printed.
 struct EnrollRequest
 {
-    std::string_view nodeId;                ///< The identity it minted into its own `--cluster-dir`.
-    std::string_view raftEndpoint;          ///< host:port its consensus port will answer on; empty for a `Worker`.
-    EnrollRole role { EnrollRole::Member }; ///< What it asks to be admitted as.
-    std::span<std::byte const> publicKey;   ///< Its identity key: `IdentityPublicKeyBytes` of it.
+    std::string_view nodeId; ///< The identity it minted into its own `--cluster-dir`.
+
+    /// The joiner's CURRENT advertised `0xFC` endpoint -- where the fleet reaches its node
+    /// surface -- and never a consensus endpoint, which a learner does not have.
+    std::string_view nodeEndpoint;
+
+    EnrollRole role { EnrollRole::Learner }; ///< What it asks to be admitted as.
+    std::span<std::byte const> publicKey;    ///< Its identity key: `IdentityPublicKeyBytes` of it.
 };
 
 /// The same, decoded from a received payload. The id and the endpoint are views; the role and
@@ -6270,18 +6677,18 @@ struct EnrollRequest
 struct EnrollView
 {
     std::span<std::byte const> nodeId;                          ///< The id, as sent.
-    std::span<std::byte const> raftEndpoint;                    ///< The endpoint, as sent; empty for a `Worker`.
-    EnrollRole role { EnrollRole::Member };                     ///< What it asks to be admitted as.
+    std::span<std::byte const> nodeEndpoint;                    ///< The `0xFC` endpoint, as sent.
+    EnrollRole role { EnrollRole::Learner };                    ///< What it asks to be admitted as.
     std::array<std::byte, IdentityPublicKeyBytes> publicKey {}; ///< Its identity key.
 };
 
 /// Frame an ENROLL request.
 ///
-/// Four fields. The id and the endpoint for `ClusterAdmit`'s reason -- an id with no address is
-/// a member the cluster counts towards quorum and cannot reach -- the role because a member and
-/// a worker are admitted by different commands, and the key because it is what the cluster
-/// records instead of handing a secret back. The joiner states all four because it is the only
-/// party that knows any of them.
+/// Four fields. The id, the `0xFC` endpoint the joiner currently advertises -- shown to the
+/// operator beside the host the request came from -- the role because a learner and a worker
+/// are admitted by different commands, and the key because it is what the cluster records
+/// instead of handing a secret back. The joiner states all four because it is the only party
+/// that knows any of them.
 /// @param request Who is asking, as what, under which key, and where it will answer.
 /// @param version Version to advertise.
 /// @return The framed request.
@@ -6291,7 +6698,7 @@ struct EnrollView
     return Detail::EncodeRequest(
         version,
         Op::Enroll,
-        { AsBytes(request.nodeId), AsBytes(request.raftEndpoint), std::span<std::byte const> { role }, request.publicKey });
+        { AsBytes(request.nodeId), AsBytes(request.nodeEndpoint), std::span<std::byte const> { role }, request.publicKey });
 }
 
 /// Split an ENROLL payload.
@@ -6311,7 +6718,7 @@ struct EnrollView
     if (role.size() != 1 || !IsKnownEnrollRole(static_cast<std::uint8_t>(role[0])) || key.size() != IdentityPublicKeyBytes)
         return std::nullopt;
     auto view = EnrollView {
-        .nodeId = (*fields)[0], .raftEndpoint = (*fields)[1], .role = static_cast<EnrollRole>(role[0]), .publicKey = {}
+        .nodeId = (*fields)[0], .nodeEndpoint = (*fields)[1], .role = static_cast<EnrollRole>(role[0]), .publicKey = {}
     };
     std::ranges::copy(key, view.publicKey.begin());
     return view;
@@ -6390,7 +6797,9 @@ struct EnrollReplyView
 
 /// Frame an ENROLL-CONTROL request.
 /// @param verb What to do.
-/// @param subject The pending id for `Approve`/`Reject`; empty for the rest.
+/// @param subject What the verb's `EnrollControlVerbTable` row says its second field carries:
+///        the pending id for `Approve`/`Reject`, whole seconds in decimal for `AutoApprove`,
+///        empty for the rest.
 /// @param version Version to advertise.
 /// @return The framed request.
 [[nodiscard]] inline std::vector<std::byte> EncodeEnrollControl(EnrollControlVerb verb,
@@ -6401,27 +6810,88 @@ struct EnrollReplyView
     return Detail::EncodeRequest(version, Op::EnrollControl, { std::span<std::byte const> { tag }, AsBytes(subject) });
 }
 
+/// Frame an ENROLL-CONTROL request arming an auto-approve deadline @p duration from now.
+///
+/// The duration travels as whole seconds in decimal, the `Seconds` subject's spelling. Whether
+/// it is zero or above the ceiling is not this encoder's to judge, and not the decoder's either:
+/// those are the leader's named refusals, so an operator hears which rule rather than *a frame
+/// this build cannot read*.
+///
+/// **A negative duration is a programmer error**, asserted rather than encoded: its decimal
+/// spelling carries a sign, which the decoder refuses as malformed, so the frame would be refused
+/// as a version mismatch rather than as the caller's mistake it is.
+/// @param duration How long the deadline lasts, from when the leader applies it; never negative.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeEnrollAutoApprove(std::chrono::seconds duration,
+                                                                    WireVersion version = CurrentVersion)
+{
+    assert(duration.count() >= 0 && "an auto-approve duration is never negative; the decoder refuses a sign");
+    return EncodeEnrollControl(EnrollControlVerb::AutoApprove, std::to_string(duration.count()), version);
+}
+
+/// Frame an ENROLL-CONTROL request approving @p nodeId under @p key.
+///
+/// **The key rides with the id** because the id alone names a ROW, and a row can be replaced:
+/// once the machine an operator compared stops asking, its row lapses, and the next machine to
+/// ask under that id is recorded under ITS key. An approval naming only the id would admit
+/// that one. The leader refuses an approval whose key is not the row's, by name.
+///
+/// The key's bytes follow the id's in the subject field: a key is exactly
+/// `IdentityPublicKeyBytes` long, so the split is unambiguous whatever the id holds.
+/// @param nodeId The pending id; non-empty.
+/// @param key The key the operator compared.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeEnrollApprove(std::string_view nodeId,
+                                                                std::span<std::byte const, IdentityPublicKeyBytes> key,
+                                                                WireVersion version = CurrentVersion)
+{
+    std::array<std::byte, 1> const tag { static_cast<std::byte>(EnrollControlVerb::Approve) };
+    auto subject = std::vector<std::byte> {};
+    subject.reserve(nodeId.size() + key.size());
+    auto const id = AsBytes(nodeId);
+    subject.insert(subject.end(), id.begin(), id.end());
+    subject.insert(subject.end(), key.begin(), key.end());
+    return Detail::EncodeRequest(version, Op::EnrollControl, { std::span<std::byte const> { tag }, subject });
+}
+
 /// An operator's request, decoded.
 struct EnrollControlView
 {
     /// What to do.
     ///
     /// Defaulted to `List` EXPLICITLY, for `EnrollReplyView::outcome`'s reason: this
-    /// enum starts at `0x01`, so `{}` would hold a 0 that names no enumerator. `List` is
-    /// the choice among the five because it is the only one that CHANGES nothing -- a
-    /// view nobody filled in must not read as `Open`, which is the verb that lets anyone
-    /// who can reach the port put a row on the list an operator reads.
+    /// enum starts at `0x03`, so `{}` would hold a 0 that names no enumerator. `List` is
+    /// the choice among the live verbs because it is the only one that CHANGES nothing -- a
+    /// view nobody filled in must not read as `AutoApprove`, which is the verb that admits
+    /// anyone who asks with nobody comparing a key.
     EnrollControlVerb verb { EnrollControlVerb::List };
 
-    std::span<std::byte const> subject {}; ///< The id, empty for the verbs that name none.
+    /// The second field as sent, empty for the verbs that name none -- and for a `NodeIdAndKey`
+    /// verb the id ALONE, the key split off into `key`.
+    std::span<std::byte const> subject {};
+
+    /// The duration a `Seconds` verb carries, read out of `subject`. Present exactly for a
+    /// `Seconds` verb, and absent for every other.
+    std::optional<std::chrono::seconds> duration {};
+
+    /// The key a `NodeIdAndKey` verb names. Present exactly for such a verb, and absent for every
+    /// other.
+    std::optional<std::array<std::byte, IdentityPublicKeyBytes>> key {};
 };
 
 /// Split an ENROLL-CONTROL payload.
 ///
-/// Refuses a verb this build does not implement, and refuses a subject that does not
-/// match the verb's own arity -- a `Close` naming an id, or an `Approve` naming none,
-/// is a client this build does not understand, and answering either by ignoring the
-/// mismatch is how an operator comes to believe they approved somebody.
+/// Refuses a verb this build does not implement -- a retired byte among them -- and refuses a
+/// second field that does not match what the verb's `EnrollControlVerbTable` row says it
+/// carries: `None` needs an empty field, `NodeId` a non-empty one, `Seconds` a non-empty
+/// run of ASCII digits that fits a `std::uint64_t`, and `NodeIdAndKey` a non-empty id followed
+/// by exactly a key. An `AutoApproveOff` carrying a duration,
+/// or an `Approve` naming nobody, is a client this build does not understand, and answering
+/// either by ignoring the mismatch is how an operator comes to believe they approved
+/// somebody. **Zero and the ceiling are NOT judged here**: those are the leader's named
+/// refusals, so an operator hears which rule rather than *a frame this build cannot read*.
 /// @param payload The bytes following the request header.
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<EnrollControlView> DecodeEnrollControlPayload(std::span<std::byte const> payload)
@@ -6434,9 +6904,46 @@ struct EnrollControlView
         return std::nullopt;
     auto const verb = static_cast<EnrollControlVerb>(tag[0]);
     auto const subject = (*fields)[1];
-    if (EnrollControlNamesSubject(verb) == subject.empty())
-        return std::nullopt;
-    return EnrollControlView { .verb = verb, .subject = subject };
+    auto view = EnrollControlView { .verb = verb, .subject = subject, .duration = std::nullopt, .key = std::nullopt };
+    switch (EnrollControlSubjectOf(verb))
+    {
+        case EnrollSubject::None:
+            if (!subject.empty())
+                return std::nullopt;
+            return view;
+        case EnrollSubject::NodeId:
+            if (subject.empty())
+                return std::nullopt;
+            return view;
+        case EnrollSubject::NodeIdAndKey: {
+            // An id of at least one byte, then exactly a key: a field no longer than a key names
+            // nobody, which is refused rather than read as a key with an empty id.
+            if (subject.size() <= IdentityPublicKeyBytes)
+                return std::nullopt;
+            auto const split = subject.size() - IdentityPublicKeyBytes;
+            auto key = std::array<std::byte, IdentityPublicKeyBytes> {};
+            std::ranges::copy(subject.subspan(split), key.begin());
+            view.subject = subject.first(split);
+            view.key = key;
+            return view;
+        }
+        case EnrollSubject::Seconds: {
+            // The integer overload into an UNSIGNED type reads ASCII digits and nothing else --
+            // no sign, no whitespace, nothing from the locale -- and the WHOLE field must be
+            // consumed: `15m` would otherwise read as fifteen seconds. A count that fits the
+            // `uint64_t` but not `seconds::rep` is refused too, or the cast below would read
+            // `9223372036854775808` as a NEGATIVE duration.
+            auto const text = AsStringView(subject);
+            auto seconds = std::uint64_t { 0 };
+            auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), seconds);
+            if (error != std::errc {} || end != text.data() + text.size()
+                || seconds > static_cast<std::uint64_t>(std::chrono::seconds::max().count()))
+                return std::nullopt;
+            view.duration = std::chrono::seconds { static_cast<std::chrono::seconds::rep>(seconds) };
+            return view;
+        }
+    }
+    return std::nullopt;
 }
 
 /// How far one pending request has got.
@@ -6504,7 +7011,7 @@ static_assert(NoRetiredEnrollmentDecisionIsReused(),
 struct EnrollmentPendingEntry
 {
     std::string nodeId;       ///< The identity it claims.
-    std::string raftEndpoint; ///< The consensus address it claims.
+    std::string nodeEndpoint; ///< The `0xFC` endpoint it claims, shown beside `peerId`.
 
     /// The host the KERNEL says the request came from.
     ///
@@ -6534,14 +7041,14 @@ struct EnrollmentPendingEntry
     /// row has stopped tracking the machine. Non-zero is a machine that moved after it
     /// was decided about -- ordinary, and fixed by enrolling it again -- or somebody
     /// else answering to a decided id, which is the same reading a `peerId` that
-    /// disagrees with `raftEndpoint` gets: **shown to a person, never acted on by the
+    /// disagrees with `nodeEndpoint` gets: **shown to a person, never acted on by the
     /// node.** #242 settled that gating on the observed host refuses the documented
     /// setup and stops only a third host.
     std::uint32_t claimsChanged { 0 };
 
     EnrollmentDecision decision { EnrollmentDecision::Pending }; ///< What has been decided about it.
 
-    EnrollRole role { EnrollRole::Member }; ///< What it asked to be admitted as.
+    EnrollRole role { EnrollRole::Learner }; ///< What it asked to be admitted as.
 
     /// The identity key it asked with, WHOLE (#178).
     ///
@@ -6561,15 +7068,34 @@ struct EnrollmentPendingEntry
     /// admission -- a batch of approvals would otherwise make every joiner's print disagree with
     /// the list for a reason that is no attack at all.
     std::optional<std::array<std::byte, RosterFingerprintBytes>> rosterFingerprint {};
+
+    /// How long ago the auto-approve deadline that approved this row was armed, in seconds, or
+    /// absent on a row a person decided -- or nobody has.
+    ///
+    /// The audit an auto-approval owes: no person compared this row's key, so the list says so
+    /// and says WHICH arming admitted it, which is what an operator reading it later needs to
+    /// find out who armed what. A duration rather than an instant, for `firstSeenSecondsAgo`'s
+    /// reason.
+    std::optional<std::uint64_t> autoApprovedArmedSecondsAgo {};
+
+    /// The host this row was CREATED from, as the kernel reported it, with an IPv4-mapped address
+    /// folded to its IPv4 form (`UnmappedHost`). Set once, and never refreshed.
+    ///
+    /// It is the key of the per-host bound: a leader counts a host's undecided rows by it, so
+    /// re-polling rows from a second address cannot move them out of the first address's share.
+    /// It travels so the list can explain that bound. `EnrollmentHostFull` names the host in this
+    /// spelling, and a row whose `peerId` has since moved to another address is MARKED beside
+    /// this one, for #242's reason: shown to a person, never acted on.
+    std::string firstPeerId {};
 };
 
 /// What an ENROLL-CONTROL was answered with.
 struct EnrollmentReport
 {
-    WireEnrollmentState state { WireEnrollmentState::Closed }; ///< Whether the window is taking requests.
+    WireEnrollmentState state { WireEnrollmentState::Manual }; ///< How the window decides a joiner.
 
-    /// How long the window has been open, in seconds; zero when it is closed.
-    std::uint64_t openForSeconds { 0 };
+    /// How many whole seconds the armed auto-approve deadline has left; zero in `Manual`.
+    std::uint64_t autoApproveSecondsLeft { 0 };
 
     std::vector<EnrollmentPendingEntry> pending; ///< Everything waiting, oldest first.
 };
@@ -6597,8 +7123,10 @@ struct EnrollmentReport
         auto const fingerprint = entry.rosterFingerprint.has_value()
                                      ? std::span<std::byte const> { *entry.rosterFingerprint }
                                      : std::span<std::byte const> {};
+        // Absent as zero length, the optional-field convention the runtime record holds.
+        auto const armedAgo = Detail::OptionalBigEndian(entry.autoApprovedArmedSecondsAgo);
         rows.push_back(WireFields::Encode({ AsBytes(entry.nodeId),
-                                            AsBytes(entry.raftEndpoint),
+                                            AsBytes(entry.nodeEndpoint),
                                             AsBytes(entry.peerId),
                                             std::span<std::byte const> { EncodeU64Field(entry.firstSeenSecondsAgo) },
                                             std::span<std::byte const> { EncodeU32Field(entry.attempts) },
@@ -6606,7 +7134,9 @@ struct EnrollmentReport
                                             std::span<std::byte const> { EncodeU32Field(entry.claimsChanged) },
                                             std::span<std::byte const> { role },
                                             std::span<std::byte const> { entry.publicKey },
-                                            fingerprint }));
+                                            fingerprint,
+                                            armedAgo,
+                                            AsBytes(entry.firstPeerId) }));
     }
     std::vector<std::span<std::byte const>> views;
     views.reserve(rows.size());
@@ -6616,11 +7146,11 @@ struct EnrollmentReport
     // Named locals, all three: the spans handed to `Encode` view them, and a temporary
     // would be gone before the call -- the same reason `EncodeNodeStatus` names its own.
     std::array<std::byte, 1> const state { static_cast<std::byte>(report.state) };
-    auto const openFor = EncodeU64Field(report.openForSeconds);
+    auto const secondsLeft = EncodeU64Field(report.autoApproveSecondsLeft);
     auto const entries = WireFields::Encode(WireFields::FieldList { views });
 
     return WireFields::Encode({ std::span<std::byte const> { state },
-                                std::span<std::byte const> { openFor },
+                                std::span<std::byte const> { secondsLeft },
                                 std::span<std::byte const> { entries } });
 }
 
@@ -6638,18 +7168,13 @@ struct EnrollmentReport
     if (!outer.has_value())
         return std::nullopt;
     auto const state = (*outer)[0];
-    if (state.size() != 1)
+    // REFUSED rather than skipped, unlike the runtime record's copy of this byte: the reader is a
+    // person deciding whom to admit, and a mode guessed is the one wrong answer this report must
+    // not give. A retired byte is one this build cannot name.
+    if (state.size() != 1 || !IsKnownEnrollmentState(static_cast<std::uint8_t>(state[0])))
         return std::nullopt;
-    switch (static_cast<WireEnrollmentState>(state[0]))
-    {
-        case WireEnrollmentState::Closed:
-        case WireEnrollmentState::Open:
-            break;
-        default:
-            return std::nullopt;
-    }
-    auto const openFor = DecodeU64Field((*outer)[1]);
-    if (!openFor.has_value())
+    auto const secondsLeft = DecodeU64Field((*outer)[1]);
+    if (!secondsLeft.has_value())
         return std::nullopt;
 
     auto const rows = WireFields::SplitAll((*outer)[2]);
@@ -6657,19 +7182,20 @@ struct EnrollmentReport
         return std::nullopt;
 
     EnrollmentReport report { .state = static_cast<WireEnrollmentState>(state[0]),
-                              .openForSeconds = *openFor,
+                              .autoApproveSecondsLeft = *secondsLeft,
                               .pending = {} };
     report.pending.reserve(rows->size());
     for (auto const& row: *rows)
     {
-        // At LEAST the ten a version-12 row carries, and any surplus is skipped: a row from a
-        // build that records one more fact than this one knows about is read for what it does
-        // know, exactly as `DecodeNodeRuntime` reads its own record. A row SHORTER than ten is
-        // refused, because those ten are not optional -- the key above all, which is the thing
-        // the operator is reading this list to compare -- and reading a missing one would
-        // invent a value rather than omit a fact. An older sender is refused by VERSION first.
+        // At LEAST the twelve a row carries, and any surplus is skipped: a row from a build that
+        // records one more fact than this one knows about is read for what it does know, exactly
+        // as `DecodeNodeRuntime` reads its own record. A row SHORTER than twelve is refused,
+        // because those positions are not optional -- the key above all, which is the thing the
+        // operator is reading this list to compare -- and reading a missing one would invent a
+        // value rather than omit a fact. The two optional facts, the fingerprint and the
+        // auto-approval, are optional in their VALUE and travel as a zero-length field.
         auto const parts = WireFields::SplitAll(row);
-        if (!parts.has_value() || parts->size() < 10)
+        if (!parts.has_value() || parts->size() < 12)
             return std::nullopt;
         auto const firstSeen = DecodeU64Field((*parts)[3]);
         auto const attempts = DecodeU32Field((*parts)[4]);
@@ -6686,7 +7212,7 @@ struct EnrollmentReport
             || !IsKnownEnrollRole(static_cast<std::uint8_t>(role[0])))
             return std::nullopt;
         auto entry = EnrollmentPendingEntry { .nodeId = std::string { AsStringView((*parts)[0]) },
-                                              .raftEndpoint = std::string { AsStringView((*parts)[1]) },
+                                              .nodeEndpoint = std::string { AsStringView((*parts)[1]) },
                                               .peerId = std::string { AsStringView((*parts)[2]) },
                                               .firstSeenSecondsAgo = *firstSeen,
                                               .attempts = *attempts,
@@ -6694,7 +7220,11 @@ struct EnrollmentReport
                                               .decision = static_cast<EnrollmentDecision>(decision[0]),
                                               .role = static_cast<EnrollRole>(role[0]),
                                               .publicKey = {},
-                                              .rosterFingerprint = std::nullopt };
+                                              .rosterFingerprint = std::nullopt,
+                                              .autoApprovedArmedSecondsAgo = std::nullopt,
+                                              .firstPeerId = std::string { AsStringView((*parts)[11]) } };
+        if (!Detail::ReadOptionalBigEndian((*parts)[10], entry.autoApprovedArmedSecondsAgo))
+            return std::nullopt;
         std::ranges::copy(key, entry.publicKey.begin());
         if (!fingerprint.empty())
         {
@@ -6704,6 +7234,224 @@ struct EnrollmentReport
         report.pending.push_back(std::move(entry));
     }
     return report;
+}
+
+// ---- Fleet formation ---------------------------------------------------------------------
+
+/// Whether a fleet has admitted anybody but its founder.
+///
+/// **TRANSMITTED**: in a node's beacon and in its `FleetSummary` reply, so the values are
+/// explicit and the list is append-only. A byte this build has no name for is refused by the
+/// decoder rather than read as `Solitary`, because the two meet in a yield decision: a node
+/// that read an established fleet as solitary would treat it as a peer that may be asked to
+/// yield, or would yield to it for the wrong reason.
+enum class FleetState : std::uint8_t
+{
+    Solitary = 0x01,    ///< Only its founder has ever been admitted.
+    Established = 0x02, ///< Somebody besides its founder has been admitted, ever.
+};
+
+/// Every fleet state this build implements, as ONE list, for `KnownEnrollRoles`' reason: the
+/// decoder refuses a byte outside it.
+inline constexpr std::array KnownFleetStates { FleetState::Solitary, FleetState::Established };
+
+/// What a node says about the fleet it is in: the body of its beacon, and of its `FleetSummary`
+/// reply.
+///
+/// **Owns every field.** A decoder returns it by value, so a view member would be a
+/// use-after-free the moment the payload it was decoded from is dropped -- and this struct is
+/// handed from a reply reader to a yield decision that outlives the frame.
+struct FleetSummary
+{
+    std::string clusterId {};                  ///< The fleet's id, as its founder minted it.
+    FleetState state { FleetState::Solitary }; ///< Whether anybody but the founder was ever admitted.
+    std::uint64_t createdAtUnixSeconds { 0 };  ///< When the founder created the fleet.
+    std::string leaderId {};                   ///< Empty when this node knows no leader.
+    std::string leaderNodeEndpoint {};         ///< host:port of the leader's 0xFC port, where a joiner sends Enroll.
+    std::string nodeId {};                     ///< Who is speaking.
+    std::string raftEndpoint {};               ///< Where the speaker answers Raft; EMPTY for a learner.
+
+    /// Field-wise equality.
+    [[nodiscard]] friend bool operator==(FleetSummary const&, FleetSummary const&) = default;
+};
+
+/// How many length-prefixed fields `EncodeFleetSummaryFields` writes, in `FleetSummary`'s order.
+inline constexpr std::size_t FleetSummaryFieldCount = 7;
+
+/// Encode a fleet summary as its fields, for a beacon or a reply to carry.
+///
+/// The state is one byte and the creation time eight big-endian bytes; every other field is text,
+/// written as it stands. An empty field is a length of zero rather than an absent one, so the arity
+/// never depends on what a node knows.
+///
+/// **Precondition: the cluster id is not empty.** `DecodeFleetSummaryFields` refuses an empty one
+/// as malformed, so encoding it would be sending what every peer drops; a node's cluster id is
+/// minted into its formation record, never empty.
+/// @param summary What the node says; its `clusterId` is not empty.
+/// @return `FleetSummaryFieldCount` fields.
+[[nodiscard]] inline std::vector<std::byte> EncodeFleetSummaryFields(FleetSummary const& summary)
+{
+    assert(!summary.clusterId.empty() && "a fleet summary names its cluster; the decoder refuses an empty id");
+    std::array<std::byte, 1> const state { static_cast<std::byte>(summary.state) };
+    auto const created = EncodeU64Field(summary.createdAtUnixSeconds);
+    return WireFields::Encode({ AsBytes(summary.clusterId),
+                                std::span<std::byte const> { state },
+                                std::span<std::byte const> { created },
+                                AsBytes(summary.leaderId),
+                                AsBytes(summary.leaderNodeEndpoint),
+                                AsBytes(summary.nodeId),
+                                AsBytes(summary.raftEndpoint) });
+}
+
+/// One text field of `EncodeFleetSummaryFields`' and the most bytes a reader accepts in it.
+struct FleetSummaryTextField
+{
+    std::size_t index;    ///< Its position among the summary's fields.
+    std::size_t maxBytes; ///< Its bound: longer is refused.
+};
+
+/// Which of `EncodeFleetSummaryFields`' fields are text -- the cluster, the leader, its endpoint,
+/// the node and its endpoint -- each with its bound: the three ids `MaxIdBytes`, the two endpoints
+/// `MaxFleetSummaryTextBytes`.
+inline constexpr std::array<FleetSummaryTextField, 5> FleetSummaryTextFields { {
+    { .index = 0, .maxBytes = MaxIdBytes },
+    { .index = 3, .maxBytes = MaxIdBytes },
+    { .index = 4, .maxBytes = MaxFleetSummaryTextBytes },
+    { .index = 5, .maxBytes = MaxIdBytes },
+    { .index = 6, .maxBytes = MaxFleetSummaryTextBytes },
+} };
+
+/// The largest FLEET-SUMMARY reply payload a peer can send that `DecodeFleetSummaryReply` accepts:
+/// the nested summary at its largest, the key and the signature, each behind its length prefix.
+/// @return The size in bytes.
+[[nodiscard]] consteval std::size_t LargestFleetSummaryReply() noexcept
+{
+    auto text = std::size_t { 0 };
+    for (auto const& field: FleetSummaryTextFields)
+        text += field.maxBytes;
+    auto const summary = (FleetSummaryFieldCount * WireFields::FieldPrefixSize) + text + 1 /* state */
+                         + sizeof(std::uint64_t) /* created */;
+    return (3 * WireFields::FieldPrefixSize) + summary + IdentityPublicKeyBytes + NodeSignatureBytes;
+}
+
+static_assert(LargestFleetSummaryReply() <= MaxFleetSummaryReply,
+              "the fleet summary reply ceiling must hold the largest summary a peer can make, with its key and signature");
+
+/// Read a fleet summary back.
+///
+/// Refuses a field count other than `FleetSummaryFieldCount`, a text field longer than its bound
+/// (`FleetSummaryTextFields`: an id past `MaxIdBytes` included), an EMPTY cluster id, a
+/// state byte
+/// this build has no name for (see `FleetState`) and a creation time that is not exactly eight
+/// bytes. A cluster id is minted and never empty, so an empty one is malformed rather than a value:
+/// read as one, it would sort below every real id and win every same-second tie-break a yield
+/// decision makes, and two of them would read as the same fleet.
+/// @param blob What `EncodeFleetSummaryFields` wrote.
+/// @return The summary, owning every field, or nullopt when malformed.
+[[nodiscard]] inline std::optional<FleetSummary> DecodeFleetSummaryFields(std::span<std::byte const> blob)
+{
+    auto const fields = WireFields::SplitExactly(blob, FleetSummaryFieldCount);
+    if (!fields.has_value() || (*fields)[0].empty())
+        return std::nullopt;
+    // Every text field inside its bound, so the largest summary a peer can make a reader hold is a
+    // constant and `MaxFleetSummaryReply` can be asserted to hold it -- and a cluster id inside the
+    // one a discovery challenge needs.
+    for (auto const& field: FleetSummaryTextFields)
+        if ((*fields)[field.index].size() > field.maxBytes)
+            return std::nullopt;
+    auto const state = (*fields)[1];
+    if (state.size() != 1 || !std::ranges::contains(KnownFleetStates, static_cast<FleetState>(state[0])))
+        return std::nullopt;
+    auto const created = DecodeU64Field((*fields)[2]);
+    if (!created.has_value())
+        return std::nullopt;
+    return FleetSummary { .clusterId = std::string { AsStringView((*fields)[0]) },
+                          .state = static_cast<FleetState>(state[0]),
+                          .createdAtUnixSeconds = *created,
+                          .leaderId = std::string { AsStringView((*fields)[3]) },
+                          .leaderNodeEndpoint = std::string { AsStringView((*fields)[4]) },
+                          .nodeId = std::string { AsStringView((*fields)[5]) },
+                          .raftEndpoint = std::string { AsStringView((*fields)[6]) } };
+}
+
+/// Frame a FLEET-SUMMARY request.
+///
+/// One field: the asker's nonce, drawn fresh per question, which the answering node signs over so
+/// a recorded reply cannot be replayed to a later asker.
+/// @param nonce The asker's nonce.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeFleetSummaryRequest(std::span<std::byte const, NodeChallengeBytes> nonce,
+                                                                      WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::FleetSummary, { std::span<std::byte const> { nonce } });
+}
+
+/// Split a FLEET-SUMMARY payload.
+///
+/// Refuses a nonce that is not exactly `NodeChallengeBytes` wide: a shorter one is a weaker
+/// challenge than the asker thinks it sent, and a longer one is a sender this build does not know.
+/// @param payload The bytes following the request header.
+/// @return The nonce, copied out, or nullopt when malformed.
+[[nodiscard]] inline std::optional<std::array<std::byte, NodeChallengeBytes>> DecodeFleetSummaryRequestPayload(
+    std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::FleetSummary));
+    if (!fields.has_value() || (*fields)[0].size() != NodeChallengeBytes)
+        return std::nullopt;
+    auto nonce = std::array<std::byte, NodeChallengeBytes> {};
+    std::ranges::copy((*fields)[0], nonce.begin());
+    return nonce;
+}
+
+/// A FLEET-SUMMARY reply: the summary, the answering node's identity key, and its signature.
+///
+/// The codec carries the key and the signature and checks only their widths. What the signature
+/// covers -- the asker's nonce and the summary -- is decided where it is made and where it is
+/// checked, never here, so that a reply this decoder accepts is not mistaken for one that verified.
+struct FleetSummaryReply
+{
+    FleetSummary summary {};                                    ///< What the answering node says.
+    std::array<std::byte, IdentityPublicKeyBytes> publicKey {}; ///< The answering node's identity key.
+    std::array<std::byte, NodeSignatureBytes> signature {};     ///< Its signature over the nonce and the summary.
+
+    /// Field-wise equality.
+    [[nodiscard]] friend bool operator==(FleetSummaryReply const&, FleetSummaryReply const&) = default;
+};
+
+/// Frame the payload of a FLEET-SUMMARY reply.
+///
+/// Three fields: the summary's own fields as ONE nested field, so the beacon and the reply share
+/// `EncodeFleetSummaryFields` byte for byte, then the key and the signature.
+/// @param reply The reply.
+/// @return The reply payload, to be carried by `EncodeReply(Status::Ok, ...)`.
+[[nodiscard]] inline std::vector<std::byte> EncodeFleetSummaryReply(FleetSummaryReply const& reply)
+{
+    auto const summary = EncodeFleetSummaryFields(reply.summary);
+    return WireFields::Encode({ std::span<std::byte const> { summary },
+                                std::span<std::byte const> { reply.publicKey },
+                                std::span<std::byte const> { reply.signature } });
+}
+
+/// Read a FLEET-SUMMARY reply payload back.
+///
+/// Refuses a key or a signature that is not exactly one wide -- a prefix of a signature verifies
+/// nothing, and a caller must not be handed one to try -- and a summary `DecodeFleetSummaryFields`
+/// refuses.
+/// @param payload The reply payload.
+/// @return The reply, owning every field, or nullopt when malformed.
+[[nodiscard]] inline std::optional<FleetSummaryReply> DecodeFleetSummaryReply(std::span<std::byte const> payload)
+{
+    auto const fields = WireFields::SplitExactly(payload, 3);
+    if (!fields.has_value() || (*fields)[1].size() != IdentityPublicKeyBytes || (*fields)[2].size() != NodeSignatureBytes)
+        return std::nullopt;
+    auto summary = DecodeFleetSummaryFields((*fields)[0]);
+    if (!summary.has_value())
+        return std::nullopt;
+    auto reply = FleetSummaryReply { .summary = *std::move(summary) };
+    std::ranges::copy((*fields)[1], reply.publicKey.begin());
+    std::ranges::copy((*fields)[2], reply.signature.begin());
+    return reply;
 }
 
 // ---- The node proof (#1428, #178) --------------------------------------------------------
@@ -6961,7 +7709,7 @@ enum class LiveEventKind : std::uint8_t
     WorkerLeft = 0x03,
     LeadershipChanged = 0x04, ///< Who leads the cluster changed.
     SurveyChanged = 0x05,     ///< The node's toolchain survey state changed.
-    EnrollmentChanged = 0x06, ///< An enrollment window opened or closed.
+    EnrollmentChanged = 0x06, ///< The enrollment window's mode changed: an auto-approve deadline armed or ended.
 };
 
 /// Every event kind this build implements, as ONE list; see `KnownEnrollmentDecisions`.

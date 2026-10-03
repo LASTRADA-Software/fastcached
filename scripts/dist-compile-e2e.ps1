@@ -96,8 +96,13 @@ if (-not $SelfTest) {
     $Fastcached = (Resolve-Path $Fastcached).Path
     $Node       = (Resolve-Path $Node).Path
 
+# Every WORKER started below runs no consensus (`--listen-raft=`) and every scheduler no
+# discovery (`--discovery=`), named since both are on by default: a worker would otherwise be
+# a cluster of itself on the default raft port, and a beacon would reach every other fixture
+# on this machine.
+#
 # Every node started below turns its own cache tier OFF. `--listen-node` defaults
-# to 127.0.0.1:6674 -- where `fastcache-cc` looks -- which is right for the one node
+# to 0.0.0.0:6674 -- 6674 being where `fastcache-cc` looks -- which is right for the one node
 # per machine a real deployment runs and wrong here, where several share a host and
 # would race for it. Said explicitly rather than left to the default's
 # warn-and-continue, so a node that failed to bind for some OTHER reason still shows
@@ -304,7 +309,7 @@ function Wait-ForLine([string]$path, [string]$pattern, [int]$seconds, [string]$w
 # the same files back rather than minting a second identity.
 function Get-SchedulerKey([string]$stateDir, [int]$raftPort) {
     $identity = & $Node --print-identity "--listen-raft=127.0.0.1:$raftPort" `
-                        "--raft-self=127.0.0.1" "--cluster-dir=$stateDir"
+                        "--raft-self=127.0.0.1" "--cluster-dir=$stateDir" "--discovery="
     if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint a scheduler identity in $stateDir (exit $LASTEXITCODE)" }
     $line = @($identity) | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
     if (-not $line) { throw "--print-identity printed no public-key line: $identity" }
@@ -322,7 +327,9 @@ function Get-SchedulerKey([string]$stateDir, [int]$raftPort) {
 #
 # Bounded by a Stopwatch, which is monotonic, rather than by counting the sleeps it asked for.
 function Admit-Worker([string]$stateDir, [string]$scheduler, [string]$what) {
-    $identity = @(& $Node --print-identity "--cluster-dir=$stateDir")
+    # A worker runs no consensus -- named, since consensus is on by default -- so the
+    # identity printed is a worker's, with the `--cluster-admit-worker` line.
+    $identity = @(& $Node --print-identity "--cluster-dir=$stateDir" "--listen-raft=")
     if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint an identity for the $what in $stateDir (exit $LASTEXITCODE)" }
     $tokenLine = $identity | Where-Object { $_ -like 'cluster-admit-worker *' } | Select-Object -First 1
     $keyLine = $identity | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
@@ -1108,9 +1115,9 @@ try {
         $schedKey = Get-SchedulerKey $schedState $schedRaftPort
         $scheduler = Start-Background $Node @(
             $NoLocalCache,
-            "--serve-scheduler", "--listen-node=127.0.0.1:$dispatchPort", "--fleet-open",
+            "--listen-node=127.0.0.1:$dispatchPort", "--fleet-open",
             "--listen-raft=127.0.0.1:$schedRaftPort", "--raft-self=127.0.0.1",
-            "--cluster-dir=$schedState",
+            "--cluster-dir=$schedState", "--discovery=",
             "--advertise=127.0.0.1:$dispatchPort",
             "--slots=0",
             "--log-level=debug") $schedLog
@@ -1149,7 +1156,7 @@ try {
         $workerState = Join-Path $scratch "worker.state"
         Admit-Worker $workerState "127.0.0.1:$dispatchPort" "worker"
         $worker = Start-Background $Node @(
-            $NoLocalCache, "--voter-key=$schedKey", "--cluster-dir=$workerState",
+            $NoLocalCache, "--voter-key=$schedKey", "--cluster-dir=$workerState", "--listen-raft=",
             "--scheduler=127.0.0.1:$dispatchPort", "--listen-node=127.0.0.1:$workerPort",
             "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=$workerSlots",
             "--log-level=debug") $workerLog
@@ -1357,9 +1364,9 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $isoSchedKey = Get-SchedulerKey $isoSchedState $isoRaftPort
         $isoScheduler = Start-Background $Node @(
             $NoLocalCache,
-            "--serve-scheduler", "--listen-node=127.0.0.1:$isoDispatch", "--fleet-open",
+            "--listen-node=127.0.0.1:$isoDispatch", "--fleet-open",
             "--listen-raft=127.0.0.1:$isoRaftPort", "--raft-self=127.0.0.1",
-            "--cluster-dir=$isoSchedState",
+            "--cluster-dir=$isoSchedState", "--discovery=",
             "--advertise=127.0.0.1:$isoDispatch",
             "--slots=0", "--log-level=debug") $isoSchedLog
         $procs += $isoScheduler
@@ -1369,7 +1376,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $isoWorkerState = Join-Path $scratch "iso-worker.state"
         Admit-Worker $isoWorkerState "127.0.0.1:$isoDispatch" "isolation worker"
         $isoNode = Start-Background $Node @(
-            $NoLocalCache, "--voter-key=$isoSchedKey", "--cluster-dir=$isoWorkerState",
+            $NoLocalCache, "--voter-key=$isoSchedKey", "--cluster-dir=$isoWorkerState", "--listen-raft=",
             "--scheduler=127.0.0.1:$isoDispatch", "--listen-node=127.0.0.1:$isoWorker",
             "--advertise=127.0.0.1:$isoWorker",
             "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",

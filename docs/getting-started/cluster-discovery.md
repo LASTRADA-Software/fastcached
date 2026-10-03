@@ -3,10 +3,10 @@
 How the nodes of a `fastcache-compile-node` cluster find each other on a LAN, and
 how one proves which member it is before anything it claims is believed.
 
-It is off unless you ask for it. Turn it on with `--discovery`, which needs
-`--listen-raft` and is refused without it; without it a cluster is exactly the
-`--raft-peer` list an operator typed, which works and is the right answer for a fleet
-that does not change. A discovery proof is a signature by the node's OWN identity key,
+It is on by default, beside consensus: `--discovery` names where beacons are sent, an
+empty one turns it off, and a node whose consensus is off opens neither of its sockets.
+Without it a cluster's members are exactly the ones its operators admitted, which works
+and is the right answer for a fleet that does not change. A discovery proof is a signature by the node's OWN identity key,
 the same key every consensus connection proves — see
 [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication).
 The flags, and what a deployment looks like end to end, are under

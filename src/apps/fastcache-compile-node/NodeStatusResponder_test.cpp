@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "EnrollmentWindow.hpp"
 #include "NodeConfig.hpp"
 #include "NodeStatusResponder.hpp"
 #include "Responders.hpp"
@@ -32,6 +33,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/MembershipFakes.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -70,7 +72,7 @@ class CapturedReadings final: public ILiveStatsSources
         // responder's reading against a capture the node would never produce -- a fake more
         // permissive than the thing it stands for, which is the one kind of fixture defect
         // reading the fake never finds.
-        auto const served = NodeServedSurfacesFor(NodeConfig {});
+        auto const served = NodeServedSurfacesFor(Testing::FirstStart(NodeConfig {}));
         return CaptureCacheSubject(_metrics, _snapshot, served.Span());
     }
 
@@ -204,15 +206,18 @@ struct ConfigShape
 /// @return The configuration.
 [[nodiscard]] NodeConfig NodeConfigOf(ConfigShape const& shape)
 {
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeListen = "127.0.0.1:0";
     if (shape.admin)
         cfg.adminListen = std::format("127.0.0.1:{}", AdminPort);
+    // Every surface off unless the shape asks for it -- consensus and discovery are on by
+    // default, so a shape naming neither turns both off, as `--listen-raft=` and
+    // `--discovery=` would.
+    cfg.raftListen.clear();
     if (shape.raft)
         cfg.raftListen = shape.raftWildcard ? std::format("{}", RaftPort) : std::format("127.0.0.1:{}", RaftPort);
     cfg.raftSelf = std::string { shape.raftSelf };
-    if (shape.discovery)
-        cfg.discoveryAddress = std::format("0.0.0.0:{}", DiscoveryPort);
+    cfg.discoveryAddress = shape.discovery ? std::format("0.0.0.0:{}", DiscoveryPort) : std::string {};
     if (shape.tlsPair || shape.tlsCertOnly)
         cfg.tlsCertFile = "cert.pem";
     if (shape.tlsPair)
@@ -247,6 +252,8 @@ struct DirectSources
     IConsensusStandingSource const* consensus { nullptr };
     /// The node's condition registry; null is a build that reports none (#1364).
     NodeConditions const* conditions { nullptr };
+    /// The enrollment list; null is a node that serves none.
+    EnrollmentWindow const* enrollment { nullptr };
 };
 
 /// A `ConfiguredNodeStatus` beside the configuration it holds a reference to.
@@ -283,6 +290,7 @@ struct Fixture
                  NodeRuntimeSources { .runtime = initial.has_value() ? &runtime : nullptr,
                                       .capacity = direct.capacity,
                                       .scheduler = direct.scheduler,
+                                      .enrollment = direct.enrollment,
                                       .membership = direct.membership,
                                       .consensus = direct.consensus,
                                       .conditions = direct.conditions } }
@@ -735,6 +743,15 @@ TEST_CASE("A consensus node reports the address peers DIAL, which is not the one
         Fixture const unstated { { .raft = true, .raftWildcard = true }, clock };
         CHECK_FALSE(unstated.status.Describe().runtime.consensusEndpoint.has_value());
     }
+
+    SECTION("and this machine's name once it has resolved, on a consensus node naming no --raft-self")
+    {
+        Fixture named { { .raft = true, .raftWildcard = true }, clock };
+        ApplyHostNames(named.cfg,
+                       NodeHostNames { .fqdn = "laptop.corp.example", .dnsSuffix = "corp.example", .withheld = {} });
+        CHECK(named.status.Describe().runtime.consensusEndpoint
+              == std::optional { std::format("laptop.corp.example:{}", RaftPort) });
+    }
 }
 
 TEST_CASE("ToolchainStateFor maps a served count onto the two states it decides", "[node][node-status][toolchains]")
@@ -813,7 +830,7 @@ TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's fi
     // The whole reading, compared as one value: every counter, every block, the version. Derived
     // from a capture of the same sink and snapshot rather than from a list of expected figures,
     // which would go stale silently the day a figure is added.
-    auto const served = NodeServedSurfacesFor(NodeConfig {});
+    auto const served = NodeServedSurfacesFor(Testing::FirstStart(NodeConfig {}));
     CHECK(reading == CaptureStatsReading(metrics, snapshot, served.Span()));
 
     REQUIRE(reading.snapshot.storage.has_value());
@@ -1394,4 +1411,47 @@ TEST_CASE("A node reports the identity key it holds, and nothing on a node that 
     auto const decoded = Wire::DecodeNodeStatus(Wire::EncodeNodeStatus(fields));
     REQUIRE(decoded.has_value());
     CHECK(Unwrap(decoded).runtime.identityPublicKey == fields.runtime.identityPublicKey);
+}
+
+TEST_CASE("A node reports where it keeps its identity, and why there", "[node][node-status][formation][defaults]")
+{
+    // One machine can hold two identities -- the service's in the machine-wide directory and a
+    // hand-started node's in the account's own -- and an operator who finds both needs the
+    // reason beside each path to tell them apart. Both or neither.
+    core::platform::ManualClock clock;
+    Fixture unresolved { {}, clock };
+    auto const none = unresolved.status.Describe().runtime;
+    CHECK_FALSE(none.stateDirectory.has_value());
+    CHECK_FALSE(none.stateDirectoryReason.has_value());
+
+    Fixture named { {}, clock };
+    named.cfg.clusterDir = "/srv/fastcache-node";
+    auto const runtime = named.status.Describe().runtime;
+    CHECK(runtime.stateDirectory == std::optional { std::filesystem::path { "/srv/fastcache-node" }.string() });
+    CHECK(runtime.stateDirectoryReason
+          == std::optional { std::string { DescribeStateDirectoryOrigin(StateDirectoryOrigin::Named) } });
+
+    // And it survives the wire, both fields.
+    auto const decoded = Wire::DecodeNodeRuntime(Wire::EncodeNodeRuntime(runtime));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).stateDirectory == runtime.stateDirectory);
+    CHECK(Unwrap(decoded).stateDirectoryReason == runtime.stateDirectoryReason);
+}
+
+TEST_CASE("A leader with an armed window reports auto-approve and the seconds left, and a manual one reports none",
+          "[node][node-status][enrollment][auto-approve]")
+{
+    core::platform::ManualClock clock;
+    EnrollmentWindow window { clock };
+    Fixture node { ConfigShape {}, clock, {}, std::nullopt, DirectSources { .enrollment = &window } };
+
+    auto const manual = node.status.Describe().runtime;
+    CHECK(manual.enrollment == std::optional { Wire::WireEnrollmentState::Manual });
+    // Absent, never a zero: a zero would read as a window ending this instant.
+    CHECK_FALSE(manual.enrollmentAutoApproveSecondsLeft.has_value());
+
+    REQUIRE(window.ArmAutoApprove(std::chrono::minutes { 10 }).has_value());
+    auto const armed = node.status.Describe().runtime;
+    CHECK(armed.enrollment == std::optional { Wire::WireEnrollmentState::AutoApprove });
+    CHECK(armed.enrollmentAutoApproveSecondsLeft == std::optional<std::uint64_t> { 600 });
 }

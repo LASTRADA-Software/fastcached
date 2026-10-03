@@ -86,8 +86,8 @@ class NodeRoster final: public IPresenceRoster, public IServerTrust
     /// Build the roster this configuration calls for.
     ///
     /// Refuses a kept roster that cannot be used -- it may be the only thing standing between
-    /// this worker and a voter the cluster has revoked since -- and one naming a fleet other
-    /// than `--cluster-id` asserts. And refuses a worker other machines can reach that holds no
+    /// this worker and a voter the cluster has revoked since. And refuses a worker other
+    /// machines can reach that holds no
     /// roster and names no `--voter-key`, which is where `RosterlessWorkerRefusal` is answered:
     /// only the state directory knows whether it holds a roster.
     /// @param cfg The parsed configuration.

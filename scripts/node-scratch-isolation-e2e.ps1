@@ -604,7 +604,9 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
 #
 # Bounded by a Stopwatch, which is monotonic, rather than by counting the sleeps it asked for.
 function Admit-Worker([string]$stateDir, [string]$scheduler, [string]$what) {
-    $identity = @(& $Node --print-identity "--cluster-dir=$stateDir")
+    # A worker runs no consensus -- named, since consensus is on by default -- so the
+    # identity printed is a worker's, with the `--cluster-admit-worker` line.
+    $identity = @(& $Node --print-identity "--cluster-dir=$stateDir" "--listen-raft=")
     if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint an identity for the $what in $stateDir (exit $LASTEXITCODE)" }
     $tokenLine = $identity | Where-Object { $_ -like 'cluster-admit-worker *' } | Select-Object -First 1
     $keyLine = $identity | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
@@ -1325,9 +1327,9 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # It runs consensus, a cluster of one (#178), keeping the identity key it signs
         # leases with in a state directory of its own; the loopback workers check nothing.
         $schedProc = Start-NodeIn "sched" @(
-            "--serve-scheduler", "--listen-node=127.0.0.1:$schedPort", "--fleet-open",
+            "--listen-node=127.0.0.1:$schedPort", "--fleet-open",
             "--listen-raft=127.0.0.1:$schedRaft", "--raft-self=127.0.0.1",
-            "--cluster-dir=$(Join-Path $phaseDir 'sched.state')",
+            "--cluster-dir=$(Join-Path $phaseDir 'sched.state')", "--discovery=",
             "--advertise=127.0.0.1:$schedPort",
             "--slots=0",
             "--admin-listen=127.0.0.1:$adminPort") $null
@@ -1395,7 +1397,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         $workerAState = Join-Path $phaseDir "workerA.state"
         Admit-Worker $workerAState "127.0.0.1:$schedPort" "workerA"
         $workerAProc = Start-NodeIn "workerA" @(
-            "--scheduler=127.0.0.1:$schedPort", "--cluster-dir=$workerAState", "--listen-node=127.0.0.1:$workerA",
+            "--scheduler=127.0.0.1:$schedPort", "--cluster-dir=$workerAState", "--listen-raft=", "--listen-node=127.0.0.1:$workerA",
             "--advertise=127.0.0.1:$workerA",
             "--toolchain=$Compiler", "--slots=1") $null
         $procs += $workerAProc
@@ -1405,7 +1407,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         $workerBState = Join-Path $phaseDir "workerB.state"
         Admit-Worker $workerBState "127.0.0.1:$schedPort" "workerB"
         $workerBProc = Start-NodeIn "workerB" @(
-            "--scheduler=127.0.0.1:$schedPort", "--cluster-dir=$workerBState", "--listen-node=127.0.0.1:$workerB",
+            "--scheduler=127.0.0.1:$schedPort", "--cluster-dir=$workerBState", "--listen-raft=", "--listen-node=127.0.0.1:$workerB",
             "--advertise=127.0.0.1:$workerB",
             "--toolchain=$Compiler", "--slots=1") $bTemp
         $procs += $workerBProc

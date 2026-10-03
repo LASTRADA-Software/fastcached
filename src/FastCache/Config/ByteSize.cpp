@@ -17,13 +17,14 @@ namespace FastCache
 namespace
 {
 
-    [[nodiscard]] ConfigError MakeError(ConfigErrorCode code, std::string_view field, std::string context)
+    /// A refusal naming no field: whoever reached this parser -- a row, a file key -- stamps its own.
+    [[nodiscard]] ConfigError MakeError(ConfigErrorCode code, std::string context)
     {
         return ConfigError {
             .code = code,
             .source = "",
             .line = 0,
-            .field = std::string { field },
+            .field = {},
             .context = std::move(context),
         };
     }
@@ -58,12 +59,10 @@ namespace
 
 } // namespace
 
-std::expected<std::size_t, ConfigError> ParseByteSize(std::string_view sv,
-                                                      std::string_view field,
-                                                      std::size_t hostTotalBytes)
+std::expected<std::size_t, ConfigError> ParseByteSize(std::string_view sv, std::size_t hostTotalBytes)
 {
     if (sv.empty())
-        return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, field, "empty value"));
+        return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, "empty value"));
 
     auto const tail = sv.back();
 
@@ -72,20 +71,20 @@ std::expected<std::size_t, ConfigError> ParseByteSize(std::string_view sv,
     {
         auto const digits = sv.substr(0, sv.size() - 1);
         if (digits.empty())
-            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, field, "percent without digits"));
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, "percent without digits"));
 
         auto pct = std::uint64_t { 0 };
         auto const [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), pct);
         if (ec != std::errc {} || ptr != digits.data() + digits.size())
-            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, field, std::format("not a number: {}", sv)));
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, std::format("not a number: {}", sv)));
 
         if (pct > 100)
             return std::unexpected(
-                MakeError(ConfigErrorCode::OutOfRange, field, std::format("percentage out of range 0..100: {}", sv)));
+                MakeError(ConfigErrorCode::OutOfRange, std::format("percentage out of range 0..100: {}", sv)));
 
         if (hostTotalBytes == 0)
             return std::unexpected(
-                MakeError(ConfigErrorCode::TypeMismatch, field, "percent-of-host requested but host memory is unknown"));
+                MakeError(ConfigErrorCode::TypeMismatch, "percent-of-host requested but host memory is unknown"));
 
         return static_cast<std::size_t>((static_cast<std::uint64_t>(hostTotalBytes) * pct) / 100U);
     }
@@ -96,25 +95,24 @@ std::expected<std::size_t, ConfigError> ParseByteSize(std::string_view sv,
     {
         multiplier = SuffixMultiplier(tail);
         if (multiplier == 0)
-            return std::unexpected(
-                MakeError(ConfigErrorCode::TypeMismatch, field, std::format("unknown unit suffix: '{}'", tail)));
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, std::format("unknown unit suffix: '{}'", tail)));
         digits = sv.substr(0, sv.size() - 1);
         if (digits.empty())
-            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, field, "suffix without digits"));
+            return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, "suffix without digits"));
     }
 
     auto raw = std::uint64_t { 0 };
     auto const [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), raw);
     if (ec != std::errc {} || ptr != digits.data() + digits.size())
-        return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, field, std::format("not a number: {}", sv)));
+        return std::unexpected(MakeError(ConfigErrorCode::TypeMismatch, std::format("not a number: {}", sv)));
 
     constexpr auto SizeMax = static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
     if (multiplier > 1 && raw > SizeMax / multiplier)
-        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, field, std::format("value overflows size_t: {}", sv)));
+        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, std::format("value overflows size_t: {}", sv)));
 
     auto const product = raw * multiplier;
     if (product > SizeMax)
-        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, field, std::format("value overflows size_t: {}", sv)));
+        return std::unexpected(MakeError(ConfigErrorCode::OutOfRange, std::format("value overflows size_t: {}", sv)));
 
     return static_cast<std::size_t>(product);
 }

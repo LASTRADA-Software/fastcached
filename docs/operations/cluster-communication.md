@@ -381,8 +381,8 @@ client's own cache connection.
 One of those numbers is a real default and one is not. A node's `0xFC` port listens
 on `6674` unless you say otherwise — and since the surfaces merged that is the only
 port a worker opens for the protocol, compiles included; **`6675` is
-only a convention this documentation follows** — a scheduler does not exist until you
-ask for one with `--serve-scheduler`, and when you do it is answered on
+only a convention this documentation follows** — the scheduler is whichever node leads
+its cluster, which a first start's does, and it is answered on
 `--listen-node`, beside the cache and compile verbs, rather than on a port of its own. Neither does a consensus or
 discovery port: those have no conventional number at all.
 
@@ -515,8 +515,8 @@ starts an election. It is a private binary protocol, distinct from the compile
 cache's — pointing a cache client at it gets nothing useful.
 
 **Every consensus connection proves which member is at each end before a single
-message is read**, each with its own identity key, so every member's `--raft-peer` list
-names every other member's key. That is the one leg of this page whose every byte is
+message is read**, each with its own identity key, checked against the key the cluster
+records for each member. That is the one leg of this page whose every byte is
 authenticated; what it checks and how a failure shows is under
 [Raft peer authentication](#raft-peer-authentication). The same key signs every lease a
 member issues and is what a member proves on the node port; there is no shared secret any
@@ -671,10 +671,9 @@ A node's tier is two independent halves, and the flags are separate because the
 questions are:
 
 - **`--listen-node`** — where it *answers*, defaulting to port `6674` because that
-  is where `fastcache-cc` already looks. Loopback by default on a worker: this tier
-  holds the machine's own build output. On a node passing `--serve-scheduler` the
-  same bare port takes the wildcard instead, because that one listener also answers
-  the fleet's scheduler verbs.
+  is where `fastcache-cc` already looks. The wildcard by default, because that one
+  listener also answers the fleet's scheduler and compile verbs; this tier holds the
+  machine's own build output, and its verbs answer this machine alone whatever the bind.
 
     It is served to **this machine and to nothing else**, always
     ([#287](https://github.com/LASTRADA-Software/fastcached/issues/287)). Not to
@@ -730,10 +729,12 @@ that machine actually runs with, lists every port it would bind and the protocol
 each, then exits without opening anything:
 
 ```console
-$ fastcache-compile-node --print-surfaces --serve-scheduler --listen-node 6675 \
+$ fastcache-compile-node --print-surfaces --listen-node 6675 \
       --scheduler 127.0.0.1:6675 --advertise 10.0.0.7:6675 --fleet-open \
-      --node-id n1 --listen-raft 6680 --raft-peer n1=10.0.0.7:6680 \
-      --discovery 255.255.255.255:6681
+      --node-id n1 --listen-raft 6680 --raft-self 10.0.0.7 \
+      --discovery 10.0.0.255:6681
+mode: solitary (no cluster minted yet; the first start mints one)
+
 node              0.0.0.0:6675  TCP
 admin             -             not served; set --admin-listen
 raft              0.0.0.0:6680  TCP
@@ -742,17 +743,22 @@ discovery beacon  0.0.0.0:6681  UDP
 dialled at:
   consensus endpoint  10.0.0.7:6680  -- what peers DIAL; the raft row above is what this node BINDS
 
+state directory:
+  <state directory> (per-user: this process is not privileged, so it keeps its identity apart from the machine's service)
+
 notes:
   …
 ```
+
+`<state directory>` stands for the path the run printed, and `…` for the notes left out.
 
 !!! note "Why the invocation carries more than the surfaces it prints"
 
     `--print-surfaces` runs the **startup policy rules** before it prints, so the
     command has to be one the node would actually accept. The rules that apply to the
     flags above each refuse a configuration that would start and silently not
-    work: `--serve-scheduler` needs `--listen-raft`, `--listen-raft` needs a `--raft-peer`
-    naming this node, membership needs an `--advertise` peers can dial, and a worker needs
+    work: consensus needs an address its peers dial (`--raft-self`, or this machine's
+    resolved name), membership needs an `--advertise` peers can dial, and a worker needs
     a `--scheduler`. (`--listen-raft` needed a `--cluster-key-file` as well, and
     `--discovery` a key rule of its own, until
     [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) moved every proof to
@@ -780,7 +786,7 @@ serves.
     Nothing. The client, the node and its tier all talk over loopback.
 
     ```sh
-    fastcache-compile-node --serve-scheduler --listen-node 127.0.0.1:6675 \
+    fastcache-compile-node --listen-node 127.0.0.1:6675 \
         --listen-raft 127.0.0.1:6680 --raft-self 127.0.0.1 \
         --scheduler 127.0.0.1:6675 --fleet-open
     ```
@@ -913,20 +919,19 @@ What that refuses, and what it does not:
   make.
 
 **Where the keys come from.** A member's key is what the cluster records for it —
-`--cluster-admit` states it, and a leader announces its own — and, until the cluster has
-recorded anything, what that node's command line types after its address:
-`--raft-peer=n2=10.0.0.2:6680@<key>`. The cluster's record wins wherever it says anything,
-and a key the cluster has revoked stays revoked whatever a command line says. So **every
-member's `--raft-peer` list names every other member's key** when a cluster is first
-formed; a member named without one cannot be verified, and a cluster none of whose members
-were given keys does not form. `fastcache-compile-node --print-identity`, run with a node's
-own flags and as the account it runs as, mints its identity into its state directory and
-prints the token its peers type:
+`--cluster-admit` states it after the address (`--cluster-admit=n2=10.0.0.2:6680@<key>`),
+and a leader announces its own — and, until the cluster has recorded anything, what the
+roster the node started from names: its own alone on a node that founded its cluster, the
+approved enrollment roster on one that joined. The cluster's record wins wherever it says
+anything, and a key the cluster has revoked stays revoked. A member admitted without a key
+cannot be verified. `fastcache-compile-node --print-identity`, run with a node's own flags
+and as the account it runs as, mints its identity into its state directory and prints the
+line an operator admits it with:
 
 ```
 node-id n1
 public-key 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
-raft-peer n1=10.0.0.1:6680@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+cluster-admit n1=10.0.0.1:6680@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
 ```
 
 **A node running consensus without an identity key does not start**, and no configuration
@@ -943,9 +948,9 @@ older one cannot talk at all — there is no compatibility mode, on purpose, bec
 peer proves only the cluster key and accepting one would be the fallback the handshake
 exists to refuse. So:
 
-- print every consensus member's identity with `--print-identity` and give each member's
-  `--raft-peer` list every other member's `@<key>` first — a cluster whose members cannot
-  verify each other does not form;
+- on the build that introduced it, whose members still named one another with the
+  since-retired `--raft-peer`, every member's list was given every other member's
+  `@<key>` first — a cluster whose members cannot verify each other does not form;
 - then upgrade **all** consensus members together. A mixed cluster shows as
   `fastcache_raft_peer_dials_refused_no_challenge_total` on the new nodes (an older peer's
   challenge is at another version) and `fastcache_raft_peer_connections_refused_no_handshake_total`
@@ -961,7 +966,7 @@ same misconfiguration usually shows on both ends of the connection:
 
 | You see | On the accepting node | On the dialling node | Meaning |
 |---|---|---|---|
-| A key never given | `..._connections_refused_unknown_key_total` | `..._dials_ended_by_acceptor_total` | The acceptor holds no key for the id the dialler claims: a `--raft-peer` without `@<key>`, a member admitted without one, or a machine that is not a member. It cannot sign a verdict for a proof it could not check, so the dialler sees the connection close |
+| A key never given | `..._connections_refused_unknown_key_total` | `..._dials_ended_by_acceptor_total` | The acceptor holds no key for the id the dialler claims: a member admitted without `@<key>`, or a machine that is not a member. It cannot sign a verdict for a proof it could not check, so the dialler sees the connection close |
 | A member's id, claimed by another machine | `..._connections_refused_proof_total` | `..._dials_ended_by_acceptor_total` | The proof did not verify under the key the acceptor holds for that id |
 | A key this node was never given | — | `..._dials_refused_acceptor_key_unknown_total` | The member that answered signed its verdict, and this node holds no key to check it with. Nothing was sent to it |
 | An impostor at a member's address | — (it is not a member) | `..._dials_refused_acceptor_proof_total` | Whatever answers there signed its verdict with a key that is not the member's. Nothing was sent to it |
@@ -971,7 +976,9 @@ same misconfiguration usually shows on both ends of the connection:
 | A stale address | `..._connections_refused_wrong_target_total` | `..._dials_refused_wrong_target_total` | Both proved their ids, and the address answers as a different member. The logs name both ids |
 | One identity on two machines | `..._connections_refused_own_id_total` | `..._dials_refused_own_id_total` | A copied `--cluster-dir`: two machines holding one private key. The accepting node's log names the second machine's address |
 | An old build, or not a consensus port | `..._connections_refused_no_handshake_total` | `..._dials_refused_timeout_total` or `..._dials_refused_no_challenge_total` | The other end does not speak this handshake |
-| Something tampering in flight | `..._frames_refused_tag_total` | — | A message on a proven connection failed its tag. A correct peer never produces one |
+| Something tampering in flight | `..._frames_refused_tag_total` | `..._dials_ended_frame_tag_total` (a learner's two-way session) | A message on a proven connection failed its tag. A correct peer never produces one. Each end counts the direction it reads |
+| A message naming another member | `..._frames_refused_sender_total` | `..._dials_ended_frame_sender_total` (a learner's two-way session) | A message whose tag verified named a sender other than the member the connection proved |
+| A frame the reader cannot use | `..._frames_refused_unreadable_total`, `..._frames_refused_over_cap_total` or `..._frames_refused_bad_magic_total` | `..._dials_ended_frame_unreadable_total`, `..._dials_ended_frame_over_cap_total` or `..._dials_ended_frame_bad_magic_total` (a learner's two-way session) | A frame at another wire version, one declaring more than the reader buffers, or one that is not this wire at all |
 
 Every series is prefixed `fastcache_raft_peer_`. Refusals before an id is proved are
 logged at most once a minute and name only the source address — anything on the network

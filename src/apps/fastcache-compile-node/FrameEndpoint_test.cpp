@@ -505,7 +505,7 @@ class Conversation
 /// Loopback is spelled out rather than left to the surface's own default, and that
 /// is deliberate: the node port's default host is the WILDCARD once the node
 /// schedules, so a bare port here would bind every interface on a developer's machine
-/// and on CI the moment a case sets `--serve-scheduler`.
+/// and on CI the moment a case serves a scheduler.
 /// @param surface Which surface to configure.
 /// @param port The port it should serve.
 /// @return A configuration serving that surface on loopback.

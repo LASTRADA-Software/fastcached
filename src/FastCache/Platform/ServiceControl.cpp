@@ -404,6 +404,9 @@ ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, CliResul
                          .description = "fastcached — fast cache daemon",
                          .serviceAccount = std::string { DaemonServiceAccount },
                          .ownedPaths = std::move(owned),
+                         // Nothing to hand the account: every path the daemon keeps is
+                         // on its command line.
+                         .serviceAccountEnvironment = {},
                          .inlineCredential = cfg.requirePass.empty() ? InlineCredential::Absent : InlineCredential::Present,
                          // The daemon takes BOTH, and it is the only service that
                          // does -- which is why one bit describing "has files" got
@@ -681,6 +684,15 @@ namespace
         for (auto const index: std::views::iota(std::size_t { 0 }, spec.arguments.size()))
             recorded.push_back(RecordedText { .what = argumentLabels[index], .text = spec.arguments[index] });
 
+        // The account's environment is recorded too -- a launchd plist carries both halves of
+        // each pair -- so it is judged by the same rule, labelled as a variable and never by
+        // its value.
+        for (auto const& [name, value]: spec.serviceAccountEnvironment)
+        {
+            recorded.push_back(RecordedText { .what = "a service environment variable's name", .text = name });
+            recorded.push_back(RecordedText { .what = "a service environment variable's value", .text = value });
+        }
+
         for (auto const& [what, text]: recorded)
             if (auto rejection = rule(what, text))
                 return rejection;
@@ -841,7 +853,7 @@ std::expected<ServiceScope, ConfigError> ParseServiceScope(std::string_view text
     return std::unexpected(
         ConfigError { .code = ConfigErrorCode::ParseError,
                       .source = "argv",
-                      .field = "service-scope",
+                      .field = {},
                       .context = std::format("unknown service scope '{}'; expected user or system", text) });
 }
 
@@ -919,6 +931,17 @@ std::string BuildLaunchdPlist(ServiceSpec const& spec, ServiceScope scope, std::
         // `ServiceSpec::serviceAccount`, which a second binary may set to whatever
         // it wants (the field's own comment says so).
         out += std::format("    <key>UserName</key>\n    <string>{}</string>\n", EscapeMarkup(spec.serviceAccount));
+
+        // The account's environment beside the account, escaped like every text node here --
+        // a value is a path a second binary chose.
+        if (!spec.serviceAccountEnvironment.empty())
+        {
+            out += "    <key>EnvironmentVariables</key>\n    <dict>\n";
+            for (auto const& [name, value]: spec.serviceAccountEnvironment)
+                out += std::format(
+                    "        <key>{}</key>\n        <string>{}</string>\n", EscapeMarkup(name), EscapeMarkup(value));
+            out += "    </dict>\n";
+        }
     }
 
     out += "    <key>ProcessType</key>\n    <string>Interactive</string>\n";

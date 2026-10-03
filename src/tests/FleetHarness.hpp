@@ -417,7 +417,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                          .notAfter = _wallClock.now() + Cluster::RosterEndorsementLifetime,
                                          .endorser = voter,
                                          .signature = {} },
-            [&key](std::span<std::byte const> message) { return key.Sign(message); });
+            [&key](LabelledMessage const& message) { return SignLabelled(key, message); });
         auto const encoded = Cluster::EncodeEndorsement(endorsement);
         auto const reply = NodeAt(scheduler).service.AnnounceNode(
             SetupCaller(),
@@ -554,6 +554,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         {
             FastCache::Node::NodeConfig cfg;
             cfg.clusterId = std::string { ClusterId };
+            // A worker that runs no consensus -- the only kind that holds a roster of its own.
+            cfg.raftListen.clear();
             for (auto const& voter: anchors)
                 cfg.voterKeys.push_back(TestKeyPair(voter).PublicKey());
             auto built = FastCache::Node::NodeRoster::Build(cfg, fleet._wallClock, fleet._metrics, fleet._logger);

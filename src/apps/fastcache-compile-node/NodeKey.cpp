@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeIdentity.hpp"
 #include "NodeKey.hpp"
+#include "NodeStateFiles.hpp"
 
+#include <FastCache/Cluster/FormationRecord.hpp>
+#include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Core/Owner.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
@@ -19,11 +22,7 @@
 
 #if defined(_WIN32)
     #include <io.h>
-    #include <share.h>
 #else
-    #include <sys/stat.h>
-
-    #include <fcntl.h>
     #include <unistd.h>
 #endif
 
@@ -62,66 +61,43 @@ namespace
         "it is never replaced because it could not be used, since the key it holds may be the one this cluster "
         "admitted. Remove it deliberately to mint a new identity, which the cluster must then admit";
 
-    /// The owning handle a `FILE*` is held in, so every failure path below closes it.
-    using FileHandle = std::unique_ptr<std::FILE, int (*)(std::FILE*)>;
-
-    /// Open @p path for reading, spelling it the way the platform wants.
-    ///
-    /// `_wfsopen` on Windows, for `FileRaftStorage::OpenBinary`'s reason: a narrow path goes
-    /// through the active code page, and a state directory holding a character that page
-    /// cannot spell would fail to open for a reason that has nothing to do with the key.
-    /// There `path.c_str()` IS the wide string, so no temporary is built: a `wstring()`
-    /// temporary wraps the call in cleanups, and cppcoreguidelines-owning-memory then cannot
-    /// see an owner being created, however `_wfsopen` is listed.
-    /// @param path The file.
-    /// @param error Set to what the C library said when it could not.
-    /// @return The stream, or null.
-    [[nodiscard]] FileHandle OpenForReading(std::filesystem::path const& path, int& error)
+    /// Whether an exposure keeps a file from holding this node's identity key, one row per
+    /// `SecretExposure`, so a new exposure is a decision somebody has to write down rather
+    /// than one the array's zero-fill makes for them.
+    struct KeyExposureRow
     {
-        errno = 0;
-#if defined(_WIN32)
-        gsl::owner<std::FILE*> const opened = ::_wfsopen(path.c_str(), L"rb", _SH_DENYNO);
-#else
-        gsl::owner<std::FILE*> const opened = std::fopen(path.c_str(), "rb");
-#endif
-        error = errno;
-        return FileHandle { opened, &std::fclose };
-    }
+        SecretExposure exposure; ///< What the guard found.
+        bool refusedAtMint;      ///< Whether a key this node is about to write there is refused.
+        bool refusedAtRead;      ///< Whether a key a previous start wrote there is refused.
+    };
 
-    /// Create @p path for writing, refusing when it exists.
-    ///
-    /// The EXCLUSIVE create is the whole guard, with nothing in front of it (`O_EXCL`, `"wbx"`
-    /// on Windows, and no `exists()`): a file that appeared a moment ago is refused, never
-    /// truncated. On POSIX the file is created mode 0600 by the same call, so there is no
-    /// moment in which the secret is readable by another account and no `chmod` whose
-    /// failure would leave it so.
-    /// @param path The file.
-    /// @param error Set to what the C library said when it could not.
-    /// @return The stream, or null.
-    [[nodiscard]] FileHandle CreateExclusively(std::filesystem::path const& path, int& error)
+    /// See `RefusesKeyExposure`.
+    constexpr auto KeyExposureTable = EnumTable<SecretExposure, KeyExposureRow> { {
+        { .exposure = SecretExposure::None, .refusedAtMint = false, .refusedAtRead = false },
+        { .exposure = SecretExposure::AnyLocalAccount, .refusedAtMint = true, .refusedAtRead = true },
+        { .exposure = SecretExposure::OwnersOwnGroup, .refusedAtMint = true, .refusedAtRead = true },
+        { .exposure = SecretExposure::Undetermined, .refusedAtMint = true, .refusedAtRead = false },
+    } };
+    static_assert(RowsInEnumeratorOrder(KeyExposureTable, &KeyExposureRow::exposure),
+                  "one row per SecretExposure, in enumerator order");
+
+    /// Whether a state directory's writers keep this node from trusting a key file in it.
+    struct KeyDirectoryRow
     {
-        errno = 0;
-#if defined(_WIN32)
-        gsl::owner<std::FILE*> const opened = ::_wfsopen(path.c_str(), L"wbx", _SH_DENYNO);
-        error = errno;
-        return FileHandle { opened, &std::fclose };
-#else
-        auto const descriptor =
-            ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
-        if (descriptor < 0)
-        {
-            error = errno;
-            return FileHandle { nullptr, &std::fclose };
-        }
-        auto* const opened = ::fdopen(descriptor, "wb");
-        if (opened == nullptr)
-        {
-            error = errno;
-            ::close(descriptor);
-        }
-        return FileHandle { opened, &std::fclose };
-#endif
-    }
+        DirectoryWriters writers; ///< What the guard found.
+        bool refused;             ///< Whether the directory is refused.
+    };
+
+    /// See `RefusesKeyDirectory`. `Undetermined` is reported by nobody and refused by nobody,
+    /// for `SecretExposure`'s reason at read: a filesystem that keeps no lists is ordinary.
+    constexpr auto KeyDirectoryTable = EnumTable<DirectoryWriters, KeyDirectoryRow> { {
+        { .writers = DirectoryWriters::OwnerOnly, .refused = false },
+        { .writers = DirectoryWriters::Others, .refused = true },
+        { .writers = DirectoryWriters::ForeignOwner, .refused = true },
+        { .writers = DirectoryWriters::Undetermined, .refused = false },
+    } };
+    static_assert(RowsInEnumeratorOrder(KeyDirectoryTable, &KeyDirectoryRow::writers),
+                  "one row per DirectoryWriters, in enumerator order");
 
     /// Flush a stream all the way to the disk, for `FileRaftStorage::FlushToDisk`'s reason:
     /// `fflush` alone reaches the kernel, which a power loss still discards -- and a key file
@@ -148,20 +124,16 @@ namespace
         return std::unexpected { NodeKeyRefusal { .fault = fault, .message = std::move(message) } };
     }
 
-    /// The text of an `errno`, as the C library names it.
-    /// @param error The value.
-    /// @return Its message.
-    [[nodiscard]] std::string ErrnoText(int error)
-    {
-        return std::error_code { error, std::generic_category() }.message();
-    }
-
     /// Read the key file, if there is one.
     ///
     /// **Absent is what the OPEN says, and nothing else.** `ENOENT` -- the file, or the state
     /// directory, is not there -- is the one answer that mints. Every other way of not
     /// getting the bytes is a refusal, because a stat or an open that cannot answer, read as
     /// "absent", would mint over a key this machine holds.
+    ///
+    /// **And only a regular file of its own is read** (`OpenRegularFile`): never through a link,
+    /// and never blocking -- a FIFO planted under the key's name would otherwise hold the start
+    /// forever, before any judgement it was about to make. Anything else there is refused by name.
     ///
     /// One byte more than a key file is asked for, so a file that is too LONG is seen rather
     /// than read as its first 70 bytes.
@@ -170,18 +142,27 @@ namespace
     [[nodiscard]] std::expected<std::optional<SecureByteBuffer>, NodeKeyRefusal> ReadKeyFile(
         std::filesystem::path const& path)
     {
-        auto openError = 0;
-        auto const file = OpenForReading(path, openError);
-        if (file == nullptr)
+        auto opened = OpenRegularFile(path);
+        if (!opened.has_value())
         {
-            if (openError == ENOENT)
+            auto const& refusal = opened.error();
+            if (refusal.notRegular)
+                return Refuse(NodeKeyFault::NotARegularFile,
+                              std::format("{} is where this node keeps its identity key, and what is there is not a "
+                                          "regular file -- a link, a FIFO, a device or a directory -- which this node "
+                                          "never writes: somebody else put it there. Remove it; nothing was read and "
+                                          "nothing was changed",
+                                          path.string()));
+            if (refusal.error == std::errc::no_such_file_or_directory)
                 return std::optional<SecureByteBuffer> {};
             return Refuse(NodeKeyFault::Unreadable,
-                          std::format("{} holds this node's identity key and cannot be opened: {}; {}",
+                          std::format("{} holds this node's identity key and cannot be opened: {}; {}{}",
                                       path.string(),
-                                      ErrnoText(openError),
-                                      RemoveDeliberately));
+                                      refusal.error.message(),
+                                      RemoveDeliberately,
+                                      StateFileUnreadableHint(path)));
         }
+        auto const file = *std::move(opened);
 
         SecureByteBuffer keyFileBytes(NodeKeyFileBytes + 1);
         auto const read = std::fread(keyFileBytes.data(), 1, keyFileBytes.size(), file.get());
@@ -193,28 +174,92 @@ namespace
         return std::optional { std::move(keyFileBytes) };
     }
 
+    /// What an operator is told about a key others may have read, and what each answer costs.
+    ///
+    /// Two branches, because the remedy that works for a member of a larger cluster is one a
+    /// cluster's ONLY voter cannot take: `--cluster-forget` refuses to remove the only voter,
+    /// and there is no other voter to ask -- and a node with no cluster flags is exactly that.
+    /// Both name what they touch: the id to forget, and the files that ARE this node's consensus.
+    /// @param stateDirectory Where the node keeps its state.
+    /// @param path The key file.
+    /// @param exposure What was found.
+    /// @return The sentence.
+    [[nodiscard]] std::string ExposedKeyRefusal(std::filesystem::path const& stateDirectory,
+                                                std::filesystem::path const& path,
+                                                SecretExposure exposure)
+    {
+        auto state = std::format("{}", (stateDirectory / Cluster::FormationRecordFileName).string());
+        for (auto const name: Consensus::FileRaftStorage::StoreFileNames())
+            state += std::format(", {}", (stateDirectory / name).string());
+        auto const id = RecordedNodeId(stateDirectory)
+                            .value_or(std::format("<the id in {}>", (stateDirectory / NodeIdentityFileName).string()));
+        return std::format(
+            "{}. It holds this node's identity key, which is refused rather than used. If nothing can have read it, "
+            "restrict it as that says and start again with the same identity. Otherwise treat the key as disclosed. "
+            "If this node is its cluster's ONLY voter -- a node started with no cluster flags is one -- no other voter "
+            "can forget it and --cluster-forget refuses to remove a cluster's only voter: remove {} and this node's "
+            "consensus state ({}), and start it again. It mints a new key and a new one-voter cluster; hand its new "
+            "public key to everything that trusted the old one. If it is a member of a larger cluster, run "
+            "--cluster-forget={} against the leader, then remove {} to mint a new key, and admit that",
+            OwnerOnlySecretExposureHint(path, exposure),
+            path.string(),
+            state,
+            id,
+            path.string());
+    }
+
     /// Write a new key file, refusing when one appeared first.
+    ///
+    /// Created ALREADY protected and unshared (`CreateStateFile`, the key's row), the protection read
+    /// back, and only then written: access is decided at open, so a list applied after the
+    /// create would leave readable every handle opened in between -- and the secret would reach
+    /// it through the later write.
     /// @param path The file.
     /// @param bytes Its contents.
+    /// @param guard Who may read it, established before the bytes arrive.
     /// @return Nothing, or why it could not be written.
     [[nodiscard]] std::expected<void, NodeKeyRefusal> CreateKeyFile(std::filesystem::path const& path,
-                                                                    std::span<std::byte const> bytes)
+                                                                    std::span<std::byte const> bytes,
+                                                                    INodeKeyFileGuard& guard)
     {
-        auto createError = 0;
-        auto file = CreateExclusively(path, createError);
-        if (file == nullptr)
+        auto created = CreateStateFile(path, StateFile::Key);
+        if (!created.has_value())
         {
             // `EEXIST` keeps its own sentence: the read a moment ago found nothing, so a file
             // there now is another process minting into the same state directory -- and two
             // nodes sharing one directory is its own problem, not this key's.
-            if (createError == EEXIST)
+            if (created.error() == std::errc::file_exists)
                 return Refuse(NodeKeyFault::WriteFailed,
                               std::format("{} appeared while this node was minting its identity key: another process "
                                           "is using the state directory {}. Nothing was written",
                                           path.string(),
                                           path.parent_path().string()));
-            return Refuse(NodeKeyFault::WriteFailed,
-                          std::format("cannot create {}: {}. Nothing was written", path.string(), ErrnoText(createError)));
+            return Refuse(
+                NodeKeyFault::WriteFailed,
+                std::format("cannot create {}: {}. Nothing was written", path.string(), created.error().message()));
+        }
+        auto file = *std::move(created);
+
+        // Read back while it is still EMPTY. One whose protection does not read back is closed
+        // before it is removed, because Windows will not delete a file this process holds open;
+        // removing it discards nothing, and the next start mints afresh rather than refusing a
+        // file that never held a key.
+        if (RefusesKeyExposure(guard.Protect(path), KeyMoment::Mint))
+        {
+            file.reset();
+            auto removeError = std::error_code {};
+            auto const removed = std::filesystem::remove(path, removeError) && !removeError;
+            return Refuse(NodeKeyFault::Unprotectable,
+                          std::format("cannot make {} readable by its owner alone: after its permissions were "
+                                      "restricted, other accounts could still read it, or who may read it could not be "
+                                      "read back -- so no identity key was written into it and {}. Either the "
+                                      "filesystem keeps no per-file permissions, or the directory's list keeps the "
+                                      "file's owner from changing the file's own; name a state directory where neither "
+                                      "holds with --cluster-dir",
+                                      path.string(),
+                                      removed ? "the empty file was removed"
+                                              : "the empty file could not be removed; the next start refuses it as "
+                                                "truncated until it is"));
         }
 
         // A partial write leaves a file the next start refuses as truncated, which is the
@@ -230,21 +275,58 @@ namespace
     }
 } // namespace
 
+SecretExposure FileTrustNodeKeyGuard::ExposureOf(std::filesystem::path const& file)
+{
+    return SecretFileExposure(file);
+}
+
+FileOwner FileTrustNodeKeyGuard::OwnerOf(std::filesystem::path const& file)
+{
+    return FileOwnerOf(file);
+}
+
+DirectoryWriters FileTrustNodeKeyGuard::WritersOf(std::filesystem::path const& directory)
+{
+    return DirectoryWritersOf(directory);
+}
+
+bool FileTrustNodeKeyGuard::IsLink(std::filesystem::path const& entry)
+{
+    return IsLinkEntry(entry);
+}
+
+std::expected<bool, std::error_code> FileTrustNodeKeyGuard::OthersMayWrite(std::filesystem::path const& entry)
+{
+    return FastCache::OthersMayWrite(entry);
+}
+
+SecretExposure FileTrustNodeKeyGuard::Protect(std::filesystem::path const& file)
+{
+    return SecureSecretFileForOwner(file);
+}
+
+bool RefusesKeyExposure(SecretExposure exposure, KeyMoment moment) noexcept
+{
+    auto const& row = KeyExposureTable[static_cast<std::size_t>(exposure)];
+    return moment == KeyMoment::Mint ? row.refusedAtMint : row.refusedAtRead;
+}
+
+bool RefusesKeyDirectory(DirectoryWriters writers) noexcept
+{
+    return KeyDirectoryTable[static_cast<std::size_t>(writers)].refused;
+}
+
 std::string_view DescribeNodeKeyOrigin(NodeKeyOrigin origin) noexcept
 {
     return OriginSentences[static_cast<std::size_t>(origin)];
 }
 
-bool HoldsNodeKey(NodeConfig const& cfg) noexcept
-{
-    return RunsConsensus(cfg) || !cfg.clusterDir.empty();
-}
-
 std::filesystem::path NodeKeyPath(NodeConfig const& cfg)
 {
-    if (!HoldsNodeKey(cfg))
+    auto const chosen = ChosenStateDirectory(cfg);
+    if (!chosen.has_value())
         return {};
-    return NodeStateDirectory(cfg) / NodeKeyFileName;
+    return chosen->path / NodeKeyFileName;
 }
 
 SecureByteBuffer EncodeNodeKeyFile(std::span<std::byte const> seed, Ed25519PublicKey const& publicKey)
@@ -320,18 +402,79 @@ std::expected<Ed25519KeyPair, NodeKeyRefusal> DecodeNodeKeyFile(std::span<std::b
     return *std::move(pair);
 }
 
-std::expected<NodeKey, NodeKeyRefusal> ResolveNodeKey(std::filesystem::path const& stateDirectory, ISecureRandom& random)
+std::expected<void, NodeKeyRefusal> JudgeStateDirectory(std::filesystem::path const& stateDirectory,
+                                                        INodeKeyFileGuard& guard)
+{
+    auto missing = std::error_code {};
+    if (!std::filesystem::is_directory(stateDirectory, missing))
+        return {};
+
+    // The WRITERS first: a directory other accounts may add to or delete from lets them plant
+    // the key this node adopts, or remove it so this node mints a new identity and falls out of
+    // its cluster with nothing but a `minted` line to say so.
+    if (auto const writers = guard.WritersOf(stateDirectory); RefusesKeyDirectory(writers))
+    {
+        auto message = std::format("{}. It holds this node's identity key, so no key in it is trusted and none is "
+                                   "minted there until it is; if another account may have put {} there, remove the "
+                                   "file too",
+                                   DirectoryWritersHint(stateDirectory, writers),
+                                   NodeKeyFileName);
+
+        // **The key's exposure is asked HERE, before the remedy is handed out.** Restricting the
+        // directory propagates to a key that INHERITED its read, taking that read away -- and with
+        // it the only evidence the key was exposed: the next start would find an owner-only key
+        // and adopt it, the `Exposed` question never asked. So the question travels with the
+        // directory's refusal, both branches of it.
+        auto const key = stateDirectory / NodeKeyFileName;
+        auto absent = std::error_code {};
+        if (std::filesystem::is_regular_file(key, absent))
+            if (auto const exposure = guard.ExposureOf(key); RefusesKeyExposure(exposure, KeyMoment::Read))
+                message += std::format(". And answer this BEFORE running that: {} is readable by other accounts as "
+                                       "well, and restricting the directory takes that read away from it, so nothing "
+                                       "will show afterwards that it ever was. {}",
+                                       key.string(),
+                                       ExposedKeyRefusal(stateDirectory, key, exposure));
+        return Refuse(NodeKeyFault::OpenDirectory, std::move(message));
+    }
+
+    // Then WHO put each file there. The key is one row of the state directory's table: a file
+    // nobody else can READ may still be one somebody else WROTE -- here a secret they chose, and
+    // beside it the id, the formation record and the consensus store the node acts on as surely.
+    // Only this node's own account, or an administrative one, may have written any of them.
+    return RefuseForeignStateFiles(stateDirectory, guard);
+}
+
+std::expected<NodeKey, NodeKeyRefusal> ResolveNodeKey(std::filesystem::path const& stateDirectory,
+                                                      ISecureRandom& random,
+                                                      INodeKeyFileGuard& guard)
 {
     auto const path = stateDirectory / NodeKeyFileName;
+
+    // WHO could have put a file there comes before the file is so much as opened
+    // (`JudgeStateDirectory`): a directory somebody else may write in is refused before anything
+    // they may have planted in it is touched. One this node creates below is created its owner's
+    // alone.
+    if (auto judged = JudgeStateDirectory(stateDirectory, guard); !judged.has_value())
+        return std::unexpected { std::move(judged).error() };
 
     auto recorded = ReadKeyFile(path);
     if (!recorded.has_value())
         return std::unexpected { std::move(recorded).error() };
+    auto missing = std::error_code {};
+    auto const directoryExists = std::filesystem::is_directory(stateDirectory, missing);
+
     if (recorded->has_value())
     {
         auto pair = DecodeNodeKeyFile(**recorded, path);
         if (!pair.has_value())
             return std::unexpected { std::move(pair).error() };
+
+        // After the decode, so a file that is not a usable key is refused for what is wrong with
+        // it -- its remedy is removing it whoever may read it. Never tightened in place: that
+        // would answer, silently, the one question only the operator can -- whether the key was
+        // read while it was exposed.
+        if (auto const exposure = guard.ExposureOf(path); RefusesKeyExposure(exposure, KeyMoment::Read))
+            return Refuse(NodeKeyFault::Exposed, ExposedKeyRefusal(stateDirectory, path, exposure));
         return NodeKey { .pair = *std::move(pair), .origin = NodeKeyOrigin::Recorded };
     }
 
@@ -351,24 +494,23 @@ std::expected<NodeKey, NodeKeyRefusal> ResolveNodeKey(std::filesystem::path cons
         return Refuse(NodeKeyFault::DrawFailed,
                       std::format("cannot mint an identity key into {}: {}", path.string(), CryptoErrorName(pair.error())));
 
-    auto failure = std::error_code {};
-    std::filesystem::create_directories(stateDirectory, failure);
-    if (failure)
-        return Refuse(NodeKeyFault::WriteFailed,
-                      std::format("cannot create {}: {}. Nothing was written", stateDirectory.string(), failure.message()));
+    if (!directoryExists)
+        if (auto const created = CreateOwnerOnlyDirectory(stateDirectory); !created.has_value())
+            return Refuse(NodeKeyFault::WriteFailed,
+                          std::format("cannot create {}: {}. Nothing was written",
+                                      stateDirectory.string(),
+                                      created.error().message()));
 
-    if (auto created = CreateKeyFile(path, EncodeNodeKeyFile(identitySeed, pair->PublicKey())); !created.has_value())
+    if (auto created = CreateKeyFile(path, EncodeNodeKeyFile(identitySeed, pair->PublicKey()), guard); !created.has_value())
         return std::unexpected { std::move(created).error() };
     return NodeKey { .pair = *std::move(pair), .origin = NodeKeyOrigin::Minted };
 }
 
-std::expected<std::optional<NodeKey>, NodeKeyRefusal> ResolveNodeKeyFor(NodeConfig const& cfg, ISecureRandom& random)
+std::expected<NodeKey, NodeKeyRefusal> ResolveNodeKeyFor(NodeConfig const& cfg,
+                                                         ISecureRandom& random,
+                                                         INodeKeyFileGuard& guard)
 {
-    if (!HoldsNodeKey(cfg))
-        return std::optional<NodeKey> {};
-    return ResolveNodeKey(NodeStateDirectory(cfg), random).transform([](NodeKey key) {
-        return std::optional<NodeKey> { std::move(key) };
-    });
+    return ResolveNodeKey(NodeStateDirectory(cfg), random, guard);
 }
 
 } // namespace FastCache::Node

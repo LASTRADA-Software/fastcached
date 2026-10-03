@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -327,6 +328,17 @@ struct CallerContext
     std::optional<std::string> provenNodeId {};
 };
 
+/// The leader acting on its own authority, for an admission an armed window made rather than a caller.
+///
+/// A member, from this machine, proving nothing: what the gate on the admission verbs requires of
+/// somebody the cluster trusts to decide who joins, which the leader itself is. The ONE place this
+/// shape is spelled for this purpose, so when `CallerContext` changes shape it changes here once.
+/// @return The context.
+[[nodiscard]] inline CallerContext SelfCaller()
+{
+    return CallerContext { .membership = Membership::Member, .peerId = "127.0.0.1", .provenNodeId = std::nullopt };
+}
+
 /// What the scheduler decided, in the vocabulary of the wire but not yet on it.
 ///
 /// The service is deliberately I/O-free, exactly as `WorkerRegistry` and
@@ -420,8 +432,9 @@ class SchedulerService
     ///        to hand out. Must outlive the service.
     /// @param clusterId Which fleet this scheduler leads, copied. Goes inside every
     ///        grant's signature, so a worker refuses a grant from a fleet that is not its
-    ///        own (#322). **Empty is legal** and means a node with no `--cluster-id`: a
-    ///        verifier that names none expects none.
+    ///        own (#322). A node never passes an empty one: its formation record mints a
+    ///        cluster id at the first start. The comparison a verifier makes is
+    ///        equality, so an empty id would still only ever match an empty one.
     SchedulerService(core::platform::IClock& clock,
                      core::platform::WallClockRef wallClock,
                      IMetricsSink& metrics,
@@ -455,6 +468,16 @@ class SchedulerService
     ///        service could derive: only the consensus driver knows the term, and a
     ///        node without one still mints grants.
     void SetRole(SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch);
+
+    /// Be told every role `SetRole` publishes, after it is published.
+    ///
+    /// A WIRING door, set once before consensus drives this service: what else on the node must
+    /// follow leadership -- the enrollment list's auto-approve deadline ends at demotion -- is
+    /// told by the one call consensus already makes, rather than by a second path that could
+    /// miss a change. Called outside every lock this service holds.
+    /// @param observer What to call with each role; empty clears it. Must outlive this service's
+    ///        last `SetRole`.
+    void ObserveRole(std::function<void(SchedulerRole)> observer);
 
     /// Give this scheduler a cluster to administer.
     ///
@@ -701,7 +724,7 @@ class SchedulerService
     ///
     /// The counterpart `ClusterForget` had none of, and its absence was the reason
     /// a fleet without `--discovery` could shrink and never grow: nothing anywhere
-    /// could put a member into the replicated state, so `--raft-peer` stayed the
+    /// could put a member into the replicated state, so a typed peer list stayed the
     /// only answer and growing a cluster meant restarting every machine in it.
     ///
     /// One verb for adding and for moving, because they are one intention — a node
@@ -1077,6 +1100,9 @@ class SchedulerService
 
     mutable std::mutex _leaderMutex;
     std::string _leaderEndpoint {}; ///< Guarded by `_leaderMutex`.
+
+    /// Told every published role (`ObserveRole`). Guarded by `_leaderMutex`, called outside it.
+    std::function<void(SchedulerRole)> _roleObserver;
 
     /// The cluster, when this node runs one. Null is a legitimate state.
     IClusterAdmin* _admin { nullptr };

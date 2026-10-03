@@ -71,7 +71,7 @@ constexpr auto Noon = std::chrono::system_clock::time_point { std::chrono::hours
                                                                   .notAfter = notAfter,
                                                                   .endorser = endorser,
                                                                   .signature = {} },
-                                     [&key](std::span<std::byte const> message) { return key.Sign(message); }));
+                                     [&key](LabelledMessage const& message) { return SignLabelled(key, message); }));
     }
     return certified;
 }
@@ -126,7 +126,7 @@ TEST_CASE("A worker's first roster is the one a majority of its anchors certify"
 TEST_CASE("Once a roster is held, it certifies its successor and the anchors are never read again", "[distributed][roster]")
 {
     // An anchor the cluster later drops must not get its say back by having been typed on a
-    // command line: the replicated state wins over `--voter-key`, as it wins over `--raft-peer`.
+    // command line: the replicated state wins over `--voter-key`, as it wins over a bootstrap roster.
     AtomicMetricsSink metrics;
     NullLogger logger;
     RosterTrust trust { std::nullopt, Anchors({ "n1", "n2", "n3" }), std::nullopt, nullptr, metrics, logger };

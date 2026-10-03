@@ -44,48 +44,47 @@ namespace
     [[nodiscard]] std::expected<std::string, ConfigError> ParseBindAddress(std::string_view sv)
     {
         if (sv.empty())
-            return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, "bind", "empty bind address"));
+            return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, "empty bind address"));
         if (std::ranges::any_of(sv, [](char c) { return c == ' ' || c == '\t' || static_cast<unsigned char>(c) < 0x20; }))
             return std::unexpected(
-                ArgvError(ConfigErrorCode::TypeMismatch, "bind", std::format("invalid characters in bind address: {}", sv)));
+                ArgvError(ConfigErrorCode::TypeMismatch, std::format("invalid characters in bind address: {}", sv)));
         return std::string { sv };
     }
 
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParseMaxMemory(std::string_view sv)
     {
-        return ParseByteSize(sv, "max-memory", QueryHostTotalMemoryBytes()).transform_error(WithArgvSource);
+        return ParseByteSize(sv, QueryHostTotalMemoryBytes()).transform_error(WithArgvSource);
     }
 
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParseStorageMaxValue(std::string_view sv)
     {
-        return ParseByteSize(sv, "storage-max-value").transform_error(WithArgvSource);
+        return ParseByteSize(sv).transform_error(WithArgvSource);
     }
 
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParseStorageMaxDisk(std::string_view sv)
     {
-        return ParseByteSize(sv, "storage-max-disk").transform_error(WithArgvSource);
+        return ParseByteSize(sv).transform_error(WithArgvSource);
     }
 
-    [[nodiscard]] std::expected<std::size_t, ConfigError> ParsePositiveInt(std::string_view sv, std::string_view field)
+    [[nodiscard]] std::expected<std::size_t, ConfigError> ParsePositiveInt(std::string_view sv)
     {
         if (sv.empty())
-            return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, std::string { field }, "empty value"));
+            return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, "empty value"));
         std::size_t value = 0;
         auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value);
         if (ec != std::errc {} || ptr != sv.data() + sv.size())
-            return std::unexpected(
-                ArgvError(ConfigErrorCode::TypeMismatch, std::string { field }, std::format("not a number: {}", sv)));
+            return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, std::format("not a number: {}", sv)));
         return value;
     }
 
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParseThreads(std::string_view sv)
     {
-        return ParsePositiveInt(sv, "threads");
+        return ParsePositiveInt(sv);
     }
 
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParseStorageShards(std::string_view sv)
     {
-        return ParsePositiveInt(sv, "storage-shards");
+        return ParsePositiveInt(sv);
     }
 
     /// A day. Not a limit anybody reaches on purpose; it is here so a figure typed
@@ -102,7 +101,6 @@ namespace
                 if (value > ExpiryIntervalCeiling)
                     return std::unexpected(ArgvError(
                         ConfigErrorCode::OutOfRange,
-                        "expiry-interval",
                         std::format("`{}` is longer than the ceiling of {}", sv, FormatDuration(ExpiryIntervalCeiling))));
                 return value;
             });
@@ -110,25 +108,24 @@ namespace
 
     [[nodiscard]] std::expected<std::size_t, ConfigError> ParseExpiryScan(std::string_view sv)
     {
-        return ParsePositiveInt(sv, "expiry-scan")
-            .and_then([](std::size_t value) -> std::expected<std::size_t, ConfigError> {
-                // Zero would mean "no ceiling" to `PurgeBudget`, i.e. sweep the
-                // whole keyspace under the shard lock -- the opposite of what an
-                // operator typing a scan budget of zero is asking for.
-                if (value == 0)
-                    return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "expiry-scan", "must be at least 1"));
-                return value;
-            });
+        return ParsePositiveInt(sv).and_then([](std::size_t value) -> std::expected<std::size_t, ConfigError> {
+            // Zero would mean "no ceiling" to `PurgeBudget`, i.e. sweep the
+            // whole keyspace under the shard lock -- the opposite of what an
+            // operator typing a scan budget of zero is asking for.
+            if (value == 0)
+                return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "must be at least 1"));
+            return value;
+        });
     }
 
     [[nodiscard]] std::expected<int, ConfigError> ParseListenBacklog(std::string_view sv)
     {
         // The kernel clamps to its own SOMAXCONN ceiling, so we only guard
         // against absurd or non-positive input; 1..65535 is plenty of headroom.
-        return ParsePositiveInt(sv, "listen-backlog").and_then([](std::size_t value) -> std::expected<int, ConfigError> {
+        return ParsePositiveInt(sv).and_then([](std::size_t value) -> std::expected<int, ConfigError> {
             if (value == 0 || value > 65535)
-                return std::unexpected(ArgvError(
-                    ConfigErrorCode::OutOfRange, "listen-backlog", std::format("out of range (1..65535): {}", value)));
+                return std::unexpected(
+                    ArgvError(ConfigErrorCode::OutOfRange, std::format("out of range (1..65535): {}", value)));
             return static_cast<int>(value);
         });
     }
@@ -141,8 +138,7 @@ namespace
             return StorageDurability::Batched;
         if (sv == "none")
             return StorageDurability::None;
-        return std::unexpected(
-            ArgvError(ConfigErrorCode::OutOfRange, "storage-durability", std::format("unknown durability mode: {}", sv)));
+        return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, std::format("unknown durability mode: {}", sv)));
     }
 
     [[nodiscard]] std::expected<LruRecency, ConfigError> ParseLruRecency(std::string_view sv)
@@ -151,8 +147,8 @@ namespace
             return LruRecency::Approximate;
         if (sv == "strict")
             return LruRecency::Strict;
-        return std::unexpected(ArgvError(
-            ConfigErrorCode::OutOfRange, "lru-mode", std::format("unknown mode (expect approximate|strict): {}", sv)));
+        return std::unexpected(
+            ArgvError(ConfigErrorCode::OutOfRange, std::format("unknown mode (expect approximate|strict): {}", sv)));
     }
 
     [[nodiscard]] std::expected<CpuAffinity, ConfigError> ParseCpuAffinity(std::string_view sv)
@@ -161,8 +157,8 @@ namespace
             return CpuAffinity::None;
         if (sv == "per-core")
             return CpuAffinity::PerCore;
-        return std::unexpected(ArgvError(
-            ConfigErrorCode::OutOfRange, "cpu-affinity", std::format("unknown mode (expect none|per-core): {}", sv)));
+        return std::unexpected(
+            ArgvError(ConfigErrorCode::OutOfRange, std::format("unknown mode (expect none|per-core): {}", sv)));
     }
 
     // The three compression value parsers live in `Config/CompressionValues.hpp`:
@@ -201,7 +197,7 @@ namespace
             return LogLevel::Error;
         if (sv == "fatal")
             return LogLevel::Fatal;
-        return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "log-level", std::format("unknown level: {}", sv)));
+        return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, std::format("unknown level: {}", sv)));
     }
 
     // The listener kinds live in Config.hpp's ListenerFlags table, so the flag that
@@ -224,8 +220,7 @@ namespace
     [[nodiscard]] std::expected<BindConfig, ConfigError> ParseListenSpec(std::string_view sv, ListenerFlagSpec const& kind)
     {
         if (sv.empty())
-            return std::unexpected(
-                ArgvError(ConfigErrorCode::TypeMismatch, std::string { kind.flag }, "empty value (expected host:port)"));
+            return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, "empty value (expected host:port)"));
         std::string_view host;
         std::string_view portText;
         if (sv.front() == '[')
@@ -234,9 +229,8 @@ namespace
             // a `:port` tail immediately after.
             auto const close = sv.find(']');
             if (close == std::string_view::npos || close + 1 >= sv.size() || sv[close + 1] != ':')
-                return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch,
-                                                 std::string { kind.flag },
-                                                 std::format("malformed [ipv6]:port spec: {}", sv)));
+                return std::unexpected(
+                    ArgvError(ConfigErrorCode::TypeMismatch, std::format("malformed [ipv6]:port spec: {}", sv)));
             host = sv.substr(1, close - 1);
             portText = sv.substr(close + 2);
         }
@@ -247,8 +241,7 @@ namespace
             // unbracketed IPv6 we reject (the standard requires brackets).
             auto const colon = sv.rfind(':');
             if (colon == std::string_view::npos)
-                return std::unexpected(ArgvError(
-                    ConfigErrorCode::TypeMismatch, std::string { kind.flag }, std::format("missing :port in: {}", sv)));
+                return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, std::format("missing :port in: {}", sv)));
             host = sv.substr(0, colon);
             portText = sv.substr(colon + 1);
             // Reject unbracketed IPv6 literals: if `host` contains a `:`
@@ -258,7 +251,6 @@ namespace
             if (host.contains(':'))
                 return std::unexpected(
                     ArgvError(ConfigErrorCode::TypeMismatch,
-                              std::string { kind.flag },
                               std::format("IPv6 literal requires brackets: [{}]:port (got: {})", host, sv)));
         }
         auto const address = ParseBindAddress(host);
@@ -1005,9 +997,9 @@ std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv)
     std::uint32_t raw = 0;
     auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), raw);
     if (ec != std::errc {} || ptr != sv.data() + sv.size())
-        return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, "port", std::format("not a number: {}", sv)));
+        return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, std::format("not a number: {}", sv)));
     if (raw == 0 || raw > 65535)
-        return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "port", std::format("out of range: {}", raw)));
+        return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, std::format("out of range: {}", raw)));
     return static_cast<std::uint16_t>(raw);
 }
 

@@ -539,6 +539,7 @@ namespace
 {
     return RaftWire::ProofFrame { .dialler = "d",
                                   .target = "a",
+                                  .direction = RaftWire::SessionDirection::OneWay,
                                   .nonce = DistinctNonce(0x01),
                                   .ephemeral = DistinctEphemeral(0x21),
                                   .signature = DistinctSignature() };
@@ -566,6 +567,7 @@ TEST_CASE("Every handshake frame round-trips, field for field", "[consensus][raf
     RaftWire::ChallengeFrame const challenge { .nonce = DistinctNonce(0x10), .ephemeral = DistinctEphemeral(0x30) };
     RaftWire::ProofFrame const proof { .dialler = "the-dialler",
                                        .target = "the-target",
+                                       .direction = RaftWire::SessionDirection::TwoWay,
                                        .nonce = DistinctNonce(0x40),
                                        .ephemeral = DistinctEphemeral(0x60),
                                        .signature = DistinctSignature() };
@@ -688,7 +690,7 @@ TEST_CASE("Each handshake frame carries the fields of its version, at their widt
         return row->fieldCount;
     };
     CHECK(fieldsOf(RaftWire::MessageType::Challenge) == 2);
-    CHECK(fieldsOf(RaftWire::MessageType::Proof) == 5);
+    CHECK(fieldsOf(RaftWire::MessageType::Proof) == 6);
     CHECK(fieldsOf(RaftWire::MessageType::Verdict) == 3);
     CHECK(RaftWire::SignatureSize == 64);
     CHECK(RaftWire::EphemeralKeySize == 32);
@@ -743,6 +745,7 @@ TEST_CASE("A handshake frame is refused before any field is trusted", "[consensu
         auto const ephemeral = DistinctEphemeral(0x21);
         auto const signature = DistinctSignature();
         auto const shortField = WireFields::AsBytes(std::string_view { "short" });
+        auto const oneWay = std::array { std::byte { 0x00 } };
         auto const proofWith = [&](std::span<std::byte const> nonceField,
                                    std::span<std::byte const> ephemeralField,
                                    std::span<std::byte const> signatureField) {
@@ -750,6 +753,7 @@ TEST_CASE("A handshake frame is refused before any field is trusted", "[consensu
                 RaftWire::CurrentVersion,
                 std::array { WireFields::AsBytes(std::string_view { "d" }),
                              WireFields::AsBytes(std::string_view { "a" }),
+                             std::span<std::byte const> { oneWay },
                              nonceField,
                              ephemeralField,
                              signatureField });
@@ -810,5 +814,59 @@ TEST_CASE("Every handshake row has a ceiling and every Raft message has none", "
             CHECK(row.phase.Ceiling() > 0);
             CHECK(row.phase.Ceiling() <= RaftWire::MaxHandshakePayload);
         }
+    }
+}
+
+TEST_CASE("A proof carries its session direction and the byte is what travels",
+          "[consensus][raft][wire][handshake][formation]")
+{
+    // The raw enumerators, the anchor: every other case spells the names, which would go on
+    // agreeing with each other if a value moved.
+    CHECK(static_cast<std::uint8_t>(RaftWire::SessionDirection::OneWay) == 0);
+    CHECK(static_cast<std::uint8_t>(RaftWire::SessionDirection::TwoWay) == 1);
+
+    for (auto const direction: { RaftWire::SessionDirection::OneWay, RaftWire::SessionDirection::TwoWay })
+    {
+        CAPTURE(static_cast<unsigned>(direction));
+        auto proof = SomeProof();
+        proof.direction = direction;
+        auto const frame = RaftWire::EncodeProof(proof);
+        auto const [header, payload] = Split(frame);
+
+        // The byte, at its position: the third field, one byte wide, after the two ids.
+        auto const fields = Unwrap(WireFields::SplitExactly(payload, 6));
+        REQUIRE(fields[2].size() == 1);
+        CHECK(fields[2][0] == std::byte { static_cast<std::uint8_t>(direction) });
+
+        CHECK(RaftWire::DecodeProof(header, payload) == proof);
+    }
+}
+
+TEST_CASE("A proof naming a direction this build does not know is refused", "[consensus][raft][wire][handshake][formation]")
+{
+    auto const frame = RaftWire::EncodeProof(SomeProof());
+    auto const [header, payload] = Split(frame);
+    auto const fields = Unwrap(WireFields::SplitExactly(payload, 6));
+
+    auto const decodesWith = [&](std::span<std::byte const> direction) {
+        auto const rebuilt = WireFields::Encode({ fields[0], fields[1], direction, fields[3], fields[4], fields[5] });
+        auto rebuiltHeader = header;
+        rebuiltHeader.payloadLength = static_cast<std::uint32_t>(rebuilt.size());
+        return RaftWire::DecodeProof(rebuiltHeader, rebuilt);
+    };
+
+    // The control: the frame's own byte, put back where it was, decodes.
+    CHECK(decodesWith(fields[2]).has_value());
+
+    auto const last = std::array { std::byte { static_cast<std::uint8_t>(RaftWire::SessionDirection::Last) } };
+    auto const bogus = std::array { std::byte { 0x07 } };
+    auto const wide = std::array { std::byte { 0x00 }, std::byte { 0x01 } };
+    for (auto const direction:
+         { std::span<std::byte const> { last }, std::span<std::byte const> { bogus }, std::span<std::byte const> { wide } })
+    {
+        auto const decoded = decodesWith(direction);
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == ConsensusErrorCode::MalformedFrame);
+        CHECK(decoded.error().context.contains("direction"));
     }
 }

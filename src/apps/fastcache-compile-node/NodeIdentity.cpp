@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeIdentity.hpp"
 #include "NodeKey.hpp"
+#include "NodeStateFiles.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
+#include <FastCache/Platform/FileTrust.hpp>
 
 #include <algorithm>
 #include <array>
@@ -16,6 +18,7 @@
 #include <limits>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -103,14 +106,19 @@ namespace
     /// @return Nothing, or why it could not be written.
     [[nodiscard]] std::expected<void, std::string> WriteIdentityFile(std::filesystem::path const& path, std::string_view id)
     {
-        auto const temporary = std::filesystem::path { path }.concat(".new");
+        // Created exclusively, after a temporary a crash left is cleared, with the access its row
+        // gives it (`CreateStateFile`): the id is not a secret, and an install mints it elevated
+        // BEFORE the service's grant is made -- which a protected list would never take.
+        auto const temporary = std::filesystem::path { path }.concat(NodeIdentityReplacementSuffix);
         {
-            auto stream = std::ofstream { temporary, std::ios::binary | std::ios::trunc };
-            if (!stream.is_open())
-                return std::unexpected { std::format("cannot write {}", temporary.string()) };
-            stream << id << '\n';
-            stream.flush();
-            if (!stream.good())
+            auto stale = std::error_code {};
+            std::filesystem::remove(temporary, stale);
+            auto created = CreateStateFile(temporary, StateFile::Identity);
+            if (!created.has_value())
+                return std::unexpected { std::format("cannot write {}: {}", temporary.string(), created.error().message()) };
+            auto const stream = *std::move(created);
+            auto const line = std::format("{}\n", id);
+            if (std::fwrite(line.data(), 1, line.size(), stream.get()) != line.size() || std::fflush(stream.get()) != 0)
                 return std::unexpected { std::format("cannot write {}", temporary.string()) };
         }
 
@@ -142,22 +150,42 @@ std::string_view DescribeNodeIdentityOrigin(NodeIdentityOrigin origin) noexcept
     return OriginSentences[static_cast<std::size_t>(origin)];
 }
 
-std::filesystem::path NodeStateDirectory(NodeConfig const& cfg)
+std::optional<NodeStateDirectoryChoice> ChosenStateDirectory(NodeConfig const& cfg)
 {
     if (!cfg.clusterDir.empty())
-        return cfg.clusterDir;
-    return std::filesystem::path { "fastcache-cluster" };
+        return NodeStateDirectoryChoice { .path = cfg.clusterDir, .origin = StateDirectoryOrigin::Named };
+    return cfg.stateDirectory;
+}
+
+std::filesystem::path NodeStateDirectory(NodeConfig const& cfg)
+{
+    auto chosen = ChosenStateDirectory(cfg);
+    if (!chosen.has_value())
+        throw std::logic_error { "NodeStateDirectory asked before ApplyNodeStateDirectory resolved a default: every "
+                                 "caller writes there, and a relative path would be the working directory" };
+    return std::move(chosen->path);
+}
+
+std::optional<std::string_view> StateDirectoryRefusal(NodeConfig const& cfg)
+{
+    if (ChosenStateDirectory(cfg).has_value() || NodeIdentityNeed(cfg) == IdentityNeed::None)
+        return std::nullopt;
+    return NoStateDirectoryRefusal;
+}
+
+std::string DescribeNodeStateDirectory(NodeConfig const& cfg)
+{
+    auto const chosen = ChosenStateDirectory(cfg);
+    if (!chosen.has_value())
+        return "not resolved: the platform's default is derived when the node starts, from its privilege and "
+               "environment; name --cluster-dir to state one";
+    return std::format("{} ({})", chosen->path.string(), DescribeStateDirectoryOrigin(chosen->origin));
 }
 
 IdentityNeed NodeIdentityNeed(NodeConfig const& cfg) noexcept
 {
-    // A node that holds an identity KEY, first, because everything else here is a refinement of
-    // it: the id travels with the key (#178). A consensus member is admitted under it, and a
-    // worker with a `--cluster-dir` proves it on every connection to a scheduler, so both keep one
-    // in the directory their key is in. A node with neither has nowhere an id would survive.
-    if (!HoldsNodeKey(cfg))
-        return IdentityNeed::None;
-
+    // Every node holds an identity key now, and the id travels with it (#178): a consensus
+    // member is admitted under it, and a worker proves it on every connection to a scheduler.
     // The verbs that answer and exit. Each of them would otherwise CREATE a state
     // directory as a side effect of being asked a question -- `--print-surfaces` says
     // in its own comment that it opens nothing and changes nothing, a cluster verb is a
@@ -196,6 +224,17 @@ std::expected<std::string, SecureRandomError> MintNodeId(ISecureRandom& random)
     return id;
 }
 
+std::optional<std::string> RecordedNodeId(std::filesystem::path const& stateDirectory)
+{
+    auto const recorded = ReadIdentityFile(stateDirectory / NodeIdentityFileName);
+    if (!recorded.has_value())
+        return std::nullopt;
+    auto const trimmed = Trimmed(*recorded);
+    if (trimmed.empty() || !IsValidUtf8(trimmed))
+        return std::nullopt;
+    return std::string { trimmed };
+}
+
 std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::path const& stateDirectory,
                                                              std::string_view configured,
                                                              ISecureRandom& random)
@@ -207,7 +246,16 @@ std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::pa
     // changed the thing the cluster admitted, and this is the one moment anybody can
     // be told so. The flag still wins -- it is an override, and refusing it would
     // leave a wrongly-recorded id unfixable except by deleting a file.
+    // A file that is THERE and cannot be opened is refused, never read as absent: minting over it
+    // would replace an id the cluster may already have admitted, and the rename would succeed
+    // wherever the directory lets this account delete it -- silently. Only an ABSENT id mints.
     auto const recorded = ReadIdentityFile(path);
+    auto present = std::error_code {};
+    if (!recorded.has_value() && std::filesystem::exists(path, present))
+        return std::unexpected { std::format("{} holds this node's identity and cannot be read; it is never minted "
+                                             "over, since the cluster may have admitted the id it holds{}",
+                                             path.string(),
+                                             StateFileUnreadableHint(path)) };
     if (recorded.has_value())
     {
         auto const trimmed = Trimmed(*recorded);
@@ -245,10 +293,11 @@ std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::pa
                                              path.string(),
                                              minted.error().ToString()) };
 
-    auto failure = std::error_code {};
-    std::filesystem::create_directories(stateDirectory, failure);
-    if (failure)
-        return std::unexpected { std::format("cannot create {}: {}", stateDirectory.string(), failure.message()) };
+    // Created its owner's alone, as the identity key's directory is: an install mints the id
+    // here before any key exists, and a directory that took `%ProgramData%`'s list would be one
+    // every local account can plant files in -- which the key's start then refuses.
+    if (auto const created = CreateOwnerOnlyDirectory(stateDirectory); !created.has_value())
+        return std::unexpected { std::format("cannot create {}: {}", stateDirectory.string(), created.error().message()) };
 
     if (auto const written = WriteIdentityFile(path, *minted); !written.has_value())
         return std::unexpected { written.error() };
@@ -256,19 +305,6 @@ std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::pa
     return NodeIdentity { .id = *minted,
                           .origin = configured.empty() ? NodeIdentityOrigin::Minted : NodeIdentityOrigin::Configured,
                           .publicKey = std::nullopt };
-}
-
-std::optional<std::string> SelfKeyContradiction(NodeConfig const& cfg, std::optional<Ed25519PublicKey> const& held)
-{
-    auto const* const self = ClusterSelfMember(cfg);
-    if (!held.has_value() || self == nullptr || !self->publicKey.has_value() || self->publicKey == held)
-        return std::nullopt;
-    return std::format("--raft-peer names this node ({}) with the key {}, and the key it holds is {}: either the token "
-                       "was copied from another node, or this is not the state directory it was written for. Correct "
-                       "the --raft-peer entry, or run this node from the state directory that holds that key",
-                       self->id,
-                       FormatEd25519PublicKey(*self->publicKey),
-                       FormatEd25519PublicKey(*held));
 }
 
 std::string DescribeIdentity(std::string_view id,
@@ -284,7 +320,7 @@ std::string DescribeIdentity(std::string_view id,
     if (id.empty())
         return text;
     if (role == IdentityRole::Member && dialAddress.has_value())
-        text += std::format("raft-peer {}={}@{}\n", id, *dialAddress, spelled);
+        text += std::format("cluster-admit {}={}@{}\n", id, *dialAddress, spelled);
     if (role == IdentityRole::Worker)
         text += std::format("cluster-admit-worker {}@{}\n", id, spelled);
     return text;
@@ -305,42 +341,6 @@ void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity)
         return;
 
     cfg.nodeId = identity.id;
-
-    // Nothing to synthesise when the operator named this node's own `--raft-peer`, which
-    // they can only have done for an id they typed -- but the key is filled in when the
-    // entry names none, so the record this node announces carries the key it holds. An
-    // entry naming ANOTHER key is left as typed: that is `SelfKeyContradiction`'s refusal,
-    // and quietly overwriting it would hide the mistake it exists to report.
-    if (auto const self = std::ranges::find(cfg.raftPeers, cfg.nodeId, &Cluster::ClusterMember::id);
-        self != cfg.raftPeers.end())
-    {
-        if (!self->publicKey.has_value())
-            self->publicKey = identity.publicKey;
-        return;
-    }
-
-    // Through `ConsensusDialAddressOf`, the one derivation of where peers dial this node
-    // (#1328): `--print-surfaces` and `NodeStatus` report it, so building the entry any
-    // other way would let a node run under one address and print another. Its `--raft-self`
-    // half is `RaftSelfEndpoint`, which the rule refusing a CONTRADICTING `--raft-peer` also
-    // asks -- written out here, the two would disagree about IPv6 bracketing and that rule
-    // would refuse every reload of a node it had just accepted. No address is no entry: no
-    // consensus, or none stated, which the startup table has already refused.
-    auto endpoint = ConsensusDialAddressOf(cfg);
-    if (!endpoint.has_value())
-        return;
-
-    // `schedulerEndpoint` empty, which is what this node knows about itself here: the
-    // scheduler port it will ANNOUNCE is the one its listener actually binds, and that
-    // is not known until it has bound. `ConsensusTier::Start` fills it in when this
-    // node announces its own record, exactly as it does for a typed `--raft-peer`.
-    cfg.raftPeers.push_back(
-        Cluster::ClusterMember { .id = identity.id,
-                                 .raftEndpoint = std::move(*endpoint),
-                                 .schedulerEndpoint = {},
-                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
-                                 .seat = Cluster::MemberSeat::Voter,
-                                 .publicKey = identity.publicKey });
 }
 
 } // namespace FastCache::Node

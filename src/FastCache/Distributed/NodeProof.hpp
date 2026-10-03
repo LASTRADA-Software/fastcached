@@ -4,6 +4,7 @@
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
@@ -14,7 +15,9 @@
 #include <cstdint>
 #include <expected>
 #include <optional>
+#include <span>
 #include <string_view>
+#include <vector>
 
 namespace FastCache::Distributed
 {
@@ -76,8 +79,8 @@ static_assert(SessionTagBytes == CompileCacheWire::SealedFrameTagBytes,
 
 /// The two signatures the handshake carries.
 ///
-/// **PRIVATE: persisted and transmitted nowhere** -- what travels is the LABEL each row names, and
-/// the enumerator only selects it.
+/// **PRIVATE: persisted and transmitted nowhere** -- what travels is the LABEL of the construction
+/// each row names, and the enumerator only selects it.
 enum class NodeProofSignature : std::uint8_t
 {
     ServerChallenge, ///< The server's, over the caller's half and its own.
@@ -88,26 +91,33 @@ enum class NodeProofSignature : std::uint8_t
 /// One row of `NodeProofSignatureLabels`.
 struct NodeProofSignatureLabel
 {
-    NodeProofSignature purpose; ///< The signature this row describes.
-    std::string_view label;     ///< The bytes signed ahead of the transcript.
+    NodeProofSignature purpose;      ///< The signature this row describes.
+    IdentityKeyPurpose construction; ///< The construction it is signed as, and so its label.
 };
 
-/// What each signature signs ahead of its transcript.
-///
-/// Versioned and distinct, so a signature made for one purpose -- or for the Raft handshake, the
-/// lease or the roster -- verifies as nothing else. `v2` because `fastcache-node-proof-v1` was the
-/// pre-shared key's MAC label; a retired label is never reused, so a MAC input and a signed message
-/// can never be the same bytes.
+/// Which construction each signature is, so a signature made for one purpose -- or for the Raft
+/// handshake, the lease or the roster -- verifies as nothing else. The labels themselves, and the
+/// retired ones, are `IdentityKeyLabels`' and `RetiredIdentityKeyLabels`'.
 inline constexpr EnumTable<NodeProofSignature, NodeProofSignatureLabel> NodeProofSignatureLabels { {
-    { .purpose = NodeProofSignature::ServerChallenge, .label = "fastcache-node-challenge-v2" },
-    { .purpose = NodeProofSignature::NodeProof, .label = "fastcache-node-proof-v2" },
+    { .purpose = NodeProofSignature::ServerChallenge, .construction = IdentityKeyPurpose::NodeServerChallenge },
+    { .purpose = NodeProofSignature::NodeProof, .construction = IdentityKeyPurpose::NodeProof },
 } };
 
 static_assert(RowsInEnumeratorOrder(NodeProofSignatureLabels, &NodeProofSignatureLabel::purpose),
               "NodeProofSignatureLabels must hold one row per NodeProofSignature, in enumerator order");
+static_assert(EachRowItsOwnConstruction(NodeProofSignatureLabels, &NodeProofSignatureLabel::construction),
+              "each NodeProofSignature needs a construction, and so a label, of its own");
 
-/// The labels this wire has retired: never signed again, so never reused for a different purpose.
-inline constexpr std::array<std::string_view, 1> RetiredNodeProofLabels { "fastcache-node-proof-v1" };
+/// What a node-proof signature for @p purpose is over: its construction's label as the FIRST field,
+/// then the transcript, as one encoded message.
+///
+/// Public for `RaftPeerSignedMessage`'s reason: the test asking every identity-key construction
+/// where its label sits reaches this builder rather than a copy of it.
+/// @param purpose Which signature.
+/// @param transcript The handshake's fields, in wire order.
+/// @return The message.
+[[nodiscard]] LabelledMessage NodeProofSignedMessage(NodeProofSignature purpose,
+                                                     std::span<std::span<std::byte const> const> transcript);
 
 /// A fresh ephemeral X25519 key pair, whose secret half lives in `SecureByteBuffer`.
 struct NodeEphemeral
