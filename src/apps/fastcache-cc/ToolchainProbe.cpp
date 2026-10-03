@@ -9,12 +9,6 @@
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
 
-#if defined(_WIN32)
-    #include <windows.h>
-#else
-    #include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -344,22 +338,6 @@ namespace
         return argv;
     }
 
-    /// This process's id, for a temp filename no concurrent writer will reuse.
-    ///
-    /// A `#if` for the same reason `NullInputPath` is one: the OSes genuinely
-    /// provide this differently rather than spelling one call two ways. Used only
-    /// to make a name unique -- nothing depends on the value -- so it needs no
-    /// injected seam and a collision would cost a rewritten cache entry, not
-    /// correctness.
-    [[nodiscard]] std::uint64_t CurrentProcessId() noexcept
-    {
-#if defined(_WIN32)
-        return static_cast<std::uint64_t>(::GetCurrentProcessId());
-#else
-        return static_cast<std::uint64_t>(::getpid());
-#endif
-    }
-
     /// The environment variable an MSVC toolchain publishes its search list in.
     constexpr std::string_view MsvcIncludeVariable = "INCLUDE";
 
@@ -682,43 +660,17 @@ namespace
 
     /// Write `stamp` and `fingerprint` so a concurrent reader sees both or neither.
     ///
-    /// Temp file plus rename, because sixteen launchers on a cold cache all write
+    /// Through `ReplaceStateFile`, because sixteen launchers on a cold cache all write
     /// this at once. A reader that caught a half-written file would either fail to
     /// parse it -- costing a needless 2-second rewalk -- or, worse, read a stamp
     /// paired with a truncated fingerprint and dispatch against a toolchain
     /// identity no other machine will ever produce.
+    ///
+    /// A failure is silent: the fingerprint is recomputed next time, which is what a
+    /// cold cache costs anyway.
     void WriteCacheAtomically(std::filesystem::path const& path, std::string_view stamp, std::string_view fingerprint)
     {
-        std::error_code ec;
-        // The temp name carries the pid so two writers do not share one temp file
-        // and interleave into it; the rename is what makes the result atomic.
-        auto const temp =
-            path.parent_path() / (path.filename().string() + "." + std::to_string(CurrentProcessId()) + ".tmp");
-        bool written = false;
-        {
-            std::ofstream out { temp, std::ios::binary | std::ios::trunc };
-            if (out)
-            {
-                out << stamp << '\n' << fingerprint << '\n';
-                out.flush();
-                written = out.good();
-            }
-        }
-
-        // Every path that does not end in a rename removes the temp file. Returning
-        // early on a write failure instead -- which is what this did -- leaves one
-        // behind per failure, in a directory nothing ever sweeps, so a machine with
-        // a full disk or a permissions problem accumulates them indefinitely while
-        // the fingerprint silently recomputes on every invocation.
-        if (!written)
-        {
-            std::filesystem::remove(temp, ec);
-            return;
-        }
-
-        std::filesystem::rename(temp, path, ec);
-        if (ec)
-            std::filesystem::remove(temp, ec);
+        (void) ReplaceStateFile(path, std::format("{}\n{}\n", stamp, fingerprint));
     }
 
     /// Read a cache file written by `WriteCacheAtomically`.

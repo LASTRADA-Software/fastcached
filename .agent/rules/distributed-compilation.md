@@ -485,6 +485,38 @@ Consequences that are each load-bearing:
       here ever keyed on a caller's port. And `::ffff:10.0.0.1` versus `10.0.0.1` is a property of how
       the *listener was bound*, so `Core/HostPort::UnmappedHost` folds them or two
       identically configured nodes disagree about one machine.
+    - **A lease's dial hint is `peerId`, and only that.** The default
+      `--advertise` is a DNS name, and after a VPN reconnect the name resolves to an
+      address the machine no longer holds for as long as the TTL says. The scheduler has
+      seen the current one on every heartbeat, so a grant carries it BESIDE the name
+      (`Distributed::DecideDialHint`): never for loopback or a link-local observed host,
+      an unparsable or IP-literal advertise, or an address the worker does not itself
+      report -- the NAT filter, because a relay's address dialled is somebody else's port.
+      The token signs the advertised NAME and never the hint, which is the whole safety
+      argument: a hint that has gone stale onto another fleet worker is refused
+      `LeaseEndpointMismatch` there, and the client dials the name. The observed host and
+      the reported list are REPLACED together on every REGISTER and HEARTBEAT, an empty
+      list included, so the NAT filter never pairs one exchange's host with another's list.
+      The client dials the hint first under `AtDialHint` (connect capped at
+      `HintConnectBudget`, an unbounded configured connect included) and retries the name
+      ONLY on `Unreached` or `LeaseEndpointMismatch` (`HintRetryTransportFailures`,
+      `HintRetryRefusals`): nothing ran in either. `PeerLost`, `Expired` and `Silent`
+      reached a machine that may be compiling, and a second dial could run the job twice;
+      every other refusal is the worker's own answer. The name gets what is LEFT of the
+      grant when it is dialled, never a fresh budget, and the two dials are one lease,
+      released once. A hint that reached nothing while the name answered is a stale
+      address, never an unreachable worker, so only a dead NAME enters the exclusion memo.
+    - **The worker reads that list from `IHostAddressSource` in EVERY round, never once
+      at construction** -- `HeartbeatRound::addresses` is the seam, not a vector, for
+      `--requirepass`'s reason: a captured list is the address the VPN had before it
+      reconnected, and the hint would then be vetoed as a NAT for the rest of the process.
+      `Node::ReportableInterfaceAddresses` leaves out, one `UnreportedAddresses` row
+      each, what the wire refuses (`IsCarriedInterfaceAddress`, asked and never restated),
+      loopback and link-local -- nothing the scheduler could ever hint, so none of it may
+      spend the `MaxInterfaceAddresses` budget -- filtering BEFORE the cap, then sorting so
+      a cap drops by the set rather than by adapter order. A cap that bites is said once
+      per process at `Info`; an address source that answers nothing is an empty list, no
+      hint, and never a failed round.
   - **The oracle is a seam and not a call into `Cluster::PeerDirectory`.** The
     dependency would run the wrong way — `Distributed` is the policy, `Cluster` is
     one way of establishing the fact it needs — and the answer is *deployment*-shaped
@@ -895,6 +927,33 @@ Consequences that are each load-bearing:
   *liveness*, not presence — an expired entry is left behind until the next
   `Acquire` for that key sweeps it, so a check on the map alone would refuse one key
   forever after a single client abandoned it, with nothing saying so.
+  A client's EXCLUSIONS are asked inside `Pick`, before capacity and not as a match:
+  a fleet whose every matching worker was excluded answers `NoWorker` on the wire and
+  moves `DispatchLeasesAllExcluded`, never `DispatchLeasesNoWorker`, because one is
+  the network and the other a toolchain nobody serves. `PickErrorTable` rows carry
+  the counter, and `PickRefusalsCountOnce` keeps the code-keyed table from counting a
+  second time.
+- **A launcher remembers a scheduler NOTHING reached, per user, for fifteen seconds**
+  (`Cc::ReachabilityMemo`). One process per translation unit made every miss of a
+  wide build pay the full connect budget, a second preprocess and a fingerprint
+  against a machine that was down. Only `TransportFailure::Unreached` at the
+  CONFIGURED endpoint writes it -- a leader a redirect named is not the configured
+  machine, and a peer that was reached and then went wrong is not a down one -- and
+  a completed lease clears it. Stamps are WALL clock because a steady clock is not
+  comparable across processes after a sleep, so a stamp in the future is its own
+  outcome and reads as stale. It lives in the per-user state directory rather than
+  `TEMP`: `/tmp` is shared between users on POSIX, and every e2e fixture already
+  isolates the state directory.
+  It remembers a WORKER nothing reached as well, by the endpoint it ADVERTISES, for a
+  minute, and the next launchers name the fresh entries on their LEASE, newest first
+  and at most `MaxLeaseExclusions`, on every redirect hop. **One verdict decides both
+  ends**: `TransportFailureTable`'s `marksUnreachable` column, true for `Unreached`
+  alone -- a worker lost mid-compile, outwaited or `Silent` was reached and is up,
+  and naming it would steer every launcher off a working machine for the whole TTL.
+  The list is read BEFORE the dispatch, so it can never name the worker that dispatch
+  is granted; what the dispatch learns comes back as `unreachedWorker`, for the next.
+  Only a dial at the worker's NAME can set it: a dial HINT that reached nothing is
+  followed by the name, and the name's outcome decides.
 - **A lease has THREE transitions and expiry is only the third.** `Acquire` takes
   one, `Release` resolves it, and the lifetime running out is the safety net for a
   client that *died* — `Ctrl-C` on a build. For a long time only two of the three

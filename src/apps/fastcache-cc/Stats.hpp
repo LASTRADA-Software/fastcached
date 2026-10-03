@@ -228,6 +228,25 @@ void AppendRecord(Record const& record);
 /// written to one path and read from another is a cache that silently never hits.
 [[nodiscard]] std::filesystem::path StateDirectory();
 
+/// Replace @p file's contents with @p text so that a concurrent reader sees the
+/// previous file or the new one, never part of either.
+///
+/// Temp file plus rename, because every file under `StateDirectory` is written by
+/// launchers running side by side -- sixteen of them on a cold cache -- and a reader
+/// that caught a half-written one would act on a prefix of it. The temp name carries
+/// this process's id AND a per-process sequence number, so two writers never share
+/// one temp file and interleave into it -- not two processes, and not two threads of
+/// one process either; the rename is what makes the result whole. Every path that does not end in a
+/// rename removes the temp file, so a full disk does not accumulate them in a
+/// directory nothing sweeps.
+///
+/// One writer rather than one per file, because the second copy is where the pid
+/// gets left out of the name.
+/// @param file The file to replace. Its directory must exist.
+/// @param text The whole new contents.
+/// @return True when @p file now holds exactly @p text.
+[[nodiscard]] bool ReplaceStateFile(std::filesystem::path const& file, std::string_view text);
+
 /// Absolute path of the log file (%LOCALAPPDATA%/fastcache-cc/invocations.log on
 /// Windows, $XDG_STATE_HOME or ~/.local/state equivalent elsewhere). Empty when
 /// no suitable directory can be resolved.

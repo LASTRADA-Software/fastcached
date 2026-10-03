@@ -6,6 +6,7 @@
 #include <FastCache/Core/StateFiles.hpp>
 #include <FastCache/Core/StopAwareWait.hpp>
 
+#include <core/Ranges.hpp>
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
 #if defined(FC_TLS_ENABLED)
@@ -668,25 +669,76 @@ EnumTable<Distributed::FleetMetric, std::uint64_t> SampleFrom(Distributed::Fleet
         values[static_cast<std::size_t>(metric)] = value;
     };
 
-    // The five dispatch counters keep `LeaseOutcomeTable`'s order rather than being
-    // named one by one, so a sixth outcome lands here by being added to that table.
-    static constexpr std::array<Distributed::FleetMetric, 5> dispatchSlots {
-        Distributed::FleetMetric::DispatchGranted,    Distributed::FleetMetric::DispatchNoWorker,
-        Distributed::FleetMetric::DispatchNoCapacity, Distributed::FleetMetric::DispatchWithdrawn,
-        Distributed::FleetMetric::DispatchDuplicate,
+    // Matched by COUNTER rather than by position, and that is load-bearing now that
+    // `LeaseOutcomeTable` can grow somewhere other than its own end:
+    // `DispatchLeasesAllExcluded` landed beside `Withdrawn`, which shifted `duplicate`
+    // from index 4 to index 5. A position-keyed loop would have kept reading
+    // `duplicate`'s old slot -- `all-excluded`'s value -- into `FleetMetric::DispatchDuplicate`
+    // forever, silently, which is exactly what a neuter of this loop back to positional
+    // indexing demonstrated before this was written.
+    struct DispatchSlot
+    {
+        Distributed::FleetMetric metric;
+        IMetricsSink::Counter counter;
     };
+    static constexpr std::array<DispatchSlot, 6> dispatchSlots {
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchGranted,
+                       .counter = IMetricsSink::Counter::DispatchLeasesGranted },
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchNoWorker,
+                       .counter = IMetricsSink::Counter::DispatchLeasesNoWorker },
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchNoCapacity,
+                       .counter = IMetricsSink::Counter::DispatchLeasesNoCapacity },
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchWithdrawn,
+                       .counter = IMetricsSink::Counter::DispatchLeasesWithdrawn },
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchAllExcluded,
+                       .counter = IMetricsSink::Counter::DispatchLeasesAllExcluded },
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchDuplicate,
+                       .counter = IMetricsSink::Counter::DispatchLeasesDuplicate },
+    };
+    // Two checks, not one: the lambda below proves every `LeaseOutcomeTable` ROW
+    // matches exactly one `dispatchSlots` entry, which says nothing about a SLOT
+    // matching no row -- a 7th slot naming a counter no row has would still pass it,
+    // and the loop's `findOrNull` would then come back null for that slot, making
+    // the pointer arithmetic below undefined behaviour. The size check closes that:
+    // with both facts holding, no slot can be left over one row short of a match,
+    // so together they prove a true bijection rather than only the direction the
+    // lambda checks on its own.
     static_assert(dispatchSlots.size() == Distributed::LeaseOutcomeTable.size(),
                   "every lease outcome needs a slot, or a refusal reason silently stops being recorded");
-    for (auto const index: std::views::iota(std::size_t { 0 }, dispatchSlots.size()))
+    static_assert(
+        []() consteval {
+            for (auto const& row: Distributed::LeaseOutcomeTable)
+            {
+                auto matches = 0;
+                for (auto const& slot: dispatchSlots)
+                    if (slot.counter == row.counter)
+                        ++matches;
+                if (matches != 1)
+                    return false;
+            }
+            return true;
+        }(),
+        "every LeaseOutcomeTable counter must appear in dispatchSlots exactly once, or a lease outcome silently "
+        "stops reaching its FleetMetric slot");
+    for (auto const& slot: dispatchSlots)
+    {
+        // `findOrNull` rather than `std::ranges::find` because `LeaseOutcomeTable` is a
+        // `std::array`, whose iterator type is not portably nameable; see `core/Ranges.hpp`.
+        // Never null: the two static_asserts above together prove every slot's counter
+        // matches exactly one row, so there is nothing left to guard against here.
+        auto const* const row =
+            core::findOrNull(Distributed::LeaseOutcomeTable, slot.counter, &Distributed::LeaseOutcomeRow::counter);
+        auto const index = static_cast<std::size_t>(row - Distributed::LeaseOutcomeTable.data());
         if (index < snapshot.leases.size())
-            put(dispatchSlots[index], snapshot.leases[index]);
+            put(slot.metric, snapshot.leases[index]);
+    }
 
     // Summed over `NodeReports()`, never over `LiveWorkers()`: a node started with
     // two --toolchain flags is two registry entries carrying one machine's cache,
     // and summing there counts that cache once per toolchain.
     //
     // Every slot, including the ones a machine can also answer for itself. This is
-    // the FLEET series and a leader can answer for all nine -- these are fleet-wide
+    // the FLEET series and a leader can answer for all ten -- these are fleet-wide
     // sums, which is a different number from any one machine's and the one this page
     // draws. `FleetMetricScope` is about what a NODE may claim about itself, not
     // about what belongs here.

@@ -5,6 +5,7 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
+#include <FastCache/Distributed/DialHint.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 
 #include <algorithm>
@@ -42,11 +43,12 @@ namespace
         IMetricsSink::Counter counter; ///< What the operator sees rise.
     };
 
+    // `NoWorker`, `NoCapacity` and `Withdrawn` are deliberately absent: those three
+    // codes are pick refusals, counted by `PickErrorTable`'s own row rather than by
+    // this code-keyed lookup, because `Excluded` shares `NoWorker`'s wire code and
+    // must not share its counter -- the row is the refusal, not the code.
+    // `PickRefusalsCountOnce` is what keeps them from being added back here.
     constexpr std::array RefusalTable {
-        RefusalDescriptor { .code = Wire::ErrorCode::NoWorker, .counter = IMetricsSink::Counter::DispatchLeasesNoWorker },
-        RefusalDescriptor { .code = Wire::ErrorCode::NoCapacity,
-                            .counter = IMetricsSink::Counter::DispatchLeasesNoCapacity },
-        RefusalDescriptor { .code = Wire::ErrorCode::Withdrawn, .counter = IMetricsSink::Counter::DispatchLeasesWithdrawn },
         RefusalDescriptor { .code = Wire::ErrorCode::AlreadyInFlight,
                             .counter = IMetricsSink::Counter::DispatchLeasesDuplicate },
         RefusalDescriptor { .code = Wire::ErrorCode::MalformedRegistration,
@@ -301,35 +303,66 @@ namespace
         return ProposalRefusals[static_cast<std::size_t>(code)].reported;
     }
 
-    /// What a pick refusal becomes on the wire.
+    /// What a pick refusal becomes on the wire, and what rises when it does.
     struct PickErrorRow
     {
-        PickError error;          ///< Why no worker could be chosen.
-        Wire::ErrorCode reported; ///< What the client is told.
+        PickError error;               ///< Why no worker could be chosen.
+        Wire::ErrorCode reported;      ///< What the client is told.
+        IMetricsSink::Counter counter; ///< What the operator sees rise.
+        std::string_view detail;       ///< Words for a person; empty where the code says it all.
     };
 
-    /// One row per `PickError`, in enumerator order: the wire code it becomes.
+    /// One row per `PickError`, in enumerator order: the wire code it becomes and the
+    /// counter that rises for it.
     ///
-    /// A table rather than a conditional for the reason the refusal table below is
-    /// one: the mapping is the whole of what a client and an operator are told, and
-    /// a `PickError` added without a row here would silently arrive as whichever
-    /// arm an `if` happened to fall through to.
+    /// The counter travels WITH the row rather than through the code-keyed
+    /// `RefusalTable`, because `Excluded` and `NoWorker` share a wire code and must
+    /// not share a counter -- one names a fingerprint nobody serves, the other a
+    /// fleet the client could not reach, and they are opposite fixes. This is the
+    /// same shape `ReleaseRefusalTable` uses for `UnknownLease`'s three causes, for
+    /// the same reason: the row is the refusal, not the code.
     constexpr EnumTable<PickError, PickErrorRow> PickErrorTable { {
-        { .error = PickError::NoWorker, .reported = Wire::ErrorCode::NoWorker },
-        { .error = PickError::NoCapacity, .reported = Wire::ErrorCode::NoCapacity },
-        { .error = PickError::Withdrawn, .reported = Wire::ErrorCode::Withdrawn },
+        { .error = PickError::NoWorker,
+          .reported = Wire::ErrorCode::NoWorker,
+          .counter = IMetricsSink::Counter::DispatchLeasesNoWorker,
+          .detail = {} },
+        { .error = PickError::NoCapacity,
+          .reported = Wire::ErrorCode::NoCapacity,
+          .counter = IMetricsSink::Counter::DispatchLeasesNoCapacity,
+          .detail = {} },
+        { .error = PickError::Withdrawn,
+          .reported = Wire::ErrorCode::Withdrawn,
+          .counter = IMetricsSink::Counter::DispatchLeasesWithdrawn,
+          .detail = {} },
+        // The same CODE as the first row and a different COUNTER: the row is the refusal.
+        { .error = PickError::Excluded,
+          .reported = Wire::ErrorCode::NoWorker,
+          .counter = IMetricsSink::Counter::DispatchLeasesAllExcluded,
+          .detail = "every worker serving this toolchain is on this client's exclusion list" },
     } };
 
     static_assert(RowsInEnumeratorOrder(PickErrorTable, &PickErrorRow::error),
                   "PickErrorTable must hold one row per PickError, in enumerator order");
 
-    /// The wire code a pick refusal is reported as.
-    /// @param error Why no worker could be chosen.
-    /// @return The code to answer with.
-    [[nodiscard]] constexpr Wire::ErrorCode WireCodeFor(PickError error) noexcept
+    /// Whether a pick refusal's counter is the only one its answer can move.
+    ///
+    /// `PickErrorTable` rows now carry their own counter, so a reported code that
+    /// also appeared as a row of the code-keyed `RefusalTable` would be counted
+    /// twice for one refusal -- once from the pick row and once from `Refuse`'s
+    /// lookup. The same guard `ReleaseRefusalsCountOnce` makes for release refusals,
+    /// here for pick refusals.
+    /// @return True when no pick refusal's reported code carries a code-keyed counter.
+    [[nodiscard]] consteval bool PickRefusalsCountOnce() noexcept
     {
-        return PickErrorTable[static_cast<std::size_t>(error)].reported;
+        for (auto const& row: PickErrorTable)
+            for (auto const& counted: RefusalTable)
+                if (row.reported == counted.code)
+                    return false;
+        return true;
     }
+
+    static_assert(PickRefusalsCountOnce(),
+                  "a pick refusal carries its own counter, so its code must not also carry a code-keyed one");
 
     /// Every string a REGISTER carries, in one place.
     ///
@@ -914,7 +947,11 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
                          written + 1 == MismatchLineBudget ? " -- further mismatches are counted only" : "");
     }
 
-    auto const id = _workers.Register(registration);
+    // Where it was seen is the KERNEL's fact, never the registration's claim: whatever a
+    // caller put in `observedHost` is overwritten with the connection's own peer.
+    auto seen = registration;
+    seen.observedHost = caller.peerId;
+    auto const id = _workers.Register(seen);
 
     // A re-registration deliberately does NOT release this worker's leases, even
     // though it resets `inFlight` two lines above on the reasoning that whatever it
@@ -1074,7 +1111,8 @@ std::optional<Cluster::CertifiedRoster> SchedulerService::CertifiedRosterNow(std
 SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller,
                                            std::string_view workerId,
                                            NodeLoad const& load,
-                                           std::span<FleetBucket const> history)
+                                           std::span<FleetBucket const> history,
+                                           std::span<std::string const> interfaceAddresses)
 {
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
@@ -1083,7 +1121,11 @@ SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller,
     // expired this worker, and the worker's correct response is to register again.
     // Silence would leave it heartbeating into a void forever while the fleet ran
     // without it.
-    auto const endpoint = _workers.Heartbeat(workerId, load);
+    //
+    // Where it was seen comes from the connection, on EVERY beat: a VPN reconnect moves the
+    // worker's address while its process, and so its registration, stays up.
+    auto const endpoint = _workers.Heartbeat(
+        workerId, load, WorkerAddresses { .observedHost = caller.peerId, .interfaceAddresses = interfaceAddresses });
     if (!endpoint.has_value())
         return Refuse(Wire::ErrorCode::UnknownLease, "unknown worker; register again");
 
@@ -1196,18 +1238,19 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
         // clients that missed the same key, each of which compiles locally.
         return Refuse(Wire::ErrorCode::AlreadyInFlight);
 
-    auto const picked = _workers.Pick(request.fingerprint);
+    auto const picked = _workers.Pick(request.fingerprint, request.excluded);
     if (!picked.has_value())
-        // Counted apart by the table above, because they are three different
-        // operator problems: no worker means the fleet is misconfigured (a
-        // fingerprint nobody serves), no capacity means it is too small, and
-        // withdrawn means it is big enough and its machines are doing something
-        // else. Summing any two of them hides the more actionable one.
+    {
+        // Counted by the ROW rather than by `Refuse`'s code-keyed lookup: `Excluded`
+        // reports the same code as `NoWorker` and must not move its counter, for the
+        // reason `PickErrorTable`'s own comment gives.
         //
-        // A table rather than a `switch`, so a fourth `PickError` is a build failure
-        // here rather than a refusal that silently arrives as one of the other
-        // three.
-        return Refuse(WireCodeFor(picked.error()));
+        // A table rather than a `switch`, so a fifth `PickError` is a build failure
+        // here rather than a refusal that silently arrives as one of the other four.
+        auto const& row = PickErrorTable[static_cast<std::size_t>(picked.error())];
+        _metrics.Increment(row.counter);
+        return Refuse(row.reported, std::string { row.detail });
+    }
 
     auto const lease = _leases.Acquire(request.key, picked->id, AgreedLeaseLifetime());
     if (!lease.has_value())
@@ -1235,6 +1278,13 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
     // registry entry -- rather than resting on `Pick`'s comparison staying exact.
     auto const token = MintGrantToken(*lease, picked->endpoint, picked->fingerprint);
 
+    // A hint BESIDE the name, never instead of it: the token above signs `picked->endpoint`,
+    // so a hint that has gone stale onto another machine is refused `LeaseEndpointMismatch`
+    // there and the client falls back to the name. Empty whenever `DecideDialHint` vetoes.
+    auto const hint = DialHintFor(DialHintInputs { .advertised = picked->endpoint,
+                                                   .observedHost = picked->observedHost,
+                                                   .interfaceAddresses = picked->interfaceAddresses });
+
     // The worker's codecs travel with the grant so the client can choose one for the
     // preprocessed payload it is about to send -- without a negotiation round trip,
     // and without guessing at something the worker cannot decode after the whole
@@ -1246,7 +1296,8 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
                                                   // From the LEASE, like the token's own expiry, so the client's
                                                   // bound and the grant's cannot be two readings of one setting
                                                   // taken a moment apart.
-                                                  .lifetime = lease->lifetime }));
+                                                  .lifetime = lease->lifetime,
+                                                  .dialHint = hint }));
 }
 
 SchedulerReply SchedulerService::Release(CallerContext const& caller, std::string_view leaseToken, std::string_view key)

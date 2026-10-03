@@ -12,6 +12,7 @@
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
+#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -479,6 +480,8 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
     SilentLoadSampler loadSampler;
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    Testing::ScriptedHostAddresses const addresses;
+    std::atomic<bool> addressCapNoticed { false };
     std::vector<Cc::WorkerRegistrar> registrars;
     registrars.emplace_back("gcc-14", "10.0.0.2:6677", 1U, Wire::CodecList {}, Wire::CapacityFields {});
     std::vector<Cc::WorkerRegistrar> withdrawals;
@@ -494,6 +497,8 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
                                 .withdrawals = withdrawals,
                                 .capacity = capacity,
                                 .loadSampler = loadSampler,
+                                .addresses = addresses,
+                                .addressCapNoticed = addressCapNoticed,
                                 .cacheTier = nullptr,
                                 .metrics = metrics,
                                 .prover = proving,

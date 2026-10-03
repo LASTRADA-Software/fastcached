@@ -1215,16 +1215,95 @@ TEST_CASE("A compile that writes a second artefact is not cacheable")
         CHECK_FALSE(cmd.parsedOk);
     }
 
-    // And an ordinary compile is untouched -- including `/Yu`, which USES a
-    // precompiled header rather than writing one.
-    for (auto const& argv: { std::vector<std::string> { "cl", "/c", "/Yupch.h", "a.cpp", "/Foa.obj" },
-                             std::vector<std::string> { "cl", "/c", "/O2", "a.cpp", "/Foa.obj" },
+    // And an ordinary compile is untouched.
+    for (auto const& argv: { std::vector<std::string> { "cl", "/c", "/O2", "a.cpp", "/Foa.obj" },
                              std::vector<std::string> { "g++", "-c", "-fmodules-ts", "a.cpp", "-o", "a.o" } })
     {
         auto const cmd = ParseCommand(argv);
         INFO("flag: " << argv[2]);
         CHECK_FALSE(cmd.sideArtefact);
         CHECK(cmd.parsedOk);
+    }
+}
+
+TEST_CASE("cl's shared-PDB debug formats are not cacheable, and clang-cl's same spellings are", "[cmdline][pdb]")
+{
+    // `cl /Zi` and `/ZI` write the translation unit's types into a PDB SHARED across the
+    // target, and the object only refers to it. A hit restores the object and leaves that
+    // PDB without this TU's types: a debugger that cannot see them, under a green build.
+    for (auto const* flag: { "/Zi", "-Zi", "/ZI", "-ZI" })
+    {
+        auto const cl = Parse({ "cl.exe", "/nologo", "/c", flag, "/Foa.obj", "a.cpp" });
+        INFO("cl " << flag);
+        CHECK(cl.sideArtefact);
+        CHECK_FALSE(cl.parsedOk);
+    }
+
+    // clang-cl reads the same spellings as `/Z7` -- debug info INSIDE the object -- so a
+    // hit reproduces everything the compile wrote. Refusing it would un-cache every
+    // clang-cl build CMake configures with its default `-Zi`, for nothing.
+    for (auto const* flag: { "/Zi", "-Zi", "/ZI", "-ZI" })
+    {
+        auto const clangCl = Parse({ "clang-cl.exe", "/nologo", "/c", flag, "/Foa.obj", "a.cpp" });
+        INFO("clang-cl " << flag);
+        CHECK_FALSE(clangCl.sideArtefact);
+        CHECK(clangCl.parsedOk);
+    }
+
+    // A later `/Z7` does not rescue the line: which one `cl` obeys is its own override
+    // rule, and a model more permissive than the driver produces wrong agreement.
+    CHECK(Parse({ "cl.exe", "/c", "/Zi", "/Z7", "/Foa.obj", "a.cpp" }).sideArtefact);
+
+    // The control: `/Z7` alone is the embedded format and stays cacheable.
+    auto const embedded = Parse({ "cl.exe", "/c", "/Z7", "/Foa.obj", "a.cpp" });
+    CHECK_FALSE(embedded.sideArtefact);
+    CHECK(embedded.parsedOk);
+}
+
+TEST_CASE("A compile that USES a precompiled header is not cacheable either", "[cmdline][pch]")
+{
+    // Measured with cl 19.51.36252 and link 14.51.36252 over a two-build /Yc + /Yu
+    // reproduction: a `cl /Yu` object carries `-INCLUDE:__@@_PchSym_...`, a symbol
+    // whose name differs per checkout, and an `LF_PRECOMP` record naming the ABSOLUTE
+    // path of the pch.obj it was compiled against. The key hashes the header's text
+    // and neither of those, so the same key was a hit in both builds:
+    //   - replayed into another checkout, the link FAILED with LNK2011 and LNK1120,
+    //     while the same checkout compiled directly linked clean;
+    //   - replayed into the same checkout after its PCH was rebuilt, the link exited 0
+    //     with LNK4206 and dropped the translation unit's debug info, in silence.
+    // Every spelling, fused (how a build writes it) and bare.
+    for (auto const* flag: { "/Yupch.h", "-Yupch.h", "/Yu", "-Yu" })
+    {
+        auto const cmd = Parse({ "cl.exe", "/nologo", "/c", flag, "/Fppch.pch", "/Foa.obj", "a.cpp" });
+        INFO("cl " << flag);
+        CHECK(cmd.sideArtefact);
+        CHECK_FALSE(cmd.parsedOk);
+    }
+
+    // `/Y-` makes `cl` ignore `/Yu` wherever it appears, and the launcher deliberately
+    // does not model that: getting it wrong costs a wrong hit, not modelling it costs a
+    // local compile of a line nobody writes. Err narrow.
+    CHECK(Parse({ "cl.exe", "/c", "/Yupch.h", "/Y-", "/Foa.obj", "a.cpp" }).sideArtefact);
+
+    // clang-cl measured clean under the same reproduction (clang 22.1.3): its `/Yu`
+    // object has no `LF_PRECOMP` record and no `__@@_PchSym_` directive, and every
+    // replay linked and ran. So the refusal is `cl`'s alone, and this is what makes the
+    // scoping a checked fact rather than a row's comment.
+    for (auto const* flag: { "/Yupch.h", "-Yupch.h", "/Yu", "-Yu" })
+    {
+        auto const clangCl = Parse({ "clang-cl.exe", "/nologo", "/c", flag, "/Fppch.pch", "/Foa.obj", "a.cpp" });
+        INFO("clang-cl " << flag);
+        CHECK_FALSE(clangCl.sideArtefact);
+        CHECK(clangCl.parsedOk);
+    }
+
+    // The neighbours that must survive: a bare `/Y-` or `/Yd` is not `/Yu`.
+    for (auto const* flag: { "/Y-", "/Yd" })
+    {
+        auto const neighbour = Parse({ "cl.exe", "/c", flag, "/Foa.obj", "a.cpp" });
+        INFO("cl " << flag);
+        CHECK_FALSE(neighbour.sideArtefact);
+        CHECK(neighbour.parsedOk);
     }
 }
 

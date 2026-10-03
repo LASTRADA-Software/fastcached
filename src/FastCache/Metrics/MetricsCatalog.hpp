@@ -110,6 +110,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "had withdrawn them: their machines are busy elsewhere or out of "
               "scratch space. The fleet is big enough and unavailable.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchLeasesAllExcluded,
+      .prometheusName = "fastcached_dispatch_leases_all_excluded_total",
+      .help = "Lease requests refused because every matching worker was on the client's "
+              "exclusion list: the machines exist and the clients cannot reach them. "
+              "Answered no-worker; never sum this with no_worker.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::DispatchLeasesDuplicate,
       .prometheusName = "fastcached_dispatch_leases_duplicate_total",
       .help = "Lease requests refused because another client already held a lease "

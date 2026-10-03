@@ -2,11 +2,15 @@
 #include "CompileCorrelation.hpp"
 #include "Dispatch.hpp"
 
+#include <FastCache/Core/HostPort.hpp>
+
 #include <algorithm>
 #include <format>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace FastCache::Cc
 {
@@ -54,7 +58,11 @@ namespace
                                 .stderrText = {},
                                 .detail = std::move(detail),
                                 .workerEndpoint = {},
-                                .declinedAt = {} };
+                                .dialledEndpoint = {},
+                                .declinedAt = {},
+                                .leaseTransport = TransportFailure::None,
+                                .leaseEndpoint = {},
+                                .unreachedWorker = {} };
     }
 
     /// Build a declined `DispatchResult`, classified by what the peer answered.
@@ -109,25 +117,24 @@ namespace
 
     /// Everything the compile half of a dispatch needs, once a lease exists.
     ///
-    /// A struct rather than six parameters, three of which are string-ish and would
-    /// be transposable at the one call site there is.
+    /// A struct rather than a run of parameters, several of which are string-ish and
+    /// would be transposable at the call sites there are.
     struct LeasedJob
     {
-        std::string_view endpoint;       ///< The worker the scheduler named.
+        /// The ADDRESS this compile is sent to: the grant's dial hint, or the name.
+        std::string_view endpoint;
+        /// The worker the scheduler named, by the endpoint it advertises -- what the token
+        /// signs and what the reachability memo keys on. Equal to `endpoint` unless the
+        /// dial went to the hint.
+        std::string_view worker;
         std::string_view leaseToken;     ///< What authorizes the job there.
-        Wire::CodecList const& codecs;   ///< What that worker can decode.
         Wire::CodecList const& accepted; ///< What this client can decode.
-        /// What this client can PRODUCE — what the source is compressed with.
-        ///
-        /// Deliberately not `accepted`, though the two hold the same value today.
-        /// `accepted` is a decode capability and a caller may legitimately narrow it;
-        /// narrowing what this client can *read* must not narrow what it can *write*,
-        /// because the client never decodes its own source — the worker does. Folding
-        /// the two together is the same conflation of two codec lists that #265 was.
-        Wire::CodecList const& own;
-        Credential const& credential;   ///< Presented to the worker.
-        DispatchRequest const& request; ///< The job itself.
-        ExchangeBudget budget;          ///< How long the compile may take.
+        Credential const& credential;    ///< Presented to the worker.
+        DispatchRequest const& request;  ///< The job itself.
+        /// The preprocessed source, enveloped ONCE against the worker's codecs: a dial at
+        /// the name after one at the hint resends the same bytes rather than compressing
+        /// a whole translation unit a second time.
+        std::span<std::byte const> sourceField;
         /// Ceiling on the object the worker may declare it is sending back.
         ///
         /// The launcher dialled a worker the SCHEDULER named, which is not the same
@@ -136,16 +143,28 @@ namespace
         std::size_t maxObjectBytes;
     };
 
-    /// Send one preprocessed translation unit to the worker a lease named.
+    /// How to name the machine a job went to, in a message an operator reads.
     ///
-    /// Split out of `Dispatch` so the lease has exactly ONE place to be resolved.
-    /// Every branch below is a way a job can end, and a release written per branch
-    /// is a release somebody forgets on the branch added next -- which is how the
-    /// key this lease pins comes to be pinned for the full lease timeout.
+    /// The worker's name alone when the dial went there, and the name AND the address
+    /// when it went to a hint: "could not be reached" about a bare address sends an
+    /// operator looking for a machine by a number nobody configured.
+    /// @param job The job.
+    /// @return The phrase.
+    [[nodiscard]] std::string Where(LeasedJob const& job)
+    {
+        return WorkerAt(job.worker, job.endpoint);
+    }
+
+    /// Send one preprocessed translation unit to the address @p job names, and return
+    /// the worker's answer as it came.
+    ///
+    /// Split from `InterpretCompile` so the dial order in `Dispatch` can look at an
+    /// outcome -- and dial again -- before anything is decided from it.
     /// @param exchange How to reach the worker.
-    /// @param job The lease and what to compile under it.
-    /// @return What happened, as `Dispatch` will return it.
-    [[nodiscard]] DispatchResult CompileOnWorker(IEndpointExchange& exchange, LeasedJob const& job)
+    /// @param job The lease, the address and what to compile under it.
+    /// @param budget How long this dial may take.
+    /// @return The exchange's outcome.
+    [[nodiscard]] CacheOutcome ExchangeCompile(IEndpointExchange& exchange, LeasedJob const& job, ExchangeBudget budget)
     {
         auto const argsField = EncodeArgs(job.request.args);
         // **The client's WHOLE spelling travels, not its base name** (#660). It used to
@@ -161,43 +180,61 @@ namespace
         // `-fdebug-prefix-map` rule; it never opens it, and `SafeSourceName` still
         // decides the file the worker creates.
         //
-        // No wire change: this is the same field, carrying more of the same fact, and a
-        // worker predating #660 sanitizes what arrives exactly as before. Read ONCE and
-        // used for both the request and the correlation below -- the worker digests the
-        // name it was SENT, so a client that sent one spelling and verified another would
-        // refuse every honest reply.
-        auto const sourceName = job.request.sourceName;
-        // Compressed against the WORKER's codecs, which the grant relayed -- not
-        // against this client's. The two need not agree, and guessing wrong would
-        // only be discovered after the whole preprocessed payload had crossed the
-        // network.
-        auto const sourceField = Envelope(Wire::AsBytes(job.request.preprocessed), job.codecs, job.own);
-
+        // No wire change: this is the same field, carrying more of the same fact. The
+        // worker digests the name it was SENT, and `InterpretCompile` verifies against
+        // the same `request.sourceName`, so the two cannot come to disagree.
+        //
         // Not `const`: the frame carries a whole preprocessed translation unit, so it
         // is MOVED into the exchange rather than copied on the hot path of a build.
         auto compileFrame =
             Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = job.leaseToken,
                                                        .fingerprint = job.request.fingerprint,
                                                        .args = argsField,
-                                                       .source = sourceField,
+                                                       .source = job.sourceField,
                                                        .acceptedCodecs = job.accepted,
-                                                       .sourceName = sourceName,
+                                                       .sourceName = job.request.sourceName,
                                                        .compileDir = job.request.compileDir,
                                                        .compileDirReplacement = job.request.compileDirReplacement,
                                                        .sourceRoot = job.request.sourceRoot,
                                                        .sourceRootReplacement = job.request.sourceRootReplacement });
-        auto const compileOutcome = exchange.Exchange(job.endpoint, std::move(compileFrame), job.credential, job.budget);
+        return exchange.Exchange(job.endpoint, std::move(compileFrame), job.credential, budget);
+    }
+
+    /// Turn the compile exchange's outcome into what `Dispatch` returns.
+    ///
+    /// Split out of `Dispatch` so the lease has exactly ONE place to be resolved.
+    /// Every branch below is a way a job can end, and a release written per branch
+    /// is a release somebody forgets on the branch added next -- which is how the
+    /// key this lease pins comes to be pinned for the full lease timeout.
+    /// @param compileOutcome What the last dial answered.
+    /// @param job The lease, the address that answered and what was compiled under it.
+    /// @return What happened, as `Dispatch` will return it.
+    [[nodiscard]] DispatchResult InterpretCompile(CacheOutcome const& compileOutcome, LeasedJob const& job)
+    {
         if (compileOutcome.kind == CacheOutcomeKind::Transport)
+        {
             // Unreachable, broken mid-reply, or out of budget. The three are one
             // ANSWER here -- compile it locally -- and for a long time they were one
             // sentence too, which is a different thing (#247). "that machine is off"
             // and "that compile took longer than the budget" are fixed in different
             // places, and the endpoint alone cannot tell them apart. Named, so the
             // dispatch that now fails in seconds instead of minutes says why it did.
-            return Refused(DispatchStatus::Unavailable,
-                           std::format("compile exchange with {} {}",
-                                       job.endpoint,
-                                       DescribeTransportFailure(compileOutcome.transportFailure)));
+            auto refused = Refused(DispatchStatus::Unavailable,
+                                   std::format("compile exchange with {} {}",
+                                               Where(job),
+                                               DescribeTransportFailure(compileOutcome.transportFailure)));
+            // And only the first of them names the worker for the memo, by the endpoint
+            // it ADVERTISES -- what the scheduler compares an exclusion against. The
+            // verdict is `TransportFailureTable`'s, never a comparison written here.
+            //
+            // Only a dial at the NAME can say so. A hint that reached nothing is a stale
+            // address, and the name is dialled after it (`HintRetryTransportFailures`),
+            // so the dial that decides is the name's; a hint outcome arriving here
+            // unreached is one the name was never asked about.
+            if (MarksUnreachable(compileOutcome.transportFailure) && job.endpoint == job.worker)
+                refused.unreachedWorker = std::string { job.worker };
+            return refused;
+        }
         if (!compileOutcome.IsHit())
             // A refusal here is the worker declining the JOB -- an unknown lease, a
             // fingerprint it does not have, an argument it will not accept. Distinct
@@ -206,7 +243,7 @@ namespace
             return DeclinedBy(
                 compileOutcome,
                 ExchangeSite { .endpoint = std::string { job.endpoint }, .opcode = std::to_underlying(Wire::Op::Compile) },
-                std::format("{} refused the job: {}", job.endpoint, DescribeOutcome(compileOutcome)));
+                std::format("{} refused the job: {}", Where(job), DescribeOutcome(compileOutcome)));
 
         auto const result = Wire::DecodeCompileResult(compileOutcome.value);
         if (!result.has_value())
@@ -230,7 +267,7 @@ namespace
             CompileCorrelation(CorrelatedCompile { .preprocessed = job.request.preprocessed,
                                                    .args = job.request.args,
                                                    .fingerprint = job.request.fingerprint,
-                                                   .sourceName = sourceName,
+                                                   .sourceName = job.request.sourceName,
                                                    .compileDir = job.request.compileDir,
                                                    .compileDirReplacement = job.request.compileDirReplacement,
                                                    .sourceRoot = job.request.sourceRoot,
@@ -238,7 +275,7 @@ namespace
         if (Wire::AsStringView(result->correlation) != expected)
             return Refused(DispatchStatus::Mismatched,
                            std::format("{} answered about a different compile (expected {}, got {})",
-                                       job.endpoint,
+                                       Where(job),
                                        expected,
                                        DescribeCorrelation(result->correlation)));
 
@@ -249,7 +286,7 @@ namespace
         if (!object.has_value())
             return Refused(DispatchStatus::Unavailable,
                            std::format("compile result object from {} could not be decoded: {}",
-                                       job.endpoint,
+                                       Where(job),
                                        DescribeEnvelopeError(object.error())));
 
         return DispatchResult { .status = DispatchStatus::Compiled,
@@ -258,8 +295,14 @@ namespace
                                 .stdoutText = std::string { Wire::AsStringView(result->stdoutText) },
                                 .stderrText = std::string { Wire::AsStringView(result->stderrText) },
                                 .detail = {},
-                                .workerEndpoint = std::string { job.endpoint },
-                                .declinedAt = {} };
+                                // The worker by its NAME, whichever address reached it: the
+                                // memo forgets an exclusion under the name it was noted by.
+                                .workerEndpoint = std::string { job.worker },
+                                .dialledEndpoint = {},
+                                .declinedAt = {},
+                                .leaseTransport = TransportFailure::None,
+                                .leaseEndpoint = {},
+                                .unreachedWorker = {} };
     }
 
     /// Tell the scheduler this lease is done with, however the job ended.
@@ -348,12 +391,18 @@ namespace
                                               ExchangeBudget budget)
     {
         LeaseAttempt attempt { .outcome = {}, .scheduler = std::string { start } };
+        // Views over the caller's strings, built once: the same list rides every hop,
+        // because a redirect changes who decides and not which workers this client
+        // could not reach.
+        std::vector<std::string_view> const excluded { request.excludedWorkers.begin(), request.excludedWorkers.end() };
         for (auto const hop: std::views::iota(0, MaxLeaseRedirects + 1))
         {
             // Rebuilt per attempt: `Exchange` takes the frame by value and moves it,
             // so the second ask cannot reuse the first one's bytes.
-            auto frame = Wire::EncodeLease(Wire::LeaseRequest {
-                .fingerprint = request.fingerprint, .key = request.objectKey, .acceptedCodecs = accepted });
+            auto frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = request.fingerprint,
+                                                                .key = request.objectKey,
+                                                                .acceptedCodecs = accepted,
+                                                                .excluded = excluded });
             attempt.outcome = exchange.Exchange(attempt.scheduler, std::move(frame), credential, budget);
 
             auto redirect = RedirectTarget(attempt.outcome);
@@ -405,7 +454,7 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
 
     // Derived ONCE. `available` is what this build can produce; `accepted` is what
     // this client will read back, which a caller may narrow and which therefore is
-    // not the same question -- see `LeasedJob::own`.
+    // not the same question -- see where the source is enveloped below.
     auto const available = AvailableCodecs();
     auto const& accepted = acceptedCodecs.empty() ? available : acceptedCodecs;
 
@@ -424,24 +473,44 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
     auto const lease = LeaseFromFleet(exchange, request.schedulerEndpoint, request, accepted, credential, budgets.control);
     auto const& leaseOutcome = lease.outcome;
     if (leaseOutcome.kind == CacheOutcomeKind::Transport)
+    {
         // Unreachable or broken mid-reply. Nothing was leased, so there is nothing
         // to release and the worker is never asked -- the client does not guess at
-        // an endpoint the scheduler did not name.
-        return Refused(DispatchStatus::Unavailable, "scheduler exchange failed");
+        // an endpoint the scheduler did not name. HOW it failed, and at which
+        // scheduler, travel back for the reachability memo.
+        auto refused = Refused(DispatchStatus::Unavailable, "scheduler exchange failed");
+        refused.leaseTransport = leaseOutcome.transportFailure;
+        refused.leaseEndpoint = lease.scheduler;
+        return refused;
+    }
     if (!leaseOutcome.IsHit())
+    {
         // NoWorker, NoCapacity, AlreadyInFlight, DispatchNotPermitted -- every one
         // of them ordinary, and every one answered by compiling locally. The
         // scheduler's own words travel so the caller can say which it was.
-        return DeclinedBy(leaseOutcome,
-                          ExchangeSite { .endpoint = lease.scheduler, .opcode = std::to_underlying(Wire::Op::Lease) },
-                          DescribeOutcome(leaseOutcome));
+        auto declined =
+            DeclinedBy(leaseOutcome,
+                       ExchangeSite { .endpoint = lease.scheduler, .opcode = std::to_underlying(Wire::Op::Lease) },
+                       DescribeOutcome(leaseOutcome));
+        declined.leaseEndpoint = lease.scheduler;
+        return declined;
+    }
 
     auto const grant = Wire::DecodeLeaseGrant(leaseOutcome.value);
     if (!grant.has_value())
-        return Refused(DispatchStatus::Unavailable, "malformed lease grant");
+    {
+        auto refused = Refused(DispatchStatus::Unavailable, "malformed lease grant");
+        refused.leaseEndpoint = lease.scheduler;
+        return refused;
+    }
 
     auto const endpoint = std::string { Wire::AsStringView(grant->endpoint) };
     auto const token = std::string { Wire::AsStringView(grant->leaseToken) };
+    // A hint that is not an address to dial -- or that IS the name -- is no hint. The
+    // same predicate `RedirectTarget` and `DialEndpoint` ask, so "may this be dialled"
+    // has one answer (`Core/HostPort.hpp`).
+    auto const hintText = std::string { Wire::AsStringView(grant->dialHint) };
+    auto const hint = ParseDialEndpoint(hintText).has_value() && hintText != endpoint ? hintText : std::string {};
 
     // The lease conversation is over and its connection is already gone: an exchange
     // owns its socket for exactly one request/reply. Holding one for the length of a
@@ -449,29 +518,56 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
     // launcher on nothing, and the scheduler would sweep it anyway.
 
     // --- have the worker compile it -----------------------------------------
-    auto result = CompileOnWorker(
-        exchange,
-        LeasedJob { .endpoint = endpoint,
-                    .leaseToken = token,
-                    .codecs = grant->workerCodecs,
-                    .accepted = accepted,
-                    .own = available,
-                    .credential = credential,
-                    .request = request,
-                    // What is LEFT of the grant's bound, not
-                    // this process's and not the grant's whole
-                    // lifetime. `UnderGrantedLease` carries the
-                    // argument for both halves.
-                    .budget = UnderGrantedLease(budgets.compile,
-                                                grant->lifetime,
-                                                std::chrono::duration_cast<std::chrono::milliseconds>(now.now() - askedAt)),
-                    .maxObjectBytes = budgets.maxDecompressedBytes });
+    // Compressed against the WORKER's codecs, which the grant relayed -- not against
+    // this client's. The two need not agree, and guessing wrong would only be
+    // discovered after the whole preprocessed payload had crossed the network. And with
+    // what this client can PRODUCE (`available`), never `accepted`: narrowing what this
+    // client can *read* must not narrow what it can *write*, because the client never
+    // decodes its own source -- the worker does. Folding the two together is the same
+    // conflation of two codec lists that #265 was.
+    //
+    // Enveloped ONCE: a dial at the name after one at the hint resends these bytes.
+    auto const sourceField = Envelope(Wire::AsBytes(request.preprocessed), grant->workerCodecs, available);
+    auto const jobAt = [&](std::string_view address) {
+        return LeasedJob { .endpoint = address,
+                           .worker = endpoint,
+                           .leaseToken = token,
+                           .accepted = accepted,
+                           .credential = credential,
+                           .request = request,
+                           .sourceField = sourceField,
+                           .maxObjectBytes = budgets.maxDecompressedBytes };
+    };
+    // What is LEFT of the grant's bound, not this process's and not the grant's whole
+    // lifetime -- `UnderGrantedLease` carries the argument for both halves. Measured
+    // again at EACH dial, because a dial at the name starts after the hint's has
+    // already spent some of the grant.
+    auto const leftOfGrant = [&] {
+        return UnderGrantedLease(
+            budgets.compile, grant->lifetime, std::chrono::duration_cast<std::chrono::milliseconds>(now.now() - askedAt));
+    };
+
+    auto dialled = hint.empty() ? endpoint : hint;
+    auto outcome = ExchangeCompile(exchange, jobAt(dialled), hint.empty() ? leftOfGrant() : AtDialHint(leftOfGrant()));
+    // At most ONE more dial, and only when nothing ran at the hint: a second dial after a
+    // machine was reached could compile the job twice.
+    if (!hint.empty() && RetriesAtAdvertisedName(outcome))
+    {
+        dialled = endpoint;
+        outcome = ExchangeCompile(exchange, jobAt(dialled), leftOfGrant());
+    }
+
+    auto result = InterpretCompile(outcome, jobAt(dialled));
+    result.dialledEndpoint = dialled;
+    // The lease leg completed, whatever the compile did: `leaseTransport` stays `None`.
+    result.leaseEndpoint = lease.scheduler;
 
     // --- and hand the lease back, however that went -------------------------
     // On every path out of the compile, which is why the compile is a function
     // rather than a run of early returns: an unreachable worker, a refused job and
     // a finished one all mean the same thing to the scheduler -- this key is no
-    // longer being built here.
+    // longer being built here. ONE release whichever addresses were dialled: the
+    // hint and the name are one lease, issued once.
     ReleaseLease(exchange, lease.scheduler, request, token, credential, budgets.control);
     return result;
 }

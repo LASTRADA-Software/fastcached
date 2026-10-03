@@ -560,10 +560,15 @@ commit, developer branches and toolchain bumps. Size it for that shape rather
 than for steady load.
 
 **Some compiles never distribute, by design.** A C++ module interface unit and
-anything writing a precompiled header produce a second artefact beside the object,
-and only the object travels — so they are compiled locally and not cached either.
-So is a command line that names its own input language (`/TP`, `-x c++`), because
-the launcher must state the language of the preprocessed text it sends and would
+anything writing a precompiled header or `cl`'s shared `/Zi` PDB produce a second
+artefact beside the object, and only the object travels — so they are compiled
+locally and not cached either. So is a `cl` compile that uses a precompiled
+header (`/Yu`): its object names the `pch.obj` it was compiled against by
+absolute path, and with `cl` 19.51 a hit in another checkout failed to link while
+one after a PCH rebuild silently lost its debug info. clang-cl's `/Yu` object
+carries no such tie and is cached. A command line that names its own input
+language (`/TP`, `-x c++`) is not distributed or cached either, because the
+launcher must state the language of the preprocessed text it sends and would
 otherwise silently override yours.
 
 **Caching never breaks a build.** Every error path — an unreachable daemon, a

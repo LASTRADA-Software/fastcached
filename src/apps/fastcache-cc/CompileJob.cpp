@@ -700,8 +700,8 @@ namespace
         AllowedArg { .spelling = "Fr", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
         AllowedArg { .spelling = "Fx", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
         // The precompiled-header family. `ProducesSideArtefact` already refuses `/Yc`
-        // because it WRITES one; these refuse the rest of the family, which reads one
-        // off this machine.
+        // because it WRITES one, and `cl`'s `/Yu` because its object is tied to one;
+        // these refuse the rest of the family, which reads one off this machine.
         AllowedArg { .spelling = "Y", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
 
         // -- the flags that make the compile write a SECOND artefact
@@ -811,7 +811,7 @@ bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver, std
     // makes the compile write a second artefact is refused, because only the object
     // comes back. `-fmodule-mapper=|program args` is on it and makes GCC spawn a
     // subprocess, so this check is load-bearing rather than tidy.
-    if (ProducesSideArtefact(arg, driver.family))
+    if (ProducesSideArtefact(arg, driver))
         return false;
 
     // The language the client states for a preprocessed input, read out of the

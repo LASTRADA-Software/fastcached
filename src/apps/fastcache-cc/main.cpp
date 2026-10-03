@@ -63,6 +63,7 @@
 #include "NotePathCollapse.hpp"
 #include "ParallelFor.hpp"
 #include "PathResolve.hpp"
+#include "ReachabilityMemo.hpp"
 #include "ReactorExchange.hpp"
 #include "RefusalNotice.hpp"
 #include "ReplayGuard.hpp"
@@ -2238,6 +2239,20 @@ void RecordManifest(InvocationRecord const& record,
                                RefusedHere("the command line is not dispatchable"),
                                std::format("not dispatchable ({}); compiling locally", args.error()));
 
+    // Asked BEFORE the second preprocess and the fingerprint, because saving those is
+    // half the point: a scheduler nothing reached a moment ago costs this compile one
+    // file read instead of a preprocess, a fingerprint and a full connect budget. One
+    // launcher per translation unit is why the memo is a FILE; see ReachabilityMemo.hpp
+    // for why it is safe to believe for fifteen seconds and not longer.
+    Cc::FileMemoStore memoStore { Cc::ReachabilityMemoPath() };
+    core::platform::SystemWallClock const wallClock;
+    auto memo = Cc::ReachabilityMemo::Load(memoStore);
+    if (memo.Remembers(Cc::MemoKind::SchedulerUnreached, cfg.schedulerAddr, wallClock.now()))
+        return DeclineDispatch(
+            record,
+            Cc::RememberedUnreachableRecording(),
+            std::format("not dispatched ({} at {}); compiling locally", Cc::RememberedUnreachableReason, cfg.schedulerAddr));
+
     // Preprocessed again, with `#line` markers this time. The key's text has them
     // suppressed so no checkout path reaches the key; a worker needs them, because
     // they are what marks system-header lines as system-header lines. Without that
@@ -2371,6 +2386,12 @@ void RecordManifest(InvocationRecord const& record,
                                 : std::string_view {};
     auto const sourceRootReplacement = sourceRoot.empty() ? std::string_view {} : std::string_view { sourceName };
 
+    // The workers a launcher failed to reach within the last minute, newest first: the
+    // scheduler grants somebody else rather than the machine this build just failed to
+    // dial. Read from the memo loaded above, never re-read, and named rather than a
+    // temporary because `DispatchRequest` holds a view of it.
+    auto const excludedWorkers = memo.Fresh(Cc::MemoKind::WorkerUnreached, wallClock.now());
+
     // Every endpoint the dispatch dials -- the scheduler, the worker its grant names, whoever
     // issued the lease -- is shown a ticket minted for it, so the credential handed to
     // `Dispatch` is none: the decorator asks per dial.
@@ -2387,9 +2408,15 @@ void RecordManifest(InvocationRecord const& record,
                                                             .compileDir = compileDirPath,
                                                             .compileDirReplacement = compileDirReplacement,
                                                             .sourceRoot = sourceRoot,
-                                                            .sourceRootReplacement = sourceRootReplacement },
+                                                            .sourceRootReplacement = sourceRootReplacement,
+                                                            .excludedWorkers = excludedWorkers },
                                       DispatchBudgetsOf(cfg),
                                       Cc::Credential {});
+    // Every outcome is absorbed -- an Unreached scheduler is remembered, a completed lease
+    // clears it -- and the file is written only when that changed anything.
+    memo.Absorb(outcome, cfg.schedulerAddr, wallClock.now());
+    memo.SaveIfChanged(memoStore);
+
     // What the fleet's own answer means on the statistics axis, decided once and in a
     // tested file -- `main.cpp` is in no test target. A decline whose DECLINING exchange
     // presented no ticket is recorded under WHY, which names the thing to fix.
@@ -2421,7 +2448,7 @@ void RecordManifest(InvocationRecord const& record,
         return DeclineDispatch(record,
                                Discarded("a worker compile failed and was retried locally"),
                                std::format("worker {} reported exit {}; recompiling locally to confirm",
-                                           outcome.workerEndpoint,
+                                           Cc::DescribeWorkerReached(outcome),
                                            outcome.exitCode));
 
     // The object first: everything after it is a record ABOUT this object, and
@@ -2515,7 +2542,7 @@ void RecordManifest(InvocationRecord const& record,
     // `DeclineDispatch` and a state written up front would be overwritten by each of
     // them -- an ordering nothing would enforce.
     ApplyDispatchRecording(record, fleetAnswer);
-    Note(record.verbose, std::format("DISPATCHED to {} key={}", outcome.workerEndpoint, key));
+    Note(record.verbose, std::format("DISPATCHED to {} key={}", Cc::DescribeWorkerReached(outcome), key));
     return run;
 }
 
@@ -3349,13 +3376,15 @@ int main(int argc, char** argv)
         //
         // One of those reasons is worth naming, because it is the one that looks
         // like a defect from outside: a compile that also writes a BMI or a
-        // precompiled header is stepped over deliberately, and an operator watching
-        // a module-using build get no hits at all deserves to be told why rather
-        // than left to conclude the cache is broken.
+        // precompiled header, or uses one under `cl`, is stepped over deliberately,
+        // and an operator watching a module-using build, or a `cl` build with
+        // precompiled headers, get no hits at all deserves to be told why rather than
+        // left to conclude the cache is broken.
         if (cmd.sideArtefact)
             Note(record.verbose,
-                 "the compile writes a second artefact (a BMI or a precompiled header) "
-                 "that a cache hit cannot reproduce; not cached");
+                 "the compile writes a second artefact (a BMI, a precompiled header or cl's shared /Zi PDB) "
+                 "or uses a precompiled header with cl (/Yu), whose object is tied to the one pch.obj it was "
+                 "compiled against; a cache hit cannot reproduce either, so not cached");
         if (cmd.separatedPassThrough)
             Note(record.verbose,
                  "a clang-cl pass-through dependency flag (-clang:-MF) carries its value in a separate "

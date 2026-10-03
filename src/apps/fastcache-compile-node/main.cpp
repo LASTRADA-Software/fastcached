@@ -826,6 +826,7 @@ using Node::NodeReloader;
                                                                                             : Node::SocketActivation::No,
                                                         .membership = membership.Oracle(),
                                                         .locality = locality,
+                                                        .addresses = *hostAddresses,
                                                         .io = nodeIo,
                                                         .host = *host,
                                                         .cacheTier = cacheTier.get(),

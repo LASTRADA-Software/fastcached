@@ -389,4 +389,26 @@ namespace Detail
     return Detail::SplitUpTo(payload, std::numeric_limits<std::size_t>::max());
 }
 
+/// Split a payload into however many fields it holds, up to a cap.
+///
+/// The capped counterpart to `SplitAll`, for a repeated group the protocol bounds.
+/// A payload holding more than @p limit fields is REFUSED rather than truncated,
+/// since a list that silently lost its tail reads as a shorter list the peer never
+/// sent. The walk stops at the cap, so a hostile payload of empty fields costs what
+/// one field too many does rather than a span per four bytes; anything left over
+/// after @p limit fields, a further field or stray bytes alike, is the refusal.
+/// @param payload The bytes to split.
+/// @param limit Most fields to accept. It is reserved up front, so it is a
+///              protocol's cap and not a large sentinel.
+/// @return The fields as spans into `payload`, or nullopt when malformed or over
+///         the cap.
+[[nodiscard]] inline std::optional<std::vector<std::span<std::byte const>>> SplitAtMost(std::span<std::byte const> payload,
+                                                                                        std::size_t limit)
+{
+    auto fields = Detail::SplitUpTo(payload, limit);
+    if (!fields.has_value() || EncodedSize(*fields) != payload.size())
+        return std::nullopt;
+    return fields;
+}
+
 } // namespace FastCache::WireFields

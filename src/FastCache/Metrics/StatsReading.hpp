@@ -562,6 +562,8 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::CompileScheduler },
     CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesWithdrawn,
                         .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesAllExcluded,
+                        .surface = MetricsSurface::CompileScheduler },
     CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesDuplicate,
                         .surface = MetricsSurface::CompileScheduler },
     CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchWorkerRegistrations,

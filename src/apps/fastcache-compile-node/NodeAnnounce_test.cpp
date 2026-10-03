@@ -19,16 +19,20 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
+#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -151,8 +155,8 @@ TEST_CASE("Adopting a served set retires a registration the scheduler accepted",
         RegisterOk("w-gcc"),
         RegisterOk("w-clang"),
     }) };
-    REQUIRE(current[0].Register(scheduler).has_value());
-    REQUIRE(current[1].Register(scheduler).has_value());
+    REQUIRE(current[0].Register(scheduler, {}).has_value());
+    REQUIRE(current[1].Register(scheduler, {}).has_value());
     REQUIRE(current[0].WorkerId() == "w-gcc");
 
     std::vector<Cc::WorkerRegistrar> rebuilt;
@@ -229,8 +233,8 @@ TEST_CASE("A node that moves the address it advertises retires every registratio
         RegisterOk("w-gcc"),
         RegisterOk("w-clang"),
     }) };
-    REQUIRE(current[0].Register(scheduler).has_value());
-    REQUIRE(current[1].Register(scheduler).has_value());
+    REQUIRE(current[0].Register(scheduler, {}).has_value());
+    REQUIRE(current[1].Register(scheduler, {}).has_value());
 
     // The same fingerprints -- nothing about what this machine SERVES has changed, which
     // is exactly why the fingerprint alone could not answer this.
@@ -272,7 +276,7 @@ TEST_CASE("A node re-adopting the same set at the same address retires nothing",
     current.push_back(Registrar("gcc-13"));
 
     Testing::ScriptedSocket scheduler { Testing::Replies({ RegisterOk("w-gcc") }) };
-    REQUIRE(current[0].Register(scheduler).has_value());
+    REQUIRE(current[0].Register(scheduler, {}).has_value());
 
     std::vector<Cc::WorkerRegistrar> rebuilt;
     rebuilt.push_back(Registrar("gcc-13"));
@@ -378,8 +382,14 @@ struct AnnounceFixture
 {
     NodeConfig cfg;
     AtomicMetricsSink metrics;
-    NullLogger logger;
+    CapturingLogger logger;
     SilentLoadSampler loadSampler;
+    /// What this machine answers on: one of each thing a report leaves out, a repeat, and two
+    /// routable addresses listed out of order.
+    Testing::ScriptedHostAddresses addresses {
+        { "127.0.0.1", "192.168.1.20", "::1", "fe80::1", "169.254.3.4", "10.8.0.7", "10.8.0.7" }
+    };
+    std::atomic<bool> addressCapNoticed { false };
     // The process singleton wall clock, for the reason `NodeCredential_test` gives beside
     // the same construction: the sampler keeps the ADDRESS and reads it from its own thread.
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
@@ -402,6 +412,8 @@ struct AnnounceFixture
                                 .withdrawals = withdrawals,
                                 .capacity = capacity,
                                 .loadSampler = loadSampler,
+                                .addresses = addresses,
+                                .addressCapNoticed = addressCapNoticed,
                                 .cacheTier = nullptr,
                                 .metrics = metrics,
                                 // Nothing proves: every case in this file is about the announce
@@ -620,4 +632,195 @@ TEST_CASE("A worker whose remembered leader stops answering falls back through t
                                         std::string { FirstScheduler },
                                         std::string { SecondScheduler } });
     CHECK(OpsSentOn(dialer, 4) == std::vector<std::uint8_t> { HeartbeatOp });
+}
+
+namespace
+{
+
+/// The addresses a report keeps out of @p addresses.
+/// @param addresses What the machine answers on.
+/// @return The report's list alone.
+[[nodiscard]] std::vector<std::string> Kept(std::vector<std::string> addresses)
+{
+    return ReportableInterfaceAddresses(std::move(addresses)).addresses;
+}
+
+/// The interface addresses a REGISTER frame carries.
+/// @param frame An op byte and its payload.
+/// @return The list, or nullopt when this is not a REGISTER that decodes.
+[[nodiscard]] std::optional<std::vector<std::string>> RegisteredAddresses(
+    std::pair<std::uint8_t, std::vector<std::byte>> const& frame)
+{
+    if (frame.first != RegisterOp)
+        return std::nullopt;
+    auto const decoded = Wire::DecodeRegisterPayload(frame.second);
+    if (!decoded.has_value())
+        return std::nullopt;
+    return decoded->capacity.interfaceAddresses;
+}
+
+/// The interface addresses a HEARTBEAT frame carries.
+/// @param frame An op byte and its payload.
+/// @return The list, or nullopt when this is not a HEARTBEAT that decodes.
+[[nodiscard]] std::optional<std::vector<std::string>> BeatAddresses(
+    std::pair<std::uint8_t, std::vector<std::byte>> const& frame)
+{
+    if (frame.first != HeartbeatOp)
+        return std::nullopt;
+    auto const decoded = Wire::DecodeHeartbeatPayload(frame.second);
+    if (!decoded.has_value())
+        return std::nullopt;
+    return decoded->load.interfaceAddresses;
+}
+
+/// Routable addresses from `10.0.0.100` upwards, which sort as they count.
+/// @param count How many.
+/// @return The addresses, in order.
+[[nodiscard]] std::vector<std::string> RoutableAddresses(std::size_t count)
+{
+    std::vector<std::string> many;
+    many.reserve(count);
+    for (auto const i: std::views::iota(std::size_t { 0 }, count))
+        many.push_back(std::format("10.0.0.{}", 100 + i));
+    return many;
+}
+
+/// How many times the cap has been said.
+/// @param logger The fixture's log.
+/// @return The count of Info lines naming the cap.
+[[nodiscard]] std::size_t CapNotices(CapturingLogger const& logger)
+{
+    auto const records = logger.Snapshot();
+    return static_cast<std::size_t>(std::ranges::count_if(records, [](CapturingLogger::Record const& record) {
+        return record.level == LogLevel::Info && record.message.contains("a report carries at most");
+    }));
+}
+
+/// The routable address each filter case keeps beside the entries it drops, so a filter that
+/// dropped everything reads as a failure rather than as the row under test holding.
+constexpr std::string_view Routable = "10.8.0.7";
+
+} // namespace
+
+TEST_CASE("A report leaves out loopback, in every spelling", "[node][announce][dialhint]")
+{
+    CHECK(Kept({ std::string { Routable }, "127.0.0.1", "127.3.4.5", "::1", "::ffff:127.0.0.2" })
+          == std::vector<std::string> { std::string { Routable } });
+}
+
+TEST_CASE("A report leaves out link-local addresses, which the scheduler never hints", "[node][announce][dialhint]")
+{
+    CHECK(Kept({ std::string { Routable }, "fe80::1", "febf::9", "169.254.3.4", "::ffff:169.254.0.9" })
+          == std::vector<std::string> { std::string { Routable } });
+    // Just outside fe80::/10 on both sides, and a unique-local address: none is link-local.
+    CHECK(Kept({ "fec0::1", "fd00::7", "fe7f::1" }) == std::vector<std::string> { "fd00::7", "fe7f::1", "fec0::1" });
+}
+
+TEST_CASE("A report leaves out what the wire would refuse, and keeps the longest entry it carries",
+          "[node][announce][dialhint]")
+{
+    auto const longest = std::string(Wire::MaxInterfaceAddressBytes, 'a');
+    CHECK(Kept({ std::string { Routable }, "", longest + "a", longest })
+          == std::vector<std::string> { std::string { Routable }, longest });
+}
+
+TEST_CASE("A report is sorted and unique, so one set always encodes to one list", "[node][announce][dialhint]")
+{
+    auto const report = ReportableInterfaceAddresses({ "10.8.0.9", "10.8.0.7", "10.8.0.9", "10.8.0.7" });
+    CHECK(report.addresses == std::vector<std::string> { "10.8.0.7", "10.8.0.9" });
+    CHECK(report.overCap == 0);
+    CHECK(ReportableInterfaceAddresses({}).addresses.empty());
+}
+
+TEST_CASE("A report stops at the wire's cap after filtering, and says how many the cap left out",
+          "[node][announce][dialhint]")
+{
+    auto const over = ReportableInterfaceAddresses(RoutableAddresses(Wire::MaxInterfaceAddresses + 8));
+    CHECK(over.addresses.size() == Wire::MaxInterfaceAddresses);
+    CHECK(over.overCap == 8);
+    // The ones that sort first are kept, whatever order they were enumerated in.
+    CHECK(over.addresses.front() == "10.0.0.100");
+    CHECK(over.addresses.back() == std::format("10.0.0.{}", 100 + Wire::MaxInterfaceAddresses - 1));
+
+    auto const exact = ReportableInterfaceAddresses(RoutableAddresses(Wire::MaxInterfaceAddresses));
+    CHECK(exact.addresses.size() == Wire::MaxInterfaceAddresses);
+    CHECK(exact.overCap == 0);
+
+    // Filtered FIRST: a cap spent on loopback aliases would leave the routable one out.
+    std::vector<std::string> aliases;
+    for (auto const i: std::views::iota(std::size_t { 0 }, Wire::MaxInterfaceAddresses + 4))
+        aliases.push_back(std::format("127.0.1.{}", i));
+    aliases.emplace_back("10.200.0.1");
+    auto const filtered = ReportableInterfaceAddresses(aliases);
+    CHECK(filtered.addresses == std::vector<std::string> { "10.200.0.1" });
+    CHECK(filtered.overCap == 0);
+}
+
+TEST_CASE("A registration and every heartbeat carry the addresses this machine answers on now", "[node][announce][dialhint]")
+{
+    AnnounceFixture fix;
+    auto const expected = std::vector<std::string> { "10.8.0.7", "192.168.1.20" };
+
+    auto const registered = fix.AnnounceTo(RegisterOk("w-7"));
+    REQUIRE(registered.size() == 1);
+    CHECK(RegisteredAddresses(registered[0]) == std::optional { expected });
+
+    auto const beat = fix.AnnounceTo(HeartbeatOk());
+    REQUIRE(beat.size() == 1);
+    CHECK(BeatAddresses(beat[0]) == std::optional { expected });
+
+    // A VPN reconnect between two rounds: the NEXT beat reports the new set, not the one the
+    // registration carried.
+    fix.addresses.Publish({ "10.8.0.42", "127.0.0.1" });
+    auto const moved = fix.AnnounceTo(HeartbeatOk());
+    REQUIRE(moved.size() == 1);
+    CHECK(BeatAddresses(moved[0]) == std::optional { std::vector<std::string> { "10.8.0.42" } });
+}
+
+TEST_CASE("A machine whose addresses cannot be read still registers and heartbeats, reporting none",
+          "[node][announce][dialhint]")
+{
+    AnnounceFixture fix;
+    fix.addresses.Publish({});
+
+    auto const registered = fix.AnnounceTo(RegisterOk("w-7"));
+    REQUIRE(registered.size() == 1);
+    CHECK(RegisteredAddresses(registered[0]) == std::optional { std::vector<std::string> {} });
+    CHECK(fix.lease.fleet.Pinned() == std::optional<std::string> { "fleet-a" });
+
+    auto const beat = fix.AnnounceTo(HeartbeatOk());
+    REQUIRE(beat.size() == 1);
+    CHECK(BeatAddresses(beat[0]) == std::optional { std::vector<std::string> {} });
+}
+
+TEST_CASE("A machine with more addresses than a report carries says so once, not every heartbeat",
+          "[node][announce][dialhint]")
+{
+    SECTION("over the cap: one line across a registration and two heartbeats, naming the dropped count")
+    {
+        AnnounceFixture fix;
+        fix.addresses.Publish(RoutableAddresses(Wire::MaxInterfaceAddresses + 8));
+
+        (void) fix.AnnounceTo(RegisterOk("w-7"));
+        (void) fix.AnnounceTo(HeartbeatOk());
+        auto const beat = fix.AnnounceTo(HeartbeatOk());
+
+        REQUIRE(beat.size() == 1);
+        CHECK(BeatAddresses(beat[0]).value_or(std::vector<std::string> {}).size() == Wire::MaxInterfaceAddresses);
+        CHECK(CapNotices(fix.logger) == 1);
+        auto const records = fix.logger.Snapshot();
+        CHECK(std::ranges::any_of(
+            records, [](CapturingLogger::Record const& record) { return record.message.contains("the 8 that sort last"); }));
+    }
+
+    SECTION("at the cap: nothing to say")
+    {
+        AnnounceFixture fix;
+        fix.addresses.Publish(RoutableAddresses(Wire::MaxInterfaceAddresses));
+
+        (void) fix.AnnounceTo(RegisterOk("w-7"));
+        (void) fix.AnnounceTo(HeartbeatOk());
+
+        CHECK(CapNotices(fix.logger) == 0);
+    }
 }

@@ -7,12 +7,12 @@
 // asserted with no socket and no clock of the machine's.
 #include "ReactorExchange.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
@@ -844,14 +844,8 @@ TEST_CASE("Every transport failure has words of its own")
     // above for the pair it happens to separate, and lose the distinction for the
     // next one added. Asserted over the whole enumeration instead, which is what
     // makes it hold for a row nobody has written yet.
-    constexpr auto All = std::to_array({ Cc::TransportFailure::None,
-                                         Cc::TransportFailure::Unreached,
-                                         Cc::TransportFailure::PeerLost,
-                                         Cc::TransportFailure::Expired,
-                                         Cc::TransportFailure::Silent });
-
     std::vector<std::string_view> phrases;
-    for (auto const failure: All)
+    for (auto const failure: Enumerators<Cc::TransportFailure>())
     {
         auto const phrase = Cc::DescribeTransportFailure(failure);
         CHECK_FALSE(phrase.empty());

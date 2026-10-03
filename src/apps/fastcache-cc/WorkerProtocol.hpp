@@ -442,11 +442,19 @@ class WorkerRegistrar
     /// saying why -- the node's own log can only report that it did not register.
     /// Presents no credential (`ExchangeWithScheduler`).
     /// @param scheduler Connected transport; not owned.
+    /// @param interfaceAddresses What this machine answers on this round. A parameter
+    ///        rather than part of the capacity this registrar was built with, because
+    ///        the capacity is fixed for the registrar's life and the addresses are not:
+    ///        a VPN reconnect moves them, and a re-registration must carry the new set.
+    ///        **Required, never defaulted**: a caller that forgot the list would
+    ///        register a worker the scheduler can never hint, and compile. A caller that
+    ///        genuinely has none passes `{}` and says so.
     /// @return Nothing when the scheduler accepted, and the assigned id is kept
     ///         internally; otherwise the refusal, carrying both the phrase to log
     ///         and -- when this was a `NotLeader` naming somewhere else -- the
     ///         endpoint to announce to instead.
-    [[nodiscard]] std::expected<void, AnnounceRefusal> Register(core::net::ISocket& scheduler);
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Register(core::net::ISocket& scheduler,
+                                                                std::span<std::string const> interfaceAddresses);
 
     /// Report liveness and current load.
     ///

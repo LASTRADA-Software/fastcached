@@ -512,15 +512,20 @@ namespace
         { .spelling = "/U", .families = DriverFamily::Msvc },
     } };
 
-    /// One flag that makes a compile write a second artefact, and which families
-    /// spell it that way.
+    /// One flag that makes a compile write a second artefact (or, for `cl /Yu`, tie its
+    /// object to one), and which drivers spell it that way.
     struct SideArtefactFlag
     {
         std::string_view spelling;
         DriverFamily families;
+        /// The one driver the row is about, when another driver of `families` accepts
+        /// the same spelling and means something a hit CAN reproduce by it. Disengaged:
+        /// every driver of `families`.
+        std::optional<Flavor> onlyFlavor {};
     };
 
-    /// Flags that make a compile write something BESIDES its object file.
+    /// Flags that make a compile write something BESIDES its object file, and one flag,
+    /// `cl`'s `/Yu`, that makes the object depend on a build artefact the key cannot see.
     ///
     /// One row per spelling, exactly as PathValues does it and for the same reason:
     /// an MSVC driver accepts `-` for every option, and a row matched on introducer
@@ -532,7 +537,7 @@ namespace
     /// and matches nothing here. It is left out rather than half-matched, because a
     /// row that fires on `-Xclang` alone would un-cache every build that passes any
     /// `-Xclang` flag at all.
-    constexpr std::array<SideArtefactFlag, 13> SideArtefacts { {
+    constexpr std::array<SideArtefactFlag, 19> SideArtefacts { {
         { .spelling = "/interface", .families = DriverFamily::Msvc },
         { .spelling = "-interface", .families = DriverFamily::Msvc },
         { .spelling = "/internalPartition", .families = DriverFamily::Msvc },
@@ -546,7 +551,32 @@ namespace
         { .spelling = "-fmodule-output", .families = DriverFamily::Gnu },
         { .spelling = "-fmodule-mapper", .families = DriverFamily::Gnu },
         { .spelling = "--precompile", .families = DriverFamily::Gnu },
+        // `cl`'s shared-PDB debug formats. The object only REFERS to the PDB, which holds
+        // every translation unit's types, so a hit restores an object whose types were
+        // never written anywhere. clang-cl reads these spellings as `/Z7` -- its own option
+        // table says "Like /Z7" -- so they are `cl`'s rows alone.
+        { .spelling = "/Zi", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
+        { .spelling = "-Zi", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
+        { .spelling = "/ZI", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
+        { .spelling = "-ZI", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
+        // `cl`'s `/Yu` READS a precompiled header rather than writing one, and is here on
+        // measured evidence (cl 19.51): the object forces a `__@@_PchSym_` symbol whose
+        // name differs per checkout, and its types begin with an `LF_PRECOMP` record
+        // naming the absolute path of the pch.obj it was compiled against. The key hashes
+        // the header's text and neither of those, so a hit replayed into another checkout
+        // failed to link (LNK2011), and one replayed after a PCH rebuild linked without
+        // the translation unit's debug info (LNK4206). clang-cl 22's `/Yu` object carries
+        // neither and replayed clean, so these are `cl`'s rows alone.
+        { .spelling = "/Yu", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
+        { .spelling = "-Yu", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
     } };
+
+    // The stated extent must equal the row count. A larger one pads the array with
+    // value-initialized rows, and an empty spelling would reach `.front()` in
+    // `ProducesSideArtefact` -- undefined behaviour rather than a row that matches
+    // nothing. An empty spelling is exactly what such a row has.
+    static_assert(std::ranges::none_of(SideArtefacts, [](SideArtefactFlag const& row) { return row.spelling.empty(); }),
+                  "SideArtefacts' stated extent must equal its row count -- an empty row is a padded one");
 
     /// Which introducer characters each family's options start with.
     constexpr std::array<std::pair<DriverFamily, std::string_view>, 4> FamilyIntroducers { {
@@ -1044,9 +1074,9 @@ std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg, std::stri
     return std::nullopt;
 }
 
-bool ProducesSideArtefact(std::string_view arg, DriverFamily family)
+bool ProducesSideArtefact(std::string_view arg, DriverSpec const& driver)
 {
-    auto const introducers = IntroducersOf(family);
+    auto const introducers = IntroducersOf(driver.family);
     if (arg.empty() || introducers.empty() || !introducers.contains(arg.front()))
         return false;
 
@@ -1057,7 +1087,8 @@ bool ProducesSideArtefact(std::string_view arg, DriverFamily family)
     // bare form would have caught the shape nobody writes and missed the one
     // everybody does.
     return std::ranges::any_of(SideArtefacts, [&](SideArtefactFlag const& row) {
-        return introducers.contains(row.spelling.front()) && Overlaps(row.families, family) && arg.starts_with(row.spelling);
+        return introducers.contains(row.spelling.front()) && Overlaps(row.families, driver.family)
+               && (!row.onlyFlavor.has_value() || *row.onlyFlavor == driver.flavor) && arg.starts_with(row.spelling);
     });
 }
 
@@ -1254,9 +1285,10 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
         }
 
         // Asked of every argument, and of the SOURCE too by way of its extension
-        // below: a compile that also writes a BMI or a precompiled header is not
-        // one a cache hit can reproduce.
-        if (ProducesSideArtefact(a, driver.family))
+        // below: a compile that also writes a BMI, a precompiled header or `cl`'s
+        // shared `/Zi` PDB, or that reads a precompiled header under `cl` (`/Yu`),
+        // is not one a cache hit can reproduce.
+        if (ProducesSideArtefact(a, driver))
         {
             out.sideArtefact = true;
             continue;

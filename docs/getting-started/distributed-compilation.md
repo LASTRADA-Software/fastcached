@@ -119,10 +119,10 @@ none. Across a fleet of mixed machines — the ordinary case — counting jobs s
 work to the smallest machines first and leaves the big ones idle.
 
 The scheduler refuses rather than queues — `no-worker`, `no-capacity`,
-`withdrawn`, `already-in-flight` — because the client is holding the source and
-can simply compile it. Queueing would buy latency and nothing else. Each names a
-different operator problem, which is why they are counted apart; see
-[the sizing notes](#sizing-and-operations).
+`withdrawn`, `all-excluded`, `already-in-flight` — because the client is holding
+the source and can simply compile it. Queueing would buy latency and nothing
+else. Each names a different operator problem, which is why they are counted
+apart; see [the sizing notes](#sizing-and-operations).
 
 ### 3. The client sends preprocessed text, not files
 
@@ -564,6 +564,7 @@ start it with `--admin-listen` and these count the outcomes.
 | `fastcached_dispatch_leases_no_worker_total` | The fleet is **misconfigured** — workers are up but nobody matches. |
 | `fastcached_dispatch_leases_no_capacity_total` | The fleet is **too small** — full of your own build. |
 | `fastcached_dispatch_leases_withdrawn_total` | The fleet is **unavailable** — slots free on paper, machines busy elsewhere or out of scratch space. |
+| `fastcached_dispatch_leases_all_excluded_total` | The fleet is **unreachable from its clients** — every matching worker was on the asking client's exclusion list. A network problem, not a missing toolchain. Check the VPN and the workers' advertised names. |
 | `fastcached_dispatch_leases_duplicate_total` | Duplicate-work suppression is doing its job. Not a problem. |
 | `fastcached_dispatch_worker_registrations_total` | Workers registering. A steady rise means heartbeats are not arriving. |
 | `fastcached_dispatch_worker_registrations_malformed_total` | A peer named its toolchain, endpoint or version in bytes that are not UTF-8 and was refused. Any rise names a machine that is **not** in the fleet. |
@@ -879,12 +880,14 @@ have — but it looks like a cold cache the first time a fleet upgrades past it.
   fleet's own jobs are subtracted, so what is left is load that belongs to
   somebody else. A worker whose scratch filesystem fills up stops being picked
   entirely, and starts again when it drains.
-- **Three lease refusals, never summed.** `no-worker` means a fingerprint
-  nobody serves, `no-capacity` means the fleet is too small, and `withdrawn`
-  means the machines are there and unavailable. Each has its own
+- **Four lease refusals, never summed.** `no-worker` means a fingerprint
+  nobody serves, `no-capacity` means the fleet is too small, `withdrawn` means
+  the machines are there and unavailable, and `all-excluded` means the machines
+  are there and the client itself could not reach them. Each has its own
   `fastcached_dispatch_leases_*_total`, because the fixes are different and
   folding `withdrawn` into `no-capacity` sends an operator to buy hardware they
-  already own.
+  already own, while `all-excluded` folded into `no-worker` sends them chasing
+  a toolchain that is not missing.
 - **A node's own cache tier is subtracted from what it can compile.** Capacity is
   one job per gigabyte of RAM, and a resident cache is memory that will not yield —
   so a 64-thread host with 32 GiB holding 8 GiB of cache offers 24 slots, not 32.
@@ -1005,12 +1008,25 @@ minute and is spent once.
   carrying code or data is byte-identical, which is what the end-to-end test
   asserts. If your build compares object bytes across machines, compare sections.
 - **Some compiles are never distributed, by design.** A C++ **module interface
-  unit** and any compile that writes a precompiled header produce a second artefact
-  beside the object, and only the object travels — so those are compiled locally and
-  are not cached either. So is a command line that names its input language itself
-  (`/TP`, `-x c++`), because the launcher has to state the language of the
-  preprocessed text it sends and would otherwise silently override yours. Run with
-  `FASTCACHE_VERBOSE=1` to see which of these applied.
+  unit**, any compile that writes a precompiled header, and `cl /Zi` or `/ZI` (a PDB
+  shared across the target) produce a second artefact beside the object, and only
+  the object travels — so those are compiled locally and are not cached either.
+  So is a `cl` compile that *uses* a precompiled header (`/Yu`): its object names
+  the `pch.obj` it was compiled against by absolute path, and with `cl` 19.51 a
+  hit replayed into another checkout failed to link (`LNK2011`), while one
+  replayed after a PCH rebuild linked without the translation unit's debug info
+  (`LNK4206`). clang-cl's `/Yu` object carries no such tie, so it is cached, but
+  it is still compiled locally: the header it reads is on your machine, not the
+  worker's. A command line that names its input language itself (`/TP`,
+  `-x c++`) is not distributed or cached either, because the launcher has to
+  state the language of the preprocessed text it sends and would otherwise
+  silently override yours. Run with `FASTCACHE_VERBOSE=1` to
+  see which of these applied.
+- **An unreachable scheduler is remembered for fifteen seconds.** When a launcher could
+  not reach the scheduler at all, the launchers after it compile locally without dialling
+  it again for fifteen seconds (`not dispatched (the scheduler was unreachable moments
+  ago …)` under `FASTCACHE_VERBOSE=1`). The memo lives in the per-user state directory
+  (`%LOCALAPPDATA%\fastcache-cc\reachability.memo`), and deleting it is always safe.
 
 - **A node's `--requirepass` is for its `--upstream` alone.** It is the secret of the
   shared `fastcached`, presented there and nowhere else. The fleet's own traffic is

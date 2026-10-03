@@ -47,19 +47,39 @@ collapse or a mis-serve and is now covered by regression tests:
 
 - **A compile that writes a second artefact is not cached at all.** What a hit
   reproduces is the object and the dependency record; a **C++ module interface
-  unit** also writes a BMI (`.ifc`, `.pcm`), and `/Yc` a precompiled header. Replay
-  one and the second artefact is either missing afterwards — which fails loudly —
-  or left over from a previous build, which does not. Both halves are one rule and
-  neither may be dropped: the module **extensions** (`.ixx`, `.cppm`, `.ccm`,
-  `.cxxm`, `.c++m`, `.mxx`) are classified as their own language and refused by
-  name, and an ordinary source **promoted by a flag** (`cl /interface`,
-  `-fmodule-output`, `--precompile`) is refused off a table. Until this was written
-  down the first half held by accident — those extensions simply were not in
-  `IsSourceSuffix`, so such a line fell through as "no source file found" and was
-  passed through *in silence*, which reads exactly like a broken cache; and the
-  obvious "add .ixx so modules are supported" change would have turned that
-  accident into a silent wrong build. The refusal now says so under
-  `FASTCACHE_VERBOSE`.
+  unit** also writes a BMI (`.ifc`, `.pcm`), and `/Yc` a precompiled header.
+  `cl /Zi` and `/ZI` write the translation unit's types into a PDB shared across the
+  target and leave only a reference in the object, so they are refused for
+  `Flavor::Cl` alone: clang-cl reads both spellings as `/Z7`, which a row's
+  `onlyFlavor` column says. Replay one and the second artefact is either missing
+  afterwards — which fails loudly — or left over from a previous build, which does
+  not. The module rule has two halves, and neither may be dropped: the module
+  **extensions** (`.ixx`, `.cppm`, `.ccm`, `.cxxm`, `.c++m`, `.mxx`) are classified
+  as their own language and refused by name, and an ordinary source **promoted by
+  a flag** (`cl /interface`, `-fmodule-output`, `--precompile`) is refused off a
+  table. Until this was written down the first half held by accident — those
+  extensions simply were not in `IsSourceSuffix`, so such a line fell through as
+  "no source file found" and was passed through *in silence*, which reads exactly
+  like a broken cache; and the obvious "add .ixx so modules are supported" change
+  would have turned that accident into a silent wrong build. The refusal now says
+  so under `FASTCACHE_VERBOSE`.
+
+  **`cl /Yu` is refused as well although it writes nothing**: its object is
+  tied to the one `pch.obj` it was compiled against, and the key sees neither tie.
+  *Measured* with `cl` 19.51.36252 and `link` 14.51.36252 over a two-build `/Yc` +
+  `/Yu` reproduction, where two checkouts produced the SAME key: the object carries
+  `-INCLUDE:__@@_PchSym_…`, a symbol whose name differs between the two checkouts'
+  `pch.obj`, and its types open with an `LF_PRECOMP` record naming that `pch.obj` by
+  absolute path. A hit replayed into the other checkout still forced the first
+  one's symbol and failed to link (`LNK2011`, then `LNK1120`), and one replayed
+  after the same checkout's PCH was rebuilt linked with exit 0 and `LNK4206` —
+  *linking object as if no debug info* — which is a wrong artefact that looks right.
+  clang-cl 22.1.3's `/Yu` object has neither record and every replay linked and ran,
+  so the rows are `onlyFlavor = Cl` and a test pins clang-cl's `/Yu` cacheable.
+  *Inferred, not measured*: that the symbol's name is that absolute path under a
+  letter substitution (it decodes to one), that `LF_PRECOMP`'s signature changes on
+  every `/Yc` build, and that CMake's `cmake_pch.hxx` + `/FI` shape behaves the
+  same.
 
 The first two break cross-checkout sharing while every unit test still passes,
 the third breaks it the moment two machines differ, the fourth breaks it the

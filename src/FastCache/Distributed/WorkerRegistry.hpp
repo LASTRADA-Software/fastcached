@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -22,11 +23,12 @@ namespace FastCache::Distributed
 
 /// Why a worker could not be picked.
 ///
-/// Three reasons rather than one "no", because they are three different
+/// Four reasons rather than one "no", because they are four different
 /// operator problems and the client reports the scheduler's own words: an empty
 /// fleet for a toolchain is a configuration mistake, a busy fleet is a capacity
-/// one, and a duplicate is neither. All three end the same way at the client —
-/// compile locally — so this type never has to express a failure.
+/// one, an unreachable fleet is a network one, and a duplicate is neither. All
+/// four end the same way at the client — compile locally — so this type never
+/// has to express a failure.
 enum class PickError : std::uint8_t
 {
     NoWorker,   ///< Nothing registered with this fingerprint (or all expired).
@@ -41,6 +43,10 @@ enum class PickError : std::uint8_t
     /// this into that one would send an operator shopping for hardware they already
     /// own, and hide a fleet-wide full disk behind a number that looks like growth.
     Withdrawn,
+    /// Every matching live worker was on the requesting client's exclusion list: the
+    /// machines exist and that client could not reach them a moment ago. A NETWORK
+    /// problem, and never summed with `NoWorker`, which is a configuration one.
+    Excluded,
     Last, ///< Not a refusal, and has no row: the length of a table keyed by one.
 };
 
@@ -109,6 +115,19 @@ struct WorkerInfo
     /// it. Held as raw ids rather than the wire header's alias, so the registry
     /// keeps no dependency on the protocol layer.
     std::vector<std::uint8_t> codecs;
+
+    /// The host this worker's last REGISTER or HEARTBEAT arrived from, as the kernel named
+    /// it (`CallerContext::peerId`, trusted). What a dial hint is made of; empty until seen.
+    ///
+    /// A host and never a port: the worker dialled from an ephemeral one, so the hint takes
+    /// its port from `endpoint`, which is what the worker listens on.
+    std::string observedHost {};
+
+    /// The addresses the worker says it answers on, as of that same exchange. What decides
+    /// whether `observedHost` is the worker's own address or a NAT in front of it.
+    ///
+    /// Owned: the exchange that carried them is gone by the time a lease reads them.
+    std::vector<std::string> interfaceAddresses {};
 };
 
 /// One live worker, as a diagnostic rather than as a scheduling input.
@@ -333,6 +352,24 @@ struct WorkerRegistration
     /// A worker that got that arithmetic wrong would advertise more of a developer's
     /// machine than the operator allowed, and nothing downstream could tell.
     NodeCapacity capacity {};
+
+    /// `CallerContext::peerId` of the REGISTER. Set by `SchedulerService::Register` from the
+    /// connection, never from anything the worker sent.
+    std::string_view observedHost {};
+
+    /// From the capacity record; empty when it reported none. Borrowed for the call only:
+    /// the registry copies it into `WorkerInfo::interfaceAddresses`.
+    std::span<std::string const> interfaceAddresses {};
+};
+
+/// Where a worker was SEEN and what it says it answers on, as one exchange carried them.
+///
+/// Borrowed for the length of one `WorkerRegistry::Heartbeat` call, which copies both into
+/// the entry's owned strings before it returns. Nothing keeps this struct.
+struct WorkerAddresses
+{
+    std::string_view observedHost {};                   ///< `CallerContext::peerId` of that exchange.
+    std::span<std::string const> interfaceAddresses {}; ///< What the worker reported; empty means it reported none.
 };
 
 /// The set of live compile workers, grouped by toolchain.
@@ -417,11 +454,20 @@ class WorkerRegistry
     /// a worker expiring in that gap would drop a batch the node has already stopped
     /// resending.
     ///
+    /// Where the heartbeat was seen, and the addresses it reported, REPLACE the entry's
+    /// whole: a VPN reconnect moves both mid-session, and the dial hint a lease carries must
+    /// pair an observed host with the list the worker sent from the same moment. An empty
+    /// list therefore clears the entry's, which withdraws the hint rather than keeping one
+    /// from an earlier exchange.
+    ///
     /// @param workerId The id from `Register`.
     /// @param load What the worker reports about itself, its job count included.
+    /// @param addresses Where this heartbeat arrived from and what it reported; copied.
     /// @return Its endpoint, or nullopt when the id is unknown (the worker should
     ///         re-register).
-    [[nodiscard]] std::optional<std::string> Heartbeat(std::string_view workerId, NodeLoad const& load);
+    [[nodiscard]] std::optional<std::string> Heartbeat(std::string_view workerId,
+                                                       NodeLoad const& load,
+                                                       WorkerAddresses const& addresses = {});
 
     /// Pick the least-loaded live worker whose fingerprint matches exactly.
     ///
@@ -439,15 +485,18 @@ class WorkerRegistry
     /// the operation must do anyway, which is the shape `ClaimReadSlot` already uses
     /// one layer down.
     ///
-    /// A REFUSAL stamps nothing, on any of the three arms. It has to be that way or
+    /// A REFUSAL stamps nothing, on any of the four arms. It has to be that way or
     /// the field answers a different question than its name: a fingerprint every
     /// worker refused for want of capacity would read as picked, and the toolchain
     /// nobody ever asks for -- the one case this exists to find -- would still be the
     /// only absence. What is recorded is *this entry was chosen*, never *somebody
     /// asked about this toolchain*.
     /// @param fingerprint The toolchain the client is compiling with.
+    /// @param excluded Endpoints the client could not reach a moment ago, by what
+    ///        they advertise; they narrow this pick only, never a registration.
     /// @return The chosen worker, or why none could be chosen.
-    [[nodiscard]] std::expected<WorkerInfo, PickError> Pick(std::string_view fingerprint);
+    [[nodiscard]] std::expected<WorkerInfo, PickError> Pick(std::string_view fingerprint,
+                                                            std::span<std::string_view const> excluded = {});
 
     /// Note that a job has been dispatched to a worker.
     ///

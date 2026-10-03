@@ -6,11 +6,13 @@
 
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <optional>
 #include <span>
 #include <string>
@@ -303,6 +305,60 @@ struct DispatchBudgetKnobs
 /// of shipping a launcher that dials with it unset.
 static_assert(DispatchBudgetsFor(DispatchBudgetKnobs {}) == DispatchBudgets {},
               "DispatchBudgetsFor must reproduce DispatchBudgets' own defaults, field for field");
+
+/// How long a grant's dial HINT may take to connect before the advertised name is tried.
+///
+/// A third of the ordinary connect budget. A hint is the address the scheduler last saw
+/// this worker's connections arrive from, seconds ago, so an answer inside 300 ms is the
+/// ordinary case -- and a hint that has gone stale (the VPN moved the machine again, the
+/// address went to somebody else) costs a third of a second before the name is tried,
+/// rather than the full second a dead name costs.
+inline constexpr std::chrono::milliseconds HintConnectBudget { 300 };
+
+/// The compile leg's budget, for a dial at the grant's hint.
+///
+/// Only `connect` differs, and it is capped rather than replaced: an operator who set a
+/// SHORTER connect timeout keeps it. A non-positive connect is `core::net`'s spelling of
+/// *the platform's default* -- which is minutes, not a third of a second -- so it takes
+/// the cap too, or `FASTCACHE_CONNECT_TIMEOUT=0s` would give a stale hint the longest
+/// wait of all.
+/// @param compile The compile leg's budget as it stands for this dial.
+/// @return The same budget, with its connect ceiling at most `HintConnectBudget`.
+[[nodiscard]] constexpr ExchangeBudget AtDialHint(ExchangeBudget compile) noexcept
+{
+    compile.connect = compile.connect > std::chrono::milliseconds::zero() ? std::min(compile.connect, HintConnectBudget)
+                                                                          : HintConnectBudget;
+    return compile;
+}
+
+/// The transport failures at the hint that send the client on to the advertised name.
+///
+/// One row: `Unreached`, which made no connection, so nothing can have run. `PeerLost`,
+/// `Expired` and `Silent` all REACHED a machine that may be compiling the job right now,
+/// and a second dial could compile it twice -- so they are final, and the table errs
+/// narrow: a failure missing here costs one local compile, a failure wrongly present
+/// costs a duplicate one on the fleet.
+inline constexpr std::array HintRetryTransportFailures { TransportFailure::Unreached };
+
+/// The refusals at the hint that send the client on to the advertised name.
+///
+/// One row: `LeaseEndpointMismatch`, which a worker answers when the token names a
+/// different endpoint from its own -- the hint's address now belongs to ANOTHER fleet
+/// worker, which refused before running anything. Every other refusal is the granted
+/// worker's own answer, and the name would reach the same machine to hear it again.
+inline constexpr std::array HintRetryRefusals { CompileCacheWire::ErrorCode::LeaseEndpointMismatch };
+
+/// Whether an outcome at the dial hint is retried at the advertised name.
+/// @param outcome The compile exchange's outcome at the hint.
+/// @return True only for a row of `HintRetryTransportFailures` or `HintRetryRefusals`.
+[[nodiscard]] inline bool RetriesAtAdvertisedName(CacheOutcome const& outcome) noexcept
+{
+    if (outcome.kind == CacheOutcomeKind::Transport)
+        return std::ranges::contains(HintRetryTransportFailures, outcome.transportFailure);
+    if (outcome.kind == CacheOutcomeKind::Rejected)
+        return std::ranges::contains(HintRetryRefusals, outcome.code);
+    return false;
+}
 
 /// How a dispatch attempt ended.
 ///
@@ -608,11 +664,33 @@ struct DispatchResult
     std::string stdoutText;        ///< The remote compiler's stdout.
     std::string stderrText;        ///< The remote compiler's stderr.
     std::string detail;            ///< Why it was declined or unavailable; empty on success.
-    std::string workerEndpoint;    ///< Which worker ran it, for diagnostics.
+    /// Which worker ran it, by the endpoint it ADVERTISES -- the name the lease token signs,
+    /// whichever address reached it. Set only when a worker compiled.
+    std::string workerEndpoint;
+    /// Which ADDRESS the compile that produced this result was sent to: the grant's dial
+    /// hint, or the advertised name. `workerEndpoint` says which worker; this says how it
+    /// was reached. Empty when no compile dial was attempted.
+    std::string dialledEndpoint;
     /// The exchange whose refusal declined the dispatch, when `status` is `Declined`: the LEASE at
     /// whoever answered it, or the COMPILE at the worker the grant named. Never the RELEASE, which
     /// runs after a refused compile too and decides nothing about it.
     std::optional<ExchangeSite> declinedAt {};
+    /// How the LEASE exchange ended at the transport, `None` when it completed. Read by
+    /// the reachability memo, which remembers only `Unreached` -- a scheduler that was
+    /// reached and then misbehaved is not one that is down.
+    TransportFailure leaseTransport { TransportFailure::None };
+    /// Which scheduler the last lease exchange went to: the configured one, or the leader
+    /// a `NotLeader` named. The memo records only against the configured one.
+    std::string leaseEndpoint;
+    /// The ADVERTISED endpoint of a worker that nothing reached, so the next launcher
+    /// excludes it. Empty otherwise.
+    ///
+    /// Set only when a dial at the worker's NAME made no connection at all
+    /// (`MarksUnreachable`). A worker that was reached and then lost, outwaited or went
+    /// quiet is UP, and so is one that refused the job or compiled; none of those is
+    /// named here. Nor is a dial HINT that reached nothing while the name then answered:
+    /// that is a stale address, not a dead machine.
+    std::string unreachedWorker;
 
     /// @return True when a worker actually ran the compiler.
     [[nodiscard]] bool Ran() const noexcept
@@ -620,6 +698,34 @@ struct DispatchResult
         return status == DispatchStatus::Compiled;
     }
 };
+
+/// How to name a worker and the address that reached it, in a line an operator reads.
+///
+/// The name alone when the dial went to the name, and `<name> at <address>` when it went
+/// to a dial hint: the two can both work (split-horizon DNS over a VPN), so a line naming
+/// only the worker cannot say which one the compile used. ONE spelling for the failure
+/// messages `Dispatch` builds and the success lines the launcher prints.
+/// @param worker The worker by the endpoint it advertises; may be empty.
+/// @param dialled The address the compile was sent to; may be empty.
+/// @return The phrase; the non-empty one of the two when only one is set, and empty when
+///         neither is.
+[[nodiscard]] inline std::string WorkerAt(std::string_view worker, std::string_view dialled)
+{
+    if (dialled.empty() || dialled == worker)
+        return std::string { worker };
+    if (worker.empty())
+        return std::string { dialled };
+    return std::format("{} at {}", worker, dialled);
+}
+
+/// `WorkerAt` for a finished dispatch.
+/// @param result What `Dispatch` returned.
+/// @return Which worker the compile went to, and at which address when that was a hint;
+///         empty when no compile dial was attempted.
+[[nodiscard]] inline std::string DescribeWorkerReached(DispatchResult const& result)
+{
+    return WorkerAt(result.workerEndpoint, result.dialledEndpoint);
+}
 
 /// Everything one dispatch needs.
 struct DispatchRequest
@@ -660,6 +766,17 @@ struct DispatchRequest
     /// malformed and the worker refuses it, exactly as the compilation-directory pair.
     std::string_view sourceRoot;
     std::string_view sourceRootReplacement;
+
+    /// Workers this client could not reach moments ago, by the endpoint they advertise,
+    /// newest first -- the reachability memo's `Fresh(WorkerUnreached)`. Sent on the LEASE
+    /// so the scheduler grants somebody else; empty is the ordinary case.
+    ///
+    /// Taken BEFORE this dispatch, so it can never name the worker this dispatch is about
+    /// to be granted: a worker this dispatch fails to reach comes back as
+    /// `DispatchResult::unreachedWorker`, for the NEXT launcher. The wire takes at most
+    /// `CompileCacheWire::MaxLeaseExclusions`, the newest ones, which is also as many as
+    /// the memo keeps.
+    std::span<std::string const> excludedWorkers {};
 };
 
 /// Ask the scheduler for a worker and have it compile this translation unit.
@@ -671,6 +788,13 @@ struct DispatchRequest
 /// one. The client never waits in a queue — a scheduler with nothing free refuses
 /// immediately, and the caller compiles locally. That is not a fallback bolted on
 /// afterwards; it is why the scheduler is allowed to refuse at all.
+///
+/// **A grant carrying a dial hint is compiled at the hint first**, under
+/// `AtDialHint`'s short connect ceiling, and at the advertised name only when
+/// `RetriesAtAdvertisedName` says nothing ran at the hint. The token signs the NAME
+/// either way, so a hint that lands on another fleet worker is refused there rather than
+/// compiled. The retry gets what is left of the grant at that moment, never a fresh
+/// budget, and it is still the one lease, released once.
 ///
 /// **The release is not optional and not the caller's to remember.** A lease
 /// suppresses every other client's attempt at the same key, so one that is never

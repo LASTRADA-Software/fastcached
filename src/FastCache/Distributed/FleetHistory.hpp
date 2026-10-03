@@ -250,7 +250,7 @@ class FleetHistory
     ///
     /// Idempotent within a bucket: sampling twice inside the same minute overwrites
     /// rather than appends, so a jittery timer cannot double-count.
-    /// @param values The nine readings, counters cumulative.
+    /// @param values The ten readings, counters cumulative.
     void Record(EnumTable<FleetMetric, std::uint64_t> const& values);
 
     /// Replay a bucket another machine recorded, at ITS instant rather than now.
@@ -363,9 +363,14 @@ class FleetHistory
     void AppendBody(std::string& out) const;
 
     /// Read rings back from a nested body.
+    ///
+    /// A nested body carries no envelope of its own -- `version` is the OUTER
+    /// `NodeStoreFile`'s, the only place which shape this body was written in
+    /// travels, since `AppendBody` stamps nothing of its own inside it.
     /// @param body The bytes `AppendBody` wrote.
+    /// @param version What NodeStoreFile's envelope said.
     /// @return True when they were understood.
-    bool ReadBody(std::string_view body);
+    bool ReadBody(std::string_view body, std::uint8_t version);
 
     /// One reading at a stated instant; `Record` and `Adopt` differ only in that.
     /// @param now When the reading was taken.

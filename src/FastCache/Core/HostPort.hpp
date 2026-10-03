@@ -10,6 +10,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 namespace FastCache
@@ -316,6 +317,69 @@ namespace Detail
 {
     auto const unmapped = UnmappedHost(host);
     return NamesOnlyThisMachine(unmapped) || unmapped == "0.0.0.0" || unmapped == "::";
+}
+
+/// Whether a host is link-local: scoped to the interface it was observed on, not to any
+/// particular machine.
+///
+/// A link-local address is zone-less text once it leaves the socket it came from -- `fe80::1`
+/// names a different machine on every link -- so it is scoped to the SCHEDULER's own link, never
+/// to the client dialling the hint. Handing it out anyway would spend a lease's dial-hint budget
+/// on an address the client cannot reach, which is exactly the failure mode a stale DNS record
+/// was supposed to avoid. It shows up more than the range alone would suggest: mDNS `.local`
+/// names commonly resolve to one, and a NAT'd or bridged host often has no other address on the
+/// interface the scheduler heard it from.
+///
+/// IPv4's link-local range is `169.254.0.0/16`, unmapped first as `IsLoopbackHost` does. IPv6's
+/// is `fe80::/10` -- the ten most significant bits fixed -- which is not a textual prefix a
+/// `starts_with` can spell: the range covers every address whose first 16-bit group, read as a
+/// number, falls in `[0xfe80, 0xfebf]`, so that group is parsed and compared numerically rather
+/// than pattern-matched. A zone id (`fe80::1%eth0`) sits after the address and never inside its
+/// first group, so it does not need stripping first.
+/// @param host A host, without a port or brackets; a zone id, if any, is ignored.
+/// @return True for an IPv4 or IPv6 link-local address.
+[[nodiscard]] inline bool IsLinkLocalHost(std::string_view host) noexcept
+{
+    constexpr std::string_view V4Prefix = "169.254.";
+    auto const bare = UnmappedHost(host);
+    if (bare.starts_with(V4Prefix))
+        return true;
+
+    auto const colon = bare.find(':');
+    if (colon == std::string_view::npos || colon == 0 || colon > 4)
+        return false;
+    auto const firstGroup = bare.substr(0, colon);
+    unsigned value = 0;
+    auto const [end, error] = std::from_chars(firstGroup.data(), firstGroup.data() + firstGroup.size(), value, 16);
+    if (error != std::errc {} || end != firstGroup.data() + firstGroup.size())
+        return false;
+    return value >= 0xfe80 && value <= 0xfebf;
+}
+
+/// Whether a host is an IP address written out rather than a name to resolve.
+///
+/// TEXTUAL and pure, deliberately not `inet_pton`: it decides whether a DNS record could
+/// be stale, which is a question about the SPELLING. A colon means an IPv6 literal -- a
+/// DNS name never carries one -- and otherwise four dot-separated decimal octets, each
+/// 0-255 in at most three digits. The IPv4-mapped form is unmapped first.
+/// @param host A host, without a port or brackets.
+/// @return True for an IPv4 or IPv6 literal.
+[[nodiscard]] inline bool IsIpLiteralHost(std::string_view host) noexcept
+{
+    auto const bare = UnmappedHost(host);
+    if (bare.contains(':'))
+        return true;
+    std::size_t octets = 0;
+    for (auto const part: std::views::split(bare, '.'))
+    {
+        auto const text = std::string_view { part.begin(), part.end() };
+        unsigned value = 0;
+        auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (text.empty() || text.size() > 3 || error != std::errc {} || end != text.data() + text.size() || value > 255)
+            return false;
+        ++octets;
+    }
+    return octets == 4;
 }
 
 /// Split an endpoint that may name only a port.

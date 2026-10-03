@@ -3,6 +3,7 @@
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Distributed/DialHint.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -713,6 +714,28 @@ TEST_CASE("Refusals an operator sizes a fleet from are counted; client defects a
     sized.capacity = NodeCapacity { .logicalCores = 4, .nodeClass = NodeClass::Dedicated };
     CHECK(fleet.service.Register(Insider, sized).status == Wire::Status::Ok);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkerRegistrations) == 2);
+}
+
+TEST_CASE("A lease that excludes every worker is NoWorker on the wire and counted apart",
+          "[distributed][scheduler][exclusion]")
+{
+    Leading fleet;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "laptop.corp:7100")).status == Wire::Status::Ok);
+
+    std::array<std::string_view, 1> const excluded { "laptop.corp:7100" };
+    auto const reply = fleet.service.Lease(
+        Insider, Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {}, .excluded = excluded });
+    CHECK(reply.error == Wire::ErrorCode::NoWorker);
+    CHECK(reply.message.contains("exclusion"));
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesAllExcluded) == 1);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesNoWorker) == 0);
+
+    // The control: the same fleet with no exclusion grants, and a toolchain nobody serves is
+    // still the no-worker series -- the two rows are the two causes, never one.
+    CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "k2")).status == Wire::Status::Ok);
+    CHECK(fleet.service.Lease(Insider, Ask("gcc-99", "k3")).error == Wire::ErrorCode::NoWorker);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesNoWorker) == 1);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesAllExcluded) == 1);
 }
 
 TEST_CASE("Every refusal this service makes is describable on the wire", "[distributed][scheduler][wire]")
@@ -2472,4 +2495,119 @@ TEST_CASE("A scheduler hands out a roster only once a strict majority of its vot
                                                                   .endorsement = garbage });
     CHECK(landed.status == Wire::Status::Ok);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused) == 1);
+}
+
+namespace
+{
+/// The dial hint out of a granted lease.
+/// @param reply What `Lease` answered; must be a grant.
+/// @return The hint, empty when the grant carries none.
+[[nodiscard]] std::string HintOf(SchedulerReply const& reply)
+{
+    REQUIRE(reply.status == Wire::Status::Ok);
+    auto const grant = Wire::DecodeLeaseGrant(reply.payload);
+    REQUIRE(grant.has_value());
+    return std::string { Wire::AsStringView(Unwrap(grant).dialHint) };
+}
+} // namespace
+
+TEST_CASE("A grant hints where the worker was seen, and its token still signs the NAME",
+          "[distributed][scheduler][dialhint]")
+{
+    Leading fleet;
+    auto const id = AssignedId(fleet.service.Register(Insider, OneSlot("gcc-14", "laptop.corp:7100")));
+    REQUIRE_FALSE(id.empty());
+    std::vector<std::string> const interfaces { "10.8.0.7" };
+    CallerContext const fromVpn { .membership = Membership::Member, .peerId = "10.8.0.7" };
+    REQUIRE(fleet.service.Heartbeat(fromVpn, id, NodeLoad {}, {}, interfaces).status == Wire::Status::Ok);
+
+    auto const reply = fleet.service.Lease(Insider, Ask("gcc-14", "k"));
+    REQUIRE(reply.status == Wire::Status::Ok);
+    auto const grant = Wire::DecodeLeaseGrant(reply.payload);
+    REQUIRE(grant.has_value());
+    CHECK(Wire::AsStringView(Unwrap(grant).dialHint) == "10.8.0.7:7100");
+    CHECK(Wire::AsStringView(Unwrap(grant).endpoint) == "laptop.corp:7100");
+
+    // What makes a stale hint harmless: the worker compares the token's endpoint with the
+    // name IT advertises, so an address that now belongs to another machine is refused
+    // `LeaseEndpointMismatch` there instead of being compiled on.
+    auto const claims = AuthenticateLeaseToken(Testing::FixedLeaseRoster {}, TokenOf(reply));
+    REQUIRE(claims.has_value());
+    CHECK(Unwrap(claims).endpoint == "laptop.corp:7100");
+}
+
+TEST_CASE("No hint where the worker did not say it answers on the address it was seen at",
+          "[distributed][scheduler][dialhint]")
+{
+    Leading fleet;
+    auto const id = AssignedId(fleet.service.Register(Insider, OneSlot("gcc-14", "laptop.corp:7100")));
+    REQUIRE_FALSE(id.empty());
+    std::vector<std::string> const interfaces { "10.8.0.7" };
+
+    // The control: seen at the address it reports, the same worker IS hinted. Without it an
+    // empty hint below would pass whichever veto emptied it -- a heartbeat that never recorded
+    // where it was seen leaves the registration's host, and no hint, just as well.
+    CallerContext const direct { .membership = Membership::Member, .peerId = "10.8.0.7" };
+    REQUIRE(fleet.service.Heartbeat(direct, id, NodeLoad {}, {}, interfaces).status == Wire::Status::Ok);
+    CHECK(HintOf(fleet.service.Lease(Insider, Ask("gcc-14", "k1"))) == "10.8.0.7:7100");
+
+    // Now it arrives through a NAT whose address it does not report: no hint, and for THAT reason.
+    CallerContext const viaNat { .membership = Membership::Member, .peerId = "203.0.113.9" };
+    REQUIRE(fleet.service.Heartbeat(viaNat, id, NodeLoad {}, {}, interfaces).status == Wire::Status::Ok);
+    auto const grant = Wire::DecodeLeaseGrant(fleet.service.Lease(Insider, Ask("gcc-14", "k2")).payload);
+    REQUIRE(grant.has_value());
+    CHECK(Unwrap(grant).dialHint.empty());
+
+    auto const live = fleet.service.Workers().LiveWorkers();
+    REQUIRE(live.size() == 1);
+    CHECK(live[0].observedHost == "203.0.113.9");
+    CHECK(DecideDialHint(DialHintInputs { .advertised = live[0].endpoint,
+                                          .observedHost = live[0].observedHost,
+                                          .interfaceAddresses = live[0].interfaceAddresses })
+              .veto
+          == HintVeto::NotAReportedInterface);
+}
+
+TEST_CASE("Where a registering worker was seen is the connection's peer, never its own claim",
+          "[distributed][scheduler][dialhint]")
+{
+    // The registration names an observed host of its own and lists it among its interfaces;
+    // the service overwrites it with `caller.peerId`, so the hint names the address the
+    // kernel saw -- which also proves a REGISTER alone, before any heartbeat, is enough.
+    Leading fleet;
+    std::vector<std::string> const interfaces { "10.8.0.7", "10.8.0.99" };
+    auto registration = OneSlot("gcc-14", "laptop.corp:7100");
+    registration.observedHost = "10.8.0.99";
+    registration.interfaceAddresses = interfaces;
+    CallerContext const fromVpn { .membership = Membership::Member, .peerId = "10.8.0.7" };
+    REQUIRE_FALSE(AssignedId(fleet.service.Register(fromVpn, registration)).empty());
+
+    CHECK(HintOf(fleet.service.Lease(Insider, Ask("gcc-14", "k"))) == "10.8.0.7:7100");
+}
+
+TEST_CASE("The hint follows a worker whose VPN address moved, and a beat reporting none withdraws it",
+          "[distributed][scheduler][dialhint]")
+{
+    // Each heartbeat reports zero jobs, which is also what frees the one slot the previous
+    // grant took: the worker's count wins over the registry's.
+    Leading fleet;
+    auto const id = AssignedId(fleet.service.Register(Insider, OneSlot("gcc-14", "laptop.corp:7100")));
+    REQUIRE_FALSE(id.empty());
+
+    std::vector<std::string> const first { "10.8.0.7" };
+    CallerContext const before { .membership = Membership::Member, .peerId = "10.8.0.7" };
+    REQUIRE(fleet.service.Heartbeat(before, id, NodeLoad {}, {}, first).status == Wire::Status::Ok);
+    CHECK(HintOf(fleet.service.Lease(Insider, Ask("gcc-14", "k1"))) == "10.8.0.7:7100");
+
+    // The VPN reconnected with a new address; the process, and so the registration, stayed up.
+    std::vector<std::string> const moved { "10.8.0.42" };
+    CallerContext const after { .membership = Membership::Member, .peerId = "10.8.0.42" };
+    REQUIRE(fleet.service.Heartbeat(after, id, NodeLoad {}, {}, moved).status == Wire::Status::Ok);
+    CHECK(HintOf(fleet.service.Lease(Insider, Ask("gcc-14", "k2"))) == "10.8.0.42:7100");
+
+    // A beat from the same address that reports no interfaces clears the list rather than
+    // keeping the previous one, so the NAT check has nothing to match and the grant carries
+    // no hint: the client dials the name, as it would have without this feature.
+    REQUIRE(fleet.service.Heartbeat(after, id, NodeLoad {}, {}, {}).status == Wire::Status::Ok);
+    CHECK(HintOf(fleet.service.Lease(Insider, Ask("gcc-14", "k3"))).empty());
 }

@@ -91,9 +91,9 @@ namespace FastCache::Distributed
 /// `CompileCacheWire.hpp` cannot include `FleetHistory.hpp` -- it stays
 /// dependency-free because `fastcache-cc` compiles it without linking `FastCache` --
 /// so the count is spelled there too, and this file, which converts between the two,
-/// is the one place both spellings are visible. A tenth metric added without moving
-/// `HistorySlotCount` would have every peer reading nine of them and silently
-/// dropping the tenth, which is the same shape of defect `StorageTier`'s positional
+/// is the one place both spellings are visible. An eleventh metric added without
+/// moving `HistorySlotCount` would have every peer reading ten of them and silently
+/// dropping the eleventh, which is the same shape of defect `StorageTier`'s positional
 /// carrying already records.
 static_assert(EnumeratorCount<FleetMetric> == CompileCacheWire::HistorySlotCount,
               "a slot added to FleetMetric must move HistorySlotCount, or it never reaches the leader");

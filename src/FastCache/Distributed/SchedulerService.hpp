@@ -673,10 +673,15 @@ class SchedulerService
     /// @param history Closed buckets this node is handing over, oldest first. Routed
     ///                 to the sink under the worker's ENDPOINT, and dropped when
     ///                 there is no sink.
+    /// @param interfaceAddresses What the worker says it answers on right now. Recorded
+    ///                 beside `caller.peerId` -- where the kernel saw this heartbeat arrive
+    ///                 from -- and both REPLACE the entry's, so a lease's dial hint follows
+    ///                 a VPN reconnect. Empty clears the entry's list and so withdraws the hint.
     [[nodiscard]] SchedulerReply Heartbeat(CallerContext const& caller,
                                            std::string_view workerId,
                                            NodeLoad const& load,
-                                           std::span<FleetBucket const> history = {});
+                                           std::span<FleetBucket const> history = {},
+                                           std::span<std::string const> interfaceAddresses = {});
 
     /// Record that a machine EXISTS, and take whatever history it is handing over.
     ///

@@ -281,7 +281,8 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     });
 
     REQUIRE(stopped.wait_for(15s) == std::future_status::ready);
-    REQUIRE(stopped.get());
+    auto const startedOk = stopped.get();
+    REQUIRE(startedOk);
 
     // And the port is free again, which is only true if the listener was really
     // closed rather than leaked with its thread still parked on it.
@@ -942,7 +943,11 @@ TEST_CASE("A sample records what the fleet is, in the slots the table names", "[
 {
     Distributed::FleetSnapshot snapshot;
     snapshot.role = Distributed::SchedulerRole::Leader;
-    snapshot.leases = { 11, 2, 3, 4, 5 };
+    // Six now: `LeaseOutcomeTable` grew `all-excluded` in between `withdrawn` and
+    // `duplicate`, which is why the sample below is matched by counter identity
+    // rather than by position -- a positional read would keep landing `duplicate`'s
+    // OLD slot, this fleet's `all-excluded` reading, into `DispatchDuplicate` forever.
+    snapshot.leases = { 11, 2, 3, 4, 9, 5 };
     // Two machines, each of which registered against two toolchains. The cache
     // figures come off NodeReports() and so are counted once per machine.
     snapshot.nodes.resize(2);
@@ -962,10 +967,11 @@ TEST_CASE("A sample records what the fleet is, in the slots the table names", "[
 
     CHECK(slot(Distributed::FleetMetric::DispatchGranted) == 11);
     CHECK(slot(Distributed::FleetMetric::DispatchNoWorker) == 2);
+    CHECK(slot(Distributed::FleetMetric::DispatchAllExcluded) == 9);
     CHECK(slot(Distributed::FleetMetric::DispatchDuplicate) == 5);
 
     // EVERY slot, including the four a machine can also answer for itself. This is
-    // the fleet series, a leader can answer for all nine, and these are fleet-wide
+    // the fleet series, a leader can answer for all ten, and these are fleet-wide
     // sums -- a different number from any one machine's, and the one this page draws.
     // Filling only the fleet-scoped half here would have flattened the capacity and
     // hit-rate charts to zero, with an existing install's restored history plotting a

@@ -200,6 +200,8 @@ if(FASTCACHED_BUILD_TESTS)
         FleetRoster_test.cpp
         FleetTickets_test.cpp
         FleetLeaseRouting_test.cpp
+        FleetExclusion_test.cpp
+        FleetDialHint_test.cpp
         NodeConfig_test.cpp
         NodeDefaults.cpp
         NodeDefaults_test.cpp
@@ -267,6 +269,10 @@ if(FASTCACHED_BUILD_TESTS)
         # that proves every surface walks the node's real table renders through the code the CLI
         # draws its `node` line and panel with (#1364).
         "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cli/NodeStatusText.cpp"
+        # The launcher's reachability memo, so the fleet case can drive the chain from one
+        # launcher's unreachable worker to the next one's LEASE through the real scheduler.
+        # Tests only: the node never runs the memo.
+        "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ReachabilityMemo.cpp"
     )
     target_include_directories(fastcache-compile-node-tests PRIVATE
         "${CMAKE_SOURCE_DIR}/src"

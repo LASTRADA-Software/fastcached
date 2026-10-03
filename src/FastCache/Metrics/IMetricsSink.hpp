@@ -117,6 +117,11 @@ class IMetricsSink
         /// disks would go and buy machines rather than free 200 MB. Rising here with
         /// a flat `NoCapacity` is a fleet that is big enough and unavailable.
         DispatchLeasesWithdrawn,
+        /// Lease requests refused because every matching worker was on the client's own
+        /// exclusion list -- workers it could not reach a moment ago. Answered `no-worker`
+        /// on the wire and NEVER counted there: this is the network between clients and
+        /// machines, that one is a toolchain nobody serves.
+        DispatchLeasesAllExcluded,
         /// Lease requests refused because another client already held a lease for
         /// this key. Not a failure: it is duplicate-work suppression doing its
         /// job, and the clients it refuses compile locally.

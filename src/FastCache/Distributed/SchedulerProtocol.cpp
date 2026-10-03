@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 namespace FastCache::Distributed
 {
@@ -340,12 +341,15 @@ Wire::LoadFields LoadToWire(NodeLoad const& load)
     // handed its series over. Named rather than defaulted because clang-tidy fails
     // the build on a designated initializer that skips a field -- which is how a
     // field added to this record would otherwise be silently dropped here.
+    // `interfaceAddresses` is stated and left empty for the same reason: `NodeLoad`
+    // does not carry them, and the worker attaches its own.
     return Wire::LoadFields { .cpuBusyPermille = load.cpuBusyPermille,
                               .availableMemoryBytes = load.availableMemoryBytes,
                               .freeScratchBytes = load.freeScratchBytes,
                               .cache = CacheLoadToWire(load.cache),
                               .history = {},
-                              .cordoned = load.cordoned };
+                              .cordoned = load.cordoned,
+                              .interfaceAddresses = {} };
 }
 
 NodeLoad LoadFromWire(Wire::LoadFields const& fields, std::uint32_t inFlight)
@@ -384,7 +388,13 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                                           .displayName = fields->capacity.displayName,
                                                           .slots = fields->slots,
                                                           .codecs = fields->acceptedCodecs,
-                                                          .capacity = *capacity });
+                                                          .capacity = *capacity,
+                                                          // Set by the service from the
+                                                          // connection, never from the payload.
+                                                          .observedHost = {},
+                                                          // Borrows `fields`, which outlives the
+                                                          // call; the registry copies it.
+                                                          .interfaceAddresses = fields->capacity.interfaceAddresses });
         }
         case Wire::Op::NodeAnnounce: {
             auto const fields = Wire::DecodeNodeAnnouncePayload(payload);
@@ -427,7 +437,8 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             return _service.Heartbeat(caller,
                                       Wire::AsStringView(fields->workerId),
                                       LoadFromWire(fields->load, fields->inFlight),
-                                      HistoryFromWire(fields->load.history));
+                                      HistoryFromWire(fields->load.history),
+                                      fields->load.interfaceAddresses);
         }
         case Wire::Op::Withdraw: {
             auto const fields = Wire::DecodeWithdrawPayload(payload);
@@ -439,10 +450,15 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             auto const fields = Wire::DecodeLeasePayload(payload);
             if (!fields.has_value())
                 return SchedulerReply::Malformed();
+            std::vector<std::string_view> excluded;
+            excluded.reserve(fields->excluded.size());
+            for (auto const entry: fields->excluded)
+                excluded.push_back(Wire::AsStringView(entry));
             return _service.Lease(caller,
                                   Wire::LeaseRequest { .fingerprint = Wire::AsStringView(fields->fingerprint),
                                                        .key = Wire::AsStringView(fields->key),
-                                                       .acceptedCodecs = fields->acceptedCodecs });
+                                                       .acceptedCodecs = fields->acceptedCodecs,
+                                                       .excluded = excluded });
         }
         case Wire::Op::Release: {
             auto const fields = Wire::DecodeReleasePayload(payload);

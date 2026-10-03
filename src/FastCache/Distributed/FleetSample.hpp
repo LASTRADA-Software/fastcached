@@ -14,19 +14,32 @@ namespace FastCache::Distributed
 
 /// One number a sample records.
 ///
-/// Nine slots rather than nine members, so a tenth is a row and every walk over
+/// Ten slots rather than ten members, so an eleventh is a row and every walk over
 /// them -- sampling, encoding, decoding, rendering -- picks it up without being
-/// edited. The five dispatch counters are `LeaseOutcomeTable`'s, read through the
-/// same `IMetricsSink::Counter` values so the page and the history cannot drift
-/// into two vocabularies for one fact.
+/// edited. The dispatch counters are `LeaseOutcomeTable`'s, read through the same
+/// `IMetricsSink::Counter` values so the page and the history cannot drift into two
+/// vocabularies for one fact.
 /// **ORDINALS ARE A PERSISTED CONTRACT. Append only; never insert or reorder.** (#308)
 ///
-/// A history file's body is `[start][sample][present][coverage][9 values][9 folds]` --
-/// the readings are stored POSITIONALLY, indexed by `static_cast<std::size_t>(metric)`,
-/// and read back the same way. Inserting an enumerator mid-enum therefore does not fail
-/// to load: every bucket already on disk comes back with each reading attributed to the
-/// NEXT series, silently, for as long as the file exists. A cache-hit count rendered as
-/// a gauge of jobs in flight, with nothing anywhere reporting a fault.
+/// A history file's body is `[start][sample][present][coverage][N values][N folds]`, where `N`
+/// is the width the format VERSION that wrote it used -- see `FleetHistory.cpp`'s
+/// `LegacyValueWidth`, frozen at nine for versions 1 and 2 forever, and this build's
+/// count from version 3 onward. The readings are stored POSITIONALLY, indexed by
+/// `static_cast<std::size_t>(metric)`, and read back the same way. Inserting an
+/// enumerator mid-enum therefore does not fail to load: every bucket already on disk
+/// comes back with each reading attributed to the NEXT series, silently, for as long
+/// as the file exists. A cache-hit count rendered as a gauge of jobs in flight, with
+/// nothing anywhere reporting a fault.
+///
+/// The same ordinal is also `CompileCacheWire::HistorySlotCount`'s width, positionally,
+/// over the wire -- see the `static_assert` tying the two in `SchedulerProtocol.hpp`.
+/// That record is variable-arity (a peer carrying fewer slots is tolerated, extra ones
+/// from a newer peer are ignored), so growing this needs no `CompileCacheWire` version
+/// move; the two on-disk history formats do, because EACH of their layouts is
+/// fixed-width per version -- `FleetHistory.cpp`'s `RingFile` for a node's own series
+/// and `NodeStoreFile` for what it received from others, independently, since a
+/// nested body inside the latter carries no envelope of its own to move on its own
+/// schedule.
 ///
 /// The explicit `= N` is the enforcement rather than decoration. Without it a mid-enum
 /// insertion is one added line with no other visible change; with it, the same edit
@@ -48,8 +61,18 @@ enum class FleetMetric : std::uint8_t
     CacheMisses = 6,        ///< Cumulative, summed over machines.
     OfferableSlots = 7,     ///< Gauge: slots a compile could start on.
     JobsInFlight = 8,       ///< Gauge: this fleet's compiles running.
-    Last = 9
+    /// Cumulative: every matching worker was on the asking client's exclusion list.
+    ///
+    /// Appended rather than placed beside its `LeaseOutcomeTable` neighbours, per the
+    /// append-only contract above -- a history file older than this build has no
+    /// column for it, and reading one back at zero is the correct answer for that
+    /// period: no exclusion list existed yet for it to count.
+    DispatchAllExcluded = 9,
+    Last = 10
 };
+
+static_assert(static_cast<std::uint8_t>(FleetMetric::DispatchAllExcluded) == 9,
+              "FleetMetric's ordinals are a persisted, wire-carried contract: append only, never renumber");
 
 /// Whether a slot accumulates or is read afresh each time.
 ///
@@ -65,7 +88,7 @@ enum class FleetMetricKind : std::uint8_t
 /// Whether a MACHINE can answer for a slot about itself.
 ///
 /// Not "which series carries it" -- the fleet series carries every slot, because a
-/// leader can answer for all nine and its readings are fleet-wide sums. This is the
+/// leader can answer for all ten and its readings are fleet-wide sums. This is the
 /// narrower question the node series asks: is there a version of this number that is
 /// true of one machine, whoever happens to be leading?
 ///
@@ -129,6 +152,10 @@ inline constexpr EnumTable<FleetMetric, FleetMetricRow> FleetMetricTable {
                      .kind = FleetMetricKind::Gauge,
                      .scope = FleetMetricScope::Node,
                      .key = "in-flight" },
+    FleetMetricRow { .metric = FleetMetric::DispatchAllExcluded,
+                     .kind = FleetMetricKind::Counter,
+                     .scope = FleetMetricScope::Fleet,
+                     .key = "all-excluded" },
 };
 static_assert(RowsInEnumeratorOrder(FleetMetricTable, &FleetMetricRow::metric));
 

@@ -2963,6 +2963,7 @@ opposite:
 | `no-worker` | `fastcached_dispatch_leases_no_worker_total` | Nothing serves that toolchain — a fingerprint mismatch. |
 | `no-capacity` | `fastcached_dispatch_leases_no_capacity_total` | The fleet is full of your own build. Add machines. |
 | `withdrawn` | `fastcached_dispatch_leases_withdrawn_total` | The machines are there and unavailable — somebody is using them, or a disk is full. |
+| `all-excluded` | `fastcached_dispatch_leases_all_excluded_total` | The machines are there and the clients cannot reach them — a network problem. |
 
 Never sum them. `withdrawn` folded into `no-capacity` reads as "the fleet is too
 small", so a fleet whose build hosts have all filled their scratch disks would
@@ -3651,8 +3652,8 @@ These distinctions cost real debugging time when they are collapsed:
   exactly one of them.
 - **Do not add the lease refusals together.** `no-worker` is a misconfiguration,
   `no-capacity` says buy more machines, `withdrawn` says your machines are busy
-  with something else, and `duplicate` says it is already being built. A total
-  hides all four.
+  with something else, `all-excluded` says your clients cannot reach them, and
+  `duplicate` says it is already being built. A total hides all five.
 - **A worker that is never *picked* looks exactly like a healthy one.** It
   registered, it heartbeats, and every refusal counter on both machines reads
   zero — because nothing ever arrives to be refused. That is what one compiler

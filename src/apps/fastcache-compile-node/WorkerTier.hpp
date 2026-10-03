@@ -104,9 +104,12 @@ struct WorkerTierParts
     SocketActivation activation;                      ///< Whether a supervisor handed the port over.
     Distributed::IMembershipOracle const& membership; ///< Who may send a compile at all.
     ILocalityOracle const& locality;                  ///< Who may cordon this worker.
-    NodeIoLoop& io;                                   ///< The reactor a compile's reply returns to.
-    IHostFactsSource const& host;                     ///< The hostname a registration labels.
-    CacheTier const* cacheTier;                       ///< Null on a node with no cache.
+    /// What this machine answers on, asked on every heartbeat: the same source `locality`
+    /// caches, read here uncached because a VPN address moves while the process runs.
+    IHostAddressSource const& addresses;
+    NodeIoLoop& io;               ///< The reactor a compile's reply returns to.
+    IHostFactsSource const& host; ///< The hostname a registration labels.
+    CacheTier const* cacheTier;   ///< Null on a node with no cache.
     /// How this machine proves WHICH machine it is to a scheduler (#178), or null where nothing
     /// proves -- a test whose scripted fleet serves no handshake. One instance per process,
     /// shared with the presence loop.
@@ -310,6 +313,9 @@ class WorkerTier
     /// check both read. Borrowed from `main`, which declares it above this tier and destroys
     /// it after -- `_prover`'s arrangement, for `_prover`'s reason.
     AnnouncedEndpoint& _announced;
+    /// What each heartbeat reports this machine answers on. Borrowed from `main`, which
+    /// declares it above this tier.
+    IHostAddressSource const& _addresses;
     WorkerMachine _machine;
     core::platform::SteadyClock _toolchainClock;
     DiscoveredToolchains _discovered;
@@ -330,6 +336,7 @@ class WorkerTier
     BlockingEndpointDialer _dialer;
     SchedulerLink _link;
     std::atomic<bool> _surveyFoundNothing { false };
+    std::atomic<bool> _addressCapNoticed { false };
 };
 
 } // namespace FastCache::Node

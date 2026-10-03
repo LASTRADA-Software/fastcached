@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -115,7 +116,8 @@ namespace FastCache::Testing
 /// Not real: there is no socket and no worker process. A request is handed to the
 /// addressed scheduler's protocol object, and its answer is replayed to the
 /// client through a `ScriptedSocket`. The worker's endpoint answers whatever
-/// `SetWorkerReply` was given.
+/// `SetWorkerReply` (or, per address, `AddWorkerAddress`) was given, or reaches nothing
+/// once `SetWorkerUnreachable` has taken it off the network.
 ///
 /// Time moves only in `Step`.
 ///
@@ -128,6 +130,11 @@ namespace FastCache::Testing
 /// command's caller is `Distributed::CallerContextOf` over the node's oracle with the ticket's
 /// machine folded in -- so a case sets a production `NodeMembership` (`PublishMembershipAt`) and a
 /// non-loopback caller host (`SetCallerHost`) before it asserts anything about admission.
+///
+/// A WORKER address answers a presented ticket without looking at it, unless
+/// `VerifyTicketsAtWorker` named it: then the same production verifier decides, over an audience
+/// the case supplies -- production's `NodeAudience` when the question is which endpoints a ticket
+/// may name, as it is for a dial hint.
 ///
 /// ## Rosters (#178)
 ///
@@ -267,6 +274,49 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         _workerEndpoints.emplace_back(workerEndpoint);
     }
 
+    /// Register a worker the way a machine behind a DNS NAME does, and return its id so a
+    /// case can heartbeat it from wherever that machine is now.
+    ///
+    /// Through `SetupCaller` for `RegisterWorker`'s reason, so it is seen on loopback until a
+    /// `HeartbeatFrom` says otherwise -- and loopback is never a dial hint.
+    /// @param scheduler Which scheduler; must be leading.
+    /// @param advertised What the worker advertises, e.g. `laptop.corp:6677`.
+    /// @param fingerprint The toolchain it serves.
+    /// @return The id the scheduler assigned.
+    [[nodiscard]] std::string RegisterWorkerNamed(std::string_view scheduler,
+                                                  std::string_view advertised,
+                                                  std::string_view fingerprint)
+    {
+        auto const reply = NodeAt(scheduler).service.Register(
+            SetupCaller(),
+            Distributed::WorkerRegistration {
+                .fingerprint = fingerprint, .endpoint = advertised, .slots = 1, .codecs = {} });
+        auto const decoded = CompileCacheWire::DecodeRegisterReply(reply.payload);
+        if (reply.status != CompileCacheWire::Status::Ok || !decoded.has_value())
+            throw std::runtime_error { "FleetHarness: the scheduler refused a worker registration" };
+        _workerEndpoints.emplace_back(advertised);
+        return decoded->workerId;
+    }
+
+    /// Heartbeat @p workerId as the kernel would report it arriving from @p observedHost,
+    /// with the interface addresses the worker says it answers on.
+    /// @param scheduler Which scheduler; must be leading.
+    /// @param workerId The id `RegisterWorkerNamed` returned.
+    /// @param observedHost The peer host the scheduler's connection reports.
+    /// @param interfaces What the worker reports it answers on.
+    void HeartbeatFrom(std::string_view scheduler,
+                       std::string_view workerId,
+                       std::string observedHost,
+                       std::vector<std::string> const& interfaces)
+    {
+        auto const caller = Distributed::CallerContext { .membership = Distributed::Membership::Member,
+                                                         .peerId = std::move(observedHost),
+                                                         .provenNodeId = std::string { ProvenMachine } };
+        if (NodeAt(scheduler).service.Heartbeat(caller, workerId, Distributed::NodeLoad {}, {}, interfaces).status
+            != CompileCacheWire::Status::Ok)
+            throw std::runtime_error { "FleetHarness: the scheduler refused a heartbeat" };
+    }
+
     /// Announce a MACHINE to one scheduler, as `NodeAnnounce` does.
     ///
     /// **The verb a node sends whatever components it runs**, which is why this is beside
@@ -367,11 +417,91 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         _workerReply = std::move(reply);
     }
 
+    /// Take a WORKER address off the network, or put it back: a compile dialled there
+    /// reaches nothing (`Unreached`), as a machine whose VPN address moved answers.
+    ///
+    /// Separate from `SetUnreachable`, which is about a scheduler's presence dial and is
+    /// consulted only by `Dial`; this is consulted by the client's `Exchange`.
+    /// @param address The endpoint as the client would dial it.
+    /// @param unreachable Whether it answers.
+    void SetWorkerUnreachable(std::string_view address, bool unreachable)
+    {
+        std::erase(_unreachableWorkers, std::string { address });
+        if (unreachable)
+            _unreachableWorkers.emplace_back(address);
+    }
+
+    /// Make @p address answer COMPILE -- the machine a dial hint names -- with @p reply, or
+    /// with the shared worker reply when none is given.
+    ///
+    /// Registers nothing with any scheduler: this is an address a client may DIAL, which is
+    /// a different fact from a worker a scheduler may GRANT.
+    /// @param address The endpoint.
+    /// @param reply What that address answers a COMPILE with.
+    void AddWorkerAddress(std::string address, std::optional<std::vector<std::byte>> reply = std::nullopt)
+    {
+        if (reply.has_value())
+            _workerReplyAt.insert_or_assign(address, *std::move(reply));
+        _workerEndpoints.push_back(std::move(address));
+    }
+
+    /// Make the worker answering at @p address verify a presented machine ticket as its session
+    /// surface does: the production `Distributed::TicketVerifier`, over a roster adopting
+    /// @p stateOf's applied state at every exchange, a spent set of its own and @p audience -- and
+    /// the counted refusal ahead of the command's reply when it refuses (`Distributed::AnswerTicket`),
+    /// which the launcher's framing reads as the whole exchange refused.
+    ///
+    /// Without it a worker address answers whatever was presented, so no case could tell whether the
+    /// ticket a dial carried is one the machine it reached would take -- which is the question a
+    /// dial HINT raises: the launcher mints for the address it dials, not for the name the worker
+    /// advertises.
+    /// @param address The endpoint as the client dials it; `AddWorkerAddress` it as well.
+    /// @param audience What that worker answers to; borrowed, and must outlive the harness's use.
+    ///        Production's `FastCache::Node::NodeAudience` for a case about which endpoints a ticket
+    ///        may name.
+    /// @param stateOf The scheduler whose applied state the worker's roster holds.
+    void VerifyTicketsAtWorker(std::string address, Distributed::IAudience const& audience, std::string_view stateOf)
+    {
+        (void) NodeAt(stateOf);
+        auto worker = std::make_unique<TicketedWorker>();
+        worker->address = std::move(address);
+        worker->audience = &audience;
+        worker->stateOf = std::string { stateOf };
+        _ticketedWorkers.push_back(std::move(worker));
+    }
+
     /// Every exchange the fleet has served, in order.
     /// @return The log.
     [[nodiscard]] std::vector<Call> const& Calls() const noexcept
     {
         return _calls;
+    }
+
+    /// The COMPILE exchanges logged from @p from on, in the order they were sent.
+    ///
+    /// Which ADDRESS a compile went to is the fact a dial-order case is about, and how it
+    /// ended there is the fact that says whether a second dial was allowed.
+    /// @param from How many calls to skip: the log's size before the launcher ran.
+    /// @return One call per COMPILE -- a dial that reached nothing included.
+    [[nodiscard]] std::vector<Call> CompileCallsSince(std::size_t from) const
+    {
+        auto const compileOp = static_cast<std::uint8_t>(CompileCacheWire::Op::Compile);
+        std::vector<Call> compiles;
+        for (auto const& call: std::span { _calls }.subspan(from))
+            if (call.opRaw == compileOp)
+                compiles.push_back(call);
+        return compiles;
+    }
+
+    /// The addresses COMPILE was sent to, from @p from on.
+    /// @param from How many calls to skip: the log's size before the launcher ran.
+    /// @return One endpoint per COMPILE, in order -- a dial that reached nothing included.
+    [[nodiscard]] std::vector<std::string> CompiledAt(std::size_t from) const
+    {
+        std::vector<std::string> compiledAt;
+        for (auto const& call: CompileCallsSince(from))
+            compiledAt.push_back(call.endpoint);
+        return compiledAt;
     }
 
     /// Whether @p scheduler still has @p key marked as being built.
@@ -729,9 +859,10 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// @param hostPort The endpoint the client chose. **This is the fact most of
     ///        these tests are about**: which machine the client decided to ask.
     /// @param frame The complete request.
-    /// @param credential What the client presents: a machine ticket to a scheduler is decided by that
-    ///        node's verifier (see the class comment); anything else is answered `Ok` and admits
-    ///        nothing, as a surface with nothing to verify answers it.
+    /// @param credential What the client presents: a machine ticket to a scheduler, or to a worker
+    ///        address `VerifyTicketsAtWorker` named, is decided by that machine's verifier (see the
+    ///        class comment); anything else is answered `Ok` and admits nothing, as a surface with
+    ///        nothing to verify answers it.
     /// @param budget Ignored; nothing here blocks.
     /// @return The outcome, decoded by the launcher's own client code.
     [[nodiscard]] Cc::CacheOutcome Exchange(std::string_view hostPort,
@@ -749,6 +880,11 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                 .opRaw = OpOf(frame),
                                 .kind = Cc::CacheOutcomeKind::Transport,
                                 .code = CompileCacheWire::ErrorCode::MalformedFrame });
+
+        if (std::ranges::contains(_unreachableWorkers, hostPort))
+            // Recorded as the Transport it is, with nothing answered: `CacheOutcome {}` is
+            // the seeded "nothing was reached", which is `Unreached`.
+            return Cc::CacheOutcome {};
 
         auto reply = credential.Configured() ? AnswerAuthenticated(hostPort, frame, credential) : Answer(hostPort, frame);
         // The launcher's own framing, over a socket that replays what the addressed
@@ -844,6 +980,11 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                                              std::span<std::byte const> frame,
                                                              Cc::Credential const& credential)
     {
+        auto const ticketed = std::ranges::find(
+            _ticketedWorkers, hostPort, [](auto const& worker) { return std::string_view { worker->address }; });
+        if (credential.kind == CompileCacheWire::AuthKind::MachineTicket && ticketed != _ticketedWorkers.end())
+            return AnswerTicketedWorker(**ticketed, hostPort, frame, credential);
+
         auto const scheduler =
             std::ranges::find_if(_nodes, [hostPort](auto const& node) { return node->endpoint == hostPort; });
         if (credential.kind != CompileCacheWire::AuthKind::MachineTicket || scheduler == _nodes.end())
@@ -868,6 +1009,39 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                                                                   .revokedMachine = answer.revoked })
                                  : Caller(node);
         auto const command = node.protocol.Answer(frame, context);
+        replies.insert(replies.end(), command.begin(), command.end());
+        return replies;
+    }
+
+    /// A worker that verifies machine tickets; see `VerifyTicketsAtWorker`.
+    struct TicketedWorker
+    {
+        std::string address;                       ///< Where a compile dials it.
+        Distributed::IAudience const* audience {}; ///< What it answers to; borrowed.
+        std::string stateOf;                       ///< Whose applied state its roster holds.
+        Distributed::StateLeaseRoster roster;      ///< Re-adopted at every exchange.
+        Distributed::SpentTickets spent;           ///< Its own: a node spends each ticket once.
+    };
+
+    /// The replies to AUTH presenting @p credential and then @p frame, from a worker that verifies
+    /// tickets: the counted refusal or `Ok`, then whatever the address answers the command with.
+    /// @param worker Which worker.
+    /// @param hostPort The addressed endpoint.
+    /// @param frame The command.
+    /// @param credential The machine ticket presented.
+    /// @return AUTH's reply, then the command's.
+    [[nodiscard]] std::vector<std::byte> AnswerTicketedWorker(TicketedWorker& worker,
+                                                              std::string_view hostPort,
+                                                              std::span<std::byte const> frame,
+                                                              Cc::Credential const& credential)
+    {
+        worker.roster.Adopt(NodeAt(worker.stateOf).cluster.state);
+        auto const verifier = Distributed::TicketVerifier { &worker.roster, *worker.audience, worker.spent };
+        auto const answer = Distributed::AnswerTicket(
+            _metrics, verifier.Verify(CompileCacheWire::AsBytes(credential.secret.View()), _wallClock.now()));
+        auto replies = answer.machine.has_value() ? CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok, {})
+                                                  : answer.refusalReply;
+        auto const command = Answer(hostPort, frame);
         replies.insert(replies.end(), command.begin(), command.end());
         return replies;
     }
@@ -906,6 +1080,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             auto const hook = std::exchange(_onCompile, {});
             hook();
         }
+        if (auto const own = _workerReplyAt.find(hostPort); own != _workerReplyAt.end())
+            return own->second;
         return _workerReply;
     }
 
@@ -1050,6 +1226,12 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     std::optional<ProvenIdentity> _callerIdentity;
     std::vector<std::unique_ptr<Node>> _nodes;
     std::vector<std::string> _workerEndpoints;
+    /// Worker addresses a compile dial does not reach; see `SetWorkerUnreachable`.
+    std::vector<std::string> _unreachableWorkers;
+    /// Per-address COMPILE replies, overriding `_workerReply`; see `AddWorkerAddress`.
+    std::map<std::string, std::vector<std::byte>, std::less<>> _workerReplyAt;
+    /// Worker addresses that verify a presented ticket; see `VerifyTicketsAtWorker`.
+    std::vector<std::unique_ptr<TicketedWorker>> _ticketedWorkers;
     std::vector<std::byte> _workerReply;
     std::vector<Call> _calls;
     std::function<void()> _onCompile;

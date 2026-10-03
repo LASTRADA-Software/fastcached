@@ -637,13 +637,17 @@ WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
 {
 }
 
-std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocket& scheduler)
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocket& scheduler,
+                                                               std::span<std::string const> interfaceAddresses)
 {
+    // A copy per registration: the addresses are this round's, the rest is the registrar's.
+    auto capacity = _capacity;
+    capacity.interfaceAddresses.assign(interfaceAddresses.begin(), interfaceAddresses.end());
     auto const frame = Wire::EncodeRegister(Wire::RegisterRequest { .fingerprint = _fingerprint,
                                                                     .endpoint = _endpoint,
                                                                     .slots = _slots,
                                                                     .acceptedCodecs = _acceptedCodecs,
-                                                                    .capacity = _capacity });
+                                                                    .capacity = capacity });
     auto const outcome = ExchangeWithScheduler(scheduler, frame);
     if (!outcome.IsHit())
         // The scheduler's own words, code and message both, which is the whole

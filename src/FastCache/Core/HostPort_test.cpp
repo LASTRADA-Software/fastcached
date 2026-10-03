@@ -308,3 +308,41 @@ TEST_CASE("Two hosts name one machine across the spellings a listener imposes", 
     // an unnameable peer the answer the rule above exists to deny it.
     CHECK_FALSE(SameHost("::ffff:", ""));
 }
+
+TEST_CASE("A link-local address is told apart from every other range, in both families", "[core][hostport]")
+{
+    for (auto const* linkLocal: { "169.254.1.1",
+                                  "169.254.0.0",
+                                  "169.254.255.255",
+                                  "::ffff:169.254.1.1",
+                                  "fe80::1",
+                                  "fe80::",
+                                  "fe80::1%eth0",
+                                  "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff" })
+    {
+        INFO(linkLocal);
+        CHECK(IsLinkLocalHost(linkLocal));
+    }
+    for (auto const* other:
+         { "127.0.0.1", "10.8.0.7", "169.253.1.1", "169.255.1.1", "fe7f::1", "fec0::1", "::1", "::", "laptop.corp", "" })
+    {
+        INFO(other);
+        CHECK_FALSE(IsLinkLocalHost(other));
+    }
+}
+
+TEST_CASE("An IP literal is told apart from a name, in both families", "[core][hostport]")
+{
+    for (auto const* literal:
+         { "10.8.0.7", "0.0.0.0", "255.255.255.255", "::1", "fe80::1%eth0", "2001:db8::7", "::ffff:10.0.0.1" })
+    {
+        INFO(literal);
+        CHECK(IsIpLiteralHost(literal));
+    }
+    for (auto const* name:
+         { "laptop.corp", "localhost", "10.8.0", "10.8.0.7.9", "256.1.1.1", "1.2.3.x", "01234.1.1.1", "", "a" })
+    {
+        INFO(name);
+        CHECK_FALSE(IsIpLiteralHost(name));
+    }
+}

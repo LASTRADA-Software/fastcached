@@ -878,6 +878,15 @@ TEST_CASE("IsAcceptableJobArgument refuses the program-invoking options a denyli
     // it, so only the object needing to come back stays one rule.
     CHECK_FALSE(IsAcceptableJobArgument("-fmodule-output=x.pcm", DriverOf(Flavor::Gcc)));
     CHECK_FALSE(IsAcceptableJobArgument("/Ycpch.h", DriverOf(Flavor::Cl)));
+    // clang-cl's `/Yu` is CACHEABLE (its object is not tied to one pch.obj), which the
+    // side-artefact table says by scoping its `/Yu` rows to `cl`. It is still not
+    // DISPATCHED: the precompiled header it reads is on this machine, not the worker.
+    // Absence from the table already refuses it, so the operator names it here: what
+    // must hold is that the `Y` deny row refuses it for the whole family even then,
+    // since for clang-cl nothing else does.
+    std::vector<std::string> const namingYu { "/Yupch.h" };
+    CHECK_FALSE(IsAcceptableJobArgument("/Yupch.h", DriverOf(Flavor::ClangCl), namingYu));
+    CHECK_FALSE(IsAcceptableJobArgument("/Yupch.h", DriverOf(Flavor::Cl), namingYu));
     // Profile options read and write files whose names the driver derives; not listed,
     // so refused.
     CHECK_FALSE(IsAcceptableJobArgument("-fprofile-generate", DriverOf(Flavor::Gcc)));

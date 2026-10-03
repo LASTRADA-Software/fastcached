@@ -9,10 +9,13 @@
 #include "NodeProofClient.hpp"
 #include "SchedulerLink.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
@@ -20,6 +23,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -186,8 +190,19 @@ struct HeartbeatRound
     std::vector<Cc::WorkerRegistrar>& withdrawals;
     CompileCapacity const& capacity; ///< For the in-flight count and the cordon.
     IHostLoadSampler& loadSampler;   ///< CPU, memory and scratch.
-    CacheTier const* cacheTier;      ///< Null on a node with no cache.
-    IMetricsSink const& metrics;     ///< Where the cache figures are read.
+    /// What this machine answers on, asked every round: a VPN address moves while the
+    /// process runs, and the scheduler's dial hint is only as right as the last report.
+    ///
+    /// The seam and never a list, for #404's reason: a list here would be a
+    /// copy taken when the round was built, and a worker whose VPN reconnected under a new
+    /// address would go on reporting the old one until it was restarted.
+    IHostAddressSource const& addresses;
+    /// Set once this process has said that it answers on more addresses than a report
+    /// carries. Never lowered: the machine's interface count is a property of the machine,
+    /// and repeating the line every heartbeat would bury it rather than say it.
+    std::atomic<bool>& addressCapNoticed;
+    CacheTier const* cacheTier;  ///< Null on a node with no cache.
+    IMetricsSink const& metrics; ///< Where the cache figures are read.
 
     /// How this machine proves WHICH machine it is on every connection the round dials (#178),
     /// or null where nothing proves -- a test whose scripted fleet serves no handshake.
@@ -350,6 +365,66 @@ constexpr std::chrono::seconds NodeAnnounceInterval { 20 };
                                                              IMetricsSink const& metrics,
                                                              std::uint32_t inFlight,
                                                              bool cordoned);
+
+/// Why an interface address is left out of what a worker reports. PRIVATE: never
+/// transmitted, never persisted.
+enum class UnreportedAddress : std::uint8_t
+{
+    Uncarried,
+    Loopback,
+    LinkLocal,
+    Last,
+};
+
+/// One reason to leave an address out, and the predicate that raises it.
+struct UnreportedAddressRow
+{
+    UnreportedAddress reason;
+    /// @param address One entry as `IHostAddressSource` spells it. @return True to leave it out.
+    bool (*applies)(std::string_view address);
+};
+
+/// What a report leaves out, every row asked of every entry.
+///
+/// Each row is an address the scheduler could never hand a client as a dial hint, so
+/// carrying it would only spend the `MaxInterfaceAddresses` budget that a routable address
+/// needs on a machine with many virtual adapters:
+///   - **Uncarried** is the wire's own per-entry rule, `IsCarriedInterfaceAddress`, asked
+///     rather than restated: an entry the decoder refuses loses the WHOLE record it rides in.
+///   - **Loopback** is never hinted: a peer observed there is on the scheduler's machine.
+///   - **LinkLocal** is vetoed by the scheduler (`HintVeto::LinkLocalObserved`), because a
+///     zone-less `fe80::` names a different machine on every link.
+inline constexpr EnumTable<UnreportedAddress, UnreportedAddressRow> UnreportedAddresses { {
+    { .reason = UnreportedAddress::Uncarried,
+      .applies = [](std::string_view address) { return !CompileCacheWire::IsCarriedInterfaceAddress(address.size()); } },
+    { .reason = UnreportedAddress::Loopback, .applies = [](std::string_view address) { return IsLoopbackHost(address); } },
+    { .reason = UnreportedAddress::LinkLocal, .applies = [](std::string_view address) { return IsLinkLocalHost(address); } },
+} };
+
+static_assert(RowsInEnumeratorOrder(UnreportedAddresses, &UnreportedAddressRow::reason),
+              "UnreportedAddresses must hold one row per UnreportedAddress, in order");
+
+/// The addresses one report carries, and how many the cap left out.
+struct ReportableAddresses
+{
+    /// What survives `UnreportedAddresses`, sorted, unique, at most `MaxInterfaceAddresses`.
+    std::vector<std::string> addresses;
+    /// Entries that survived every row and were dropped by the cap; zero on almost every
+    /// machine, and the number a person needs to read when it is not.
+    std::size_t overCap = 0;
+};
+
+/// The addresses a worker reports on REGISTER and HEARTBEAT, out of what the machine has.
+///
+/// Filtered before the cap, so a host with thirty loopback aliases still reports its one
+/// routable address. **Sorted**, so equal sets encode to equal bytes whatever order the
+/// platform enumerated them in, and so that which entries a cap drops is decided by the
+/// set rather than by the adapter order of the moment. An empty input -- the platform would
+/// not say -- is an empty report, which the scheduler reads as no hint and never as a
+/// refusal.
+/// @param addresses What `IHostAddressSource` answered, unordered and possibly repeated.
+/// @return The report, and how many the cap left out.
+[[nodiscard]] ReportableAddresses ReportableInterfaceAddresses(std::vector<std::string> addresses);
 
 /// One announcement, on a connection somebody else dialled.
 ///

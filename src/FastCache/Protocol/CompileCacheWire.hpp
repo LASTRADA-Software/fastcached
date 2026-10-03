@@ -2211,7 +2211,7 @@ inline constexpr std::array OpTable {
                    .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::Lease,
                    .name = "lease",
-                   .fieldCount = 3, // fingerprint, key, accepted codecs
+                   .fieldCount = 4, // fingerprint, key, accepted codecs, exclusions
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
@@ -3976,6 +3976,74 @@ struct CacheLoadFields
     return out;
 }
 
+/// The most interface addresses one worker reports; a Windows host with virtual adapters
+/// was measured at 26 (`Platform/LocalAddresses.hpp`).
+inline constexpr std::size_t MaxInterfaceAddresses = 32;
+
+/// The longest address text one entry may be: an IPv6 literal with a scope suffix fits.
+inline constexpr std::size_t MaxInterfaceAddressBytes = 64;
+
+static_assert((MaxInterfaceAddresses * (MaxInterfaceAddressBytes + WireFields::FieldPrefixSize))
+                      + WireFields::FieldPrefixSize
+                  <= MaxControlPayload / 16,
+              "a full address list must leave a heartbeat room for its history and everything else");
+
+/// Whether one interface address may travel: non-empty and at most `MaxInterfaceAddressBytes`.
+///
+/// ONE predicate for both ends, because they must agree: the encoder skips what fails it and
+/// the decoder refuses it. An encoder that sent an entry its own decoder refuses would lose
+/// the WHOLE record it rides in -- a REGISTER or HEARTBEAT -- over one odd adapter name, and
+/// the worker would vanish from the fleet.
+/// @param bytes The entry's length in bytes.
+/// @return True when an entry of that length is one the wire carries.
+[[nodiscard]] constexpr bool IsCarriedInterfaceAddress(std::size_t bytes) noexcept
+{
+    return bytes != 0 && bytes <= MaxInterfaceAddressBytes;
+}
+
+/// Frame a worker's interface addresses as one nested field list.
+/// @param addresses What the worker answers on. An entry `IsCarriedInterfaceAddress` rejects
+///                  is skipped, and of the rest at most `MaxInterfaceAddresses` are taken,
+///                  the first ones.
+/// @return The nested list's bytes; empty for an empty list.
+[[nodiscard]] inline std::vector<std::byte> EncodeAddressList(std::span<std::string const> addresses)
+{
+    auto taken = addresses
+                 | std::views::filter([](std::string const& address) { return IsCarriedInterfaceAddress(address.size()); })
+                 | std::views::take(MaxInterfaceAddresses);
+    std::vector<std::span<std::byte const>> fields;
+    fields.reserve(std::min(addresses.size(), MaxInterfaceAddresses));
+    for (auto const& address: taken)
+        fields.push_back(AsBytes(address));
+    return WireFields::Encode(WireFields::FieldList { fields });
+}
+
+/// Read a worker's interface addresses back, OWNED: both records carrying them are
+/// returned by value, and a view here would dangle the moment the encoding died.
+///
+/// Strict, as `DecodeExclusions` is: more than the cap, an empty entry or one longer
+/// than an address can be is refused rather than truncated, and the walk stops at the
+/// cap, so a list of thousands of empty entries costs what a list one too long does.
+/// @param field The nested list's bytes; empty reads as an empty list.
+/// @return The addresses, or nullopt when the list is malformed.
+[[nodiscard]] inline std::optional<std::vector<std::string>> DecodeAddressList(std::span<std::byte const> field)
+{
+    if (field.empty())
+        return std::vector<std::string> {};
+    auto const parts = WireFields::SplitAtMost(field, MaxInterfaceAddresses);
+    if (!parts.has_value())
+        return std::nullopt;
+    std::vector<std::string> out;
+    out.reserve(parts->size());
+    for (auto const part: *parts)
+    {
+        if (!IsCarriedInterfaceAddress(part.size()))
+            return std::nullopt;
+        out.emplace_back(AsStringView(part));
+    }
+    return out;
+}
+
 /// A worker announcing itself to the scheduler.
 /// A worker's static hardware facts, as they travel inside REGISTER.
 ///
@@ -4079,6 +4147,17 @@ struct CapacityFields
     ///
     /// **Owned, not a view**, for the reason `version` documents at length.
     std::string displayName {};
+
+    /// What this machine answers on right now, loopback excluded, for the scheduler's
+    /// check that a dial hint is an address the worker reports as its own.
+    ///
+    /// Refreshed on every HEARTBEAT through `LoadFields::interfaceAddresses`, because a
+    /// VPN address moves while the process runs. Bounded by `MaxInterfaceAddresses` and
+    /// `MaxInterfaceAddressBytes`: the encoder skips an entry `IsCarriedInterfaceAddress`
+    /// rejects, and a received list past either bound is refused with the record.
+    ///
+    /// **Owned, not a view**, for `version`'s reason.
+    std::vector<std::string> interfaceAddresses {};
 };
 
 /// Frame a capacity record as one nested field list.
@@ -4107,6 +4186,7 @@ struct CapacityFields
         capacity.reservedCores.has_value() ? std::span<std::byte const> { reserveBytes } : std::span<std::byte const> {};
     auto const cache = EncodeCacheCapacity(capacity.cache);
     auto const reservedMemory = WireFields::ToBigEndian<std::uint64_t>(capacity.reservedMemoryBytes);
+    auto const addresses = EncodeAddressList(capacity.interfaceAddresses);
     return WireFields::Encode({ std::span<std::byte const> { cores },
                                 std::span<std::byte const> { memory },
                                 std::span<std::byte const> { nodeClass },
@@ -4115,7 +4195,8 @@ struct CapacityFields
                                 AsBytes(capacity.version),
                                 std::span<std::byte const> { reservedMemory },
                                 AsBytes(capacity.toolchainLabel),
-                                AsBytes(capacity.displayName) });
+                                AsBytes(capacity.displayName),
+                                std::span<std::byte const> { addresses } });
 }
 
 /// Read a capacity record back.
@@ -4197,6 +4278,12 @@ struct CapacityFields
     // empty.
     out.toolchainLabel = std::string { AsStringView(at(7)) };
     out.displayName = std::string { AsStringView(at(8)) };
+    // Absent from a peer older than the field, which `at` answers as empty and the list
+    // reads as no addresses; a malformed list is refused with the record.
+    auto addresses = DecodeAddressList(at(9));
+    if (!addresses.has_value())
+        return std::nullopt;
+    out.interfaceAddresses = *std::move(addresses);
     return out;
 }
 
@@ -4223,12 +4310,33 @@ struct RegisterView
     CapacityFields capacity {};
 };
 
+/// The most unreachable workers one LEASE may name.
+///
+/// A CLIENT's memo, sent so the scheduler does not grant the worker the client just
+/// failed to reach. Sixteen: a launcher remembers an unreachable worker for about a
+/// minute, and a fleet losing more than sixteen machines to one client inside a minute
+/// is a partition that the scheduler's own heartbeat expiry already sees. The
+/// launcher's memo capacity is asserted equal to this.
+inline constexpr std::size_t MaxLeaseExclusions = 16;
+
+/// The longest endpoint one exclusion may spell: a 253-byte DNS name, two brackets
+/// and `:65535`.
+inline constexpr std::size_t MaxExcludedEndpointBytes = 261;
+
+/// The whole list fits a LEASE with room to spare beside the fingerprint and key.
+static_assert((MaxLeaseExclusions * (MaxExcludedEndpointBytes + WireFields::FieldPrefixSize)) + WireFields::FieldPrefixSize
+                  <= MaxControlPayload / 8,
+              "a full exclusion list must leave a LEASE room for everything else it carries");
+
 /// A client asking the scheduler where to compile.
 struct LeaseRequest
 {
     std::string_view fingerprint; ///< The toolchain the client is compiling with.
     std::string_view key;         ///< The object key, for duplicate suppression.
     CodecList acceptedCodecs;     ///< What the client can decode.
+    /// Workers this client could not reach moments ago, by the endpoint they
+    /// ADVERTISE, newest first. They narrow THIS request's pick and nothing else.
+    std::span<std::string_view const> excluded {};
 };
 
 /// The same, as views into a received payload.
@@ -4237,6 +4345,7 @@ struct LeaseView
     std::span<std::byte const> fingerprint;
     std::span<std::byte const> key;
     CodecList acceptedCodecs;
+    std::vector<std::span<std::byte const>> excluded; ///< Borrowed from the payload, newest first.
 };
 
 /// A client handing a worker one translation unit.
@@ -4494,7 +4603,7 @@ struct RegisterReplyFields
 /// come across as zero. Sending just the node-scoped ones would make the arity
 /// depend on a table the two peers might disagree about, and a misaligned reading is
 /// worse than five wasted words.
-inline constexpr std::size_t HistorySlotCount = 9;
+inline constexpr std::size_t HistorySlotCount = 10;
 
 /// One closed bucket of a node's own history.
 ///
@@ -4689,6 +4798,14 @@ struct LoadFields
     /// zero-length field, which is also what every peer older than the field sends, so the leader
     /// renders such a machine ABSENT rather than as one with nothing raised.
     std::optional<std::vector<NodeConditionFields>> conditions {};
+
+    /// What this machine answers on right now, loopback excluded -- the heartbeat copy of
+    /// `CapacityFields::interfaceAddresses`, restated every beat because a VPN address
+    /// moves while the process runs. Empty from a peer that says nothing about them.
+    ///
+    /// **Owned, not a view**, for `CapacityFields::version`'s reason: this record is
+    /// returned by value too.
+    std::vector<std::string> interfaceAddresses {};
 };
 
 /// A list of conditions fits in a `NodeAnnounce` beside everything else it carries.
@@ -4718,6 +4835,7 @@ static_assert(MaxNodeConditionListBytes <= MaxControlPayload / 4,
     auto constexpr Cordoned = std::array { std::byte { 1 } };
     // Absent as zero length; an engaged list is never empty -- see `EncodeNodeConditions`.
     auto const conditions = load.conditions.has_value() ? EncodeNodeConditions(*load.conditions) : std::vector<std::byte> {};
+    auto const addresses = EncodeAddressList(load.interfaceAddresses);
     return WireFields::Encode(
         { load.cpuBusyPermille.has_value() ? std::span<std::byte const> { cpu } : std::span<std::byte const> {},
           load.availableMemoryBytes.has_value() ? std::span<std::byte const> { memory } : std::span<std::byte const> {},
@@ -4725,7 +4843,8 @@ static_assert(MaxNodeConditionListBytes <= MaxControlPayload / 4,
           std::span<std::byte const> { cache },
           std::span<std::byte const> { history },
           load.cordoned ? std::span<std::byte const> { Cordoned } : std::span<std::byte const> {},
-          std::span<std::byte const> { conditions } });
+          std::span<std::byte const> { conditions },
+          std::span<std::byte const> { addresses } });
 }
 
 /// Read a live-load record back.
@@ -4791,6 +4910,12 @@ static_assert(MaxNodeConditionListBytes <= MaxControlPayload / 4,
     // as an empty span; a malformed list is refused with the record, as a malformed field is.
     if (!ReadNodeConditions(at(6), out.conditions))
         return std::nullopt;
+    // Absent from a peer older than the field and read as no addresses; a malformed list is
+    // refused with the record.
+    auto addresses = DecodeAddressList(at(7));
+    if (!addresses.has_value())
+        return std::nullopt;
+    out.interfaceAddresses = *std::move(addresses);
     return out;
 }
 
@@ -4954,6 +5079,39 @@ struct WithdrawView
     return WithdrawView { .workerId = (*fields)[0] };
 }
 
+/// Frame a client's exclusion list as one nested field list.
+/// @param excluded Endpoints, newest first; at most `MaxLeaseExclusions` are taken,
+///                 the newest ones.
+/// @return The nested list's bytes; empty for an empty list.
+[[nodiscard]] inline std::vector<std::byte> EncodeExclusions(std::span<std::string_view const> excluded)
+{
+    auto const taken = excluded.first(std::min(excluded.size(), MaxLeaseExclusions));
+    std::vector<std::span<std::byte const>> fields;
+    fields.reserve(taken.size());
+    for (auto const endpoint: taken)
+        fields.push_back(AsBytes(endpoint));
+    return WireFields::Encode(WireFields::FieldList { fields });
+}
+
+/// Read an exclusion list back.
+///
+/// Strict, because every entry decides what a scheduler skips: more than the cap, an
+/// empty entry or one longer than an endpoint can be is a peer this build does not
+/// understand, refused rather than truncated. The walk stops at the cap, so a list
+/// of thousands of empty entries costs what a list one too long does.
+/// @param field The nested list's bytes.
+/// @return The entries, borrowed from @p field, or nullopt when malformed.
+[[nodiscard]] inline std::optional<std::vector<std::span<std::byte const>>> DecodeExclusions(
+    std::span<std::byte const> field)
+{
+    auto parts = WireFields::SplitAtMost(field, MaxLeaseExclusions);
+    if (!parts.has_value())
+        return std::nullopt;
+    if (std::ranges::any_of(*parts, [](auto const& part) { return part.empty() || part.size() > MaxExcludedEndpointBytes; }))
+        return std::nullopt;
+    return parts;
+}
+
 /// Frame a LEASE request.
 /// @param request What the client wants to compile and with what.
 /// @param version Version to advertise.
@@ -4961,19 +5119,30 @@ struct WithdrawView
 [[nodiscard]] inline std::vector<std::byte> EncodeLease(LeaseRequest const& request, WireVersion version = CurrentVersion)
 {
     auto const codecs = EncodeCodecList(request.acceptedCodecs);
-    return Detail::EncodeRequest(
-        version, Op::Lease, { AsBytes(request.fingerprint), AsBytes(request.key), std::span<std::byte const> { codecs } });
+    auto const excluded = EncodeExclusions(request.excluded);
+    return Detail::EncodeRequest(version,
+                                 Op::Lease,
+                                 { AsBytes(request.fingerprint),
+                                   AsBytes(request.key),
+                                   std::span<std::byte const> { codecs },
+                                   std::span<std::byte const> { excluded } });
 }
 
 /// Split a LEASE payload.
 /// @param payload The bytes following the request header.
-/// @return The fields, or nullopt when malformed.
+/// @return The fields, or nullopt when malformed, the exclusion list included.
 [[nodiscard]] inline std::optional<LeaseView> DecodeLeasePayload(std::span<std::byte const> payload)
 {
     auto const fields = SplitFields(payload, OpFieldCount(Op::Lease));
     if (!fields.has_value())
         return std::nullopt;
-    return LeaseView { .fingerprint = (*fields)[0], .key = (*fields)[1], .acceptedCodecs = DecodeCodecList((*fields)[2]) };
+    auto excluded = DecodeExclusions((*fields)[3]);
+    if (!excluded.has_value())
+        return std::nullopt;
+    return LeaseView { .fingerprint = (*fields)[0],
+                       .key = (*fields)[1],
+                       .acceptedCodecs = DecodeCodecList((*fields)[2]),
+                       .excluded = *std::move(excluded) };
 }
 
 /// A client reporting that the job it leased has ended.
@@ -5428,6 +5597,13 @@ struct LeaseGrant
     /// else still considered live -- the same failure in the third of three places, and
     /// the one the operator sees.
     std::chrono::milliseconds lifetime { 0 };
+
+    /// Where the worker was last SEEN, as `host:port`, when that differs from the name it
+    /// advertises and the worker reports that address as its own; empty otherwise
+    /// (`Distributed::DecideDialHint`). The client dials this FIRST and falls back to
+    /// `endpoint`, and the token signs `endpoint` -- never this -- so a stale hint that
+    /// lands on another machine is refused `LeaseEndpointMismatch` rather than obeyed.
+    std::string_view dialHint {};
 };
 
 /// Frame the payload of a successful LEASE reply.
@@ -5440,7 +5616,8 @@ struct LeaseGrant
     return WireFields::Encode({ AsBytes(grant.endpoint),
                                 AsBytes(grant.leaseToken),
                                 std::span<std::byte const> { codecs },
-                                std::span<std::byte const> { lifetime } });
+                                std::span<std::byte const> { lifetime },
+                                AsBytes(grant.dialHint) });
 }
 
 /// The fields of a LEASE grant, as views.
@@ -5450,14 +5627,18 @@ struct LeaseGrantView
     std::span<std::byte const> leaseToken;
     CodecList workerCodecs;
     std::chrono::milliseconds lifetime { 0 };
+    std::span<std::byte const> dialHint; ///< Empty when the scheduler has no hint.
 };
 
 /// Split a LEASE reply payload.
+///
+/// Exactly five fields: a reply is not stepped over the way a request is, so a grant
+/// of any other arity is a peer this build cannot read.
 /// @param payload The reply body.
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<LeaseGrantView> DecodeLeaseGrant(std::span<std::byte const> payload)
 {
-    auto const fields = SplitFields(payload, 4);
+    auto const fields = SplitFields(payload, 5);
     if (!fields.has_value())
         return std::nullopt;
     // Strict about the width, like every other numeric field here: a lifetime of
@@ -5469,7 +5650,8 @@ struct LeaseGrantView
     return LeaseGrantView { .endpoint = (*fields)[0],
                             .leaseToken = (*fields)[1],
                             .workerCodecs = DecodeCodecList((*fields)[2]),
-                            .lifetime = std::chrono::milliseconds { *lifetime } };
+                            .lifetime = std::chrono::milliseconds { *lifetime },
+                            .dialHint = (*fields)[4] };
 }
 
 /// What a worker answers a COMPILE with.

@@ -1073,3 +1073,41 @@ TEST_CASE("An operator's control verb is refused a caller only --fleet-open admi
     // And the verbs a client sends are not control verbs: the anonymous caller still leases.
     CHECK_FALSE(fixture.protocol.RefusePeer(anonymous, static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
 }
+
+TEST_CASE("Where a worker was seen and what it answers on cross the wire into a grant's dial hint",
+          "[distributed][scheduler][protocol][dialhint]")
+{
+    // Through the framing, for the reason the whole-exchange case above gives: the service's
+    // own cases hand it the address lists directly, and would not notice an arm that decoded
+    // them and passed nothing on. Each hint below is reachable ONLY through the list its verb
+    // carried -- REGISTER's capacity record, then HEARTBEAT's load record.
+    Fixture fixture;
+    CallerContext const beforeReconnect { .membership = Membership::Member, .peerId = "10.8.0.7", .provenNodeId = "node-1" };
+    CallerContext const afterReconnect { .membership = Membership::Member, .peerId = "10.8.0.42", .provenNodeId = "node-1" };
+
+    Wire::CapacityFields capacity {};
+    capacity.interfaceAddresses = { "10.8.0.7" };
+    auto const registration = Wire::EncodeRegister(Wire::RegisterRequest {
+        .fingerprint = "gcc-14", .endpoint = "laptop.corp:7100", .slots = 1, .acceptedCodecs = {}, .capacity = capacity });
+    auto const admitted = fixture.protocol.Answer(registration, beforeReconnect);
+    REQUIRE(StatusOf(admitted) == Wire::Status::Ok);
+    auto const record = Wire::DecodeRegisterReply(PayloadOf(admitted));
+    REQUIRE(record.has_value());
+
+    auto const hintFor = [&fixture](std::string_view key) {
+        auto const granted = fixture.protocol.Answer(
+            Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = key, .acceptedCodecs = {} }), Insider);
+        REQUIRE(StatusOf(granted) == Wire::Status::Ok);
+        auto const grant = Wire::DecodeLeaseGrant(PayloadOf(granted));
+        REQUIRE(grant.has_value());
+        CHECK(Wire::AsStringView(Unwrap(grant).endpoint) == "laptop.corp:7100");
+        return std::string { Wire::AsStringView(Unwrap(grant).dialHint) };
+    };
+    CHECK(hintFor("k1") == "10.8.0.7:7100");
+
+    Wire::LoadFields load {};
+    load.interfaceAddresses = { "10.8.0.42" };
+    auto const beat = Wire::EncodeHeartbeat(Unwrap(record).workerId, /*inFlight=*/0, load);
+    REQUIRE(StatusOf(fixture.protocol.Answer(beat, afterReconnect)) == Wire::Status::Ok);
+    CHECK(hintFor("k2") == "10.8.0.42:7100");
+}

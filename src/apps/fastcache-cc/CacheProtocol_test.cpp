@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -765,4 +766,27 @@ TEST_CASE("A served object is not a redirect")
 
     REQUIRE(outcome.kind == CacheOutcomeKind::Hit);
     CHECK(RedirectTarget(outcome) == std::nullopt);
+}
+
+TEST_CASE("Only a dial that made no connection marks its peer unreachable", "[exclusion]")
+{
+    // Walked over every enumerator rather than a list of the ones that exist today, so
+    // a sixth failure arrives with a verdict somebody chose: `RowsInEnumeratorOrder`
+    // refuses a missing row, and this refuses a row that quietly says "unreachable".
+    std::vector<TransportFailure> marked;
+    for (auto const failure: Enumerators<TransportFailure>())
+        if (MarksUnreachable(failure))
+            marked.push_back(failure);
+    CHECK(marked == std::vector { TransportFailure::Unreached });
+
+    // Each row by name, so a failure says WHICH verdict moved.
+    CHECK_FALSE(MarksUnreachable(TransportFailure::None));
+    CHECK(MarksUnreachable(TransportFailure::Unreached));
+    CHECK_FALSE(MarksUnreachable(TransportFailure::PeerLost));
+    CHECK_FALSE(MarksUnreachable(TransportFailure::Expired));
+    CHECK_FALSE(MarksUnreachable(TransportFailure::Silent));
+
+    // A value past the table keeps a phrase and marks nobody: no row classified it.
+    CHECK_FALSE(MarksUnreachable(TransportFailure::Last));
+    CHECK_FALSE(DescribeTransportFailure(TransportFailure::Last).empty());
 }

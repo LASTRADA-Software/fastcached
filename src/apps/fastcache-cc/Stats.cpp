@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -90,6 +91,21 @@ namespace
         std::ranges::replace(out, '\r', ' ');
         std::ranges::replace(out, '\n', ' ');
         return out;
+    }
+
+    /// This process's id, for a temp filename no concurrent writer will reuse.
+    ///
+    /// A `#if` because the OSes genuinely provide this differently rather than
+    /// spelling one call two ways. Used only to make a name unique -- nothing
+    /// depends on the value -- so it needs no injected seam, and a collision would
+    /// cost a rewritten state file, not correctness.
+    [[nodiscard]] std::uint64_t CurrentProcessId() noexcept
+    {
+#if defined(_WIN32)
+        return static_cast<std::uint64_t>(::GetCurrentProcessId());
+#else
+        return static_cast<std::uint64_t>(::getpid());
+#endif
     }
 
     /// Directory holding the log, created on demand. Empty on failure.
@@ -790,6 +806,37 @@ std::string_view ToStringView(DispatchOutcome outcome) noexcept
 std::filesystem::path StateDirectory()
 {
     return StateDirectoryImpl();
+}
+
+bool ReplaceStateFile(std::filesystem::path const& file, std::string_view text)
+{
+    auto temporary = file;
+    // The process id tells two launchers apart and the sequence number two writes of
+    // one process, whichever threads they run on.
+    static std::atomic<std::uint64_t> writes { 0 };
+    temporary += std::format(".{}.{}.tmp", CurrentProcessId(), writes.fetch_add(1, std::memory_order_relaxed));
+    bool written = false;
+    {
+        std::ofstream out { temporary, std::ios::binary | std::ios::trunc };
+        if (out)
+        {
+            out.write(text.data(), static_cast<std::streamsize>(text.size()));
+            out.flush();
+            written = out.good();
+        }
+    }
+
+    std::error_code ec;
+    if (!written)
+    {
+        std::filesystem::remove(temporary, ec);
+        return false;
+    }
+    std::filesystem::rename(temporary, file, ec);
+    if (!ec)
+        return true;
+    std::filesystem::remove(temporary, ec);
+    return false;
 }
 
 std::string LogPath()

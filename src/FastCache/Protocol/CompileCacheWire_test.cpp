@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <optional>
 #include <ranges>
@@ -996,8 +997,8 @@ TEST_CASE("A dispatch payload decoded as the wrong verb fails", "[wire]")
     CHECK_FALSE(DecodeReleasePayload(payload).has_value());
     CHECK(DecodeLeasePayload(payload).has_value());
 
-    // And the other way round: RELEASE carries one field, so a three-field LEASE
-    // cannot be read out of it either.
+    // And the other way round: RELEASE carries two fields, so a LEASE, which carries
+    // more, cannot be read out of it either.
     auto const release = EncodeRelease(ReleaseRequest { .leaseToken = "l1", .key = "k" });
     auto const releasePayload = std::span<std::byte const> { release }.subspan(RequestHeaderSize);
     CHECK_FALSE(DecodeLeasePayload(releasePayload).has_value());
@@ -1339,6 +1340,54 @@ TEST_CASE("A heartbeat carries closed history buckets and gets them back", "[wir
     // The fields beside it are untouched: this is an addition to the nested record,
     // not a reshaping of it.
     CHECK(read.cpuBusyPermille == sent.cpuBusyPermille);
+}
+
+TEST_CASE("A history bucket tolerates a peer with fewer or more slots than this build", "[wire][compile-cache][history]")
+{
+    using namespace FastCache::CompileCacheWire;
+
+    // The tolerance `HistorySlotCount`'s own doc comment claims, and the reason
+    // growing `FleetMetric` needed no `CompileCacheWire` version move: a peer
+    // carrying fewer slots is read with the rest defaulting to zero, and one
+    // carrying more has the extra words ignored. Pinned here as a hand-packed
+    // record rather than through `HistorySlotCount` itself, so a future width
+    // change cannot silently narrow what this test actually exercises.
+    auto const packWords = [](std::initializer_list<std::uint64_t> words) {
+        std::vector<std::byte> packed;
+        for (auto const word: words)
+        {
+            auto const be = WireFields::ToBigEndian<std::uint64_t>(word);
+            packed.insert(packed.end(), be.begin(), be.end());
+        }
+        return packed;
+    };
+    auto const oneBucket = [&](std::vector<std::byte> const& packed) {
+        auto const record =
+            WireFields::Encode({ std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(1'700'000'000'000ULL) },
+                                 std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(1'700'000'000'137ULL) },
+                                 std::span<std::byte const> { packed } });
+        std::vector<std::span<std::byte const>> fields { record };
+        return WireFields::Encode(WireFields::FieldList { fields });
+    };
+
+    SECTION("nine words: a peer built before DispatchAllExcluded")
+    {
+        auto const decoded = DecodeHistoryBuckets(oneBucket(packWords({ 1, 2, 3, 4, 5, 6, 7, 8, 9 })));
+        REQUIRE(decoded.has_value());
+        REQUIRE(Unwrap(decoded).size() == 1);
+        CHECK(Unwrap(decoded).front().values[8] == 9);
+        // The slot this peer never sent stays at its default, not garbage.
+        CHECK(Unwrap(decoded).front().values[9] == 0);
+    }
+
+    SECTION("eleven words: a peer built after this one's HistorySlotCount")
+    {
+        auto const decoded = DecodeHistoryBuckets(oneBucket(packWords({ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 999 })));
+        REQUIRE(decoded.has_value());
+        REQUIRE(Unwrap(decoded).size() == 1);
+        CHECK(Unwrap(decoded).front().values[9] == 10);
+        // The eleventh word is this build's future; it decodes, rather than refuses.
+    }
 }
 
 TEST_CASE("A heartbeat from a peer that sends no history is not a refusal", "[wire][compile-cache][history]")
@@ -2924,12 +2973,13 @@ TEST_CASE("A heartbeat carries the cordon, and a record without it is a serving 
     REQUIRE(serving.has_value());
     CHECK_FALSE(Unwrap(serving).cordoned);
 
-    // The encoding is kept in a local: `SplitAll` hands back spans INTO it. Seven since #1364
-    // appended the conditions list; the cuts below are still counted from the cordon's position.
+    // The encoding is kept in a local: `SplitAll` hands back spans INTO it. Eight since the
+    // interface addresses were appended after #1364's conditions list; the cuts below are still
+    // counted from the cordon's position.
     auto const encoded = EncodeLoad(cordoned);
     auto const parts = WireFields::SplitAll(encoded);
     REQUIRE(parts.has_value());
-    REQUIRE(Unwrap(parts).size() == 7);
+    REQUIRE(Unwrap(parts).size() == 8);
     auto const five = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 5 };
     auto const shorter = DecodeLoad(WireFields::Encode(WireFields::FieldList { five }));
     REQUIRE(shorter.has_value());
@@ -2941,6 +2991,171 @@ TEST_CASE("A heartbeat carries the cordon, and a record without it is a serving 
     auto const two = std::array { std::byte { 0x02 } };
     odd.emplace_back(two);
     CHECK_FALSE(DecodeLoad(WireFields::Encode(WireFields::FieldList { odd })).has_value());
+}
+
+TEST_CASE("A LEASE grant carries a dial hint beside the endpoint the token signs", "[wire][lease][dialhint]")
+{
+    auto const payload = EncodeLeaseGrant(LeaseGrant { .endpoint = "laptop.corp:6676",
+                                                       .leaseToken = "t",
+                                                       .workerCodecs = {},
+                                                       .lifetime = std::chrono::milliseconds { 0 },
+                                                       .dialHint = "10.8.0.7:6676" });
+    auto const grant = DecodeLeaseGrant(payload);
+    REQUIRE(grant.has_value());
+    CHECK(AsStringView(Unwrap(grant).endpoint) == "laptop.corp:6676");
+    CHECK(AsStringView(Unwrap(grant).dialHint) == "10.8.0.7:6676");
+
+    // The BYTES are pinned with the version bump, over the final field order.
+
+    // No hint is an EMPTY fifth field; a four-field reply is a peer this build cannot read,
+    // and so is a six-field one -- the split is exact in both directions.
+    auto const bare =
+        DecodeLeaseGrant(EncodeLeaseGrant(LeaseGrant { .endpoint = "w:1", .leaseToken = "t", .workerCodecs = {} }));
+    REQUIRE(bare.has_value());
+    CHECK(Unwrap(bare).dialHint.empty());
+    auto const zero = EncodeU32Field(0);
+    auto const fourFields = WireFields::Encode(
+        { AsBytes("w:1"), AsBytes("t"), std::span<std::byte const> {}, std::span<std::byte const> { zero } });
+    CHECK_FALSE(DecodeLeaseGrant(fourFields).has_value());
+    auto const sixFields = WireFields::Encode({ AsBytes("w:1"),
+                                                AsBytes("t"),
+                                                std::span<std::byte const> {},
+                                                std::span<std::byte const> { zero },
+                                                AsBytes("10.8.0.7:6676"),
+                                                AsBytes("extra") });
+    CHECK_FALSE(DecodeLeaseGrant(sixFields).has_value());
+}
+
+TEST_CASE("A worker's interface addresses ride both REGISTER and HEARTBEAT, bounded", "[wire][dialhint]")
+{
+    std::vector<std::string> const addresses { "10.8.0.7", "fe80::1" };
+
+    CapacityFields capacity {};
+    capacity.interfaceAddresses = addresses;
+    auto const capacityBack = DecodeCapacity(EncodeCapacity(capacity));
+    REQUIRE(capacityBack.has_value());
+    CHECK(Unwrap(capacityBack).interfaceAddresses == addresses);
+
+    LoadFields load {};
+    load.interfaceAddresses = addresses;
+    auto const loadBack = DecodeLoad(EncodeLoad(load));
+    REQUIRE(loadBack.has_value());
+    CHECK(Unwrap(loadBack).interfaceAddresses == addresses);
+
+    // A record from a peer that says nothing about them decodes as an empty list.
+    CHECK(Unwrap(DecodeLoad(EncodeLoad(LoadFields {}))).interfaceAddresses.empty());
+    CHECK(Unwrap(DecodeCapacity(EncodeCapacity(CapacityFields {}))).interfaceAddresses.empty());
+
+    // At the caps is accepted, so the refusals below are the caps and not something coarser.
+    std::string const longest(MaxInterfaceAddressBytes, '1');
+    std::vector<std::span<std::byte const>> const full(MaxInterfaceAddresses, AsBytes(longest));
+    auto const atCaps = DecodeAddressList(WireFields::Encode(WireFields::FieldList { full }));
+    REQUIRE(atCaps.has_value());
+    CHECK(Unwrap(atCaps).size() == MaxInterfaceAddresses);
+
+    // More than the cap, an empty entry or an over-long one is refused with the record.
+    std::vector<std::span<std::byte const>> const over(MaxInterfaceAddresses + 1, AsBytes("10.0.0.1"));
+    CHECK_FALSE(DecodeAddressList(WireFields::Encode(WireFields::FieldList { over })).has_value());
+    std::vector<std::span<std::byte const>> const empty { std::span<std::byte const> {} };
+    CHECK_FALSE(DecodeAddressList(WireFields::Encode(WireFields::FieldList { empty })).has_value());
+    std::string const tooLong(MaxInterfaceAddressBytes + 1, '1');
+    std::vector<std::span<std::byte const>> const longOne { AsBytes(tooLong) };
+    CHECK_FALSE(DecodeAddressList(WireFields::Encode(WireFields::FieldList { longOne })).has_value());
+
+    // A malformed list refuses the RECORD that carries it, not only the list.
+    auto const encodedOver = WireFields::Encode(WireFields::FieldList { over });
+    std::vector<std::span<std::byte const>> capacityParts(9, std::span<std::byte const> {});
+    capacityParts.emplace_back(encodedOver);
+    CHECK_FALSE(DecodeCapacity(WireFields::Encode(WireFields::FieldList { capacityParts })).has_value());
+    std::vector<std::span<std::byte const>> loadParts(7, std::span<std::byte const> {});
+    loadParts.emplace_back(encodedOver);
+    CHECK_FALSE(DecodeLoad(WireFields::Encode(WireFields::FieldList { loadParts })).has_value());
+
+    // The encoder takes the FIRST `MaxInterfaceAddresses` rather than producing a list its
+    // own decoder refuses.
+    std::vector<std::string> many;
+    many.reserve(MaxInterfaceAddresses + 1);
+    for (auto const index: std::views::iota(std::size_t { 0 }, MaxInterfaceAddresses + 1))
+        many.push_back(std::format("10.0.0.{}", index));
+    auto const taken = DecodeAddressList(EncodeAddressList(many));
+    REQUIRE(taken.has_value());
+    REQUIRE(Unwrap(taken).size() == MaxInterfaceAddresses);
+    CHECK(Unwrap(taken).front() == "10.0.0.0");
+    CHECK(Unwrap(taken).back() == std::format("10.0.0.{}", MaxInterfaceAddresses - 1));
+}
+
+TEST_CASE("An interface address the wire cannot carry is skipped, and its record still decodes", "[wire][dialhint]")
+{
+    // The decoder refuses the WHOLE record over one bad entry, so an encoder that sent one
+    // would make a worker vanish from the fleet over an odd adapter name. The encoder skips
+    // what `IsCarriedInterfaceAddress` rejects, and the good entries keep their order.
+    std::string const tooLong(MaxInterfaceAddressBytes + 1, '1');
+    std::vector<std::string> const mixed { "10.8.0.7", tooLong, "", "fe80::1" };
+    std::vector<std::string> const carried { "10.8.0.7", "fe80::1" };
+
+    CapacityFields capacity {};
+    capacity.interfaceAddresses = mixed;
+    auto const capacityBack = DecodeCapacity(EncodeCapacity(capacity));
+    REQUIRE(capacityBack.has_value());
+    CHECK(Unwrap(capacityBack).interfaceAddresses == carried);
+
+    LoadFields load {};
+    load.interfaceAddresses = mixed;
+    auto const loadBack = DecodeLoad(EncodeLoad(load));
+    REQUIRE(loadBack.has_value());
+    CHECK(Unwrap(loadBack).interfaceAddresses == carried);
+
+    // The count cap applies to what SURVIVES the skip: two rejected entries ahead of
+    // `MaxInterfaceAddresses` good ones still leave every good one carried.
+    std::vector<std::string> many { "", tooLong };
+    many.reserve(MaxInterfaceAddresses + 2);
+    for (auto const index: std::views::iota(std::size_t { 0 }, MaxInterfaceAddresses))
+        many.push_back(std::format("10.0.1.{}", index));
+    auto const taken = DecodeAddressList(EncodeAddressList(many));
+    REQUIRE(taken.has_value());
+    REQUIRE(Unwrap(taken).size() == MaxInterfaceAddresses);
+    CHECK(Unwrap(taken).front() == "10.0.1.0");
+    CHECK(Unwrap(taken).back() == std::format("10.0.1.{}", MaxInterfaceAddresses - 1));
+}
+
+TEST_CASE("A worker's decoded interface addresses outlive the record they were read from", "[wire][dialhint]")
+{
+    // Both records are returned BY VALUE, so a list of views would be a use-after-free the
+    // moment the encoding died. The ARRANGEMENT is what bites, for the reason the CLUSTER-ADMIT
+    // receipt's case gives: STORED, the source dropped, the freed storage churned, and only
+    // then read. The LENGTH is not what bites: a view would point into the encoding's
+    // heap-allocated byte vector, not into a `std::string`'s inline buffer, so it dangles into
+    // freed heap at any length. A view-typed copy was measured red under MSVC /MDd at 8 and at
+    // 29 bytes -- the Debug CRT fills a freed block with 0xDD -- and under ASan as a
+    // heap-use-after-free. The scoped literal is here because it is a realistic address.
+    constexpr std::string_view Scoped = "fe80::1ff:fe23:4567:890a%eth0";
+    static_assert(Scoped.size() <= MaxInterfaceAddressBytes, "the address must be one the decoder accepts");
+
+    auto capacity = std::optional<CapacityFields> {};
+    auto load = std::optional<LoadFields> {};
+    {
+        std::vector<std::string> const sent { std::string { Scoped }, "10.8.0.7" };
+        CapacityFields capacitySent {};
+        capacitySent.interfaceAddresses = sent;
+        LoadFields loadSent {};
+        loadSent.interfaceAddresses = sent;
+        auto const capacityBytes = EncodeCapacity(capacitySent);
+        auto const loadBytes = EncodeLoad(loadSent);
+        capacity = DecodeCapacity(capacityBytes);
+        load = DecodeLoad(loadBytes);
+    }
+
+    // Churn whatever the encodings' allocations have become; the assertion keeps an optimiser
+    // from eliding the allocations that do the churning.
+    auto const churn = std::vector<std::string>(64, std::string(128, 'x'));
+    CHECK(churn.size() == 64);
+
+    REQUIRE(capacity.has_value());
+    REQUIRE(load.has_value());
+    REQUIRE(Unwrap(capacity).interfaceAddresses.size() == 2);
+    REQUIRE(Unwrap(load).interfaceAddresses.size() == 2);
+    CHECK(Unwrap(capacity).interfaceAddresses.front() == Scoped);
+    CHECK(Unwrap(load).interfaceAddresses.front() == Scoped);
 }
 
 TEST_CASE("A node runtime record carries the cordon state, and absent is not serving", "[wire][cordon][node-status]")
@@ -4167,4 +4382,65 @@ TEST_CASE("A shared-cache record with a state byte this build does not name is s
     auto out = std::optional<SharedCacheStatusFields> {};
     CHECK_FALSE(ReadSharedCacheStatus(WireFields::Encode(WireFields::FieldList { parts }), out));
     CHECK_FALSE(out.has_value());
+}
+
+TEST_CASE("A LEASE carries the client's unreachable workers, and none is an empty field", "[wire][lease][exclusion]")
+{
+    std::array<std::string_view, 2> const excluded { "laptop.corp:6676", "10.0.0.9:6676" };
+    auto const frame =
+        EncodeLease(LeaseRequest { .fingerprint = "f", .key = "k", .acceptedCodecs = {}, .excluded = excluded });
+    auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+
+    auto const view = DecodeLeasePayload(payload);
+    REQUIRE(view.has_value());
+    REQUIRE(Unwrap(view).excluded.size() == 2);
+    CHECK(AsStringView(Unwrap(view).excluded[0]) == "laptop.corp:6676");
+    CHECK(AsStringView(Unwrap(view).excluded[1]) == "10.0.0.9:6676");
+
+    // The BYTES are pinned where the version that carries this field is declared,
+    // over the final field order.
+
+    // No exclusions is an EMPTY field, never an absent one: the arity is exact.
+    auto const none = EncodeLease(LeaseRequest { .fingerprint = "f", .key = "k", .acceptedCodecs = {} });
+    auto const noneView = DecodeLeasePayload(std::span<std::byte const> { none }.subspan(RequestHeaderSize));
+    REQUIRE(noneView.has_value());
+    CHECK(Unwrap(noneView).excluded.empty());
+    CHECK(OpFieldCount(Op::Lease) == 4);
+}
+
+TEST_CASE("A LEASE naming too many, an empty or an over-long exclusion is refused", "[wire][lease][exclusion]")
+{
+    auto const leaseWith = [](std::vector<std::span<std::byte const>> const& entries) {
+        auto const list = WireFields::Encode(WireFields::FieldList { entries });
+        auto const fields =
+            std::vector<std::span<std::byte const>> { AsBytes("f"), AsBytes("k"), {}, std::span<std::byte const> { list } };
+        return WireFields::Encode(WireFields::FieldList { fields });
+    };
+
+    std::string const endpoint = "w:1";
+    std::vector<std::span<std::byte const>> const atCap(MaxLeaseExclusions, AsBytes(endpoint));
+    CHECK(DecodeLeasePayload(leaseWith(atCap)).has_value());
+
+    std::vector<std::span<std::byte const>> const overCap(MaxLeaseExclusions + 1, AsBytes(endpoint));
+    CHECK_FALSE(DecodeLeasePayload(leaseWith(overCap)).has_value());
+
+    CHECK_FALSE(DecodeLeasePayload(leaseWith({ std::span<std::byte const> {} })).has_value());
+
+    std::string const longest(MaxExcludedEndpointBytes, 'a');
+    CHECK(DecodeLeasePayload(leaseWith({ AsBytes(longest) })).has_value());
+    std::string const tooLong(MaxExcludedEndpointBytes + 1, 'a');
+    CHECK_FALSE(DecodeLeasePayload(leaseWith({ AsBytes(tooLong) })).has_value());
+
+    // The encoder cannot produce what the decoder refuses: it takes the newest sixteen,
+    // which is the FRONT of a newest-first list, so the oldest four are the ones lost.
+    std::vector<std::string> spelled;
+    for (auto const index: std::views::iota(std::size_t { 0 }, MaxLeaseExclusions + 4))
+        spelled.push_back(std::format("w{}:1", index));
+    std::vector<std::string_view> const many(spelled.begin(), spelled.end());
+    auto const frame = EncodeLease(LeaseRequest { .fingerprint = "f", .key = "k", .acceptedCodecs = {}, .excluded = many });
+    auto const view = DecodeLeasePayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
+    REQUIRE(view.has_value());
+    REQUIRE(Unwrap(view).excluded.size() == MaxLeaseExclusions);
+    CHECK(AsStringView(Unwrap(view).excluded.front()) == "w0:1");
+    CHECK(AsStringView(Unwrap(view).excluded.back()) == std::format("w{}:1", MaxLeaseExclusions - 1));
 }

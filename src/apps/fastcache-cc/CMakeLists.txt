@@ -166,6 +166,7 @@ set(_fc_cc_sources
     PathResolve.cpp
     RefusalNotice.cpp
     ReplayGuard.cpp
+    ReachabilityMemo.cpp
     RootReconciler.cpp
     Stats.cpp
     TicketCredentials.cpp
@@ -299,6 +300,7 @@ if(FASTCACHED_BUILD_TESTS)
         PathResolve_test.cpp
         RefusalNotice_test.cpp
         ReplayGuard_test.cpp
+        ReachabilityMemo_test.cpp
         RootReconciler_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp

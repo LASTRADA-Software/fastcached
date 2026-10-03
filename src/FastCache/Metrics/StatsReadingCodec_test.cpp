@@ -355,6 +355,10 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
+    // Moved by a lease exclusion list: `dispatch_leases_all_excluded` joined the catalogue after
+    // `withdrawn`, for a lease whose every matching worker the client had excluded. Clients and
+    // nodes upgrade together, as below.
+    //
     // Moved by the fleet's shared cache: fifteen counters joined the catalogue -- the
     // shared tier's hits, misses, store failures and seven refusals, and the client's wrong-key,
     // failed-proof, unresolved, stale-hint and sessions-opened tallies. Clients and nodes upgrade
@@ -522,6 +526,9 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // nodes upgrade together, as above.
     //
     // Moved when lane 2c's fifteen shared-cache counters joined the catalogue, after lane 2b's in
+    // integration order (ruling 8). Read off the built test, never computed by hand.
+    //
+    // Moved when lane 3's `dispatch_leases_all_excluded` joined the catalogue after `withdrawn`, in
     // integration order (ruling 8). Read off the built test, never computed by hand.
     CHECK(StatsReadingLayout == 0xed690b6da9395300ULL);
 }

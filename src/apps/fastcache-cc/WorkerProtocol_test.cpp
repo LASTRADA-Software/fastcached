@@ -1766,7 +1766,7 @@ TEST_CASE("A NotLeader refusal reaches the node as an endpoint, not as prose", "
     auto registrar = MakeRegistrar();
     Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") };
 
-    auto const outcome = registrar.Register(scheduler);
+    auto const outcome = registrar.Register(scheduler, {});
     REQUIRE_FALSE(outcome.has_value());
     REQUIRE(outcome.error().leader.has_value());
     CHECK(Unwrap(outcome.error().leader) == "10.0.0.7:6676");
@@ -1782,7 +1782,7 @@ TEST_CASE("A refusal that is not a redirect names no leader", "[cc][registrar][n
     auto registrar = MakeRegistrar();
     Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not in this cluster") };
 
-    auto const outcome = registrar.Register(scheduler);
+    auto const outcome = registrar.Register(scheduler, {});
     REQUIRE_FALSE(outcome.has_value());
     CHECK_FALSE(outcome.error().leader.has_value());
 }
@@ -1795,7 +1795,7 @@ TEST_CASE("A NotLeader whose message is prose is not a redirect", "[cc][registra
     auto registrar = MakeRegistrar();
     Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "no leader: try again") };
 
-    auto const outcome = registrar.Register(scheduler);
+    auto const outcome = registrar.Register(scheduler, {});
     REQUIRE_FALSE(outcome.has_value());
     CHECK_FALSE(outcome.error().leader.has_value());
 }
@@ -1813,7 +1813,7 @@ TEST_CASE("A heartbeat refused NotLeader keeps its worker id", "[cc][registrar][
     Testing::ScriptedSocket scheduler { Testing::Replies(
         { RegisterOk("w-1"), Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") }) };
 
-    REQUIRE(registrar.Register(scheduler).has_value());
+    REQUIRE(registrar.Register(scheduler, {}).has_value());
     REQUIRE(registrar.WorkerId() == "w-1");
 
     auto const beat = registrar.Heartbeat(scheduler, 0);
@@ -1843,7 +1843,7 @@ TEST_CASE("A withdrawal an older scheduler cannot answer is survivable", "[cc][r
     Testing::ScriptedSocket scheduler { Testing::Replies(
         { RegisterOk("w-1"), Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode, {}) }) };
 
-    REQUIRE(registrar.Register(scheduler).has_value());
+    REQUIRE(registrar.Register(scheduler, {}).has_value());
     REQUIRE(registrar.WorkerId() == "w-1");
 
     auto const retired = registrar.Withdraw(scheduler);
@@ -1868,13 +1868,52 @@ TEST_CASE("A registrar that never registered has nothing to withdraw", "[cc][reg
     CHECK(scheduler.Sent().empty());
 }
 
+namespace
+{
+
+/// The interface addresses the one REGISTER sent on @p scheduler carried.
+/// @param scheduler A socket a registrar has registered over once.
+/// @return The list, or nullopt when what was sent is not one REGISTER that decodes.
+[[nodiscard]] std::optional<std::vector<std::string>> RegisteredAddressesOn(Testing::ScriptedSocket const& scheduler)
+{
+    auto const sent = std::span<std::byte const> { scheduler.Sent() };
+    auto const header = Wire::DecodeRequestHeader(sent);
+    if (!header.has_value() || header->opRaw != static_cast<std::uint8_t>(Wire::Op::Register)
+        || sent.size() != Wire::RequestHeaderSize + std::size_t { header->payloadLength })
+        return std::nullopt;
+    auto const decoded = Wire::DecodeRegisterPayload(sent.subspan(Wire::RequestHeaderSize));
+    if (!decoded.has_value())
+        return std::nullopt;
+    return decoded->capacity.interfaceAddresses;
+}
+
+} // namespace
+
+TEST_CASE("A registration carries the addresses it is handed, and the next one does not inherit them",
+          "[cc][registrar][dialhint]")
+{
+    // The addresses are the round's and the capacity is the registrar's: a registrar that
+    // folded one round's list into its own capacity would re-register after a VPN reconnect
+    // still naming the address the machine no longer has.
+    auto registrar = MakeRegistrar();
+    auto const addresses = std::vector<std::string> { "10.8.0.7", "192.168.1.20" };
+
+    Testing::ScriptedSocket first { RegisterOk("w-1") };
+    REQUIRE(registrar.Register(first, addresses).has_value());
+    CHECK(RegisteredAddressesOn(first) == std::optional { addresses });
+
+    Testing::ScriptedSocket second { RegisterOk("w-1") };
+    REQUIRE(registrar.Register(second, {}).has_value());
+    CHECK(RegisteredAddressesOn(second) == std::optional { std::vector<std::string> {} });
+}
+
 TEST_CASE("A heartbeat refused UnknownLease forgets its worker id and names no leader", "[cc][registrar][notleader]")
 {
     auto registrar = MakeRegistrar();
     Testing::ScriptedSocket scheduler { Testing::Replies(
         { RegisterOk("w-1"), Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}) }) };
 
-    REQUIRE(registrar.Register(scheduler).has_value());
+    REQUIRE(registrar.Register(scheduler, {}).has_value());
     auto const beat = registrar.Heartbeat(scheduler, 0);
     REQUIRE_FALSE(beat.has_value());
     CHECK_FALSE(beat.error().leader.has_value());

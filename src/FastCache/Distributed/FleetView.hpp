@@ -65,7 +65,7 @@ struct LeaseOutcomeRow
 /// can hold. A counter added without a catalogue row fails at `CounterTable`'s own
 /// assertion first, so the second one was the shape AGENT.md names: a guard that
 /// fires only when nothing is wrong. One guard, cited, rather than two.
-inline constexpr std::array<LeaseOutcomeRow, 5> LeaseOutcomeTable {
+inline constexpr std::array<LeaseOutcomeRow, 6> LeaseOutcomeTable {
     LeaseOutcomeRow { .counter = IMetricsSink::Counter::DispatchLeasesGranted,
                       .key = "granted",
                       .label = "granted",
@@ -82,6 +82,10 @@ inline constexpr std::array<LeaseOutcomeRow, 5> LeaseOutcomeTable {
                       .key = "withdrawn",
                       .label = "withdrawn",
                       .meaning = "the machines are busy with something else, or out of scratch space." },
+    LeaseOutcomeRow { .counter = IMetricsSink::Counter::DispatchLeasesAllExcluded,
+                      .key = "all-excluded",
+                      .label = "all excluded",
+                      .meaning = "every matching worker was unreachable from the client that asked: a network problem." },
     LeaseOutcomeRow { .counter = IMetricsSink::Counter::DispatchLeasesDuplicate,
                       .key = "duplicate",
                       .label = "duplicate",

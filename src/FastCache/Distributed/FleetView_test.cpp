@@ -83,7 +83,7 @@ class FakeCluster final: public IClusterAdmin
     FleetSnapshot snapshot;
     snapshot.role = SchedulerRole::Leader;
     snapshot.nodes = { Machine("10.0.0.2:7100", 32) };
-    snapshot.leases = { 100, 7, 5, 3, 2 };
+    snapshot.leases = { 100, 7, 5, 3, 1, 2 };
     snapshot.liveLeases = 4;
     snapshot.registrations = 9;
     return snapshot;
@@ -892,13 +892,14 @@ TEST_CASE("Each lease outcome carries its own number", "[distributed][fleetview]
     // rather than passing on equal numbers -- and because summing this split is the
     // mistake the whole table exists to prevent.
     auto snapshot = LeadingSnapshot();
-    snapshot.leases = { 100, 7, 5, 3, 2 };
+    snapshot.leases = { 100, 7, 5, 3, 9, 2 };
 
     auto const json = RenderFleetJson(snapshot, NoHistory());
     CHECK(json.contains(R"("granted":100)"));
     CHECK(json.contains(R"("no-worker":7)"));
     CHECK(json.contains(R"("no-capacity":5)"));
     CHECK(json.contains(R"("withdrawn":3)"));
+    CHECK(json.contains(R"("all-excluded":9)"));
     CHECK(json.contains(R"("duplicate":2)"));
     // And the page says out loud that they must not be added together.
     CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("Do not add these together"));
@@ -1004,8 +1005,8 @@ TEST_CASE("A fleet nothing was ever dispatched to says so, rather than reading a
     // host CPU, found none of it accounted for by work this fleet had handed out,
     // and told the operator their own build belonged to somebody else.
     auto snapshot = LeadingSnapshot();
-    snapshot.leases = { 0, 0, 0, 0, 0 }; // registered, and never asked
-    snapshot.liveLeases = 0;             // nor is anything outstanding
+    snapshot.leases = { 0, 0, 0, 0, 0, 0 }; // registered, and never asked
+    snapshot.liveLeases = 0;                // nor is anything outstanding
     auto busy = Machine("10.0.0.1:7100", 16);
     busy.registeredSlots = 16;
     busy.fleetJobsInFlight = 0;
@@ -1059,8 +1060,8 @@ TEST_CASE("A scheduler that has just taken over does not call a working fleet un
     // them" on a page whose own bar shows four running, and would displace the
     // withheld reading that is the actually useful one.
     auto snapshot = LeadingSnapshot();
-    snapshot.leases = { 0, 0, 0, 0, 0 }; // this leader has granted nothing yet
-    snapshot.liveLeases = 0;             // and holds no lease of its own
+    snapshot.leases = { 0, 0, 0, 0, 0, 0 }; // this leader has granted nothing yet
+    snapshot.liveLeases = 0;                // and holds no lease of its own
     auto busy = Machine("10.0.0.1:7100", 16);
     busy.registeredSlots = 16;
     busy.fleetJobsInFlight = 4; // but the fleet is demonstrably working
@@ -1082,7 +1083,7 @@ TEST_CASE("A lease outstanding is dispatch, even before the count catches up", "
     // `liveLeases` is the only thing that knows, and without it this page would
     // announce an unused fleet in the gap between a grant and its job.
     auto snapshot = LeadingSnapshot();
-    snapshot.leases = { 0, 0, 0, 0, 0 };
+    snapshot.leases = { 0, 0, 0, 0, 0, 0 };
     snapshot.liveLeases = 2;
     auto idle = Machine("10.0.0.1:7100", 16);
     idle.registeredSlots = 16;

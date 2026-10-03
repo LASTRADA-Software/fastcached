@@ -7,6 +7,7 @@
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 
+#include <algorithm>
 #include <format>
 #include <memory>
 #include <optional>
@@ -75,6 +76,49 @@ Wire::LoadFields SampleMachineLoad(IHostLoadSampler& loadSampler,
                                                            .cordoned = cordoned });
 }
 
+ReportableAddresses ReportableInterfaceAddresses(std::vector<std::string> addresses)
+{
+    std::erase_if(addresses, [](std::string const& address) {
+        return std::ranges::any_of(UnreportedAddresses,
+                                   [&address](UnreportedAddressRow const& row) { return row.applies(address); });
+    });
+    std::ranges::sort(addresses);
+    auto const [first, last] = std::ranges::unique(addresses);
+    addresses.erase(first, last);
+
+    auto const overCap =
+        addresses.size() > Wire::MaxInterfaceAddresses ? addresses.size() - Wire::MaxInterfaceAddresses : std::size_t { 0 };
+    addresses.resize(addresses.size() - overCap);
+    return ReportableAddresses { .addresses = std::move(addresses), .overCap = overCap };
+}
+
+namespace
+{
+    /// What this round reports this machine answers on, read from the seam NOW.
+    ///
+    /// Asked per round and never cached across rounds, because the answer this exists for is
+    /// the one that moves: a VPN that reconnects under a new address mid-session. The probe
+    /// costs about two milliseconds on Windows, against a round every twenty seconds.
+    ///
+    /// A cap that bit is said ONCE per process, at Info: the interface count is the
+    /// machine's, so the line would otherwise repeat unchanged on every heartbeat.
+    /// @param round Where the addresses, the latch and the logger are.
+    /// @return The addresses to send on every REGISTER and HEARTBEAT of this round.
+    [[nodiscard]] std::vector<std::string> AddressesToReport(HeartbeatRound const& round)
+    {
+        auto reportable = ReportableInterfaceAddresses(round.addresses.Addresses());
+        if (reportable.overCap > 0 && !round.addressCapNoticed.exchange(true))
+            round.logger.Logf(LogLevel::Info,
+                              "this machine answers on {} reportable addresses and a report carries at most {}: the "
+                              "{} that sort last are left out of every registration and heartbeat, so no dial hint "
+                              "can name them. Said once",
+                              reportable.addresses.size() + reportable.overCap,
+                              Wire::MaxInterfaceAddresses,
+                              reportable.overCap);
+        return std::move(reportable.addresses);
+    }
+} // namespace
+
 AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& client, std::string_view endpoint)
 {
     // Counted rather than short-circuited: one toolchain the scheduler refuses must
@@ -107,8 +151,10 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
     // conditional heartbeat that existed to step it. History is the MACHINE's and travels
     // on NODE-ANNOUNCE, which a node running no worker also sends -- see
     // `SampleMachineLoad`, which owns the argument for one carrier.
-    auto const load =
-        SampleMachineLoad(round.loadSampler, round.cacheTier, round.metrics, inFlight, round.capacity.IsCordoned());
+    auto load = SampleMachineLoad(round.loadSampler, round.cacheTier, round.metrics, inFlight, round.capacity.IsCordoned());
+    // Sampled beside the load for the load's reason -- one reading of one machine per round --
+    // and handed to REGISTER as well, which carries no load record of its own.
+    load.interfaceAddresses = AddressesToReport(round);
 
     // The first leader any entry was pointed at. One per round rather than one per
     // registrar: every entry here describes the same machine talking to the same
@@ -178,7 +224,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
         // operator knew about a node that had silently dropped out of the fleet -- a
         // fingerprint the scheduler will not accept, a cluster this node is not a
         // member of, a leader that has moved.
-        if (auto const registered = registrar.Register(client); registered.has_value())
+        if (auto const registered = registrar.Register(client, load.interfaceAddresses); registered.has_value())
         {
             // The fleet the scheduler named, adopted here rather than configured. Until
             // this runs the worker is unpinned and refuses every grant, which is the
