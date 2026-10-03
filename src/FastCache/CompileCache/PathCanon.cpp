@@ -3,8 +3,12 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
+#include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache::PathCanon
 {
@@ -13,6 +17,70 @@ namespace
 
     constexpr std::string_view SrcRootSentinel = "<SRCROOT>";
     constexpr std::string_view BuildTreeSentinel = "<BUILDTREE>";
+
+    /// Either separator, because a compiler emits both and often in one path.
+    [[nodiscard]] constexpr bool IsPathSeparator(char c) noexcept
+    {
+        return c == '/' || c == '\\';
+    }
+
+    /// True when `text` carries `..` as a whole path SEGMENT.
+    ///
+    /// The distinction is the point: `D:\src\a..b\x.hpp` contains `..` and has no `..` segment, so
+    /// a `contains("..")` test would send it down the slow path and hand back a re-separated
+    /// spelling for no reason. Both ends must land on a boundary.
+    [[nodiscard]] bool HasDotDotSegment(std::string_view text)
+    {
+        auto at = text.find("..");
+        while (at != std::string_view::npos)
+        {
+            auto const after = at + 2;
+            bool const opensSegment = at == 0 || IsPathSeparator(text[at - 1]);
+            bool const closesSegment = after == text.size() || IsPathSeparator(text[after]);
+            if (opensSegment && closesSegment)
+                return true;
+            at = text.find("..", at + 1);
+        }
+        return false;
+    }
+
+    /// The lexical normal form of a `/`-only path: empty and `.` segments dropped, and each `..`
+    /// taking the segment before it. A `..` with nothing before it is dropped on an absolute path
+    /// (nothing ascends past a root) and kept on a relative one, where the caller then sees it
+    /// survive. A trailing separator survives, as `lexically_normal` keeps one.
+    /// @param tail A path whose separators are all `/`, its anchor already split off.
+    /// @return The collapsed form.
+    [[nodiscard]] std::string LexicallyCollapsed(std::string_view tail)
+    {
+        bool const absolute = tail.starts_with('/');
+        bool const trailing = tail.size() > 1 && tail.ends_with('/');
+        std::vector<std::string_view> kept;
+        for (auto const segment: std::views::split(tail, '/'))
+        {
+            std::string_view const name { segment.begin(), segment.end() };
+            if (name.empty() || name == ".")
+                continue;
+            if (name != "..")
+                kept.push_back(name);
+            else if (!kept.empty() && kept.back() != "..")
+                kept.pop_back();
+            else if (!absolute)
+                kept.push_back(name);
+        }
+
+        std::string out { absolute ? "/" : "" };
+        for (auto const& name: kept)
+        {
+            if (!out.empty() && out.back() != '/')
+                out.push_back('/');
+            out.append(name);
+        }
+        if (out.empty())
+            return ".";
+        if (trailing && out.back() != '/')
+            out.push_back('/');
+        return out;
+    }
 
     /// Build the comparison form of a path: separators normalized to '/' and,
     /// on Windows, lower-cased. Used only for prefix matching, never emitted.
@@ -333,120 +401,239 @@ namespace
 
     // --- Region grammar --------------------------------------------------------
 
-    /// Split a line into (leading text kept verbatim, path span, trailing text kept
-    /// verbatim) for the given grammar. Returns false when the line does not match
-    /// the grammar's shape (then the whole line is preserved).
-    /// @param line    One line WITHOUT its trailing newline (a trailing '\r' is
-    ///                treated as part of the trailing text and preserved).
-    /// @param grammar The active grammar.
-    /// @param head    [out] Text before the path span.
-    /// @param path    [out] The path span.
-    /// @param tail    [out] Text after the path span (incl. any '\r').
-    /// @return True if a path span was located.
-    [[nodiscard]] bool SplitLine(
-        std::string_view line, Grammar grammar, std::string_view& head, std::string_view& path, std::string_view& tail)
+    /// One line split around its path span: text kept verbatim, the span, text kept
+    /// verbatim. The span never includes a trailing '\r'; the tail does, so CRLF
+    /// survives a round trip.
+    struct LineSplit
     {
-        // Length of an optional trailing carriage return, kept as part of the
-        // line body (so it lands in the trailing text and CRLF survives round-trip).
-        std::size_t const crLen = (!line.empty() && line.back() == '\r') ? 1U : 0U;
-        std::string_view const body = line.substr(0, line.size() - crLen);
+        std::string_view head; ///< Text before the path span.
+        std::string_view path; ///< The path span.
+        std::string_view tail; ///< Text after the path span, incl. any '\r'.
+    };
 
+    /// One SHAPE a line can have that locates a path span in it.
+    ///
+    /// A grammar is a list of these rather than one, because a stream can carry more
+    /// than one line language: the MSVC family's console streams carry `/showIncludes`
+    /// notes AND diagnostics, on either stream depending on the flag (#825), and a
+    /// region carries exactly one grammar tag. So a grammar that could hold only one
+    /// shape left the other language verbatim, with the producer's absolute paths in it.
+    /// @param line One line without its newline, a trailing '\r' included.
+    /// @param body The same line with that '\r' removed.
+    /// @return The split, or nothing when the line is not this shape.
+    using LineRule = std::optional<LineSplit> (*)(std::string_view line, std::string_view body);
+
+    /// `<marker><blanks><path>`, the marker at column zero.
+    ///
+    /// `IncludeNoteMarker` rather than a literal of this file's own. A stored region
+    /// carries the canonical marker BY CONTRACT -- the producer normalizes to it -- so
+    /// the grammar and that contract are one constant, not two that happen to read alike.
+    [[nodiscard]] std::optional<LineSplit> SplitIncludeNote(std::string_view line, std::string_view body)
+    {
+        std::size_t start = IncludeNoteMarkerEnd(body, IncludeNoteMarker);
+        if (start == std::string_view::npos)
+            return std::nullopt;
+        while (start < body.size() && body[start] == ' ')
+            ++start;
+        if (start >= body.size())
+            return std::nullopt;
+        return LineSplit { .head = line.substr(0, start), .path = body.substr(start), .tail = line.substr(body.size()) };
+    }
+
+    /// The offset just past a run of ASCII digits starting at `from`.
+    [[nodiscard]] std::size_t DigitsEnd(std::string_view text, std::size_t from) noexcept
+    {
+        while (from < text.size() && text[from] >= '0' && text[from] <= '9')
+            ++from;
+        return from;
+    }
+
+    /// What may follow an MSVC-family location's digits. `): ` is what the drivers write;
+    /// `) : ` is the `#pragma message(__FILE__ "(" STR(__LINE__) ") : warning: ...")` idiom
+    /// MSVC's own documentation gives, written so IDEs and problem matchers read it as a
+    /// diagnostic head -- which is why a foreign path in it sends a developer to the wrong
+    /// tree. Equally anchored and equally numeric, so it admits no source echo the tighter
+    /// spelling rejects.
+    constexpr std::array<std::string_view, 2> MsvcLocationEnds { "): ", ") : " };
+
+    /// Whether the `(` at `open` begins an MSVC-family location: `(<digits>)` or
+    /// `(<digits>,<digits>)` followed by one of `MsvcLocationEnds`, and nothing looser.
+    [[nodiscard]] bool OpensMsvcLocation(std::string_view body, std::size_t open) noexcept
+    {
+        std::size_t end = DigitsEnd(body, open + 1);
+        if (end == open + 1)
+            return false;
+        if (end < body.size() && body[end] == ',')
+        {
+            std::size_t const columnEnd = DigitsEnd(body, end + 1);
+            if (columnEnd == end + 1)
+                return false;
+            end = columnEnd;
+        }
+        auto const rest = body.substr(end);
+        return std::ranges::any_of(MsvcLocationEnds, [rest](std::string_view ending) { return rest.starts_with(ending); });
+    }
+
+    /// Whether the `:` at `colon` ends a GCC-family path: `:<digits>` followed by `:` or `,`.
+    [[nodiscard]] bool EndsGccPath(std::string_view body, std::size_t colon) noexcept
+    {
+        std::size_t const digits = DigitsEnd(body, colon + 1);
+        return digits > colon + 1 && digits < body.size() && (body[digits] == ':' || body[digits] == ',');
+    }
+
+    /// `<path>(<digits>[,<digits>]): ...`, the path at column zero -- the head `cl` and
+    /// `clang-cl` both write, a warning, an error and a `note:` continuation alike.
+    ///
+    /// **Anchored, and tight, because the stream also carries SOURCE.** Under
+    /// `/diagnostics:caret` a driver echoes the offending source line and a caret after
+    /// the head, and this repository's code quotes paths. So the location must be exactly
+    /// `(digits)` or `(digits,digits)` followed by `): ` or `) : `, and a parenthesis that
+    /// does not open a location (`Program Files (x86)`, a call in the echoed code) is
+    /// stepped over rather than taken as the end of the path.
+    ///
+    /// **What protects an indented echo is the ROOT match, not the column-zero check.**
+    /// A span is rewritten only when it BEGINS with a root (`CanonicalizeOne`), and an
+    /// indented line's span begins with its blanks, so it is left alone either way --
+    /// removing the check turns nothing red (measured by the Job 2 review). The check is
+    /// kept as the statement of what a head IS, and is defensive only. The one shape
+    /// still rewritten is a source line whose own text begins, at column zero, with an
+    /// in-root path followed by a location, which only a raw string or a comment
+    /// continuation can produce.
+    [[nodiscard]] std::optional<LineSplit> SplitMsvcDiagnostic(std::string_view line, std::string_view body)
+    {
+        if (body.empty() || body.front() == ' ' || body.front() == '\t')
+            return std::nullopt;
+        // From 1, so the path is never empty.
+        std::size_t open = body.find('(', 1);
+        while (open != std::string_view::npos && !OpensMsvcLocation(body, open))
+            open = body.find('(', open + 1);
+        if (open == std::string_view::npos)
+            return std::nullopt;
+        return LineSplit { .head = {}, .path = body.substr(0, open), .tail = line.substr(open) };
+    }
+
+    /// The GCC-family location suffix: the path starting at `begin` runs to the `:` that
+    /// begins `:<digits>` followed by `:` or `,`.
+    ///
+    /// Searched left to right from `begin`, so a drive letter's colon cannot end it -- `C:`
+    /// is not followed by digits-then-separator -- and a path containing a literal
+    /// `:<digits>:` would have to do so before its real location suffix, which no compiler
+    /// emits.
+    [[nodiscard]] std::optional<LineSplit> SplitGccPathAt(std::string_view line, std::string_view body, std::size_t begin)
+    {
+        std::size_t colon = body.find(':', begin);
+        while (colon != std::string_view::npos && colon != begin && !EndsGccPath(body, colon))
+            colon = body.find(':', colon + 1);
+        if (colon == std::string_view::npos || colon == begin)
+            return std::nullopt;
+        return LineSplit { .head = line.substr(0, begin),
+                           .path = body.substr(begin, colon - begin),
+                           .tail = line.substr(colon) };
+    }
+
+    /// The include-chain head `In file included from `, spelled once for both GCC rules.
+    constexpr std::string_view IncludedFrom = "In file included from ";
+
+    /// The GCC-family include chain: two ANCHORED shapes --
+    ///
+    ///     In file included from <path>:<line>[,:]  the chain's head
+    ///                      from <path>:<line>[,:]  its continuations
+    ///
+    /// Its own rule because it is its own line language: `clang-cl` writes it on the MSVC
+    /// family's stream too, in front of a header's diagnostic -- measured on the `clang-cl`
+    /// VS 18 installs, `In file included from <root>\src\a.cpp:1:` above a `(3,29): warning`
+    /// -- so `MsvcStream` needs this half and no other part of the GCC grammar.
+    [[nodiscard]] std::optional<LineSplit> SplitGccIncludeChain(std::string_view line, std::string_view body)
+    {
+        constexpr std::string_view ContinuedFrom = "from ";
+        if (body.starts_with(IncludedFrom))
+            return SplitGccPathAt(line, body, IncludedFrom.size());
+        if (body.empty() || body.front() != ' ')
+            return std::nullopt;
+        // A continuation line: spaces, then `from `. Anything else that begins with a space
+        // is source text or a caret and is left alone.
+        std::size_t at = 0;
+        while (at < body.size() && body[at] == ' ')
+            ++at;
+        if (!body.substr(at).starts_with(ContinuedFrom))
+            return std::nullopt;
+        return SplitGccPathAt(line, body, at + ContinuedFrom.size());
+    }
+
+    /// The GCC-family diagnostic head, `<path>:<line>:<col>: ...`, at column zero.
+    ///
+    /// Never a scan for path-shaped spans. A GCC diagnostic embeds the offending SOURCE
+    /// LINE and a caret, and this repository's own tests carry path literals -- a blanket
+    /// rewrite would corrupt a snippet that merely quotes one, turning a correct diagnostic
+    /// into a wrong one. Only a column-zero head and the include chain hold a path; the
+    /// rest of the line is somebody's code. An include-chain line or an indented one is
+    /// the other rule's to answer, or nobody's.
+    [[nodiscard]] std::optional<LineSplit> SplitGccDiagnosticHead(std::string_view line, std::string_view body)
+    {
+        if (body.starts_with(IncludedFrom) || (!body.empty() && body.front() == ' '))
+            return std::nullopt;
+        return SplitGccPathAt(line, body, 0);
+    }
+
+    constexpr std::array<LineRule, 1> IncludeNoteRules { &SplitIncludeNote };
+    constexpr std::array<LineRule, 1> MsvcDiagnosticRules { &SplitMsvcDiagnostic };
+    /// Every line language the MSVC family writes on one console stream: `/showIncludes`
+    /// notes, its own diagnostic heads, and `clang-cl`'s GCC-style include chain -- and its
+    /// GCC-style HEAD, `<path>:<line>:<col>: `, which `clang-cl -fdiagnostics-format=clang`
+    /// (or `/clang:` spelling it) writes instead of `(line,col): `. The note rule FIRST: a
+    /// note line has no location, so it cannot be a diagnostic, but the order states which
+    /// language a line is asked about before the others. The MSVC head before the GCC one,
+    /// so a line both could read is read as the driver's own shape.
+    ///
+    /// Not covered, and stated so: `In module 'm' imported from <path>:1:` keeps the
+    /// producer's path -- a clang modules build, which this launcher refuses to cache anyway.
+    constexpr std::array<LineRule, 4> MsvcStreamRules {
+        &SplitIncludeNote, &SplitMsvcDiagnostic, &SplitGccIncludeChain, &SplitGccDiagnosticHead
+    };
+    constexpr std::array<LineRule, 2> GccDiagnosticRules { &SplitGccIncludeChain, &SplitGccDiagnosticHead };
+
+    /// The line shapes a grammar recognizes, tried in order.
+    ///
+    /// An exhaustive `switch` rather than an indexed table so a new enumerator is a
+    /// `-Wswitch` error HERE, at the one place that says what it means.
+    /// @param grammar The region's grammar.
+    /// @return Its rules; none for the depfile grammar, which `RewriteDepfile` walks.
+    [[nodiscard]] std::span<LineRule const> RulesOf(Grammar grammar) noexcept
+    {
         switch (grammar)
         {
-            case Grammar::ShowIncludes: {
-                // `IncludeNoteMarker` rather than a literal of this file's own. A
-                // stored region carries the canonical marker BY CONTRACT -- the
-                // producer normalizes to it -- so the grammar and that contract are
-                // one constant, not two that happen to read alike.
-                std::size_t start = IncludeNoteMarkerEnd(body, IncludeNoteMarker);
-                if (start == std::string_view::npos)
-                    return false;
-                while (start < body.size() && body[start] == ' ')
-                    ++start;
-                if (start >= body.size())
-                    return false;
-                head = line.substr(0, start);
-                path = body.substr(start);               // path excludes the CR
-                tail = line.substr(line.size() - crLen); // just the CR (or empty)
-                return true;
-            }
-            case Grammar::MsvcDiagnostics: {
-                // "<path>(line[,col]): ..." — the path ends at the '(' beginning the
-                // location. Require a following "): " to avoid matching a stray '('.
-                std::size_t const open = body.find('(');
-                std::size_t const close = body.find("): ");
-                if (open == std::string_view::npos || close == std::string_view::npos || close < open)
-                    return false;
-                head = {};
-                path = body.substr(0, open);
-                tail = line.substr(open); // everything from '(' onward, incl. CR
-                return true;
-            }
-            case Grammar::GccDiagnostics: {
-                // Three ANCHORED shapes and nothing else:
-                //
-                //     <path>:<line>:<col>: ...                the diagnostic itself
-                //     In file included from <path>:<line>[,:]  the include chain head
-                //                      from <path>:<line>[,:]  its continuations
-                //
-                // Never a scan for path-shaped spans. A GCC diagnostic embeds the
-                // offending SOURCE LINE and a caret, and this repository's own
-                // tests carry path literals -- a blanket rewrite would corrupt a
-                // snippet that merely quotes one, turning a correct diagnostic into
-                // a wrong one. Only these positions hold a path; the rest of the
-                // line is somebody's code.
-                constexpr std::string_view IncludedFrom = "In file included from ";
-                constexpr std::string_view ContinuedFrom = "from ";
-
-                std::size_t begin = 0;
-                if (body.starts_with(IncludedFrom))
-                {
-                    begin = IncludedFrom.size();
-                }
-                else if (!body.empty() && body.front() == ' ')
-                {
-                    // A continuation line: spaces, then `from `. Anything else that
-                    // begins with a space is source text or a caret and is left alone.
-                    std::size_t at = 0;
-                    while (at < body.size() && body[at] == ' ')
-                        ++at;
-                    if (!body.substr(at).starts_with(ContinuedFrom))
-                        return false;
-                    begin = at + ContinuedFrom.size();
-                }
-
-                // The path runs to the `:` that begins `:<digits>` followed by `:`
-                // or `,`. Searched left to right from `begin`, so a drive letter's
-                // colon cannot end it -- `C:` is not followed by digits-then-
-                // separator -- and a path containing a literal `:<digits>:` would
-                // have to do so before its real location suffix, which no compiler
-                // emits.
-                std::size_t at = begin;
-                while (true)
-                {
-                    std::size_t const colon = body.find(':', at);
-                    if (colon == std::string_view::npos || colon == begin)
-                        return false;
-                    std::size_t digits = colon + 1;
-                    while (digits < body.size() && body[digits] >= '0' && body[digits] <= '9')
-                        ++digits;
-                    if (digits > colon + 1 && digits < body.size() && (body[digits] == ':' || body[digits] == ','))
-                    {
-                        head = line.substr(0, begin);
-                        path = body.substr(begin, colon - begin);
-                        tail = line.substr(colon); // from the ':' onward, incl. any CR
-                        return true;
-                    }
-                    at = colon + 1;
-                }
-            }
+            case Grammar::ShowIncludes:
+                return IncludeNoteRules;
+            case Grammar::MsvcDiagnostics:
+                return MsvcDiagnosticRules;
+            case Grammar::MsvcStream:
+                return MsvcStreamRules;
+            case Grammar::GccDiagnostics:
+                return GccDiagnosticRules;
             case Grammar::GccDepfile:
                 // A depfile line carries MANY path spans (a target plus its whole
                 // dependency list), so it cannot be expressed as one head/path/tail
                 // split. RewriteDepfile handles this grammar instead.
-                return false;
+                return {};
         }
-        return false;
+        return {};
+    }
+
+    /// Split a line around its path span under the given grammar: the first of the
+    /// grammar's rules the line matches decides it.
+    /// @param line    One line WITHOUT its trailing newline (a trailing '\r' is
+    ///                treated as part of the trailing text and preserved).
+    /// @param grammar The active grammar.
+    /// @return The split, or nothing when the line matches none of the grammar's shapes
+    ///         (then the whole line is preserved).
+    [[nodiscard]] std::optional<LineSplit> SplitLine(std::string_view line, Grammar grammar)
+    {
+        std::size_t const crLen = (!line.empty() && line.back() == '\r') ? 1U : 0U;
+        std::string_view const body = line.substr(0, line.size() - crLen);
+        for (auto const rule: RulesOf(grammar))
+            if (auto split = rule(line, body))
+                return split;
+        return std::nullopt;
     }
 
     /// Rewrite every path token in a GNU-style Makefile depfile.
@@ -588,14 +775,11 @@ namespace
             bool const hasNl = nl != std::string_view::npos;
             std::string_view const line = text.substr(pos, hasNl ? nl - pos : std::string_view::npos);
 
-            std::string_view head;
-            std::string_view path;
-            std::string_view tail;
-            if (SplitLine(line, grammar, head, path, tail))
+            if (auto const split = SplitLine(line, grammar))
             {
-                out.append(head);
-                out.append(xform(path));
-                out.append(tail);
+                out.append(split->head);
+                out.append(xform(split->path));
+                out.append(split->tail);
             }
             else
             {
@@ -686,14 +870,75 @@ std::string Localize(std::string_view token, Layout const& layout)
     return LocalizeOne(token, layout);
 }
 
+std::string CollapseRelativeSegments(std::string_view path)
+{
+    // The overwhelmingly common case, and the reason this is cheap enough to run over every note
+    // of every compile: nothing to collapse means nothing to re-spell either.
+    if (!HasDotDotSegment(path))
+        return std::string { path };
+    return LexicallyNormal(path);
+}
+
+std::string LexicallyNormal(std::string_view path)
+{
+    bool const wasNative = path.contains('\\');
+    std::string folded { path };
+    std::ranges::replace(folded, '\\', '/');
+
+    // The anchor is held aside so the lexical pass never sees it: a drive root cannot be ascended
+    // past, and neither can a UNC share -- `\\host\share` is ONE root, so `\\host\share\..\x.h`
+    // is `\\host\share\x.h`, which is where Windows resolves it. Held as the host alone, the
+    // share was an ordinary segment and `..` climbed to `\\host\x.h`, a different file.
+    std::string_view tail { folded };
+    std::string_view anchor;
+    if (tail.starts_with("//") && !tail.starts_with("///"))
+    {
+        // `//host/share`, and the tail starts at the separator after it -- or is empty, for a
+        // bare share, which has nothing to collapse.
+        auto const hostEnd = tail.find('/', 2);
+        auto const shareEnd = hostEnd == std::string_view::npos ? std::string_view::npos : tail.find('/', hostEnd + 1);
+        if (shareEnd == std::string_view::npos)
+            return std::string { path };
+        anchor = tail.substr(0, shareEnd);
+        tail.remove_prefix(shareEnd);
+    }
+    else if (tail.size() >= 2 && IsDriveLetter(tail[0]) && tail[1] == ':')
+    {
+        anchor = tail.substr(0, 2);
+        tail.remove_prefix(2);
+    }
+
+    auto const collapsed = LexicallyCollapsed(tail);
+
+    // A genuinely relative `../../x.hpp` has nothing lexical left to resolve. Returning the input
+    // rather than the rewrite keeps the byte-exactness promise for a caller who gained nothing.
+    if (HasDotDotSegment(collapsed))
+        return std::string { path };
+
+    auto rejoined = std::string { anchor } + collapsed;
+    if (wasNative)
+        std::ranges::replace(rejoined, '/', '\\');
+    return rejoined;
+}
+
 std::string CanonicalizeRegion(std::string_view text, Grammar grammar, Layout const& layout)
 {
     // Folded ONCE for the whole region rather than per span, which is where this
     // matters: the walkers below call `xform` once per path, and the roots are the
     // same for every one of them.
     auto const folded = FoldRoots(layout);
+    // `..` is collapsed BEFORE a span is matched against the roots (#1593). A driver reports
+    // `D:\proj\build\..\inc\a.hpp` for a header reached through a relative include, and matched
+    // as it stands that is `<BUILDTREE>/../inc/a.hpp`: a token naming a file the path does not
+    // name, which localizes into a consumer whose build tree sits elsewhere as a path to nothing.
+    //
+    // And a span whose collapsed form lies under NO root is stored as that collapsed spelling,
+    // never matched as it was written: `<SRCROOT>/../third/x.h` is the same token naming a file
+    // the path does not name, since it resolves against the CONSUMER's root depth. An absolute
+    // path outside every root names this machine's file whichever way it is spelled, and
+    // collapsed it at least names the file the compiler read.
     auto const xform = [&](std::string_view span) {
-        return CanonicalizeOne(span, layout, folded);
+        return CanonicalizeOne(CollapseRelativeSegments(span), layout, folded);
     };
     // The depfile grammar is multi-token per line, so it needs its own walker.
     if (grammar == Grammar::GccDepfile)

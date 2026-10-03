@@ -657,7 +657,7 @@ The wire version describes the *framing*; `CompileValueVersion`, the first byte
 of a stored blob, describes the *value format*. They are separate because a
 stored blob outlives any connection: the wire version is agreed per request,
 while the blob's version is discovered when it is decoded, however long after it
-was written. The launcher's cache key additionally carries an `objkey-v6` schema
+was written. The launcher's cache key additionally carries an `objkey-v7` schema
 tag; bumping it re-keys the cache, so stale entries miss and are rewritten rather
 than being served under rules they were not written by.
 
@@ -709,9 +709,15 @@ CompileValue {
 
 The object blob is opaque and never rewritten. Text regions are the compiler's
 captured stdout and stderr, and their grammar tells the server where the paths
-are — `/showIncludes` notes for MSVC drivers, Makefile depfile syntax for GNU
-ones. Only recognised path spans are rewritten; every other byte, including
-diagnostics the grammar does not match, is preserved verbatim.
+are. An MSVC driver's streams carry `/showIncludes` notes AND diagnostics -- the
+notes move between the two streams with the flag -- so both are tagged with one
+grammar that reads every line language such a stream holds: the note, the
+`<path>(<line>[,<col>]): ` diagnostic head, and the `In file included from`
+chain clang-cl writes on it. A GNU driver's streams carry diagnostics, and its
+dependency record is a third region in Makefile depfile syntax. Only recognised
+path spans are rewritten, a span's `..` segments collapsed first where the
+result lies under a root; every other byte, a caret's echoed source line
+included, is preserved verbatim.
 
 This asymmetry is the whole design: canonicalize on STORE, serve canonical on
 FETCH, localize on the client. The server stores exactly one representation of

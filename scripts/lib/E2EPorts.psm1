@@ -34,6 +34,11 @@
 
 Set-StrictMode -Version Latest
 
+# A fixture that draws a port inherits no FASTCACHE_* setting: importing this module
+# imports `E2EEnvironment.psm1`, which clears them. `-Force` so the clearing runs on
+# every import rather than only the first one in a session.
+Import-Module (Join-Path $PSScriptRoot "E2EEnvironment.psm1") -Force
+
 # The repository root, from this module's own location. Used only by the
 # self-test, which drives the consuming fixtures by path.
 $script:RepoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -726,6 +731,8 @@ function Invoke-E2EPortSelfTest {
         $listener.Stop()
     }
 
+    Invoke-E2EEnvironmentCases
+
     # A self-test that ran nothing is not a self-test that passed. Zero cases and
     # a clean tree produce byte-identical output otherwise.
     if ($script:SelfTestCases -lt 1) {
@@ -773,6 +780,44 @@ function Invoke-E2EPortSelfTest {
 # a host this case proves the refusal fired and does NOT prove a holder was named.
 #
 # @param held a port this process is currently listening on.
+# A fixture inherits no FASTCACHE_* (`E2EEnvironment.psm1`), driven the way a fixture
+# meets it: the variable EXPORTED before the fixture imports this module, the fixture's
+# own setting assigned after, and a stand-in compile -- a child process -- that reports
+# the environment it was started with.
+#
+# The control runs first and is not decoration: a stand-in that saw no exported
+# variable at all would satisfy "did not reach" while testing nothing.
+function Invoke-E2EEnvironmentCases {
+    $pwsh = (Get-Process -Id $PID).Path
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) "e2e-environment-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    $probe = Join-Path $dir "compile.ps1"
+    $fixture = Join-Path $dir "fixture.ps1"
+    Set-Content -Path $probe -Value @'
+Get-ChildItem Env: | Where-Object { $_.Name -like 'FASTCACHE_*' } | ForEach-Object { "$($_.Name)=$($_.Value)" }
+'@
+    Set-Content -Path $fixture -Value @'
+param([string]$Module, [string]$Probe)
+Import-Module $Module -Force
+$env:FASTCACHE_VERBOSE = "1"
+& (Get-Process -Id $PID).Path -NoProfile -File $Probe
+'@
+    try {
+        $env:FASTCACHE_SCHEDULER = "staged.invalid:6674"
+        $control = @(& $pwsh -NoProfile -File $probe)
+        Expect "control: a child started here sees an exported FASTCACHE_SCHEDULER" $true `
+            ([bool]($control -contains "FASTCACHE_SCHEDULER=staged.invalid:6674"))
+        $seen = @(& $pwsh -NoProfile -File $fixture -Module (Join-Path $PSScriptRoot "E2EPorts.psm1") -Probe $probe)
+        Expect "an inherited FASTCACHE_SCHEDULER does not reach a fixture's compile" $false `
+            ([bool]($seen | Where-Object { $_ -like "FASTCACHE_SCHEDULER=*" }))
+        Expect "the fixture's own FASTCACHE_VERBOSE, set after the import, does" $true `
+            ([bool]($seen -contains "FASTCACHE_VERBOSE=1"))
+    } finally {
+        Remove-Item Env:\FASTCACHE_SCHEDULER -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-E2EPortSiteCases([int]$held) {
     $pwshPath = (Get-Process -Id $PID).Path
     if (-not $pwshPath) {

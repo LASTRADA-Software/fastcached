@@ -190,10 +190,11 @@ TEST_CASE("The generation byte is pinned by value, not only by name")
     // like, and it is expected to be edited by a deliberate generation bump -- which
     // is exactly the moment somebody should have to think about it.
     //
-    // Generation 5 since #1270.
+    // Generation 7 since a span leaving every root is stored collapsed, a `) : ` head is read,
+    // clang-cl's GCC-format head joined `Grammar::MsvcStream`, and a UNC share became one anchor.
     auto const encoded = EncodeCompileValue(CompileValue {});
     REQUIRE_FALSE(encoded.empty());
-    CHECK(encoded.front() == std::byte { 5 });
+    CHECK(encoded.front() == std::byte { 7 });
 }
 
 TEST_CASE("DecodeCompileValue refuses a region count the frame cannot supply")
@@ -981,6 +982,132 @@ constexpr std::array ConformanceCorpus {
                       .grammar = Grammar::GccDiagnostics,
                       .producerEffect = RegionEffect::Preserves,
                       .consumerEffect = RegionEffect::Preserves },
+    // Generation 6: the MSVC family's streams carry notes AND diagnostics, one tag for both.
+    // Every line language `cl` writes on one stream, in the order it writes them: the echoed
+    // source name, a note, a header warning, an error, its `note:` continuation, a TU-level
+    // warning, a toolchain warning (outside both roots, so untouched) and a command-line
+    // warning with no location at all.
+    ConformanceCase { .name = "msvc stream: notes, warnings, an error and its note",
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(E:\ci\proj)",
+                      .consumerBuildTree = R"(E:\ci\proj\out)",
+                      .text = "a.cpp\r\n"
+                              "Note: including file: C:\\src\\proj\\inc\\probe.h\r\n"
+                              "C:\\src\\proj\\inc\\probe.h(4): warning C4100: 'x': unreferenced parameter\r\n"
+                              "C:\\src\\proj\\a.cpp(9,5): error C2065: 'y': undeclared identifier\r\n"
+                              "C:\\src\\proj\\a.cpp(3): note: see declaration of 'f'\r\n"
+                              "C:\\src\\proj\\a.cpp(2): warning C4101: 'z': unreferenced local variable\r\n"
+                              "C:\\Program Files (x86)\\MSVC\\include\\vector(10): warning C4996: 'q'\r\n"
+                              "cl : Command line warning D9002 : ignoring unknown option '/foo'\r\n",
+                      .grammar = Grammar::MsvcStream,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    // clang-cl writes `<path>(line,col): warning: ...` with no code, a GCC-style include chain
+    // in front of a header's diagnostic, and an indented `N | source` caret echo -- all on the
+    // MSVC stream, as measured with VS 18's clang-cl.
+    ConformanceCase { .name = "msvc stream: clang-cl's diagnostic shape",
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(E:\ci\proj)",
+                      .consumerBuildTree = R"(E:\ci\proj\out)",
+                      .text =
+                          "In file included from C:\\src\\proj\\a.cpp:1:\r\n"
+                          "C:\\src\\proj\\inc/probe.h(3,29): warning: unused parameter 'x' [-Wunused-parameter]\r\n"
+                          "    3 | inline int unused_param(int x) { return 0; }\r\n"
+                          "      |                             ^\r\n"
+                          "C:\\src\\proj\\out\\gen\\cfg.h(2,3): note: 'old' has been explicitly marked deprecated here\r\n",
+                      .grammar = Grammar::MsvcStream,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    // `/diagnostics:caret` puts SOURCE on the stream: the head is rewritten, the echoed line
+    // and its caret are not, even where the source quotes an in-root path and a location.
+    ConformanceCase { .name = "msvc stream: a caret source echo is left alone",
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(E:\ci\proj)",
+                      .consumerBuildTree = R"(E:\ci\proj\out)",
+                      .text = "C:\\src\\proj\\a.cpp(3,20): warning C4100: 'x': unreferenced parameter\r\n"
+                              "    Log(\"C:\\src\\proj\\a.h(3): \");\r\n"
+                              "                   ^\r\n"
+                              "C:\\src\\proj\\a.h(see Frob()): the header this reads\r\n",
+                      .grammar = Grammar::MsvcStream,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    // #1593: a span is `..`-collapsed before it meets the roots, so a header reached through the
+    // build tree canonicalizes under the source root -- and replays correctly into a consumer whose
+    // build tree is NOT under its source root, where `<BUILDTREE>/../inc` would name nothing.
+    ConformanceCase { .name = "a dot-dot span canonicalizes under the root it collapses into",
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(E:\ci\proj)",
+                      .consumerBuildTree = R"(E:\ci\build-x64)",
+                      .text = "Note: including file: C:\\src\\proj\\out\\..\\inc\\a.hpp\r\n"
+                              "C:\\src\\proj\\out\\..\\inc\\a.hpp(3): warning C4100: 'x'\r\n",
+                      .grammar = Grammar::MsvcStream,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    ConformanceCase { .name = "a depfile dot-dot dependency canonicalizes collapsed",
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/out",
+                      .text = "/home/dev/proj/build/u.o: /home/dev/proj/build/../inc/a.hpp \\\n"
+                              " /home/dev/proj/src/./b.hpp\n",
+                      .grammar = Grammar::GccDepfile,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    // A span that climbs OUT of every root once collapsed is stored as that collapsed absolute
+    // spelling: matched as written it was `<SRCROOT>/../third/x.h`, a token that resolves against
+    // the CONSUMER's root depth and so names a different file there (Job 2 review, I1).
+    ConformanceCase { .name = "a dot-dot span that leaves every root is stored collapsed and absolute",
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(E:\ci\proj)",
+                      .consumerBuildTree = R"(E:\ci\proj\out)",
+                      .text = "Note: including file: C:\\src\\proj\\..\\third\\x.h\r\n"
+                              "Note: including file: C:\\elsewhere\\a\\..\\x.h\r\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      // Stored as the collapsed absolute spelling, which carries no token: the
+                      // consumer localizes nothing, and replays the file the producer read.
+                      .consumerEffect = RegionEffect::Preserves },
+    // A UNC share is one root: a span climbing out of a checkout on a share stops AT the share,
+    // where Windows resolves it, never at the host (Job 2 review, M3).
+    ConformanceCase { .name = "a dot-dot span on a UNC share is never ascended past the share",
+                      .producerSourceRoot = R"(\\build\share\proj)",
+                      .producerBuildTree = R"(\\build\share\proj\out)",
+                      .consumerSourceRoot = R"(\\ci\share\proj)",
+                      .consumerBuildTree = R"(\\ci\share\proj\out)",
+                      .text = "Note: including file: \\\\build\\share\\proj\\..\\..\\x.h\r\n"
+                              "Note: including file: \\\\build\\share\\proj\\out\\..\\inc\\a.hpp\r\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    // The `#pragma message(__FILE__ "(" STR(__LINE__) ") : ...")` idiom's spaced head, which direct
+    // mode shares across checkouts (Job 2 review, I2), and clang-cl's GCC-format head under
+    // `-fdiagnostics-format=clang` (M4) -- both on the MSVC family's one stream.
+    ConformanceCase { .name = "msvc stream: the pragma-message head and clang-cl's GCC-format head",
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(E:\ci\proj)",
+                      .consumerBuildTree = R"(E:\ci\proj\out)",
+                      .text = "C:\\src\\proj\\inc\\probe.h(12) : warning: TODO fix this\r\n"
+                              "C:\\src\\proj\\inc\\probe.h:3:29: warning: unused parameter 'x'\r\n",
+                      .grammar = Grammar::MsvcStream,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    // clang-cl runs on POSIX too, so the grammar must hold under a POSIX layout.
+    ConformanceCase { .name = "msvc stream under a posix layout",
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "Note: including file: /home/dev/proj/inc/a.hpp\n"
+                              "/home/dev/proj/inc/a.hpp(7,3): warning: unused variable 'v' [-Wunused-variable]\n",
+                      .grammar = Grammar::MsvcStream,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
 };
 
 /// One generation of the stored-value contract: the `CompileValueVersion` it was
@@ -1038,7 +1165,18 @@ constexpr std::array StoredValueGenerations {
     // instead was an indented line that merely begins with the marker, which a
     // diagnostic region can carry and preprocessed source routinely does.
     StoredValueGeneration { .key = 4, .digest = "53089e7f32b6881cb354df3af4850c75f7fee50fed240c7ca5eaf3b448597edf" },
+    // Generation 5 is RETIRED: the MSVC family's two console streams were tagged
+    // `Grammar::ShowIncludes`, which rewrites note lines only, so every warning, error and
+    // `note:` a hit replayed named the checkout that STORED it. Generation 6 tags them
+    // `Grammar::MsvcStream`, notes AND diagnostics, and collapses `..` out of a span before
+    // matching the roots (#1593).
     StoredValueGeneration { .key = 5, .digest = "97d625c0408e91238872947738821f167c69baf82a22b348ff09b8ddc225461f" },
+    // Generation 6 is RETIRED (Job 2 review): a span leaving every root was matched as it was
+    // written, so `<SRCROOT>/../third/x.h` resolved against the CONSUMER's root depth; the
+    // `) : ` head and clang-cl's GCC-format head were not read; and a UNC collapse climbed past
+    // the share. It never left the branch that introduced it, and is retired anyway.
+    StoredValueGeneration { .key = 6, .digest = "648044ebb1e95a4ce9dc085b542ba818ab03426685595d8bfa726af8a6f4e60c" },
+    StoredValueGeneration { .key = 7, .digest = "d0d9b6a4bd49f2578c3bc23d12cb5c0355c441a54b4b740f013be91e71cf87ae" },
 };
 
 /// One corpus row's own contribution to a generation's conformance digest.
@@ -1188,10 +1326,141 @@ constexpr std::array Generation5Rows {
                 .digest = "16fe82ed9c6251e1bcbd244378e69d4fb03670b65d489e180bb4415f24517fcc" },
 };
 
+/// Generation 6's rows, frozen as this build produces them.
+constexpr std::array Generation6Rows {
+    RowDigest { .row = "posix showIncludes under both roots",
+                .digest = "04084ef0cad5f146d918ca37fc7ffcfbb8128beb57ef94692221baab0a047b34" },
+    RowDigest { .row = "windows showIncludes, mixed case, CRLF",
+                .digest = "a0d45d85a3f67faa43e671d6ddf13af5e293ba5726469645861c307f2f707d92" },
+    RowDigest { .row = "showIncludes final line with no newline",
+                .digest = "52c69b7c7c402954ba13832a22c963d854f22f72e2b81c38e63e9b63388c320c" },
+    RowDigest { .row = "showIncludes already carrying tokens is left alone",
+                .digest = "91478d116bdeae202dc6917ec44ec6a7886f2c14c441a5576caa36cb46dc9dde" },
+    RowDigest { .row = "msvc diagnostics, line and column",
+                .digest = "efb740a541c301a244c397606c3db8c8c73ca9ecf070f04efaf1305604a69bed" },
+    RowDigest { .row = "gcc depfile, target, continuations and escaped space",
+                .digest = "5f4aaf31c73fdeac0b5f77ef51e0ddad8b219d33efdcdabb7142dc9f013fef18" },
+    RowDigest { .row = "depfile under a drive-relative root",
+                .digest = "2755da51d0ebc3fa4c19d165a81af4ca7e39f7eecdf74c6ecad0eebebad5c78a" },
+    RowDigest { .row = "showIncludes under a UNC root",
+                .digest = "db3d8128b3c195bba429fce7992ebc8fb2d0e2874e75391e7378e1d4afc348b9" },
+    RowDigest { .row = "a bare root produces, and a bare root consumes",
+                .digest = "bbf1869228a44f96f2d847936a686b802ebf328d026e967c562ef89cb505d3e1" },
+    RowDigest { .row = "a bare drive root produces, and a bare drive root consumes",
+                .digest = "efcbe27a6580d08e1368974e1a590a610f26ee20bc16830737602fdfc2bc5f59" },
+    RowDigest { .row = "an untrimmed root produces, and an untrimmed root consumes",
+                .digest = "b1990a36ab4e2f9c8686cb552cde94c380c116def4e94597eb6ee17c55aaac90" },
+    RowDigest { .row = "a drive-relative root consumes",
+                .digest = "562dd3728ab0c7d6e9779b3153b85a83f37c225e5e1365e397e04ec58439ec72" },
+    RowDigest { .row = "a UNC root consumes", .digest = "2c0393f5a6e47fc2ae7c51a070d7568c449940a3e2f29c0ed2327bd9468ffb23" },
+    RowDigest { .row = "a bare drive root consumes",
+                .digest = "efcbe27a6580d08e1368974e1a590a610f26ee20bc16830737602fdfc2bc5f59" },
+    RowDigest { .row = "a localized producer normalizes its marker, and an English consumer matches it",
+                .digest = "3b1751d675da80bf2acd6b0a41783401b766473cc461273cdc7f957a11809a72" },
+    RowDigest { .row = "an English producer's value replays under a localized consumer's marker",
+                .digest = "f30c8e8bd2e7c9f8331e2f6e28d8ebb439183135c7853ea592d9e612317ae807" },
+    RowDigest { .row = "a depth-indented note canonicalizes, and its depth survives",
+                .digest = "7d1b1d3b9b514be952278c50571a56162ae791a2c07b75035ccfe29e5902c1e0" },
+    RowDigest { .row = "a line with blanks in front of the marker is not a note",
+                .digest = "dcc9ea6be024b2f6ad923fdb574803b14e441359e5f780553805a971ac6d4cfe" },
+    RowDigest { .row = "a diagnostic quoting the marker mid-line is not a note",
+                .digest = "bc27b766c90b989f262a9aba51a6ae05527447eb203e448ab89956d8f83f2ff7" },
+    RowDigest { .row = "empty region", .digest = "5216aebc3919a515bd5a1024983145174e22824f51136359855084c5cba7a3ab" },
+    RowDigest { .row = "gcc diagnostic under the source root",
+                .digest = "76cd93ac13343e6307a2f5708c1e3d37f9d03d18c54833d24784950fae500df1" },
+    RowDigest { .row = "gcc include chain, header and continuation",
+                .digest = "d6d2d221079a05e3c856bfd32476aa0e79906ba3535b8c48c87a788ea7c268bc" },
+    RowDigest { .row = "gcc diagnostic in a toolchain header is untouched",
+                .digest = "a1d38c13165897a87e03abc86cbb6649f687184b9d9cf8113dbc343e6c0805fc" },
+    RowDigest { .row = "msvc stream: notes, warnings, an error and its note",
+                .digest = "4c00a8d1af60b34b7b959687474daf321f621b97b0a9655b835ccecbff8fe451" },
+    RowDigest { .row = "msvc stream: clang-cl's diagnostic shape",
+                .digest = "b529b97396c384f06442ee93d3142675e76c4f688bbf58ed896061399dde4543" },
+    RowDigest { .row = "msvc stream: a caret source echo is left alone",
+                .digest = "d1c6139a4f835921e8efe3e0dd51e6942459419779ecb8a199b06e0afa74a43e" },
+    RowDigest { .row = "a dot-dot span canonicalizes under the root it collapses into",
+                .digest = "444b8595d0af779981ab842ef91ad4966f23bcd8439397117de01629d0170f6b" },
+    RowDigest { .row = "a depfile dot-dot dependency canonicalizes collapsed",
+                .digest = "afa9e104071321157f0186a2819dc2bfc7e2715effecafeefc3348d20c58b232" },
+    RowDigest { .row = "a dot-dot span that leaves every root is matched as spelled",
+                .digest = "c2d141c697ee3253ab4a11d0a37b5a29b0297cf8ece169416954c963d93f6987" },
+    RowDigest { .row = "msvc stream under a posix layout",
+                .digest = "eb32a3e8faf242e9c882e779157cbc004003272ff5338f74d1bd1d1f08f71979" },
+
+};
+
+/// Generation 7's rows, frozen as this build produces them.
+constexpr std::array Generation7Rows {
+    RowDigest { .row = "posix showIncludes under both roots",
+                .digest = "3fc2dae041c521630d12a44a58dae0ca48a3b062edac850093bf8259fae5ded0" },
+    RowDigest { .row = "windows showIncludes, mixed case, CRLF",
+                .digest = "37d0feb195ac312857168a7b21352c6783c393e7b5c6124bd74ce60f579023f9" },
+    RowDigest { .row = "showIncludes final line with no newline",
+                .digest = "2a080166212395d37abb1b23c9817de9a4e4b8733616adac8d980df46ed82a3b" },
+    RowDigest { .row = "showIncludes already carrying tokens is left alone",
+                .digest = "06dd72af6d7710e9f11256553ed270aab0eae74bcecb2c44e5a9bb2ae3817d0e" },
+    RowDigest { .row = "msvc diagnostics, line and column",
+                .digest = "fe5d96c4f6e93376ec24d10d69897c5346caf8a2bf286002445c9afa25ec21d5" },
+    RowDigest { .row = "gcc depfile, target, continuations and escaped space",
+                .digest = "33b7e9ac1dfdfb3ecbdfc559a5b57d552ddced3771e0719c06602a47dfa1769e" },
+    RowDigest { .row = "depfile under a drive-relative root",
+                .digest = "7a839d1c9e33ff14ad4737cee9fb0386ebc189640b9d8183870cae811f99142a" },
+    RowDigest { .row = "showIncludes under a UNC root",
+                .digest = "22d6067776b37d7ed71f399ac6c46b79a8c3a86cd5ef232f68fffc0d45640c72" },
+    RowDigest { .row = "a bare root produces, and a bare root consumes",
+                .digest = "356c1a39a6ccb16b4cbca442284f66e729b66fc8668188e9095166d14e0f1889" },
+    RowDigest { .row = "a bare drive root produces, and a bare drive root consumes",
+                .digest = "840aed0960063592ee725e23c80c4d05f7f6dc98a817d8a815f6851ae5ab7aa6" },
+    RowDigest { .row = "an untrimmed root produces, and an untrimmed root consumes",
+                .digest = "94b13633855f7dd84aedc564ee975596b10278cccf097e40315106f9f2f2f86d" },
+    RowDigest { .row = "a drive-relative root consumes",
+                .digest = "1cd994df3c0c0ea9a8bf77e416113ab8a9ac112500c365472b3137fd7f393589" },
+    RowDigest { .row = "a UNC root consumes", .digest = "667985abe92c1803a9a8659d25118275e298a18d0b03cdf03393f3ed0ac6cec7" },
+    RowDigest { .row = "a bare drive root consumes",
+                .digest = "840aed0960063592ee725e23c80c4d05f7f6dc98a817d8a815f6851ae5ab7aa6" },
+    RowDigest { .row = "a localized producer normalizes its marker, and an English consumer matches it",
+                .digest = "2d5c2422ba9343d681170570560351d6813959f5d4da81fa08f9f92f36f9ddd0" },
+    RowDigest { .row = "an English producer's value replays under a localized consumer's marker",
+                .digest = "938857153d28535cdc4a5c5285fbdabbadb21a8892663af51f8416692889a10d" },
+    RowDigest { .row = "a depth-indented note canonicalizes, and its depth survives",
+                .digest = "b8c827f94f541a7e816eeb3d9de88e3b4dad26bbc14be92408e107cd0e37607b" },
+    RowDigest { .row = "a line with blanks in front of the marker is not a note",
+                .digest = "90a1ba94942a1604f1373bbdfbb56365c4673c8f5c8cbc834fd6c3274b0b9fd2" },
+    RowDigest { .row = "a diagnostic quoting the marker mid-line is not a note",
+                .digest = "6b78d2e4dab1cd61f257844b5a994cf1be6ec21d700ae64a94da474fb0869bb5" },
+    RowDigest { .row = "empty region", .digest = "6d946b89040574ccf121eeda5effd5a76d0c4f9314b951db11ff09641cf5762a" },
+    RowDigest { .row = "gcc diagnostic under the source root",
+                .digest = "4a7be47a603147d56bf4cc55121040ecb589df7bce997a638837d827e16008b4" },
+    RowDigest { .row = "gcc include chain, header and continuation",
+                .digest = "b072f2a832629da02578e9b5ff3f24384f12c842083fe92ff8c96b6237033a45" },
+    RowDigest { .row = "gcc diagnostic in a toolchain header is untouched",
+                .digest = "c382f49cab00b1bce9ec022a4909ef22270c1ebece3365fdc791113e0435d04f" },
+    RowDigest { .row = "msvc stream: notes, warnings, an error and its note",
+                .digest = "d5d4646129b9721e30da808ca3248320bbd820f107a4667f037a84117f5c8223" },
+    RowDigest { .row = "msvc stream: clang-cl's diagnostic shape",
+                .digest = "20a5a35868a416f8125c27e5cb40069612aa7dd69d77b0c38a808e251e8999d5" },
+    RowDigest { .row = "msvc stream: a caret source echo is left alone",
+                .digest = "eed857cb4255f0b5c323fffdf4c5ba1126e6b147dfc0627571023694dce895b3" },
+    RowDigest { .row = "a dot-dot span canonicalizes under the root it collapses into",
+                .digest = "16c630db0768a491e436f76912903301300f35e4a66628a273b8bad91cd55447" },
+    RowDigest { .row = "a depfile dot-dot dependency canonicalizes collapsed",
+                .digest = "fd2199d14f4cc58a61d5e177d2abf37073af71b1d563245948c8e482ff5c1bd5" },
+    RowDigest { .row = "a dot-dot span that leaves every root is stored collapsed and absolute",
+                .digest = "762ecd4244fd95a5430d315d4fa4b3523bbdf7a06b9f35410c699a8ebfdeb3ac" },
+    RowDigest { .row = "a dot-dot span on a UNC share is never ascended past the share",
+                .digest = "a3af5e2f0c8236f585a465d4129a6ac28a3b65314bdcf5d70d2010aac2938a35" },
+    RowDigest { .row = "msvc stream: the pragma-message head and clang-cl's GCC-format head",
+                .digest = "ad0b8f3c0642ba8383ed86243e68693f019dbfe8d1e3ba335fb291f78c696ba0" },
+    RowDigest { .row = "msvc stream under a posix layout",
+                .digest = "d15f021fcd72f9ed25404338a235ab4c6334ba9d9a5239148865adf58189a891" },
+};
+
 /// Every generation frozen per row, oldest first.
 constexpr std::array FrozenGenerations {
     FrozenGeneration { .rows = Generation4Rows, .generation = 4 },
     FrozenGeneration { .rows = Generation5Rows, .generation = 5 },
+    FrozenGeneration { .rows = Generation6Rows, .generation = 6 },
+    FrozenGeneration { .rows = Generation7Rows, .generation = 7 },
 };
 
 /// What a bump CLAIMS it changed.
@@ -1204,8 +1473,8 @@ constexpr std::array FrozenGenerations {
 struct GenerationBump
 {
     std::span<std::string_view const> changedRows; ///< Rows this bump says it moved.
-    std::uint8_t from;                             ///< The generation left behind.
-    std::uint8_t to;                               ///< The generation adopted.
+    std::uint8_t from {};                          ///< The generation left behind.
+    std::uint8_t to {};                            ///< The generation adopted.
 };
 
 /// Every bump between adjacent frozen generations.
@@ -1245,9 +1514,78 @@ constexpr std::array ChangedBy4To5 = std::to_array<std::string_view>({
     "gcc diagnostic in a toolchain header is untouched",
 });
 
+/// The 5-to-6 row, by the argument the 4-to-5 row states: the leading byte moves every row
+/// the two generations share, so the claim is all of them. The eight rows generation 6 adds
+/// are ARRIVALS, the corpus widening to cover what moved: five for `Grammar::MsvcStream` -- a
+/// tag a generation-5 build refuses outright, so no generation-5 row could have exercised it --
+/// and three for #1593's collapse, whose inputs no generation-5 row carried.
+constexpr std::array ChangedBy5To6 = std::to_array<std::string_view>({
+    "posix showIncludes under both roots",
+    "windows showIncludes, mixed case, CRLF",
+    "showIncludes final line with no newline",
+    "showIncludes already carrying tokens is left alone",
+    "msvc diagnostics, line and column",
+    "gcc depfile, target, continuations and escaped space",
+    "depfile under a drive-relative root",
+    "showIncludes under a UNC root",
+    "a bare root produces, and a bare root consumes",
+    "a bare drive root produces, and a bare drive root consumes",
+    "an untrimmed root produces, and an untrimmed root consumes",
+    "a drive-relative root consumes",
+    "a UNC root consumes",
+    "a bare drive root consumes",
+    "a localized producer normalizes its marker, and an English consumer matches it",
+    "an English producer's value replays under a localized consumer's marker",
+    "a depth-indented note canonicalizes, and its depth survives",
+    "a line with blanks in front of the marker is not a note",
+    "a diagnostic quoting the marker mid-line is not a note",
+    "empty region",
+    "gcc diagnostic under the source root",
+    "gcc include chain, header and continuation",
+    "gcc diagnostic in a toolchain header is untouched",
+});
+
+/// The 6-to-7 row: the leading byte moves every row the two generations share, so the claim is
+/// all of them. One row DEPARTS and returns under a new name -- "a dot-dot span that leaves
+/// every root" is matched as spelled no more, which is the point of the bump -- and two ARRIVE:
+/// the pragma-message and GCC-format heads on the MSVC stream, and the UNC share.
+constexpr std::array ChangedBy6To7 = std::to_array<std::string_view>({
+    "posix showIncludes under both roots",
+    "windows showIncludes, mixed case, CRLF",
+    "showIncludes final line with no newline",
+    "showIncludes already carrying tokens is left alone",
+    "msvc diagnostics, line and column",
+    "gcc depfile, target, continuations and escaped space",
+    "depfile under a drive-relative root",
+    "showIncludes under a UNC root",
+    "a bare root produces, and a bare root consumes",
+    "a bare drive root produces, and a bare drive root consumes",
+    "an untrimmed root produces, and an untrimmed root consumes",
+    "a drive-relative root consumes",
+    "a UNC root consumes",
+    "a bare drive root consumes",
+    "a localized producer normalizes its marker, and an English consumer matches it",
+    "an English producer's value replays under a localized consumer's marker",
+    "a depth-indented note canonicalizes, and its depth survives",
+    "a line with blanks in front of the marker is not a note",
+    "a diagnostic quoting the marker mid-line is not a note",
+    "empty region",
+    "gcc diagnostic under the source root",
+    "gcc include chain, header and continuation",
+    "gcc diagnostic in a toolchain header is untouched",
+    "msvc stream: notes, warnings, an error and its note",
+    "msvc stream: clang-cl's diagnostic shape",
+    "msvc stream: a caret source echo is left alone",
+    "a dot-dot span canonicalizes under the root it collapses into",
+    "a depfile dot-dot dependency canonicalizes collapsed",
+    "msvc stream under a posix layout",
+});
+
 /// Every bump between adjacent frozen generations.
 constexpr std::array GenerationBumps {
     GenerationBump { .changedRows = ChangedBy4To5, .from = 4, .to = 5 },
+    GenerationBump { .changedRows = ChangedBy5To6, .from = 5, .to = 6 },
+    GenerationBump { .changedRows = ChangedBy6To7, .from = 6, .to = 7 },
 };
 
 static_assert(GenerationBumps.size() + 1 == FrozenGenerations.size(),

@@ -147,6 +147,7 @@ endif()
 # distinctly from a miss" be a test rather than a hope.
 set(_fc_cc_sources
     CmdLine.cpp
+    AtomicFile.cpp
     CodecEnvelope.cpp
     CompileJob.cpp
     LauncherCli.cpp
@@ -162,11 +163,13 @@ set(_fc_cc_sources
     MarkerDiscovery.cpp
     NotePathCollapse.cpp
     ObjectEquivalence.cpp
+    ObjectSections.cpp
     ParallelFor.cpp
     PathResolve.cpp
     RefusalNotice.cpp
     ReplayGuard.cpp
     ReachabilityMemo.cpp
+    RootBinding.cpp
     RootReconciler.cpp
     Stats.cpp
     TicketCredentials.cpp
@@ -279,6 +282,7 @@ if(FASTCACHED_BUILD_TESTS)
     add_executable(fastcache-cc-tests
         test_main.cpp
         ${_fc_cc_sources}
+        AtomicFile_test.cpp
         CacheDecision_test.cpp
         CmdLine_test.cpp
         CompileJob_test.cpp
@@ -290,6 +294,7 @@ if(FASTCACHED_BUILD_TESTS)
         CacheProtocol_test.cpp
         HitVerification_test.cpp
         ObjectEquivalence_test.cpp
+        ObjectSections_test.cpp
         CompileCorrelation_test.cpp
         ReactorExchange_test.cpp
         Dispatch_test.cpp
@@ -301,6 +306,8 @@ if(FASTCACHED_BUILD_TESTS)
         RefusalNotice_test.cpp
         ReplayGuard_test.cpp
         ReachabilityMemo_test.cpp
+        RootBinding_test.cpp
+        StreamGrammar_test.cpp
         RootReconciler_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp

@@ -1797,12 +1797,15 @@ if(_fc_cache_chosen)
     # all. `.agent/rules/compile-cache.md` records that as an accepted cost.
     #
     # `-fdebug-prefix-map` and not `-ffile-prefix-map`, which also implies
-    # `-fmacro-prefix-map` and would rewrite `__FILE__`. That buys nothing here:
-    # the preprocessor expands `__FILE__` and the cache key hashes preprocessed
-    # output raw, so whenever the expansion is checkout-dependent it is
-    # checkout-dependent in the hashed text too and the two checkouts never share
-    # a key. Changing program-visible strings to fix a defect that cannot occur is
-    # a bad trade.
+    # `-fmacro-prefix-map` and would rewrite `__FILE__` -- in the preprocessed text
+    # the launcher's key is taken over, which the real compile would then not
+    # produce. Program-visible file names are not this module's to fix, and the
+    # launcher does not need it to: the preprocessed key alone sees a `__FILE__`
+    # expansion, while the direct-mode key never does and `std::source_location`
+    # reaches no key at all, so `fastcache-cc` reads the OBJECT instead and keys an
+    # object naming its checkout apart (`apps/fastcache-cc/RootBinding.hpp`). This
+    # comment used to say two checkouts never share a key while their `__FILE__`
+    # strings differ; that was true of one key out of the three a hit can come from.
     #
     # The mapping MUST be identical on every machine sharing the cache, or two
     # producers write different objects. That is not left as advice: the launcher

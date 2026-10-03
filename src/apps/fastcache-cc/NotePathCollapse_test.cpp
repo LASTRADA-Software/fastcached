@@ -16,95 +16,10 @@ using PathCanon::Grammar;
 namespace
 {
 
-// The shape and the magnitude of the report, rebuilt from generic names: a chain of nested
-// relative includes where each hop appends `../..` to the TEXTUAL path of its includer, ending in
-// a run that climbs out of the module. Mixed separators are deliberate -- the `-I` roots arrive
-// spelled with backslash and the `#include` bodies with forward slash, and a driver echoes both
-// halves as it found them. The prefix is 60 bytes, so the whole is 299 and the collapse is 88:
-// the figures measured on the build that prompted this.
-constexpr std::string_view MeasuredPrefix = R"(D:\build-agent\workspace-00007\a1b2c3d4e5\3\example\project\)";
-
-constexpr std::string_view MeasuredTail =
-    R"(src\Graphics\Shared\Common\../../Sampling/View\../../Rendering/Raster/Core\../..)"
-    R"(/Core\../../Geometry/Core\../../Shared/Core\../../Blending/Core\../../Shading/Pa)"
-    R"(lette/Core\../../Sample/Common\../../../../Platform\../Graphics/GlyphRaster.hpp)";
-
 // `cl` is not the only spelling of the prefix; a localized toolchain has its own.
 constexpr std::string_view GermanMarker = "Hinweis: Einlesen der Datei:";
 
 } // namespace
-
-// ---------------------------------------------------------------------------
-// CollapseRelativeSegments -- the path rule
-
-TEST_CASE("The measured 299-byte note path collapses under Ninja's limit", "[note-path-collapse]")
-{
-    auto const input = std::string { MeasuredPrefix } + std::string { MeasuredTail };
-    auto const collapsed = CollapseRelativeSegments(input);
-
-    // Pinned as their own checks: a fixture that drifts under 260 stops testing the thing it
-    // exists for, and would keep passing while doing it.
-    CHECK(input.size() == 299);
-    CHECK(collapsed.size() == 88);
-    CHECK(collapsed == std::string { MeasuredPrefix } + R"(src\Graphics\GlyphRaster.hpp)");
-}
-
-TEST_CASE("A path with nothing to collapse comes back byte-identical", "[note-path-collapse]")
-{
-    // Mixed separators are the shape a driver really emits, and they must not be re-spelled just
-    // because the path passed through here.
-    constexpr std::string_view mixed = R"(D:\ci\src\inc/h1.h)";
-    CHECK(CollapseRelativeSegments(mixed) == mixed);
-
-    // `..` that is not a SEGMENT. A `contains("..")` test would take the slow path and hand back a
-    // uniformly re-separated spelling for no reason at all.
-    constexpr std::string_view dotsInName = R"(D:\ci\src\a..b\inc/h1.h)";
-    CHECK(CollapseRelativeSegments(dotsInName) == dotsInName);
-}
-
-TEST_CASE("Dots inside a name do not block a real collapse elsewhere in the path", "[note-path-collapse]")
-{
-    // This is what pins `..` being tested as a SEGMENT rather than as a substring, and it is the
-    // only shape that can: a path with nothing to collapse survives a substring test unharmed,
-    // because the step-6 bail then returns the input and the output is right for the wrong reason.
-    // Here the two shapes sit in one path, so a substring test bails on `a..b` and silently leaves
-    // the genuine `tmp\..` uncollapsed.
-    CHECK(CollapseRelativeSegments(R"(D:\ci\src\a..b\tmp\..\x.hpp)") == R"(D:\ci\src\a..b\x.hpp)");
-}
-
-TEST_CASE("A drive root cannot be ascended past on either host", "[note-path-collapse]")
-{
-    // This is the POSIX-host case. On Windows `lexically_normal` already refuses to walk above a
-    // drive root, so a Windows-only run cannot see the anchor split being removed; on POSIX `D:` is
-    // an ordinary filename and `D:/../x.hpp` would otherwise normalize to a bare `x.hpp`.
-    CHECK(CollapseRelativeSegments(R"(D:\..\x.hpp)") == R"(D:\x.hpp)");
-    CHECK(CollapseRelativeSegments(R"(D:\ci\..\x.hpp)") == R"(D:\x.hpp)");
-}
-
-TEST_CASE("A UNC root keeps both of its leading separators", "[note-path-collapse]")
-{
-    // `lexically_normal` collapses a leading `//` on POSIX and keeps it on Windows, so the prefix is
-    // held aside rather than trusted to the pass.
-    CHECK(CollapseRelativeSegments(R"(\\build\share\a\..\b\x.hpp)") == R"(\\build\share\b\x.hpp)");
-}
-
-TEST_CASE("A leading dot-dot that nothing lexical can resolve is left alone", "[note-path-collapse]")
-{
-    // Returning the rewrite here would re-spell the separators of a path whose `..` is still there,
-    // which is a change with no benefit attached.
-    //
-    // The separators are deliberately MIXED. An all-backslash fixture cannot see this rule at all:
-    // the rewrite would fold to `/`, fail to collapse anything, and then restore every separator to
-    // `\`, arriving back at bytes identical to the input. The case would pass with the bail removed
-    // and would be testing nothing.
-    constexpr std::string_view relative = R"(..\../inc/a.hpp)";
-    CHECK(CollapseRelativeSegments(relative) == relative);
-}
-
-TEST_CASE("A forward-slash path stays forward-slash", "[note-path-collapse]")
-{
-    CHECK(CollapseRelativeSegments("/home/dev/proj/src/a/../b/x.hpp") == "/home/dev/proj/src/b/x.hpp");
-}
 
 // ---------------------------------------------------------------------------
 // CollapseNotePaths -- the region rule
@@ -175,6 +90,17 @@ TEST_CASE("Only the showIncludes grammar is length-limited", "[note-path-collaps
     CHECK(CollapseNotePaths(diagnostic, Grammar::ShowIncludes, IncludeNoteMarker) == diagnostic);
 }
 
+TEST_CASE("On an MSVC stream the notes collapse and the diagnostics do not", "[note-path-collapse]")
+{
+    // The stream grammar finds diagnostic paths too, and only a note is length-limited: a warning is
+    // printed rather than parsed, so its path stays exactly as the compiler spelled it.
+    std::string const stream = std::string { IncludeNoteMarker } + " " + R"(D:\ci\src\a\..\b\x.hpp)" + "\r\n"
+                               + R"(D:\ci\src\a\..\b\x.hpp(3): warning C4100: 'x': unreferenced parameter)" + "\r\n";
+    CHECK(CollapseNotePaths(stream, Grammar::MsvcStream, IncludeNoteMarker)
+          == std::string { IncludeNoteMarker } + " " + R"(D:\ci\src\b\x.hpp)" + "\r\n"
+                 + R"(D:\ci\src\a\..\b\x.hpp(3): warning C4100: 'x': unreferenced parameter)" + "\r\n");
+}
+
 TEST_CASE("The collapse never adds or removes a note", "[note-path-collapse]")
 {
     // The property the MaterializeHit ordering rule protects: the stale-hit guard must never start
@@ -195,18 +121,7 @@ TEST_CASE("A final note with no line terminator survives the rewrite", "[note-pa
           == std::string { IncludeNoteMarker } + " " + R"(D:\ci\src\b\x.hpp)");
 }
 
-TEST_CASE("Two spellings of one header become two identical notes", "[note-path-collapse]")
-{
-    // Accepted rather than missed. RenderShowIncludes dedups byte-exactly and runs BEFORE this, so
-    // two spellings survive as one entry each and collapse onto the same text. The record is
-    // redundant, never untruthful, and the local path has always emitted un-deduped per-site
-    // repeats anyway. Deduping after the collapse belongs with the ingest-side work.
-    std::vector<std::string> const deps { R"(D:\s\a\..\b\x.h)", R"(D:\s\b\x.h)" };
-    auto const rendered = RenderShowIncludes(deps, IncludeNoteMarker);
-    auto const collapsed = CollapseNotePaths(rendered, Grammar::ShowIncludes, IncludeNoteMarker);
-
-    auto const paths = ParseIncludePaths(collapsed);
-    REQUIRE(paths.size() == 2);
-    CHECK(paths[0] == R"(D:\s\b\x.h)");
-    CHECK(paths[1] == R"(D:\s\b\x.h)");
-}
+// "Two spellings of one header become two identical notes" was pinned here as accepted until
+// #1593 collapsed the dependency list where it enters. Its replacement asserts the opposite, at
+// that boundary: RootReconciler_test, "One header reached by two include chains is one note and
+// one depfile entry".

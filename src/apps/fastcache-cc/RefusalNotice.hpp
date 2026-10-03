@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "AtomicFile.hpp"
+
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <array>
@@ -82,15 +84,22 @@ inline constexpr std::chrono::seconds RefusalNoticeInterval { 300 };
 /// that cannot persist the stamp is one where suppressing the message would make it
 /// permanently silent, and this exists precisely to break a silence.
 ///
+/// The stamp is replaced through `WriteFileAtomically`, the launcher's one writer of the state
+/// directory, and read through `SharedReadFile`: a reader never meets half a stamp and never
+/// stops another launcher's replace.
+///
 /// @param stateDir Where to keep the stamp; empty when none could be resolved.
 /// @param endpoint The daemon that refused, so two daemons throttle separately.
 /// @param code The refusal.
 /// @param now The clock reading to compare and record.
+/// @param files The filesystem the stamp is replaced on.
+/// @param interval How long one announcement holds the next back.
 /// @return True when the caller should print.
 [[nodiscard]] bool ShouldAnnounceRefusal(std::filesystem::path const& stateDir,
                                          std::string_view endpoint,
                                          CompileCacheWire::ErrorCode code,
                                          std::chrono::system_clock::time_point now,
+                                         IAtomicWriteFiles& files,
                                          std::chrono::seconds interval = RefusalNoticeInterval);
 
 /// The line to print for a persistent refusal.

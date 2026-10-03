@@ -86,6 +86,8 @@ class ScopedStateDir
 
     [[nodiscard]] static std::optional<std::string> Current()
     {
+        // The tree's one environment reader, which the launcher compiles in: `std::getenv` is
+        // deprecated under the MSVC CRT, and clang-cl's analyser rejects it there.
         return FastCache::ReadEnvironmentVariable(VariableName);
     }
 
@@ -160,6 +162,55 @@ TEST_CASE("ToStringView round-trips every outcome token")
     CHECK(ToStringView(Outcome::Miss) == "MISS");
     CHECK(ToStringView(Outcome::Uncacheable) == "UNCACHEABLE");
     CHECK(ToStringView(Outcome::Unavailable) == "UNAVAILABLE");
+    CHECK(ToStringView(Outcome::VerifyMismatch) == "VERIFY-MISMATCH");
+}
+
+TEST_CASE("A hit the verifier rejected is recorded as its own outcome and never as a hit")
+{
+    // The verifier compiles to the SAME output path, so on a mismatch the build links the
+    // fresh object: the cache's was wrong. Recording that as a HIT counted every wrong
+    // object the verifier caught as a success.
+    CHECK(OutcomeOfServedHit(HitVerdict::Mismatched) == Outcome::VerifyMismatch);
+    // Every other verdict leaves the served object where the build uses it.
+    for (auto const verdict:
+         { HitVerdict::NotChecked, HitVerdict::Matched, HitVerdict::Inconclusive, HitVerdict::Unsupported })
+        CHECK(OutcomeOfServedHit(verdict) == Outcome::Hit);
+}
+
+TEST_CASE("A rejected hit round-trips through the log as itself")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::VerifyMismatch, "main", "a.cpp", 10));
+    auto const records = ParseLog("");
+    REQUIRE(records.size() == 1);
+    CHECK(records.front().outcome == Outcome::VerifyMismatch);
+}
+
+TEST_CASE("FormatReport names wrong objects and rates the cache against them")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+    AppendRecord(MakeRecord(Outcome::Miss, "main", "b.cpp", 200));
+    AppendRecord(MakeRecord(Outcome::VerifyMismatch, "main", "c.cpp", 400));
+
+    auto const report = FormatReport("");
+    CHECK(report.contains("compiles     : 3"));
+    // The cache ANSWERED all three, one of them wrongly, so the rate is one of three --
+    // not one of two, which is what leaving the wrong object out of the denominator reads.
+    CHECK(report.contains("33.3% of 3 cacheable"));
+    CHECK(report.contains("wrong object : 1"));
+    CHECK(report.contains("WRONG OBJECT SERVED"));
+
+    auto const html = FormatHtmlReport("");
+    CHECK(html.contains("wrong objects"));
+}
+
+TEST_CASE("A report with no rejected hit says nothing about wrong objects")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+    CHECK_FALSE(FormatReport("").contains("wrong object"));
+    CHECK_FALSE(FormatHtmlReport("").contains("wrong objects"));
 }
 
 TEST_CASE("RecordingFor names what an operator reads for each dispatch status")

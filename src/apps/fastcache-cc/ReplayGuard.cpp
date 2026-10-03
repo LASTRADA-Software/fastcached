@@ -36,9 +36,14 @@ namespace
     ///
     /// Both extractors are the ones direct mode already uses to build a manifest,
     /// so a path is recognized here exactly as it is there.
-    constexpr std::array<DependencyGrammar, 2> DependencyGrammars { {
+    ///
+    /// `Grammar::MsvcStream` reads its NOTES through the same extractor as
+    /// `ShowIncludes` and nothing else: the grammar also rewrites diagnostic paths,
+    /// which is the decision above for `MsvcDiagnostics` arriving by a second door.
+    constexpr std::array<DependencyGrammar, 3> DependencyGrammars { {
         { .grammar = PathCanon::Grammar::GccDepfile, .extract = &ParseDepFilePaths },
         { .grammar = PathCanon::Grammar::ShowIncludes, .extract = &ParseIncludePaths },
+        { .grammar = PathCanon::Grammar::MsvcStream, .extract = &ParseIncludePaths },
     } };
 
     /// Whether this machine is answerable for `path` existing. See the header for

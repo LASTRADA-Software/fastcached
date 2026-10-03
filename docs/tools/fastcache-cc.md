@@ -491,10 +491,14 @@ the identity probe is forced to English,
 ([#879](https://github.com/LASTRADA-Software/fastcached/issues/879)), so a value written
 by a generation-2 build is refused rather than replayed.
 
-The byte has moved twice since: to 4 for
-[#202](https://github.com/LASTRADA-Software/fastcached/issues/202), and to **5** for
+The byte has moved three times since: to 4 for
+[#202](https://github.com/LASTRADA-Software/fastcached/issues/202), to 5 for
 [#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270), which put back the
-half of the note anchor #891 gave away. Each of those is its own cold cache, and the
+half of the note anchor #891 gave away, and to **6**, where an MSVC-family compile's
+replayed warnings, errors and `note:` lines stopped naming the checkout that stored them
+and a stored path's `..` segments are collapsed
+([#1593](https://github.com/LASTRADA-Software/fastcached/issues/1593)). Each of those is
+its own cold cache, and the
 paragraph below applies to every one of them unchanged. **Expect one cold cache on the
 upgrade** — one, because a refused generation now falls through to the miss path and the
 STORE that follows overwrites the key with a value of this generation. A bump that
@@ -562,6 +566,43 @@ preprocessed key; a manifest records that key rather than a second copy of the
 object, so a direct hit follows one extra fetch instead of doubling the cached
 volume (which, since the memory tier keeps values uncompressed, would land on
 RAM where compression cannot help).
+
+### An object that names its checkout is not shared with another one
+
+The key is portable across checkouts by design, and a few things a compiler puts
+into an object are not: `__FILE__` expanded under an absolute source path (every
+CMake compile), `std::source_location`, MSVC's `assert` message. Those name the
+checkout that compiled the object, and served into another checkout they point
+assertion messages and log lines at a tree nobody is building. No key can see
+them -- the direct-mode key never sees the `__FILE__` expansion, and
+`source_location` is filled in after preprocessing -- so the launcher reads the
+**object** before storing it.
+
+An object whose program data names neither `FASTCACHE_SOURCE_DIR`,
+`FASTCACHE_BINARY_DIR` nor the compile's working directory is stored and shared
+exactly as before. One that names any of them is stored under a key that also
+folds in the directories it NAMES -- each absolute and resolved, so a relative
+export (`.`) identifies the checkout as well as an absolute one -- with a marker in
+its place under the ordinary key that lists them: the checkout that stored it hits
+it as usual, and any other checkout misses, compiles, and stores its own copy. Only
+what the object names is folded, so an object whose `__FILE__` names the source
+tree is still shared by a second build directory of the same checkout, and one
+naming the build directory is not. The working directory is looked for because it
+is what `cl /FC` makes a relative path absolute against, whatever the roots say. Debug records
+(`.debug$S`, DWARF) are not counted -- see
+[Debug paths in a replayed object](#debug-paths-in-a-replayed-object) -- so a debug
+build shares as much as it did. `FASTCACHE_VERBOSE` says which it was:
+`root-bound object (it names … in .rdata (UTF-16LE)); storing it under key=…` on
+the compile that stores, and `MISS key=… (root-bound: the cached object names its build-tree; …)` or
+`HIT key=… (root-bound: served from key=…)` on the ones after it.
+
+The scan errs on the side of calling an object bound, because the opposite mistake
+serves another checkout's paths: a spelling it over-recognises costs that
+translation unit its cross-checkout sharing and nothing else. Whatever cannot be
+read as bytes is always treated as bound: an LTO object, clang's coverage map
+(`-fcoverage-mapping`, which keeps the source's absolute path in a compressed
+stream), and any compressed section. A `?` where a root has a character the
+compiler's code page cannot hold (`cl` without `/utf-8`) is matched too.
 
 ### Why the dependency paths are in the key
 
@@ -829,6 +870,7 @@ ask.
 | `rejected (payload-too-large): …` | The object exceeded the daemon's `--storage-max-value`. Raise it, or accept that this TU will not cache. |
 | `rejected (…)` (other codes) | The daemon refused the command and said why; see [the error-code table](../protocols/compile-cache.md#error-codes). |
 | `could not write object on hit` | The object output path was not writable. |
+| `the cached object names its <parts>; this compile's differs, or its copy was evicted; compiled this one's own` | Not a fault, and still a miss. The object stored under this key names the checkout that compiled it -- a `__FILE__` or a `std::source_location` -- so it is [not shared](#an-object-that-names-its-checkout-is-not-shared-with-another-one), and this compile built and stored its own copy, which the next compile here hits. `<parts>` is what the object names, from `source-root`, `build-tree` and `working-directory`; an object naming only the build tree or the working directory also misses from a second build directory of the SAME checkout. The reason cannot say which part differed -- this end never sees the producer's -- and neither does the `MISS` trace line under `FASTCACHE_VERBOSE`, which carries the same text. A translation unit that shows up here from every checkout is one whose source keeps it from ever being shared across them; spelling its sources relatively AND compiling without `/FC` (which MSBuild turns on by default as "Use Full Paths", and which makes `cl` write the absolute path whatever the command line said), or not baking the file name into program data, is what changes that. |
 | `a worker answered about a different compile` | **A defect somewhere in the fleet, not a fleet declining to help.** The worker's reply did not belong to the request that asked for it — see [`correlation`](../protocols/compile-cache.md#distributed-execution). The object is refused unread and the translation unit is compiled locally, so the build is correct and the caching of it is unaffected (the outcome is still a miss). This is the one reason printed unconditionally rather than only under `FASTCACHE_VERBOSE`, and the line names the worker, the correlation this client expected and the one that arrived. Accepting such a reply would store a wrong object under a correct key and serve it to every other machine that fetches it, so there is no configuration that relaxes this. If it appears at all, find the machine the line names. |
 | `a reported dependency path is not text this host can read`, `a captured region names a path that is not text this host can read` | Deliberate, and Windows-only. `cl.exe` writes the paths in `/showIncludes` in the **console output** code page, while this launcher's own roots arrive as UTF-8 -- so a header under a non-ASCII directory can reach it as bytes it cannot read as text. Such a path prefix-matches no root, which would key a project header as toolchain content and serve a stale object under a zero exit code, so the compile is not cached at all. Reported as *uncacheable*, not as an error. The fix is the console: `chcp 65001` makes `cl` emit UTF-8 and this stops appearing. |
 
@@ -868,7 +910,7 @@ retrying, the other never will be:
 | Outcome | Meaning |
 |---|---|
 | *(silence)* | The cached object is the object this compiler produces. |
-| `WRONG OBJECT served for key …` | It is not. The message names what differed — a section such as `.text$mn` is stale code; `.debug$S` or `.chks64` is a foreign build path. The fresh object was used, so this build is unaffected. Find the machine that stored it. |
+| `WRONG OBJECT served for key …` | It is not. The message names what differed — a section such as `.text$mn` is stale code; `.debug$S` or `.chks64` is a foreign build path. The fresh object was used, so this build is unaffected. Find the machine that stored it. The compile is recorded as `VERIFY-MISMATCH` rather than `HIT` — in `invocations.log`, on the `FASTCACHE_VERBOSE` trace line, and as `wrong object` in `--show-stats`, which rates the hit rate against it — because the build did not use what the cache served. |
 | `could not verify the hit for key …` | The check did not complete: the fresh compile failed, or a file could not be read. Nothing is known about the cached object either way, and the next hit may well answer. |
 | `cannot verify hits for this toolchain …` | This build cannot lay out the object format its own compiler produced, so it can say nothing about any hit — not this one and not the next. A property of the toolchain, not a statement about your cache. |
 
@@ -1025,7 +1067,7 @@ Two things this is **not**:
   dependency record naming a path the consumer lacks. Project headers — the ones
   that actually move — are covered by the key, so this is now confined to the
   toolchain.
-- The cache key normalization is deliberately young (`objkey-v6`). Tune it
+- The cache key normalization is deliberately young (`objkey-v7`). Tune it
   against real developer↔CI hit rates before relying on it broadly. Bumping the
   schema re-keys the cache: existing entries miss once and are rewritten.
 - Localized path separators may be normalized to `/` in some segments. Ninja

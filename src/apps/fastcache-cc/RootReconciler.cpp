@@ -2,7 +2,10 @@
 #include "RootReconciler.hpp"
 
 #include <algorithm>
+#include <array>
+#include <functional>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -10,6 +13,124 @@
 
 namespace FastCache::Cc
 {
+
+namespace
+{
+
+    /// The roots a reconciler maps paths onto, and the part each one is.
+    struct ReconciledRoot
+    {
+        CheckoutPart part;
+        std::string PathCanon::Layout::* root;
+    };
+
+    constexpr std::array<ReconciledRoot, 2> ReconciledRoots { {
+        { .part = CheckoutPart::SourceRoot, .root = &PathCanon::Layout::sourceRoot },
+        { .part = CheckoutPart::BuildTree, .root = &PathCanon::Layout::buildTree },
+    } };
+
+    /// @param path A path. @param root A root, or empty.
+    /// @return Whether @p path spells @p root itself, as `PathCanon` compares roots.
+    [[nodiscard]] bool SpellsRoot(std::string_view path, std::string const& root)
+    {
+        if (root.empty())
+            return false;
+        PathCanon::Layout const alone { .sourceRoot = root, .buildTree = {} };
+        return PathCanon::Canonicalize(path, alone) == PathCanon::Canonicalize(root, alone);
+    }
+
+    /// @param path A path. @param root A root, or empty.
+    /// @return Whether @p path is @p root or lies below it, as `PathCanon` compares roots.
+    [[nodiscard]] bool LiesIn(std::string_view path, std::string const& root)
+    {
+        if (root.empty())
+            return false;
+        PathCanon::Layout const alone { .sourceRoot = root, .buildTree = {} };
+        return PathCanon::Canonicalize(path, alone) != path;
+    }
+
+    /// @param path A path, either separator. @param count How many components to drop.
+    /// @return @p path without its last @p count components and without a trailing
+    ///         separator -- except a drive's own root, `S:\`, which keeps it -- or nothing
+    ///         when too few components are left to name a directory.
+    [[nodiscard]] std::optional<std::string> WithoutTrailingComponents(std::string_view path, std::size_t count)
+    {
+        auto const isSeparator = [](char c) {
+            return c == '/' || c == '\\';
+        };
+        // `S:\` is a directory and `S:` is not: the second is the drive's CURRENT directory.
+        auto const isDriveRoot = [](std::string const& text) {
+            return text.size() == 3 && PathCanon::IsDriveLetter(text[0]) && text[1] == ':';
+        };
+        std::string prefix { path };
+        auto const trim = [&] {
+            while (prefix.size() > 1 && isSeparator(prefix.back()) && !isDriveRoot(prefix))
+                prefix.pop_back();
+        };
+        trim();
+        for ([[maybe_unused]] auto const step: std::views::iota(std::size_t { 0 }, count))
+        {
+            if (isDriveRoot(prefix))
+                return std::nullopt;
+            auto const separator = prefix.find_last_of("/\\");
+            if (separator == std::string::npos || separator == 0)
+                return std::nullopt;
+            auto const keepsDriveRoot = separator == 2 && prefix[1] == ':';
+            prefix.resize(keepsDriveRoot ? separator + 1 : separator);
+            trim();
+        }
+        return prefix;
+    }
+
+    /// @param a A spelling. @param b Another.
+    /// @return Whether they differ at most in separator style -- which `LexicallyNormal`'s
+    ///         own output does between a path and a prefix of it that has no `\`.
+    [[nodiscard]] bool SameSeparatorsAside(std::string_view a, std::string_view b)
+    {
+        auto const unified = [](char c) {
+            return c == '\\' ? '/' : c;
+        };
+        return std::ranges::equal(a, b, [&unified](char x, char y) { return unified(x) == unified(y); });
+    }
+
+    /// One prefix of a path as spelled, and its lexical normal form.
+    struct SpelledPrefix
+    {
+        std::string spelled;
+        std::string normal;
+    };
+
+    /// @param spelling A path as spelled. @return It and every ancestor, nearest first, each
+    ///         beside its lexical normal form.
+    [[nodiscard]] std::vector<SpelledPrefix> SpelledPrefixes(std::optional<std::string> spelling)
+    {
+        std::vector<SpelledPrefix> prefixes;
+        while (spelling.has_value())
+        {
+            auto normal = PathCanon::LexicallyNormal(*spelling);
+            auto next = WithoutTrailingComponents(*spelling, 1);
+            prefixes.push_back(SpelledPrefix { .spelled = std::move(*spelling), .normal = std::move(normal) });
+            spelling = std::move(next);
+        }
+        return prefixes;
+    }
+
+    /// The prefix of the spelling that IS @p ancestor: the LONGEST one whose normal form it
+    /// is, since only after the last such prefix does the rest of the spelling stay below
+    /// it -- `a\L\..\L\x` passes `a\L` twice, and the route continues from the second.
+    /// @param ancestor An ancestor of the spelling's normal form.
+    /// @param prefixes The spelling's prefixes, nearest first.
+    /// @return That prefix as spelled, or nothing when none normalizes to @p ancestor.
+    [[nodiscard]] std::optional<std::string> SpelledPrefixOf(std::string_view ancestor,
+                                                             std::span<SpelledPrefix const> prefixes)
+    {
+        for (auto const& prefix: prefixes)
+            if (SameSeparatorsAside(prefix.normal, ancestor))
+                return prefix.spelled;
+        return std::nullopt;
+    }
+
+} // namespace
 
 std::string WithoutTrailingSeparator(std::string root)
 {
@@ -109,10 +230,15 @@ std::string RootReconciler::Directory(std::string_view path)
     return Translate(path, Depth::Whole);
 }
 
-void RootReconciler::All(std::vector<std::string>& paths)
+void RootReconciler::DependencyList(std::vector<std::string>& paths)
 {
+    bool const windows = PathCanon::IsWindowsLayout(Layout());
     for (auto& path: paths)
-        path = Path(path);
+    {
+        path = PathCanon::CollapseRelativeSegments(Path(path));
+        if (windows)
+            std::ranges::replace(path, '/', '\\');
+    }
 }
 
 std::string RootReconciler::Region(std::string_view text, PathCanon::Grammar grammar, std::span<std::string const> preserve)
@@ -167,7 +293,136 @@ std::string RootReconciler::Translate(std::string_view original, Depth depth)
     auto const token = PathCanon::Canonicalize(resolved, _resolved);
     if (token == resolved)
         return std::string { original };
+
+    // Mapped only through a spelling the root scan will know, and that is ONE operation:
+    // the alias is recorded here or the path is not mapped at all. A mapping the list
+    // does not cover is how two build directories came to share a key while the scan
+    // judged their objects portable -- a WRONG hit -- so the fallback is to key the
+    // spelling as it stands, which costs sharing and nothing else.
+    if (!RecordAlias(original, depth))
+        return std::string { original };
     return PathCanon::Localize(token, _asGiven);
+}
+
+bool RootReconciler::RecordAlias(std::string_view original, Depth depth)
+{
+    // Walked UP the spelling, ancestor by ancestor, asking the filesystem about each: a
+    // count of components below the root cannot find the alias once the tail crosses a
+    // second link (`jx\L1\genlink` with `genlink` a junction inside the build tree), and
+    // that shape was mapped and never recorded. A file's own leaf is not asked about.
+    //
+    // And walked to the TOP, one root at a time: the nearest ancestor naming a root is not
+    // the only one. `jx\L1\srclink\src\gen`, with `jx\L1` a junction to build directory 1
+    // and `srclink` one inside it back to the source root, names the source root through
+    // `jx\L1\srclink` and build directory 1 through `jx\L1` above it. Stopping at the first
+    // bound the object to the source root alone, and build directory 2 was served a path
+    // spelled through build directory 1's link.
+    // So each root is looked for until it is found, and the walk ends when all are.
+    //
+    // And a root no ancestor resolves TO, but one resolves INTO, takes the highest such
+    // ancestor. `jx\L1` a junction to `b1\x` -- a subdirectory of the build tree -- with
+    // `srclink` inside it back to the source root: no ancestor is build directory 1, yet
+    // `jx\L1` is inside it, and the object is spelled through it. The FOURTH shape of one
+    // class, so the rule is stated as the class: for every root ANY ancestor resolves into,
+    // an ancestor is recorded for that root -- the lowest that resolves TO it, else the
+    // highest that resolves INTO it, which is the broadest needle and one entry rather than
+    // one per directory below it. `RootReconciler_test` checks it GENERATIVELY, over every
+    // composition of links it enumerates, rather than shape by shape.
+    //
+    // And each ancestor is recorded in BOTH spellings, because which one the object carries
+    // depends on the compiler's flags (measured): `cl` writes the `-I` spelling verbatim, `.`
+    // and `..` included, with no debug flag, and collapses it under `/Z7`, `/Zi`, `/ZI` or
+    // `/FC`; clang-cl writes it verbatim, and under `-Z7` both. Recorded only as `jx\L1`,
+    // `jx\zz\..\L1` was a needle a verbatim object never contains -- judged portable, and
+    // build directory 2 was served build directory 1's spelling (measured on clang-cl) -- and
+    // recorded only as spelled it is one a collapsed object never contains (`cl /FC`). The
+    // spelled prefix is DERIVED for each ancestor walked, and where it cannot be, or leads
+    // elsewhere than the normal form (a `..` after a link ascends from the TARGET wherever the
+    // filesystem resolves physically), the mapping is refused: the walk would have recorded a
+    // directory the path does not pass through.
+    auto const leaf = depth == Depth::Whole ? std::size_t { 0 } : std::size_t { 1 };
+    auto const prefixes = SpelledPrefixes(WithoutTrailingComponents(original, leaf));
+    auto spelling = WithoutTrailingComponents(PathCanon::LexicallyNormal(original), leaf);
+    std::array<bool, ReconciledRoots.size()> found {};
+    // The highest ancestor seen so far that resolves INTO each root, for a root nothing
+    // resolves TO -- in both spellings.
+    std::array<std::optional<SpelledPrefix>, ReconciledRoots.size()> into {};
+    // A root the layout does not name cannot be found, and is not waited for.
+    for (auto const index: std::views::iota(std::size_t { 0 }, ReconciledRoots.size()))
+        found[index] = (_resolved.*ReconciledRoots[index].root).empty();
+    auto const anyFound = [&found, this] {
+        return std::ranges::any_of(std::views::iota(std::size_t { 0 }, ReconciledRoots.size()), [&](std::size_t index) {
+            return found[index] && !(_resolved.*ReconciledRoots[index].root).empty();
+        });
+    };
+    // A root's own spelling, or an alias already on the list, needs no entry.
+    auto const covered = [this](SpelledPrefix const& ancestor, ReconciledRoot const& root) {
+        auto const listed = [&](std::string const& text) {
+            return SpellsRoot(text, _resolved.*root.root) || SpellsRoot(text, _asGiven.*root.root)
+                   || _aliases.Contains(root.part, text);
+        };
+        return listed(ancestor.normal) && listed(ancestor.spelled);
+    };
+    auto const record = [this](SpelledPrefix const& ancestor, ReconciledRoot const& root) {
+        for (auto const* text: std::array { &ancestor.normal, &ancestor.spelled })
+            if (!SpellsRoot(*text, _resolved.*root.root) && !SpellsRoot(*text, _asGiven.*root.root))
+                _aliases.Add(root.part, *text);
+    };
+    while (spelling.has_value() && !std::ranges::all_of(found, std::identity {}))
+    {
+        auto spelled = SpelledPrefixOf(*spelling, prefixes);
+        // No PRODUCTION input reaches this refusal, and no test reddens without it -- but not
+        // because it is unreachable in itself. A RELATIVE spelling reaches it: `a\..\..\L\x`
+        // keeps its surviving `..`, so `LexicallyNormal` hands it back as spelled, the walk
+        // comes to the ancestor `a\..`, and the only prefix of that name normalizes to `.`, so
+        // none matches (measured by rev-filemacro, with a resolver that maps `a\..\..\L`). The
+        // real resolver never gets it here: it hands a relative spelling back verbatim
+        // (`IsResolvable`), so `Translate` never maps one and this walk never runs for it. That
+        // premise belongs to the resolver, so this stays a refusal: under a resolver that maps
+        // relative paths an assertion would be a reachable abort, where this costs one miss.
+        if (!spelled.has_value())
+            return false;
+        SpelledPrefix const ancestor { .spelled = std::move(*spelled), .normal = *spelling };
+        std::optional<std::string> resolved;
+        auto const resolve = [&]() -> std::string const& {
+            if (!resolved.has_value())
+                resolved = WithoutTrailingSeparator(_resolver.ResolveDirectory(ancestor.normal));
+            return *resolved;
+        };
+        // Compared by where each LEADS, so an answer a resolver spells unnormalized -- one it
+        // could not resolve comes back as asked -- is not a disagreement by spelling alone.
+        auto const leadsTo = [](std::string const& answer) {
+            return WithoutTrailingSeparator(PathCanon::LexicallyNormal(answer));
+        };
+        if (!SameSeparatorsAside(ancestor.spelled, ancestor.normal)
+            && leadsTo(_resolver.ResolveDirectory(ancestor.spelled)) != leadsTo(resolve()))
+            return false;
+        for (auto const index: std::views::iota(std::size_t { 0 }, ReconciledRoots.size()))
+        {
+            if (found[index])
+                continue;
+            auto const& root = ReconciledRoots[index];
+            if (covered(ancestor, root))
+                found[index] = true;
+            else if (SpellsRoot(resolve(), _resolved.*root.root))
+            {
+                record(ancestor, root);
+                found[index] = true;
+            }
+            else if (LiesIn(resolve(), _resolved.*root.root))
+                into[index] = ancestor;
+        }
+        spelling = WithoutTrailingComponents(*spelling, 1);
+    }
+    for (auto const index: std::views::iota(std::size_t { 0 }, ReconciledRoots.size()))
+    {
+        auto const& candidate = into[index];
+        if (found[index] || !candidate.has_value())
+            continue;
+        record(*candidate, ReconciledRoots[index]);
+        found[index] = true;
+    }
+    return anyFound();
 }
 
 } // namespace FastCache::Cc

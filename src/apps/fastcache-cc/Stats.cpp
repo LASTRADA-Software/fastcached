@@ -12,7 +12,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -96,21 +95,6 @@ namespace
         std::ranges::replace(out, '\r', ' ');
         std::ranges::replace(out, '\n', ' ');
         return out;
-    }
-
-    /// This process's id, for a temp filename no concurrent writer will reuse.
-    ///
-    /// A `#if` because the OSes genuinely provide this differently rather than
-    /// spelling one call two ways. Used only to make a name unique -- nothing
-    /// depends on the value -- so it needs no injected seam, and a collision would
-    /// cost a rewritten state file, not correctness.
-    [[nodiscard]] std::uint64_t CurrentProcessId() noexcept
-    {
-#if defined(_WIN32)
-        return static_cast<std::uint64_t>(::GetCurrentProcessId());
-#else
-        return static_cast<std::uint64_t>(::getpid());
-#endif
     }
 
     /// The dispatch specifics as the log may hold them: printable text, and bounded.
@@ -466,6 +450,8 @@ namespace
         std::uint64_t unavailable {};
         std::uint64_t exitCodes {};      ///< Records that carry an exit code at all.
         std::uint64_t compilesFailed {}; ///< Of those, a non-zero one.
+        /// Hits `FASTCACHE_VERIFY` rejected; see `Outcome::VerifyMismatch`.
+        std::uint64_t verifyMismatches {};
 
         // Full sample sets, not running sums: the point of the distribution is the
         // shape (a bimodal miss profile means something an average hides).
@@ -503,7 +489,17 @@ namespace
 
         [[nodiscard]] std::uint64_t Total() const noexcept
         {
-            return hits + misses + uncacheable + unavailable;
+            return hits + misses + uncacheable + unavailable + verifyMismatches;
+        }
+
+        /// The compiles the cache ANSWERED, which is what a hit rate is rated against.
+        ///
+        /// A rejected hit is one of them -- the cache answered, wrongly -- so it counts
+        /// in the denominator and not in the numerator. One definition, because the text
+        /// and the HTML report both rate against it.
+        [[nodiscard]] std::uint64_t Servable() const noexcept
+        {
+            return hits + misses + verifyMismatches;
         }
 
         /// Sum the per-state dispatch counters whose row has @p column set.
@@ -587,6 +583,8 @@ namespace
             return Outcome::Miss;
         if (token == "UNCACHEABLE")
             return Outcome::Uncacheable;
+        if (token == "VERIFY-MISMATCH")
+            return Outcome::VerifyMismatch;
         return Outcome::Unavailable;
     }
 
@@ -1005,7 +1003,7 @@ namespace
         // Rate the cache against the compiles it could actually serve. Dividing by
         // every invocation blends "the cache did not have it" with "the cache was
         // unreachable", so an outage reads as a poor hit rate and hides its own cause.
-        auto const servable = tally.hits + tally.misses;
+        auto const servable = tally.Servable();
 
         out << "  compiles     : " << tally.Total() << '\n'
             << "  hits         : " << Colorize(std::to_string(tally.hits), palette.good, palette.reset) << "  ("
@@ -1021,6 +1019,10 @@ namespace
             out << "  unavailable  : " << Colorize(std::to_string(tally.unavailable), palette.bad, palette.reset) << "  ("
                 << Percent(tally.unavailable, tally.Total()) << " of all compiles -- "
                 << Colorize("CACHE NOT REACHED", palette.bad, palette.reset) << ")\n";
+        if (tally.verifyMismatches > 0)
+            out << "  wrong object : " << Colorize(std::to_string(tally.verifyMismatches), palette.bad, palette.reset)
+                << "  (hits FASTCACHE_VERIFY rejected -- " << Colorize("WRONG OBJECT SERVED", palette.bad, palette.reset)
+                << "; the fresh compile was used)\n";
 
         if (!tally.reasons.empty())
         {
@@ -1067,10 +1069,27 @@ std::string_view ToStringView(Outcome outcome) noexcept
             return "MISS";
         case Outcome::Uncacheable:
             return "UNCACHEABLE";
+        case Outcome::VerifyMismatch:
+            return "VERIFY-MISMATCH";
         case Outcome::Unavailable:
             break;
     }
     return "UNAVAILABLE";
+}
+
+Outcome OutcomeOfServedHit(HitVerdict verdict) noexcept
+{
+    switch (verdict)
+    {
+        case HitVerdict::Mismatched:
+            return Outcome::VerifyMismatch;
+        case HitVerdict::NotChecked:
+        case HitVerdict::Matched:
+        case HitVerdict::Inconclusive:
+        case HitVerdict::Unsupported:
+            break;
+    }
+    return Outcome::Hit;
 }
 
 DispatchRecording RecordingFor(DispatchStatus status, DeclineCause cause) noexcept
@@ -1129,37 +1148,6 @@ std::string_view ToStringView(DispatchOutcome outcome) noexcept
 std::filesystem::path StateDirectory()
 {
     return StateDirectoryImpl();
-}
-
-bool ReplaceStateFile(std::filesystem::path const& file, std::string_view text)
-{
-    auto temporary = file;
-    // The process id tells two launchers apart and the sequence number two writes of
-    // one process, whichever threads they run on.
-    static std::atomic<std::uint64_t> writes { 0 };
-    temporary += std::format(".{}.{}.tmp", CurrentProcessId(), writes.fetch_add(1, std::memory_order_relaxed));
-    bool written = false;
-    {
-        std::ofstream out { temporary, std::ios::binary | std::ios::trunc };
-        if (out)
-        {
-            out.write(text.data(), static_cast<std::streamsize>(text.size()));
-            out.flush();
-            written = out.good();
-        }
-    }
-
-    std::error_code ec;
-    if (!written)
-    {
-        std::filesystem::remove(temporary, ec);
-        return false;
-    }
-    std::filesystem::rename(temporary, file, ec);
-    if (!ec)
-        return true;
-    std::filesystem::remove(temporary, ec);
-    return false;
 }
 
 std::string LogPath()
@@ -1307,6 +1295,9 @@ namespace
                         break;
                     case Outcome::Unavailable:
                         ++tally->unavailable;
+                        break;
+                    case Outcome::VerifyMismatch:
+                        ++tally->verifyMismatches;
                         break;
                 }
                 if (!record.detail.empty())
@@ -1533,7 +1524,7 @@ namespace
                 ++bucket.hits;
                 ++bucket.servable;
             }
-            else if (record.outcome == Outcome::Miss)
+            else if (record.outcome == Outcome::Miss || record.outcome == Outcome::VerifyMismatch)
                 ++bucket.servable;
         }
         return { byDay.begin(), byDay.end() };
@@ -1790,7 +1781,7 @@ std::string FormatHtmlReport(std::string_view groupFilter)
         return "fastcache-cc: no records for prefetch group '" + std::string { groupFilter } + "'.\n";
     }
 
-    auto const servable = overall.hits + overall.misses;
+    auto const servable = overall.Servable();
     auto const hitRate = Percent(overall.hits, servable);
 
     std::ostringstream out;
@@ -1830,6 +1821,10 @@ std::string FormatHtmlReport(std::string_view groupFilter)
     AppendTallyCard(out, "misses", overall.misses, "miss");
     AppendTallyCard(out, "uncacheable", overall.uncacheable, "uncache");
     AppendTallyCard(out, "unavailable", overall.unavailable, "bad");
+    // Only when there is one, like the text report's line: a card reading zero on every
+    // dashboard of a machine that never verifies would teach a reader to skip it.
+    if (overall.verifyMismatches > 0)
+        AppendTallyCard(out, "wrong objects", overall.verifyMismatches, "bad");
     out << "</div>";
 
     out << R"(<div class="panel"><div class="panel-title">hit rate over time</div>)" << RenderTrendSvg(records) << "</div>";

@@ -40,61 +40,42 @@ namespace FastCache::Cc
 /// check, via `GetFullPathNameA`. Collapsing before the check rather than after changes no
 /// dependency edge -- it only stops a path being refused for a length it does not really have.
 ///
-/// ## Why the EMIT side only
+/// ## Both sides, since #1593
 ///
-/// Every byte here goes to a build system; none of it goes to the cache. The store side reads
-/// the untouched streams a few lines further down (`main.cpp` around the `storedOut`/`storedErr`
-/// pair), and that separation is the whole design: canonicalizing at `RootReconciler::Path` --
-/// the funnel `.agent/rules/compile-cache.md` names -- would feed the key, the manifest and the
-/// stored regions, which is a `CompileValueVersion` bump, a conformance-corpus row and a
-/// `GenerationBumps` entry, costing every fleet one cold compile cache (#879, #891). The ingest
-/// side is deferred to its own ticket so that bump is paid once, with company.
+/// #1592 collapsed the EMIT side only -- the bytes handed to a build system -- and deferred the
+/// ingest side so the stored-value bump it needs would be paid once, with company. It rode value
+/// generation 6, and the ingest side is now two places, each doing it once:
 ///
-/// The invariant, stated so a later reader can check it in one pass: **every byte fastcached
-/// hands a build system has its note paths collapsed; every byte it hands the cache does not.**
+/// - **The probe's dependency list**, collapsed at the probe boundary (`RootReconciler::DependencyList`,
+///   the one call every dependency list makes). It feeds the key's neighbours, the manifest and the
+///   dispatch path's depfile and notes, so one header reached by two include chains has ONE
+///   spelling in all of them -- and `RenderShowIncludes`' byte-exact dedup, which ran before any
+///   collapse, now sees two spellings of one header as one. The key itself does not move: it
+///   hashes `LexicalForm`, which collapsed already.
+/// - **The stored regions**, collapsed by the SERVER: `PathCanon::CanonicalizeRegion` collapses a
+///   span before matching the roots. The launcher still sends the streams as the compiler wrote
+///   them, which is what keeps "every server canonicalizes identically" true by construction.
 ///
-/// ## Why a fourth normalizer
+/// The invariant, stated so a later reader can check it in one pass: **every note path fastcached
+/// hands a build system is collapsed; every dependency list it carries is collapsed wherever a
+/// collapse is lexically possible; and every stored path is collapsed wherever the collapse lands
+/// under a root.** The last is narrower on purpose: a stored path outside every root is replayed
+/// on another machine as the producer spelled it, so the server leaves its spelling alone.
 ///
-/// Three already exist and none of them fits this half of the problem:
+/// ## The path rule is PathCanon's
+///
+/// `PathCanon::CollapseRelativeSegments` is the one lexical `..` collapse, and it is in the
+/// library rather than here because the servers' canonicalizer uses it too. It is host-neutral AND
+/// separator-preserving AND byte-exact when there is nothing to collapse, which none of the other
+/// normalizers is:
 ///
 /// - `NormalizePath` (`DirectManifest.hpp`) preserves native separators, but on a POSIX host it
 ///   does not collapse a Windows path at all -- `std::filesystem` treats `\` as a separator only
-///   on a Windows host. `NormalizeForLayout` corrects the separator afterwards, which as its own
-///   comment says cannot recover a collapse that did not occur.
+///   on a Windows host.
 /// - `LexicalForm` (`DependencyProbe.cpp`) is host-neutral but folds to `/` by contract, which on
-///   the emit side would rewrite the separators of every note on the dominant path for no
-///   benefit. It is also a KEY-path helper: sharing it would mean an edit made for the emit side
-///   silently moving the cache key.
-///
-/// `DirectManifest.hpp` already blesses that divergence in as many words -- "not duplicates of
-/// one rule but answers to two different halves of it". This is a third half: host-neutral AND
-/// separator-preserving AND byte-exact when there is nothing to collapse.
-
-/// Collapse `..` segments out of one path, lexically, preserving how it was spelled.
-///
-/// Byte-exact when there is nothing to collapse, which is the overwhelmingly common case: a path
-/// with no `..` SEGMENT is returned verbatim without being parsed. `a..b` is not a `..` segment
-/// and is left alone, which a `contains("..")` test would get wrong.
-///
-/// Host-neutral by construction rather than by correction. The separators are folded to `/` for
-/// the lexical pass so it runs identically on either host, a leading anchor is split off and kept
-/// verbatim, and the original separator style is restored afterwards:
-///
-/// - a UNC root (`\\host\share`) keeps both leading separators;
-/// - a drive specifier (`D:`) is held aside, so `D:\..\x.hpp` is `D:\x.hpp` on every host rather
-///   than POSIX's bare `x.hpp` -- a drive root cannot be ascended past, and that is a property of
-///   the path, not of the machine reading it.
-///
-/// A path that still carries a `..` segment after the pass (a genuinely relative `..\..\x.hpp`,
-/// which nothing lexical can resolve) comes back as the INPUT, so a caller never pays a
-/// separator change for a collapse that did not happen.
-///
-/// Purely lexical: nothing here asks the filesystem, so it behaves the same on a machine where
-/// the path does not exist.
-///
-/// @param path A path as a compiler spelled it.
-/// @return The collapsed path, or @p path verbatim when there was nothing to collapse.
-[[nodiscard]] std::string CollapseRelativeSegments(std::string_view path);
+///   the emit side would rewrite the separators of every note for no benefit. It is also a
+///   KEY-path helper: sharing it would mean an edit made for the emit side silently moving the
+///   cache key.
 
 /// Collapse the path of every `/showIncludes` note in a captured text region.
 ///
@@ -103,10 +84,12 @@ namespace FastCache::Cc
 /// (it pads by inclusion depth AFTER it). Anything that is not a note, including a line that
 /// merely quotes the marker, survives byte-for-byte.
 ///
-/// @p grammar gates the whole transform: only `Grammar::ShowIncludes` is length-limited, because
-/// only Ninja's `/showIncludes` reader carries that check -- its depfile reader does not. The gate
-/// lives here rather than at each call site so "only `/showIncludes` is length-limited" is one
-/// testable property instead of an `if` repeated at every seam.
+/// @p grammar gates the whole transform: only a grammar that `PathCanon::CarriesIncludeNotes` is
+/// length-limited, because only Ninja's `/showIncludes` reader carries that check -- its depfile
+/// reader does not. The gate lives here rather than at each call site so "only `/showIncludes` is
+/// length-limited" is one testable property instead of an `if` repeated at every seam. And only
+/// the NOTES are rewritten, under any such grammar: `Grammar::MsvcStream` finds diagnostic paths
+/// too, and a diagnostic is printed rather than parsed, so nothing limits its length.
 ///
 /// @p marker is required and undefaulted for #700's reason, applied to this seam: `PathCanon`'s
 /// span finder matches the CANONICAL marker only, so a localized build's notes are invisible to

@@ -102,9 +102,27 @@ inline void PutLe(std::vector<std::byte>& bytes, std::size_t at, std::size_t wid
 
     auto const symbolsAt = dataAt + payload;
     auto const stringsAt = symbolsAt + (symbolRecord * StubSymbolCount);
+
+    // A name longer than the eight-byte field is spelled `/<offset>` into the string
+    // table, the way a compiler writes `.debug_info` -- so a reader that does not
+    // resolve it sees `/4` and cannot tell a debug section from program data.
+    std::string longNames;
+    std::vector<std::string> fieldNames;
+    for (auto const& section: sections)
+    {
+        if (section.name.size() <= 8)
+        {
+            fieldNames.push_back(section.name);
+            continue;
+        }
+        fieldNames.push_back("/" + std::to_string(4 + longNames.size()));
+        longNames += section.name;
+        longNames.push_back('\0');
+    }
+
     // The string table opens with its own size, INCLUDING those four bytes, and is
     // the last thing in the file -- which is what makes a truncated object detectable.
-    std::vector<std::byte> image(stringsAt + 4, std::byte { 0 });
+    std::vector<std::byte> image(stringsAt + 4 + longNames.size(), std::byte { 0 });
 
     if (big)
     {
@@ -133,7 +151,7 @@ inline void PutLe(std::vector<std::byte>& bytes, std::size_t at, std::size_t wid
     {
         auto const at = tableAt + (StubSectionHeaderSize * index);
         auto const& section = sections[index];
-        std::ranges::transform(section.name | std::views::take(8),
+        std::ranges::transform(fieldNames[index] | std::views::take(8),
                                std::next(image.begin(), static_cast<std::ptrdiff_t>(at)),
                                [](char c) { return static_cast<std::byte>(c); });
         PutLe(image, at + 16, 4, section.data.size());
@@ -144,7 +162,10 @@ inline void PutLe(std::vector<std::byte>& bytes, std::size_t at, std::size_t wid
         cursor += section.data.size();
     }
 
-    PutLe(image, stringsAt, 4, 4);
+    PutLe(image, stringsAt, 4, 4 + longNames.size());
+    std::ranges::transform(longNames, std::next(image.begin(), static_cast<std::ptrdiff_t>(stringsAt + 4)), [](char c) {
+        return static_cast<std::byte>(c);
+    });
     return image;
 }
 

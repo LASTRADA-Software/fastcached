@@ -28,7 +28,7 @@
 /// **There is deliberately no version here either.** Canonical text only ever
 /// travels inside a CompileValue, whose container carries `CompileValueVersion` and
 /// is rejected on mismatch, so a change to the canonicalization spec is expressed by
-/// bumping that — and by the `objkey-v6` schema tag in the launcher's ComputeKey,
+/// bumping that — and by the `objkey-v*` schema tag in the launcher's ComputeKey,
 /// which re-keys the cache so stale entries miss rather than being localized under
 /// rules they were not written by. A version here was declared once and never
 /// referenced by anything, because it had no work to do; `header-state-v1` is the
@@ -82,7 +82,50 @@ enum class Grammar : std::uint8_t
     /// a path at one of the three positions above is a path; everything else on
     /// the line is somebody's code.
     GccDiagnostics = 3,
+
+    /// The MSVC family's console streams: `/showIncludes` notes AND diagnostics -- the
+    /// union of `ShowIncludes`, a tightened `MsvcDiagnostics`, and the GCC include chain
+    /// (`In file included from <path>:<line>:`), which `clang-cl` writes in front of a
+    /// header's diagnostic on this same stream. Note rule first.
+    ///
+    /// **A stream region's grammar must cover EVERY line language that stream can
+    /// carry**, because a region carries one tag and a line the tag's grammar cannot
+    /// see is stored verbatim, with the producer's absolute path in it. `cl` and
+    /// `clang-cl` put their notes on stdout under `/c` and on stderr under `/EP` (#825),
+    /// so neither stream can be tagged with a diagnostics-only grammar -- and tagged
+    /// `ShowIncludes`, as both were, every warning, error and `note:` a hit replayed
+    /// named the checkout that STORED it. The investigation measured C4100 in a header
+    /// on two byte-identical checkouts with direct mode off: a legitimately shared key,
+    /// a correctly served object, and a foreign path in the replayed warning.
+    ///
+    /// The diagnostic head is `<path>(<digits>[,<digits>]): ` at column zero and nothing
+    /// looser, since `/diagnostics:caret` puts SOURCE on the same stream.
+    MsvcStream = 4,
 };
+
+/// Whether a region under @p grammar can carry `/showIncludes` notes.
+///
+/// The question the note-only readers ask -- the stale-hit guard's dependency extractor
+/// and the emit side's `..` collapse -- and it is a separate question from "which lines
+/// does this grammar rewrite": `MsvcStream` rewrites diagnostic paths too, and a
+/// diagnostic quotes a path without declaring a dependency, so those readers run the
+/// notes-only rule over it rather than the region's own grammar.
+/// @param grammar A region's grammar tag.
+/// @return True for `ShowIncludes` and `MsvcStream`.
+[[nodiscard]] constexpr bool CarriesIncludeNotes(Grammar grammar) noexcept
+{
+    switch (grammar)
+    {
+        case Grammar::ShowIncludes:
+        case Grammar::MsvcStream:
+            return true;
+        case Grammar::MsvcDiagnostics:
+        case Grammar::GccDepfile:
+        case Grammar::GccDiagnostics:
+            return false;
+    }
+    return false;
+}
 
 /// The marker a `/showIncludes` note carries **in a stored value**.
 ///
@@ -160,9 +203,10 @@ inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
 /// `  Note: including file: A` is deleted from the bytes the cache key is hashed
 /// over, so a revision differing only in that literal keys identically to its
 /// predecessor and is served the predecessor's object. Reproduced with a real `cl`
-/// rather than argued. One layer down it is milder and still real: both regions the
-/// launcher stores carry `Grammar::ShowIncludes` and one of them is the DIAGNOSTIC
-/// stream, so a loosened anchor rewrites a path a compiler merely quoted.
+/// rather than argued. One layer down it is milder and still real: an MSVC-family
+/// launcher stores both streams as `Grammar::MsvcStream`, which walks notes with this
+/// rule, and one of them is the DIAGNOSTIC stream, so a loosened anchor rewrites a path
+/// a compiler merely quoted.
 ///
 /// @param body   One line, already stripped of its terminators (a trailing `\r`
 ///               included — it cannot precede the marker, so it does not matter
@@ -413,9 +457,64 @@ enum class Anchor : std::uint8_t
 ///         names no sentinel this layout knows.
 [[nodiscard]] std::string Localize(std::string_view token, Layout const& layout);
 
+/// Collapse `..` segments out of one path, lexically, preserving how it was spelled.
+///
+/// **The one lexical collapse this project has, and it serves both halves of the cache.** A
+/// compiler resolves a quoted `#include` against the TEXTUAL path of the including file and
+/// reports the concatenation verbatim, so a chain of nested relative includes accumulates `..`
+/// segments (#1592 measured a 299-byte note path that collapses to 88). The launcher collapses
+/// what it hands a build system (`Cc::CollapseNotePaths`) and what it carries from its probe
+/// (`Cc::RootReconciler::DependencyList`), and `CanonicalizeRegion` collapses a span before it asks
+/// whether that span lies under a root -- so one header reached by two include chains has one
+/// spelling in the key's neighbours, the manifest, the stored regions, the depfile and the notes
+/// (#1593). It lives HERE rather than in the launcher because the servers run the canonicalizer
+/// and link no launcher code.
+///
+/// Byte-exact when there is nothing to collapse, which is the overwhelmingly common case: a path
+/// with no `..` SEGMENT is returned verbatim without being parsed. `a..b` is not a `..` segment
+/// and is left alone, which a `contains("..")` test would get wrong.
+///
+/// Host-neutral by construction rather than by correction: pure string work over a `/`-folded
+/// copy, with a leading anchor split off and kept verbatim, and the original separator style
+/// restored afterwards --
+///
+/// - a UNC root (`\\host\share`) keeps both leading separators, and the share is part of the
+///   anchor: `\\host\share\..\x.h` is `\\host\share\x.h`, never `\\host\x.h`;
+/// - a drive specifier (`D:`) is held aside, so `D:\..\x.hpp` is `D:\x.hpp` on every host -- a
+///   drive root cannot be ascended past, and that is a property of the path, not of the machine
+///   reading it. So is a POSIX root: `/..` is `/`.
+///
+/// Empty and `.` segments are dropped in the same pass, as `std::filesystem::lexically_normal`
+/// drops them. A path that still carries a `..` segment afterwards (a genuinely relative
+/// `..\..\x.hpp`, which nothing lexical can resolve) comes back as the INPUT, so a caller never
+/// pays a separator change for a collapse that did not happen.
+///
+/// Purely lexical: nothing here asks the filesystem, so it behaves the same on a daemon where the
+/// producer's path does not exist -- and like every lexical collapse it reads `link/..` as the
+/// directory holding `link`, which is what Ninja's own `GetFullPathNameA` pass does too.
+///
+/// @param path A path as a compiler spelled it.
+/// @return The collapsed path, or @p path verbatim when there was nothing to collapse.
+[[nodiscard]] std::string CollapseRelativeSegments(std::string_view path);
+
+/// The lexical normal form of @p path whatever it carries: `.` and empty segments dropped and
+/// every `..` collapsed, by the rules `CollapseRelativeSegments` states -- which is this, guarded
+/// by "only when there is a `..` to collapse". For a caller that BUILT the path and wants one
+/// spelling of it, such as a relative root joined onto a working directory (`<cwd>\.`).
+/// @param path A path.
+/// @return Its normal form, or @p path verbatim when a `..` survives (a relative path climbing
+///         above its start).
+[[nodiscard]] std::string LexicallyNormal(std::string_view path);
+
 /// Canonicalize every path span in a captured text region, per its grammar.
 /// Lines that do not match the grammar's shape are preserved byte-for-byte,
 /// including their line endings.
+///
+/// A span is `..`-collapsed (`CollapseRelativeSegments`) before it is matched against
+/// the roots -- so `D:\proj\build\..\inc\a.hpp` is `<SRCROOT>/inc/a.hpp` rather than
+/// `<BUILDTREE>/../inc/a.hpp` (#1593, value generation 6) -- and a span that lies under no
+/// root once collapsed is stored as that collapsed spelling (value generation 7), never as
+/// a token climbing out of a root, which would resolve against the CONSUMER's depth.
 /// @param text    The captured region bytes (e.g. `/showIncludes` stdout).
 /// @param grammar The grammar identifying path spans within `text`.
 /// @param layout  The producing machine's roots.

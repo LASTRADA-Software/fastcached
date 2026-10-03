@@ -35,6 +35,7 @@ namespace
             case PathCanon::Grammar::MsvcDiagnostics:
             case PathCanon::Grammar::GccDepfile:
             case PathCanon::Grammar::GccDiagnostics:
+            case PathCanon::Grammar::MsvcStream:
                 return true;
         }
         return false;

@@ -47,6 +47,7 @@
 //
 // Contains no project-specific data; it compiles whatever it is pointed at.
 
+#include "AtomicFile.hpp"
 #include "CacheDecision.hpp"
 #include "CacheKey.hpp"
 #include "CacheProtocol.hpp"
@@ -67,8 +68,10 @@
 #include "ReactorExchange.hpp"
 #include "RefusalNotice.hpp"
 #include "ReplayGuard.hpp"
+#include "RootBinding.hpp"
 #include "RootReconciler.hpp"
 #include "Stats.hpp"
+#include "StreamGrammar.hpp"
 #include "TicketCredentials.hpp"
 #include "ToolchainHost.hpp"
 #include "ToolchainProbe.hpp"
@@ -103,6 +106,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <core/net/TcpClient.hpp>
@@ -426,7 +430,7 @@ struct InvocationRecord
     // tree's layout rule and the one `DispatchRow` states for itself a file away.
     bool verbose = false; ///< FASTCACHE_VERBOSE; gates every diagnostic here.
 
-    Cc::Outcome outcome = Cc::Outcome::Unavailable; ///< Hit / Miss / Uncacheable / Unavailable.
+    Cc::Outcome outcome = Cc::Outcome::Unavailable; ///< What `--show-stats` buckets this compile as.
 
     /// What this invocation did about DISTRIBUTION — a second axis, never a
     /// refinement of `outcome` above. A dispatch failure and a cache failure are two
@@ -812,15 +816,21 @@ void ReportCrossedReply(InvocationRecord& record, std::string_view detail)
               << "); refusing that object and compiling this translation unit locally\n";
 }
 
-/// Emit a HIT/MISS trace line (stderr) when FASTCACHE_VERBOSE is set. Useful in
+/// Emit the outcome trace line (stderr) when FASTCACHE_VERBOSE is set. Useful in
 /// real use to see the cache working, and the signal the E2E harness asserts on.
+///
+/// The word printed is the one the statistics log records, `Cc::ToStringView`'s, so
+/// the trace and `--show-stats` cannot name one compile two ways.
 /// @param record The invocation record this updates.
-void TraceOutcome(InvocationRecord& record, std::string_view outcome, std::string_view key)
+/// @param outcome What this compile was: a hit, a miss, or a hit the verifier rejected.
+/// @param key The key it was decided under.
+/// @param qualifier Said after the key, or empty.
+void TraceOutcome(InvocationRecord& record, Cc::Outcome outcome, std::string_view key, std::string_view qualifier)
 {
-    record.outcome = (outcome == "HIT") ? Cc::Outcome::Hit : Cc::Outcome::Miss;
+    record.outcome = outcome;
     record.outcomeDetail.clear();
     if (record.verbose)
-        std::cerr << "fastcache-cc: " << outcome << " key=" << key << '\n';
+        std::cerr << "fastcache-cc: " << Cc::ToStringView(outcome) << " key=" << key << qualifier << '\n';
 }
 
 /// Report a daemon refusal on a best-effort side-channel operation.
@@ -1144,10 +1154,10 @@ void ReplayStreams(std::string_view out, std::string_view err)
     {
         // The fresh compile failed, which says nothing about the cached object -- and
         // may well have left no output at all. Put back what the hit served, so a
-        // failed verification never costs the build its object.
-        std::filesystem::copy_file(aside, *served, std::filesystem::copy_options::overwrite_existing, ec);
-        std::filesystem::remove(aside, ec);
-        return { .verdict = Cc::HitVerdict::Inconclusive, .comparison = std::nullopt, .detail = {} };
+        // failed verification never costs the build its object; and the aside, the only
+        // good copy, goes only once the put-back is confirmed.
+        auto const files = Cc::MakeDiskFiles();
+        return Cc::RestoreServedObject(aside, *served, *files);
     }
 
     auto comparison = Cc::CompareObjectFiles(aside, *served);
@@ -1179,15 +1189,71 @@ void ReportVerification(InvocationRecord const& record, Cc::HitComparison const&
     std::cerr << line << '\n';
 }
 
+/// Verify a served hit when it is sampled, and record what the build actually used.
+///
+/// **A hit `FASTCACHE_VERIFY` rejected is not recorded as a hit.** The verifier compiles
+/// to the SAME output path, so on a mismatch the object the build links is the fresh one
+/// and the cache's was wrong; logging that as `HIT` counted every wrong object the
+/// verifier caught as a success, in the one report an operator reads to judge the cache.
+/// The `WRONG OBJECT` line still goes out unconditionally, first, from
+/// `ReportVerification`.
+/// @param record The invocation record this updates.
+/// @param cfg Launcher config, for the verification rate.
+/// @param cmd The parsed compile command; `objPath` is what the hit wrote.
+/// @param argv What to run to compile for real.
+/// @param key The portable key this compile looked up.
+/// @param fetched What the lookup served, and from which key.
+/// @return 0, the exit code of a served compile.
+[[nodiscard]] int FinishServedHit(InvocationRecord& record,
+                                  Config const& cfg,
+                                  Cc::ParsedCommand const& cmd,
+                                  std::span<std::string const> argv,
+                                  std::string const& key,
+                                  Cc::FetchedObject const& fetched)
+{
+    // Before the trace, so a build log reads in the order the events happened: the
+    // hit, then what verifying it found. Off unless `FASTCACHE_VERIFY` names a rate, in
+    // which case this costs a whole compile (#423). The SERVED key, because that is the
+    // entry an operator reading a `WRONG OBJECT` line has to go and look at.
+    auto const comparison = VerifyServedObject(cmd, argv, fetched.servedKey, cfg.verifyRate);
+    ReportVerification(record, comparison, fetched.servedKey);
+    TraceOutcome(record,
+                 Cc::OutcomeOfServedHit(comparison.verdict),
+                 key,
+                 fetched.followedMarker ? std::format(" (root-bound: served from key={})", fetched.servedKey)
+                                        : std::string {});
+    return 0;
+}
+
 // --- file helpers -----------------------------------------------------------
 
-[[nodiscard]] bool WriteFileBytes(std::filesystem::path const& path, std::span<std::byte const> bytes)
+/// The filesystem every file a hit or a dispatched compile restores is written through.
+[[nodiscard]] Cc::IAtomicWriteFiles& OutputFiles()
 {
-    std::ofstream out { path, std::ios::binary };
-    if (!out)
-        return false;
-    out.write(reinterpret_cast<char const*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    return out.good();
+    static std::unique_ptr<Cc::IAtomicWriteFiles> const files = Cc::MakeDiskFiles();
+    return *files;
+}
+
+/// Restore the files a compile the launcher did not run would have written: the depfile,
+/// when the build names one, FIRST and the object LAST (`Cc::RestoreOutputs`).
+///
+/// Through `WriteFileAtomically` because no compiler wrote them: a direct write interrupted
+/// by a kill or a full disk left a PREFIX under a fresh timestamp, which the build system
+/// then took as up to date and linked.
+/// @param cmd The compile command: where the object and the depfile go.
+/// @param object The object's bytes.
+/// @param depFileText The depfile's text; ignored when the build names no depfile.
+/// @return Nothing, or which file failed.
+[[nodiscard]] std::expected<void, Cc::RestoreFailure> RestoreCompileOutputs(Cc::ParsedCommand const& cmd,
+                                                                            std::span<std::byte const> object,
+                                                                            std::string_view depFileText)
+{
+    std::optional<Cc::RestoredFile> depfile;
+    if (!cmd.depPath.empty())
+        depfile = Cc::RestoredFile { .path = std::filesystem::path { cmd.depPath },
+                                     .bytes = std::as_bytes(std::span { depFileText }) };
+    return Cc::RestoreOutputs(
+        Cc::RestoredFile { .path = cmd.objPath, .bytes = object }, depfile, Cc::CurrentProcessId(), OutputFiles());
 }
 
 /// The deadlines this invocation runs a dispatch under.
@@ -1250,41 +1316,6 @@ void ReportVerification(InvocationRecord const& record, Cc::HitComparison const&
     return tickets;
 }
 
-/// The grammar to tag a stored TEXT REGION with, per compiler flavor.
-///
-/// `ShowIncludes` for the MSVC family and a diagnostics grammar for the GNU one,
-/// and the asymmetry is the whole of it.
-///
-/// A GNU driver emits no `/showIncludes` on either stream, so `ShowIncludes` had
-/// nothing to find there and nothing was ever rewritten -- which is why a
-/// replayed GCC warning named the checkout that STORED it. On a machine with
-/// several checkouts that path resolves to a different tree at a possibly
-/// different revision, so the line number lands on unrelated code and the
-/// developer edits the wrong one (#202).
-///
-/// The MSVC family is deliberately LEFT on `ShowIncludes`, and the measurement
-/// #825 was waiting for now says why that has to stay: the channel follows the
-/// FLAG, not the driver. Both `cl` and `clang-cl` put the notes on stdout under
-/// `/c` and on stderr under `/EP`. So a stored value can carry notes on EITHER
-/// region depending on which run produced it, and moving stderr to
-/// `MsvcDiagnostics` would stop canonicalizing the `/EP` ones.
-/// `.agent/rules/compile-cache.md` holds the table; this must not become a second
-/// home for it.
-[[nodiscard]] PathCanon::Grammar TextGrammar(Cc::Flavor flavor) noexcept
-{
-    switch (flavor)
-    {
-        case Cc::Flavor::Gcc:
-        case Cc::Flavor::Clang:
-            return PathCanon::Grammar::GccDiagnostics;
-        case Cc::Flavor::Cl:
-        case Cc::Flavor::ClangCl:
-        case Cc::Flavor::Unknown:
-            return PathCanon::Grammar::ShowIncludes;
-    }
-    return PathCanon::Grammar::ShowIncludes;
-}
-
 // `DepFileRegionIndex` is in CacheDecision.hpp, beside `ReproducesDepFile`, which is the
 // rule that reads it: a value with no depfile region is NOT served to a compile that
 // names a depfile (#1531).
@@ -1313,29 +1344,6 @@ constexpr std::size_t ReplayRegionCount = 2;
     if (!bytes.has_value())
         return std::nullopt;
     return std::string { reinterpret_cast<char const*>(bytes->data()), bytes->size() };
-}
-
-/// Write the cached depfile back.
-///
-/// Called on every hit. A miss wrote its own depfile as a side effect of running
-/// the real compiler; a hit runs no compiler, so without this the file the build
-/// system depends on would simply be absent (or, worse, left stale from an
-/// earlier build).
-///
-/// Takes text that is already localized rather than localizing here: the hit path
-/// localizes every region once up front, because the same localized text is what
-/// the replay guard examines before any of it is written.
-///
-/// @param depPath The destination, from the compile command's -MF.
-/// @param text    The localized depfile bytes.
-/// @return True when the write succeeded.
-[[nodiscard]] bool WriteDepFile(std::string const& depPath, std::string_view text)
-{
-    std::ofstream out { std::filesystem::path { depPath }, std::ios::binary };
-    if (!out)
-        return false;
-    out.write(text.data(), static_cast<std::streamsize>(text.size()));
-    return out.good();
 }
 
 /// True if the source file at `path` references a compile-time-varying macro
@@ -1522,7 +1530,7 @@ struct ProbedDependencies
             Note(record.verbose, "dependency probe wrote no depfile; keying without the dependency set");
         // Reconciled at the boundary, so KeyDependencySet and everything after it
         // stay pure string work over paths spelled the way this host spells them.
-        reconciler.All(probe.dependencyPaths);
+        reconciler.DependencyList(probe.dependencyPaths);
         return probe;
     }
 
@@ -1554,7 +1562,7 @@ struct ProbedDependencies
     // diagnosis of the compiler.
     auto const unreadable = split.notePaths.empty() && Cc::CarriesUnreadableIncludeNotes(run.err);
 
-    reconciler.All(split.notePaths);
+    reconciler.DependencyList(split.notePaths);
     return SourceProbe { .preprocessed = std::move(split.preprocessed),
                          .dependencyPaths = std::move(split.notePaths),
                          .dependenciesUnreadable = unreadable };
@@ -1639,6 +1647,17 @@ struct ProbedDependencies
     return std::move(outcome.value);
 }
 
+/// Fetch the value under one key, for `Cc::ResolveFetchedObject` to follow a marker with.
+/// @param record The invocation record; read here, never written.
+/// @param cfg Launcher config.
+/// @return The fetch, bound to this invocation.
+[[nodiscard]] Cc::ValueFetch BoundFetch(InvocationRecord const& record, Config const& cfg)
+{
+    return [&record, &cfg](std::string const& key) {
+        return FetchRaw(record, cfg, key);
+    };
+}
+
 /// STORE bytes under `key`, best-effort. A manifest that fails to store only
 /// costs the next compile its shortcut, so failures are silent unless verbose.
 ///
@@ -1692,7 +1711,7 @@ using Cc::HitDisposition;
 /// harmless leftover: it is a claim about who reads it.
 struct MaterializedHit
 {
-    HitDisposition disposition { HitDisposition::Unusable };
+    HitDisposition disposition { HitDisposition::ObjectUnwritable };
 };
 
 /// A hit that was not materialized, so carries no streams. A named factory rather
@@ -1773,15 +1792,29 @@ struct MaterializedHit
         return NotMaterialized(HitDisposition::Stale);
     }
 
-    if (!WriteFileBytes(cmd.objPath, decoded.objectBlob))
-        return NotMaterialized(HitDisposition::Unusable);
-
-    // The depfile is a file, not a stream: restore it before replaying, so a
-    // failure to write it is not reported after the build has already seen the
-    // compiler's output.
-    if (!cmd.depPath.empty() && localized.size() > DepFileRegionIndex
-        && !WriteDepFile(cmd.depPath, localized[DepFileRegionIndex].bytes))
-        return NotMaterialized(HitDisposition::Unusable);
+    // Both files before replaying, so a failure is not reported after the build has
+    // already seen the compiler's output -- and the depfile before the object, whose
+    // rename is the commit (`RestoreOutputs`). A hit runs no compiler, so without the
+    // depfile the file the build system depends on would be absent, or stale from an
+    // earlier build. `ReproducesDepFile` above made sure there is one when it is named.
+    auto const depFileText = localized.size() > DepFileRegionIndex ? std::string_view { localized[DepFileRegionIndex].bytes }
+                                                                   : std::string_view {};
+    if (auto const restored = RestoreCompileOutputs(cmd, decoded.objectBlob, depFileText); !restored.has_value())
+    {
+        // Named, with what it means, because the two mean different things: an object
+        // this machine cannot write is a cache it cannot use, while a depfile is this
+        // build's own output location refusing one file -- the entry is fine, the object
+        // was not touched (it is written last), and this compiles as a miss would.
+        auto const role = restored.error().role;
+        auto const disposition =
+            role == Cc::OutputRole::Object ? HitDisposition::ObjectUnwritable : HitDisposition::DepFileUnwritable;
+        Note(record.verbose,
+             std::format("could not restore the {} ({} failed): {}",
+                         Cc::OutputRoleName(role),
+                         Cc::AtomicWriteStepName(restored.error().step),
+                         Cc::CacheActionReason(Cc::ObserveFetch(Cc::CacheOutcomeKind::Hit, true, true, disposition))));
+        return NotMaterialized(disposition);
+    }
 
     // Only the first ReplayRegionCount regions are streams; the rest are files and
     // must never reach stdout or stderr.
@@ -1828,6 +1861,7 @@ struct MaterializedHit
 /// @param key              The object key to serve.
 /// @param layout           This machine's roots, for localizing the replayed text.
 /// @param workingDirectory The directory this compile runs in.
+/// @param checkout         This compile's checkout, for following a root-bound marker.
 /// @return The exit code to return on a hit, or nullopt when not served.
 [[nodiscard]] std::optional<int> TryServeFromCache(InvocationRecord& record,
                                                    Config const& cfg,
@@ -1835,20 +1869,33 @@ struct MaterializedHit
                                                    std::span<std::string const> argv,
                                                    std::string const& key,
                                                    PathCanon::Layout const& layout,
-                                                   std::filesystem::path const& workingDirectory)
+                                                   std::filesystem::path const& workingDirectory,
+                                                   Cc::CheckoutRoots const& checkout)
 {
     auto const payload = FetchRaw(record, cfg, key);
     if (!payload.has_value())
         return std::nullopt;
 
-    auto decoded = DecodeCompileValue(*payload);
-    if (!decoded.has_value())
+    // Through the one classifier, so a manifest's pointer lands on a root-bound marker
+    // exactly as the preprocessed path's fetch does -- a manifest is shared between
+    // checkouts, and it is this step that keeps it from sharing an object that names one
+    // of them (see RootBinding.hpp).
+    auto const fetched = Cc::ResolveFetchedObject(*payload, key, checkout, BoundFetch(record, cfg));
+    if (auto const* error = std::get_if<ProtocolError>(&fetched.answer))
     {
         // Said rather than swallowed: direct mode falls through to the preprocessed
         // path here, so an undecodable value costs a whole preprocess and shows up
         // as nothing but a slower build. During a rolling upgrade that is every
         // compile on the machine.
-        NoteUndecodableValue(record, "the direct-mode object", decoded.error());
+        NoteUndecodableValue(record, "the direct-mode object", *error);
+        return std::nullopt;
+    }
+    auto const* decoded = std::get_if<CompileValue>(&fetched.answer);
+    if (decoded == nullptr)
+    {
+        // The preprocessed path meets the same marker and records the miss; saying it
+        // here too would print it twice per translation unit.
+        Note(record.verbose, "the direct-mode object is root-bound and this checkout has no copy; preprocessing");
         return std::nullopt;
     }
 
@@ -1861,12 +1908,7 @@ struct MaterializedHit
         return std::nullopt;
 
     record.valueBytes = decoded->objectBlob.size();
-    // Before the trace, so a build log reads in the order the events happened: the
-    // hit, then what verifying it found. Off unless `FASTCACHE_VERIFY` names a rate,
-    // in which case this costs a whole compile (#423).
-    ReportVerification(record, VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
-    TraceOutcome(record, "HIT", key);
-    return 0;
+    return FinishServedHit(record, cfg, cmd, argv, key, fetched);
 }
 
 /// Report that this compile gets no direct-mode manifest, and why.
@@ -1966,7 +2008,7 @@ void RecordManifest(InvocationRecord const& record,
             // Reconciled here because this set came straight off disk, unlike the
             // probe's. Resolution is memoized and idempotent, so it costs a hash
             // lookup per path.
-            reconciler.All(includes);
+            reconciler.DependencyList(includes);
         }
 
     // Asked here as well as on the key path, because a manifest is the direct-mode
@@ -2095,6 +2137,7 @@ void RecordManifest(InvocationRecord const& record,
 /// @param relativizedArgs  The command line with checkout-rooted paths tokenized.
 /// @param toolchainStamp   The compiler identity folded into the manifest key.
 /// @param reconciler       Translates a driver's spelling into this build's.
+/// @param checkout         This compile's checkout, for following a root-bound marker.
 /// @return The exit code if the object was served, nullopt to keep going.
 [[nodiscard]] std::optional<int> TryDirectMode(InvocationRecord& record,
                                                Config const& cfg,
@@ -2104,7 +2147,8 @@ void RecordManifest(InvocationRecord const& record,
                                                std::filesystem::path const& workingDirectory,
                                                std::vector<std::string> const& relativizedArgs,
                                                std::string const& toolchainStamp,
-                                               Cc::RootReconciler& reconciler)
+                                               Cc::RootReconciler& reconciler,
+                                               Cc::CheckoutRoots const& checkout)
 {
     auto const directStarted = std::chrono::steady_clock::now();
     // Every early return records how long the attempt took, so the statistics
@@ -2168,9 +2212,14 @@ void RecordManifest(InvocationRecord const& record,
     record.directMs = MsSince(directStarted);
     // Follow the manifest's pointer to the object, which is stored exactly once
     // under its ordinary preprocessed key.
-    auto served = TryServeFromCache(record, cfg, cmd, argv, manifest->objectKey, layout, workingDirectory);
+    auto served = TryServeFromCache(record, cfg, cmd, argv, manifest->objectKey, layout, workingDirectory, checkout);
     if (served.has_value())
+    {
         record.directHit = true;
+        // Said, because a direct hit and a preprocessed hit trace the same `HIT key=` line:
+        // without it, a direct mode that never validates anything reads as healthy.
+        Note(record.verbose, "direct mode: the manifest validated; served without preprocessing");
+    }
     return served;
 }
 
@@ -2251,7 +2300,8 @@ void RecordManifest(InvocationRecord const& record,
     // file read instead of a preprocess, a fingerprint and a full connect budget. One
     // launcher per translation unit is why the memo is a FILE; see ReachabilityMemo.hpp
     // for why it is safe to believe for fifteen seconds and not longer.
-    Cc::FileMemoStore memoStore { Cc::ReachabilityMemoPath() };
+    auto const memoFiles = Cc::MakeDiskFiles();
+    Cc::FileMemoStore memoStore { Cc::ReachabilityMemoPath(), *memoFiles };
     core::platform::SystemWallClock const wallClock;
     auto memo = Cc::ReachabilityMemo::Load(memoStore);
     if (memo.Remembers(Cc::MemoKind::SchedulerUnreached, cfg.schedulerAddr, wallClock.now()))
@@ -2465,21 +2515,23 @@ void RecordManifest(InvocationRecord const& record,
                                            Cc::DescribeWorkerReached(outcome),
                                            outcome.exitCode));
 
-    // The object first: everything after it is a record ABOUT this object, and
-    // writing those first would leave a dependency record describing a file that is
-    // not there if the write fails.
-    if (!WriteFileBytes(cmd.objPath, outcome.object))
-        return DeclineDispatch(record,
-                               Discarded("the dispatched object could not be written"),
-                               "could not write the dispatched object; compiling locally");
+    // The depfile FIRST and the object LAST (`RestoreOutputs`): the object's rename is the
+    // commit, so a failure between the two leaves the OLD object, out of date against the
+    // edited source, beside a new dependency record -- which costs a rebuild. The other
+    // order left a new object with a fresh timestamp beside the previous build's record.
+    auto const depFileText = cmd.depPath.empty() ? std::string {} : Cc::RenderDepFile(cmd.objPath, dependencyPaths);
+    if (auto const restored = RestoreCompileOutputs(cmd, outcome.object, depFileText); !restored.has_value())
+        return restored.error().role == Cc::OutputRole::Object
+                   ? DeclineDispatch(record,
+                                     Discarded("the dispatched object could not be written"),
+                                     "could not write the dispatched object; compiling locally")
+                   : DeclineDispatch(record,
+                                     Discarded("the depfile for a dispatched compile could not be written"),
+                                     "could not write the depfile for a dispatched compile; compiling locally");
 
-    // The dependency record, in whichever form this build asked for. Both can be
-    // wanted at once, and neither is inferred from the other.
+    // The notes, in whichever form this build asked for: a depfile and `/showIncludes` can
+    // both be wanted at once, and neither is inferred from the other.
     Cc::CompileRun run { .exitCode = 0, .out = outcome.stdoutText, .err = outcome.stderrText };
-    if (!cmd.depPath.empty() && !WriteDepFile(cmd.depPath, Cc::RenderDepFile(cmd.objPath, dependencyPaths)))
-        return DeclineDispatch(record,
-                               Discarded("the depfile for a dispatched compile could not be written"),
-                               "could not write the depfile for a dispatched compile; compiling locally");
     if (cmd.wantShowIncludes)
     {
         // Said on every dispatched compile that synthesises notes, because this is the
@@ -2696,11 +2748,23 @@ void RecordManifest(InvocationRecord const& record,
     auto workingDirectory = std::filesystem::current_path(cwdError);
     if (cwdError)
         workingDirectory = ".";
+    // Kept before anchoring, for the root binding: anchoring re-spells the directory in
+    // the LAYOUT's vocabulary, and under a relative export (`.`) that vocabulary is
+    // relative -- the anchored directory is `.` in every checkout, which is what bound
+    // every checkout to one key.
+    auto const processDirectory = workingDirectory.string();
     workingDirectory = Cc::AnchorWorkingDirectory(workingDirectory.string(), layout);
 
+    // Which checkout this compile ran in, for the root binding: both roots and the working
+    // directory, absolute and resolved -- and the directory as `$PWD` spells it too, which
+    // is what a compiler absolutizing against it writes and `getcwd(3)` never answers.
+    // Built once, so the scan at the STORE and the bound key at every FETCH cannot
+    // disagree about it (see RootBinding.hpp).
+    auto const checkout = Cc::BindCheckout(reconciler, processDirectory, Cc::CompilerWorkingDirectory(processDirectory));
+
     if (cfg.direct && !SourceReferencesVolatileMacro(cmd.source))
-        if (auto served =
-                TryDirectMode(record, cfg, cmd, argv, layout, workingDirectory, relativizedArgs, toolchainStamp, reconciler))
+        if (auto served = TryDirectMode(
+                record, cfg, cmd, argv, layout, workingDirectory, relativizedArgs, toolchainStamp, reconciler, checkout))
             return served;
 
     auto const preprocessStarted = std::chrono::steady_clock::now();
@@ -2856,6 +2920,17 @@ void RecordManifest(InvocationRecord const& record,
     // skips the assignment, because there is none.
     auto fetchKind = Cc::CacheOutcomeKind::Transport;
 
+    // The parts of the root-bound marker the fetch met when this compile's own copy was
+    // absent; disengaged otherwise. Still a MISS; carried out of the block only so the MISS
+    // it records says why, in the one text its trace and its reason share (`BoundMissReason`).
+    std::optional<Cc::CheckoutParts> boundMiss;
+    // The parts the met marker named, for the STORE: an object stored behind a marker it
+    // met stays bound to them whatever its own scan finds (`PlanStore`). Taken from EVERY
+    // followed marker, not only an absent bound copy: one whose bound value is damaged,
+    // of another generation or stale reaches the STORE too, and a portable store there
+    // would overwrite the marker for every checkout.
+    std::optional<Cc::CheckoutParts> metMarker;
+
     // FETCH.
     {
         auto const presented = Tickets(cfg, record.verbose).Present(cfg.addr);
@@ -2889,8 +2964,11 @@ void RecordManifest(InvocationRecord const& record,
                 // else with it.
                 if (auto const* const row = Cc::PersistentRefusalFor(outcome.code);
                     row != nullptr
-                    && Cc::ShouldAnnounceRefusal(
-                        Cc::StateDirectory(), cfg.addr, outcome.code, std::chrono::system_clock::now()))
+                    && Cc::ShouldAnnounceRefusal(Cc::StateDirectory(),
+                                                 cfg.addr,
+                                                 outcome.code,
+                                                 std::chrono::system_clock::now(),
+                                                 *Cc::MakeDiskFiles()))
                     std::cerr << Cc::RefusalNoticeLine(cfg.addr, *row, outcome.message) << '\n';
             }
             else
@@ -2898,10 +2976,14 @@ void RecordManifest(InvocationRecord const& record,
         }
         else if (outcome.IsHit())
         {
-            auto decoded = DecodeCompileValue(outcome.value);
-            if (!decoded.has_value())
+            // A marker is followed to THIS checkout's bound key here, and only here --
+            // `ResolveFetchedObject` is the one place a fetched object value is
+            // classified, so no path can write a marker to disk as an object file.
+            auto const fetched = Cc::ResolveFetchedObject(outcome.value, key, checkout, BoundFetch(record, cfg));
+            metMarker = fetched.markerParts;
+            if (auto const* error = std::get_if<ProtocolError>(&fetched.answer))
             {
-                NoteUndecodableValue(record, "the fetched object", decoded.error());
+                NoteUndecodableValue(record, "the fetched object", *error);
                 // CARRY ON rather than return, and that is what makes a generation
                 // bump cost one cold cache instead of a permanent outage.
                 //
@@ -2920,9 +3002,16 @@ void RecordManifest(InvocationRecord const& record,
                 // STALE-hit branch below already does, and for the same reason stated
                 // there. `WarnAndCarryOn` is the spelling the fetch-failure arms above
                 // use; the bucket an operator sees is unchanged.
-                WarnAndCarryOn(record, DecodeFailureReason(decoded.error()));
+                WarnAndCarryOn(record, DecodeFailureReason(*error));
             }
-            else
+            else if (std::holds_alternative<Cc::BoundAbsence>(fetched.answer))
+            {
+                // The object under this key names paths this compile does not share. A MISS, and
+                // the STORE after the compile writes this checkout's own copy under its
+                // own bound key -- which is what makes the next compile here a hit.
+                boundMiss = fetched.markerParts;
+            }
+            else if (auto const* decoded = std::get_if<CompileValue>(&fetched.answer))
             {
 
                 // HIT: check what the value asserts, then write the object, reproduce
@@ -2979,21 +3068,23 @@ void RecordManifest(InvocationRecord const& record,
                     // is. Both paths, because a wrong object served through either is the
                     // same defect and a feature that covered one would be a feature an
                     // operator could not rely on (#423).
-                    ReportVerification(record, VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
-                    TraceOutcome(record, "HIT", key);
-                    return 0;
+                    return FinishServedHit(record, cfg, cmd, argv, key, fetched);
                 }
                 if (!Cc::StoresResult(action))
                 {
-                    // The cache is not usable on this machine: the object could not be
-                    // written, and a STORE would fail the same way. `Warn` returns
-                    // nullopt, which reaches `RunPassthrough` -- a plain compile with no
-                    // store, which is correct HERE and catastrophic one branch up, where
-                    // the value is merely of a generation this build cannot read.
-                    return Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitUnusable));
+                    // The object could not be written, so the cache is not usable on this
+                    // machine and a STORE would fail the same way -- the one observation that
+                    // skips the store (an unwritable DEPFILE compiles as a miss would). Named
+                    // at the site, because `check-cache-flow-continuations.sh` classifies
+                    // this call by the observation it spells. `Warn` returns nullopt, which
+                    // reaches `RunPassthrough` -- a plain compile with no store, which is
+                    // correct HERE and catastrophic one branch up, where the value is merely
+                    // of a generation this build cannot read.
+                    return Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitObjectUnwritable));
                 }
                 // Stale: the object is fine but the dependency record it carries is not
-                // true here, so fall through and compile for real. The STORE that follows
+                // true here -- or the depfile this build names could not be written, which
+                // says nothing against the entry -- so fall through and compile for real. The STORE that follows
                 // overwrites this very key with a correct one, which is what repairs the
                 // entry rather than leaving it to poison every later build.
                 //
@@ -3012,7 +3103,19 @@ void RecordManifest(InvocationRecord const& record,
     // cache as a cold one -- the exact conflation `CacheOutcomeKind` was split to
     // end, arriving by a different road.
     if (Cc::CacheIsServing(fetchKind))
-        TraceOutcome(record, "MISS", key);
+    {
+        // Which parts, from the marker -- and no claim about WHICH of them differs, which
+        // this end cannot know: the trace and the tallied reason say the same thing.
+        TraceOutcome(
+            record, Cc::Outcome::Miss, key, boundMiss.has_value() ? Cc::BoundMissQualifier(*boundMiss) : std::string {});
+        // A miss carrying a reason, as a crossed reply is: the cache answered honestly, and
+        // what it holds under this key names paths this compile does not share -- or this
+        // compile's own copy was evicted. Worth ranking, because a translation unit that is a
+        // root-bound miss everywhere is one whose `__FILE__` or `source_location` keeps it
+        // from ever being shared, and that is fixed in the source rather than in the cache.
+        if (boundMiss.has_value())
+            record.outcomeDetail = Cc::BoundMissReason(*boundMiss);
+    }
 
     // MISS: try a worker first when one is configured, then the real compiler.
     //
@@ -3029,10 +3132,10 @@ void RecordManifest(InvocationRecord const& record,
     // Always surface the compiler's output on its true streams and its exit code.
     //
     // These are COPIES, and deliberately so: the store below re-reads `run->out` and `run->err`
-    // untouched. What a build system reads has its note paths collapsed; what the cache stores does
-    // not, because collapsing on the way in would change a stored region's bytes and owe a
-    // `CompileValueVersion` bump.
-    auto const textGrammar = TextGrammar(cmd.flavor);
+    // untouched. What a build system reads has its note paths collapsed here; what the cache
+    // stores is collapsed by the SERVER, span by span, as it canonicalizes (generations 6 and 7,
+    // `CanonicalizeRegion`) -- one collapse, `PathCanon::CollapseRelativeSegments`, on both sides.
+    auto const textGrammar = Cc::StreamGrammar(cmd.flavor);
     auto const replayOut = Cc::CollapseNotePaths(run->out, textGrammar, cfg.showIncludesMarker);
     auto const replayErr = Cc::CollapseNotePaths(run->err, textGrammar, cfg.showIncludesMarker);
     ReplayStreams(replayOut, replayErr);
@@ -3157,6 +3260,33 @@ void RecordManifest(InvocationRecord const& record,
         return code;
     }
 
+    // WHERE the object goes is read off the object, and this is the one place that can:
+    // it holds both the fresh object -- compiled here or returned by a worker, which is
+    // why a dispatched compile needs nothing of its own -- and the roots it would name.
+    // An object naming neither root is stored as it always was and keeps every
+    // cross-checkout hit it ever had. One naming a root is keyed apart under the roots,
+    // behind a marker at the portable key, so another checkout following the marker
+    // MISSES rather than being served a `__FILE__` or a `source_location` naming this
+    // one; see RootBinding.hpp for the whole of it and for why the scan errs broad.
+    //
+    // The marker is stored FIRST: between the two stores, a reader in another checkout
+    // then misses rather than being served whatever the portable key held before.
+    auto const plan = Cc::PlanStore(key, value.objectBlob, checkout, metMarker);
+    if (plan.markerKey.has_value())
+    {
+        Note(record.verbose,
+             std::format("root-bound object (it {}); storing it under key={} behind a marker at key={}",
+                         plan.scan.evidence,
+                         plan.objectKey,
+                         *plan.markerKey));
+        auto const marker = Cc::EncodeRootBoundMarker(plan.scan.parts);
+        StoreRaw(record,
+                 cfg.addr,
+                 cfg,
+                 *plan.markerKey,
+                 std::string_view { reinterpret_cast<char const*>(marker.data()), marker.size() });
+    }
+
     // Best-effort store: a failure here must never fail the build (the compile
     // already succeeded). Surface the outcome under verbose so store rejections
     // (e.g. a value over the server's --storage-max-value) are diagnosable — and
@@ -3167,7 +3297,7 @@ void RecordManifest(InvocationRecord const& record,
     auto const outcome =
         Cc::RunOneExchange(cfg.addr,
                            Notice(record.verbose),
-                           Wire::EncodeStore(Wire::StoreRequest { .key = key,
+                           Wire::EncodeStore(Wire::StoreRequest { .key = plan.objectKey,
                                                                   .prefetchGroup = cfg.prefetchGroup,
                                                                   .srcRoot = cfg.srcRoot,
                                                                   .buildTree = cfg.buildTree,
@@ -3175,12 +3305,14 @@ void RecordManifest(InvocationRecord const& record,
                            presented.credential,
                            BudgetOf(cfg));
     if (outcome.IsHit())
-        Note(record.verbose, std::format("STORED key={} bytes={}", key, encoded.size()));
+        Note(record.verbose, std::format("STORED key={} bytes={}", plan.objectKey, encoded.size()));
     else if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
-        Note(record.verbose,
-             std::format("STORE key={} bytes={} {}", key, encoded.size(), Cc::RecordedReason(outcome, presented.missing)));
+        Note(
+            record.verbose,
+            std::format(
+                "STORE key={} bytes={} {}", plan.objectKey, encoded.size(), Cc::RecordedReason(outcome, presented.missing)));
     else
-        Note(record.verbose, std::format("STORE exchange failed key={}", key));
+        Note(record.verbose, std::format("STORE exchange failed key={}", plan.objectKey));
 
     // Record the direct-mode manifest so the NEXT compile of this TU can reach the
     // object without preprocessing. The include set comes from the /showIncludes
@@ -3269,16 +3401,15 @@ void RecordManifest(InvocationRecord const& record,
     if (auto const parent = std::filesystem::path { destination }.parent_path(); !parent.empty())
         std::filesystem::create_directories(parent, ec);
 
-    std::ofstream out { destination, std::ios::binary | std::ios::trunc };
-    if (!out)
+    // The launcher's one writer: a dashboard killed mid-write leaves the previous one, never a
+    // truncated page, and a failure says at which step.
+    auto const files = Cc::MakeDiskFiles();
+    if (auto const written =
+            Cc::WriteFileAtomically(destination, std::as_bytes(std::span { report }), Cc::CurrentProcessId(), *files);
+        !written.has_value())
     {
-        std::cerr << "fastcache-cc: could not write dashboard to '" << destination << "'.\n";
-        return 1;
-    }
-    out << report;
-    if (!out)
-    {
-        std::cerr << "fastcache-cc: could not write dashboard to '" << destination << "'.\n";
+        std::cerr << "fastcache-cc: could not write dashboard to '" << destination << "' ("
+                  << Cc::AtomicWriteStepName(written.error()) << ").\n";
         return 1;
     }
 
@@ -3403,7 +3534,7 @@ int main(int argc, char** argv)
             Note(record.verbose,
                  "a clang-cl pass-through dependency flag (-clang:-MF) carries its value in a separate "
                  "argument, which the launcher cannot read; spell it fused (-clang:-MF<path>) to cache this compile");
-        return RunPassthrough(std::span<std::string const> { args }, TextGrammar(cmd.flavor), cfg.showIncludesMarker);
+        return RunPassthrough(std::span<std::string const> { args }, Cc::StreamGrammar(cmd.flavor), cfg.showIncludesMarker);
     }
 
     auto const started = std::chrono::steady_clock::now();
@@ -3411,7 +3542,7 @@ int main(int argc, char** argv)
     int const code =
         handled.has_value()
             ? *handled
-            : RunPassthrough(std::span<std::string const> { args }, TextGrammar(cmd.flavor), cfg.showIncludesMarker);
+            : RunPassthrough(std::span<std::string const> { args }, Cc::StreamGrammar(cmd.flavor), cfg.showIncludesMarker);
 
     if (cfg.stats)
     {

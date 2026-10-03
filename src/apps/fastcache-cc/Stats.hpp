@@ -2,6 +2,7 @@
 #pragma once
 
 #include "Dispatch.hpp"
+#include "HitVerification.hpp"
 
 #include <FastCache/Cli/UsageDoc.hpp>
 
@@ -18,17 +19,39 @@ namespace FastCache::Cc
 {
 
 /// What the launcher did with one compile — the outcome recorded per invocation.
+///
+/// Persisted as the TOKEN `ToStringView` names, never as the enumerator's value, so the
+/// order here is private and a reader of an older log meets an unknown token rather than
+/// a renumbered one.
 enum class Outcome : std::uint8_t
 {
     Hit,         ///< Served from the cache; no compiler run.
     Miss,        ///< Compiled and stored.
     Uncacheable, ///< Deliberately not cached (time macros, unparsable line).
     Unavailable, ///< Cache error; fell back to a real compile.
+    /// Served from the cache, then compiled again by `FASTCACHE_VERIFY`, and the fresh
+    /// object DIFFERED -- so the build used the fresh one and the cache's was wrong.
+    ///
+    /// Its own outcome and never a `Hit`, because it is the opposite of one: the object
+    /// the build links came from the compiler, and the one the cache holds is exactly the
+    /// failure class the verifier exists to surface. Tallied as a hit it would raise the
+    /// hit rate by the number of wrong objects served, and the one line an operator reads
+    /// to judge the cache would read best when the cache was at its worst.
+    VerifyMismatch,
 };
 
 /// @param outcome The outcome to name.
 /// @return The stable token written to the log (also parsed back when reporting).
 [[nodiscard]] std::string_view ToStringView(Outcome outcome) noexcept;
+
+/// What a served hit is recorded as, given what verifying it found.
+///
+/// Here rather than in the launcher's `main.cpp`, which is in no test target (#909). Only
+/// a mismatch changes the answer: an unsampled, matching, inconclusive or unsupported
+/// verification leaves the served object in place, and that is a hit.
+/// @param verdict What `FASTCACHE_VERIFY` found, or `NotChecked`.
+/// @return `VerifyMismatch` for a rejected hit; `Hit` otherwise.
+[[nodiscard]] Outcome OutcomeOfServedHit(HitVerdict verdict) noexcept;
 
 /// What the launcher did about DISTRIBUTION on one compile — an axis of its own,
 /// beside `Outcome` rather than folded into it.
@@ -279,25 +302,6 @@ void AppendRecord(Record const& record);
 /// platform `#if` would be two places for the location to drift, and a cache
 /// written to one path and read from another is a cache that silently never hits.
 [[nodiscard]] std::filesystem::path StateDirectory();
-
-/// Replace @p file's contents with @p text so that a concurrent reader sees the
-/// previous file or the new one, never part of either.
-///
-/// Temp file plus rename, because every file under `StateDirectory` is written by
-/// launchers running side by side -- sixteen of them on a cold cache -- and a reader
-/// that caught a half-written one would act on a prefix of it. The temp name carries
-/// this process's id AND a per-process sequence number, so two writers never share
-/// one temp file and interleave into it -- not two processes, and not two threads of
-/// one process either; the rename is what makes the result whole. Every path that does not end in a
-/// rename removes the temp file, so a full disk does not accumulate them in a
-/// directory nothing sweeps.
-///
-/// One writer rather than one per file, because the second copy is where the pid
-/// gets left out of the name.
-/// @param file The file to replace. Its directory must exist.
-/// @param text The whole new contents.
-/// @return True when @p file now holds exactly @p text.
-[[nodiscard]] bool ReplaceStateFile(std::filesystem::path const& file, std::string_view text);
 
 /// Absolute path of the log file (%LOCALAPPDATA%/fastcache-cc/invocations.log on
 /// Windows, $XDG_STATE_HOME or ~/.local/state equivalent elsewhere). Empty when

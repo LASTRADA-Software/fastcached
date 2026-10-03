@@ -79,6 +79,10 @@
 #
 # `e2e_begin` after the EXIT trap, because it installs a TERM trap whose whole
 # purpose is to let the EXIT trap run (see `fail`).
+#
+# And a fixture exports its OWN `FASTCACHE_*` settings AFTER sourcing this file,
+# because sourcing it clears every one it inherited -- see
+# `e2e_scrub_fastcache_environment` below.
 
 # The text every failure message is prefixed with, so a suite log says which
 # fixture stopped. Set by `e2e_begin`.
@@ -107,6 +111,49 @@ _e2e_on_fail=""
 # cold runner. A fixture that has measured its own cost should say so where the
 # measurement is, which is in the fixture.
 _e2e_wait_seconds=20
+
+# ---------------------------------------------------------------------------
+# A fixture inherits no FASTCACHE_* setting
+# ---------------------------------------------------------------------------
+#
+# The launcher, fastcached and the node read their whole configuration from
+# FASTCACHE_* variables, so one this shell inherited decides what a fixture
+# measures: an operator's FASTCACHE_SCHEDULER dispatches each "local" compile to
+# their fleet, whose objects name a worker's scratch directory instead of the
+# fixture's checkout, and FASTCACHE_VERIFY or FASTCACHE_NO_DIRECT changes the
+# outcome a case asserts. A fixture sets what it means and inherits nothing.
+#
+# So SOURCING this file clears them, and every fixture gets that by construction.
+# It was a loop in one fixture, and absent from the rest: `launcher-replay-e2e.sh`
+# configured and built a whole project with whatever scheduler the shell carried,
+# and its cold build then compiled on somebody's fleet. The one ordering rule is
+# the caller contract's above -- a fixture's own exports come after the `source`.
+#
+# The exceptions are `E2eInheritedKnobs`: a variable the HARNESS reads, which no
+# server and no launcher does, and which an operator sets on purpose. Clearing one
+# would silently turn the knob off. A row here is a claim that nothing this project
+# ships reads the name -- a launcher setting must never be added.
+#
+#   FASTCACHE_TSAN_TIMEOUT  `tsan-gate.sh`'s per-target bound, read after it
+#                           sources this file.
+E2eInheritedKnobs="FASTCACHE_TSAN_TIMEOUT"
+
+# Unset every FASTCACHE_* variable in this shell's environment except the harness
+# knobs in `E2eInheritedKnobs`. Runs when this file is sourced; callable again.
+e2e_scrub_fastcache_environment() {
+    local name
+    for name in $(compgen -e); do
+        case "$name" in
+            FASTCACHE_*)
+                case " ${E2eInheritedKnobs} " in
+                    *" ${name} "*) ;;
+                    *) unset "$name" ;;
+                esac
+                ;;
+        esac
+    done
+}
+e2e_scrub_fastcache_environment
 
 # Begin a run. Call once, at the top level, after the EXIT trap is installed.
 #

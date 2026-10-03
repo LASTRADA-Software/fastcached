@@ -26,6 +26,11 @@
 #   1. Equivalent object -- a worker's object matches a locally compiled one.
 #   2. Still a cache     -- a dispatched result is served from the cache next time.
 #   3. C, not C++        -- a dispatched C translation unit comes back compiled as C.
+#  3b. Root-bound        -- a dispatched object naming its checkout (the builtin
+#                           `source_location` is made of) is not served into a second
+#                           checkout, and is served back to the first.
+#  3c. One spelling      -- a header one dispatched compile reaches through two include
+#                           chains is ONE /showIncludes note, with no `..` in any note.
 #   4. Fingerprint       -- a worker for another toolchain is never chosen.
 #
 # "MATCHES" IS NOT BYTE-IDENTICAL HERE, and every part of that is measured rather
@@ -793,7 +798,8 @@ int Probe() { return static_cast<int>(std::string("x").size()); }
 }
 
 function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
-                            [string]$scheduler, [int]$cache, [string]$sourceName = "u.cpp") {
+                            [string]$scheduler, [int]$cache, [string]$sourceName = "u.cpp",
+                            [string[]]$extra = @()) {
     $env:FASTCACHE_ADDR       = "127.0.0.1:$cache"
     $env:FASTCACHE_SOURCE_DIR = $root
     $env:FASTCACHE_BINARY_DIR = (Join-Path $root "build")
@@ -802,13 +808,15 @@ function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
     else            { Remove-Item -Path "env:FASTCACHE_SCHEDULER" -ErrorAction SilentlyContinue }
 
     $source  = Join-Path $root $sourceName
+    $outFile = New-TemporaryFile
     $errFile = New-TemporaryFile
     $p = Start-Process -FilePath $Launcher `
-        -ArgumentList (ConvertTo-QuotedArgs @($compiler, "/nologo", "/c", "/Fo$obj", $source)) `
-        -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile
+        -ArgumentList (ConvertTo-QuotedArgs (@($compiler, "/nologo", "/c", "/Fo$obj") + $extra + @($source))) `
+        -NoNewWindow -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    $out = Get-Content -Raw $outFile -ErrorAction SilentlyContinue
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
-    Remove-Item $errFile -ErrorAction SilentlyContinue
-    return @{ code = $p.ExitCode; stderr = $err }
+    Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
+    return @{ code = $p.ExitCode; stdout = [string]$out; stderr = $err }
 }
 # --- the object comparison, tested against input it can be given on purpose ----
 #
@@ -1120,6 +1128,13 @@ function Invoke-SelfTest {
 }
 
 if ($SelfTest) { exit (Invoke-SelfTest) }
+
+# The launcher reads its whole configuration from FASTCACHE_* variables, and the calls
+# below set only the ones they mean -- so an inherited FASTCACHE_VERIFY, FASTCACHE_TOKEN
+# or FASTCACHE_NO_DIRECT would decide what a case measures. Importing the shared module
+# clears every one of them; this fixture draws no port through `E2EPorts.psm1`, which
+# would otherwise have imported it.
+Import-Module (Join-Path $PSScriptRoot "lib/E2EEnvironment.psm1") -Force
 
 
 # What "the same object" means, per driver, and why it is not one answer.
@@ -1472,6 +1487,80 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
             throw "a dispatched C translation unit did not come back compiled as C"
         }
         Write-Host "   a C translation unit was compiled as C on the worker"
+
+        # --- 3b: a dispatched object naming its checkout stays with it -------
+        #
+        # A worker compiles `/E` text whose line markers name the CLIENT's paths, so
+        # the builtin `std::source_location` is made of resolves to the client's
+        # checkout on the worker -- and no key sees it, because it is filled in after
+        # preprocessing. The dispatched object is stored by the same code as a local
+        # one, scanned against the client's roots (apps/fastcache-cc/RootBinding.hpp),
+        # so a second checkout must MISS through the first one's marker and dispatch
+        # its own, and the first must still HIT its own copy without dispatching.
+        # Before root binding the second checkout was served the first one's object.
+        $boundRoots = @{}
+        foreach ($co in 'checkout-a', 'checkout-b') {
+            $broot = Join-Path $scratch "bound\$co"
+            New-Item -ItemType Directory -Force -Path (Join-Path $broot "build") | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $broot "inc") | Out-Null
+            "#pragma once`ninline int One() { return 1; }" | Set-Content -Encoding utf8 (Join-Path $broot "inc\h1.h")
+            ("#include `"inc/h1.h`"`nchar const* Tag() { return `"$cc-dist-case-bound`"; }`n" +
+             "char const* Where() { return __builtin_FILE(); }`nint G() { return One(); }") |
+                Set-Content -Encoding utf8 (Join-Path $broot "u.cpp")
+            $boundRoots[$co] = $broot
+        }
+        $objA = Join-Path $boundRoots['checkout-a'] "build\u.obj"
+        $objB = Join-Path $boundRoots['checkout-b'] "build\u.obj"
+        $rA = Invoke-Dispatching $cc $boundRoots['checkout-a'] $objA "127.0.0.1:$dispatchPort" $cachePort
+        $rB = Invoke-Dispatching $cc $boundRoots['checkout-b'] $objB "127.0.0.1:$dispatchPort" $cachePort
+        Remove-Item -LiteralPath $objA -Force -ErrorAction SilentlyContinue
+        $rA2 = Invoke-Dispatching $cc $boundRoots['checkout-a'] $objA "127.0.0.1:$dispatchPort" $cachePort
+        $bNamesA = (Test-Path $objB) -and [System.Text.Encoding]::Latin1.GetString(
+            [System.IO.File]::ReadAllBytes($objB)).Contains($boundRoots['checkout-a'])
+        $okA = $rA.code -eq 0 -and $rA.stderr -match "DISPATCHED to " -and $rA.stderr -match "root-bound object"
+        $okB = $rB.code -eq 0 -and $rB.stderr -match "fastcache-cc: MISS key=\S+ \(root-bound:" `
+               -and $rB.stderr -match "DISPATCHED to " -and (Test-Path $objB) -and -not $bNamesA
+        $okA2 = $rA2.code -eq 0 -and $rA2.stderr -match "fastcache-cc: HIT key=\S+ \(root-bound:" `
+                -and $rA2.stderr -notmatch "DISPATCHED to "
+        if (-not ($okA -and $okB -and $okA2)) {
+            foreach ($leg in @(@{n="a"; r=$rA}, @{n="b"; r=$rB}, @{n="a again"; r=$rA2})) {
+                Write-Host "--- $($leg.n) ---"
+                Write-Host $leg.r.stderr
+            }
+            throw "a dispatched root-bound object was not kept with its checkout (a=$okA b=$okB b-names-a=$bNamesA a-again=$okA2)"
+        }
+        Write-Host "   a dispatched object naming its checkout was kept with it, and served back to it"
+
+        # --- 3c: one header, two include chains, one note (#1593) ------------
+        #
+        # A worker sees no `#include`, so the client writes a dispatched compile's
+        # /showIncludes notes from its probe's dependency list. `cl` reports a header it
+        # reaches twice in two spellings -- `<root>\a/x.h` directly, `<root>\b\../a/x.h`
+        # through `b/y.h` (measured, VS 18) -- and the renderer's dedup is byte-exact, so
+        # before the list was collapsed and spelled one way at the probe boundary this
+        # wrote two notes for one file. The header is UNGUARDED on purpose: both drivers
+        # skip the note for a guarded header's second inclusion entirely.
+        $chainRoot = Join-Path $scratch "chains"
+        New-Item -ItemType Directory -Force -Path (Join-Path $chainRoot "build"), (Join-Path $chainRoot "a"),
+            (Join-Path $chainRoot "b") | Out-Null
+        "extern int xv;" | Set-Content -Encoding utf8 (Join-Path $chainRoot "a\x.h")
+        "#include `"../a/x.h`"`ninline int Y() { return 2; }" | Set-Content -Encoding utf8 (Join-Path $chainRoot "b\y.h")
+        ("#include `"a/x.h`"`n#include `"b/y.h`"`nchar const* Tag() { return `"$cc-dist-case-chains`"; }`n" +
+         "int U() { return Y() + xv; }") | Set-Content -Encoding utf8 (Join-Path $chainRoot "u.cpp")
+        $chainObj = Join-Path $chainRoot "build\u.obj"
+        $rC = Invoke-Dispatching $cc $chainRoot $chainObj "127.0.0.1:$dispatchPort" $cachePort "u.cpp" @("/showIncludes")
+        $notes = @(($rC.stdout -split "`r?`n") | Where-Object { $_ -match '^Note: including file:' })
+        $xNotes = @($notes | Where-Object { $_ -match '[\\/]a[\\/]x\.h$' })
+        $yNotes = @($notes | Where-Object { $_ -match '[\\/]b[\\/]y\.h$' })
+        $dotted = @($notes | Where-Object { $_ -match '(^|[\\/ ])\.\.([\\/]|$)' })
+        if (-not ($rC.code -eq 0 -and $rC.stderr -match "DISPATCHED to " -and $xNotes.Count -eq 1 -and $yNotes.Count -eq 1 `
+                  -and $dotted.Count -eq 0)) {
+            Write-Host "--- stdout ---"; Write-Host $rC.stdout
+            Write-Host "--- stderr ---"; Write-Host $rC.stderr
+            throw ("a header reached through two include chains was not ONE note (x.h notes=$($xNotes.Count), " +
+                   "y.h notes=$($yNotes.Count), notes with '..'=$($dotted.Count))")
+        }
+        Write-Host "   a header reached through two include chains was one note, with no '..' in any"
 
         # --- 4: a worker for another toolchain is never chosen ---------------
         # Its own daemon and its own worker, so the mismatched worker is the ONLY

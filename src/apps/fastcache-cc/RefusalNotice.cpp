@@ -2,8 +2,11 @@
 #include "RefusalNotice.hpp"
 
 #include <algorithm>
-#include <fstream>
+#include <charconv>
+#include <span>
 #include <string>
+#include <system_error>
+#include <tuple>
 
 namespace FastCache::Cc
 {
@@ -42,6 +45,7 @@ bool ShouldAnnounceRefusal(std::filesystem::path const& stateDir,
                            std::string_view endpoint,
                            CompileCacheWire::ErrorCode code,
                            std::chrono::system_clock::time_point now,
+                           IAtomicWriteFiles& files,
                            std::chrono::seconds interval)
 {
     // No state directory means no throttle, and the answer is YES rather than no.
@@ -57,19 +61,20 @@ bool ShouldAnnounceRefusal(std::filesystem::path const& stateDir,
     // ANNOUNCE, for the same reason the empty directory does: this is a noise
     // ceiling, not a correctness mechanism, and failing it closed would restore the
     // silence.
-    std::error_code ec;
-    if (std::ifstream in { stamp }; in)
+    if (auto const text = ReadFileShared(stamp); text.has_value())
     {
         long long last = 0;
-        if (in >> last && nowSeconds - last < interval.count())
+        auto const [end, error] = std::from_chars(text->data(), text->data() + text->size(), last);
+        if (error == std::errc {} && end != text->data() && nowSeconds - last < interval.count())
             return false;
     }
-
     // Best effort, and its failure is not reported: statistics and notices must
-    // never break a build. A write that fails simply means the next unit asks again.
+    // never break a build. A write that fails simply means the next unit asks again --
+    // the launcher's one writer, so no reader ever meets half a stamp.
+    std::error_code ec;
     std::filesystem::create_directories(stateDir, ec);
-    if (std::ofstream out { stamp, std::ios::trunc }; out)
-        out << nowSeconds << '\n';
+    auto const line = std::format("{}\n", nowSeconds);
+    std::ignore = WriteFileAtomically(stamp, std::as_bytes(std::span { line }), CurrentProcessId(), files);
     return true;
 }
 

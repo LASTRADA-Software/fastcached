@@ -44,6 +44,44 @@ collapse or a mis-serve and is now covered by regression tests:
   producing machine's paths in the stored value, all at once and all silently.
   `Cc::IPathResolver` resolves the roots and every emitted path through the same
   function; resolving only one side breaks the driver that previously worked.
+  - **The root scan is a side too.** An object bound to its checkout is judged by
+    whether it names a root, and the key accepts any spelling the filesystem
+    resolves onto one. The two drifted apart: an `-I` spelled wholly in 8.3 short
+    names was tokenized as `<BUILDTREE>` by the key and matched no needle of the
+    scan, so a second build directory was served the first one's
+    `__builtin_FILE()` — a WRONG HIT, measured on `cl` and clang-cl. So the
+    spellings are ONE list, `Cc::RootAliasList`: `RootReconciler` maps a path onto
+    a root ONLY after recording the ancestors of its spelling that resolve to a
+    root -- walked up the WHOLE spelling, because a count of components missed an
+    alias whose tail crossed a second junction and the key mapped it anyway (a
+    second wrong hit), and stopping at the first root bound an alias that runs
+    through the build tree into the source root to the source root alone (a
+    third, and through a SUBDIRECTORY of it a fourth). So the rule is the CLASS:
+    for every root ANY ancestor resolves into, an ancestor is recorded for it --
+    the lowest resolving TO it, else the highest resolving INTO it -- checked
+    GENERATIVELY over enumerated link compositions, never shape by shape. A path
+    no ancestor of which resolves into a root is left unmapped.
+  - **And an ancestor is recorded as SPELLED, not only as the walk asked about it.**
+    The walk asks about the lexical normal form, and which spelling a compiler
+    writes depends on its FLAGS (measured): `cl` writes the `-I` spelling
+    verbatim, `.` and `..` kept, with no debug flag, collapses it under `/Z7`,
+    `/Zi` or `/ZI` (object and `/showIncludes`) and under `/FC` (the object only);
+    clang-cl writes it verbatim, and under `-Z7` both. So `jx\zz\..\L1` recorded
+    only as `jx\L1` was a needle a verbatim object never contained -- a fifth
+    wrong hit, measured on clang-cl -- and recorded only as spelled it is one a
+    collapsed object never contains (measured, `cl /FC`). BOTH halves are
+    load-bearing: each walked ancestor's spelled prefix is DERIVED (the longest
+    prefix whose normal form it is) and recorded beside the normal form, and an
+    e2e leg covers each writer. Where none can be derived, or the two lead to different
+    places (a `..` after a link, read physically on POSIX, ascends from the
+    TARGET), the mapping is refused. The generative check shared the normal-form
+    premise and could not see this, so it now asks dotted spellings too, under
+    BOTH readings of `..`, and asserts coverage against the spelling AS WRITTEN;
+    its figures are pinned exactly, never as floors.
+    `BindCheckout` seeds each part's 8.3 short form through
+    `IPathResolver::ShortForm`, and the scan reads that list at STORE time. A
+    second derivation of "which spellings are this root", or a mapping that can
+    happen without the recording, is the defect.
 
 - **A compile that writes a second artefact is not cached at all.** What a hit
   reproduces is the object and the dependency record; a **C++ module interface
@@ -319,7 +357,7 @@ same on both — the same defect with no MSVC anywhere near it.
   older launcher keeps resolving to an older object; direct mode is on by default and
   short-circuits before the preprocessed path,
   so without the second bump the re-key never happens where it matters most. The coupling is
-  ONE-WAY, though, and both tags currently read `v5`: an `objkey` bump must drag the manifest
+  ONE-WAY, though, and both tags currently read `v7`: an `objkey` bump must drag the manifest
   tag with it, while the reverse is free — and free is the direction `v5` itself moved in
   (issue #111), the manifest half forced and the object half taken only to keep the two from
   sitting numerically apart.
@@ -667,8 +705,10 @@ same on both — the same defect with no MSVC anywhere near it.
     identified by the header it NAMES rather than by the English prefix, so the reading
     holds for a localized `cl` too.
 
-    It stays inert at the one site that reads it, because both regions are tagged
-    `ShowIncludes` whichever stream carries the notes. What sharpens is #821's shape: a
+    It stays inert at the one site that reads it, because both regions carry one tag
+    whichever stream carries the notes -- `Grammar::MsvcStream` since value generation 6,
+    which reads notes on either stream and diagnostics too (below, *A stream region's
+    grammar must cover EVERY line language*). What sharpens is #821's shape: a
     dispatch refusal fed from **stderr alone** is now known to be wrong for a COMPILE
     and right only for a `/EP` run — a firmer statement than "it may not fire for `cl`".
   - **The note grammar is one rule, not one string, and it is anchored at COLUMN ZERO.**
@@ -1434,20 +1474,38 @@ same on both — the same defect with no MSVC anywhere near it.
   one), and a path still carrying `..` afterwards comes back as the input rather than
   as a re-separated spelling that gained nothing.
 
-- **Emit and store are different answers, and the split is the whole point.** Every
-  byte handed to a build system is collapsed; every byte handed to the cache is not.
-  Collapsing on the way IN would change what a stored `ShowIncludes` region looks
-  like, which is a `CompileValueVersion` bump, a conformance row and a
-  `GenerationBumps` entry — one cold compile cache for every fleet. That is
-  [#1593](https://github.com/LASTRADA-Software/fastcached/issues/1593), held back so
-  the bump is paid once with company, exactly as #879 and #891 were batched.
+- **The ingest side followed with value generation 6, which is what it was waiting
+  for** ([#1593](https://github.com/LASTRADA-Software/fastcached/issues/1593)). Collapsing
+  on the way IN changes what a stored region looks like, so it was held back until a
+  `CompileValueVersion` bump came along to pay for it once, as #879 and #891 were
+  batched. It is two places, each doing it once. The probe's dependency list crosses
+  `RootReconciler::DependencyList`, which reconciles, collapses and -- on a Windows
+  layout -- spells every path with `\`, so the key's neighbours, the manifest and a
+  dispatched compile's depfile and notes read one spelling per header. The separator is
+  part of that and was MEASURED: `cl` (VS 18) reports one header as `<root>\a/x.h`
+  directly and as `<root>\b\../a/x.h` through a second header, so a collapse alone
+  leaves two byte strings. The stored regions are collapsed by the SERVER:
+  `PathCanon::CanonicalizeRegion` collapses EVERY span before matching the roots, so a
+  span under a root becomes its token and one that lands under none is stored as its
+  collapsed absolute spelling -- never `<BUILDTREE>/../..`, a token resolving against the
+  CONSUMER's root depth, which names a different file there (Job 2 review, I1). Every
+  server still canonicalizes identically by construction. The collapse holds a drive and
+  a whole UNC share (`\\host\share`) aside as the anchor, so neither is ascended past. There is ONE lexical collapse,
+  `PathCanon::CollapseRelativeSegments`, shared by the emit side and both ingest places;
+  `LexicalForm` stays apart as the key-path helper whose output is hashed.
+- **A guarded header reached twice is ONE note from the driver; an unguarded one is
+  two.** Measured on both drivers under `/c` and `/EP`: the multiple-include optimization
+  skips the second note entirely, so a fixture for the two-spelling case needs a header
+  that is read again.
 
 - **The seam is the four emit sites, never `ReplayStreams`.** That function is a
   byte-exact I/O primitive and holds neither the grammar nor the marker, and the hit
   path has to collapse per region on that region's own grammar. The grammar comes
-  from `TextGrammar(cmd.flavor)` for the reason #825 already gives — the channel
-  follows the FLAG, not the driver — and only `Grammar::ShowIncludes` is gated,
-  because Ninja's depfile reader carries no length check.
+  from `Cc::StreamGrammar(cmd.flavor)` for the reason #825 already gives — the channel
+  follows the FLAG, not the driver — and only a grammar that `CarriesIncludeNotes` is
+  gated in, because Ninja's depfile reader carries no length check. Only the NOTES are
+  rewritten even then, under `Grammar::MsvcStream` too: a diagnostic is printed rather
+  than parsed, so its spelling stays the compiler's.
 
 - **On the hit path the collapse sits between localization and the marker restore, and
   both ends pin it there.** A `<SRCROOT>` token is not a path, so there is nothing to
@@ -1568,15 +1626,20 @@ stops being one — the same confound that cost #493 a re-run.
   every differing pair. A wrong *artefact* under a correct key, not wrong *code* —
   which is why neither ticket can be #368's mechanism.
 - **`-fdebug-prefix-map`, never `-ffile-prefix-map`.** The wider flag implies
-  `-fmacro-prefix-map` and rewrites `__FILE__`, and that buys nothing here.
-  `__FILE__` is **self-protecting**: the preprocessor expands it and `ComputeKey`
-  hashes preprocessed output raw, so whenever the expansion is checkout-dependent
-  it is checkout-dependent in the hashed text too, and whenever the hashed text
-  agrees the expansion agrees. Measured through `/EP` alone — absolute source
-  spelling differs, relative agrees, relative plus `/FC` differs. There is no
-  arrangement in which two checkouts share a key while their `__FILE__` strings
-  differ, so changing program-visible strings would fix a defect that cannot
-  occur.
+  `-fmacro-prefix-map` and rewrites `__FILE__` in the text the key hashes, which is
+  the *Only the DEBUG spelling* bullet below. `__FILE__` is self-protecting **for
+  `ComputeKey` and for nothing else**: the preprocessor expands it and `ComputeKey`
+  hashes preprocessed output raw, so whenever the expansion is checkout-dependent it
+  is checkout-dependent in THAT key's text too, and whenever that text agrees the
+  expansion agrees. Measured through `/EP` alone — absolute source spelling differs,
+  relative agrees, relative plus `/FC` differs. **It protects no other key.** The
+  direct-mode manifest key never sees the expansion, and `std::source_location` is
+  filled in by the compiler after preprocessing, so it reaches no key at all: two
+  checkouts DID share a key while their program-visible file names differed, on the
+  default path for `__FILE__` and on every path for `source_location`. This bullet
+  used to say no such arrangement existed; the measurement it cited touched the one
+  key where that is true. *An object that names its producer's roots is keyed apart*,
+  below, is what closes both.
 - **The flag names the producing checkout by construction, so the KEY has to
   relativize it.** Measured before the row existed: `RelativizeArgs` returned
   `-fdebug-prefix-map=/home/ci/checkout-aaa=/fastcache/src` byte-for-byte, so
@@ -1916,6 +1979,90 @@ stops being one — the same confound that cost #493 a re-run.
   replays objects naming another checkout; a line reporting only the applied half
   would read the same in all three cases.
 
+### An object that names its producer's roots is keyed apart, and only the OBJECT can say so
+
+The debug records above are the accepted cost; this is their program-visible sibling,
+and it is not accepted. A string the PROGRAM reads that names the producing checkout --
+an assertion message, a log line, a Catch2 location -- points a developer at a tree they
+are not building, and a hit serves it to every other checkout that computes the key.
+
+**Measured**, `cl` 14.51 through the installed launcher, two byte-identical checkouts
+compiled one after the other (the second row is what the second checkout printed):
+
+<!-- table-total: none -->
+| spelling | `__FILE__`, direct on | `__FILE__`, direct off | `source_location`, either |
+| --- | --- | --- | --- |
+| absolute source (every CMake compile) | HIT, **the first checkout's path** | MISS, own path | HIT, **the first checkout's path** |
+| absolute plus `/FC` | HIT, **the first checkout's path** | MISS, own path | HIT, **the first checkout's path** |
+| relative source | HIT, relative (correct) | HIT, relative (correct) | HIT, relative (correct) |
+| relative plus `/FC` | HIT, **the first checkout's path** | MISS, own path | HIT, **the first checkout's path** |
+
+**Why no key can see it.** `ComputeManifestKey` hashes the stamp, the `<SRCROOT>` token of
+the source and the relativized arguments -- in which an absolute source and `-I` are both
+`<SRCROOT>/...` -- and `ValidateManifest` re-hashes each dependency's CONTENT, so two
+checkouts reach one manifest and it validates. `source_location::current()` and
+`__builtin_FILE()` are filled in by the compiler from the presumed file name, after
+preprocessing, and `/EP` / `-E -P` suppress the markers that would carry it, deliberately.
+Predicting it from the command line is not available either: `__FILE__`, the builtin, a
+`#line`, `/FC`, MSVC's `assert` (a WIDE `__FILE__`) and a path-valued macro nobody
+anticipated all reach the same bytes. Folding the absolute roots into every key whose
+source is spelled absolutely is correct, and ends cross-checkout sharing for every CMake
+compile -- the rejected alternative.
+
+**The mechanism is `apps/fastcache-cc/RootBinding.hpp`, and the header carries the whole
+argument.** At STORE time the launcher scans the object's program-visible sections for
+the parts of its own checkout -- source root, build tree, working directory, each in the
+build's spelling and the resolved one. An object naming none keeps today's key and
+today's sharing. An object naming one is stored under a key that folds in the parts it
+NAMES and nothing else (`rootbound-v2`), with a MARKER at the portable key listing them;
+a consumer that meets the marker folds ITS OWN values for those parts, so another
+checkout MISSES -- failing closed -- and stores its own bound copy, while the producing
+checkout HITs its own.
+Direct mode resolves to the portable key and meets the marker there, and a dispatched
+compile is stored by the same code, scanned against the CLIENT's roots. Measured after:
+every bold cell above becomes a MISS naming the compiling checkout's own path, the
+producing checkout re-compiling HITs its bound copy, and a translation unit naming no
+path HITs across the two checkouts in every spelling.
+
+- **The scan errs BROAD, because missing a spelling is wrong-but-looks-right.** Both
+  separators and a run of them, case folded, every non-ASCII run one wildcard (a
+  code-page `__FILE__` is one byte where the root's UTF-8 is two), narrow, UTF-16LE and
+  UTF-32LE at every alignment, debug records NAMED as the exclusion rather than program
+  data named as the inclusion, and a section that cannot be read as bytes -- LTO IR,
+  embedded bitcode, a compressed section, `cl /GL`'s anonymous object -- BOUND. Over-
+  recognising costs one translation unit its sharing; under-recognising serves another
+  checkout's path.
+- **The debug records stay out of the scan**, for #203's reason: they name the producing
+  checkout on every compile with debug info, and counting them would end sharing for
+  every debug build.
+- **The key folds what the object is OBSERVED to name, never the whole checkout.**
+  `rootbound-v1` folded all three parts, and `launcher-replay-e2e` then missed 32 times in
+  a warm build of the same source in a second build directory: every miss a `*_test.cpp`
+  whose object names the source root (Catch2's `__FILE__`) and no build directory at all.
+  It is "only machine-independent dependency paths are hashed", applied to the binding.
+  The marker carries the parts BY NAME, because the fetch cannot see the object first; a
+  marker this build cannot read is refused as undecodable, never followed.
+- **The marker is a current-generation `CompileValue` with a versioned blob and NO text
+  region, and `CompileValueVersion` did not move for it.** It passes `CanonicalStoredValue`
+  unchanged on every server (nothing to rewrite), a server of another generation refuses
+  it by its leading byte as it refuses everything else, and only launchers deriving
+  `objkey-v7` keys can reach one. A stored object always carries two regions, so the
+  recogniser cannot take an object for a marker; `ResolveFetchedObject` is the one place a
+  fetched value is classified, and it follows a marker at most once.
+- **`objkey-v7` and `manifest-v7` moved together**, and the manifest half is required on
+  its own: a `v6` manifest is shared between checkouts and points straight at the
+  producer's object. The object half retires every entry stored before the scan existed.
+- **A hit `FASTCACHE_VERIFY` rejects is `VERIFY-MISMATCH`, never `HIT`**, in
+  `invocations.log`, on the trace line and in `--show-stats` (`Outcome::VerifyMismatch`).
+  The verifier compiles to the same path, so the build links the fresh object; logging
+  it as a hit counted every wrong object the verifier caught as a success. Note what it
+  still reports on `cl`: a cross-checkout hit of a portable object differs in
+  `.debug$S`, which the verifier does not excuse (the section above), so a verified
+  cross-checkout `cl` hit is a `VERIFY-MISMATCH` by design.
+- **Residuals, stated where they apply**: a root reached through an alias neither spelling
+  names is not found; and two spellings of ONE root that tokenize alike share the
+  portable key, so only an exported root spelled differently keys apart.
+
 ## Two servers on one wire are two VERSIONS on one wire
 
 <!-- agent-tripwire: And by every **VERSION** of them, or the rule holds at no moment a fleet is actually in -->
@@ -2192,6 +2339,59 @@ were open to breaking it, and neither needed anybody's install to be stale.
   look at, and an operator does different things about them. Otherwise an upgrade
   window presents as an endlessly cold cache with no diagnostic, which this wire has
   already recorded paying for once.
+
+### A stream region's grammar must cover EVERY line language that stream can carry
+
+A stored text region carries ONE grammar tag, and a line that grammar cannot see is
+stored verbatim -- with the producing checkout's absolute path in it, replayed into every
+consumer. So the tag of a console stream is a claim about every kind of line the driver
+can write on that stream, and a grammar that covers one of them is a grammar that
+misses the rest in silence.
+
+- **It shipped that way for the whole MSVC family until value generation 6.** Both
+  streams were tagged `Grammar::ShowIncludes`, which rewrites note lines only, because
+  #825 showed the notes move between the streams with the flag -- so neither stream
+  could take a diagnostics-only grammar, and nobody wrote one that did both. Every
+  `cl` and `clang-cl` warning, error and `note:` a hit replayed named the checkout that
+  stored it. MEASURED by the investigation that found it: C4100 in a header, two
+  byte-identical checkouts, direct mode OFF, a key the two share by design and a
+  correct object -- the defect was the text around it. `Grammar::MsvcDiagnostics`
+  existed, was unit-tested, and reached no production region: **a correct grammar
+  nothing tags a region with is this bug**, which is why `Cc::StreamGrammar` lives
+  where a test can reach it.
+- **The union is a list of line rules, and it has FOUR members, not two.**
+  `Grammar::MsvcStream` is the `/showIncludes` note, the MSVC diagnostic head, the
+  GCC-style include chain -- which `clang-cl` writes on this same stream in front of a
+  header's diagnostic (`In file included from <path>:1:`) -- and the GCC-style head, which
+  `clang-cl -fdiagnostics-format=clang` writes instead of `(line,col): `. MEASURED while capturing the
+  test shapes (VS 18 Community, MSVC 14.51 and its clang-cl); a notes-plus-diagnostics
+  union read from the ticket would have left that line naming the producer. Capture
+  the driver's real output before writing the grammar; the shapes a ticket lists are
+  the ones somebody looked at.
+- **The diagnostic head is anchored and TIGHT**: `<path>(<digits>[,<digits>])` then `): `
+  or `) : ` -- the second being the `#pragma message(__FILE__ "(" ... ") : warning: ...")`
+  idiom MSVC documents, which direct mode shares across checkouts and only this grammar
+  keeps local (Job 2 review, I2, measured end to end). A parenthesis that opens no location
+  is stepped over. `/diagnostics:caret` (and clang-cl's `N | source` echo) put SOURCE on the
+  stream, and **what keeps an indented echo intact is the ROOT match** -- a span is
+  rewritten only when it begins with a root, and an indented span begins with blanks.
+  The column-zero check is defensive, and removing it turns nothing red. What is still
+  rewritten is a column-zero source line that itself begins with an in-root path and a
+  numeric location, which only a raw string or a comment continuation produces.
+- **The note-only readers stay note-only.** The stale-hit guard extracts dependencies
+  from an `MsvcStream` region through the notes parser alone -- a diagnostic quotes a
+  path without declaring a dependency on it -- and the emit-side `..` collapse walks
+  such a region under `ShowIncludes`. `PathCanon::CarriesIncludeNotes` is the one
+  answer to "can this region carry notes", separate from "which lines does this
+  grammar rewrite".
+- **A new line language is a new generation.** A grammar's rules are part of the
+  canonicalization spec, so adding one to a stream's grammar moves `CompileValueVersion`
+  and adds corpus rows, exactly as `MsvcStream` did; the grammar-coverage case in
+  `CompileValue_test.cpp` refuses a decodable tag no corpus row exercises. The Job 2
+  review's I1, I2, M3 and M4 moved it again, to generation 7, although generation 6 had
+  never left the branch that introduced it: a server built from that branch still
+  stamps 6 on text it rewrites the old way, and the frozen-row check says so in as many
+  words. "It never shipped" is not an argument the version byte can hear.
 
 ## Accepted trade-offs
 

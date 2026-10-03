@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "AtomicFile.hpp"
 #include "CacheProtocol.hpp"
 #include "Dispatch.hpp"
 #include "Stats.hpp"
@@ -48,7 +49,8 @@ class IMemoStore
     virtual bool Write(std::string_view text) = 0;
 };
 
-/// A memo kept in one file, replaced atomically (temp file plus rename).
+/// A memo kept in one file, replaced by `WriteFileAtomically` and read through
+/// `SharedReadFile`, so a launcher reading it never stops another from replacing it.
 ///
 /// An EMPTY path reads nothing and writes nothing, which is how `StateDirectory`'s
 /// "do not persist" answer reaches the memo without a second code path.
@@ -56,7 +58,8 @@ class FileMemoStore final: public IMemoStore
 {
   public:
     /// @param file Where the memo lives; empty for a store that keeps nothing.
-    explicit FileMemoStore(std::filesystem::path file);
+    /// @param files The filesystem the memo is replaced on; must outlive this.
+    FileMemoStore(std::filesystem::path file, IAtomicWriteFiles& files);
 
     /// @return The file's contents, or nothing when it is absent or unreadable.
     [[nodiscard]] std::optional<std::string> Read() const override;
@@ -67,6 +70,7 @@ class FileMemoStore final: public IMemoStore
 
   private:
     std::filesystem::path _file;
+    IAtomicWriteFiles& _files;
 };
 
 /// What a memo entry says could not be reached.

@@ -37,7 +37,7 @@ Subject="src/apps/fastcache-cc/main.cpp"
 #
 # EXCEPT where the reason is no longer IN this file. #909 moved the hit branch's
 # decision into `CacheDecision.hpp`'s table, so the site now reads
-# `Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitUnusable))` and the
+# `Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitObjectUnwritable))` and the
 # sentence an operator sees is a `constexpr` lookup away. A scan of `main.cpp`
 # cannot see text that is not in `main.cpp`, so that row anchors on the OBSERVATION
 # enumerator instead: stable, spelled at the site, and naming the exact state whose
@@ -48,7 +48,7 @@ Subject="src/apps/fastcache-cc/main.cpp"
 Table='
 missing FASTCACHE_ADDR|Warn|cache not configured: nothing was reached, so nothing to replace
 preprocess failed|Warn|no preprocessed text means no key, so nothing to replace
-FetchObservation::HitUnusable|Warn|the STORED entry is good; the local write failed
+FetchObservation::HitObjectUnwritable|Warn|the STORED entry is good; the local write failed
 RecordedReason|WarnAndCarryOn|the daemon refused: carry on so a MISS can store
 fetch exchange failed|WarnAndCarryOn|unreached: carry on so a MISS can store
 DecodeFailureReason|WarnAndCarryOn|an UNUSABLE value sits under this key and must be overwritten
@@ -173,7 +173,7 @@ if [ "$selftest" -eq 1 ]; then
         cat <<'SRC'
 return Warn(record, "missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
 return Warn(record, "preprocess failed");
-return Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitUnusable));
+return Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitObjectUnwritable));
 WarnAndCarryOn(record, Cc::RecordedReason(outcome, presented.missing));
 WarnAndCarryOn(record, "fetch exchange failed");
 WarnAndCarryOn(record, DecodeFailureReason(decoded.error()));

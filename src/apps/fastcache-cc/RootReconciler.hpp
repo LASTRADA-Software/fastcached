@@ -2,6 +2,7 @@
 #pragma once
 
 #include "PathResolve.hpp"
+#include "RootAliases.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
@@ -105,9 +106,32 @@ class RootReconciler
     /// @return The same location in this build's spelling, or `path` unchanged.
     [[nodiscard]] std::string Directory(std::string_view path);
 
-    /// Reconcile every path in a list, in place.
-    /// @param paths The dependency paths to reconcile.
-    void All(std::vector<std::string>& paths);
+    /// The boundary every DEPENDENCY LIST crosses, in place: each path reconciled to this
+    /// build's spelling, then `..`-collapsed (`PathCanon::CollapseRelativeSegments`), then --
+    /// on a Windows layout only -- spelled with `\` throughout.
+    ///
+    /// The separator is part of "one spelling", measured rather than assumed: `cl` (VS 18,
+    /// under `/c` and `/EP` alike) reports one header as `<root>\a/x.h` when included directly
+    /// and as `<root>\b\../a/x.h` through a second header, so collapsing alone yields
+    /// `<root>\a\x.h` beside `<root>\a/x.h` -- still two spellings to a byte-exact dedup.
+    /// Both separators are one to a Windows filesystem, and the key (`LexicalForm`) and the
+    /// manifest (`NormalizeForLayout`) fold them already. A POSIX layout is left alone: `\` is
+    /// an ordinary filename byte there.
+    ///
+    /// One call per list and every list makes it -- the probe's, from a depfile or from notes,
+    /// and the build's own depfile read back for a manifest -- so the key's dependency set, the
+    /// manifest and a dispatched compile's depfile and notes read ONE spelling per header
+    /// (#1593). Deduplication stays with each consumer, which already does it: the renderers
+    /// unique the list, and the keyed set is sorted and uniqued. The key does not move: it hashes
+    /// `LexicalForm`, which collapsed already.
+    ///
+    /// Collapsed AFTER reconciling, because reconciling reads the filesystem per parent
+    /// directory and the collapse is text: the collapse then works on the spelling every other
+    /// path in this build uses. Not applied by `Path` or `Region`: a stored region travels as the
+    /// compiler wrote it and the SERVER collapses it, which is what keeps every server
+    /// canonicalizing identically.
+    /// @param paths The dependency paths.
+    void DependencyList(std::vector<std::string>& paths);
 
     /// Reconcile every path span a captured region names, per its grammar, except
     /// one the caller names as the build system's own.
@@ -168,6 +192,46 @@ class RootReconciler
         return _asGiven;
     }
 
+    /// The resolved layout: the roots as the filesystem spells them.
+    ///
+    /// Nothing downstream TRANSLATES with it -- that stays this class's job -- but one
+    /// question needs both spellings side by side: whether an object names either root.
+    /// A compiler writes `__FILE__` in whichever spelling it was handed, so a scan that
+    /// knew only the build's own would miss the other; see `RootBinding.hpp`.
+    /// @return The roots as resolved at construction.
+    [[nodiscard]] PathCanon::Layout const& ResolvedLayout() const noexcept
+    {
+        return _resolved;
+    }
+
+    /// Every alias spelling this compile accepts for a root: each prefix `Translate` MAPPED
+    /// onto one, recorded as it mapped it, plus whatever `BindCheckout` seeds (each part's
+    /// 8.3 short form). The root scan reads this list, which is what keeps it from judging
+    /// portable an object naming a spelling the key already reconciled (`RootAliasList`).
+    ///
+    /// Covers every alias the resolver accepts, because recording is part of mapping: an
+    /// 8.3 spelling, a `subst` drive (`GetFinalPathNameByHandleW` resolves one to its
+    /// target, `PathResolve.cpp`), a junction or a symlinked prefix alike.
+    /// @return The list; the reconciler keeps adding to it while the compile runs.
+    [[nodiscard]] RootAliasList const& Aliases() const noexcept
+    {
+        return _aliases;
+    }
+
+    /// The same list, for `BindCheckout` to seed.
+    /// @return The list.
+    [[nodiscard]] RootAliasList& Aliases() noexcept
+    {
+        return _aliases;
+    }
+
+    /// The path-identity seam this reconciler resolves through, for `BindCheckout`.
+    /// @return The resolver.
+    [[nodiscard]] IPathResolver& Resolver() const noexcept
+    {
+        return _resolver;
+    }
+
     /// How many paths this reconciler could not read as text.
     ///
     /// Not a drop and not a diagnostic: a path whose bytes this process cannot read
@@ -198,10 +262,36 @@ class RootReconciler
     /// @return The as-given spelling of the same location.
     [[nodiscard]] std::string Translate(std::string_view original, Depth depth);
 
+    /// Record the ancestor of @p original that spells a root, for a path resolution has
+    /// just mapped onto one: the alias the key is about to accept, handed to the scan
+    /// (`Aliases`). `Translate` maps the path only when this returns true, which is what
+    /// makes mapping and recording one operation.
+    ///
+    /// Walks up @p original, nearest ancestor first, and records -- for EACH root any
+    /// ancestor resolves into -- the first ancestor that RESOLVES to that root, or failing
+    /// that the highest one that resolves INTO it; a root's own spelling, or an alias
+    /// already listed, finds that root with nothing to add. The walk goes on past the first
+    /// root it finds, because an alias can run through one root into the other: the object
+    /// then names both, and must be bound to both.
+    ///
+    /// Each recorded ancestor is recorded in BOTH spellings, since which one the object
+    /// carries depends on the compiler's flags: the prefix of @p original as spelled, dot
+    /// segments kept (`cl` with no debug flag, clang-cl), and the lexical normal form the walk
+    /// asks about (`cl` under `/Z7`, `/Zi`, `/ZI` or `/FC`). A walked ancestor
+    /// whose spelled prefix cannot be derived, or leads somewhere its normal form does not
+    /// (a `..` after a link, where the filesystem ascends from the TARGET), refuses the
+    /// mapping: the walk asked about a directory the path does not pass through.
+    /// @param original The path as emitted.
+    /// @param depth Whether its leaf is a file, which is not asked about.
+    /// @return Whether an ancestor spells a root the scan knows -- false leaves the path
+    ///         unmapped.
+    [[nodiscard]] bool RecordAlias(std::string_view original, Depth depth);
+
     IPathResolver& _resolver;
     PathCanon::Layout _asGiven;
     PathCanon::Layout _resolved;
     NarrowTextPolicy _policy;
+    RootAliasList _aliases;
     std::size_t _unreadablePaths { 0 };
 };
 

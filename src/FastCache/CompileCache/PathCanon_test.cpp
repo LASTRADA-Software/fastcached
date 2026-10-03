@@ -3,6 +3,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -450,6 +452,234 @@ TEST_CASE("MsvcDiagnostics rewrites the leading path of a diagnostic line")
 }
 
 // ---------------------------------------------------------------------------
+// MsvcStream: one tag for every line language an MSVC-family console stream carries.
+// The lines are real `cl` and `clang-cl` output (VS 18 Community, MSVC 14.51, its clang-cl)
+// with the capture's root replaced, so the SHAPES are measured rather than recalled.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// The checkout that stored the stream.
+[[nodiscard]] Layout MsvcProducer()
+{
+    return Layout { .sourceRoot = R"(C:\work\aaa\src)", .buildTree = R"(C:\work\aaa\build)" };
+}
+
+/// The checkout that replays it.
+[[nodiscard]] Layout MsvcConsumer()
+{
+    return Layout { .sourceRoot = R"(D:\ci\bbb\src)", .buildTree = R"(D:\ci\bbb\build)" };
+}
+
+/// One stream as `cl /showIncludes /diagnostics:caret` wrote it: the echoed source name, a note,
+/// a header warning, a TU-level warning, an error, its `note:` continuations, the caret echo of
+/// each, a toolchain warning outside both roots, and a command-line warning with no location.
+constexpr std::string_view ClStream =
+    "a.cpp\r\n"
+    "Note: including file: C:\\work\\aaa\\src\\inc/probe.h\r\n"
+    "C:\\work\\aaa\\src\\inc\\probe.h(3,29): warning C4100: 'x': unreferenced parameter\r\n"
+    "inline int unused_param(int x) { return 0; }\r\n"
+    "                            ^\r\n"
+    "C:\\work\\aaa\\src\\a.cpp(3,17): warning C4101: 'z': unreferenced local variable\r\n"
+    "C:\\work\\aaa\\src\\a.cpp(2): error C2660: 'f': function does not take 2 arguments\r\n"
+    "C:\\work\\aaa\\src\\a.cpp(1): note: see declaration of 'f'\r\n"
+    "C:\\work\\aaa\\build\\gen\\cfg.h(7): note: while trying to match the argument list\r\n"
+    "C:\\Program Files (x86)\\MSVC\\include\\vector(10): warning C4996: 'q'\r\n"
+    "cl : Command line warning D9002 : ignoring unknown option '/foo'\r\n";
+
+/// The same stream as `clang-cl` writes it: no code, a GCC-style include chain in front of a
+/// header's diagnostic, and an indented `N | source` echo.
+constexpr std::string_view ClangClStream = "Note: including file: C:\\work\\aaa\\src\\inc/probe.h\r\n"
+                                           "In file included from C:\\work\\aaa\\src\\a.cpp:1:\r\n"
+                                           "C:\\work\\aaa\\src\\inc/probe.h(3,29): warning: unused parameter 'x'\r\n"
+                                           "    3 | inline int unused_param(int x) { return 0; }\r\n"
+                                           "      |                             ^\r\n"
+                                           "C:\\work\\aaa\\src\\a.cpp(2,3): note: 'old' has been explicitly marked here\r\n"
+                                           "C:\\work\\aaa\\src\\a.cpp(4,20): error: use of undeclared identifier 'y'\r\n";
+
+/// Whether `text` names `root` anywhere, in either separator and either case -- the question a
+/// replayed stream must answer NO to for the producer's root.
+[[nodiscard]] bool NamesRoot(std::string_view text, std::string_view root)
+{
+    auto const fold = [](std::string_view s) {
+        std::string out;
+        for (char const c: s)
+            out.push_back(PathCanon::AsciiLower(c == '\\' ? '/' : c));
+        return out;
+    };
+    return fold(text).contains(fold(root));
+}
+
+} // namespace
+
+TEST_CASE("MsvcStream rewrites every note and diagnostic head cl writes, and nothing else", "[msvc-stream]")
+{
+    auto const canonical = PathCanon::CanonicalizeRegion(ClStream, Grammar::MsvcStream, MsvcProducer());
+    CHECK(canonical
+          == "a.cpp\r\n"
+             "Note: including file: <SRCROOT>/inc/probe.h\r\n"
+             "<SRCROOT>/inc/probe.h(3,29): warning C4100: 'x': unreferenced parameter\r\n"
+             "inline int unused_param(int x) { return 0; }\r\n"
+             "                            ^\r\n"
+             "<SRCROOT>/a.cpp(3,17): warning C4101: 'z': unreferenced local variable\r\n"
+             "<SRCROOT>/a.cpp(2): error C2660: 'f': function does not take 2 arguments\r\n"
+             "<SRCROOT>/a.cpp(1): note: see declaration of 'f'\r\n"
+             "<BUILDTREE>/gen/cfg.h(7): note: while trying to match the argument list\r\n"
+             "C:\\Program Files (x86)\\MSVC\\include\\vector(10): warning C4996: 'q'\r\n"
+             "cl : Command line warning D9002 : ignoring unknown option '/foo'\r\n");
+}
+
+TEST_CASE("MsvcStream rewrites clang-cl's include chain and diagnostic heads", "[msvc-stream]")
+{
+    auto const canonical = PathCanon::CanonicalizeRegion(ClangClStream, Grammar::MsvcStream, MsvcProducer());
+    CHECK(canonical
+          == "Note: including file: <SRCROOT>/inc/probe.h\r\n"
+             "In file included from <SRCROOT>/a.cpp:1:\r\n"
+             "<SRCROOT>/inc/probe.h(3,29): warning: unused parameter 'x'\r\n"
+             "    3 | inline int unused_param(int x) { return 0; }\r\n"
+             "      |                             ^\r\n"
+             "<SRCROOT>/a.cpp(2,3): note: 'old' has been explicitly marked here\r\n"
+             "<SRCROOT>/a.cpp(4,20): error: use of undeclared identifier 'y'\r\n");
+}
+
+TEST_CASE("An MSVC stream round-trips into another checkout with no trace of the producer", "[msvc-stream]")
+{
+    for (auto const stream: { ClStream, ClangClStream })
+    {
+        auto const replayed = PathCanon::LocalizeRegion(
+            PathCanon::CanonicalizeRegion(stream, Grammar::MsvcStream, MsvcProducer()), Grammar::MsvcStream, MsvcConsumer());
+        INFO(replayed);
+        CHECK_FALSE(NamesRoot(replayed, MsvcProducer().sourceRoot));
+        CHECK_FALSE(NamesRoot(replayed, MsvcProducer().buildTree));
+        CHECK(replayed.contains(R"(D:\ci\bbb\src\inc\probe.h()"));
+        CHECK(replayed.contains(R"(D:\ci\bbb\src\a.cpp()"));
+        // CRLF survives on every line, which is a line count of terminators left unchanged.
+        CHECK(std::ranges::count(replayed, '\r') == std::ranges::count(stream, '\r'));
+    }
+}
+
+TEST_CASE("ShowIncludes alone leaves every diagnostic head naming the producer", "[msvc-stream]")
+{
+    // The generation-5 behaviour, kept as the contrast that makes the case above mean something:
+    // tagged ShowIncludes, the notes travel and every diagnostic keeps the producer's root.
+    auto const replayed =
+        PathCanon::LocalizeRegion(PathCanon::CanonicalizeRegion(ClStream, Grammar::ShowIncludes, MsvcProducer()),
+                                  Grammar::ShowIncludes,
+                                  MsvcConsumer());
+    CHECK(NamesRoot(replayed, MsvcProducer().sourceRoot));
+    CHECK(replayed.contains(R"(Note: including file: D:\ci\bbb\src\inc\probe.h)"));
+}
+
+TEST_CASE("A caret source echo quoting an in-root path is left alone", "[msvc-stream]")
+{
+    // An indented echo quoting a path and a location, and a column-zero one -- a comment
+    // continuation -- whose parenthesis opens no location. The looser generation-5 head took the
+    // first `(` before any later `): ` and rewrote the second; the anchored head steps over it.
+    std::string const echo = "    Log(\"C:\\work\\aaa\\src\\a.h(3): \");\r\n"
+                             "C:\\work\\aaa\\src\\a.h(see Frob()): the header this reads\r\n";
+    CHECK(PathCanon::CanonicalizeRegion(echo, Grammar::MsvcStream, MsvcProducer()) == echo);
+    CHECK(PathCanon::CanonicalizeRegion(echo, Grammar::MsvcDiagnostics, MsvcProducer()) == echo);
+}
+
+TEST_CASE("The MSVC diagnostic head is exactly a column-zero path and a numeric location", "[msvc-stream]")
+{
+    struct Row
+    {
+        std::string_view line;
+        std::string_view expected;
+    };
+    constexpr auto Rows = std::to_array<Row>({
+        // Taken: a line, a line and a column, and a parenthesis inside the path stepped over.
+        { .line = R"(C:\work\aaa\src\a.cpp(3): warning C1)", .expected = R"(<SRCROOT>/a.cpp(3): warning C1)" },
+        { .line = R"(C:\work\aaa\src\a.cpp(3,9): error C2)", .expected = R"(<SRCROOT>/a.cpp(3,9): error C2)" },
+        { .line = R"(C:\work\aaa\src\x (y)\a.cpp(3): note: n)", .expected = R"(<SRCROOT>/x (y)/a.cpp(3): note: n)" },
+        // Taken: the `#pragma message(__FILE__ "(" STR(__LINE__) ") : warning: ...")` idiom, whose
+        // blank before the colon is how MSVC's own documentation spells it (Job 2 review, I2).
+        { .line = R"(C:\work\aaa\src\a.cpp(12) : warning: TODO fix this)",
+          .expected = R"(<SRCROOT>/a.cpp(12) : warning: TODO fix this)" },
+        { .line = R"(C:\work\aaa\src\a.cpp(3,9) : error C2)", .expected = R"(<SRCROOT>/a.cpp(3,9) : error C2)" },
+        // Refused: indented, a non-numeric location, an empty column, no blank after the colon.
+        { .line = R"(  C:\work\aaa\src\a.cpp(3): warning C1)", .expected = R"(  C:\work\aaa\src\a.cpp(3): warning C1)" },
+        { .line = R"(C:\work\aaa\src\a.cpp(x): warning C1)", .expected = R"(C:\work\aaa\src\a.cpp(x): warning C1)" },
+        { .line = R"(C:\work\aaa\src\a.cpp(3,): warning C1)", .expected = R"(C:\work\aaa\src\a.cpp(3,): warning C1)" },
+        { .line = R"(C:\work\aaa\src\a.cpp(3):warning C1)", .expected = R"(C:\work\aaa\src\a.cpp(3):warning C1)" },
+        // ... and the spaced form no looser: two blanks, or none after the colon, is no head.
+        { .line = R"(C:\work\aaa\src\a.cpp(3)  : warning C1)", .expected = R"(C:\work\aaa\src\a.cpp(3)  : warning C1)" },
+        { .line = R"(C:\work\aaa\src\a.cpp(3) :warning C1)", .expected = R"(C:\work\aaa\src\a.cpp(3) :warning C1)" },
+    });
+    for (auto const& row: Rows)
+    {
+        INFO(row.line);
+        CHECK(PathCanon::CanonicalizeRegion(row.line, Grammar::MsvcStream, MsvcProducer()) == row.expected);
+    }
+}
+
+TEST_CASE("A dot-dot span canonicalizes under the root its collapsed form lies under", "[collapse]")
+{
+    // #1593: matched as spelled, the first is `<BUILDTREE>/../inc/a.hpp` -- a token naming a file
+    // the path does not name, which a consumer whose build tree sits elsewhere localizes into a path
+    // to nothing. Every grammar's spans go through the one rewrite, so one of each walker is here.
+    Layout const layout { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\out)" };
+    CHECK(PathCanon::CanonicalizeRegion("Note: including file: C:\\src\\proj\\out\\..\\inc\\a.hpp\r\n"
+                                        "C:\\src\\proj\\a\\..\\b.cpp(3): warning C4100: 'x'\r\n",
+                                        Grammar::MsvcStream,
+                                        layout)
+          == "Note: including file: <SRCROOT>/inc/a.hpp\r\n"
+             "<SRCROOT>/b.cpp(3): warning C4100: 'x'\r\n");
+
+    Layout const posix { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
+    CHECK(PathCanon::CanonicalizeRegion(
+              "/home/dev/proj/build/u.o: /home/dev/proj/build/../inc/a.hpp\n", Grammar::GccDepfile, posix)
+          == "<BUILDTREE>/u.o: <SRCROOT>/inc/a.hpp\n");
+}
+
+TEST_CASE("A dot-dot span that leaves every root is stored collapsed and absolute", "[collapse]")
+{
+    // Matched as it is spelled, `C:\src\proj\..\third\x.h` became `<SRCROOT>/../third/x.h`: a token
+    // that resolves against the CONSUMER's source-root depth, so a consumer at `E:\ci\proj`
+    // localized it to `E:\ci\third\x.h`, which is not the file the producer read (Job 2 review, I1).
+    // Collapsed, it lies under no root, and it is stored as the file the compiler read.
+    Layout const layout { .sourceRoot = R"(C:\src\proj)", .buildTree = R"(C:\src\proj\out)" };
+    CHECK(PathCanon::CanonicalizeRegion(
+              "Note: including file: C:\\src\\proj\\..\\third\\x.h\r\n", Grammar::ShowIncludes, layout)
+          == "Note: including file: C:\\src\\third\\x.h\r\n");
+    CHECK(PathCanon::CanonicalizeRegion("Note: including file: C:\\elsewhere\\a\\..\\x.h\r\n", Grammar::ShowIncludes, layout)
+          == "Note: including file: C:\\elsewhere\\x.h\r\n");
+    // The review's own measurement: a diagnostic head climbing out of the build tree.
+    CHECK(PathCanon::CanonicalizeRegion(
+              "C:\\src\\proj\\out\\..\\..\\other\\x.h(3): warning C4100: 'x'\r\n", Grammar::MsvcStream, layout)
+          == "C:\\src\\other\\x.h(3): warning C4100: 'x'\r\n");
+    // And no escaping span leaves a root token behind in any grammar's output.
+    CHECK_FALSE(PathCanon::CanonicalizeRegion("/home/dev/proj/build/u.o: /home/dev/proj/build/../../x.h\n",
+                                              Grammar::GccDepfile,
+                                              Layout { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" })
+                    .contains("/../"));
+}
+
+TEST_CASE("clang-cl's GCC-format head on the MSVC stream is rewritten", "[msvc-stream]")
+{
+    // `clang-cl -fdiagnostics-format=clang` writes `<path>:<line>:<col>: ` on the stream MSVC's
+    // own heads use (Job 2 review, M4). A toolchain header stays as spelled, as everywhere.
+    std::string const stream = "C:\\work\\aaa\\src\\inc\\probe.h:3:29: warning: unused parameter 'x'\r\n"
+                               "    3 | inline int unused_param(int x) { return 0; }\r\n"
+                               "C:\\Program Files\\LLVM\\lib\\clang\\22\\include\\x.h:1:1: note: here\r\n";
+    CHECK(PathCanon::CanonicalizeRegion(stream, Grammar::MsvcStream, MsvcProducer())
+          == "<SRCROOT>/inc/probe.h:3:29: warning: unused parameter 'x'\r\n"
+             "    3 | inline int unused_param(int x) { return 0; }\r\n"
+             "C:\\Program Files\\LLVM\\lib\\clang\\22\\include\\x.h:1:1: note: here\r\n");
+}
+
+TEST_CASE("Only ShowIncludes and MsvcStream carry include notes", "[msvc-stream]")
+{
+    CHECK(PathCanon::CarriesIncludeNotes(Grammar::ShowIncludes));
+    CHECK(PathCanon::CarriesIncludeNotes(Grammar::MsvcStream));
+    CHECK_FALSE(PathCanon::CarriesIncludeNotes(Grammar::MsvcDiagnostics));
+    CHECK_FALSE(PathCanon::CarriesIncludeNotes(Grammar::GccDepfile));
+    CHECK_FALSE(PathCanon::CarriesIncludeNotes(Grammar::GccDiagnostics));
+}
+
+// ---------------------------------------------------------------------------
 // GccDepfile: the multi-token grammar. A depfile line names a target AND a whole
 // dependency list, so every token on it is a path that must travel.
 // ---------------------------------------------------------------------------
@@ -881,4 +1111,106 @@ TEST_CASE("GccDiagnostics leaves a line that is not a diagnostic alone")
     // No `:<line>:<col>:` anchor, so nothing here is a path span this grammar owns.
     auto const text = std::string { "ld: cannot find -lfoo in /home/dev/proj/lib\n" };
     CHECK(PathCanon::CanonicalizeRegion(text, Grammar::GccDiagnostics, producer) == text);
+}
+
+namespace
+{
+
+// The shape and the magnitude of the report, rebuilt from generic names: a chain of nested
+// relative includes where each hop appends `../..` to the TEXTUAL path of its includer, ending in
+// a run that climbs out of the module. Mixed separators are deliberate -- the `-I` roots arrive
+// spelled with backslash and the `#include` bodies with forward slash, and a driver echoes both
+// halves as it found them. The prefix is 60 bytes, so the whole is 299 and the collapse is 88:
+// the figures measured on the build that prompted this.
+constexpr std::string_view MeasuredPrefix = R"(D:\build-agent\workspace-00007\a1b2c3d4e5\3\example\project\)";
+
+constexpr std::string_view MeasuredTail =
+    R"(src\Graphics\Shared\Common\../../Sampling/View\../../Rendering/Raster/Core\../..)"
+    R"(/Core\../../Geometry/Core\../../Shared/Core\../../Blending/Core\../../Shading/Pa)"
+    R"(lette/Core\../../Sample/Common\../../../../Platform\../Graphics/GlyphRaster.hpp)";
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// CollapseRelativeSegments -- the one lexical `..` collapse (#1592, #1593)
+
+TEST_CASE("The measured 299-byte note path collapses under Ninja's limit", "[collapse]")
+{
+    auto const input = std::string { MeasuredPrefix } + std::string { MeasuredTail };
+    auto const collapsed = PathCanon::CollapseRelativeSegments(input);
+
+    // Pinned as their own checks: a fixture that drifts under 260 stops testing the thing it
+    // exists for, and would keep passing while doing it.
+    CHECK(input.size() == 299);
+    CHECK(collapsed.size() == 88);
+    CHECK(collapsed == std::string { MeasuredPrefix } + R"(src\Graphics\GlyphRaster.hpp)");
+}
+
+TEST_CASE("A path with nothing to collapse comes back byte-identical", "[collapse]")
+{
+    // Mixed separators are the shape a driver really emits, and they must not be re-spelled just
+    // because the path passed through here.
+    constexpr std::string_view mixed = R"(D:\ci\src\inc/h1.h)";
+    CHECK(PathCanon::CollapseRelativeSegments(mixed) == mixed);
+
+    // `..` that is not a SEGMENT. A `contains("..")` test would take the slow path and hand back a
+    // uniformly re-separated spelling for no reason at all.
+    constexpr std::string_view dotsInName = R"(D:\ci\src\a..b\inc/h1.h)";
+    CHECK(PathCanon::CollapseRelativeSegments(dotsInName) == dotsInName);
+}
+
+TEST_CASE("Dots inside a name do not block a real collapse elsewhere in the path", "[collapse]")
+{
+    // This is what pins `..` being tested as a SEGMENT rather than as a substring, and it is the
+    // only shape that can: a path with nothing to collapse survives a substring test unharmed,
+    // because the step-6 bail then returns the input and the output is right for the wrong reason.
+    // Here the two shapes sit in one path, so a substring test bails on `a..b` and silently leaves
+    // the genuine `tmp\..` uncollapsed.
+    CHECK(PathCanon::CollapseRelativeSegments(R"(D:\ci\src\a..b\tmp\..\x.hpp)") == R"(D:\ci\src\a..b\x.hpp)");
+}
+
+TEST_CASE("A drive root cannot be ascended past on either host", "[collapse]")
+{
+    // This is the POSIX-host case. On Windows `lexically_normal` already refuses to walk above a
+    // drive root, so a Windows-only run cannot see the anchor split being removed; on POSIX `D:` is
+    // an ordinary filename and `D:/../x.hpp` would otherwise normalize to a bare `x.hpp`.
+    CHECK(PathCanon::CollapseRelativeSegments(R"(D:\..\x.hpp)") == R"(D:\x.hpp)");
+    CHECK(PathCanon::CollapseRelativeSegments(R"(D:\ci\..\x.hpp)") == R"(D:\x.hpp)");
+}
+
+TEST_CASE("A UNC root keeps both of its leading separators", "[collapse]")
+{
+    // `lexically_normal` collapses a leading `//` on POSIX and keeps it on Windows, so the prefix is
+    // held aside rather than trusted to the pass.
+    CHECK(PathCanon::CollapseRelativeSegments(R"(\\build\share\a\..\b\x.hpp)") == R"(\\build\share\b\x.hpp)");
+}
+
+TEST_CASE("A UNC share cannot be ascended past", "[collapse]")
+{
+    // `\\host\share` is ONE root, and Windows resolves both of these to `\\host\share\x.h`. Held
+    // aside as the host alone, the share was an ordinary segment and `..` climbed to `\\host\x.h`
+    // -- a different file, which looks right (Job 2 review, M3).
+    CHECK(PathCanon::CollapseRelativeSegments(R"(\\host\share\a\..\..\x.h)") == R"(\\host\share\x.h)");
+    CHECK(PathCanon::CollapseRelativeSegments(R"(\\host\share\..\x.h)") == R"(\\host\share\x.h)");
+    CHECK(PathCanon::CollapseRelativeSegments("//host/share/../x.h") == "//host/share/x.h");
+    // A bare share has nothing to collapse, and comes back as written.
+    CHECK(PathCanon::CollapseRelativeSegments(R"(\\host\..)") == R"(\\host\..)");
+}
+
+TEST_CASE("A leading dot-dot that nothing lexical can resolve is left alone", "[collapse]")
+{
+    // Returning the rewrite here would re-spell the separators of a path whose `..` is still there,
+    // which is a change with no benefit attached.
+    //
+    // The separators are deliberately MIXED. An all-backslash fixture cannot see this rule at all:
+    // the rewrite would fold to `/`, fail to collapse anything, and then restore every separator to
+    // `\`, arriving back at bytes identical to the input. The case would pass with the bail removed
+    // and would be testing nothing.
+    constexpr std::string_view relative = R"(..\../inc/a.hpp)";
+    CHECK(PathCanon::CollapseRelativeSegments(relative) == relative);
+}
+
+TEST_CASE("A forward-slash path stays forward-slash", "[collapse]")
+{
+    CHECK(PathCanon::CollapseRelativeSegments("/home/dev/proj/src/a/../b/x.hpp") == "/home/dev/proj/src/b/x.hpp");
 }

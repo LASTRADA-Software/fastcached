@@ -82,6 +82,20 @@ class IPathResolver
     /// @return The host's own spelling, or `path` unchanged.
     [[nodiscard]] virtual std::string ResolveDirectory(std::string_view path) = 0;
 
+    /// The 8.3 SHORT spelling of a directory: the opposite direction to the two above.
+    ///
+    /// Asked for the root scan rather than for the key: a compiler writes into an object
+    /// whatever spelling it was handed, and `...\BUILDV~1\gen` handed to it by an `-I`
+    /// is resolved by the key yet names no spelling the scan would otherwise know (see
+    /// `RootAliasList`). `GetShortPathNameW` on Windows; a POSIX filesystem has no short
+    /// names, and a volume that makes none answers with the long form.
+    ///
+    /// Total and never throwing, as the other two are: anything that cannot be shortened
+    /// comes back verbatim.
+    /// @param directory An absolute directory path.
+    /// @return Its short spelling, or `directory` unchanged.
+    [[nodiscard]] virtual std::string ShortForm(std::string_view directory) = 0;
+
     /// How many times the filesystem was actually consulted so far.
     ///
     /// Reported rather than assumed, because the cost of resolving every emitted

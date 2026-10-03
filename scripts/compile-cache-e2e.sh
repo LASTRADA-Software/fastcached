@@ -36,6 +36,12 @@
 #                           every one of them, and an empty manifest validates
 #                           against anything: an edited header served the previous
 #                           object under a zero exit code, permanently.
+#  10. Root-bound object — a translation unit whose object names its checkout
+#                           (`__FILE__`, `source_location`) is not served into a
+#                           second checkout in either direct mode, one naming no
+#                           path still is, the first checkout still hits its own
+#                           copy, and a hit FASTCACHE_VERIFY rejects is logged
+#                           VERIFY-MISMATCH rather than HIT.
 #   2c. Dropped object    — the operator's repair after 2b names a wrong object: the
 #                           key is dropped over CACHE-DROP while its direct-mode
 #                           manifest stands. The next compile must MISS, recompile
@@ -100,11 +106,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Statistics are per-user state; keep this run out of the developer's real log.
-export XDG_STATE_HOME="${workdir}/state"
-export FASTCACHE_VERBOSE=1
-export FASTCACHE_PREFETCH_GROUP="e2e"
-
 # The shared helpers: `fail`, `free_port`, `wait_for_port` -- one copy for every
 # POSIX fixture (#449). This file's own `free_port` was a near-copy of
 # dist-compile-e2e.sh's WITHOUT the issued-port ledger, and it draws two ports
@@ -121,8 +122,17 @@ export FASTCACHE_PREFETCH_GROUP="e2e"
 # stranger's, and both halves of that mistake show up as a claim about caching --
 # a first compile reported as a HIT, or a second one that was not served -- with
 # nothing anywhere naming the port.
+#
+# Sourcing it also clears every FASTCACHE_* this shell inherited (an operator's
+# FASTCACHE_SCHEDULER would dispatch each "local" compile to their fleet), which is
+# why this fixture's own exports come AFTER it.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
 e2e_begin "compile-cache E2E" "$workdir"
+
+# Statistics are per-user state; keep this run out of the developer's real log.
+export XDG_STATE_HOME="${workdir}/state"
+export FASTCACHE_VERBOSE=1
+export FASTCACHE_PREFETCH_GROUP="e2e"
 
 [[ -n "$port" ]] || port="$(free_port)"
 
@@ -255,8 +265,10 @@ EOF
     # nothing.
     grep '^fastcache-cc:' "${workdir}/verify.log" || true
 
-    grep -q "fastcache-cc: HIT" "${workdir}/verify.log" \
-        || fail "the planted object was not served, so nothing was verified"
+    # A hit the verifier REJECTS is traced `VERIFY-MISMATCH`, never `HIT` -- the outcome the
+    # build actually used -- so that word, on this key, is the proof the plant was served.
+    grep -q "fastcache-cc: VERIFY-MISMATCH key=${planted_key}" "${workdir}/verify.log" \
+        || fail "the planted object was not served and rejected, so nothing was verified (a hit FASTCACHE_VERIFY rejects is VERIFY-MISMATCH)"
     grep -q "WRONG OBJECT" "${workdir}/verify.log" \
         || fail "a wrong object was served and nothing said so"
     grep -q "$planted_key" "${workdir}/verify.log" \
@@ -1167,6 +1179,157 @@ else
     echo "   direct mode records and serves a manifest on an aliased root: OK"
 fi
 
+# --- 10: an object naming its checkout is not served into another -----------
+# A translation unit that bakes its own path into program data -- `__FILE__`, or the
+# builtin `std::source_location` is made of -- must not be served into a second
+# checkout, in either direct mode, while one that bakes none still is; the checkout
+# that stored a root-bound copy must still hit it; and a hit FASTCACHE_VERIFY rejects
+# is logged VERIFY-MISMATCH, never HIT. No key can see those paths: the direct-mode
+# key never sees the `__FILE__` expansion and `source_location` reaches no key at
+# all, so the launcher reads the OBJECT (apps/fastcache-cc/RootBinding.hpp). Before
+# that, `__FILE__` with direct mode on and `source_location` in both modes printed
+# the first checkout's path from the second.
+#
+# The outcome of the second checkout is per kind, and that is the discrimination:
+# `srcloc` shares a portable key with the first (the builtin reaches no key), so it
+# meets the first checkout's marker and is a BOUND-MISS; `file` does not share one on
+# the preprocessed path, so once direct mode declines it is an ordinary MISS; `none`
+# is a HIT of the first checkout's very bytes.
+# The tree includes a PROJECT header, and that is load-bearing: a translation unit
+# reporting no dependency records no direct-mode manifest, so a "direct on" leg would
+# never reach direct mode -- where `__FILE__` was mis-served -- and would pass with the
+# fix removed. check_root_bound asserts the manifest was stored.
+write_bound_tree() {
+    local root="$1" kind="$2" tag="$3" body
+    mkdir -p "${root}/src/inc" "${root}/build"
+    printf '#pragma once\ninline int one() { return 1; }\n' > "${root}/src/inc/h1.hpp"
+    case "$kind" in
+        file)   body='char const* Where() { return __FILE__; }' ;;
+        srcloc) body='char const* Where() { return __builtin_FILE(); }' ;;
+        none)   body='char const* Where() { return "nowhere"; }' ;;
+        *)      fail "unknown root-bound kind: ${kind}" ;;
+    esac
+    printf '#include "inc/h1.hpp"\nchar const* Tag() { return "%s"; }\n%s\nint G() { return one(); }\n' \
+        "$tag" "$body" > "${root}/src/u.cpp"
+}
+
+# Compile one tree through the launcher. The environment assignments come first and
+# there is always at least one, so `"$@"` is never empty under `set -u`.
+bound_compile() {
+    local root="$1" log="$2" flag="$3"
+    shift 3
+    env "$@" FASTCACHE_SOURCE_DIR="$root" FASTCACHE_BINARY_DIR="${root}/build" \
+        "$launcher" "$compiler" -std=c++20 ${flag:+"$flag"} -MD -MF "${root}/build/u.d" \
+        -c "${root}/src/u.cpp" -o "${root}/build/u.o" 2> "$log"
+}
+
+# The trace line's word, with the root-binding qualifier the launcher adds.
+bound_outcome() {
+    if grep -q "fastcache-cc: VERIFY-MISMATCH key=" "$1"; then echo VERIFY-MISMATCH
+    elif grep -qE "fastcache-cc: HIT key=[^ ]+ \(root-bound:" "$1"; then echo BOUND-HIT
+    elif grep -qE "fastcache-cc: MISS key=[^ ]+ \(root-bound:" "$1"; then echo BOUND-MISS
+    elif grep -q "fastcache-cc: HIT" "$1"; then echo HIT
+    elif grep -q "fastcache-cc: MISS" "$1"; then echo MISS
+    else echo UNKNOWN
+    fi
+}
+
+check_root_bound() {
+    local kind="$1" direct="$2" want_b="$3" dir a b no_direct oa ob oa2 want_a2
+    dir="${workdir}/bound/${kind}-${direct}"
+    a="${dir}/checkout-a"
+    b="${dir}/checkout-b"
+    write_bound_tree "$a" "$kind" "rootbound-${kind}-${direct}"
+    write_bound_tree "$b" "$kind" "rootbound-${kind}-${direct}"
+    no_direct="FASTCACHE_E2E_CASE=rootbound"
+    [[ "$direct" == off ]] && no_direct="FASTCACHE_NO_DIRECT=1"
+
+    bound_compile "$a" "${dir}/a.log" "" "$no_direct" || fail "root-bound ${kind}/${direct}: checkout a failed to compile"
+    bound_compile "$b" "${dir}/b.log" "" "$no_direct" || fail "root-bound ${kind}/${direct}: checkout b failed to compile"
+    cp "${a}/build/u.o" "${dir}/a.o"
+    # And a again, from a deleted object: the checkout that stored a root-bound copy
+    # must still be served it, or the fix bought correctness by giving up the cache
+    # for these translation units altogether.
+    rm -f "${a}/build/u.o"
+    bound_compile "$a" "${dir}/a2.log" "" "$no_direct" || fail "root-bound ${kind}/${direct}: checkout a failed again"
+
+    if [[ "$direct" == on ]] && ! grep -q "fastcache-cc: MANIFEST stored" "${dir}/a.log"; then
+        cat "${dir}/a.log"
+        fail "root-bound ${kind}/direct on: checkout a recorded no manifest, so the leg never reaches direct mode"
+    fi
+    oa="$(bound_outcome "${dir}/a.log")"
+    ob="$(bound_outcome "${dir}/b.log")"
+    oa2="$(bound_outcome "${dir}/a2.log")"
+    want_a2=BOUND-HIT
+    [[ "$kind" == none ]] && want_a2=HIT
+    if [[ "$oa" != MISS || "$ob" != "$want_b" || "$oa2" != "$want_a2" ]]; then
+        cat "${dir}/a.log" "${dir}/b.log" "${dir}/a2.log"
+        fail "root-bound ${kind}/direct ${direct}: a=${oa} b=${ob} (want ${want_b}) a-again=${oa2} (want ${want_a2})"
+    fi
+    # And b must have READ that manifest: one a stored and b never validated would turn this
+    # leg back into a direct-off one without a single outcome moving. For a bound object, b's
+    # direct mode follows the manifest to a's marker and says so -- and with direct mode off
+    # it never can.
+    if [[ "$kind" != none ]]; then
+        followed=no
+        grep -q "the direct-mode object is root-bound and this checkout has no copy" "${dir}/b.log" && followed=yes
+        want_followed=no
+        [[ "$direct" == on ]] && want_followed=yes
+        if [[ "$followed" != "$want_followed" ]]; then
+            cat "${dir}/b.log"
+            fail "root-bound ${kind}/direct ${direct}: checkout b followed a's manifest=${followed} (want ${want_followed})"
+        fi
+    fi
+    if [[ "$kind" == none ]]; then
+        cmp "${dir}/a.o" "${b}/build/u.o" \
+            || fail "root-bound ${kind}/direct ${direct}: a path-free object was not served into the other checkout"
+    elif grep -qaF "$a" "${b}/build/u.o"; then
+        # `if` rather than `grep && fail`: under `set -e` a non-matching grep would
+        # end the script on the SUCCESS path.
+        fail "root-bound ${kind}/direct ${direct}: checkout b's object names checkout a"
+    fi
+    echo "   ${kind}, direct ${direct}: a=${oa} b=${ob} a-again=${oa2}"
+}
+
+echo "== root-bound objects =="
+for direct in on off; do
+    check_root_bound file "$direct" MISS
+    check_root_bound srcloc "$direct" BOUND-MISS
+    check_root_bound none "$direct" HIT
+done
+
+# A verified hit is logged as what the build USED. An ELF object keeps a strict byte
+# comparison, so a path-free object served across checkouts verifies clean without
+# debug info and is rejected with it (its DWARF names the source) -- both directions,
+# which is what keeps this from passing under a launcher that logged every verified
+# hit one way.
+echo "== a verified cross-checkout hit is logged as what the build used =="
+for debug in off on; do
+    dir="${workdir}/bound/verify-${debug}"
+    write_bound_tree "${dir}/checkout-a" none "rootbound-verify-${debug}"
+    write_bound_tree "${dir}/checkout-b" none "rootbound-verify-${debug}"
+    flag=""
+    want=HIT
+    if [[ "$debug" == on ]]; then
+        flag="-g"
+        want=VERIFY-MISMATCH
+    fi
+    bound_compile "${dir}/checkout-a" "${dir}/a.log" "$flag" FASTCACHE_NO_DIRECT=1 || fail "verify ${debug}: a failed"
+    bound_compile "${dir}/checkout-b" "${dir}/b.log" "$flag" FASTCACHE_NO_DIRECT=1 FASTCACHE_VERIFY=1 \
+        || fail "verify ${debug}: b failed"
+    ob="$(bound_outcome "${dir}/b.log")"
+    logged="$(tail -n 1 "${XDG_STATE_HOME}/fastcache-cc/invocations.log" | cut -f1)"
+    wrong=no
+    if grep -q "WRONG OBJECT served" "${dir}/b.log"; then wrong=yes; fi
+    want_wrong=no
+    [[ "$want" == VERIFY-MISMATCH ]] && want_wrong=yes
+    if [[ "$ob" != "$want" || "$logged" != "$want" || "$wrong" != "$want_wrong" ]]; then
+        cat "${dir}/b.log"
+        fail "verify with debug info ${debug}: trace=${ob} logged=${logged} (want ${want}), WRONG OBJECT line=${wrong}"
+    fi
+    echo "   debug info ${debug}: logged ${logged}, WRONG OBJECT line=${wrong}"
+done
+
 # --- authentication ---------------------------------------------------------
 # The compile-cache protocol was the only one in the tree that never checked
 # SessionContext::CurrentAuth(), so a daemon started with --requirepass gated
@@ -1277,6 +1440,6 @@ echo "   retired flags exit 2 with a diagnostic"
 "$launcher" --zero-stats >/dev/null || fail "--zero-stats returned non-zero"
 
 echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, store ceiling, cross-depth, nested roots," \
-     "moved-header convergence (both layouts keyed apart), an edit re-keying," \
+     "moved-header convergence (both layouts keyed apart), an edit re-keying, root-bound objects keyed apart," \
      "authentication (refused without a credential, cached with one), and safe fallback"
 exit 0

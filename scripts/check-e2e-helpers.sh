@@ -693,6 +693,44 @@ run_case() {
         echo "stop_and_require_clean_exit accepted status ${E2eStopStatus}"
         ;;
 
+    # --- a fixture inherits no FASTCACHE_* ------------------------------------
+    #
+    # Sourcing the library clears every FASTCACHE_* the shell inherited, so an
+    # operator's FASTCACHE_SCHEDULER cannot send a fixture's "local" compile to
+    # their fleet. Driven the way a fixture meets it: the variable EXPORTED before
+    # the `source`, the fixture's own setting exported after, and a stand-in
+    # compile that reports the environment it was started with.
+    #
+    # The control runs first and is not decoration: a stand-in that saw no
+    # exported variable at all would satisfy the "did not reach" line while testing
+    # nothing. And the harness knob row is the other direction -- a scrub that
+    # cleared everything would pass the first two lines and switch `tsan-gate.sh`'s
+    # bound off in silence.
+    fastcache-env-scrubbed)
+        stub="${scratch}/stub-compile"
+        printf '#!/bin/sh\nenv\n' > "$stub"
+        chmod +x "$stub"
+        control="$(FASTCACHE_SCHEDULER=staged.invalid:6674 "$stub")"
+        case "$control" in
+            *FASTCACHE_SCHEDULER=staged.invalid:6674*) ;;
+            *) echo "BUG: the stand-in compile never saw an exported variable, so nothing below is tested" ;;
+        esac
+        seen="$(FASTCACHE_SCHEDULER=staged.invalid:6674 FASTCACHE_TSAN_TIMEOUT=77 \
+            bash -c '. "$1"; export FASTCACHE_VERBOSE=1; "$2"' _ "$library" "$stub")"
+        case "$seen" in
+            *FASTCACHE_SCHEDULER=*) echo "BUG: an inherited FASTCACHE_SCHEDULER reached the fixture's compile" ;;
+            *) echo "an inherited FASTCACHE_SCHEDULER did not reach the compile" ;;
+        esac
+        case "$seen" in
+            *FASTCACHE_VERBOSE=1*) echo "the fixture's own FASTCACHE_VERBOSE did" ;;
+            *) echo "BUG: the fixture's own export, made after sourcing, did not reach the compile" ;;
+        esac
+        case "$seen" in
+            *FASTCACHE_TSAN_TIMEOUT=77*) echo "the harness knob FASTCACHE_TSAN_TIMEOUT was kept" ;;
+            *) echo "BUG: the harness knob FASTCACHE_TSAN_TIMEOUT was cleared" ;;
+        esac
+        ;;
+
     # --- the wait loop -------------------------------------------------------
     #
     # Driven through `wait_until` rather than through `wait_for_port`,
@@ -2654,6 +2692,77 @@ note_failure() {
     esac
 }
 
+# Run the case of every record, several at once, and judge each in RECORD ORDER.
+#
+# The cases were run one after another, and they are mostly WAITS -- a staged
+# timeout, a budget of one or two seconds, a listener that answers late -- so the
+# serial loop spent most of this test's time asleep: the cases summed to about two
+# minutes alone on a WSL host, against a 120 s ctest TIMEOUT the whole test has to
+# fit in (the conditions are in the filemacro lane's Job 3 report). Every case is
+# its own `bash --case` process with its own scratch directory, port ledger and job
+# table, so running them side by side changes nothing a case can see.
+#
+# `start_case_lanes` deals the records round-robin into `CaseLanes` lanes; each lane
+# runs its cases one after another in the background, while the scans below go on
+# in the foreground. `judge_case_lanes` waits for exactly those lanes and only then
+# judges: `expect` and `note_failure` run here, in the parent, in the order of the
+# table -- so the counters, the failure names and the order of the `FAIL` lines are
+# what the serial loop produced. A case whose lane recorded no status never reached
+# a verdict, and is a failure by name rather than a silent gap.
+#
+# Lanes rather than a job pool because bash 3.2 has no `wait -n`. Each lane clears
+# the traps it inherited before it does anything else.
+CaseLanes=8
+
+# Start the lanes for a table of case records.
+# Sets `started_lanes` to the lanes' directory, which `judge_case_lanes` takes; a
+# directory that could not be created is the empty string, and judging it fails
+# every case by name.
+# @param ... the case records
+start_case_lanes() {
+    local record lane index=0
+    started_lanes="$(mktemp -d)" || { started_lanes=""; return 0; }
+    for record in "$@"; do
+        printf '%s\n' "${record%%|*}" >> "${started_lanes}/lane-$(( index % CaseLanes ))"
+        index=$(( index + 1 ))
+    done
+    for lane in "${started_lanes}"/lane-*; do
+        (
+            trap - EXIT TERM INT HUP
+            while IFS= read -r name; do
+                bash "${BASH_SOURCE[0]}" --case "$name" > "${started_lanes}/out.${name}" 2>&1
+                echo "$?" > "${started_lanes}/status.${name}"
+            done < "$lane"
+        ) &
+        echo "$!" >> "${started_lanes}/pids"
+    done
+}
+
+# Wait for one table's lanes, then judge every record in table order.
+# @param 1 the directory `start_case_lanes` set
+# @param ... the case records it was started with
+judge_case_lanes() {
+    local lanes="$1" record name pid
+    shift
+    if [ -n "$lanes" ] && [ -r "${lanes}/pids" ]; then
+        while IFS= read -r pid; do
+            wait "$pid" 2>/dev/null || true
+        done < "${lanes}/pids"
+    fi
+    for record in "$@"; do
+        name="${record%%|*}"
+        ran=$(( ran + 1 ))
+        if [ -z "$lanes" ] || [ ! -s "${lanes}/status.${name}" ]; then
+            echo "FAIL ${name}: its lane recorded no exit status, so the case never reached a verdict" >&2
+            note_failure "$name"
+            continue
+        fi
+        expect "$record" "$(cat "${lanes}/out.${name}")" "$(cat "${lanes}/status.${name}")" \
+            || note_failure "$name"
+    done
+    [ -z "$lanes" ] || rm -rf "$lanes"
+}
+
 # What each case must exit with and what its combined output must and must not
 # say. A table rather than a function per case, so adding a branch to
 # `_e2e_verdict` is adding a row.
@@ -3106,6 +3215,7 @@ cases=(
     "clean-stop-bad-opt-in|1|unknown fifth argument 'term-is-fine'|!accepted status|!BUG:"
     "clean-stop-crashed|1|exited with status 134 when asked to stop|!accepted status|!BUG:"
     "clean-stop-refusal-line|1|refused to destroy its shared-cache host|exit status 0|!accepted status|!BUG:"
+    "fastcache-env-scrubbed|0|an inherited FASTCACHE_SCHEDULER did not reach the compile|the fixture's own FASTCACHE_VERBOSE did|the harness knob FASTCACHE_TSAN_TIMEOUT was kept|!BUG:"
     "wait-success|0|the wait returned when the predicate became true|polls) for the staged marker"
     "wait-death-is-prompt|1|the process DIED|exit=3|of a 10s budget|!BUG:|!waited 9s|!waited 10s"
     "wait-timeout-silent|1|logged NOTHING for the whole 2s|!BUG:"
@@ -3187,15 +3297,6 @@ socket_cases=(
     "counter-flat|1|of a 1s budget|never reached 1; the last reading was 0|!BUG:"
     "counter-absent|1|of a 1s budget|exports no staged_counter_total series at all|!BUG:"
 )
-
-echo "== the helpers, in real shells"
-for record in "${cases[@]}"; do
-    name="${record%%|*}"
-    out="$( bash "${BASH_SOURCE[0]}" --case "$name" 2>&1 )"
-    status=$?
-    ran=$(( ran + 1 ))
-    expect "$record" "$out" "$status" || note_failure "${record%%|*}"
-done
 
 # --- `--case` is a verdict, in BOTH directions -----------------------------
 #
@@ -3613,6 +3714,25 @@ expect "bounded-fast-path|0| immediate commands asked for |!BUG:" "$out" "$statu
 # the paragraph above happening to the line below it.
 sed -n -e 's/^[0-9][0-9]* immediate/   &/p' -e 's/^SLOW:/   &/p' <<< "$out"
 
+# Both case tables' lanes start HERE and are judged at the end of the run, so the
+# scans below overlap the cases' waits. Here and not earlier: the sections above
+# time the helpers against the clock (`run_bounded`'s ceiling, its fast path, a
+# bound read as a duration), and sixteen lanes of case processes beside them made
+# `bounded-clock` read a 1 s bound as more than 10 s under Git Bash, where a fork
+# is expensive -- measured, and it passed there with the lanes started after them.
+# The scans read files and time nothing. The listener cases need perl to stage a
+# listener, asked once, here, for both places that act on it.
+start_case_lanes "${cases[@]}"
+shell_case_lanes="$started_lanes"
+socket_case_lanes=""
+socket_cases_runnable=no
+if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then # perl-lifetime: a foreground availability probe; it exits at once and is never backgrounded
+    socket_cases_runnable=yes
+    start_case_lanes "${socket_cases[@]}"
+    socket_case_lanes="$started_lanes"
+fi
+echo "== the helpers: ${#cases[@]} case(s), and the listener cases, started in lanes; judged at the end"
+
 # --- no fixture spells `timeout` again -------------------------------------
 #
 # `run_bounded` above is not only a helper, it is this check's subject. macOS has
@@ -3754,8 +3874,22 @@ rm -rf "$canary_dir"
 # `find` and not a glob, because a glob cannot recurse portably and this has to
 # work in an exported tarball where there is no git. Scoped to `scripts/`, which
 # is a choice and is therefore checked further down rather than assumed.
+#
+# It walks a SNAPSHOT of `scripts/`, taken once below, rather than the tree. Seven
+# scans each read every file several times, one process per read, and where the
+# checkout sits on a slow filesystem the OPEN is the cost: the early-exit scan
+# alone, over the same 78 files, took 9.8 s on WSL's `/mnt/d` and 0.9 s over an
+# ext4 copy (Job 3, measured). The copy is the same bytes, taken before any scan
+# runs, and every scan reports by basename, so nothing a scan says changes. The
+# walk-scope check further down still asks the TREE (`git ls-files`), because its
+# question is about the tree.
 _shell_scripts() {
-    find "${source_dir}/scripts" -type f -name '*.sh' 2>/dev/null | LC_ALL=C sort
+    find "${scan_root}/scripts" -type f -name '*.sh' 2>/dev/null | LC_ALL=C sort
+}
+
+scan_root="$(mktemp -d)" && cp -R "${source_dir}/scripts" "${scan_root}/" || {
+    echo "FAIL shell-walk: could not snapshot ${source_dir}/scripts for the scans" >&2
+    exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -4543,21 +4677,6 @@ else
     skipped=$(( skipped + 1 ))
 fi
 
-if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then # perl-lifetime: a foreground availability probe; it exits at once and is never backgrounded
-    echo "== the helpers, against a real listener"
-    for record in "${socket_cases[@]}"; do
-        name="${record%%|*}"
-        out="$( bash "${BASH_SOURCE[0]}" --case "$name" 2>&1 )"
-        status=$?
-        ran=$(( ran + 1 ))
-        expect "$record" "$out" "$status" || note_failure "${record%%|*}"
-    done
-else
-    for record in "${socket_cases[@]}"; do
-        echo "SKIPPED ${record%%|*}: perl with IO::Socket::INET is not available to stage a listener" >&2
-        skipped=$(( skipped + 1 ))
-    done
-fi
 
 # --- bash 3.2 --------------------------------------------------------------
 #
@@ -5378,6 +5497,21 @@ case "$first_line" in
         note_failure "shebang"
         ;;
 esac
+
+rm -rf "$scan_root"
+
+# --- the cases, judged ------------------------------------------------------
+echo "== the helpers, in real shells"
+judge_case_lanes "$shell_case_lanes" "${cases[@]}"
+if [ "$socket_cases_runnable" = yes ]; then
+    echo "== the helpers, against a real listener"
+    judge_case_lanes "$socket_case_lanes" "${socket_cases[@]}"
+else
+    for record in "${socket_cases[@]}"; do
+        echo "SKIPPED ${record%%|*}: perl with IO::Socket::INET is not available to stage a listener" >&2
+        skipped=$(( skipped + 1 ))
+    done
+fi
 
 # ---------------------------------------------------------------------------
 

@@ -360,8 +360,27 @@ e2e_note "warm, third-party under _deps:  ${warm_deps_hits} hit(s), ${warm_deps_
 # the case this fixture is for: 106 of 221 units missing looks alarming and was
 # entirely Catch2, while a single project unit missing would have been invisible
 # inside the same number and is the actual regression shape.
-[ "$warm_project_misses" = "0" ] \
-    || fail "${warm_project_misses} of this project's own unit(s) missed on the warm build; the same source in a different build directory must replay, and that is what path canonicalization is for"
+if [ "$warm_project_misses" != "0" ]; then
+    # Which units, and the launcher's own reason for each: a count alone cannot say
+    # whether this is canonicalization or the root binding keying a unit apart.
+    python3 - "${workdir}/warm.build" <<'PY' >&2
+import sys
+
+current = None
+for line in open(sys.argv[1], errors="replace").read().splitlines():
+    marker = line.find("fastcache-cc-fixture: unit=")
+    if marker >= 0:
+        current = line[marker + len("fastcache-cc-fixture: unit="):].strip()
+        continue
+    if "fastcache-cc: MISS" in line:
+        if current is not None and "/_deps/" not in current:
+            print("   MISSED: %s\n     %s" % (current, line.strip()))
+        current = None
+    elif "fastcache-cc: HIT" in line:
+        current = None
+PY
+    fail "${warm_project_misses} of this project's own unit(s) missed on the warm build; the same source in a different build directory must replay, and that is what path canonicalization is for"
+fi
 
 if [ "$warm_deps_misses" -gt 0 ]; then
     e2e_note "note: ${warm_deps_misses} third-party unit(s) missed; their sources live UNDER the build directory, so the two builds really do compile different paths"

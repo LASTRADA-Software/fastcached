@@ -41,6 +41,13 @@
 #                            hands over preprocessed text, and taking that from the
 #                            extension alone is wrong for exactly this shape — a
 #                            wrong object rather than a failed one.
+#  7b. Root-bound           — a dispatched object naming its checkout (the builtin
+#                            `source_location` is made of) is not served into a second
+#                            checkout, and is served back to the first. The worker
+#                            compiles text whose line markers name the CLIENT's paths,
+#                            so the object names the client's checkout and no key sees
+#                            it; the launcher scans a dispatched object as it scans a
+#                            local one. The Windows fixture's case 3b is its twin.
 #   8. Graceful stop        — a worker asked to stop does, promptly, rather than
 #                            waiting for a supervisor to escalate.
 #  12. Cache independence   — a cache the launcher cannot reach does not stop the
@@ -1300,6 +1307,61 @@ cmp -s "${proj}/build/seven-ref.o" "${proj}/build/seven.o"     || {
         fail "a .c source did not come back compiled the way this driver compiles it"
     }
 echo "   a .c source came back matching what this driver produces locally"
+
+# --- 7b: a dispatched object naming its checkout stays with it ------------------
+echo "== case 7b: a dispatched root-bound object is kept with its checkout"
+# Two checkouts of one tree, each exporting its own roots. The source is compiled by
+# its ABSOLUTE path, so `__builtin_FILE()` names the checkout -- and the worker, which
+# resolves it from the client's line markers, writes the client's path, not its own.
+# A second checkout must MISS through the first one's marker and dispatch its own
+# compile; the first must still HIT its own copy without dispatching. Before root
+# binding the second checkout was served the first one's object.
+bound_compile() {
+    local root="$1" logfile="$2"
+    FASTCACHE_SOURCE_DIR="$root" FASTCACHE_BINARY_DIR="${root}/build" \
+        run_launcher "$logfile" -std=c++17 -O1 -c "${root}/u.cpp" -o "${root}/build/u.o"
+}
+bound_a="${workdir}/bound/checkout-a"
+bound_b="${workdir}/bound/checkout-b"
+for bound_root in "$bound_a" "$bound_b"; do
+    mkdir -p "${bound_root}/build" "${bound_root}/inc"
+    printf '#pragma once\ninline int One() { return 1; }\n' > "${bound_root}/inc/h1.h"
+    printf '%s\n' '#include "inc/h1.h"' \
+        'char const* Tag() { return "dist-case-bound"; }' \
+        'char const* Where() { return __builtin_FILE(); }' \
+        'int G() { return One(); }' > "${bound_root}/u.cpp"
+done
+bound_compile "$bound_a" "${workdir}/case7b-a.log" \
+    || { cat "${workdir}/case7b-a.log" >&2; fail "case 7b: checkout a's compile failed"; }
+bound_compile "$bound_b" "${workdir}/case7b-b.log" \
+    || { cat "${workdir}/case7b-b.log" >&2; fail "case 7b: checkout b's compile failed"; }
+rm -f "${bound_a}/build/u.o"
+bound_compile "$bound_a" "${workdir}/case7b-a2.log" \
+    || { cat "${workdir}/case7b-a2.log" >&2; fail "case 7b: checkout a's second compile failed"; }
+
+# The control that keeps the case honest: a's own object DOES name a, so what b is
+# spared is a real hazard rather than a portable object. Every broken property is
+# named, not only the last one checked.
+bound_why=""
+grep -qaF "$bound_a" "${bound_a}/build/u.o" || bound_why+="; a's object does not name a (the case exercises nothing)"
+grep -q "DISPATCHED to " "${workdir}/case7b-a.log" || bound_why+="; a was not dispatched"
+grep -q "root-bound object" "${workdir}/case7b-a.log" || bound_why+="; a's dispatched object was not stored bound"
+grep -Eq "fastcache-cc: MISS key=[^ ]+ \(root-bound:" "${workdir}/case7b-b.log" \
+    || bound_why+="; b did not miss through a's marker"
+grep -q "DISPATCHED to " "${workdir}/case7b-b.log" || bound_why+="; b was not dispatched"
+[[ -f "${bound_b}/build/u.o" ]] || bound_why+="; b wrote no object"
+if grep -qaF "$bound_a" "${bound_b}/build/u.o" 2>/dev/null; then bound_why+="; b's object names checkout a"; fi
+grep -Eq "fastcache-cc: HIT key=[^ ]+ \(root-bound:" "${workdir}/case7b-a2.log" \
+    || bound_why+="; a was not served its own bound copy"
+if grep -q "DISPATCHED to " "${workdir}/case7b-a2.log"; then bound_why+="; a's second compile was dispatched again"; fi
+if [[ -n "$bound_why" ]]; then
+    for leg in a b a2; do
+        echo "--- ${leg} ---" >&2
+        cat "${workdir}/case7b-${leg}.log" >&2
+    done
+    fail "case 7b: a dispatched root-bound object was not kept with its checkout${bound_why}"
+fi
+echo "   a dispatched object naming its checkout was kept with it, and served back to it"
 
 # --- 8: a worker stops when it is asked to --------------------------------------
 echo "== case 8: a worker exits on SIGTERM"

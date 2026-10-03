@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "AtomicFile.hpp"
 #include "DirectManifest.hpp"
 #include "IParallelFor.hpp"
 #include "KeyDigest.hpp"
@@ -17,12 +18,14 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <iterator>
 #include <optional>
 #include <ranges>
+#include <span>
+#include <sstream>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <vector>
 
 namespace FastCache::Cc
@@ -660,26 +663,30 @@ namespace
 
     /// Write `stamp` and `fingerprint` so a concurrent reader sees both or neither.
     ///
-    /// Through `ReplaceStateFile`, because sixteen launchers on a cold cache all write
+    /// Through `WriteFileAtomically`, because sixteen launchers on a cold cache all write
     /// this at once. A reader that caught a half-written file would either fail to
     /// parse it -- costing a needless 2-second rewalk -- or, worse, read a stamp
     /// paired with a truncated fingerprint and dispatch against a toolchain
     /// identity no other machine will ever produce.
     ///
     /// A failure is silent: the fingerprint is recomputed next time, which is what a
-    /// cold cache costs anyway.
+    /// cold cache costs anyway -- a replace a reader refused included (`WriteFileAtomically`).
     void WriteCacheAtomically(std::filesystem::path const& path, std::string_view stamp, std::string_view fingerprint)
     {
-        (void) ReplaceStateFile(path, std::format("{}\n{}\n", stamp, fingerprint));
+        auto const text = std::format("{}\n{}\n", stamp, fingerprint);
+        auto const files = MakeDiskFiles();
+        std::ignore = WriteFileAtomically(path, std::as_bytes(std::span { text }), CurrentProcessId(), *files);
     }
 
-    /// Read a cache file written by `WriteCacheAtomically`.
+    /// Read a cache file written by `WriteCacheAtomically`, through `SharedReadFile` so that
+    /// reading it never stops another launcher from replacing it.
     /// @return {stamp, fingerprint}, both empty when unreadable or malformed.
     [[nodiscard]] std::pair<std::string, std::string> ReadCache(std::filesystem::path const& path)
     {
-        std::ifstream in { path, std::ios::binary };
-        if (!in)
+        auto const text = ReadFileShared(path);
+        if (!text.has_value())
             return {};
+        std::istringstream in { *text };
         std::string stamp;
         std::string fingerprint;
         if (!std::getline(in, stamp) || !std::getline(in, fingerprint))

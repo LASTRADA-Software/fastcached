@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "AtomicFile.hpp"
 #include "ReachabilityMemo.hpp"
 #include "ReachabilityMemoTestSupport.hpp"
 #include "Stats.hpp"
@@ -162,7 +163,8 @@ TEST_CASE("A memo is saved only when it changed, and the file store round-trips"
     CHECK(ReachabilityMemo::Load(store).Remembers(MemoKind::SchedulerUnreached, Scheduler, Noon));
 
     FastCache::Testing::ScratchDirectory const scratch { "fc-cc-memo" };
-    FileMemoStore file { scratch / "reachability.memo" };
+    auto const disk = MakeDiskFiles();
+    FileMemoStore file { scratch / "reachability.memo", *disk };
     CHECK_FALSE(file.Read().has_value()); // absent is nothing, not an error
     REQUIRE(file.Write("fastcache-cc reachability 1\n"));
     CHECK(file.Read() == std::optional<std::string> { "fastcache-cc reachability 1\n" });
@@ -206,7 +208,8 @@ TEST_CASE("The file store replaces an existing memo and leaves no temp file behi
     // The atomicity argument rests on the rename REPLACING a file that is already there
     // -- the ordinary case, since every launcher after the first writes over the last one.
     FastCache::Testing::ScratchDirectory const scratch { "fc-cc-memo-replace" };
-    FileMemoStore file { scratch / "reachability.memo" };
+    auto const disk = MakeDiskFiles();
+    FileMemoStore file { scratch / "reachability.memo", *disk };
     REQUIRE(file.Write("fastcache-cc reachability 1\nscheduler-unreached 1 first:1\n"));
     REQUIRE(file.Write("fastcache-cc reachability 1\nscheduler-unreached 2 second:1\n"));
     CHECK(file.Read() == std::optional<std::string> { "fastcache-cc reachability 1\nscheduler-unreached 2 second:1\n" });

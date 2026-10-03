@@ -984,7 +984,15 @@ std::string ComputeManifestKey(std::string_view canonicalSource,
     // manifests that defect produced -- ones recorded from an uncanonicalized hit,
     // naming the translation unit and not one header, which revalidate on the TU
     // alone and serve their object however the headers move.
-    KeyDigest digest { "manifest-v6" };
+    //
+    // v7 is the lock-step half of `objkey-v7` (root binding), and it would be required
+    // on its own. This key is built from the tokenized source path and the relativized
+    // arguments and never sees the spelling `__FILE__` expands to, so two checkouts
+    // reach ONE manifest, it validates, and a v6 manifest points straight at the
+    // producer's object -- the direct-mode half of the defect, and the default path.
+    // Only a re-key makes those manifests unreachable; a v7 manifest points at a
+    // portable key, which a root-bound object answers with a marker.
+    KeyDigest digest { "manifest-v7" };
     digest.Field(toolchainStamp);
     digest.Field(canonicalSource);
     for (auto const& arg: relativizedArgs)

@@ -6,9 +6,8 @@
 #include <charconv>
 #include <cstdint>
 #include <format>
-#include <fstream>
 #include <ranges>
-#include <sstream>
+#include <span>
 #include <system_error>
 #include <utility>
 
@@ -62,8 +61,9 @@ namespace
     }
 } // namespace
 
-FileMemoStore::FileMemoStore(std::filesystem::path file):
-    _file { std::move(file) }
+FileMemoStore::FileMemoStore(std::filesystem::path file, IAtomicWriteFiles& files):
+    _file { std::move(file) },
+    _files { files }
 {
 }
 
@@ -71,12 +71,7 @@ std::optional<std::string> FileMemoStore::Read() const
 {
     if (_file.empty())
         return std::nullopt;
-    std::ifstream in { _file, std::ios::binary };
-    if (!in)
-        return std::nullopt;
-    std::ostringstream text;
-    text << in.rdbuf();
-    return text.str();
+    return ReadFileShared(_file);
 }
 
 bool FileMemoStore::Write(std::string_view text)
@@ -85,7 +80,7 @@ bool FileMemoStore::Write(std::string_view text)
         return false;
     // Many launchers write at once, and a reader must see a whole memo or the previous
     // one, never half of either -- the fingerprint cache's reason, and its writer.
-    return ReplaceStateFile(_file, text);
+    return WriteFileAtomically(_file, std::as_bytes(std::span { text }), CurrentProcessId(), _files).has_value();
 }
 
 ReachabilityMemo ReachabilityMemo::Parse(std::string_view text)
