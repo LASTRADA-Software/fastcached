@@ -208,6 +208,7 @@ TEST_CASE("Clearing drops every undecided row and keeps the decided ones", "[enr
     core::platform::ManualClock clock;
     NodeConditions conditions;
     EnrollmentWindow window { clock, &conditions };
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {}); // the list is the leader's
     REQUIRE(window.Offer(Claim("waiting-a", "", KeyOf(0x31)), "192.0.2.1") == EnrollDecision::Pending);
     REQUIRE(window.Offer(Claim("approved", "", KeyOf(0x32)), "192.0.2.2") == EnrollDecision::Pending);
     REQUIRE(window.Offer(Claim("rejected", "", KeyOf(0x33)), "192.0.2.3") == EnrollDecision::Pending);
@@ -544,7 +545,11 @@ TEST_CASE("Waiting joiners raise enrollment-requests-waiting and a decision clea
     NodeConditions conditions;
     EnrollmentWindow window { clock, &conditions };
 
-    // Checked at construction, not assumed: a process starts with nobody waiting.
+    // NOT clear at construction: the list lives in the leader's memory, and nothing has said yet
+    // that this node leads. Clear once it does -- a fresh leadership starts with nobody waiting.
+    CHECK(conditions.StateOf(NodeCondition::EnrollmentRequestsWaiting) == Wire::ConditionState::NotEvaluated);
+    CHECK(conditions.StateOf(NodeCondition::EnrollmentWindowOpen) == Wire::ConditionState::NotEvaluated);
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
     CHECK(conditions.StateOf(NodeCondition::EnrollmentRequestsWaiting) == Wire::ConditionState::Clear);
     CHECK(conditions.StateOf(NodeCondition::EnrollmentWindowOpen) == Wire::ConditionState::Clear);
 
@@ -645,10 +650,10 @@ TEST_CASE("A demotion ends the window, and leading again does not bring it back"
     core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.ArmAutoApprove(std::chrono::minutes { 10 }).has_value());
-    window.OnRoleChanged(Distributed::SchedulerRole::Leader);
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
     CHECK(window.AutoApproveLeft().has_value());
-    window.OnRoleChanged(Distributed::SchedulerRole::Follower);
-    window.OnRoleChanged(Distributed::SchedulerRole::Leader);
+    window.OnRoleChanged(Distributed::SchedulerRole::Follower, "10.0.0.1:6674");
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
     CHECK_FALSE(window.AutoApproveLeft().has_value());
     CHECK(Offer(window, "laptop") == EnrollDecision::Pending);
 }
@@ -663,6 +668,7 @@ TEST_CASE("An armed window raises enrollment-window-open naming its deadline and
     core::platform::ManualWallClock wallClock { std::chrono::sys_days { 2026y / 9 / 29 } + 8h + 45min };
     NodeConditions conditions;
     EnrollmentWindow window { clock, &conditions, nullptr, wallClock };
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
     REQUIRE(window.ArmAutoApprove(std::chrono::minutes { 15 }).has_value());
     CHECK(conditions.StateOf(NodeCondition::EnrollmentWindowOpen) == Wire::ConditionState::Raised);
     auto const detail = DetailOf(conditions, NodeCondition::EnrollmentWindowOpen);
@@ -702,6 +708,7 @@ TEST_CASE("A deadline that passes on a quiet leader is lowered by the warning ti
     core::platform::ManualClock clock;
     NodeConditions conditions;
     EnrollmentWindow window { clock, &conditions };
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
     REQUIRE(window.ArmAutoApprove(std::chrono::minutes { 5 }).has_value());
     REQUIRE(conditions.StateOf(NodeCondition::EnrollmentWindowOpen) == Wire::ConditionState::Raised);
     // Named no wall clock, the window reads the system's: the detail still states a deadline.
@@ -733,22 +740,40 @@ TEST_CASE("A report says the mode, the seconds left and which rows the window ad
     CHECK(window.Summary().first == Wire::WireEnrollmentState::AutoApprove);
 }
 
-TEST_CASE("A demotion forgets every row and lowers the waiting condition", "[enrollment][window][formation]")
+TEST_CASE("A demotion forgets every row, and a follower's rows name the leader rather than read clear",
+          "[enrollment][window][formation][conditions]")
 {
+    // The list lives in the leader's memory alone. A follower's empty list says nothing about who is
+    // waiting, so its rows read not-evaluated, naming the leader to ask -- never `clear`.
     core::platform::ManualClock clock;
     NodeConditions conditions;
     EnrollmentWindow window { clock, &conditions };
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
     REQUIRE(window.Offer(Claim("waiting", "", KeyOf(0x31)), "192.0.2.1") == EnrollDecision::Pending);
     REQUIRE(window.Offer(Claim("approved", "", KeyOf(0x32)), "192.0.2.2") == EnrollDecision::Pending);
     REQUIRE(window.Decide("approved", Wire::EnrollmentDecision::Approved) == EnrollControlOutcome::Done);
     REQUIRE(conditions.StateOf(NodeCondition::EnrollmentRequestsWaiting) == Wire::ConditionState::Raised);
 
-    window.OnRoleChanged(Distributed::SchedulerRole::Leader);
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
     CHECK(window.Report().pending.size() == 2);
 
-    window.OnRoleChanged(Distributed::SchedulerRole::Follower);
+    window.OnRoleChanged(Distributed::SchedulerRole::Follower, "10.0.0.1:6674");
     CHECK(window.Report().pending.empty());
+    for (auto const condition: { NodeCondition::EnrollmentRequestsWaiting, NodeCondition::EnrollmentWindowOpen })
+    {
+        CHECK(conditions.StateOf(condition) == Wire::ConditionState::NotEvaluated);
+        CHECK(DetailOf(conditions, condition).contains("ask the leader at 10.0.0.1:6674"));
+    }
+
+    // With no leader known, it says so rather than naming one.
+    window.OnRoleChanged(Distributed::SchedulerRole::Undecided, {});
+    CHECK(conditions.StateOf(NodeCondition::EnrollmentRequestsWaiting) == Wire::ConditionState::NotEvaluated);
+    CHECK(DetailOf(conditions, NodeCondition::EnrollmentRequestsWaiting).contains("knows no leader yet"));
+
+    // And leading again answers from the list, empty now.
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
     CHECK(conditions.StateOf(NodeCondition::EnrollmentRequestsWaiting) == Wire::ConditionState::Clear);
+    CHECK(conditions.StateOf(NodeCondition::EnrollmentWindowOpen) == Wire::ConditionState::Clear);
 }
 
 TEST_CASE("Re-polling rows from a second address does not move them out of the first address's bound",
@@ -823,8 +848,8 @@ TEST_CASE("A demotion leaves no host charged for rows it forgot", "[enrollment][
         REQUIRE(window.Offer(Claim(std::format("a{}", index), "", KeyOf(0x62)), "198.51.100.7") == EnrollDecision::Pending);
     REQUIRE(window.Offer(Claim("b0", "", KeyOf(0x61)), "2001:db8::7") == EnrollDecision::Pending);
 
-    window.OnRoleChanged(Distributed::SchedulerRole::Follower);
-    window.OnRoleChanged(Distributed::SchedulerRole::Leader);
+    window.OnRoleChanged(Distributed::SchedulerRole::Follower, "10.0.0.1:6674");
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
     REQUIRE(window.Report().pending.empty());
 
     REQUIRE(window.Offer(Claim("b1", "", KeyOf(0x61)), "2001:db8::7") == EnrollDecision::Pending);

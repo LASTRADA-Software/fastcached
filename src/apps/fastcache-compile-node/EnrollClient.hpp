@@ -12,11 +12,13 @@
 #include <FastCache/Distributed/RosterStore.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -123,7 +125,43 @@ struct EnrollReading
     /// or empty -- for every outcome but `Admitted`, and on an admission while the leader holds no
     /// certified roster yet (#178).
     std::vector<std::byte> certificate {};
+
+    /// The answering node's signature over its answer -- an approval, a refusal or a "not yet" alike
+    /// (`SignedOutcomeTable`) -- as sent, and DISENGAGED when it carried none. Read here and judged by
+    /// the caller, which alone knows the nonce it sent and the key it proved for the fleet it asked
+    /// (`Cluster::VerifyAdmission`).
+    std::optional<CompileCacheWire::EnrollReplySignature> signature {};
 };
+
+/// Which reading an answer's OUTCOME became, for the outcomes the answering node signs.
+struct SignedOutcomeRow
+{
+    EnrollProgress progress;                 ///< The reading.
+    CompileCacheWire::EnrollOutcome outcome; ///< The outcome the answer stated, which its signature covers.
+};
+
+/// The readings a fleet's own answer produces, each beside the outcome it signed: every one of them
+/// can move a joiner -- into the fleet, back to solitary, or into waiting instead of giving up -- so
+/// every one is held to the key the joiner proved. A redirect, a closed window and a failure are
+/// wire REFUSALS, which nobody signs, so a formation joiner lets none of them move what a forger
+/// could want moved: each counts towards giving the join up as silence does, and a redirect's
+/// endpoint is proved before it is asked.
+inline constexpr std::array SignedOutcomeTable {
+    SignedOutcomeRow { .progress = EnrollProgress::Waiting, .outcome = CompileCacheWire::EnrollOutcome::Pending },
+    SignedOutcomeRow { .progress = EnrollProgress::Admitted, .outcome = CompileCacheWire::EnrollOutcome::Approved },
+    SignedOutcomeRow { .progress = EnrollProgress::Refused, .outcome = CompileCacheWire::EnrollOutcome::Rejected },
+};
+
+/// The outcome @p progress was read from, when it is one a fleet signs.
+/// @param progress A reading.
+/// @return Its signed outcome, or nothing for a reading no answer signs.
+[[nodiscard]] constexpr std::optional<CompileCacheWire::EnrollOutcome> SignedOutcomeOf(EnrollProgress progress) noexcept
+{
+    for (auto const& row: SignedOutcomeTable)
+        if (row.progress == progress)
+            return row.outcome;
+    return std::nullopt;
+}
 
 /// Read one `Enroll` reply.
 ///

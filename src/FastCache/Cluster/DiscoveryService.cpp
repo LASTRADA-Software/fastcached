@@ -99,8 +99,11 @@ BeaconSendReport DiscoveryService::SendBeacon()
 
 std::optional<CompileCacheWire::FleetSummary> DiscoveryService::AnnounceableSummary()
 {
-    auto summary = _self.Current();
-    if (!AnnouncesOnlyThisMachine(summary))
+    // Cut to what a datagram carries HERE, the one door both the beacon and the proof leave by, so
+    // the two never carry different lists and neither carries more than a reader accepts.
+    auto summary = CompileCacheWire::WithMembersAtMost(_self.Current(), CompileCacheWire::MaxFleetSummaryMembers);
+    auto const onlyHere = EndpointsOnlyThisMachine(summary);
+    if (onlyHere.empty())
         return summary;
 
     // Withheld rather than sent, and said: every peer resolves such a name to ITSELF, so a
@@ -111,12 +114,13 @@ std::optional<CompileCacheWire::FleetSummary> DiscoveryService::AnnounceableSumm
     if (auto const now = _clock.now(); now >= _nextUnannounceableReport)
     {
         _nextUnannounceableReport = now + UnannounceableReportInterval;
+        auto named = std::string {};
+        for (auto const endpoint: onlyHere)
+            named += std::format("{}{}", named.empty() ? "" : " and ", endpoint);
         _logger.Logf(LogLevel::Warn,
-                     "discovery: withheld this node's announcement, because it names {}{}{}, which every peer "
+                     "discovery: withheld this node's announcement, because it names {}, which every peer "
                      "resolves to itself",
-                     summary.raftEndpoint,
-                     summary.raftEndpoint.empty() || summary.leaderNodeEndpoint.empty() ? "" : " and ",
-                     summary.leaderNodeEndpoint);
+                     named);
     }
     return std::nullopt;
 }
@@ -360,6 +364,10 @@ DiscoveryEvent DiscoveryService::JudgeProof(DiscoveryWire::Proof const& proof, c
 
     if (!_directory.MarkAuthenticated(proof.summary.nodeId, proof.summary.raftEndpoint, proof.publicKey))
         return DiscoveryEvent::ProofRejected;
+
+    // Told as every authenticated reply is: a reply of this node's own fleet is what says the segment
+    // is HEARD, so an empty list of other fleets reads as a finding rather than as deafness.
+    _fleets.OnFleetProven(ProvenFleet::FromBeaconProof(*std::move(proven)));
 
     _logger.Logf(LogLevel::Info,
                  "discovery: {} at {} proved the key the cluster holds for it",

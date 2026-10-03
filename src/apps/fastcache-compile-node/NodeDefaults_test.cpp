@@ -769,7 +769,7 @@ TEST_CASE("host-name-reaches-only-this-machine is raised while a withheld name s
     CHECK(remedy.contains("--raft-self (raft_self in the configuration file; a restart applies it)"));
 }
 
-TEST_CASE("A service registration owns the machine-wide state directory, and hands it to a POSIX daemon",
+TEST_CASE("A service registration owns the machine-wide state directory and hands it to a POSIX daemon",
           "[node][formation][defaults][service]")
 {
     // OWNED on every platform, so the install creates it for the service's account and secures

@@ -121,11 +121,14 @@ namespace
     /// removed record held. A v3 entry naming a keyed member decodes cleanly here and would
     /// be replayed as a forget that revokes a key the build that wrote it never revoked. A
     /// NEW verb's byte is refused by name; a CHANGED verb's is not, so only this can detect it.
-    constexpr std::uint8_t CommandVersion = 4;
+    ///
+    /// 5 added a seventh and an eighth field, the survivor's creation time and its leader's key, for
+    /// `DissolveInto` -- fields the layout had no room for.
+    constexpr std::uint8_t CommandVersion = 5;
 
     /// Fields in an encoded command: the header, then key, value, scheduler endpoint,
-    /// public key and role.
-    constexpr std::size_t CommandFields = 6;
+    /// public key, role, creation time and leader key.
+    constexpr std::size_t CommandFields = 8;
 
     /// Wire tag in front of every encoded state: a snapshot, and a `ClusterStatus` body.
     ///
@@ -136,8 +139,9 @@ namespace
     /// member's `MemberSeat` (#1449). 6 added each member's public key, the principals and
     /// the revoked keys (#178). 7 added the roster version every voter endorses (#178).
     /// 8 removed the client and forgotten-host groups (spec §7): a machine is admitted and
-    /// forgotten by its key alone.
-    constexpr std::uint8_t StateVersion = 8;
+    /// forgotten by its key alone. 9 added the dissolve order a healing split replicates, as a
+    /// group of zero or one.
+    constexpr std::uint8_t StateVersion = 9;
 
     /// Fields one member occupies in an encoded state: id, Raft, scheduler, the
     /// scheduler endpoint's history, the seat, and the public key.
@@ -157,9 +161,14 @@ namespace
     /// Fields one revoked key occupies: whose it was, and the key.
     constexpr std::size_t RevokedKeyFields = 2;
 
+    /// Fields one dissolve order occupies: the survivor's id, the key that proved it, its leader's
+    /// endpoint, its creation time and its leader's key.
+    constexpr std::size_t DissolveOrderFields = 5;
+
     /// Fields in front of the groups: the version, then the member, setting, principal and
-    /// revoked-key counts, then the roster version.
-    constexpr std::size_t StateHeaderFields = 6;
+    /// revoked-key counts, then the roster version, then how many dissolve orders follow (zero
+    /// or one).
+    constexpr std::size_t StateHeaderFields = 7;
 
     /// Where the roster version sits in the header.
     constexpr std::size_t RosterVersionField = 5;
@@ -180,6 +189,9 @@ namespace
         return InvalidConfiguration("that cluster verb is retired: a machine is admitted and forgotten by its key "
                                     "(--cluster-admit, --cluster-forget)");
     }
+
+    /// Where the dissolve-order count sits in the header: right after the roster version.
+    constexpr std::size_t DissolveOrderCountField = RosterVersionField + 1;
 
     /// A key field's bytes: empty when no key is stated, the 32 bytes when one is.
     /// @param key The key, or nothing.
@@ -396,12 +408,20 @@ std::vector<std::byte> Encode(Command const& command)
     // a role byte of zero would be `Worker`, which is a claim, not an absence.
     auto const role =
         command.role.has_value() ? std::vector { static_cast<std::byte>(*command.role) } : std::vector<std::byte> {};
+    auto created = std::vector<std::byte> {};
+    if (command.createdAtUnixSeconds.has_value())
+    {
+        auto const bytes = WireFields::ToBigEndian<std::uint64_t>(*command.createdAtUnixSeconds);
+        created.assign(bytes.begin(), bytes.end());
+    }
     return WireFields::Encode({ std::span<std::byte const> { header },
                                 WireFields::AsBytes(command.key),
                                 WireFields::AsBytes(command.value),
                                 WireFields::AsBytes(command.schedulerEndpoint),
                                 OptionalKeyBytes(command.publicKey),
-                                std::span<std::byte const> { role } });
+                                std::span<std::byte const> { role },
+                                std::span<std::byte const> { created },
+                                OptionalKeyBytes(command.leaderKey) });
 }
 
 std::expected<Command, ConsensusError> DecodeCommand(std::span<std::byte const> payload)
@@ -418,7 +438,7 @@ std::expected<Command, ConsensusError> DecodeCommand(std::span<std::byte const> 
 
     auto const fields = WireFields::SplitExactly(payload, CommandFields);
     if (!fields.has_value())
-        return std::unexpected(MalformedWireFrame("a cluster command is not six fields"));
+        return std::unexpected(MalformedWireFrame("a cluster command is not eight fields"));
 
     auto const header = (*fields)[0];
     if (header.empty())
@@ -470,12 +490,27 @@ std::expected<Command, ConsensusError> DecodeCommand(std::span<std::byte const> 
                 std::format("cluster command role {} this build does not know", static_cast<unsigned>(roleField[0]))));
     }
 
+    // Empty is absent, eight bytes is a time, anything else is damage.
+    auto created = std::optional<std::uint64_t> {};
+    if (auto const createdField = (*fields)[6]; !createdField.empty())
+    {
+        created = WireFields::FromBigEndian<std::uint64_t>(createdField);
+        if (!created.has_value())
+            return std::unexpected(MalformedWireFrame("a cluster command's creation time is not eight bytes"));
+    }
+
+    auto const leaderKey = ReadKeyField((*fields)[7]);
+    if (!leaderKey.has_value())
+        return std::unexpected(MalformedWireFrame("a cluster command's leader key is neither absent nor 32 bytes"));
+
     return Command { .kind = *kind,
                      .key = std::string { WireFields::AsStringView((*fields)[1]) },
                      .value = std::string { WireFields::AsStringView((*fields)[2]) },
                      .schedulerEndpoint = std::string { WireFields::AsStringView((*fields)[3]) },
                      .publicKey = *publicKey,
-                     .role = role };
+                     .role = role,
+                     .createdAtUnixSeconds = created,
+                     .leaderKey = *leaderKey };
 }
 
 std::vector<std::byte> Encode(ClusterState const& state)
@@ -494,6 +529,9 @@ std::vector<std::byte> Encode(ClusterState const& state)
     auto const principalCount = countOf(state.principals.size());
     auto const revokedCount = countOf(state.revokedKeys.size());
     auto const rosterVersion = WireFields::ToBigEndian<std::uint64_t>(state.rosterVersion);
+    auto const dissolveCount = countOf(state.dissolveOrder.has_value() ? 1U : 0U);
+    auto const dissolveCreated = WireFields::ToBigEndian<std::uint64_t>(
+        state.dissolveOrder.has_value() ? state.dissolveOrder->createdAtUnixSeconds : 0);
 
     // Every history and seat byte is written before any span into them is taken,
     // because the list below holds spans and a vector that grew under them would leave
@@ -519,6 +557,7 @@ std::vector<std::byte> Encode(ClusterState const& state)
     fields.emplace_back(principalCount);
     fields.emplace_back(revokedCount);
     fields.emplace_back(rosterVersion);
+    fields.emplace_back(dissolveCount);
     auto cursor = std::span<std::byte const> { memberBytes };
     for (auto const& member: state.members)
     {
@@ -548,6 +587,14 @@ std::vector<std::byte> Encode(ClusterState const& state)
         fields.push_back(WireFields::AsBytes(revoked.id));
         fields.emplace_back(revoked.publicKey);
     }
+    if (state.dissolveOrder.has_value())
+    {
+        fields.push_back(WireFields::AsBytes(state.dissolveOrder->clusterId));
+        fields.emplace_back(state.dissolveOrder->provenKey);
+        fields.push_back(WireFields::AsBytes(state.dissolveOrder->leaderNodeEndpoint));
+        fields.emplace_back(dissolveCreated);
+        fields.emplace_back(state.dissolveOrder->leaderKey);
+    }
     return WireFields::Encode(WireFields::FieldList { fields });
 }
 
@@ -565,7 +612,8 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
             std::format("cluster state encoding version {} (this build reads {})", version, StateVersion)));
 
     if (fields->size() < StateHeaderFields)
-        return std::unexpected(MalformedWireFrame("a cluster state does not state its four counts and its roster version"));
+        return std::unexpected(
+            MalformedWireFrame("a cluster state does not state its four counts, its roster version and its dissolve count"));
     auto const memberCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[1]);
     auto const settingCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[2]);
     auto const principalCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[3]);
@@ -575,6 +623,9 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
     auto const rosterVersion = WireFields::FromBigEndian<std::uint64_t>((*fields)[RosterVersionField]);
     if (!rosterVersion.has_value())
         return std::unexpected(MalformedWireFrame("a cluster state's roster version is not eight bytes"));
+    auto const dissolveCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[DissolveOrderCountField]);
+    if (!dissolveCount.has_value() || *dissolveCount > 1)
+        return std::unexpected(MalformedWireFrame("a cluster state carries more than one dissolve order"));
 
     // Members as sextuples, settings as pairs, principals as triples and revoked keys as
     // pairs -- and the TOTAL is checked against what actually arrived. A truncated snapshot
@@ -586,7 +637,8 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
     auto const settingSpan = std::uint64_t { *settingCount } * SettingFields;
     auto const principalSpan = std::uint64_t { *principalCount } * PrincipalFields;
     auto const revokedSpan = std::uint64_t { *revokedCount } * RevokedKeyFields;
-    auto const expected = StateHeaderFields + memberSpan + settingSpan + principalSpan + revokedSpan;
+    auto const dissolveSpan = std::uint64_t { *dissolveCount } * DissolveOrderFields;
+    auto const expected = StateHeaderFields + memberSpan + settingSpan + principalSpan + revokedSpan + dissolveSpan;
     if (expected != fields->size())
         return std::unexpected(MalformedWireFrame("a cluster state's fields do not match its counts"));
 
@@ -680,6 +732,22 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
         if (!publicKey.has_value() || !publicKey->has_value())
             return std::unexpected(MalformedWireFrame("a revoked key is not 32 bytes"));
         state.revokedKeys.push_back(RevokedKey { .id = at(index), .publicKey = **publicKey });
+    }
+    if (*dissolveCount == 1)
+    {
+        auto const index = principalsEnd + revokedSpan;
+        auto const provenKey = ReadKeyField(field(index + 1));
+        auto const created = WireFields::FromBigEndian<std::uint64_t>(field(index + 3));
+        auto const leaderKey = ReadKeyField(field(index + 4));
+        if (!provenKey.has_value() || !provenKey->has_value() || !created.has_value() || !leaderKey.has_value()
+            || !leaderKey->has_value())
+            return std::unexpected(
+                MalformedWireFrame("a dissolve order carries no 32-byte key, no eight-byte age, or no 32-byte leader key"));
+        state.dissolveOrder = DissolveOrder { .clusterId = at(index),
+                                              .provenKey = **provenKey,
+                                              .leaderNodeEndpoint = at(index + 2),
+                                              .createdAtUnixSeconds = *created,
+                                              .leaderKey = **leaderKey };
     }
 
     if (auto const broken = BrokenRosterRule(state); broken.has_value())
@@ -841,6 +909,19 @@ namespace
                 return;
             }
 
+            case CommandKind::DissolveInto:
+                // The last order wins: a fleet that decided again decided about a newer survivor.
+                // Dropped when a field `Validate` requires has gone missing, as every verb here is.
+                if (!command.publicKey.has_value() || !command.createdAtUnixSeconds.has_value()
+                    || !command.leaderKey.has_value())
+                    return;
+                state.dissolveOrder = DissolveOrder { .clusterId = command.key,
+                                                      .provenKey = *command.publicKey,
+                                                      .leaderNodeEndpoint = command.value,
+                                                      .createdAtUnixSeconds = *command.createdAtUnixSeconds,
+                                                      .leaderKey = *command.leaderKey };
+                return;
+
             case CommandKind::SetSetting: {
                 auto const it = std::ranges::find(state.settings, command.key, &Setting::name);
                 if (it != state.settings.end())
@@ -983,6 +1064,14 @@ namespace
         { .name = "a principal id", .project = [](Command const& c) -> std::string_view { return c.key; } },
     } };
 
+    /// What `DissolveInto` records: the survivor's id and its leader's endpoint, which every member
+    /// then dials and every renderer of the state prints.
+    constexpr std::array<TextField<Command>, 2> DissolveText { {
+        { .name = "a surviving fleet's id", .project = [](Command const& c) -> std::string_view { return c.key; } },
+        { .name = "a surviving fleet's leader endpoint",
+          .project = [](Command const& c) -> std::string_view { return c.value; } },
+    } };
+
     /// Whether a verb carries one of `Command`'s optional fields (#178).
     ///
     /// **Private: never transmitted or persisted.** Three answers, because the two fields
@@ -1004,6 +1093,8 @@ namespace
         std::span<TextField<Command> const> fields; ///< What it must be able to name.
         FieldUse publicKey;                         ///< Whether it takes `Command::publicKey`.
         FieldUse role;                              ///< Whether it takes `Command::role`.
+        FieldUse createdAt;                         ///< Whether it takes `Command::createdAtUnixSeconds`.
+        FieldUse leaderKey;                         ///< Whether it takes `Command::leaderKey`.
     };
 
     /// One row per `CommandKind`, in enumerator order.
@@ -1016,37 +1107,58 @@ namespace
           .noun = "a member admission",
           .fields = AddMemberText,
           .publicKey = FieldUse::Optional,
-          .role = FieldUse::Refused },
+          .role = FieldUse::Refused,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
         { .kind = CommandKind::Forget,
           .noun = "a forget",
           .fields = {},
           .publicKey = FieldUse::Optional,
-          .role = FieldUse::Refused },
+          .role = FieldUse::Refused,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
         { .kind = CommandKind::SetSetting,
           .noun = "a setting",
           .fields = SetSettingText,
           .publicKey = FieldUse::Refused,
-          .role = FieldUse::Refused },
+          .role = FieldUse::Refused,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
         { .kind = CommandKind::RetiredAdmitClient,
           .noun = "a retired verb",
           .fields = {},
           .publicKey = FieldUse::Refused,
-          .role = FieldUse::Refused },
+          .role = FieldUse::Refused,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
         { .kind = CommandKind::RetiredForgetClient,
           .noun = "a retired verb",
           .fields = {},
           .publicKey = FieldUse::Refused,
-          .role = FieldUse::Refused },
+          .role = FieldUse::Refused,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
         { .kind = CommandKind::AddLearner,
           .noun = "a member admission",
           .fields = AddMemberText,
           .publicKey = FieldUse::Optional,
-          .role = FieldUse::Refused },
+          .role = FieldUse::Refused,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
         { .kind = CommandKind::AdmitPrincipal,
           .noun = "a principal admission",
           .fields = PrincipalText,
           .publicKey = FieldUse::Required,
-          .role = FieldUse::Required },
+          .role = FieldUse::Required,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
+        { .kind = CommandKind::DissolveInto,
+          .noun = "a dissolve",
+          .fields = DissolveText,
+          .publicKey = FieldUse::Required,
+          .role = FieldUse::Refused,
+          .createdAt = FieldUse::Required,
+          .leaderKey = FieldUse::Required },
     } };
 
     static_assert(RowsInEnumeratorOrder(CommandShapes, &CommandShapeRow::kind),
@@ -1103,6 +1215,12 @@ std::expected<void, ConsensusError> Validate(Command const& command)
         !refused.has_value())
         return refused;
     if (auto refused = RefuseFieldUse(shape, shape.role, command.role.has_value(), "principal role"); !refused.has_value())
+        return refused;
+    if (auto refused = RefuseFieldUse(shape, shape.createdAt, command.createdAtUnixSeconds.has_value(), "creation time");
+        !refused.has_value())
+        return refused;
+    if (auto refused = RefuseFieldUse(shape, shape.leaderKey, command.leaderKey.has_value(), "leader key");
+        !refused.has_value())
         return refused;
 
     switch (command.kind)
@@ -1172,6 +1290,19 @@ std::expected<void, ConsensusError> Validate(Command const& command)
             if (!command.value.empty() || !command.schedulerEndpoint.empty())
                 return std::unexpected(
                     InvalidConfiguration(std::format("{} carries an id and a key and nothing else", shape.noun)));
+            return {};
+
+        // Every member dials the endpoint, and one day archives its own store under the survivor's
+        // side of the heal -- so the id is held to the one id bound, and the endpoint to the one
+        // dial rule a summary's endpoints meet.
+        case CommandKind::DissolveInto:
+            if (!command.schedulerEndpoint.empty())
+                return std::unexpected(InvalidConfiguration("a dissolve carries no scheduler endpoint"));
+            if (command.key.size() > CompileCacheWire::MaxIdBytes)
+                return std::unexpected(InvalidConfiguration(std::format(
+                    "a dissolve names a fleet id past the {} bytes every id is held to", CompileCacheWire::MaxIdBytes)));
+            if (!ParseDialEndpoint(command.value).has_value())
+                return std::unexpected(InvalidConfiguration("a dissolve names a leader endpoint nobody can dial"));
             return {};
 
         // The count rather than a verb; falls out to the refusal below.
@@ -1293,6 +1424,9 @@ std::expected<void, ConsensusError> ValidateAgainst(ClusterState const& state, C
                             command.value,
                             revoked ? " (its key was revoked when it was forgotten)" : "")));
         }
+
+        case CommandKind::DissolveInto:
+            return {};
 
         // `Validate` refused them above; named rather than swept up by a `default`, for the
         // reason `Apply` names it.

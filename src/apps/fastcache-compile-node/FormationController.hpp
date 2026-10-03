@@ -4,6 +4,7 @@
 #include "EnrollChannel.hpp"
 #include "EnrollClient.hpp"
 #include "FleetProbe.hpp"
+#include "NodeConditions.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/FleetEndpoints.hpp>
@@ -12,10 +13,12 @@
 #include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Cluster/ProvenFleet.hpp>
 #include <FastCache/Cluster/SeedSources.hpp>
+#include <FastCache/Cluster/SplitEvidence.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -29,6 +32,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <core/platform/Clock.hpp>
@@ -69,6 +73,11 @@ inline constexpr std::chrono::seconds SeedProbeInterval { 60 };
 /// The queue holds what was proven since the last decision and is emptied by it, so this is a bound
 /// on one beat's sightings, not a memory of the segment.
 inline constexpr std::size_t MaxQueuedFleets = 16;
+
+/// How many of this fleet's machines seen speaking for another proven fleet a controller remembers,
+/// newest first: the ids its summary lists first (`Cluster::SummaryMembers`). More than a datagram
+/// carries, so the order past the cut is still the right one for a reply.
+inline constexpr std::size_t MaxSpokeElsewhere = 64;
 
 /// How many fleet ids a node names, once each, as never to be asked for their id; past it, the rest
 /// go unnamed rather than growing a set a segment can fill.
@@ -120,13 +129,40 @@ struct SelfFacts
 };
 
 /// What a formation controller acts through. Every member outlives the controller.
+/// Whether the startup rules refuse the shape a record would give this node: what EVERY formation
+/// transition asks of the record it is about to write, before writing it.
+///
+/// A seam rather than a call, so the controller judges a move by the rules `main` judges a start by
+/// without owning the configuration they read (`StartupShapeJudge`).
+class IShapeJudge
+{
+  public:
+    IShapeJudge() = default;
+    IShapeJudge(IShapeJudge const&) = delete;
+    IShapeJudge(IShapeJudge&&) = delete;
+    IShapeJudge& operator=(IShapeJudge const&) = delete;
+    IShapeJudge& operator=(IShapeJudge&&) = delete;
+    virtual ~IShapeJudge() = default;
+
+    /// @param next The record a move would write.
+    /// @return The startup rule's refusal of the shape it gives this node, or nothing when it may serve it.
+    [[nodiscard]] virtual std::optional<std::string> RefusalOf(Cluster::FormationRecord const& next) const = 0;
+};
+
 struct FormationParts
 {
     Cluster::IFormationStore& store;        ///< Where every change is written, before it is acted on.
-    IStoreArchiver& archiver;               ///< Moves a left cluster's store out of the root.
     IEnrollChannel& enroll;                 ///< Asks a fleet to admit this node, once a beat.
     IFleetProbe& probe;                     ///< Asks a seed which fleet it is in.
     Cluster::FleetEndpointsFile& endpoints; ///< Where an approval remembers the fleet's voters as seeds.
+
+    /// The join memos this fleet's members announced -- the leader's `SchedulerService`, where
+    /// every member announces -- read as the announced half of the split evidence.
+    Cluster::IAnnouncedJoinMemos const& announced;
+
+    /// Where this node, while it leads its fleet, proposes the fleet's dissolve into the survivor of a
+    /// split it verified: the consensus tier, which replicates it to every member.
+    Distributed::IClusterAdmin& admin;
 
     /// Every seed to try, in `OrderSeeds`' order; re-asked at every probe round, so a DNS answer or
     /// a remembered endpoint that changed is seen. Its `--fleet-seed` candidates are the TYPED seeds:
@@ -137,9 +173,16 @@ struct FormationParts
     IReformSignal& reform;               ///< Told when a move changes the node's shape.
     core::platform::IClock const& clock; ///< What the give-up and the probe interval are measured on.
     core::platform::WallClockRef wall;   ///< What the record's instants and the rejection window read.
-    ISecureRandom& random;               ///< Where a newly minted cluster id comes from.
-    IMetricsSink& metrics;               ///< `FormationYields`, `FormationJoinsAbandoned`.
+    ISecureRandom& random;               ///< Where a newly minted cluster id, and each poll's nonce, come from.
+    IMetricsSink& metrics;               ///< `FormationYields`, `FormationJoinsAbandoned`, the admission refusals.
     ILogger& logger;                     ///< Every move, and every move that could not be written.
+
+    /// Asked of every record a move is about to write: a move whose shape the startup rules refuse is
+    /// not taken, whether or not it reforms.
+    IShapeJudge const& judge;
+
+    /// Where `formation-move-refused` is answered; null when nobody reads it.
+    NodeConditions* conditions;
 };
 
 /// Moves a node between modes by `Cluster::FormationTransitions`, writing the record first.
@@ -155,7 +198,11 @@ struct FormationParts
 /// Thread-safe: discovery hands fleets in and reads `Current` on its thread, the applied state
 /// arrives on consensus's, a revocation verdict on the transport's, and `Tick` runs on the heartbeat
 /// thread. `Tick` itself is called from one thread.
-class FormationController final: public Cluster::IFleetSummarySource, public Cluster::IFleetObserver
+class FormationController final:
+    public Cluster::IFleetSummarySource,
+    public Cluster::IFleetObserver,
+    public Cluster::IAskedJoinsSource,
+    public Cluster::ISplitEvidenceSource
 {
   public:
     /// @param parts What it acts through.
@@ -167,9 +214,21 @@ class FormationController final: public Cluster::IFleetSummarySource, public Clu
     /// @return The summary.
     [[nodiscard]] CompileCacheWire::FleetSummary Current() const override;
 
-    /// Queue a proven fleet; it is decided on at the next beat.
+    /// Queue a proven fleet of ANOTHER cluster; it is decided on at the next beat. This node's own fleet
+    /// is dropped here by cluster id, never left to whatever observer stands in front.
     /// @param fleet What was proven, and how it arrived.
     void OnFleetProven(Cluster::ProvenFleet const& fleet) override;
+
+    /// The fleets this node once asked, as its record keeps them now: what every announcement
+    /// hands the leader.
+    /// @return The memos, oldest first.
+    [[nodiscard]] std::vector<Cluster::AskedJoin> AskedJoins() const override;
+
+    /// What this node can say about @p seen: `Cluster::ReadSplit` over the state its own cluster last
+    /// applied, its record and what members announced. No evidence before a state was applied.
+    /// @param seen A proven fleet of another cluster.
+    /// @return The reading.
+    [[nodiscard]] Cluster::SplitReading ReadSplit(Cluster::ProvenFleetSummary const& seen) const override;
 
     /// The heartbeat thread's beat: decide, probe or poll -- at most one exchange.
     void Tick();
@@ -242,6 +301,7 @@ class FormationController final: public Cluster::IFleetSummarySource, public Clu
 
     [[nodiscard]] FireOutcome Fire(Cluster::FormationTrigger trigger, TriggerContext const& context, std::string_view why);
     void Publish(Cluster::FormationRecord const& record);
+    void AdoptLocked(Cluster::FormationRecord record);
     [[nodiscard]] std::expected<Cluster::FormationRecord, std::string> Move(Cluster::FormationTransition const& row,
                                                                             TriggerContext const& context,
                                                                             Cluster::FormationRecord const& from);
@@ -250,15 +310,47 @@ class FormationController final: public Cluster::IFleetSummarySource, public Clu
                                                                  Cluster::FormationRecord& next) const;
     [[nodiscard]] JoinerIdentity Joiner() const;
     void ResetPoll();
+    void ResetChain();
+    /// An endpoint and the key the chain from the key that proved the fleet proved there.
+    struct ChainLink
+    {
+        std::string endpoint;    ///< Where it answers.
+        Ed25519PublicKey key {}; ///< The key it proved.
+    };
+    [[nodiscard]] std::optional<EnrollReading> ProvePollEndpoint(std::string const& endpoint,
+                                                                 std::string const& clusterId,
+                                                                 std::optional<Ed25519PublicKey> expected,
+                                                                 std::optional<ChainLink> const& anchor);
+    [[nodiscard]] EnrollReading PollProven(std::string const& endpoint,
+                                           Cluster::JoinTarget const& target,
+                                           Ed25519PublicKey const& pollKey);
     void Queue(Cluster::ProvenFleet const& fleet);
     void NameUnaskable(std::string const& clusterId);
     [[nodiscard]] std::uint64_t WallSeconds() const;
+    /// Count a reading nobody signed towards giving the join up. The caller holds the lock.
+    /// @return True once `PendingGiveUpAfter` has passed with no answer a proven key signed.
+    [[nodiscard]] bool GiveUpDueLocked();
     [[nodiscard]] bool RecentlyRejectedBy(std::string_view clusterId) const;
     [[nodiscard]] CompileCacheWire::FleetSummary CurrentLocked() const;
+    [[nodiscard]] std::optional<Ed25519PublicKey> LeaderKeyLocked() const;
+    [[nodiscard]] Cluster::ClusterState const* AppliedLocked() const;
     [[nodiscard]] bool IsVoter(Consensus::NodeId const& id) const;
 
+    /// A pending node this one follows, and what it points at.
+    struct FollowedPointer
+    {
+        std::string pendingId;                 ///< The pending node's own cluster.
+        CompileCacheWire::JoinPointer pointer; ///< The fleet it asked, as it states it: a hint.
+    };
+    [[nodiscard]] std::optional<FollowedPointer> PointerOf(CompileCacheWire::FleetSummary const& own,
+                                                           Cluster::ProvenFleet const& fleet) const;
     void TickSolitary();
     void TickPending();
+    void TickMember();
+    [[nodiscard]] std::optional<Cluster::Command> ProposalLocked(CompileCacheWire::FleetSummary const& own,
+                                                                 Cluster::ProvenFleetSummary const& seen,
+                                                                 Cluster::SplitReading const& reading,
+                                                                 std::string& why);
     void Reform(FireOutcome outcome);
 
     FormationParts _parts;
@@ -267,21 +359,50 @@ class FormationController final: public Cluster::IFleetSummarySource, public Clu
     RecordPublisher _publisher; ///< Every move's saves go through it; it publishes what the store kept.
 
     std::mutex _effectLock; ///< Serializes moves. Taken first, and never while `_lock` is held.
+
+    /// The refusal `formation-move-refused` was last raised for, said once until it changes; guarded by
+    /// `_effectLock`, under which every save runs.
+    std::string _shapeRefusal;
+
+    /// Whether the move in progress was refused by the judge rather than by the store; guarded by
+    /// `_effectLock`.
+    bool _refusedByJudge { false };
     mutable std::mutex _lock;
-    std::uint64_t _published { 0 }; ///< Records published so far; a move that published one moved.
     Cluster::FormationRecord _record;
-    std::vector<Cluster::ProvenFleet> _seen;                      ///< Proven since the last decision, one per cluster id.
-    std::vector<std::string> _typedAsked;                         ///< The typed seeds asked once already.
-    std::size_t _probeCursor { 0 };                               ///< Which seed the next interval probe asks.
-    core::platform::SteadyTimePoint _nextProbeAt;                 ///< When the next interval probe is due.
-    std::string _leaderId;                                        ///< From the last applied state.
-    std::string _leaderNodeEndpoint;                              ///< From the last applied state.
-    std::vector<Consensus::NodeId> _voters;                       ///< The last applied state's voters.
-    std::string _pollEndpoint;                                    ///< Where the next poll goes; a redirect moves it.
+    /// Proven since the last decision, one per cluster id -- and since this node entered the mode it is
+    /// in: each mode decides only what it queued (`AdoptLocked`).
+    std::vector<Cluster::ProvenFleet> _seen;
+    std::vector<std::string> _typedAsked;         ///< The typed seeds asked once already.
+    std::size_t _probeCursor { 0 };               ///< Which seed the next interval probe asks.
+    core::platform::SteadyTimePoint _nextProbeAt; ///< When the next interval probe is due.
+    /// The state this node's cluster last applied, under the id it was applied for; a state of a
+    /// cluster this node has since left is never read as the current one (`AppliedLocked`).
+    std::optional<std::pair<std::string, Cluster::ClusterState>> _applied;
+    std::vector<std::string> _spokeElsewhere; ///< Members seen speaking for another fleet, newest first.
+    std::string _leaderId;                    ///< From the last applied state.
+    std::string _leaderNodeEndpoint;          ///< From the last applied state.
+    std::vector<Consensus::NodeId> _voters;   ///< The last applied state's voters.
+    std::string _pollEndpoint;                ///< Where the next poll goes; a redirect moves it.
+    /// The key this node PROVED for the fleet it asked, answering at `_pollEndpoint`, which an
+    /// admission from there must be signed by; none until it is proved, and the beat that proves it
+    /// polls nothing.
+    std::optional<Ed25519PublicKey> _pollKey;
+    /// The key `_pollEndpoint` must prove, as the chain from the key that proved the fleet reached it;
+    /// none after a redirect, until `_anchor` says which key leads.
+    std::optional<Ed25519PublicKey> _expectedKey;
+    /// Where a key the chain proved answers -- the root's own endpoint where the decided summary
+    /// states it, else the first endpoint proved, so rooted at `provenKey` transitively -- asked
+    /// which key leads after a redirect.
+    std::optional<ChainLink> _anchor;
     int _redirects { 0 };                                         ///< Consecutive redirects followed.
     std::optional<core::platform::SteadyTimePoint> _failingSince; ///< When the fleet last stopped answering.
     std::string _lastSaid;                                        ///< The last reading told to the log.
     std::set<std::string> _namedUnaskable;                        ///< Fleet ids already named as never asked.
+    std::string _proposedFor;                                   ///< The survivor this leader last proposed dissolving into.
+    std::optional<core::platform::SteadyTimePoint> _proposedAt; ///< When; the same proposal waits `SeedProbeInterval`.
+    /// When this node may next follow a pending node's pointer: one follow per `SeedProbeInterval`,
+    /// whichever endpoint it names.
+    core::platform::SteadyTimePoint _nextFollowAt;
 };
 
 } // namespace FastCache::Node

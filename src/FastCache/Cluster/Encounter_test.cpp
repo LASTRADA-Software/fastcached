@@ -43,8 +43,8 @@ namespace
 /// Whether the encounter decision can be asked of a seen side of type @p Seen.
 template <typename Seen>
 concept DecidesAgainst = requires(FleetSummary const& own, Seen const& seen) {
-    ClassifyEncounter(own, seen);
-    YieldTo(own, seen);
+    ClassifyEncounter(own, seen, SplitEvidence::None);
+    YieldTo(own, seen, SplitEvidence::None);
 };
 
 // A raw summary -- what a beacon carries -- cannot even be passed as the seen side; only a
@@ -74,6 +74,7 @@ struct Row
             return Encounter::Yield;
         case Encounter::SameFleet:
         case Encounter::ForeignFleet:
+        case Encounter::Follow:
         case Encounter::Last:
             break;
     }
@@ -125,12 +126,38 @@ TEST_CASE("ClassifyEncounter decides every pair of fleet states and every tie", 
               .own = Fleet("aa", Solitary, 7),
               .seen = Fleet("bb", Solitary, 7),
               .expected = Encounter::Stay },
+        // A pending node is a pointer. A solitary node follows it whatever the ages say -- the rows
+        // that would have yielded to it by the tiebreak are exactly the ones that must not.
+        Row { .name = "solitary meets an older pending node",
+              .own = Fleet("c1", Solitary, 9),
+              .seen = Fleet("c2", Pending, 1),
+              .expected = Encounter::Follow },
+        Row { .name = "solitary meets a younger pending node",
+              .own = Fleet("c1", Solitary, 1),
+              .seen = Fleet("c2", Pending, 9),
+              .expected = Encounter::Follow },
+        Row { .name = "established meets a pending node",
+              .own = Fleet("c1", Established, 9),
+              .seen = Fleet("c2", Pending, 1),
+              .expected = Encounter::Stay },
+        Row { .name = "pending meets an older solitary",
+              .own = Fleet("c1", Pending, 9),
+              .seen = Fleet("c2", Solitary, 1),
+              .expected = Encounter::Stay },
+        Row { .name = "pending meets an established fleet",
+              .own = Fleet("c1", Pending, 9),
+              .seen = Fleet("c2", Established, 1),
+              .expected = Encounter::Stay },
+        Row { .name = "pending meets an older pending node",
+              .own = Fleet("c1", Pending, 9),
+              .seen = Fleet("c2", Pending, 1),
+              .expected = Encounter::Stay },
     };
     for (auto const& row: rows)
     {
         INFO(row.name);
-        CHECK(ClassifyEncounter(row.own, Proven(row.seen)) == row.expected);
-        CHECK(YieldTo(row.own, Proven(row.seen)) == (row.expected == Encounter::Yield));
+        CHECK(ClassifyEncounter(row.own, Proven(row.seen), SplitEvidence::None) == row.expected);
+        CHECK(YieldTo(row.own, Proven(row.seen), SplitEvidence::None) == (row.expected == Encounter::Yield));
     }
 }
 
@@ -147,7 +174,7 @@ TEST_CASE("Exactly one of two solitary fleets yields to the other whichever meet
             if (a.clusterId == b.clusterId)
                 continue;
             INFO(a.clusterId << " against " << b.clusterId);
-            CHECK(YieldTo(a, Proven(b)) != YieldTo(b, Proven(a)));
+            CHECK(YieldTo(a, Proven(b), SplitEvidence::None) != YieldTo(b, Proven(a), SplitEvidence::None));
         }
 }
 
@@ -174,11 +201,13 @@ TEST_CASE("Two sides of every encounter conclude mirror images of each other", "
             INFO(a.clusterId << " against " << b.clusterId);
             auto const bothEstablished = a.state == FleetState::Established && b.state == FleetState::Established;
             // Exactly one yields, or neither when both are established -- never both.
-            CHECK(static_cast<int>(YieldTo(a, Proven(b))) + static_cast<int>(YieldTo(b, Proven(a)))
+            CHECK(static_cast<int>(YieldTo(a, Proven(b), SplitEvidence::None))
+                      + static_cast<int>(YieldTo(b, Proven(a), SplitEvidence::None))
                   == (bothEstablished ? 0 : 1));
-            CHECK(ClassifyEncounter(b, Proven(a)) == MirrorOf(ClassifyEncounter(a, Proven(b))));
+            CHECK(ClassifyEncounter(b, Proven(a), SplitEvidence::None)
+                  == MirrorOf(ClassifyEncounter(a, Proven(b), SplitEvidence::None)));
             if (bothEstablished)
-                CHECK(ClassifyEncounter(a, Proven(b)) == Encounter::ForeignFleet);
+                CHECK(ClassifyEncounter(a, Proven(b), SplitEvidence::None) == Encounter::ForeignFleet);
         }
     CHECK(pairs == fleets.size() * (fleets.size() - 1));
 }
@@ -191,11 +220,14 @@ TEST_CASE("A node never yields to its own cluster id whatever the other fields s
             // The seen summary claims an older fleet and a different leader: still the same fleet.
             auto const own = Fleet("c1", ownState, 9);
             auto seen = Fleet("c1", seenState, 1);
-            seen.leaderId = "someone-else";
+            // A pending summary's leader slots are its pointer (`FleetStateTable`), so the other
+            // leader it names goes there.
+            (CompileCacheWire::LeaderSlotsNameAskedFleet(seenState) ? seen.pointsAt.leaderId : seen.leaderId) =
+                "someone-else";
             seen.nodeId = "someone-else";
             INFO(static_cast<int>(ownState) << " against " << static_cast<int>(seenState));
-            CHECK(ClassifyEncounter(own, Proven(seen)) == Encounter::SameFleet);
-            CHECK_FALSE(YieldTo(own, Proven(seen)));
+            CHECK(ClassifyEncounter(own, Proven(seen), SplitEvidence::None) == Encounter::SameFleet);
+            CHECK_FALSE(YieldTo(own, Proven(seen), SplitEvidence::None));
         }
 }
 
@@ -207,11 +239,101 @@ TEST_CASE("A clock that read before the epoch yields to every sane one", "[clust
     {
         auto const sane = Fleet("zz", FleetState::Solitary, created);
         INFO(created);
-        CHECK(ClassifyEncounter(broken, Proven(sane)) == Encounter::Yield);
-        CHECK(ClassifyEncounter(sane, Proven(broken)) == Encounter::Stay);
+        CHECK(ClassifyEncounter(broken, Proven(sane), SplitEvidence::None) == Encounter::Yield);
+        CHECK(ClassifyEncounter(sane, Proven(broken), SplitEvidence::None) == Encounter::Stay);
     }
     // Established still beats solitary, whichever clock is broken.
     CHECK(ClassifyEncounter(Fleet("aa", FleetState::Established, UnbelievableClockCreatedAt),
-                            Proven(Fleet("zz", FleetState::Solitary, 0)))
+                            Proven(Fleet("zz", FleetState::Solitary, 0)),
+                            SplitEvidence::None)
           == Encounter::Stay);
+}
+
+TEST_CASE("Two established fleets proven to be one fleet decide by the tiebreak, and exactly one moves",
+          "[cluster][formation][encounter][split]")
+{
+    // The owner's rule: a split of ONE fleet heals without an operator -- on a voter's key. With
+    // evidence on both sides the pair is the tiebreak's, so exactly one yields -- the same XOR two
+    // solitary fleets obey.
+    auto const fleets = std::array { Fleet("aa", FleetState::Established, 7),
+                                     Fleet("bb", FleetState::Established, 7),
+                                     Fleet("cc", FleetState::Established, 3),
+                                     Fleet("dd", FleetState::Established, UnbelievableClockCreatedAt) };
+    auto const verified = SplitEvidence::TheirSpeakerIsOurVoter;
+    auto pairs = std::size_t { 0 };
+    for (auto const& a: fleets)
+        for (auto const& b: fleets)
+        {
+            if (a.clusterId == b.clusterId)
+                continue;
+            ++pairs;
+            INFO(a.clusterId << " against " << b.clusterId);
+            CHECK(YieldTo(a, Proven(b), verified) != YieldTo(b, Proven(a), verified));
+            CHECK(ClassifyEncounter(b, Proven(a), verified) == MirrorOf(ClassifyEncounter(a, Proven(b), verified)));
+
+            // Evidence on ONE side only: that side decides by the tiebreak and the other stays
+            // foreign, so the two can never both yield -- the one that must yield waits for its own
+            // evidence rather than the other moving for it.
+            auto const oneSided = static_cast<int>(YieldTo(a, Proven(b), verified))
+                                  + static_cast<int>(YieldTo(b, Proven(a), SplitEvidence::None));
+            CHECK(oneSided <= 1);
+            CHECK(ClassifyEncounter(b, Proven(a), SplitEvidence::None) == Encounter::ForeignFleet);
+        }
+    CHECK(pairs == fleets.size() * (fleets.size() - 1));
+
+    // The winner is the tiebreak's: the older fleet stays, the younger yields.
+    CHECK(
+        ClassifyEncounter(Fleet("zz", FleetState::Established, 9), Proven(Fleet("yy", FleetState::Established, 1)), verified)
+        == Encounter::Yield);
+    CHECK(
+        ClassifyEncounter(Fleet("yy", FleetState::Established, 1), Proven(Fleet("zz", FleetState::Established, 9)), verified)
+        == Encounter::Stay);
+}
+
+TEST_CASE("Split evidence changes nothing but what would otherwise be foreign", "[cluster][formation][encounter][split]")
+{
+    // Every pair a solitary node is in, and the same-id rule, decide alike whatever the evidence says:
+    // evidence heals a split and must never move a first join.
+    // And a pending node stays a pointer under any evidence: nothing turns a follow into a yield.
+    auto const fleets = std::array { Fleet("aa", FleetState::Solitary, 7), Fleet("bb", FleetState::Established, 3),
+                                     Fleet("cc", FleetState::Solitary, 1), Fleet("dd", FleetState::Established, 9),
+                                     Fleet("ee", FleetState::Pending, 2),  Fleet("ff", FleetState::Pending, 11) };
+    auto decided = std::size_t { 0 };
+    for (auto const& a: fleets)
+        for (auto const& b: fleets)
+            for (auto const kind: Enumerators<SplitEvidence>())
+            {
+                INFO(a.clusterId << " against " << b.clusterId << " with "
+                                 << SplitEvidenceNames[static_cast<std::size_t>(kind)].name);
+                auto const without = ClassifyEncounter(a, Proven(b), SplitEvidence::None);
+                auto const with = ClassifyEncounter(a, Proven(b), kind);
+                ++decided;
+                if (without == Encounter::ForeignFleet && HealingOf(kind) == SplitHealing::Automatically)
+                    CHECK((with == Encounter::Yield || with == Encounter::Stay));
+                else
+                    CHECK(with == without);
+            }
+    CHECK(decided == fleets.size() * fleets.size() * static_cast<std::size_t>(SplitEvidence::Last));
+}
+
+TEST_CASE("Only a voter's key heals a split by itself; a memo's and a learner's are an operator's decision",
+          "[cluster][formation][encounter][split][security]")
+{
+    // A whole fleet follows a dissolve, so the evidence that moves one must rest on a key an operator
+    // chose to trust. A memo's key was trusted on first use -- whoever beaconed oldest -- and a
+    // learner's was admitted by auto-approval: either one, believed, lets an outsider move an
+    // established fleet. So each is a split an operator is told about, decided here as foreign.
+    CHECK(HealingOf(SplitEvidence::None) == SplitHealing::NotASplit);
+    CHECK(HealingOf(SplitEvidence::TheirSpeakerIsOurVoter) == SplitHealing::Automatically);
+    CHECK(HealingOf(SplitEvidence::TheirSpeakerIsOurLearner) == SplitHealing::ByOperator);
+    CHECK(HealingOf(SplitEvidence::WeAskedAndTheyListUs) == SplitHealing::ByOperator);
+
+    // An older established fleet: what the younger one decides on each kind.
+    auto const own = Fleet("zz", FleetState::Established, 9);
+    auto const older = Proven(Fleet("aa", FleetState::Established, 1));
+    CHECK(ClassifyEncounter(own, older, SplitEvidence::TheirSpeakerIsOurVoter) == Encounter::Yield);
+    CHECK(ClassifyEncounter(own, older, SplitEvidence::TheirSpeakerIsOurLearner) == Encounter::ForeignFleet);
+    CHECK(ClassifyEncounter(own, older, SplitEvidence::WeAskedAndTheyListUs) == Encounter::ForeignFleet);
+    CHECK(IsSplit(SplitEvidence::WeAskedAndTheyListUs)); // told, all the same
+    CHECK_FALSE(IsSplit(SplitEvidence::None));
 }

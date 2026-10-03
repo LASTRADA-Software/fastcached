@@ -84,6 +84,16 @@ namespace Detail
 /// that needs it can include from; `src` is on all three test targets' include
 /// paths, which is the same reason `tests/Unwrap.hpp` lives beside this file.
 ///
+/// **And unique among LIVE processes is not unique across TIME: the path is handed out EMPTY.**
+/// A pid is reused -- on Windows within minutes -- so a directory an earlier process left behind
+/// under the same pid and counter is the path a later process is handed. A fixture that died
+/// before its teardown, or never had one, left a Raft log, a snapshot and a key there, and the
+/// next process to draw that pid opened them as its own: `ConsensusTier_test` failed SaveLog in
+/// every section of one case, and refused a tier start in another, at 9 runs in 200 (both cases
+/// per run, through ctest, against the 1400 such directories one machine had accumulated). So
+/// whatever sits at the path is removed before it is returned. That is safe for the reason
+/// `ScratchDirectory` always cleared: the name carries THIS process's pid, so what it can reach is
+/// this process's own -- never a live peer's, whose pid differs -- or a dead one's.
 /// @param prefix Short, human-recognisable tag so a leaked directory can be
 ///        traced back to the test that made it.
 /// @param parent Directory the name is placed under. Defaults to the system

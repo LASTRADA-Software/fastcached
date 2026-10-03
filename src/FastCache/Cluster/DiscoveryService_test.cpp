@@ -609,11 +609,13 @@ TEST_CASE("A proof is refused before this node logs what it claimed", "[cluster]
 
     // And then answers the real cookie for an endpoint that is not text. The signature is not even
     // filled in: the cookie names another endpoint, so this is refused before anything is verified.
+    // The byte sits in the HOST, which the summary's dial rule does not read: past the port it would
+    // make the proof undecodable, dropped before the refusal this case is about.
     REQUIRE(peer.service.PumpOnce(1ms) == DiscoveryEvent::Ignored); // its own beacon
     auto const challenge = NextChallenge(*peer.socket);
     REQUIRE(peer.socket
                 ->send(DiscoveryWire::EncodeProof(
-                           DiscoveryWire::Proof { .summary = Claiming("prod", "peer", "10.0.0.2:7000\xFF"),
+                           DiscoveryWire::Proof { .summary = Claiming("prod", "peer", "10.0.0.2\xFF:7000"),
                                                   .answers = challenge.nonce,
                                                   .publicKey = {},
                                                   .signature = {} }),
@@ -756,6 +758,30 @@ TEST_CASE("A KNOWN id proving another key is reported, not authenticated", "[clu
     // authenticated. Without it the refusal above passes under a service refusing everybody.
     Node genuine { bus, clock, random, logger, "worker-a", "10.0.0.3:7000", "prod", roster };
     CHECK(Handshake(insider, genuine) == DiscoveryEvent::PeerAuthenticated);
+}
+
+TEST_CASE("Every authenticated reply is handed on, this node's own fleet's included, and nothing else",
+          "[cluster][discovery][service]")
+{
+    // What lets "no other fleet is visible" be a FINDING: the watch hears this fleet's replies through
+    // the one seam it hears other fleets' through. Only authenticated ones -- a known id proving
+    // another key is not a reply anybody should count.
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
+    ScriptedSecureRandom random { NonceScript({ 11 }) };
+    NullLogger logger;
+
+    auto const roster = SharedRoster::Of({ "insider", "worker-a" });
+    Node insider { bus, clock, random, logger, "insider", "10.0.0.1:7000", "prod", roster };
+    Node impostor { bus, clock, random, logger, "worker-a", "10.0.0.2:7000", "prod", roster, TestKeyPair("impostor") };
+    REQUIRE(Handshake(insider, impostor) == DiscoveryEvent::PeerUnknownKey);
+    CHECK(insider.fleets.proven.empty());
+
+    Node genuine { bus, clock, random, logger, "worker-a", "10.0.0.3:7000", "prod", roster };
+    REQUIRE(Handshake(insider, genuine) == DiscoveryEvent::PeerAuthenticated);
+    REQUIRE(insider.fleets.proven.size() == 1);
+    CHECK(insider.fleets.proven[0].Summary().clusterId == "prod");
+    CHECK(insider.fleets.proven[0].Key() == TestKeyPair("worker-a").PublicKey());
 }
 
 TEST_CASE("A proof under a REVOKED key is recognised as one", "[cluster][discovery][service][security]")
@@ -1020,6 +1046,59 @@ TEST_CASE("A discovery node never replies with more than the datagram that provo
     REQUIRE(proof.has_value());
     CHECK(Unwrap(proof) <= Unwrap(padded).size());
     CHECK(office.metrics.Read(IMetricsSink::Counter::DiscoveryRepliesWithheld) == 1);
+}
+
+TEST_CASE("A beacon and the proof after it carry the same member list, cut to what a datagram holds",
+          "[cluster][discovery][service][formation]")
+{
+    // The node's summary names more members than a datagram carries. Both announcements leave by one
+    // door, which cuts the list there -- the first ids kept, the total untouched -- so the beacon a
+    // peer challenged and the proof it gets back say the same thing, and neither is refused.
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
+    SystemSecureRandom random;
+    CapturingLogger logger;
+    auto const roster = SharedRoster::Of({ "office" });
+    Node office { bus, clock, random, logger, "office", "10.0.0.1:7000", "prod", roster };
+    auto summary = office.self.Current();
+    for (auto const index: std::views::iota(std::size_t { 0 }, std::size_t { 20 }))
+        summary.members.push_back(std::format("n-{}", index));
+    summary.memberTotal = 20;
+    office.self.Set(summary);
+    auto const listener = bus.open(AtEndpoint("10.0.0.66:6681"));
+
+    // What the listener's socket holds next of @p kind, stepping over anything else.
+    auto const nextOf = [&listener](DiscoveryWire::Kind kind) -> std::optional<std::vector<std::byte>> {
+        auto received = listener->receive(1ms);
+        while (received.has_value())
+        {
+            if (DiscoveryWire::ClassifyDatagram(received->payload) == std::optional { kind })
+                return received->payload;
+            received = listener->receive(1ms);
+        }
+        return std::nullopt;
+    };
+
+    REQUIRE(office.service.SendBeacon().outcome == BeaconSendOutcome::Sent);
+    auto const beaconBytes = nextOf(DiscoveryWire::Kind::Beacon);
+    REQUIRE(beaconBytes.has_value());
+    auto const beacon = DiscoveryWire::DecodeBeacon(Unwrap(beaconBytes));
+    REQUIRE(beacon.has_value());
+    auto const expected = std::vector<std::string>(summary.members.begin(),
+                                                   summary.members.begin() + CompileCacheWire::MaxFleetSummaryMembers);
+    CHECK(Unwrap(beacon).summary.members == expected);
+    CHECK(Unwrap(beacon).summary.memberTotal == 20);
+
+    auto const challenge = DiscoveryWire::EncodeChallenge({ .clusterId = "x", .nonce = {} }, Unwrap(beaconBytes).size());
+    REQUIRE(challenge.has_value());
+    REQUIRE(listener->send(Unwrap(challenge), AtEndpoint("10.0.0.1:7000")).has_value());
+    REQUIRE(office.service.PumpOnce(1ms) == DiscoveryEvent::Ignored); // its own beacon
+    REQUIRE(office.service.PumpOnce(1ms) == DiscoveryEvent::ChallengeAnswered);
+    auto const proofBytes = nextOf(DiscoveryWire::Kind::Proof);
+    REQUIRE(proofBytes.has_value());
+    auto const proof = DiscoveryWire::DecodeProof(Unwrap(proofBytes));
+    REQUIRE(proof.has_value());
+    CHECK(Unwrap(proof).summary == Unwrap(beacon).summary);
 }
 
 TEST_CASE("A beacon too small for this node's challenge is not challenged, and is counted",

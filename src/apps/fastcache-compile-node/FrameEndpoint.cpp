@@ -690,6 +690,79 @@ struct FrameServer::State
     }
 };
 
+std::optional<HeaderRefusal> DecideHeaderRefusal(HeaderGate const& gate,
+                                                 PeerIdentity const& peer,
+                                                 Wire::RequestHeader const& decoded,
+                                                 std::size_t cap)
+{
+    // Refused with a reply naming BOTH numbers, because "too large" without the
+    // ceiling tells an operator nothing about a 64 KiB limit. The bytes are never
+    // taken: the check is on the declared length, before the read.
+    //
+    // Encoded and counted by the SURFACE, exactly as the pre-payload refusal below
+    // is, and this branch was the one that was not: it answered `payload-too-large`
+    // correctly and moved nothing, so the cheapest probe there is -- a header and no
+    // body -- left the series an operator alerts on perfectly flat (#326, undone by
+    // the merge and reinstated by #447). Two ceilings, one fact: this is the
+    // surface-wide cap and `DecidePrePayload` holds the per-verb one, an operator
+    // does the same thing about both, so they share one counter and one decision
+    // rather than splitting.
+    if (decoded.payloadLength > cap)
+        return HeaderRefusal { .reply = gate.responder.RefusalReply(
+                                   Wire::PrePayloadDecision::PayloadTooLarge,
+                                   decoded.opRaw,
+                                   std::format(
+                                       "{} exceeds the {} {}-byte request cap", decoded.payloadLength, gate.what, cap)),
+                               .resynchronize = Resynchronize::Oversize };
+
+    // Admission. The predicate belongs to the responder; this only asks it early.
+    if (auto refusal = gate.responder.RefusePeer(peer, decoded.opRaw); refusal.has_value())
+        return HeaderRefusal { .reply = *std::move(refusal), .resynchronize = Resynchronize::StepOver };
+
+    // The per-verb ceiling and the opcode, through the same `DecidePrePayload` the daemon
+    // asks. No credential is required of any verb: the node checks no password, and
+    // admission is `RefusePeer`'s, asked above.
+    auto const decision = Wire::DecidePrePayload({ .opRaw = decoded.opRaw,
+                                                   .declaredLength = decoded.payloadLength,
+                                                   .sessionCap = cap,
+                                                   .authRequired = false,
+                                                   .credentialAccepted = false });
+    if (decision != Wire::PrePayloadDecision::Serve)
+        // Encoded and counted by the surface, not here: the endpoint owns WHEN the
+        // question is asked, the responder owns the answer.
+        return HeaderRefusal { .reply = gate.responder.RefusalReply(decision, decoded.opRaw, {}),
+                               .resynchronize = Resynchronize::StepOver };
+
+    // Checked on the DECLARED length, before a payload byte is read, so an
+    // over-budget request costs no allocation at all. The connection cap alone would
+    // not bound memory: N connections each declaring the per-request maximum is
+    // still N times it.
+    //
+    // Refused rather than closed -- this is only reached for a declaration the
+    // surface WOULD have accepted, so the peer is told to come back rather than made
+    // to reconnect over a transient budget.
+    //
+    // The figure in the message is the one the DECISION was taken on, read once.
+    // Loaded a second time to format it, the refusal could name a number that does
+    // not explain it -- another connection releasing in between yields "has 0 of N
+    // bytes in flight" beside a refusal for having too many.
+    //
+    // Counted by the surface too, and it is the same regression the oversize branch
+    // above was: the dedicated compile port answered this with
+    // `CompileRefusal::EndpointBusy` and moved
+    // `worker_jobs_refused_endpoint_busy_total`, which the operator documentation
+    // still promises, and the merged listener answered it with a bare code (#447).
+    if (auto const budget = gate.responder.MaxInFlightBytes(), held = gate.inFlightBytes;
+        budget != 0 && held + decoded.payloadLength > budget)
+        return HeaderRefusal { .reply = gate.responder.EndpointRefusalReply(
+                                   EndpointRefusal::InFlightBudget,
+                                   decoded.opRaw,
+                                   std::format("{} has {} of {} bytes in flight", gate.what, held, budget)),
+                               .resynchronize = Resynchronize::StepOver };
+
+    return std::nullopt;
+}
+
 namespace
 {
 
@@ -1842,134 +1915,6 @@ namespace
         co_return true;
     }
 
-    /// How a refused request gets back to a frame boundary, so the connection stays
-    /// usable.
-    ///
-    /// **A PRIVATE enum -- nothing transmits it and nothing stores it -- so it states no
-    /// ordinals.** An explicit `= N` here would assert a contract that does not exist.
-    enum class Resynchronize : std::uint8_t
-    {
-        StepOver, ///< Read and discard exactly what the header declared.
-        Oversize, ///< The declaration is past the cap, so the step-over is bounded too.
-    };
-
-    /// A refusal decided from a request HEADER, before a payload byte is read.
-    ///
-    /// Returned by value and owning: the reply is bytes this endpoint will hand to a
-    /// write, not a view into anything the decision borrowed. `.agent/rules/wire-and-protocol.md`
-    /// is explicit that a struct a decoder returns by value must not borrow from what it
-    /// decoded, and the same reasoning governs a decision returned to a caller that then
-    /// suspends.
-    struct HeaderRefusal
-    {
-        std::vector<std::byte> reply; ///< What to send. Encoded and counted by the surface.
-        Resynchronize resynchronize;  ///< How to reach the next frame boundary afterwards.
-    };
-
-    /// Whether this header is refused, and with what.
-    ///
-    /// **Four refusals, one question, and it writes nothing** -- which is what makes
-    /// lifting it out of `ServeConnection` legal at all (#675). That loop holds the
-    /// endpoint's exactly-one-writer property, so an extraction that takes a write with
-    /// it turns the property into an agreement between two functions; this takes the
-    /// DECISION and leaves every byte to the loop, which is why the four `WriteAll`
-    /// calls that used to sit in these branches are now one.
-    ///
-    /// **The ORDER is the load-bearing part and it is now stated in one place.** Each
-    /// step's reasoning is on the step:
-    ///
-    ///  1. The surface-wide cap, on the DECLARED length, so nothing is allocated.
-    ///  2. Admission, ahead of any resource decision -- a peer this surface will not
-    ///     serve must not be able to reach one, or a flood of refusable frames exhausts
-    ///     the budget and makes the surface answer `EndpointBusy` to the peers it does
-    ///     serve, which is the denial reconstructed one step out (#285, #377).
-    ///  3. The credential and the per-verb ceiling, through the same `DecidePrePayload`
-    ///     the daemon's loop calls, so the two surfaces cannot disagree about which
-    ///     verbs are open before authentication.
-    ///  4. The in-flight byte budget, last, for the reason step 2 gives.
-    ///
-    /// @param state The server state: the responder, the budget and the surface's name.
-    /// @param peer Who is at the other end: the kernel's host, and what this connection has
-    ///        proved. A source port is ephemeral and is not an identity, so the address is all an
-    ///        admission policy had before #1428 -- and a proof is the second thing it now has.
-    /// @param decoded The request header, as it decoded.
-    /// @param cap The surface-wide request ceiling, read once by the caller.
-    /// @return The refusal, or nullopt when the request is to be served.
-    [[nodiscard]] std::optional<HeaderRefusal> DecideHeaderRefusal(FrameServer::State* state,
-                                                                   PeerIdentity const& peer,
-                                                                   Wire::RequestHeader const& decoded,
-                                                                   std::size_t cap)
-    {
-        // Refused with a reply naming BOTH numbers, because "too large" without the
-        // ceiling tells an operator nothing about a 64 KiB limit. The bytes are never
-        // taken: the check is on the declared length, before the read.
-        //
-        // Encoded and counted by the SURFACE, exactly as the pre-payload refusal below
-        // is, and this branch was the one that was not: it answered `payload-too-large`
-        // correctly and moved nothing, so the cheapest probe there is -- a header and no
-        // body -- left the series an operator alerts on perfectly flat (#326, undone by
-        // the merge and reinstated by #447). Two ceilings, one fact: this is the
-        // surface-wide cap and `DecidePrePayload` holds the per-verb one, an operator
-        // does the same thing about both, so they share one counter and one decision
-        // rather than splitting.
-        if (decoded.payloadLength > cap)
-            return HeaderRefusal {
-                .reply = state->responder.RefusalReply(
-                    Wire::PrePayloadDecision::PayloadTooLarge,
-                    decoded.opRaw,
-                    std::format("{} exceeds the {} {}-byte request cap", decoded.payloadLength, state->what, cap)),
-                .resynchronize = Resynchronize::Oversize
-            };
-
-        // Admission. The predicate belongs to the responder; this only asks it early.
-        if (auto refusal = state->responder.RefusePeer(peer, decoded.opRaw); refusal.has_value())
-            return HeaderRefusal { .reply = *std::move(refusal), .resynchronize = Resynchronize::StepOver };
-
-        // The per-verb ceiling and the opcode, through the same `DecidePrePayload` the daemon
-        // asks. No credential is required of any verb: the node checks no password, and
-        // admission is `RefusePeer`'s, asked above.
-        auto const decision = Wire::DecidePrePayload({ .opRaw = decoded.opRaw,
-                                                       .declaredLength = decoded.payloadLength,
-                                                       .sessionCap = cap,
-                                                       .authRequired = false,
-                                                       .credentialAccepted = false });
-        if (decision != Wire::PrePayloadDecision::Serve)
-            // Encoded and counted by the surface, not here: the endpoint owns WHEN the
-            // question is asked, the responder owns the answer.
-            return HeaderRefusal { .reply = state->responder.RefusalReply(decision, decoded.opRaw, {}),
-                                   .resynchronize = Resynchronize::StepOver };
-
-        // Checked on the DECLARED length, before a payload byte is read, so an
-        // over-budget request costs no allocation at all. The connection cap alone would
-        // not bound memory: N connections each declaring the per-request maximum is
-        // still N times it.
-        //
-        // Refused rather than closed -- this is only reached for a declaration the
-        // surface WOULD have accepted, so the peer is told to come back rather than made
-        // to reconnect over a transient budget.
-        //
-        // The figure in the message is the one the DECISION was taken on, read once.
-        // Loaded a second time to format it, the refusal could name a number that does
-        // not explain it -- another connection releasing in between yields "has 0 of N
-        // bytes in flight" beside a refusal for having too many.
-        //
-        // Counted by the surface too, and it is the same regression the oversize branch
-        // above was: the dedicated compile port answered this with
-        // `CompileRefusal::EndpointBusy` and moved
-        // `worker_jobs_refused_endpoint_busy_total`, which the operator documentation
-        // still promises, and the merged listener answered it with a bare code (#447).
-        if (auto const budget = state->responder.MaxInFlightBytes(),
-            held = state->inFlightBytes.load(std::memory_order_acquire);
-            budget != 0 && held + decoded.payloadLength > budget)
-            return HeaderRefusal { .reply = state->responder.EndpointRefusalReply(
-                                       EndpointRefusal::InFlightBudget,
-                                       decoded.opRaw,
-                                       std::format("{} has {} of {} bytes in flight", state->what, held, budget)),
-                                   .resynchronize = Resynchronize::StepOver };
-
-        return std::nullopt;
-    }
-
     /// Step over a refused request's body, so the next read starts on a frame boundary.
     ///
     /// **It reads and never writes**, which is what lets it out of `ServeConnection` at
@@ -2304,7 +2249,14 @@ namespace
                 // closes it, i.e. never usefully. Writing first costs nothing and the
                 // resynchronization is just as good: a peer that sends what it declared
                 // is still stepped over exactly.
-                if (auto const refusal = DecideHeaderRefusal(state, identity, *decoded, cap); refusal.has_value())
+                if (auto const refusal = DecideHeaderRefusal(
+                        HeaderGate { .responder = state->responder,
+                                     .what = state->what,
+                                     .inFlightBytes = state->inFlightBytes.load(std::memory_order_acquire) },
+                        identity,
+                        *decoded,
+                        cap);
+                    refusal.has_value())
                 {
                     if (!co_await WriteAll(EndpointWriter::Loop, socket.get(), refusal->reply))
                         break;

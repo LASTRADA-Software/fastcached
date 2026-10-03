@@ -1496,10 +1496,13 @@ TEST_CASE("With every component present, the surface main composes routes each f
     REQUIRE(*scheduler != nullptr);
 
     EnrollmentWindow window { fix.clock };
-    EnrollmentResponder enrollment { window, (*scheduler)->ServiceForSurfaces(), fix.membership, fix.metrics, fix.logger };
+    // One summary for the enrollment surface and the FLEET-SUMMARY answer, as `main` holds one.
+    FixedFleetSummary const answered { Wire::FleetSummary { .clusterId = "c-office", .nodeId = "n1" } };
+    EnrollmentResponder enrollment {
+        window, (*scheduler)->ServiceForSurfaces(), fix.membership, answered, *identityKey, fix.metrics, fix.logger
+    };
     SystemSecureRandom random;
     NodeProofResponder nodeProof { "n1", *identityKey, fix.membership, random, fix.metrics, fix.logger };
-    FixedFleetSummary const answered { Wire::FleetSummary { .clusterId = "c-office", .nodeId = "n1" } };
     FleetSummaryResponder formation { answered, *identityKey };
     EveryNodeResponders every { nodeCfg, fix.io, fix.metrics };
 

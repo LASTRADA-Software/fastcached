@@ -6,6 +6,8 @@
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/HostPort.hpp>
 
+#include <core/Ranges.hpp>
+
 #include <algorithm>
 #include <format>
 #include <utility>
@@ -101,6 +103,11 @@ bool ModeServesConsensusToPeers(Cluster::NodeMode mode) noexcept
     return ModeOpensRaftPort(mode) && Cluster::NodeModeRowFor(mode).consensus == Cluster::ConsensusScope::Fleet;
 }
 
+bool ServesEnrollment(NodeConfig const& cfg, bool schedulerRuns) noexcept
+{
+    return RunsConsensus(cfg) && schedulerRuns;
+}
+
 bool ServesScheduler(NodeConfig const& cfg) noexcept
 {
     // Only while it runs consensus: a scheduler signs every grant with its identity key and hands
@@ -146,6 +153,14 @@ std::vector<Cluster::MemberSpec> BootstrapMembersOf(NodeConfig const& cfg)
     auto const dial = ConsensusDialAddressOf(cfg);
     return { Cluster::MemberSpec {
         .id = cfg.nodeId, .raftEndpoint = dial.value_or(std::string {}), .publicKey = cfg.identityPublicKey } };
+}
+
+Cluster::MemberSeat SeatInFormation(NodeConfig const& cfg, std::string_view id)
+{
+    if (!cfg.formation.has_value() || cfg.formation->foundedHere)
+        return Cluster::MemberSeat::Voter;
+    auto const* const member = core::findOrNull(cfg.formation->fleetMembers, id, &Cluster::ClusterMember::id);
+    return member != nullptr ? member->seat : Cluster::MemberSeat::Voter;
 }
 
 std::optional<std::string> RaftClosedByFormation(NodeConfig const& cfg)

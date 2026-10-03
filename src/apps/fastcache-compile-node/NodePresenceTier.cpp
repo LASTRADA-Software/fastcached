@@ -32,12 +32,14 @@ namespace
                              Wire::CapacityFields const& capacity,
                              Wire::LoadFields const& load,
                              std::span<std::byte const> endorsement,
+                             std::span<Wire::JoinMemoFields const> joinMemos,
                              ILogger& logger,
                              SchedulerReachability& reachability) noexcept:
             _endpoint { endpoint },
             _capacity { capacity },
             _load { load },
             _endorsement { endorsement },
+            _joinMemos { joinMemos },
             _logger { logger },
             _reachability { reachability }
         {
@@ -45,7 +47,7 @@ namespace
 
         [[nodiscard]] AnnounceOutcome Attempt(core::net::ISocket& client, std::string_view endpoint) override
         {
-            auto sent = Cc::AnnounceNodePresence(client, _endpoint, _capacity, _load, _endorsement);
+            auto sent = Cc::AnnounceNodePresence(client, _endpoint, _capacity, _load, _endorsement, _joinMemos);
             if (sent.has_value())
             {
                 _accepted = true;
@@ -104,6 +106,7 @@ namespace
         Wire::CapacityFields const& _capacity;
         Wire::LoadFields const& _load;
         std::span<std::byte const> _endorsement;
+        std::span<Wire::JoinMemoFields const> _joinMemos;
         ILogger& _logger;
         SchedulerReachability& _reachability;
         bool _accepted = false;
@@ -133,6 +136,13 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
     // live row that cleared is clear at the leader one interval later.
     load.conditions = round.conditions.Snapshot();
 
+    // Every fleet this machine once asked, read per round: the leader files them under the id this
+    // machine PROVED, as the evidence a split of the fleet is told on (`Cluster::SplitEvidenceFor`).
+    auto memos = std::vector<Wire::JoinMemoFields> {};
+    if (round.askedJoins != nullptr)
+        for (auto const& asked: round.askedJoins->AskedJoins())
+            memos.push_back(Wire::JoinMemoFields { .clusterId = asked.clusterId, .provenKey = asked.provenKey });
+
     auto const accepted = AnnouncePresence(
         PresenceMessage {
             .endpoint = round.endpoint,
@@ -141,6 +151,7 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
             .logger = round.logger,
             .prover = round.prover,
             .reachability = round.reachability,
+            .joinMemos = memos,
         },
         round.roster,
         link,
@@ -157,8 +168,9 @@ bool AnnouncePresence(PresenceMessage const& message, IPresenceRoster* roster, S
     // the leader can certify -- which a node that holds none adopts in this same round, from
     // whichever scheduler the round's redirects and fallbacks reached.
     auto const endorsement = roster != nullptr ? roster->Endorsement() : std::vector<std::byte> {};
-    PresenceAnnouncement announcement { message.endpoint, message.capacity, message.load,
-                                        endorsement,      message.logger,   message.reachability };
+    PresenceAnnouncement announcement { message.endpoint,  message.capacity, message.load,
+                                        endorsement,       message.joinMemos, message.logger,
+                                        message.reachability };
     (void) DialAndAnnounce(
         link, message.reachability, dialer, message.logger, announcement, AnnounceProof { .prover = message.prover });
 
@@ -188,6 +200,7 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _roster { parts.roster },
     _prover { parts.prover },
     _reachability { parts.reachability },
+    _askedJoins { parts.askedJoins },
     // `AnnouncedCapacity` rather than `Distributed::CapacityToWire` alone: the latter knows
     // nothing of the version, so a node with no worker sent NODE-ANNOUNCE with none, and the
     // leader recorded it exactly as absent as a build too old to know the field.
@@ -228,7 +241,8 @@ void NodePresence::Loop(std::stop_token const& stop)
                                                        .conditions = _conditions,
                                                        .roster = _roster,
                                                        .prover = _prover,
-                                                       .reachability = _reachability },
+                                                       .reachability = _reachability,
+                                                       .askedJoins = _askedJoins },
                                        _link,
                                        _dialer);
 

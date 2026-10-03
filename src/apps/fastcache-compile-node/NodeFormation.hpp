@@ -11,6 +11,7 @@
 #include <expected>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <core/platform/Clock.hpp>
@@ -84,6 +85,20 @@ struct NodeFormationView
 /// @return True when the scheduler tier belongs here.
 [[nodiscard]] bool ServesScheduler(NodeConfig const& cfg) noexcept;
 
+/// Whether @p cfg serves the enrollment surface: it runs consensus -- there is a cluster to be
+/// admitted to -- AND a scheduler tier was built, without which the responder has nothing to admit
+/// through. The second half is a runtime fact about what was BUILT, which the caller states.
+///
+/// One predicate for `main`'s two sites -- the surface and what `NodeStatus` reports, which must not
+/// disagree, or a window no verb can act on is reported open -- and for the formation harness, so the
+/// surface a test builds is the one production builds: a fixture that gave every body a responder
+/// answered `Enroll` on a learner, which production never does. No key file is a clause: since #178
+/// an approval hands over no key.
+/// @param cfg The configuration.
+/// @param schedulerRuns Whether this node's scheduler tier was built.
+/// @return True when both hold.
+[[nodiscard]] bool ServesEnrollment(NodeConfig const& cfg, bool schedulerRuns) noexcept;
+
 /// Where this node's worker registers.
 ///
 /// Its own node port for a mode that serves a scheduler -- it leads its own cluster, or it is a
@@ -102,6 +117,15 @@ struct NodeFormationView
 /// @return The members; empty for an unformed configuration.
 [[nodiscard]] std::vector<Cluster::MemberSpec> BootstrapMembersOf(NodeConfig const& cfg);
 
+/// The seat a member of `BootstrapMembersOf` holds, which the `MemberSpec` it is carried as does not.
+///
+/// From the approved roster in a fleet this node joined; a voter otherwise, which is the one member
+/// a founder starts with -- itself.
+/// @param cfg The configuration the members were read from.
+/// @param id The member.
+/// @return Its seat.
+[[nodiscard]] Cluster::MemberSeat SeatInFormation(NodeConfig const& cfg, std::string_view id);
+
 /// Why the formation keeps the Raft surface closed, for `--print-surfaces`.
 /// @param cfg The configuration.
 /// @return The trailing column, or nothing when the formation is not why.
@@ -113,6 +137,12 @@ struct KeptFormation
     std::optional<Cluster::FormationRecord> record; ///< The record, DISENGAGED when none was ever written.
     Cluster::FleetEndpoints remembered;             ///< The fleet endpoints last known; empty when none are.
 };
+
+/// What a node that is already running says when the record it runs by is no longer in its state
+/// directory: a reload declines, and a reform refuses (`ReadoptFormation`). Lost state, never a first
+/// start -- only a start mints one.
+inline constexpr std::string_view FormationRecordGone =
+    "the formation record this node runs by is gone from its state directory";
 
 /// Read what the state directory holds, writing nothing.
 ///

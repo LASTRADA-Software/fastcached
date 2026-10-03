@@ -7973,8 +7973,8 @@ if(TARGET FastCacheTest)
         # the assertion that could not have failed while this ticket was open: 69
         # cases ran, and 69 is non-zero.
         #
-        # 223 = 158 (CompileCacheWire) + 25 (RaftWire) + 17 (ClusterState)
-        #     + 18 (DiscoveryWire) + 1 (RaftTypes) + 1 (SchedulerService)
+        # 237 = 170 (CompileCacheWire) + 25 (RaftWire) + 17 (ClusterState)
+        #     + 20 (DiscoveryWire) + 1 (RaftTypes) + 1 (SchedulerService)
         #     + 1 (MachineTicket) + 1 (MachineStanding) + 1 (RosterCertificate).
         # The first four files are wholly wire subject and are the scan's table; the
         # last five carry wire cases among others, which is why the scan cannot cover
@@ -7990,7 +7990,7 @@ if(TARGET FastCacheTest)
         # anything matches nothing. No `SKIP_RETURN_CODE` here -- Catch2's exit code
         # is its failed-assertion count clamped at 255 (#1152), and the pattern has
         # already replaced the status.
-        PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in 223 test cases[)]"
+        PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in 237 test cases[)]"
         LABELS "hygiene"
         TIMEOUT 300
     )

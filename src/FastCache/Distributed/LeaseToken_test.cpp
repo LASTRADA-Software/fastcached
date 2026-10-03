@@ -370,7 +370,7 @@ TEST_CASE("A lease expires, with slack for a fleet whose clocks disagree", "[dis
         // legs. Ordered by a comparison first, it cannot happen, and the answer is
         // the correct one -- a clock this far behind has not reached any expiry.
         auto const farFuture =
-            std::chrono::system_clock::time_point { std::chrono::milliseconds { Detail::MaxExpiryMillis } };
+            std::chrono::system_clock::time_point { std::chrono::milliseconds { Distributed::Detail::MaxExpiryMillis } };
         auto const distant = MintLeaseToken(signer,
                                             LeaseClaims { .serial = "17",
                                                           .endpoint = "10.0.0.7:6675",
@@ -682,8 +682,8 @@ TEST_CASE("A version-2 token no longer authenticates", "[distributed][lease][tok
     Testing::FixedLeaseRoster const roster;
     auto claims = Grant();
     claims.signer = std::string { signer.SignerId() };
-    auto const packedV2 = Detail::PackClaims(2, claims);
-    auto const signature = signer.Sign(Detail::SignedLeaseMessage(packedV2));
+    auto const packedV2 = Distributed::Detail::PackClaims(2, claims);
+    auto const signature = signer.Sign(Distributed::Detail::SignedLeaseMessage(packedV2));
     auto const envelope =
         WireFields::Encode({ std::span<std::byte const> { packedV2 }, std::span<std::byte const> { signature } });
 
@@ -800,7 +800,7 @@ TEST_CASE("A signature over the claims without the lease's label is not a lease"
     Testing::FixedLeaseRoster const roster;
     auto claims = Grant();
     claims.signer = std::string { signer.SignerId() };
-    auto const packed = Detail::PackClaims(LeaseTokenVersion, claims);
+    auto const packed = Distributed::Detail::PackClaims(LeaseTokenVersion, claims);
 
     auto const envelopeOver = [&packed](std::span<std::byte const> message, Ed25519KeyPair const& key) {
         auto const signature = key.Sign(message);
@@ -815,7 +815,7 @@ TEST_CASE("A signature over the claims without the lease's label is not a lease"
     // The control, built the same way with the label: accepted, so the refusal above is the
     // label's and not the helper's.
     CHECK(AuthenticateLeaseToken(roster,
-                                 envelopeOver(Detail::SignedLeaseMessage(packed).Bytes(), Testing::TestKeyPair("scheduler")))
+                                 envelopeOver(Distributed::Detail::SignedLeaseMessage(packed).Bytes(), Testing::TestKeyPair("scheduler")))
               .has_value());
 }
 

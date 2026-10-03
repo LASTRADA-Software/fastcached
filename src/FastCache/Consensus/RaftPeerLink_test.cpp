@@ -1150,6 +1150,150 @@ TEST_CASE("A leader whose key is withdrawn is closed by the learner at the leade
     CHECK(link.leaderMetrics.Read(RowFor(AcceptorRefusal::KeyWithdrawn).counter) == 0);
 }
 
+TEST_CASE("An idle learner session whose key was withdrawn is closed by a recheck, and the learner hears it signed",
+          "[consensus][raft][learner][formation][revocation]")
+{
+    // A forgotten learner is sent NOTHING once the configuration drops it, so the per-frame
+    // question has no frame to ride on and its session idles on; the learner, which never
+    // campaigns, would never dial again to hear the verdict. `RecheckProofs` asks without a
+    // frame. The tier asks it on every reconcile pass (`ConsensusTier_test`, "A forgotten learner
+    // hears its key revoked...").
+    LearnerLink link;
+    link.LearnerSends(1);
+    link.LeaderSends(2);
+    REQUIRE(link.learnerSink.received.size() == 1);
+    REQUIRE(link.leaderTransport->InboundLinks() == 1);
+
+    link.roster->Revoke("laptop");
+    link.reactor.drain();
+    REQUIRE(link.leaderTransport->InboundLinks() == 1); // nothing was sent, so nothing asked
+
+    link.leaderTransport->RecheckProofs();
+    link.reactor.drain();
+    CHECK(link.Refused(AcceptorRefusal::KeyWithdrawn) == 1);
+    CHECK(link.leaderTransport->InboundLinks() == 0);
+    CHECK(link.learnerSink.received.size() == 1);
+    CHECK(link.leaderTransport->DroppedMessages() == 0); // a wake is not a message
+
+    link.clock.advance(DialBackoffOf(RaftWire::SessionDirection::TwoWay).initial);
+    link.reactor.drain();
+    CHECK(link.learnerMetrics.Read(RowFor(DiallerRefusal::OwnKeyRevoked).counter) == 1);
+    CHECK(link.ownKeyRevokedBy == std::vector<NodeId> { "office" });
+}
+
+TEST_CASE("A recheck's wake into a full outbox counts the message it displaces",
+          "[consensus][raft][learner][formation][revocation]")
+{
+    // The outbox is bounded and gives up its OLDEST entry to a push past the bound: `Send` and a
+    // reader's end count what they displace, and a recheck's wake displaces a real message the same way.
+    LearnerLink link;
+    link.LearnerSends(1);
+    link.LeaderSends(2);
+    REQUIRE(link.leaderTransport->InboundLinks() == 1);
+
+    link.roster->Revoke("laptop");
+    for (auto const term:
+         std::views::iota(std::uint64_t { 3 }, std::uint64_t { 3 } + static_cast<std::uint64_t>(LearnerQueueBound)))
+        link.leaderTransport->Send(NodeId { "laptop" }, LearnerLink::LeaderMessage(term)); // fills it; nothing drains
+    REQUIRE(link.leaderTransport->DroppedMessages() == 0);
+
+    link.leaderTransport->RecheckProofs();
+    CHECK(link.leaderTransport->DroppedMessages() == 1);
+    link.reactor.drain();
+}
+
+TEST_CASE("A recheck leaves an idle learner session whose key still proves attached and uncounted",
+          "[consensus][raft][learner][formation][revocation]")
+{
+    // The other half of the recheck: it asks, and a session that still proves is not ended by being
+    // asked. Several passes, as the tier runs one a second for as long as the session idles. Two
+    // layers keep it: the recheck wakes only a session whose key no longer proves, and a sender that
+    // pops a wake for one that proves again steps over it (the next case). Either alone keeps this
+    // green, so it is red only under a neuter of both.
+    LearnerLink link;
+    link.LearnerSends(1);
+    link.LeaderSends(2);
+    REQUIRE(link.leaderTransport->InboundLinks() == 1);
+
+    for ([[maybe_unused]] auto const pass: std::views::iota(0, 3))
+    {
+        link.leaderTransport->RecheckProofs();
+        link.reactor.drain();
+    }
+
+    CHECK(link.leaderTransport->InboundLinks() == 1);
+    CHECK(link.learnerTransport->ConnectedPeers() == 1);
+    CHECK(link.Refused(AcceptorRefusal::KeyWithdrawn) == 0);
+    CHECK(link.learnerMetrics.Read(RowFor(DiallerRefusal::KeyWithdrawn).counter) == 0);
+    CHECK(link.leaderTransport->DroppedMessages() == 0);
+    CHECK(link.probing.Accepted() == 1);
+}
+
+TEST_CASE("A wake a sender steps over never reaches the wire: the next real frame still verifies at both ends",
+          "[consensus][raft][learner][formation][revocation]")
+{
+    // The wake rides the leader's outbox as a zero-length entry, and every frame on the session is
+    // sealed under an IMPLICIT sequence number. A wake that was sealed would spend one the learner
+    // never sees, and the leader's next real frame would fail its tag there -- the session closed
+    // by asking whether it may stay open. So after several woken passes, a frame each way, each one
+    // read and delivered by the other end's own check, on the one connection the session began on.
+    //
+    // Each pass wakes the session while its key does not prove and lets it prove again before the
+    // sender pops the wake: the recheck wakes no session that proves, so this is the arrangement in
+    // which an attached sender steps over a wake at all. The dialled sender's step-over -- a wake an
+    // earlier session's reader left behind -- is `RaftPeerTransport_test`'s "A wake left behind by
+    // one two-way session does not end the next", whose acceptor checks every tag.
+    LearnerLink link;
+    link.LearnerSends(1);
+    link.LeaderSends(2);
+    REQUIRE(link.learnerSink.received.size() == 1);
+    REQUIRE(link.leaderSink.received.size() == 1);
+
+    for ([[maybe_unused]] auto const pass: std::views::iota(0, 3))
+    {
+        link.roster->Revoke("laptop");
+        link.leaderTransport->RecheckProofs(); // queued, not yet popped: the reactor runs below
+        link.roster->Admit("laptop", Testing::TestKeyPair("laptop").PublicKey());
+        link.reactor.drain();
+    }
+    REQUIRE(link.Refused(AcceptorRefusal::KeyWithdrawn) == 0);
+
+    link.LeaderSends(3);
+    link.LearnerSends(4);
+
+    CHECK(link.learnerSink.received.size() == 2);
+    CHECK(link.leaderSink.received.size() == 2);
+    CHECK(link.learnerTransport->ConnectedPeers() == 1);
+    CHECK(link.leaderTransport->InboundLinks() == 1);
+    CHECK(link.probing.Accepted() == 1);
+}
+
+TEST_CASE("A recheck leaves a session this node dialled alone, whatever its peer's key",
+          "[consensus][raft][handshake][revocation]")
+{
+    // Deliberately not woken. A forgotten member learns of its forget only from the verdict on a
+    // dial of ITS OWN, so closing one this node dialled teaches the acceptor nothing -- and the
+    // sender redials after its backoff with or without a message, so the idle socket would become
+    // a refused handshake every backoff for as long as this process runs. The session still ends
+    // at its next frame ("A key revoked mid-session closes that session...", the acceptor's section).
+    Link link { LinkShape { .server = "n3", .dialler = "n1", .target = "n3" } };
+    link.SendVote(1);
+    REQUIRE(link.Connected() == 1);
+
+    link.roster->Revoke("n3");
+    link.transport->RecheckProofs();
+    link.reactor.drain();
+    for ([[maybe_unused]] auto const backoff: std::views::iota(0, 3))
+    {
+        link.clock.advance(ReconnectBackoff);
+        link.reactor.drain();
+    }
+
+    CHECK(link.Connected() == 1);
+    CHECK(link.AnyRefusals() == 0);
+    CHECK(link.sink.received.size() == 1);
+}
+
 TEST_CASE("A two-way dialler backs off from one second doubling to thirty", "[consensus][raft][learner][formation]")
 {
     auto delay = DialBackoffOf(RaftWire::SessionDirection::TwoWay).initial;

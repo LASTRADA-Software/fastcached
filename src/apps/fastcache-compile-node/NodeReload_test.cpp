@@ -8,6 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -162,8 +163,11 @@ TEST_CASE("A reload candidate is shaped by the formation, the names and the iden
         ReloadBasis {
             .stateDirectory = stateDirectory,
             .hostNames = NodeHostNames { .fqdn = "box.corp.example", .dnsSuffix = "corp.example", .withheld = {} },
-            .formation = record,
-            .remembered = {},
+            .formation =
+                [&record] {
+                    return std::expected<KeptFormation, std::string> { KeptFormation { .record = record,
+                                                                                       .remembered = {} } };
+                },
             .identity = identity,
         });
 
@@ -184,6 +188,74 @@ TEST_CASE("A reload candidate is shaped by the formation, the names and the iden
     auto const reloaded = reloader.Reload();
     INFO((reloaded.has_value() ? std::string {} : reloaded.error().context));
     CHECK(reloaded.has_value());
+}
+
+TEST_CASE("A reload is shaped by the formation kept at the reload and not by the record the start kept",
+          "[node][reload][formation]")
+{
+    // A reform rewrites the record while the process runs. A candidate shaped by the record the
+    // START kept would put the node, in its live configuration, back into the mode it left -- and
+    // the worker reads where it registers from that configuration.
+    Testing::ScratchDirectory const scratch { "node-reload-reformed" };
+    auto const path = WriteFile(scratch.Path(), std::format("cluster_dir: {}\n", (scratch / "state").generic_string()));
+    auto kept = Cluster::FormationRecord { .mode = Cluster::NodeMode::Solitary,
+                                           .own = { .clusterId = "own-c", .createdAtUnixSeconds = 100 },
+                                           .joining = std::nullopt,
+                                           .fleet = std::nullopt,
+                                           .archivePending = std::nullopt,
+                                           .rejectedBy = std::nullopt,
+                                           .askedJoins = {} };
+    auto const read = ReloadCandidateReader(
+        {},
+        ReloadBasis {
+            .stateDirectory = NodeStateDirectoryChoice { .path = scratch / "state", .origin = StateDirectoryOrigin::Named },
+            .hostNames = NodeHostNames { .fqdn = "box.corp.example", .dnsSuffix = "corp.example", .withheld = {} },
+            .formation =
+                [&kept] {
+                    return std::expected<KeptFormation, std::string> { KeptFormation { .record = kept, .remembered = {} } };
+                },
+            .identity = NodeIdentity { .id = "n1",
+                                       .origin = NodeIdentityOrigin::Recorded,
+                                       .publicKey = Testing::TestKeyPair("n1").PublicKey() },
+        });
+
+    auto const before = read(path);
+    REQUIRE(before.has_value());
+    CHECK(Testing::Unwrap(before->formation).mode == Cluster::NodeMode::Solitary);
+    CHECK(before->clusterId == "own-c");
+
+    // The node moved: a dissolve left its own cluster for a fleet, and the reform is done.
+    kept.mode = Cluster::NodeMode::Voter;
+    kept.own.clusterId = "other-c";
+    auto const after = read(path);
+    REQUIRE(after.has_value());
+    CHECK(Testing::Unwrap(after->formation).mode == Cluster::NodeMode::Voter);
+    CHECK(after->clusterId == "other-c");
+}
+
+TEST_CASE("A reload declines when the formation record cannot be read or is gone", "[node][reload][formation]")
+{
+    Testing::ScratchDirectory const scratch { "node-reload-unreadable" };
+    auto const path = WriteFile(scratch.Path(), std::format("cluster_dir: {}\n", (scratch / "state").generic_string()));
+    auto answer = std::expected<KeptFormation, std::string> { std::unexpected {
+        std::string { "the formation record was written in format 9" } } };
+    auto const read = ReloadCandidateReader(
+        {},
+        ReloadBasis {
+            .stateDirectory = NodeStateDirectoryChoice { .path = scratch / "state", .origin = StateDirectoryOrigin::Named },
+            .hostNames = NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = {} },
+            .formation = [&answer] { return answer; },
+            .identity = NodeIdentity { .id = "n1", .origin = NodeIdentityOrigin::Recorded, .publicKey = std::nullopt },
+        });
+
+    auto const unreadable = read(path);
+    REQUIRE_FALSE(unreadable.has_value());
+    CHECK(unreadable.error().context.contains("format 9"));
+
+    answer = KeptFormation { .record = std::nullopt, .remembered = {} };
+    auto const gone = read(path);
+    REQUIRE_FALSE(gone.has_value());
+    CHECK(gone.error().context.contains("gone"));
 }
 
 TEST_CASE("Dropping fleet_open closes the node again", "[node][membership][reload][revocation]")

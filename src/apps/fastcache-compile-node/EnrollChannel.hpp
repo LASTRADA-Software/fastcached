@@ -3,13 +3,10 @@
 
 #include "EndpointDialer.hpp"
 #include "EnrollClient.hpp"
-#include "NodeCredential.hpp"
 
-#include <FastCache/Core/Logger.hpp>
-
+#include <cstddef>
+#include <span>
 #include <string_view>
-
-#include <CacheProtocol.hpp>
 
 namespace FastCache::Node
 {
@@ -36,9 +33,12 @@ class IEnrollChannel
     /// Ask @p endpoint to admit @p self, once.
     /// @param endpoint The `host:port` of the `0xFC` port to ask.
     /// @param self Who this node asks to be admitted as.
+    /// @param nonce What the caller drew for this one request: an admission is signed over it.
     /// @return What the answer means; `EnrollProgress::Fatal` naming the endpoint when it could not
     ///         be reached at all.
-    [[nodiscard]] virtual EnrollReading Poll(std::string_view endpoint, JoinerIdentity const& self) = 0;
+    [[nodiscard]] virtual EnrollReading Poll(std::string_view endpoint,
+                                             JoinerIdentity const& self,
+                                             std::span<std::byte const> nonce) = 0;
 };
 
 /// `IEnrollChannel` over a dialled connection: one connection, one request, one answer.
@@ -46,21 +46,28 @@ class IEnrollChannel
 /// `RunEnrollClient`'s loop body for one request, with the loop left to the caller: the dial bounded
 /// by `EnrollDialTimeout`, the exchange by `Cc::ExchangeFramed`'s own round-trip bound, so one poll
 /// holds the calling thread for at most one exchange.
+///
+/// **It presents NO credential, and that is its signature rather than its configuration.** `Enroll`
+/// is answered before authentication, and the endpoint it goes to is whatever a beacon, a DNS SRV
+/// record or a seed named -- any machine on the network can be it. A `--requirepass` presented here
+/// went out in the clear, pipelined ahead of the request and of any seal, once a beat, to whoever
+/// answered. Nothing an approval decides depends on a password either: the joiner is admitted on
+/// its key, and the answer is believed on a signature. So there is no `ICredentialSource` among the
+/// constructor's parameters or the members, and presenting one again is a new parameter, never a
+/// forgotten argument (`[node][credential][seam]` holds the node's sources to a list).
 class DialledEnrollChannel final: public IEnrollChannel
 {
   public:
     /// @param dialer How an endpoint is reached; must outlive this.
-    /// @param credential What to present, read where it is presented; must outlive this.
-    /// @param logger Where a credential the fleet ignored is reported, once; must outlive this.
-    DialledEnrollChannel(IEndpointDialer& dialer, ICredentialSource const& credential, ILogger& logger);
+    explicit DialledEnrollChannel(IEndpointDialer& dialer);
 
     /// @copydoc IEnrollChannel::Poll
-    [[nodiscard]] EnrollReading Poll(std::string_view endpoint, JoinerIdentity const& self) override;
+    [[nodiscard]] EnrollReading Poll(std::string_view endpoint,
+                                     JoinerIdentity const& self,
+                                     std::span<std::byte const> nonce) override;
 
   private:
     IEndpointDialer& _dialer;
-    ICredentialSource const& _credential;
-    Cc::CredentialNotice _notice; ///< Held across polls, so an ignored credential is said once, not once a beat.
 };
 
 } // namespace FastCache::Node

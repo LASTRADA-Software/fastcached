@@ -869,7 +869,8 @@ TEST_CASE("A worker's success at a scheduler does not end the presence loop's re
                                                   .load = load,
                                                   .logger = fix.logger,
                                                   .prover = nullptr,
-                                                  .reachability = fix.reachability },
+                                                  .reachability = fix.reachability,
+                                                  .joinMemos = {} },
                                 nullptr,
                                 presenceLink,
                                 dialer);

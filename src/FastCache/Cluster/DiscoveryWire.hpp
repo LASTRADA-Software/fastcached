@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -68,6 +69,11 @@ inline constexpr std::uint8_t MinimumVersion = 2;
 /// because a challenger keeps no table of what it asked: the nonce is a cookie it recomputes from
 /// what the proof claims (`ChallengeCookies`), so the proof has to carry it back. The same one
 /// move to 3 carries that too.
+///
+/// **And the summary both nest grew from seven fields to ten** -- the fleet's member ids, how many
+/// it records, and the speaker's own `0xFC` endpoint -- with every dialled endpoint in it now held
+/// to `ParseDialEndpoint`. A seven-field reader refuses the ten-field summary by arity, and the proof
+/// signs all ten, so this too is a grammar change and rides the same one move to 3.
 inline constexpr std::uint8_t CurrentVersion = 2;
 
 /// What a datagram is.
@@ -231,6 +237,8 @@ struct Proof
 /// @return The bytes to send.
 [[nodiscard]] inline std::vector<std::byte> EncodeProof(Proof const& proof)
 {
+    assert(proof.summary.members.size() <= CompileCacheWire::MaxFleetSummaryMembers
+           && "a datagram carries a cut list (`WithMembersAtMost`); a longer one is refused by every reader");
     auto const fields = CompileCacheWire::EncodeFleetSummaryFields(proof.summary);
     return Frame(Kind::Proof,
                  WireFields::Encode({ std::span<std::byte const> { fields },
@@ -240,12 +248,14 @@ struct Proof
 }
 
 /// The smallest proof a node of this build can send, and so the smallest honest beacon: a summary
-/// naming a one-byte cluster and nothing else, then the nonce, the key and the signature.
+/// naming a one-byte cluster and nothing else -- no member, a member total of zero -- then the
+/// nonce, the key and the signature.
 /// @return Its datagram's size in bytes.
 [[nodiscard]] consteval std::size_t SmallestProofDatagram() noexcept
 {
     auto const summary = (CompileCacheWire::FleetSummaryFieldCount * WireFields::FieldPrefixSize) + 1 /* cluster */
-                         + 1 /* state */ + sizeof(std::uint64_t) /* created */;
+                         + 1 /* state */ + sizeof(std::uint64_t)                                      /* created */
+                         + sizeof(std::uint64_t) /* memberTotal */;
     return WireFrame::HeaderSize + (ProofFieldCount * WireFields::FieldPrefixSize) + summary + NonceBytes
            + Ed25519PublicKeyBytes + Ed25519SignatureBytes;
 }
@@ -288,6 +298,8 @@ static_assert(LargestUnpaddedChallenge() <= SmallestProofDatagram(),
 /// @return The bytes to send.
 [[nodiscard]] inline std::vector<std::byte> EncodeBeacon(Beacon const& beacon)
 {
+    assert(beacon.summary.members.size() <= CompileCacheWire::MaxFleetSummaryMembers
+           && "a datagram carries a cut list (`WithMembersAtMost`); a longer one is refused by every reader");
     auto const fields = CompileCacheWire::EncodeFleetSummaryFields(beacon.summary);
     auto const unpadded =
         WireFrame::HeaderSize
@@ -374,7 +386,7 @@ static_assert(LargestUnpaddedChallenge() <= SmallestProofDatagram(),
     if (!fields.has_value())
         return std::nullopt;
 
-    auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0]);
+    auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0], CompileCacheWire::MaxFleetSummaryMembers);
     if (!summary.has_value())
         return std::nullopt;
     return Beacon { .summary = *std::move(summary) };
@@ -424,7 +436,7 @@ static_assert(LargestUnpaddedChallenge() <= SmallestProofDatagram(),
     if (answers.size() != NonceBytes || key.size() != Ed25519PublicKeyBytes || signature.size() != Ed25519SignatureBytes)
         return std::nullopt;
 
-    auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0]);
+    auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0], CompileCacheWire::MaxFleetSummaryMembers);
     if (!summary.has_value())
         return std::nullopt;
 

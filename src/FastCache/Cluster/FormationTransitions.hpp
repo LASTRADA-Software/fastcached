@@ -38,6 +38,7 @@ enum class FormationTrigger : std::uint8_t
     SeatedVoter,   ///< The applied state seats this node as a voter.
     SeatedLearner, ///< The applied state seats this node as a learner.
     SelfForgotten, ///< Forgotten: the applied state (#1539), or a signed `OwnKeyRevoked` verdict.
+    DissolvedInto, ///< The applied state carries the fleet's order to dissolve into a survivor.
 };
 
 /// What the controller does on a transition, BEFORE the mode it leads to is acted on.
@@ -53,6 +54,7 @@ enum class FormationEffect : std::uint8_t
     Dissolve,          ///< Take on the fleet's roster and archive its own cluster's store.
     AdoptSeat,         ///< Nothing to write beyond the mode: the seat is the applied state's.
     ArchiveAndMint,    ///< Archive the fleet's store and mint a new solitary cluster.
+    LeaveForSurvivor,  ///< Archive the fleet's store, mint a new solitary cluster, and ask the survivor.
     None,              ///< Nothing beyond the mode.
 };
 
@@ -126,6 +128,18 @@ inline constexpr std::array FormationTransitions {
                           .trigger = FormationTrigger::SelfForgotten,
                           .to = NodeMode::Solitary,
                           .effect = FormationEffect::ArchiveAndMint,
+                          .reform = true },
+    // A healing split: the losing fleet's every member leaves for the survivor at once, on the order
+    // its leader replicated. Pending in a NEW solitary cluster of its own, never the left one reopened.
+    FormationTransition { .from = NodeMode::Voter,
+                          .trigger = FormationTrigger::DissolvedInto,
+                          .to = NodeMode::Pending,
+                          .effect = FormationEffect::LeaveForSurvivor,
+                          .reform = true },
+    FormationTransition { .from = NodeMode::Learner,
+                          .trigger = FormationTrigger::DissolvedInto,
+                          .to = NodeMode::Pending,
+                          .effect = FormationEffect::LeaveForSurvivor,
                           .reform = true },
 };
 
@@ -222,7 +236,9 @@ static_assert(EveryOriginRankIsDistinct(), "every FleetOrigin needs a rank of it
     ProvenFleet const* best = nullptr;
     for (auto const& fleet: seen)
     {
-        if (ClassifyEncounter(own, fleet.Proven()) != Encounter::Yield)
+        // A FIRST join: only a solitary node asks, and the rows a solitary node meets decide alike
+        // with split evidence and without (`EvidenceDecidesOnlyForeignPairs`).
+        if (ClassifyEncounter(own, fleet.Proven(), SplitEvidence::None) != Encounter::Yield)
             continue;
         if (best == nullptr || key(fleet) < key(*best))
             best = &fleet;

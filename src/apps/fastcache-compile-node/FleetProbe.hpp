@@ -7,6 +7,7 @@
 #include <FastCache/Cluster/ProvenFleet.hpp>
 #include <FastCache/Cluster/SeedSources.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -42,6 +43,18 @@ class IFleetProbe
     /// @return The fleet its signature proves, over a nonce drawn for this question; or a sentence
     ///         naming the endpoint and what was wrong.
     [[nodiscard]] virtual std::expected<Cluster::ProvenFleet, std::string> Ask(Cluster::SeedCandidate const& seed) = 0;
+
+    /// Ask an endpoint for the summary of the fleet it is in, claiming no ORIGIN for the answer.
+    ///
+    /// The same exchange as `Ask`, for a reader that is not joining through a seed: a pending node
+    /// proving the key an endpoint it is about to poll answers under -- the leader a summary named, or
+    /// one a redirect named -- and a solitary node following a pending one's pointer. Stamping a seed's
+    /// origin on it would be a confident wrong claim about how it arrived, so it returns the proven
+    /// summary and nothing more.
+    /// @param endpoint Its `host:port`.
+    /// @return The summary its signature proves, over a nonce drawn for this question; or a sentence
+    ///         naming the endpoint and what was wrong.
+    [[nodiscard]] virtual std::expected<Cluster::ProvenFleetSummary, std::string> AskSummary(std::string_view endpoint) = 0;
 };
 
 /// `IFleetProbe` over a dialled connection: one question, one answer, one connection.
@@ -76,7 +89,23 @@ class DialledFleetProbe final: public IFleetProbe
     /// @copydoc IFleetProbe::Ask
     [[nodiscard]] std::expected<Cluster::ProvenFleet, std::string> Ask(Cluster::SeedCandidate const& seed) override;
 
+    /// @copydoc IFleetProbe::AskSummary
+    [[nodiscard]] std::expected<Cluster::ProvenFleetSummary, std::string> AskSummary(std::string_view endpoint) override;
+
   private:
+    /// An answer as it arrived, with the nonce it must be signed over: what `Ask` and `AskSummary`
+    /// each prove in their own way.
+    struct Answered
+    {
+        Cluster::IssuedNonce held;                 ///< The nonce this question drew, to verify against.
+        CompileCacheWire::FleetSummaryReply reply; ///< What came back, decoded and not yet verified.
+    };
+
+    /// Ask @p endpoint the question, under one deadline, and read the reply.
+    /// @param endpoint Its `host:port`.
+    /// @return The answer and its nonce, or a sentence naming the endpoint and what was wrong.
+    [[nodiscard]] std::expected<Answered, std::string> Exchange(std::string_view endpoint);
+
     IEndpointDialer& _dialer;
     core::platform::IClock const& _clock;
     Cluster::ChallengeIssuer _issuer; ///< Each question's one-use nonce (`IssueNonce`).

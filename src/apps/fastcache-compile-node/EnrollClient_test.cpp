@@ -13,11 +13,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <format>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -31,6 +33,7 @@
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/SteppedDrainWait.hpp>
 #include <tests/TicketFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -51,7 +54,7 @@ namespace
 [[nodiscard]] Cc::CacheOutcome Served(Wire::EnrollOutcome outcome, std::span<std::byte const> roster = {})
 {
     return Cc::CacheOutcome { .kind = Cc::CacheOutcomeKind::Hit,
-                              .value = Wire::EncodeEnrollReply(outcome, roster),
+                              .value = Wire::EncodeEnrollReply(outcome, roster, {}, std::nullopt),
                               .message = {},
                               .credentialIgnored = false,
                               .transportFailure = Cc::TransportFailure::None };
@@ -125,6 +128,47 @@ TEST_CASE("A pending reply is a wait, and an approved one carries the roster", "
     // out and then report a timeout for a decision that was already taken.
     auto const refused = ReadEnrollReply(Served(Wire::EnrollOutcome::Rejected));
     CHECK(refused.progress == EnrollProgress::Refused);
+}
+
+TEST_CASE("Every outcome a fleet signs is read back as the outcome its signature is checked over",
+          "[enrollment][client][formation]")
+{
+    // `SignedOutcomeTable` decides which outcome a joiner checks a signature OVER, from the reading
+    // the reply became. A swapped row verifies nothing the fleet signed -- every join stops, closed --
+    // and no controller case can see it, since the controller's fake signs the same reading. So the
+    // table is held to the wire here: each outcome encoded, read back, and mapped to what was sent.
+    // The readings are this case's own, written out rather than read from the table.
+    auto const roster = RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x42)));
+    struct Row
+    {
+        Wire::EnrollOutcome outcome; ///< What the fleet decided and signed.
+        EnrollProgress reading;      ///< What a joiner reads it as.
+        bool carriesRoster;          ///< Whether the reply carries the roster.
+    };
+    constexpr auto rows = std::array {
+        Row { .outcome = Wire::EnrollOutcome::Pending, .reading = EnrollProgress::Waiting, .carriesRoster = false },
+        Row { .outcome = Wire::EnrollOutcome::Approved, .reading = EnrollProgress::Admitted, .carriesRoster = true },
+        Row { .outcome = Wire::EnrollOutcome::Rejected, .reading = EnrollProgress::Refused, .carriesRoster = false },
+    };
+    for (auto const& row: rows)
+    {
+        INFO("outcome " << static_cast<int>(row.outcome));
+        auto const read = ReadEnrollReply(
+            Served(row.outcome, row.carriesRoster ? std::span<std::byte const> { roster } : std::span<std::byte const> {}));
+        CHECK(read.progress == row.reading);
+        CHECK(SignedOutcomeOf(read.progress) == std::optional { row.outcome });
+    }
+    CHECK(SignedOutcomeTable.size() == rows.size()); // every outcome a fleet signs, and no other
+
+    // A wire refusal is signed by nobody, and maps to no outcome: there is nothing to check.
+    for (auto const code:
+         { Wire::ErrorCode::EnrollmentFull, Wire::ErrorCode::EnrollmentHostFull, Wire::ErrorCode::NotLeader })
+    {
+        INFO("refusal " << static_cast<int>(code));
+        CHECK_FALSE(SignedOutcomeOf(ReadEnrollReply(Refused(code)).progress).has_value());
+    }
+    CHECK_FALSE(SignedOutcomeOf(ReadEnrollReply(Refused(Wire::ErrorCode::UnknownOpcode)).progress).has_value());
+    CHECK_FALSE(SignedOutcomeOf(EnrollProgress::Redirect).has_value());
 }
 
 TEST_CASE("An approval carrying no roster is a fault rather than an admission", "[enrollment][client]")
@@ -667,14 +711,14 @@ namespace
 /// @return The framed reply.
 [[nodiscard]] std::vector<std::byte> Recorded()
 {
-    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Pending, {}));
+    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Pending, {}, {}, std::nullopt));
 }
 
 /// A seed whose operator refused this machine.
 /// @return The framed reply.
 [[nodiscard]] std::vector<std::byte> Rejected()
 {
-    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Rejected, {}));
+    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Rejected, {}, {}, std::nullopt));
 }
 
 } // namespace
@@ -802,7 +846,8 @@ namespace
 /// @return The framed reply.
 [[nodiscard]] std::vector<std::byte> ApprovedWith(std::span<std::byte const> roster)
 {
-    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Approved, roster));
+    return Wire::EncodeReply(Wire::Status::Ok,
+                             Wire::EncodeEnrollReply(Wire::EnrollOutcome::Approved, roster, {}, std::nullopt));
 }
 
 /// A joiner's configuration, and the identity and key it will mint -- minted HERE first, so a
@@ -872,7 +917,9 @@ TEST_CASE("A joiner asks under the key it minted and believes a roster that reco
 
     // **What it ASKED with, read off the wire**: the key in the request is the key minted
     // into the state directory, on every poll. A client that minted a second key per run,
-    // or sent none, would be admitted under a key it does not hold.
+    // or sent none, would be admitted under a key it does not hold. And each poll carries a nonce
+    // of its own, as the grammar requires of every request.
+    auto nonces = std::vector<std::array<std::byte, Wire::NodeChallengeBytes>> {};
     for (auto const index: { std::size_t { 0 }, std::size_t { 1 } })
     {
         auto const sent = dialer.SentOn(index);
@@ -888,7 +935,29 @@ TEST_CASE("A joiner asks under the key it minted and believes a roster that reco
         // and the one-shot verb admits a worker by its key. It states no endpoint.
         CHECK(Unwrap(request).role == Wire::EnrollRole::Worker);
         CHECK(Unwrap(request).nodeEndpoint.empty());
+        nonces.push_back(Unwrap(request).nonce);
     }
+    CHECK(nonces[0] != nonces[1]);
+}
+
+TEST_CASE("A joiner whose generator cannot draw a nonce sends no request", "[enrollment][client][security]")
+{
+    // A request over bytes somebody could predict is one whose answer could have been recorded from
+    // another ask, so a failed draw is a refusal before anything is dialled -- and says which draw.
+    Testing::ScratchDirectory scratch { "enroll-no-nonce" };
+    auto const joiner = MintJoiner(scratch.Path());
+    Testing::ScriptedDialer dialer { { Recorded() } };
+    Testing::SteppedDrainWait wait;
+    Testing::ScriptedSecureRandom random { Testing::ScriptedSecureRandom::DeniedFailure() };
+    auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
+    auto const refused = RunEnrollClient(joiner.cfg, random, keyGuard, wait, dialer);
+
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().reason.contains("no nonce could be drawn for the enroll request"));
+    CHECK(refused.error().reason.contains("scripted-getrandom"));
+    // An I/O arm rather than a decision: the next run may draw.
+    CHECK(refused.error().ending == CommandEnding::Failed);
+    CHECK(dialer.Dialed().empty());
 }
 
 TEST_CASE("A joiner handed a roster naming it under another key is not admitted", "[enrollment][client][security]")

@@ -232,12 +232,13 @@ class EnrollmentWindow
         _metrics { metrics },
         _wallClock { wallClock }
     {
-        // Clear at construction, and checked rather than assumed: the list is held in memory and
-        // nowhere else, so a process starts with nobody waiting.
+        // NOT clear at construction: the list lives in the LEADER's memory alone, and this node does
+        // not know yet whether it leads. A follower's empty list says nothing about who is waiting,
+        // so both rows read not-evaluated until leadership says otherwise (`OnRoleChanged`).
         if (_conditions != nullptr)
         {
-            _conditions->Clear(NodeCondition::EnrollmentWindowOpen);
-            _conditions->Clear(NodeCondition::EnrollmentRequestsWaiting);
+            _conditions->NotEvaluated(NodeCondition::EnrollmentWindowOpen, NotLeadingReason({}));
+            _conditions->NotEvaluated(NodeCondition::EnrollmentRequestsWaiting, NotLeadingReason({}));
         }
     }
 
@@ -331,7 +332,11 @@ class EnrollmentWindow
     void MarkAutoApproved(std::string_view nodeId);
 
     /// Follow this node's scheduler role: any role but `Leader` ends an armed window and forgets
-    /// the list, lowering `enrollment-requests-waiting`.
+    /// the list.
+    ///
+    /// **And the rows follow the role, because the list lives in the leader's memory alone.** On the
+    /// leader they are answered from the list; anywhere else they read NOT EVALUATED, naming the leader
+    /// to ask -- never `clear`, which on a follower would be a statement about a list it does not hold.
     ///
     /// **At DEMOTION**, so a leader that loses leadership and regains it inside the deadline does
     /// not resume admitting -- a new leader never had a deadline, and this one was a new leader
@@ -339,7 +344,13 @@ class EnrollmentWindow
     /// enrollment verb `NotLeader`, so its rows are ones nobody can decide about. One method for `main` and for a test to
     /// call, so the wiring a test drives is the wiring that ships.
     /// @param role The role this node now holds.
-    void OnRoleChanged(Distributed::SchedulerRole role);
+    /// @param leaderEndpoint Where the leader answers, when one is known; empty otherwise.
+    void OnRoleChanged(Distributed::SchedulerRole role, std::string_view leaderEndpoint);
+
+    /// Why a node that does not lead answers the enrollment rows not-evaluated.
+    /// @param leaderEndpoint Where the leader answers; empty when none is known.
+    /// @return The reason, naming the leader when one is known.
+    [[nodiscard]] static std::string NotLeadingReason(std::string_view leaderEndpoint);
 
     /// The window and everything waiting, as the wire reports it.
     /// @return The report, oldest entry first.
@@ -391,6 +402,10 @@ class EnrollmentWindow
     /// Caller holds `_mutex`.
     void ReportWaitingLocked() const;
 
+    /// Say the auto-approve window is shut: `clear` on the leader, not-evaluated anywhere else.
+    /// The caller holds `_mutex`.
+    void ReportWindowClosedLocked() const;
+
     /// Clear an auto-approve deadline that has passed, and its condition. Caller holds `_mutex`.
     /// `const` over `mutable` state for `SweepLocked`'s reason: a read is where a lapse is noticed.
     void LapseLocked() const;
@@ -414,6 +429,12 @@ class EnrollmentWindow
     /// Where the list's state is reported as conditions; null on a node that serves none.
     /// Written under `_mutex`, so two racing changes cannot report in the other order.
     NodeConditions* _conditions;
+
+    /// Whether this node leads, as the scheduler last said (`OnRoleChanged`). Guarded by `_mutex`.
+    bool _leading { false };
+
+    /// Where the leader answers, when this node does not lead and one is known. Guarded by `_mutex`.
+    std::string _leaderEndpoint;
 
     /// Where a row forgotten undecided is counted; null where nothing counts it.
     IMetricsSink* _metrics;

@@ -3,6 +3,7 @@
 #include "MembershipGate.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/EnrollAdmissionSignature.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Ed25519.hpp>
@@ -226,8 +227,8 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
         return Cc::Refuse(_metrics,
                           { .code = Wire::ErrorCode::MalformedFrame,
                             .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed },
-                          "an enroll request names an id, an endpoint, a role this build knows and a 32-byte "
-                          "identity key");
+                          "an enroll request names an id, an endpoint, a role this build knows, a 32-byte "
+                          "identity key and a 32-byte nonce");
 
     auto const nodeId = Wire::AsStringView(fields->nodeId);
     auto const nodeEndpoint = Wire::AsStringView(fields->nodeEndpoint);
@@ -313,6 +314,30 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
 
     auto const claim =
         JoinerClaim { .nodeId = nodeId, .nodeEndpoint = nodeEndpoint, .role = fields->role, .publicKey = fields->publicKey };
+    // **Every answer is signed, over the joiner's own nonce, by this node's identity key** -- a
+    // refusal and a "not yet" as well as an approval. The roster is public, so nothing in an answer's
+    // content can tell it from a copy anybody at the polled endpoint could make; and a refusal sends
+    // a joiner away for an hour while a "not yet" keeps it waiting on a join that may be dead, so an
+    // unsigned one of either is a lever for whoever answers there. The joiner holds each to a key it
+    // proved for this cluster. The cluster id is the one this node's own summary states, the summary
+    // a joiner's probe proves the key with.
+    //
+    // **So every `Enroll` answered past the list's bounds costs one Ed25519 signature, to anybody**:
+    // the verb is pre-auth, and nothing but its payload cap and the header window bounds who asks.
+    // That is the work a stranger buys per request here -- small, and the reason a full list and a
+    // capped host are refused BEFORE this lambda runs and sign nothing.
+    auto const answer = [&](Wire::EnrollOutcome outcome,
+                            std::span<std::byte const> roster = {},
+                            std::span<std::byte const> certificate = {}) {
+        auto const signature = Cluster::SignAdmission(_identity,
+                                                      Cluster::AdmissionClaim { .nonce = fields->nonce,
+                                                                                .joinerId = nodeId,
+                                                                                .joinerKey = fields->publicKey,
+                                                                                .clusterId = _self.Current().clusterId,
+                                                                                .outcome = outcome,
+                                                                                .roster = roster });
+        return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(outcome, roster, certificate, signature));
+    };
     switch (recorded ? EnrollDecision::Approved : _window.Offer(claim, peer))
     {
         case EnrollDecision::Full:
@@ -337,11 +362,11 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
         case EnrollDecision::Pending:
             // No roster, and the encoder is what makes that a length rather than a
             // convention -- see `EncodeEnrollReply`.
-            return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Pending, {}));
+            return answer(Wire::EnrollOutcome::Pending);
         case EnrollDecision::Rejected:
-            return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Rejected, {}));
+            return answer(Wire::EnrollOutcome::Rejected);
         case EnrollDecision::AutoApprove:
-            return AnswerAutoApprove(nodeId);
+            return AnswerAutoApprove(nodeId, answer(Wire::EnrollOutcome::Pending));
         case EnrollDecision::Approved:
             break;
     }
@@ -354,10 +379,10 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
     // says "not admitted yet" and carries nothing.
     auto const state = _scheduler.AdministeredState();
     if (!state.has_value())
-        return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Pending, {}));
+        return answer(Wire::EnrollOutcome::Pending);
     auto const projected = Cluster::ProjectRoster(*state);
     if (!RosterRecordsJoiner(projected, nodeId, fields->publicKey, fields->role))
-        return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Pending, {}));
+        return answer(Wire::EnrollOutcome::Pending);
 
     // The roster, and no secret: it is every member's PUBLIC key, and nothing in it lets its
     // holder prove anything (#178). The fingerprint is taken over these bytes and recorded
@@ -374,7 +399,8 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
         _scheduler.CurrentCertifiedRoster()
             .transform([](Cluster::CertifiedRoster const& certified) { return Cluster::EncodeCertifiedRoster(certified); })
             .value_or(std::vector<std::byte> {});
-    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Approved, roster, certificate));
+
+    return answer(Wire::EnrollOutcome::Approved, roster, certificate);
 }
 
 std::vector<std::byte> EnrollmentResponder::AnswerClear(PeerIdentity const& peer)
@@ -396,11 +422,10 @@ std::vector<std::byte> EnrollmentResponder::AnswerClear(PeerIdentity const& peer
     return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollmentReport(_window.Report()));
 }
 
-std::vector<std::byte> EnrollmentResponder::AnswerAutoApprove(std::string_view nodeId)
+std::vector<std::byte> EnrollmentResponder::AnswerAutoApprove(std::string_view nodeId, std::vector<std::byte> const& pending)
 {
     // Pending, whatever happens here: the roster is not applied yet, so the joiner's next poll
     // is the one answered `Approved` -- the ordering a manual approval already has.
-    auto const pending = Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Pending, {}));
     auto const entry = _window.Find(nodeId);
     if (!entry.has_value())
         return pending;

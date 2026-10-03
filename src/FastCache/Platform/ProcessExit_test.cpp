@@ -373,7 +373,7 @@ TEST_CASE("Both daemons give up at each step through the table, never with a bar
         { .main = std::filesystem::path { "src" } / "apps" / "fastcached" / "main.cpp",
           .sites = { 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1 } },
         { .main = std::filesystem::path { "src" } / "apps" / "fastcache-compile-node" / "main.cpp",
-          .sites = { 1, 0, 0, 0, 2, 0, 0, 0, 1, 4, 0, 0, 0, 0, 0 } },
+          .sites = { 1, 0, 0, 0, 2, 0, 0, 0, 1, 5, 0, 0, 0, 0, 0 } },
     });
     // And the node chooses its key's and identity's step by the fault that refused.
     auto const node = SourceText(std::filesystem::path { "src" } / "apps" / "fastcache-compile-node" / "main.cpp");

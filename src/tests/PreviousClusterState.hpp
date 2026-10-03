@@ -13,26 +13,24 @@
 namespace FastCache::Testing
 {
 
-/// The `ClusterState` version the build before a machine was forgotten by its key alone wrote.
-inline constexpr std::uint8_t PreviousClusterStateVersion = 7;
+/// The `ClusterState` version the build before the replicated dissolve wrote.
+inline constexpr std::uint8_t PreviousClusterStateVersion = 8;
 
-/// The `Command` version the build before #1555 wrote: this build's layout, and other meanings.
-inline constexpr std::uint8_t PreviousClusterCommandVersion = 3;
+/// The `Command` version the build before the replicated dissolve wrote: six fields, no age.
+inline constexpr std::uint8_t PreviousClusterCommandVersion = 4;
 
 /// The last `Command` version laid out differently: before #178 a command was four fields.
 inline constexpr std::uint8_t FourFieldClusterCommandVersion = 2;
 
-/// A one-member cluster state, encoded as the build before the client and forgotten-host groups
-/// were removed laid it out.
+/// A one-member cluster state, encoded as the build before the replicated dissolve laid it out.
 ///
 /// **A BUILDER shared by every case that needs one, for the reason `ForeignGenerationValue.hpp`
 /// is**: each such case asserts a REFUSAL, and a copy that drifted into building something else
 /// is refused too -- so every copy goes on passing under a name for what it no longer builds.
 /// The one fact that matters lives here alone: the previous LAYOUT, which is not the current
-/// one with its version byte changed. Version 7 wrote eight header fields rather than six -- the
-/// client and forgotten-host counts beside the member, setting, principal and revoked-key counts
-/// and the roster version -- so a decoder that judged the arity before the version refuses this
-/// as damage while passing a test that only flips the byte of a current encoding.
+/// one with its version byte changed. Version 8 wrote six header fields rather than seven --
+/// no dissolve count -- so a decoder that judged the arity before the version refuses this as
+/// damage while passing a test that only flips the byte of a current encoding.
 ///
 /// Member `n1` at `10.0.0.1:6675`: never announced a scheduler endpoint, seated as a voter,
 /// stating no key.
@@ -53,8 +51,6 @@ inline constexpr std::uint8_t FourFieldClusterCommandVersion = 2;
     return WireFields::Encode({ std::span<std::byte const> { version },
                                 std::span<std::byte const> { members },
                                 std::span<std::byte const> { none }, // settings
-                                std::span<std::byte const> { none }, // clients
-                                std::span<std::byte const> { none }, // forgotten hosts
                                 std::span<std::byte const> { none }, // principals
                                 std::span<std::byte const> { none }, // revoked keys
                                 std::span<std::byte const> { rosterVersion },
@@ -66,15 +62,12 @@ inline constexpr std::uint8_t FourFieldClusterCommandVersion = 2;
                                 std::span<std::byte const> {} }); // no key
 }
 
-/// A command removing member `n1`, encoded as the build before #1555 wrote it.
+/// A command forgetting member `n1`, encoded as the build before the replicated dissolve wrote it.
 ///
-/// Here for `EncodePreviousClusterState`'s reason, and this time the point is the VERB rather
-/// than the layout: a v3 command is the six fields this build writes, and ordinal 1 was
-/// `RemoveMember` there and is `Forget` here, which also revokes the key the removed record
-/// held. So nothing but the version byte refuses it -- a decoder that judged anything else
-/// first would accept it and replay it as a forget its writer never meant. What a node's own
-/// log holds after that upgrade is exactly this, and a node recovering it refuses to start
-/// (#1542).
+/// Here for `EncodePreviousClusterState`'s reason: a v4 command is SIX fields where this build
+/// writes seven, so a decoder that counted the fields first would call an intact entry damage.
+/// What a node's own log holds after that upgrade is exactly this, and a node recovering it
+/// refuses to start (#1542).
 /// @return The encoded command.
 [[nodiscard]] inline std::vector<std::byte> EncodePreviousClusterCommand()
 {

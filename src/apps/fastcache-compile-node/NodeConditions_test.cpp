@@ -3,6 +3,8 @@
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
 #include "EnrollmentWindow.hpp"
+#include "FormationLoop.hpp"
+#include "FormationRuntime.hpp"
 #include "NodeConditions.hpp"
 #include "NodeDefaults.hpp"
 #include "NodeMembership.hpp"
@@ -46,6 +48,10 @@
 #include <core/net/BlockingConnector.hpp>
 #include <core/net/BlockingSocket.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/FormationFakes.hpp>
+#include <tests/HostNamingFakes.hpp>
+#include <tests/ManualClockWait.hpp>
+#include <tests/NodeFormationControllerFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ReactorHomeFakes.hpp>
@@ -372,6 +378,7 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     clusteredNode.raftListen = std::format("127.0.0.1:{}", raftPort);
     clusteredNode.raftSelf = "127.0.0.1";
     clusteredNode.clusterDir = consensusState / "state";
+    clusteredNode.identityPublicKey = FastCache::Testing::TestKeyPair("n1").PublicKey(); // what a formation states
     auto const consensus = ConsensusTier::Start(
         clusteredNode,
         {},
@@ -383,6 +390,7 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
         metrics,
         logger,
         &conditions,
+        FormationHooks {},
         std::move(raftHeld));
     REQUIRE(consensus.has_value());
 
@@ -390,7 +398,8 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     // `foreign-fleet-visible` -- here as not evaluated, since this consensus port is loopback and
     // is never announced, which is a component answering its row rather than one forgetting it.
     FixedFleetSummary const answered { AnsweredFleetSummary(clusteredNode) };
-    auto const discovery = StartDiscoveryOrExplain(clusteredNode, *consensus, answered, conditions, metrics, logger);
+    auto const discovery =
+        StartDiscoveryOrExplain(clusteredNode, *consensus, answered, conditions, metrics, logger, DiscoveryFormation {});
     REQUIRE(discovery.has_value());
 
     // The consensus scope's shared cache, built the way `main` builds it on a consensus node: it
@@ -413,6 +422,31 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     SharedSessionPool sharedSessions { sharedDialer, sharedSessionClock, sharedSessionHome };
     SharedCacheUpstream const sharedUpstream { sharedDirectory, sharedSessions,          nullptr, metrics, &conditions,
                                                logger,          SharedCacheDialPolicy {} };
+
+    // The formation, built the way `main` builds it over the consensus node: it answers
+    // `formation-move-refused` as its controller starts.
+    FastCache::Testing::InMemoryFormationStore formationStore;
+    Cluster::FleetEndpointsFile formationEndpoints { consensusState.Path() };
+    ReformRequest reform;
+    core::platform::ManualWallClock formationWall;
+    FastCache::Testing::ScriptedSecureRandom formationRandom { FastCache::Testing::ScriptedSecureRandom::Ascending(64) };
+    FastCache::Testing::UnreachableDialer formationDialer;
+    FastCache::Testing::ScriptedSrvResolver formationSrv;
+    FastCache::Testing::ManualClockWait formationWait;
+    auto const formationBody =
+        FormationBody { .record = FastCache::Testing::Minted("c-n1", 500),
+                        .durables = FormationDurables { formationStore,
+                                                        formationEndpoints,
+                                                        reform,
+                                                        FormationRuntimeParts { .wall = formationWall,
+                                                                                .random = formationRandom,
+                                                                                .dialer = formationDialer,
+                                                                                .srv = formationSrv,
+                                                                                .wait = formationWait } },
+                        .reloader = nullptr };
+    auto const formation = MakeFormationRuntime(clusteredNode, formationBody, nullptr, metrics, logger, &conditions);
+    REQUIRE(formation.has_value());
+    REQUIRE(*formation != nullptr);
 
     // The admin surface.
     auto admin = Testing::FirstStart(NodeConfig {});

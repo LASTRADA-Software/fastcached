@@ -1284,14 +1284,33 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::FormationJoinsAbandoned,
       .prometheusName = "fastcache_formation_joins_abandoned_total",
-      .help = "Joins this node gave up because the fleet it asked stopped answering for ten minutes. It stays in its "
-              "own cluster, keeps serving, and asks again when it next proves a fleet it yields to.",
+      .help = "Joins this node gave up because the fleet it asked gave no answer it signed for ten minutes: silence, or "
+              "only what nobody signs -- a full list, a not-leader, a redirect. It stays in its own cluster, keeps "
+              "serving, and asks again when it next proves a fleet it yields to.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::FormationAdmissionsRefused,
       .prometheusName = "fastcache_formation_admissions_refused_total",
-      .help = "Admissions this node did not believe: the roster it was handed does not record it under its own key, "
-              "or records no member under the key that proved the fleet it asked -- whoever answered is not that "
-              "fleet. Nothing was archived; the node stays in its own cluster, and gives the join up if it goes on.",
+      .help = "Admissions this node did not believe although they were signed by a key it proved for that fleet: "
+              "the roster does not record it under its own key, or records no member under the key that proved the "
+              "fleet. The fleet answered, wrongly -- an approval of another key for this id, most often. Nothing was "
+              "archived; the node stays in its own cluster, and gives the join up if it goes on.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FormationAdmissionsUnverified,
+      .prometheusName = "fastcache_formation_admissions_unverified_total",
+      .help = "Answers to this node's join -- an admission, a refusal or a not-yet -- it refused because nothing "
+              "bound them to the fleet it asked: no signature, one that does not verify over this node's own "
+              "request and the outcome it states, or a genuine one by a key it never proved for that fleet. Such an "
+              "answer counts as no answer: a refusal does not send the node away and a not-yet does not keep it "
+              "waiting. A rise is something answering at the endpoint this node polls that is not that fleet. "
+              "Nothing was archived; the node stays in its own cluster, and gives the join up if it goes on.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::StateFileReplacesFellBack,
+      .prometheusName = "fastcache_state_file_replaces_fell_back_total",
+      .help = "Serving bodies that found, as they started, that the state files in this node's directory are "
+              "replaced by the classic rename because the POSIX-semantics one was refused -- a filesystem "
+              "without it, or a path form it will not take. Every replace still lands; on Windows a reader "
+              "holding a state file open then makes its replace fail. The warning names the directory and the "
+              "refusal.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeTicketsAccepted,
       .prometheusName = "fastcache_node_tickets_accepted_total",

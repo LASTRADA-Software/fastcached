@@ -16,6 +16,7 @@
 #include <iterator>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <set>
 #include <shared_mutex>
 #include <span>
@@ -448,6 +449,37 @@ struct PeerSenderAccess
     /// @param halves The session.
     static void EndReader(SessionHalves* halves) noexcept;
 
+    /// What a session's sender does with one entry it popped off its outbox.
+    ///
+    /// **Private: never transmitted or persisted**, so the enumerators carry no values.
+    enum class SenderStep : std::uint8_t
+    {
+        Write,    ///< A message, on a session whose key still proves: sealed, then written.
+        StepOver, ///< A wake, on a session whose key still proves: nothing is sealed or written.
+        Withdraw, ///< The key no longer proves: the session ends here.
+    };
+
+    /// Decide what a sender does with one entry popped off its outbox -- asked by BOTH senders,
+    /// the dialled one and the attached one, so a wake means the same thing on either side.
+    ///
+    /// The roster first, whatever was popped: a WAKE -- a zero-length entry, which no message is,
+    /// every one having a header -- exists precisely to make a sender with nothing to write ask
+    /// it (`RaftPeerTransport::RecheckProofs`, and a dialled session's reader ending). Only a
+    /// MESSAGE then reaches the seal. A wake that reached it would spend a sequence number the
+    /// peer never sees, and the next real frame's tag would fail at the other end
+    /// (`Core/SessionSeal.hpp`): an idle session closed by the act of asking whether it may stay
+    /// open. A message popped into a withdrawal is counted as dropped with the session; a wake is
+    /// not a message, so it is not.
+    /// @param self The transport, whose roster is asked and whose drop count moves.
+    /// @param peer The member the session proved.
+    /// @param key The key it proved itself with.
+    /// @param popped What was popped.
+    /// @return The step.
+    [[nodiscard]] static SenderStep StepFor(RaftPeerTransport* self,
+                                            NodeId const& peer,
+                                            Ed25519PublicKey const& key,
+                                            std::vector<std::byte> const& popped);
+
     /// Count this session's withdrawn key, once, whichever half noticed it.
     /// @param halves The session.
     /// @param detail What was seen, for the log line.
@@ -621,21 +653,19 @@ core::async::Task<void> PeerSenderAccess::WriteSession(SessionHalves* halves)
             break;
         }
 
-        // Zero-length is never a message -- every frame has a header -- and with this session's
-        // reader alive it is a wake an EARLIER session's reader pushed while its writer was parked
-        // in a write rather than here. Stepped over.
-        if (frame->empty())
-            continue;
-
-        // The roster, asked again before every frame: a key revoked since the handshake ends
-        // the session here, and the redial is judged against the roster as it is now. The
-        // frame is dropped with the session, which Raft already survives for any message.
-        if (!self->_identity.StillProves(halves->where.id, halves->proven.provenKey))
+        // The roster, asked again before every frame and every wake: a key revoked since the
+        // handshake ends the session here, and the redial is judged against the roster as it is
+        // now. A message is dropped with the session, which Raft already survives for any of
+        // them. A wake -- with this session's reader alive, one an EARLIER session's reader pushed
+        // while its writer was parked in a write rather than here -- is stepped over.
+        auto const step = StepFor(self, halves->where.id, halves->proven.provenKey, *frame);
+        if (step == SenderStep::Withdraw)
         {
             NoteWithdrawal(halves, "");
-            self->_dropped.fetch_add(1, std::memory_order_relaxed);
             break;
         }
+        if (step == SenderStep::StepOver)
+            continue;
 
         SealInPlace(sealer, *frame);
 
@@ -696,6 +726,20 @@ void PeerSenderAccess::EndReader(SessionHalves* halves) noexcept
         auto const pushed = halves->peer->outbox.push(std::vector<std::byte> {});
         halves->self->_dropped.fetch_add(pushed.displaced, std::memory_order_relaxed);
     }
+}
+
+PeerSenderAccess::SenderStep PeerSenderAccess::StepFor(RaftPeerTransport* self,
+                                                       NodeId const& peer,
+                                                       Ed25519PublicKey const& key,
+                                                       std::vector<std::byte> const& popped)
+{
+    if (!self->_identity.StillProves(peer, key))
+    {
+        if (!popped.empty())
+            self->_dropped.fetch_add(1, std::memory_order_relaxed);
+        return SenderStep::Withdraw;
+    }
+    return popped.empty() ? SenderStep::StepOver : SenderStep::Write;
 }
 
 void PeerSenderAccess::NoteWithdrawal(SessionHalves* halves, std::string_view detail)
@@ -953,22 +997,25 @@ core::async::DetachedTask PeerSenderAccess::RunInboundSender(RaftPeerTransport* 
         if (!frame.has_value())
             break; // detached, replaced by a newer session, or stopping
 
-        // The roster, asked again before every frame, as the dialling sender asks it. A key
-        // withdrawn since the proof ends the session here: closing the socket ends the
-        // server's reader too, which detaches this link. Counted on the ACCEPTOR's row, since
-        // this is the acceptor's session -- whichever of its reader and this sender noticed
-        // first, and the other then sees only a closed socket.
-        if (!self->_identity.StillProves(link.Peer(), link.ProvenKey()))
+        // The roster, asked again before every frame and every wake, by the step the dialling
+        // sender asks it through. A key withdrawn since the proof ends the session here: closing
+        // the socket ends the server's reader too, which detaches this link. Counted on the
+        // ACCEPTOR's row, since this is the acceptor's session -- whichever of its reader and this
+        // sender noticed first, and the other then sees only a closed socket. A wake is what
+        // `RecheckProofs` pushes a session nothing is being sent on, so that it is asked at all.
+        auto const step = StepFor(self, link.Peer(), link.ProvenKey(), *frame);
+        if (step == SenderStep::Withdraw)
         {
             auto const& row = RowFor(AcceptorRefusal::KeyWithdrawn);
             self->_metrics.Increment(row.counter);
             self->_logger.Log(
                 LogLevel::Warn,
                 std::format("raft: closed the session peer {} dialled in on, because {}", link.Peer(), row.says));
-            self->_dropped.fetch_add(1, std::memory_order_relaxed);
             link.Socket().close();
             break;
         }
+        if (step == SenderStep::StepOver)
+            continue;
 
         SealInPlace(link.Sealer(), *frame);
 
@@ -1061,6 +1108,27 @@ RaftPeerTransport::RaftPeerTransport(std::vector<PeerEndpoint> peers,
 {
     for (auto& endpoint: peers)
         Learn(std::move(endpoint));
+}
+
+void RaftPeerTransport::RecheckProofs()
+{
+    // The outboxes of the sessions that no longer prove, collected under the lock and woken outside
+    // it, as `Send` pushes. Only the OUTBOX is shared off the reactor -- never the link, which owns
+    // the socket (`InboundPeer`).
+    auto withdrawn = std::vector<std::shared_ptr<InboundOutbox>> {};
+    {
+        auto const guard = std::shared_lock { _peersMutex };
+        for (auto const& [id, inbound]: _inbound)
+            if (!_identity.StillProves(inbound->link->Peer(), inbound->link->ProvenKey()))
+                withdrawn.push_back(inbound->outbox);
+    }
+    // A full outbox gives up its oldest entry for the wake, as it does for `Send`'s message and for
+    // `EndReader`'s wake, and that loss is counted like theirs.
+    for (auto const& outbox: withdrawn)
+    {
+        auto const pushed = outbox->push(std::vector<std::byte> {});
+        _dropped.fetch_add(pushed.displaced, std::memory_order_relaxed);
+    }
 }
 
 void RaftPeerTransport::ObserveOwnKeyRevoked(OwnKeyRevokedObserver observer)
@@ -1236,6 +1304,15 @@ std::size_t RaftPeerTransport::PeerCount() const noexcept
 {
     auto const guard = std::shared_lock { _peersMutex };
     return _peers.size();
+}
+
+std::vector<NodeId> RaftPeerTransport::DialTargets() const
+{
+    auto const guard = std::shared_lock { _peersMutex };
+    auto ids = std::vector<NodeId> {};
+    ids.reserve(_peers.size());
+    std::ranges::copy(_peers | std::views::keys, std::back_inserter(ids)); // a `std::map`: in id order
+    return ids;
 }
 
 PeerEndpoint RaftPeerTransport::AddressOf(Peer const& peer) const

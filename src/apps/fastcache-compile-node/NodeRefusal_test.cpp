@@ -133,7 +133,7 @@ TEST_CASE("The node's body gives up with the cause its refusal carries, never on
     // was one answer for all of them.
     auto const text = NodeMain();
     CHECK(Occurrences(text, ".error().cause);") == 10);
-    CHECK(Occurrences(text, "return ExitCodeFor(") == 11);
+    CHECK(Occurrences(text, "return ExitCodeFor(") == 12);
     CHECK(Occurrences(text, "->Ending()") == 1);
     CHECK(Occurrences(text, "StartStage::Serving") == 0);
     CHECK(Occurrences(text, "EndedInRefusal") == 0);

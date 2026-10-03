@@ -29,14 +29,25 @@ NodeReloader::Reparse ReloadCandidateReader(std::span<char const* const> args, R
         candidate.stateDirectory = basis.stateDirectory;
         ApplyHostNames(candidate, basis.hostNames);
 
-        // The formation, from the record the start kept: a candidate shaped by no record would
-        // run no consensus the running node does.
-        if (auto applied = ApplyFormation(candidate, basis.formation, basis.remembered); !applied.has_value())
+        // The formation as it is kept NOW: a candidate shaped by no record would run no consensus the
+        // running node does, and one shaped by the record the start kept would put a reformed node
+        // back in a mode it has left. A record that cannot be read, or is gone, declines the reload.
+        auto const formationRefusal = [](std::string context) {
             return std::unexpected(ConfigError { .code = ConfigErrorCode::ParseError,
                                                  .source = "formation",
                                                  .line = 0,
                                                  .field = {},
-                                                 .context = applied.error() });
+                                                 .context = std::move(context) });
+        };
+        auto const kept = basis.formation ? basis.formation()
+                                          : std::expected<KeptFormation, std::string> { std::unexpected {
+                                                std::string { "this node keeps no formation record" } } };
+        if (!kept.has_value())
+            return formationRefusal(kept.error());
+        if (!kept->record.has_value())
+            return formationRefusal(std::string { FormationRecordGone });
+        if (auto applied = ApplyFormation(candidate, *kept->record, kept->remembered); !applied.has_value())
+            return formationRefusal(applied.error());
 
         // The identity again, through the function the start used. A candidate rebuilt without it
         // holds an empty `--node-id`, an unreloadable field that has CHANGED -- so every reload

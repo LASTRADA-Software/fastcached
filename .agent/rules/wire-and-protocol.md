@@ -958,6 +958,17 @@ Every rule below has already been a bug.
     from one only it holds, so sharing is asked for per socket
     (`PortSharing`) rather than being every UDP socket's default. See
     `.agent/rules/consensus-and-cluster.md`.
+  - **A port a node binds itself is bound AGAIN by every serving body, never kept and
+    duplicated across bodies -- because on Windows the duplicate cannot be served.** A
+    completion-port association belongs to the SOCKET, not to the handle, and every
+    body has its own reactor: once one body's duplicate was associated with its IOCP,
+    associating a new duplicate with the next body's IOCP is refused
+    (`CreateIoCompletionPort` error 87), measured on Windows 11 build 26200. The rebind
+    it costs is safe there, measured the same day: an exclusive rebind at once succeeds
+    after a server-first close, a client-first close, and with an accepted connection
+    still open. `FrameEndpoint_test`'s reform case holds the last two shapes; the
+    duplicate stays a POSIX socket-activation device (`Node::ActivationHold`), and
+    must never be extended to Windows.
 
 - **A platform socket error is classified in one place.** `Detail::TranslateError`
   in `BlockingSocket.cpp` mapped ten conditions onto `NetErrorCode`;

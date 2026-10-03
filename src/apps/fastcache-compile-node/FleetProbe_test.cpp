@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -93,6 +94,42 @@ TEST_CASE("A probe asks a seed with a fresh nonce and holds only what its signat
     auto const asked = Wire::DecodeFleetSummaryRequestPayload(sent.subspan(Wire::RequestHeaderSize));
     REQUIRE(asked.has_value());
     CHECK(std::ranges::equal(Unwrap(asked), script));
+}
+
+TEST_CASE("A summary question returns the whole list a reply carries, proven and claiming no origin",
+          "[node][formation][summary][split]")
+{
+    // The full-list question a split's evidence may need: the same exchange as a seed's, its answer
+    // held to the same signature over the same fresh nonce -- and a list past a datagram's cut.
+    auto const script = NonceScript();
+    auto summary = Office();
+    for (auto const index: std::views::iota(std::size_t { 0 }, Wire::MaxFleetSummaryMembers + 9))
+        summary.members.push_back(std::format("n-{}", index));
+    summary.memberTotal = summary.members.size();
+    auto const key = Testing::TestKeyPair("n-office");
+    auto reply = Wire::FleetSummaryReply { .summary = summary };
+    reply.publicKey = key.PublicKey();
+    reply.signature = SignLabelled(key, Cluster::FleetSummaryMessage(script, reply.summary, reply.publicKey));
+    Testing::ScriptedDialer dialer { { Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeFleetSummaryReply(reply)) } };
+    core::platform::ManualClock clock;
+    Testing::ScriptedSecureRandom random { script };
+    DialledFleetProbe probe { dialer, random, clock };
+
+    auto const proven = probe.AskSummary("office.example:6674");
+    REQUIRE(proven.has_value());
+    CHECK(proven->Summary() == summary);
+    CHECK(proven->Key() == key.PublicKey());
+    CHECK(dialer.Dialed() == std::vector<std::string> { "office.example:6674" });
+
+    // A replayed answer is refused here as a seed's is.
+    auto recorded = NonceScript();
+    recorded[0] = std::byte { 0xEE };
+    Testing::ScriptedDialer replaying { { SignedOver(recorded) } };
+    Testing::ScriptedSecureRandom again { NonceScript() };
+    DialledFleetProbe second { replaying, again, clock };
+    auto const refused = second.AskSummary("office.example:6674");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().contains("not signed over this question"));
 }
 
 TEST_CASE("A probe refuses an answer signed over another question, naming the seed", "[node][formation][summary]")

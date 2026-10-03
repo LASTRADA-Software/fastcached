@@ -10,6 +10,7 @@
 #include "SchedulerLink.hpp"
 #include "SchedulerReachability.hpp"
 
+#include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -22,6 +23,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stop_token>
 #include <thread>
 
@@ -56,6 +58,9 @@ struct NodePresenceParts
     IEndpointDialer& dialer;
     /// Where the host's resume and network events arrive; either runs the next round at once.
     IHostEvents& hostEvents;
+    /// The fleets this machine once asked, read per round and handed to the leader; null where no
+    /// formation record is kept.
+    Cluster::IAskedJoinsSource const* askedJoins {};
 };
 
 /// Per-call send/recv ceiling on the presence loop's connection to a scheduler: the ceiling of
@@ -83,6 +88,7 @@ struct PresenceRound
     NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
     /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
     SchedulerReachability& reachability;
+    Cluster::IAskedJoinsSource const* askedJoins;     ///< The fleets it once asked; null where none are kept.
 };
 
 /// Announce this machine once, and hand over the history it owes.
@@ -107,6 +113,7 @@ struct PresenceMessage
     NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
     /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
     SchedulerReachability& reachability;
+    std::span<CompileCacheWire::JoinMemoFields const> joinMemos; ///< The fleets it once asked, as the wire carries them.
 };
 
 /// Make one presence announcement: dial, follow a redirect, fall back, and carry the roster both
@@ -235,6 +242,7 @@ class NodePresence
     IPresenceRoster* _roster;
     NodeProofClient const* _prover;
     SchedulerReachability& _reachability;
+    Cluster::IAskedJoinsSource const* _askedJoins;
 
     /// This machine's capacity record, converted once: it is compiled-in and configured
     /// state, and nothing about it changes between rounds.

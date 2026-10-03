@@ -335,7 +335,7 @@ TEST_CASE("A snapshot the previous build wrote, in its own layout, is refused by
     CHECK(std::ranges::any_of(records, [](auto const& record) {
         return record.message.contains("cannot decode")
                && record.message.contains(std::format("version {}", Testing::PreviousClusterStateVersion))
-               && record.message.contains("reads 8");
+               && record.message.contains("reads 9");
     }));
 }
 
@@ -403,7 +403,7 @@ TEST_CASE("Whether a command can be applied is asked without applying it, in the
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
         CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterCommandVersion)));
-        CHECK(refused.error().context.contains("reads 4"));
+        CHECK(refused.error().context.contains("reads 5"));
     }
 
     SECTION("bytes that are no command at all are damage")
@@ -438,7 +438,7 @@ TEST_CASE("Whether a snapshot can be restored is asked without restoring it, in 
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
         CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
-        CHECK(refused.error().context.contains("reads 8"));
+        CHECK(refused.error().context.contains("reads 9"));
     }
 
     SECTION("bytes that are no state at all are damage")

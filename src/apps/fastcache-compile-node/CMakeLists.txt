@@ -57,6 +57,8 @@ add_executable(fastcache-compile-node
     EnrollClient.cpp
     FormationController.cpp
     FormationEffects.cpp
+    FormationLoop.cpp
+    FormationRuntime.cpp
     RaftStoreArchiver.cpp
     EnrollmentResponder.cpp
     EnrollmentWindow.cpp
@@ -158,6 +160,11 @@ if(FASTCACHED_BUILD_TESTS)
         FormationController_test.cpp
         FormationEffects.cpp
         FormationEffects_test.cpp
+        FormationFleet_test.cpp
+        FormationLoop.cpp
+        FormationLoop_test.cpp
+        FormationRuntime.cpp
+        FormationRuntime_test.cpp
         RaftStoreArchiver.cpp
         RaftStoreArchiver_test.cpp
         FleetForgetPropagation_test.cpp

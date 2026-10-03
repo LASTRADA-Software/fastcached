@@ -8,6 +8,8 @@
 
 #include <format>
 #include <span>
+#include <string>
+#include <string_view>
 #include <utility>
 
 #include <CacheProtocol.hpp>
@@ -34,9 +36,8 @@ DialledFleetProbe::DialledFleetProbe(IEndpointDialer& dialer,
 {
 }
 
-std::expected<Cluster::ProvenFleet, std::string> DialledFleetProbe::Ask(Cluster::SeedCandidate const& seed)
+std::expected<DialledFleetProbe::Answered, std::string> DialledFleetProbe::Exchange(std::string_view endpoint)
 {
-    auto const& endpoint = seed.endpoint;
     // Taken first, so the connect is inside the deadline too.
     auto const deadline = _clock.now() + ExchangeDeadline;
     // Drawn per question and never kept: the nonce is what makes a recorded answer worthless, so
@@ -78,18 +79,47 @@ std::expected<Cluster::ProvenFleet, std::string> DialledFleetProbe::Ask(Cluster:
             return std::unexpected { std::format("{} answered which fleet it is in with nothing", endpoint) };
     }
 
-    auto const reply = Wire::DecodeFleetSummaryReply(outcome.value);
+    auto reply = Wire::DecodeFleetSummaryReply(outcome.value);
     if (!reply.has_value())
         return std::unexpected { std::format("{} answered which fleet it is in with a reply this build cannot read",
                                              endpoint) };
+    return Answered { .held = std::move(nonce->held), .reply = *std::move(reply) };
+}
+
+namespace
+{
+    /// What a probe says of an answer whose signature does not verify over its question.
+    /// @param endpoint Whom it asked.
+    /// @return The sentence.
+    [[nodiscard]] std::string NotSignedOverThisQuestion(std::string_view endpoint)
+    {
+        return std::format(
+            "{} answered which fleet it is in with a summary not signed over this question by the key it carries", endpoint);
+    }
+} // namespace
+
+std::expected<Cluster::ProvenFleet, std::string> DialledFleetProbe::Ask(Cluster::SeedCandidate const& seed)
+{
+    auto answered = Exchange(seed.endpoint);
+    if (!answered.has_value())
+        return std::unexpected { std::move(answered).error() };
 
     // Only what the signature proves, over THIS question's nonce: an answer signed over another
     // nonce is somebody replaying one, and names nobody here.
-    auto proven = Cluster::ProvenFleet::FromSeedAnswer(std::move(nonce->held), *reply, seed.source);
+    auto proven = Cluster::ProvenFleet::FromSeedAnswer(std::move(answered->held), answered->reply, seed.source);
     if (!proven.has_value())
-        return std::unexpected { std::format(
-            "{} answered which fleet it is in with a summary not signed over this question by the key it carries",
-            endpoint) };
+        return std::unexpected { NotSignedOverThisQuestion(seed.endpoint) };
+    return *std::move(proven);
+}
+
+std::expected<Cluster::ProvenFleetSummary, std::string> DialledFleetProbe::AskSummary(std::string_view endpoint)
+{
+    auto answered = Exchange(endpoint);
+    if (!answered.has_value())
+        return std::unexpected { std::move(answered).error() };
+    auto proven = Cluster::ProvenFleetSummary::VerifyAnswer(std::move(answered->held), answered->reply);
+    if (!proven.has_value())
+        return std::unexpected { NotSignedOverThisQuestion(endpoint) };
     return *std::move(proven);
 }
 

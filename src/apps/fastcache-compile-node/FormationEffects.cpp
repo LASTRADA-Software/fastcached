@@ -108,8 +108,8 @@ std::expected<void, std::string> CheckAdmission(JoinerIdentity const& self,
             "the fleet admitted {} with a roster this build cannot read: {}", self.nodeId, decoded.error().context) };
     if (!RosterRecordsJoiner(*decoded, self.nodeId, self.publicKey, self.role))
         return std::unexpected { std::format("the fleet said {} was admitted, and the roster it sent does not record "
-                                             "{} as a {} under this machine's key: whoever answered is not the cluster "
-                                             "this node asked, or an operator approved another key for this id",
+                                             "{} as a {} under this machine's key: an operator approved another key "
+                                             "for this id",
                                              self.nodeId,
                                              self.nodeId,
                                              EnrollRoleRowFor(self.role).name) };
@@ -123,11 +123,10 @@ std::expected<void, std::string> CheckAdmission(JoinerIdentity const& self,
     if (!vouched)
         return std::unexpected { std::format(
             "the roster that admits {} records no member under the key that proved the fleet {} this node asked{}: "
-            "whoever answered at {} is not that fleet",
+            "it is not the fleet this node decided to join",
             self.nodeId,
             target.summary.clusterId,
-            speaker.empty() ? std::string {} : std::format(" (its member {})", speaker),
-            target.summary.leaderNodeEndpoint) };
+            speaker.empty() ? std::string {} : std::format(" (its member {})", speaker)) };
     return {};
 }
 
@@ -135,7 +134,6 @@ std::expected<Cluster::FormationRecord, std::string> DissolveInto(Cluster::Forma
                                                                   std::span<std::byte const> roster,
                                                                   JoinerIdentity const& self,
                                                                   Cluster::IFormationStore& store,
-                                                                  IStoreArchiver& archiver,
                                                                   Cluster::FleetEndpointsFile& endpoints,
                                                                   ILogger& logger)
 {
@@ -160,11 +158,19 @@ std::expected<Cluster::FormationRecord, std::string> DissolveInto(Cluster::Forma
                                             .roster = { roster.begin(), roster.end() },
                                             .createdAtUnixSeconds = target.createdAtUnixSeconds };
     next.archivePending = Cluster::CurrentClusterId(pending);
+    // The memo of this ask becomes one no later ask displaces: the fleet admitted this node under it.
+    Cluster::RememberAdmitted(next, target.clusterId, pending.joining->provenKey);
     next.joining.reset();
-    if (auto saved = SaveOrSay(store, next, std::format("this node as a learner of {}", target.clusterId));
-        !saved.has_value())
-        return std::unexpected { std::move(saved).error() };
 
+    // The fleet's voters are remembered BEFORE the record is saved, because that save is where the move
+    // is judged (`IShapeJudge`), and the judge reads this file: the learner's schedulers are derived from
+    // it (`ApplyFormation`), as the reform that adopts the record and every restart derive them. Written
+    // after, the judge would weigh a learner with no fleet schedulers -- a shape no restart sees -- and
+    // pass a record the reform then refuses. ONE source of truth, the file, read at one moment by all
+    // three. Safe when the save is refused or fails: the file names its cluster, and a learner's
+    // schedulers are read from it only for a record naming that cluster, so a node still pending on the
+    // fleet holds a hint about the very fleet it asked, nothing more.
+    //
     // A hint, so a failure is said and never stops the move: no state of that file may keep a node
     // from joining, any more than from starting.
     if (decoded.has_value())
@@ -175,14 +181,14 @@ std::expected<Cluster::FormationRecord, std::string> DissolveInto(Cluster::Forma
                         target.clusterId,
                         remembered.error().context);
 
-    if (auto finished = FinishArchive(next, store, archiver); !finished.has_value())
-        return std::unexpected { std::move(finished).error() };
+    if (auto saved = SaveOrSay(store, next, std::format("this node as a learner of {}", target.clusterId));
+        !saved.has_value())
+        return std::unexpected { std::move(saved).error() };
     return next;
 }
 
 std::expected<Cluster::FormationRecord, std::string> ArchiveAndMint(Cluster::FormationRecord const& forgotten,
                                                                     Cluster::IFormationStore& store,
-                                                                    IStoreArchiver& archiver,
                                                                     ISecureRandom& random,
                                                                     core::platform::IWallClock const& wall)
 {
@@ -203,9 +209,60 @@ std::expected<Cluster::FormationRecord, std::string> ArchiveAndMint(Cluster::For
     if (auto saved = SaveOrSay(store, next, std::format("this node alone in a new cluster {}", next.own.clusterId));
         !saved.has_value())
         return std::unexpected { std::move(saved).error() };
+    return next;
+}
 
-    if (auto finished = FinishArchive(next, store, archiver); !finished.has_value())
-        return std::unexpected { std::move(finished).error() };
+std::expected<Cluster::FormationRecord, std::string> LeaveForSurvivor(Cluster::FormationRecord const& member,
+                                                                      Cluster::DissolveOrder const& order,
+                                                                      Cluster::IFormationStore& store,
+                                                                      ISecureRandom& random,
+                                                                      core::platform::IWallClock const& wall)
+{
+    auto const left = Cluster::CurrentClusterId(member);
+    // For `DissolveInto`'s reason: the survivor's id may one day name the archive of its store here.
+    if (!IsArchivableClusterId(order.clusterId))
+        return std::unexpected { std::format("will not leave for the fleet {}: its id could not name the archive this "
+                                             "node would keep its store in",
+                                             BoundedPeerText(order.clusterId, CompileCacheWire::MaxIdBytes)) };
+    if (order.clusterId == left)
+        return std::unexpected { std::format("the order names {}, the fleet this node is in; a fleet does not "
+                                             "dissolve into itself",
+                                             left) };
+
+    auto minted = Cluster::MintSolitary(random, wall);
+    if (!minted.has_value())
+        return std::unexpected { std::format("cannot mint a new cluster: {}", minted.error().detail) };
+    auto const asked = minted->own.createdAtUnixSeconds; // read off the same clock, a moment ago
+
+    auto next = member;
+    next.mode = Cluster::NodeMode::Pending;
+    next.own = minted->own;
+    next.fleet.reset();
+    next.archivePending = left;
+    next.joining =
+        Cluster::JoinTarget { .summary = CompileCacheWire::FleetSummary { .clusterId = order.clusterId,
+                                                                          .state = CompileCacheWire::FleetState::Established,
+                                                                          .createdAtUnixSeconds = order.createdAtUnixSeconds,
+                                                                          .leaderId = {},
+                                                                          .leaderNodeEndpoint = order.leaderNodeEndpoint,
+                                                                          .nodeId = {},
+                                                                          .raftEndpoint = {},
+                                                                          .members = {},
+                                                                          .memberTotal = 0,
+                                                                          .nodeEndpoint = {},
+                                                                          .leaderKey = order.leaderKey,
+                                                                          .pointsAt = {} },
+                              .provenKey = order.provenKey,
+                              .askedAtUnixSeconds = asked };
+    Cluster::RememberAsked(
+        next,
+        Cluster::AskedJoin { .clusterId = order.clusterId, .provenKey = order.provenKey, .askedAtUnixSeconds = asked });
+    if (auto saved = SaveOrSay(
+            store,
+            next,
+            std::format("this node leaving {} for {}, in a new cluster {}", left, order.clusterId, next.own.clusterId));
+        !saved.has_value())
+        return std::unexpected { std::move(saved).error() };
     return next;
 }
 

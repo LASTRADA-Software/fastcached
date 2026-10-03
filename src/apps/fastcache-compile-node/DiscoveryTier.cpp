@@ -30,6 +30,18 @@ namespace
         void OnFleetProven(Cluster::ProvenFleet const& /*fleet*/) override {}
     };
 
+    /// What a node with no formation controller can say about another fleet: nothing proves a split,
+    /// since the evidence is read from a formation record and the fleet's state, which the controller
+    /// holds. So every established fleet seen is foreign, as it was before split healing existed.
+    class NoSplitEvidence final: public Cluster::ISplitEvidenceSource
+    {
+      public:
+        [[nodiscard]] Cluster::SplitReading ReadSplit(Cluster::ProvenFleetSummary const& /*seen*/) const override
+        {
+            return Cluster::SplitReading {};
+        }
+    };
+
     /// @param addresses Destinations.
     /// @return Them as `host:port`, joined by `, `, for a log line.
     [[nodiscard]] std::string Listed(std::span<core::net::DatagramAddress const> addresses)
@@ -61,6 +73,7 @@ struct DiscoveryTier::Production
 {
     core::platform::SteadyClock clock;
     SystemSecureRandom random;
+    NoSplitEvidence evidence;
     NoFormation fleets;
     std::unique_ptr<IInterfaceAddressSource> interfaces = MakeSystemInterfaceAddresses();
 };
@@ -115,7 +128,7 @@ DiscoveryTier::DiscoveryTier(Parts parts):
     _socket { std::move(parts.socket) },
     _clock { parts.clock },
     _directory { _clock, parts.self, parts.keys },
-    _watch { parts.self, _clock, parts.conditions, parts.fleets },
+    _watch { parts.self, parts.evidence, _clock, parts.conditions, parts.fleets, parts.config.beaconInterval },
     _beaconInterval { parts.config.beaconInterval },
     // Due immediately rather than one interval from now: a node that waited would be
     // invisible to a segment that is already up for as long as its own interval, and
@@ -137,7 +150,8 @@ std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> DiscoveryTier::Start(
                                                                                 NodeConditions& conditions,
                                                                                 PeerObserver onPeers,
                                                                                 IMetricsSink& metrics,
-                                                                                ILogger& logger)
+                                                                                ILogger& logger,
+                                                                                DiscoveryFormation formation)
 {
     // The ANNOUNCE address -- where beacons are sent. Only its host is read here; the
     // port and everything bound come from the row below, so the two cannot disagree.
@@ -237,7 +251,8 @@ std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> DiscoveryTier::Start(
                              .keys = keys,
                              .self = self,
                              .conditions = conditions,
-                             .fleets = production->fleets,
+                             .evidence = formation.evidence != nullptr ? *formation.evidence : production->evidence,
+                             .fleets = formation.fleets != nullptr ? *formation.fleets : production->fleets,
                              .onPeers = std::move(onPeers),
                              .metrics = metrics,
                              .logger = logger });
@@ -461,14 +476,16 @@ std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> StartDiscoveryOrExpla
     Cluster::IFleetSummarySource const& self,
     NodeConditions& conditions,
     IMetricsSink& metrics,
-    ILogger& logger)
+    ILogger& logger,
+    DiscoveryFormation formation)
 {
     // A node that runs consensus and no discovery can see no other fleet, which is an answer
     // about the row rather than a clear one: said, with why, so it never reads `undecided`.
     // A node with no consensus has the row answered by its scope (`NodeConditions::Settle`).
     auto const standDown = [&](std::string_view why) {
         if (consensus != nullptr)
-            conditions.NotEvaluated(NodeCondition::ForeignFleetVisible, why);
+            for (auto const condition: ForeignFleetWatch::WatchedConditions)
+                conditions.NotEvaluated(condition, why);
         return std::unique_ptr<DiscoveryTier> {};
     };
 
@@ -526,7 +543,8 @@ std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> StartDiscoveryOrExpla
             consensus->Desire(peers);
         },
         metrics,
-        logger);
+        logger,
+        formation);
 }
 
 } // namespace FastCache::Node

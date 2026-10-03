@@ -99,12 +99,14 @@ struct NodeModeRow
 /// carries no `Last`. Completeness is asserted against `KnownNodeModes` instead.
 ///
 /// A pending node is still its solitary cluster and keeps serving exactly as one, so its row
-/// differs from `Solitary`'s in its name and in `members` alone: it has asked a fleet to take it,
-/// so other machines are about to be its members -- the strongest signal there is that remote
-/// ones are coming. A learner's Raft surface is closed because the
-/// leader never dials a learner: the learner dials in, and the session carries both ways. A voter
-/// serves the scheduler, which answers `Lease` only while this node leads; a fleet's founder is
-/// its first voter and its first leader.
+/// differs from `Solitary`'s in its name, in `members` and in what it announces: it has asked a
+/// fleet to take it, so other machines are about to be its members -- the strongest signal there is
+/// that remote ones are coming -- and its summary points at that fleet (`FleetState::Pending`), so a
+/// node meeting it joins the fleet it asked rather than a cluster about to be left.
+///
+/// A learner's Raft surface is closed because the leader never dials a learner: the learner dials
+/// in, and the session carries both ways. A voter serves the scheduler, which answers `Lease` only
+/// while this node leads; a fleet's founder is its first voter and its first leader.
 inline constexpr std::array NodeModeTable {
     NodeModeRow { .mode = NodeMode::Solitary,
                   .name = "solitary",
@@ -118,7 +120,7 @@ inline constexpr std::array NodeModeTable {
                   .name = "pending",
                   .consensus = ConsensusScope::OwnCluster,
                   .raftListener = RaftListenerState::Open,
-                  .announces = CompileCacheWire::FleetState::Solitary,
+                  .announces = CompileCacheWire::FleetState::Pending,
                   .scheduler = SchedulerDuty::Serves,
                   .dials = Consensus::RaftWire::SessionDirection::OneWay,
                   .members = FleetReach::Beyond },

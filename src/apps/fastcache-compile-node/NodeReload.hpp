@@ -4,6 +4,7 @@
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeDefaults.hpp"
+#include "NodeFormation.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeMembership.hpp"
 
@@ -12,8 +13,11 @@
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Core/Logger.hpp>
 
+#include <expected>
+#include <functional>
 #include <optional>
 #include <span>
+#include <string>
 
 namespace FastCache::Node
 {
@@ -29,18 +33,28 @@ namespace FastCache::Node
 /// `ConfigReloaderOf<NodeConfig>` again, which is a second name for one concept.
 using NodeReloader = ConfigReloaderOf<NodeConfig>;
 
+/// Reads the formation the RUNNING body was adopted from: the record and the remembered endpoints,
+/// never minting (`RunningFormationOf` in production).
+///
+/// Asked at every reload rather than carried from the start, because a reform changes the record
+/// while the process runs: a candidate shaped by the record the START kept would put the node back,
+/// in its live configuration, into a mode it has left -- and the worker reads where it registers
+/// from there. And never the FILE, which a move saves before the body it ends has drained: a
+/// candidate shaped by that is a mode the node has not entered.
+using KeptFormationReader = std::function<std::expected<KeptFormation, std::string>()>;
+
 /// What the start resolved ONCE, which every reload candidate is shaped by again rather than
 /// resolving.
 ///
-/// A reload runs on a signal: it must not mint, re-derive a directory or re-ask DNS, since any of
-/// those could land somewhere the running node is not. So the start's answers travel here.
+/// A reload must not mint, re-derive a directory or re-ask DNS, since any of those could land
+/// somewhere the running node is not. So the start's answers travel here -- all but the formation,
+/// which a reform changes and is read as the running body adopted it (`KeptFormationReader`).
 struct ReloadBasis
 {
     std::optional<NodeStateDirectoryChoice> stateDirectory; ///< Where the start put this node's state.
     NodeHostNames hostNames;                                ///< This machine's names, as the start asked them.
-    Cluster::FormationRecord formation;                     ///< The record the start kept; a reload never mints one.
-    Cluster::FleetEndpoints remembered;                     ///< The fleet endpoints the start last knew.
-    NodeIdentity identity;                                  ///< The id and key the start resolved.
+    KeptFormationReader formation; ///< The formation the running body adopted; a reload never mints one.
+    NodeIdentity identity;         ///< The id and key the start resolved.
 };
 
 /// How the node's reloader reads its file: a FRESH configuration, the file applied through the

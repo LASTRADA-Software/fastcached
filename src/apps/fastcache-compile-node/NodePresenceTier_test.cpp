@@ -21,6 +21,7 @@
 #include "NodeRoster.hpp"
 #include "SchedulerReachability.hpp"
 
+#include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
@@ -53,6 +54,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/FleetHistoryFakes.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScriptedHostEvents.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -115,6 +117,25 @@ class SilentLoadSampler final: public IHostLoadSampler
     return frames;
 }
 
+/// A formation record's memos, handed on as the formation controller hands them.
+class ListedAskedJoins final: public Cluster::IAskedJoinsSource
+{
+  public:
+    /// @param joins What the record keeps.
+    explicit ListedAskedJoins(std::vector<Cluster::AskedJoin> joins):
+        _joins { std::move(joins) }
+    {
+    }
+
+    [[nodiscard]] std::vector<Cluster::AskedJoin> AskedJoins() const override
+    {
+        return _joins;
+    }
+
+  private:
+    std::vector<Cluster::AskedJoin> _joins;
+};
+
 /// Everything one presence round needs, with a sampler holding one closed bucket.
 ///
 /// The bucket is produced the way the node produces one -- a sample, a minute of wall clock,
@@ -132,6 +153,7 @@ struct PresenceFixture
     NodeConditions conditions;
     core::platform::ManualClock clock;
     SchedulerReachability reachability { clock, &conditions };
+    Cluster::IAskedJoinsSource const* askedJoins { nullptr }; ///< What the machine once asked; none by default.
 
     PresenceFixture()
     {
@@ -160,7 +182,8 @@ struct PresenceFixture
                                .roster = nullptr,
                                // Nothing proves: the scripted fleet serves no handshake (#178).
                                .prover = nullptr,
-                               .reachability = reachability };
+                               .reachability = reachability,
+                               .askedJoins = askedJoins };
     }
 
     /// Announce once through @p dialer.
@@ -186,6 +209,36 @@ struct PresenceFixture
 };
 
 } // namespace
+
+TEST_CASE("A presence round hands the leader every fleet this machine once asked", "[node][presence][formation]")
+{
+    // The evidence a split of the fleet is told on must reach the LEADER whichever machine asked, so it
+    // rides the one verb every node sends, read afresh each round from the record.
+    auto const office = Testing::TestKeyPair("n-office").PublicKey();
+    auto const lab = Testing::TestKeyPair("n-lab").PublicKey();
+    ListedAskedJoins const joins {
+        { Cluster::AskedJoin { .clusterId = "c-office", .provenKey = office, .askedAtUnixSeconds = 1 },
+          Cluster::AskedJoin { .clusterId = "c-lab", .provenKey = lab, .askedAtUnixSeconds = 2 } }
+    };
+    PresenceFixture fixture;
+    fixture.askedJoins = &joins;
+    Testing::ScriptedDialer dialer { { Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}) } };
+    REQUIRE(fixture.AnnounceThrough(dialer));
+
+    auto const frames = FramesIn(dialer.SentOn(0));
+    REQUIRE(frames.size() == 1);
+    auto const announced = Unwrap(Wire::DecodeNodeAnnouncePayload(frames.front().second));
+    CHECK(announced.joinMemos
+          == std::vector { Wire::JoinMemoFields { .clusterId = "c-office", .provenKey = office },
+                           Wire::JoinMemoFields { .clusterId = "c-lab", .provenKey = lab } });
+
+    // A machine that keeps no record announces none -- an empty list, never an absent field.
+    PresenceFixture plain;
+    Testing::ScriptedDialer second { { Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}) } };
+    REQUIRE(plain.AnnounceThrough(second));
+    auto const none = Unwrap(Wire::DecodeNodeAnnouncePayload(FramesIn(second.SentOn(0)).front().second));
+    CHECK(none.joinMemos.empty());
+}
 
 TEST_CASE("A machine announces itself under its own address and hands over its history", "[node][presence][fleethistory]")
 {
@@ -278,7 +331,8 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
                                                               .conditions = conditions,
                                                               .roster = nullptr,
                                                               .prover = nullptr,
-                                                              .reachability = reachability },
+                                                              .reachability = reachability,
+                                                              .askedJoins = nullptr },
                                               link,
                                               dialer);
 

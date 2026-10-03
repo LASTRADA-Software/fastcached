@@ -108,7 +108,10 @@ std::vector<std::byte> FleetSummaryResponder::AnswerOnce(std::span<std::byte con
 
 std::vector<std::byte> FleetSummaryResponder::Sign(std::span<std::byte const> nonce) const
 {
-    auto summary = _self.Current();
+    // Cut to what a reply carries, the list up to `MaxFleetSummaryReplyMembers`, with `memberTotal`
+    // saying when it was cut: a seed's answer, which the node that dialled it reads its split evidence
+    // over as it reads a beacon's.
+    auto summary = Wire::WithMembersAtMost(_self.Current(), Wire::MaxFleetSummaryReplyMembers);
     if (summary.clusterId.empty())
         return Cc::RefuseWithoutCounter(NoFleetToOffer, "this node runs no consensus, so it belongs to no fleet");
 

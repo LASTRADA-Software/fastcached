@@ -17,9 +17,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -559,7 +561,8 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
                                                        .load = load,
                                                        .logger = logger,
                                                        .prover = nullptr,
-                                                       .reachability = reachability },
+                                                       .reachability = reachability,
+                                                       .joinMemos = {} },
                                      nullptr,
                                      link,
                                      dialer));
@@ -620,19 +623,27 @@ TEST_CASE("A worker with no configuration file presents what it was started with
     CHECK(credential.Current().Configured());
 }
 
-TEST_CASE("Only the seam derives a credential from the configuration", "[node][credential][seam]")
+namespace
 {
-    // **The guard is a scan, because nothing forces a site to reach for the seam.**
-    //
-    // The type system stops a site that HOLDS an `ICredentialSource const&` from going
-    // stale -- there is no field to be stale in. It says nothing about a fourth site
-    // that never asks for one and builds its own `Cc::Credential` from `cfg.token`
-    // instead, which is exactly what the three sites this ticket is about did. That is
-    // the rulebook's split: a guard folded INTO the operation is self-enforcing, a
-    // guard nothing compels needs a scan.
-    //
-    // Test sources are excluded and they must be: this very file constructs
-    // credentials, which is what makes it able to say what a rotation looks like.
+
+/// One non-test source of this binary's directory, with its full-line comments dropped.
+struct NodeSource
+{
+    std::string name; ///< Its file name.
+    std::string code; ///< Its text, every line that is only a `//` comment blanked.
+};
+
+/// Every non-test `.cpp` and `.hpp` of `src/apps/fastcache-compile-node`, read whole.
+///
+/// **The `[node][credential][seam]` cases walk this, and that is why they are scans**: nothing
+/// forces a site to reach for the seam, or a leg to hold no source. A guard folded INTO an
+/// operation is self-enforcing; a guard nothing compels needs a scan.
+///
+/// Test sources are excluded and they must be: the case files construct credentials, which is
+/// what makes them able to say what a rotation looks like.
+/// @return One entry per file.
+[[nodiscard]] std::vector<NodeSource> NodeSourcesWithoutComments()
+{
     std::filesystem::path const nodeDir =
         std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node";
     REQUIRE(std::filesystem::is_directory(nodeDir));
@@ -658,13 +669,10 @@ TEST_CASE("Only the seam derives a credential from the configuration", "[node][c
         return out;
     };
 
-    std::vector<std::string> offenders;
-    std::size_t scanned = 0;
-    bool seamConstructsOne = false;
-
+    auto sources = std::vector<NodeSource> {};
     for (auto const& entry: std::filesystem::directory_iterator { nodeDir })
     {
-        auto const name = entry.path().filename().string();
+        auto name = entry.path().filename().string();
         auto const extension = entry.path().extension().string();
         if (extension != ".cpp" && extension != ".hpp")
             continue;
@@ -689,10 +697,138 @@ TEST_CASE("Only the seam derives a credential from the configuration", "[node][c
         contents << in.rdbuf();
         auto const text = std::move(contents).str();
         REQUIRE_FALSE(text.empty());
-        ++scanned;
+        sources.push_back(NodeSource { .name = std::move(name), .code = withoutComments(text) });
+    }
+    return sources;
+}
 
-        auto const code = withoutComments(text);
-        auto const constructs = code.contains("Cc::Credential {") || code.contains("Cc::Credential{");
+/// Why a file of this directory may name a credential source at all. Private to this file: never
+/// transmitted or persisted.
+enum class HolderKind : std::uint8_t
+{
+    Seam,     ///< Declares the source, or builds the one production instance of it.
+    Upstream, ///< The `--upstream` leg: the cache behind it is what checks `--requirepass`.
+    Fixture,  ///< A test helper that is not a `_test.cpp`.
+    Retiring, ///< A leg that still presents it, to an endpoint an operator or the fleet named.
+};
+
+/// A file allowed to hold a credential -- a source, or a `Cc::Credential` value -- and why.
+struct CredentialHolderRow
+{
+    std::string_view file; ///< Its name in `src/apps/fastcache-compile-node`.
+    HolderKind kind;       ///< Why it may.
+    std::string_view why;  ///< What it presents, and to whom.
+};
+
+/// **The positive list: every non-test file here that holds a credential, source or value, and no other.**
+///
+/// A source is `--requirepass`, and the one service that checks a password is the cache behind
+/// `--upstream`. A leg presenting it anywhere else hands the secret, in the clear and ahead of any
+/// seal, to an endpoint that checks nothing -- the enroll channel did, once a beat, to whatever
+/// machine a beacon named. A file absent from this list is refused by name, so a new holder is a
+/// new ROW with a reason rather than a forgotten argument; and a row whose file names no source
+/// any more is refused as stale, so a `Retiring` row leaves with the leg it describes.
+constexpr auto CredentialHolders = std::array {
+    CredentialHolderRow { .file = "NodeCredential.hpp",
+                          .kind = HolderKind::Seam,
+                          .why = "declares the source and its one production implementation" },
+    CredentialHolderRow { .file = "main.cpp",
+                          .kind = HolderKind::Seam,
+                          .why = "builds the source from the live configuration and hands it to the legs below" },
+    CredentialHolderRow { .file = "CacheTier.hpp",
+                          .kind = HolderKind::Upstream,
+                          .why = "takes the source for the --upstream leg it builds, and for nothing else" },
+    CredentialHolderRow { .file = "RemoteUpstream.hpp",
+                          .kind = HolderKind::Upstream,
+                          .why = "the --upstream leg: presents --requirepass to the cache that checks it" },
+    CredentialHolderRow { .file = "RemoteUpstream.cpp",
+                          .kind = HolderKind::Upstream,
+                          .why = "the --upstream leg: presents --requirepass to the cache that checks it" },
+    CredentialHolderRow { .file = "OperatorCredentials.hpp",
+                          .kind = HolderKind::Seam,
+                          .why = "what an operator's one-shot verb presents to each endpoint (Cc::ICredentialFor): this "
+                                 "machine's node's ticket, and --requirepass to --upstream alone" },
+    CredentialHolderRow { .file = "OperatorCredentials.cpp",
+                          .kind = HolderKind::Seam,
+                          .why = "builds that per-endpoint seam from the configuration the verb was invoked with" },
+    CredentialHolderRow { .file = "ClusterAdminCli.hpp",
+                          .kind = HolderKind::Retiring,
+                          .why = "an operator's cluster verb, to the --scheduler the operator typed" },
+    CredentialHolderRow { .file = "ClusterAdminCli.cpp",
+                          .kind = HolderKind::Retiring,
+                          .why = "an operator's cluster verb, to the --scheduler the operator typed" },
+    CredentialHolderRow {
+        .file = "EnrollClient.hpp",
+        .kind = HolderKind::Retiring,
+        .why = "--enroll-from and its admin verbs: every pre-auth Enroll poll presents it to the seed the operator "
+               "typed AND to each endpoint an unsigned NotLeader redirect names; integration's polls "
+               "present none" },
+    CredentialHolderRow {
+        .file = "EnrollClient.cpp",
+        .kind = HolderKind::Retiring,
+        .why = "--enroll-from and its admin verbs: every pre-auth Enroll poll presents it to the seed the operator "
+               "typed AND to each endpoint an unsigned NotLeader redirect names; integration's polls "
+               "present none" },
+};
+
+/// What marks a file as holding a credential: a source, or a credential VALUE.
+///
+/// A value is the shape a source is turned into one call before it is presented, so a leg handed
+/// one by `main` -- `Cc::Credential const& credential` -- presents a secret as surely as a leg
+/// holding the source does, and a list of source names alone is blind to it.
+///
+/// **What no needle finds, and the direction it fails in: OPEN.** A source's `Current()` handed
+/// straight into a callee that takes the value under another spelling -- `auto`, an alias, a
+/// template, or a callee outside this directory -- names neither, so a file presenting a credential
+/// that way is not refused here.
+constexpr auto CredentialNeedles = std::array<std::string_view, 6> {
+    "ICredentialSource",    // the source
+    "ConfiguredCredential", // its production implementation
+    "ICredentialFor",       // the per-endpoint seam an operator's one-shot verb asks
+    "Cc::Credential ",      // a value or a `const&` declared: `Cc::Credential credential`, `Cc::Credential const&`
+    "Cc::Credential&",      // a reference spelled without a space
+    "Cc::Credential>",      // one inside a template: `std::optional<Cc::Credential>`
+};
+
+/// Whether @p code holds a credential.
+/// @param code A file's text with its comments dropped.
+/// @return True when it contains any of `CredentialNeedles`.
+[[nodiscard]] bool NamesCredentialSource(std::string_view code)
+{
+    return std::ranges::any_of(CredentialNeedles, [code](std::string_view needle) { return code.contains(needle); });
+}
+
+/// @param names What to join.
+/// @return @p names, comma-separated.
+[[nodiscard]] std::string Joined(std::vector<std::string> const& names)
+{
+    std::string joined;
+    for (auto const& name: names)
+        joined += (joined.empty() ? "" : ", ") + name;
+    return joined;
+}
+
+} // namespace
+
+TEST_CASE("Only the seam derives a credential from the configuration", "[node][credential][seam]")
+{
+    // **The guard is a scan, because nothing forces a site to reach for the seam.**
+    //
+    // The type system stops a site that HOLDS an `ICredentialSource const&` from going
+    // stale -- there is no field to be stale in. It says nothing about a fourth site
+    // that never asks for one and builds its own `Cc::Credential` from `cfg.token`
+    // instead, which is exactly what the three sites this ticket is about did. That is
+    // the rulebook's split: a guard folded INTO the operation is self-enforcing, a
+    // guard nothing compels needs a scan.
+    std::vector<std::string> offenders;
+    std::size_t scanned = 0;
+    bool seamConstructsOne = false;
+
+    for (auto const& [name, code]: NodeSourcesWithoutComments())
+    {
+        ++scanned;
+        auto const constructs = code.contains("Cc::Credential {") || code.contains("Cc::Credential{")
+                                || code.contains("decltype(NoCredential())");
         if (name == "NodeCredential.hpp")
         {
             seamConstructsOne = constructs;
@@ -710,11 +846,63 @@ TEST_CASE("Only the seam derives a credential from the configuration", "[node][c
     INFO("the seam itself must construct one, or the pattern below means nothing");
     CHECK(seamConstructsOne);
 
-    INFO("deriving a credential outside NodeCredential.hpp: " << [&] {
-        std::string joined;
-        for (auto const& name: offenders)
-            joined += (joined.empty() ? "" : ", ") + name;
-        return joined;
-    }());
+    INFO("deriving a credential outside NodeCredential.hpp: " << Joined(offenders));
     CHECK(offenders.empty());
+}
+
+TEST_CASE("The holder scan finds a credential held by value and says what it cannot find", "[node][credential][seam]")
+{
+    // Each needle against the shape it exists for, planted: a needle that stopped matching reads
+    // exactly like a tree with no such holder.
+    CHECK(NamesCredentialSource("void Prove(std::string const& endpoint, Cc::Credential const& credential);"));
+    CHECK(NamesCredentialSource("    Cc::Credential _held;"));
+    CHECK(NamesCredentialSource("void Present(Cc::Credential& credential);"));
+    CHECK(NamesCredentialSource("std::optional<Cc::Credential> maybe;"));
+    CHECK(NamesCredentialSource("Node::ICredentialSource const& credential"));
+    CHECK(NamesCredentialSource("ConfiguredCredential source { reloader };"));
+    CHECK(NamesCredentialSource("void Run(ClusterRequest const& request, Cc::ICredentialFor& credentials);"));
+
+    // The stated blind spot, pinned: a source's value handed straight through is not found. Fails
+    // OPEN, which is why `CredentialNeedles` says so -- and the day a needle covers it, this line goes.
+    CHECK_FALSE(NamesCredentialSource("client.Prove(endpoint, proof.credential->Current());"));
+
+    // And nothing about a credential at all is not a holder.
+    CHECK_FALSE(NamesCredentialSource("auto const credential = NoCredential();"));
+}
+
+TEST_CASE("Only the files the holder list names hold a credential source", "[node][credential][seam]")
+{
+    // A credential presented where nothing checks it is a secret handed to whoever answers, and a
+    // leg that HOLDS a source is invisible to the scan above, which looks for a credential BUILT
+    // outside the seam. So the holders are a list, judged in both directions.
+    auto const sources = NodeSourcesWithoutComments();
+    REQUIRE(sources.size() > 20);
+
+    auto unlisted = std::vector<std::string> {};
+    for (auto const& [name, code]: sources)
+        if (NamesCredentialSource(code) && !std::ranges::contains(CredentialHolders, name, &CredentialHolderRow::file))
+            unlisted.push_back(name);
+
+    auto stale = std::vector<std::string> {};
+    for (auto const& row: CredentialHolders)
+    {
+        auto const holds = std::ranges::any_of(sources, [&row](NodeSource const& source) {
+            return source.name == row.file && NamesCredentialSource(source.code);
+        });
+        if (!holds)
+            stale.emplace_back(row.file);
+    }
+
+    // The positive control: the pattern still finds the seam, so an empty `unlisted` is a finding
+    // about the tree rather than about a spelling that stopped matching.
+    CHECK(std::ranges::any_of(sources, [](NodeSource const& source) {
+        return source.name == "NodeCredential.hpp" && NamesCredentialSource(source.code);
+    }));
+
+    INFO("holding a credential source with no CredentialHolders row -- a credential is presented to the "
+         "cache behind --upstream and to nothing else: "
+         << Joined(unlisted));
+    CHECK(unlisted.empty());
+    INFO("CredentialHolders rows whose file names no credential source any more -- delete them: " << Joined(stale));
+    CHECK(stale.empty());
 }

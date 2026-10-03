@@ -9,12 +9,15 @@
 
 #include <array>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <tests/ScratchPath.hpp>
 
@@ -44,6 +47,36 @@ TEST_CASE("ConfigReloader: Current() returns the initial snapshot", "[config][re
     auto const snapshot = reloader.Current();
     REQUIRE(snapshot->bindAddress == "127.0.0.1");
     REQUIRE(snapshot->port == 11500);
+}
+
+TEST_CASE("A published configuration is the live snapshot and every subscriber is told", "[config][reload]")
+{
+    // What a node's reform rebuilt is in force from the moment it is published: a reader of
+    // `Current()` that still saw the start's configuration would act on a shape the node has left.
+    // No file is read and nothing is checked against one.
+    struct Shape
+    {
+        int mode { 0 };
+    };
+    auto reparses = 0;
+    FastCache::ConfigReloaderOf<Shape> reloader {
+        Shape { .mode = 1 },
+        {},
+        [&reparses](std::filesystem::path const&) -> std::expected<Shape, FastCache::ConfigError> {
+            ++reparses;
+            return Shape {};
+        },
+        [](Shape const&, Shape const&) -> std::expected<void, FastCache::ConfigError> { return {}; },
+    };
+    auto told = std::vector<std::pair<int, int>> {};
+    reloader.Subscribe(
+        [&told](auto const& previous, auto const& current) { told.emplace_back(previous->mode, current->mode); });
+
+    reloader.Publish(Shape { .mode = 2 });
+
+    CHECK(reloader.Current()->mode == 2);
+    CHECK(told == std::vector<std::pair<int, int>> { { 1, 2 } });
+    CHECK(reparses == 0);
 }
 
 TEST_CASE("ConfigReloader::Reload picks up reloadable changes", "[config][reload]")

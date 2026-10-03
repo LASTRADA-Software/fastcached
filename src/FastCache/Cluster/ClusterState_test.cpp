@@ -512,7 +512,7 @@ TEST_CASE("A truncated snapshot is refused rather than half-read", "[cluster][st
 
 TEST_CASE("A state another build encoded is refused by its version while a command keeps its own", "[cluster][state][wire]")
 {
-    // Removing the client and forgotten-host groups moved the state's version again -- and the
+    // The dissolve order a healing split replicates moved the state's version again -- and the
     // byte is pinned as well as the refusal, because a symbol both ends spell can only test the
     // NAME of a wire constant. The version is the first field's only byte, after that
     // field's u32 length prefix.
@@ -520,17 +520,17 @@ TEST_CASE("A state another build encoded is refused by its version while a comma
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     auto bytes = Encode(state);
     REQUIRE(bytes.size() > 4);
-    CHECK(bytes[4] == std::byte { 8 });
+    CHECK(bytes[4] == std::byte { 9 });
 
     // A version the next build might write. Refused BY NAME, both versions stated, and
     // never as `MalformedFrame`: those bytes are intact, and *damaged* is what gets a
     // healthy snapshot deleted. The previous build's LAYOUT is the case below this one.
-    bytes[4] = std::byte { 9 };
+    bytes[4] = std::byte { 10 };
     auto const newerState = DecodeState(bytes);
     REQUIRE_FALSE(newerState.has_value());
     CHECK(newerState.error().code == ConsensusErrorCode::UnsupportedVersion);
-    CHECK(newerState.error().context.contains("version 9"));
-    CHECK(newerState.error().context.contains("reads 8"));
+    CHECK(newerState.error().context.contains("version 10"));
+    CHECK(newerState.error().context.contains("reads 9"));
 
     // #178 moved the COMMAND layout as well -- two fields, a key and a role -- and #1555 moved
     // the version again with the layout untouched, because it changed what a verb MEANS: a
@@ -538,15 +538,15 @@ TEST_CASE("A state another build encoded is refused by its version while a comma
     // replay it as something its writer never meant.
     auto command = Encode(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     REQUIRE(command.size() > 4);
-    CHECK(command[4] == std::byte { 4 });
+    CHECK(command[4] == std::byte { 5 });
 
     // And a command another build encoded is refused by ITS version, by name, never as damage.
-    command[4] = std::byte { 5 };
+    command[4] = std::byte { 6 };
     auto const newer = DecodeCommand(command);
     REQUIRE_FALSE(newer.has_value());
     CHECK(newer.error().code == ConsensusErrorCode::UnsupportedVersion);
-    CHECK(newer.error().context.contains("command encoding version 5"));
-    CHECK(newer.error().context.contains("reads 4"));
+    CHECK(newer.error().context.contains("command encoding version 6"));
+    CHECK(newer.error().context.contains("reads 5"));
 }
 
 TEST_CASE("A state the previous build wrote is refused as another build's, never as damage",
@@ -561,10 +561,10 @@ TEST_CASE("A state the previous build wrote is refused as another build's, never
     // node RESTARTING on a snapshot of its own at this version takes a different path, and
     // that path is #1542's -- this case says nothing about it.
     //
-    // The previous layout is v7's: eight header fields, the client and forgotten-host counts
-    // among them, where this build writes six. Pinned as a literal, so a builder left writing
+    // The previous layout is v8's: six header fields, no dissolve count, where this build
+    // writes seven. Pinned as a literal, so a builder left writing
     // an older layout still is caught rather than passing under this case's name.
-    REQUIRE(Testing::PreviousClusterStateVersion == 7);
+    REQUIRE(Testing::PreviousClusterStateVersion == 8);
     auto const previous = Testing::EncodePreviousClusterState();
     auto const refused = DecodeState(previous);
     REQUIRE_FALSE(refused.has_value());
@@ -575,7 +575,7 @@ TEST_CASE("A state the previous build wrote is refused as another build's, never
     CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
     // The current version as a literal: it is private to the codec, and pinned by the
     // version case above.
-    CHECK(refused.error().context.contains("reads 8"));
+    CHECK(refused.error().context.contains("reads 9"));
 }
 
 TEST_CASE("A command the previous build wrote is refused by its version before its arity is judged",
@@ -588,10 +588,8 @@ TEST_CASE("A command the previous build wrote is refused by its version before i
     // replaying its own log would report damage in every entry. The version is read first,
     // and the answer is *another build*.
     //
-    // A v3 command is the SIX fields this build writes, and its verb 1 was `RemoveMember`
-    // where here it is `Forget` (#1555) -- so nothing but the version tells it apart, and a
-    // decoder that judged anything else first would accept it and replay a forget its writer
-    // never meant.
+    // A v4 command is SIX fields where this build writes eight (the survivor's creation time and
+    // leader key a dissolve carries), so it is refused by its version rather than counted as damage.
     //
     // The builders are shared (`tests/PreviousClusterState.hpp`), and their verb bytes are
     // pinned here against the enumerators they stand for.
@@ -606,8 +604,124 @@ TEST_CASE("A command the previous build wrote is refused by its version before i
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedVersion);
         CHECK(refused.error().context.contains(std::format("version {}", version)));
-        CHECK(refused.error().context.contains("reads 4"));
+        CHECK(refused.error().context.contains("reads 5"));
     }
+}
+
+namespace
+{
+/// The office's dissolve order: the survivor `c-office`, proven under `KeyOf(0x0F)`, its leader
+/// answering at `office:6674` under `KeyOf(0x1F)`, created at 100.
+/// @return The command.
+[[nodiscard]] Command OfficeDissolve()
+{
+    return Command { .kind = CommandKind::DissolveInto,
+                     .key = "c-office",
+                     .value = "office:6674",
+                     .schedulerEndpoint = {},
+                     .publicKey = KeyOf(0x0F),
+                     .role = std::nullopt,
+                     .createdAtUnixSeconds = 100,
+                     .leaderKey = KeyOf(0x1F) };
+}
+} // namespace
+
+TEST_CASE("A dissolve round-trips and records the order every member leaves on", "[cluster][state][formation]")
+{
+    auto const command = OfficeDissolve();
+    REQUIRE(Validate(command).has_value());
+    auto const decoded = DecodeCommand(Encode(command));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == command);
+
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
+    auto const rosterBefore = state.rosterVersion;
+    Apply(state, command);
+    REQUIRE(state.dissolveOrder.has_value());
+    CHECK(Unwrap(state.dissolveOrder)
+          == DissolveOrder { .clusterId = "c-office",
+                             .provenKey = KeyOf(0x0F),
+                             .leaderNodeEndpoint = "office:6674",
+                             .createdAtUnixSeconds = 100,
+                             .leaderKey = KeyOf(0x1F) });
+    CHECK(state.rosterVersion == rosterBefore); // the roster did not change, so its version does not move
+
+    // In the snapshot too: a member catching up from one taken after the entry still reads it.
+    auto const restored = DecodeState(Encode(state));
+    REQUIRE(restored.has_value());
+    CHECK(Unwrap(restored) == state);
+
+    // The last order wins.
+    auto later = command;
+    later.key = "c-lab";
+    later.value = "lab:6674";
+    Apply(state, later);
+    CHECK(Unwrap(state.dissolveOrder).clusterId == "c-lab");
+}
+
+TEST_CASE("A dissolve names a survivor every member can dial and nothing else, and no other verb carries an age",
+          "[cluster][state][formation]")
+{
+    struct Row
+    {
+        std::string_view name; ///< The case.
+        Command command;       ///< What is proposed.
+    };
+    auto const with = [](auto change) {
+        auto command = OfficeDissolve();
+        change(command);
+        return command;
+    };
+    auto const rows = std::array {
+        Row { .name = "no key", .command = with([](Command& c) { c.publicKey.reset(); }) },
+        Row { .name = "no age", .command = with([](Command& c) { c.createdAtUnixSeconds.reset(); }) },
+        Row { .name = "no leader key", .command = with([](Command& c) { c.leaderKey.reset(); }) },
+        Row { .name = "an endpoint nobody can dial", .command = with([](Command& c) { c.value = "office"; }) },
+        Row { .name = "a scheduler endpoint", .command = with([](Command& c) { c.schedulerEndpoint = "office:7000"; }) },
+        Row { .name = "a role", .command = with([](Command& c) { c.role = PrincipalRole::Worker; }) },
+        Row { .name = "an id past the bound",
+              .command = with([](Command& c) { c.key = std::string(CompileCacheWire::MaxIdBytes + 1, 'c'); }) },
+    };
+    for (auto const& row: rows)
+    {
+        INFO(row.name);
+        CHECK_FALSE(Validate(row.command).has_value());
+    }
+    // The control: the order itself is valid, so each refusal above is its one change's.
+    CHECK(Validate(OfficeDissolve()).has_value());
+
+    // An age or a leader key on any other verb is a field somebody misunderstood.
+    auto admit = Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000");
+    REQUIRE(Validate(admit).has_value());
+    auto aged = admit;
+    aged.createdAtUnixSeconds = 100;
+    CHECK_FALSE(Validate(aged).has_value());
+    auto led = admit;
+    led.leaderKey = KeyOf(0x1F);
+    CHECK_FALSE(Validate(led).has_value());
+}
+
+TEST_CASE("A state carrying more than one dissolve order is damage", "[cluster][state][formation]")
+{
+    // Zero or one, never more: `Apply` keeps the last. The dissolve count is the header's last field,
+    // so a state claiming two with one order's fields behind it is refused by its counts.
+    ClusterState state;
+    state.dissolveOrder = DissolveOrder { .clusterId = "c-office",
+                                          .provenKey = KeyOf(0x0F),
+                                          .leaderNodeEndpoint = "office:6674",
+                                          .createdAtUnixSeconds = 100,
+                                          .leaderKey = KeyOf(0x1F) };
+    auto const encoded = Encode(state);
+    REQUIRE(DecodeState(encoded).has_value());
+    auto fields = WireFields::SplitAll(encoded);
+    REQUIRE(fields.has_value());
+    auto list = std::vector<std::span<std::byte const>> { Unwrap(fields).begin(), Unwrap(fields).end() };
+    auto const two = WireFields::ToBigEndian<std::uint32_t>(2);
+    list[8] = std::span<std::byte const> { two };
+    auto const doubled = DecodeState(WireFields::Encode(WireFields::FieldList { list }));
+    REQUIRE_FALSE(doubled.has_value());
+    CHECK(doubled.error().code == ConsensusErrorCode::MalformedFrame);
 }
 
 TEST_CASE("A member's scheduler endpoint says whether it was never announced or cleared by a re-admit", "[cluster][state]")
@@ -998,9 +1112,10 @@ TEST_CASE("The retired client verbs keep their bytes and are refused by name", "
     CHECK(byteOf(CommandKind::RetiredForgetClient) == 4U);
     CHECK(byteOf(CommandKind::AddLearner) == 5U);
     CHECK(byteOf(CommandKind::AdmitPrincipal) == 6U);
-    // And nothing above it: the next verb is 7, and until then a 7 is a verb this build does
+    CHECK(static_cast<unsigned>(CommandKind::DissolveInto) == 7U); // the raw enumerator: the anchor
+    // And nothing above it: the next verb is 8, and until then an 8 is a verb this build does
     // not know, skipped by name rather than applied as something else.
-    CHECK(static_cast<unsigned>(CommandKind::Last) == 7U);
+    CHECK(static_cast<unsigned>(CommandKind::Last) == 8U);
 
     // Refused by name at BOTH doors a command has. Its bytes, where every committed entry is
     // read -- as the verb it is, retired, never as one this build lacks and never as damage --
@@ -1325,30 +1440,36 @@ TEST_CASE("A command carries its key and role, and a role this build cannot name
     CHECK(*decoded == principal);
 
     // The role BYTE is pinned: it is persisted in every log entry and snapshot that carries a
-    // principal. It is the last field's only byte, after that field's u32 length prefix.
+    // principal. It is the sixth field's only byte, after that field's u32 length prefix, and
+    // before the empty seventh and eighth fields' prefixes -- a principal carries no age and no
+    // leader key.
     auto bytes = Encode(principal);
-    REQUIRE(bytes.size() > 1);
-    CHECK(bytes.back() == std::byte { 0 });
+    REQUIRE(bytes.size() > (2 * WireFields::FieldPrefixSize) + 1);
+    auto const roleAt = bytes.size() - 1 - (2 * WireFields::FieldPrefixSize);
+    CHECK(bytes[roleAt] == std::byte { 0 });
     CHECK(static_cast<unsigned>(PrincipalRole::Worker) == 0U);
 
     // A role a later build names is refused as another vocabulary, never applied as whichever
     // role it aliases -- which would admit a machine to do something nobody granted.
-    bytes.back() = std::byte { 9 };
+    bytes[roleAt] = std::byte { 9 };
     auto const unknown = DecodeCommand(bytes);
     REQUIRE_FALSE(unknown.has_value());
     CHECK(unknown.error().code == ConsensusErrorCode::UnknownMessageType);
 
     // A key field that is neither absent nor 32 bytes is damage, not a shorter key.
-    auto const header = std::array { std::byte { 4 }, static_cast<std::byte>(CommandKind::AdmitPrincipal) };
+    auto const header = std::array { std::byte { 5 }, static_cast<std::byte>(CommandKind::AdmitPrincipal) };
     auto const shortKey = std::vector<std::byte>(31, std::byte { 0x55 });
     auto const malformed = DecodeCommand(WireFields::Encode({ std::span<std::byte const> { header },
                                                               WireFields::AsBytes(std::string_view { "w1" }),
                                                               WireFields::AsBytes(std::string_view {}),
                                                               WireFields::AsBytes(std::string_view {}),
                                                               std::span<std::byte const> { shortKey },
+                                                              WireFields::AsBytes(std::string_view {}),
+                                                              WireFields::AsBytes(std::string_view {}),
                                                               WireFields::AsBytes(std::string_view {}) }));
     REQUIRE_FALSE(malformed.has_value());
     CHECK(malformed.error().code == ConsensusErrorCode::MalformedFrame);
+    CHECK(malformed.error().context.contains("key is neither absent nor 32 bytes")); // the key's refusal, not the arity's
 }
 
 TEST_CASE("A revoked key is never admitted again, and the refusal says it is permanent", "[cluster][state][identity]")

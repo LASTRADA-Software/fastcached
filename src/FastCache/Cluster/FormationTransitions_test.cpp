@@ -68,7 +68,8 @@ TEST_CASE("Every transition row is unique and every reform leaves the node in an
         auto const& after = NodeModeRowFor(row.to);
         auto const shapeChanges = before.raftListener != after.raftListener || before.dials != after.dials
                                   || before.scheduler != after.scheduler || row.effect == FormationEffect::Dissolve
-                                  || row.effect == FormationEffect::ArchiveAndMint;
+                                  || row.effect == FormationEffect::ArchiveAndMint
+                                  || row.effect == FormationEffect::LeaveForSurvivor;
         CHECK(row.reform == shapeChanges);
     }
 }
@@ -87,6 +88,22 @@ TEST_CASE("A machine that joined a fleet never yields to a foreign fleet", "[clu
     REQUIRE(first != nullptr);
     CHECK(first->to == NodeMode::Pending);
     CHECK(first->effect == FormationEffect::RecordJoinTarget);
+}
+
+TEST_CASE("Only a member leaves on a dissolve, and always for a new cluster of its own", "[cluster][formation][transitions]")
+{
+    // The order is the FLEET's: its voters and learners follow it. A solitary or pending node has no
+    // fleet an order could be about.
+    for (auto const mode: { NodeMode::Voter, NodeMode::Learner })
+    {
+        auto const* const row = TransitionFor(mode, FormationTrigger::DissolvedInto);
+        REQUIRE(row != nullptr);
+        CHECK(row->to == NodeMode::Pending);
+        CHECK(row->effect == FormationEffect::LeaveForSurvivor);
+        CHECK(row->reform);
+    }
+    CHECK(TransitionFor(NodeMode::Solitary, FormationTrigger::DissolvedInto) == nullptr);
+    CHECK(TransitionFor(NodeMode::Pending, FormationTrigger::DissolvedInto) == nullptr);
 }
 
 TEST_CASE("A trigger a mode has no row for is ignored", "[cluster][formation][transitions]")

@@ -240,11 +240,15 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
             // the leader's own roster -- which takes a moment and needs nothing from anybody.
             return EnrollReading { .progress = EnrollProgress::Waiting,
                                    .detail = "recorded; waiting to be admitted",
-                                   .roster = {} };
+                                   .roster = {},
+                                   .certificate = {},
+                                   .signature = reply->signature };
         case Wire::EnrollOutcome::Rejected:
             return EnrollReading { .progress = EnrollProgress::Refused,
                                    .detail = "an operator refused this machine",
-                                   .roster = {} };
+                                   .roster = {},
+                                   .certificate = {},
+                                   .signature = reply->signature };
         case Wire::EnrollOutcome::Approved:
             break;
     }
@@ -259,7 +263,8 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
     return EnrollReading { .progress = EnrollProgress::Admitted,
                            .detail = "approved",
                            .roster = std::vector<std::byte> { reply->roster.begin(), reply->roster.end() },
-                           .certificate = std::vector<std::byte> { reply->certificate.begin(), reply->certificate.end() } };
+                           .certificate = std::vector<std::byte> { reply->certificate.begin(), reply->certificate.end() },
+                           .signature = reply->signature };
 }
 
 std::string RenderEnrollmentReport(Wire::EnrollmentReport const& report, std::string_view scheduler)
@@ -656,6 +661,19 @@ std::expected<std::string, UnfinishedCommand> RunEnrollClient(NodeConfig const& 
         // Through the seam, so a test can script what comes BACK. The blocking dial
         // and its `core::net::BlockingConnector` live in `BlockingEndpointDialer`, where
         // `DialEndpointBlocking` still sees the concrete type it requires.
+        // A nonce per request, as the grammar requires, and a failed draw is a refusal rather than a
+        // request over bytes somebody else could predict. This mode does not judge the answer's
+        // signature by it: it proves no key of the fleet before asking, so there is no key to hold
+        // a signature to, and what an operator compares -- this key before approval, the roster's
+        // fingerprint after it -- is this mode's trust root, as it always was.
+        auto nonce = std::array<std::byte, Wire::NodeChallengeBytes> {};
+        if (auto drawn = random.Fill(nonce); !drawn.has_value())
+            // A draw is an I/O arm, so the command ends `Failed` (`StartStage`'s rule): the next run
+            // may draw, where a decision would refuse it again.
+            return std::unexpected { UnfinishedCommand {
+                .ending = CommandEnding::Failed,
+                .reason = std::format("no nonce could be drawn for the enroll request: {}", drawn.error().ToString()) } };
+
         auto client = dialer.Dial(seed, core::net::DialOptions { .connectTimeout = EnrollDialTimeout });
         if (client == nullptr)
             return std::unexpected { Unanswered(AnswerSource::Transport, std::format("cannot reach the seed at {}", seed)) };
@@ -670,7 +688,8 @@ std::expected<std::string, UnfinishedCommand> RunEnrollClient(NodeConfig const& 
                                Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = self.nodeId,
                                                                         .nodeEndpoint = self.nodeEndpoint,
                                                                         .role = self.role,
-                                                                        .publicKey = self.publicKey })));
+                                                                        .publicKey = self.publicKey,
+                                                                        .nonce = nonce })));
         auto reading = ReadEnrollReply(outcome);
 
         switch (reading.progress)

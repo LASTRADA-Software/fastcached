@@ -21,8 +21,9 @@ Every rule below has already been a bug.
   nobody (#178).** It was an HMAC under the pre-shared key until then, and a proof of
   possession of the fleet's key WAS membership, so any machine holding the file on the
   segment was desired and admitted. Now discovery broadcasts what a node *is* and the fleet
-  it is in -- its fleet SUMMARY: cluster id, state, age, leader, node id and Raft endpoint
-  -- and the challenge that follows is answered with an Ed25519 signature over
+  it is in -- its fleet SUMMARY: cluster id, state, age, leader, node id, Raft endpoint, the
+  ids of the machines it records (cut to `MaxFleetSummaryMembers` in a datagram, a measured
+  bound, with the total beside them) and its own `0xFC` endpoint -- and the challenge that follows is answered with an Ed25519 signature over
   `(fastcache-discovery-proof-v3, challenger's cluster, nonce, summary, key)`, the key
   carried beside it. The consequences, each of which some plausible simpler design gets
   wrong:
@@ -47,7 +48,8 @@ Every rule below has already been a bug.
     (`DiscoveryTier::PublishAuthenticated`), because it is re-published whenever ANY peer
     proves itself and a proof taken before a revocation must not ride along after it.
   - **The proof signs the node's whole fleet SUMMARY (cluster id, state, age, leader, node
-    id and Raft endpoint) AND the key, not the nonce alone.** Signing the nonce only would
+    id, Raft endpoint, member ids and total, and its own `0xFC` endpoint) AND the key, not the
+    nonce alone.** Signing the nonce only would
     let anyone who observed one valid proof replay it with a *different* endpoint
     substituted -- pointing a known node id at an attacker's address. A member is assigned
     compile jobs and returns objects cached fleet-wide, so that is object injection into
@@ -201,12 +203,76 @@ Every rule below has already been a bug.
     `NoCluster` refusal is UNSIGNED, so it is no answer, never the fact that a seed has no
     fleet.
   - **What `foreign-fleet-visible` calls foreign is `ClassifyEncounter`'s answer, asked
-    afresh, never a test of two states.** Two clusters that share a member are one fleet
-    split, which heals by the tiebreak even when both are established (the owner's
-    split-brain decision); a watch that raised on "both established" would call that
-    split a foreign fleet forever. `ForeignFleetWatch` raises exactly while the encounter
-    table says `ForeignFleet`, forgets a fleet it no longer classifies so at the next
-    tick, and forwards EVERY proven fleet to formation whatever it decided.
+    afresh, never a test of two states.** Two established clusters that are one fleet split
+    in two heal by the tiebreak (the owner's split-brain decision); a watch that raised on
+    "both established" would call that split a foreign fleet forever. `ForeignFleetWatch`
+    raises exactly while the encounter table says `ForeignFleet`, forgets a fleet it no
+    longer classifies so at the next tick, and forwards EVERY proven fleet to formation
+    whatever it decided. It asks the SAME evidence formation acts on
+    (`ISplitEvidenceSource`), so a pair with split evidence that would otherwise be foreign is
+    raised as `fleet-split-healing` instead -- naming who yields and why, or that an operator
+    decides and on which machine's word -- and the two rows and the decision to heal cannot
+    disagree.
+  - **A split is recognised only on SPLIT EVIDENCE a key this fleet already held verifies,
+    never on the other fleet's member list** (`SplitEvidenceFor`). The signature proves who
+    SPOKE, not what it records, and ids ride every beacon: a fleet minted with
+    `createdAt = 1` that lists this fleet's leader, believed, dissolves an established fleet
+    into whoever minted it -- a one-beacon takeover. So a yield between established fleets
+    needs (A) their speaker recorded in OUR state under that id WITH the key it proved, or
+    (C) a machine of ours that asked THEIR fleet under the key proving it now, and that
+    their list names; a member's announced memo counts only while the member is recorded.
+    Evidence changes only what would otherwise be foreign, and only to the tiebreak
+    (`EvidenceDecidesOnlyForeignPairs`), so a first join is decided as before. The attack
+    case -- speaking as our leader, claiming a fleet id we asked, listing everybody, under a
+    key nobody here holds for any of them -- is `SplitEvidence_test`'s, and neutering
+    either key comparison reddens it and nothing else.
+    - **A split heals BY ITSELF only on (A) spoken by a VOTER; (C), and (A) spoken by a
+      learner, are an OPERATOR's decision.** A whole fleet follows a dissolve, so what moves
+      one must rest on a key an operator chose to trust. (C)'s key is FIRST-USE trust: a
+      solitary machine asks whichever fleet beaconed oldest, and a fleet that refused it,
+      never answered, or admitted it and then dissolved itself away leaves the same memo a
+      real split does -- so an outsider who mints a fleet, is asked once, and later lists the
+      asker would otherwise move the established fleet the asker joined, voters included. A
+      learner's key is first-use trust too, since auto-approval admits learners. Which kind
+      heals by itself is the `healing` column of `SplitEvidenceNames`, read by
+      `ClassifyEncounter`; the rest raise `fleet-split-healing` naming the machine the
+      evidence rests on, and fail CLOSED as a foreign fleet does. The attack cases -- a fleet
+      that refused the asker, one that never answered, one that admitted it and dissolved --
+      are `FormationController_test`'s, and setting (C)'s row to heal automatically reddens
+      them; the learner case is beside them.
+  - **A split heals on ONE replicated order, never on each member's evidence.** Only the
+    losing fleet's LEADER decides (`FormationController::TickMember`), and it proposes
+    `CommandKind::DissolveInto` -- the survivor's id, its leader's `0xFC` endpoint, the key
+    that proved it and its age -- recorded as `ClusterState::dissolveOrder`, in the snapshot
+    as well as the log. Every voter and learner that APPLIES it leaves (`DissolvedInto` ->
+    `LeaveForSurvivor`): one record naming the left cluster in `archivePending`, a NEWLY
+    minted solitary cluster (a founder never reopens the left id over an empty directory),
+    and the survivor as its join target with NO speaker, so its leader is proved before it
+    is asked and the admission needs a member under the proven key. From there it is a first
+    join; a member restarting after the order applied re-applies it and leaves the same.
+    `RaftSplitHeal_test` drives it over the whole harness -- a voter's (A) on either side and
+    the mutual case, with (C) and the attack case beside them moving nothing.
+  - **A pending node is a POINTER, never a fleet to join.** Its cluster ends when the fleet
+    it asked admits it, so a machine that yielded to it would be left in a cluster nobody
+    runs -- and the tiebreak sends there every machine minted after it, which after a
+    split's leave is every machine that starts. It announces `FleetState::Pending`, whose
+    signed leader slots name the fleet it asked; a solitary node meeting one is told
+    `Encounter::Follow`, asks that endpoint for its own proof and decides on THAT, one step
+    and never on the pointer's word -- a key the pointer states is one the answer must be
+    signed by, never one taken as proven. Neutering the row back to the tiebreak strands the
+    fresh machine in the pointer cases of `FormationController_test`.
+    - **No reader can take a pointer for a leader, because none is ever handed one**: the
+      codec reads a `Pending` summary's leader slots into `FleetSummary::pointsAt`
+      (`FleetStateTable`), and leaves `leaderId`, `leaderNodeEndpoint` and `leaderKey` EMPTY,
+      which every reader already treats as no leader to ask. A rule every reader had to
+      remember -- consult the state first -- would be the census this makes unnecessary.
+  - **A memo of a fleet that ADMITTED this node is never displaced by asks that went
+    nowhere.** A fleet costs nothing to mint, so eight asks would push out the one memo an
+    operator's split is told on; `RememberAsked` drops the oldest memo NOT admitted first
+    (`AskedJoin::admitted`, set by the dissolve, which runs only on a signed admission). When
+    eight real admissions displace one anyway the split reads as `ForeignFleet`, which is
+    told to an operator too. Admitted is not TRUSTED: `CountedMemos` reads every memo, and
+    none of them heals by itself.
   - **A node never announces an endpoint every peer resolves to itself.** `localhost`, a
     name under `.localhost` or a loopback address reach the DIALLER on every machine
     (`NamesOnlyThisMachine`), so a beacon naming one sends each peer to dial itself,
@@ -559,7 +625,8 @@ simpler design gets wrong.
   - An unknown message type is still stepped over -- after its tag verifies, and it
     consumes a `seq`. Stepping over an UNVERIFIED frame would be a free injection channel.
 
-- **A revoked key ends the sessions it proved, at their next frame -- PULLED, not pushed.**
+- **A revoked key ends the sessions it proved, at their next frame -- or, for an ATTACHED session a
+  peer dialled in on, at the next reconcile pass -- PULLED, not pushed.**
   Both ends re-ask the roster (`IRaftPeerIdentity::StillProves`) for every frame: the acceptor
   after the tag verifies, the dialler before it seals. So an applied forget -- or a
   re-admission under another key -- closes the session at its next frame
@@ -569,6 +636,27 @@ simpler design gets wrong.
   heartbeat, so the pull costs no latency worth a thread hazard. Over TCP a dialler whose
   acceptor closed learns so from its next write's reset; the in-memory socket accepts writes
   nobody reads, so the link and node cases READDRESS to force the redial and say why.
+  - **Asked per frame AND per reconcile pass for ATTACHED inbound sessions, still PULLED; a dialler
+    learns at its next write.** A session nothing is SENT on has no next frame, and that is exactly
+    a forgotten LEARNER's: the configuration drops it, the leader sends it nothing, and a learner
+    never campaigns, so it never dials again to hear the signed `OwnKeyRevoked`. So the pass calls `RaftPeerTransport::RecheckProofs` right after
+    `AdoptConfiguration`, which pushes a zero-length WAKE onto the outbox of every ATTACHED session
+    whose key no longer proves. Still a pull: the wake carries no verdict, and the reactor's own
+    sender asks the roster again and decides.
+  - **The wake is internal.** Both senders decide what they popped through ONE step
+    (`PeerSenderAccess::StepFor`): the roster first, whatever was popped, and only a MESSAGE
+    reaches the seal. A sealed wake would spend a sequence number the peer never sees, and the
+    next real frame's tag would fail there -- an idle session closed by asking whether it may stay
+    open. A wake is not a message, so a withdrawal it causes counts no drop.
+  - **Sessions this node DIALLED are not woken, deliberately.** A forgotten member learns only
+    from the verdict on a dial of ITS OWN, so closing one this node dialled teaches the acceptor
+    nothing, and the sender redials after its backoff with or without a message: one idle socket
+    would become a refused handshake every backoff for as long as the process runs. A forgotten
+    VOTER's own one-way dial closes at its next frame, which its election timer sends because
+    nobody heartbeats it once the configuration drops it; a voter that applied its own removal
+    has no election timer and already knows. No idle TIMEOUT either: the wake asks the one
+    question a timeout would only approximate. `ConsensusTier_test` ("A forgotten learner hears its
+    key revoked...") through the real tier, `RaftPeerLink_test`'s recheck cases at the link.
 
 - **The roster is the one the node started from until the cluster says anything, and then
   the cluster.** `Cluster::RosterKeys` answers from the bootstrap members' keys -- the roster is
@@ -1576,12 +1664,15 @@ and it is recorded here because the question will be asked again.
   - **A node must have DISSOLVED its solitary cluster before it adopts a roster.** Every
     node bootstraps itself now -- a solitary cluster at its first start -- so the rule is
     kept by ARCHIVING rather than by not bootstrapping: an approval writes the learner
-    record with `archivePending` naming the solitary cluster BEFORE any file moves,
-    `FileRaftStorage::StoreFileNames()` are moved under `archive/<cluster-id>/` in the
+    record with `archivePending` naming the solitary cluster and MOVES NO FILE -- the
+    decision is taken while that cluster's tier still runs, holding its log open and
+    rewriting its state into the root, and on POSIX a store moved under it is re-created
+    in the root after the record said it was archived. The move asks for a reform, and
+    only `ResumeFormation`, at that reform or at a start, before any tier opens the
+    directory, moves `FileRaftStorage::StoreFileNames()` under `archive/<cluster-id>/` in the
     state directory (kept, never deleted: filled as `<id>.partial` and renamed into place,
     so a complete archive is never written again and a cluster left twice lands beside the
-    first, in `<id>.1`), and a start that finds `archivePending`
-    finishes the move (`ResumeFormation`) before any consensus tier opens the directory.
+    first, in `<id>.1`); nothing else moves a store.
     A learner therefore never opens the log that elected it. The archive is a row of the
     state-file table like every other entry, and the start-time walk accepts its fixed
     layout and nothing else below the top level -- a directory the node writes and the
@@ -1598,6 +1689,15 @@ and it is recorded here because the question will be asked again.
     member set is to be sent one. It gives nothing away: the node holds no committed
     state, has never voted, and is counted by nobody. The moment it adopts a
     configuration the guard applies again, permanently.
+  - **A reform is a START of the body, and is judged and adopted as one.**
+    `Node::RunNodeBodies` adopts the record again before every body but the first
+    (`ReadoptFormation`), judges the reshaped configuration by `StartupPolicyRejection`
+    before it serves, and publishes it -- otherwise a reform serves a shape the next restart
+    refuses, and every reload between is declined. The body that ended was adopted from a
+    record, so one that is GONE is lost state, refused by name (`FormationRecordGone`):
+    only a first start mints, or the node leaves its fleet for a cluster of its own over
+    the fleet's store. A reload shapes its candidate by the record the RUNNING body
+    adopted (`RunningFormationOf`), never the file a move saves ahead of the body.
   - **Who a node DIALS is not who it COUNTS, and a joiner needs the first without the
     second.** The obvious spelling — `--raft-join` takes this node's own address and
     nothing else — deadlocks, and the end-to-end case is what said so. A leader
@@ -2064,6 +2164,9 @@ right, because the wire now trusts it.
     `RosterKeys` per node; neutered, three of four never elect. Raft's own rule for a removed
     server, stated about keys. Everywhere else the revocation is immediate: the same key under
     another id, the enrollment door, discovery, and a principal, which consensus never counts.
+    The pass that drops the member is also the one that re-asks every idle attached session
+    (`RecheckProofs`, *A revoked key ends the sessions it proved*), so the grace ends on the wire
+    in that pass rather than at a frame nobody will send.
   - **A forgotten member leaves the quorum whoever typed it.** The rule that a typed member is
     never removed is about ABSENCE, and a revocation under the id is the forget's own record,
     which a fresh leader's empty state cannot contain. It is load-bearing BECAUSE of the grace

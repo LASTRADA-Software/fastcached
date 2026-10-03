@@ -11,12 +11,14 @@
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
+#include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/RosterStore.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -25,6 +27,7 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <ranges>
 #include <set>
@@ -46,6 +49,7 @@
 #include <tests/ScopedUmask.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SecureRandomFakes.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -852,4 +856,87 @@ TEST_CASE("Below the top level the walk accepts the archive's layout and nothing
         CHECK(walked.error().fault == NodeKeyFault::ForeignOwner);
         CHECK(walked.error().message.contains("consensus log"));
     }
+}
+
+namespace
+{
+/// A POSIX-semantics rename that answers what it was scripted to, and moves nothing when it refuses.
+class ScriptedReplacingRename final: public Consensus::IReplacingRename
+{
+  public:
+    /// @param refusal What every rename answers; empty to rename as the platform does.
+    explicit ScriptedReplacingRename(std::error_code refusal):
+        _refusal { refusal }
+    {
+    }
+
+    /// @copydoc Consensus::IReplacingRename::RenameReplacing
+    [[nodiscard]] std::error_code RenameReplacing(std::filesystem::path const& from,
+                                                  std::filesystem::path const& to) const override
+    {
+        ++_asked;
+        if (_refusal)
+            return _refusal;
+        return Consensus::SystemReplacingRename {}.RenameReplacing(from, to);
+    }
+
+    /// @return How many renames were asked.
+    [[nodiscard]] int Asked() const noexcept
+    {
+        return _asked;
+    }
+
+  private:
+    std::error_code _refusal;
+    mutable int _asked { 0 };
+};
+
+/// `ERROR_INVALID_PARAMETER`: what `SetFileInformationByHandle` answers where the rename has no POSIX
+/// semantics -- and, the reason a fallback must be said, for a path form it will not take.
+constexpr int InvalidParameter = 87;
+} // namespace
+
+TEST_CASE("A replace whose POSIX rename is refused as unsupported still lands, and says so", "[node][state-files]")
+{
+    auto const scratch = ScratchDirectory { "replace-route" };
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    auto const refused = std::error_code { InvalidParameter, std::system_category() };
+    auto const rename = ScriptedReplacingRename { refused };
+    auto const route = ReportReplaceRoute(scratch.Path(), rename, logger, metrics);
+
+    // Only Windows reads that answer as "no such rename here": `rename(2)` has the semantics, so a
+    // POSIX build treats any refusal as the failure it is.
+    if (!Consensus::MeansNoPosixRename(refused))
+    {
+        CHECK_FALSE(route.has_value());
+        CHECK(metrics.Read(IMetricsSink::Counter::StateFileReplacesFellBack) == 0);
+        return;
+    }
+    REQUIRE(route.has_value());
+    CHECK(Testing::Unwrap(route) == Consensus::ReplaceRoute::Classic);
+    CHECK(rename.Asked() > 0);
+    CHECK(metrics.Read(IMetricsSink::Counter::StateFileReplacesFellBack) == 1);
+    auto const said = logger.Snapshot();
+    auto const warned = std::ranges::any_of(said, [&](auto const& record) {
+        return record.level == LogLevel::Warn && record.message.contains(scratch.Path().string())
+               && record.message.contains(std::format("{}", InvalidParameter)) && record.message.contains("classic rename");
+    });
+    CHECK(warned);
+    CHECK_FALSE(std::filesystem::exists(scratch / Consensus::ReplaceProbeFileName));
+}
+
+TEST_CASE("A replace whose POSIX rename works is neither said nor counted", "[node][state-files]")
+{
+    auto const scratch = ScratchDirectory { "replace-route-posix" };
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    auto const rename = ScriptedReplacingRename { std::error_code {} };
+    auto const route = ReportReplaceRoute(scratch.Path(), rename, logger, metrics);
+    REQUIRE(route.has_value());
+    CHECK(Testing::Unwrap(route) == Consensus::ReplaceRoute::PosixSemantics);
+    CHECK(rename.Asked() > 0);
+    CHECK(metrics.Read(IMetricsSink::Counter::StateFileReplacesFellBack) == 0);
+    CHECK(logger.Snapshot().empty());
+    CHECK_FALSE(std::filesystem::exists(scratch / Consensus::ReplaceProbeFileName));
 }

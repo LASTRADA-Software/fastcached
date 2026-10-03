@@ -667,6 +667,8 @@ class WorkerRegistrar
 /// @param load What it is doing, and the history buckets it is handing over.
 /// @param endorsement This machine's encoded endorsement of the roster it applied, when it is a
 ///        voter; empty otherwise (#178).
+/// @param joinMemos The fleets this machine once asked to admit it, as its formation record keeps
+///        them; empty on a node that asked none.
 /// @return The reply's payload on acceptance -- an encoded certified roster, or empty when the
 ///         scheduler has none to hand out -- or why it was refused and where the leader is.
 [[nodiscard]] std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(
@@ -674,6 +676,7 @@ class WorkerRegistrar
     std::string_view endpoint,
     CompileCacheWire::CapacityFields const& capacity,
     CompileCacheWire::LoadFields const& load = {},
-    std::span<std::byte const> endorsement = {});
+    std::span<std::byte const> endorsement = {},
+    std::span<CompileCacheWire::JoinMemoFields const> joinMemos = {});
 
 } // namespace FastCache::Cc

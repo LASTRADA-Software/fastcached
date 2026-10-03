@@ -23,6 +23,8 @@
 #include "EnrollmentWindow.hpp"
 #include "FleetSummaryResponder.hpp"
 #include "FleetTextResponder.hpp"
+#include "FormationLoop.hpp"
+#include "FormationRuntime.hpp"
 #include "LiveStatsResponder.hpp"
 #include "LiveStatsSources.hpp"
 #include "NodeAnnounce.hpp"
@@ -49,6 +51,7 @@
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
 #include "OperatorCredentials.hpp"
+#include "RaftStoreArchiver.hpp"
 #include "SchedulerLink.hpp"
 #include "SchedulerReachability.hpp"
 #include "SchedulerTier.hpp"
@@ -105,6 +108,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -225,8 +229,9 @@ void InstallNodeStopHandlers()
 /// it, and handing an owned descriptor on is a double close rather than a handover.
 ///
 /// Nothing here closes what it returns. On the two refusal paths the process exits
-/// immediately, and on the success path ownership passes to the listener -- which
-/// takes it even when the adoption itself fails.
+/// immediately, and on the success path ownership passes to `Node::ActivationHold`,
+/// which keeps it for the process and hands every body a copy its listener owns --
+/// and takes even when the adoption itself fails.
 /// @param cfg What the operator asked for.
 /// @param logger Where the handoff is announced.
 /// @return The descriptor, `std::nullopt` when nothing was handed over, or why the
@@ -357,29 +362,6 @@ void InstallNodeStopHandlers()
 
     std::cout << prefix << *answer;
     return CommandExitCode(CommandEnding::Completed);
-}
-
-/// Whether this node will serve an enrollment surface.
-///
-/// Two clauses, and they answer different KINDS of question. `RunsConsensus` is the
-/// RULE, asked of the configuration, and `tier != nullptr` is a runtime fact about
-/// what was actually built, which only this translation unit knows and which no test
-/// links.
-///
-/// **There was a third clause, a named `--cluster-key-file`, and it is gone for good**: an
-/// approval no longer hands over any key (#178), so a window has nothing a key file could be
-/// missing for.
-///
-/// Named rather than spelled inline because `WorkerBody` is at the
-/// cognitive-complexity ceiling the build enforces, and because the two sites that
-/// need this answer must not be able to disagree: reporting a window no verb can act
-/// on is the reading the repeating open-window warning exists to make impossible.
-/// @param cfg The parsed configuration.
-/// @param tier The scheduler tier, or nullptr when none was started.
-/// @return True when both halves hold.
-[[nodiscard]] bool ServesEnrollment(NodeConfig const& cfg, Node::SchedulerTier const* tier) noexcept
-{
-    return Node::RunsConsensus(cfg) && tier != nullptr;
 }
 
 /// The address held by @p slot, or nullptr when it holds nothing.
@@ -592,7 +574,9 @@ using Node::NodeReloader;
                              std::optional<Ed25519KeyPair> const& identityKey,
                              ILogger& logger,
                              NodeReloader* reloader,
-                             IHostEvents& hostEvents)
+                             IHostEvents& hostEvents,
+                             Node::FormationBody const& formation,
+                             std::optional<int> activated)
 {
     // ONE origin for every uptime this process reports. `/healthz` and the `0xFC`
     // `NodeStatus` verb both answer *how long has this been serving*, and two
@@ -602,20 +586,8 @@ using Node::NodeReloader;
     // rather than whichever startup step happened to be declared above the reader.
     auto const startedAt = std::chrono::steady_clock::now();
 
-    // Socket activation is resolved BEFORE the toolchains, and the order is
-    // deliberate. Computing a fingerprint walks the whole include tree and takes
-    // seconds; a bad handoff is decided in microseconds. Doing the cheap, fallible
-    // thing first means a misconfigured unit fails immediately instead of after a
-    // multi-second pause -- and it means the startup log reads in the order things
-    // actually happened, so an operator watching a worker come up sees what it did
-    // with the socket before the long quiet part.
-    auto const activatedOrError = ActivatedDescriptor(cfg, logger);
-    if (!activatedOrError.has_value())
-    {
-        logger.Logf(LogLevel::Error, "{}", activatedOrError.error().reason);
-        return ExitCodeFor(activatedOrError.error().cause);
-    }
-    auto const activated = *activatedOrError;
+    // Socket activation was resolved before the first body, and before the toolchains
+    // (`RunNodeBodies`): `activated` is this body's own copy of what the supervisor handed over.
 
     // The ONE derivation, shared with the startup refusal that judges it. This value
     // goes to the worker tier's lease validator and to its REGISTER, and a lease's MAC is
@@ -673,6 +645,14 @@ using Node::NodeReloader;
     Node::NodeConditions conditions;
     Node::EvaluateProcessConditions(conditions, metrics);
     Node::EvaluateHostNameCondition(conditions, cfg);
+
+    // How a state file here is replaced, said -- and counted -- once per body when it falls back to the
+    // classic rename, which on Windows a reader holding the file open refuses (`ReportReplaceRoute`).
+    if (auto const stateDirectory = Node::ChosenStateDirectory(cfg); stateDirectory.has_value())
+    {
+        Consensus::SystemReplacingRename const replacingRename;
+        static_cast<void>(Node::ReportReplaceRoute(stateDirectory->path, replacingRename, logger, metrics));
+    }
 
     // One policy for all THREE surfaces -- the compile port here, the scheduler and
     // the cache below -- and it outlives every one of them. A node that answered "is
@@ -771,6 +751,19 @@ using Node::NodeReloader;
         }
         schedulerTier = std::move(*started);
     }
+
+    // **The formation, before anything that describes this node** (`MakeFormationRuntime`): the
+    // controller IS the summary every beacon, proof and enrollment answer reads, the observer every
+    // proven fleet goes to, and what consensus tells the applied state. Declared after the scheduler,
+    // whose service holds the join memos it reads, and before every tier that reads it, so it
+    // outlives them all. Its beat begins once consensus runs, below.
+    auto formationOrRefusal = Node::MakeFormationRuntime(cfg, formation, schedulerTier.get(), metrics, logger, &conditions);
+    if (!formationOrRefusal.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}; refusing to start", formationOrRefusal.error());
+        return ExitCodeFor(StartStage::Formation);
+    }
+    auto const formationRuntime = *std::move(formationOrRefusal);
 
     // The node's own cache tier, in front of the shared one. It exists so a local
     // rebuild on a slow or bad network never reaches the wire: the shared cache holds
@@ -998,7 +991,12 @@ using Node::NodeReloader;
     // No test reaches this: `main.cpp` is the translation unit none of them links, so
     // the guard here is CONSTRUCTION rather than a case -- a test built around a second
     // copy of this expression would assert something other than what ships.
-    auto const servesEnrollment = ServesEnrollment(cfg, schedulerTier.get());
+    //
+    // And an identity key, which signs every admission the surface answers: one without would sign
+    // nothing, and an unsigned admission is one every joiner refuses. Every configuration holds one
+    // (`AdoptNodeKey`), so the clause narrows nothing that runs -- it is here so the surface and what
+    // `NodeStatus` reports stay one condition if that ever changes.
+    auto const servesEnrollment = Node::ServesEnrollment(cfg, schedulerTier != nullptr) && identityKey.has_value();
 
     // Where this node sits in its consensus configuration (#1449), for `NodeStatus`. A SLOT,
     // because the tier that answers is built below and this surface is built now -- see
@@ -1153,10 +1151,26 @@ using Node::NodeReloader;
     //
     // `membership.Oracle()` bound once, by reference, exactly as every other surface
     // binds it.
+    //
+    // Every admission it answers is SIGNED by this node's identity key, which `servesEnrollment`
+    // requires, for the cluster id the summary here states -- the summary a joiner's probe proves
+    // that key with -- so the summary is taken before it.
+    // (Restated beside the dereference, which a reader -- and the optional-access check -- sees
+    // here and not three screens up; it narrows nothing `servesEnrollment` does not.)
+    //
+    // The formation's summary when it runs one, which every mode does; the summary the start
+    // computed for a node whose consensus is closed, which moves nowhere.
+    Node::FixedFleetSummary const answeredSummary { Node::AnsweredFleetSummary(cfg) };
+    auto const& summary = Node::SummarySourceOf(formationRuntime.get(), &answeredSummary);
     std::optional<Node::EnrollmentResponder> enrollmentResponder;
-    if (servesEnrollment)
-        enrollmentResponder.emplace(
-            enrollmentWindow, schedulerTier->ServiceForSurfaces(), membership.Oracle(), metrics, logger);
+    if (servesEnrollment && identityKey.has_value())
+        enrollmentResponder.emplace(enrollmentWindow,
+                                    schedulerTier->ServiceForSurfaces(),
+                                    membership.Oracle(),
+                                    summary,
+                                    *identityKey,
+                                    metrics,
+                                    logger);
 
     // The identity prover (#178), built wherever this node runs CONSENSUS: a proof is judged
     // against the cluster's applied roster -- members, enrolled principals and revoked keys --
@@ -1170,11 +1184,11 @@ using Node::NodeReloader;
     // Which fleet this node is in, answered to anybody who asks: every node holds an identity key,
     // and one that runs no consensus answers `NoCluster` itself rather than leaving the family
     // missing at the door. The summary is fixed for the process, and it is the ONE this node
-    // announces: the discovery tier below is handed the same object, never a second derivation.
-    Node::FixedFleetSummary answeredSummary { Node::AnsweredFleetSummary(cfg) };
+    // announces: the discovery tier below is handed the same object, never a second derivation --
+    // nor does the enrollment surface above, which signs admissions for the cluster it states.
     std::optional<Node::FleetSummaryResponder> fleetSummaryResponder;
     if (identityKey.has_value())
-        fleetSummaryResponder.emplace(answeredSummary, *identityKey);
+        fleetSummaryResponder.emplace(summary, *identityKey);
 
     auto nodeSurfaceOrRefusal =
         Node::StartNodeSurfaceOrExplain(nodeIo,
@@ -1266,7 +1280,8 @@ using Node::NodeReloader;
         rosterWallClock,
         metrics,
         logger,
-        &conditions);
+        &conditions,
+        Node::FormationHooksOf(formationRuntime.get()));
     if (!consensusOrRefusal.has_value())
     {
         // No flag prefix here, for the reason the cache tier's line below has none:
@@ -1282,6 +1297,10 @@ using Node::NodeReloader;
     // consensus member.
     auto const consensusTier = std::move(*consensusOrRefusal);
 
+    // The formation's beat, over the tier it proposes through. Declared after the tier, so the beat
+    // has stopped and let go of it before the tier is destroyed.
+    auto const formationBeat = Node::BeginFormation(formationRuntime.get(), consensusTier.get());
+
     // Attached as soon as the tier exists and before anything serves, and detached before the
     // tier is destroyed: the attachment is declared after it. A null tier attaches nothing.
     auto const consensusStandingAttached = consensusStanding.Attach(consensusTier.get());
@@ -1294,10 +1313,10 @@ using Node::NodeReloader;
     // destroyed before it, because its observer pushes into the tier above: a
     // discovery loop outliving the thing it hands peers to is a dangling reference
     // that only fires while a node is shutting down.
-    // `answeredSummary` is the one summary the FLEET-SUMMARY responder signs, so a beacon and an
-    // answer from this node are one derivation.
-    auto discoveryOrRefusal =
-        Node::StartDiscoveryOrExplain(cfg, consensusTier, answeredSummary, conditions, metrics, logger);
+    // `summary` is the one summary the FLEET-SUMMARY responder signs, so a beacon and an answer from
+    // this node are one derivation; every fleet it proves goes on to the formation.
+    auto discoveryOrRefusal = Node::StartDiscoveryOrExplain(
+        cfg, consensusTier, summary, conditions, metrics, logger, Node::DiscoveryFormationOf(formationRuntime.get()));
     if (!discoveryOrRefusal.has_value())
     {
         // Fatal; why is `RowFor(NodeSurface::Discovery).bindFailureReason` (#352).
@@ -1509,7 +1528,8 @@ using Node::NodeReloader;
                                                                               .prover = AddressOrNull(prover),
                                                                               .reachability = schedulerReachability,
                                                                               .dialer = presenceDialer,
-                                                                              .hostEvents = hostEvents });
+                                                                              .hostEvents = hostEvents,
+                                                                              .askedJoins = Node::AskedJoinsOf(formationRuntime.get()) });
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.
@@ -1559,7 +1579,10 @@ using Node::NodeReloader;
     //
     // That deletes the watcher rather than rehoming it: it existed only because a
     // parked `accept()` cannot be woken by a flag.
-    while (!DaemonControls::Instance().StopRequested())
+    //
+    // A reform ends it the same way: a move that changed this node's shape saved the record, and
+    // `main` starts the next body from it once this one has drained exactly as for a stop.
+    while (!DaemonControls::Instance().StopRequested() && !formation.durables.reform.Pending())
     {
         // Taken here rather than in the handler, for the reason the handler's own note
         // gives. `TakeReloadRequest` clears the flag atomically, so a burst of SIGHUPs
@@ -1572,7 +1595,7 @@ using Node::NodeReloader;
             Node::ApplyReloadRequest(reloader, membership, conditions, logger);
         std::this_thread::sleep_for(StopPollInterval);
     }
-    logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");
+    logger.Log(LogLevel::Info, Node::DrainSentence(formation.durables.reform.Pending()));
 
     // **Every compile drained HERE, while the node's reactor is still turning** -- see
     // `WorkerTier::StopAndDrain` for why destruction order cannot express it.
@@ -1609,6 +1632,101 @@ using Node::NodeReloader;
     if (auto const ending = workerTier != nullptr ? workerTier->Ending() : std::nullopt; ending.has_value())
         return ExitCodeFor(*ending);
     return ExitCodeOf(ProcessExit::Served);
+}
+
+/// What `main` serves with, across reforms: what outlives every body.
+struct ServingParts
+{
+    Cluster::IFormationStore& store;        ///< Where the record is kept.
+    Cluster::FleetEndpointsFile& endpoints; ///< Where the fleet endpoints are remembered.
+    Node::IStoreArchiver& archiver;         ///< What finishes a left cluster's store at every reform.
+    Node::ReformRequest& reform;            ///< Raised by a move; ends a body and starts the next.
+    Node::FormationRuntimeParts runtime;    ///< What every body's formation acts through.
+};
+
+/// Wait @p wait, returning early once a stop is asked: the pause between two reforms.
+/// @param wait How long.
+void PauseUnlessStopped(std::chrono::milliseconds wait)
+{
+    auto const until = std::chrono::steady_clock::now() + wait;
+    while (!DaemonControls::Instance().StopRequested() && std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(StopPollInterval);
+}
+
+/// Serve until a body ends other than for a reform (`Node::RunNodeBodies`).
+///
+/// What is left here is what only `main` can build -- the socket activation, read once for the
+/// process, and the serving body itself; what a reform decides is `Node::RunNodeBodies`', which a
+/// test target builds.
+/// @param cfg The configuration the start shaped: the first body's, and every reformed body's while
+///        this node has no file. With one, a reformed body is adopted into the reloader's snapshot.
+/// @param identityKey This node's identity key.
+/// @param logger Where every body logs.
+/// @param reloader The live configuration, or null when this node has no file.
+/// @param running What the start adopted; rewritten to what the running body was adopted from.
+/// @param hostEvents Where the host's resume and network events arrive, for every body.
+/// @param parts What outlives every body.
+/// @return The last body's exit code.
+[[nodiscard]] int ServeNodeBodies(NodeConfig const& cfg,
+                                  std::optional<Ed25519KeyPair> const& identityKey,
+                                  ILogger& logger,
+                                  NodeReloader* reloader,
+                                  IHostEvents& hostEvents,
+                                  Node::AdoptedFormation& running,
+                                  ServingParts const& parts)
+{
+    // Socket activation is resolved BEFORE the toolchains, and the order is
+    // deliberate. Computing a fingerprint walks the whole include tree and takes
+    // seconds; a bad handoff is decided in microseconds. Doing the cheap, fallible
+    // thing first means a misconfigured unit fails immediately instead of after a
+    // multi-second pause -- and it means the startup log reads in the order things
+    // actually happened, so an operator watching a worker come up sees what it did
+    // with the socket before the long quiet part.
+    //
+    // And ONCE, for the process: the handoff clears the environment it read, and a body's
+    // listener closes what it adopts. The hold keeps the original and every body serves a copy
+    // (`Node::ActivationHold`), so a reformed body never binds a port the supervisor holds.
+    auto const activatedOrError = ActivatedDescriptor(cfg, logger);
+    if (!activatedOrError.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}", activatedOrError.error().reason);
+        return ExitCodeFor(activatedOrError.error().cause);
+    }
+    SystemInheritedDescriptors const inheritedDescriptors;
+    Node::ActivationHold const activation { *activatedOrError, inheritedDescriptors };
+
+    core::platform::SteadyClock const loopClock;
+    auto publisher = std::optional<Node::ReloaderPublisher> {};
+    if (reloader != nullptr)
+        publisher.emplace(*reloader);
+    auto const bodies = Node::NodeBodies {
+        .adoption = Node::ReformAdoption { .store = parts.store,
+                                           .archiver = parts.archiver,
+                                           .endpoints = parts.endpoints,
+                                           .publisher = publisher.has_value() ? &*publisher : nullptr },
+        .reform = parts.reform,
+        .activation = activation,
+        .controls = Node::LoopControls { .stopRequested = [] { return DaemonControls::Instance().StopRequested(); },
+                                         .pause = PauseUnlessStopped,
+                                         .clock = loopClock },
+    };
+    auto const durables = Node::FormationDurables { parts.store, parts.endpoints, parts.reform, parts.runtime };
+    // The configuration IN FORCE, which an accepted reload changes and `cfg` does not.
+    Node::LiveNodeConfig const inForce { cfg, reloader };
+    return Node::RunNodeBodies(
+        inForce,
+        running,
+        bodies,
+        [&](NodeConfig const& shaped, Cluster::FormationRecord const& record, std::optional<int> served) {
+            return WorkerBody(shaped,
+                              identityKey,
+                              logger,
+                              reloader,
+                              hostEvents,
+                              Node::FormationBody { .record = record, .durables = durables, .reloader = reloader },
+                              served);
+        },
+        logger);
 }
 
 /// What every early verb is handed.
@@ -2205,11 +2323,13 @@ int main(int argc, char** argv)
     // read (`ReadStateDirectoryFormation`), as the key resolution asks again.
     auto const formationDirectory = Node::ChosenStateDirectory(cfg);
     std::optional<Cluster::FileFormationStore> formationStore;
+    std::optional<Cluster::FleetEndpointsFile> endpointsFile;
     auto keptFormation = std::expected<Node::KeptFormation, std::string> { std::unexpected {
         std::string { "this node has no state directory to keep its formation record in" } } };
     if (formationDirectory.has_value())
     {
         formationStore.emplace(formationDirectory->path);
+        endpointsFile.emplace(formationDirectory->path);
         keptFormation = Node::ReadStateDirectoryFormation(formationDirectory->path);
     }
     if (keptFormation.has_value())
@@ -2384,24 +2504,30 @@ int main(int argc, char** argv)
                            ExitCodeFor(StartStage::Formation));
     // Engaged whenever a record was read -- the store is what read it -- so this is the same
     // fact stated where the dereference can see it.
-    if (!formationStore.has_value())
+    if (!formationStore.has_value() || !endpointsFile.has_value())
         return RefuseStart(startHost,
                            logger,
                            "no state directory keeps this node's formation record; refusing to start",
                            ExitCodeFor(StartStage::Formation));
-    auto const formationRecord =
-        Node::KeepFormation(*keptFormation, *formationStore, identityRandom, core::platform::defaultSystemWallClock());
-    if (!formationRecord.has_value())
+
+    // **Adopted** (`AdoptFormation`), HERE where a refusal can still be reported: minted and SAVED
+    // when the state directory holds none, and a move a crash interrupted finished -- the store a
+    // dissolve left in the root archived -- before any consensus tier opens the directory. Every
+    // reform adopts it again the same way (`RunNodeBodies`).
+    Node::RaftStoreArchiver archiver { Node::NodeStateDirectory(cfg) };
+    Node::ReformRequest reform;
+    auto adopted = Node::AdoptFormation(
+        cfg, *formationStore, archiver, *endpointsFile, identityRandom, core::platform::defaultSystemWallClock());
+    if (!adopted.has_value())
         return RefuseStart(startHost,
                            logger,
-                           std::format("{}; refusing to start", formationRecord.error()),
+                           std::format("{}; refusing to start", adopted.error()),
                            ExitCodeFor(StartStage::Formation));
-    for (auto* const shaped: { &cfg, &cliOnly })
-        if (auto applied = Node::ApplyFormation(*shaped, *formationRecord, keptFormation->remembered); !applied.has_value())
-            return RefuseStart(startHost,
-                               logger,
-                               std::format("{}; refusing to start", applied.error()),
-                               ExitCodeFor(StartStage::Formation));
+    if (auto applied = Node::ApplyFormation(cliOnly, adopted->record, adopted->remembered); !applied.has_value())
+        return RefuseStart(startHost,
+                           logger,
+                           std::format("{}; refusing to start", applied.error()),
+                           ExitCodeFor(StartStage::Formation));
     logger.Logf(LogLevel::Info, "{}, cluster {}", Node::DescribeFormationMode(cfg), cfg.clusterId);
 
     // Built only when there IS a file, and holding the SAME argv the startup parse
@@ -2424,8 +2550,12 @@ int main(int argc, char** argv)
                                                      Node::ReloadBasis {
                                                          .stateDirectory = cfg.stateDirectory,
                                                          .hostNames = names.names,
-                                                         .formation = *formationRecord,
-                                                         .remembered = keptFormation->remembered,
+                                                         // The record the RUNNING body was adopted from,
+                                                         // which a reform rewrites -- never the file, which a
+                                                         // move saves on the beat thread before the body it
+                                                         // ends has drained. A reload runs on the body's stop
+                                                         // loop, the thread a reform adopts on between bodies.
+                                                         .formation = Node::RunningFormationOf(*adopted),
                                                          .identity = identity->value_or(Node::NodeIdentity {}),
                                                      }),
                          &ValidateNodeReloadable);
@@ -2571,7 +2701,24 @@ int main(int argc, char** argv)
         host = std::make_unique<ForegroundHost>();
 
     auto* const reloaderPtr = reloader.has_value() ? &*reloader : nullptr;
-    return host->Run([&cfg, &identityKey, &logger, reloaderPtr, &hostEvents] {
-        return WorkerBody(cfg, *identityKey, logger, reloaderPtr, hostEvents);
+
+    // What every body's formation acts through, built once here -- the one place production seams are
+    // constructed -- and handed to each body's runtime (`Node::FormationRuntimeParts`).
+    SystemStopAwareWait const formationWait;
+    Node::BlockingEndpointDialer formationDialer { Node::FormationRuntime::IoTimeout };
+    auto const formationSrv = MakeSystemSrvResolver();
+    auto const parts = ServingParts { .store = *formationStore,
+                                      .endpoints = *endpointsFile,
+                                      .archiver = archiver,
+                                      .reform = reform,
+                                      .runtime = Node::FormationRuntimeParts {
+                                          .wall = core::platform::defaultSystemWallClock(),
+                                          .random = identityRandom,
+                                          .dialer = formationDialer,
+                                          .srv = *formationSrv,
+                                          .wait = formationWait,
+                                      } };
+    return host->Run([&cfg, &identityKey, &logger, reloaderPtr, &hostEvents, &adopted, &parts] {
+        return ServeNodeBodies(cfg, *identityKey, logger, reloaderPtr, hostEvents, *adopted, parts);
     });
 }

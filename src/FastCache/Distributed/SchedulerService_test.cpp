@@ -3077,3 +3077,61 @@ TEST_CASE("A machine's announcement field longer than a scheduler records is ref
         CHECK(kept == std::vector<std::optional<std::string>> { atBound });
     }
 }
+
+TEST_CASE("A member's announced join memos are filed under the id it proved, and only while the state records it",
+          "[distributed][scheduler][formation]")
+{
+    // The leader holds every member's evidence that a fleet it sees is this one split, whichever
+    // machine did the asking -- but a memo is evidence only for the machine that PROVED it asked, and
+    // only while this fleet records that machine.
+    Signing fleet;
+    StubCluster cluster;
+    cluster.state = VotersState({ "n1", "n2" }, 1);
+    fleet.service.AdministerWith(cluster);
+    fleet.service.SetRole(SchedulerRole::Leader, {}, 1);
+
+    auto const asked = [](std::string id) {
+        auto memo = Wire::JoinMemoFields { .clusterId = std::move(id) };
+        memo.provenKey.fill(std::byte { 0x4C });
+        return memo;
+    };
+    auto const memos = std::vector { asked("c-lab") };
+    auto const provenAs = [](std::string id) {
+        return CallerContext { .membership = Membership::Member, .peerId = "peer-1", .provenNodeId = std::move(id) };
+    };
+    auto const announce = [&fleet](CallerContext const& caller, std::span<Wire::JoinMemoFields const> carried) {
+        return fleet.service.AnnounceNode(caller,
+                                          NodePresence { .endpoint = "n2:6674",
+                                                         .version = "test",
+                                                         .capacity = {},
+                                                         .load = {},
+                                                         .conditions = std::nullopt,
+                                                         .endorsement = {},
+                                                         .joinMemos = carried });
+    };
+
+    REQUIRE(announce(provenAs("n2"), memos).status == Wire::Status::Ok);
+    auto const filed = fleet.service.AnnouncedJoinMemos();
+    REQUIRE(filed.size() == 1);
+    CHECK(filed[0] == Cluster::AskedJoinBy { .askerId = "n2", .clusterId = "c-lab", .provenKey = memos[0].provenKey });
+
+    // Under the id it PROVED: a caller that proved none files nothing, whatever it announces.
+    REQUIRE(announce(Insider, std::vector { asked("c-other") }).status == Wire::Status::Ok);
+    CHECK(fleet.service.AnnouncedJoinMemos() == filed);
+
+    // A machine this fleet does not record speaks for nobody in it.
+    REQUIRE(announce(provenAs("n-stranger"), memos).status == Wire::Status::Ok);
+    CHECK(fleet.service.AnnouncedJoinMemos() == filed);
+
+    // Its next announcement replaces what it said before; an empty list says it asked nothing.
+    REQUIRE(announce(provenAs("n2"), {}).status == Wire::Status::Ok);
+    CHECK(fleet.service.AnnouncedJoinMemos().empty());
+
+    // And a member the state stops recording takes its memos with it at the next announcement
+    // anybody makes.
+    REQUIRE(announce(provenAs("n2"), memos).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.AnnouncedJoinMemos().size() == 1);
+    cluster.state = VotersState({ "n1" }, 2);
+    REQUIRE(announce(provenAs("n1"), {}).status == Wire::Status::Ok);
+    CHECK(fleet.service.AnnouncedJoinMemos().empty());
+}

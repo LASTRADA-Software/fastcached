@@ -138,4 +138,16 @@ class ConfiguredCredential final: public ICredentialSource
     NodeReloader const* _reloader;
 };
 
+/// What an exchange presents when it must present NOTHING.
+///
+/// Spelled here, at the seam that owns every `Cc::Credential` this binary builds, so a leg that
+/// presents nothing says so BY NAME rather than by an argument left out -- which reads the same as
+/// one forgotten. The enroll channel is that leg: it asks whatever endpoint a beacon named, before
+/// authentication, and a password sent there goes to whoever answers.
+/// @return A credential with no secret, so the exchange sends no `Auth` frame at all.
+[[nodiscard]] inline Cc::Credential NoCredential()
+{
+    return Cc::Credential {};
+}
+
 } // namespace FastCache::Node

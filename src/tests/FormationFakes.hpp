@@ -9,6 +9,7 @@
 #include <FastCache/Cluster/ProvenFleet.hpp>
 #include <FastCache/Cluster/ProvenFleetSummary.hpp>
 #include <FastCache/Cluster/Roster.hpp>
+#include <FastCache/Cluster/SplitEvidence.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -16,9 +17,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -71,6 +74,55 @@ class ScriptedSummarySource final: public Cluster::IFleetSummarySource
   private:
     mutable std::mutex _lock;
     CompileCacheWire::FleetSummary _summary;
+};
+
+/// What a node can say about each other fleet, as a case scripts it: `SplitEvidence::None`, naming
+/// no machine, for any fleet the case did not set.
+class ScriptedSplitEvidence final: public Cluster::ISplitEvidenceSource
+{
+  public:
+    [[nodiscard]] Cluster::SplitReading ReadSplit(Cluster::ProvenFleetSummary const& seen) const override
+    {
+        std::scoped_lock const lock { _lock };
+        auto const found = _readings.find(seen.Summary().clusterId);
+        return found == _readings.end() ? Cluster::SplitReading {} : found->second;
+    }
+
+    /// Read @p reading for @p clusterId's fleet from now on.
+    /// @param clusterId The fleet.
+    /// @param reading What this node says about it.
+    void Set(std::string const& clusterId, Cluster::SplitReading reading)
+    {
+        std::scoped_lock const lock { _lock };
+        _readings[clusterId] = std::move(reading);
+    }
+
+  private:
+    mutable std::mutex _lock;
+    std::map<std::string, Cluster::SplitReading> _readings;
+};
+
+/// What a fleet's members announced, as a case scripts it: nothing until the case sets some.
+class ScriptedAnnouncedMemos final: public Cluster::IAnnouncedJoinMemos
+{
+  public:
+    [[nodiscard]] std::vector<Cluster::AskedJoinBy> AnnouncedJoinMemos() const override
+    {
+        std::scoped_lock const lock { _lock };
+        return _memos;
+    }
+
+    /// Announce @p memos from now on.
+    /// @param memos What members announced.
+    void Set(std::vector<Cluster::AskedJoinBy> memos)
+    {
+        std::scoped_lock const lock { _lock };
+        _memos = std::move(memos);
+    }
+
+  private:
+    mutable std::mutex _lock;
+    std::vector<Cluster::AskedJoinBy> _memos;
 };
 
 /// Every proven fleet it was handed, in order.
@@ -266,23 +318,66 @@ inline constexpr std::uint64_t OfficeCreatedAt = 100;
 class InMemoryFormationStore final: public Cluster::IFormationStore
 {
   public:
+    /// How long a held save waits for its release before it goes ahead anyway: bounded, so a case that
+    /// never releases fails rather than hangs -- and far longer than any bounded wait a case holds a
+    /// save across, so the save never lets go by itself while the case is still watching: a case
+    /// asserting what happens WHILE it is held must not pass because the hold ran out first.
+    static constexpr std::chrono::seconds HeldSaveBound { 60 };
+
     /// @return The last record saved, or nothing when none was.
     [[nodiscard]] std::expected<std::optional<Cluster::FormationRecord>, ConsensusError> Load() const override
     {
+        std::scoped_lock const gate { _gate };
         if (_saves.empty())
             return std::optional<Cluster::FormationRecord> {};
         return std::optional { _saves.back() };
     }
 
-    /// Keep @p record, or refuse with the scripted reason.
+    /// Keep @p record, or refuse with the scripted reason. While saves are HELD, it says it has been
+    /// entered and waits for `ReleaseSaves` -- a disk as slow as a case wants.
     /// @param record The record.
     /// @return Nothing, or the scripted refusal.
     [[nodiscard]] std::expected<void, ConsensusError> Save(Cluster::FormationRecord const& record) override
     {
+        std::unique_lock gate { _gate };
+        _entered = true;
+        ++_waiting;
+        _changed.notify_all();
+        (void) _changed.wait_for(gate, HeldSaveBound, [this] { return !_held; });
+        --_waiting;
         if (_failure.has_value())
             return std::unexpected(StorageFailure(*_failure));
         _saves.push_back(record);
         return {};
+    }
+
+    /// Hold every later save until `ReleaseSaves`.
+    void HoldSaves()
+    {
+        std::scoped_lock const gate { _gate };
+        _held = true;
+    }
+
+    /// Let held saves, and every later one, go ahead.
+    void ReleaseSaves()
+    {
+        std::scoped_lock const gate { _gate };
+        _held = false;
+        _changed.notify_all();
+    }
+
+    /// @return Whether a save has been entered, held or not.
+    [[nodiscard]] bool SaveEntered() const
+    {
+        std::scoped_lock const gate { _gate };
+        return _entered;
+    }
+
+    /// @return Whether a save is being held at this moment: entered, and not yet let go.
+    [[nodiscard]] bool SaveHeldNow() const
+    {
+        std::scoped_lock const gate { _gate };
+        return _waiting > 0;
     }
 
     /// Make every later save fail with @p reason, as a full disk does.
@@ -292,13 +387,19 @@ class InMemoryFormationStore final: public Cluster::IFormationStore
         _failure = std::move(reason);
     }
 
-    /// @return Every record kept, in order.
+    /// @return Every record kept, in order. Read once whatever saves have finished: it is the list
+    ///         itself, not a copy.
     [[nodiscard]] std::vector<Cluster::FormationRecord> const& Saves() const noexcept
     {
         return _saves;
     }
 
   private:
+    mutable std::mutex _gate;
+    std::condition_variable _changed;
+    bool _held { false };
+    bool _entered { false };
+    int _waiting { 0 };
     std::vector<Cluster::FormationRecord> _saves;
     std::optional<std::string> _failure;
 };

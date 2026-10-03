@@ -728,10 +728,11 @@ std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(core
                                                                             std::string_view endpoint,
                                                                             Wire::CapacityFields const& capacity,
                                                                             Wire::LoadFields const& load,
-                                                                            std::span<std::byte const> endorsement)
+                                                                            std::span<std::byte const> endorsement,
+                                                                            std::span<Wire::JoinMemoFields const> joinMemos)
 {
-    auto const frame = Wire::EncodeNodeAnnounce(
-        Wire::NodeAnnounceRequest { .endpoint = endpoint, .capacity = capacity, .load = load, .endorsement = endorsement });
+    auto const frame = Wire::EncodeNodeAnnounce(Wire::NodeAnnounceRequest {
+        .endpoint = endpoint, .capacity = capacity, .load = load, .endorsement = endorsement, .joinMemos = joinMemos });
     auto outcome = ExchangeWithScheduler(scheduler, frame);
     if (outcome.IsHit())
         return std::move(outcome.value);

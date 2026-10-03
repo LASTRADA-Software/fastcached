@@ -418,6 +418,12 @@ class RaftClusterHarness
         RaftMessage message;
         core::platform::SteadyTimePoint deliverAt;
         Carriage carriage; ///< Decided when it was sent, from the sender's configuration then.
+
+        /// The cluster the sender was in when it SENT this, which is the cluster the message speaks
+        /// for. Read at delivery instead, a message a leader sent just before it dissolved would be
+        /// credited to the cluster it joined since, and a follower still in the old one would be
+        /// reported as joining that cluster without dissolving.
+        std::string senderCluster;
     };
 
     /// Collects sends into the harness's own queue.
@@ -600,9 +606,14 @@ class RaftClusterHarness
     /// Hand @p message to @p receiver's driver, keeping its cluster tag and checking isolation.
     /// @param receiver The running receiver.
     /// @param from The sender's name on the network.
+    /// @param senderCluster The cluster the sender was in when it sent @p message.
     /// @param message What the receiver authenticated.
     /// @param now The current instant.
-    void Hear(Member& receiver, NodeId const& from, RaftMessage const& message, core::platform::SteadyTimePoint now);
+    void Hear(Member& receiver,
+              NodeId const& from,
+              std::string const& senderCluster,
+              RaftMessage const& message,
+              core::platform::SteadyTimePoint now);
 
     /// The highest-term leader among the running members @p inCluster admits.
     /// @param inCluster Which members count.
@@ -1047,7 +1058,8 @@ inline void RaftClusterHarness::Enqueue(NodeId const& from, NodeId const& to, Ra
                                .to = to,
                                .message = std::move(message),
                                .deliverAt = _clock.now() + std::chrono::milliseconds { delay * 5 },
-                               .carriage = std::move(carriage) });
+                               .carriage = std::move(carriage),
+                               .senderCluster = Find(from).cluster });
 }
 
 inline void RaftClusterHarness::RecordApplied(NodeId const& who, AppliedEntry const& entry)
@@ -1252,7 +1264,7 @@ inline void RaftClusterHarness::Step(std::chrono::milliseconds by)
             continue; // Down: see `IsUp`.
 
         ++_deliveredFrom[message.from];
-        Hear(receiver, message.from, *authenticated, now);
+        Hear(receiver, message.from, message.senderCluster, *authenticated, now);
     }
 
     for (auto& node: _nodes | std::views::filter(IsUp))
@@ -1263,13 +1275,13 @@ inline void RaftClusterHarness::Step(std::chrono::milliseconds by)
 
 inline void RaftClusterHarness::Hear(Member& receiver,
                                      NodeId const& from,
+                                     std::string const& senderCluster,
                                      RaftMessage const& message,
                                      core::platform::SteadyTimePoint now)
 {
     auto const fromLeader =
         std::holds_alternative<AppendEntriesRequest>(message) || std::holds_alternative<InstallSnapshotRequest>(message);
     auto const leader = SenderOf(message);
-    auto const& senderCluster = Find(from).cluster;
 
     // A member with no cluster takes the tag of the first leader it accepts: tentatively, BEFORE
     // it hears the message, since hearing it may apply entries, and undone when the node did not

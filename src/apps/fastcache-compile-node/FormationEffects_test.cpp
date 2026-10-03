@@ -12,8 +12,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <ios>
@@ -97,7 +99,7 @@ TEST_CASE("A crash after the learner record and before the archive resumes as an
           "[node][formation][archive]")
 {
     Testing::InMemoryFormationStore store;
-    Testing::RecordingArchiver archiver { store };
+    Testing::RecordingArchiver archiver;
     REQUIRE(store.Save(InterruptedDissolve()).has_value());
 
     auto const resumed = ResumeFormation(InterruptedDissolve(), store, archiver);
@@ -113,7 +115,7 @@ TEST_CASE("A crash after the learner record and before the archive resumes as an
 TEST_CASE("A start with nothing pending resumes nothing", "[node][formation][archive]")
 {
     Testing::InMemoryFormationStore store;
-    Testing::RecordingArchiver archiver { store };
+    Testing::RecordingArchiver archiver;
     auto const resumed = ResumeFormation(LearnerIn("c-laptop", "c-office"), store, archiver);
     REQUIRE(resumed.has_value());
     CHECK(Unwrap(resumed) == LearnerIn("c-laptop", "c-office"));
@@ -124,7 +126,7 @@ TEST_CASE("A start with nothing pending resumes nothing", "[node][formation][arc
 TEST_CASE("An archive that fails at start refuses the start and names what it could not move", "[node][formation][archive]")
 {
     Testing::InMemoryFormationStore store;
-    Testing::RecordingArchiver archiver { store };
+    Testing::RecordingArchiver archiver;
     archiver.FailArchives("cannot move /var/lib/fastcache-node/raft-log: permission denied");
 
     auto const resumed = ResumeFormation(InterruptedDissolve(), store, archiver);
@@ -138,22 +140,15 @@ TEST_CASE("Dissolving refuses a roster that does not name this node under its ke
           "[node][formation][archive]")
 {
     Testing::InMemoryFormationStore store;
-    Testing::RecordingArchiver archiver { store };
     ScratchDirectory const scratch { "dissolve" };
     Cluster::FleetEndpointsFile endpoints { scratch.Path() };
     CapturingLogger logger;
 
-    auto const dissolved = DissolveInto(Pending("c-laptop", 500, "c-office", "office:6674"),
-                                        OfficeRosterWith("n-desk"),
-                                        Laptop(),
-                                        store,
-                                        archiver,
-                                        endpoints,
-                                        logger);
+    auto const dissolved = DissolveInto(
+        Pending("c-laptop", 500, "c-office", "office:6674"), OfficeRosterWith("n-desk"), Laptop(), store, endpoints, logger);
     REQUIRE_FALSE(dissolved.has_value());
     CHECK(dissolved.error().contains("n-laptop"));
     CHECK(store.Saves().empty());
-    CHECK(archiver.Archived().empty());
     CHECK(endpoints.Load().outcome == Cluster::FleetEndpointsLoad::Absent);
 }
 
@@ -161,7 +156,6 @@ TEST_CASE("Dissolving refuses a roster no key of the proven fleet vouches for, a
           "[node][formation][archive]")
 {
     Testing::InMemoryFormationStore store;
-    Testing::RecordingArchiver archiver { store };
     ScratchDirectory const scratch { "dissolve-evil" };
     Cluster::FleetEndpointsFile endpoints { scratch.Path() };
     CapturingLogger logger;
@@ -170,19 +164,16 @@ TEST_CASE("Dissolving refuses a roster no key of the proven fleet vouches for, a
                                         Testing::RosterWith("n-evil", "n-laptop"),
                                         Laptop(),
                                         store,
-                                        archiver,
                                         endpoints,
                                         logger);
     REQUIRE_FALSE(dissolved.has_value());
     CHECK(dissolved.error().contains("key that proved"));
     CHECK(store.Saves().empty());
-    CHECK(archiver.Archived().empty());
 }
 
 TEST_CASE("Dissolving refuses a fleet whose id could not name the archive of its store", "[node][formation][archive]")
 {
     Testing::InMemoryFormationStore store;
-    Testing::RecordingArchiver archiver { store };
     ScratchDirectory const scratch { "dissolve-id" };
     Cluster::FleetEndpointsFile endpoints { scratch.Path() };
     CapturingLogger logger;
@@ -191,20 +182,17 @@ TEST_CASE("Dissolving refuses a fleet whose id could not name the archive of its
                                         OfficeRosterWith("n-laptop"),
                                         Laptop(),
                                         store,
-                                        archiver,
                                         endpoints,
                                         logger);
     REQUIRE_FALSE(dissolved.has_value());
     CHECK(dissolved.error().contains("archive"));
     CHECK(store.Saves().empty());
-    CHECK(archiver.Archived().empty());
 }
 
-TEST_CASE("Dissolving records the learner before the archive, and remembers the fleet's voters as seeds",
+TEST_CASE("Dissolving records the learner with its old store still to move, and remembers the fleet's voters as seeds",
           "[node][formation][archive]")
 {
     Testing::InMemoryFormationStore store;
-    Testing::RecordingArchiver archiver { store };
     ScratchDirectory const scratch { "dissolve-seeds" };
     Cluster::FleetEndpointsFile endpoints { scratch.Path() };
     CapturingLogger logger;
@@ -213,18 +201,15 @@ TEST_CASE("Dissolving records the learner before the archive, and remembers the 
                                         OfficeRosterWith("n-laptop"),
                                         Laptop(),
                                         store,
-                                        archiver,
                                         endpoints,
                                         logger);
     REQUIRE(dissolved.has_value());
     CHECK(Unwrap(dissolved).mode == NodeMode::Learner);
     CHECK_FALSE(Unwrap(dissolved).joining.has_value());
-    CHECK_FALSE(Unwrap(dissolved).archivePending.has_value());
+    CHECK(Unwrap(dissolved).archivePending == std::optional<std::string> { "c-laptop" }); // for the next start
 
-    REQUIRE(store.Saves().size() == 2);
-    CHECK(store.Saves()[0].archivePending == std::optional<std::string> { "c-laptop" });
-    CHECK(archiver.ArchivedAfterSave() == 1); // the archive ran after the FIRST save
-    CHECK(archiver.Archived() == std::vector<std::string> { "c-laptop" });
+    REQUIRE(store.Saves().size() == 1);
+    CHECK(store.Saves()[0] == Unwrap(dissolved));
 
     auto loaded = Cluster::FleetEndpointsFile { scratch.Path() }.Load();
     REQUIRE(loaded.outcome == Cluster::FleetEndpointsLoad::Loaded);
@@ -245,25 +230,29 @@ TEST_CASE("A cluster left twice keeps both of its stores, each in an archive of 
     auto random = Testing::ScriptedSecureRandom { Testing::ScriptedSecureRandom::Ascending(2 * Cluster::ClusterIdBytes) };
     core::platform::ManualWallClock const wall { std::chrono::system_clock::time_point { std::chrono::seconds { 900 } } };
 
+    // Each move is recorded at runtime and finished by the start after it, as a node does it.
+    auto const finish = [&store, &archiver](std::expected<Cluster::FormationRecord, std::string> const& moved) {
+        REQUIRE(moved.has_value());
+        auto resumed = ResumeFormation(Unwrap(moved), store, archiver);
+        REQUIRE(resumed.has_value());
+        return Unwrap(resumed);
+    };
+
     WriteStore(scratch.Path(), "office-first");
-    auto const firstLeave = ArchiveAndMint(LearnerIn("c-laptop", "c-office"), store, archiver, random, wall);
-    REQUIRE(firstLeave.has_value());
-    auto const minted = Unwrap(firstLeave).own.clusterId;
+    auto const firstLeave = finish(ArchiveAndMint(LearnerIn("c-laptop", "c-office"), store, random, wall));
+    auto const minted = firstLeave.own.clusterId;
 
     // Its own new cluster ran, and then it asked the office again and was admitted.
     WriteStore(scratch.Path(), "own-second");
-    auto rejoining = Unwrap(firstLeave);
+    auto rejoining = firstLeave;
     rejoining.mode = NodeMode::Pending;
     rejoining.joining = Cluster::JoinTarget { .summary = Testing::OfficeSummary("c-office", "office:6674"),
                                               .provenKey = Testing::TestKeyPair("n-office").PublicKey(),
                                               .askedAtUnixSeconds = 42 };
-    auto const rejoined =
-        DissolveInto(rejoining, OfficeRosterWith("n-laptop"), Laptop(), store, archiver, endpoints, logger);
-    REQUIRE(rejoined.has_value());
+    auto const rejoined = finish(DissolveInto(rejoining, OfficeRosterWith("n-laptop"), Laptop(), store, endpoints, logger));
 
     WriteStore(scratch.Path(), "office-second");
-    auto const secondLeave = ArchiveAndMint(Unwrap(rejoined), store, archiver, random, wall);
-    REQUIRE(secondLeave.has_value());
+    (void) finish(ArchiveAndMint(rejoined, store, random, wall));
 
     auto const archive = scratch.Path() / ArchiveDirectoryName;
     CHECK(StoreTagAt(archive / "c-office") == "office-first");
@@ -299,26 +288,100 @@ TEST_CASE("A leave a crash interrupted part-way is finished into its own archive
     CHECK_FALSE(std::filesystem::exists(archive / "c-office.partial"));
 }
 
+TEST_CASE("Leaving for a survivor refuses an order into itself or into an id no archive could carry, and writes nothing",
+          "[node][formation][archive][split]")
+{
+    Testing::InMemoryFormationStore store;
+    Testing::ScriptedSecureRandom random { Testing::ScriptedSecureRandom::Ascending(64) };
+    core::platform::ManualWallClock wall { std::chrono::system_clock::time_point {
+        std::chrono::seconds { 1'700'000'000 } } };
+    auto order = Cluster::DissolveOrder { .clusterId = "c-office",
+                                          .provenKey = Testing::TestKeyPair("n-laptop").PublicKey(),
+                                          .leaderNodeEndpoint = "office:6674",
+                                          .createdAtUnixSeconds = 100,
+                                          .leaderKey = Testing::TestKeyPair("n-home").PublicKey() };
+
+    auto const intoItself = LeaveForSurvivor(LearnerIn("c-laptop", "c-office"), order, store, random, wall);
+    REQUIRE_FALSE(intoItself.has_value());
+    CHECK(intoItself.error().contains("does not dissolve into itself"));
+
+    order.clusterId = "c/../home";
+    auto const unarchivable = LeaveForSurvivor(LearnerIn("c-laptop", "c-office"), order, store, random, wall);
+    REQUIRE_FALSE(unarchivable.has_value());
+    CHECK(unarchivable.error().contains("could not name the archive"));
+    CHECK(store.Saves().empty());
+
+    // The control: a survivor it can leave for is left for, the other memos kept.
+    order.clusterId = "c-home";
+    auto member = LearnerIn("c-laptop", "c-office");
+    member.askedJoins.push_back(Cluster::AskedJoin { .clusterId = "c-lab", .provenKey = {}, .askedAtUnixSeconds = 7 });
+    auto const left = LeaveForSurvivor(member, order, store, random, wall);
+    REQUIRE(left.has_value());
+    CHECK(Unwrap(left).mode == NodeMode::Pending);
+    // The survivor's leader is held to the key the order reached, never to whichever key answers there.
+    REQUIRE(Unwrap(left).joining.has_value());
+    CHECK(Unwrap(Unwrap(left).joining).summary.leaderKey == std::optional { Testing::TestKeyPair("n-home").PublicKey() });
+    CHECK(std::ranges::any_of(Unwrap(left).askedJoins,
+                              [](Cluster::AskedJoin const& memo) { return memo.clusterId == "c-lab"; }));
+    REQUIRE(store.Saves().size() == 1);
+}
+
 TEST_CASE("A forgotten node mints a cluster id it never had, and keeps nothing of the fleet", "[node][formation][archive]")
 {
     Testing::InMemoryFormationStore store;
-    Testing::RecordingArchiver archiver { store };
     auto random = Testing::ScriptedSecureRandom { std::vector<std::byte>(Cluster::ClusterIdBytes, std::byte { 0xcd }) };
     core::platform::ManualWallClock const wall { std::chrono::system_clock::time_point { std::chrono::seconds { 900 } } };
     auto forgotten = LearnerIn("c-laptop", "c-office");
     forgotten.askedJoins = { Cluster::AskedJoin { .clusterId = "c-office", .provenKey = {}, .askedAtUnixSeconds = 1 },
                              Cluster::AskedJoin { .clusterId = "c-lab", .provenKey = {}, .askedAtUnixSeconds = 2 } };
 
-    auto const minted = ArchiveAndMint(forgotten, store, archiver, random, wall);
+    auto const minted = ArchiveAndMint(forgotten, store, random, wall);
     REQUIRE(minted.has_value());
     CHECK(Unwrap(minted).mode == NodeMode::Solitary);
     CHECK(Unwrap(minted).own.clusterId == "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd");
     CHECK(Unwrap(minted).own.createdAtUnixSeconds == 900);
     CHECK_FALSE(Unwrap(minted).fleet.has_value());
-    CHECK_FALSE(Unwrap(minted).archivePending.has_value());
-    CHECK(archiver.Archived() == std::vector<std::string> { "c-office" });
-    CHECK(archiver.ArchivedAfterSave() == 1); // the new record was written before the store moved
+    CHECK(Unwrap(minted).archivePending == std::optional<std::string> { "c-office" }); // for the next start
+    REQUIRE(store.Saves().size() == 1);
     // A forget outranks an observation: the forgetting fleet's memo goes, every other one stays.
     REQUIRE(Unwrap(minted).askedJoins.size() == 1);
     CHECK(Unwrap(minted).askedJoins[0].clusterId == "c-lab");
+}
+
+TEST_CASE("A store its tier is still writing is moved only at the next start, with everything written into it",
+          "[node][formation][archive]")
+{
+    // The decision is taken while the cluster's tier still RUNS: it holds its log open and rewrites its
+    // state and snapshot into the root. A move made then archives a store still being written -- on
+    // POSIX the rename succeeds, and a vote after it re-creates the old cluster's files in the root
+    // after the record said the archive was done. So the decision moves nothing, and the start moves
+    // the store as its tier last left it.
+    ScratchDirectory const scratch { "live-store" };
+    Testing::InMemoryFormationStore store;
+    Cluster::FleetEndpointsFile endpoints { scratch.Path() };
+    CapturingLogger logger;
+    WriteStore(scratch.Path(), "before");
+
+    auto const dissolved = DissolveInto(Pending("c-laptop", 500, "c-office", "office:6674"),
+                                        OfficeRosterWith("n-laptop"),
+                                        Laptop(),
+                                        store,
+                                        endpoints,
+                                        logger);
+    REQUIRE(dissolved.has_value());
+    CHECK(Unwrap(dissolved).archivePending == std::optional<std::string> { "c-laptop" });
+    for (auto const name: Consensus::FileRaftStorage::StoreFileNames())
+        CHECK(std::filesystem::exists(scratch.Path() / name)); // untouched by the decision
+    CHECK_FALSE(std::filesystem::exists(scratch.Path() / ArchiveDirectoryName));
+
+    // The tier goes on writing until the reform stops it.
+    WriteStore(scratch.Path(), "after");
+
+    RaftStoreArchiver archiver { scratch.Path() };
+    auto const resumed = ResumeFormation(Unwrap(dissolved), store, archiver);
+    REQUIRE(resumed.has_value());
+    CHECK_FALSE(Unwrap(resumed).archivePending.has_value());
+    CHECK(StoreTagAt(scratch.Path() / ArchiveDirectoryName / "c-laptop") == "after");
+    for (auto const name: Consensus::FileRaftStorage::StoreFileNames())
+        CHECK_FALSE(std::filesystem::exists(scratch.Path() / name)); // the learner's tier opens an empty root
 }

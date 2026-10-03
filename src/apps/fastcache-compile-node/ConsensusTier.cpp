@@ -20,9 +20,12 @@
 #include <chrono>
 #include <cstddef>
 #include <format>
+#include <functional>
+#include <iterator>
 #include <mutex>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include <core/Ranges.hpp>
 #include <core/net/IConnector.hpp>
@@ -273,6 +276,14 @@ std::expected<Cluster::ClusterMember, std::string> ConsensusSelfMemberOf(NodeCon
                                     .publicKey = publicKey };
 }
 
+ConsensusTierShape ConsensusTierShapeOf(NodeConfig const& cfg) noexcept
+{
+    if (!cfg.formation.has_value())
+        return ConsensusTierShape {};
+    auto const& row = Cluster::NodeModeRowFor(cfg.formation->mode);
+    return ConsensusTierShape { .listens = row.raftListener == Cluster::RaftListenerState::Open, .direction = row.dials };
+}
+
 std::string DescribeConsensusEndpoint(std::string_view raftEndpoint)
 {
     return raftEndpoint.empty() ? std::string { "with no consensus endpoint" } : std::format("at {}", raftEndpoint);
@@ -307,7 +318,8 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              EndorsementObserver onEndorsement,
                              IMetricsSink& metrics,
                              ILogger& logger,
-                             NodeConditions* conditions):
+                             NodeConditions* conditions,
+                             FormationHooks hooks):
     _logger { logger },
     _storage { std::move(storage) },
     // Unseeded, so two nodes started together do not draw the same election timeout and
@@ -326,7 +338,8 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     _conditions { conditions },
     _wallClock { wallClock },
     _clusterId { std::move(clusterId) },
-    _onEndorsement { std::move(onEndorsement) }
+    _onEndorsement { std::move(onEndorsement) },
+    _hooks { std::move(hooks) }
 {
     // Seeded with this node's own record, and its scheduler endpoint travels as a
     // value that is PRESENT even when it is empty. That is an assertion -- "I know
@@ -360,6 +373,7 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> ConsensusTier::Start(
     IMetricsSink& metrics,
     ILogger& logger,
     NodeConditions* conditions,
+    FormationHooks hooks,
     std::unique_ptr<BlockingListener> boundListener)
 {
     // The members the FORMATION starts consensus with (`BootstrapMembersOf`): this node alone
@@ -398,6 +412,23 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> ConsensusTier::Start(
     auto const foundedHere = cfg.formation.has_value() && cfg.formation->foundedHere;
     auto const bootstrap = foundedHere ? members : std::vector<Cluster::MemberSpec> {};
 
+    // Who this node DIALS is every member whose seat is dialled (`Cluster::LinkOfSeat`), never a
+    // learner: a learner dials in, so its recorded endpoint is empty or stale and either way nobody's
+    // to dial -- and an empty one used to refuse the start of every voter whose fleet had a learner.
+    // Every member still lends its KEY to the roster below, a learner's included: a voter must accept
+    // the proof of the learner that dials it before it has applied any state.
+    //
+    // The bootstrap members are `MemberSpec`s, which carry no seat, so each one's seat is read
+    // from the formation record they came from (`SeatInFormation`).
+    auto dialable = std::vector<Cluster::MemberSpec> {};
+    std::ranges::copy_if(members, std::back_inserter(dialable), [&cfg](Cluster::MemberSpec const& member) {
+        return Cluster::LinkOfSeat(SeatInFormation(cfg, member.id)) == Consensus::PeerLink::Dialled;
+    });
+
+    // The mode's ROW decides the shape (`ConsensusTierShapeOf`): whether the Raft port is bound,
+    // and which way the sessions this node dials flow.
+    auto const shape = ConsensusTierShapeOf(cfg);
+
     // The wildcard for a bare port, like the scheduler's and unlike the cache's:
     // peers are on other machines by definition, so a loopback default would be one
     // that silently cannot work.
@@ -411,10 +442,23 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> ConsensusTier::Start(
     // The asymmetry with a worker's `--listen-node` loopback is the rule -- peers are on
     // other machines by definition -- and it is a column rather than a constant each
     // opener reaches for.
-    auto const resolved = SoleEndpointOf(NodeSurface::Raft, cfg);
-    if (!resolved.has_value())
-        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, resolved.error()) };
-    auto const& endpoint = *resolved;
+    //
+    // Only for a mode whose row binds one: a learner listens for nobody, and its Raft surface
+    // resolves no address by design -- asked anyway, that was a refusal of every learner's start.
+    // A listener handed over for such a mode would be served by nothing, so it is refused by name
+    // rather than closed in silence.
+    auto bind = std::optional<SurfaceEndpoint> {};
+    if (shape.listens)
+    {
+        auto resolved = SoleEndpointOf(NodeSurface::Raft, cfg);
+        if (!resolved.has_value())
+            return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, resolved.error()) };
+        bind = *std::move(resolved);
+    }
+    else if (boundListener != nullptr)
+        return std::unexpected { Refusal(NodeRefusalCause::HandedOverListeners,
+                                         "a listener was handed to consensus, and this node's mode binds no "
+                                         "consensus port") };
 
     // The listener is bound in `Launch` rather than here, because it binds against
     // the reactor and the reactor is a member of the object this has not built yet.
@@ -448,27 +492,30 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> ConsensusTier::Start(
     announced.schedulerEndpoint = AdvertisedSchedulerEndpoint(self->raftEndpoint, schedulerBound);
     announced.publicKey = identityKey->PublicKey();
 
-    auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier { std::move(announced),
-                                                                     *std::move(storage),
-                                                                     *identityKey,
-                                                                     members,
-                                                                     std::format("{}:{}", endpoint.host, endpoint.port),
-                                                                     std::move(onRole),
-                                                                     std::move(onMembers),
-                                                                     wallClock,
-                                                                     cfg.clusterId,
-                                                                     std::move(onEndorsement),
-                                                                     metrics,
-                                                                     logger,
-                                                                     conditions } };
+    auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier {
+        std::move(announced),
+        *std::move(storage),
+        *identityKey,
+        members,
+        bind.has_value() ? std::format("{}:{}", bind->host, bind->port) : std::string {},
+        std::move(onRole),
+        std::move(onMembers),
+        wallClock,
+        cfg.clusterId,
+        std::move(onEndorsement),
+        metrics,
+        logger,
+        conditions,
+        std::move(hooks) } };
 
-    if (auto started = tier->Launch(cfg, members, bootstrap, endpoint.host, endpoint.port, std::move(boundListener));
+    if (auto started = tier->Launch(cfg, dialable, bootstrap, bind, shape.direction, std::move(boundListener));
         !started.has_value())
         return std::unexpected { std::move(started).error() };
 
     logger.Logf(LogLevel::Info,
-                "consensus on {} as {} ({}, state in {})",
-                tier->BoundEndpoint(),
+                "consensus {} as {} ({}, state in {})",
+                bind.has_value() ? std::format("on {}", tier->BoundEndpoint())
+                                 : std::format("dialling {} voter(s) and listening for nobody", dialable.size()),
                 cfg.nodeId,
                 bootstrap.empty() ? std::string { "no cluster yet; waiting to be admitted" }
                                   : std::format("{} member(s)", bootstrap.size()),
@@ -476,11 +523,7 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> ConsensusTier::Start(
     return tier;
 }
 
-std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
-                                                       std::vector<Cluster::MemberSpec> const& dialable,
-                                                       std::vector<Cluster::MemberSpec> const& bootstrap,
-                                                       std::string_view bindAddress,
-                                                       std::uint16_t bindPort,
+std::expected<void, NodeRefusal> ConsensusTier::Listen(SurfaceEndpoint const& bind,
                                                        std::unique_ptr<BlockingListener> boundListener)
 {
     // A socket the caller already bound is served as it is, and only if it is the ADDRESS the
@@ -500,26 +543,26 @@ std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
         // unspecified address answers.
         auto const heldHost = boundListener->BoundAddress();
         auto const heldPort = boundListener->boundPort();
-        auto const configuredHost = CanonicalAddressLiteral(bindAddress);
-        if (!bindAddress.empty() && !configuredHost.has_value())
+        auto const configuredHost = CanonicalAddressLiteral(bind.host);
+        if (!bind.host.empty() && !configuredHost.has_value())
             return std::unexpected { Refusal(
                 NodeRefusalCause::HandedOverListeners,
                 std::format("the listener handed to consensus cannot be matched to {}: the configuration names its "
                             "host by name, and a handed listener is matched against an address literal only",
-                            FormatHostPort(bindAddress, bindPort))) };
+                            FormatHostPort(bind.host, bind.port))) };
         auto const hostMatches =
-            bindAddress.empty() ? (heldHost == "0.0.0.0" || heldHost == "::") : heldHost == *configuredHost;
-        if (!hostMatches || heldPort != bindPort)
+            bind.host.empty() ? (heldHost == "0.0.0.0" || heldHost == "::") : heldHost == *configuredHost;
+        if (!hostMatches || heldPort != bind.port)
             return std::unexpected { Refusal(NodeRefusalCause::HandedOverListeners,
                                              std::format("the listener handed to consensus is bound to {}, and the "
                                                          "configuration names {}",
                                                          FormatHostPort(heldHost, heldPort),
-                                                         FormatHostPort(bindAddress, bindPort))) };
+                                                         FormatHostPort(bind.host, bind.port))) };
         auto adopted = AdoptBoundListener(_reactor, boundListener->Release());
         if (!adopted.has_value())
             return std::unexpected { Refusal(NodeRefusalCause::Listener,
                                              std::format("cannot serve the listener handed to consensus on {}: {}",
-                                                         FormatHostPort(bindAddress, bindPort),
+                                                         FormatHostPort(bind.host, bind.port),
                                                          adopted.error())) };
         _listener = std::move(*adopted);
     }
@@ -528,7 +571,7 @@ std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
         // Bound against THIS node's reactor, which is what makes `co_await Accept()`
         // and every read inside `RaftPeerServer` actually suspend. A blocking listener
         // would serve the first peer that connects and never accept another.
-        auto listened = core::net::listen(_reactor, core::net::ListenOptions { .host = bindAddress, .port = bindPort });
+        auto listened = core::net::listen(_reactor, core::net::ListenOptions { .host = bind.host, .port = bind.port });
 
         // The failure is the `expected`'s, and carries its own diagnostic.
         if (!listened.has_value())
@@ -537,7 +580,7 @@ std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
             // here: a paraphrase beside a pointer is two copies that can disagree.
             auto judged = JudgeBindFailure(
                 RowFor(NodeSurface::Raft),
-                std::format("cannot bind {}: {}", FormatHostPort(bindAddress, bindPort), listened.error().toString()),
+                std::format("cannot bind {}: {}", FormatHostPort(bind.host, bind.port), listened.error().toString()),
                 _logger);
             if (!judged.has_value())
                 return std::unexpected { Refusal(NodeRefusalCause::Listener, std::move(judged).error()) };
@@ -555,6 +598,21 @@ std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
         }
         _listener = std::move(*listened);
     }
+    return {};
+}
+
+std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
+                                                       std::vector<Cluster::MemberSpec> const& dialable,
+                                                       std::vector<Cluster::MemberSpec> const& bootstrap,
+                                                       std::optional<SurfaceEndpoint> const& bind,
+                                                       Consensus::RaftWire::SessionDirection direction,
+                                                       std::unique_ptr<BlockingListener> boundListener)
+{
+    // FIRST, so a port that cannot be bound refuses before anything is built over it. A mode whose
+    // row binds none has no listener, and no peer server below either.
+    if (bind.has_value())
+        if (auto listened = Listen(*bind, std::move(boundListener)); !listened.has_value())
+            return listened;
 
     // Two lists out of two, and the split is the whole of how a node joins. Who
     // this node DIALS is everything its operator named; who consensus COUNTS is
@@ -598,8 +656,17 @@ std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
     // seat of.
     auto ids = _bootstrapIds;
 
+    // Which way every session this node dials flows is the mode row's `dials` column: `TwoWay` for a
+    // learner, which nobody dials, so the voter it dials answers on the same connection.
+    auto options = Consensus::PeerTransportOptions {};
+    options.direction = direction;
     _transport = std::make_unique<Consensus::RaftPeerTransport>(
-        std::move(peers), _reactor, *_connector, _inbound, _logger, _metrics, _identity, _nonces);
+        std::move(peers), _reactor, *_connector, _inbound, _logger, _metrics, _identity, _nonces, options);
+
+    // A signed verdict that this node's own key is revoked reaches the formation (#1555): how a
+    // learner offline through its forget learns of it. Set before `Start`, as the transport asks.
+    if (_hooks.onOwnKeyRevoked)
+        _transport->ObserveOwnKeyRevoked(_hooks.onOwnKeyRevoked);
 
     auto recovered = _storage.Load();
     if (!recovered.has_value())
@@ -679,9 +746,11 @@ std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
     // was built before, and a message arriving unbound would be dropped.
     _inbound.Bind(*_sink);
     // The transport is the server's inbound links: a learner's two-way session, accepted here,
-    // is how the transport writes to that learner, which nobody dials. One reactor for both.
-    _peerServer = std::make_unique<Consensus::RaftPeerServer>(
-        *_listener, _reactor, *_sink, *_transport, _logger, _metrics, _identity, _nonces, _acceptLoops);
+    // is how the transport writes to that learner, which nobody dials. One reactor for both. A mode
+    // that binds no port accepts nothing, so it runs no server -- and one loop fewer stops the reactor.
+    if (_listener != nullptr)
+        _peerServer = std::make_unique<Consensus::RaftPeerServer>(
+            *_listener, _reactor, *_sink, *_transport, _logger, _metrics, _identity, _nonces, _acceptLoops);
 
     // Both loops on ONE reactor, and neither through `core::async::syncRun`: that function
     // resumes a coroutine exactly once and throws when it is still suspended, so a
@@ -716,8 +785,16 @@ std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
     assert(_inbound.Bound() && "the transport's inbound sink must be bound before it starts");
     _transport->Start();
 
-    serve(_peerServer.get(), this);
-    tick(_driver.get(), &_reactor, this);
+    // The loops this mode runs, in the order they are submitted -- and their COUNT is what the last one
+    // to finish reads, so it is taken from this list rather than restated beside it. Counted before
+    // either is submitted: a loop that ends at once must not stop the reactor under the other.
+    auto loops = std::vector<std::function<void()>> {};
+    if (_peerServer != nullptr)
+        loops.emplace_back([&serve, this] { serve(_peerServer.get(), this); });
+    loops.emplace_back([&tick, this] { tick(_driver.get(), &_reactor, this); });
+    _loopsRunning.store(static_cast<int>(loops.size()), std::memory_order_relaxed);
+    for (auto const& submit: loops)
+        submit();
 
     _ioThread = std::jthread { [this] { _reactor.run(); } };
 
@@ -803,6 +880,16 @@ std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluste
         return std::unexpected { allowed.error() };
 
     return _driver->Propose(Cluster::Encode(proposal), std::chrono::steady_clock::now());
+}
+
+Consensus::RaftWire::SessionDirection ConsensusTier::Direction() const noexcept
+{
+    return _transport->Direction();
+}
+
+std::vector<Consensus::NodeId> ConsensusTier::DialTargets() const
+{
+    return _transport->DialTargets();
 }
 
 Cluster::ClusterState ConsensusTier::ClusterState() const
@@ -1048,8 +1135,12 @@ void ConsensusTier::LearnMembers(Cluster::ClusterState const& state, std::span<C
             _logger.Logf(LogLevel::Info, "raft: peer {} moved to {}", id, endpoint);
     };
 
+    // Only a member whose seat is DIALLED (`Cluster::LinkOfSeat`): a learner dials in, and its
+    // recorded endpoint -- empty, or one it once had -- is nobody's to dial. So a leader never dials
+    // a learner, and a learner dials the voters and no other learner.
     for (auto const& member: state.members)
-        learn(member.id, member.raftEndpoint);
+        if (Cluster::LinkOfSeat(member.seat) == Consensus::PeerLink::Dialled)
+            learn(member.id, member.raftEndpoint);
 
     // Which members reach this node by dialling in is the link column's, read from the record's
     // seats AND the configuration's standings (`DialInPeers`) and never decided here -- so the
@@ -1097,6 +1188,10 @@ void ConsensusTier::ReportQuorum()
     // forget revoked keeps its key on this wire until the configuration drops it, or a cluster
     // losing its leader inside that pass could be left with a quorum nobody can reach.
     _roster.AdoptConfiguration(configuration);
+    // And every session a peer dialled in on is asked again NOW rather than at its next frame: a
+    // forgotten learner's session carries none, so without this it idles on and the learner never
+    // hears it was forgotten (`RaftPeerTransport::RecheckProofs`).
+    _transport->RecheckProofs();
 
     // The FIRST pass reports whatever it finds, changed or not, and that is the
     // point rather than an initialisation detail. A joiner starts with no members,
@@ -1292,8 +1387,14 @@ void ConsensusTier::PublishRole(Consensus::RaftDriver::RoleChange const& change)
 
     _lastRole = change.role;
     _lastTerm = change.term;
+    auto const leaderMoved = _lastLeader != change.knownLeader;
     _lastLeader = change.knownLeader;
     Republish();
+
+    // Who leads is part of what the formation reads off the applied state, and it can move with no
+    // state applied at all.
+    if (leaderMoved)
+        TellFormation(_application.State());
 }
 
 void ConsensusTier::Endorse(Cluster::ClusterState const& state)
@@ -1348,6 +1449,19 @@ void ConsensusTier::OnStateChanged(Cluster::ClusterState const& state)
     // And the leader's ADDRESS may have just arrived, which is a different answer
     // from the role this node already knew.
     Republish();
+
+    TellFormation(state);
+}
+
+void ConsensusTier::TellFormation(Cluster::ClusterState const& state)
+{
+    if (!_hooks.onState)
+        return;
+    // Where the leader answers the `0xFC` port is the state's to say; this node's own too, since a
+    // formation reads "who leads" the same way whoever leads.
+    auto const leaderNodeEndpoint =
+        _lastLeader.has_value() ? state.SchedulerEndpointOf(*_lastLeader).value_or(std::string {}) : std::string {};
+    _hooks.onState(state, _clusterId, _lastLeader, leaderNodeEndpoint);
 }
 
 void ConsensusTier::Republish()
@@ -1418,7 +1532,8 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
     core::platform::WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger,
-    NodeConditions* conditions)
+    NodeConditions* conditions,
+    FormationHooks hooks)
 {
     // No cluster configured: a pure worker, which since #178 is the only node that runs
     // none -- a scheduler is a consensus member even alone.
@@ -1476,7 +1591,8 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
         },
         metrics,
         logger,
-        conditions);
+        conditions,
+        std::move(hooks));
 
     // Wired here rather than at construction, and the order is forced: consensus
     // needs the port the scheduler surface BOUND in order to announce where

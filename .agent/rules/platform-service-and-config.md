@@ -1031,6 +1031,18 @@ readable and silently ignored. Every rule below has already been one of them.
   rather than as a reader, deliberately — a process's environment does not change
   under it, so replaying what the start resolved makes the two assemblies identical
   by construction rather than by inspection.
+  - **And a REFORM shapes its body from the configuration IN FORCE, never the one the
+    process started with.** `fastcache-compile-node` replaces its serving body in-process
+    when its formation mode changes (`RunNodeBodies`), and PUBLISHES the reformed
+    configuration into the reloader as the one in force. Shaped from the start's `cfg`,
+    which no reload changes, it reverted every accepted reload at the next yield,
+    approval, forget or dissolve: a `--fleet-member` entry the operator removed was
+    admitted again, a rotated `--requirepass` went back to the old secret, and nothing
+    logged either. Removal is the direction that fails OPEN, so this is the dangerous
+    reading of the rule above, one level later. Every body is adopted from
+    `INodeConfigSource::Current()` — `LiveNodeConfig`, the reloader's snapshot, or the
+    start's configuration only when there is no file — the seam the move judge reads, so
+    the judge, the reform and a restart read one configuration.
 - **A setting a FILE can carry and argv cannot is a defect, not a category.** Three
   `memory_compression*` keys were exactly that: accepted by `ReadYamlConfig`,
   documented in the shipped reference, live-wired at startup by `main.cpp`, and in no

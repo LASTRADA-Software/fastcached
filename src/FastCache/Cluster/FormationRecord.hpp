@@ -84,14 +84,22 @@ struct RejectionMemo
 
 /// A fleet this node once asked to admit it, remembered after the ask ended.
 ///
-/// The evidence a split of one fleet heals on: a machine that asked a fleet under the key it was proven by
-/// can tell that fleet, and only that fleet, apart from anybody claiming its id -- so the memo outlives
-/// an abandoned, rejected or approved ask, and is dropped only past `MaxAskedJoins`.
+/// The evidence a split of one fleet is TOLD on (`Cluster::SplitEvidence::WeAskedAndTheyListUs`): a
+/// machine that asked a fleet under the key it was proven by can tell that fleet, and only that fleet,
+/// apart from anybody claiming its id -- so the memo outlives an abandoned, rejected or approved ask,
+/// and is dropped only past `MaxAskedJoins`. It never heals a split by itself: the key it names is one
+/// this node trusted on first use, so an operator decides (`Cluster::SplitHealing::ByOperator`).
 struct AskedJoin
 {
     std::string clusterId;                  ///< The fleet it asked.
     Ed25519PublicKey provenKey {};          ///< The key that proved that fleet's summary when it asked.
     std::uint64_t askedAtUnixSeconds { 0 }; ///< When it first asked.
+
+    /// Whether that fleet ADMITTED this node under that key: an admission signed over this node's own
+    /// request by the key it proved there. The memos an ask that went nowhere must never displace, since
+    /// a fleet lists a machine because it admitted it -- but admitted is not trusted: every memo, admitted
+    /// or not, is evidence an operator decides on, and none heals by itself.
+    bool admitted { false };
 
     /// Field-wise equality.
     [[nodiscard]] friend bool operator==(AskedJoin const&, AskedJoin const&) = default;
@@ -102,6 +110,28 @@ struct AskedJoin
 /// A handful, because a machine asks a fleet rarely -- at install, and again only after a rejection
 /// window or an abandonment -- and a bound, because the record is read at every start.
 inline constexpr std::size_t MaxAskedJoins = 8;
+
+// Every memo a record keeps travels in one announcement, so the leader holds all of them.
+static_assert(CompileCacheWire::MaxAnnouncedJoinMemos == MaxAskedJoins,
+              "a NODE-ANNOUNCE carries exactly the join memos a formation record keeps");
+
+/// Where the fleets this node once asked are read from, as they stand now.
+///
+/// What a node hands its leader in every announcement, so the leader holds every member's evidence
+/// that a fleet it sees is this one split -- whichever machine did the asking.
+class IAskedJoinsSource
+{
+  public:
+    IAskedJoinsSource() = default;
+    IAskedJoinsSource(IAskedJoinsSource const&) = delete;
+    IAskedJoinsSource(IAskedJoinsSource&&) = delete;
+    IAskedJoinsSource& operator=(IAskedJoinsSource const&) = delete;
+    IAskedJoinsSource& operator=(IAskedJoinsSource&&) = delete;
+    virtual ~IAskedJoinsSource() = default;
+
+    /// @return The memos, oldest first; at most `MaxAskedJoins`.
+    [[nodiscard]] virtual std::vector<AskedJoin> AskedJoins() const = 0;
+};
 
 /// Everything a node keeps about how it formed.
 struct FormationRecord
@@ -121,7 +151,18 @@ struct FormationRecord
 /// The layout `EncodeFormationRecord` writes. A record in any other layout is refused as
 /// `UnsupportedFormatVersion` and left where it is; a record a LATER build wrote is never read
 /// as this build's, and never written over.
-inline constexpr std::uint8_t FormationRecordFormat = 2;
+///
+/// 3 because a join target nests the fleet's summary as the summary's own codec writes it, and that
+/// grew from seven fields to ten: a format 2 record is intact and holds a seven-field summary, which
+/// read as this build's would be reported as damage that is not there.
+///
+/// **Format 3 is this branch's own, UNRELEASED definition, and is FINAL only at the lane-0 flag
+/// day.** It has changed twice since it was named -- an asked-fleet memo went from three fields to
+/// four, and the nested summary from ten fields to eleven -- without moving, because no build that
+/// wrote the earlier shapes ever shipped: a record one of them left decodes as `MalformedFrame`
+/// rather than `UnsupportedFormatVersion`, and that is accepted for an unreleased format only. From
+/// the flag day on, every change to this layout moves this number.
+inline constexpr std::uint8_t FormationRecordFormat = 3;
 
 /// The four bytes every formation record starts with, so a file that is not one is told apart
 /// from one in another layout.
@@ -196,11 +237,26 @@ inline constexpr std::uint64_t UnbelievableClockCreatedAt = std::numeric_limits<
 ///
 /// One memo per `(clusterId, provenKey)`: asking the same fleet under the same key again changes
 /// nothing, so a memo keeps the time it was FIRST asked; the same id under ANOTHER key is a different
-/// claim and a memo of its own -- the evidence a split heals on must not let a later key stand in for
-/// the one the node actually asked. Past `MaxAskedJoins` the oldest memo is dropped.
+/// claim and a memo of its own -- the evidence a split is told on must not let a later key stand in for
+/// the one the node actually asked.
+///
+/// **Past `MaxAskedJoins` the oldest memo NOT admitted is dropped**, and an admitted one only when
+/// every memo is. Asking costs a fleet nothing it cannot mint -- a fresh id, or the same id under a
+/// fresh key, proves itself to any challenge -- so a node led to ask eight of them would otherwise
+/// lose the one memo it holds for a fleet that admitted it, and with it the split's heal. An
+/// admission is signed by the key the node proved (`Cluster::VerifyAdmission`), so displacing an
+/// admitted memo takes eight fleets that each really admitted it. The direction when that happens
+/// anyway: the heal it would have given becomes `ForeignFleet`, told to an operator -- CLOSED.
 /// @param record The record to change.
 /// @param asked The fleet asked.
 void RememberAsked(FormationRecord& record, AskedJoin asked);
+
+/// Mark the memo of asking @p clusterId under @p provenKey as ADMITTED: the fleet it names took this
+/// node in, under that key. Nothing changes when the record holds no such memo.
+/// @param record The record to change.
+/// @param clusterId The fleet that admitted this node.
+/// @param provenKey The key it was proven by when this node asked it.
+void RememberAdmitted(FormationRecord& record, std::string_view clusterId, Ed25519PublicKey const& provenKey);
 
 /// Whether the node is in the cluster it minted itself rather than one it joined.
 /// @param record The record.

@@ -96,6 +96,7 @@ struct Peer
     SystemSecureRandom random;
     Testing::ScriptedSummarySource self;
     NodeConditions conditions;
+    Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets fleets;
     RosterPeerKeys keys;
     std::unique_ptr<DiscoveryTier> tier;
@@ -140,6 +141,7 @@ struct Peer
             .keys = keys,
             .self = self,
             .conditions = conditions,
+            .evidence = evidence,
             .fleets = fleets,
             .onPeers = [this](std::span<Cluster::DesiredMember const> peers) { seen.assign(peers.begin(), peers.end()); },
             .metrics = metrics,
@@ -436,7 +438,8 @@ TEST_CASE("Two established fleets on one segment prove each other, desire nothin
     auto const roster = SharedRoster::Of({ "n1", "n2" });
     Peer ours { bus, "n1", roster };
     Peer theirs { bus, SummaryFor("n2", "somebody-elses"), roster };
-    CHECK(ours.conditions.StateOf(NodeCondition::ForeignFleetVisible) == CompileCacheWire::ConditionState::Clear);
+    // Not clear before discovery has listened: nothing has been heard to say "nobody" with.
+    CHECK(ours.conditions.StateOf(NodeCondition::ForeignFleetVisible) == CompileCacheWire::ConditionState::NotEvaluated);
 
     Settle(ours, theirs, 6);
 
@@ -489,8 +492,7 @@ TEST_CASE("Discovery on a consensus port bound to loopback stands down when defa
     auto const port = probe->boundPort();
     probe.reset();
 
-    auto const scratch = Testing::UniqueScratchPath("discovery-loopback-consensus");
-    std::filesystem::create_directories(scratch);
+    Testing::ScratchDirectory const scratch { "discovery-loopback-consensus" };
 
     auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeId = "n1";
@@ -509,14 +511,17 @@ TEST_CASE("Discovery on a consensus port bound to loopback stands down when defa
         core::platform::defaultSystemWallClock(),
         {},
         metrics,
-        logger);
+        logger,
+        nullptr,
+        FormationHooks {});
     REQUIRE(started.has_value());
     auto const consensus = std::move(*started);
 
     NodeConditions conditions;
     // The one summary `main` hands both discovery and the FLEET-SUMMARY responder.
     FixedFleetSummary const answered { AnsweredFleetSummary(cfg) };
-    auto const defaulted = StartDiscoveryOrExplain(cfg, consensus, answered, conditions, metrics, logger);
+    auto const defaulted =
+        StartDiscoveryOrExplain(cfg, consensus, answered, conditions, metrics, logger, DiscoveryFormation {});
     REQUIRE(defaulted.has_value());
     CHECK(*defaulted == nullptr);
     CHECK(conditions.StateOf(NodeCondition::ForeignFleetVisible) == CompileCacheWire::ConditionState::NotEvaluated);
@@ -525,13 +530,15 @@ TEST_CASE("Discovery on a consensus port bound to loopback stands down when defa
     // none of its own: handed one naming another loopback endpoint, that is the endpoint it names.
     NodeConditions namedConditions;
     FixedFleetSummary const named { ConfiguredFleetSummary(cfg, "localhost:7777") };
-    REQUIRE(StartDiscoveryOrExplain(cfg, consensus, named, namedConditions, metrics, logger).has_value());
+    REQUIRE(
+        StartDiscoveryOrExplain(cfg, consensus, named, namedConditions, metrics, logger, DiscoveryFormation {}).has_value());
     CHECK(Testing::DetailOf(namedConditions, NodeCondition::ForeignFleetVisible).contains("localhost:7777"));
 
     auto typed = cfg;
     typed.discoveryAddressExplicit = true;
     NodeConditions typedConditions;
-    auto const refused = StartDiscoveryOrExplain(typed, consensus, answered, typedConditions, metrics, logger);
+    auto const refused =
+        StartDiscoveryOrExplain(typed, consensus, answered, typedConditions, metrics, logger, DiscoveryFormation {});
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().reason == DiscoveryAnnouncesOnlyThisMachineRefusal);
 
@@ -558,6 +565,14 @@ TEST_CASE("A node announces the state its recorded mode announces", "[node][disc
     voter.mode = Cluster::NodeMode::Voter;
     cfg.formation = std::move(voter);
     CHECK(ConfiguredFleetSummary(cfg, "n1.example:6680").state == FleetState::Established);
+
+    // A pending record points before the controller exists to say where: at nothing, which nobody
+    // follows, rather than at a leader of its own a peer would take for the fleet to join.
+    auto pending = Unwrap(cfg.formation);
+    pending.mode = Cluster::NodeMode::Pending;
+    cfg.formation = std::move(pending);
+    CHECK(ConfiguredFleetSummary(cfg, "n1.example:6680").state == FleetState::Pending);
+    CHECK(ConfiguredFleetSummary(cfg, "n1.example:6680").leaderNodeEndpoint.empty());
 }
 
 TEST_CASE("Discovery defaulted on a node running no consensus starts nothing, and typed is refused",
@@ -576,7 +591,8 @@ TEST_CASE("Discovery defaulted on a node running no consensus starts nothing, an
     REQUIRE_FALSE(worker.discoveryAddress.empty());
     NodeConditions conditions;
     FixedFleetSummary const answered { AnsweredFleetSummary(worker) };
-    auto const defaulted = StartDiscoveryOrExplain(worker, none, answered, conditions, metrics, logger);
+    auto const defaulted =
+        StartDiscoveryOrExplain(worker, none, answered, conditions, metrics, logger, DiscoveryFormation {});
     REQUIRE(defaulted.has_value());
     CHECK(*defaulted == nullptr);
 
@@ -585,7 +601,7 @@ TEST_CASE("Discovery defaulted on a node running no consensus starts nothing, an
 
     auto typed = worker;
     typed.discoveryAddressExplicit = true;
-    auto const refused = StartDiscoveryOrExplain(typed, none, answered, conditions, metrics, logger);
+    auto const refused = StartDiscoveryOrExplain(typed, none, answered, conditions, metrics, logger, DiscoveryFormation {});
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().reason.starts_with("--discovery needs --listen-raft"));
 }
@@ -666,6 +682,7 @@ struct BeatingTier
     SystemSecureRandom random;
     Testing::ScriptedSummarySource self;
     NodeConditions conditions;
+    Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets fleets;
     RosterPeerKeys keys;
     Testing::ScriptedInterfaceAddresses interfaces;
@@ -699,6 +716,7 @@ struct BeatingTier
                                    .keys = keys,
                                    .self = self,
                                    .conditions = conditions,
+                                   .evidence = evidence,
                                    .fleets = fleets,
                                    .onPeers = [](std::span<Cluster::DesiredMember const>) {},
                                    .metrics = metrics,
@@ -979,7 +997,7 @@ TEST_CASE("The discovery tier refuses a node without consensus in the startup ta
     NodeConditions conditions;
     FixedFleetSummary const answered { AnsweredFleetSummary(cfg) };
 
-    auto const started = StartDiscoveryOrExplain(cfg, none, answered, conditions, metrics, logger);
+    auto const started = StartDiscoveryOrExplain(cfg, none, answered, conditions, metrics, logger, DiscoveryFormation {});
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().reason == DiscoveryNeedsConsensusRefusal);
     CHECK(started.error().cause == NodeRefusalCause::EarlierRule);

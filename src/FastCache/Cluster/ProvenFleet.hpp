@@ -12,9 +12,11 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 /// @file ProvenFleet.hpp
 /// Another fleet as this node came to know it, and the two seams discovery reaches formation
@@ -173,11 +175,16 @@ class IFleetSummarySource
     [[nodiscard]] virtual CompileCacheWire::FleetSummary Current() const = 0;
 };
 
-/// Where a proven fleet of ANOTHER cluster is handed.
+/// Where every authenticated discovery reply is handed: a fleet of ANOTHER cluster, proven by its
+/// signature alone, and this node's OWN fleet, once the key the roster holds for the speaker proved it.
 ///
-/// Never asked of the roster and never desired: another cluster's machine is nobody this node's
-/// cluster admits. What it IS good for is formation -- a solitary node yields to it, an
-/// established one says two fleets can see each other.
+/// Another cluster's machine is never asked of the roster and never desired: nobody this node's
+/// cluster admits. What it IS good for is formation -- a solitary node yields to it, an established
+/// one says two fleets can see each other. This node's own fleet is told too, because hearing ANY
+/// reply is the evidence that "no other fleet is visible" is a finding rather than deafness
+/// (`ForeignFleetWatch`). **Every observer acting on other fleets tells the two apart by cluster id
+/// ITSELF**, the guard folded into the operation -- never trusting a decorator in front of it to have
+/// filtered, since nothing makes one stand there.
 class IFleetObserver
 {
   public:
@@ -188,27 +195,37 @@ class IFleetObserver
     IFleetObserver& operator=(IFleetObserver&&) = delete;
     virtual ~IFleetObserver() = default;
 
-    /// Told a fleet of another cluster proved its summary.
+    /// Told a fleet proved its summary: another cluster's, or this node's own -- see the class comment.
     /// @param fleet What it proved, and how it arrived.
     virtual void OnFleetProven(ProvenFleet const& fleet) = 0;
 };
 
-/// Whether @p summary tells a peer to dial an address that reaches only the machine dialling it.
+/// The endpoints in @p summary a peer would dial and reach only ITSELF, in
+/// `CompileCacheWire::DialledEndpointTexts`' order.
 ///
-/// **What a node must never announce** -- in a beacon, in a proof, or in a `FleetSummary` answer.
 /// `localhost`, a name under `.localhost` or a loopback address resolve to the PEER itself on every
 /// machine (`NamesOnlyThisMachine`), so a peer acting on one dials itself, confidently, with no error
-/// at either end. Both endpoints a peer dials are asked: where this node answers consensus, and
-/// where its leader answers the `0xFC` port. An EMPTY endpoint names nothing to dial -- a learner
-/// has no consensus endpoint -- and is not this.
+/// at either end. Every endpoint a peer dials is asked, from the one list the decoder's dial rule
+/// walks too. An EMPTY endpoint names nothing to dial -- a learner has no consensus endpoint -- and
+/// is not this.
 /// @param summary What this node would announce.
-/// @return True when it names an endpoint only the dialling machine would reach.
-[[nodiscard]] inline bool AnnouncesOnlyThisMachine(CompileCacheWire::FleetSummary const& summary) noexcept
+/// @return The offending endpoints; empty when there are none.
+[[nodiscard]] inline std::vector<std::string_view> EndpointsOnlyThisMachine(CompileCacheWire::FleetSummary const& summary)
 {
-    auto const dialsItself = [](std::string_view endpoint) {
-        return !endpoint.empty() && NamesOnlyThisMachine(HostOfEndpoint(endpoint));
-    };
-    return dialsItself(summary.raftEndpoint) || dialsItself(summary.leaderNodeEndpoint);
+    auto found = std::vector<std::string_view> {};
+    for (auto const text: CompileCacheWire::DialledEndpointTexts(summary))
+        if (!text.empty() && NamesOnlyThisMachine(HostOfEndpoint(text)))
+            found.emplace_back(text);
+    return found;
+}
+
+/// Whether @p summary tells a peer to dial an address that reaches only the machine dialling it:
+/// **what a node must never announce** -- in a beacon, in a proof, or in a `FleetSummary` answer.
+/// @param summary What this node would announce.
+/// @return True when `EndpointsOnlyThisMachine` names any.
+[[nodiscard]] inline bool AnnouncesOnlyThisMachine(CompileCacheWire::FleetSummary const& summary)
+{
+    return !EndpointsOnlyThisMachine(summary).empty();
 }
 
 } // namespace FastCache::Cluster

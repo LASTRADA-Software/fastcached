@@ -42,8 +42,9 @@ namespace
     /// Fields in a fleet membership: the fleet's id, the roster and the fleet's creation time.
     constexpr std::size_t FleetMembershipFields = 3;
 
-    /// Fields in one asked fleet: its id, the key that proved it, when this node asked.
-    constexpr std::size_t AskedJoinFields = 3;
+    /// Fields in one asked fleet: its id, the key that proved it, when this node asked, and whether it
+    /// admitted this node (one byte, 0 or 1).
+    constexpr std::size_t AskedJoinFields = 4;
 
     /// Fields in a rejection memo: the fleet's id and when it refused.
     constexpr std::size_t RejectionMemoFields = 2;
@@ -119,7 +120,10 @@ namespace
         auto const fields = WireFields::SplitExactly(body, JoinTargetFields);
         if (!fields.has_value())
             return std::nullopt;
-        auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0]);
+        // At the REPLY's cap, the larger: a target may have been proven by a seed's answer, and
+        // the record keeps the summary exactly as it was proven.
+        auto summary =
+            CompileCacheWire::DecodeFleetSummaryFields((*fields)[0], CompileCacheWire::MaxFleetSummaryReplyMembers);
         auto const asked = WireFields::FromBigEndian<std::uint64_t>((*fields)[2]);
         if (!summary.has_value() || (*fields)[1].size() != Ed25519PublicKeyBytes || !asked.has_value())
             return std::nullopt;
@@ -205,9 +209,11 @@ namespace
         for (auto const& memo: asked)
         {
             auto const at = WireFields::ToBigEndian<std::uint64_t>(memo.askedAtUnixSeconds);
+            auto const admitted = std::array { static_cast<std::byte>(memo.admitted ? 1 : 0) };
             entries.push_back(WireFields::Encode({ WireFields::AsBytes(memo.clusterId),
                                                    std::span<std::byte const> { memo.provenKey },
-                                                   std::span<std::byte const> { at } }));
+                                                   std::span<std::byte const> { at },
+                                                   std::span<std::byte const> { admitted } }));
         }
         auto const views = std::vector<std::span<std::byte const>> { entries.begin(), entries.end() };
         return WireFields::Encode(WireFields::FieldList { views });
@@ -216,7 +222,7 @@ namespace
     /// Read the field `EncodeAskedJoins` wrote.
     ///
     /// More than `MaxAskedJoins` is damage, since no build writes more; so is an entry whose key is
-    /// not a key's width or whose time is not eight bytes.
+    /// not a key's width, whose time is not eight bytes, or whose admitted byte is not 0 or 1.
     /// @param field The field.
     /// @return The memos, or nothing when damaged.
     [[nodiscard]] std::optional<std::vector<AskedJoin>> DecodeAskedJoins(std::span<std::byte const> field)
@@ -232,9 +238,13 @@ namespace
             if (!fields.has_value() || (*fields)[1].size() != Ed25519PublicKeyBytes)
                 return std::nullopt;
             auto const at = WireFields::FromBigEndian<std::uint64_t>((*fields)[2]);
-            if (!at.has_value())
+            auto const admitted = (*fields)[3];
+            if (!at.has_value() || admitted.size() != 1 || std::to_integer<unsigned>(admitted[0]) > 1)
                 return std::nullopt;
-            auto memo = AskedJoin { .clusterId = OwnedText((*fields)[0]), .provenKey = {}, .askedAtUnixSeconds = *at };
+            auto memo = AskedJoin { .clusterId = OwnedText((*fields)[0]),
+                                    .provenKey = {},
+                                    .askedAtUnixSeconds = *at,
+                                    .admitted = admitted[0] == std::byte { 1 } };
             std::ranges::copy((*fields)[1], memo.provenKey.begin());
             asked.push_back(std::move(memo));
         }
@@ -430,10 +440,22 @@ void RememberAsked(FormationRecord& record, AskedJoin asked)
     if (known)
         return;
     record.askedJoins.push_back(std::move(asked));
-    if (record.askedJoins.size() > MaxAskedJoins)
-        record.askedJoins.erase(record.askedJoins.begin(),
-                                record.askedJoins.begin()
-                                    + static_cast<std::ptrdiff_t>(record.askedJoins.size() - MaxAskedJoins));
+    // One past the bound at most, since every write goes through here: the oldest memo nothing
+    // admitted goes first, and an admitted one only when every memo is. The memo just added is
+    // never its own victim -- it is not admitted yet, so it would always be "the oldest not admitted"
+    // once every older memo is, and the ask would be forgotten the moment it was made.
+    if (record.askedJoins.size() <= MaxAskedJoins)
+        return;
+    auto const older = std::prev(record.askedJoins.end());
+    auto const unadmitted = std::ranges::find(record.askedJoins.begin(), older, false, &AskedJoin::admitted);
+    record.askedJoins.erase(unadmitted != older ? unadmitted : record.askedJoins.begin());
+}
+
+void RememberAdmitted(FormationRecord& record, std::string_view clusterId, Ed25519PublicKey const& provenKey)
+{
+    for (auto& memo: record.askedJoins)
+        if (memo.clusterId == clusterId && memo.provenKey == provenKey)
+            memo.admitted = true;
 }
 
 bool FoundedHere(FormationRecord const& record) noexcept

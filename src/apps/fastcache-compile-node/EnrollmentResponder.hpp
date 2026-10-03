@@ -4,6 +4,8 @@
 #include "EnrollmentWindow.hpp"
 #include "FrameEndpoint.hpp"
 
+#include <FastCache/Cluster/ProvenFleet.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
@@ -70,6 +72,10 @@ class EnrollmentResponder final: public IFrameResponder
     /// @param scheduler Whose leadership decides whether this node may answer, and
     ///        whose `ClusterAdmit` records an approval; must outlive this.
     /// @param membership Who may reach `EnrollControl`; must outlive this.
+    /// @param self What this node says about itself: the cluster id an admission is signed for is
+    ///        the one its FLEET-SUMMARY answer states, so the key a joiner proved and the cluster it
+    ///        proved it for are one reading. Must outlive this.
+    /// @param identity This node's identity key, which signs every admission; must outlive this.
     /// @param metrics Where refusals and admissions served are recorded; must outlive this.
     /// @param logger Where a reject of an already-admitted machine is said out loud.
     ///
@@ -81,15 +87,24 @@ class EnrollmentResponder final: public IFrameResponder
     EnrollmentResponder(EnrollmentWindow& window,
                         Distributed::SchedulerService& scheduler,
                         Distributed::IMembershipOracle const& membership,
+                        Cluster::IFleetSummarySource const& self,
+                        Ed25519KeyPair const& identity,
                         IMetricsSink& metrics,
                         ILogger& logger):
         _window { window },
         _scheduler { scheduler },
         _membership { membership },
+        _self { self },
+        _identity { identity },
         _metrics { metrics },
         _logger { logger }
     {
-        _scheduler.ObserveRole([&window](Distributed::SchedulerRole role) { window.OnRoleChanged(role); });
+        _scheduler.ObserveRole([&window, &scheduler](Distributed::SchedulerRole role) {
+            window.OnRoleChanged(role, scheduler.LeaderEndpoint());
+        });
+        // And the role it holds NOW, which a scheduler told before this surface was built never tells
+        // again: the rows would otherwise wait for the next election to stop reading not-evaluated.
+        window.OnRoleChanged(scheduler.Role(), scheduler.LeaderEndpoint());
     }
 
     /// @copydoc IFrameResponder::Answer
@@ -293,8 +308,9 @@ class EnrollmentResponder final: public IFrameResponder
 
     /// Admit a joiner the armed auto-approve deadline answered for, and record that it did.
     /// @param nodeId The joiner's id.
-    /// @return `Pending`, admitted or not: the joiner's next poll is answered from the roster.
-    [[nodiscard]] std::vector<std::byte> AnswerAutoApprove(std::string_view nodeId);
+    /// @param pending The signed `Pending` answer to this request.
+    /// @return @p pending, admitted or not: the joiner's next poll is answered from the roster.
+    [[nodiscard]] std::vector<std::byte> AnswerAutoApprove(std::string_view nodeId, std::vector<std::byte> const& pending);
 
     /// Drop every request nobody decided about, count and log what went, and answer the report.
     /// @param peer Who asked, named in the log line.
@@ -332,6 +348,8 @@ class EnrollmentResponder final: public IFrameResponder
     EnrollmentWindow& _window;
     Distributed::SchedulerService& _scheduler;
     Distributed::IMembershipOracle const& _membership;
+    Cluster::IFleetSummarySource const& _self;
+    Ed25519KeyPair const& _identity;
     IMetricsSink& _metrics;
 
     /// Where the one condition no counter can carry is said out loud: a machine rejected

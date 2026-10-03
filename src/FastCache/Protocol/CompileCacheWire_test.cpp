@@ -2031,11 +2031,17 @@ TEST_CASE("An enroll request round-trips, and a payload of the wrong arity is re
 {
     auto key = std::array<std::byte, IdentityPublicKeyBytes> {};
     key.fill(std::byte { 0x42 });
-    auto const frame = EncodeEnroll(EnrollRequest {
-        .nodeId = "joiner-a", .nodeEndpoint = "10.0.0.9:6674", .role = EnrollRole::Worker, .publicKey = key });
+    auto nonce = std::array<std::byte, NodeChallengeBytes> {};
+    nonce.fill(std::byte { 0x77 });
+    auto const frame = EncodeEnroll(EnrollRequest { .nodeId = "joiner-a",
+                                                    .nodeEndpoint = "10.0.0.9:6674",
+                                                    .role = EnrollRole::Worker,
+                                                    .publicKey = key,
+                                                    .nonce = nonce });
     auto const header = DecodeRequestHeader(frame);
     REQUIRE(header.has_value());
     CHECK(Unwrap(header).opRaw == static_cast<std::uint8_t>(Op::Enroll));
+    CHECK(OpFieldCount(Op::Enroll) == 5);
 
     auto const fields = DecodeEnrollPayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
     REQUIRE(fields.has_value());
@@ -2043,32 +2049,38 @@ TEST_CASE("An enroll request round-trips, and a payload of the wrong arity is re
     CHECK(AsStringView(Unwrap(fields).nodeEndpoint) == "10.0.0.9:6674");
     CHECK(Unwrap(fields).role == EnrollRole::Worker);
     CHECK(Unwrap(fields).publicKey == key);
+    CHECK(Unwrap(fields).nonce == nonce);
 
     // The role's BYTES, since they travel: a symbol both ends spell tests only the name.
     CHECK(static_cast<std::uint8_t>(EnrollRole::Worker) == 0x02);
     CHECK(static_cast<std::uint8_t>(EnrollRole::Learner) == 0x03);
 
-    // Two fields where four are declared -- a version-11 request's shape -- refused on the
+    // Two fields where five are declared -- a version-11 request's shape -- refused on the
     // count alone, which is what keeps a peer speaking a shape this build does not know
-    // from being read as a short one.
+    // from being read as a short one. So is the four-field request of the grammar before the
+    // nonce: a request an admission cannot be signed over.
     auto const id = AsBytes(std::string_view { "joiner-a" });
     auto const endpoint = AsBytes(std::string_view { "10.0.0.9:6674" });
-    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint })).has_value());
-
-    // A role this build cannot name, and a key that is not 32 bytes, are refused rather than
-    // defaulted: a joiner recorded under a key it did not send is admitted under a key nobody
-    // holds, and a role guessed is a machine admitted as something it did not ask to be.
     auto const learner = std::array { static_cast<std::byte>(EnrollRole::Learner) };
+    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint })).has_value());
+    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key })).has_value());
+
+    // A role this build cannot name, and a key or a nonce that is not 32 bytes, are refused rather
+    // than defaulted: a joiner recorded under a key it did not send is admitted under a key nobody
+    // holds, a role guessed is a machine admitted as something it did not ask to be, and a nonce cut
+    // short is one both ends would sign and verify over different bytes.
     auto const unknownRole = std::array { std::byte { 0x7F } };
     auto const shortKey = std::span<std::byte const> { key }.first(IdentityPublicKeyBytes - 1);
-    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, unknownRole, key })).has_value());
-    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, shortKey })).has_value());
-    CHECK(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key })).has_value());
+    auto const shortNonce = std::span<std::byte const> { nonce }.first(NodeChallengeBytes - 1);
+    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, unknownRole, key, nonce })).has_value());
+    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, shortKey, nonce })).has_value());
+    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, shortNonce })).has_value());
+    CHECK(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, nonce })).has_value());
 
     // The RETIRED role byte is refused like any unknown one, never read as its successor: 0x01
     // was `Member`, and a joiner still sending it asks for a seat this build no longer grants.
     auto const retiredMember = std::array { std::byte { 0x01 } };
-    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, retiredMember, key })).has_value());
+    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, retiredMember, key, nonce })).has_value());
 }
 
 TEST_CASE("A pending enroll reply carries a zero-length roster field rather than an absent one", "[wire][enrollment]")
@@ -2084,14 +2096,14 @@ TEST_CASE("A pending enroll reply carries a zero-length roster field rather than
     // named `*View` to announce, and this file is where it gets tested rather than
     // demonstrated -- the first draft of this case was written the obvious way and the
     // payload came back as thirteen bytes of rubble.
-    auto const pendingPayload = EncodeEnrollReply(EnrollOutcome::Pending, {});
+    auto const pendingPayload = EncodeEnrollReply(EnrollOutcome::Pending, {}, {}, std::nullopt);
     auto const pending = DecodeEnrollReply(pendingPayload);
     REQUIRE(pending.has_value());
     CHECK(Unwrap(pending).outcome == EnrollOutcome::Pending);
     CHECK(Unwrap(pending).roster.empty());
 
     auto const roster = AsBytes(std::string_view { "roster-bytes" });
-    auto const approvedPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster);
+    auto const approvedPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster, {}, std::nullopt);
     auto const approved = DecodeEnrollReply(approvedPayload);
     REQUIRE(approved.has_value());
     CHECK(Unwrap(approved).outcome == EnrollOutcome::Approved);
@@ -2552,8 +2564,12 @@ TEST_CASE("An enroll request carries the joiner's node endpoint as its second fi
 {
     auto key = std::array<std::byte, IdentityPublicKeyBytes> {};
     key.fill(std::byte { 0x42 });
-    auto const frame = EncodeEnroll(EnrollRequest {
-        .nodeId = "laptop", .nodeEndpoint = "laptop.corp.example:6674", .role = EnrollRole::Learner, .publicKey = key });
+    auto const nonce = std::array<std::byte, NodeChallengeBytes> {};
+    auto const frame = EncodeEnroll(EnrollRequest { .nodeId = "laptop",
+                                                    .nodeEndpoint = "laptop.corp.example:6674",
+                                                    .role = EnrollRole::Learner,
+                                                    .publicKey = key,
+                                                    .nonce = nonce });
     auto const view = DecodeEnrollPayload(std::span { frame }.subspan(RequestHeaderSize));
     REQUIRE(view.has_value());
     CHECK(AsStringView(Unwrap(view).nodeEndpoint) == "laptop.corp.example:6674");
@@ -2599,6 +2615,7 @@ TEST_CASE("The fleet summary verb occupies its byte and is the formation family"
     CHECK(std::ranges::count(OpTable, Op::FleetSummary, &OpDescriptor::code) == 1);
     CHECK(static_cast<std::uint8_t>(FleetState::Solitary) == 0x01);
     CHECK(static_cast<std::uint8_t>(FleetState::Established) == 0x02);
+    CHECK(static_cast<std::uint8_t>(FleetState::Pending) == 0x03);
     CHECK(FamilyOf(static_cast<std::uint8_t>(Op::FleetSummary)) == VerbFamily::Formation);
 
     // A stranger asks this before it has any credential, so it is pre-auth, and its ceiling is one
@@ -2608,6 +2625,109 @@ TEST_CASE("The fleet summary verb occupies its byte and is the formation family"
     CHECK(MaxFleetSummaryPayload < MaxEnrollPayload);
 }
 
+namespace
+{
+/// A key every byte of which is @p fill.
+/// @param fill The byte.
+/// @return The key.
+[[nodiscard]] std::array<std::byte, IdentityPublicKeyBytes> FilledKey(std::uint8_t fill)
+{
+    auto key = std::array<std::byte, IdentityPublicKeyBytes> {};
+    key.fill(std::byte { fill });
+    return key;
+}
+
+/// A summary every field of which the decoder accepts, each a different value.
+/// @return The summary.
+[[nodiscard]] FleetSummary AcceptedSummary()
+{
+    return FleetSummary { .clusterId = "c",
+                          .state = FleetState::Solitary,
+                          .createdAtUnixSeconds = 1'790'000'000,
+                          .leaderId = "n-leader",
+                          .leaderNodeEndpoint = "desk:6674",
+                          .nodeId = "n-speaker",
+                          .raftEndpoint = "desk:6680",
+                          .members = { "n-leader", "n-speaker" },
+                          .memberTotal = 2,
+                          .nodeEndpoint = "desk:6675",
+                          .leaderKey = FilledKey(0x4C),
+                          .pointsAt = {} };
+}
+
+/// @p blob's fields with field @p index replaced by @p value, re-framed.
+/// @param blob What `EncodeFleetSummaryFields` wrote.
+/// @param index Which field.
+/// @param value What it holds instead.
+/// @return The spliced summary.
+[[nodiscard]] std::vector<std::byte> WithField(std::span<std::byte const> blob,
+                                               std::size_t index,
+                                               std::span<std::byte const> value)
+{
+    auto const split = WireFields::SplitExactly(blob, FleetSummaryFieldCount);
+    REQUIRE(split.has_value());
+    auto parts = std::vector<std::span<std::byte const>> { Unwrap(split).begin(), Unwrap(split).end() };
+    parts[index] = value;
+    return WireFields::Encode(WireFields::FieldList { parts });
+}
+
+/// Text of exactly @p bytes that the decoder reads as field @p index's kind: a dialable endpoint
+/// for an endpoint field, plain text otherwise.
+/// @param bytes Its length.
+/// @param endpoint Whether the field is a dialled endpoint.
+/// @return The text.
+[[nodiscard]] std::string TextOf(std::size_t bytes, bool endpoint)
+{
+    return endpoint ? std::string(bytes - 2, 'x') + ":1" : std::string(bytes, 'x');
+}
+
+/// The field indices the summary's dialled endpoints are written at, found from what the encoder
+/// WRITES rather than restated: each endpoint is given a marker and looked for.
+/// @return Whether each index is a dialled endpoint.
+[[nodiscard]] std::array<bool, FleetSummaryFieldCount> DialledEndpointIndices()
+{
+    auto marked = AcceptedSummary();
+    for (auto const endpoint: FleetSummaryDialledEndpoints)
+        marked.*endpoint = "marked-endpoint:1";
+    // Named: the split BORROWS from the bytes it splits, so a temporary here is freed before a
+    // field is read -- and every comparison then reads rubble and finds no endpoint at all.
+    auto const encoded = EncodeFleetSummaryFields(marked);
+    auto const split = WireFields::SplitExactly(encoded, FleetSummaryFieldCount);
+    REQUIRE(split.has_value());
+    auto found = std::array<bool, FleetSummaryFieldCount> {};
+    for (auto const index: std::views::iota(std::size_t { 0 }, FleetSummaryFieldCount))
+        found[index] = WireFields::AsStringView(Unwrap(split)[index]) == "marked-endpoint:1";
+    return found;
+}
+
+/// A reply carrying @p summaryFields with a key and a signature of the right widths.
+/// @param summaryFields The nested summary.
+/// @return The reply payload.
+[[nodiscard]] std::vector<std::byte> ReplyOf(std::span<std::byte const> summaryFields)
+{
+    auto const key = std::array<std::byte, IdentityPublicKeyBytes> {};
+    auto const signature = std::array<std::byte, NodeSignatureBytes> {};
+    return WireFields::Encode(
+        { summaryFields, std::span<std::byte const> { key }, std::span<std::byte const> { signature } });
+}
+
+/// @p count distinct member ids, each @p bytes long.
+/// @param count How many.
+/// @param bytes How long each is.
+/// @return The ids.
+[[nodiscard]] std::vector<std::string> MemberIds(std::size_t count, std::size_t bytes)
+{
+    auto ids = std::vector<std::string> {};
+    for (auto const index: std::views::iota(std::size_t { 0 }, count))
+    {
+        auto id = std::format("m{}", index);
+        id.resize(bytes, 'x');
+        ids.push_back(std::move(id));
+    }
+    return ids;
+}
+} // namespace
+
 TEST_CASE("A fleet summary round-trips every field and refuses an unknown state", "[wire][formation]")
 {
     auto const summary = FleetSummary { .clusterId = "3f1c9a0e5b7d2c4e6a8f0b1d3e5c7a9b",
@@ -2616,62 +2736,119 @@ TEST_CASE("A fleet summary round-trips every field and refuses an unknown state"
                                         .leaderId = "n-leader",
                                         .leaderNodeEndpoint = "office-a.corp.example:6674",
                                         .nodeId = "n-speaker",
-                                        .raftEndpoint = "" };
+                                        .raftEndpoint = "",
+                                        .members = { "n-speaker", "n-leader", "n-laptop" },
+                                        .memberTotal = 7,
+                                        .nodeEndpoint = "office-b.corp.example:6674",
+                                        .leaderKey = FilledKey(0x51),
+                                        .pointsAt = {} };
     auto const blob = EncodeFleetSummaryFields(summary);
-    auto const decoded = DecodeFleetSummaryFields(blob);
+    auto const decoded = DecodeFleetSummaryFields(blob, MaxFleetSummaryMembers);
     REQUIRE(decoded.has_value());
     CHECK(Unwrap(decoded) == summary);
 
     // The state byte is the second field. A byte this build cannot name is refused rather than
     // read as solitary, which would make an established fleet yield to anybody.
-    auto const split = WireFields::SplitExactly(blob, FleetSummaryFieldCount);
-    REQUIRE(split.has_value());
-    auto const& fields = Unwrap(split);
     auto const bogus = std::array { std::byte { 0x7F } };
-    auto const reencoded = WireFields::Encode(
-        { fields[0], std::span<std::byte const> { bogus }, fields[2], fields[3], fields[4], fields[5], fields[6] });
-    CHECK_FALSE(DecodeFleetSummaryFields(reencoded).has_value());
+    CHECK_FALSE(DecodeFleetSummaryFields(WithField(blob, 1, bogus), MaxFleetSummaryMembers).has_value());
 
     // Arity is exact.
-    CHECK_FALSE(DecodeFleetSummaryFields(WireFields::Encode({ fields[0], fields[1] })).has_value());
+    auto const split = WireFields::SplitExactly(blob, FleetSummaryFieldCount);
+    REQUIRE(split.has_value());
+    CHECK_FALSE(DecodeFleetSummaryFields(WireFields::Encode({ Unwrap(split)[0], Unwrap(split)[1] }), MaxFleetSummaryMembers)
+                    .has_value());
+}
+
+TEST_CASE("A pending summary's leader slots arrive as its pointer, and its own leader fields stay empty",
+          "[wire][formation][pointer]")
+{
+    // The ONE place a pointer could be taken for a leader is where the slots are read, so that is where
+    // the state decides which members they land in (`FleetStateTable`): a reader of `leaderNodeEndpoint`
+    // finds nothing to dial under `Pending`, and has nothing to remember to check.
+    auto const own = AcceptedSummary();
+    auto pointer = own;
+    pointer.state = FleetState::Pending;
+    pointer.pointsAt = JoinPointer { .leaderId = std::exchange(pointer.leaderId, {}),
+                                     .leaderNodeEndpoint = std::exchange(pointer.leaderNodeEndpoint, {}),
+                                     .leaderKey = std::exchange(pointer.leaderKey, std::nullopt) };
+
+    // The same slots on the wire: only the state byte tells them apart. Both encodings are named: a
+    // split BORROWS from the bytes it splits, so one of a temporary reads freed memory.
+    auto const encodedOwn = EncodeFleetSummaryFields(own);
+    auto const ownFields = WireFields::SplitExactly(encodedOwn, FleetSummaryFieldCount);
+    auto const encodedPointer = EncodeFleetSummaryFields(pointer);
+    auto const pointerFields = WireFields::SplitExactly(encodedPointer, FleetSummaryFieldCount);
+    REQUIRE(ownFields.has_value());
+    REQUIRE(pointerFields.has_value());
+    for (auto const index: { std::size_t { 3 }, std::size_t { 4 }, FleetSummaryLeaderKeyField })
+        CHECK(std::ranges::equal(Unwrap(ownFields)[index], Unwrap(pointerFields)[index]));
+
+    auto const decoded = DecodeFleetSummaryFields(encodedPointer, MaxFleetSummaryMembers);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == pointer);
+    CHECK(Unwrap(decoded).leaderNodeEndpoint.empty());
+    CHECK(Unwrap(decoded).leaderId.empty());
+    CHECK_FALSE(Unwrap(decoded).leaderKey.has_value());
+    CHECK(Unwrap(decoded).pointsAt.leaderNodeEndpoint == own.leaderNodeEndpoint);
+    CHECK(Unwrap(decoded).pointsAt.leaderKey == own.leaderKey);
+
+    // And the other way: every state whose slots are its own leaves the pointer empty.
+    for (auto const& row: FleetStateTable)
+    {
+        INFO(static_cast<int>(row.state));
+        CHECK(LeaderSlotsNameAskedFleet(row.state) == (row.state == FleetState::Pending));
+    }
+    auto const decodedOwn = DecodeFleetSummaryFields(EncodeFleetSummaryFields(own), MaxFleetSummaryMembers);
+    REQUIRE(decodedOwn.has_value());
+    CHECK(Unwrap(decodedOwn).pointsAt == JoinPointer {});
+    CHECK(Unwrap(decodedOwn) == own);
+
+    // The pointer is dialled too, so it is held to the one dial rule.
+    auto const undialable = WithField(encodedPointer, 4, WireFields::AsBytes(std::string_view { "6674" }));
+    CHECK_FALSE(DecodeFleetSummaryFields(undialable, MaxFleetSummaryMembers).has_value());
+}
+
+TEST_CASE("A fleet summary's leader key is absent or exactly one key wide", "[wire][formation]")
+{
+    auto const blob = EncodeFleetSummaryFields(AcceptedSummary());
+    auto noKey = AcceptedSummary();
+    noKey.leaderKey.reset();
+    auto const absent = DecodeFleetSummaryFields(EncodeFleetSummaryFields(noKey), MaxFleetSummaryMembers);
+    REQUIRE(absent.has_value());
+    CHECK_FALSE(Unwrap(absent).leaderKey.has_value()); // absent is not a key of zeroes
+
+    // One byte short and one byte long are both damage, never a shorter or a longer key.
+    for (auto const size: { IdentityPublicKeyBytes - 1, IdentityPublicKeyBytes + 1 })
+    {
+        INFO(size);
+        auto const wrong = std::vector<std::byte>(size, std::byte { 0x4C });
+        CHECK_FALSE(DecodeFleetSummaryFields(WithField(blob, FleetSummaryLeaderKeyField, wrong), MaxFleetSummaryMembers)
+                        .has_value());
+    }
+    auto const right = std::vector<std::byte>(IdentityPublicKeyBytes, std::byte { 0x4C });
+    CHECK(DecodeFleetSummaryFields(WithField(blob, FleetSummaryLeaderKeyField, right), MaxFleetSummaryMembers).has_value());
 }
 
 TEST_CASE("A fleet summary with an empty cluster id is refused and a one-byte id is not", "[wire][formation]")
 {
     // The control first: a one-byte id, every other field one the decoder accepts, round-trips.
-    auto const summary = FleetSummary { .clusterId = "c",
-                                        .state = FleetState::Solitary,
-                                        .createdAtUnixSeconds = 1'790'000'000,
-                                        .leaderId = "n-leader",
-                                        .leaderNodeEndpoint = "desk:6674",
-                                        .nodeId = "n-speaker",
-                                        .raftEndpoint = "desk:6680" };
+    auto const summary = AcceptedSummary();
     auto const control = EncodeFleetSummaryFields(summary);
-    auto const oneByte = DecodeFleetSummaryFields(control);
+    auto const oneByte = DecodeFleetSummaryFields(control, MaxFleetSummaryMembers);
     REQUIRE(oneByte.has_value());
     CHECK(Unwrap(oneByte) == summary);
 
     // The same fields with the id emptied, spliced by hand because the encoder refuses to write
     // one. They differ from the control in that field alone, so the ONLY refusal they can meet
     // is the empty id's.
-    auto const split = WireFields::SplitExactly(control, FleetSummaryFieldCount);
-    REQUIRE(split.has_value());
-    auto const& fields = Unwrap(split);
-    auto const empty = WireFields::Encode(
-        { std::span<std::byte const> {}, fields[1], fields[2], fields[3], fields[4], fields[5], fields[6] });
+    auto const empty = WithField(control, 0, {});
     REQUIRE(WireFields::SplitExactly(empty, FleetSummaryFieldCount).has_value());
-    CHECK_FALSE(DecodeFleetSummaryFields(empty).has_value());
+    CHECK_FALSE(DecodeFleetSummaryFields(empty, MaxFleetSummaryMembers).has_value());
 
     // The reply carries the summary through the same decoder, so it refuses the same bytes; the
     // key and the signature are the right widths, so they are not what it refuses.
-    auto const key = std::array<std::byte, IdentityPublicKeyBytes> {};
-    auto const signature = std::array<std::byte, NodeSignatureBytes> {};
-    auto const replyOf = [&key, &signature](std::span<std::byte const> summaryFields) {
-        return WireFields::Encode(
-            { summaryFields, std::span<std::byte const> { key }, std::span<std::byte const> { signature } });
-    };
-    CHECK(DecodeFleetSummaryReply(replyOf(control)).has_value());
-    CHECK_FALSE(DecodeFleetSummaryReply(replyOf(empty)).has_value());
+    CHECK(DecodeFleetSummaryReply(ReplyOf(control)).has_value());
+    CHECK_FALSE(DecodeFleetSummaryReply(ReplyOf(empty)).has_value());
 }
 
 TEST_CASE("Every text field of a fleet summary is refused past its own bound, and a cluster id past the tightest",
@@ -2680,42 +2857,27 @@ TEST_CASE("Every text field of a fleet summary is refused past its own bound, an
     // Walked from the table the decoder reads, so a field added to it is tested here without
     // being named. Each field at its bound decodes and one byte past it does not, in the summary
     // and in the reply that carries one; the rest of the summary is the same both times, so the
-    // one refusal the longer bytes can meet is that field's bound.
+    // one refusal the longer bytes can meet is that field's bound. An endpoint field is given text
+    // the dial rule reads, so the bound is the only rule it can meet.
     STATIC_REQUIRE(FleetSummaryTextFields[0].index == 0);
     STATIC_REQUIRE(FleetSummaryTextFields[0].maxBytes == MaxIdBytes);
     STATIC_REQUIRE(MaxIdBytes < MaxFleetSummaryTextBytes);
 
-    auto const key = std::array<std::byte, IdentityPublicKeyBytes> {};
-    auto const signature = std::array<std::byte, NodeSignatureBytes> {};
-    auto const replyOf = [&key, &signature](std::span<std::byte const> summaryFields) {
-        return WireFields::Encode(
-            { summaryFields, std::span<std::byte const> { key }, std::span<std::byte const> { signature } });
-    };
-    auto const base = EncodeFleetSummaryFields(FleetSummary { .clusterId = "c",
-                                                              .state = FleetState::Solitary,
-                                                              .createdAtUnixSeconds = 1'790'000'000,
-                                                              .leaderId = "n-leader",
-                                                              .leaderNodeEndpoint = "desk:6674",
-                                                              .nodeId = "n-speaker",
-                                                              .raftEndpoint = "desk:6680" });
-    auto const split = WireFields::SplitExactly(base, FleetSummaryFieldCount);
-    REQUIRE(split.has_value());
-
+    auto const base = EncodeFleetSummaryFields(AcceptedSummary());
+    auto const endpoints = DialledEndpointIndices();
     for (auto const& field: FleetSummaryTextFields)
     {
         INFO("field " << field.index << ", bound " << field.maxBytes);
-        auto const withText = [&split, &field](std::size_t bytes) {
-            auto const text = std::vector<std::byte>(bytes, std::byte { 'x' });
-            auto parts = std::vector<std::span<std::byte const>> { Unwrap(split).begin(), Unwrap(split).end() };
-            parts[field.index] = text;
-            return WireFields::Encode(WireFields::FieldList { parts });
+        auto const withText = [&base, &field, &endpoints](std::size_t bytes) {
+            auto const text = TextOf(bytes, endpoints[field.index]);
+            return WithField(base, field.index, WireFields::AsBytes(text));
         };
         auto const atBound = withText(field.maxBytes);
         auto const pastBound = withText(field.maxBytes + 1);
-        CHECK(DecodeFleetSummaryFields(atBound).has_value());
-        CHECK_FALSE(DecodeFleetSummaryFields(pastBound).has_value());
-        CHECK(DecodeFleetSummaryReply(replyOf(atBound)).has_value());
-        CHECK_FALSE(DecodeFleetSummaryReply(replyOf(pastBound)).has_value());
+        CHECK(DecodeFleetSummaryFields(atBound, MaxFleetSummaryMembers).has_value());
+        CHECK_FALSE(DecodeFleetSummaryFields(pastBound, MaxFleetSummaryMembers).has_value());
+        CHECK(DecodeFleetSummaryReply(ReplyOf(atBound)).has_value());
+        CHECK_FALSE(DecodeFleetSummaryReply(ReplyOf(pastBound)).has_value());
     }
 }
 
@@ -2735,23 +2897,18 @@ TEST_CASE("Every id a fleet summary names is held to the one id bound, and no en
         Row { .what = "node id", .member = &FleetSummary::nodeId, .isId = true },
         Row { .what = "leader endpoint", .member = &FleetSummary::leaderNodeEndpoint, .isId = false },
         Row { .what = "raft endpoint", .member = &FleetSummary::raftEndpoint, .isId = false },
+        Row { .what = "node endpoint", .member = &FleetSummary::nodeEndpoint, .isId = false },
     };
     for (auto const& row: rows)
     {
         INFO(row.what);
         auto const naming = [&row](std::size_t bytes) {
-            auto summary = FleetSummary { .clusterId = "c",
-                                          .state = FleetState::Solitary,
-                                          .createdAtUnixSeconds = 1'790'000'000,
-                                          .leaderId = "n-leader",
-                                          .leaderNodeEndpoint = "desk:6674",
-                                          .nodeId = "n-speaker",
-                                          .raftEndpoint = "desk:6680" };
-            summary.*row.member = std::string(bytes, 'x');
+            auto summary = AcceptedSummary();
+            summary.*row.member = TextOf(bytes, !row.isId);
             return EncodeFleetSummaryFields(summary);
         };
-        CHECK(DecodeFleetSummaryFields(naming(MaxIdBytes)).has_value());
-        CHECK(DecodeFleetSummaryFields(naming(MaxIdBytes + 1)).has_value() == !row.isId);
+        CHECK(DecodeFleetSummaryFields(naming(MaxIdBytes), MaxFleetSummaryMembers).has_value());
+        CHECK(DecodeFleetSummaryFields(naming(MaxIdBytes + 1), MaxFleetSummaryMembers).has_value() == !row.isId);
     }
 }
 
@@ -2784,6 +2941,197 @@ TEST_CASE("A fleet summary reply round-trips and refuses a short signature", "[w
     auto const& parts = Unwrap(split);
     auto const cut = parts[2].first(NodeSignatureBytes - 1);
     CHECK_FALSE(DecodeFleetSummaryReply(WireFields::Encode({ parts[0], parts[1], cut })).has_value());
+}
+
+TEST_CASE("The fleet summary's member fields sit where they are pinned, with the bounds they are pinned to",
+          "[wire][formation]")
+{
+    // Names AND values: a symbol both ends spell tests only the first fact. The datagram cap is the
+    // measured one (`DiscoveryWire_test.cpp` measures it); the reply cap is tied to the reply ceiling
+    // by the assert beside `LargestFleetSummaryReply`, repeated here so a change to either is a red
+    // case as well as a red build.
+    STATIC_REQUIRE(FleetSummaryFieldCount == 11);
+    STATIC_REQUIRE(FleetSummaryMembersField == 7);
+    STATIC_REQUIRE(FleetSummaryMemberTotalField == 8);
+    STATIC_REQUIRE(FleetSummaryLeaderKeyField == 10);
+    STATIC_REQUIRE(MaxFleetSummaryMembers == 10);
+    STATIC_REQUIRE(MaxFleetSummaryReplyMembers == 512);
+    STATIC_REQUIRE(LargestFleetSummaryReply(MaxFleetSummaryReplyMembers) <= MaxFleetSummaryReply);
+}
+
+TEST_CASE("A two-member fleet summary encodes to exactly these bytes", "[wire][formation]")
+{
+    // A golden encoding, written out byte by byte rather than re-derived through any encoder, so
+    // the ORDER of the eleven fields and the width of each is pinned: a transposed field or a total
+    // written in four bytes changes these bytes, whatever both ends agree on.
+    auto const summary = FleetSummary { .clusterId = "c",
+                                        .state = FleetState::Established,
+                                        .createdAtUnixSeconds = 0x0102030405060708ULL,
+                                        .leaderId = "L",
+                                        .leaderNodeEndpoint = "h:1",
+                                        .nodeId = "n",
+                                        .raftEndpoint = "",
+                                        .members = { "a", "b" },
+                                        .memberTotal = 3,
+                                        .nodeEndpoint = "h:2" };
+    auto const golden = [] {
+        auto const values = std::to_array<std::uint8_t>({
+            0, 0, 0, 1,  'c',                                     // cluster id
+            0, 0, 0, 1,  0x02,                                    // state: Established
+            0, 0, 0, 8,  1,    2,   3,   4, 5,   6, 7, 8,         // created, big-endian
+            0, 0, 0, 1,  'L',                                     // leader id
+            0, 0, 0, 3,  'h',  ':', '1',                          // leader's 0xFC endpoint
+            0, 0, 0, 1,  'n',                                     // speaker id
+            0, 0, 0, 0,                                           // speaker's Raft endpoint: none
+            0, 0, 0, 10, 0,    0,   0,   1, 'a', 0, 0, 0, 1, 'b', // members, nested
+            0, 0, 0, 8,  0,    0,   0,   0, 0,   0, 0, 3,         // member total, big-endian
+            0, 0, 0, 3,  'h',  ':', '2',                          // speaker's own 0xFC endpoint
+            0, 0, 0, 0,                                           // leader's key: none stated
+        });
+        auto bytes = std::vector<std::byte> {};
+        for (auto const value: values)
+            bytes.push_back(std::byte { value });
+        return bytes;
+    }();
+    CHECK(EncodeFleetSummaryFields(summary) == golden);
+    auto const decoded = DecodeFleetSummaryFields(golden, MaxFleetSummaryMembers);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == summary);
+}
+
+TEST_CASE("A fleet summary's member list is refused as malformed for each way it can be wrong", "[wire][formation]")
+{
+    // One row per refusal, each beside the nearest list that decodes, so the refusal a row meets can
+    // only be its own. The list is text a peer sent -- a claim, rendered on a fleet page -- so it is
+    // held to what an id is anywhere else.
+    struct Row
+    {
+        std::string_view what;
+        std::vector<std::string> refused;
+        std::vector<std::string> accepted;
+    };
+    auto const rows = std::array {
+        Row { .what = "an empty id", .refused = { "a", "" }, .accepted = { "a", "b" } },
+        Row { .what = "an id past the id bound",
+              .refused = { std::string(MaxIdBytes + 1, 'x') },
+              .accepted = { std::string(MaxIdBytes, 'x') } },
+        Row { .what = "an id that is not UTF-8", .refused = { "n-\xC3" }, .accepted = { "n-\xC3\xA9" } },
+        Row { .what = "an id named twice", .refused = { "a", "b", "a" }, .accepted = { "a", "b", "c" } },
+        Row { .what = "more ids than a datagram carries",
+              .refused = MemberIds(MaxFleetSummaryMembers + 1, 8),
+              .accepted = MemberIds(MaxFleetSummaryMembers, 8) },
+    };
+    auto const listing = [](std::vector<std::string> const& members) {
+        auto summary = AcceptedSummary();
+        summary.members = members;
+        summary.memberTotal = members.size();
+        return EncodeFleetSummaryFields(summary);
+    };
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        CHECK(DecodeFleetSummaryFields(listing(row.accepted), MaxFleetSummaryMembers).has_value());
+        CHECK_FALSE(DecodeFleetSummaryFields(listing(row.refused), MaxFleetSummaryMembers).has_value());
+    }
+
+    // A total below the list, spliced by hand because the encoder refuses to write one: a cut list
+    // names fewer than the fleet records, never more. The same total as the list is the control.
+    auto const two = listing({ "a", "b" });
+    auto const one = WireFields::ToBigEndian<std::uint64_t>(1);
+    auto const exact = WireFields::ToBigEndian<std::uint64_t>(2);
+    CHECK(DecodeFleetSummaryFields(WithField(two, FleetSummaryMemberTotalField, exact), MaxFleetSummaryMembers).has_value());
+    CHECK_FALSE(
+        DecodeFleetSummaryFields(WithField(two, FleetSummaryMemberTotalField, one), MaxFleetSummaryMembers).has_value());
+}
+
+TEST_CASE("The member cap is the carrier's: a reply reads the list a datagram may not, up to its own cap",
+          "[wire][formation]")
+{
+    auto const listing = [](std::size_t count) {
+        auto summary = AcceptedSummary();
+        summary.members = MemberIds(count, MaxIdBytes);
+        summary.memberTotal = count;
+        return EncodeFleetSummaryFields(summary);
+    };
+    // One past the datagram's cap: refused there, read by a reply.
+    auto const past = listing(MaxFleetSummaryMembers + 1);
+    CHECK_FALSE(DecodeFleetSummaryFields(past, MaxFleetSummaryMembers).has_value());
+    CHECK(DecodeFleetSummaryFields(past, MaxFleetSummaryReplyMembers).has_value());
+    CHECK(DecodeFleetSummaryReply(ReplyOf(past)).has_value());
+
+    // The reply's own cap, and one past it.
+    CHECK(DecodeFleetSummaryReply(ReplyOf(listing(MaxFleetSummaryReplyMembers))).has_value());
+    CHECK_FALSE(DecodeFleetSummaryReply(ReplyOf(listing(MaxFleetSummaryReplyMembers + 1))).has_value());
+}
+
+TEST_CASE("Every endpoint a fleet summary names is held to the one dial rule, and empty states none", "[wire][formation]")
+{
+    // One row per field, named by MEMBER rather than taken from `FleetSummaryDialledEndpoints`, so a
+    // field dropped from that list is caught here: its row goes red and the other two stay green.
+    struct Row
+    {
+        std::string_view what;
+        std::string FleetSummary::* member;
+    };
+    auto const rows = std::array {
+        Row { .what = "leader endpoint", .member = &FleetSummary::leaderNodeEndpoint },
+        Row { .what = "raft endpoint", .member = &FleetSummary::raftEndpoint },
+        Row { .what = "node endpoint", .member = &FleetSummary::nodeEndpoint },
+    };
+    // Each has already been a bug somewhere (`ParseDialEndpoint`): a sentence that merely splits, an
+    // empty host, a bare port.
+    auto const malformed = std::array<std::string_view, 3> { "no leader: try again", ":6674", "6675" };
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        auto const with = [&row](std::string_view endpoint) {
+            auto summary = AcceptedSummary();
+            summary.*row.member = std::string { endpoint };
+            return EncodeFleetSummaryFields(summary);
+        };
+        CHECK(DecodeFleetSummaryFields(with(""), MaxFleetSummaryMembers).has_value());
+        CHECK(DecodeFleetSummaryFields(with("office:6674"), MaxFleetSummaryMembers).has_value());
+        for (auto const text: malformed)
+        {
+            INFO(text);
+            CHECK_FALSE(DecodeFleetSummaryFields(with(text), MaxFleetSummaryMembers).has_value());
+        }
+    }
+}
+
+TEST_CASE("A carrier cuts a member list to its cap, keeping the first ids and the total", "[wire][formation]")
+{
+    auto summary = AcceptedSummary();
+    summary.members = MemberIds(20, 8);
+    summary.memberTotal = 20;
+
+    auto const cut = WithMembersAtMost(summary, MaxFleetSummaryMembers);
+    REQUIRE(cut.members.size() == MaxFleetSummaryMembers);
+    CHECK(std::ranges::equal(cut.members, summary.members | std::views::take(MaxFleetSummaryMembers)));
+    CHECK(cut.memberTotal == 20); // a reader can tell it was cut
+
+    // A list inside the cap is left whole.
+    CHECK(WithMembersAtMost(summary, MaxFleetSummaryReplyMembers) == summary);
+}
+
+TEST_CASE("The largest reply a peer can make is exactly the size the ceiling is asserted against", "[wire][formation]")
+{
+    // Built, not reasoned: every text field at its bound, every member a reply carries at the id
+    // bound. It decodes, and its size is `LargestFleetSummaryReply`'s -- so the static_assert that
+    // ties the reply cap to `MaxFleetSummaryReply` is about a summary that exists.
+    auto const endpoints = DialledEndpointIndices();
+    auto summary = AcceptedSummary();
+    summary.members = MemberIds(MaxFleetSummaryReplyMembers, MaxIdBytes);
+    summary.memberTotal = MaxFleetSummaryReplyMembers;
+    auto blob = EncodeFleetSummaryFields(summary);
+    for (auto const& field: FleetSummaryTextFields)
+    {
+        auto const text = TextOf(field.maxBytes, endpoints[field.index]);
+        blob = WithField(blob, field.index, WireFields::AsBytes(text));
+    }
+    auto const payload = ReplyOf(blob);
+    CHECK(payload.size() == LargestFleetSummaryReply(MaxFleetSummaryReplyMembers));
+    CHECK(DecodeFleetSummaryReply(payload).has_value());
 }
 
 // --- Live stats (#1399) -----------------------------------------------------
@@ -4000,7 +4348,7 @@ TEST_CASE("NODE-ANNOUNCE carries a voter's endorsement as its fourth field, empt
     // #178. The endorsement is opaque here -- the scheduler decodes and verifies it -- and the
     // arity is exact whether or not there is one: absent is a zero-length FOURTH field, never a
     // three-field payload an older reader would have accepted.
-    CHECK(OpFieldCount(Op::NodeAnnounce) == 4);
+    CHECK(OpFieldCount(Op::NodeAnnounce) == 5);
     auto const endorsement = std::vector<std::byte> { std::byte { 0x01 }, std::byte { 0x02 }, std::byte { 0x03 } };
 
     for (auto const& carried: { std::span<std::byte const> {}, std::span<std::byte const> { endorsement } })
@@ -4010,12 +4358,64 @@ TEST_CASE("NODE-ANNOUNCE carries a voter's endorsement as its fourth field, empt
         REQUIRE(frame.size() > RequestHeaderSize);
         CHECK(std::to_integer<unsigned>(frame[1]) == 14);
         auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
-        REQUIRE(WireFields::SplitExactly(payload, 4).has_value());
+        REQUIRE(WireFields::SplitExactly(payload, 5).has_value());
 
         auto const decoded = DecodeNodeAnnouncePayload(payload);
         REQUIRE(decoded.has_value());
         CHECK(std::ranges::equal(Unwrap(decoded).endorsement, carried));
     }
+}
+
+TEST_CASE("NODE-ANNOUNCE carries the fleets a node once asked as its fifth field", "[wire][formation]")
+{
+    // The evidence a split of a fleet is told on reaches the leader in the verb every node sends. The
+    // fifth field is present whether or not there are memos: none is a zero-length field.
+    STATIC_REQUIRE(MaxAnnouncedJoinMemos == 8);
+    auto memos = std::vector<JoinMemoFields> {};
+    for (auto const index: std::views::iota(std::size_t { 0 }, MaxAnnouncedJoinMemos))
+    {
+        auto memo = JoinMemoFields { .clusterId = std::format("c-{}", index) };
+        memo.provenKey.fill(static_cast<std::byte>(index));
+        memos.push_back(memo);
+    }
+    for (auto const count: { std::size_t { 0 }, std::size_t { 1 }, MaxAnnouncedJoinMemos })
+    {
+        INFO(count << " memos");
+        auto const carried = std::span<JoinMemoFields const> { memos }.first(count);
+        auto const frame = EncodeNodeAnnounce(NodeAnnounceRequest { .endpoint = "10.0.0.2:6674", .joinMemos = carried });
+        auto const decoded = DecodeNodeAnnouncePayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK(std::ranges::equal(Unwrap(decoded).joinMemos, carried));
+    }
+}
+
+TEST_CASE("A join memo list is refused as malformed for each way it can be wrong", "[wire][formation]")
+{
+    // Spliced by hand: the encoder refuses a list past the bound. Each row beside the nearest list
+    // that decodes, so the refusal a row meets can only be its own.
+    auto const memo = [](std::span<std::byte const> id, std::span<std::byte const> key) {
+        return WireFields::Encode({ id, key });
+    };
+    auto const key = std::array<std::byte, IdentityPublicKeyBytes> {};
+    auto const shortKey = std::array<std::byte, IdentityPublicKeyBytes - 1> {};
+    auto const listOf = [](std::vector<std::vector<std::byte>> const& entries) {
+        auto views = std::vector<std::span<std::byte const>> { entries.begin(), entries.end() };
+        return WireFields::Encode(WireFields::FieldList { views });
+    };
+    auto const good = memo(WireFields::AsBytes(std::string_view { "c-lab" }), key);
+    CHECK(DecodeJoinMemos(listOf({ good })).has_value());
+    CHECK(DecodeJoinMemos({}).has_value()); // none is a list of none
+
+    CHECK_FALSE(DecodeJoinMemos(listOf({ memo({}, key) })).has_value()); // an empty cluster id
+    auto const longest = std::string(MaxIdBytes, 'c');
+    CHECK(DecodeJoinMemos(listOf({ memo(WireFields::AsBytes(longest), key) })).has_value());
+    auto const tooLong = std::string(MaxIdBytes + 1, 'c');
+    CHECK_FALSE(DecodeJoinMemos(listOf({ memo(WireFields::AsBytes(tooLong), key) })).has_value());
+    CHECK_FALSE(DecodeJoinMemos(listOf({ memo(WireFields::AsBytes(std::string_view { "c-lab" }), shortKey) })).has_value());
+    CHECK_FALSE(DecodeJoinMemos(listOf({ WireFields::Encode({ WireFields::AsBytes(std::string_view { "c-lab" }) }) }))
+                    .has_value()); // one field where a memo is two
+    CHECK(DecodeJoinMemos(listOf(std::vector(MaxAnnouncedJoinMemos, good))).has_value());
+    CHECK_FALSE(DecodeJoinMemos(listOf(std::vector(MaxAnnouncedJoinMemos + 1, good))).has_value());
 }
 
 TEST_CASE("roster-expired is its own wire code, pinned as a byte", "[wire][roster]")
@@ -4207,14 +4607,14 @@ TEST_CASE("An enroll reply carries the certified roster as its third field, empt
     // Named payloads, for the borrowing reason the pending-reply case gives.
     auto const roster = AsBytes(std::string_view { "roster" });
     auto const certificate = AsBytes(std::string_view { "certificate" });
-    auto const withPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster, certificate);
+    auto const withPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster, certificate, std::nullopt);
     auto const with = DecodeEnrollReply(withPayload);
     REQUIRE(with.has_value());
     CHECK(AsStringView(Unwrap(with).certificate) == "certificate");
 
     // No certificate is a zero-length THIRD field, never a two-field payload.
-    auto const withoutPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster);
-    REQUIRE(WireFields::SplitExactly(withoutPayload, 3).has_value());
+    auto const withoutPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster, {}, std::nullopt);
+    REQUIRE(WireFields::SplitExactly(withoutPayload, 5).has_value());
     auto const without = DecodeEnrollReply(withoutPayload);
     REQUIRE(without.has_value());
     CHECK(Unwrap(without).certificate.empty());
@@ -4222,6 +4622,50 @@ TEST_CASE("An enroll reply carries the certified roster as its third field, empt
     // The two-field reply an older build sent is refused rather than read as one with no certificate.
     auto const tag = std::array { static_cast<std::byte>(EnrollOutcome::Approved) };
     CHECK_FALSE(DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, roster })).has_value());
+}
+
+TEST_CASE("An enroll reply carries its signature as two fields, both or neither, each exactly one wide",
+          "[wire][enrollment]")
+{
+    // Named payloads, for the borrowing reason the pending-reply case gives. The signature itself is
+    // COPIED out, so it outlives its payload by design -- asserted after the payload is gone.
+    auto const roster = AsBytes(std::string_view { "roster" });
+    auto signature = EnrollReplySignature {};
+    signature.publicKey.fill(std::byte { 0x31 });
+    signature.signature.fill(std::byte { 0x62 });
+    auto decodedSignature = std::optional<EnrollReplySignature> {};
+    {
+        auto const signedPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster, {}, signature);
+        auto const signedReply = DecodeEnrollReply(signedPayload);
+        REQUIRE(signedReply.has_value());
+        decodedSignature = Unwrap(signedReply).signature;
+    }
+    CHECK(decodedSignature == std::optional { signature });
+
+    // None is two zero-length fields, and decodes as none rather than as a signature of zeroes.
+    auto const unsignedPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster, {}, std::nullopt);
+    auto const unsignedReply = DecodeEnrollReply(unsignedPayload);
+    REQUIRE(unsignedReply.has_value());
+    CHECK_FALSE(Unwrap(unsignedReply).signature.has_value());
+
+    // Half a signature, or a width that is not one key and one signature, is refused: a prefix of a
+    // signature verifies nothing, and a caller must not be handed one to try.
+    auto const tag = std::array { static_cast<std::byte>(EnrollOutcome::Approved) };
+    auto const key = std::span<std::byte const> { signature.publicKey };
+    auto const signatureBytes = std::span<std::byte const> { signature.signature };
+    auto const refuses = [&tag, roster](std::span<std::byte const> keyField, std::span<std::byte const> signatureField) {
+        return !DecodeEnrollReply(
+                    WireFields::Encode({ std::span<std::byte const> { tag }, roster, {}, keyField, signatureField }))
+                    .has_value();
+    };
+    CHECK(refuses(key, {}));
+    CHECK(refuses({}, signatureBytes));
+    CHECK(refuses(key.first(IdentityPublicKeyBytes - 1), signatureBytes));
+    CHECK(refuses(key, signatureBytes.first(NodeSignatureBytes - 1)));
+    CHECK_FALSE(refuses(key, signatureBytes)); // the control: both, each exactly one wide
+
+    // And the three-field reply of the grammar before the signature is refused, never read as unsigned.
+    CHECK_FALSE(DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, roster, {} })).has_value());
 }
 
 TEST_CASE("cluster-admit-worker carries the worker's id and its key as text", "[wire][nodeproof]")
@@ -4543,8 +4987,9 @@ TEST_CASE("The condition list's bound is the most full rows its share holds, and
 TEST_CASE("The longest NODE-ANNOUNCE is exactly the budget its constants add up and it decodes", "[wire][node-announce]")
 {
     // The budget beside `MaxNodeAnnounceOtherBytes` is a sum of named ceilings; this builds the
-    // request that meets every one of them at once -- sixteen full condition rows, a full history
-    // batch, every string and list at its ceiling -- and asserts the payload is EXACTLY that sum, so
+    // request that meets every one of them at once -- `MaxNodeConditions` full condition rows, a full
+    // history batch, every string and list at its ceiling, every join memo a node may hand over -- and
+    // asserts the payload is EXACTLY that sum, so
     // a field the constants forgot, or one they count twice, is a red case rather than a frame a
     // leader one day refuses.
     auto const fill = [](std::size_t bytes, char c) {
@@ -4581,8 +5026,14 @@ TEST_CASE("The longest NODE-ANNOUNCE is exactly the budget its constants add up 
     load.interfaceAddresses = addresses;
 
     auto const endorsement = std::vector<std::byte>(MaxRosterEndorsementBytes, std::byte { 0x5e });
-    auto const frame = EncodeNodeAnnounce(NodeAnnounceRequest {
-        .endpoint = fill(MaxEndpointBytes, 'e'), .capacity = capacity, .load = load, .endorsement = endorsement });
+    auto memo = JoinMemoFields { .clusterId = fill(MaxIdBytes, 'm') };
+    memo.provenKey.fill(std::byte { 0x6b });
+    auto const memos = std::vector<JoinMemoFields>(MaxAnnouncedJoinMemos, memo);
+    auto const frame = EncodeNodeAnnounce(NodeAnnounceRequest { .endpoint = fill(MaxEndpointBytes, 'e'),
+                                                                .capacity = capacity,
+                                                                .load = load,
+                                                                .endorsement = endorsement,
+                                                                .joinMemos = memos });
     auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
 
     CHECK(payload.size()
@@ -4602,4 +5053,5 @@ TEST_CASE("The longest NODE-ANNOUNCE is exactly the budget its constants add up 
     REQUIRE(conditions.size() == MaxNodeConditions);
     CHECK(conditions.back().remedy.size() == MaxConditionRemedyBytes);
     CHECK(Unwrap(decoded).endorsement.size() == MaxRosterEndorsementBytes);
+    CHECK(Unwrap(decoded).joinMemos == memos);
 }

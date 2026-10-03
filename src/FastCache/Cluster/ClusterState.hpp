@@ -579,6 +579,29 @@ struct Setting
     [[nodiscard]] friend bool operator==(Setting const&, Setting const&) = default;
 };
 
+/// A fleet's decision to dissolve into another: one fleet split in two heals by its losing half
+/// leaving for the survivor, every member at once.
+///
+/// Replicated rather than decided by each member, so every member of the losing fleet follows the
+/// SAME decision and none needs evidence of its own: the leader that decided proved the survivor, and
+/// what it proved travels here. Recorded in the state as well as the log, so a member that restarts,
+/// or catches up from a snapshot taken after the entry, still reads it.
+struct DissolveOrder
+{
+    std::string clusterId;                    ///< The fleet that survives.
+    Ed25519PublicKey provenKey {};            ///< The key that proved its summary to the leader that decided.
+    std::string leaderNodeEndpoint;           ///< Where its leader answers the `0xFC` port, as proven.
+    std::uint64_t createdAtUnixSeconds { 0 }; ///< Its age, as proven.
+
+    /// Its leader's identity key, as the proven summary reached it from `provenKey`: the speaker's
+    /// own when it spoke as the leader, else the leader key its signed summary stated. What a leaving
+    /// member holds the survivor's leader to, rather than to whichever key answers at
+    /// `leaderNodeEndpoint`.
+    Ed25519PublicKey leaderKey {};
+
+    [[nodiscard]] friend bool operator==(DissolveOrder const&, DissolveOrder const&) = default;
+};
+
 /// Everything the cluster agrees on.
 ///
 /// Deliberately small, and deliberately **not** the cache. The log that carries this
@@ -626,6 +649,10 @@ struct ClusterState
     /// what stops a replayed old roster -- endorsed when it was current -- from winding a
     /// worker back.
     std::uint64_t rosterVersion {};
+
+    /// The last dissolve this fleet decided, if any (`CommandKind::DissolveInto`): every member that
+    /// applies it leaves for the survivor it names.
+    std::optional<DissolveOrder> dissolveOrder {};
 
     [[nodiscard]] friend bool operator==(ClusterState const&, ClusterState const&) = default;
 
@@ -767,6 +794,15 @@ enum class CommandKind : std::uint8_t
     /// wire as a key nobody holds. A key an operator wants refused FOR GOOD is revoked by
     /// forgetting the id before it is admitted again under its new one (`Forget`).
     AdmitPrincipal,
+
+    /// Dissolve this fleet into another: record the `DissolveOrder` every member leaves on.
+    ///
+    /// Proposed by the LEADER of the fleet that loses a healing split, and only on evidence that heals
+    /// by itself -- a VOTER's key (`Cluster::SplitHealing`). Carries the survivor's id (`key`), its leader's
+    /// `0xFC` endpoint (`value`), the key that proved it (`publicKey`) and its age
+    /// (`createdAtUnixSeconds`) -- the one field no earlier verb had, which is why `CommandVersion`
+    /// moved with it.
+    DissolveInto,
 
     Last, ///< Not a verb, and has no row: the length of a table keyed by one.
 };
@@ -912,6 +948,14 @@ struct Command
     /// `AdmitPrincipal` only, and required there: what the principal may do. Refused for
     /// every other verb.
     std::optional<PrincipalRole> role;
+
+    /// `DissolveInto` only, and required there: when the survivor was created, as proven. Refused for
+    /// every other verb.
+    std::optional<std::uint64_t> createdAtUnixSeconds {};
+
+    /// `DissolveInto` only, and required there: the survivor's leader's key, reached from
+    /// `publicKey` (`DissolveOrder::leaderKey`). Refused for every other verb.
+    std::optional<Ed25519PublicKey> leaderKey {};
 
     [[nodiscard]] friend bool operator==(Command const&, Command const&) = default;
 };

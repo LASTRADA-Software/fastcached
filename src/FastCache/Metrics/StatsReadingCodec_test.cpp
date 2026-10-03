@@ -355,6 +355,15 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
+    // Moved by the state-file replace probe: one counter joined the catalogue for a serving body that
+    // found its state files replaced by the classic rename (`state_file_replaces_fell_back`), which
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together, as
+    // below.
+    //
+    // Moved when a pending node began holding an admission's signature to a key it proved for the
+    // fleet it asked: one counter joined the catalogue (`formation_admissions_unverified`). Clients
+    // and nodes upgrade together, as below.
+    //
     // Moved by the ceilings on what REGISTER and NODE-ANNOUNCE keep: two counters joined the
     // catalogue for a registration (`dispatch_worker_registrations_field_too_long`) and an
     // announcement (`dispatch_node_announcements_field_too_long`) refused for a string longer than a
@@ -542,7 +551,13 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved when lane 3's `dispatch_leases_all_excluded` joined the catalogue after `withdrawn`, in
     // integration order (ruling 8). Read off the built test, never computed by hand.
-    CHECK(StatsReadingLayout == 0x3a68efe79d2418b8ULL);
+    //
+    // Moved when lane 2a's `formation_admissions_unverified` joined the catalogue after lane 3's
+    // rows, in integration order (ruling 8). Read off the built test, never computed by hand.
+    //
+    // Moved when lane 2a's `state_file_replaces_fell_back` joined the catalogue after it, in
+    // integration order (ruling 8). Read off the built test, never computed by hand.
+    CHECK(StatsReadingLayout == 0x93dc205cb5431266ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

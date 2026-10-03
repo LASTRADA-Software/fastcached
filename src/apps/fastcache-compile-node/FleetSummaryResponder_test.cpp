@@ -10,8 +10,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <format>
+#include <optional>
+#include <ranges>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -128,6 +132,74 @@ TEST_CASE("A node with no fleet to offer refuses NoCluster rather than signing o
         .clusterId = "c-local", .state = FleetState::Solitary, .nodeId = "n-local", .raftEndpoint = "10.0.0.7:6680" });
     CHECK(StatusOf(AnswerSync(loopback, Wire::EncodeFleetSummaryRequest(nonce), Stranger()))
           == std::optional { Wire::Status::Ok });
+}
+
+TEST_CASE("A reply carries the member list up to its own cap and says how many the fleet records",
+          "[node][formation][summary]")
+{
+    // The reply is how a reader holding this node's key learns the members a datagram left out, so
+    // it carries the whole list up to `MaxFleetSummaryReplyMembers` -- cut here, the first ids kept --
+    // and the total, so a fleet past even that is said rather than guessed.
+    auto summary = FleetSummary { .clusterId = "c-office", .state = FleetState::Established, .nodeId = "n-office" };
+    for (auto const index: std::views::iota(std::size_t { 0 }, Wire::MaxFleetSummaryReplyMembers + 88))
+        summary.members.push_back(std::format("n-{}", index));
+    summary.memberTotal = summary.members.size();
+    Testing::ScriptedSummarySource self { summary };
+    auto const identity = Testing::TestKeyPair("n-office");
+    FleetSummaryResponder responder { self, identity };
+
+    auto fresh = Testing::IssuedNonceOf(std::byte { 3 });
+    auto const nonce = fresh.wire;
+    auto const decoded = Wire::DecodeFleetSummaryReply(
+        OkPayloadOf(AnswerSync(responder, Wire::EncodeFleetSummaryRequest(nonce), Stranger())));
+    REQUIRE(decoded.has_value());
+    auto const& carried = Unwrap(decoded).summary;
+    REQUIRE(carried.members.size() == Wire::MaxFleetSummaryReplyMembers);
+    CHECK(carried.members.front() == "n-0");
+    CHECK(carried.members.back() == std::format("n-{}", Wire::MaxFleetSummaryReplyMembers - 1));
+    CHECK(carried.memberTotal == Wire::MaxFleetSummaryReplyMembers + 88);
+
+    // And it is what was signed: the cut list proves under the node's key.
+    auto const proven =
+        Cluster::ProvenFleet::FromSeedAnswer(std::move(fresh.held), Unwrap(decoded), Cluster::SeedSource::FleetSeedFlag);
+    CHECK(proven.has_value());
+}
+
+TEST_CASE("Every endpoint a summary names that only the asker would reach refuses the answer", "[node][formation][summary]")
+{
+    // One row per endpoint a peer dials, named by MEMBER so a field dropped from the one list the rule
+    // walks (`FleetSummaryDialledEndpoints`) turns its own row red. Empty names nothing to dial.
+    struct Row
+    {
+        std::string_view what;
+        std::string FleetSummary::* member;
+    };
+    auto const rows = std::array {
+        Row { .what = "leader endpoint", .member = &FleetSummary::leaderNodeEndpoint },
+        Row { .what = "raft endpoint", .member = &FleetSummary::raftEndpoint },
+        Row { .what = "node endpoint", .member = &FleetSummary::nodeEndpoint },
+    };
+    auto const identity = Testing::TestKeyPair("n-local");
+    auto const nonce = NonceOf(std::byte { 6 });
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        auto summary = FleetSummary { .clusterId = "c-local", .state = FleetState::Solitary, .nodeId = "n-local" };
+        Testing::ScriptedSummarySource self { summary };
+        FleetSummaryResponder responder { self, identity };
+
+        summary.*row.member = "localhost:6674";
+        self.Set(summary);
+        CHECK(Cluster::EndpointsOnlyThisMachine(summary) == std::vector<std::string_view> { "localhost:6674" });
+        CHECK(ErrorOf(AnswerSync(responder, Wire::EncodeFleetSummaryRequest(nonce), Stranger()))
+              == std::optional { Wire::ErrorCode::NoCluster });
+
+        summary.*row.member = "10.0.0.7:6674";
+        self.Set(summary);
+        CHECK(Cluster::EndpointsOnlyThisMachine(summary).empty());
+        CHECK(StatusOf(AnswerSync(responder, Wire::EncodeFleetSummaryRequest(nonce), Stranger()))
+              == std::optional { Wire::Status::Ok });
+    }
 }
 
 TEST_CASE("A fleet-summary question that is not one nonce is refused as malformed", "[node][formation][summary]")

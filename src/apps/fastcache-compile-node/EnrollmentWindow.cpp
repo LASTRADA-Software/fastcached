@@ -328,10 +328,37 @@ std::vector<std::string> EnrollmentWindow::ClearPending()
     return cleared;
 }
 
+std::string EnrollmentWindow::NotLeadingReason(std::string_view leaderEndpoint)
+{
+    if (leaderEndpoint.empty())
+        return "this node does not lead its cluster and knows no leader yet; the enrollment list lives in the "
+               "leader's memory alone";
+    return std::format("this node does not lead its cluster; the enrollment list lives in the leader's memory "
+                       "alone -- ask the leader at {}",
+                       leaderEndpoint);
+}
+
+void EnrollmentWindow::ReportWindowClosedLocked() const
+{
+    if (_conditions == nullptr)
+        return;
+    if (!_leading)
+    {
+        _conditions->NotEvaluated(NodeCondition::EnrollmentWindowOpen, NotLeadingReason(_leaderEndpoint));
+        return;
+    }
+    _conditions->Clear(NodeCondition::EnrollmentWindowOpen);
+}
+
 void EnrollmentWindow::ReportWaitingLocked() const
 {
     if (_conditions == nullptr)
         return;
+    if (!_leading)
+    {
+        _conditions->NotEvaluated(NodeCondition::EnrollmentRequestsWaiting, NotLeadingReason(_leaderEndpoint));
+        return;
+    }
     auto ids = std::string {};
     auto waiting = std::size_t { 0 };
     for (auto const& row: _pending)
@@ -394,8 +421,7 @@ EnrollControlOutcome EnrollmentWindow::DisarmAutoApprove()
     if (!_autoApproveUntil.has_value())
         return EnrollControlOutcome::AlreadyInForce;
     _autoApproveUntil.reset();
-    if (_conditions != nullptr)
-        _conditions->Clear(NodeCondition::EnrollmentWindowOpen);
+    ReportWindowClosedLocked();
     return EnrollControlOutcome::Done;
 }
 
@@ -415,22 +441,34 @@ void EnrollmentWindow::MarkAutoApproved(std::string_view nodeId)
         _autoApprovedArmedAt[static_cast<std::size_t>(entry - _pending.data())] = _autoApproveArmedAt;
 }
 
-void EnrollmentWindow::OnRoleChanged(Distributed::SchedulerRole role)
+void EnrollmentWindow::OnRoleChanged(Distributed::SchedulerRole role, std::string_view leaderEndpoint)
 {
-    if (role == Distributed::SchedulerRole::Leader)
-        return;
-    (void) DisarmAutoApprove();
-    // And the LIST goes with the leadership: every enrollment verb is answered `NotLeader` from
-    // here on, so a row kept would be one nobody can decide about, and `waiting` would keep
-    // telling an operator to act on a node that now sends them elsewhere. Every row, decided
-    // ones included -- a joiner the cluster admitted is answered the roster by whichever node
-    // leads, from the replicated state and not from this list.
     std::scoped_lock const guard { _mutex };
+    if (role == Distributed::SchedulerRole::Leader)
+    {
+        // Leading: the list IS this node's now, so its rows are answered from it -- empty at a fresh
+        // leadership, since a demotion forgot it.
+        _leading = true;
+        _leaderEndpoint.clear();
+        ReportWaitingLocked();
+        if (!AutoApprovingLocked())
+            ReportWindowClosedLocked();
+        return;
+    }
+    _leading = false;
+    _leaderEndpoint.assign(leaderEndpoint);
+    // An armed window ends at demotion, and the LIST goes with the leadership: every enrollment verb
+    // is answered `NotLeader` from here on, so a row kept would be one nobody can decide about, and
+    // `waiting` would keep telling an operator to act on a node that now sends them elsewhere. Every
+    // row, decided ones included -- a joiner the cluster admitted is answered the roster by whichever
+    // node leads, from the replicated state and not from this list.
+    _autoApproveUntil.reset();
     _pending.clear();
     _firstSeen.clear();
     _lastSeen.clear();
     _autoApprovedArmedAt.clear();
     ReportWaitingLocked();
+    ReportWindowClosedLocked();
 }
 
 void EnrollmentWindow::LapseLocked() const
@@ -438,8 +476,7 @@ void EnrollmentWindow::LapseLocked() const
     if (!_autoApproveUntil.has_value() || _clock.now() < *_autoApproveUntil)
         return;
     _autoApproveUntil.reset();
-    if (_conditions != nullptr)
-        _conditions->Clear(NodeCondition::EnrollmentWindowOpen);
+    ReportWindowClosedLocked();
 }
 
 bool EnrollmentWindow::AutoApprovingLocked() const noexcept

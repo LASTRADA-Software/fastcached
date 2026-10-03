@@ -150,6 +150,8 @@ constexpr std::array WriterFiles {
                         .path = "src/apps/fastcache-compile-node/SharedCacheResponder.hpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeSharedCache,
                         .path = "src/apps/fastcache-compile-node/SharedTierProfile.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeFormation,
+                        .path = "src/apps/fastcache-compile-node/NodeStateFiles.cpp" },
 };
 
 /// A production file that names a counter and writes none.
@@ -735,7 +737,7 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // was never taken under. Drift is a red build, which is what the previous "106 of 144" --
     // a sentence with nothing watching it -- did not get. Unaffected by the exemption above: none
     // of these five sets can contain a counter with no writer, exempt or not.
-    CHECK(incremented.size() == 56);
+    CHECK(incremented.size() == 58);
     CHECK(refusalRow.size() == 141);
     CHECK(outcomeRow.size() == 10);
     CHECK(returned.size() == 4);
@@ -761,7 +763,7 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
             reachedByRefusalRowsAlone.insert(name);
     CHECK(reachedByRefusalRowsAlone.size() == 140);
 
-    // And four rows are written two ways, which is why the column sums to 227 over 223 rows.
+    // And four rows are written two ways, which is why the column sums to 228 over 224 rows.
     CHECK(incremented.size() + refusalRow.size() + outcomeRow.size() + returned.size() + profileRow.size()
           == nonExempt.size() + 4);
 }

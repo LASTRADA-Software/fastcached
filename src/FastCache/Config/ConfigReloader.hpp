@@ -152,6 +152,32 @@ class ConfigReloaderOf
         return {};
     }
 
+    /// Publish @p next as the live snapshot, without reading the file, and tell every subscriber.
+    ///
+    /// For a configuration the PROCESS rebuilt rather than an operator edited: a node's reform
+    /// reshapes it from its formation record, and a reader of `Current()` must see what the node now
+    /// runs rather than what it started as -- the worker's registration reads where to register from
+    /// here. Not asked of the immutability check, which says what a FILE may not change; nothing here
+    /// came from one.
+    /// @param next The configuration now in force.
+    void Publish(ConfigT next)
+    {
+        Snapshot previous;
+        Snapshot published;
+        std::vector<Subscriber> observers;
+        {
+            std::scoped_lock const lock { _swapMutex };
+            previous = _current;
+            published = std::make_shared<ConfigT>(std::move(next));
+            _current = published;
+            observers = _subscribers;
+        }
+
+        // Outside the lock, for `Reload`'s reason.
+        for (auto const& obs: observers)
+            obs(previous, published);
+    }
+
   private:
     std::filesystem::path _configPath;
     Reparse _reparse;

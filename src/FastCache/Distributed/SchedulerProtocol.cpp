@@ -427,7 +427,10 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                                         .conditions = fields->load.conditions,
                                                         // A voter's roster endorsement (#178),
                                                         // opaque until the service verifies it.
-                                                        .endorsement = fields->endorsement },
+                                                        .endorsement = fields->endorsement,
+                                                        // Borrowed from the decoded frame, which
+                                                        // outlives the call.
+                                                        .joinMemos = fields->joinMemos },
                                          HistoryFromWire(fields->load.history));
         }
         case Wire::Op::Heartbeat: {

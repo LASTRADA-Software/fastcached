@@ -4,7 +4,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstddef>
+#include <cstdio>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -42,6 +46,32 @@ TEST_CASE("A replaced file reads back whole, and replacing it again leaves only 
     REQUIRE(read.has_value());
     REQUIRE(Testing::Unwrap(read).has_value());
     CHECK(WireFields::AsStringView(Testing::Unwrap(Testing::Unwrap(read))) == "short");
+}
+
+TEST_CASE("A file a reader holds open is still replaced, and the reader keeps what it opened", "[consensus][storage]")
+{
+    // A node's record is replaced on the formation's beat thread; a reader holding it open at that
+    // moment must not make the replace fail. On Windows that needs the reader's delete sharing AND the
+    // replace's POSIX-semantics rename -- measured, either alone refuses -- and this case holds both.
+    auto const scratch = Testing::ScratchDirectory { "durable-file-held" };
+    auto const path = scratch / "formation";
+    REQUIRE(ReplaceFileAtomically(path, WireFields::AsBytes("old"), StateFile::Formation).has_value());
+
+    auto held = OpenForReading(path);
+    REQUIRE(held.has_value());
+    auto const replaced = ReplaceFileAtomically(path, WireFields::AsBytes("new"), StateFile::Formation);
+    INFO((replaced.has_value() ? std::string { "(replaced)" } : replaced.error().context));
+    CHECK(replaced.has_value());
+
+    auto kept = std::array<char, 8> {};
+    auto const n = std::fread(kept.data(), 1, kept.size(), held->get());
+    CHECK(std::string_view { kept.data(), n } == "old");
+    held->reset();
+
+    auto const read = ReadFileIfPresent(path);
+    REQUIRE(read.has_value());
+    REQUIRE(Testing::Unwrap(read).has_value());
+    CHECK(WireFields::AsStringView(Testing::Unwrap(Testing::Unwrap(read))) == "new");
 }
 
 TEST_CASE("A directory where a file belongs is a failure to read, never an absent file", "[consensus][storage]")

@@ -767,7 +767,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                                                                         // harness's transport; see
                                                                                         // `Caller`.
                                                                                         .prover = nullptr,
-                                                                                        .reachability = _reachability },
+                                                                                        .reachability = _reachability,
+                                                                                        .joinMemos = {} },
                                                      _roster.get(),
                                                      _link,
                                                      _fleet);

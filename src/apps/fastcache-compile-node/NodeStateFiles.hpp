@@ -5,12 +5,15 @@
 #include "NodeFormation.hpp"
 #include "NodeKey.hpp"
 
+#include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/StateFiles.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -33,6 +36,23 @@
 
 namespace FastCache::Node
 {
+
+/// Probe how the state files in @p directory are replaced, and say so when the replace FALLS BACK:
+/// a Warn naming the directory and the refusal, and `StateFileReplacesFellBack`.
+///
+/// A fallback is the classic rename, which every replace still lands with -- but on Windows a reader
+/// holding the file open then refuses it, which is the failure the POSIX-semantics rename exists to
+/// close. `MeansNoPosixRename` is broad enough to take a path form the rename refuses for a
+/// filesystem that has it, so the degraded property is said where it is found, once per body.
+/// @param directory The node's state directory.
+/// @param rename The POSIX-semantics rename every replace tries first.
+/// @param logger Where a fallback, or a probe that could not run, is said.
+/// @param metrics Where a fallback is counted.
+/// @return The route, or nothing when the probe could not be written.
+std::optional<Consensus::ReplaceRoute> ReportReplaceRoute(std::filesystem::path const& directory,
+                                                          Consensus::IReplacingRename const& rename,
+                                                          ILogger& logger,
+                                                          IMetricsSink& metrics);
 
 /// What a node does with a state file another account owns.
 ///

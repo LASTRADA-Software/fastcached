@@ -12,6 +12,7 @@
 #include <FastCache/Distributed/NodeProof.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheAuth.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
@@ -960,6 +961,72 @@ class IFrameResponder
     /// @return The prover, which must outlive the endpoint, or null.
     [[nodiscard]] virtual INodeProver* NodeProver() noexcept = 0;
 };
+
+/// How a refused request gets back to a frame boundary, so the connection stays
+/// usable.
+///
+/// **A PRIVATE enum -- nothing transmits it and nothing stores it -- so it states no
+/// ordinals.** An explicit `= N` here would assert a contract that does not exist.
+enum class Resynchronize : std::uint8_t
+{
+    StepOver, ///< Read and discard exactly what the header declared.
+    Oversize, ///< The declaration is past the cap, so the step-over is bounded too.
+};
+
+/// A refusal decided from a request HEADER, before a payload byte is read.
+///
+/// Returned by value and owning: the reply is bytes this endpoint will hand to a
+/// write, not a view into anything the decision borrowed. `.agent/rules/wire-and-protocol.md`
+/// is explicit that a struct a decoder returns by value must not borrow from what it
+/// decoded, and the same reasoning governs a decision returned to a caller that then
+/// suspends.
+struct HeaderRefusal
+{
+    std::vector<std::byte> reply; ///< What to send. Encoded and counted by the surface.
+    Resynchronize resynchronize;  ///< How to reach the next frame boundary afterwards.
+};
+
+/// What `DecideHeaderRefusal` reads of a surface.
+struct HeaderGate
+{
+    IFrameResponder& responder; ///< What answers -- and encodes and counts -- every refusal.
+    std::string_view what;      ///< The surface's name, for the messages that name it.
+    std::size_t inFlightBytes;  ///< What the surface holds in flight now, read ONCE: the figure decided on.
+};
+
+/// Whether this header is refused, and with what.
+///
+/// **Four refusals, one question, and it writes nothing** -- which is what makes
+/// lifting it out of `ServeConnection` legal at all (#675). That loop holds the
+/// endpoint's exactly-one-writer property, so an extraction that takes a write with
+/// it turns the property into an agreement between two functions; this takes the
+/// DECISION and leaves every byte to the loop, which is why the four `WriteAll`
+/// calls that used to sit in these branches are now one.
+///
+/// **The ORDER is the load-bearing part and it is now stated in one place.** Each
+/// step's reasoning is on the step:
+///
+///  1. The surface-wide cap, on the DECLARED length, so nothing is allocated.
+///  2. Admission, ahead of any resource decision -- a peer this surface will not
+///     serve must not be able to reach one, or a flood of refusable frames exhausts
+///     the budget and makes the surface answer `EndpointBusy` to the peers it does
+///     serve, which is the denial reconstructed one step out (#285, #377).
+///  3. The credential and the per-verb ceiling, through the same `DecidePrePayload`
+///     the daemon's loop calls, so the two surfaces cannot disagree about which
+///     verbs are open before authentication.
+///  4. The in-flight byte budget, last, for the reason step 2 gives.
+///
+/// @param gate What the surface answers with, its name, and the bytes it holds in flight now.
+/// @param peer Who is at the other end: the kernel's host, and what this connection has
+///        proved. A source port is ephemeral and is not an identity, so the address is all an
+///        admission policy had before #1428 -- and a proof is the second thing it now has.
+/// @param decoded The request header, as it decoded.
+/// @param cap The surface-wide request ceiling, read once by the caller.
+/// @return The refusal, or nullopt when the request is to be served.
+[[nodiscard]] std::optional<HeaderRefusal> DecideHeaderRefusal(HeaderGate const& gate,
+                                                               PeerIdentity const& peer,
+                                                               CompileCacheWire::RequestHeader const& decoded,
+                                                               std::size_t cap);
 
 /// Accepts connections and answers framed requests on each until the peer stops.
 ///

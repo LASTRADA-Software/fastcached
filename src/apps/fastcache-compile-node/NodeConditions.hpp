@@ -57,6 +57,8 @@ enum class NodeCondition : std::uint8_t
     RefusedCompileArguments,        ///< The worker refused compiles over arguments it will not pass to its compiler.
     SurfaceNotAccepting,            ///< A serving surface's accept loop has ended: its port listens and refuses.
     SurfaceAcceptDegraded,          ///< A serving surface's accept loop is backing off on failures nothing classifies.
+    FleetSplitHealing,              ///< This fleet and another are one fleet split in two: healing by itself, or waiting on an operator.
+    FormationMoveRefused,           ///< A move of this node's formation was refused: the startup rules refuse the shape it moves to.
     Last,                           ///< Not a condition.
 };
 
@@ -224,10 +226,10 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .severity = CompileCacheWire::ConditionSeverity::Warning,
       .scope = ConditionScope::Consensus,
       .remedy = "Decide which fleet each machine named here belongs to, and --cluster-forget it from the other: two "
-                "established fleets that share no member never merge on their own, so their machines keep building "
-                "apart and caching twice. If both fleets are meant to stay, nothing is wrong and this clears on its "
-                "own a few minutes after the other fleet stops being heard; put them on separate segments to stop "
-                "hearing it." },
+                "established fleets merge only when a key this fleet already holds proves them one fleet split in "
+                "two, so these keep building apart and caching twice. A fleet that merely CLAIMS a machine of this "
+                "one is named as such and never merges. If both fleets are meant to stay, this clears a few minutes "
+                "after the other stops being heard; separate segments stop hearing it." },
     { .condition = NodeCondition::SharedCacheUnavailable,
       .id = "shared-cache-unavailable",
       .persistence = CompileCacheWire::ConditionPersistence::Live,
@@ -322,6 +324,24 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "compile cold. /healthz answers 503 while this is raised, and the row clears by itself once an "
                 "accept succeeds. Check this host for exhausted file descriptors or memory, and report the reason "
                 "with this node's version so the failure can be classified." },
+    { .condition = NodeCondition::FleetSplitHealing,
+      .id = "fleet-split-healing",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Consensus,
+      .remedy = "Where the detail says which side yields, nothing: that side rejoins the other by itself, and a "
+                "machine the survivor did not record waits on its --enroll-list. Where it says an operator decides, "
+                "nothing moves until you do: ask the machine it names which fleet it is in, and check the other with "
+                "--cluster-status. Not yours: leave it. Yours: --cluster-forget=<id> each machine of the fleet that "
+                "does not stay, then --enroll-approve=<id>@<key> it on the survivor. Clears once the other is no "
+                "longer heard." },
+    { .condition = NodeCondition::FormationMoveRefused,
+      .id = "formation-move-refused",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Alert,
+      .scope = ConditionScope::Consensus,
+      .remedy = "Fix the rule the detail names and restart this node; until then it keeps the mode it is in rather "
+                "than serve a shape its next restart would refuse." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");

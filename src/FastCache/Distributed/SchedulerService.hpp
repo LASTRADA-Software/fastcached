@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cluster/RosterCertificate.hpp>
+#include <FastCache/Cluster/SplitEvidence.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetSample.hpp>
@@ -572,7 +573,7 @@ struct SchedulerReply
 /// *operator* problems -- an empty fleet is a misconfiguration, a busy one is
 /// under-capacity, a non-member is a policy decision somebody made -- even though
 /// the client answers all of them identically.
-class SchedulerService
+class SchedulerService final: public Cluster::IAnnouncedJoinMemos
 {
   public:
     /// @param clock Time source for registry expiry and lease timeouts; must
@@ -735,6 +736,14 @@ class SchedulerService
     /// @param endorsement The endorsement.
     /// @return What it did.
     EndorsementOutcome AcceptEndorsement(Cluster::RosterEndorsement const& endorsement);
+
+    /// Every join memo a recorded member announced, each under the id it PROVED.
+    ///
+    /// Filed by `AnnounceNode` and kept only for machines this node's applied state records, so a
+    /// member that leaves takes its memos with it; the leader's formation controller reads them
+    /// as the announced half of `Cluster::SplitEvidenceFor`.
+    /// @return The memos, one entry per (member, fleet asked).
+    [[nodiscard]] std::vector<Cluster::AskedJoinBy> AnnouncedJoinMemos() const override;
 
     /// The roster this node would hand a worker now.
     /// @param now This machine's wall clock.
@@ -1013,6 +1022,12 @@ class SchedulerService
     }
 
   private:
+    /// File @p memos under @p caller's proven id, replacing what it announced before, and drop
+    /// every machine's memos this node's state no longer records.
+    /// @param caller Who announced; nothing is filed for a caller that proved no id.
+    /// @param memos What it announced.
+    void RecordJoinMemos(CallerContext const& caller, std::span<CompileCacheWire::JoinMemoFields const> memos);
+
     /// Where handed-over history goes; null until the admin surface sets one.
     IFleetHistorySink* _history { nullptr };
 
@@ -1252,6 +1267,13 @@ class SchedulerService
     /// holds.
     mutable std::mutex _endorsementsMutex;
     std::map<std::string, Cluster::RosterEndorsement, std::less<>> _endorsements; ///< Guarded by `_endorsementsMutex`.
+
+    /// The join memos each recorded member last announced, by the id it proved.
+    ///
+    /// Bounded by the members: one entry per machine the state records, each at most
+    /// `CompileCacheWire::MaxAnnouncedJoinMemos`, replaced at its next announcement.
+    mutable std::mutex _joinMemosMutex;
+    std::map<std::string, std::vector<Cluster::AskedJoinBy>, std::less<>> _joinMemos; ///< Guarded by `_joinMemosMutex`.
 };
 
 } // namespace FastCache::Distributed

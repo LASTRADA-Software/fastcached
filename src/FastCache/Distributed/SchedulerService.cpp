@@ -1228,6 +1228,10 @@ SchedulerReply SchedulerService::AnnounceNode(CallerContext const& caller,
     if (_history != nullptr && !history.empty())
         _history->AcceptHistory(std::string { presence.endpoint }, history);
 
+    // The fleets it once asked, filed apart from the rest for the endorsement's reason: they are the
+    // evidence a split of THIS fleet is told to an operator on, not a reading of the machine.
+    RecordJoinMemos(caller, presence.joinMemos);
+
     // A voter's endorsement rides beside the rest and is judged APART from it: an endorsement
     // this node refuses is counted, and the machine's load and history still land -- they are
     // true whoever it is, and refusing them would hide the machine that is misbehaving.
@@ -1243,6 +1247,39 @@ SchedulerReply SchedulerService::AnnounceNode(CallerContext const& caller,
     auto const certified = CertifiedRosterNow(_wallClock.now());
     return SchedulerReply::Success(certified.has_value() ? Cluster::EncodeCertifiedRoster(*certified)
                                                          : std::vector<std::byte> {});
+}
+
+void SchedulerService::RecordJoinMemos(CallerContext const& caller, std::span<Wire::JoinMemoFields const> memos)
+{
+    // Under the id the caller PROVED, never one it named: a machine's memos are evidence only for
+    // the machine that asked. And only while the state records it -- one this fleet does not record
+    // speaks for nobody in it -- so a machine that leaves takes its memos with it at the next
+    // announcement anybody makes.
+    if (!caller.provenNodeId.has_value() || _admin == nullptr)
+        return;
+    auto const state = _admin->ClusterState();
+    auto const recorded = [&state](std::string_view id) {
+        return std::ranges::contains(state.members, id, &Cluster::ClusterMember::id);
+    };
+
+    std::scoped_lock const lock { _joinMemosMutex };
+    std::erase_if(_joinMemos, [&recorded](auto const& entry) { return !recorded(entry.first); });
+    if (!recorded(*caller.provenNodeId))
+        return;
+    auto& filed = _joinMemos[*caller.provenNodeId];
+    filed.clear();
+    for (auto const& memo: memos)
+        filed.push_back(Cluster::AskedJoinBy {
+            .askerId = *caller.provenNodeId, .clusterId = memo.clusterId, .provenKey = memo.provenKey });
+}
+
+std::vector<Cluster::AskedJoinBy> SchedulerService::AnnouncedJoinMemos() const
+{
+    std::scoped_lock const lock { _joinMemosMutex };
+    auto all = std::vector<Cluster::AskedJoinBy> {};
+    for (auto const& [asker, memos]: _joinMemos)
+        all.insert(all.end(), memos.begin(), memos.end());
+    return all;
 }
 
 SchedulerService::EndorsementOutcome SchedulerService::AcceptEndorsement(Cluster::RosterEndorsement const& endorsement)

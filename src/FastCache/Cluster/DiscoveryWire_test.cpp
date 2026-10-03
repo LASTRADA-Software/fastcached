@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <ranges>
 #include <span>
 #include <string>
@@ -57,7 +58,10 @@ namespace
                                             .leaderId = "n-a",
                                             .leaderNodeEndpoint = "office-a:6674",
                                             .nodeId = "n-b",
-                                            .raftEndpoint = "" };
+                                            .raftEndpoint = "",
+                                            .members = { "n-a", "n-b" },
+                                            .memberTotal = 3,
+                                            .nodeEndpoint = "office-b:6674" };
 }
 
 /// A solitary node's summary naming @p nodeId at @p endpoint, as a node that knows no leader says it.
@@ -228,7 +232,7 @@ TEST_CASE("A beacon or a proof whose summary the codec refuses is refused", "[cl
     REQUIRE(fields.has_value());
     auto const stateOffset = static_cast<std::size_t>(Unwrap(fields)[1].data() - summary.data());
     summary[stateOffset] = std::byte { 0x7F };
-    REQUIRE_FALSE(CompileCacheWire::DecodeFleetSummaryFields(summary).has_value());
+    REQUIRE_FALSE(CompileCacheWire::DecodeFleetSummaryFields(summary, CompileCacheWire::MaxFleetSummaryMembers).has_value());
 
     // In the beacon's own shape -- the summary, then padding -- so the refusal is the state byte's
     // and not the arity's; the honest summary in the same shape is the control.
@@ -290,6 +294,73 @@ TEST_CASE("A cluster id past its bound is refused where it enters, and an honest
     };
     CHECK(DiscoveryWire::DecodeChallenge(challengeNaming(CompileCacheWire::MaxIdBytes)).has_value());
     CHECK_FALSE(DiscoveryWire::DecodeChallenge(challengeNaming(CompileCacheWire::MaxIdBytes + 1)).has_value());
+}
+
+TEST_CASE("A proof naming as many members as a datagram carries fits the tightest unfragmented UDP payload",
+          "[cluster][discovery][wire][formation]")
+{
+    // A PINNED MEASUREMENT, and its conditions live here rather than beside the constant:
+    //   - every id at `MaxIdBytes` (64 bytes): the cluster, the leader, the speaker and each member;
+    //   - each of the three dialled endpoints at the longest IPv4 spelling, 21 bytes;
+    //   - the leader's identity key present, 32 bytes -- the field that took the bound from 11 to 10;
+    //   - the budget is 1232 bytes of UDP payload: IPv6's 1280-byte minimum link MTU, less its
+    //     40-byte header and UDP's 8. Discovery runs over IPv4 directed broadcast, whose budgets --
+    //     1472 on Ethernet, 1392 behind a 1420-byte tunnel -- are all larger, so this is the
+    //     tightest a datagram meets.
+    // Endpoints are bounded only by `MaxFleetSummaryTextBytes`, so this is a measurement under
+    // these conditions and not a ceiling; `AnswerFits` still refuses to amplify a longer one.
+    constexpr std::size_t Ipv6MinimumMtuUdpPayload = 1280 - 40 - 8;
+    auto const id = [](std::string_view prefix) {
+        auto text = std::string { prefix };
+        text.resize(CompileCacheWire::MaxIdBytes, 'x');
+        return text;
+    };
+    auto const endpoint = std::string { "255.255.255.255:65535" };
+    auto worst =
+        CompileCacheWire::FleetSummary { .clusterId = id("c"),
+                                         .state = CompileCacheWire::FleetState::Established,
+                                         .createdAtUnixSeconds = 1'790'000'000,
+                                         .leaderId = id("l"),
+                                         .leaderNodeEndpoint = endpoint,
+                                         .nodeId = id("n"),
+                                         .raftEndpoint = endpoint,
+                                         .members = {},
+                                         .memberTotal = 1000,
+                                         .nodeEndpoint = endpoint,
+                                         .leaderKey = std::array<std::byte, CompileCacheWire::IdentityPublicKeyBytes> {},
+                                         .pointsAt = {} };
+    for (auto const index: std::views::iota(std::size_t { 0 }, CompileCacheWire::MaxFleetSummaryMembers))
+        worst.members.push_back(id(std::format("m{}", index)));
+
+    auto const size = DiscoveryWire::ProofDatagramSize(worst);
+    CHECK(size == 1179); // the measurement, pinned
+    CHECK(size <= Ipv6MinimumMtuUdpPayload);
+    // And the bound is the largest that fits: one more member is one more prefixed id.
+    CHECK(size + WireFields::FieldPrefixSize + CompileCacheWire::MaxIdBytes > Ipv6MinimumMtuUdpPayload);
+}
+
+TEST_CASE("A datagram naming more members than a datagram carries is refused, and a reply reads the same summary",
+          "[cluster][discovery][wire][formation]")
+{
+    // Framed by hand, because the encoders refuse to write a list past the cap (`WithMembersAtMost`
+    // is where a sender cuts it); what is tested is that a reader refuses one a peer sent anyway.
+    auto const listing = [](std::size_t count) {
+        auto summary = Established();
+        summary.members.clear();
+        for (auto const index: std::views::iota(std::size_t { 0 }, count))
+            summary.members.push_back(std::format("n-{}", index));
+        summary.memberTotal = count;
+        return CompileCacheWire::EncodeFleetSummaryFields(summary);
+    };
+    auto const beaconOf = [](std::span<std::byte const> nested) {
+        return DiscoveryWire::Frame(DiscoveryWire::Kind::Beacon,
+                                    WireFields::Encode({ nested, std::span<std::byte const> {} }));
+    };
+    auto const atCap = listing(CompileCacheWire::MaxFleetSummaryMembers);
+    auto const pastCap = listing(CompileCacheWire::MaxFleetSummaryMembers + 1);
+    CHECK(DiscoveryWire::DecodeBeacon(beaconOf(atCap)).has_value());
+    CHECK_FALSE(DiscoveryWire::DecodeBeacon(beaconOf(pastCap)).has_value());
+    CHECK(CompileCacheWire::DecodeFleetSummaryFields(pastCap, CompileCacheWire::MaxFleetSummaryReplyMembers).has_value());
 }
 
 TEST_CASE("DiscoveryWire refuses what is not its datagram", "[cluster][discovery][wire]")
@@ -410,7 +481,7 @@ TEST_CASE("A proof signs every summary field so changing any one is refused", "[
 
     // One mutation per field, as a table: dropping a field from what is signed turns its row red.
     using Summary = CompileCacheWire::FleetSummary;
-    auto const mutations = std::array<std::pair<std::string_view, void (*)(Summary&)>, 7> { {
+    auto const mutations = std::array<std::pair<std::string_view, void (*)(Summary&)>, 10> { {
         { "clusterId", [](Summary& s) { s.clusterId += "x"; } },
         { "state", [](Summary& s) { s.state = CompileCacheWire::FleetState::Solitary; } },
         { "createdAt", [](Summary& s) { ++s.createdAtUnixSeconds; } },
@@ -418,6 +489,9 @@ TEST_CASE("A proof signs every summary field so changing any one is refused", "[
         { "leaderNodeEndpoint", [](Summary& s) { s.leaderNodeEndpoint += "0"; } },
         { "nodeId", [](Summary& s) { s.nodeId += "x"; } },
         { "raftEndpoint", [](Summary& s) { s.raftEndpoint = "attacker:6680"; } },
+        { "members", [](Summary& s) { s.members.front() += "x"; } },
+        { "memberTotal", [](Summary& s) { ++s.memberTotal; } },
+        { "nodeEndpoint", [](Summary& s) { s.nodeEndpoint = "attacker:6674"; } },
     } };
     for (auto const& [name, mutate]: mutations)
     {

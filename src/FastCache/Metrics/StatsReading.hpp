@@ -973,6 +973,10 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::CompileScheduler },
     CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchNodeAnnouncementsFieldTooLong,
                         .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::FormationAdmissionsUnverified,
+                        .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::StateFileReplacesFellBack,
+                        .surface = MetricsSurface::NodeFormation },
 };
 
 /// Whether every catalogue row has at least one surface attributed to it.

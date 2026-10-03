@@ -273,11 +273,13 @@ inline constexpr std::size_t MaxConditionIdBytes = ConditionFieldCeiling(&NodeCo
 /// Every row of a node's table travels, and the node asserts its table fits, so a list is never cut
 /// short to honour this. Its cost, `MaxNodeConditionListBytes`, is checked against
 /// `CompileCacheWire::ConditionPayloadShare` in one sum with everything else a NODE-ANNOUNCE
-/// carries. It is the most full rows that share holds, with no headroom: one row more than this
-/// overruns the share, so the next row is a decision about the share and not only about this number
-/// (`CompileCacheWire_test` asserts both sides). A DECODER bound, so it moves with lane 0's version
-/// bump; the flag day re-derives it and the share split from the final row count.
-inline constexpr std::size_t MaxNodeConditions = 18;
+/// carries. It is the most full rows that share holds -- `ConditionPayloadShare /
+/// MaxNodeConditionRowBytes()`, asserted equal in `CompileCacheWire.hpp`, which derives the share
+/// and so is the one header that can -- and one row more than this overruns the share, so the next
+/// row is a decision about the share and not only about this number (`CompileCacheWire_test`
+/// asserts both sides). A DECODER bound, so it moves with lane 0's version bump; the flag day
+/// re-derives it and the share from the final row count.
+inline constexpr std::size_t MaxNodeConditions = 21;
 
 /// What one encoded row costs at most, framing included: every field at its ceiling behind its
 /// length prefix, plus the prefix on the row itself.

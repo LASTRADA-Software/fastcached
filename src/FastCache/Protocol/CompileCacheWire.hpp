@@ -2,6 +2,8 @@
 #pragma once
 
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Protocol/NodeConditionWire.hpp>
@@ -1980,6 +1982,32 @@ inline constexpr std::size_t MaxFleetSummaryReply = MaxRefusalReply;
 /// and generous against both. `DecodeFleetSummaryFields` refuses a longer field.
 inline constexpr std::size_t MaxFleetSummaryTextBytes = 1024;
 
+/// The most member ids a fleet summary carries in a discovery DATAGRAM -- a beacon, and the proof
+/// that answers its challenge.
+///
+/// **A measured bound, not a derived one.** A proof naming this many ids at `MaxIdBytes`, beside a
+/// cluster, leader and speaker id at `MaxIdBytes`, three IPv4 endpoints at their longest spelling
+/// and the leader's identity key, is one UDP payload no larger than 1232 bytes: IPv6's 1280-byte minimum link MTU less
+/// its 40-byte header and UDP's 8, the smallest budget any link a datagram crosses unfragmented is
+/// held to. The figure and its conditions live in `DiscoveryWire_test.cpp`, which measures it with
+/// `ProofDatagramSize`; this comment does not restate it. Endpoints are bounded only by
+/// `MaxFleetSummaryTextBytes`, so a node announcing longer ones sends a larger datagram: the
+/// bound is a measurement under stated conditions, and `AnswerFits` still refuses to amplify.
+///
+/// A fleet recording more machines says so (`FleetSummary::memberTotal`), so a reader never mistakes
+/// a cut list for a whole one; a seed's answer over TCP carries more of it
+/// (`MaxFleetSummaryReplyMembers`).
+inline constexpr std::size_t MaxFleetSummaryMembers = 10;
+
+/// The most member ids a FLEET-SUMMARY REPLY carries: the whole list a datagram had to cut.
+///
+/// A parameter of the decoder rather than a second grammar, so one summary codec reads both
+/// carriers; the ceiling is asserted beside `LargestFleetSummaryReply` to fit
+/// `MaxFleetSummaryReply` with every other field at its largest, so raising either number fails the
+/// BUILD rather than the wire. A fleet recording more is past what a reply carries, and a reader
+/// says that rather than guessing (`memberTotal` names how many).
+inline constexpr std::size_t MaxFleetSummaryReplyMembers = 512;
+
 /// The longest an ID may be -- a cluster's or a node's -- wherever one enters: ONE bound for both.
 ///
 /// Tighter than every other text field, because an id is what the fleet's own messages carry
@@ -2207,7 +2235,7 @@ inline constexpr std::array OpTable {
                    .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::NodeAnnounce,
                    .name = "node-announce",
-                   .fieldCount = 4, // endpoint, capacity, load, endorsement
+                   .fieldCount = 5, // endpoint, capacity, load, endorsement, join memos
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    // Not pre-auth: this column is the daemon's credential gate, which a node
                    // never reaches. On a node no verb waits for a credential -- admission is
@@ -2404,7 +2432,7 @@ inline constexpr std::array OpTable {
     // comment a reviewer reads to understand this table's security posture.
     OpDescriptor { .code = Op::Enroll,
                    .name = "enroll",
-                   .fieldCount = 4, // nodeId, nodeEndpoint, role, publicKey
+                   .fieldCount = 5, // nodeId, nodeEndpoint, role, publicKey, nonce
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    // The second such row this table has ever held, and the first that is
                    // not AUTH. `PreAuthVerbsAreBounded` is what keeps the ceiling below
@@ -5164,17 +5192,6 @@ struct LoadFields
     std::vector<std::string> interfaceAddresses {};
 };
 
-/// The part of `MaxControlPayload` a node's condition list may take: a THIRD.
-///
-/// A third rather than a quarter so that every row keeps its words -- a remedy is what an operator
-/// reads, held to `MaxConditionRemedyBytes` -- at `MaxNodeConditions` rows, which this share holds
-/// and one row more does not. A further row needs a larger share, which the sum below decides, or
-/// shorter ceilings.
-inline constexpr std::size_t ConditionPayloadShare = MaxControlPayload / 3;
-
-static_assert(MaxNodeConditionListBytes <= ConditionPayloadShare,
-              "a node's conditions must fit the share of the payload they are given");
-
 namespace Detail
 {
     /// @param bytes What a field holds.
@@ -5212,6 +5229,15 @@ inline constexpr std::size_t MaxLoadRecordFixedBytes =
         + Detail::FramedField(sizeof(std::uint64_t)) + Detail::FramedField(sizeof(std::uint64_t)))
     + Detail::FramedField(0) + Detail::FramedField(1) + Detail::FramedField(0) + Detail::FramedField(MaxAddressListBytes);
 
+/// The most join memos one NODE-ANNOUNCE carries: as many as a formation record keeps
+/// (`Cluster::MaxAskedJoins`, asserted equal where both are visible), so a node hands over every one.
+inline constexpr std::size_t MaxAnnouncedJoinMemos = 8;
+
+/// The longest join-memo list `EncodeJoinMemos` writes, its own prefix excluded: every memo a nested
+/// cluster id at `MaxIdBytes`, which `DecodeJoinMemos` refuses past, and a key.
+inline constexpr std::size_t MaxJoinMemoListBytes =
+    MaxAnnouncedJoinMemos * Detail::FramedField(Detail::FramedField(MaxIdBytes) + Detail::FramedField(IdentityPublicKeyBytes));
+
 /// The longest roster endorsement a node attaches: `Cluster::EncodeEndorsement`'s six fields --
 /// cluster id, roster version, the roster's SHA-256 (32 bytes), not-after, endorser id, signature.
 /// OPAQUE to this header, which names no `Cluster/` type; `RosterCertificate_test` encodes the
@@ -5221,19 +5247,40 @@ inline constexpr std::size_t MaxRosterEndorsementBytes =
     + Detail::FramedField(sizeof(std::uint64_t)) + Detail::FramedField(MaxIdBytes) + Detail::FramedField(NodeSignatureBytes);
 
 /// Everything a NODE-ANNOUNCE carries besides its history batch and its condition list, at its
-/// longest: the endpoint, the capacity record, the load record's fixed fields, the endorsement.
+/// longest: the endpoint, the capacity record, the load record's fixed fields, the endorsement, the
+/// join memos.
 inline constexpr std::size_t MaxNodeAnnounceOtherBytes =
     Detail::FramedField(MaxEndpointBytes) + Detail::FramedField(MaxCapacityRecordBytes)
-    + Detail::FramedField(MaxLoadRecordFixedBytes) + Detail::FramedField(MaxRosterEndorsementBytes);
+    + Detail::FramedField(MaxLoadRecordFixedBytes) + Detail::FramedField(MaxRosterEndorsementBytes)
+    + Detail::FramedField(MaxJoinMemoListBytes);
 
 /// ONE budget for the verb, summed, rather than two fractions each checked alone (which said
 /// nothing about whether the rest still fit). Every term is a constant, never a figure restated here:
 ///   history     `HistoryPayloadShare`, which holds a full batch of
 ///               `MaxHistoryBucketsPerHeartbeat` x `MaxHistoryBucketBytes`;
-///   conditions  `ConditionPayloadShare`, which holds `MaxNodeConditionListBytes`;
+///   conditions  `ConditionPayloadShare`, which holds `MaxNodeConditionListBytes` and is what the
+///               other two leave;
 ///   the rest    `MaxNodeAnnounceOtherBytes`, every other field at its ceiling.
 /// `CompileCacheWire_test` encodes the worst case of all three, asserts its size is exactly what
 /// these constants say, and decodes it.
+/// The part of `MaxControlPayload` a node's condition list may take: everything the history share
+/// and every other field leave, so the verb's budget below holds with no slack.
+///
+/// DERIVED rather than a fraction, so every row keeps its words -- a remedy is what an operator
+/// reads, held to `MaxConditionRemedyBytes` -- and the row count is whatever that leaves room for:
+/// `MaxNodeConditions` is asserted to be the most full rows this share holds. A further row needs a
+/// smaller history share, fewer other bytes, or shorter ceilings; nothing here can simply grow.
+inline constexpr std::size_t ConditionPayloadShare =
+    MaxControlPayload - HistoryPayloadShare - MaxNodeAnnounceOtherBytes;
+
+static_assert(MaxNodeConditionListBytes <= ConditionPayloadShare,
+              "a node's conditions must fit the share of the payload they are given");
+
+// The bound is the share's, exactly: `NodeConditionWire.hpp` cannot name this share (it is derived
+// from fields this header defines after including it), so the literal there is held to it here.
+static_assert(MaxNodeConditions == ConditionPayloadShare / MaxNodeConditionRowBytes(),
+              "MaxNodeConditions must be the most full rows ConditionPayloadShare holds");
+
 static_assert(HistoryPayloadShare + ConditionPayloadShare + MaxNodeAnnounceOtherBytes <= MaxControlPayload,
               "a NODE-ANNOUNCE's history, conditions and everything else must fit one control payload together");
 
@@ -5345,6 +5392,61 @@ static_assert(HistoryPayloadShare + ConditionPayloadShare + MaxNodeAnnounceOther
 /// The ENDPOINT is the machine's identity here, as it is for a worker entry -- it is what an
 /// operator means by *a node*, and `NodeReports()` already groups by it. No fingerprint and no
 /// slots, for `Op::NodeAnnounce`'s reasons.
+/// One fleet a node once asked to admit it, as its NODE-ANNOUNCE hands it to the leader: the
+/// evidence a split of the node's fleet is told to an operator on, which the leader must hold whichever
+/// machine asked.
+///
+/// **Owns its fields**: the leader keeps it past the frame that carried it.
+struct JoinMemoFields
+{
+    std::string clusterId;                                      ///< The fleet asked.
+    std::array<std::byte, IdentityPublicKeyBytes> provenKey {}; ///< The key that proved it when it was asked.
+
+    /// Field-wise equality.
+    [[nodiscard]] friend bool operator==(JoinMemoFields const&, JoinMemoFields const&) = default;
+};
+
+/// Encode join memos as ONE nested field: each memo a nested `[cluster id, key]`.
+/// @param memos The memos; at most `MaxAnnouncedJoinMemos`.
+/// @return The field.
+[[nodiscard]] inline std::vector<std::byte> EncodeJoinMemos(std::span<JoinMemoFields const> memos)
+{
+    assert(memos.size() <= MaxAnnouncedJoinMemos && "a record keeps no more memos than an announcement carries");
+    auto encoded = std::vector<std::vector<std::byte>> {};
+    encoded.reserve(memos.size());
+    for (auto const& memo: memos)
+        encoded.push_back(WireFields::Encode({ AsBytes(memo.clusterId), std::span<std::byte const> { memo.provenKey } }));
+    auto views = std::vector<std::span<std::byte const>> { encoded.begin(), encoded.end() };
+    return WireFields::Encode(WireFields::FieldList { views });
+}
+
+/// Read join memos back.
+///
+/// Refuses more than `MaxAnnouncedJoinMemos`, a memo that is not exactly two fields, an EMPTY cluster
+/// id or one past `MaxIdBytes`, and a key that is not exactly one wide -- a prefix of a key is a
+/// different key, and a memo holding one would match nothing or the wrong fleet.
+/// @param field The nested field `EncodeJoinMemos` wrote; empty for none.
+/// @return The memos, owned, or nullopt when malformed.
+[[nodiscard]] inline std::optional<std::vector<JoinMemoFields>> DecodeJoinMemos(std::span<std::byte const> field)
+{
+    auto const parts = WireFields::Detail::SplitUpTo(field, MaxAnnouncedJoinMemos + 1);
+    if (!parts.has_value() || parts->size() > MaxAnnouncedJoinMemos || WireFields::EncodedSize(*parts) != field.size())
+        return std::nullopt;
+    auto memos = std::vector<JoinMemoFields> {};
+    memos.reserve(parts->size());
+    for (auto const part: *parts)
+    {
+        auto const fields = WireFields::SplitExactly(part, 2);
+        if (!fields.has_value() || (*fields)[0].empty() || (*fields)[0].size() > MaxIdBytes
+            || (*fields)[1].size() != IdentityPublicKeyBytes)
+            return std::nullopt;
+        auto memo = JoinMemoFields { .clusterId = std::string { AsStringView((*fields)[0]) } };
+        std::ranges::copy((*fields)[1], memo.provenKey.begin());
+        memos.push_back(std::move(memo));
+    }
+    return memos;
+}
+
 struct NodeAnnounceRequest
 {
     /// Where this machine answers, as it would register.
@@ -5374,6 +5476,11 @@ struct NodeAnnounceRequest
     /// reading of the machine, and the leader must be able to refuse it without refusing the
     /// load and the history that ride beside it.
     std::span<std::byte const> endorsement {};
+
+    /// The fleets this node once asked to admit it (`EncodeJoinMemos`): how the leader holds every
+    /// member's evidence that a fleet it sees is this one split, whichever machine did the asking.
+    /// A top-level field for the endorsement's reason: it is not a reading of the machine.
+    std::span<JoinMemoFields const> joinMemos {};
 };
 
 /// Frame a NODE-ANNOUNCE request.
@@ -5385,12 +5492,14 @@ struct NodeAnnounceRequest
 {
     auto const capacity = EncodeCapacity(request.capacity);
     auto const load = EncodeLoad(request.load);
+    auto const memos = EncodeJoinMemos(request.joinMemos);
     return Detail::EncodeRequest(version,
                                  Op::NodeAnnounce,
                                  { AsBytes(request.endpoint),
                                    std::span<std::byte const> { capacity },
                                    std::span<std::byte const> { load },
-                                   request.endorsement });
+                                   request.endorsement,
+                                   std::span<std::byte const> { memos } });
 }
 
 /// A node's announcement of itself, as received.
@@ -5406,6 +5515,7 @@ struct NodeAnnounceView
     CapacityFields capacity {};
     LoadFields load {};
     std::span<std::byte const> endorsement; ///< Borrowed, and empty when none travelled.
+    std::vector<JoinMemoFields> joinMemos;  ///< Owned: the leader keeps them past the frame.
 };
 
 /// Split a NODE-ANNOUNCE payload.
@@ -5422,9 +5532,14 @@ struct NodeAnnounceView
     auto load = DecodeLoad((*fields)[2]);
     if (!load.has_value())
         return std::nullopt;
-    return NodeAnnounceView {
-        .endpoint = (*fields)[0], .capacity = *std::move(capacity), .load = *std::move(load), .endorsement = (*fields)[3]
-    };
+    auto memos = DecodeJoinMemos((*fields)[4]);
+    if (!memos.has_value())
+        return std::nullopt;
+    return NodeAnnounceView { .endpoint = (*fields)[0],
+                              .capacity = *std::move(capacity),
+                              .load = *std::move(load),
+                              .endorsement = (*fields)[3],
+                              .joinMemos = *std::move(memos) };
 }
 
 /// Frame a HEARTBEAT request.
@@ -7744,6 +7859,10 @@ struct EnrollRequest
 
     EnrollRole role { EnrollRole::Learner }; ///< What it asks to be admitted as.
     std::span<std::byte const> publicKey;    ///< Its identity key: `IdentityPublicKeyBytes` of it.
+
+    /// `NodeChallengeBytes` the joiner drew for THIS request, which an `Approved` answer is signed
+    /// over: what makes a recorded admission worthless to anybody who replays it at a later ask.
+    std::span<std::byte const> nonce;
 };
 
 /// The same, decoded from a received payload. The id and the endpoint are views; the role and
@@ -7754,32 +7873,38 @@ struct EnrollView
     std::span<std::byte const> nodeEndpoint;                    ///< The `0xFC` endpoint, as sent.
     EnrollRole role { EnrollRole::Learner };                    ///< What it asks to be admitted as.
     std::array<std::byte, IdentityPublicKeyBytes> publicKey {}; ///< Its identity key.
+    std::array<std::byte, NodeChallengeBytes> nonce {};         ///< What an admission is signed over.
 };
 
 /// Frame an ENROLL request.
 ///
-/// Four fields. The id, the `0xFC` endpoint the joiner currently advertises -- shown to the
+/// Five fields. The id, the `0xFC` endpoint the joiner currently advertises -- shown to the
 /// operator beside the host the request came from -- the role because a learner and a worker
-/// are admitted by different commands, and the key because it is what the cluster records
-/// instead of handing a secret back. The joiner states all four because it is the only party
-/// that knows any of them.
+/// are admitted by different commands, the key because it is what the cluster records
+/// instead of handing a secret back, and a nonce the answering node signs an admission over.
+/// The joiner states all five because it is the only party that knows any of them.
 /// @param request Who is asking, as what, under which key, and where it will answer.
 /// @param version Version to advertise.
 /// @return The framed request.
 [[nodiscard]] inline std::vector<std::byte> EncodeEnroll(EnrollRequest const& request, WireVersion version = CurrentVersion)
 {
     std::array<std::byte, 1> const role { static_cast<std::byte>(request.role) };
-    return Detail::EncodeRequest(
-        version,
-        Op::Enroll,
-        { AsBytes(request.nodeId), AsBytes(request.nodeEndpoint), std::span<std::byte const> { role }, request.publicKey });
+    return Detail::EncodeRequest(version,
+                                 Op::Enroll,
+                                 { AsBytes(request.nodeId),
+                                   AsBytes(request.nodeEndpoint),
+                                   std::span<std::byte const> { role },
+                                   request.publicKey,
+                                   request.nonce });
 }
 
 /// Split an ENROLL payload.
 ///
-/// Refuses a role this build does not implement and a key that is not exactly one key wide: a
-/// prefix of a key is a different key, and an operator would be shown a string no machine holds.
-/// Whether the endpoint suits the role is the RESPONDER's to refuse, with a sentence of its own.
+/// Refuses a role this build does not implement, a key that is not exactly one key wide -- a
+/// prefix of a key is a different key, and an operator would be shown a string no machine holds --
+/// and a nonce that is not exactly `NodeChallengeBytes`, which both ends would sign and verify over
+/// different bytes. Whether the endpoint suits the role is the RESPONDER's to refuse, with a
+/// sentence of its own.
 /// @param payload The bytes following the request header.
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<EnrollView> DecodeEnrollPayload(std::span<std::byte const> payload)
@@ -7789,16 +7914,35 @@ struct EnrollView
         return std::nullopt;
     auto const role = (*fields)[2];
     auto const key = (*fields)[3];
-    if (role.size() != 1 || !IsKnownEnrollRole(static_cast<std::uint8_t>(role[0])) || key.size() != IdentityPublicKeyBytes)
+    auto const nonce = (*fields)[4];
+    if (role.size() != 1 || !IsKnownEnrollRole(static_cast<std::uint8_t>(role[0])) || key.size() != IdentityPublicKeyBytes
+        || nonce.size() != NodeChallengeBytes)
         return std::nullopt;
-    auto view = EnrollView {
-        .nodeId = (*fields)[0], .nodeEndpoint = (*fields)[1], .role = static_cast<EnrollRole>(role[0]), .publicKey = {}
-    };
+    auto view = EnrollView { .nodeId = (*fields)[0],
+                             .nodeEndpoint = (*fields)[1],
+                             .role = static_cast<EnrollRole>(role[0]),
+                             .publicKey = {},
+                             .nonce = {} };
     std::ranges::copy(key, view.publicKey.begin());
+    std::ranges::copy(nonce, view.nonce.begin());
     return view;
 }
 
-/// What an ENROLL was answered with, as views into the reply payload.
+/// The answering node's signature over its answer -- of any outcome: its identity key, and what that key signed.
+///
+/// Owned, fixed-width fields, for `FleetSummaryReply`'s reason; `Cluster/EnrollAdmissionSignature.hpp`
+/// pins both to the types the signature primitive takes.
+struct EnrollReplySignature
+{
+    std::array<std::byte, IdentityPublicKeyBytes> publicKey {}; ///< The answering node's identity key.
+    std::array<std::byte, NodeSignatureBytes> signature {};     ///< Its signature over the admission.
+
+    /// Field-wise equality.
+    [[nodiscard]] friend bool operator==(EnrollReplySignature const&, EnrollReplySignature const&) = default;
+};
+
+/// What an ENROLL was answered with, as views into the reply payload -- but for the signature, which
+/// is copied out as `DecodeFleetSummaryReply` copies its own.
 struct EnrollReplyView
 {
     /// What the leader decided, so far.
@@ -7817,6 +7961,11 @@ struct EnrollReplyView
     /// every outcome but `Approved`, and empty on an approval while a majority of the voters has
     /// not yet endorsed the roster: the worker then adopts one on its first announcement instead.
     std::span<std::byte const> certificate {};
+
+    /// The answering node's signature over the answer, and DISENGAGED when the reply carries none.
+    /// Every outcome is signed, and a joiner holding a key for the fleet it asked treats an answer
+    /// that carries none as no answer at all.
+    std::optional<EnrollReplySignature> signature {};
 };
 
 /// Frame the payload of an ENROLL reply.
@@ -7825,16 +7974,27 @@ struct EnrollReplyView
 /// zero rather than a convention.** A client asserts that length, which is the only assertion
 /// that can catch a server handing the roster to a machine nobody approved -- an outcome byte is
 /// equally correct in both the healthy and the broken build.
+///
+/// **The signature is two fields, both empty or both exactly one wide**, for the roster's reason: a
+/// reply carrying none says so by length, and a joiner treats such an answer as no answer.
 /// @param outcome What was decided.
 /// @param roster `Cluster::EncodeRoster(Cluster::ProjectRoster(state))`'s bytes for `Approved`, empty otherwise.
 /// @param certificate The leader's certified roster for `Approved`, when it has one; empty otherwise.
+/// @param signature The answering node's signature over this answer, whatever its outcome. **No
+///        default**: every outcome is signed, so a call that leaves it out fails to build rather than
+///        sending an answer every joiner treats as none; a case that means unsigned says `std::nullopt`.
 /// @return The reply payload, to be carried by `EncodeReply(Status::Ok, ...)`.
 [[nodiscard]] inline std::vector<std::byte> EncodeEnrollReply(EnrollOutcome outcome,
                                                               std::span<std::byte const> roster,
-                                                              std::span<std::byte const> certificate = {})
+                                                              std::span<std::byte const> certificate,
+                                                              std::optional<EnrollReplySignature> const& signature)
 {
     std::array<std::byte, 1> const tag { static_cast<std::byte>(outcome) };
-    return WireFields::Encode({ std::span<std::byte const> { tag }, roster, certificate });
+    auto const key =
+        signature.has_value() ? std::span<std::byte const> { signature->publicKey } : std::span<std::byte const> {};
+    auto const signatureBytes =
+        signature.has_value() ? std::span<std::byte const> { signature->signature } : std::span<std::byte const> {};
+    return WireFields::Encode({ std::span<std::byte const> { tag }, roster, certificate, key, signatureBytes });
 }
 
 /// Read an ENROLL reply payload back.
@@ -7844,13 +8004,20 @@ struct EnrollReplyView
 /// answer here: a status report may be partially understood and still useful, while a
 /// joiner that cannot tell *approved* from *rejected* has no safe default -- treating
 /// an unknown outcome as pending polls forever, and treating it as approved reads a roster
-/// out of a field that may hold anything.
+/// out of a field that may hold anything. A signature is both of its fields or neither, each
+/// exactly one wide: a prefix of a signature verifies nothing, and a caller must not be handed one
+/// to try.
 /// @param payload The reply payload.
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<EnrollReplyView> DecodeEnrollReply(std::span<std::byte const> payload)
 {
-    auto const fields = WireFields::SplitExactly(payload, 3);
+    auto const fields = WireFields::SplitExactly(payload, 5);
     if (!fields.has_value())
+        return std::nullopt;
+    auto const key = (*fields)[3];
+    auto const signatureBytes = (*fields)[4];
+    auto const unsignatureBytes = key.empty() && signatureBytes.empty();
+    if (!unsignatureBytes && (key.size() != IdentityPublicKeyBytes || signatureBytes.size() != NodeSignatureBytes))
         return std::nullopt;
     auto const tag = (*fields)[0];
     if (tag.size() != 1)
@@ -7864,9 +8031,17 @@ struct EnrollReplyView
         default:
             return std::nullopt;
     }
+    auto signature = std::optional<EnrollReplySignature> {};
+    if (!unsignatureBytes)
+    {
+        signature.emplace();
+        std::ranges::copy(key, signature->publicKey.begin());
+        std::ranges::copy(signatureBytes, signature->signature.begin());
+    }
     return EnrollReplyView { .outcome = static_cast<EnrollOutcome>(tag[0]),
                              .roster = (*fields)[1],
-                             .certificate = (*fields)[2] };
+                             .certificate = (*fields)[2],
+                             .signature = signature };
 }
 
 /// Frame an ENROLL-CONTROL request.
@@ -8312,7 +8487,8 @@ struct EnrollmentReport
 
 // ---- Fleet formation ---------------------------------------------------------------------
 
-/// Whether a fleet has admitted anybody but its founder.
+/// Whether a fleet has admitted anybody but its founder -- or whether its speaker is on its way to
+/// another fleet, which makes the summary a POINTER.
 ///
 /// **TRANSMITTED**: in a node's beacon and in its `FleetSummary` reply, so the values are
 /// explicit and the list is append-only. A byte this build has no name for is refused by the
@@ -8323,11 +8499,78 @@ enum class FleetState : std::uint8_t
 {
     Solitary = 0x01,    ///< Only its founder has ever been admitted.
     Established = 0x02, ///< Somebody besides its founder has been admitted, ever.
+    /// Its speaker has asked another fleet to take it, and its cluster ends when that fleet does:
+    /// the leader slots name THAT fleet's leader, not one of its own, and are read into
+    /// `FleetSummary::pointsAt` (`FleetStateTable`). A node meeting it asks the fleet it names
+    /// rather than joining one that is about to be left.
+    Pending = 0x03,
 };
 
 /// Every fleet state this build implements, as ONE list, for `KnownEnrollRoles`' reason: the
 /// decoder refuses a byte outside it.
-inline constexpr std::array KnownFleetStates { FleetState::Solitary, FleetState::Established };
+inline constexpr std::array KnownFleetStates { FleetState::Solitary, FleetState::Established, FleetState::Pending };
+
+/// Whose leader a summary's leader slots -- the leader's id, its `0xFC` endpoint and its key -- name.
+///
+/// **Private**: never transmitted or persisted; the state byte is what travels.
+enum class LeaderSlots : std::uint8_t
+{
+    OwnLeader,  ///< The leader of the speaker's own fleet: `leaderId`, `leaderNodeEndpoint`, `leaderKey`.
+    AskedFleet, ///< The leader of the fleet the speaker asked to join: `FleetSummary::pointsAt`.
+};
+
+/// One fleet state and what its leader slots name.
+struct FleetStateRow
+{
+    FleetState state;        ///< The state.
+    LeaderSlots leaderSlots; ///< Whose leader its slots name.
+};
+
+/// What each state's leader slots name, and so which MEMBERS the codec reads them into.
+///
+/// **This table is what keeps a pointer from being read as a leader.** A pending node's slots name
+/// the fleet it ASKED, and a reader that dialled them as the fleet's own leader would join a
+/// cluster about to be left. So the codec never puts them where such a reader looks: under
+/// `AskedFleet` they arrive in `pointsAt` and the summary's own leader fields are EMPTY, which every
+/// reader of those fields already treats as "no leader to ask". Nothing about a reader has to
+/// remember to consult the state.
+inline constexpr std::array FleetStateTable {
+    FleetStateRow { .state = FleetState::Solitary, .leaderSlots = LeaderSlots::OwnLeader },
+    FleetStateRow { .state = FleetState::Established, .leaderSlots = LeaderSlots::OwnLeader },
+    FleetStateRow { .state = FleetState::Pending, .leaderSlots = LeaderSlots::AskedFleet },
+};
+
+static_assert(FleetStateTable.size() == KnownFleetStates.size()
+                  && std::ranges::all_of(KnownFleetStates,
+                                         [](FleetState state) {
+                                             return std::ranges::count(FleetStateTable, state, &FleetStateRow::state) == 1;
+                                         }),
+              "every fleet state this build knows needs exactly one FleetStateTable row");
+
+/// Whether @p state's leader slots name the fleet its speaker asked rather than its own.
+/// @param state A state `KnownFleetStates` holds.
+/// @return True under `LeaderSlots::AskedFleet`.
+[[nodiscard]] constexpr bool LeaderSlotsNameAskedFleet(FleetState state) noexcept
+{
+    return std::ranges::any_of(FleetStateTable, [state](FleetStateRow const& row) {
+        return row.state == state && row.leaderSlots == LeaderSlots::AskedFleet;
+    });
+}
+
+/// The leader of the fleet a pending node asked to join, as the summary it decided on named it.
+///
+/// **A HINT, never proof.** It is what the pending node says; a node following it proves whoever
+/// answers at `leaderNodeEndpoint` itself and decides on THAT node's own proven summary, and a key
+/// stated here is one the answer must match, never one taken as proven.
+struct JoinPointer
+{
+    std::string leaderId {};           ///< The asked fleet's leader, or empty when it named none.
+    std::string leaderNodeEndpoint {}; ///< Where that leader's `0xFC` port answers, or empty.
+    std::optional<std::array<std::byte, IdentityPublicKeyBytes>> leaderKey {}; ///< Its key as stated, or none.
+
+    /// Field-wise equality.
+    [[nodiscard]] friend bool operator==(JoinPointer const&, JoinPointer const&) = default;
+};
 
 /// What a node says about the fleet it is in: the body of its beacon, and of its `FleetSummary`
 /// reply.
@@ -8340,17 +8583,97 @@ struct FleetSummary
     std::string clusterId {};                  ///< The fleet's id, as its founder minted it.
     FleetState state { FleetState::Solitary }; ///< Whether anybody but the founder was ever admitted.
     std::uint64_t createdAtUnixSeconds { 0 };  ///< When the founder created the fleet.
-    std::string leaderId {};                   ///< Empty when this node knows no leader.
+    std::string leaderId {};                   ///< Empty when this node knows no leader, and under `Pending`.
     std::string leaderNodeEndpoint {};         ///< host:port of the leader's 0xFC port, where a joiner sends Enroll.
     std::string nodeId {};                     ///< Who is speaking.
     std::string raftEndpoint {};               ///< Where the speaker answers Raft; EMPTY for a learner.
+
+    /// The machines the fleet records, by id: as many as the carrier holds, the ones a reader most
+    /// needs first.
+    ///
+    /// **A claim, never evidence on its own.** The signature proves who SPOKE, not that the fleet
+    /// records whom it names -- anybody can mint a fleet listing any id, and ids ride every beacon --
+    /// so a reader acts on this list only beside a key it already holds.
+    std::vector<std::string> members {};
+
+    /// How many machines the fleet records: `members.size()` when the list is whole, more when a
+    /// carrier cut it. Never fewer; the decoder refuses that.
+    std::uint64_t memberTotal { 0 };
+
+    /// Where the speaker's OWN `0xFC` port answers, so a peer holding its key can ask it again;
+    /// EMPTY states none, as `leaderNodeEndpoint` does while no leader is known.
+    std::string nodeEndpoint {};
+
+    /// The identity key of the leader `leaderId` names, as the speaker believes it -- inside what the
+    /// speaker signs, so a key proven for the speaker VOUCHES for it: a joiner told to ask that
+    /// leader holds its answer to this key rather than to whichever key answers there. Disengaged
+    /// when the speaker knows none, and under `Pending`.
+    std::optional<std::array<std::byte, IdentityPublicKeyBytes>> leaderKey {};
+
+    /// Under `Pending` alone, what the leader slots name: the fleet the speaker asked
+    /// (`FleetStateTable`). Empty in every other state, where the slots are this fleet's own.
+    JoinPointer pointsAt {};
 
     /// Field-wise equality.
     [[nodiscard]] friend bool operator==(FleetSummary const&, FleetSummary const&) = default;
 };
 
 /// How many length-prefixed fields `EncodeFleetSummaryFields` writes, in `FleetSummary`'s order.
-inline constexpr std::size_t FleetSummaryFieldCount = 7;
+inline constexpr std::size_t FleetSummaryFieldCount = 11;
+
+/// Where the leader's identity key sits: empty, or exactly `IdentityPublicKeyBytes`.
+inline constexpr std::size_t FleetSummaryLeaderKeyField = 10;
+
+/// Where the member ids sit among the summary's fields: ONE nested field of ids.
+inline constexpr std::size_t FleetSummaryMembersField = 7;
+
+/// Where the member total sits: eight big-endian bytes.
+inline constexpr std::size_t FleetSummaryMemberTotalField = 8;
+
+/// The summary's endpoints a peer DIALS -- where the leader's `0xFC` port answers, where the
+/// speaker answers Raft, and where its own `0xFC` port does -- as ONE list every rule about a
+/// dialled endpoint walks: the decoder holds each to `ParseDialEndpoint`, and
+/// `Cluster::AnnouncesOnlyThisMachine` refuses to announce one only the dialler reaches.
+///
+/// One rule per summary rather than one per field, because a reader dials whichever it needs and
+/// cannot be told which a sender checked. EMPTY is legal in each, and states none. A pending node's
+/// pointer is dialled too, and `DialledEndpointTexts` walks it beside these.
+inline constexpr std::array<std::string FleetSummary::*, 3> FleetSummaryDialledEndpoints {
+    &FleetSummary::leaderNodeEndpoint,
+    &FleetSummary::raftEndpoint,
+    &FleetSummary::nodeEndpoint,
+};
+
+/// Every endpoint in @p summary a peer may dial: `FleetSummaryDialledEndpoints`' three, then the
+/// endpoint a pending node points at. The ONE list both the decoder's dial rule and
+/// `Cluster::EndpointsOnlyThisMachine` walk.
+/// @param summary The summary.
+/// @return The endpoints, borrowed from @p summary; an empty one states none.
+[[nodiscard]] inline std::array<std::string_view, FleetSummaryDialledEndpoints.size() + 1> DialledEndpointTexts(
+    FleetSummary const& summary)
+{
+    auto texts = std::array<std::string_view, FleetSummaryDialledEndpoints.size() + 1> {};
+    std::ranges::transform(FleetSummaryDialledEndpoints, texts.begin(), [&summary](std::string FleetSummary::* endpoint) {
+        return std::string_view { summary.*endpoint };
+    });
+    texts.back() = summary.pointsAt.leaderNodeEndpoint;
+    return texts;
+}
+
+/// @p summary as a carrier holding at most @p maxMembers ids carries it: the first ids kept, in the
+/// order the summary lists them, and `memberTotal` untouched, so a reader can tell it was cut.
+///
+/// The ONE place a list is cut, so the ids a reader most needs are the ones every carrier keeps:
+/// whoever builds the summary lists them first.
+/// @param summary The summary, its whole list.
+/// @param maxMembers The carrier's cap: `MaxFleetSummaryMembers` or `MaxFleetSummaryReplyMembers`.
+/// @return The summary as that carrier holds it.
+[[nodiscard]] inline FleetSummary WithMembersAtMost(FleetSummary summary, std::size_t maxMembers)
+{
+    if (summary.members.size() > maxMembers)
+        summary.members.resize(maxMembers);
+    return summary;
+}
 
 /// Encode a fleet summary as its fields, for a beacon or a reply to carry.
 ///
@@ -8360,21 +8683,42 @@ inline constexpr std::size_t FleetSummaryFieldCount = 7;
 ///
 /// **Precondition: the cluster id is not empty.** `DecodeFleetSummaryFields` refuses an empty one
 /// as malformed, so encoding it would be sending what every peer drops; a node's cluster id is
-/// minted into its formation record, never empty.
+/// minted into its formation record, never empty. **And the leader slots are written from the
+/// members `FleetStateTable` says they name**: the pointer under `Pending`, this fleet's own
+/// leader otherwise -- the other set is empty, or the decoder would hand back a different summary.
 /// @param summary What the node says; its `clusterId` is not empty.
 /// @return `FleetSummaryFieldCount` fields.
 [[nodiscard]] inline std::vector<std::byte> EncodeFleetSummaryFields(FleetSummary const& summary)
 {
     assert(!summary.clusterId.empty() && "a fleet summary names its cluster; the decoder refuses an empty id");
+    assert(summary.memberTotal >= summary.members.size() && "a cut list names fewer than the total, never more");
+    auto const pointer = LeaderSlotsNameAskedFleet(summary.state);
+    assert((pointer ? summary.leaderId.empty() && summary.leaderNodeEndpoint.empty() && !summary.leaderKey.has_value()
+                    : summary.pointsAt == JoinPointer {})
+           && "the leader slots carry one set: the pointer under Pending, this fleet's own leader otherwise");
+    auto const& leaderId = pointer ? summary.pointsAt.leaderId : summary.leaderId;
+    auto const& leaderNodeEndpoint = pointer ? summary.pointsAt.leaderNodeEndpoint : summary.leaderNodeEndpoint;
+    auto const& leaderKey = pointer ? summary.pointsAt.leaderKey : summary.leaderKey;
+    auto const key = leaderKey.has_value() ? std::span<std::byte const> { *leaderKey } : std::span<std::byte const> {};
     std::array<std::byte, 1> const state { static_cast<std::byte>(summary.state) };
     auto const created = EncodeU64Field(summary.createdAtUnixSeconds);
+    auto ids = std::vector<std::span<std::byte const>> {};
+    ids.reserve(summary.members.size());
+    for (auto const& id: summary.members)
+        ids.push_back(AsBytes(id));
+    auto const members = WireFields::Encode(WireFields::FieldList { ids });
+    auto const total = EncodeU64Field(summary.memberTotal);
     return WireFields::Encode({ AsBytes(summary.clusterId),
                                 std::span<std::byte const> { state },
                                 std::span<std::byte const> { created },
-                                AsBytes(summary.leaderId),
-                                AsBytes(summary.leaderNodeEndpoint),
+                                AsBytes(leaderId),
+                                AsBytes(leaderNodeEndpoint),
                                 AsBytes(summary.nodeId),
-                                AsBytes(summary.raftEndpoint) });
+                                AsBytes(summary.raftEndpoint),
+                                std::span<std::byte const> { members },
+                                std::span<std::byte const> { total },
+                                AsBytes(summary.nodeEndpoint),
+                                key });
 }
 
 /// One text field of `EncodeFleetSummaryFields`' and the most bytes a reader accepts in it.
@@ -8385,44 +8729,86 @@ struct FleetSummaryTextField
 };
 
 /// Which of `EncodeFleetSummaryFields`' fields are text -- the cluster, the leader, its endpoint,
-/// the node and its endpoint -- each with its bound: the three ids `MaxIdBytes`, the two endpoints
-/// `MaxFleetSummaryTextBytes`.
-inline constexpr std::array<FleetSummaryTextField, 5> FleetSummaryTextFields { {
+/// the node, its Raft endpoint and its own `0xFC` endpoint -- each with its bound: the three ids
+/// `MaxIdBytes`, the three endpoints `MaxFleetSummaryTextBytes`. The member ids are a nested list
+/// and are bounded where it is read (`DecodeFleetSummaryMembers`).
+inline constexpr std::array<FleetSummaryTextField, 6> FleetSummaryTextFields { {
     { .index = 0, .maxBytes = MaxIdBytes },
     { .index = 3, .maxBytes = MaxIdBytes },
     { .index = 4, .maxBytes = MaxFleetSummaryTextBytes },
     { .index = 5, .maxBytes = MaxIdBytes },
     { .index = 6, .maxBytes = MaxFleetSummaryTextBytes },
+    { .index = 9, .maxBytes = MaxFleetSummaryTextBytes },
 } };
 
-/// The largest FLEET-SUMMARY reply payload a peer can send that `DecodeFleetSummaryReply` accepts:
-/// the nested summary at its largest, the key and the signature, each behind its length prefix.
+/// The largest FLEET-SUMMARY reply payload a peer can send that `DecodeFleetSummaryReply` accepts
+/// when it reads at most @p maxMembers ids: the nested summary at its largest, the key and the
+/// signature, each behind its length prefix.
+/// @param maxMembers The member cap the reader holds the summary to.
 /// @return The size in bytes.
-[[nodiscard]] consteval std::size_t LargestFleetSummaryReply() noexcept
+[[nodiscard]] consteval std::size_t LargestFleetSummaryReply(std::size_t maxMembers) noexcept
 {
     auto text = std::size_t { 0 };
     for (auto const& field: FleetSummaryTextFields)
         text += field.maxBytes;
-    auto const summary = (FleetSummaryFieldCount * WireFields::FieldPrefixSize) + text + 1 /* state */
-                         + sizeof(std::uint64_t) /* created */;
+    auto const members = maxMembers * (WireFields::FieldPrefixSize + MaxIdBytes);
+    auto const summary = (FleetSummaryFieldCount * WireFields::FieldPrefixSize) + text + 1       /* state */
+                         + sizeof(std::uint64_t) /* created */ + members + sizeof(std::uint64_t) /* memberTotal */
+                         + IdentityPublicKeyBytes /* leader key */;
     return (3 * WireFields::FieldPrefixSize) + summary + IdentityPublicKeyBytes + NodeSignatureBytes;
 }
 
-static_assert(LargestFleetSummaryReply() <= MaxFleetSummaryReply,
-              "the fleet summary reply ceiling must hold the largest summary a peer can make, with its key and signature");
+static_assert(LargestFleetSummaryReply(MaxFleetSummaryReplyMembers) <= MaxFleetSummaryReply,
+              "the fleet summary reply ceiling must hold the largest summary a peer can make -- every member a reply "
+              "carries at the id bound -- with its key and signature");
+
+/// Read the member ids of a summary back, holding them to @p maxMembers.
+///
+/// Refuses more than @p maxMembers ids, an empty id, one past `MaxIdBytes`, one that is not UTF-8
+/// -- an id is text a peer sent, and a fleet page renders it -- and an id named twice, which would
+/// make a count of the list say more than the fleet does. Walked at most one id past the cap, so a
+/// hostile list of empty fields costs the cap and no more.
+/// @param field The nested field `EncodeFleetSummaryFields` wrote.
+/// @param maxMembers The carrier's cap.
+/// @return The ids, owned, or nullopt when malformed.
+[[nodiscard]] inline std::optional<std::vector<std::string>> DecodeFleetSummaryMembers(std::span<std::byte const> field,
+                                                                                       std::size_t maxMembers)
+{
+    auto const ids = WireFields::Detail::SplitUpTo(field, maxMembers + 1);
+    if (!ids.has_value() || ids->size() > maxMembers || WireFields::EncodedSize(*ids) != field.size())
+        return std::nullopt;
+    auto members = std::vector<std::string> {};
+    members.reserve(ids->size());
+    for (auto const id: *ids)
+    {
+        auto const text = AsStringView(id);
+        if (text.empty() || text.size() > MaxIdBytes || !IsValidUtf8(text) || std::ranges::contains(members, text))
+            return std::nullopt;
+        members.emplace_back(text);
+    }
+    return members;
+}
 
 /// Read a fleet summary back.
 ///
 /// Refuses a field count other than `FleetSummaryFieldCount`, a text field longer than its bound
-/// (`FleetSummaryTextFields`: an id past `MaxIdBytes` included), an EMPTY cluster id, a
-/// state byte
-/// this build has no name for (see `FleetState`) and a creation time that is not exactly eight
-/// bytes. A cluster id is minted and never empty, so an empty one is malformed rather than a value:
-/// read as one, it would sort below every real id and win every same-second tie-break a yield
-/// decision makes, and two of them would read as the same fleet.
+/// (`FleetSummaryTextFields`: an id past `MaxIdBytes` included), an EMPTY cluster id, a state
+/// byte this build has no name for (see `FleetState`), a creation time or member total that is not
+/// exactly eight bytes, a member list `DecodeFleetSummaryMembers` refuses, a total smaller than the
+/// list, a leader key that is neither empty nor exactly one key wide, and a dialled endpoint
+/// (`DialledEndpointTexts`) that is neither empty nor one `ParseDialEndpoint` reads -- refused here
+/// as MALFORMED, so nothing downstream ever dials it. The leader slots are read into the members
+/// the state's `FleetStateTable` row names.
+///
+/// A cluster id is minted and never empty, so an empty one is malformed rather than a value: read
+/// as one, it would sort below every real id and win every same-second tie-break a yield decision
+/// makes, and two of them would read as the same fleet.
 /// @param blob What `EncodeFleetSummaryFields` wrote.
+/// @param maxMembers The most member ids the carrier holds: `MaxFleetSummaryMembers` for a
+///        datagram, `MaxFleetSummaryReplyMembers` for a reply. No default, so each carrier says.
 /// @return The summary, owning every field, or nullopt when malformed.
-[[nodiscard]] inline std::optional<FleetSummary> DecodeFleetSummaryFields(std::span<std::byte const> blob)
+[[nodiscard]] inline std::optional<FleetSummary> DecodeFleetSummaryFields(std::span<std::byte const> blob,
+                                                                          std::size_t maxMembers)
 {
     auto const fields = WireFields::SplitExactly(blob, FleetSummaryFieldCount);
     if (!fields.has_value() || (*fields)[0].empty())
@@ -8437,15 +8823,42 @@ static_assert(LargestFleetSummaryReply() <= MaxFleetSummaryReply,
     if (state.size() != 1 || !std::ranges::contains(KnownFleetStates, static_cast<FleetState>(state[0])))
         return std::nullopt;
     auto const created = DecodeU64Field((*fields)[2]);
-    if (!created.has_value())
+    auto const total = DecodeU64Field((*fields)[FleetSummaryMemberTotalField]);
+    auto members = DecodeFleetSummaryMembers((*fields)[FleetSummaryMembersField], maxMembers);
+    auto const keyField = (*fields)[FleetSummaryLeaderKeyField];
+    if (!created.has_value() || !total.has_value() || !members.has_value() || *total < members->size()
+        || (!keyField.empty() && keyField.size() != IdentityPublicKeyBytes))
         return std::nullopt;
-    return FleetSummary { .clusterId = std::string { AsStringView((*fields)[0]) },
-                          .state = static_cast<FleetState>(state[0]),
-                          .createdAtUnixSeconds = *created,
-                          .leaderId = std::string { AsStringView((*fields)[3]) },
-                          .leaderNodeEndpoint = std::string { AsStringView((*fields)[4]) },
-                          .nodeId = std::string { AsStringView((*fields)[5]) },
-                          .raftEndpoint = std::string { AsStringView((*fields)[6]) } };
+    auto leaderKey = std::optional<std::array<std::byte, IdentityPublicKeyBytes>> {};
+    if (!keyField.empty())
+    {
+        leaderKey.emplace();
+        std::ranges::copy(keyField, leaderKey->begin());
+    }
+    auto summary = FleetSummary { .clusterId = std::string { AsStringView((*fields)[0]) },
+                                  .state = static_cast<FleetState>(state[0]),
+                                  .createdAtUnixSeconds = *created,
+                                  .leaderId = std::string { AsStringView((*fields)[3]) },
+                                  .leaderNodeEndpoint = std::string { AsStringView((*fields)[4]) },
+                                  .nodeId = std::string { AsStringView((*fields)[5]) },
+                                  .raftEndpoint = std::string { AsStringView((*fields)[6]) },
+                                  .members = *std::move(members),
+                                  .memberTotal = *total,
+                                  .nodeEndpoint = std::string { AsStringView((*fields)[9]) },
+                                  .leaderKey = leaderKey,
+                                  .pointsAt = {} };
+    // A pointer's slots go where only a reader of the pointer looks.
+    if (LeaderSlotsNameAskedFleet(summary.state))
+        summary.pointsAt = JoinPointer { .leaderId = std::exchange(summary.leaderId, {}),
+                                         .leaderNodeEndpoint = std::exchange(summary.leaderNodeEndpoint, {}),
+                                         .leaderKey = std::exchange(summary.leaderKey, std::nullopt) };
+    // One dial rule for every endpoint a reader might dial; empty states none.
+    auto const dialable = [](std::string_view text) {
+        return text.empty() || ParseDialEndpoint(text).has_value();
+    };
+    if (!std::ranges::all_of(DialledEndpointTexts(summary), dialable))
+        return std::nullopt;
+    return summary;
 }
 
 /// Frame a FLEET-SUMMARY request.
@@ -8511,7 +8924,7 @@ struct FleetSummaryReply
 ///
 /// Refuses a key or a signature that is not exactly one wide -- a prefix of a signature verifies
 /// nothing, and a caller must not be handed one to try -- and a summary `DecodeFleetSummaryFields`
-/// refuses.
+/// refuses at the reply's member cap, `MaxFleetSummaryReplyMembers`.
 /// @param payload The reply payload.
 /// @return The reply, owning every field, or nullopt when malformed.
 [[nodiscard]] inline std::optional<FleetSummaryReply> DecodeFleetSummaryReply(std::span<std::byte const> payload)
@@ -8519,7 +8932,7 @@ struct FleetSummaryReply
     auto const fields = WireFields::SplitExactly(payload, 3);
     if (!fields.has_value() || (*fields)[1].size() != IdentityPublicKeyBytes || (*fields)[2].size() != NodeSignatureBytes)
         return std::nullopt;
-    auto summary = DecodeFleetSummaryFields((*fields)[0]);
+    auto summary = DecodeFleetSummaryFields((*fields)[0], MaxFleetSummaryReplyMembers);
     if (!summary.has_value())
         return std::nullopt;
     auto reply = FleetSummaryReply { .summary = *std::move(summary) };

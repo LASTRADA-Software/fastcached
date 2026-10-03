@@ -3397,6 +3397,48 @@ reply -- and prints nothing from it. The leader records the fingerprint of what 
 the row (`NoteServed`), per row, because the roster moves with every admission and one
 cluster-wide fingerprint would make a batch of approvals disagree for no attack at all.
 
+**A formation joiner believes an admission on its SIGNATURE, never on its roster.** A roster
+is PUBLIC -- every member's id and key rides every beacon and summary -- so a check of its
+CONTENT, however strict, is satisfied by a copy: a roster naming the proven member under its
+public key, seated as a learner or a voter, and the joiner was believed from whoever answered
+at the polled endpoint, measured. Requiring the proven key to be a VOTER bought nothing -- the
+forger seats it as one as easily -- and would refuse a join decided on a learner's beacon.
+So every `Enroll` carries a nonce the joiner drew from `ISecureRandom` (a failed draw sends
+nothing), and EVERY answer -- `Approved`, `Rejected` and `Pending` alike -- carries the
+ANSWERING node's signature (`IdentityKeyPurpose::EnrollAdmission`) over that nonce, the joiner's
+id and key, the cluster id its own FLEET-SUMMARY states, the OUTCOME and the roster's digest
+(`Cluster/EnrollAdmissionSignature.hpp`). A refusal sends a joiner away for an hour and a
+not-yet keeps it from giving a dead join up, so an unsigned one of either was a lever for
+whoever answered at the polled endpoint; each is now held to the same key, and one that does
+not verify is NO answer -- asked again on the beat, counted towards the give-up -- never the
+refusal it claims to be (`SignedOutcomeTable`). **And only a VERIFIED answer resets that
+give-up**: a full list, a `NotLeader` naming nobody and a redirect are wire refusals nobody
+signs, so whoever answers the poll's connection could say one every beat -- each counts
+towards the give-up exactly as silence does, and a legitimate full list lasting past it gives
+the join up and asks again, which is benign. The signature is judged before the key
+(`Forged` before `Unproven`), and an unsigned, forged or unproven answer is refused by name and
+counted (`FormationAdmissionsUnverified`), apart from a signed admission whose roster is wrong
+(`FormationAdmissionsRefused`). The one-shot `--enroll-from` sends the nonce and does not judge
+the signature: it proves no key before asking, and its trust root is the operator's two
+comparisons above.
+
+**And the key an answer is held to is reached from the key the join was DECIDED on, never
+from whichever key answers at an endpoint.** A fresh FLEET-SUMMARY probe proves only that
+somebody there holds SOME key, and a `NotLeader` redirect is unsigned, so a probe of where it
+points bound the admission to nothing at all. The chain's root is `JoinTarget::provenKey`: when
+the decided summary's speaker leads, the root is the key polled; when it names another leader,
+the key it states for that leader (`FleetSummary::leaderKey`, inside what the root signed) is
+the one that endpoint must prove; after a redirect, an endpoint whose key the chain already
+proved -- the root's own where the summary states it, else the first endpoint the chain proved,
+so the chain is rooted at `provenKey` TRANSITIVELY -- is asked which key leads now, and the
+redirect's endpoint must prove EXACTLY that key (`FormationController::ProvePollEndpoint`).
+Root-only would leave a member leaving on a dissolve, whose order names no speaker endpoint,
+unable to follow any redirect. A
+dissolve carries the survivor's leader key the same way (`DissolveOrder::leaderKey`), reached
+by the leader that decided, so a leaving member is held to it too. The case that pins it is a
+redirect to an endpoint proving the right cluster id under another key: refused, where the fresh
+probe believed it.
+
 **A role is a table (`EnrollRoleTable`), and each column is a decision.** A member states
 an endpoint and is admitted by `ClusterAdmit`, with no seat opinion so an approval cannot
 promote a demoted learner; a worker states none and is admitted by `AdmitPrincipal`. The

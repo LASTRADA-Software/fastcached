@@ -2,10 +2,13 @@
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/InheritedListener.hpp>
 
+#include <cerrno>
 #include <charconv>
 #include <cstdlib>
+#include <format>
 #include <ranges>
 #include <string>
+#include <system_error>
 
 #if !defined(_WIN32)
     #include <fcntl.h>
@@ -138,6 +141,28 @@ std::vector<int> AdoptInheritedDescriptors()
     ClearActivationEnvironment();
 
     return descriptors;
+}
+
+std::expected<int, std::string> SystemInheritedDescriptors::Duplicate([[maybe_unused]] int descriptor) const
+{
+#if defined(_WIN32)
+    return std::unexpected { std::string { "a supervisor hands no socket over on Windows, so there is none to copy" } };
+#else
+    auto const copy = ::fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0)
+        return std::unexpected { std::format("cannot copy the listening socket a supervisor handed over (descriptor "
+                                             "{}): {}",
+                                             descriptor,
+                                             std::system_category().message(errno)) };
+    return copy;
+#endif
+}
+
+void SystemInheritedDescriptors::Close([[maybe_unused]] int descriptor) const noexcept
+{
+#if !defined(_WIN32)
+    static_cast<void>(::close(descriptor));
+#endif
 }
 
 } // namespace FastCache

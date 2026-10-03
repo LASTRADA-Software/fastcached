@@ -375,4 +375,32 @@ std::expected<KeptFormation, std::string> ReadStateDirectoryFormation(std::files
     });
 }
 
+std::optional<Consensus::ReplaceRoute> ReportReplaceRoute(std::filesystem::path const& directory,
+                                                          Consensus::IReplacingRename const& rename,
+                                                          ILogger& logger,
+                                                          IMetricsSink& metrics)
+{
+    auto const probed = Consensus::ProbeReplaceRoute(directory, rename);
+    if (!probed.has_value())
+    {
+        logger.Logf(LogLevel::Warn,
+                    "cannot tell how the state files in {} are replaced: {}",
+                    directory.string(),
+                    probed.error().context);
+        return std::nullopt;
+    }
+    if (probed->route == Consensus::ReplaceRoute::Classic)
+    {
+        metrics.Increment(IMetricsSink::Counter::StateFileReplacesFellBack);
+        logger.Logf(LogLevel::Warn,
+                    "the state files in {} are replaced by the classic rename: the POSIX-semantics rename was refused "
+                    "({} {}: {}). Every replace still lands, but a reader holding one open now makes its replace fail",
+                    directory.string(),
+                    probed->posixRefusal.category().name(),
+                    probed->posixRefusal.value(),
+                    probed->posixRefusal.message());
+    }
+    return probed->route;
+}
+
 } // namespace FastCache::Node

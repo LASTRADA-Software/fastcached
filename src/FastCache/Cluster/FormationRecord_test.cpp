@@ -67,8 +67,9 @@ TEST_CASE("The mode table states the spec's shape for each mode", "[cluster][for
     CHECK(NodeModeRowFor(Pending).consensus == ConsensusScope::OwnCluster);
     CHECK(NodeModeRowFor(Pending).raftListener == RaftListenerState::Open);
     CHECK(NodeModeRowFor(Pending).scheduler == SchedulerDuty::Serves);
-    CHECK(NodeModeRowFor(Pending).announces == CompileCacheWire::FleetState::Solitary);
-    // A solitary node and a pending one announce solitary; a fleet member announces established.
+    CHECK(NodeModeRowFor(Pending).announces == CompileCacheWire::FleetState::Pending);
+    // A solitary node announces solitary, a pending one points at the fleet it asked, and a fleet
+    // member announces established.
     CHECK(NodeModeRowFor(Solitary).announces == CompileCacheWire::FleetState::Solitary);
     CHECK(NodeModeRowFor(Voter).announces == CompileCacheWire::FleetState::Established);
     CHECK(NodeModeRowFor(Learner).announces == CompileCacheWire::FleetState::Established);
@@ -143,6 +144,27 @@ TEST_CASE("A formation record round-trips every optional part", "[cluster][forma
     auto const second = DecodeFormationRecord(EncodeFormationRecord(record));
     REQUIRE(second.has_value());
     CHECK(Unwrap(second) == record);
+}
+
+TEST_CASE("A join target keeps the member list it was proven with, longer than a datagram carries",
+          "[cluster][formation][record]")
+{
+    // A target may have been proven by a seed's ANSWER, whose list is longer than a beacon's; the
+    // record keeps the summary as it was proven, so it reads at the reply's cap.
+    auto record = SolitaryRecord("c", 1);
+    record.mode = NodeMode::Pending;
+    auto summary = CompileCacheWire::FleetSummary { .clusterId = "fleet-c", .nodeId = "n-a" };
+    for (auto const index: std::views::iota(std::size_t { 0 }, CompileCacheWire::MaxFleetSummaryMembers + 9))
+        summary.members.push_back(std::format("n-{}", index));
+    summary.memberTotal = 40;
+    summary.nodeEndpoint = "office-a:6674";
+    record.joining = JoinTarget { .summary = summary, .provenKey = {}, .askedAtUnixSeconds = 7 };
+
+    auto const decoded = DecodeFormationRecord(EncodeFormationRecord(record));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == record);
+    REQUIRE(Unwrap(decoded).joining.has_value());
+    CHECK(Unwrap(Unwrap(decoded).joining).summary.members.size() == CompileCacheWire::MaxFleetSummaryMembers + 9);
 }
 
 TEST_CASE("A formation record naming a cluster id past its bound is refused as damage, by name",
@@ -329,7 +351,7 @@ TEST_CASE("A damaged formation record, or a file that is not one, is kept and ne
 TEST_CASE("A record remembers each fleet and key it asked once, first ask kept, and at most the bound",
           "[cluster][formation][record]")
 {
-    // The memo a split of one fleet heals on, keyed by (cluster id, proven key): asking the same
+    // The memo a split of one fleet is told on, keyed by (cluster id, proven key): asking the same
     // fleet under the same key again keeps the FIRST ask; the same id under another key is another
     // claim with a memo of its own; and a machine that asked many keeps the most recent ones.
     auto record = SolitaryRecord("c", 1);
@@ -365,6 +387,45 @@ TEST_CASE("A record remembers each fleet and key it asked once, first ask kept, 
     CHECK(Unwrap(decoded).askedJoins == record.askedJoins);
 }
 
+TEST_CASE("Asks that went nowhere never displace the memo of a fleet that admitted this node",
+          "[cluster][formation][record]")
+{
+    // The flood: a fleet costs nothing to mint, so a node can be led to ask many. Each ask is a memo,
+    // and with oldest-first eviction the eighth would push out the one memo a split is told on. So the
+    // oldest memo NOT admitted goes first, and an admitted one only when every memo is.
+    auto record = SolitaryRecord("c", 1);
+    auto const memo = [](std::string id, std::uint64_t at) {
+        return AskedJoin { .clusterId = std::move(id), .provenKey = {}, .askedAtUnixSeconds = at };
+    };
+    RememberAsked(record, memo("office", 10));
+    RememberAdmitted(record, "office", Ed25519PublicKey {});
+    REQUIRE(record.askedJoins.front().admitted);
+
+    for (auto const index: std::views::iota(std::uint64_t { 0 }, std::uint64_t { 3 * MaxAskedJoins }))
+        RememberAsked(record, memo(std::format("minted-{}", index), 100 + index));
+    REQUIRE(record.askedJoins.size() == MaxAskedJoins);
+    CHECK(record.askedJoins.front().clusterId == "office"); // kept, and still the oldest
+    CHECK(record.askedJoins.front().admitted);
+    CHECK(record.askedJoins.back().clusterId == std::format("minted-{}", (3 * MaxAskedJoins) - 1));
+
+    // The control, and the limit: once every memo was admitted, the oldest goes after all.
+    auto allAdmitted = SolitaryRecord("c", 1);
+    for (auto const index: std::views::iota(std::uint64_t { 0 }, std::uint64_t { MaxAskedJoins }))
+    {
+        RememberAsked(allAdmitted, memo(std::format("fleet-{}", index), index));
+        RememberAdmitted(allAdmitted, std::format("fleet-{}", index), Ed25519PublicKey {});
+    }
+    RememberAsked(allAdmitted, memo("one-more", 99));
+    REQUIRE(allAdmitted.askedJoins.size() == MaxAskedJoins);
+    CHECK(allAdmitted.askedJoins.front().clusterId == "fleet-1");
+    CHECK(allAdmitted.askedJoins.back().clusterId == "one-more");
+
+    // Marked where it is, and read back as written.
+    auto const decoded = DecodeFormationRecord(EncodeFormationRecord(record));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).askedJoins == record.askedJoins);
+}
+
 TEST_CASE("A record holding more asked fleets than any build keeps is damage", "[cluster][formation][record]")
 {
     // No build writes more than the bound, since `RememberAsked` drops the oldest; so more is damage,
@@ -383,16 +444,24 @@ TEST_CASE("A record holding more asked fleets than any build keeps is damage", "
     CHECK(refused.error().context.contains("asked fleets"));
 }
 
-TEST_CASE("A format 1 record is another layout, refused by name, and never read as damage", "[cluster][formation][record]")
+TEST_CASE("An earlier record format is another layout, refused by name, and never read as damage",
+          "[cluster][formation][record]")
 {
-    // Format 2 added the fleet's age and the asked fleets. A format 1 record is intact and belongs to
-    // the build that wrote it: `UnsupportedFormatVersion`, which is what monitoring sees, never
-    // `MalformedFrame`.
-    static_assert(FormationRecordFormat == 2, "this case pins the format the fleet age and the memo arrived in");
-    auto older = EncodeFormationRecord(SolitaryRecord("c", 1));
-    older[FormationRecordFormatOffset] = std::byte { 1 };
-    auto const refused = DecodeFormationRecord(older);
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
-    CHECK(refused.error().context.contains("format 1"));
+    // Format 2 added the fleet's age and the asked fleets; format 3 is this branch's unreleased layout
+    // -- a nested summary of eleven fields, memos of four -- FINAL only at the lane-0 flag day (see
+    // `FormationRecordFormat`). An earlier record is intact and belongs to the build that wrote it:
+    // `UnsupportedFormatVersion`, which is what monitoring sees, never `MalformedFrame`.
+    static_assert(FormationRecordFormat == 3,
+                  "this case pins format 3, unreleased and final only at the lane-0 flag day; from then on a "
+                  "layout change moves the number and adds the old one below");
+    for (auto const format: { std::uint8_t { 1 }, std::uint8_t { 2 } })
+    {
+        INFO("format " << int { format });
+        auto older = EncodeFormationRecord(SolitaryRecord("c", 1));
+        older[FormationRecordFormatOffset] = std::byte { format };
+        auto const refused = DecodeFormationRecord(older);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
+        CHECK(refused.error().context.contains(std::format("format {}", format)));
+    }
 }

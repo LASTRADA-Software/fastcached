@@ -78,6 +78,18 @@ namespace FastCache::Node
 /// @return The summary.
 [[nodiscard]] CompileCacheWire::FleetSummary AnsweredFleetSummary(NodeConfig const& cfg);
 
+/// What discovery hands a node's formation, and asks it: where every proven fleet goes after the
+/// tier's watch, and whether a proven fleet is this one split.
+///
+/// Both null for a node that runs no formation controller -- every proven fleet is then dropped
+/// after the watch, and no split is ever evidenced -- which is what a tier a case builds without one
+/// gets too.
+struct DiscoveryFormation
+{
+    Cluster::ISplitEvidenceSource const* evidence { nullptr }; ///< Whether a proven fleet is this one split.
+    Cluster::IFleetObserver* fleets { nullptr };               ///< Where every proven fleet goes after the watch.
+};
+
 /// A summary that does not change: what `ConfiguredFleetSummary` computed at startup.
 ///
 /// Enough while a node's cluster, id and mode change only across a reform, which rebuilds the
@@ -144,7 +156,8 @@ class DiscoveryTier
         Cluster::DiscoveryConfig config;                    ///< Where to beacon, and how often.
         Consensus::IRaftPeerKeys const& keys;               ///< This node's key and the roster's.
         Cluster::IFleetSummarySource const& self;           ///< What this node says about itself.
-        NodeConditions& conditions;                         ///< Where `foreign-fleet-visible` is answered.
+        NodeConditions& conditions;                         ///< Where the watch's rows are answered.
+        Cluster::ISplitEvidenceSource const& evidence;      ///< Whether a proven fleet is this one split.
         Cluster::IFleetObserver& fleets;                    ///< Where every proven fleet goes after the watch.
         PeerObserver onPeers;                               ///< Told the authenticated set.
         IMetricsSink& metrics;                              ///< Where refusals and bounds are counted.
@@ -166,6 +179,9 @@ class DiscoveryTier
     /// @param onPeers Told the authenticated set; must outlive the tier.
     /// @param metrics Where proofs under keys the roster does not accept are counted.
     /// @param logger Where beacons, joins and rejections are reported.
+    /// @param formation Where proven fleets go, and what says whether one is this fleet split; both
+    ///        must outlive the tier. Stated by every caller, never defaulted: a defaulted collaborator
+    ///        is how a new production caller would drop the formation without a word.
     /// @return The running tier, or the fatal reason.
     [[nodiscard]] static std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> Start(
         NodeConfig const& cfg,
@@ -174,7 +190,8 @@ class DiscoveryTier
         NodeConditions& conditions,
         PeerObserver onPeers,
         IMetricsSink& metrics,
-        ILogger& logger);
+        ILogger& logger,
+        DiscoveryFormation formation);
 
     /// Build a tier over a socket somebody else chose, without starting its thread.
     ///
@@ -310,6 +327,7 @@ class DiscoveryTier
 /// @param conditions Where `foreign-fleet-visible` is answered.
 /// @param metrics Where discovery's refusals are counted.
 /// @param logger Where progress and refusals are reported.
+/// @param formation Where proven fleets go and what evidences a split; see `DiscoveryTier::Start`.
 /// @return The tier, a null tier meaning "not configured", or the fatal reason.
 [[nodiscard]] std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> StartDiscoveryOrExplain(
     NodeConfig const& cfg,
@@ -317,7 +335,8 @@ class DiscoveryTier
     Cluster::IFleetSummarySource const& self,
     NodeConditions& conditions,
     IMetricsSink& metrics,
-    ILogger& logger);
+    ILogger& logger,
+    DiscoveryFormation formation);
 
 /// What an operator is told when discovery's two sockets cannot be bound.
 ///

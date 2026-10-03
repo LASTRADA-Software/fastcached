@@ -4,6 +4,7 @@
 // keys both ends derive from it. Where it runs on a connection is `NodeProofResponder_test` and
 // `FrameEndpoint_test`; where the keys seal frames is `SealedFrameSocket_test`.
 #include <FastCache/Cluster/DiscoveryWire.hpp>
+#include <FastCache/Cluster/EnrollAdmissionSignature.hpp>
 #include <FastCache/Cluster/FleetSummarySignature.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
@@ -286,6 +287,17 @@ constexpr EnumTable<IdentityKeyPurpose, ConstructionBuilder> ConstructionBuilder
                                                                 .audience = "office.corp:6674",
                                                                 .expiresAtUnixSeconds = 1,
                                                                 .nonce = {} });
+          } },
+    { .purpose = IdentityKeyPurpose::EnrollAdmission,
+      .build =
+          [](ConstructionSamples const& samples) {
+              return Cluster::EnrollAdmissionMessage(
+                  Cluster::AdmissionClaim { .nonce = samples.nonce,
+                                            .joinerId = "n-joiner",
+                                            .joinerKey = samples.key,
+                                            .clusterId = "c-sample",
+                                            .outcome = CompileCacheWire::EnrollOutcome::Approved,
+                                            .roster = samples.field });
           } },
 } };
 

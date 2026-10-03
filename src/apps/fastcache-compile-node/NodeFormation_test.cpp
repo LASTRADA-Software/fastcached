@@ -98,17 +98,23 @@ TEST_CASE("Each mode opens the Raft port its row says and runs the consensus it 
         bool consensus;
         bool raftPort;
         bool scheduler;
+        bool enrollment;
     };
-    for (auto const row: { Row { .mode = Solitary, .consensus = true, .raftPort = true, .scheduler = true },
-                           Row { .mode = Pending, .consensus = true, .raftPort = true, .scheduler = true },
-                           Row { .mode = Learner, .consensus = true, .raftPort = false, .scheduler = false },
-                           Row { .mode = Voter, .consensus = true, .raftPort = true, .scheduler = true } })
+    for (auto const row:
+         { Row { .mode = Solitary, .consensus = true, .raftPort = true, .scheduler = true, .enrollment = true },
+           Row { .mode = Pending, .consensus = true, .raftPort = true, .scheduler = true, .enrollment = true },
+           Row { .mode = Learner, .consensus = true, .raftPort = false, .scheduler = false, .enrollment = false },
+           Row { .mode = Voter, .consensus = true, .raftPort = true, .scheduler = true, .enrollment = true } })
     {
         INFO(Cluster::NodeModeRowFor(row.mode).name);
         auto const cfg = FormedBy(RecordIn(row.mode));
         CHECK(RunsConsensus(cfg) == row.consensus);
         CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).empty() == !row.raftPort);
         CHECK(ServesScheduler(cfg) == row.scheduler);
+        // Asked as `main` asks it: of the configuration, and of whether the scheduler was BUILT.
+        CHECK(ServesEnrollment(cfg, ServesScheduler(cfg)) == row.enrollment);
+        // A scheduler tier that failed to start serves no window, whatever the mode says.
+        CHECK_FALSE(ServesEnrollment(cfg, false));
     }
 }
 
@@ -117,6 +123,7 @@ TEST_CASE("A configuration no record shaped runs no consensus and opens no raft 
     auto const cfg = NodeConfig {};
     CHECK_FALSE(RunsConsensus(cfg));
     CHECK_FALSE(ServesScheduler(cfg));
+    CHECK_FALSE(ServesEnrollment(cfg, true));
     CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).empty());
     CHECK(SchedulersOf(cfg).empty());
     CHECK(BootstrapMembersOf(cfg).empty());
@@ -334,6 +341,42 @@ TEST_CASE("A worker on a machine whose name reaches only itself registers at loo
         worker.schedulers = { "127.0.0.1:6674", "sched.corp.example:6675" };
         CHECK(StartupPolicyRejection(worker) == std::optional { std::string { WorkerNameReachesOnlyThisMachineRefusal } });
     }
+}
+
+TEST_CASE("A learner and a voter whose fleet records a learner pass every startup rule", "[node][formation][mode]")
+{
+    // The node-level half of the two go-live blockers: a learner -- which runs consensus and binds no
+    // Raft port -- and a voter whose roster names a learner with no endpoint, judged by the rules a
+    // start asks before any tier exists. Their tiers' starts are `ConsensusTier_test`'s.
+    //
+    // Each names its scheduler, as every worker must today: the `--scheduler is required` row reads
+    // `cfg.schedulers`, never `SchedulersOf`, which nothing in production calls yet. That a zero-config
+    // worker is refused by it is Task 24's to close, where registration moves to `SchedulersOf`.
+    auto named = [](NodeConfig cfg) {
+        cfg.hostNames = NodeHostNames { .fqdn = "this-pc.corp.example", .dnsSuffix = "corp.example", .withheld = {} };
+        cfg.schedulers = { "office:6674" };
+        return cfg;
+    };
+
+    auto const learner = named(FormedBy(RecordIn(Cluster::NodeMode::Learner)));
+    REQUIRE(RunsConsensus(learner));
+    CHECK(StartupPolicyRejection(learner).value_or("(none)") == "(none)"); // the refusal itself, when one is made
+
+    auto voterRecord = RecordIn(Cluster::NodeMode::Voter);
+    auto roster = OfficeRoster();
+    roster.members.back().seat = Cluster::MemberSeat::Voter; // this node, promoted
+    roster.members.back().raftEndpoint = "this-pc:6680";
+    roster.members.push_back(Cluster::RosterMember { .id = "laptop",
+                                                     .raftEndpoint = {},
+                                                     .seat = Cluster::MemberSeat::Learner,
+                                                     .publicKey = Testing::TestKeyPair("laptop").PublicKey() });
+    voterRecord.fleet = Cluster::FleetMembership { .clusterId = "fleet-c",
+                                                   .roster = Cluster::EncodeRoster(roster),
+                                                   .createdAtUnixSeconds = 0 };
+    auto const voter = named(FormedBy(voterRecord));
+    REQUIRE(RunsConsensus(voter));
+    REQUIRE(Unwrap(voter.formation).fleetMembers.size() == 2); // office and laptop, never this node
+    CHECK(StartupPolicyRejection(voter).value_or("(none)") == "(none)");
 }
 
 TEST_CASE("The surface map prints the mode and a learner's closed Raft port with why", "[node][formation][surfaces]")

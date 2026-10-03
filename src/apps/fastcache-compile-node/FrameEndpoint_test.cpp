@@ -93,6 +93,7 @@
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/ExactAudience.hpp>
+#include <tests/FormationFakes.hpp>
 #include <tests/HalfClose.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
@@ -705,6 +706,72 @@ TEST_CASE("This machine is admitted, and a stranger is refused, with no list any
     // string the transport would have handed over, so nothing is being simulated away.
     CHECK(ErrorOf(core::async::syncRun(fleet.responder.Answer(frame, PeerIdentity { .host = "10.9.9.9" })).bytes)
           == Wire::ErrorCode::NotAMember);
+}
+
+namespace
+{
+/// How the last body's client connection stood when that body ended. **Private**: never transmitted
+/// or persisted.
+enum class LastBodyClient : std::uint8_t
+{
+    HungUpFirst,      ///< The client closed before the body ended: the client side holds TIME_WAIT.
+    OpenAcrossTheEnd, ///< Still open when the body closed its listener and its connections, and after.
+};
+
+/// One way the last body's connection ended, as the reform case walks them.
+struct LastBodyShape
+{
+    LastBodyClient client; ///< How the client connection stood.
+    std::string_view name; ///< What the case says it is.
+};
+} // namespace
+
+TEST_CASE("A reformed body serves its fixed port again, however the last body's connections ended", "[node][frame][reform]")
+{
+    // A reform ends a body -- its reactor, its listener and every connection it accepted -- and the next
+    // body BINDS THE SAME PORT again, at once. Rebinding rather than keeping one socket across bodies
+    // is the design because the other cannot work on Windows: a completion-port association belongs to
+    // the SOCKET, so a duplicate handed to the next body's reactor is refused (error 87, measured on
+    // Windows 11 build 26200; `ActivationHold`). What a rebind risks there is `SO_EXCLUSIVEADDRUSE`
+    // refusing a port the last body's connections still hold, so each shape is one the measurement
+    // covered: a client that hung up first, and one still open when the body closed its side.
+    auto const shapes = std::array {
+        LastBodyShape { .client = LastBodyClient::HungUpFirst, .name = "the client hung up first" },
+        LastBodyShape { .client = LastBodyClient::OpenAcrossTheEnd, .name = "a client still open across the end" },
+    };
+    auto const lease = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+    for (auto const& shape: shapes)
+    {
+        INFO(shape.name);
+        auto const port = FreePort();
+        auto held = std::optional<Conversation> {};
+        {
+            Fleet first;
+            auto body = FrameEndpoint::Start(first.io,
+                                             NodeSurface::Node,
+                                             LoopbackFor(NodeSurface::Node, port),
+                                             first.responder,
+                                             first.metrics,
+                                             first.logger);
+            REQUIRE(body.has_value());
+            first.Serve();
+            held.emplace(port);
+            REQUIRE(ErrorOf(held->Send(lease)) == Wire::ErrorCode::NoWorker); // served, over an accepted connection
+            if (shape.client == LastBodyClient::HungUpFirst)
+                held.reset();
+            body->reset(); // the body ends: its listener goes, and the connections it holds
+        }
+
+        // The next body, at once, on the same port.
+        Fleet next;
+        auto reformed = FrameEndpoint::Start(
+            next.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), next.responder, next.metrics, next.logger);
+        INFO((reformed.has_value() ? std::string { "(bound)" } : reformed.error()));
+        REQUIRE(reformed.has_value());
+        next.Serve();
+        CHECK(ErrorOf(Exchange(port, lease)) == Wire::ErrorCode::NoWorker);
+        held.reset();
+    }
 }
 
 TEST_CASE("An oversize frame is refused with both numbers, and never buffered", "[node][scheduler]")
@@ -4633,7 +4700,11 @@ struct TicketedNode
     LiveStatsResponder live { readings, membership.Oracle(), AdminCredential {}, fleet.io.Reactor(), fleet.metrics };
     FleetTextResponder fleetText { readings, membership.Oracle(), AdminCredential {}, fleet.metrics };
     EnrollmentWindow window { fleet.clock };
-    EnrollmentResponder enrollment { window, fleet.service, membership.Oracle(), fleet.metrics, fleet.logger };
+    /// What this node says about itself, and the key every admission it answers is signed with.
+    Testing::ScriptedSummarySource const self { Wire::FleetSummary { .clusterId = "c-ticketed",
+                                                                     .nodeId = "n-ticketed" } };
+    Ed25519KeyPair const signingKey = Testing::TestKeyPair("n-ticketed");
+    EnrollmentResponder enrollment { window, fleet.service, membership.Oracle(), self, signingKey, fleet.metrics, fleet.logger };
 
     MergedResponder merged { SurfaceComponents { .cache = &cacheTier,
                                                  .compile = &compile,

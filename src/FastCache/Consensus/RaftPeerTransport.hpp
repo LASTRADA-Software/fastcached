@@ -343,6 +343,24 @@ class RaftPeerTransport final: public IRaftTransport, public IRaftInboundLinks
     /// @param observer Called on the reactor's thread with the acceptor's id; may be empty.
     void ObserveOwnKeyRevoked(OwnKeyRevokedObserver observer);
 
+    /// Wake every ATTACHED session -- one a peer dialled in on -- whose key no longer proves, so its
+    /// sender asks the roster without waiting for a frame. Safe from any thread.
+    ///
+    /// Why: each session asks `StillProves` before every frame, and a forgotten LEARNER's has no next
+    /// frame -- the leader sends a member it no longer counts nothing, and a learner never campaigns
+    /// -- so it never dials again to hear the signed `OwnKeyRevoked`. Woken, its sender closes the
+    /// session, and the learner, whose two-way session has a reader, redials into the verdict.
+    ///
+    /// The wake is internal: a zero-length entry both senders read through one step that asks the
+    /// roster first and seals only a message, so it never reaches the wire or spends a sequence number.
+    ///
+    /// **Sessions this node DIALLED are not woken, and must not be "completed" to include them.** A
+    /// forgotten member learns only from the verdict on a dial of ITS OWN, so closing one this node
+    /// dialled teaches the acceptor nothing -- and the sender redials after its backoff, message or
+    /// not, turning one idle socket into a refused handshake every backoff forever. A dialler learns
+    /// at its next write: a forgotten voter's election timer sends one, since nobody heartbeats it.
+    void RecheckProofs();
+
     /// Begin dialling peers. Idempotent.
     ///
     /// Each sender is a **lazy** `core::async::Task` submitted to the reactor rather than a
@@ -402,6 +420,15 @@ class RaftPeerTransport final: public IRaftTransport, public IRaftInboundLinks
 
     /// @return How many peers this transport currently dials, self excluded.
     [[nodiscard]] std::size_t PeerCount() const noexcept;
+
+    /// @return Every peer this transport currently dials, self excluded, sorted by id.
+    [[nodiscard]] std::vector<NodeId> DialTargets() const;
+
+    /// @return Which way the sessions this transport dials flow.
+    [[nodiscard]] RaftWire::SessionDirection Direction() const noexcept
+    {
+        return _options.direction;
+    }
 
     /// Ask every sender to finish, without waiting. Any thread, including the
     /// reactor's.
