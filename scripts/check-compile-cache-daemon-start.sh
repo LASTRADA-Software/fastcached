@@ -71,7 +71,6 @@ done
 readonly SKIP=77
 
 [[ -n "$fastcached" && -x "$fastcached" ]] || { echo "fastcached not found: '$fastcached'; skipping"; exit "$SKIP"; }
-[[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
 [[ -n "$sourceDir"  && -d "$sourceDir"  ]] || { echo "source dir not found: '$sourceDir'; skipping"; exit "$SKIP"; }
 command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler'; skipping"; exit "$SKIP"; }
 command -v cmake >/dev/null 2>&1 || { echo "cmake not found; skipping"; exit "$SKIP"; }
@@ -122,6 +121,16 @@ trap cleanup EXIT
 #     `.agent/rules/testing.md` asks a bounded wait to do.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
 e2e_begin "compile-cache daemon-start" "$workdir"
+
+# After `e2e_begin`, whose snapshot of the caller's statistics must precede every use of
+# the launcher variable -- `launcher-state-isolation` refuses one above it.
+[[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
+
+# Before the launcher is staged, so what the configure finds and runs is the shim.
+# Every launcher this fixture runs records into a state directory of the run's own,
+# through the shim `e2e_launcher_state_enter` (scripts/lib/e2e-common.sh) puts in
+# front of it. Before any launcher runs, and after `e2e_begin`, whose workdir holds it.
+e2e_launcher_state_enter launcher "$fixtureDir"
 
 port="$(free_port)"
 addr="127.0.0.1:${port}"
@@ -246,4 +255,10 @@ secondPid="$(cat "$daemonPidfile")"
 [[ "$firstPid" == "$secondPid" ]] || fail "pidfile changed from ${firstPid} to ${secondPid}; a second daemon replaced the first"
 kill -0 "$secondPid" 2>/dev/null || fail "the original daemon (PID ${secondPid}) is no longer running"
 
+# Every launcher run here opts out of statistics -- `compile_once` sets FASTCACHE_NO_STATS=1,
+# and so do CompileCache.cmake's configure probes -- and none dispatches, so today none of
+# them writes to a state directory at all. The seam is kept anyway: dropping one of those
+# opt-outs would otherwise put this run's records in the developer's log, silently.
+e2e_launcher_state_assert_used --no-stats
+e2e_launcher_state_assert_caller_untouched
 echo "compile-cache daemon-start: spawned once, cache verified end to end, second configure found the same daemon"

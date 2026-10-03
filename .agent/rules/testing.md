@@ -2879,6 +2879,146 @@ not run the parent's EXIT trap at all and the shape does not reproduce, so the p
 that shows this is macOS's bash 3.2 — the one no development host here can measure. A
 green Linux run is not evidence about it.
 
+## A launcher fixture records only into its run's own state directory
+
+<!-- agent-tripwire: none: this lane's AGENT.md bullet waits on the final consolidation, pending proposal [25] in integration-log.txt -->
+
+The launcher records every invocation in `<state>/fastcache-cc/invocations.log`, and
+`-z` / `--zero-stats` DELETES that file. `<state>` is the DEVELOPER's — `%LOCALAPPDATA%` on
+Windows, `$XDG_STATE_HOME` or `$HOME/.local/state` elsewhere — unless the fixture says
+otherwise. The Windows launcher e2e (`run-launcher-e2e.ps1`) did not: every run deleted
+the developer's real statistics, and every compile it drove had first been appended to
+them. Three more fixtures appended without deleting. Nothing looked wrong from inside any
+of them — the result was right, and only somebody else's file had changed. The POSIX twin
+had exported `XDG_STATE_HOME` all along, which is why nobody noticed the Windows one.
+
+So a fixture handed a launcher — `$<TARGET_FILE:fastcache-cc>` (or any
+`$<TARGET_FILE…:fastcache-cc>`) on its registration, directly or through a variable
+carrying it, or a launcher parameter it declares — goes through ONE seam, **entered before
+the launcher first runs**: `Enter-E2ELauncherState` in `scripts/lib/E2EEnvironment.psm1`,
+or `e2e_launcher_state_enter` in `scripts/lib/e2e-common.sh`. Never a variable exported by
+hand. An export names the variables its author remembered, while the seam READS them from
+`StateDirectoryImpl` in `Stats.cpp` — only the branch of its `#if defined(_WIN32)` that
+applies on this platform — and refuses a preprocessor shape or a base it cannot read.
+
+**Scoped to the LAUNCHER, never the process.** `LOCALAPPDATA` is not the launcher's alone —
+sccache, the CPM source cache and the VS tooling read it too — and `HOME` re-homes git. So
+the PowerShell seam redirects around ONE launcher child (`Use-E2ELauncherState $h { ... }`)
+and puts the caller's values back before the next line runs, an unset variable UNSET
+again; the bash seam puts a shim in front of the launcher that sets the variables and
+`exec`s it. Only the variables the launcher reads on THIS platform are redirected, because
+its children — `cl`, `clang-cl` — inherit them. A process-wide redirect without a restore
+was the defect `dist-compile-e2e.ps1` carried.
+
+**A caller with no log at all is the common case, not an edge**: every CI runner, anybody
+who has never run the launcher, anybody who just ran `-z`. It is a case of its own in every
+check below, and nothing in the seam may end a `set -euo pipefail` fixture on a missing
+file — a review found exactly that silent exit in every bash fixture, while every sentinel
+it had been verified against held a record.
+
+Four checks, each with the direction it fails in:
+
+1. **A read-only guard when the seam is entered.** The seam asks the launcher where it will
+   record, through the redirect, and refuses a path outside the run's root. It asks with
+   `--show-stats`, which names the log while the log is empty. `-z` names it too, but only
+   by deleting what is there — which on exactly the failure being checked is the caller's
+   log. This guard, and not the readers, is what catches a state variable the readers
+   cannot see: a base taken from a helper or from `std::getenv` is invisible to BOTH
+   readers, and a review built exactly that launcher and watched `Enter` refuse it with
+   every sentinel untouched. Blind spot: none at the moment it runs — but it runs ONCE, so
+   the runs after it are checks 2 and 3's to judge.
+2. **A positive control: this run's launcher runs were redirected, and its own log holds
+   records**, asked BEFORE any `-z`. That the caller's log was spared is no evidence that
+   the launcher recorded HERE, because a launcher recording nowhere spares it too. The bash
+   shim also records, for every run, the value each state variable HAD when it ran, and
+   the control refuses any that does not name the run's root. A fixture whose every run
+   sets `FASTCACHE_NO_STATS=1` has no record to count — its runs write neither the log nor
+   the toolchain fingerprint cache, which only a dispatch or `--print-toolchain-fingerprint`
+   writes — so for it that shim record IS the control: at least one run beyond the guard,
+   each with every variable at the run's root. `FASTCACHE_NO_STATS` does not gate
+   everything, though: a PERSISTENT refusal from the daemon writes a throttle stamp
+   (`refusal-*.stamp`, `RefusalNotice.cpp`, reached from `main.cpp`'s fetch path) into the
+   same state directory. It is not used as the control, because `compile-cache-daemon-start`'s
+   daemon never refuses on the path that fixture tests; it lands in the run's root, since the
+   stamp and the log resolve one state directory.
+3. **The caller's side, asked directly, on EVERY exit.** The caller's logs are snapshotted
+   when the fixture STARTS — `e2e_begin`, or the `.ps1` fixture's startup
+   `Assert-E2ELauncherFixture` — and check 4 holds every run that names the launcher
+   variable BELOW that point: a bash fixture may not name it above `e2e_begin` at all, and
+   a `.ps1` fixture can only run it inside the wrapper, which exists only after `Enter`. So
+   damage done before the seam is entered is measured and does not become the "before"
+   picture. At the end — from the bash EXIT trap the seam chains in front of the fixture's
+   own, and from the `.ps1` fixture's `finally` through `Exit-E2ELauncherState` — a log
+   present at the start must keep every byte (not deleted, not shorter, the same tail) and
+   gain no record naming one of this run's trees; a log ABSENT at the start must still be
+   absent or hold no record of this run. A fixture that fails midway therefore still
+   reports the damage it did, which is where a leak shows. Blind spots, failing OPEN: a
+   launcher reached WITHOUT naming the variable (a second copy of its path taken from the
+   command line, or the other shapes check 4 lists) can run above the snapshot, and its
+   damage then IS the "before" picture;
+   a record whose source is relative, or spelled through `subst` or an 8.3 name, names no
+   tree; and only the LOG is judged — `toolchains/` and the refusal throttle stamps in the
+   same directory are not, since other builds on the machine write both and cannot be told
+   apart from this run.
+4. **No launcher runs outside the seam.** A `.ps1` fixture calls `Assert-E2ELauncherFixture`
+   at startup, BEFORE its skips and self-test modes, so a machine that skips the fixture
+   still judges it. It reads the fixture's syntax tree — `$script:`, `$global:` and
+   `$using:` spellings included, and the parameter reached as `$PSBoundParameters["Launcher"]`,
+   `$PSBoundParameters.Launcher` or `$MyInvocation.BoundParameters.Launcher` — and refuses a
+   launcher run outside the wrapper. A path
+   `Resolve-Path`, `Split-Path` or `Join-Path` derives from `$Launcher` is accepted only
+   where it ends at a KNOWN sink — an assignment, `Test-Path`, `Write-Host`, another of
+   those three — and every other consumer is refused: `&`, `.`, an executor or its
+   `-ArgumentList`, a later pipeline stage, a method's argument, `Get-Item`, `cmd /c`, a
+   hashtable. A `Start-Job` is accepted only binding the path to a block parameter named
+   `Launcher`. Every shape two reviews found is a refused control row. A bash fixture is
+   held to the ORDER instead, since the shim becomes the launcher variable only at
+   `e2e_launcher_state_enter`: nothing may name the variable above `e2e_begin`; between
+   `e2e_begin` and the seam only a test, a message or its absolute-path rewrite may, and
+   none of them may hold a command substitution naming it, because
+   `[ -n "$("$launcher" -z)" ]` is a test that RUNS it — nor pipe a message or hand it to
+   `eval`, `source`, `.`, `sh -c` or `bash -c`, because `echo "$launcher -z" | sh` is a
+   message that RUNS it; and no EXIT trap (`trap … EXIT`, or `trap … 0`, its other
+   spelling) may be installed after the seam, which would replace the check it chained in
+   front of the fixture's own (a background subshell resetting its own inherited traps
+   excepted). Blind spots, failing OPEN, and caught at run time by checks 2 and 3 (except
+   above the snapshot, as check 3 says): a launcher reached without naming the variable at
+   all — in bash, a second copy of the path from the command line, a `${!name}`
+   indirection, or a function from a sourced library that runs it; in PowerShell,
+   `Get-Variable -Name ("Laun" + "cher") -ValueOnly` or
+   `$ExecutionContext.InvokeCommand.ExpandString('$Launcher')` — and a PowerShell path
+   derived from `$Launcher`, STORED in another variable and run through that, the
+   assignment being the one sink accepted without following the variable further. And one
+   rule that fails CLOSED where it could be wrong: a bash function defined above the seam that runs the
+   launcher when called below it reads as a use above it.
+
+**The enforcement is `ctest -R launcher-state-isolation`** (`scripts/check-launcher-state-isolation.sh`),
+which selects TWO registrations of that script. `launcher-state-isolation` finds every
+fixture handed a launcher and requires it to call its language's seam — a bash one in the
+order check 4 gives — and it fails CLOSED on what it cannot classify: a launcher reference
+or a carrier variable outside an `add_test`/`set` it can read, a block it cannot close, a
+registration naming no script, a script declaring no launcher parameter, a bash fixture
+calling no `e2e_begin`. Carriers are followed to a fixpoint, across files, and a census
+that found no fixture is a failure. It fails OPEN where a registration reaches the launcher
+without naming `$<TARGET_FILE…:fastcache-cc>` or a carrier — a path spelled from the build
+tree's layout, a `find_program` of its own — and nothing catches that. It also holds the
+two readers to one answer per platform. `launcher-state-isolation-selftest` (`--self-test`)
+is the check's proof that it can fail: a planted tree that must earn every verdict, and
+both seams DRIVEN against a stand-in launcher with the caller's log present, empty and
+absent. Both run in the default set on EVERY platform rather than inside
+`e2e-helpers-selftest`, which is not run on Windows — where the `.ps1` fixtures they are
+mostly about run. Their cost is process spawns, which Git Bash makes expensive, so they run
+one process per pass over the tree rather than one per file, and they are two registrations
+so that each keeps its own bound on a saturated host rather than sharing a raised one.
+
+A sentinel is the proof, not the developer's real log, and it is taken in all THREE
+states: pointed at a directory holding one fake record, at one holding an EMPTY log, and
+at one holding NO log. Require each to come out exactly as it went in. That is
+deterministic whatever else runs on the machine, while other lanes' builds legitimately
+append to the real log — and a sentinel that always holds a record cannot see the
+fresh-machine case, which is how the silent exit above survived a verification that
+passed.
+
 ## Open work
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->

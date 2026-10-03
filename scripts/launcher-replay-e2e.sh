@@ -119,17 +119,13 @@ SKIP=77
 # green, and it is not there.
 skip() { echo "launcher-replay-e2e: $* -- skipping"; exit "$SKIP"; }
 
-for pair in "fastcached:$fastcached" "launcher:$launcher"; do
-    path="${pair#*:}"
-    [ -n "$path" ] && [ -x "$path" ] || skip "${pair%%:*} was not given an executable"
-done
+[ -n "$fastcached" ] && [ -x "$fastcached" ] || skip "fastcached was not given an executable"
 [ -n "$compiler" ] && command -v "$compiler" >/dev/null 2>&1 || skip "no usable compiler ($compiler)"
 command -v cmake  >/dev/null 2>&1 || skip "cmake is not on PATH"
 command -v ninja  >/dev/null 2>&1 || skip "ninja is not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 is not on PATH"
 
 fastcached="$(cd "$(dirname "$fastcached")" && pwd)/$(basename "$fastcached")"
-launcher="$(cd "$(dirname "$launcher")" && pwd)/$(basename "$launcher")"
 
 workdir="$(mktemp -d)"
 daemon_pid=""
@@ -145,6 +141,17 @@ trap cleanup EXIT
 # goes. The label is what every `FAILED:` line is prefixed with, so it is the
 # spelling this fixture's own messages have always carried.
 e2e_begin "launcher-replay-e2e" "$workdir"
+
+# After `e2e_begin`, whose snapshot of the caller's statistics must precede every use of
+# the launcher variable -- `launcher-state-isolation` refuses one above it.
+[ -n "$launcher" ] && [ -x "$launcher" ] || skip "launcher was not given an executable"
+launcher="$(cd "$(dirname "$launcher")" && pwd)/$(basename "$launcher")"
+
+# Before the compiler-launcher wrapper below is written, so the path it `exec`s is the shim.
+# Every launcher this fixture runs records into a state directory of the run's own,
+# through the shim `e2e_launcher_state_enter` (scripts/lib/e2e-common.sh) puts in
+# front of it. Before any launcher runs, and after `e2e_begin`, whose workdir holds it.
+e2e_launcher_state_enter launcher "$source_dir"
 
 # The port, DRAWN when the caller named none (#1254).
 #
@@ -526,4 +533,6 @@ EOF
     e2e_note "canary: the suite went red on a wrong object, as it must"
 fi
 
+e2e_launcher_state_assert_used
+e2e_launcher_state_assert_caller_untouched
 echo "launcher-replay-e2e: a real target replayed from cache passes its own tests"

@@ -170,6 +170,11 @@ e2e_begin() {
     # workdir. So the signal is turned back into an ordinary exit here: one
     # failing status whichever shell raised it, and cleanup still runs.
     trap 'exit 1' TERM
+
+    # The caller's launcher statistics as they are BEFORE this fixture can have run a
+    # launcher, so a `-z` ahead of `e2e_launcher_state_enter` is measured rather than
+    # becoming the "before" picture. Never fails the run; see the launcher-state section.
+    _e2e_launcher_state_snapshot
 }
 
 # Name a function to run immediately before a failure is printed.
@@ -3116,4 +3121,575 @@ reap_background_jobs() {
 # reap and anything else the cleanup does, since it may `exit`.
 e2e_exit_if_reap_left_survivors() {
     [ "$E2eReapSurvivors" -eq 0 ] || exit 1
+}
+
+# ---------------------------------------------------------------------------
+# A fixture's launcher records into a state directory of the run's own
+# ---------------------------------------------------------------------------
+#
+# The launcher keeps its statistics in `<state>/fastcache-cc/invocations.log`, and `-z`
+# DELETES that file. A fixture that runs `-z` against the developer's state directory
+# deletes their statistics; one that merely compiles appends its records to them. Both
+# happened: the Windows launcher e2e did the first, and three fixtures the second.
+#
+# Scoped to the LAUNCHER, never the fixture's shell. The variables it resolves its state
+# from include HOME, and exporting HOME across a fixture would re-home git and every
+# other tool the fixture runs. So `e2e_launcher_state_enter` writes a SHIM that exports
+# them and `exec`s the real launcher, and points the fixture's launcher variable at it:
+# every call the fixture makes -- forty spellings in `compile-cache-e2e.sh`, a
+# compiler-launcher wrapper, a nested CMake configure -- reaches the launcher through it
+# without one of them being edited. The one way past it is to re-derive the real
+# binary's path, which fails OPEN, and which the positive control and the caller check
+# below exist to catch.
+#
+# The caller's logs are snapshotted by `e2e_begin`, before anything in the fixture can
+# have run a launcher, so damage done BEFORE the seam is entered is measured too. They
+# are judged again when the run ends, on EVERY exit: `e2e_launcher_state_enter` chains a
+# check in front of the fixture's own EXIT trap, so a fixture that fails midway still
+# reports what it did to the caller. That check only READS; the cleanup it hands over to
+# is the fixture's own.
+#
+# The PowerShell twin is `Enter-E2ELauncherState` in `scripts/lib/E2EEnvironment.psm1`:
+# the same variables, the same read-only guard, the same checks, and a per-call wrapper
+# instead of a shim, since a `.cmd` shim would mangle `Start-Process`'s arguments.
+# `launcher-state-isolation` holds the two readers of Stats.cpp to one answer, and
+# `launcher-state-isolation-selftest` drives both seams against an absent, an empty and a
+# present caller log.
+#
+# Nothing here may end a `set -euo pipefail` fixture on a missing file: an ABSENT caller
+# log is the ordinary state of every CI runner and of anybody who just ran `-z`.
+
+# Where the launcher decides its state directory. Read, never restated.
+_e2e_launcher_state_source="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/src/apps/fastcache-cc/Stats.cpp"
+# Where under a state base the launcher keeps its log. RESTATED, because `e2e_begin` needs
+# it before any launcher may be asked; `e2e_launcher_state_enter` refuses when the
+# launcher's own answer disagrees, so a move is a refusal rather than an unchecked log.
+_e2e_launcher_state_log_rel="fastcache-cc/invocations.log"
+_e2e_launcher_state_root=""
+_e2e_launcher_state_log=""
+# This run's trees, one per line: a caller record naming one of them is this run's.
+_e2e_launcher_state_trees=""
+# The EXIT trap the fixture had installed when the seam was entered, run after the check.
+_e2e_launcher_state_prev_exit=""
+# Set once a damage report has been made, so the EXIT check does not repeat it.
+_e2e_launcher_state_reported=""
+# The caller's logs as `e2e_begin` found them, one `path|state|size|sum` line each, state
+# `absent` or `present`. `unread` until a snapshot is taken, `unreadable` when the rows
+# could not be read.
+_e2e_launcher_state_caller="unread"
+# This platform's rows as the snapshot read them: read once per shell, since every read is
+# several processes, which on Git Bash is most of what the seam costs a fixture.
+_e2e_launcher_state_rows_read=""
+# How many trailing bytes of a present log the snapshot sums. The launcher only appends
+# and deletes, so a smaller size or a changed tail is every way a record can be lost.
+_e2e_launcher_state_tail_bytes=65536
+
+# The interpreter line for a script this library writes: the bash running now, named
+# directly, so running that script is one process and not `env` and then bash -- every
+# launcher run through the seam's shim is two scripts. `env` only where the path holds a
+# space, which a shebang cannot carry, or where bash does not say where it is.
+e2e_bash_shebang() {
+    case "${BASH-}" in
+        *[[:space:]]*) printf '#!/usr/bin/env bash\n' ;;
+        /*) printf '#!%s\n' "$BASH" ;;
+        *) printf '#!/usr/bin/env bash\n' ;;
+    esac
+}
+
+# The platform whose branch of `StateDirectoryImpl` applies to this shell: `windows` or
+# `posix`. Git Bash and MSYS are Windows: a launcher they run reads LOCALAPPDATA.
+e2e_launcher_state_platform() {
+    # `$OSTYPE` rather than `uname -s`: every bash sets it, and it costs no process.
+    case "${OSTYPE-}" in
+        msys*|cygwin*|win32*) echo windows ;;
+        *) echo posix ;;
+    esac
+}
+
+# The environment variables the launcher's state directory is resolved from ON ONE
+# PLATFORM, read out of `StateDirectoryImpl`: one `NAME|SUFFIX` line per variable, SUFFIX
+# being what the launcher appends when that variable is the base (`/.local/state` for
+# HOME), in the order the source reads them. `|` and not a tab: `IFS=$'\t' read` collapses
+# the empty suffix most rows have.
+#
+# Only the platform's branch of `#if defined(_WIN32)` / `#else` / `#endif`: redirecting a
+# variable the launcher does not read there is not harmless, since the children of the
+# launcher -- the compiler -- inherit it. Any other preprocessor line is refused.
+#
+# Answers 2, saying why on stderr, for a shape it does not understand -- a body it cannot
+# find, a variable read that is never a base, a base built from no variable read. A
+# partial answer is the one that leaks. What it cannot see at all -- a base from a helper,
+# or from `std::getenv` -- is caught by the read-only guard in `e2e_launcher_state_enter`,
+# which asks the launcher itself.
+#
+# @param 1 the Stats.cpp to read (default: this checkout's)
+# @param 2 `windows` or `posix` (default: `e2e_launcher_state_platform`)
+e2e_launcher_state_rows() {
+    local stats="${1:-$_e2e_launcher_state_source}" platform="${2:-}" rows rc=0
+    [ -n "$platform" ] || platform="$(e2e_launcher_state_platform)"
+    case "$platform" in
+        windows|posix) ;;
+        *) echo "unknown platform '${platform}': windows or posix" >&2; return 2 ;;
+    esac
+    [ -r "$stats" ] || { echo "cannot read ${stats}" >&2; return 2; }
+    # ONE awk, not five processes: every fixture's `e2e_begin` asks this, and a spawn is
+    # what a saturated Git Bash host charges for. It finds the body, keeps this platform's
+    # branch, and matches the reads and the bases within it, as `grep -o` would: every
+    # match on a line, leftmost first. Its exit says which shape it refused.
+    # Through ENVIRON and not `-v`: BWK awk, macOS's, refuses a newline in a `-v` value.
+    rows="$(E2E_STATE_PLATFORM="$platform" awk '
+        # Every `IDENT = FastCache::ReadEnvironmentVariable("NAME")` on the line, in order.
+        function reads_on(s,   m, id, name) {
+            while (match(s, /[A-Za-z_][A-Za-z0-9_]* = FastCache::ReadEnvironmentVariable\("[A-Z_]+"\)/)) {
+                m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+                id = m; sub(/ = .*/, "", id)
+                name = m; sub(/^.*\("/, "", name); sub(/"\)$/, "", name)
+                nr++; rid[nr] = id; rname[nr] = name
+            }
+        }
+        # Every `base = *IDENT;` or `base = *IDENT + "SUFFIX";` on the line, in order.
+        function bases_on(s,   m, id, suffix) {
+            while (match(s, /base = \*[A-Za-z_][A-Za-z0-9_]*([[:space:]]*\+[[:space:]]*"[^"]*")?[[:space:]]*;/)) {
+                m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+                id = m; sub(/^base = \*/, "", id); sub(/[^A-Za-z0-9_].*$/, "", id)
+                suffix = ""
+                if (match(m, /"[^"]*"/)) suffix = substr(m, RSTART + 1, RLENGTH - 2)
+                count[id]++; suffixOf[id] = suffix
+            }
+        }
+        !on && /StateDirectoryImpl\(\)/ { on = 1 }
+        !on { next }
+        {
+            line = $0
+            # The body ends at its closing brace, which is still part of it.
+            last = (line ~ /^    }\r?$/)
+            if (line ~ /^[[:space:]]*#[[:space:]]*if[[:space:]]+defined[[:space:]]*\(_WIN32\)[[:space:]]*\r?$/) {
+                if (branch != "") { bad = 1; exit } branch = "windows"
+            } else if (line ~ /^[[:space:]]*#[[:space:]]*else[[:space:]]*\r?$/) {
+                if (branch != "windows") { bad = 1; exit } branch = "posix"
+            } else if (line ~ /^[[:space:]]*#[[:space:]]*endif[[:space:]]*\r?$/) {
+                if (branch == "") { bad = 1; exit } branch = ""
+            } else if (line ~ /^[[:space:]]*#/) {
+                bad = 1; exit
+            } else if (branch == "" || branch == ENVIRON["E2E_STATE_PLATFORM"]) {
+                reads_on(line); bases_on(line)
+            }
+            if (last) { ended = 1; exit }
+        }
+        END {
+            if (!on) exit 3
+            # A body the file ended inside is read to the end, as it always was; only an
+            # `#if` still open there is a shape this reader refuses.
+            if (bad || branch != "") exit 4
+            for (i = 1; i <= nr; i++) {
+                read[rid[i]] = 1
+                if (count[rid[i]] != 1) { printf "StateDirectoryImpl reads %s but uses it as a base %d times, not once\n", rname[i], count[rid[i]] > "/dev/stderr"; failed = 1; continue }
+                printf "%s|%s\n", rname[i], suffixOf[rid[i]]
+            }
+            for (id in count) if (!(id in read)) { printf "StateDirectoryImpl builds its base from %s, which is no environment read this reader recognises\n", id > "/dev/stderr"; failed = 1 }
+            exit failed ? 2 : 0
+        }' "$stats")" || rc=$?
+    case "$rc" in
+        0) ;;
+        3) echo "no StateDirectoryImpl() body in ${stats}" >&2; return 2 ;;
+        4) echo "StateDirectoryImpl in ${stats} has a preprocessor line this reader does not understand; it reads #if defined(_WIN32), #else and #endif only" >&2; return 2 ;;
+        *) return 2 ;;
+    esac
+    [ -n "$rows" ] || { echo "StateDirectoryImpl in ${stats} reads no environment variable this reader recognises on ${platform}" >&2; return 2; }
+    printf '%s\n' "$rows"
+}
+
+# `cksum` of bytes [size - tail, size) of @p 1, or `unreadable`. `tail -c +N | head -c`
+# with pipefail OFF: `head` closing early is the point, and tail's SIGPIPE is not a failure.
+# @param 1 the log
+# @param 2 how many leading bytes of it the sum describes
+_e2e_launcher_state_tail_sum() {
+    local from=0
+    [ "$2" -gt "$_e2e_launcher_state_tail_bytes" ] && from=$(( $2 - _e2e_launcher_state_tail_bytes ))
+    if [ "$from" -eq 0 ]; then
+        ( set +o pipefail; head -c "$2" "$1" 2>/dev/null | cksum ) 2>/dev/null || echo unreadable
+        return 0
+    fi
+    ( set +o pipefail; tail -c "+$(( from + 1 ))" "$1" 2>/dev/null | head -c "$(( $2 - from ))" | cksum ) 2>/dev/null \
+        || echo unreadable
+}
+
+# One snapshot line for the log @p 1: `path|absent||` or `path|present|size|sum`.
+_e2e_launcher_state_describe() {
+    local size
+    if [ -f "$1" ]; then
+        size=$(( $(wc -c < "$1" 2>/dev/null) )) || size=0
+        printf '%s|present|%s|%s\n' "$1" "${size:-0}" "$(_e2e_launcher_state_tail_sum "$1" "${size:-0}")"
+    else
+        printf '%s|absent||\n' "$1"
+    fi
+}
+
+# Snapshot every log the caller's environment would have the launcher write, one per state
+# variable that is set. Called by `e2e_begin`; never fails the run -- rows it cannot read
+# leave the snapshot `unreadable`, which `e2e_launcher_state_enter` refuses by name.
+_e2e_launcher_state_snapshot() {
+    local rows name suffix value log out=""
+    if ! rows="$(e2e_launcher_state_rows 2>/dev/null)"; then
+        _e2e_launcher_state_caller="unreadable"
+        return 0
+    fi
+    _e2e_launcher_state_rows_read="$rows"
+    while IFS='|' read -r name suffix; do
+        [ -n "$name" ] || continue
+        value="${!name-}"
+        [ -n "$value" ] || continue
+        log="${value%/}${suffix}/${_e2e_launcher_state_log_rel}"
+        # XDG_STATE_HOME may name HOME/.local/state: one log, judged once.
+        case $'\n'"$out" in *$'\n'"${log}|"*) continue ;; esac
+        out="${out}$(_e2e_launcher_state_describe "$log")"$'\n'
+    done < <(printf '%s\n' "$rows")
+    _e2e_launcher_state_caller="$out"
+}
+
+# What this run did to the caller's logs since `e2e_begin`, one line per finding; nothing
+# when it did nothing. Never fails, and never exits: it runs from the EXIT trap as well.
+#
+# A log present at the start keeps every byte it had -- it is not deleted, not shorter,
+# and its tail sums the same -- and gains no record naming one of this run's trees. A log
+# ABSENT at the start is still absent, or holds no record of this run: other builds on the
+# machine may create it meanwhile, and are told apart by the source each record names --
+# read by its column NAME (`e2e_launcher_log_layout`), and a record in a version this build
+# does not write is reported, since nothing can say whose it is.
+# Blind spot, failing OPEN: a record whose source is relative names no tree.
+_e2e_launcher_state_caller_damage() {
+    local log state size sum now ours from trees layout counted foreign malformed
+    case "$_e2e_launcher_state_caller" in
+        unread|unreadable)
+            echo "the caller's statistics logs were not snapshotted when the run began (${_e2e_launcher_state_caller}), so nothing can say what this run did to them"
+            return 0 ;;
+    esac
+    if ! layout="$(e2e_launcher_log_layout 2>/dev/null)"; then
+        echo "the launcher's log layout could not be read from ${_e2e_launcher_state_source}, so nothing can say which records in the caller's statistics logs are this run's"
+        return 0
+    fi
+    trees="${_e2e_workdir}"$'\n'"${_e2e_launcher_state_trees}"
+    while IFS='|' read -r log state size sum; do
+        [ -n "$log" ] || continue
+        from=1
+        if [ "$state" = present ]; then
+            if [ ! -f "$log" ]; then
+                echo "the caller's statistics log was DELETED during this run (${log}, ${size} byte(s) at the start)"
+                continue
+            fi
+            now=$(( $(wc -c < "$log" 2>/dev/null) )) || now=0
+            if [ "${now:-0}" -lt "$size" ]; then
+                echo "the caller's statistics log lost records during this run (${log}: ${size} byte(s) at the start, ${now:-0} now)"
+                continue
+            fi
+            if [ "$(_e2e_launcher_state_tail_sum "$log" "$size")" != "$sum" ]; then
+                echo "the caller's statistics log was rewritten during this run (${log}: its first ${size} byte(s) changed)"
+                continue
+            fi
+            from=$(( size + 1 ))
+        elif [ ! -f "$log" ]; then
+            continue
+        fi
+        counted="$(set +o pipefail
+            tail -c "+${from}" "$log" 2>/dev/null \
+                | E2E_STATE_TREES="$trees" E2E_LOG_LAYOUT="$layout" awk -F '\t' "${_e2e_launcher_log_awk}"'
+                    BEGIN { n = split(ENVIRON["E2E_STATE_TREES"], t, "\n"); log_setup() }
+                    {
+                        source = log_field("source")
+                        for (i = 1; i <= n; i++) if (source != "" && t[i] != "" && index(source, t[i]) == 1) { hits++; break }
+                    }
+                    END { print hits + 0, log_foreign + 0, log_malformed + 0 }')" || counted=""
+        # A count that did not come back is the instrument failing, never a clean log: it is its
+        # own answer, and a damage line, since nothing then says what this run did to the log.
+        case "$counted" in
+            *[!0-9\ ]* | "" )
+                echo "the caller's statistics log (${log}) could not be read past its start, so nothing can say what this run did to it"
+                continue ;;
+        esac
+        read -r ours foreign malformed <<< "$counted"
+        [ "${ours:-0}" -eq 0 ] \
+            || echo "${ours} of this run's compiles were recorded in the caller's statistics log (${log})"
+        [ "${foreign:-0}" -eq 0 ] \
+            || echo "${foreign} record(s) appended to the caller's statistics log during this run name a log version this build does not write (${log}), so nothing can say whether they are this run's"
+        [ "${malformed:-0}" -eq 0 ] \
+            || echo "${malformed} record(s) appended to the caller's statistics log during this run do not carry this build's columns (${log}), so nothing can say whether they are this run's"
+    done <<< "$_e2e_launcher_state_caller"
+}
+
+# The EXIT check: report what this run did to the caller's logs -- on a failure path too,
+# which is where a leak shows -- then run the fixture's own EXIT trap, and exit failing if
+# there was damage. Read-only: the cleanup stays the fixture's.
+_e2e_launcher_state_on_exit() {
+    local rc=$? damage line
+    if [ -z "$_e2e_launcher_state_reported" ]; then
+        damage="$(_e2e_launcher_state_caller_damage)" || damage=""
+        if [ -n "$damage" ]; then
+            while IFS= read -r line; do
+                echo "${_e2e_label} FAILED: ${line}" >&2
+            done <<< "$damage"
+            rc=1
+        fi
+    fi
+    if [ -n "$_e2e_launcher_state_prev_exit" ]; then
+        eval "$_e2e_launcher_state_prev_exit"
+    fi
+    exit "$rc"
+}
+
+# Give the fixture's launcher a state directory of the run's own, and point the fixture's
+# launcher variable at the shim that keeps it there. Call once, after `e2e_begin` and
+# BEFORE any line that runs the launcher -- `launcher-state-isolation` refuses a fixture
+# that runs it earlier.
+#
+# Before returning it asks the LAUNCHER where it will record, through the shim:
+# `--show-stats` names the log only while the log is absent or empty, which a fresh root
+# always is, so the question is read-only -- `-z` names it too, but only by deleting what
+# is there, which would destroy the caller's log on exactly the failure being checked.
+# Refused both ways a redirect can miss: a path outside the root, or a report naming no
+# path.
+#
+# @param 1 the NAME of the variable holding the launcher's path; rewritten to the shim
+# @param ... directories this run's sources live under, beyond its workdir
+e2e_launcher_state_enter() {
+    local var="$1" real rows root shim shown path rel name suffix prev line
+    shift
+    [ -n "$_e2e_workdir" ] || fail "e2e_launcher_state_enter before e2e_begin: there is no workdir to keep the launcher's state in"
+    case "$_e2e_launcher_state_caller" in
+        unread|unreadable) fail "the caller's statistics logs were not snapshotted by e2e_begin (${_e2e_launcher_state_caller}); refusing to run a launcher whose effect on them nothing could measure" ;;
+    esac
+    real="${!var-}"
+    [ -n "$real" ] && [ -x "$real" ] || fail "e2e_launcher_state_enter: \$${var} is not an executable launcher: '${real}'"
+    # As `e2e_begin`'s snapshot read them -- which the check above has already required.
+    rows="$_e2e_launcher_state_rows_read"
+    [ -n "$rows" ] \
+        || fail "cannot read the launcher's state-directory variables from ${_e2e_launcher_state_source}; refusing to run a launcher unisolated"
+    root="${_e2e_workdir}/launcher-state"
+    mkdir -p "${root}/bin" || fail "cannot create ${root}/bin"
+    shim="${root}/bin/${real##*/}"
+    {
+        e2e_bash_shebang
+        printf '# Written by e2e_launcher_state_enter (scripts/lib/e2e-common.sh): this run'"'"'s\n'
+        printf '# launcher records into its own state directory, and nothing else is re-homed.\n'
+        while IFS='|' read -r name suffix; do
+            printf 'export %s=%q\n' "$name" "$root"
+        done < <(printf '%s\n' "$rows")
+        # Every run, and the value each variable HAD when it ran, so the positive control
+        # proves the runs were redirected rather than only that they passed through here.
+        printf 'echo run >> %q\n' "${root}/shim-runs"
+        while IFS='|' read -r name suffix; do
+            printf 'printf "%%s=%%s\\n" %s "${%s-}" >> %q\n' "$name" "$name" "${root}/shim-runs"
+        done < <(printf '%s\n' "$rows")
+        printf 'exec %q "$@"\n' "$real"
+    } > "$shim" || fail "cannot write ${shim}"
+    chmod +x "$shim" || fail "cannot make ${shim} executable"
+
+    shown="$("$shim" --show-stats 2>&1)" || true
+    # The first line naming it, read by the shell rather than `sed | head`: the LAST
+    # "recorded yet (" on that line, to the ")." that ends it.
+    path=""
+    while IFS= read -r line; do
+        case "$line" in
+            *"no statistics recorded yet ("*").") line="${line##*no statistics recorded yet (}"; path="${line%).}"; break ;;
+        esac
+    done <<< "$shown"
+    case "$path" in
+        "${root}"/*) ;;
+        *) fail "the launcher would not record under this run's state root (${root}) -- the redirect misses a variable it reads; it printed: ${shown}" ;;
+    esac
+    rel="${path#"${root}"/}"
+    [ "$rel" = "$_e2e_launcher_state_log_rel" ] \
+        || fail "the launcher keeps its log at ${rel} under its state directory, but e2e_begin snapshotted the caller's at ${_e2e_launcher_state_log_rel}; update _e2e_launcher_state_log_rel"
+
+    _e2e_launcher_state_root="$root"
+    _e2e_launcher_state_log="$path"
+    _e2e_launcher_state_trees="$root"
+    for line in "$@"; do _e2e_launcher_state_trees="${_e2e_launcher_state_trees}"$'\n'"${line}"; done
+    # The check in front of whatever EXIT trap the fixture installed: `trap -p` prints
+    # `trap -- 'cmd' EXIT`, whose third word is the command.
+    prev="$(trap -p EXIT)"
+    if [ -n "$prev" ]; then
+        eval "set -- ${prev}"
+        _e2e_launcher_state_prev_exit="${3-}"
+    fi
+    trap _e2e_launcher_state_on_exit EXIT
+    printf -v "$var" '%s' "$shim"
+    e2e_note "launcher statistics isolated to ${path}"
+}
+
+# The run's own statistics log, as the launcher itself named it.
+e2e_launcher_state_log() { printf '%s\n' "$_e2e_launcher_state_log"; }
+
+# The invocation log's LAYOUT, read out of Stats.cpp rather than restated: the version this
+# build writes (`v` and `CurrentLogVersion`) on the first line, then the names of
+# `LogColumnTable`'s columns in the order they are written, space-separated. A line the
+# launcher writes opens with that version and then those columns; a line with no version is
+# the layout from before versions, the same columns in the same order up to its arity. Refuses
+# (status 2) rather than guessing when either half is not found -- and when the names it read
+# are fewer than the table's `LogColumn::` rows: a name outside `[a-z-]+` skipped in silence
+# would shift every later column by one, which is the failure this reader exists to end.
+#
+# Read by NAME because a column's position is not the launcher's contract: the version is.
+# The readers this replaces each took the outcome as the first field and the source as the
+# fifth, which held until the log learned to name its version -- after which the outcome read
+# `v2`, and the caller-damage check compared every record's ELAPSED TIME against the run's
+# trees, matched nothing, and reported a leak as clean.
+#
+# @param 1 the Stats.cpp to read (default: this checkout's)
+e2e_launcher_log_layout() {
+    local stats="${1:-$_e2e_launcher_state_source}"
+    [ -r "$stats" ] || { echo "cannot read ${stats}" >&2; return 2; }
+    awk '
+        /constexpr unsigned CurrentLogVersion = [0-9]+;/ { v = $0; sub(/^.*= /, "", v); sub(/;.*$/, "", v) }
+        /LogColumnTable \{ \{/ { inside = 1; next }
+        inside && /^    \} \};/ { inside = 0 }
+        inside && /\.column = LogColumn::/ { rows++ }
+        inside && match($0, /\.name = "[a-z-]+"/) { names++; cols = cols " " substr($0, RSTART + 9, RLENGTH - 10) }
+        END {
+            if (v == "" || cols == "") exit 2
+            if (names != rows) {
+                print "the invocation log layout names " names " column(s) for " rows " LogColumn row(s); a name outside [a-z-] would shift every later column, so it is refused" > "/dev/stderr"
+                exit 2
+            }
+            print "v" v; print substr(cols, 2)
+        }' "$stats"
+}
+
+# The version this build writes, `v` and the number: the first line of
+# `e2e_launcher_log_layout`, taken without a pipe, since a consumer that stops early under
+# `pipefail` is what `early-exit-scan` refuses.
+e2e_launcher_log_version() {
+    local layout
+    layout="$(e2e_launcher_log_layout "$@")" || return 2
+    printf '%s\n' "${layout%%$'\n'*}"
+}
+
+# The awk that reads an invocation-log line by column NAME, for a program that sets
+# `E2E_LOG_LAYOUT` to `e2e_launcher_log_layout`'s answer: `log_setup()` once, then
+# `log_field(name)` per line answers that column, or "" for a line it must not read by
+# position -- one naming a version this build does not write (`log_foreign`), or one in this
+# build's version that does not carry exactly its columns (`log_malformed`), which Stats.cpp's
+# own reader refuses too. ONE copy, which both the field reader and the caller-damage check
+# prepend.
+_e2e_launcher_log_awk='
+    function log_setup(   l, i) {
+        split(ENVIRON["E2E_LOG_LAYOUT"], l, "\n"); log_version = l[1]
+        log_columns = split(l[2], log_column, " ")
+        for (i = 1; i <= log_columns; i++) log_at[log_column[i]] = i
+    }
+    function log_field(name,   at) {
+        at = log_at[name]
+        if ($1 ~ /^v[0-9]+$/) {
+            if ($1 != log_version) { log_foreign++; return "" }
+            if (NF != log_columns + 1) { log_malformed++; return "" }
+            return $(at + 1)
+        }
+        return $at
+    }
+'
+
+# One invocation-log line exactly as this build writes it: the version and every column of the
+# layout, @p 1 as the outcome, @p 2 as the source and every other column empty. What a stand-in
+# launcher records, so a reader is tested against a line the launcher's own reader would read.
+e2e_launcher_log_line() {
+    local layout version columns column line
+    layout="$(e2e_launcher_log_layout)" || return 2
+    version="${layout%%$'\n'*}"
+    columns="${layout#*$'\n'}"
+    line="$version"
+    for column in $columns; do
+        case "$column" in
+            outcome) line="${line}"$'\t'"$1" ;;
+            source) line="${line}"$'\t'"$2" ;;
+            *) line="${line}"$'\t' ;;
+        esac
+    done
+    printf '%s\n' "$line"
+}
+
+# Print column @p 1 of every invocation-log line on stdin, one per line, by NAME
+# (`e2e_launcher_log_layout`). Status 2 for a column the log does not have, 3 when a line named
+# a version this build does not write, 4 when a line in this build's version did not carry its
+# columns -- each printed as nothing, and said on stderr.
+e2e_launcher_log_field() {
+    local layout
+    layout="$(e2e_launcher_log_layout)" || return 2
+    E2E_LOG_LAYOUT="$layout" awk -F '\t' -v want="$1" "${_e2e_launcher_log_awk}"'
+        BEGIN {
+            log_setup()
+            if (!(want in log_at)) { print "e2e_launcher_log_field: the invocation log has no column named " want > "/dev/stderr"; bad = 2; exit 2 }
+        }
+        {
+            value = log_field(want)
+            if (log_foreign > foreign) { foreign = log_foreign; print "e2e_launcher_log_field: a line names log version " $1 ", and this build writes " log_version > "/dev/stderr"; next }
+            if (log_malformed > malformed) { malformed = log_malformed; print "e2e_launcher_log_field: a " log_version " line has " NF - 1 " column(s), and this build writes " log_columns > "/dev/stderr"; next }
+            print value
+        }
+        END { if (bad) exit bad; if (log_foreign) exit 3; if (log_malformed) exit 4 }'
+}
+
+# The state variables a shim run saw that did NOT name this run's root, one `NAME=value`
+# per line; nothing when every run was redirected.
+_e2e_launcher_state_misdirected() {
+    local line
+    [ -f "${_e2e_launcher_state_root}/shim-runs" ] || return 0
+    while IFS= read -r line; do
+        [ "$line" = run ] && continue
+        [ "${line#*=}" = "$_e2e_launcher_state_root" ] || printf '%s\n' "$line"
+    done < "${_e2e_launcher_state_root}/shim-runs"
+}
+
+# The positive control: this run's launcher runs went through the shim with every state
+# variable pointing at this run's root, and its own log holds records. Ask it BEFORE any
+# `-z`, which clears the log. That the caller's log was spared is no evidence the launcher
+# recorded HERE -- a launcher recording nowhere spares it too.
+#
+# `--no-stats` is for a fixture whose every launcher run sets FASTCACHE_NO_STATS=1. Such a
+# run writes NOTHING to the state directory -- the toolchain fingerprint cache beside the
+# log is written only by a dispatch or by `--print-toolchain-fingerprint` -- so there is no
+# record to count, and the control is the shim's own record instead: at least one run
+# beyond the guard, each of them with every variable the launcher reads set to this run's
+# root, and the log absent, as the opt-out asks.
+#
+# @param 1 `--no-stats`, or nothing
+e2e_launcher_state_assert_used() {
+    local n=0 runs=0 wrong
+    [ -n "$_e2e_launcher_state_log" ] || fail "e2e_launcher_state_assert_used before e2e_launcher_state_enter"
+    wrong="$(_e2e_launcher_state_misdirected)"
+    [ -z "$wrong" ] \
+        || fail "a launcher run through the shim did not have its state redirected to this run's root (${_e2e_launcher_state_root}): $(printf '%s' "$wrong" | tr '\n' ' ')"
+    if [ -f "${_e2e_launcher_state_root}/shim-runs" ]; then
+        runs="$(grep -c '^run$' "${_e2e_launcher_state_root}/shim-runs" || true)"
+    fi
+    if [ "${1-}" = "--no-stats" ]; then
+        [ ! -f "$_e2e_launcher_state_log" ] \
+            || fail "every launcher run here sets FASTCACHE_NO_STATS=1, yet this run's state log exists (${_e2e_launcher_state_log})"
+        # The guard in `e2e_launcher_state_enter` is one of them.
+        [ "${runs:-0}" -ge 2 ] \
+            || fail "no launcher run of this fixture went through the launcher-state shim (${runs:-0} run(s), the guard included), so nothing says its runs were redirected"
+        e2e_note "$(( runs - 1 )) launcher run(s) went through the launcher-state shim with every state variable at this run's root, and recorded no statistics, as FASTCACHE_NO_STATS asks"
+        return 0
+    fi
+    if [ -f "$_e2e_launcher_state_log" ]; then
+        n=$(( $(wc -l < "$_e2e_launcher_state_log") ))
+    fi
+    [ "${n:-0}" -ge 1 ] || fail "the launcher recorded nothing in this run's state log (${_e2e_launcher_state_log})"
+    e2e_note "this run's compiles were recorded in its own state log: ${n} record(s)"
+}
+
+# The caller's logs came through the run intact, judged against `e2e_begin`'s snapshot:
+# see `_e2e_launcher_state_caller_damage`. The same check runs again from the EXIT trap on
+# any exit, so a fixture that fails before reaching this line still reports.
+#
+# @param ... more directories this run's sources live under, beyond those given to enter
+e2e_launcher_state_assert_caller_untouched() {
+    local damage
+    [ -n "$_e2e_launcher_state_root" ] || fail "e2e_launcher_state_assert_caller_untouched before e2e_launcher_state_enter"
+    if [ $# -gt 0 ]; then
+        _e2e_launcher_state_trees="${_e2e_launcher_state_trees}"$'\n'"$(printf '%s\n' "$@")"
+    fi
+    damage="$(_e2e_launcher_state_caller_damage)" || damage=""
+    if [ -n "$damage" ]; then
+        _e2e_launcher_state_reported=1
+        fail "$(printf '%s' "$damage" | tr '\n' ';')"
+    fi
 }

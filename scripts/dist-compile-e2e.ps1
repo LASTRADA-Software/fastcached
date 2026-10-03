@@ -91,6 +91,13 @@ $SKIP = 77
 $exit = 0
 $ranAnyCompiler = $false
 
+# Before the skips and the self-test modes, so a machine that skips this fixture still
+# judges it: every launcher it runs must sit inside `Use-E2ELauncherState`, or it would
+# read or delete the caller's statistics. The why is written in the module, once.
+Import-Module (Join-Path $PSScriptRoot "lib/E2EEnvironment.psm1") -Force
+try { Assert-E2ELauncherFixture -Fixture $PSCommandPath }
+catch { Write-Host "dist-compile E2E FAILED: $($_.Exception.Message)"; exit 1 }
+
 # Skipped entirely under -SelfTest, which drives no process at all: requiring the
 # three binaries there would make the one check that needs no build the one check
 # that cannot run without one.
@@ -810,9 +817,11 @@ function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
     $source  = Join-Path $root $sourceName
     $outFile = New-TemporaryFile
     $errFile = New-TemporaryFile
-    $p = Start-Process -FilePath $Launcher `
-        -ArgumentList (ConvertTo-QuotedArgs (@($compiler, "/nologo", "/c", "/Fo$obj") + $extra + @($source))) `
-        -NoNewWindow -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    $p = Use-E2ELauncherState $launcherState {
+        Start-Process -FilePath $Launcher `
+            -ArgumentList (ConvertTo-QuotedArgs (@($compiler, "/nologo", "/c", "/Fo$obj") + $extra + @($source))) `
+            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    }
     $out = Get-Content -Raw $outFile -ErrorAction SilentlyContinue
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
     Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
@@ -1164,12 +1173,21 @@ $Drivers = @(
 $runRoot = $null
 # Every process a teardown between drivers could not end, for the verdict in `finally`.
 $script:killSurvivors = @()
+# Every launcher this fixture runs records into a state directory of the run's own,
+# through `Use-E2ELauncherState` in `scripts/lib/E2EEnvironment.psm1`, which also
+# refuses this file if any launcher runs outside it. This replaces a LOCALAPPDATA the
+# driver loop set process-wide and never put back. Inside the `try` whose `finally`
+# removes the state root and reports what the run did to the caller's logs.
+$launcherState = $null
 try {
     # Old roots first, reported and never fatal; then this run's own: see `$scratchBase`.
     foreach ($line in @(Clear-E2EStaleRoots -Base $scratchBase)) { Write-Host "stale scratch: $line" }
     $runRoot = New-E2ERunRoot -Base $scratchBase
     $scratchRoot = $runRoot.Path
     Write-Host "== scratch root for this run: $scratchRoot"
+    $launcherState = Enter-E2ELauncherState -Launcher $Launcher -Fixture $PSCommandPath -RunTrees @($scratchRoot)
+    Write-Host "launcher statistics isolated to $($launcherState.Log)"
+
     foreach ($driver in $Drivers) {
         $cc = $driver.Name
         $rules = $driver.Rules
@@ -1203,10 +1221,6 @@ try {
         }
         $ranAnyCompiler = $true
         Write-Host "== driver: $cc (ports $BasePort..$($BasePort + $PortsNeeded - 1), scratch $scratch)"
-
-        # Statistics are per-user state; keep this run out of the developer's log.
-        $env:LOCALAPPDATA = Join-Path $scratch "state"
-        New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
 
         # One listener now, and only the cache. `fastcached` used to carry the
         # scheduler too, on a second `--listen-dispatch` endpoint; that flag is gone.
@@ -1261,7 +1275,7 @@ try {
         # case would degrade to a local compile and still exit 0 -- passing while
         # testing nothing.
         $ccPath = (Get-Command $cc).Source
-        $fingerprint = (& $Launcher --print-toolchain-fingerprint $ccPath) | Select-Object -First 1
+        $fingerprint = Use-E2ELauncherState $launcherState { (& $Launcher --print-toolchain-fingerprint $ccPath) | Select-Object -First 1 }
         if (-not $fingerprint) { throw "the launcher reported no toolchain fingerprint for $cc" }
 
         # ONE slot above the node's own core count, so no amount of CPU used outside
@@ -1728,6 +1742,12 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         Write-Host "no usable MSVC-family compiler here; skipping"
         exit $SKIP
     }
+
+    # The positive control: this run's compiles recorded in its own log.
+    $recorded = Get-E2ELauncherStateRecordCount $launcherState
+    if ($recorded -lt 1) { throw "the launcher recorded nothing in this run's state log ($($launcherState.Log))" }
+    Write-Host "this run's compiles were recorded in its own state log: $recorded record(s)"
+
     Write-Host ""
     Write-Host "dist-compile E2E PASSED"
 } catch {
@@ -1737,9 +1757,14 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
     # Those found between drivers were printed when found; only this teardown's are new.
     $final = @(Stop-Spawned)
     foreach ($line in $final) { Write-Host "teardown: $line" }
+    # What the run did to the caller's logs, reported on EVERY way out -- a failure path is
+    # where a leak shows -- and a failure whatever else happened.
+    $callerDamage = @(Exit-E2ELauncherState $launcherState)
+    foreach ($line in $callerDamage) { Write-Host "dist-compile E2E FAILED: $line" }
     $survivors = @($script:killSurvivors) + $final
     # Released LAST, once nothing this run started should still be writing under it.
     if ($null -ne $runRoot) { $runRoot.Claim.Dispose() }
+    if ($callerDamage.Count -gt 0) { exit 1 }
     # And not a clean exit. A run that is already failing keeps its failure, which is
     # the diagnostic that matters; a pass -- or a SKIP, whose `exit` is unwinding
     # through here -- leaving a process it could not kill is not one, so the `exit`

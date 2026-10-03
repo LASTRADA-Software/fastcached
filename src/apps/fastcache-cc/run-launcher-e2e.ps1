@@ -131,6 +131,13 @@ param(
 $ErrorActionPreference = "Stop"
 $exit = 0
 
+# Before the skips and the self-test modes, so a machine that skips this fixture still
+# judges it: every launcher it runs must sit inside `Use-E2ELauncherState`, or it would
+# read or delete the caller's statistics. The why is written in the module, once.
+Import-Module (Join-Path $PSScriptRoot "../../../scripts/lib/E2EEnvironment.psm1") -Force
+try { Assert-E2ELauncherFixture -Fixture $PSCommandPath }
+catch { Write-Host "launcher E2E FAILED: $($_.Exception.Message)"; exit 1 }
+
 # CTest's SKIP_RETURN_CODE. A missing binary or compiler is a missing runtime
 # prerequisite, not a failure, so it must be distinguishable from a real fault.
 $SKIP = 77
@@ -225,6 +232,9 @@ foreach ($name in 'DeepTemp', 'ShallowTemp', 'MoveTemp', 'EditTemp', 'AliasTemp'
 # (`scripts/lib/E2EEnvironment.psm1`): an operator's FASTCACHE_SCHEDULER would
 # dispatch each "local" compile to their fleet. So nothing above sets one.
 Import-Module (Join-Path $PSScriptRoot "../../../scripts/lib/E2EPorts.psm1") -Force
+# And imported by name as well, for the launcher-state seam: E2EPorts' own import of it
+# is nested, so its functions stop at E2EPorts and never reach this script.
+Import-Module (Join-Path $PSScriptRoot "../../../scripts/lib/E2EEnvironment.psm1") -Force
 
 if ($SelfTestPorts) { exit (Invoke-E2EPortSelfTest) }
 
@@ -296,9 +306,11 @@ function Invoke-Launcher([string]$compiler, [string]$srcRoot, [string]$buildTree
     $env:FASTCACHE_VERBOSE    = "1"
     $source = Join-Path $srcRoot "u.cpp"
     $errFile = New-TemporaryFile
-    $p = Start-Process -FilePath $Launcher `
-        -ArgumentList $compiler,"/nologo","/c","/showIncludes","/Fo$obj",$source `
-        -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile
+    $p = Use-E2ELauncherState $launcherState {
+        Start-Process -FilePath $Launcher `
+            -ArgumentList $compiler,"/nologo","/c","/showIncludes","/Fo$obj",$source `
+            -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile
+    }
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
     Remove-Item $errFile -ErrorAction SilentlyContinue
     return @{ code = $p.ExitCode; stderr = $err }
@@ -444,9 +456,11 @@ function Invoke-LauncherStreams([string]$compiler, [string]$srcRoot, [string]$bu
     $source = Join-Path $srcRoot "u.cpp"
     $outFile = New-TemporaryFile
     $errFile = New-TemporaryFile
-    $p = Start-Process -FilePath $Launcher `
-        -ArgumentList $compiler,"/nologo","/c","/showIncludes","/Fo$obj",$source `
-        -NoNewWindow -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    $p = Use-E2ELauncherState $launcherState {
+        Start-Process -FilePath $Launcher `
+            -ArgumentList $compiler,"/nologo","/c","/showIncludes","/Fo$obj",$source `
+            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    }
     $out = Get-Content -Raw $outFile -ErrorAction SilentlyContinue
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
     Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
@@ -470,8 +484,10 @@ function Invoke-LauncherIn([string]$cwd, [string]$srcRoot, [string]$buildTree, [
     $env:FASTCACHE_VERBOSE    = "1"
     $outFile = New-TemporaryFile
     $errFile = New-TemporaryFile
-    $p = Start-Process -FilePath $Launcher -ArgumentList $compileArgs -WorkingDirectory $cwd `
-        -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile -RedirectStandardOutput $outFile
+    $p = Use-E2ELauncherState $launcherState {
+        Start-Process -FilePath $Launcher -ArgumentList $compileArgs -WorkingDirectory $cwd `
+            -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile -RedirectStandardOutput $outFile
+    }
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
     Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
     return @{ code = $p.ExitCode; stderr = [string]$err }
@@ -506,9 +522,13 @@ function Invoke-LauncherBounded([string]$compiler, [string]$srcRoot, [string]$bu
     $env:FASTCACHE_VERBOSE    = "1"
     $source = Join-Path $srcRoot $sourceName
     $errFile = New-TemporaryFile
-    $p = Start-Process -FilePath $Launcher `
-        -ArgumentList $compiler,"/nologo","/c","/Fo$obj",$source `
-        -NoNewWindow -PassThru -RedirectStandardError $errFile
+    # Unwaited, so the redirect is only as long as the START: the child took its copy
+    # of the environment when it was created, and the wait below is the caller's.
+    $p = Use-E2ELauncherState $launcherState {
+        Start-Process -FilePath $Launcher `
+            -ArgumentList $compiler,"/nologo","/c","/Fo$obj",$source `
+            -NoNewWindow -PassThru -RedirectStandardError $errFile
+    }
     $exited = $p.WaitForExit($timeoutSec * 1000)
     if (-not $exited) {
         try { $p.Kill() } catch { }
@@ -527,8 +547,17 @@ function Invoke-LauncherBounded([string]$compiler, [string]$srcRoot, [string]$bu
 # reason to make it a constant (#220).
 $Port = Get-E2EFixturePort $Port $Fastcached "fastcached"
 
-$server = Start-Fastcached
+# Entered here, after every skip, so a skipped run leaves nothing in TEMP -- and inside
+# the `try` whose `finally` removes it, before the daemon or any compile, since it is
+# what asks the launcher where it will record.
+$launcherState = $null
+$server = $null
 try {
+    $launcherState = Enter-E2ELauncherState -Launcher $Launcher -Fixture $PSCommandPath `
+        -RunTrees @($DeepTemp, $ShallowTemp, $MoveTemp, $EditTemp, $AliasTemp, $BoundTemp)
+    Write-Host "launcher statistics isolated to $($launcherState.Log)"
+    $server = Start-Fastcached
+
     foreach ($cc in @("cl","clang-cl")) {
         if (-not (Get-Command $cc -ErrorAction SilentlyContinue)) { Write-Host "skip $cc (not on PATH)"; continue }
         $ranAnyCompiler = $true
@@ -976,19 +1005,22 @@ try {
         $rootA = Join-Path $case "checkout-a"; $rootB = Join-Path $case "checkout-b"
         $srcA = New-BoundTree $rootA 'none' $tag
         $srcB = New-BoundTree $rootB 'none' $tag
+        # A state root of the CASE's own, to count exactly this case's two records, which
+        # the run's shared log cannot. It re-points the launcher-state handle rather than
+        # LOCALAPPDATA -- the wrapper would overwrite that on every launcher start -- and
+        # so moves every state variable, not only the Windows one.
         $state = Join-Path $case "state"
         New-Item -ItemType Directory -Force $state | Out-Null
-        $savedState = $env:LOCALAPPDATA
         $env:FASTCACHE_NO_DIRECT = "1"
         try {
-            $env:LOCALAPPDATA = $state
+            $launcherState.Root = $state
             $rA = Invoke-Launcher $cc $srcA (Join-Path $rootA "build") (Join-Path $rootA "build\u.obj")
             $rB = Invoke-LauncherWithEnv $cc $srcB (Join-Path $rootB "build") (Join-Path $rootB "build\u.obj") "FASTCACHE_VERIFY" "1"
         } finally {
-            $env:LOCALAPPDATA = $savedState
+            $launcherState.Root = $launcherState.RunRoot
             Remove-Item Env:\FASTCACHE_NO_DIRECT -ErrorAction SilentlyContinue
         }
-        $logged = @(Get-Content (Join-Path $state "fastcache-cc\invocations.log") -ErrorAction SilentlyContinue | ForEach-Object { ($_ -split "`t")[0] })
+        $logged = @(Get-Content (Join-Path $state "fastcache-cc\invocations.log") -ErrorAction SilentlyContinue | ForEach-Object { Get-E2ELauncherLogField $_ 'outcome' })
         $oB = Get-BoundOutcome $rB.stderr
         $wrongLine = [bool]($rB.stderr -match "WRONG OBJECT served")
         $want = if ($cc -eq "cl") { "VERIFY-MISMATCH" } else { "HIT" }
@@ -1479,7 +1511,7 @@ try {
     # The help text must describe the flags the binary actually accepts. This
     # repeats the unit-level guard against the shipped launcher, and it is the
     # only place the Windows-only "/?" spelling gets exercised.
-    $help = (& $Launcher --help | Out-String)
+    $help = Use-E2ELauncherState $launcherState { & $Launcher --help | Out-String }
     foreach ($flag in @('--show-stats','-s','--zero-stats','-z','--help','-h','/?','--version','--prefetch-group')) {
         if ($help -notmatch [regex]::Escape($flag)) {
             Write-Host "  HELP DRIFT: --help does not document $flag" -ForegroundColor Red
@@ -1487,28 +1519,48 @@ try {
         }
     }
 
-    & $Launcher /? | Out-Null
+    Use-E2ELauncherState $launcherState { & $Launcher /? | Out-Null }
     if ($LASTEXITCODE -ne 0) { Write-Host "  '/?' did not print help" -ForegroundColor Red; $exit = 1 }
 
-    & $Launcher -s | Out-Null
+    Use-E2ELauncherState $launcherState { & $Launcher -s | Out-Null }
     if ($LASTEXITCODE -ne 0) { Write-Host "  '-s' returned non-zero" -ForegroundColor Red; $exit = 1 }
 
     # Retired spellings must be diagnosed (exit 2), not spawned as a compiler.
-    & $Launcher --stats 2>&1 | Out-Null
+    Use-E2ELauncherState $launcherState { & $Launcher --stats 2>&1 | Out-Null }
     if ($LASTEXITCODE -ne 2) {
         Write-Host "  retired --stats should exit 2, got $LASTEXITCODE" -ForegroundColor Red
         $exit = 1
     }
 
-    & $Launcher -z | Out-Null
+    # The positive control, read BEFORE `-z` clears it: this run's log holds records.
+    if ($ranAnyCompiler) {
+        $recorded = Get-E2ELauncherStateRecordCount $launcherState
+        if ($recorded -lt 1) {
+            Write-Host "  the launcher recorded nothing in this run's state log ($($launcherState.Log))" -ForegroundColor Red
+            $exit = 1
+        } else {
+            Write-Host "  this run's compiles were recorded in its own state log: $recorded record(s)" -ForegroundColor Green
+        }
+    }
+
+    Use-E2ELauncherState $launcherState { & $Launcher -z | Out-Null }
     if ($LASTEXITCODE -ne 0) { Write-Host "  '-z' returned non-zero" -ForegroundColor Red; $exit = 1 }
+    # And `-z` cleared THIS run's log -- the operation that deleted a developer's.
+    if ($ranAnyCompiler -and (Test-Path $launcherState.Log)) {
+        Write-Host "  '-z' left this run's state log in place ($($launcherState.Log)), so it cleared some other one" -ForegroundColor Red
+        $exit = 1
+    }
 
     if ($exit -eq 0) { Write-Host "  CLI surface matches --help: OK" -ForegroundColor Green }
 }
 finally {
-    $server | Stop-Process -Force -ErrorAction SilentlyContinue
+    if ($server) { $server | Stop-Process -Force -ErrorAction SilentlyContinue }
     Remove-Item -Recurse -Force $DeepTemp,$ShallowTemp,$MoveTemp,$EditTemp,$AliasTemp,$BoundTemp -ErrorAction SilentlyContinue
     Remove-Item Env:\FASTCACHE_ADDR,Env:\FASTCACHE_SOURCE_DIR,Env:\FASTCACHE_BINARY_DIR,Env:\FASTCACHE_VERBOSE -ErrorAction SilentlyContinue
+    # What the run did to the caller's logs, reported on EVERY way out -- a failure path is
+    # where a leak shows -- and a failure whatever else happened.
+    $callerDamage = @(Exit-E2ELauncherState $launcherState)
+    if ($callerDamage.Count) { $callerDamage | ForEach-Object { Write-Host "launcher E2E FAILED: $_" }; exit 1 }
 }
 
 if (-not $ranAnyCompiler) {

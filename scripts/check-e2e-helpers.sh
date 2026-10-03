@@ -731,6 +731,71 @@ run_case() {
         esac
         ;;
 
+    # --- the invocation log, read by column NAME ---------------------------------
+    #
+    # The layout comes from Stats.cpp, so a line in the version this build writes, a line
+    # from before versions and a line in a version it does not write are three answers: the
+    # column, the column read one place earlier, and nothing with status 3. The current
+    # line comes FIRST, from the layout itself: a reader that took the first field as the
+    # outcome passes the old line and reads `v2` here.
+    launcher-log-field)
+        e2e_launcher_log_line MISS /tree/v.cpp > "${scratch}/log"
+        printf 'HIT\tdefault\t1\t2\t/tree/old.cpp\n' >> "${scratch}/log"
+        echo "outcomes: $(e2e_launcher_log_field outcome < "${scratch}/log" | tr '\n' ' ')"
+        echo "sources: $(e2e_launcher_log_field source < "${scratch}/log" | tr '\n' ' ')"
+        printf 'v999\tMISS\tdefault\t0\t1\t/tree/new.cpp\n' > "${scratch}/foreign"
+        status=0
+        foreign="$(e2e_launcher_log_field source < "${scratch}/foreign" 2>/dev/null)" || status=$?
+        echo "a foreign version: status ${status}, [${foreign}]"
+        status=0
+        e2e_launcher_log_field no-such-column < "${scratch}/log" >/dev/null 2>&1 || status=$?
+        echo "an unknown column: status ${status}"
+        # A line in this build's version that is short of its columns: Stats.cpp refuses it, so
+        # this reader must too, rather than read what is there by position.
+        printf '%s\tMISS\tdefault\t0\t1\t/tree/short.cpp\n' "$(e2e_launcher_log_version)" > "${scratch}/short"
+        status=0
+        short="$(e2e_launcher_log_field source < "${scratch}/short" 2>/dev/null)" || status=$?
+        echo "a short line: status ${status}, [${short}]"
+        # A column name this reader cannot read is a refused LAYOUT, never a column skipped in
+        # silence -- which would shift every later column by one.
+        sed 's/\.name = "elapsed-ms"/.name = "elapsed_ms"/' "${source_dir}/src/apps/fastcache-cc/Stats.cpp" > "${scratch}/Stats.cpp"
+        grep -q 'elapsed_ms' "${scratch}/Stats.cpp" || echo "BUG: the odd column name was not planted"
+        status=0
+        e2e_launcher_log_layout "${scratch}/Stats.cpp" >/dev/null 2>&1 || status=$?
+        echo "an odd column name: status ${status}"
+        ;;
+
+    # --- the caller-damage check, when its own count cannot be taken -------------
+    #
+    # The check counts this run's records in the caller's log with one awk. An awk that FAILS
+    # is the instrument failing, which must read as damage nobody can rule out -- never as a
+    # clean log. The control runs first through the same function: a record of this run is
+    # found. Then an `awk` that fails only for the count (the layout read still works) is put
+    # first on PATH.
+    launcher-damage-unread)
+        caller="${scratch}/caller.log"
+        e2e_launcher_log_line MISS "${scratch}/run/a.cpp" > "$caller"
+        _e2e_workdir="${scratch}/run"
+        _e2e_launcher_state_trees=""
+        _e2e_launcher_state_caller="${caller}|absent||"
+        control="$(_e2e_launcher_state_caller_damage)"
+        case "$control" in
+            *"1 of this run's compiles were recorded"*) echo "the control found this run's record" ;;
+            *) echo "BUG: the control did not find this run's record: [${control}]" ;;
+        esac
+        # The stub reaches the real awk by dropping itself, PATH's first entry -- never through
+        # `command -v awk`, which unguarded-prerequisites reads as a guard making awk optional.
+        mkdir -p "${scratch}/bin"
+        printf '#!/bin/sh\nif [ -n "${E2E_STATE_TREES+x}" ]; then exit 2; fi\nPATH="${PATH#*:}" exec awk "$@"\n' > "${scratch}/bin/awk"
+        chmod +x "${scratch}/bin/awk"
+        failed="$(PATH="${scratch}/bin:${PATH}" _e2e_launcher_state_caller_damage)"
+        case "$failed" in
+            *"could not be read past its start"*) echo "a failed count is reported, not clean" ;;
+            "") echo "BUG: a failed count read as a clean log" ;;
+            *) echo "BUG: a failed count read as: [${failed}]" ;;
+        esac
+        ;;
+
     # --- the wait loop -------------------------------------------------------
     #
     # Driven through `wait_until` rather than through `wait_for_port`,
@@ -3206,6 +3271,8 @@ cases=(
     "ports|0|40 distinct ports, all in range, all recorded"
     "ports-ledger|0|the ledger confined five draws to the ports it had not issued"
     "port-answers-closed|0|port_answers is false for an unbound port"
+    "launcher-log-field|0|outcomes: MISS HIT |sources: /tree/v.cpp /tree/old.cpp |a foreign version: status 3, []|an unknown column: status 2|a short line: status 4, []|an odd column name: status 2|!BUG:"
+    "launcher-damage-unread|0|the control found this run's record|a failed count is reported, not clean|!BUG:"
     # Both accepting rows first: a helper refusing everything would satisfy every
     # refusing row while failing each clean stop. 143 is refused by DEFAULT -- a TERM
     # that killed a process skipped its teardown -- and accepted only when opted into.

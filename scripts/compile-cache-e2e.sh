@@ -86,7 +86,6 @@ done
 readonly SKIP=77
 
 [[ -n "$fastcached" && -x "$fastcached" ]] || { echo "fastcached not found: '$fastcached'; skipping"; exit "$SKIP"; }
-[[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
 command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler'; skipping"; exit "$SKIP"; }
 
 workdir="$(mktemp -d)"
@@ -129,8 +128,14 @@ trap cleanup EXIT
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
 e2e_begin "compile-cache E2E" "$workdir"
 
-# Statistics are per-user state; keep this run out of the developer's real log.
-export XDG_STATE_HOME="${workdir}/state"
+# After `e2e_begin`, whose snapshot of the caller's statistics must precede every use of
+# the launcher variable -- `launcher-state-isolation` refuses one above it.
+[[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
+
+# Every launcher this fixture runs records into a state directory of the run's own,
+# through the shim `e2e_launcher_state_enter` (scripts/lib/e2e-common.sh) puts in
+# front of it. Before any launcher runs, and after `e2e_begin`, whose workdir holds it.
+e2e_launcher_state_enter launcher
 export FASTCACHE_VERBOSE=1
 export FASTCACHE_PREFETCH_GROUP="e2e"
 
@@ -1318,7 +1323,7 @@ for debug in off on; do
     bound_compile "${dir}/checkout-b" "${dir}/b.log" "$flag" FASTCACHE_NO_DIRECT=1 FASTCACHE_VERIFY=1 \
         || fail "verify ${debug}: b failed"
     ob="$(bound_outcome "${dir}/b.log")"
-    logged="$(tail -n 1 "${XDG_STATE_HOME}/fastcache-cc/invocations.log" | cut -f1)"
+    logged="$(tail -n 1 "$(e2e_launcher_state_log)" | e2e_launcher_log_field outcome)"
     wrong=no
     if grep -q "WRONG OBJECT served" "${dir}/b.log"; then wrong=yes; fi
     want_wrong=no
@@ -1436,8 +1441,13 @@ fi
 [ "${rc:-0}" -eq 2 ] || fail "retired flag should exit 2, got ${rc:-0}"
 echo "   retired flags exit 2 with a diagnostic"
 
+# The positive control, BEFORE `-z` clears it; and after it, the caller's logs intact --
+# `-z` being the call that deleted a developer's statistics on the Windows twin.
+e2e_launcher_state_assert_used
 "$launcher" -z >/dev/null || fail "-z returned non-zero"
 "$launcher" --zero-stats >/dev/null || fail "--zero-stats returned non-zero"
+[ ! -f "$(e2e_launcher_state_log)" ] || fail "-z left this run's state log in place ($(e2e_launcher_state_log)), so it cleared some other one"
+e2e_launcher_state_assert_caller_untouched
 
 echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, store ceiling, cross-depth, nested roots," \
      "moved-header convergence (both layouts keyed apart), an edit re-keying, root-bound objects keyed apart," \

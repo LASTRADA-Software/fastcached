@@ -335,7 +335,6 @@ readonly SKIP=77
 # than left to the default's warn-and-continue, so a node that failed to bind for
 # some OTHER reason still shows up as the fault it is.
 no_local_cache="--cache-memory=0"
-[[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
 command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler'; skipping"; exit "$SKIP"; }
 
 workdir="$(mktemp -d)"
@@ -454,8 +453,14 @@ e2e_begin "dist-compile E2E" "$workdir"
 # triage survived the conversion rather than being traded for the budget.
 e2e_wait_seconds 30
 
-# Statistics are per-user state; keep this run out of the developer's real log.
-export XDG_STATE_HOME="${workdir}/state"
+# After `e2e_begin`, whose snapshot of the caller's statistics must precede every use of
+# the launcher variable -- `launcher-state-isolation` refuses one above it.
+[[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
+
+# Every launcher this fixture runs records into a state directory of the run's own,
+# through the shim `e2e_launcher_state_enter` (scripts/lib/e2e-common.sh) puts in
+# front of it. Before any launcher runs, and after `e2e_begin`, whose workdir holds it.
+e2e_launcher_state_enter launcher
 export FASTCACHE_VERBOSE=1
 
 # --- helpers ----------------------------------------------------------------
@@ -2097,5 +2102,7 @@ else
         echo "            ${compiler} object here, so the compilation directory cannot be read"
     fi
 fi
+e2e_launcher_state_assert_used
+e2e_launcher_state_assert_caller_untouched
 echo
 echo "dist-compile E2E PASSED"

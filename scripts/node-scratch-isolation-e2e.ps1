@@ -43,13 +43,23 @@ function Skip([string]$why) {
     exit $SkipExit
 }
 
+# Before the skips and the self-test modes, so a machine that skips this fixture still
+# judges it: every launcher it runs must sit inside `Use-E2ELauncherState`, or it would
+# read or delete the caller's statistics. The why is written in the module, once.
+Import-Module (Join-Path $PSScriptRoot "lib/E2EEnvironment.psm1") -Force
+try { Assert-E2ELauncherFixture -Fixture $PSCommandPath }
+catch { Write-Host "node-scratch-isolation-e2e FAILED: $($_.Exception.Message)"; exit 1 }
+
 # Skipped entirely under -SelfTest, which drives none of these: requiring a built
 # node to exercise a wait's arithmetic would put the one check that has no
 # prerequisites behind every prerequisite there is.
 if (-not $SelfTest) {
-    foreach ($pair in @(@{p=$Fastcached;n="-Fastcached"}, @{p=$Node;n="-Node"}, @{p=$Launcher;n="-Launcher"})) {
+    foreach ($pair in @(@{p=$Fastcached;n="-Fastcached"}, @{p=$Node;n="-Node"})) {
         if (-not $pair.p -or -not (Test-Path $pair.p)) { Skip "$($pair.n) was not given a built binary" }
     }
+    # Asked apart from the loop above: a launcher path copied into a table is an alias
+    # the launcher-state scan in `E2EEnvironment.psm1` rightly refuses.
+    if (-not $Launcher -or -not (Test-Path $Launcher)) { Skip "-Launcher was not given a built binary" }
     if (-not $Compiler) { $Compiler = (Get-Command cl.exe -ErrorAction SilentlyContinue).Source }
     if (-not $Compiler -or -not (Test-Path $Compiler)) { Skip "no MSVC cl.exe on PATH" }
 }
@@ -62,6 +72,11 @@ if (-not $SelfTest) {
 # from 20000..30000 where the other four drew 20000..32000, which is the drift the
 # shared module exists to stop rather than a choice anybody made (#1284).
 Import-Module (Join-Path $PSScriptRoot "lib/E2EPorts.psm1") -Force
+# And by name, for the launcher-state seam: E2EPorts' own import of it is nested, so
+# its functions stop at E2EPorts and never reach this script. The client JOBS import it
+# too, from this path, since a job is a process of its own.
+$launcherStateModule = Join-Path $PSScriptRoot "lib/E2EEnvironment.psm1"
+Import-Module $launcherStateModule -Force
 
 # The teardown: kill, confirm each process EXITED within one shared bound, and name
 # what did not. It used to kill and sleep 400 ms, confirming nothing -- the teardown
@@ -1196,7 +1211,10 @@ long long marker_$seed(std::string const& s) {
 }
 
 $clientBody = {
-    param($Launcher, $cc, $proj, $obj, $src, $sched, $cache, $tag)
+    param($Launcher, $cc, $proj, $obj, $src, $sched, $cache, $tag, $StateModule, $StateHandle)
+    # First, before this job sets any FASTCACHE_* of its own: importing the module
+    # clears the ones it inherited, and brings the launcher-state wrapper into the job.
+    Import-Module $StateModule -Force
     function ConvertTo-QuotedArgs([string[]]$arguments) {
         return $arguments | ForEach-Object {
             if ($_ -match '\s' -and $_ -notmatch '^"') { '"' + $_ + '"' } else { $_ }
@@ -1213,9 +1231,11 @@ $clientBody = {
     $errFile = [IO.Path]::GetTempFileName()
     $outFile = [IO.Path]::GetTempFileName()
     $started = Get-Date
-    $p = Start-Process -FilePath $Launcher `
-         -ArgumentList (ConvertTo-QuotedArgs @($cc, "/nologo", "/c", "/std:c++20", "/EHsc", "/O2", "/Fo$obj", $src)) `
-         -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile -RedirectStandardOutput $outFile
+    $p = Use-E2ELauncherState $StateHandle {
+        Start-Process -FilePath $Launcher `
+             -ArgumentList (ConvertTo-QuotedArgs @($cc, "/nologo", "/c", "/std:c++20", "/EHsc", "/O2", "/Fo$obj", $src)) `
+             -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile -RedirectStandardOutput $outFile
+    }
     $e = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
     Remove-Item $errFile, $outFile -ErrorAction SilentlyContinue
     [pscustomobject]@{ tag = $tag; code = $p.ExitCode; stderr = $e; startedAt = $started; endedAt = (Get-Date) }
@@ -1449,8 +1469,8 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
 
         $objA = Join-Path $proj "build\a.obj"; $objB = Join-Path $proj "build\b.obj"
         $jobs = @(
-            Start-Job -ScriptBlock $clientBody -ArgumentList $Launcher,$Compiler,$proj,$objA,$srcA,"127.0.0.1:$schedPort",$cachePort,"A"
-            Start-Job -ScriptBlock $clientBody -ArgumentList $Launcher,$Compiler,$proj,$objB,$srcB,"127.0.0.1:$schedPort",$cachePort,"B"
+            Start-Job -ScriptBlock $clientBody -ArgumentList $Launcher,$Compiler,$proj,$objA,$srcA,"127.0.0.1:$schedPort",$cachePort,"A",$launcherStateModule,$launcherState
+            Start-Job -ScriptBlock $clientBody -ArgumentList $Launcher,$Compiler,$proj,$objB,$srcB,"127.0.0.1:$schedPort",$cachePort,"B",$launcherStateModule,$launcherState
         )
         $results = $jobs | Wait-Job -Timeout 300 | Receive-Job
         $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
@@ -1495,15 +1515,35 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
     }
 }
 
+# Every launcher this fixture runs records into a state directory of the run's own,
+# through `Use-E2ELauncherState` in `scripts/lib/E2EEnvironment.psm1`, which also
+# refuses this file if any launcher runs outside it. The client jobs inherit nothing
+# from here that matters: each wraps its own launcher with the handle it is passed.
+# Inside the `try` whose `finally` removes the state root and reports what the run did
+# to the caller's logs.
+$launcherState = $null
 try {
+    $launcherState = Enter-E2ELauncherState -Launcher $Launcher -Fixture $PSCommandPath -RunTrees @($scratch)
+    Write-Host "launcher statistics isolated to $($launcherState.Log)"
+
     # Phase 1 is the defect's own configuration and must now be clean; phase 2 is the
     # control, and a regression that broke both would otherwise look like the
     # environment rather than like this change.
     Invoke-Phase "shared-temp" $false
     Invoke-Phase "separate-temp" $true
+
+    # The positive control: this run's compiles recorded in its own log.
+    $recorded = Get-E2ELauncherStateRecordCount $launcherState
+    if ($recorded -lt 1) { throw "the launcher recorded nothing in this run's state log ($($launcherState.Log))" }
+    Write-Host "this run's compiles were recorded in its own state log: $recorded record(s)"
+
     Write-Host "node-scratch-isolation-e2e: PASS"
     exit 0
 }
 finally {
     Remove-Item -Recurse -Force $scratch -ErrorAction SilentlyContinue
+    # What the run did to the caller's logs, reported on EVERY way out -- a failure path is
+    # where a leak shows -- and a failure whatever else happened.
+    $callerDamage = @(Exit-E2ELauncherState $launcherState)
+    if ($callerDamage.Count) { $callerDamage | ForEach-Object { Write-Host "node-scratch-isolation-e2e FAILED: $_" }; exit 1 }
 }

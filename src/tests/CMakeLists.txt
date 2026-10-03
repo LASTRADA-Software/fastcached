@@ -2383,6 +2383,58 @@ else()
         "the helper library is POSIX and serves POSIX fixtures; on msys2 bash a /dev/tcp connect to an unbound loopback port can SUCCEED, so its socket cases would pass against a listener that is not there")
 endif()
 
+# Every fixture handed a launcher -- `$<TARGET_FILE:fastcache-cc>` on its registration, or
+# a launcher parameter it declares -- calls the launcher-state seam, so the launcher
+# records into the run's own state directory rather than the developer's. The Windows
+# launcher e2e deleted the developer's statistics (`-z`) on every run, and three fixtures
+# appended their records to them.
+#
+# On EVERY platform, and deliberately not a case of `e2e-helpers-selftest`, which is not
+# run on Windows: the `.ps1` fixtures this is mostly about run nowhere else. Neither needs
+# a build. TWO registrations of one script, because they answer two questions:
+# `launcher-state-isolation` scans the REAL tree and holds the two readers of Stats.cpp's
+# state variables -- the bash one and the PowerShell one -- to one answer per platform;
+# `launcher-state-isolation-selftest` is the check's proof that it can fail -- a planted
+# tree that must earn every verdict -- and DRIVES both seams against a stand-in launcher
+# and a caller log that is present, empty and absent. The PowerShell halves need pwsh and
+# are named skips without it.
+#
+# Their cost is PROCESS SPAWNS, which Git Bash makes expensive: a version that ran a `grep`
+# per CMake file and each seam case one after another took 37-47s on an idle Windows host
+# and 114-175s with 24 busy loops on its 32 cores. One `awk`/`grep` per pass over all the
+# files, the seam cases in lanes and one reader subshell brought the whole to 11s idle and
+# 22-29s under the same load (Git Bash 5.2); a reviewer then measured 182s at 32 busy
+# loops, and the split is the answer to that rather than a larger bound. Judging every
+# `.sh` fixture in ONE awk rather than a handful of processes each then measured 21s for
+# the self-test and 8s for the tree under 32 busy loops with 2-4 other compilers running
+# (39.8s and 11.9s before it). With the other lanes' builds on top -- up to ~30 compilers
+# as well as the loops -- the self-test measured 80-126s, AT its bound, before and after:
+# on a host that saturated, every Git Bash spawn costs an order of magnitude more, and the
+# self-test is hundreds of them. That is harsher than any real run. The load that DECIDES
+# is the gate's own shape, `ctest -L hygiene -j32` beside it on the same 32-CPU host, and
+# there the self-test measured up to 83s while its seam cases cost ~1,170 processes. With
+# the seam library cut to ~830, five such runs on Windows measured the self-test at
+# 14-48s and the tree at 7-20s, started anywhere from 79th to 173rd of 202 and with 0 to
+# 34 other lanes' compilers running; in WSL 2s (the pwsh half a named skip) and 10s.
+# Each bound is for a check that stops ending; if a run approaches it, make the check
+# cheaper again rather than raising it.
+add_test(
+    NAME "launcher-state-isolation"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-launcher-state-isolation.sh"
+)
+set_tests_properties("launcher-state-isolation" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+add_test(
+    NAME "launcher-state-isolation-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-launcher-state-isolation.sh" --self-test
+)
+set_tests_properties("launcher-state-isolation-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 # ---------------------------------------------------------------------------
 # The ELF guard that keeps a vendored library out of what ships (#1538).
 #
