@@ -1056,7 +1056,8 @@ TEST_CASE("MergedResponder routes the Node family to the node responder and nowh
     roster.members.push_back(Cluster::RosterMember { .id = "pc-07",
                                                      .raftEndpoint = {},
                                                      .seat = Cluster::MemberSeat::Learner,
-                                                     .publicKey = Testing::TestKeyPair("pc-07").PublicKey() });
+                                                     .publicKey = Testing::TestKeyPair("pc-07").PublicKey(),
+                                                     .schedulerEndpoint = {} });
     roster.revoked.push_back(Cluster::RevokedKey { .id = "gone", .publicKey = Testing::TestKeyPair("gone").PublicKey() });
     return roster;
 }

@@ -440,7 +440,7 @@
          when the deferred script is generated, so nothing is lost by writing them
          first, and a write that fails then rolls the transaction back before
          anything is registered. After them, a failed write rolled the FILES back
-         while the services it had just registered, and started, stayed behind --
+         while the services it had just registered, and started, stayed behind,
          pointing at removed binaries on a fresh install, replaying a command line
          against the restored old ones on an upgrade. -->
     <CustomAction Id="FastCacheRememberFirewallAllow"

@@ -40,10 +40,11 @@ namespace
     [[nodiscard]] NodeProofAttempt Unproved(Cc::CacheOutcome const& outcome,
                                             std::optional<ServerStanding> standing = std::nullopt)
     {
-        auto const rejected = outcome.kind == Cc::CacheOutcomeKind::Rejected;
-        auto const result = rejected && SaysNoProofHere(outcome.code)                          ? NodeProofResult::NotOffered
-                            : rejected && outcome.code == Wire::ErrorCode::RosterNotYetApplied ? NodeProofResult::Deferred
-                                                                                               : NodeProofResult::Refused;
+        auto result = NodeProofResult::Refused;
+        if (outcome.kind == Cc::CacheOutcomeKind::Rejected && SaysNoProofHere(outcome.code))
+            result = NodeProofResult::NotOffered;
+        else if (outcome.kind == Cc::CacheOutcomeKind::Rejected && outcome.code == Wire::ErrorCode::RosterNotYetApplied)
+            result = NodeProofResult::Deferred;
         return NodeProofAttempt { .result = result, .reason = Cc::DescribeOutcome(outcome), .standing = standing };
     }
 

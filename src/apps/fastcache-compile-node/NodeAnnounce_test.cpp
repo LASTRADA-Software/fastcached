@@ -860,7 +860,7 @@ TEST_CASE("A learner's next round registers where its applied state records a vo
     AppliedSchedulers schedulers { fix.cfg, AsConfigured };
     auto built = SchedulerLink::Over(schedulers);
     REQUIRE(built.has_value());
-    auto link = Testing::Unwrap(std::move(built));
+    auto link = Testing::Unwrap(built);
 
     auto const recorded = Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {});
     Testing::ScriptedDialer dialer { { recorded, recorded } };

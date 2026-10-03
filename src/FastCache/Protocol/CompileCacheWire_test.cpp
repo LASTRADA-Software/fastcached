@@ -4994,9 +4994,9 @@ TEST_CASE("A shared-cache record with a state byte this build does not name is s
 
     auto parts = Unwrap(WireFields::SplitAll(record));
     REQUIRE(parts.size() == SharedCacheStatusFieldCount);
-    for (auto const [index, unnamed]: { std::pair { std::size_t { 0 }, std::byte { 0x7F } },
-                                        std::pair { std::size_t { 3 }, std::byte { 0x7F } },
-                                        std::pair { std::size_t { 3 }, std::byte { 0x00 } } })
+    for (auto const& [index, unnamed]: { std::pair { std::size_t { 0 }, std::byte { 0x7F } },
+                                         std::pair { std::size_t { 3 }, std::byte { 0x7F } },
+                                         std::pair { std::size_t { 3 }, std::byte { 0x00 } } })
     {
         INFO("field " << index << " byte " << static_cast<int>(unnamed));
         auto rewrittenParts = parts;

@@ -617,15 +617,18 @@ TEST_CASE("A key this node lacks while its state has not caught up is not yet ju
         Wire::ErrorCode expected;
         IMetricsSink::Counter counted;
     };
-    for (auto const& [reading, expected, counted]: { Reading { AppliedStateReading::Behind,
-                                                               Wire::ErrorCode::RosterNotYetApplied,
-                                                               IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied },
-                                                     Reading { AppliedStateReading::Unknown,
-                                                               Wire::ErrorCode::RosterNotYetApplied,
-                                                               IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied },
-                                                     Reading { AppliedStateReading::CaughtUp,
-                                                               Wire::ErrorCode::NodeKeyUnknown,
-                                                               IMetricsSink::Counter::NodeProofsRefusedUnknownKey } })
+    auto const readings = {
+        Reading { .reading = AppliedStateReading::Behind,
+                  .expected = Wire::ErrorCode::RosterNotYetApplied,
+                  .counted = IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied },
+        Reading { .reading = AppliedStateReading::Unknown,
+                  .expected = Wire::ErrorCode::RosterNotYetApplied,
+                  .counted = IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied },
+        Reading { .reading = AppliedStateReading::CaughtUp,
+                  .expected = Wire::ErrorCode::NodeKeyUnknown,
+                  .counted = IMetricsSink::Counter::NodeProofsRefusedUnknownKey },
+    };
+    for (auto const& [reading, expected, counted]: readings)
     {
         INFO("reading " << static_cast<int>(reading));
         ProvingNode node;

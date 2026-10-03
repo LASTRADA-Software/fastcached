@@ -391,7 +391,8 @@ using SecretFileStream = std::unique_ptr<std::FILE, int (*)(std::FILE*)>;
 /// **Private: never transmitted or persisted.**
 enum class FileOwnerStanding : std::uint8_t
 {
-    ThisProcess,    ///< The account this process runs as.
+    ThisProcess,    ///< The account this process runs as -- on Windows, or the owner its token stamps on
+                    ///< what it creates (Administrators, under an elevated token).
     Administrative, ///< SYSTEM or Administrators on Windows; root on POSIX.
     Another,        ///< Any other account: somebody else put this file here.
     Undetermined,   ///< The platform would not say.

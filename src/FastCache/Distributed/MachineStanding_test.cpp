@@ -26,11 +26,13 @@ namespace
     roster.members.push_back(Cluster::RosterMember { .id = "v1",
                                                      .raftEndpoint = "v1:6680",
                                                      .seat = Cluster::MemberSeat::Voter,
-                                                     .publicKey = Testing::TestKeyPair("v1").PublicKey() });
+                                                     .publicKey = Testing::TestKeyPair("v1").PublicKey(),
+                                                     .schedulerEndpoint = {} });
     roster.members.push_back(Cluster::RosterMember { .id = "l1",
                                                      .raftEndpoint = {},
                                                      .seat = Cluster::MemberSeat::Learner,
-                                                     .publicKey = Testing::TestKeyPair("l1").PublicKey() });
+                                                     .publicKey = Testing::TestKeyPair("l1").PublicKey(),
+                                                     .schedulerEndpoint = {} });
     roster.revoked.push_back(Cluster::RevokedKey { .id = "gone", .publicKey = Testing::TestKeyPair("gone").PublicKey() });
     return roster;
 }
@@ -80,7 +82,8 @@ TEST_CASE("A machine's standing is read from the roster, by id or by key", "[dis
     readmitted.members.push_back(Cluster::RosterMember { .id = "gone",
                                                          .raftEndpoint = {},
                                                          .seat = Cluster::MemberSeat::Learner,
-                                                         .publicKey = Testing::TestKeyPair("gone-2").PublicKey() });
+                                                         .publicKey = Testing::TestKeyPair("gone-2").PublicKey(),
+                                                         .schedulerEndpoint = {} });
     CHECK(StandingOfMachine(readmitted, "gone", false) == MachineStanding::Learner);
     CHECK(StandingOfMachine(readmitted, KeyText("gone"), false) == MachineStanding::Revoked);
     CHECK(StandingOfMachine(readmitted, KeyText("gone-2"), false) == MachineStanding::Learner);
@@ -106,7 +109,8 @@ TEST_CASE("The key a machine question folds is the live key, the revoked key, or
     readmitted.members.push_back(Cluster::RosterMember { .id = "gone",
                                                          .raftEndpoint = {},
                                                          .seat = Cluster::MemberSeat::Learner,
-                                                         .publicKey = Testing::TestKeyPair("gone-2").PublicKey() });
+                                                         .publicKey = Testing::TestKeyPair("gone-2").PublicKey(),
+                                                         .schedulerEndpoint = {} });
     CHECK(KeyOfMachine(readmitted, "gone") == identity("gone", "gone-2"));
     CHECK(KeyOfMachine(readmitted, KeyText("gone")) == identity("gone", "gone"));
 }

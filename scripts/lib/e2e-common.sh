@@ -3503,8 +3503,9 @@ _e2e_launcher_state_caller_damage() {
                         for (i = 1; i <= n; i++) if (source != "" && t[i] != "" && index(source, t[i]) == 1) { hits++; break }
                     }
                     END { print hits + 0, log_foreign + 0, log_malformed + 0 }'
-            # BOTH stages: under `set +o pipefail` the status is awk's alone, and an awk a failed
-            # `tail` handed nothing prints `0 0 0` -- which reads as a clean log.
+            # BOTH stages: under `set +o pipefail` the status is the awk stage alone, and an awk a
+            # failed `tail` handed nothing prints `0 0 0` -- which reads as a clean log. No
+            # apostrophe in a comment inside `$( )`: bash 3.2 opens a quote on it (#1096).
             statuses=("${PIPESTATUS[@]}")
             [ "${statuses[0]}" -eq 0 ] && [ "${statuses[1]}" -eq 0 ])" || counted=""
         # A count that did not come back is the instrument failing, never a clean log: it is its
@@ -3567,6 +3568,14 @@ e2e_launcher_state_enter() {
     esac
     real="${!var-}"
     [ -n "$real" ] && [ -x "$real" ] || fail "e2e_launcher_state_enter: \$${var} is not an executable launcher: '${real}'"
+    # Absolute before it is written into the shim, which may be run from any directory: CI passes
+    # `--launcher out/build/.../fastcache-cc`, and a fixture section that `cd`s first (the
+    # relative-paths case) then exec'd a path that resolved to nothing -- a red reading as a
+    # failed compile, with no word about the launcher.
+    case "$real" in
+        /*) ;;
+        *) real="$(cd "$(dirname "$real")" && pwd)/${real##*/}" || fail "e2e_launcher_state_enter: cannot resolve '${real}' to an absolute path" ;;
+    esac
     # As `e2e_begin`'s snapshot read them -- which the check above has already required.
     rows="$_e2e_launcher_state_rows_read"
     [ -n "$rows" ] \

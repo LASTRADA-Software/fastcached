@@ -296,8 +296,14 @@ class ScriptedSchedulers final: public ISchedulerEndpointSource
 
     [[nodiscard]] std::vector<std::string> Current() const override
     {
-        ++reads;
+        ++_reads;
         return _endpoints;
+    }
+
+    /// @return How many times the link asked.
+    [[nodiscard]] int Reads() const noexcept
+    {
+        return _reads;
     }
 
     /// Answer @p endpoints from now on.
@@ -307,10 +313,9 @@ class ScriptedSchedulers final: public ISchedulerEndpointSource
         _endpoints = std::move(endpoints);
     }
 
-    mutable int reads { 0 }; ///< How many times the link asked.
-
   private:
     std::vector<std::string> _endpoints;
+    mutable int _reads { 0 };
 };
 } // namespace
 
@@ -322,14 +327,14 @@ TEST_CASE("A link over a source re-reads it at every round, and a moved list is 
     ScriptedSchedulers source { { std::string { Configured } } };
     auto built = SchedulerLink::Over(source);
     REQUIRE(built.has_value());
-    auto link = Unwrap(std::move(built));
+    auto link = Unwrap(built);
     CHECK(NextRoundOpensAt(link) == Configured);
     link.Accepted();
-    auto const readsAfterFirst = source.reads;
+    auto const readsAfterFirst = source.Reads();
 
     source.Move({ std::string { Second } });
     CHECK(NextRoundOpensAt(link) == Second);
-    CHECK(source.reads == readsAfterFirst + 1);
+    CHECK(source.Reads() == readsAfterFirst + 1);
     CHECK(link.Configured() == std::vector<std::string> { std::string { Second } });
 
     // A source that knows nothing for a moment forgets nothing the link knew.

@@ -2660,6 +2660,9 @@ TEST_CASE("A learner enrolled through its leader's own route is recorded under t
                                             .roster = roster,
                                             .createdAtUnixSeconds = 0,
                                             .admittedBy = seed.identity.PublicKey() },
+        .archivePending = std::nullopt,
+        .rejectedBy = std::nullopt,
+        .askedJoins = {},
     };
     auto const applied = ApplyFormation(fleet.joiner, record, Cluster::FleetEndpoints {});
     INFO("the formation was refused: " << (applied.has_value() ? std::string {} : applied.error()));

@@ -2,9 +2,9 @@
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeDefaults.hpp"
-#include "NodeMembership.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeKey.hpp"
+#include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Cli/Options.hpp>

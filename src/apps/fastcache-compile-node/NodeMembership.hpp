@@ -81,8 +81,8 @@ inline void PublishClusterKeys(Distributed::KeyRosterMembership& keys, Cluster::
 /// know what the caller counts of that route, and the caller states it: `Absent` counts none,
 /// `Unknown` counts it on every node running consensus -- the only node that holds a roster, its
 /// applied state -- which is the fail-closed reading a guard wants, and `Formed` is consensus's own
-/// roster, which admits exactly the members the formation half below names. Removing a route fails OPEN through exactly this function,
-/// because a worker that reads it as false builds a lease check that verifies nothing.
+/// roster, which admits exactly the members the formation half below names. Removing a route fails OPEN through exactly this
+/// function, because a worker that reads it as false builds a lease check that verifies nothing.
 ///
 /// It cannot be answered by asking the oracle, which is why it is a separate function rather
 /// than a method. `Oracle()` answers "is this caller admitted" in the present tense; this asks

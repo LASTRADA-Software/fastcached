@@ -356,6 +356,7 @@ struct Seed
                                                     .role = Wire::EnrollRole::Learner,
                                                     .publicKey = key,
                                                     .nonce = nonce,
+                                                    .challenge = {},
                                                     .signature = signature });
 }
 

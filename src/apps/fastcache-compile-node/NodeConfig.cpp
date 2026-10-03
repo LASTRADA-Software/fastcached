@@ -3217,8 +3217,8 @@ bool AdvertisedNameAwaited(NodeConfig const& cfg)
 /// It is `AdmitsRemotePeers` asked with `RosterPresence::Unknown`, and deliberately that
 /// reading rather than a spelling of its own: these rows are asked of a configuration
 /// before any roster is read, so a key route counts whenever this node runs consensus, and a
-/// node its formation record puts in a fleet, or asking into one, counts too. Every node that runs consensus answers yes, which is the
-/// point: it admits ticket holders and proven keys, and each of them is told where to dial.
+/// node its formation record puts in a fleet, or asking into one, counts too. Every node that runs consensus answers yes,
+/// which is the point: it admits ticket holders and proven keys, and each of them is told where to dial.
 /// @param cfg The parsed configuration.
 /// @return Whether `--fleet-open` was given, a key could admit another machine, or the
 ///         formation record puts this node in a fleet.

@@ -91,7 +91,7 @@ std::expected<ReplacedBy, std::error_code> RenameIntoPlace(std::filesystem::path
     auto error = rename.RenameReplacing(from, to);
     if (MeansNoPosixRename(error))
     {
-        replaced = ReplacedBy { .route = ReplaceRoute::Classic, .posixRefusal = error };
+        replaced = ReplacedBy { .route = ReplaceRoute::Classic, .posixRefusal = error, .directoryUnsynced = {} };
         error.clear();
         std::filesystem::rename(from, to, error);
     }

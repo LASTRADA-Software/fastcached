@@ -707,7 +707,10 @@ TEST_CASE("A state file the node cannot open names the command that hands it to 
 {
     auto const file = std::filesystem::path { "C:/ProgramData/fastcache-node/cluster/roster" };
     auto const hint = StateFileUnreadableHint(file);
-    CHECK(hint.contains(std::format(R"(icacls "{}" /setowner "NT SERVICE\<the service's name>")", file.string())));
+    // Outside the CHECK: MSVC 19.44 re-reads a raw string's backslash as an escape when the macro
+    // stringizes its argument (C4129 on `\<`, an error under /WX); 19.51 does not.
+    auto const command = std::format(R"(icacls "{}" /setowner "NT SERVICE\<the service's name>")", file.string());
+    CHECK(hint.contains(command));
     CHECK(hint.contains("--print-identity"));
 }
 #else
@@ -734,7 +737,11 @@ TEST_CASE("A node id that is there and cannot be read is refused, never minted o
     auto const path = dir / NodeIdentityFileName;
     WriteText(path, "n-admitted\n");
 #if defined(_WIN32)
-    REQUIRE(Testing::ApplyAccessList(path, L"D:P(A;;FA;;;SY)(A;;FA;;;BA)"));
+    // SYSTEM alone, the Windows counterpart of the root skip below: an elevated token HOLDS
+    // Administrators, so a list granting BA is one this process reads whenever it runs elevated --
+    // as every CI runner does -- and nothing here would be unreadable. The owner may still rewrite
+    // the list, which is how it is restored below.
+    REQUIRE(Testing::ApplyAccessList(path, L"D:P(A;;FA;;;SY)"));
 #else
     if (::geteuid() == 0)
         SKIP("root reads a file whatever its mode");

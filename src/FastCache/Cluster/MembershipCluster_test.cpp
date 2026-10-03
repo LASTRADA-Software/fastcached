@@ -190,8 +190,7 @@ class Fleet
         // roster holds live for it (`WithLiveKeys`). Nothing is held in flight here: a re-proposal of a
         // record still uncommitted is the same record again.
         auto const desired = WithAnnouncedEndpoints(DesiredBy(*leader), AnnouncedEndpointDesires(state, _announced, {}));
-        auto const plan =
-            MembershipProposals(state, configuration, WithLiveKeys(state, desired, *_rosters.at(*leader)));
+        auto const plan = MembershipProposals(state, configuration, WithLiveKeys(state, desired, *_rosters.at(*leader)));
         for (auto const& command: plan.proposals)
             std::ignore = _cluster.ProposeOnLeader(Encode(command));
 

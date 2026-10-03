@@ -1831,9 +1831,11 @@ TEST_CASE("A flood of other fleets' beacons never keeps this cluster's rostered 
     auto& office = fix.NodeIn("c-office", "n-office", "10.0.0.1:6680", FleetState::Established);
     auto& peer = fix.NodeIn("c-office", "n-peer", "10.0.0.2:6680", FleetState::Established);
     auto const flood = fix.Sender("10.0.0.66:6681");
-    auto constexpr SpoofedClusters = 4;
-    auto constexpr SpoofedIds = 64;
     auto const spoofAll = [&] {
+        // Declared in the lambda rather than captured into it: gcc 14 reports a constexpr local
+        // that only a lambda reads as `set but not used`, which -Werror makes a build failure.
+        auto constexpr SpoofedClusters = 4;
+        auto constexpr SpoofedIds = 64;
         for (auto const index: std::views::iota(0, SpoofedIds))
         {
             flood.Send(DiscoveryWire::EncodeBeacon(DiscoveryWire::Beacon {

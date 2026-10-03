@@ -181,20 +181,48 @@ static_assert(RowsInEnumeratorOrder(TicketRefusalTable, &TicketRefusalRow::reaso
 /// carries.
 ///
 /// **A revoked-key refusal cannot be spelled without its evidence.** Every other reason is built
-/// from a CONSTANT (`consteval`), which refuses `Revoked` at compile time, and `Revoked` is built
-/// only by `RevokedKey`, from the evidence -- so "refused as revoked, carrying nothing" is not a
-/// value this type has. That pairing is what lets the endpoint refuse every later verb on the
-/// connection as the forgotten machine's (`ConnectionFacts::revokedMachine`).
+/// from a CONSTANT (`Constant`, whose constructor is `consteval`), which refuses `Revoked` at
+/// compile time, and `Revoked` is built only by `RevokedKey`, from the evidence -- so "refused as
+/// revoked, carrying nothing" is not a value this type has. That pairing is what lets the endpoint
+/// refuse every later verb on the connection as the forgotten machine's
+/// (`ConnectionFacts::revokedMachine`).
 class TicketRejection
 {
   public:
+    /// A reason that carries no evidence, proven at compile time not to be `Revoked`.
+    ///
+    /// The `consteval` lives HERE, on a type holding nothing but the reason, rather than on
+    /// `TicketRejection`'s own constructor: MSVC 19.44 (toolset 14.44) refuses that immediate
+    /// invocation as "invalid aggregate initialization" -- the same class without the
+    /// `std::optional<RevokedKeyEvidence>` member compiles -- while 19.51, clang and gcc accept
+    /// it. The guard is the same either way.
+    class Constant
+    {
+      public:
+        /// Implicit, so `TicketRejection { TicketRefusal::Malformed }` reads as before.
+        /// @param reason Why; a constant, and never `Revoked`, which the build refuses.
+        consteval Constant(TicketRefusal reason):
+            _reason { reason }
+        {
+            if (reason == TicketRefusal::Revoked)
+                throw std::logic_error { "a revoked-key refusal carries its evidence: TicketRejection::RevokedKey" };
+        }
+
+        /// @return The reason.
+        [[nodiscard]] constexpr TicketRefusal Reason() const noexcept
+        {
+            return _reason;
+        }
+
+      private:
+        TicketRefusal _reason;
+    };
+
     /// A refusal that carries no evidence.
     /// @param reason Why; a constant, and never `Revoked`, which the build refuses.
-    explicit consteval TicketRejection(TicketRefusal reason):
-        _reason { reason }
+    explicit constexpr TicketRejection(Constant reason) noexcept:
+        _reason { reason.Reason() }
     {
-        if (reason == TicketRefusal::Revoked)
-            throw std::logic_error { "a revoked-key refusal carries its evidence: TicketRejection::RevokedKey" };
     }
 
     /// A refusal because the ticket verified under a key this node's roster revoked.

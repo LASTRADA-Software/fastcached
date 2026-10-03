@@ -3276,12 +3276,15 @@ src/apps/fastcached/Main.hpp"
         "said|1" "$(report_says 'the cause is the pattern'"'"'s SEPARATORS, not where this checkout lives' header_filter_report /w/.clang-tidy "$_p1")"
     expect "P1: ... and its remedy prints the class as .clang-tidy spells it" \
         "said|1" "$(report_says 'Accept either separator ([/\\]) rather than adding' header_filter_report /w/.clang-tidy "$_p1")"
+    # `if`, never `case`, inside `$( )`: bash 3.2 reads a case pattern's `)` as the
+    # substitution's end (#1224).
     expect "P1: ... and never #1040, which is the location cause" \
         "absent" \
-        "$(case "$(header_filter_report /w/.clang-tidy "$_p1" 2>&1)" in
-               *"#1040"*) echo "said #1040" ;;
-               *) echo absent ;;
-           esac)"
+        "$(if [[ "$(header_filter_report /w/.clang-tidy "$_p1" 2>&1)" == *"#1040"* ]]; then
+               echo "said #1040"
+           else
+               echo absent
+           fi)"
     expect "a config with no HeaderFilterRegex refuses" \
         "said|1" "$(report_says 'names no HeaderFilterRegex' header_filter_report /w/.clang-tidy no-regex)"
     expect "a config that cannot be read refuses" \

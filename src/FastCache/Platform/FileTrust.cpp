@@ -476,9 +476,31 @@ namespace
     /// The owning handle for a kernel object.
     using OwnedHandle = std::unique_ptr<std::remove_pointer_t<HANDLE>, HandleCloser>;
 
-    /// Is @p sid the account this process runs as?
+    /// A SID this process's token names, read out of the token-information class that carries it.
+    struct TokenSidRow
+    {
+        TOKEN_INFORMATION_CLASS kind;                ///< The class to ask for.
+        PSID (*sidOf)(std::byte const* information); ///< Where that class's answer keeps the SID.
+    };
+
+    /// The SIDs that make a file this process's own: the account it runs as, and the OWNER its
+    /// token stamps on every object it creates. The two differ under an elevated token, whose
+    /// default owner is BUILTIN\Administrators -- so without the second row a file this process
+    /// had just created read as `Administrative` on every elevated run, CI's runners included.
+    constexpr auto ThisProcessSids = std::array {
+        TokenSidRow { .kind = TokenUser,
+                      .sidOf = [](std::byte const* information) -> PSID {
+                          return reinterpret_cast<TOKEN_USER const*>(information)->User.Sid;
+                      } },
+        TokenSidRow { .kind = TokenOwner,
+                      .sidOf = [](std::byte const* information) -> PSID {
+                          return reinterpret_cast<TOKEN_OWNER const*>(information)->Owner;
+                      } },
+    };
+
+    /// Is @p sid one this process's own files are owned by?
     /// @param sid The SID to test.
-    /// @return True when it is the token's user.
+    /// @return True when it is the token's user, or the owner the token stamps on what it creates.
     [[nodiscard]] bool IsThisProcessUser(PSID sid)
     {
         HANDLE raw = nullptr;
@@ -486,15 +508,16 @@ namespace
             return false;
         auto const token = OwnedHandle { raw };
 
-        DWORD size = 0;
-        (void) ::GetTokenInformation(token.get(), TokenUser, nullptr, 0, &size);
-        if (size == 0)
-            return false;
-        std::vector<std::byte> buffer(size);
-        if (::GetTokenInformation(token.get(), TokenUser, buffer.data(), size, &size) == FALSE)
-            return false;
-        auto const* const user = reinterpret_cast<TOKEN_USER const*>(buffer.data());
-        return ::EqualSid(user->User.Sid, sid) == TRUE;
+        return std::ranges::any_of(ThisProcessSids, [&token, sid](TokenSidRow const& row) {
+            DWORD size = 0;
+            (void) ::GetTokenInformation(token.get(), row.kind, nullptr, 0, &size);
+            if (size == 0)
+                return false;
+            std::vector<std::byte> buffer(size);
+            if (::GetTokenInformation(token.get(), row.kind, buffer.data(), size, &size) == FALSE)
+                return false;
+            return ::EqualSid(row.sidOf(buffer.data()), sid) == TRUE;
+        });
     }
 
     /// @p sid as an operator reads it: `DOMAIN\name`, or the SID itself when it names no account.
