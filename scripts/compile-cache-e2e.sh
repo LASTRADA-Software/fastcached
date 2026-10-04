@@ -890,13 +890,20 @@ cat "${workdir}/fallback.log"
 #   never-accepting    the connect completes into the backlog, so the exchange runs out TOTAL
 #   refused            the dial fails: at once here, after SYN retries on Windows, never past CONNECT
 #   accept-then-reset  the RST arrives at once; at most CONNECT
-# A shape's bound is baseline + N x cost + cost / 2: N exchanges fit with half an exchange to
-# spare, and ONE exchange more overshoots it by half an exchange of that shape. The shared bound
-# this replaces, baseline + N x (connect + total), left never-accepting -- which never spends a
-# connect -- exactly one whole exchange of slack, so a launcher retrying a failed fetch once
-# passed it on Windows and failed it here by 6 ms (review I-1). A shape whose exchanges cost
-# NOTHING in practice -- the reset, and a refusal on this platform -- cannot be held to a count by
-# time at all; the reset leg COUNTS its exchanges instead.
+# Those costs compose the leg's HANG bound -- baseline + N x cost + cost / 2 + `dead_wall_slack_ms`
+# -- and nothing else. HOW MANY exchanges a leg spent is COUNTED, never inferred from time: every
+# cache exchange the launcher makes goes through one door that says so on its verbose trace
+# (`cache exchange (...)`), and each leg asks for exactly `dead_exchanges` such lines; the reset
+# peer counts its accepts too, and the two must agree. Time judged the count twice and both times
+# measured the HOST: a wall-clock bound with half an exchange of slack failed on loaded Windows
+# runners (round 8), and so did the launcher's own exchange time on a starved one (round 9, 3616
+# ms for two 1000 ms dials). A launcher that is not scheduled cannot fire its deadline on time;
+# its count is the same however slow the machine is. run-launcher-e2e.ps1 holds the same legs,
+# with the never-accepting peer counting too and a floor on that leg's reported time.
+#
+# BLIND SPOTS, failing OPEN. A retry INSIDE one exchange -- in the dial, below the door -- is one
+# trace line, seen only as an extra accept on the reset leg. A WAIT anywhere is judged only by the
+# hang bound.
 #
 # The peers and the clock are perl, because bash can neither listen nor read a monotonic
 # clock (`SECONDS` is the wall clock, which this host steps). A missing perl, or a missing core
@@ -904,6 +911,9 @@ cat "${workdir}/fallback.log"
 dead_connect_ms=1000
 dead_total_ms=2000
 dead_exchanges=2
+# What the wall clock may run past the most N exchanges may take before a leg is a hang: the
+# compile, two process starts and whatever a starved runner adds to them.
+dead_wall_slack_ms=10000
 # shape, then the NAME of the deadline one exchange against it can spend. The silent shape
 # LAST: this fixture stops at its first failure, and a hang there is the regression the bound
 # exists for, so the other two have reported by the time it can fire.
@@ -1005,8 +1015,8 @@ echo "   baseline ${dead_baseline_ms} ms against the live daemon"
 # fd 3, so nothing the body runs can read the table as its stdin.
 while read -r shape dead_cost_name <&3; do
     dead_cost_ms="${!dead_cost_name}"
-    dead_bound_ms=$(( dead_baseline_ms + dead_exchanges * dead_cost_ms + dead_cost_ms / 2 ))
-    echo "   ${shape}: bound ${dead_bound_ms} ms = baseline + ${dead_exchanges} x ${dead_cost_ms} + ${dead_cost_ms} / 2 ms"
+    dead_bound_ms=$(( dead_baseline_ms + dead_exchanges * dead_cost_ms + dead_cost_ms / 2 + dead_wall_slack_ms ))
+    echo "   ${shape}: exactly ${dead_exchanges} exchange(s); hang bound ${dead_bound_ms} ms = baseline + ${dead_exchanges} x ${dead_cost_ms} + ${dead_cost_ms} / 2 + ${dead_wall_slack_ms} ms"
     rm -f "${workdir}/dead-peer.port" "${workdir}/dead-peer.port.accepts"
     case "$shape" in
         refused)
@@ -1033,24 +1043,29 @@ while read -r shape dead_cost_name <&3; do
     [[ "$dead_status" -eq 0 ]] \
         || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the compile exited ${dead_status}"; }
     [[ "$dead_elapsed_ms" -le "$dead_bound_ms" ]] \
-        || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: ${dead_elapsed_ms} ms, over the ${dead_bound_ms} ms bound"; }
+        || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: ${dead_elapsed_ms} ms, over the ${dead_bound_ms} ms hang bound"; }
+    # The COUNT, from the launcher's own trace. grep -c prints 0 and answers 1 for no line; an
+    # answer above 1 prints nothing, and the empty count then fails the comparison -- CLOSED.
+    dead_traced="$(grep -c -- '^fastcache-cc: cache exchange (' "${workdir}/dead.log" || true)"
+    [[ "$dead_traced" == "$dead_exchanges" ]] \
+        || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the launcher traced '${dead_traced}' cache exchange(s), want exactly ${dead_exchanges}"; }
     # What tells this leg from one that never reached the peer: the launcher says it fell back.
     grep -qF "(fetch exchange failed)" "${workdir}/dead.log" \
         || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: no 'fetch exchange failed' fall-back, so the peer was never asked"; }
-    # And on the reset leg, where every exchange is a connection the peer accepts, the COUNT:
-    # exactly `dead_exchanges`. Its exchanges cost nothing, so no time bound can see one too
-    # many -- a launcher that retried a failed fetch once passes every bound and fails this.
+    # And on the reset leg, where every exchange is a connection the peer accepts, the PEER's
+    # count, which must agree with the trace: what makes the launcher's own count trustworthy on
+    # the shapes whose peer cannot count.
     if [[ "$shape" = accept-then-reset ]]; then
         # No file is no accept at all -- a count of 0, not a fixture fault.
         dead_accepts=0
         [[ ! -e "${workdir}/dead-peer.port.accepts" ]] \
             || dead_accepts="$(count_lines "${workdir}/dead-peer.port.accepts")"
-        [[ "$dead_accepts" -eq "$dead_exchanges" ]] \
-            || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the peer accepted ${dead_accepts} connection(s), want exactly ${dead_exchanges} -- one per exchange"; }
+        [[ "$dead_accepts" -eq "$dead_traced" ]] \
+            || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the peer accepted ${dead_accepts} connection(s) while the launcher traced ${dead_traced} exchange(s) -- its own count is not to be trusted"; }
     fi
     cmp -s "${workdir}/dead-expected.o" "${dead}/build/d.o" \
         || fail "dead peers: ${shape}: no object, or not the one the live baseline compiled"
-    echo "   ${shape}: compiled locally in ${dead_elapsed_ms} ms (bound ${dead_bound_ms}), object matches the baseline${dead_accepts:+, ${dead_accepts} exchange(s) counted}"
+    echo "   ${shape}: compiled locally in ${dead_elapsed_ms} ms after ${dead_traced} exchange(s), object matches the baseline${dead_accepts:+, ${dead_accepts} accepted by the peer}"
     dead_accepts=""
 done 3<<< "$dead_shapes"
 

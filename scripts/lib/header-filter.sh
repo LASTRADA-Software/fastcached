@@ -79,6 +79,22 @@ header_filter_spell() {
     printf '%s\n' "$HeaderFilterSpelled"
 }
 
+# Say why a filter's grep exited above 1, on stderr. grep answers 2 both for a pattern it cannot
+# compile and for failing itself, so the status alone cannot tell the FILTER's fault from the
+# CHECK's: the pattern is compiled once more against no input, where only the pattern can fail. A
+# grep that fails there too names the filter; one that compiles it names the check. grep's own
+# message, if it printed one, is above.
+# @param 1 `include` or `exclude`. @param 2 The regex. @param 3 The status the match exited with.
+header_filter_grep_failure() {
+    local probe=0
+    grep -E -- "$2" < /dev/null > /dev/null 2>&1 || probe=$?
+    if [[ "$probe" -gt 1 ]]; then
+        echo "header-filter: the $1 filter '$2' does not compile as an extended regular expression (grep exited $3, and $probe again over no input) -- this is a verdict about the FILTER, not the tree" >&2
+    else
+        echo "header-filter: grep exited $3 matching the $1 filter, which compiles (grep exited $probe over no input), so which headers it selects is not known -- this is the CHECK failing, not a verdict about the filter" >&2
+    fi
+}
+
 # Which of @p 4's paths the filter takes in ONE spelling, as `,<line>,<line>,` -- 1-based input
 # lines, the shape `[[ $set == *",$i,"* ]]` asks. One `grep -n` per regex over the whole spelled
 # list, never one per path.
@@ -100,14 +116,14 @@ header_filter_taken_lines() {
     local status matched=""
     taken="$(grep -nE -- "$include" < <(printf '%s' "$spelled"))" && status=0 || status=$?
     if [[ "$status" -gt 1 ]]; then
-        echo "header-filter: grep exited ${status} matching the include filter, so which headers it takes is not known -- this is the CHECK failing, not a verdict about the filter" >&2
+        header_filter_grep_failure include "$include" "$status"
         return 2
     fi
     excluded=","
     if [[ -n "$exclude" ]]; then
         matched="$(grep -nE -- "$exclude" < <(printf '%s' "$spelled"))" && status=0 || status=$?
         if [[ "$status" -gt 1 ]]; then
-            echo "header-filter: grep exited ${status} matching the exclude filter, so which headers it drops is not known -- this is the CHECK failing, not a verdict about the filter" >&2
+            header_filter_grep_failure exclude "$exclude" "$status"
             return 2
         fi
         while IFS= read -r line; do

@@ -569,40 +569,42 @@ $DeadPeerTotalMs   = 2000
 # did not serve skips. `fastcache-cc --help` says the same under FASTCACHE_TIMEOUT.
 $DeadPeerExchanges = 2
 
-# What ONE exchange can cost against each dead shape -- the deadline that ends it -- and so the
-# bound each shape is held to. A table, because the shapes spend different deadlines:
+# What ONE exchange can cost against each dead shape -- the deadline that ends it -- from which the
+# leg's HANG bound is composed. A table, because the shapes spend different deadlines:
 #   never-accepting    the connect completes into the backlog, so the exchange runs out TOTAL
 #   refused            the dial fails: at once on Linux, after SYN retries on Windows, never past CONNECT
 #   accept-then-reset  the RST arrives at once; at most CONNECT
-# A shape's EXCHANGE bound is N x cost + cost / 2: N exchanges fit with half an exchange to
-# spare, and ONE exchange more overshoots it by half an exchange of that shape. The shared
-# bound this replaces, baseline + N x (connect + total), left never-accepting -- which never
-# spends a connect -- exactly one whole exchange of slack, so a launcher retrying a failed
-# fetch once passed it (review I-1: green by 89 and 8 ms on Windows). A shape whose exchanges
-# cost NOTHING in practice -- the reset, and a refusal on Linux -- cannot be held to a count by
-# time at all; the reset leg counts its exchanges instead, and so does never-accepting, whose
-# listener keeps every connection the launcher made in its backlog (measured on Windows: a
-# connection closed or reset before it is accepted is still accepted afterwards).
 #
-# That bound is judged on the time the LAUNCHER says it spent on the cache -- `direct-ms` plus
-# `cache-ms`, from its own invocation record -- never on the wall clock, which also carries the
-# compile and the process start. Those are what a loaded runner delays: round 8 put two legs
-# past a wall-clock bound with half an exchange of slack (refused, never-accepting), on a tree
-# whose launcher and fixture had passed seven Windows legs unchanged. The wall clock keeps a
-# bound of its own, as the HANG detector, wide enough that load does not reach it.
+# HOW MANY exchanges a leg spent is COUNTED, never inferred from time. Every cache exchange the
+# launcher makes goes through one door that says so on its verbose trace (`cache exchange (...)`),
+# and each leg asks for exactly $DeadPeerExchanges such lines. The two shapes whose peer can count
+# too -- the reset accepts every connection, and never-accepting's listener keeps every one in its
+# backlog (measured on Windows: a connection closed or reset before it is accepted is still
+# accepted afterwards) -- must agree with the trace, which is what makes the launcher's own count
+# trustworthy on the one shape whose peer cannot count: refused.
 #
-# A self-report is trusted only where it can be FALSIFIED, so a shape whose exchange cannot end
-# before a deadline also has a FLOOR: N x that deadline, less a timer's resolution. A peer that
-# never answers ends each exchange only at TOTAL, and load can only lengthen it, so the floor adds
-# no flakiness -- and a launcher whose `cache-ms` reads 0, or is taken at the wrong point, fails
-# it. Refused has no floor although Windows runs a refused dial out to CONNECT (2008 ms measured
-# for two): that is Windows' SYN-retry behaviour, not this launcher's, and a leg that went red
-# when it changed would be judging the platform. The reset's exchanges end at once.
+# Time judged the count twice, and both times it measured the HOST rather than the launcher. On the
+# wall clock (round 8) the compile and the process starts rode along; on the launcher's own
+# `direct-ms` + `cache-ms` (round 9) a refused leg on a starved runner spent 3616 ms against two
+# 1000 ms dials, with that compiler's live baseline at 3242 ms and the next one's at 150. Measured
+# here: a launcher FROZEN for 1.5 s inside a refused dial reports ~2810 ms for its two exchanges --
+# a deadline cannot fire while the process does not run -- and its trace still counts two. 128
+# busy processes on 32 cores moved neither number. The count is the same however slow the machine
+# is; no slack on a time is.
 #
-# BLIND SPOT, failing OPEN below 10 s: time OUTSIDE `direct-ms` and `cache-ms` -- a back-off before
-# the fall-back, a wait between the fetch and the compile, a store after a failed fetch -- is judged
-# only by the hang bound, and an extra exchange outside those spans only by the legs that COUNT
-# connections (never-accepting and the reset), never by refused's time.
+# Time is still judged where it cannot be fooled by a slow host. A shape whose exchange cannot end
+# before a deadline has a FLOOR: N x that deadline, less a timer's resolution. A peer that never
+# answers ends each exchange only at TOTAL, and load can only lengthen it -- so a launcher whose
+# `cache-ms` reads 0, or is taken at the wrong point, fails it. Refused has no floor although
+# Windows runs a refused dial out to CONNECT: that is Windows' SYN-retry behaviour, not this
+# launcher's. The reset's exchanges end at once. And the wall clock bounds the whole leg as the
+# HANG detector: N x cost + cost / 2, plus the baseline, plus $DeadPeerWallSlackMs.
+#
+# BLIND SPOTS, failing OPEN. A retry INSIDE one exchange -- below the door, in the dial -- is one
+# trace line: the counted shapes see it as an extra connection, refused does not see it at all.
+# And a WAIT anywhere -- a back-off, a wait before the direct attempt or the compile, a store after
+# a failed fetch -- is judged only by the hang bound, while an exchange it makes is a trace line
+# and counted.
 $DeadPeerShapeCostMs = [ordered]@{
     'refused'           = $DeadPeerConnectMs
     'never-accepting'   = $DeadPeerTotalMs
@@ -625,9 +627,8 @@ function Get-ObjectDigest([string]$path) {
     return [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes))
 }
 
-# What the wall clock may run past a leg's exchange bound before the leg is called a hang: the
-# compile, two process starts and the scheduling a loaded runner adds to them, none of which an
-# exchange bound measures.
+# What the wall clock may run past the most N exchanges may take before a leg is called a hang:
+# the compile, two process starts and whatever a starved runner adds to them.
 $DeadPeerWallSlackMs = 10000
 
 # A loopback port nothing listens on: bound, read and released. What connects to it is refused.
@@ -651,8 +652,9 @@ function New-SilentListener {
 # MONOTONIC clock has passed. With $resetOn, every connection that listener takes while the
 # launcher runs is accepted and then reset (a zero linger turns the close into an RST). The
 # launcher records into $state, a directory of this leg's own, so its one record is read back.
-# Returns @{ code; stderr; elapsedMs; timedOut; resets; spentMs }, `spentMs` being the
-# launcher's own `direct-ms` + `cache-ms`, or $null when it left not exactly one record.
+# Returns @{ code; stderr; elapsedMs; timedOut; resets; spentMs; exchanges }, `spentMs` being the
+# launcher's own `direct-ms` + `cache-ms`, or $null when it left not exactly one record, and
+# `exchanges` the `cache exchange (...)` lines on its verbose trace.
 function Invoke-LauncherDeadPeer([string]$compiler, [string]$srcRoot, [string]$buildTree, [string]$obj,
                                  [string]$addr, [long]$boundMs, $resetOn, [string]$state) {
     $env:FASTCACHE_ADDR            = $addr
@@ -705,7 +707,8 @@ function Invoke-LauncherDeadPeer([string]$compiler, [string]$srcRoot, [string]$b
         $spent = if ($records.Count -eq 1) {
             [long](Get-E2ELauncherLogField $records[0] 'direct-ms') + [long](Get-E2ELauncherLogField $records[0] 'cache-ms')
         } else { $null }
-        return @{ code = $code; stderr = $err; elapsedMs = $elapsed; timedOut = $timedOut; resets = $resets; spentMs = $spent }
+        $exchanges = @($err -split "`r?`n" | Where-Object { $_ -match '^fastcache-cc: cache exchange \(' }).Count
+        return @{ code = $code; stderr = $err; elapsedMs = $elapsed; timedOut = $timedOut; resets = $resets; spentMs = $spent; exchanges = $exchanges }
     } finally {
         Remove-Item $errFile -ErrorAction SilentlyContinue
         Remove-Item Env:\FASTCACHE_CONNECT_TIMEOUT, Env:\FASTCACHE_TIMEOUT -ErrorAction SilentlyContinue
@@ -747,7 +750,7 @@ function Test-DeadPeers([string]$compiler) {
             $exchangeBoundMs = $DeadPeerExchanges * $costMs + [long]($costMs / 2)
             $exchangeFloorMs = if ($DeadPeerShapeFloorMs[$shape] -gt 0) { $DeadPeerExchanges * $DeadPeerShapeFloorMs[$shape] - $DeadPeerTimerToleranceMs } else { 0 }
             $boundMs = $base.elapsedMs + $exchangeBoundMs + $DeadPeerWallSlackMs
-            Write-Host "  $shape : exchange bound $exchangeBoundMs ms = $DeadPeerExchanges x $costMs + $costMs / 2 ms; hang bound $boundMs ms = baseline + that + $DeadPeerWallSlackMs ms"
+            Write-Host "  $shape : exactly $DeadPeerExchanges exchange(s); hang bound $boundMs ms = baseline + $DeadPeerExchanges x $costMs + $costMs / 2 + $DeadPeerWallSlackMs ms"
             Remove-Item $obj -Force -ErrorAction SilentlyContinue
             $listener = $null
             try {
@@ -772,22 +775,23 @@ function Test-DeadPeers([string]$compiler) {
             # fetch once would pass every bound here and still fail this.
             $fellBack = $r.stderr -match '\(fetch exchange failed\)'
             $counted = $shape -in @('accept-then-reset', 'never-accepting')
-            $reached = (-not $counted) -or $r.resets -eq $DeadPeerExchanges
-            $withinExchanges = ($null -ne $r.spentMs) -and $r.spentMs -le $exchangeBoundMs -and $r.spentMs -ge $exchangeFloorMs
+            $traced = $r.exchanges -eq $DeadPeerExchanges
+            $reached = (-not $counted) -or $r.resets -eq $r.exchanges
+            $aboveFloor = ($null -ne $r.spentMs) -and $r.spentMs -ge $exchangeFloorMs
             $built = (Test-Path $obj) -and ((Get-ObjectDigest $obj) -eq $expected)
-            if (-not $r.timedOut -and $r.code -eq 0 -and $built -and $fellBack -and $reached -and $withinExchanges) {
-                Write-Host "  $shape : compiled locally in $($r.elapsedMs) ms, $($r.spentMs) ms of it on the cache (floor $exchangeFloorMs, bound $exchangeBoundMs), object matches the baseline: OK ($compiler)" -ForegroundColor Green
+            if (-not $r.timedOut -and $r.code -eq 0 -and $built -and $fellBack -and $traced -and $reached -and $aboveFloor) {
+                Write-Host "  $shape : compiled locally in $($r.elapsedMs) ms after $($r.exchanges) exchange(s), $($r.spentMs) ms of it on the cache (floor $exchangeFloorMs), object matches the baseline: OK ($compiler)" -ForegroundColor Green
                 continue
             }
             $why = if ($r.timedOut) { "still running at the $boundMs ms hang bound, stopped" }
                    elseif ($r.code -ne 0) { "exit $($r.code)" }
                    elseif (-not $built) { "no object, or not the baseline's" }
                    elseif (-not $fellBack) { "no 'fetch exchange failed' fall-back, so the peer was never asked" }
-                   elseif (-not $reached) { "the peer took $($r.resets) connection(s), want exactly $DeadPeerExchanges -- one per exchange" }
+                   elseif (-not $traced) { "the launcher traced $($r.exchanges) cache exchange(s), want exactly $DeadPeerExchanges" }
+                   elseif (-not $reached) { "the peer took $($r.resets) connection(s) while the launcher traced $($r.exchanges) exchange(s) -- its own count is not to be trusted" }
                    elseif ($null -eq $r.spentMs) { "the launcher left no single invocation record, so the time it spent on the cache is unknown" }
-                   elseif ($r.spentMs -lt $exchangeFloorMs) { "the launcher reported $($r.spentMs) ms on the cache, under the $exchangeFloorMs ms that $DeadPeerExchanges exchange(s) with a silent peer cannot end before -- its own timer is not measuring the exchanges" }
-                   else { "the launcher spent $($r.spentMs) ms on the cache, past the $exchangeBoundMs ms that $DeadPeerExchanges exchange(s) may take -- one exchange too many" }
-            Write-Host "  DEAD-PEER FAIL ($compiler, $shape): $why; $($r.elapsedMs) ms, $($r.resets) connection(s)" -ForegroundColor Red
+                   else { "the launcher reported $($r.spentMs) ms on the cache, under the $exchangeFloorMs ms that $DeadPeerExchanges exchange(s) with a silent peer cannot end before -- its own timer is not measuring the exchanges" }
+            Write-Host "  DEAD-PEER FAIL ($compiler, $shape): $why; $($r.elapsedMs) ms, $($r.exchanges) traced exchange(s), $($r.resets) connection(s)" -ForegroundColor Red
             Write-Host $r.stderr
             $ok = $false
         }

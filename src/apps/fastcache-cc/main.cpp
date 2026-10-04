@@ -1649,6 +1649,38 @@ struct ProbedDependencies
 
 // --- the cache flow ---------------------------------------------------------
 
+/// One exchange with the cache daemon, and the only door to one: every FETCH and STORE this
+/// file makes goes through here, so the verbose trace says each one happened and how it ended.
+///
+/// That line is the launcher's own COUNT of its exchanges, which is what lets a test ask how many
+/// a compile against a dead cache spent without inferring it from time. The time an exchange
+/// takes includes whatever the host does to this process meanwhile -- a starved CI runner put a
+/// refused leg 1616 ms past two 1000 ms dials (round 9) -- while the count is the same however
+/// slow the machine is.
+/// @param record The invocation record, for the trace's verbosity.
+/// @param what Which exchange, for the trace: `manifest fetch`, `fetch`, `store`, `manifest store`.
+/// @param addr The daemon's address.
+/// @param frame The request.
+/// @param credential Presented with the request.
+/// @param budget The exchange's deadlines.
+/// @return The outcome, as `Cc::RunOneExchange` gave it.
+[[nodiscard]] Cc::CacheOutcome CacheExchange(InvocationRecord const& record,
+                                             std::string_view what,
+                                             std::string_view addr,
+                                             std::vector<std::byte> frame,
+                                             Cc::Credential credential,
+                                             Cc::ExchangeBudget budget)
+{
+    auto outcome = Cc::RunOneExchange(addr, Notice(record.verbose), std::move(frame), std::move(credential), budget);
+    Note(record.verbose,
+         std::format("cache exchange ({}) with {}: {}",
+                     what,
+                     addr,
+                     outcome.kind == Cc::CacheOutcomeKind::Transport ? Cc::DescribeTransportFailure(outcome.transportFailure)
+                                                                     : std::string_view { "answered" }));
+    return outcome;
+}
+
 /// FETCH one key and return its raw stored bytes, or nullopt on miss or any
 /// transport failure. Used for manifests, whose payload is not a compile-value.
 /// @param record The invocation record; read here, never written.
@@ -1661,7 +1693,7 @@ struct ProbedDependencies
 {
     auto const presented = Tickets(cfg, record.verbose).Present(cfg.addr);
     auto outcome =
-        Cc::RunOneExchange(cfg.addr, Notice(record.verbose), Wire::EncodeFetch(key), presented.credential, BudgetOf(cfg));
+        CacheExchange(record, "manifest fetch", cfg.addr, Wire::EncodeFetch(key), presented.credential, BudgetOf(cfg));
     if (!outcome.IsHit())
     {
         WarnIfRejected(record, outcome, presented.missing, "manifest fetch", key);
@@ -1704,15 +1736,16 @@ void StoreRaw(InvocationRecord const& record,
     // otherwise, and a manifest that never lands makes direct mode look simply
     // ineffective.
     auto const presented = Tickets(cfg, record.verbose).Present(addr);
-    auto const outcome = Cc::RunOneExchange(addr,
-                                            Notice(record.verbose),
-                                            Wire::EncodeStore(Wire::StoreRequest { .key = key,
-                                                                                   .prefetchGroup = cfg.prefetchGroup,
-                                                                                   .srcRoot = cfg.srcRoot,
-                                                                                   .buildTree = cfg.buildTree,
-                                                                                   .value = Wire::AsBytes(body) }),
-                                            presented.credential,
-                                            BudgetOf(cfg));
+    auto const outcome = CacheExchange(record,
+                                       "manifest store",
+                                       addr,
+                                       Wire::EncodeStore(Wire::StoreRequest { .key = key,
+                                                                              .prefetchGroup = cfg.prefetchGroup,
+                                                                              .srcRoot = cfg.srcRoot,
+                                                                              .buildTree = cfg.buildTree,
+                                                                              .value = Wire::AsBytes(body) }),
+                                       presented.credential,
+                                       BudgetOf(cfg));
     WarnIfRejected(record, outcome, presented.missing, "STORE (raw)", key);
 }
 
@@ -2958,8 +2991,8 @@ void RecordManifest(InvocationRecord const& record,
     // FETCH.
     {
         auto const presented = Tickets(cfg, record.verbose).Present(cfg.addr);
-        auto const outcome = Cc::RunOneExchange(
-            cfg.addr, Notice(record.verbose), Wire::EncodeFetch(key), presented.credential, BudgetOf(cfg));
+        auto const outcome =
+            CacheExchange(record, "fetch", cfg.addr, Wire::EncodeFetch(key), presented.credential, BudgetOf(cfg));
         fetchKind = outcome.kind;
         if (!Cc::CacheIsServing(fetchKind))
         {
@@ -3319,15 +3352,16 @@ void RecordManifest(InvocationRecord const& record,
     // a transport failure, which reads the same way it always did.
     auto const presented = Tickets(cfg, record.verbose).Present(cfg.addr);
     auto const outcome =
-        Cc::RunOneExchange(cfg.addr,
-                           Notice(record.verbose),
-                           Wire::EncodeStore(Wire::StoreRequest { .key = plan.objectKey,
-                                                                  .prefetchGroup = cfg.prefetchGroup,
-                                                                  .srcRoot = cfg.srcRoot,
-                                                                  .buildTree = cfg.buildTree,
-                                                                  .value = std::span<std::byte const> { encoded } }),
-                           presented.credential,
-                           BudgetOf(cfg));
+        CacheExchange(record,
+                      "store",
+                      cfg.addr,
+                      Wire::EncodeStore(Wire::StoreRequest { .key = plan.objectKey,
+                                                             .prefetchGroup = cfg.prefetchGroup,
+                                                             .srcRoot = cfg.srcRoot,
+                                                             .buildTree = cfg.buildTree,
+                                                             .value = std::span<std::byte const> { encoded } }),
+                      presented.credential,
+                      BudgetOf(cfg));
     if (outcome.IsHit())
         Note(record.verbose, std::format("STORED key={} bytes={}", plan.objectKey, encoded.size()));
     else if (outcome.kind == Cc::CacheOutcomeKind::Rejected)

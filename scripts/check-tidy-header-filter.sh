@@ -321,12 +321,27 @@ src/CowTree/Tree.hpp"
         fi
         # And the rest of the shape, audited rather than left to the next red: the filter's own
         # grep behind `|| true` read as "takes nothing", and the names' sort as "declares none".
+        # A grep that fails ONCE -- killed during the match -- over a filter that compiles: the
+        # first call fails, every later one is the real grep. That is the CHECK failing.
         cases=$((cases + 1))
-        got="$(grep() { return 2; }; header_filter_taken_lines '.*' '' "$tree" posix 'src/a.h' 2>&1 >/dev/null)" && status=0 || status=$?
-        if [[ "$status" == 2 && "$got" == *"grep exited 2 matching the include filter"* ]]; then
+        rm -f "$tree/.grep-failed"
+        got="$(grep() { if [[ ! -e "$tree/.grep-failed" ]]; then : > "$tree/.grep-failed"; return 2; fi; command grep "$@"; }
+               header_filter_taken_lines '.*' '' "$tree" posix 'src/a.h' 2>&1 >/dev/null)" && status=0 || status=$?
+        rm -f "$tree/.grep-failed"
+        if [[ "$status" == 2 && "$got" == *"grep exited 2 matching the include filter, which compiles"*"the CHECK failing"* ]]; then
             echo "   ok   a filter grep that fails is refused naming grep, never read as taking nothing"
         else
             echo "   FAIL a filter grep that fails is refused naming grep, never read as taking nothing: status $status, [$got]"
+            failures=$((failures + 1))
+        fi
+        # And a filter whose own pattern does not compile -- the same status 2 from grep -- is the
+        # FILTER's fault, said so, never blamed on the check.
+        cases=$((cases + 1))
+        got="$(header_filter_taken_lines 'src/(a' '' "$tree" posix 'src/a.h' 2>&1 >/dev/null)" && status=0 || status=$?
+        if [[ "$status" == 2 && "$got" == *"the include filter 'src/(a' does not compile"*"verdict about the FILTER"* && "$got" != *"the CHECK failing"* ]]; then
+            echo "   ok   a filter that does not compile is refused as the filter's fault, not the check's"
+        else
+            echo "   FAIL a filter that does not compile is refused as the filter's fault, not the check's: status $status, [$got]"
             failures=$((failures + 1))
         fi
         cases=$((cases + 1))
