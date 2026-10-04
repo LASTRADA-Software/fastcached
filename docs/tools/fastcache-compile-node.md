@@ -2886,9 +2886,10 @@ only lets it act sooner.
   wakes. Until then a worker whose registrations were withdrawn, or expired while
   it slept, is absent from the fleet: nothing is leased to it, and clients
   compile elsewhere or locally.
-- **A roster that lapsed while the machine slept** (the voters' endorsement lasts
-  an hour) is renewed by the next ordinary presence round, again with no event
-  needed. Until it is, the worker refuses every grant it cannot verify.
+- **A machine that slept past the isolation bound** -- 65 minutes with no word
+  from a leader its fleet counts -- refuses every grant until that leader speaks to
+  it again, which its first consensus session after waking brings, with no event
+  needed. It raises `consensus-leader-silent` meanwhile.
 
 Only a service hears power events: a worker run in the foreground hears network
 changes alone, and on Linux and macOS the node hears neither and relies on its

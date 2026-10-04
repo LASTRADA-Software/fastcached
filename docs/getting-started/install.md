@@ -76,6 +76,9 @@ $USER` if you want it running while you are not logged in.
 
 ### Windows
 
+Setting up several PCs as one fleet? [Running a Windows office fleet](../operations/windows-office-fleet.md)
+is the runbook: which machine to install first, how the others join, and how to approve them.
+
 Run the MSI and choose what this machine runs: **fastcached** (the cache daemon),
 **fastcache-cc** (the compiler launcher), **fastcache-compile-node** (the compile
 worker), and the command-line client, which is always installed. The installer
@@ -166,8 +169,8 @@ Uninstalling removes the services and leaves your configuration in place.
 Registering a service also opens the Windows Firewall for whatever it listens on beyond
 loopback — nothing, for fastcached's default `127.0.0.1:6674` — and uninstalling, or
 deselecting a feature, removes its rules. An upgrade that drops a feature deletes its
-registration but leaves its rule group (`fastcached: <service>`) behind, inert, since it
-names a program that is no longer installed. What each binary opens is on its own page:
+registration and its rule group (`fastcached: <service>`) as well; only its event source
+stays, inert, since it names a program that is no longer installed. What each binary opens is on its own page:
 [fastcached](../operations/deployment.md#windows-service) and
 [fastcache-compile-node](../tools/fastcache-compile-node.md#macos-and-windows).
 
