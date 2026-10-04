@@ -660,8 +660,7 @@ fixes, and one number covering both tells you neither.
 > removed, still minting).
 
 The `..._lease_*` counters move only on a worker that checks leases: a consensus
-member -- a learner included -- against the state it applies, or a worker holding a roster
-an earlier run kept. A worker that checks nothing says so at startup rather than leaving
+member -- a learner included -- against the state it applies. A worker that checks nothing says so at startup rather than leaving
 these at zero and looking healthy — and one another machine could dial is refused
 outright ([#282](https://github.com/LASTRADA-Software/fastcached/issues/282),
 [#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
@@ -677,7 +676,8 @@ presented twice is somebody replaying a credential.
 
 The rest carry codes of their own — `..._endpoint_mismatch_total` answers
 `lease-endpoint-mismatch`, `..._expired_total` answers `lease-expired`, and
-`..._no_roster_total` and `..._roster_expired_total` both answer `roster-expired`,
+`..._no_roster_total` and `..._isolated_total` both answer `grant-unverifiable` (`0x31`;
+`0x28`, once `roster-expired`, is retired and never reused),
 which says the *worker* can check nobody's lease right now rather than that this one is
 bad — so an alert written against `lease-unauthorized` will not see them. That is deliberate and it is
 `LeaseRefusalTable` in `LeaseToken.hpp` that decides it: a client can act differently

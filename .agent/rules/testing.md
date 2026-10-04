@@ -1864,6 +1864,16 @@ all-red run would equally be a harness that had stopped working. A green test no
 has watched fail is an untested test — the sentence `compile-cache.md` applies to a
 guard, applied here to the thing the guard is made of.
 
+**A neuter that turns a red into a HANG proves nothing**, so a case whose broken rule would
+make the code under test LOOP must be built to end red. Two shapes, both measured in one
+fix round on lane 2a (T19/T20): a case that let a reforming body reform at EVERY body grew
+the test process past 69 GB under its neuter, and a lock probe that destroyed a
+`std::async` future inside the call it was watching deadlocked under its own -- a
+`std::async` future WAITS in its destructor. So a fixture asks for a repeat only once (a
+reforming body reforms once, then the case asserts), and never lets such a future go out of
+scope inside the call it observes. This is the *A failing `REQUIRE` above an explicit
+`Stop()` turns a RED into a HANG* entry's sibling on the neuter side.
+
 **Three of the five were acceptance criteria**, written by the person who understood
 the defect best, at the moment they understood it best. That is not carelessness.
 *What would prove this fixed* and *what would fail if it were not* are different
@@ -1944,6 +1954,14 @@ mutation, and read back through that binding afterwards.
 - Neutering is what catches it, and only if the neuter is the one the fixture's shape
   hides: reverting `Oracle()` to the two-object form reddens the corrected case and
   nothing else, and reddened the original not at all.
+- **A harness drives the production CHANNEL and SURFACE over a fake wire, never its own
+  reimplementation of either** (lane 2a, T21): a copy cannot state a field the real one gets
+  wrong. The formation harness's own `MachineChannel`/`MachineProbe` stayed green under the
+  join defect 5ea99fa9f fixed; over production's `DialledEnrollChannel` the same neuter turns
+  seven cases red (measured on that lane). Its sibling: **seed the harness where production
+  seeds**. A body handed the WHOLE applied state up front made the adoption that follows the
+  state deletable with nothing red, until a second learner joined a body that was not rebuilt
+  -- the update path had never run.
 
 ## A query that FAILED is not an observation about the subject
 
@@ -2280,6 +2298,17 @@ them ran the code that runs in production.
   export has no `.git`, takes the walk, says so, and reaches the same verdict — which
   is what makes the fallback sound there and unsound in a working checkout, where a
   dependency cache lives inside the source tree.
+- **A fixture that MAKES its tree a repository writes it through `scratch_git`, never bare
+  `git`** (`scripts/lib/git-scrub.sh`; `fastcached_scratch_git` in `CheckCommon.cmake`). Every
+  `git init`, `git add` and commit obeys `GIT_DIR`, `GIT_WORK_TREE` and the rest of
+  `scripts/lib/git-scrub-variables.txt` when they are in the environment, and then writes the
+  repository they NAME instead of the scratch tree: an exported `GIT_DIR` around a `ctest -L
+  hygiene` run made every scratch `git init` write `core.worktree` into the configuration all
+  of this repository's worktrees share (2026-10-02), which broke git in every one of them. The
+  scrub is folded into the command, per command and in a subshell, and `ctest -R scratch-git`
+  in the default set refuses a scratch write spelled any other way. A scratch READ is left
+  alone on purpose: under a hijacked `GIT_DIR` it answers about the wrong index and fails the
+  case loudly. And never EXPORT `GIT_DIR` around a harness at all; scope it to one command.
 
 ## A SKIP that ctest scores as a failure
 
@@ -2881,7 +2910,7 @@ green Linux run is not evidence about it.
 
 ## A launcher fixture records only into its run's own state directory
 
-<!-- agent-tripwire: none: this lane's AGENT.md bullet waits on the final consolidation, pending proposal [25] in integration-log.txt -->
+<!-- agent-tripwire: A fixture handed a launcher records ONLY into its run's own state directory -->
 
 The launcher records every invocation in `<state>/fastcache-cc/invocations.log`, and
 `-z` / `--zero-stats` DELETES that file. `<state>` is the DEVELOPER's — `%LOCALAPPDATA%` on

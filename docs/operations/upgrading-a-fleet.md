@@ -136,28 +136,29 @@ key -- a node by the key it proves, a client by the machine ticket its own node 
 forgotten by that key with `--cluster-forget`. Each is refused by name, with the step that
 replaces it, on a command line, in a configuration file and in a service registration.
 
-## Signed leases and the certified roster
+## Signed leases, checked against the state each node applied
 
 **#178 signs every lease with the issuing scheduler's own identity key and has every
-worker check it against a roster of the cluster's voters**, where a lease was an HMAC
-under the shared key. `0xFC` moved to version 13 for it (NODE-ANNOUNCE carries a
-voter's endorsement out and the certified roster back), the replicated cluster state
-to version 7 (it records the roster's version), the replicated commands to version 4
+worker check it against the cluster's voters**, where a lease was an HMAC under the
+shared key. `0xFC` moved to version 13 for it, the replicated commands to version 4
 (`--cluster-forget` now revokes the key of what it forgets, #1555), and the lease format
-to 3. Nothing older reads any of them, so this is the whole-fleet step above, with three
-changes to what each machine is started with:
+to 3. The certified roster that first carried the voters to a worker -- endorsements on
+NODE-ANNOUNCE, `--voter-key` anchors, a kept roster file and the `roster-expired` refusal --
+is **retired**: every worker is now a member of its fleet, a learner or a voter, and checks a
+grant against the state its own consensus applied. Nothing older reads any of it, so this is
+the whole-fleet step above, and what each machine is started with gets simpler:
 
-1. **Every scheduler runs consensus, even alone.** Add `--listen-raft` and
-   `--raft-self` (and `--cluster-dir`, for a service) to a scheduler that had none; it
-   is a cluster of one. One without them is refused at startup, by name.
-2. **Every worker another machine can reach joins the fleet as a learner.** It applies the
-   fleet's replicated state and checks every grant against it, so there is no key to type:
-   start it with no `--scheduler` (`--fleet-seed=<host>` where no beacon reaches) and
-   approve it on a voter with `--enroll-approve`. A worker only its own machine can reach
-   checks no grant and needs neither.
+1. **Every node runs consensus, by default.** A first start is a cluster of one, on
+   `--listen-raft`'s default port `6680`, with this machine's name as its consensus address;
+   nothing is added to a command line. `--voter-key` is gone, and a command line naming it is
+   refused as a flag this node does not have.
+2. **Every other machine joins the fleet as a learner.** It finds the fleet by beacon, or by
+   `--fleet-seed=<host>` where no beacon reaches, asks to join, and is approved on a voter with
+   `--enroll-approve` (or under `--enroll-auto-approve`); see
+   [cluster discovery](../getting-started/cluster-discovery.md). There is no key to type.
 3. **Confirm on the workers.** `fastcache_worker_jobs_refused_lease_no_roster_total`
-   rising without stopping means a worker holds nothing to check a grant against: it has
-   not been admitted yet.
+   rising without stopping means a worker's applied state names no voter yet: it has not been
+   admitted, and its leases are refused `grant-unverifiable`.
 
 ## The consensus state directory
 
@@ -169,7 +170,7 @@ moved, each refused by name rather than misread:
 |---|---|---|
 | The Raft store in `--cluster-dir` (`raft-state`, `raft-log`, `raft-snapshot`) | format 2: a configuration carries voters and learners, and every log record carries the format it was written in | `UnsupportedFormatVersion` — never the damage code — naming the format it found and the one it reads |
 | The consensus peer wire | version 3 (4 since #178, above) | refused at the handshake by its version, never read as this layout -- a fleet's consensus members upgrade together |
-| The replicated cluster state (a snapshot, and the `--cluster-status` reply) | version 5: each member records its seat | `UnsupportedVersion`, naming both versions |
+| The replicated cluster state (a snapshot, and the `--cluster-status` reply) | version 5 for #1449, which records each member's seat; this build writes version 9 | `UnsupportedVersion`, naming both versions |
 
 The store has **no conversion**, and a node started on an older one refuses to start,
 saying so. **So does a node whose store is this build's but whose snapshot or retained
@@ -202,10 +203,10 @@ and the reason to finish an upgrade rather than leave it half done.
 
 Whatever the cluster agreed at **runtime** has to be agreed again once a leader is
 elected: members admitted with `--cluster-admit` or `--cluster-admit-learner`, and
-cluster settings (`--cluster-set`). Members found by `--discovery` are re-admitted by
-discovery itself, as **learners** — promote the ones that voted again with
-`--cluster-admit` — and so is a machine the cluster had forgotten, because its tombstone
-was part of the state that was moved aside; forget it again. Nothing a build writes
+cluster settings (`--cluster-set`). Discovery admits nobody, so every other machine asks
+to join again and is approved again, as a **learner** — promote the ones that voted again
+with `--cluster-admit` — and a machine the cluster had forgotten can ask too, because its
+revoked key was part of the state that was moved aside; forget it again. Nothing a build writes
 into `--cache-dir` is involved.
 
 This is backwards compatibility not being owed yet, and it is stated rather than

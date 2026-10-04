@@ -1199,7 +1199,7 @@ Every rule below has already been a bug.
       serving one**, and a liveness probe that asks nothing is the confident wrong signal.
       The ADMIN loop is the one `/healthz` cannot report, since the thread that would answer
       `503` is the one that ended -- a probe times out instead, measured -- so on the node its
-      end is carried by that condition row (`--node-status` and the fleet page, both over
+      end is carried by that condition row (NODE-STATUS (`fastcache-cli node`) and the fleet page, both over
       other surfaces), and the daemon has only the `Error` line.
     - A fixture that ends a loop by answering some error is now a fixture that SPINS: it
       must answer `Cancelled`, the way a closed listener does. core-cpp's

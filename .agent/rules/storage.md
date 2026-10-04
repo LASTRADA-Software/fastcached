@@ -240,7 +240,7 @@ damage says which binary it is about.
 
 ## What a tier's byte figures are denominated in
 
-<!-- agent-tripwire: A tier's `bytesUsed` is denominated differently per tier -->
+<!-- agent-tripwire: Both tiers' `bytesUsed` count STORED bytes -->
 
 **Both tiers count STORED bytes; the disk tier counts its page footprint.** It was
 otherwise until the file-growth fix (owner decision, 2026-10-03): `CowTreeStorage`

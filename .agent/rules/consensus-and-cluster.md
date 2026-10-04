@@ -277,6 +277,23 @@ Every rule below has already been a bug.
     because that would be a confident wrong signal of safety. The threat model is stated in
     `docs/getting-started/cluster-discovery.md`: a key pin stops a LAN impostor; an unpinned node
     trusts on first use.
+    - **Trust on first use, for the FIRST join only (threat model).** A solitary machine that
+      finds a fleet by beacon cannot tell a legitimate fleet from a rogue one on the same LAN:
+      both prove only possession of their own keys, so an unpinned machine's first join request
+      can be captured by a rogue fleet, whose own approval is then the only gate. That exposure
+      is ACCEPTED for an unpinned node, and four things bound it. (1) A `--fleet-seed` typed at
+      install outranks every beacon (`FleetOriginPreference` ranks it first, `PreferredTarget`
+      reads the rank before age), and a solitary beat asks every typed seed it has not asked
+      before it decides on anything (`FormationController::TickSolitary`). (2) Once a machine is
+      in a fleet it never YIELDS to another: `FormationTransitions` has no `YieldDecided` row out
+      of `Learner` or `Voter`, and another established fleet raises `foreign-fleet-visible`
+      instead. The one way a fleet moves as a whole is healing a split of ITSELF -- the
+      replicated `DissolveInto` its losing leader proposes on a VOTER's key (above), a different
+      trigger on evidence a key this fleet already held verifies. (3) Otherwise a machine leaves
+      a fleet only by an operator's forget, which archives the store and mints a NEW cluster id.
+      (4) `--fleet-id`'s key pin closes the first join itself. The residual is a machine's very
+      first boot, unpinned, on a LAN where a rogue fleet answers before any seed is configured;
+      an install-time `--fleet-seed` (`FASTCACHE_FLEET_SEED`) and `--fleet-id` are what close it.
     - **ONE predicate, `AdmitsFleet(pin, clusterId, signers)`**: the id compared WHOLE and one of the
       signers a pinned voter key. Asked of the summary yielded to (INSIDE `ClassifyEncounter`, a
       REQUIRED parameter, so beacon, seed, SRV and remembered routes are one decision --
@@ -337,7 +354,7 @@ Every rule below has already been a bug.
     *cluster id* is deliberately exempt: it is compared, and another fleet's is kept as a
     key of the bounded foreign table -- filtering it would take every peer away from a
     fleet named in some other encoding, silently. **It IS rendered**, in
-    `foreign-fleet-visible`'s detail, which reaches `--node-status`, the fleet page and the
+    `foreign-fleet-visible`'s detail, which reaches NODE-STATUS (`fastcache-cli node`), the fleet page and the
     live-stats rows; it is text there because `NodeConditions` escapes every detail's
     bytes that are not UTF-8 as `\xNN` and clamps its length, which is what a watch case
     with a non-UTF-8 cluster id pins.
@@ -496,8 +513,7 @@ simpler design gets wrong.
 - **The shape, because every other rule refers to it.** A voter's connections are one-way: the
   transport only writes, the server only reads, and a reply travels on the other node's
   own outbound connection. The one exception is a learner's, which the acceptor writes on too
-  (*A leader reaches a learner over the session the learner dials*, under Learners -- not yet
-  *never dials a learner*: the node still dials one whose record carries an address). So
+  (*A leader never dials a learner*, under Learners). So
   authentication is a short two-way prologue on an otherwise one-way stream
   (`Consensus/RaftPeerSession.hpp`):
   1. the ACCEPTOR sends a `Challenge` carrying its nonce and an ephemeral X25519 key,
@@ -717,9 +733,8 @@ simpler design gets wrong.
   proves itself with the new one whatever the bootstrap roster named. **A bootstrap key the
   state has revoked is revoked, whatever the bootstrap roster says** -- a restart from the
   same record must not bring it back, which would be removal failing open. A member the state
-  records with no key falls back to its bootstrap key only when that key is not revoked. A
-  principal is a stranger here: it never joins consensus. So a member admitted with no key
-  cannot be verified, and says so in `connections_refused_unknown_key` rather than trusting
+  records with no key falls back to its bootstrap key only when that key is not revoked. So a
+  member admitted with no key cannot be verified, and says so in `connections_refused_unknown_key` rather than trusting
   whoever answers first; `--print-identity` is how an operator gets a member's
   `--cluster-admit` line before it is admitted, minting into the state directory the start
   then reads. (Until the formation record, the bootstrap roster was `--raft-peer`'s
@@ -974,8 +989,8 @@ and it is recorded here because the question will be asked again.
   - Nothing is sent until the peer proves the key the roster records for that id.
     `NamedMachineTrust` checks BOTH halves: the id alone is a claim anybody can type, and the
     key alone accepts another fleet machine answering at a stale address.
-  - The role proven is *recorded MEMBER, under this id*. `LiveKeyOf` reads `members` only, so
-    a principal cannot be named, and there is no cache role of its own to prove.
+  - The role proven is *recorded MEMBER, under this id*. `LiveKeyOf` reads `members`, which is
+    every machine the fleet holds, and there is no cache role of its own to prove.
   - Every frame after the proof is sealed under the session key, so nothing captured on that
     leg replays.
   - Nothing a node holds as a secret is presented there. `SharedCacheUpstream` holds no
@@ -1303,6 +1318,12 @@ and it is recorded here because the question will be asked again.
     **Such a volume runs with a STATED durability gap**: a power loss there can resurrect an old
     vote or record -- PostgreSQL's `fsync_fname` precedent -- and the start probe's one warning and
     `fastcache_state_directory_syncs_unsupported_total` are what an operator sees of it.
+    - **On Windows a replace survives an open reader only with BOTH halves**: the reader opened
+      with delete sharing (`FILE_SHARE_DELETE`; `_wfopen` shares none) AND the rename made with
+      POSIX semantics (`FileRenameInfoEx`, `FILE_RENAME_FLAG_POSIX_SEMANTICS`,
+      `Platform/ReplacingRename`). Either alone is refused while the reader holds the file --
+      measured on NTFS and ReFS, Windows 10.0.26200 (lane 2a) -- so a writer that "works" in a
+      test with no concurrent reader fails the first time something reads the file meanwhile.
   - **The write order is snapshot-then-trim, and the crash window it leaves is
     the reason that order is right.** A crash between them leaves a durable
     snapshot beside a log that still holds the entries it covers, which
@@ -1949,8 +1970,8 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
   cannot be a fifth state `Tick` moves between: it is a `Follower` whose STANDING forbids the
   two things a follower may otherwise do. `Consensus::Configuration` is two disjoint sets with
   at least one voter, and `Membership::StandingOf(configuration, id)` is the ONE author of
-  *where does this node sit* -- `RaftNode::CurrentStanding`, `--node-status`'s
-  `consensus-standing`, the member series' `seat` label and the node's own log line all ask it.
+  *where does this node sit* -- `RaftNode::CurrentStanding`, NODE-STATUS's
+  `consensus-standing` (`fastcache-cli node`), the member series' `seat` label and the node's own log line all ask it.
   What a standing permits is `StandingTable`'s `timer` and `votes` columns, never a switch: a
   learner's row is `TimerKind::None`, so it has no election deadline at all rather than one it
   ignores. A LEADER keeps its heartbeat whatever its standing -- one demoted by a change it has
@@ -2013,16 +2034,16 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
   row's `link` to `Dialled` reddens the table case, the learner half of the `Validate` case, the
   addition case and the desire case, and leaves the voter half green; a report renders a learner's
   missing endpoint ABSENT (`cluster-members`, `--cluster-status`), never as a blank.
-- **A leader reaches a learner over the session the learner dials, and dials none it has no
-  address for -- NOT YET "never dials a learner": the node still dials a learner whose record
-  carries an address, until a learner node's own transport dials two-way, and restoring the plain
-  headline is owed with that change.** A learner sits behind NAT, a VPN or a laptop lid; a leader that dialled
-  it would spend its sender on an address that answers nothing. The learner dials every voter
+- **A leader never dials a learner.** A learner sits behind NAT, a VPN or a laptop lid; a leader
+  that dialled it would spend its sender on an address that answers nothing. The learner dials every voter
   two-way (`SessionDirection::TwoWay`, signed into the proof), the acceptor attaches the session
   to its transport (`IRaftInboundLinks`, `RaftSessionLink`), and `Send` to a peer the transport
   does not dial rides that session or is DROPPED and counted, never dialled: a dialled peer, else
-  an attached session, else a drop. A dialled peer wins, which is why the node's own dial of a
-  learner's recorded address still reaches it today. The drop is counted on the row for what the
+  an attached session, else a drop. The node dials only members whose seat is `Dialled`
+  (`ConsensusTier`'s `LearnMembers`, through `Cluster::LinkOfSeat`), so a learner's recorded
+  endpoint -- empty, or one it once had -- is nobody's to dial, and the "NOT YET" this headline
+  carried until a learner node's own transport dialled two-way (`NodeModeTable`'s `dials` column,
+  `TwoWay` for a learner) is gone with it. The drop is counted on the row for what the
   transport OBSERVED (`SendDrop`): a peer it was told dials in and has no session attached is
   `RaftSendsDroppedNoSession` -- a learner offline or not yet dialled, which waiting fixes -- and
   a peer it can place nowhere is `RaftSendsDroppedUnknownPeer`, which waiting does not. Folding
@@ -2120,8 +2141,9 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
 <!-- agent-tripwire: Only an ABSENT `node-key` mints (#178): a key file that is there and cannot be used is refused by name -->
 
 [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) PR 2: every node with a
-state directory holds an Ed25519 identity key, and `ClusterState` records members' keys,
-principals admitted by key, and keys revoked for good. PR 3 made the Raft peer wire VERIFY
+state directory holds an Ed25519 identity key, and `ClusterState` records members' keys and
+keys revoked for good (principals admitted by key alone existed until W5 retired them:
+CommandKind 6, op 0x1D and role 0x02 are reserved). PR 3 made the Raft peer wire VERIFY
 against them (see *The Raft peer wire*), and PR 4 moved discovery and enrollment onto them
 (see *Discovery and the identity key*, and the enrollment window in
 `distributed-compilation.md`); PR 5 moved leases onto them and PR 6 the `0xFC` surface, which
@@ -2201,10 +2223,11 @@ right, because the wire now trusts it.
     two columns (`RefusesKeyExposure(exposure, KeyMoment)`), differing in `Undetermined` alone:
     refused at MINT, reported and read at READ. The secret-exposure row tells the key the SAME
     owner-only remedy (`SecretFileRow::hint`), never the services one.
-- **A node holds a key when it has a state directory to hold it in** -- consensus, or a named
-  `--cluster-dir` -- and holds NONE otherwise, said at startup. A key minted into a working
-  directory is minted afresh at every boot under the packaged unit (a runtime directory) and
-  lands in `System32` under the SCM: a new machine at every boot is worse than no key.
+- **A node holds a key because it always has a state directory to hold it in** -- a named
+  `--cluster-dir`, or the platform default the start resolves (`NodeStateDirectory`), since
+  zero-config formation made every node a consensus node. Never the working directory: a key
+  minted there is minted afresh at every boot under the packaged unit (a runtime directory) and
+  lands in `System32` under the SCM, and a new machine at every boot is worse than no key.
   `--install-service` mints no key; the service mints its own, as the account it runs as.
 - **The key file is a secret-by-path row, and the row's path is DERIVED.** `--cluster-dir`
   moved from the public table to `NodeSecretFileTable()`, whose rows are now PROJECTIONS
@@ -2234,8 +2257,8 @@ right, because the wire now trusts it.
     mint a fresh identity does not already (the mixed-order clause of the crypto seam,
     `distributed-compilation.md`). Do not read this rule as "that machine can never come back".
 - **A forget revokes, in the same entry, and there is no verb that only revokes (#1555).**
-  `--cluster-forget=<id>` is `CommandKind::Forget` -- `RemoveMember`'s ordinal, widened: the id
-  leaves whichever list records it, a member or a principal, and the key that record held is
+  `--cluster-forget=<id>` is `CommandKind::Forget` -- `RemoveMember`'s ordinal, widened: the id's
+  member record leaves, and the key that record held is
   revoked. Two halves, one act, because each half alone is a state nobody asked for: the record
   gone with its key live is a machine every node whose `--raft-peer` types that key goes on
   accepting -- removal failing OPEN -- and a key revoked under a record that stays is a member
@@ -2261,7 +2284,7 @@ right, because the wire now trusts it.
     found it (forget n3, stop the leader) and `MembershipCluster_test` pins it with production
     `RosterKeys` per node; neutered, three of four never elect. Raft's own rule for a removed
     server, stated about keys. Everywhere else the revocation is immediate: the same key under
-    another id, the enrollment door, discovery, and a principal, which consensus never counts.
+    another id, the enrollment door and discovery.
     The pass that drops the member is also the one that re-asks every idle attached session
     (`RecheckProofs`, *A revoked key ends the sessions it proved*), so the grace ends on the wire
     in that pass rather than at a frame nobody will send.
@@ -2287,17 +2310,17 @@ right, because the wire now trusts it.
 - **A recorded member holds a key BY TYPE** (`ClusterMember::publicKey`, `RosterMember::publicKey`,
   neither an `optional`): a machine is admitted and forgotten by its key, so a member without one
   is a record no forget could revoke. The type rules out ABSENT and not the all-zero key an
-  omitted initializer yields, so what holds is narrower and exact: **a member or principal
+  omitted initializer yields, so what holds is narrower and exact: **a member
   `Apply` recorded or a decoder read never holds an absent or all-zero key**
-  (`IsZeroEd25519PublicKey`). `KeyToRecord` decides it for all three admitting verbs:
-  `ValidateAgainst` refuses when it returns nothing, and `Apply` records exactly the key it
-  returns. `DecodeState` and `DecodeRoster` each refuse such a member or principal by name.
+  (`IsZeroEd25519PublicKey`). `KeyToRecord` decides it for both admitting verbs (`AddMember`,
+  `AddLearner`): `ValidateAgainst` refuses when it returns nothing, and `Apply` records exactly
+  the key it returns. `DecodeState` and `DecodeRoster` each refuse such a member by name.
   What an operator TYPES may still state no key, so a token is a `MemberSpec` --
   `--cluster-admit`'s, and the bootstrap set consensus starts from (`BootstrapMembersOf`) --
   and never a member.
-- **One key, one identity; one id, one list.** A key held by another id is refused, and an id
-  is a member or a principal, never both. `DecodeState` refuses a snapshot breaking either rule
-  or holding a revoked key live -- the combinations `Apply` never produces.
+- **One key, one identity.** A key held by another id is refused. `DecodeState` refuses a
+  snapshot breaking that rule or holding a revoked key live -- the combinations `Apply` never
+  produces.
 - **`@<key>` rides the member token** (`<id>=<host>:<port>@<key>`, split at the first `@`), so
   `--raft-peer` states a member's key and a service registration re-renders it through
   `FormatMemberSpec`. On this node's OWN entry a key other than the one it holds is a startup

@@ -13,7 +13,7 @@ about one of them:
 | [Fleet scheduler](#a-cluster-and-who-leads-it) | the node's **mode**, and consensus | **on** — a first start is a cluster of one, and serves it |
 | [Consensus member](#a-cluster-and-who-leads-it) | `--listen-raft`, and the mode | **on** (`6680`) — an empty `--listen-raft=` runs none, on a cache-only node (`--slots=0`) |
 | [The fleet's shared cache](#the-fleets-shared-cache) | `--cluster-set=shared-cache=<id>`, once, for the whole cluster | **off** — no machine is named |
-| [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery` | **off** — **UDP**, unlike every other surface |
+| [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery`, and consensus | **on** (`6681`) beside consensus — **UDP**, unlike every other surface; an empty `--discovery=` turns it off |
 | [Metrics, and the fleet dashboard](#watching-one) | `--admin-listen`, `--dashboard` | **off** |
 
 That is the list of **roles**, and it is not a firewall list — a role's default here
@@ -119,7 +119,7 @@ The surfaces, and what each is for:
 | Node port — cache verbs, compile jobs, and the scheduler's where the mode serves them | `--listen-node` | `6674` — **always on**; a bare port takes the **wildcard** | TCP |
 | Admin / metrics | `--admin-listen` | off; a bare port takes **loopback** | TCP |
 | Consensus peer | `--listen-raft` | `6680`; the **mode** opens it (every mode but a learner's), an empty `--listen-raft=` closes it, and a bare port takes the **wildcard** | TCP |
-| Discovery | `--discovery` + `--discovery-reply-port` | off; always binds the **wildcard** | **UDP** |
+| Discovery | `--discovery` + `--discovery-reply-port` | `6681`, **on** beside consensus, plus a kernel-chosen reply port; an empty `--discovery=` turns it off; always binds the **wildcard** | **UDP** |
 
 Several things on that table are easy to get wrong and expensive to get wrong:
 
@@ -572,7 +572,7 @@ Two things follow that are worth knowing when reading logs:
   scheduler that changes from refusing to unreachable and back, says the rest at `info` or
   `debug`. The worker's
   heartbeat and the machine's presence announcement share that record, so a machine
-  running both says each change once. While any scheduler does not answer, `--node-status`
+  running both says each change once. While any scheduler does not answer, `fastcache-cli node`
   also shows the `scheduler-unreachable` condition.
 - The chain is bounded at two hops. Two schedulers that disagree about who leads
   — a partition healing — produce `gave up following leader redirects` and the
@@ -860,10 +860,10 @@ to.
 
 ### An unreachable `--upstream`
 
-A shared cache that does not answer -- a dial that does not connect, or a connection
+A `fastcached` behind `--upstream` that does not answer -- a dial that does not connect, or a connection
 that stalls until the per-operation timeout or loses its peer -- is remembered as
 unreachable for ten seconds. Inside that window a local miss is answered as a miss and a
-store is not offered upstream, without dialling, so a build with the shared cache down
+store is not offered upstream, without dialling, so a build with that `fastcached` down
 pays at most one timeout every ten seconds rather than one per miss. The first operation
 after the window tries again, and one that gets any answer ends the window at once. A
 store skipped this way counts in `fastcache_node_cache_upstream_store_failures_total`,
@@ -877,13 +877,13 @@ Eight counters on `/metrics`, and the splits are the point:
 |---|---|
 | `fastcache_node_cache_hits_total` | Served without touching the network. |
 | `fastcache_node_cache_misses_total` | The local tier did not hold it. |
-| `fastcache_node_cache_upstream_hits_total` | The shared cache answered after a local miss. |
+| `fastcache_node_cache_upstream_hits_total` | The `fastcached` its `--upstream` names answered after a local miss. |
 | `fastcache_node_cache_fill_failures_total` | The upstream supplied it and the local tier refused. |
 | `fastcache_node_cache_store_failures_total` | A local write failed — this one is reported to the client. |
 | `fastcache_node_cache_upstream_stores_total` | The fleet accepted an object this node offered. |
-| `fastcache_node_cache_upstream_store_failures_total` | The fleet would not take it. Zero on a node with no shared cache — see below. |
+| `fastcache_node_cache_upstream_store_failures_total` | The fleet would not take it. Zero on a node with no `--upstream` — see below. |
 | `fastcache_node_cache_requests_refused_not_local_total` | A caller that is not on this machine asked this tier for something. The node port faces the network on every node, so this counts other machines: ordinary on a node clients are pointed at for the scheduler — peers reaching the right host for the wrong verb — and, anywhere else, something off-box asking for this machine's build output, which [#287](https://github.com/LASTRADA-Software/fastcached/issues/287) withdrew from peers — give them a shared `fastcached` via `--upstream`. |
-| `fastcache_node_upstream_configured` | `1` when this node has a shared cache to read through to, `0` when it does not. Absent on a node running no cache at all. |
+| `fastcache_node_upstream_configured` | `1` when this node has a `fastcached` to read through to (`--upstream`), `0` when it does not. Absent on a node running no cache at all. |
 
 ### The operator verbs
 
@@ -1058,16 +1058,20 @@ so pinning the default port was indistinguishable from never mentioning it.
 
 ### Who may use it
 
-**The cache is this machine's. The other two surfaces are this machine's and your
-fleet's.**
+**The cache is this machine's. The fleet and compile surfaces are this machine's and your
+fleet's, and the fleet's shared cache is your fleet's alone.**
 
-| Caller | Cache (`--listen-node`) | Fleet (the scheduler) | Compile (`--listen-node`) |
-| --- | --- | --- | --- |
-| A process on this machine | always | always | always |
-| A machine the roster admits — by its proven key, or a machine ticket it minted | **refused** | yes | yes |
-| Any caller, on a `--fleet-open` node | **refused** | yes | yes |
-| A machine the cluster forgot — its key revoked, from any address | refused | refused | refused |
-| Anyone else | refused | refused | refused |
+| Caller | Cache (`--listen-node`) | Fleet (the scheduler) | Compile (`--listen-node`) | Shared cache (`--listen-node`, on the named machine) |
+| --- | --- | --- | --- | --- |
+| A process on this machine | always | always | always | **refused** — its builds read the tier in process |
+| A machine the roster admits — by its proven key, or a machine ticket it minted | **refused** | yes | yes | yes |
+| Any caller, on a `--fleet-open` node | **refused** | yes | yes | **refused** |
+| A machine the cluster forgot — its key revoked, from any address | refused | refused | refused | refused |
+| Anyone else | refused | refused | refused | refused |
+
+The shared-cache column applies only on the machine the fleet's `shared-cache` setting names;
+every other node answers those verbs `not-shared-cache` (see [the named
+machine](#the-named-machine)).
 
 "Fleet" here is what the scheduler **serves** -- a lease, a status. What **decides** the fleet --
 `--cluster-admit` in every form, `--cluster-forget`, `--cluster-set`, and the enrollment decisions
@@ -1533,7 +1537,7 @@ restarts — and doing nothing, with the only symptom being that the thing you
 configured did not happen.
 
 **`upstream` was in this table and is not any more, and the build refuses the key by
-name.** A node reads through to the shared cache its own `--upstream` names, and it
+name.** A node reads through to the `fastcached` its own `--upstream` names, and it
 presents its own `--requirepass` credential there on every fetch and every store — so
 a replicated address would decide where every member sends a secret that is
 configured per machine, and one committed entry would redirect all of them. The
@@ -1561,9 +1565,9 @@ membership is a replicated log entry, and that is what makes a node admitted at 
 survive a restart without anybody editing a config file on any machine.
 
 The agreed keys join the fleet's admission policy directly, so a machine the
-cluster admitted is served by the two surfaces membership governs — its compile
-port and the scheduler — by the key it proves or the ticket it presents, whatever
-address it dials from. Not the cache tier: since
+cluster admitted is served by the surfaces membership governs — its compile port, the
+scheduler and, on the machine the `shared-cache` setting names, the fleet's shared cache —
+by the key it proves or the ticket it presents, whatever address it dials from. Not the cache tier: since
 [#287](https://github.com/LASTRADA-Software/fastcached/issues/287) that one serves
 its own machine and nothing else, whatever the roster says.
 
@@ -1885,7 +1889,7 @@ fastcache-compile-node --scheduler=10.0.0.1:6675 --enroll-auto-approve=off
 It is at most `24h`; running it again re-arms it from now, and `=off` ends it. It is held
 in the leader's memory alone, so a restart ends it, and so does a change of leader — a
 leader that loses leadership and wins it back does not resume admitting. While it is armed,
-`enrollment-window-open` is raised naming the deadline and when it was armed, and `--node-status` reports
+`enrollment-window-open` is raised naming the deadline and when it was armed, and `fastcache-cli node` reports
 `auto-approve (N min left)`. Afterwards, `--enroll-list` marks every row the window
 admitted with when the window was armed, and
 `fastcache_enrollment_approvals_auto_total` counts them apart from the approvals a person
@@ -1913,7 +1917,7 @@ wire proves a node's own identity key, so an admitted joiner needs nothing place
 A learner applies the fleet's state, so it checks the grants it is handed from its first
 round with nothing typed.
 
-`--node-status` carries the window's mode and the number waiting, and
+`fastcache-cli node` carries the window's mode and the number waiting, and
 `fastcache_enrollment_requests_refused_full_total` counts the requests a full list
 turned away.
 
@@ -2407,7 +2411,7 @@ through to its `--upstream`, or to nothing.
 `--upstream=<host>:<port>` on a node wins over the setting. That node reads through to the
 `fastcached` it names, speaks that daemon's `FETCH` and `STORE`, and presents its
 `--requirepass` there. The override is fixed for the process. The startup line reports it
-as `<host>:<port> (override, fastcached verbs)`. `--node-status` reports it as `override`,
+as `<host>:<port> (override, fastcached verbs)`. `fastcache-cli node` reports it as `override`,
 and its detail names the machine the setting names, if any.
 
 ### The named machine
@@ -2440,7 +2444,7 @@ fleet holds or presented a ticket the node verifies. This machine's own address 
 
 ### When it does not work
 
-Start with `--node-status` on the node whose builds are missing. Its `shared-cache` line
+Start with `fastcache-cli node` on the node whose builds are missing. Its `shared-cache` line
 says where the shared cache comes from: `none`, `setting`, `override` or `this-machine`.
 `shared-cache-state` says how the last attempt went: `not-tried`, `proven`, `unresolved`,
 `wrong-key`, `unreachable`, `proof-refused`, or `serving` or `unavailable` on the named
@@ -2488,7 +2492,7 @@ other node, reading through to it.
 | `fastcache_node_shared_cache_requests_refused_foreign_generation_total` | A store of a value generation this build does not implement. |
 | `fastcache_node_shared_cache_proofs_refused_wrong_key_total` | The machine answering at the shared cache's announced address proved a key that is not the named machine's; nothing was sent. |
 | `fastcache_node_shared_cache_proofs_failed_total` | The shared cache could not be reached, or did not complete the handshake; the build compiled locally. |
-| `fastcache_node_shared_cache_unresolved_total` | Operations skipped because the `shared-cache` setting names no machine this node can reach by key; `--node-status` says which reason. |
+| `fastcache_node_shared_cache_unresolved_total` | Operations skipped because the `shared-cache` setting names no machine this node can reach by key; `fastcache-cli node` says which reason. |
 | `fastcache_node_shared_cache_stale_hints_total` | The address this node's last proven session to the shared cache connected to failed, and the announced name was dialled instead. |
 | `fastcache_node_shared_cache_sessions_opened_total` | Proven sessions this node opened to the shared cache. One per burst of misses is healthy; one per miss means the kept session is being lost. |
 
@@ -2705,7 +2709,7 @@ by the time the worker boots.
 
 `--requirepass` is refused too, for the reason it is on the daemon: a supervisor
 records launch arguments where every local account can read them, and on a worker
-it is the secret of the shared cache behind `--upstream`. It is not what the
+it is the secret of the `fastcached` its `--upstream` names. It is not what the
 scheduler authenticates a worker by — that is the worker's proven identity key —
 but a secret on a readable command line is exposed all the same.
 
@@ -3105,7 +3109,7 @@ refused, because it was how the node spelled "derive this from the machine" — 
 left no way to offer the fleet nothing, and made the obvious spelling the one value
 that would have produced a full worker. Deriving is now what omitting the flag does,
 so zero means what it says. Such a node surveys no compilers, claims no scratch
-directory, registers with no scheduler and is never leased; `--node-status` reports it
+directory, registers with no scheduler and is never leased; `fastcache-cli node` reports it
 with no worker component and no slot figures, and a `--cordon` sent to it is refused
 as a node that runs no worker rather than as a verb its build does not know. It
 refuses to start with any setting only a worker reads — `--toolchain`,
@@ -3266,7 +3270,7 @@ Every row says two things before anything else:
 | `host-name-reaches-only-this-machine` | live | warning | this machine's name reaches only itself (`localhost`, a name under `.localhost`, or a loopback address), so nothing offers it to a peer: the node runs as a fleet of its own on loopback (its own consensus, scheduler and worker, so local dispatch works), discovery stands down, it can neither form nor join a fleet, and the worker is announced to no scheduler elsewhere; the detail says what was confined | set `--raft-self` (a restart applies it) and, to be announced to a scheduler, `--advertise` (a reload applies it) to an address or name other machines resolve; or give the machine a real host name and restart |
 | `foreign-fleet-visible` | live | warning | this node's fleet is established and discovery proves another established fleet on the segment that neither yields to, because no key this fleet holds proves the two are one fleet split in two; or `--fleet-id` pins this node to another cluster and discovery proves a fleet it would otherwise have joined or healed into. The detail names both cluster ids, and for each other fleet either "no machine in common" -- among the machines it listed, with the cut named, when its summary carried fewer than it records -- the machine of this fleet it CLAIMS to record, unproven, or the pin that keeps this node out. Not evaluated until discovery has listened one beacon interval, nor while no discovery reply has been heard for five minutes: an empty segment and a firewalled one look alike | decide which fleet each machine belongs to and `--cluster-forget` it from the other; for a fleet the pin keeps this node out of, change `--fleet-id` if it names the wrong fleet, and otherwise the pin is doing its job. It clears a few minutes after the other fleet stops being heard |
 | `shared-cache-unavailable` | live | alert | the fleet's `shared-cache` setting names this machine and its shared tier will not open, so every other node's builds miss and compile locally; the detail says why | fix what the detail names — usually another process holding `<state-dir>/shared-cache`, or a full disk — and it opens at the next change the cluster applies or within 30 seconds; or name another machine with `--cluster-set shared-cache=<id>` |
-| `shared-cache-unproven` | live | warning | the fleet's `shared-cache` setting names another machine and this node's builds are not reaching it, so they compile locally; the detail says why — a machine at the announced address that proved another key (nothing was sent to it), the named machine refusing this node's key, one that did not answer, or a setting naming a machine this cluster cannot reach by key | check `--cluster-status` and the named machine's own `--node-status`; it clears by itself at the next operation that proves the named machine's key, and at the apply that stops the setting naming another machine; an apply that names a different machine, or resolves one this cluster could not reach by key, makes it `not-evaluated` (not tried) until an operation tries it, never `clear`; a setting naming a machine this cluster cannot reach by key raises it at the apply, before any build asks; an operation still running when an apply moved the setting says nothing about the machine it had dialled |
+| `shared-cache-unproven` | live | warning | the fleet's `shared-cache` setting names another machine and this node's builds are not reaching it, so they compile locally; the detail says why — a machine at the announced address that proved another key (nothing was sent to it), the named machine refusing this node's key, one that did not answer, or a setting naming a machine this cluster cannot reach by key | check `--cluster-status` and the named machine's own `fastcache-cli node`; it clears by itself at the next operation that proves the named machine's key, and at the apply that stops the setting naming another machine; an apply that names a different machine, or resolves one this cluster could not reach by key, makes it `not-evaluated` (not tried) until an operation tries it, never `clear`; a setting naming a machine this cluster cannot reach by key raises it at the apply, before any build asks; an operation still running when an apply moved the setting says nothing about the machine it had dialled |
 | `scheduler-unreachable` | live | warning | a `--scheduler` endpoint (or a leader it named) has not answered a dial; the detail names each, and one nobody has dialled for ten minutes is dropped from it | check the VPN or network between this machine and the schedulers named; the node keeps serving this machine meanwhile and rejoins by itself |
 | `unserved-toolchain` | live | warning | clients asked the leader for a toolchain no live worker serves, so those compiles ran on the clients' own machines; the detail names each by driver and version as the client reported it (`cl 19.44.35207`), with how many leases were refused. Decided by the leader; any other scheduler answers `not-evaluated`, and so does a leader that has led for less than fifteen minutes, since nothing another leader saw carries over | put that compiler version on a worker, or move the clients to one the fleet serves; clears once a worker serves it, or after fifteen minutes with nobody asking |
 | `mixed-node-versions` | live | warning | the leader sees more than one build serving one wire — nothing refuses that, so nothing else says so; the detail names each build and the machines on it. Decided by the leader; any other scheduler answers `not-evaluated`, and so does a leader that has led for less than ninety seconds, before every machine has announced to it | upgrade every node to one build ([Upgrading a fleet](../operations/upgrading-a-fleet.md)); clears once the odd machine is upgraded or has been gone ninety seconds |
@@ -3514,7 +3518,7 @@ worth writing is the whole fleet disagreeing about
 
 Two counters, both of them **events** rather than readings, so they belong here and
 not in the gauge table above. What a window *is* — open or shut, and how many
-machines are waiting in it — is reported by `--node-status` and by the window's own
+machines are waiting in it — is reported by `fastcache-cli node` and by the window's own
 repeating warning, because that is a state and a counter cannot carry one.
 
 | Series | Says |
@@ -3540,9 +3544,10 @@ Both are rendered by **every** node, consensus or not, and read zero on a machin
 that has no window at all. That is deliberate and is this project's rule rather than
 an oversight: a counter is a tally, so zero is the truth about events that never
 happened, and absence is modelled in the *snapshot* rather than by dropping a row.
-Which of the two a zero means is answered by `--node-status`, whose enrollment field
-is **absent** on a node that runs no consensus and `closed` on one that does — the
-distinction a counter cannot carry, kept where it can be.
+Which of the two a zero means is answered by `fastcache-cli node`, whose enrollment field
+is **absent** on a node that serves no enrollment, `manual` on one that does, and
+`auto-approve (N min left)` while a deadline is armed — the distinction a counter cannot
+carry, kept where it can be.
 
 ### Discovery
 
@@ -4268,7 +4273,7 @@ worker's compiler do, and an incident is read against what was in force at the t
 
 The boundary of those framed surfaces is **network reachability plus membership**, and
 membership is a machine's key. The credentials: `--dashboard-token-file` for the fleet
-page, `fastcached`'s own `--requirepass` for the shared cache, the machine ticket every
+page, `fastcached`'s own `--requirepass` for the `fastcached` a node's `--upstream` names, the machine ticket every
 client presents to another machine, and each node's own identity key, which every **consensus**
 connection proves before a message is read — so the Raft port is not open to whoever can
 reach it and one member cannot speak as another — which every connection a machine joins

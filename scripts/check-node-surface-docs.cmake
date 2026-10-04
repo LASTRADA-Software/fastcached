@@ -160,8 +160,6 @@ set(FastCachedSurfaceNumberWords
 #
 #   <path substring>|<the phrase, verbatim and on one line>|<which sense it is in, and why>
 set(FastCachedSurfaceCountExemptions
-    "fastcache-compile-node.md|other two surfaces|Policy ROLES. The sentence divides who may reach the cache verbs from who may reach the compile and scheduler verbs -- all three of which live on the one node port."
-    "fastcache-compile-node.md|two surfaces membership governs|Policy ROLES: the compile verbs and the scheduler verbs, which membership admits a caller to. The cache verbs are excluded by #287 and are not a port distinction."
     "fastcache-compile-node.md|There is one surface now|Counts the surfaces carrying the COMPILE VERBS, which is one -- the node port -- rather than the arity of the port set. It is the sentence explaining why the startup question has one answer again after #290 merged the ports that used to give it two, so a future merge is exactly what should make somebody re-read it."
 )
 

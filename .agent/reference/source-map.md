@@ -49,7 +49,12 @@ src/FastCache/
                 endpoints) -- the last four candidates for graduation into core-cpp. LingeringClose (how a
                 server closes after answering: half-close, listen until the
                 peer closes or a bound says stop, then close -- a bare close
-                over unread input is a reset that destroys the answer)
+                over unread input is a reset that destroys the answer).
+                AcceptLoopReporter: how every accept loop carries out core-cpp's
+                AcceptErrorPolicy verdicts -- one class rather than five copies, so
+                the node's 0xFC surface, the Raft peer server, the admin surface and
+                the daemon's binds log alike and share one AcceptLoopHealth entry
+                that /healthz and the node's conditions read
   Cli/          UsageDoc (usage text as data: sections of aligned rows and
                 prose, rendered with an ANSI palette) and Options (OptionSpec
                 row type, the matching rules, the one parse loop). Dependency-
@@ -115,8 +120,8 @@ src/FastCache/
                 peer port". `Apply` is total because it runs after commitment, when
                 refusing is no longer an option; `Validate` is where a change can be
                 refused, and it runs on the proposer.
-                Roster (#178): the roster a lease is checked against -- voters,
-                principals and revoked keys, projected from the state at a version
+                Roster (#178): the roster a lease is checked against -- members
+                (voters and learners) and revoked keys, projected from the state at a version
                 `Apply` derives.
   Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
                 most-free-slots pick tie-broken by utilization, heartbeat

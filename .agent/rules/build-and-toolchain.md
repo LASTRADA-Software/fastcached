@@ -3194,6 +3194,15 @@ makes it anyway and says so there.
   [#545](https://github.com/LASTRADA-Software/fastcached/issues/545) is where it is
   being dealt with. Point a measurement at the machine's populated cache instead.
 
+  **What the shared per-machine cache buys, measured** (moved here from `AGENT.md`'s
+  Building section, which points at it): Git Bash, Windows 11, cold build tree, native
+  Windows volumes rather than DrvFs -- **45 s and 118 MB fetched without it, 24 s and
+  1.1 MB with** -- and over DrvFs, where #545 found it, the same fetch is slow enough to
+  read as a hang. *Volumes* rather than a filesystem NAME, because the two halves of this
+  measurement do not share one: the cache sits under `%LOCALAPPDATA%` and the build tree
+  does not, so on the machine this was taken on they are different filesystems. The
+  contrast the figure exists to draw is native-against-DrvFs, and that holds either way.
+
 ## Language and ABI pitfalls
 
 <!-- agent-tripwire: A return type is not part of a function's mangled name on Linux, so two functions differing only in return type silently collide -->
@@ -3228,6 +3237,14 @@ makes it anyway and says so there.
     toolchain fact, and had no `AGENT.md` tripwire -- so it fired in no session that
     did not already open a rules file, which is the population it was written for.
 
+- **A read that CONSUMES its object -- `std::future::get` -- is taken into a local before a
+  Catch2 assertion checks it, never inside one.** Measured with the pinned clang-tidy 22.1.8
+  on Windows (steps 17-19 of the integration): `REQUIRE(stopped.get())` and
+  `CHECK_FALSE(ReplyFrom(future).empty())` report `clang-analyzer-cplusplus.Move`, because
+  Catch2's macros name their expression TWICE under clang (once inside
+  `__builtin_constant_p`) and the MSVC STL's `std::future::get` moves `*this`. libstdc++'s
+  `get` does not, so only the Windows sweep sees it -- the same one-toolchain-only shape as
+  the entry above, and `NOLINT` is not the alternative here either.
 
 - **A return type is not part of a function's name on Linux, and MSVC's mangling
   hides that.** `Core/HostPort.hpp` added an `inline FastCache::ParsePort(

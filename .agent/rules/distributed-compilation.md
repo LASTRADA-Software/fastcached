@@ -1173,8 +1173,7 @@ Consequences that are each load-bearing:
     where a key that proves nothing is kept out of a list an operator reads and compares. The
     doors on master: `ParseEd25519PublicKey` (every flag and verb reading a key as TEXT --
     `--cluster-admit[-learner]`, the cli's `cluster-admit`, and the leader's `ClusterAdmit`);
-    `SchedulerService::AdmitPrincipal`, which takes BYTES, since an enrollment approval hands
-    over the key its row holds; the enrollment door (`EnrollmentResponder::AnswerEnroll`, the
+    the enrollment door (`EnrollmentResponder::AnswerEnroll`, the
     malformed row: no build mints such a key); `ValidateAgainst` and `Apply`
     (`KeyStanding::Unusable`, asked first, since it is a fact about the POINT); `DecodeState`'s
     roster rules; and `DecodeRoster`, by the holder's name. A REVOKED entry is not asked --
@@ -2225,7 +2224,7 @@ Six more about what the tier IS and who gets to see it:
   component": the merged listener's bind predicate (`AnswersAnyFamily`) and its
   session-ceiling fold (`MergedResponder::Largest`) both count the never-null operator
   families -- node, live and fleet -- or such a node names a port it does not bind -- or
-  binds one whose ceilings fold to zero and closes every connection, `--node-status`
+  binds one whose ceilings fold to zero and closes every connection, NODE-STATUS (`fastcache-cli node`)
   included. The second was found only by a test that EXCHANGED a frame over the bound
   port; the bind alone passed. The bind, the fold and the connection sum all read
   `FamilyRoutes`, one row per `VerbFamily` with a presence column and a ceilings column
@@ -3315,7 +3314,7 @@ way -- and its own counter, because a stop ends by itself and a cordon does not.
 
 ## Enrollment (#1298, #1299; on keys since #178; without a window since zero-config formation)
 
-<!-- agent-tripwire: An enrollment window is served by a node that runs consensus (`ServesEnrollment`) -->
+<!-- agent-tripwire: Enrollment is served by a node that runs consensus (`ServesEnrollment`) -->
 
 A leader records every machine that asks, up to `MaxPendingEnrollments`, refusing past
 it rather than evicting, and forgets a row nobody polled for `PendingRowLifetime`. There
@@ -3354,7 +3353,7 @@ and logged: it makes room and bans nobody, since a machine still asking is recor
 
 **No secret crosses, and a test proves it against the whole frame.** The joiner sends
 its role and its public key; `Approved` carries `Cluster::EncodeRoster(ProjectRoster(state))`
--- members with seat, key and recorded `0xFC` endpoint, principals and revoked keys, in a
+-- members with seat, key and recorded `0xFC` endpoint, and revoked keys, in a
 versioned encoding. The endpoint is what the joiner remembers its fleet's voters at, so a
 fleet serving another port is reached where it RECORDED, never at a guess from the consensus
 host; and it moves the fingerprint when a member announces a move, which only mattered while
@@ -3490,16 +3489,18 @@ by the leader that decided, so a leaving member is held to it too. The case that
 redirect to an endpoint proving the right cluster id under another key: refused, where the fresh
 probe believed it.
 
-**A role is a table (`EnrollRoleTable`), and each column is a decision.** A member states
-an endpoint and is admitted by `ClusterAdmit`, with no seat opinion so an approval cannot
-promote a demoted learner; a worker states none and is admitted by `AdmitPrincipal`. The
-role follows from `RunsConsensus`, so nobody asks for one the machine will not be. There is
-no removal column, because one verb removes either role
-([#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)): `--cluster-forget`
-takes the id out of whichever list records it and revokes its key, so the
-reject-after-approve warning names it for both. Until #1555 it could not be named for a
-worker -- it touched members only, and a warning naming it would have sent an operator to a
-command that reported success and removed nothing.
+**A role is a table (`EnrollRoleTable`), and each column is a decision.** A joiner enrolls
+as a LEARNER, the one role the wire carries (`EnrollRole::Learner`, 0x03; 0x01 and 0x02 are
+RETIRED and refused by the decoder), states the endpoint its `0xFC` port answers on (recorded as
+`schedulerEndpoint`) and no consensus endpoint, and is admitted by `ClusterAdmit` in the learner
+seat with the key it first asked with; a voter is an operator's PROMOTION, never a role. The table
+has one row, pinned to the wire by `EnrollRoleTableMatchesTheWire`, and states no seat opinion
+beyond that, so an approval cannot promote a demoted learner. There is no removal column, because one
+verb removes any member ([#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)):
+`--cluster-forget` takes the id out of the record and revokes its key, so the
+reject-after-approve warning names it. Until #1555 it could not be named for a worker -- it
+touched members only, and a warning naming it would have sent an operator to a command that
+reported success and removed nothing.
 
 **A revoked key is refused at the door**, before the window records anything
 (`EnrollmentRequestsRefusedRevokedKey`, `InvalidClusterChange` -- the code the approval would
@@ -3555,15 +3556,18 @@ changes anywhere in it aborted a legitimate enrolment with a message naming a lo
 never happened. A reading that a node answered on its own behalf breaks a chain, so it
 resets the count, and a genuine loop never reaches that arm.
 
-**And the window's state is REPORTED, or the counters cannot be read.** Both enrollment
-series are rendered by every node and read zero on a machine that has no window at all,
-so *no window here* and *a window nothing has come through* are one number. The
-distinction is kept in `--node-status`'s `enrollment` field, which is ABSENT on a node
-running no consensus and `closed` on one that does. That field was encoded, decoded,
-round-tripped in a test and rendered by NOTHING, while the operator documentation
-pointed at it three times — so the claim was circular. A case asserting only the open
-reading leaves the field's whole purpose untested; absent-against-`closed` is what
-earns its place.
+**And the enrollment state is REPORTED, or the counters cannot be read.** Both enrollment
+series are rendered by every node and read zero on a machine that serves no enrollment at
+all, so *nothing served here* and *nothing has come through* are one number.
+NODE-STATUS's `enrollment` field (`fastcache-cli node`) is ABSENT on a node that serves no enrollment
+(`main` hands the status responder a window only where `ServesEnrollment` holds), `manual`
+otherwise, and `auto-approve` with the minutes left while a deadline is armed
+(`WireEnrollmentState`; `0x01` closed and `0x02` open are RETIRED, since every request is
+recorded now). None of the three is inferred from a counter: a zero counter cannot say
+whether a window was ever armed. That field was once encoded, decoded, round-tripped in a
+test and rendered by NOTHING, while the operator documentation pointed at it three times --
+so the claim was circular. A case asserting only one reading leaves the field's purpose
+untested; absent-against-`manual` is what earns its place.
 
 ## The node proof (#1428; identity keys and sealed frames since #178)
 
@@ -3604,8 +3608,8 @@ the only gate on `CLUSTER-ADMIT` and on `ENROLL-CONTROL`, so on an open node an 
 caller could approve its own enrollment or arm an auto-approve window. Two columns decide it,
 never an `if` at a handler:
 - `OpDescriptor::identity` names the verbs: `IdentityRequirement::OperatorStanding` on
-  `ClusterSet`, `ClusterForget`, `ClusterAdmit`, `ClusterAdmitLearner`, `ClusterAdmitWorker` and
-  `EnrollControl`, pinned by `ControlVerbsNeedOperatorStanding`; `IdentifiedCaller` is only its
+  `ClusterSet`, `ClusterForget`, `ClusterAdmit`, `ClusterAdmitLearner` and `EnrollControl`
+  (`ClusterAdmitWorker`, 0x1D, is retired), pinned by `ControlVerbsNeedOperatorStanding`; `IdentifiedCaller` is only its
   PREREQUISITE (`IdentityRequirementRow::prerequisite`, walked by `UnmetRequirement`) and no verb
   names it.
 - `Distributed::MembershipRoutes`' `standing` column names the routes: loopback is an `Operator`
