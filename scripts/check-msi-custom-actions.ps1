@@ -20,16 +20,24 @@
 #   5. the actions that only READ (`RunnableActions`) are started for real, in the directory they
 #      would have, and must exit 0 over a root no process runs from -- and, the control that keeps
 #      that 0 honest, 1460 while a process DOES run from it;
-#   6. the actions that must run BEFORE the old product's removal (`BeforeOldProductRemoval`) are
-#      scheduled there: a registration copied after 0.3.0's uninstall-service had deleted it was
-#      no copy, and a failed upgrade then left 0.3.0 registered with a command line it refuses;
+#   6. Windows Installer's own rule for RemoveExistingProducts scheduled after InstallInitialize
+#      (as MajorUpgrade's afterInstallInitialize does): NO action that writes to the execution
+#      script -- deferred, rollback or commit -- may come before it, or the package is refused at
+#      once with Error 2613 (round 7, when round 6 had put the registration copies there);
 #   7. the key rollback state lives in -- read off FastCacheClearRollbackState, and the one key
 #      every action naming rollback state uses -- is covered by NO registry element of the package:
-#      one the package owns is deleted by the old product's uninstall, which an upgrade runs AFTER
-#      the copy (#6), so the next upgrade would lose the copy this one fixed. It reads the
+#      one the package owns is deleted by an uninstall, and the state must outlive a failed
+#      transaction's rollback until its last step (#8). It reads the
 #      fragment ONLY, and fails OPEN for a registry element CPack's generated sources add;
 #   8. that key is deleted where nothing else deletes it -- last in a failed transaction's
-#      rollback, after every action that reads it, and on an uninstall that is not an upgrade's.
+#      rollback, after every action that reads it, and on an uninstall that is not an upgrade's;
+#   9. every action that can FAIL the transaction (in the script, Return="check") comes after
+#      both exact restores, so its failure rolls BOTH services back: an upgrade from 0.3.0 has no
+#      other way back, since 0.3.0's uninstall deleted them and 0.3.0 ships no rollback. The
+#      window from RemoveExistingProducts through WriteRegistryValues cannot be covered, and the
+#      one checked action of ours in it is a stated residual (`ChecksBeforeTheRestores`);
+#  10. a rollback action that STARTS a service is scheduled before InstallFiles, so the rollback,
+#      which runs in reverse, starts it only after InstallFiles' rollback restored the files.
 # Every other action changes a service, the registry or the firewall, and is never started here.
 #
 # Usage: pwsh -NoProfile -File scripts/check-msi-custom-actions.ps1 -SourceDir <repository root>
@@ -45,6 +53,7 @@ $fragmentPath = Join-Path $SourceDir 'packaging/windows/service-actions.xml'
 # anchor with no row is refused rather than guessed: a new one is a decision about that table.
 $AnchorPhases = @{
     'Before:RemoveExistingProducts' = 'RootAbsent' # a fresh install has no root yet
+    'After:WriteRegistryValues' = 'RootPresent'
     'Before:InstallFiles' = 'RootAbsent'   # after RemoveExistingProducts, before the files
     'After:InstallFiles'  = 'RootPresent'
     'Before:RemoveFiles'  = 'RootPresent'  # an uninstall, while the files are still there
@@ -57,9 +66,19 @@ $RunnableActions = @{
     FastCachedAwaitExitForNode = @{ ControlImages = @('fastcached.exe') }
 }
 
-# The actions that must run before RemoveExistingProducts, in this order: the rollback state is
-# emptied, then each registration is copied while the old product's is still there.
-$BeforeOldProductRemoval = @('FastCacheClearRollbackState', 'FastCachedStashRegistration', 'FastCacheNodeStashRegistration')
+# The standard actions an anchor of the fragment ends on, with their InstallExecuteSequence
+# numbers. RemoveExistingProducts is NOT in Windows Installer's standard table at a fixed place:
+# CPack's WIX.template.in declares `<MajorUpgrade Schedule="afterInstallInitialize">`, which puts it
+# directly after InstallInitialize -- the premise of step 6, stated here because the template is
+# not in this repository to read. An anchor on a standard action with no row is refused.
+$StandardSequence = @{
+    InstallValidate        = 1400
+    InstallInitialize      = 1500
+    RemoveExistingProducts = 1501
+    RemoveFiles            = 3500
+    InstallFiles           = 4000
+    WriteRegistryValues    = 5000
+}
 
 $failures = [System.Collections.Generic.List[string]]::new()
 function Fail([string] $what) { $failures.Add($what); Write-Host "FAIL $what" }
@@ -182,17 +201,57 @@ try {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# 6. Before the old product's removal, and in order. Each must END on RemoveExistingProducts and
-# be anchored Before the next, so WiX numbers them ahead of it whatever MajorUpgrade gave it.
-foreach ($index in 0..($BeforeOldProductRemoval.Count - 1)) {
-    $id = $BeforeOldProductRemoval[$index]
-    $standard = Get-StandardAnchor $id
-    $next = if ($index -lt $BeforeOldProductRemoval.Count - 1) { "Before:$($BeforeOldProductRemoval[$index + 1])" } else { 'Before:RemoveExistingProducts' }
-    if ($standard -ne 'Before:RemoveExistingProducts' -or $schedule[$id] -ne $next) {
-        Fail "$id is scheduled '$($schedule[$id])', ending on '$standard'; it must be '$next', before RemoveExistingProducts, or an upgrade copies a registration the old product has already deleted"
-    } else {
-        Pass "$id runs before the old product's removal ($next)"
+# 6. Error 2613's rule: with RemoveExistingProducts after InstallInitialize, nothing that writes
+# to the execution script may come between them. Every deferred, rollback or commit action must
+# therefore END on a standard anchor that places it after RemoveExistingProducts: After an action
+# numbered at or after it, or Before one numbered after it. An immediate action writes no script
+# operation and may sit anywhere.
+$inScript = @($actions | Where-Object { $_.Execute -in @('deferred', 'rollback', 'commit') -and $schedule.ContainsKey($_.Id) })
+if ($inScript.Count -eq 0) { Fail 'no deferred, rollback or commit action is scheduled, so the Error 2613 rule judged nothing' }
+$removal = $StandardSequence['RemoveExistingProducts']
+foreach ($action in $inScript) {
+    $anchor = Get-StandardAnchor $action.Id
+    $relation, $standard = $anchor -split ':', 2
+    if (-not $StandardSequence.ContainsKey($standard)) { Fail "$($action.Id) ends on '$anchor', a standard action StandardSequence has no row for"; continue }
+    $legal = if ($relation -eq 'After') { $StandardSequence[$standard] -ge $removal } else { $StandardSequence[$standard] -gt $removal }
+    if (-not $legal) {
+        Fail "$($action.Id) is a $($action.Execute) action ending on '$anchor', so it writes to the execution script between InstallInitialize and RemoveExistingProducts: Windows Installer refuses the package with Error 2613 (RemoveExistingProducts action sequenced incorrectly)"
     }
+}
+if (-not ($failures | Where-Object { $_ -match 'Error 2613' })) {
+    Pass "none of the $($inScript.Count) deferred, rollback or commit actions precedes RemoveExistingProducts (Error 2613's rule)"
+}
+
+# Where an action sits relative to the standard actions: a standard action's own number, or just
+# after or just before the one its chain ends on. $null for an anchor StandardSequence has no row for.
+function Get-AnchorPoint([string] $action) {
+    if ($StandardSequence.ContainsKey($action)) { return [double] $StandardSequence[$action] }
+    $anchor = Get-StandardAnchor $action
+    if ($null -eq $anchor) { return $null }
+    $relation, $standard = $anchor -split ':', 2
+    if (-not $StandardSequence.ContainsKey($standard)) { return $null }
+    return [double] $StandardSequence[$standard] + $(if ($relation -eq 'After') { 0.5 } else { -0.5 })
+}
+
+# Does $Earlier run before $Later? True when the fragment's After/Before chains connect them, which
+# is the order WiX numbers them in, or when their chains end on different points of the standard
+# sequence and $Earlier's comes first; false when nothing ties the two together.
+function Test-ScheduledBefore([string] $Earlier, [string] $Later) {
+    $earlierPoint = Get-AnchorPoint $Earlier
+    $laterPoint = Get-AnchorPoint $Later
+    if ($null -ne $earlierPoint -and $null -ne $laterPoint -and $earlierPoint -ne $laterPoint) { return $earlierPoint -lt $laterPoint }
+    $seen = @{}
+    $queue = [System.Collections.Generic.Queue[string]]::new()
+    $queue.Enqueue($Earlier)
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        if ($current -eq $Later) { return $true }
+        if ($seen.ContainsKey($current)) { continue }
+        $seen[$current] = $true
+        foreach ($id in $schedule.Keys) { if ($schedule[$id] -eq "After:$current") { $queue.Enqueue($id) } }
+        if ($schedule.ContainsKey($current) -and $schedule[$current].StartsWith('Before:')) { $queue.Enqueue($schedule[$current].Substring(7)) }
+    }
+    return $false
 }
 
 # 7. The rollback state's key, owned by nothing the package installs or removes.
@@ -205,6 +264,7 @@ foreach ($index in 0..($BeforeOldProductRemoval.Count - 1)) {
 # Every action that names rollback state, by id, so a lost one AND a new one are both findings.
 $RollbackStateActions = @(
     'FastCachedStashRegistration', 'FastCacheNodeStashRegistration',
+    'FastCachedStashFromCopy', 'FastCacheNodeStashFromCopy',
     'FastCachedRestoreRegistrationExactly', 'FastCacheNodeRestoreRegistrationExactly',
     'FastCachedStopForNode', 'FastCacheNodeStopForRestart',
     'FastCachedRestartAfterStop', 'FastCacheNodeRestartAfterStop',
@@ -257,12 +317,12 @@ if ($null -eq $clear -or $clear.ExeCommand -notmatch 'reg\.exe"?\s+delete\s+HKLM
     }
 
     # 8. The key REMOVED where nothing else removes it, and never before it is read. A failed
-    # transaction's rollback runs in reverse, so the rollback delete is scheduled FIRST -- before
-    # the clear, before RemoveExistingProducts -- and every action that reads the key (the exact
-    # restores, the restarts), scheduled after InstallFiles, runs before it in rollback.
+    # transaction's rollback runs in reverse, so the rollback delete is scheduled ahead of every
+    # action that reads the key (the exact restores, the restarts), and each of them runs before
+    # it in a rollback.
     $undo = $actions | Where-Object { $_.Id -eq 'FastCacheUndoRollbackState' }
-    if ($null -eq $undo -or $undo.Execute -ne 'rollback' -or $schedule['FastCacheUndoRollbackState'] -ne 'Before:FastCacheClearRollbackState') {
-        Fail "FastCacheUndoRollbackState must be a rollback action scheduled Before FastCacheClearRollbackState, so it runs LAST in a rollback; it is '$($undo.Execute)' at '$($schedule['FastCacheUndoRollbackState'])'"
+    if ($null -eq $undo -or $undo.Execute -ne 'rollback' -or -not $schedule.ContainsKey('FastCacheUndoRollbackState')) {
+        Fail "FastCacheUndoRollbackState must be a scheduled rollback action, so it runs LAST in a rollback; it is '$($undo.Execute)' at '$($schedule['FastCacheUndoRollbackState'])'"
     } else {
         # Every OTHER rollback action that names rollback state reads it, so each is derived from
         # the table rather than listed again: a new one is ordered by this check the day it is added.
@@ -270,8 +330,8 @@ if ($null -eq $clear -or $clear.ExeCommand -notmatch 'reg\.exe"?\s+delete\s+HKLM
                 $RollbackStateActions -contains $_.Id -and $_.Execute -eq 'rollback' -and $_.Id -ne 'FastCacheUndoRollbackState'
             } | ForEach-Object { $_.Id })
         if ($readers.Count -eq 0) { Fail 'no rollback action reads the rollback key, so the ordering below judged nothing' }
-        $early = @($readers | Where-Object { (Get-StandardAnchor $_) -ne 'After:InstallFiles' })
-        if ($early.Count -gt 0) { Fail "these read the rollback key but are not scheduled after InstallFiles, so a rollback could run them after its delete: $($early -join ', ')" }
+        $early = @($readers | Where-Object { -not (Test-ScheduledBefore 'FastCacheUndoRollbackState' $_) })
+        if ($early.Count -gt 0) { Fail "these read the rollback key but are not scheduled after FastCacheUndoRollbackState, so a rollback could run them after its delete: $($early -join ', ')" }
         else { Pass 'FastCacheUndoRollbackState runs last in a rollback, after every action that reads the key' }
     }
     $remove = $fragment.SelectSingleNode('//InstallExecuteSequence/Custom[@Action="FastCacheRemoveRollbackState"]')
@@ -281,6 +341,61 @@ if ($null -eq $clear -or $clear.ExeCommand -notmatch 'reg\.exe"?\s+delete\s+HKLM
     } else {
         Pass 'FastCacheRemoveRollbackState deletes the key on an uninstall, never in an upgrade''s removal of the old product'
     }
+}
+
+# 9. Every checked step behind both exact restores.
+#
+# THE RESIDUAL, stated: RemoveExistingProducts runs 0.3.0's uninstall, which deletes both services
+# and has no rollback; nothing that writes the script may precede it (#6), the registration copies
+# do not exist before WriteRegistryValues and the binaries a re-registration runs do not exist
+# before InstallFiles. A failure in ANY action from RemoveExistingProducts through
+# WriteRegistryValues -- the removal itself, StopServices, DeleteServices, RemoveRegistryValues,
+# RemoveFiles, CreateFolders, InstallFiles, WriteRegistryValues -- rolls an upgrade from 0.3.0
+# back with NO service registered. Only the checked actions of OURS in that window are rows here. Each such action is a row here with its reason, and a row whose action is
+# no longer before the restores, or is gone, is refused as stale.
+$ChecksBeforeTheRestores = @{
+    FastCacheAwaitServiceExit = 'waits for the OLD product''s processes, so it must precede InstallFiles, which precedes WriteRegistryValues'
+}
+$restores = @('FastCachedRestoreRegistrationExactly', 'FastCacheNodeRestoreRegistrationExactly')
+$checked = @($actions | Where-Object {
+        $_.Execute -in @('deferred', 'commit') -and $schedule.ContainsKey($_.Id) -and
+        (-not $_.HasAttribute('Return') -or $_.Return -eq 'check')
+    })
+if ($checked.Count -eq 0) { Fail 'no checked deferred action is scheduled, so step 9 judged nothing' }
+$failuresBeforeRestoreOrder = $failures.Count
+foreach ($action in $checked) {
+    $unarmed = @($restores | Where-Object { -not (Test-ScheduledBefore $_ $action.Id) })
+    if ($unarmed.Count -eq 0) {
+        if ($ChecksBeforeTheRestores.ContainsKey($action.Id)) { Fail "$($action.Id) is a stated residual of ChecksBeforeTheRestores but comes after both exact restores; delete the row" }
+        continue
+    }
+    if (-not $ChecksBeforeTheRestores.ContainsKey($action.Id)) {
+        Fail "$($action.Id) can fail the transaction (Return=`"check`") before the script holds $($unarmed -join ' and '): a failed upgrade from 0.3.0 then rolls back with that service gone. Schedule it after both."
+    }
+}
+foreach ($id in $ChecksBeforeTheRestores.Keys) {
+    if (-not ($checked | Where-Object { $_.Id -eq $id })) { Fail "ChecksBeforeTheRestores names $id, which is no longer a checked scheduled action; delete the row" }
+}
+if ($failures.Count -eq $failuresBeforeRestoreOrder) {
+    Pass "$($checked.Count - $ChecksBeforeTheRestores.Count) of $($checked.Count) checked actions come after both exact restores; the other $($ChecksBeforeTheRestores.Count) is a stated residual before WriteRegistryValues"
+}
+
+# 10. A rollback that starts a service starts the files that were there. InstallFiles' rollback
+# restores the previous files, and runs at InstallFiles' place in reverse: a rollback action
+# scheduled AFTER InstallFiles runs BEFORE that restore, so a start there runs the new binary (or
+# loads the new runtime DLLs) while the old ones are still to be put back over it.
+$starters = @($actions | Where-Object {
+        $_.Execute -eq 'rollback' -and $schedule.ContainsKey($_.Id) -and $_.ExeCommand -match '(sc|net)\.exe"?\s+start\s'
+    })
+if ($starters.Count -eq 0) { Fail 'no scheduled rollback action starts a service, so step 10 judged nothing' }
+$failuresBeforeStarters = $failures.Count
+foreach ($action in $starters) {
+    if (-not (Test-ScheduledBefore $action.Id 'InstallFiles')) {
+        Fail "$($action.Id) starts a service in a rollback but is not scheduled before InstallFiles, so the rollback starts it BEFORE InstallFiles' rollback restores the previous files: the new binary runs, or the restore meets a file in use"
+    }
+}
+if ($failures.Count -eq $failuresBeforeStarters) {
+    Pass "all $($starters.Count) rollback actions that start a service are scheduled before InstallFiles, so they run after its rollback restored the files"
 }
 
 # Positive controls: a walk that found nothing reports nothing wrong about it.

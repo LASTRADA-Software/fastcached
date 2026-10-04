@@ -653,6 +653,32 @@ readable and silently ignored. Every rule below has already been one of them.
   replaced. CPack's own WiX template schedules `MajorUpgrade` `afterInstallInitialize` and this
   project does not override it, so there is no slot before `RemoveExistingProducts` for a stop
   of our own.
+  - **Nor for anything else that writes to the execution script**: with `RemoveExistingProducts`
+    directly after `InstallInitialize`, a deferred, rollback or commit action between them is
+    Error 2613 and the upgrade aborts before it starts (round 7, after round 6 put the
+    registration copies there; ICE63 reports it, as a WARNING). What must be read before the
+    old product's half runs is read by AppSearch into properties, and what must be WRITTEN from
+    those properties is written by the installer itself through the Registry table
+    (`RegistrationCopy` components): `[PROPERTY]` carries an `ImagePath`'s TEXT verbatim, quotes
+    included, which no custom action's command line can carry. Its registry TYPE is not carried
+    -- the raw search returned the bare text and the copy is a `REG_SZ` -- and is immaterial,
+    since a restore re-applies the image path through `Win32_Service.Change` rather than copying
+    the value. `msi-custom-action-commands` refuses the order, and the MSI job runs ICE63 on the
+    built package and fails on it.
+  - **The exact restores are ARMED before anything that can fail**: the clear, both stashes and
+    both restores run directly after `WriteRegistryValues`, and `msi-custom-action-commands`
+    refuses a `Return="check"` deferred action scheduled ahead of either restore, since 0.3.0's
+    uninstall deleted both services and ships no rollback to bring them back. The RESIDUAL is
+    EVERY action from `RemoveExistingProducts` through `WriteRegistryValues` -- the removal
+    itself, `StopServices`, `DeleteServices`, `RemoveRegistryValues`, `RemoveFiles`,
+    `CreateFolders`, `InstallFiles`, `WriteRegistryValues` -- where nothing that restores can run
+    yet; `FastCacheAwaitServiceExit` is the one of ours, a stated row of `ChecksBeforeTheRestores`.
+    A failure there rolls an upgrade from 0.3.0 back with no service registered, and the remedy
+    is to run the upgrade again.
+  - **A rollback that STARTS a service is scheduled BEFORE `InstallFiles`**, and the rollback
+    state's undo before it: a rollback runs in reverse, so a start scheduled after the files runs
+    before `InstallFiles`' rollback restores them, starting the new binary over the old one being
+    put back. Step 10 of `msi-custom-action-commands` refuses it.
   - A feature an upgrade no longer installs has its leftover registration deleted by the NEW
     product (`sc delete`, the `DeleteLeftover` rows), because the old half never removes one and
     the new product has no binary left to run `--uninstall-service` with. Only a registration

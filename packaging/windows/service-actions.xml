@@ -232,6 +232,84 @@
                       Name="Start" Type="raw" Bitness="always64" />
     </Property>
 
+    <!-- And whether an auto start was DELAYED (#1), which only the exact restore
+         reads: the registration copies below carry it with the rest. -->
+    <Property Id="FASTCACHED_DELAYED_BEFORE" Secure="yes">
+      <RegistrySearch Id="FastCachedDelayedBeforeSearch" Root="HKLM"
+                      Key="SYSTEM\CurrentControlSet\Services\FastCached"
+                      Name="DelayedAutostart" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="FASTCACHE_NODE_DELAYED_BEFORE" Secure="yes">
+      <RegistrySearch Id="FastCacheNodeDelayedBeforeSearch" Root="HKLM"
+                      Key="SYSTEM\CurrentControlSet\Services\FastCacheCompileNode"
+                      Name="DelayedAutostart" Type="raw" Bitness="always64" />
+    </Property>
+
+    <!-- Each registration AS AppSearch READ IT, written back by the installer
+         itself. The exact restore needs the old registration after an upgrade
+         from 0.3.0, whose own uninstall-service deletes both services inside
+         RemoveExistingProducts; nothing of ours may run before that: with
+         RemoveExistingProducts after InstallInitialize, any action that writes
+         to the execution script ahead of it is Error 2613, and the whole
+         upgrade aborts (round 7). AppSearch runs before either, and
+         [PROPERTY] as a Registry table value carries the TEXT verbatim, quotes
+         included, which no command line could. Its TYPE is not what matters:
+         the raw search was observed to return the ImagePath as bare text (see
+         the RegisteredHere block below), which the Registry table writes as
+         REG_SZ, where the documented #% prefix would give REG_EXPAND_SZ.
+         Either is immaterial to the restore, which reads the text and hands it
+         whole to Win32_Service.Change; Start and DelayedAutostart come back
+         as # and so as DWORDs. WriteRegistryValues writes these after
+         RemoveExistingProducts, and the stash falls back to them in an upgrade
+         whose old product deleted the live registration.
+
+         Under a key of their OWN, which the components own and remove, and not
+         the rollback state's: FastCacheClearRollbackState empties that, and the
+         copies are what it must not lose. In the ROOT feature, so a node a
+         transaction removes or deselects keeps its copy until the product is
+         uninstalled or upgraded: harmless residue, since nothing reads it
+         without a live registration and an upgrade to read it in.
+
+         Transitive, so a reinstall re-evaluates the condition. The documented
+         cost: a product with transitive components may need its source to
+         repair or upgrade. That a registry-only component asks for none is
+         INFERRED: an Add/Remove Programs repair with the .msi gone is
+         exercised nowhere, CI's REINSTALL=ALL step passing the package.
+
+         Each Guid is explicit and must NEVER be regenerated while the
+         component's key path stays: the next build's copy of the same
+         component must be the same component. And it MUST change if the key
+         path or the registry key does, or two products claim one component
+         with different contents. -->
+    <Component Id="FastCachedRegistrationCopy" Directory="INSTALL_ROOT"
+               Guid="5E7A3C1D-2B84-4F69-9A0E-6D1C8B2F4A31" Bitness="always64"
+               Condition="FASTCACHED_IMAGEPATH" Transitive="yes">
+      <RegistryValue Root="HKLM" Key="SOFTWARE\fastcached\InstallerRegistrationCopy\FastCached"
+                     Name="ImagePath" Type="string" Value="[FASTCACHED_IMAGEPATH]" KeyPath="yes" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\fastcached\InstallerRegistrationCopy\FastCached"
+                     Name="Start" Type="string" Value="[FASTCACHED_START_BEFORE]" />
+    </Component>
+    <Component Id="FastCachedRegistrationCopyDelayed" Directory="INSTALL_ROOT"
+               Guid="7C0B9D24-5E13-4A87-B6F2-1D3E8A9C5F62" Bitness="always64"
+               Condition="FASTCACHED_DELAYED_BEFORE" Transitive="yes">
+      <RegistryValue Root="HKLM" Key="SOFTWARE\fastcached\InstallerRegistrationCopy\FastCached"
+                     Name="DelayedAutostart" Type="string" Value="[FASTCACHED_DELAYED_BEFORE]" KeyPath="yes" />
+    </Component>
+    <Component Id="FastCacheNodeRegistrationCopy" Directory="INSTALL_ROOT"
+               Guid="A3D61E8F-9C27-4B05-8E4A-2F7B1C6D9E04" Bitness="always64"
+               Condition="FASTCACHE_NODE_IMAGEPATH" Transitive="yes">
+      <RegistryValue Root="HKLM" Key="SOFTWARE\fastcached\InstallerRegistrationCopy\FastCacheCompileNode"
+                     Name="ImagePath" Type="string" Value="[FASTCACHE_NODE_IMAGEPATH]" KeyPath="yes" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\fastcached\InstallerRegistrationCopy\FastCacheCompileNode"
+                     Name="Start" Type="string" Value="[FASTCACHE_NODE_START_BEFORE]" />
+    </Component>
+    <Component Id="FastCacheNodeRegistrationCopyDelayed" Directory="INSTALL_ROOT"
+               Guid="C8F25A73-1E6D-4B9C-A04F-3B7E2D8C6A15" Bitness="always64"
+               Condition="FASTCACHE_NODE_DELAYED_BEFORE" Transitive="yes">
+      <RegistryValue Root="HKLM" Key="SOFTWARE\fastcached\InstallerRegistrationCopy\FastCacheCompileNode"
+                     Name="DelayedAutostart" Type="string" Value="[FASTCACHE_NODE_DELAYED_BEFORE]" KeyPath="yes" />
+    </Component>
+
     <!-- The machine-wide config directory, with an access list of its own,
          created BEFORE anything writes into it. C:\ProgramData grants
          BUILTIN\Users create-file, inherited by every subdirectory, and a
@@ -677,14 +755,17 @@
          msi-custom-action-commands refuses a registry element of this package
          that covers it.
 
-         Taken BEFORE RemoveExistingProducts, not before the step that changes
-         the registration. An upgrade runs the OLD product's uninstall-service
-         there, and 0.3.0's deletes both services: a copy taken after it found
-         nothing, so a failed upgrade from 0.3.0 left the restored 0.3.0 binary
-         registered with THIS package's command line, which 0.3.0 refuses at
-         every start (round 6). Directory="System64Folder", because before
-         InstallFiles a fresh install has no INSTALL_ROOT to start a process in.
-         msi-custom-action-commands refuses either placement coming back. -->
+         Taken from the LIVE registration where there is one (every
+         transaction but an upgrade from 0.3.0), and otherwise from the copy the
+         installer wrote of what AppSearch read (the RegistrationCopy components
+         above; FastCachedStashFromCopy and FastCacheNodeStashFromCopy below). An upgrade runs the OLD product's uninstall-service inside
+         RemoveExistingProducts, and 0.3.0's deletes both services, so after it
+         the live key is gone: round 6 copied nothing there, and a failed
+         upgrade from 0.3.0 left the restored 0.3.0 binary registered with THIS
+         package's command line, which 0.3.0 refuses at every start. Round 6's
+         fix took the copy BEFORE RemoveExistingProducts instead, which is
+         Error 2613 (round 7). So the copy is AFTER it, and after
+         WriteRegistryValues, which wrote the fallback. -->
     <CustomAction Id="FastCachedStashRegistration"
                   Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; copy HKLM\SYSTEM\CurrentControlSet\Services\FastCached HKLM\SOFTWARE\fastcached\InstallerRollback\FastCached /s /f /reg:64"
@@ -692,6 +773,21 @@
     <CustomAction Id="FastCacheNodeStashRegistration"
                   Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; copy HKLM\SYSTEM\CurrentControlSet\Services\FastCacheCompileNode HKLM\SOFTWARE\fastcached\InstallerRollback\FastCacheCompileNode /s /f /reg:64"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- The fallback, an action of its own so it can be conditioned: only in an
+         upgrade (WIX_UPGRADE_DETECTED), whose copy this very transaction wrote,
+         and only when the live registration is gone. A copy is rewritten only
+         when its component is (re)installed, so outside an upgrade it may be
+         from the install that made it; a later step deleting a registration
+         before the stash must not roll back to that. -->
+    <CustomAction Id="FastCachedStashFromCopy"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c ([System64Folder]reg.exe query HKLM\SYSTEM\CurrentControlSet\Services\FastCached /reg:64 &gt;nul 2&gt;&amp;1 || [System64Folder]reg.exe copy HKLM\SOFTWARE\fastcached\InstallerRegistrationCopy\FastCached HKLM\SOFTWARE\fastcached\InstallerRollback\FastCached /s /f /reg:64)"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="FastCacheNodeStashFromCopy"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c ([System64Folder]reg.exe query HKLM\SYSTEM\CurrentControlSet\Services\FastCacheCompileNode /reg:64 &gt;nul 2&gt;&amp;1 || [System64Folder]reg.exe copy HKLM\SOFTWARE\fastcached\InstallerRegistrationCopy\FastCacheCompileNode HKLM\SOFTWARE\fastcached\InstallerRollback\FastCacheCompileNode /s /f /reg:64)"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <!-- The exact restore: the copied command line through the service manager
@@ -710,30 +806,40 @@
 
     <!-- And each service started again if the transaction stopped it while it
          ran (FastCachedStopForNode, FastCacheNodeStopForRestart wrote that
-         down). Scheduled EARLY, before the registration steps, so the rollback
-         runs them LAST: the service starts under the registration that was put
-         back, never under the one that failed. -->
+         down). Scheduled BEFORE InstallFiles, so a rollback, which runs in
+         reverse, starts the service only after InstallFiles' own rollback has
+         put the previous files back and after every registration restore: it
+         starts the binary and the registration that were there, never the ones
+         that failed. Scheduled after the registration steps instead, a rollback
+         started the NEW files while InstallFiles' rollback was still to restore
+         the old ones over them. Reachable wherever a transaction replaces a
+         file the service loads without replacing its executable (the Cli
+         feature's runtime DLLs), since replacing the executable stops the
+         service first (StopServices) and no mark is then written. The marks
+         are read when the rollback RUNS, so marks written later in the forward
+         sequence are seen. In System64Folder: before InstallFiles a fresh
+         install has no install root yet. -->
     <CustomAction Id="FastCachedRestartAfterStop"
-                  Directory="INSTALL_ROOT"
+                  Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]reg.exe query HKLM\SOFTWARE\fastcached\InstallerRollback /v FastCachedWasRunning /reg:64 &gt;nul 2&gt;&amp;1 &amp;&amp; [System64Folder]sc.exe start FastCached"
                   Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheNodeRestartAfterStop"
-                  Directory="INSTALL_ROOT"
+                  Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]reg.exe query HKLM\SOFTWARE\fastcached\InstallerRollback /v NodeWasRunning /reg:64 &gt;nul 2&gt;&amp;1 &amp;&amp; [System64Folder]sc.exe start FastCacheCompileNode"
                   Execute="rollback" Impersonate="no" Return="ignore" />
 
     <!-- The rollback state, emptied before the transaction writes any and after
          it succeeds: a copy or a was-running mark from an earlier transaction
-         must never be what a later one restores. The emptying runs FIRST, before
-         the copies and so before RemoveExistingProducts, in System64Folder for
-         their reason. -->
+         must never be what a later one restores. The emptying runs first after
+         WriteRegistryValues, before any stash, mark or checked step. -->
     <CustomAction Id="FastCacheClearRollbackState"
                   Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
                   Execute="deferred" Impersonate="no" Return="ignore" />
     <!-- And the KEY itself, which no component owns and so nothing else removes: by
-         a FAILED transaction, as the last step of its rollback (scheduled first, so
-         every restore that reads the key runs before it), and by an uninstall that
+         a FAILED transaction, as the last step of its rollback (scheduled before
+         every action that reads the key, the restarts included, so each of them
+         runs before it in a rollback), and by an uninstall that
          is not an upgrade's removal of the old product. Without these a failed
          install followed by an uninstall left the key on the machine for good. -->
     <CustomAction Id="FastCacheUndoRollbackState"
@@ -800,50 +906,103 @@
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <InstallExecuteSequence>
-      <!-- Before the OLD product's removal (MajorUpgrade schedules
-           RemoveExistingProducts after InstallInitialize, and these push it
-           later): the rollback state is emptied, then each registration is
-           copied while the old product's is still there. -->
-      <Custom Action="FastCacheUndoRollbackState" Before="FastCacheClearRollbackState"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCacheClearRollbackState" Before="FastCachedStashRegistration"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCachedStashRegistration" Before="FastCacheNodeStashRegistration"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
-      <Custom Action="FastCacheNodeStashRegistration" Before="RemoveExistingProducts"
-              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
+      <!-- NOTHING of ours runs between InstallInitialize and
+           RemoveExistingProducts, which MajorUpgrade schedules directly after
+           it: an action that writes to the execution script there is Error 2613
+           and ends the upgrade before it starts (round 7).
+           msi-custom-action-commands refuses one by that rule. -->
 
       <!-- Before the files: an upgrade waits for the old product's service
            processes to exit, so nothing it replaces is held (B4-2). -->
       <Custom Action="FastCacheAwaitServiceExit" Before="InstallFiles"
               Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE" />
 
-      <!-- ONE sequence: validate, register, remember, start, and only then
-           delete. The node's arguments are checked FIRST, directly after the
-           files, so a value its parser refuses fails the transaction before
-           anything is changed (B4-3: a leftover was once deleted before the
-           check, and no rollback could restore it); every later step that fails
-           rolls back through the rollback twin scheduled before each earlier
-           step. -->
-      <Custom Action="FastCacheNodeCheckArguments" After="InstallFiles"
-              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCachedRestartAfterStop" After="FastCacheNodeCheckArguments"
+      <!-- And before them, the rollback steps that must run AFTER InstallFiles'
+           rollback has restored the previous files: each service's restart, and
+           ahead of those the rollback state's undo, so a rollback deletes the
+           key LAST, after every action that reads it. Both are rollback actions,
+           which write the script and so stay after RemoveExistingProducts. -->
+      <Custom Action="FastCacheUndoRollbackState" Before="FastCachedRestartAfterStop"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCachedRestartAfterStop" Before="FastCacheNodeRestartAfterStop"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCacheNodeRestartAfterStop" After="FastCachedRestartAfterStop"
+      <Custom Action="FastCacheNodeRestartAfterStop" Before="FastCacheAwaitServiceExit"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
-      <Custom Action="FastCachedSeedConfig" After="FastCacheNodeRestartAfterStop"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCacheNodeSeedConfig" After="FastCachedSeedConfig"
-              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <!-- FIRST after WriteRegistryValues, and before any step that can fail
+           (Return="check"): the rollback is ARMED. The rollback state is emptied,
+           each registration is stashed, and each service's rollback twins are
+           in the script, so a failure at ANY checked step that follows puts
+           both services back. That is the property an upgrade from 0.3.0 needs
+           most: its uninstall-service deleted both services inside
+           RemoveExistingProducts and it has no rollback of its own, so after a
+           failure a service exists only if a rollback action of OURS that
+           re-registers it was already in the script. In a transaction that
+           changed nothing, each twin re-registers with the arguments found
+           and the exact restore puts back the stashed line: no change.
 
-      <Custom Action="FastCachedRestoreRegistrationExactly" After="FastCacheNodeSeedConfig"
+           After WriteRegistryValues, which writes the registration copies the
+           fallback stashes take; in a rollback, which runs in reverse, every
+           exact restore then reads the stash BEFORE WriteRegistryValues' own
+           rollback removes the copy.
+
+           The order inside, each for its reason: the clear first; then per
+           service: stash, fallback, exact restore, undo or re-register, so a
+           rollback runs the re-register BEFORE the exact restore that corrects
+           it. The undo and the restarts are NOT here: they sit before
+           InstallFiles (above), so a rollback runs them after the files and
+           every registration are back.
+
+           THE RESIDUAL, stated: a failure in ANY action from
+           RemoveExistingProducts through WriteRegistryValues (the old
+           product's removal itself, StopServices, DeleteServices,
+           RemoveRegistryValues, RemoveFiles, CreateFolders, InstallFiles,
+           WriteRegistryValues) leaves an upgrade from 0.3.0 with NEITHER
+           service registered; FastCacheAwaitServiceExit is the one of ours
+           there. Nothing that writes the script may precede
+           RemoveExistingProducts while it stays afterInstallInitialize, the
+           copy does not exist before WriteRegistryValues, and the new binaries
+           a re-registration needs do not exist before InstallFiles. The remedy
+           is to run the upgrade again; msi-custom-action-commands names the
+           one checked action allowed there. -->
+      <Custom Action="FastCacheClearRollbackState" After="WriteRegistryValues"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCachedStashRegistration" After="FastCacheClearRollbackState"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
+      <Custom Action="FastCachedStashFromCopy" After="FastCachedStashRegistration"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH AND WIX_UPGRADE_DETECTED" />
+      <Custom Action="FastCachedRestoreRegistrationExactly" After="FastCachedStashFromCopy"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
       <Custom Action="FastCachedUndoRegistration" After="FastCachedRestoreRegistrationExactly"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND NOT FASTCACHED_IMAGEPATH" />
       <Custom Action="FastCachedRestoreRegistration" After="FastCachedUndoRegistration"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
-      <Custom Action="FastCachedInstallService" After="FastCachedRestoreRegistration"
+
+      <Custom Action="FastCacheNodeStashRegistration" After="FastCachedRestoreRegistration"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
+      <Custom Action="FastCacheNodeStashFromCopy" After="FastCacheNodeStashRegistration"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH AND WIX_UPGRADE_DETECTED" />
+      <Custom Action="FastCacheNodeRestoreRegistrationExactly" After="FastCacheNodeStashFromCopy"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
+      <Custom Action="FastCacheNodeUndoRegistration" After="FastCacheNodeRestoreRegistrationExactly"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND NOT FASTCACHE_NODE_IMAGEPATH" />
+      <Custom Action="FastCacheNodeRestoreRegistration" After="FastCacheNodeUndoRegistration"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
+
+      <!-- ONE sequence: validate, register, remember, start, and only then
+           delete. The node's arguments are checked FIRST of the steps that can
+           fail, before any service is changed (B4-3: a leftover was once
+           deleted before the check, and no rollback could restore it), and
+           behind the armed rollback above. -->
+      <Custom Action="FastCacheNodeCheckArguments" After="FastCacheNodeRestoreRegistration"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+
+      <Custom Action="FastCachedSeedConfig" After="FastCacheNodeCheckArguments"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCacheNodeSeedConfig" After="FastCachedSeedConfig"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+
+      <Custom Action="FastCachedInstallService" After="FastCacheNodeSeedConfig"
               Condition="FASTCACHED_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCachedStopForNode" After="FastCachedInstallService"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
@@ -871,13 +1030,7 @@
            registration that could not be made, or a node that will not serve,
            fails the transaction rather than letting it succeed over a stopped
            service. -->
-      <Custom Action="FastCacheNodeRestoreRegistrationExactly" After="FastCachedStartService"
-              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
-      <Custom Action="FastCacheNodeUndoRegistration" After="FastCacheNodeRestoreRegistrationExactly"
-              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND NOT FASTCACHE_NODE_IMAGEPATH" />
-      <Custom Action="FastCacheNodeRestoreRegistration" After="FastCacheNodeUndoRegistration"
-              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
-      <Custom Action="FastCacheNodeInstallService" After="FastCacheNodeRestoreRegistration"
+      <Custom Action="FastCacheNodeInstallService" After="FastCachedStartService"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
       <!-- Remembered once the registrations were accepted, each write behind
@@ -943,6 +1096,10 @@
   <CPackWiXFragment Id="#PRODUCTFEATURE">
     <ComponentRef Id="FastCachedProgramDataDir" />
     <ComponentRef Id="FastCacheRememberedProperties" />
+    <ComponentRef Id="FastCachedRegistrationCopy" />
+    <ComponentRef Id="FastCachedRegistrationCopyDelayed" />
+    <ComponentRef Id="FastCacheNodeRegistrationCopy" />
+    <ComponentRef Id="FastCacheNodeRegistrationCopyDelayed" />
   </CPackWiXFragment>
 
   <!-- Stop each service, and WAIT for it, whenever its binary's component is

@@ -3495,6 +3495,16 @@ jobs:
           $newer = (Get-ChildItem -Path $newerDir -Filter *.msi | Select-Object -First 1).FullName
           if (-not $newer) { throw "the second cpack run left no .msi in $newerDir" }
 
+          # Windows Installer's own rule for where RemoveExistingProducts may sit, asked of the
+          # package BEFORE any install: ICE63. With it after InstallInitialize, an action that
+          # writes to the execution script ahead of it is Error 2613 at run time, which ended
+          # every upgrade in round 7; wix reports ICE63 as a warning, so it is judged here.
+          # msi-custom-action-commands states the same rule over the fragment.
+          $ice63 = @(& wix msi validate -ice ICE63 $first 2>&1)
+          $ice63 | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) { throw "wix msi validate -ice ICE63 exited $LASTEXITCODE" }
+          if ($ice63 | Select-String -SimpleMatch 'ICE63') { throw "ICE63 refuses where RemoveExistingProducts sits (Error 2613 at run time)" }
+
           # What makes each transaction below an UPGRADE rather than a second
           # product or a repair, checked against the packages rather than assumed.
           $family = Get-MsiProperty $first 'UpgradeCode'
