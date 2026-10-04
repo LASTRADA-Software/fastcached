@@ -42,6 +42,7 @@
 
 #include <tests/AccessList.hpp>
 #include <tests/FleetHistoryFakes.hpp>
+#include <tests/NodeConditionFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/NodeKeyFakes.hpp>
 #include <tests/ScopedUmask.hpp>
@@ -861,10 +862,11 @@ TEST_CASE("A replace whose POSIX rename is refused as unsupported still lands, a
     auto const scratch = ScratchDirectory { "replace-route" };
     CapturingLogger logger;
     AtomicMetricsSink metrics;
+    NodeConditions conditions;
     Consensus::SystemDurableFiles files;
     auto const refused = std::error_code { InvalidParameter, std::system_category() };
     auto const rename = ScriptedReplacingRename { refused };
-    auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics);
+    auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics, conditions);
 
     // Only Windows reads that answer as "no such rename here": `rename(2)` has the semantics, so a
     // POSIX build treats any refusal as the failure it is.
@@ -894,7 +896,7 @@ namespace
 class UnsyncedDirectoryFiles final: public Consensus::IDurableFiles
 {
   public:
-    /// @param answer What every directory sync answers.
+    /// @param answer What every directory sync's flush answers.
     explicit UnsyncedDirectoryFiles(std::error_code answer) noexcept:
         _answer { answer }
     {
@@ -906,9 +908,11 @@ class UnsyncedDirectoryFiles final: public Consensus::IDurableFiles
         return _system.Create(path, which);
     }
 
-    [[nodiscard]] std::error_code SyncDirectory(std::filesystem::path const& /*directory*/) override
+    [[nodiscard]] std::expected<void, Consensus::DirectorySyncFailure> SyncDirectory(
+        std::filesystem::path const& /*directory*/) override
     {
-        return _answer;
+        return std::unexpected { Consensus::DirectorySyncFailure { .step = Consensus::DirectorySyncStep::Flush,
+                                                                   .code = _answer } };
     }
 
   private:
@@ -930,11 +934,15 @@ TEST_CASE("A state directory whose filesystem cannot sync a directory is said an
         auto const scratch = ScratchDirectory { "replace-route-unsynced" };
         CapturingLogger logger;
         AtomicMetricsSink metrics;
+        NodeConditions conditions;
         UnsyncedDirectoryFiles files { answer };
         auto const rename = ScriptedReplacingRename { std::error_code {} };
-        auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics);
+        auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics, conditions);
         REQUIRE(route.has_value());
         CHECK(metrics.Read(IMetricsSink::Counter::StateDirectorySyncsUnsupported) == 1);
+        // And the operator's row (B3-6): latched, naming the directory, since the remedy is to move it.
+        CHECK(conditions.StateOf(NodeCondition::StateDirectoryUnsynced) == CompileCacheWire::ConditionState::Raised);
+        CHECK(Testing::DetailOf(conditions, NodeCondition::StateDirectoryUnsynced).contains(scratch.Path().string()));
         CHECK(metrics.Read(IMetricsSink::Counter::StateFileReplacesFellBack) == 0);
         auto const said = logger.Snapshot();
         CHECK(std::ranges::count_if(said,
@@ -951,10 +959,14 @@ TEST_CASE("A state directory whose filesystem cannot sync a directory is said an
     auto const scratch = ScratchDirectory { "replace-route-sync-failed" };
     CapturingLogger logger;
     AtomicMetricsSink metrics;
+    NodeConditions conditions;
     UnsyncedDirectoryFiles files { std::make_error_code(std::errc::io_error) };
     auto const rename = ScriptedReplacingRename { std::error_code {} };
-    CHECK_FALSE(ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics).has_value());
+    CHECK_FALSE(ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics, conditions).has_value());
     CHECK(metrics.Read(IMetricsSink::Counter::StateDirectorySyncsUnsupported) == 0);
+    // Nor is the row raised: a probe that could not run observed nothing, and says that rather than
+    // `clear`.
+    CHECK(conditions.StateOf(NodeCondition::StateDirectoryUnsynced) == CompileCacheWire::ConditionState::NotEvaluated);
 }
 
 TEST_CASE("A replace whose POSIX rename works is neither said nor counted", "[node][state-files]")
@@ -962,15 +974,18 @@ TEST_CASE("A replace whose POSIX rename works is neither said nor counted", "[no
     auto const scratch = ScratchDirectory { "replace-route-posix" };
     CapturingLogger logger;
     AtomicMetricsSink metrics;
+    NodeConditions conditions;
     Consensus::SystemDurableFiles files;
     auto const rename = ScriptedReplacingRename { std::error_code {} };
-    auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics);
+    auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics, conditions);
     REQUIRE(route.has_value());
     CHECK(Testing::Unwrap(route) == Platform::ReplaceRoute::PosixSemantics);
     CHECK(rename.Asked() > 0);
     CHECK(metrics.Read(IMetricsSink::Counter::StateFileReplacesFellBack) == 0);
     CHECK(logger.Snapshot().empty());
     CHECK_FALSE(std::filesystem::exists(scratch / Consensus::ReplaceProbeFileName));
+    // This machine's directory synced, so the row is checked and benign.
+    CHECK(conditions.StateOf(NodeCondition::StateDirectoryUnsynced) == CompileCacheWire::ConditionState::Clear);
 }
 
 TEST_CASE("What a crash during the replace probe leaves is no reason to refuse the next start, and the probe clears it",
@@ -990,9 +1005,10 @@ TEST_CASE("What a crash during the replace probe leaves is no reason to refuse t
 
         CapturingLogger logger;
         AtomicMetricsSink metrics;
+        NodeConditions conditions;
         auto const rename = ScriptedReplacingRename { std::error_code {} };
         Consensus::SystemDurableFiles files;
-        auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics);
+        auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics, conditions);
         REQUIRE(route.has_value());
         for (auto const name: NodeStateProbeLeftovers())
         {

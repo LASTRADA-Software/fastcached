@@ -542,17 +542,19 @@ struct FlushingStore
     std::unique_ptr<CowTree::FilePageStore> store;
     CowTree::Meta meta {};
 
-    /// Open -- or reopen -- a batched store of `GrowthPageSize` pages at `path`.
-    explicit FlushingStore(std::filesystem::path const& path)
+    /// Open -- or reopen -- a batched store at `path`.
+    /// @param path Filesystem path of the store file.
+    /// @param pageSize Page size to create it with; a reopen keeps the file's own.
+    explicit FlushingStore(std::filesystem::path const& path, std::size_t pageSize = GrowthPageSize)
     {
         CowTree::FilePageStore::Options opts;
         opts.path = path;
-        opts.pageSize = GrowthPageSize;
+        opts.pageSize = pageSize;
         opts.durability = CowTree::FilePageStore::Durability::Batched;
         auto opened = CowTree::FilePageStore::Open(opts);
         REQUIRE(opened.has_value());
         store = std::move(*opened);
-        meta.pageSize = static_cast<std::uint32_t>(GrowthPageSize);
+        meta.pageSize = static_cast<std::uint32_t>(store->PageSize());
     }
 
     /// Buffer one commit and flush it: one group commit, exactly what the interval does.
@@ -568,7 +570,7 @@ struct FlushingStore
     [[nodiscard]] std::vector<CowTree::PageId> AllocateWritten(std::size_t count) const
     {
         std::vector<CowTree::PageId> ids;
-        std::vector<std::byte> page(GrowthPageSize, std::byte { 0 });
+        std::vector<std::byte> page(store->PageSize(), std::byte { 0 });
         for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, count))
         {
             auto const id = store->Allocate();
@@ -683,6 +685,75 @@ TEST_CASE("A batched store cuts its free tail and reopens over the shorter file"
     auto const next = s.store->Allocate();
     REQUIRE(next.has_value());
     CHECK(next->value == LivePages + 1);
+}
+
+TEST_CASE("A flush writes its free list into no page the meta it supersedes still needs",
+          "[filestore][durability][batched][freelist][meta][corrupt]")
+{
+    // The crash-safety argument of a free list written into free pages, made red-capable.
+    // The list's pages may come only from `_freeList`, free in the durable meta's world AND
+    // the next one's. Two kinds of page are NOT, and a flush that took either would damage
+    // the meta it supersedes -- which is the meta a crash, or a damaged slot, falls back to:
+    //
+    //   - a PENDING free: the durable meta's tree still references it;
+    //   - a page of the PREVIOUS list: the durable meta's `freeRoot` names it.
+    //
+    // A clean reopen never reads the superseded meta, so every other case here would pass
+    // a build that broke either rule. This one reopens on it: commit k, free some of k's
+    // tree, commit k+1, damage k+1's slot, and require k's world to come back intact --
+    // every tree page reading back what it held, and no allocation handing one out.
+    //
+    // Small pages, because `DamageMetaSlot` addresses the slots at `MinPageSize`.
+    constexpr std::size_t TreePages = 16;
+    constexpr std::size_t FreedAtK1 = 8;
+    constexpr std::size_t Spare = 8;
+
+    TempFile tmp;
+    std::vector<CowTree::PageId> tree;
+    CowTree::MetaSlot damaged {};
+    {
+        FlushingStore s { tmp.path, MetaDamagePageSize };
+        tree = s.AllocateWritten(TreePages);
+        for (auto const id: s.AllocateWritten(Spare))
+            REQUIRE(s.store->Free(id).has_value());
+        s.CommitAndFlush(); // the spare pages' freeing becomes durable
+        s.CommitAndFlush(); // k: the list moves into a free page; the first list's page is pending
+
+        // Batch k+1 frees the upper half of k's tree: pending, and still k's.
+        for (auto const id: tree | std::views::drop(TreePages - FreedAtK1))
+            REQUIRE(s.store->Free(id).has_value());
+        s.CommitAndFlush(); // k+1
+        damaged = s.store->LastDurableSlot();
+    }
+    DamageMetaSlot(tmp.path, damaged);
+
+    FlushingStore s { tmp.path };
+    // The reopen landed on k, the slot that was not damaged.
+    REQUIRE(s.store->LastDurableSlot() == CowTree::OtherSlot(damaged));
+
+    // Every page of k's tree reads back what it held, the half k+1 freed included.
+    for (auto const id: tree)
+    {
+        INFO("tree page " << id.value);
+        auto const read = s.store->Read(id);
+        REQUIRE(read.has_value());
+        std::vector<std::byte> expected(s.store->PageSize(), std::byte { 0 });
+        PutNextLink(expected, id.value);
+        CHECK(std::ranges::equal(*read, expected));
+    }
+
+    // And k's free list names none of them: draining it hands out no tree page. Bounded by
+    // the pages the file holds -- the first id past them is an extension, and ends the walk.
+    auto const held = s.store->TotalDataPages();
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, held + 1))
+    {
+        auto const id = s.store->Allocate();
+        REQUIRE(id.has_value());
+        if (id->value > held)
+            break;
+        INFO("allocated " << id->value);
+        CHECK(std::ranges::find(tree, *id) == tree.end());
+    }
 }
 
 TEST_CASE("Durability=Batched flushes buffered writes on graceful close", "[filestore][durability][batched]")

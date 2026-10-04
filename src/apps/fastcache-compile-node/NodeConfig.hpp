@@ -797,6 +797,15 @@ struct NodeConfig
     bool help { false };
     bool version { false };
 
+    /// `--check-arguments`: parse the command line, and exit -- answered before any file is read.
+    ///
+    /// The PARSE is the whole check: a value its row refuses has already exited naming the flag, so
+    /// reaching this field at all is the answer. What the installer asks of the arguments it is about
+    /// to remember and register, before either (batch 3 review, B3-1): a fleet pin the parser refuses
+    /// must fail the transaction, never be remembered and replayed into a registration that ignores
+    /// the refusal.
+    bool checkArguments { false };
+
     /// List every port this configuration would open, and exit.
     ///
     /// A mode rather than a serving option, like `--version` -- and deliberately

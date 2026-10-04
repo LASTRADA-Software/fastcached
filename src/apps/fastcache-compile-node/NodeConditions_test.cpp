@@ -11,6 +11,7 @@
 #include "NodeMembership.hpp"
 #include "NodeProofClient.hpp"
 #include "NodeRoster.hpp"
+#include "NodeStateFiles.hpp"
 #include "NodeStatusText.hpp"
 #include "SchedulerReachability.hpp"
 #include "SchedulerTier.hpp"
@@ -326,10 +327,15 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     NullLogger logger;
     AtomicMetricsSink metrics;
 
-    // The process scope: the catalogue, and the host name this node is dialled at -- evaluated
-    // where `main` evaluates them, the second over the configuration it runs.
+    // The process scope: the catalogue, the host name this node is dialled at, and how its state
+    // directory replaces a file -- evaluated where `main` evaluates them, the second over the
+    // configuration it runs and the third over a state directory, through this machine's files.
     EvaluateProcessConditions(conditions, metrics);
     EvaluateHostNameCondition(conditions, Testing::FirstStart(NodeConfig {}));
+    FastCache::Testing::ScratchDirectory const replaceState { "conditions-replace-route" };
+    Consensus::SystemDurableFiles replaceFiles;
+    Platform::SystemReplacingRename const replaceRename;
+    REQUIRE(ReportReplaceRoute(replaceState.Path(), replaceFiles, replaceRename, logger, metrics, conditions).has_value());
 
     // The consensus scope: the membership a consensus node builds.
     auto clustered = Testing::FirstStart(NodeConfig {});

@@ -125,11 +125,13 @@ class RecordingDurableFiles final: public IDurableFiles
         });
     }
 
-    std::error_code SyncDirectory(std::filesystem::path const& directory) override
+    std::expected<void, DirectorySyncFailure> SyncDirectory(std::filesystem::path const& directory) override
     {
         _calls.emplace_back("sync-directory");
-        return _fail == FailedStep::DirectorySync ? std::make_error_code(std::errc::io_error)
-                                                  : _system.SyncDirectory(directory);
+        if (_fail == FailedStep::DirectorySync)
+            return std::unexpected { DirectorySyncFailure { .step = DirectorySyncStep::Flush,
+                                                            .code = std::make_error_code(std::errc::io_error) } };
+        return _system.SyncDirectory(directory);
     }
 
     /// Record a step another seam took, in the same order as this one's.
@@ -299,51 +301,84 @@ TEST_CASE("A replace whose directory cannot be synced is reported, never taken a
     CHECK(TextAt(path) == "new");
 }
 
+namespace
+{
+/// This machine's files, with a directory sync that fails as told.
+class UnsyncedDurableFiles final: public IDurableFiles
+{
+  public:
+    /// @param said What every directory sync answers.
+    explicit UnsyncedDurableFiles(DirectorySyncFailure said) noexcept:
+        _said { said }
+    {
+    }
+
+    std::expected<std::unique_ptr<IDurableSink>, std::error_code> Create(std::filesystem::path const& file,
+                                                                         StateFile which) override
+    {
+        return _system.Create(file, which);
+    }
+
+    std::expected<void, DirectorySyncFailure> SyncDirectory(std::filesystem::path const& /*directory*/) override
+    {
+        return std::unexpected { _said };
+    }
+
+  private:
+    DirectorySyncFailure _said;
+    SystemDurableFiles _system;
+};
+} // namespace
+
 TEST_CASE("A filesystem that cannot sync a directory degrades the replace, and every other sync failure refuses it",
           "[consensus][storage][durable]")
 {
-    // Each of this platform's "not supported here" answers lands the replace and carries the answer back;
-    // an answer outside the table is a sync that failed, and fails the replace (the case above).
+    // Each of this platform's "not supported here" answers, from the FLUSH, lands the replace and carries
+    // the answer back; an answer outside the table is a sync that failed, and fails the replace (the case
+    // above).
     REQUIRE_FALSE(UnsupportedDirectorySyncAnswers().empty());
     for (auto const answer: UnsupportedDirectorySyncAnswers())
     {
         INFO(answer.message());
-        CHECK(MeansDirectorySyncUnsupported(answer));
+        auto const said = DirectorySyncFailure { .step = DirectorySyncStep::Flush, .code = answer };
+        CHECK(MeansDirectorySyncUnsupported(said));
         auto const scratch = Testing::ScratchDirectory { "durable-file-unsynced" };
         auto const path = scratch / "formation";
-
-        /// This machine's files, with a directory sync that answers `answer`.
-        class Unsynced final: public IDurableFiles
-        {
-          public:
-            explicit Unsynced(std::error_code said) noexcept:
-                _said { said }
-            {
-            }
-
-            std::expected<std::unique_ptr<IDurableSink>, std::error_code> Create(std::filesystem::path const& file,
-                                                                                 StateFile which) override
-            {
-                return _system.Create(file, which);
-            }
-
-            std::error_code SyncDirectory(std::filesystem::path const& /*directory*/) override
-            {
-                return _said;
-            }
-
-          private:
-            std::error_code _said;
-            SystemDurableFiles _system;
-        } files { answer };
+        auto files = UnsyncedDurableFiles { said };
         auto const rename = Platform::SystemReplacingRename {};
         auto const replaced = ReplaceFileWith(path, WireFields::AsBytes("new"), StateFile::Formation, files, rename);
         REQUIRE(replaced.has_value());
         CHECK(Testing::Unwrap(replaced).directoryUnsynced == answer);
         CHECK(TextAt(path) == "new");
     }
-    CHECK_FALSE(MeansDirectorySyncUnsupported(std::make_error_code(std::errc::io_error)));
-    CHECK_FALSE(MeansDirectorySyncUnsupported(std::error_code {}));
+    CHECK_FALSE(MeansDirectorySyncUnsupported(
+        DirectorySyncFailure { .step = DirectorySyncStep::Flush, .code = std::make_error_code(std::errc::io_error) }));
+    CHECK_FALSE(MeansDirectorySyncUnsupported(DirectorySyncFailure { .step = DirectorySyncStep::Flush, .code = {} }));
+}
+
+TEST_CASE("A table answer from the directory sync's open or close refuses the replace: only the flush's degrades",
+          "[consensus][storage][durable]")
+{
+    // Batch 3 review, B3-2: Windows' `CreateFileW` answers `ERROR_INVALID_PARAMETER` for a bad flag or path,
+    // which is this code's defect and not the volume's -- degraded, every replace on every volume would be
+    // reported as a filesystem that cannot sync a directory. So the same codes from any call but the flush
+    // are a sync that failed. The previous case is the other direction.
+    for (auto const answer: UnsupportedDirectorySyncAnswers())
+    {
+        for (auto const step: { DirectorySyncStep::Open, DirectorySyncStep::Close })
+        {
+            INFO(answer.message() << (step == DirectorySyncStep::Open ? " from the open" : " from the close"));
+            auto const said = DirectorySyncFailure { .step = step, .code = answer };
+            CHECK_FALSE(MeansDirectorySyncUnsupported(said));
+            auto const scratch = Testing::ScratchDirectory { "durable-file-unsynced-step" };
+            auto const path = scratch / "formation";
+            auto files = UnsyncedDurableFiles { said };
+            auto const rename = Platform::SystemReplacingRename {};
+            auto const refused = ReplaceFileWith(path, WireFields::AsBytes("new"), StateFile::Formation, files, rename);
+            REQUIRE_FALSE(refused.has_value());
+            CHECK(refused.error().context.contains("cannot sync its directory"));
+        }
+    }
 }
 
 TEST_CASE("This machine's directory sync succeeds on a directory and is refused for one that is not there",
@@ -353,7 +388,10 @@ TEST_CASE("This machine's directory sync succeeds on a directory and is refused 
     // here would fail every replace a node makes. And the refusal path answers rather than passes.
     auto const scratch = Testing::ScratchDirectory { "durable-file-dirsync-real" };
     auto const synced = SyncDirectoryToDisk(scratch.Path());
-    INFO(synced.message());
-    CHECK_FALSE(synced);
-    CHECK(SyncDirectoryToDisk(scratch / "absent"));
+    INFO((synced.has_value() ? std::string { "synced" } : synced.error().code.message()));
+    CHECK(synced.has_value());
+    // A directory that is not there is refused at the OPEN, which no table answer there degrades.
+    auto const absent = SyncDirectoryToDisk(scratch / "absent");
+    REQUIRE_FALSE(absent.has_value());
+    CHECK(absent.error().step == DirectorySyncStep::Open);
 }

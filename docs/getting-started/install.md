@@ -97,8 +97,13 @@ discovery beacon reaches it, as across a VPN; it is registered as the node's `--
 node that needs more than one names them under `fleet_seed:` in its configuration file. So is
 `FASTCACHE_FLEET_ID`, the one fleet the node may join, pasted as `fastcache-cli node` prints it on a
 machine of that fleet (`<cluster-id>@<key>[,<key>...]`); it is registered VERBATIM as the node's
-`--fleet-id`, and a value the node cannot read fails the node's registration by name rather than
-registering a node that trusts whichever fleet proves itself first. The package also
+`--fleet-id`. A value the node cannot read **fails the whole transaction** (msiexec exits 1603, and
+the log names the action `FastCacheNodeCheckArguments`; `fastcache-compile-node --check-arguments
+--fleet-id=<value>` names what is wrong with the value): the node's own parser checks
+the node's arguments before anything is remembered or registered, so a refused pin is never
+remembered, and a repair or upgrade leaves the existing registration and its remembered pin as they
+were rather than starting a node that trusts whichever fleet proves itself first. A malformed
+`FASTCACHE_FLEET_SEED` or `FASTCACHE_NODE_ADVERTISE` fails it the same way. The package also
 pins the node's discovery reply port, `FASTCACHE_DISCOVERY_REPLY_PORT=6682` unless you pass another
 (or pass it empty), so its firewall opens UDP 6682 rather than every local UDP port. A node run by
 hand leaves that port to the kernel, because two nodes on one machine each need one of their own;
@@ -118,7 +123,8 @@ Every transaction that keeps a service registers it again, and the optional prop
 remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE`, `FASTCACHE_FLEET_SEED` and
 `FASTCACHE_FLEET_ID` are written to
 `HKLM\SOFTWARE\fastcached\Installer` and read back by the next repair or upgrade, so one that
-leaves them out registers what was installed. A transaction that states a new value replaces the
+leaves them out registers what was installed. The node's three are written only by a transaction
+that keeps the node, once its parser has accepted them. A transaction that states a new value replaces the
 remembered one. An empty value counts as leaving the property out, so a remembered scope is kept;
 to drop it, uninstall (which forgets the values) and install again. An installer older than this
 remembering has nothing to read back, so the first upgrade from one registers what it states: with

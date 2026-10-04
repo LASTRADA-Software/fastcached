@@ -202,6 +202,8 @@ constexpr std::array NonStartVerbs {
     // a start than anything above them.
     NonStartVerb { .flag = "--help", .why = "prints usage and exits, ahead of the config file being read" },
     NonStartVerb { .flag = "--version", .why = "prints the version and exits, ahead of the config file being read" },
+    NonStartVerb { .flag = "--check-arguments",
+                   .why = "parses the command line and exits, ahead of the config file being read" },
 };
 
 /// A command line the check deliberately does not judge.
@@ -1130,38 +1132,68 @@ constexpr std::string_view SecondPin = "fedcba9876543210fedcba9876543210@_FHNjmI
 }
 } // namespace
 
-TEST_CASE("An MSI fleet pin the node's parser refuses fails the registration by name, never registering no pin",
+TEST_CASE("An MSI fleet pin the node's parser refuses fails the transaction before it is remembered or registered",
           "[node][docs][service][msi]")
 {
     // A pin is security material: an operator who typed one meant the node to join that fleet and no
-    // other, so a value the parser cannot read must not register a node that trusts on first use. The
-    // registration action's command, formatted as Windows Installer formats it, is refused by the parse
-    // that `--install-service` runs before anything is registered -- WHICH refusal, the pin's.
+    // other. The registration is `Return="ignore"`, so its own parse refusing the pin left the OLD
+    // registration -- unpinned, or under the old pin -- to be started, with the refused pin remembered
+    // and replayed by every later transaction (batch 3 review, B3-1). So the node's arguments are
+    // CHECKED first, by `FastCacheNodeCheckArguments` (`Return="check"`, sequenced before every
+    // remember write; `check-wix-service-table` pins that), running the node's own parser over them.
+    // Here: the check's command, formatted as Windows Installer formats it, is refused -- WHICH
+    // refusal, the flag's -- and a value it accepts parses as the check and nothing else.
     std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
-    auto const command = MsiNodeInstallCommand(root);
-    for (std::string_view const bad:
-         { std::string_view { "0123456789abcdef0123456789abcdef" }, std::string_view { "office@not-a-key" } })
-    {
-        INFO(bad);
-        auto formatted = Formatted(command, "INSTALL_ROOT", R"(C:\Program Files\fastcached\)");
-        for (std::string_view const unset: { "FastCacheNodeAdvertiseArgument",
-                                             "FASTCACHE_NODE_ADVERTISE",
-                                             "FastCacheFirewallAllowArgument",
-                                             "FASTCACHE_FIREWALL_ALLOW",
-                                             "FastCacheNodeDiscoveryReplyArgument",
-                                             "FASTCACHE_DISCOVERY_REPLY_PORT",
-                                             "FastCacheFleetSeedArgument",
-                                             "FASTCACHE_FLEET_SEED" })
-            formatted = Formatted(std::move(formatted), unset, "");
-        formatted = Formatted(std::move(formatted), "FastCacheFleetIdArgument", std::format("--fleet-id={}", bad));
-        formatted = Formatted(std::move(formatted), "FASTCACHE_FLEET_ID", bad);
-        REQUIRE_FALSE(formatted.contains('['));
-        auto const arguments = SplitArguments(formatted);
+    auto const text = MsiFragmentText(root);
+    auto const checkOf = [&](std::map<std::string, std::string> const& properties) {
+        auto const command = MsiFormattedCommand(text, "FastCacheNodeCheckArguments", properties);
+        INFO(command);
+        REQUIRE_FALSE(command.contains('['));
+        auto const arguments = SplitArguments(command);
         REQUIRE(arguments.size() > 1);
-        auto const parsed = ParsedFirstStart(std::span { arguments }.subspan(1));
+        return ParsedFirstStart(std::span { arguments }.subspan(1));
+    };
+
+    // What is checked is what would be registered: the same arguments after each verb, for a
+    // transaction stating every property.
+    auto const every = std::map<std::string, std::string> { { "FASTCACHE_FIREWALL_ALLOW", "10.0.0.0/8" },
+                                                            { "FASTCACHE_NODE_ADVERTISE", "worker-01.internal:6674" },
+                                                            { "FASTCACHE_FLEET_SEED", "office-a.vpn.example" },
+                                                            { "FASTCACHE_FLEET_ID", std::string { FirstPin } } };
+    auto const after = [](std::string const& command, std::string_view verb) {
+        auto const at = command.find(verb);
+        REQUIRE(at != std::string::npos);
+        return command.substr(at + verb.size());
+    };
+    CHECK(after(MsiFormattedCommand(text, "FastCacheNodeCheckArguments", every), "--check-arguments")
+          == after(MsiFormattedCommand(text, "FastCacheNodeInstallService", every), "--install-service"));
+
+    struct Refused
+    {
+        std::string_view property; ///< The MSI property the transaction states.
+        std::string_view value;    ///< A value the node's parser refuses.
+        std::string_view flag;     ///< The flag the refusal must name.
+    };
+    for (auto const& row: std::to_array<Refused>({
+             { .property = "FASTCACHE_FLEET_ID", .value = "0123456789abcdef0123456789abcdef", .flag = "--fleet-id" },
+             { .property = "FASTCACHE_FLEET_ID", .value = "office@not-a-key", .flag = "--fleet-id" },
+             // The seed rides the same check: the step-20 re-check's N-3 shape, where a malformed one
+             // registered nothing and said so to nobody.
+             { .property = "FASTCACHE_FLEET_SEED", .value = "office-a.vpn.example:99999", .flag = "--fleet-seed" },
+         }))
+    {
+        INFO(row.property << "=" << row.value);
+        auto const parsed = checkOf({ { std::string { row.property }, std::string { row.value } } });
         REQUIRE_FALSE(parsed.has_value());
-        CHECK(parsed.error().ToString().contains("--fleet-id"));
+        CHECK(parsed.error().ToString().contains(row.flag));
     }
+
+    // The control: a pin the parser reads passes the check, and the check is all it asks for.
+    auto const accepted = checkOf(every);
+    REQUIRE(accepted.has_value());
+    CHECK(Testing::Unwrap(accepted).checkArguments);
+    CHECK_FALSE(Testing::Unwrap(accepted).installService);
+    CHECK(PinTextOf(Testing::Unwrap(accepted)) == FirstPin);
 }
 
 TEST_CASE(

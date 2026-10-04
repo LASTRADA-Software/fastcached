@@ -410,6 +410,9 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         "--daemon",         // carried as ServiceSpec::daemonFlag, not an argument
         "--help",           //
         "--version",        //
+        // Parses the command line and exits: the installer's question about the arguments it is
+        // about to register, never one a registration replays.
+        "--check-arguments",
         // The one field with no safe representation in launch arguments: a
         // supervisor records them where every local account can read them, so
         // emitting the secret would publish it to exactly the accounts it exists

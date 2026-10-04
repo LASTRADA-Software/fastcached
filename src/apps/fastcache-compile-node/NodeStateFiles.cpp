@@ -393,7 +393,8 @@ std::optional<Platform::ReplaceRoute> ReportReplaceRoute(std::filesystem::path c
                                                          Consensus::IDurableFiles& files,
                                                          Platform::IReplacingRename const& rename,
                                                          ILogger& logger,
-                                                         IMetricsSink& metrics)
+                                                         IMetricsSink& metrics,
+                                                         NodeConditions& conditions)
 {
     auto const probed = Consensus::ProbeReplaceRoute(directory, files, rename);
     if (!probed.has_value())
@@ -402,6 +403,9 @@ std::optional<Platform::ReplaceRoute> ReportReplaceRoute(std::filesystem::path c
                     "cannot tell how the state files in {} are replaced: {}",
                     directory.string(),
                     probed.error().context);
+        conditions.NotEvaluated(
+            NodeCondition::StateDirectoryUnsynced,
+            std::format("the replace probe in {} could not run: {}", directory.string(), probed.error().context));
         return std::nullopt;
     }
     if (probed->directoryUnsynced)
@@ -410,12 +414,22 @@ std::optional<Platform::ReplaceRoute> ReportReplaceRoute(std::filesystem::path c
         logger.Logf(LogLevel::Warn,
                     "the filesystem holding {} cannot sync a directory ({} {}: {}), so a replaced state file is "
                     "not known to survive a power loss there: every replace still lands and is used, and one a "
-                    "power cut takes back is read as the file before it. Move --cluster-dir to a local volume "
-                    "for durable replaces",
+                    "power cut takes back is read as the file before it. For durable replaces, stop the node, move "
+                    "the state directory whole to a local volume and point --cluster-dir at it",
                     directory.string(),
                     probed->directoryUnsynced.category().name(),
                     probed->directoryUnsynced.value(),
                     probed->directoryUnsynced.message());
+        conditions.Raise(NodeCondition::StateDirectoryUnsynced,
+                         std::format("the filesystem holding {} answered a directory sync {} {}: {}",
+                                     directory.string(),
+                                     probed->directoryUnsynced.category().name(),
+                                     probed->directoryUnsynced.value(),
+                                     probed->directoryUnsynced.message()));
+    }
+    else
+    {
+        conditions.Clear(NodeCondition::StateDirectoryUnsynced);
     }
     if (probed->route == Platform::ReplaceRoute::Classic)
     {

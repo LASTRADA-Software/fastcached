@@ -1869,6 +1869,16 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .apply = SetTrue<&NodeConfig::version>(),
           .flow = ParseFlow::Stop,
           .description = "print the version and exit" },
+        // `ParseFlow::Continue`, unlike `--version`: the arguments AFTER it are what it checks.
+        { .primary = "--check-arguments",
+          .arity = Arity::None,
+          .apply = SetTrue<&NodeConfig::checkArguments>(),
+          .description = "parse every other argument and exit: success when each\n"
+                         "one parses, the refusal naming the flag when one does\n"
+                         "not. Reads no file, opens nothing and judges no rule\n"
+                         "across flags. The Windows installer runs it over the\n"
+                         "arguments it is about to remember and register, so a\n"
+                         "value this node would refuse fails the install first." },
     });
     static_assert(TableIsWellFormed<NodeConfig>(options));
 
@@ -1925,6 +1935,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { "--enroll-clear", "drops the undecided requests and exits" },
         { "--help", "prints usage and exits" },
         { "--version", "prints the version and exits" },
+        { "--check-arguments", "parses the command line and exits; a key would check instead of serving" },
     });
 
     // A row is reachable from the file or it is named above. Checked at compile
@@ -2097,17 +2108,16 @@ std::optional<std::string> AllowlistAnnouncement(AllowlistMoment moment,
 std::optional<std::string> ObservabilityAnnouncement(NodeConfig const& cfg)
 {
     // The single-machine install says nothing, and this is the clause that keeps it
-    // quiet: a worker names `--scheduler` on one machine too, so that is no evidence of
-    // a fleet -- and neither is a key route alone, since every node naming a scheduler
-    // keeps a state directory. The question is the one that decides the lease check,
-    // could a machine that is not this one reach this node at all, asked of what the node
-    // is NOW: a node running consensus holds the roster its formation record describes, so
-    // a solitary one -- which serves its own machine only, on a wildcard port like every
-    // node -- is not told it works for others (`Formed`).
+    // quiet. The question is the one that decides the lease check -- could a machine that
+    // is not this one reach this node at all -- asked of what the node is NOW. A node's
+    // roster is the state its OWN consensus applies (T25), so a node running consensus is
+    // asked as `Formed`: its formation record says whether other machines are members, and a
+    // solitary one -- which serves its own machine only, on a wildcard port like every
+    // node -- is not told it works for others.
     //
-    // `Unknown` otherwise: said at startup, before any roster was read, so a configuration
-    // that could hold one counts -- err towards saying it, but only for a port that faces
-    // the network.
+    // A node running no consensus holds no roster, so no key route admits anybody there:
+    // `Unknown` counts one only where consensus runs (`AdmitsRemotePeers`), which leaves
+    // `--fleet-open` and the formation record as the routes this asks about.
     auto const roster = RunsConsensus(cfg) ? RosterPresence::Formed : RosterPresence::Unknown;
     if (!CompileVerbsReachOtherMachines(cfg, roster))
         return std::nullopt;

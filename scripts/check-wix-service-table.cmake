@@ -24,7 +24,10 @@
 # The After= rows also pin that the remembered values are written BEFORE either
 # registration: a write that fails then rolls the transaction back before a service
 # is registered, where after them it left the services registered, and started,
-# over files the rollback removed.
+# over files the rollback removed. And that the node's arguments are CHECKED before
+# any of them (FastCacheNodeCheckArguments, Return="check"): the registration is
+# Return="ignore", so a fleet pin its parser refused left the old registration
+# running and the refused pin remembered (batch 3 review, B3-1).
 #
 # What it does NOT see: whether Windows Installer evaluates a condition the way it
 # reads, and anything about sequencing beyond the After= values pinned below. The
@@ -173,13 +176,22 @@ set(_table [=[
 <CustomAction Id="FastCacheRememberFleetId"|/>|Execute="deferred"
 <CustomAction Id="FastCacheRememberFleetId"|/>|Impersonate="no"
 <CustomAction Id="FastCacheRememberFleetId"|/>|Return="check"
+<CustomAction Id="FastCacheNodeCheckArguments"|/>|fastcache-compile-node.exe" --check-arguments --service-start=auto [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedArgument] [FastCacheFleetIdArgument]"
+<CustomAction Id="FastCacheNodeCheckArguments"|/>|Execute="deferred"
+<CustomAction Id="FastCacheNodeCheckArguments"|/>|Impersonate="no"
+<CustomAction Id="FastCacheNodeCheckArguments"|/>|Return="check"
+<Custom Action="FastCacheNodeCheckArguments"|/>|Condition="FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheNodeCheckArguments"|/>|After="FastCacheNodeSeedConfig"
 <Custom Action="FastCacheRememberFirewallAllow"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
-<Custom Action="FastCacheRememberNodeAdvertise"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
-<Custom Action="FastCacheRememberFleetSeed"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheRememberNodeAdvertise"|/>|Condition="FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheRememberNodeAdvertise"|/>|!FASTCACHED_SELECTED
+<Custom Action="FastCacheRememberFleetSeed"|/>|Condition="FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheRememberFleetSeed"|/>|!FASTCACHED_SELECTED
 <Custom Action="FastCacheRememberFleetSeed"|/>|After="FastCacheRememberNodeAdvertise"
-<Custom Action="FastCacheRememberFleetId"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheRememberFleetId"|/>|Condition="FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheRememberFleetId"|/>|!FASTCACHED_SELECTED
 <Custom Action="FastCacheRememberFleetId"|/>|After="FastCacheRememberFleetSeed"
-<Custom Action="FastCacheRememberFirewallAllow"|/>|After="FastCacheNodeSeedConfig"
+<Custom Action="FastCacheRememberFirewallAllow"|/>|After="FastCacheNodeCheckArguments"
 <Custom Action="FastCacheRememberNodeAdvertise"|/>|After="FastCacheRememberFirewallAllow"
 <Custom Action="FastCachedInstallService"|/>|After="FastCacheRememberFleetId"
 

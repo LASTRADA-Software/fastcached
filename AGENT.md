@@ -773,6 +773,8 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - A tree walk is bounded by `PageCount()`, and must not overlap a commit.
 - Both tiers' `bytesUsed` count STORED bytes; the disk tier's is its page FOOTPRINT, which
   `--cache-disk` bounds, never the file's length. A compression test asserts ENTRIES, not bytes.
+- A flush never extends a file whose free list can hold its own list, nor writes it into a page
+  the superseded meta needs; a leaked page is lost CAPACITY, so only `batched` carries a budget.
 - The LRU mirror holds what this SESSION touched — `TouchOrInsert` is its only writer and no
   `Open` path calls it — so eviction reaches the COLD set first, and that is LRU rather than a
   workaround. A figure describing the store reads the STORE at the store's own denomination;

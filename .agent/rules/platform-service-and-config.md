@@ -679,7 +679,13 @@ readable and silently ignored. Every rule below has already been one of them.
   (passed VERBATIM, a pin being security material), each a row of `check-wix-service-table` and of the
   remember case. **The writes run BEFORE either registration**: `Return="check"` exists to fail the
   transaction loudly, and a failure AFTER the registrations rolled the files back under services it
-  had already registered and started. Not remembering them failed OPEN: a repair that left out
+  had already registered and started. **And the node's arguments are CHECKED before the writes**
+  (`FastCacheNodeCheckArguments`, the node's own `--check-arguments` over the registration's own
+  argument list, `Return="check"`), because the registration is `Return="ignore"`: a pin its parse
+  refused left the OLD registration to be started and the refused pin remembered, replayed by every
+  later transaction and clearable by no empty property (batch 3 review, B3-1). The node's three
+  properties are remembered only by a transaction that keeps the node, so nothing the check did not
+  see is ever written; the `[msi]` refusal case and the MSI job's refused repair assert both halves. Not remembering them failed OPEN: a repair that left out
   `FASTCACHE_FIREWALL_ALLOW` opened the rules to any address. The `[msi]` remember case runs the
   fragment's own rows across install, repair, upgrade and repair. `FASTCACHE_NODE_ADVERTISE` is OPTIONAL and reaches
   the command line only through the derived `FastCacheNodeAdvertiseArgument`, so an absent one is

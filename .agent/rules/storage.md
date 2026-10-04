@@ -368,6 +368,43 @@ describes stops at the first commit that reclaims a page.
 Staging into an *uncommitted* write transaction from inside a walk is fine, and
 is what the conversion does.
 
+## Where a flush writes the free list
+
+<!-- agent-tripwire: A flush never extends a file whose free list can hold its own list -->
+
+**A flush never extends a file whose free list can hold its own list, never writes the list
+into a pending free or the previous list's pages, and truncates only `_freeList` ids, before
+the pending frees graduate.** `FilePageStore::WriteFreeListLocked` and
+`TruncateFreeTailLocked`; every clause has already been a bug or is the whole argument for
+why the next one is not.
+
+- **Extending for the list's pages is how a 64 GiB disk tier became a 103 GB file, 89 % free
+  pages.** Each flush grew the file by `ceil(F / idsPerPage)` pages and handed the previous
+  list's pages back to `F`, so a store at its bound grew geometrically. The list's pages come
+  out of `_freeList`; the file is extended only for the shortfall when `_freeList` cannot
+  hold its own list.
+- **The superseded meta is the one a crash or a damaged slot falls back to**, and it still
+  needs two kinds of page that are not in `_freeList`: a PENDING free is in its tree, and the
+  previous list's pages are its `freeRoot`. Writing the list into either damages exactly the
+  fallback -- and a clean reopen never reads the fallback, so no ordinary case can see it.
+  "A flush writes its free list into no page the meta it supersedes still needs"
+  (`FilePageStore_test`) reopens on the superseded meta, and goes red under either theft.
+- **The list NAMES everything free in the new meta's world**, pending frees and the previous
+  list's pages included. Naming is not taking; leaving them out marked them live after every
+  restart.
+- **A truncation cuts only pages free in BOTH surviving metas**, which is why it runs before
+  the pending frees graduate. Both metas may still name a cut id as an ENTRY, so recovery
+  skips an entry past the end of the file; a LINK past the end stays `Corrupt`, because no
+  list page a surviving meta names is ever cut.
+
+**Since the disk budget became the page footprint, a leaked page is lost CAPACITY, not only
+file length** -- it counts against the budget and evicts a live entry, for good. That is why
+only `batched` may carry a budget: the other durabilities persist no free list, so every
+restart would leak every free page, and `fastcached` refuses the combination at startup
+(`DaemonStorageBudgetDurabilityRefusal`). Nothing reclaims a page leaked any other way yet --
+a crash's unflushed extensions, a store written before the fix -- so do not describe the
+footprint as exact on a store with a history.
+
 ## What a refused `Open` can say
 
 <!-- agent-tripwire: A refused `Open` carries the **errno it classified** -->

@@ -58,10 +58,12 @@ enum class NodeCondition : std::uint8_t
     SurfaceNotAccepting,     ///< A serving surface's accept loop has ended: its port listens and refuses.
     SurfaceAcceptDegraded,   ///< A serving surface's accept loop is backing off on failures nothing classifies.
     FleetSplitHealing, ///< This fleet and another are one fleet split in two: healing by itself, or waiting on an operator.
-    FormationMoveRefused,  ///< A move of this node's formation was refused: the startup rules refuse the shape it moves to.
-    ConsensusLeaderSilent, ///< No leader this node's applied configuration counts has spoken for too long to trust its
-                           ///< grants.
-    Last,                  ///< Not a condition.
+    FormationMoveRefused,   ///< A move of this node's formation was refused: the startup rules refuse the shape it moves to.
+    ConsensusLeaderSilent,  ///< No leader this node's applied configuration counts has spoken for too long to trust its
+                            ///< grants.
+    StateDirectoryUnsynced, ///< The state directory's filesystem cannot sync a directory, so its replaces may not survive
+                            ///< a power loss.
+    Last,                   ///< Not a condition.
 };
 
 /// Which of this node's components evaluates a row.
@@ -353,6 +355,17 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "--cluster-status on one of them. Until a leader the fleet counts speaks to it again, every grant it is "
                 "handed is refused and the compiles fall back to their own machines; a voter its fleet forgot meanwhile is "
                 "what this protects against. It clears at the first leader contact." },
+    { .condition = NodeCondition::StateDirectoryUnsynced,
+      .id = "state-directory-unsynced",
+      .persistence = CompileCacheWire::ConditionPersistence::Latched,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Process,
+      .remedy = "Stop the node, move its state directory whole to a local volume -- it holds the node's identity, so a "
+                "new empty directory would be a new machine -- point --cluster-dir at the new place and start it. "
+                "The filesystem the detail names cannot sync a directory, so a state file replaced there (the "
+                "Raft term and vote, the formation record) is not known to survive a power loss: one a power cut "
+                "takes back is read as the file before it. The node serves meanwhile; a restart on the same "
+                "volume will not clear this." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");

@@ -204,9 +204,10 @@ class FilePageStore final: public IPageStore
     /// extending the file, `Allocate` takes the lowest free id so live pages collect at
     /// the front, and each durable flush cuts the free tail. Both directions of the
     /// relation: the file is NEVER shorter than the pages in use, and it may be LONGER by
-    /// the free pages until a flush cuts them -- by a batch of copy-on-write pages at
-    /// steady state, and by every page a large eviction freed in the middle of the file
-    /// until churn migrates live data below them.
+    /// its free pages -- those at the end until a flush cuts them, those in the interior
+    /// until later writes reuse them. That is a batch of copy-on-write pages at steady
+    /// state, and every page a large eviction freed in the middle of the file until churn
+    /// migrates live data below them.
     [[nodiscard]] auto PagesInUse() const noexcept -> std::size_t override;
 
     /// @return Current durability mode.

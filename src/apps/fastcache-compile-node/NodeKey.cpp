@@ -255,12 +255,12 @@ namespace
         // And the directory, or a power loss can take back the ENTRY of a key whose bytes are on the
         // disk: the next start finds no key, mints another, and the machine the fleet knew is gone
         // (`Consensus::SyncDirectoryToDisk`). The key is written, so the next start reads it.
-        if (auto const synced = Consensus::SyncDirectoryToDisk(path.parent_path()); synced)
+        if (auto const synced = Consensus::SyncDirectoryToDisk(path.parent_path()); !synced.has_value())
             return Refuse(NodeKeyFault::WriteFailed,
                           std::format("wrote {}, but cannot sync its directory: {}; it is not known to survive a power "
                                       "loss. The next start reads the key that was written",
                                       path.string(),
-                                      synced.message()));
+                                      synced.error().code.message()));
         return {};
     }
 } // namespace

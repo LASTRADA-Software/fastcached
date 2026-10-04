@@ -1309,15 +1309,19 @@ and it is recorded here because the question will be asked again.
     NTFS and ReFS where read access alone is refused. A failed directory sync is a failed
     replace, reported and never taken as durable; the identity key, created once rather than
     replaced, flushes its directory the same way. **Except a FILESYSTEM that cannot sync a
-    directory at all** (`MeansDirectorySyncUnsupported`, a table of named answers per platform):
-    a sync it does not offer never succeeds, so refusing it refused EVERY state write on such a
-    volume. That is DEGRADED -- the replace lands, the answer rides `ReplacedBy::directoryUnsynced`,
-    and the start probe says it once and counts it (`StateDirectorySyncsUnsupported`) -- while any
-    OTHER refusal of the sync still fails the replace, since it may be a sync that would have
+    directory at all** (`MeansDirectorySyncUnsupported`, a table of named answers per platform,
+    asked of the FLUSH's answer alone -- the same code from the OPEN, Windows'
+    `ERROR_INVALID_PARAMETER` from `CreateFileW`, is this code's defect and refuses,
+    `DirectorySyncStep`): a sync it does not offer never succeeds, so refusing it refused EVERY
+    state write on such a volume. That is DEGRADED -- the replace lands, the answer rides `ReplacedBy::directoryUnsynced`,
+    and the start probe says it once, counts it (`StateDirectorySyncsUnsupported`) and raises the
+    LATCHED `state-directory-unsynced` condition, because its remedy is an operator's (B3-6) -- while
+    any OTHER refusal of the sync still fails the replace, since it may be a sync that would have
     succeeded.
     **Such a volume runs with a STATED durability gap**: a power loss there can resurrect an old
-    vote or record -- PostgreSQL's `fsync_fname` precedent -- and the start probe's one warning and
-    `fastcache_state_directory_syncs_unsupported_total` are what an operator sees of it.
+    vote or record -- PostgreSQL's `fsync_fname` precedent -- and the start probe's one warning,
+    `fastcache_state_directory_syncs_unsupported_total` and the condition row are what an operator
+    sees of it.
     - **On Windows a replace survives an open reader only with BOTH halves**: the reader opened
       with delete sharing (`FILE_SHARE_DELETE`; `_wfopen` shares none) AND the rename made with
       POSIX semantics (`FileRenameInfoEx`, `FILE_RENAME_FLAG_POSIX_SEMANTICS`,

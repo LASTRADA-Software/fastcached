@@ -2,6 +2,7 @@
 #pragma once
 
 #include "AdminEndpoint.hpp"
+#include "NodeConditions.hpp"
 #include "NodeFormation.hpp"
 #include "NodeKey.hpp"
 
@@ -41,8 +42,11 @@ namespace FastCache::Node
 /// Probe how the state files in @p directory are replaced, and say so when the replace FALLS BACK:
 /// a Warn naming the directory and the refusal, and `StateFileReplacesFellBack`. And when its
 /// filesystem cannot sync a directory at all (`Consensus::MeansDirectorySyncUnsupported`): a Warn
-/// naming the directory and the answer, and `StateDirectorySyncsUnsupported` -- every replace there
-/// lands DEGRADED rather than refused.
+/// naming the directory and the answer, `StateDirectorySyncsUnsupported`, and the latched
+/// `state-directory-unsynced` condition -- every replace there lands DEGRADED rather than refused,
+/// and the remedy is an operator's (batch 3 review, B3-6), so it is a row and not a log line alone.
+/// That row is answered on every path: raised, cleared by a probe that synced, or not evaluated by a
+/// probe that could not run.
 ///
 /// A fallback is the classic rename, which every replace still lands with -- but on Windows a reader
 /// holding the file open then refuses it, which is the failure the POSIX-semantics rename exists to
@@ -54,12 +58,14 @@ namespace FastCache::Node
 /// @param rename The POSIX-semantics rename every replace tries first.
 /// @param logger Where a fallback, or a probe that could not run, is said.
 /// @param metrics Where a fallback, or a directory that cannot be synced, is counted.
+/// @param conditions Where `state-directory-unsynced` is answered.
 /// @return The route, or nothing when the probe could not be written.
 std::optional<Platform::ReplaceRoute> ReportReplaceRoute(std::filesystem::path const& directory,
                                                          Consensus::IDurableFiles& files,
                                                          Platform::IReplacingRename const& rename,
                                                          ILogger& logger,
-                                                         IMetricsSink& metrics);
+                                                         IMetricsSink& metrics,
+                                                         NodeConditions& conditions);
 
 /// What a node does with a state file another account owns.
 ///

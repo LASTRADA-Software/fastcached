@@ -86,13 +86,16 @@ std::expected<std::unique_ptr<IDurableSink>, std::error_code> SystemDurableFiles
     });
 }
 
-std::error_code SystemDurableFiles::SyncDirectory(std::filesystem::path const& directory)
+std::expected<void, DirectorySyncFailure> SystemDurableFiles::SyncDirectory(std::filesystem::path const& directory)
 {
     return SyncDirectoryToDisk(directory);
 }
 
-std::error_code SyncDirectoryToDisk(std::filesystem::path const& directory)
+std::expected<void, DirectorySyncFailure> SyncDirectoryToDisk(std::filesystem::path const& directory)
 {
+    auto const refused = [](DirectorySyncStep step, std::error_code code) {
+        return std::unexpected { DirectorySyncFailure { .step = step, .code = code } };
+    };
 #if defined(_WIN32)
     // FILE_WRITE_DATA is a directory's add-file right, which a replace into it already needs; read
     // access alone is refused the flush (measured, see the header).
@@ -104,19 +107,26 @@ std::error_code SyncDirectoryToDisk(std::filesystem::path const& directory)
                                        FILE_FLAG_BACKUP_SEMANTICS,
                                        nullptr);
     if (handle == INVALID_HANDLE_VALUE)
-        return std::error_code { static_cast<int>(::GetLastError()), std::system_category() };
+        return refused(DirectorySyncStep::Open,
+                       std::error_code { static_cast<int>(::GetLastError()), std::system_category() });
     auto const flushed = ::FlushFileBuffers(handle) != FALSE
                              ? std::error_code {}
                              : std::error_code { static_cast<int>(::GetLastError()), std::system_category() };
     ::CloseHandle(handle);
-    return flushed;
+    if (flushed)
+        return refused(DirectorySyncStep::Flush, flushed);
+    return {};
 #else
     auto const descriptor = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (descriptor < 0)
-        return std::error_code { errno, std::generic_category() };
+        return refused(DirectorySyncStep::Open, std::error_code { errno, std::generic_category() });
     auto const synced = ::fsync(descriptor) == 0 ? std::error_code {} : std::error_code { errno, std::generic_category() };
     auto const closed = ::close(descriptor) == 0 ? std::error_code {} : std::error_code { errno, std::generic_category() };
-    return synced ? synced : closed;
+    if (synced)
+        return refused(DirectorySyncStep::Flush, synced);
+    if (closed)
+        return refused(DirectorySyncStep::Close, closed);
+    return {};
 #endif
 }
 
@@ -141,9 +151,10 @@ std::span<std::error_code const> UnsupportedDirectorySyncAnswers()
     return answers;
 }
 
-bool MeansDirectorySyncUnsupported(std::error_code failure) noexcept
+bool MeansDirectorySyncUnsupported(DirectorySyncFailure const& failure) noexcept
 {
-    return std::ranges::contains(UnsupportedDirectorySyncAnswers(), failure);
+    return failure.step == DirectorySyncStep::Flush
+           && std::ranges::contains(UnsupportedDirectorySyncAnswers(), failure.code);
 }
 
 gsl::owner<std::FILE*> OpenBinary(std::filesystem::path const& path, char const* mode)
@@ -320,19 +331,19 @@ std::expected<Platform::ReplacedBy, ConsensusError> ReplaceFileWith(std::filesys
     // such a volume refuses every state write forever.
     auto const directory = path.has_parent_path() ? path.parent_path() : std::filesystem::path { "." };
     auto const synced = files.SyncDirectory(directory);
-    if (synced && MeansDirectorySyncUnsupported(synced))
+    if (!synced.has_value() && MeansDirectorySyncUnsupported(synced.error()))
     {
         auto degraded = *replaced;
-        degraded.directoryUnsynced = synced;
+        degraded.directoryUnsynced = synced.error().code;
         return degraded;
     }
-    if (synced)
+    if (!synced.has_value())
         return std::unexpected { FastCache::StorageFailure(
             std::format("replaced {}, but cannot sync its directory {}: {}; the replace is not known to survive a "
                         "power loss",
                         path.string(),
                         directory.string(),
-                        synced.message())) };
+                        synced.error().code.message())) };
     return *replaced;
 }
 

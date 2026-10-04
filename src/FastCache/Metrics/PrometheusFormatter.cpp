@@ -95,11 +95,13 @@ namespace
                      .type = MetricType::Gauge,
                      .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.bytesLimit); } },
         // The disk tier's FILE, beside the footprint `bytes_used` reports. The budget bounds
-        // the footprint; the file can exceed it by free pages until a flush cuts the free
-        // tail, so an operator asking "what is this costing my disk" reads this one.
+        // the footprint; the file exceeds it by its free pages -- the end of the file is cut
+        // at a commit, a page inside it only leaves once later writes reuse it -- so an
+        // operator asking "what is this costing my disk" reads this one.
         TierMetric { .name = "fastcached_tier_file_bytes",
-                     .help = "Length of the file backing this tier, free pages included. Can exceed "
-                             "fastcached_tier_bytes_used until a flush cuts the free tail; never below it.",
+                     .help = "Length of the file backing this tier, free pages included. Exceeds "
+                             "fastcached_tier_bytes_used by those free pages until a commit cuts them off the end "
+                             "or later writes reuse them; never below it.",
                      .type = MetricType::Gauge,
                      .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.fileBytes); },
                      .fileTiersOnly = true },

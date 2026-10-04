@@ -98,8 +98,9 @@
          key it takes that fleet's word from, as `fastcache-cli node` prints it
          (<cluster-id>@<key>[,<key>...]), passed VERBATIM as the node's fleet-id
          flag. Left out, discovery is trust-on-first-use. Security material: a
-         value the node's parser refuses fails the registration by name rather
-         than registering a node pinned to nothing. -->
+         value the node's parser refuses FAILS THE TRANSACTION, before anything
+         is remembered or registered (FastCacheNodeCheckArguments), rather than
+         keeping a registration pinned to nothing and remembering the value. -->
     <Property Id="FASTCACHE_FLEET_ID" Secure="yes">
       <RegistrySearch Id="FastCacheRememberedFleetId" Root="HKLM"
                       Key="SOFTWARE\fastcached\Installer"
@@ -402,6 +403,22 @@
                   ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --service-start=auto [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedArgument] [FastCacheFleetIdArgument]"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
+    <!-- The node's arguments, checked by the node's own parser BEFORE anything
+         is remembered or registered: the registration below is Return="ignore"
+         (a machine with the files and no service is recoverable by hand), so a
+         value its parse refuses (a fleet pin above all, which is security
+         material) would otherwise leave the old registration, unpinned or
+         under the old pin, and be started, with the refused value remembered
+         and replayed by every later transaction. Return="check": the
+         transaction fails and rolls back with nothing remembered. The same
+         argument list as the registration, so what is checked is what would be
+         registered; the check reads no file and judges no rule across flags,
+         which the registration's own install-service still does. -->
+    <CustomAction Id="FastCacheNodeCheckArguments"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --check-arguments --service-start=auto [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedArgument] [FastCacheFleetIdArgument]"
+                  Execute="deferred" Impersonate="no" Return="check" />
+
     <CustomAction Id="FastCacheNodeStartService"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[System64Folder]sc.exe&quot; start FastCacheCompileNode"
@@ -442,7 +459,14 @@
          anything is registered. After them, a failed write rolled the FILES back
          while the services it had just registered, and started, stayed behind,
          pointing at removed binaries on a fresh install, replaying a command line
-         against the restored old ones on an upgrade. -->
+         against the restored old ones on an upgrade.
+
+         The node's three (its advertised endpoint, its fleet seed and its fleet
+         pin) are remembered only by a transaction that registers the NODE, and
+         only after FastCacheNodeCheckArguments accepted them: a value nothing
+         checked must not be remembered, since an empty property cannot clear it
+         and every later transaction would replay it. The firewall scope shapes
+         both registrations, so either remembers it. -->
     <CustomAction Id="FastCacheRememberFirewallAllow"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; add HKLM\SOFTWARE\fastcached\Installer /v FirewallAllow /t REG_SZ /d &quot;[FASTCACHE_FIREWALL_ALLOW]&quot; /f /reg:64"
@@ -488,16 +512,21 @@
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
       <!-- Every transaction that registers a service remembers what it
-           registers with, FIRST (see the FastCacheRemember actions): the same
-           conditions as the registrations, OR'ed. -->
-      <Custom Action="FastCacheRememberFirewallAllow" After="FastCacheNodeSeedConfig"
+           registers with, FIRST (see the FastCacheRemember actions): the
+           firewall scope under the registrations' conditions OR'ed, the node's
+           three under the node's. -->
+      <!-- The node's arguments are checked first of all, so a value its parser
+           refuses fails the transaction before anything is remembered. -->
+      <Custom Action="FastCacheNodeCheckArguments" After="FastCacheNodeSeedConfig"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCacheRememberFirewallAllow" After="FastCacheNodeCheckArguments"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheRememberNodeAdvertise" After="FastCacheRememberFirewallAllow"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheRememberFleetSeed" After="FastCacheRememberNodeAdvertise"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheRememberFleetId" After="FastCacheRememberFleetSeed"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
       <Custom Action="FastCachedInstallService" After="FastCacheRememberFleetId"
               Condition="FASTCACHED_SELECTED = &quot;1&quot;" />

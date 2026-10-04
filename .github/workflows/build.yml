@@ -3787,6 +3787,23 @@ jobs:
           Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed.example.invalid:6674'
           Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
 
+          # A pin the node's parser REFUSES fails the transaction (batch 3 review, B3-1): the node's
+          # arguments are checked before anything is remembered or registered, and the registration
+          # itself ignores its own failure, so without the check the repair "succeeded", kept the old
+          # registration running and remembered the refused pin for every later transaction. Both
+          # halves are asserted: the transaction is refused BY THE CHECK, and what the machine had
+          # survives it -- the registration's pin and the remembered one.
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'refused-pin.log' -What 'a repair stating a pin the node refuses' `
+            -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus', 'FASTCACHE_FLEET_ID=0123456789abcdef0123456789abcdef' `
+            -Accept @(1603)
+          Assert-MsiLog -Path 'refused-pin.log' -Present 'CustomAction FastCacheNodeCheckArguments returned actual error code'
+          Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
+          $remembered = Get-ItemPropertyValue -Path 'HKLM:\SOFTWARE\fastcached\Installer' -Name 'FleetId'
+          if ($remembered -cne $pin) {
+            throw "the refused repair changed the remembered fleet pin: '$remembered', expected '$pin'"
+          }
+          Write-Host "the refused pin failed the repair; the registration and the remembered pin are unchanged"
+
           Invoke-Msiexec -Operation '/i' -Package $msi -Log 'remove-node.log' -Properties 'REMOVE=CM_C_Node' `
             -What 'removing the node feature'
           Assert-ServiceTable -Row DaemonAlone -Log 'remove-node.log'

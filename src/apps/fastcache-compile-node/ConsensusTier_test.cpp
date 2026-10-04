@@ -2534,15 +2534,14 @@ struct FounderEnrollment
     NullLogger logger;                                                         ///< Where it says what it does.
     Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner(); ///< What the scheduler signs with.
     Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} }; ///< The founder's scheduler.
-    Testing::ListedMembership membership {
-        { std::string { OperatorAddress } },
-        Distributed::MembershipParticipant::MachineTicket,
-        // A VOTER's ticket: the control verbs ask an operator's standing, which a ticket from a
-        // machine without a voter's seat does not carry (W-1).
-        Distributed::KeyEvidenceSet {}.Add(Distributed::KeyEvidence::MachineTicket)
-    }; ///< Who may decide.
-    NodeConditions conditions;                                                                  ///< What the window raises.
-    EnrollmentWindow window { clock, &conditions, &metrics, wallClock };                        ///< The pending list.
+    Testing::ListedMembership membership { { std::string { OperatorAddress } },
+                                           Distributed::MembershipParticipant::MachineTicket,
+                                           // A VOTER's ticket: the control verbs ask an operator's standing, which a ticket
+                                           // from a machine without a voter's seat does not carry (W-1).
+                                           Distributed::KeyEvidenceSet {}.Add(
+                                               Distributed::KeyEvidence::MachineTicket) }; ///< Who may decide.
+    NodeConditions conditions;                                                             ///< What the window raises.
+    EnrollmentWindow window { clock, &conditions, &metrics, wallClock };                   ///< The pending list.
     Testing::ScriptedSummarySource self;                        ///< What the founder says about itself.
     Ed25519KeyPair const identity = Testing::TestKeyPair("n1"); ///< The founder's identity key.
     Testing::ScriptedSecureRandom random { Testing::ScriptedSecureRandom::Ascending(256) }; ///< Each row's challenge.

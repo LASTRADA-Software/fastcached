@@ -59,9 +59,10 @@ struct StorageStats
     /// `StorageTierTraits::storedInFile` says it has one.
     ///
     /// Beside `bytesUsed` because the two answer different questions: that one is what
-    /// the budget bounds, this one is what the filesystem is charged. A free page in the
-    /// middle of the file is in this figure and not in that one, so this can exceed the
-    /// budget until a flush cuts the free tail -- and is never below `bytesUsed`.
+    /// the budget bounds, this one is what the filesystem is charged. A free page is in this
+    /// figure and not in that one: one at the end of the file leaves at the next commit, one
+    /// in its INTERIOR only once later writes reuse it, lowest id first. So this can exceed
+    /// the budget for as long as that takes -- and is never below `bytesUsed`.
     std::size_t fileBytes { 0 };
     /// Resident bytes this tier spends on its own key index, or 0 where it has none
     /// distinct from `bytesUsed`.

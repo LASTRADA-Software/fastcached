@@ -686,12 +686,19 @@ using Node::NodeReloader;
 
     // How a state file here is replaced, said -- and counted -- once per body when it falls back to the
     // classic rename, which on Windows a reader holding the file open refuses, and when its filesystem
-    // cannot sync a directory, which degrades every replace there (`ReportReplaceRoute`).
+    // cannot sync a directory, which degrades every replace there and raises `state-directory-unsynced`
+    // (`ReportReplaceRoute`). A node keeping no state directory replaces no state file, and says so.
     if (auto const stateDirectory = Node::ChosenStateDirectory(cfg); stateDirectory.has_value())
     {
         Consensus::SystemDurableFiles durableFiles;
         Platform::SystemReplacingRename const replacingRename;
-        static_cast<void>(Node::ReportReplaceRoute(stateDirectory->path, durableFiles, replacingRename, logger, metrics));
+        static_cast<void>(
+            Node::ReportReplaceRoute(stateDirectory->path, durableFiles, replacingRename, logger, metrics, conditions));
+    }
+    else
+    {
+        conditions.NotEvaluated(Node::NodeCondition::StateDirectoryUnsynced,
+                                "this node keeps no state directory, so it replaces no state file");
     }
 
     // One policy for all THREE surfaces -- the compile port here, the scheduler and
@@ -2254,6 +2261,14 @@ int main(int argc, char** argv)
     if (cliOnly.version)
     {
         std::cout << "fastcache-compile-node " << FASTCACHE_NODE_VERSION << '\n';
+        return CommandExitCode(CommandEnding::Completed);
+    }
+    // The parse above IS the check: an argument its row refuses has exited there, naming the flag.
+    // Answered before any file is read for `--version`'s reason, and because what the installer
+    // asks is whether the values it is about to remember are ones this node reads (B3-1).
+    if (cliOnly.checkArguments)
+    {
+        std::cout << "fastcache-compile-node: every argument parses\n";
         return CommandExitCode(CommandEnding::Completed);
     }
 

@@ -7,6 +7,7 @@
 #include <FastCache/Platform/ReplacingRename.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <expected>
 #include <filesystem>
@@ -53,6 +54,29 @@ using ReadStream = std::unique_ptr<std::FILE, int (*)(std::FILE*)>;
 /// @return The stream, or why it could not be opened.
 [[nodiscard]] std::expected<ReadStream, std::error_code> OpenForReading(std::filesystem::path const& path);
 
+/// Which call of a directory sync gave a failed sync's answer.
+///
+/// Only the FLUSH's answer can mean the filesystem cannot sync a directory
+/// (`MeansDirectorySyncUnsupported`): the same code from the OPEN is this code asking for something
+/// wrong -- Windows' `ERROR_INVALID_PARAMETER` from `CreateFileW` is a bad flag or path, not a volume
+/// property -- and degrading on it would tell an operator their filesystem lacks a feature it has.
+/// **Private: never transmitted or persisted**, so the enumerators carry no values.
+enum class DirectorySyncStep : std::uint8_t
+{
+    Open,
+    Flush,
+    Close,
+};
+
+/// Why a directory sync failed: the call that answered, and what it said.
+struct DirectorySyncFailure
+{
+    /// The call that answered.
+    DirectorySyncStep step {};
+    /// What it said.
+    std::error_code code;
+};
+
 /// Make the directory entries a rename just wrote in @p directory survive a power loss.
 ///
 /// A file flushed to the platter and renamed into place is NOT yet durable: the rename changed the
@@ -70,11 +94,11 @@ using ReadStream = std::unique_ptr<std::FILE, int (*)(std::FILE*)>;
 /// That the flush makes the entry durable is Microsoft's documented behaviour, not something a
 /// test here measured -- only a power cut could.
 /// @param directory The directory the rename wrote into.
-/// @return Nothing, or why the directory could not be opened or flushed.
-[[nodiscard]] std::error_code SyncDirectoryToDisk(std::filesystem::path const& directory);
+/// @return Nothing, or which call refused (open, flush or close) and why.
+[[nodiscard]] std::expected<void, DirectorySyncFailure> SyncDirectoryToDisk(std::filesystem::path const& directory);
 
-/// The answers a directory sync gives on a FILESYSTEM that cannot sync a directory at all, as this
-/// platform spells them -- never about the directory or the files in it.
+/// The answers a directory sync's FLUSH gives on a FILESYSTEM that cannot sync a directory at all, as
+/// this platform spells them -- never about the directory or the files in it.
 ///
 /// POSIX: `EINVAL`, `ENOTSUP` / `EOPNOTSUPP` and `EBADF` from `fsync` on a directory descriptor, which
 /// some network and FUSE filesystems answer (PostgreSQL's `fsync_fname` ignores exactly `EBADF` and
@@ -87,7 +111,8 @@ using ReadStream = std::unique_ptr<std::FILE, int (*)(std::FILE*)>;
 [[nodiscard]] std::span<std::error_code const> UnsupportedDirectorySyncAnswers();
 
 /// Whether @p failure is a filesystem saying it cannot sync a directory (`UnsupportedDirectorySyncAnswers`)
-/// rather than one sync failing.
+/// rather than one sync failing: a table answer from the FLUSH step, and from no other
+/// (`DirectorySyncStep`).
 ///
 /// **DEGRADED, never refused** (step 20 recheck, R-A): a state directory on such a volume refused
 /// EVERY state write -- the formation record, the roster, the Raft term and vote -- because a sync the
@@ -97,7 +122,7 @@ using ReadStream = std::unique_ptr<std::FILE, int (*)(std::FILE*)>;
 /// it may be a sync that would have succeeded.
 /// @param failure What `IDurableFiles::SyncDirectory` answered.
 /// @return True when the filesystem cannot sync a directory at all.
-[[nodiscard]] bool MeansDirectorySyncUnsupported(std::error_code failure) noexcept;
+[[nodiscard]] bool MeansDirectorySyncUnsupported(DirectorySyncFailure const& failure) noexcept;
 
 /// Flush a stream all the way to the platter.
 ///
@@ -180,8 +205,9 @@ class IDurableFiles
     /// Flush @p directory, after a rename into it, so the new entry survives a power loss
     /// (`SyncDirectoryToDisk`).
     /// @param directory The directory the rename wrote into.
-    /// @return Nothing, or why it could not be flushed.
-    [[nodiscard]] virtual std::error_code SyncDirectory(std::filesystem::path const& directory) = 0;
+    /// @return Nothing, or which call refused and why.
+    [[nodiscard]] virtual std::expected<void, DirectorySyncFailure> SyncDirectory(
+        std::filesystem::path const& directory) = 0;
 };
 
 /// This machine's: `CreateStateFile`, `fwrite`, `FlushToDisk`, a checked `fclose` and
@@ -194,7 +220,7 @@ class SystemDurableFiles final: public IDurableFiles
                                                                                        StateFile which) override;
 
     /// @copydoc IDurableFiles::SyncDirectory
-    [[nodiscard]] std::error_code SyncDirectory(std::filesystem::path const& directory) override;
+    [[nodiscard]] std::expected<void, DirectorySyncFailure> SyncDirectory(std::filesystem::path const& directory) override;
 };
 
 /// `ReplaceFileAtomically` through @p files and @p rename, saying which route it took.

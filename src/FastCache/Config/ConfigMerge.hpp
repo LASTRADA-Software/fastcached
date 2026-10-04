@@ -158,6 +158,18 @@ inline constexpr std::string_view DaemonTlsUnavailableRefusal =
 /// Why TLS is refused without both halves of its material.
 inline constexpr std::string_view DaemonTlsMaterialRefusal = "--tls requires both --tls-cert and --tls-key";
 
+/// Why a disk budget is refused under a durability that keeps no durable free list.
+///
+/// `--storage-max-disk` bounds the store's page FOOTPRINT, and only `batched` persists the
+/// free list. Under `fsync` or `none` a restart marks every free page in use, so the
+/// budget would charge pages nothing holds and evict live entries to make room for them,
+/// for good -- and after enough restarts, every entry at every Set.
+inline constexpr std::string_view DaemonStorageBudgetDurabilityRefusal =
+    "--storage-max-disk cannot be combined with --storage-durability=fsync or none: only batched keeps its free "
+    "list across a restart, so under the others every restart would count free pages against the budget and evict "
+    "live entries for them. Use --storage-durability=batched (the default), or drop --storage-max-disk to let the "
+    "store grow as needed";
+
 /// Why the daemon must not start with @p config -- decided from the configuration and the BUILD
 /// alone, so `main` asks it before the service host and before an install, and an operator hears it
 /// from `--install-service` rather than from a service that refuses at every boot.

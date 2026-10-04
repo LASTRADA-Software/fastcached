@@ -160,6 +160,18 @@ the whole-fleet step above, and what each machine is started with gets simpler:
    rising without stopping means a worker's applied state names no voter yet: it has not been
    admitted, and its leases are refused `grant-unverifiable`.
 
+**A node upgraded in place over a `--cluster-dir` that still holds the kept roster refuses to
+start**, naming `<cluster-dir>/roster` as an entry this build keeps nothing by that name for.
+An older worker kept its certified roster in that file; nothing reads it any more, and the
+node refuses whatever it cannot name in the directory that holds its identity rather than
+guess. So, once per machine that ran an older worker:
+
+1. Stop the node.
+2. Delete `roster` from its `--cluster-dir` -- that file alone, and a leftover temporary named
+   after it if a crash left one; **`node-id`, `node-key` and `formation` stay**, since they are
+   the node's identity and how it formed.
+3. Start it. Nothing else in the directory needs to change for this step.
+
 ## The consensus state directory
 
 **#1449 (learners) changed what a consensus member writes to disk and says to its
