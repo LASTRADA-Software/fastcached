@@ -93,14 +93,29 @@ header_filter_taken_lines() {
         header_filter_spell_into "$spelling" "$root/$path" || return 2
         spelled="${spelled}${HeaderFilterSpelled}"$'\n'
     done < <(printf '%s\n' "$paths")
-    taken="$(grep -nE -- "$include" < <(printf '%s' "$spelled") | cut -d: -f1)" || true
+    # Each grep's status is CHECKED, and the line numbers are cut in this shell: grep answers 1
+    # for "matched nothing", and anything above it -- a grep killed, a regex it cannot compile --
+    # left an empty set behind `|| true`, which reads as "the filter takes nothing" (or "excludes
+    # nothing") and decides the verdict in whichever direction that happens to point.
+    local status matched=""
+    taken="$(grep -nE -- "$include" < <(printf '%s' "$spelled"))" && status=0 || status=$?
+    if [[ "$status" -gt 1 ]]; then
+        echo "header-filter: grep exited ${status} matching the include filter, so which headers it takes is not known -- this is the CHECK failing, not a verdict about the filter" >&2
+        return 2
+    fi
     excluded=","
     if [[ -n "$exclude" ]]; then
+        matched="$(grep -nE -- "$exclude" < <(printf '%s' "$spelled"))" && status=0 || status=$?
+        if [[ "$status" -gt 1 ]]; then
+            echo "header-filter: grep exited ${status} matching the exclude filter, so which headers it drops is not known -- this is the CHECK failing, not a verdict about the filter" >&2
+            return 2
+        fi
         while IFS= read -r line; do
-            [[ -n "$line" ]] && excluded="${excluded}${line},"
-        done < <(grep -nE -- "$exclude" < <(printf '%s' "$spelled") | cut -d: -f1 || true)
+            [[ -n "$line" ]] && excluded="${excluded}${line%%:*},"
+        done < <(printf '%s\n' "$matched")
     fi
     while IFS= read -r line; do
+        line="${line%%:*}"
         [[ -n "$line" && "$excluded" != *",${line},"* ]] && set="${set}${line},"
     done < <(printf '%s\n' "$taken")
     printf '%s' "$set"
@@ -404,10 +419,23 @@ header_filter_declared_packages() {
         echo "header-filter: the CPM reader failed over the tracked CMake files under ${root} (awk exit ${reader}; its own message is above), so which packages the tree declares is not known -- this is the CHECK failing, not a verdict about the tree" >&2
         return 2
     fi
-    unnamed="$(printf '%s\n' "$found" | sed -n 's/^unnamed //p')"
-    dynamic="$(printf '%s\n' "$found" | sed -n 's/^dynamic //p')"
-    malformed="$(printf '%s\n' "$found" | sed -n 's/^malformed \([^ ]*\) \(.*\)$/\1 (\2)/p')"
-    bracket="$(printf '%s\n' "$found" | sed -n 's/^bracket //p')"
+    # The reader's lines split by their tag in THIS shell, never one `sed` per tag: a sed that
+    # failed or was killed printed nothing, and an empty list here is a refusal not made -- a
+    # malformed or unnamed call passed, and the derived set asked about fewer packages than the
+    # tree declares, which fails OPEN. Round 8's silent grep was the same shape one call away.
+    local line rest named=""
+    unnamed=""; dynamic=""; malformed=""; bracket=""
+    while IFS= read -r line; do
+        rest="${line#* }"
+        case "$line" in
+            "unnamed "*) unnamed="${unnamed}${rest}"$'\n' ;;
+            "dynamic "*) dynamic="${dynamic}${rest}"$'\n' ;;
+            "malformed "*) malformed="${malformed}${rest%% *} (${rest#* })"$'\n' ;;
+            "bracket "*) bracket="${bracket}${rest}"$'\n' ;;
+            "name "*) named="${named}${rest}"$'\n' ;;
+        esac
+    done < <(printf '%s\n' "$found")
+    unnamed="${unnamed%$'\n'}"; dynamic="${dynamic%$'\n'}"; malformed="${malformed%$'\n'}"; bracket="${bracket%$'\n'}"
     # Both refusals are SAID before either returns, so a tree holding both shapes names every call
     # at once rather than one kind per run.
     [[ -z "$unnamed" ]] \
@@ -419,7 +447,15 @@ header_filter_declared_packages() {
     [[ -z "$bracket" ]] \
         || echo "header-filter: CPM call(s) whose NAME is given as a bracket argument ([[...]]), a spelling CMake accepts and this reader does not unwrap: $(printf '%s\n' "$bracket" | tr '\n' ' ')-- spell the NAME as a plain literal, or as a quoted one" >&2
     [[ -z "$unnamed" && -z "$dynamic" && -z "$malformed" && -z "$bracket" ]] || return 2
-    names="$(printf '%s\n' "$found" | sed -n 's/^name //p' | sort -u)"
+    names=""
+    if [[ -n "$named" ]]; then
+        local sorted=0
+        names="$(sort -u < <(printf '%s' "$named"))" || sorted=$?
+        if [[ "$sorted" != 0 || -z "$names" ]]; then
+            echo "header-filter: sort exited ${sorted} over the package names derived under ${root}, so which packages the tree declares is not known -- this is the CHECK failing, not a verdict about the tree" >&2
+            return 2
+        fi
+    fi
     if [[ -z "$names" ]]; then
         echo "header-filter: no CPM call naming a package (CPMAddPackage, CPMFindPackage, CPMGetPackage) in the tracked CMake files under ${root}; refused rather than read as a tree with no dependencies" >&2
         return 2

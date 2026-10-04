@@ -307,6 +307,36 @@ src/CowTree/Tree.hpp"
             echo "   FAIL a selection grep that fails is refused naming grep, never in silence: status $status, [$got]"
             failures=$((failures + 1))
         fi
+        # Its sibling, which failed OPEN rather than silent: a sed that fails while escaping a
+        # root left that root EMPTY, the pattern `^()(/|$)` selected nothing, and every
+        # vendored file read as this project's own with status 0. The tree is the same one, so
+        # the only thing that can turn this red is the escape's own check.
+        cases=$((cases + 1))
+        got="$(sed() { return 2; }; header_filter_declared_packages "$tree" 2>&1 >/dev/null)" && status=0 || status=$?
+        if [[ "$status" == 2 && "$got" == *"sed exited 2 escaping the root"*"the CHECK failing"* ]]; then
+            echo "   ok   a root escape that fails is refused naming sed, never read as no root"
+        else
+            echo "   FAIL a root escape that fails is refused naming sed, never read as no root: status $status, [$got]"
+            failures=$((failures + 1))
+        fi
+        # And the rest of the shape, audited rather than left to the next red: the filter's own
+        # grep behind `|| true` read as "takes nothing", and the names' sort as "declares none".
+        cases=$((cases + 1))
+        got="$(grep() { return 2; }; header_filter_taken_lines '.*' '' "$tree" posix 'src/a.h' 2>&1 >/dev/null)" && status=0 || status=$?
+        if [[ "$status" == 2 && "$got" == *"grep exited 2 matching the include filter"* ]]; then
+            echo "   ok   a filter grep that fails is refused naming grep, never read as taking nothing"
+        else
+            echo "   FAIL a filter grep that fails is refused naming grep, never read as taking nothing: status $status, [$got]"
+            failures=$((failures + 1))
+        fi
+        cases=$((cases + 1))
+        got="$(sort() { return 2; }; header_filter_declared_packages "$tree" 2>&1 >/dev/null)" && status=0 || status=$?
+        if [[ "$status" == 2 && "$got" == *"sort exited 2 over the package names"* ]]; then
+            echo "   ok   a names sort that fails is refused naming sort, never read as declaring none"
+        else
+            echo "   FAIL a names sort that fails is refused naming sort, never read as declaring none: status $status, [$got]"
+            failures=$((failures + 1))
+        fi
         cases=$((cases + 1))
         printf 'CPMAddPackage(NAME [[Foo]] VERSION 1.0)\n' > "$tree/CMakeLists.txt"
         got="$(header_filter_declared_packages "$tree" 2>&1 >/dev/null)" && status=0 || status=$?

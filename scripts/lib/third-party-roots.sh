@@ -50,12 +50,21 @@ third_party_roots() {
 #
 # @param 1 The repository root.
 third_party_path_pattern() {
-    local roots root alternation=""
+    local roots root escaped status alternation=""
     roots="$(third_party_roots "$1")" || return 2
+    # Each escape is CHECKED: a sed that fails or is killed prints nothing, and an empty
+    # root made the pattern `^()(/|$)`, which selects no path -- every vendored file read as
+    # this project's own, with status 0. That fails OPEN, so it is refused by name, as the
+    # selection's grep is. The roots arrive through process substitution, never a
+    # herestring (see `_third_party_select`).
     while IFS= read -r root; do
-        root="$(printf '%s' "$root" | sed 's/[]$*+?(){}|.^[]/\\&/g')"
-        alternation="${alternation:+${alternation}|}${root}"
-    done <<< "$roots"
+        escaped="$(printf '%s' "$root" | sed 's/[]$*+?(){}|.^[]/\\&/g')" && status=0 || status=$?
+        if [ "$status" -ne 0 ] || [ -z "$escaped" ]; then
+            echo "third-party roots: sed exited ${status} escaping the root '${root}' of ${1}, so which files are third-party is not known -- this is the CHECK failing, not a verdict about the tree" >&2
+            return 2
+        fi
+        alternation="${alternation:+${alternation}|}${escaped}"
+    done < <(printf '%s\n' "$roots")
     printf '^(%s)(/|$)\n' "$alternation"
 }
 
@@ -84,7 +93,7 @@ third_party_paths() {
 third_party_declined_summary() {
     [ -n "${2-}" ] || return 0
     printf 'declined %s third-party %s under the roots in scripts/lib/third-party-roots.txt, first %s\n' \
-        "$(grep -c . <<< "$2")" "$1" "${2%%$'\n'*}"
+        "$(grep -c . < <(printf '%s\n' "$2"))" "$1" "${2%%$'\n'*}"
 }
 
 # @param 1 `-v` to keep what is NOT under a root, empty to keep what is.
