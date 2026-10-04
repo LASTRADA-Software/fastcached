@@ -209,8 +209,9 @@ struct Config
     /// 0 (the default) means unbounded — the disk file grows to whatever the
     /// cached content needs. When non-zero, the budget is split evenly across
     /// the physical shards and each shard's CoW tree evicts its LRU tail to
-    /// stay within its share, so the total on-disk footprint is capped. Set
-    /// this to keep a build cache within a fixed disk allotment.
+    /// stay within its share, so the total on-disk footprint is capped: pages
+    /// in use, compressed values at their compressed size. Set this to keep a
+    /// build cache within a fixed disk allotment.
     std::size_t storageMaxDiskBytes { 0 };
 
     /// Number of independent pinned reactors to run (the `--threads`

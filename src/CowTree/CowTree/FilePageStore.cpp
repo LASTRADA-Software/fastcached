@@ -8,6 +8,7 @@
 #include <cstring>
 #include <expected>
 #include <filesystem>
+#include <iterator>
 #include <memory>
 #include <ranges>
 #include <span>
@@ -383,7 +384,7 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
     // both directions that matter: the sum overflows only at 2^64 - 1 data pages, and a store
     // with NONE gives an empty range, which is what `1 <= 0` gave.
     for (auto const i: std::views::iota(std::uint64_t { 1 }, _totalDataPages + 1))
-        _live.insert(i);
+        _live.Insert(i);
 
     // `live.freeRoot` names a chain of DEDICATED free-list pages, each holding a
     // `next` pointer, a count, and that many page ids. Dedicated is the whole point:
@@ -423,10 +424,16 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
         {
             std::uint64_t id = 0;
             std::memcpy(&id, page.data() + 16 + (k * sizeof(id)), sizeof(id));
-            if (id == 0 || id > _totalDataPages)
+            if (id == 0)
                 return std::unexpected(CowTreeError::Corrupt);
-            _live.erase(id);
-            _freeList.push_back(id);
+            // An ENTRY past the end names a page `TruncateFreeTailLocked` cut after this
+            // list was written: free, and now not even there. Unlike the LINK check
+            // above, which stays a refusal -- no list page a surviving meta names is
+            // ever cut, so a link past the end really is damage.
+            if (id > _totalDataPages)
+                continue;
+            _live.Erase(id);
+            _freeList.insert(id);
         }
 
         // The list's own pages are live and are NOT reusable until the next flush
@@ -525,7 +532,7 @@ auto FilePageStore::Read(PageId id) const -> std::expected<BytesView, CowTreeErr
 {
     if (!id || id.value > _totalDataPages)
         return std::unexpected(CowTreeError::OutOfRange);
-    if (!_live.contains(id.value))
+    if (!_live.Contains(id.value))
         return std::unexpected(CowTreeError::OutOfRange);
 
     std::scoped_lock const lock { _ioMutex };
@@ -542,49 +549,98 @@ namespace
 {
     /// Bytes of a free-list page before its ids: `next` then `count`.
     constexpr std::size_t FreeListHeaderBytes = 16;
+
+    /// How many pages a free list needs, given where they may come from.
+    ///
+    /// Every page the list takes from `takeable` stops being an entry, so while the
+    /// takeable pages last, `P` pages must hold the other `F - P` ids:
+    /// `P * perPage >= F - P`, the least such `P` being `ceil(F / (perPage + 1))`. When
+    /// `takeable` cannot supply that many, all of it is taken, the rest is extended, and
+    /// the pages must hold every `nameOnly` id: `P * perPage >= nameOnly` with
+    /// `P > takeable`.
+    /// @param takeable Free pages the list may be written into.
+    /// @param nameOnly Free pages the list must name but may not be written into.
+    /// @param perPage Ids one list page holds.
+    /// @return The page count; 0 when nothing is free.
+    [[nodiscard]] constexpr std::size_t ListPagesNeeded(std::size_t takeable,
+                                                        std::size_t nameOnly,
+                                                        std::size_t perPage) noexcept
+    {
+        auto const named = takeable + nameOnly;
+        auto const fromTakeable = (named + perPage) / (perPage + 1);
+        if (fromTakeable <= takeable)
+            return fromTakeable;
+        return std::max(fromTakeable, (nameOnly + perPage - 1) / perPage);
+    }
+
+    // The arithmetic, at a page holding two ids. Three free pages fit one list page
+    // holding the other two; a fourth needs a second page; and with nothing takeable,
+    // three ids need two extended pages, not the one the takeable formula would give.
+    static_assert(ListPagesNeeded(0, 0, 2) == 0);
+    static_assert(ListPagesNeeded(1, 0, 2) == 1);
+    static_assert(ListPagesNeeded(3, 0, 2) == 1);
+    static_assert(ListPagesNeeded(4, 0, 2) == 2);
+    static_assert(ListPagesNeeded(0, 2, 2) == 1);
+    static_assert(ListPagesNeeded(0, 3, 2) == 2);
+    static_assert(ListPagesNeeded(1, 3, 2) == 2);
 } // namespace
 
 auto FilePageStore::ExtendLocked() -> std::expected<PageId, CowTreeError>
 {
     auto const newIdx = static_cast<std::uint64_t>(_totalDataPages) + 1;
-    _totalDataPages = static_cast<std::size_t>(newIdx);
-    _live.insert(newIdx);
     std::vector<std::byte> blank(_pageSize, std::byte { 0 });
     if (auto const r = WriteAt(DataPageOffset(PageId { newIdx }), BytesView { blank.data(), blank.size() }); !r.has_value())
         return std::unexpected(r.error());
+    _totalDataPages = static_cast<std::size_t>(newIdx);
+    _live.Insert(newIdx);
     return PageId { newIdx };
 }
 
 auto FilePageStore::WriteFreeListLocked() -> std::expected<PageId, CowTreeError>
 {
-    // The pages that held the PREVIOUS list are freed here rather than reused: the
-    // caller frees them only after its new meta is durable, so until then the old
-    // meta is still recoverable and still names them.
-    auto const previous = std::move(_freeListPages);
-    _freeListPages.clear();
-
-    auto const snapshot = _freeList;
-    if (snapshot.empty())
-    {
-        for (auto const idx: previous)
-            _pendingFree.push_back(idx);
-        return PageId::None();
-    }
-
     auto const perPage = (_pageSize - FreeListHeaderBytes) / sizeof(std::uint64_t);
-    auto const pagesNeeded = (snapshot.size() + perPage - 1) / perPage;
+    auto const nameOnly = _pendingFree.size() + _freeListPages.size();
+    auto const pagesNeeded = ListPagesNeeded(_freeList.size(), nameOnly, perPage);
+    if (pagesNeeded == 0)
+        return PageId::None();
 
-    // Allocated by EXTENDING, never from the free list -- see `ExtendLocked`. This is
-    // also why the snapshot is taken first: extending does not change it.
+    // The LOWEST free ids, so the list never pins the tail `TruncateFreeTailLocked` cuts.
+    // Nothing is erased from `_freeList` until every page has been written: a failure
+    // below then has nothing there to put back.
+    auto const taken = std::min(pagesNeeded, _freeList.size());
     std::vector<PageId> listPages;
     listPages.reserve(pagesNeeded);
-    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, pagesNeeded))
+    for (auto const id: _freeList | std::views::take(taken))
+        listPages.emplace_back(id);
+
+    // Pages the shortfall extended exist now whatever happens next. On failure they are
+    // free in every world -- no meta names them -- so they join `_freeList`.
+    auto const abandonExtended = [&] {
+        for (auto const page: listPages | std::views::drop(taken))
+        {
+            _live.Erase(page.value);
+            _freeList.insert(page.value);
+        }
+    };
+    while (listPages.size() < pagesNeeded)
     {
         auto const page = ExtendLocked();
         if (!page.has_value())
+        {
+            abandonExtended();
             return std::unexpected(page.error());
+        }
         listPages.push_back(*page);
     }
+
+    // Everything free in the new meta's world, entries only: what stays in `_freeList`,
+    // then the pending frees and the previous list's pages, which may be named but not
+    // written into.
+    std::vector<std::uint64_t> entries;
+    entries.reserve(_freeList.size() - taken + nameOnly);
+    std::ranges::copy(_freeList | std::views::drop(taken), std::back_inserter(entries));
+    std::ranges::copy(_pendingFree, std::back_inserter(entries));
+    std::ranges::copy(_freeListPages, std::back_inserter(entries));
 
     // Written back to front so each page can name its successor: `pagesNeeded - 1` down to 0,
     // and no page at all when there are none, which is what the descending counter gave.
@@ -593,25 +649,83 @@ auto FilePageStore::WriteFreeListLocked() -> std::expected<PageId, CowTreeError>
     {
         std::ranges::fill(buffer, std::byte { 0 });
         std::uint64_t const next = (i + 1 < pagesNeeded) ? listPages[i + 1].value : 0;
-        auto const first = i * perPage;
-        auto const count = std::min(perPage, snapshot.size() - first);
+        auto const first = std::min(i * perPage, entries.size());
+        auto const count = std::min(perPage, entries.size() - first);
         std::memcpy(buffer.data(), &next, sizeof(next));
         auto const countRaw = static_cast<std::uint64_t>(count);
         std::memcpy(buffer.data() + sizeof(next), &countRaw, sizeof(countRaw));
         for (auto const k: std::views::iota(std::size_t { 0 }, count))
         {
-            auto const id = snapshot[first + k];
+            auto const id = entries[first + k];
             std::memcpy(buffer.data() + FreeListHeaderBytes + (k * sizeof(id)), &id, sizeof(id));
         }
         if (auto const r = WriteAt(DataPageOffset(listPages[i]), BytesView { buffer.data(), buffer.size() }); !r.has_value())
+        {
+            abandonExtended();
             return std::unexpected(r.error());
+        }
     }
 
-    for (auto const page: listPages)
-        _freeListPages.push_back(page.value);
-    for (auto const idx: previous)
+    // Landed. The taken pages leave `_freeList` and become this list's; the previous
+    // list's pages join the pending frees, reusable only once this meta is durable.
+    for (auto const page: listPages | std::views::take(taken))
+    {
+        _freeList.erase(page.value);
+        _live.Insert(page.value);
+    }
+    for (auto const idx: _freeListPages)
+    {
+        _live.Erase(idx);
         _pendingFree.push_back(idx);
+    }
+    _freeListPages.clear();
+    for (auto const page: listPages)
+    {
+        _freeListPages.push_back(page.value);
+        // Written around `Read`'s cache, which may hold a taken page's last contents.
+        if (_readBufferPageIdx == page.value)
+            _readBufferPageIdx = 0;
+    }
     return listPages.front();
+}
+
+auto FilePageStore::SetFileLength(std::uint64_t bytes) const -> std::expected<void, CowTreeError>
+{
+#if defined(_WIN32)
+    FILE_END_OF_FILE_INFO info {};
+    info.EndOfFile.QuadPart = static_cast<LONGLONG>(bytes);
+    if (::SetFileInformationByHandle(_handle, FileEndOfFileInfo, &info, sizeof(info)) == 0)
+        return std::unexpected(CowTreeError::IoError);
+    return {};
+#else
+    while (::ftruncate(_fd, static_cast<off_t>(bytes)) != 0)
+    {
+        if (errno != EINTR)
+            return std::unexpected(CowTreeError::IoError);
+    }
+    return {};
+#endif
+}
+
+auto FilePageStore::TruncateFreeTailLocked() -> std::expected<void, CowTreeError>
+{
+    auto keep = static_cast<std::uint64_t>(_totalDataPages);
+    for (auto const id: _freeList | std::views::reverse)
+    {
+        if (id != keep)
+            break;
+        --keep;
+    }
+    if (keep == _totalDataPages)
+        return {};
+
+    if (auto const r = SetFileLength((MetaSlotCount + keep) * static_cast<std::uint64_t>(_pageSize)); !r.has_value())
+        return std::unexpected(r.error());
+    _freeList.erase(_freeList.upper_bound(keep), _freeList.end());
+    _totalDataPages = static_cast<std::size_t>(keep);
+    if (_readBufferPageIdx > keep)
+        _readBufferPageIdx = 0;
+    return {};
 }
 
 auto FilePageStore::Allocate() -> std::expected<PageId, CowTreeError>
@@ -619,9 +733,9 @@ auto FilePageStore::Allocate() -> std::expected<PageId, CowTreeError>
     std::scoped_lock const lock { _ioMutex };
     if (!_freeList.empty())
     {
-        auto const idx = _freeList.back();
-        _freeList.pop_back();
-        _live.insert(idx);
+        auto const idx = *_freeList.begin();
+        _freeList.erase(_freeList.begin());
+        _live.Insert(idx);
         // Invalidate the read cache for this slot — it may hold the
         // freed page's stale bytes.
         if (_readBufferPageIdx == idx)
@@ -641,7 +755,7 @@ auto FilePageStore::Write(PageId id, BytesView data) -> std::expected<void, CowT
     std::scoped_lock const lock { _ioMutex };
     if (auto const r = WriteAt(DataPageOffset(id), data); !r.has_value())
         return std::unexpected(r.error());
-    _live.insert(id.value);
+    _live.Insert(id.value);
     if (_readBufferPageIdx == id.value)
         _readBufferPageIdx = 0;
     if (_options.durability == Durability::Fsync)
@@ -657,15 +771,15 @@ auto FilePageStore::Free(PageId id) -> std::expected<void, CowTreeError>
     if (!id || id.value > _totalDataPages)
         return std::unexpected(CowTreeError::OutOfRange);
     std::scoped_lock const lock { _ioMutex };
-    if (!_live.contains(id.value))
+    if (!_live.Contains(id.value))
         return std::unexpected(CowTreeError::OutOfRange);
-    _live.erase(id.value);
+    _live.Erase(id.value);
     // Batched group-commit defers reuse until the freeing is durable (see
     // _pendingFree); other modes recycle immediately.
     if (_options.durability == Durability::Batched)
         _pendingFree.push_back(id.value);
     else
-        _freeList.push_back(id.value);
+        _freeList.insert(id.value);
     if (_readBufferPageIdx == id.value)
         _readBufferPageIdx = 0;
     return {};
@@ -717,8 +831,12 @@ auto FilePageStore::FlushBatchLocked() -> std::expected<void, CowTreeError>
 
     _lastDurableSlot = target;
     _pendingMeta.reset();
+    // Before the pending frees graduate, because the meta this one superseded still
+    // references them -- see `TruncateFreeTailLocked`. Not fatal: this flush is
+    // already durable, and an uncut tail stays free and is cut by a later flush.
+    std::ignore = TruncateFreeTailLocked();
     // The freeing is now durable, so freed pages may be recycled.
-    _freeList.insert(_freeList.end(), _pendingFree.begin(), _pendingFree.end());
+    _freeList.insert(_pendingFree.begin(), _pendingFree.end());
     _pendingFree.clear();
     _commitsSinceFlush = 0;
     return {};
@@ -831,6 +949,12 @@ std::size_t FilePageStore::PageCount() const noexcept
 {
     // No lock, for the reason `LastDurableSlot` gives.
     return _totalDataPages;
+}
+
+std::size_t FilePageStore::PagesInUse() const noexcept
+{
+    // No lock either: `LivePages` keeps its count readable from any thread.
+    return _live.Count() + MetaSlotCount;
 }
 
 FilePageStore::Durability FilePageStore::DurabilityMode() const noexcept

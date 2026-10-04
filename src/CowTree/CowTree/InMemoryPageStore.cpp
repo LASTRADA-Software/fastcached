@@ -213,4 +213,11 @@ std::size_t InMemoryPageStore::PageCount() const noexcept
     return _pages.size();
 }
 
+std::size_t InMemoryPageStore::PagesInUse() const noexcept
+{
+    // The meta slots are counted as `FilePageStore` counts them, so a budget means the
+    // same thing over either store.
+    return _live.size() + MetaSlotCount;
+}
+
 } // namespace CowTree

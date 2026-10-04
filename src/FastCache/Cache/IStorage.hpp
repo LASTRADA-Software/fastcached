@@ -48,8 +48,21 @@ enum class LruMode : std::uint8_t
 struct StorageStats
 {
     std::size_t itemCount { 0 };
+    /// What the tier's budget counts, in the unit `bytesLimit` is written in: the STORED
+    /// bytes of its values for the in-memory tier, and for a disk tier its on-disk
+    /// footprint -- pages in use times the page size, compressed values at their stored
+    /// size. Both tiers therefore count what a value costs after the codec ran.
     std::size_t bytesUsed { 0 };
     std::size_t bytesLimit { 0 };
+    /// The length of the file backing this tier, its free pages included; 0 for a tier
+    /// with no file, which is why it renders only for a tier whose
+    /// `StorageTierTraits::storedInFile` says it has one.
+    ///
+    /// Beside `bytesUsed` because the two answer different questions: that one is what
+    /// the budget bounds, this one is what the filesystem is charged. A free page in the
+    /// middle of the file is in this figure and not in that one, so this can exceed the
+    /// budget until a flush cuts the free tail -- and is never below `bytesUsed`.
+    std::size_t fileBytes { 0 };
     /// Resident bytes this tier spends on its own key index, or 0 where it has none
     /// distinct from `bytesUsed`.
     ///
@@ -157,6 +170,9 @@ inline constexpr std::array StorageStatsSizeFields {
     &StorageStats::itemCount,
     &StorageStats::bytesUsed,
     &StorageStats::bytesLimit,
+    // Summed: a `ShardedStorage` of N disk tiers is N files, and the filesystem is
+    // charged for all of them.
+    &StorageStats::fileBytes,
     // Summed like the rest, and correctly: a `ShardedStorage` of N disk tiers holds N
     // mirrors, and their RAM adds up the way their item counts do.
     &StorageStats::indexBytes,

@@ -49,7 +49,9 @@ workload needs. Reads consult L1 first and fall through to disk on a miss, so a
 warm working set is served from RAM while the long tail stays durable.
 
 Cap the disk footprint with `--storage-max-disk`; the tree then evicts its LRU
-tail to fit rather than growing without bound.
+tail to fit rather than growing without bound. The cap counts what the store
+occupies — compressed values at their compressed size — so compression makes the
+same cap hold more.
 
 ## Scale it
 

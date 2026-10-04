@@ -392,10 +392,9 @@ std::expected<void, StorageError> CowTreeStorage::Initialize()
     if (auto const r = _tree->Open(); !r.has_value())
         return std::unexpected(TranslateError(r.error(), "CowTree::Open"));
 
-    // **Seeded from the meta, which is what makes `--cache-disk` mean anything after a
-    // restart** (#1006). Zero on a store written before the field existed, which is
-    // indistinguishable from an empty one and leaves that store behaving exactly as it
-    // did -- so no cache in the field is discarded or misread.
+    // Seeded from the meta (#1006). The budget no longer reads `_storeBytes` -- it is the
+    // footprint, which the page store knows from the moment it opens -- but the meta
+    // carries both totals and they are kept true.
     //
     // Note what is NOT seeded: `_bytesUsed`, the mirror's total. Seeding that would
     // double-count, because reads add to it for keys already on disk.
@@ -1647,16 +1646,20 @@ bool CowTreeStorage::EvictColdSlice()
             return false;
     }
 
-    if (!lastKey.empty())
-        _coldCursor = lastKey;
-    if (reachedEnd)
-        _coldExhausted = true;
-
+    // The cursor moves past what this slice CONSUMED, never past what it walked. The
+    // loop below stops as soon as the store fits, usually long before the last victim,
+    // and a cursor at the walk's last key skipped every victim after the stopping
+    // point -- and once the walk had reached the end, `_coldExhausted` stranded them for
+    // the session. Measured: a store reopened over its bound kept 63 cold entries
+    // forever and evicted every new Set but the newest, and the file could not shrink
+    // past the pages those strays held.
+    std::size_t consumed = 0;
     std::size_t erased = 0;
     for (auto const& key: victims)
     {
-        if (_storeBytes <= _options.maxBytes)
+        if (FootprintBytes() <= _options.maxBytes)
             break;
+        ++consumed;
         if (auto const r = EraseEntry(key); !r.has_value())
             continue;
         // Reported unconditionally, where the mirror path asks about the generation
@@ -1670,7 +1673,29 @@ bool CowTreeStorage::EvictColdSlice()
         // data does not support. It undercounts, which is the honest direction.
         ++erased;
     }
+
+    if (consumed == victims.size())
+    {
+        if (!lastKey.empty())
+            _coldCursor = lastKey;
+        if (reachedEnd)
+            _coldExhausted = true;
+    }
+    else if (consumed != 0)
+    {
+        // Strictly after the last victim taken, so the next walk starts at the first one
+        // left. A victim whose erase failed was taken too: retrying it every call would
+        // spin on a key the disk will not let go of.
+        auto const& last = victims[consumed - 1];
+        auto const bytes = std::as_bytes(std::span { last.data(), last.size() });
+        _coldCursor.assign(bytes.begin(), bytes.end());
+    }
     return erased != 0;
+}
+
+std::uint64_t CowTreeStorage::FootprintBytes() const noexcept
+{
+    return static_cast<std::uint64_t>(_store->PagesInUse()) * static_cast<std::uint64_t>(_store->PageSize());
 }
 
 void CowTreeStorage::EvictToFit()
@@ -1692,9 +1717,9 @@ void CowTreeStorage::EvictToFit()
     // been used since startup, so it is genuinely the least recently used thing in the
     // store, and taking it first is what LRU means here. Draining it also converges,
     // because the slice erases whole entries rather than rotating a fixed set.
-    while (_storeBytes > _options.maxBytes && EvictColdSlice())
+    while (FootprintBytes() > _options.maxBytes && EvictColdSlice())
         ;
-    while (_storeBytes > _options.maxBytes && !_lru.empty() && remainingAttempts != 0)
+    while (FootprintBytes() > _options.maxBytes && !_lru.empty() && remainingAttempts != 0)
     {
         auto victim = std::prev(_lru.end());
         auto const keyCopy = victim->key;
@@ -2287,10 +2312,12 @@ StorageStats CowTreeStorage::Snapshot() const noexcept
     // than wrap to eighteen quintillion.
     auto const treeRecords = _tree->ItemCount();
     _stats.itemCount = static_cast<std::size_t>(treeRecords - std::min(treeRecords, ReservedRecordsOnAnOpenedStore()));
-    // The STORE's total, not the mirror's -- which is the point of #1006: an
-    // operator watching this against `--cache-disk` was told what this session had
-    // touched, and after a restart that is zero while the store is full.
-    _stats.bytesUsed = _storeBytes;
+    // The STORE's footprint, the figure `--cache-disk` bounds -- never the mirror's total
+    // (#1006), and since the denomination change never the sum of the values' original
+    // lengths either. The file's own length travels beside it, so an operator sees both
+    // the budget's figure and what the filesystem is charged.
+    _stats.bytesUsed = static_cast<std::size_t>(FootprintBytes());
+    _stats.fileBytes = static_cast<std::size_t>((CowTree::MetaSlotCount + _store->PageCount()) * _store->PageSize());
     _stats.bytesLimit = _options.maxBytes;
     _stats.indexBytes = _indexBytes;
 

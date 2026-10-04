@@ -665,21 +665,22 @@ TEST_CASE("The disk tier compresses with the codec the node names", "[node][cach
     constexpr std::size_t PayloadBytes = 256 * 1024;
     auto const payload = Compressible(PayloadBytes);
 
-    // Measured on the STORE FILE, not on `bytesUsed`.
+    // Measured on the STORE FILE and on `bytesUsed`, and both must follow the codec.
     //
-    // The two tiers denominate their budgets differently, and it is easy to assert
-    // the wrong one: `InMemoryLruStorage` charges STORED bytes, so compression shows
-    // up there, while `CowTreeStorage` charges `originalLen` -- the pre-compression
-    // size, at `_storeBytes += originalLen` in `StoreEntry` -- so a compressed disk
-    // tier reports exactly the same `bytesUsed` as an uncompressed one. Asserting on
-    // it here would have compared 65536 with 65536 and read as "the codec did
-    // nothing", which is a true observation carrying a false claim.
-    //
-    // It also means `--cache-disk` bounds LOGICAL bytes: a compressed disk tier holds
-    // its cap in pre-compression terms and occupies less than that on the filesystem.
-    auto fileBytes = [&payload](CompressionCodec codec, std::string_view scratchName) {
+    // `bytesUsed` used to be blind to it: `CowTreeStorage` charged `originalLen`, the
+    // pre-compression size, so a compressed disk tier reported exactly what an
+    // uncompressed one did, and `--cache-disk` bounded logical bytes. It now charges
+    // the store's page footprint, so a value costs its compressed size against the
+    // budget -- which is what lets compression make the same budget hold more.
+    struct Measured
+    {
+        std::size_t file;      ///< The store file's length once closed.
+        std::size_t footprint; ///< The disk tier's `bytesUsed` while open.
+    };
+    auto measure = [&payload](CompressionCodec codec, std::string_view scratchName) {
         Testing::ScratchDirectory const scratch { scratchName };
         auto const store = scratch.Path() / DiskStoreFileName;
+        std::size_t footprint = 0;
         {
             Fixture fixture;
             auto cfg = Fixture::BaseConfig();
@@ -711,28 +712,28 @@ TEST_CASE("The disk tier compresses with the codec the node names", "[node][cach
                                      .bytes;
             REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
 
-            // The budget is denominated in logical bytes whatever the codec, which is
-            // the other half of the note above and is worth pinning: if this ever
-            // starts tracking the compressed size, the assertion below is measuring
-            // something else.
             auto const tiers = tier->SnapshotTiers();
             REQUIRE(At(tiers, StorageTier::Disk).has_value());
-            CHECK(Unwrap(At(tiers, StorageTier::Disk)).bytesUsed >= PayloadBytes);
+            footprint = Unwrap(At(tiers, StorageTier::Disk)).bytesUsed;
         }
         // Sized after the tier is closed, so the last commit has certainly landed.
         std::error_code error;
         auto const size = std::filesystem::file_size(store, error);
         REQUIRE_FALSE(error);
-        return static_cast<std::size_t>(size);
+        return Measured { .file = static_cast<std::size_t>(size), .footprint = footprint };
     };
 
-    auto const plain = fileBytes(CompressionCodec::Identity, "node-disk-codec-none");
-    auto const packed = fileBytes(CompressionCodec::Zstd, "node-disk-codec-zstd");
+    auto const plain = measure(CompressionCodec::Identity, "node-disk-codec-none");
+    auto const packed = measure(CompressionCodec::Zstd, "node-disk-codec-zstd");
 
     // A ratio rather than a constant: how well zstd does on this payload is for zstd
     // to decide, and the file carries pages of tree overhead either way.
-    CHECK(plain >= PayloadBytes);
-    CHECK(packed < plain / 2);
+    CHECK(plain.file >= PayloadBytes);
+    CHECK(packed.file < plain.file / 2);
+    // And the budget's figure sees the codec too. Uncompressed, it is at least the
+    // payload; compressed, well under half of that.
+    CHECK(plain.footprint >= PayloadBytes);
+    CHECK(packed.footprint < plain.footprint / 2);
 }
 
 TEST_CASE("The startup line names a present tier's codec and an absent tier's nothing", "[node][cache-tier][compression]")

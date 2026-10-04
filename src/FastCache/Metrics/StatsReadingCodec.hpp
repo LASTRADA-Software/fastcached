@@ -92,6 +92,7 @@ namespace StatsReadingWire
         Field<StorageStats, std::size_t> { .name = "itemCount", .member = &StorageStats::itemCount },
         Field<StorageStats, std::size_t> { .name = "bytesUsed", .member = &StorageStats::bytesUsed },
         Field<StorageStats, std::size_t> { .name = "bytesLimit", .member = &StorageStats::bytesLimit },
+        Field<StorageStats, std::size_t> { .name = "fileBytes", .member = &StorageStats::fileBytes },
         Field<StorageStats, std::size_t> { .name = "indexBytes", .member = &StorageStats::indexBytes },
         Field<StorageStats, std::size_t> { .name = "indexBytesAtCapacity", .member = &StorageStats::indexBytesAtCapacity },
     };

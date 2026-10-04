@@ -583,8 +583,9 @@ published per tier and stays on the unlabelled series above.
 | Series | Says |
 |---|---|
 | `fastcached_tier_items` | Live entries this tier holds. |
-| `fastcached_tier_bytes_used` | Bytes this tier holds. |
+| `fastcached_tier_bytes_used` | What this tier's budget counts: stored (compressed) value bytes for `memory`, the on-disk footprint (pages in use × page size) for `disk`. |
 | `fastcached_tier_bytes_limit` | This tier's own byte budget; `0` means unbounded. |
+| `fastcached_tier_file_bytes` | Length of the file backing a disk tier, free pages included; can run ahead of `bytes_used` until a commit cuts its free tail. Absent for a tier with no file. |
 | `fastcached_tier_evictions_total` | Entries this tier dropped to stay within its budget. |
 | `fastcached_tier_index_bytes` | Resident memory this tier spends on its key index — always RAM, even for a disk tier. |
 

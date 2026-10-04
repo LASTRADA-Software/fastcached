@@ -7,6 +7,7 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <ranges>
 #include <span>
 #include <string>
@@ -529,6 +530,161 @@ TEST_CASE("Durability=Batched defers freed-page reuse until the flush boundary",
     REQUIRE(p3->value == p1->value);
 }
 
+/// Page size the free-list growth cases build their store with: 510 ids per list page.
+constexpr std::size_t GrowthPageSize = 4096;
+
+/// A batched store and the one thing these cases do to it: commit and flush.
+///
+/// The meta names no tree, because the page store does not read one -- what these cases
+/// exercise is the flush, which writes the free list and makes the batch's frees durable.
+struct FlushingStore
+{
+    std::unique_ptr<CowTree::FilePageStore> store;
+    CowTree::Meta meta {};
+
+    /// Open -- or reopen -- a batched store of `GrowthPageSize` pages at `path`.
+    explicit FlushingStore(std::filesystem::path const& path)
+    {
+        CowTree::FilePageStore::Options opts;
+        opts.path = path;
+        opts.pageSize = GrowthPageSize;
+        opts.durability = CowTree::FilePageStore::Durability::Batched;
+        auto opened = CowTree::FilePageStore::Open(opts);
+        REQUIRE(opened.has_value());
+        store = std::move(*opened);
+        meta.pageSize = static_cast<std::uint32_t>(GrowthPageSize);
+    }
+
+    /// Buffer one commit and flush it: one group commit, exactly what the interval does.
+    void CommitAndFlush()
+    {
+        ++meta.txnId;
+        REQUIRE(store->WriteMeta(meta).has_value());
+        REQUIRE(store->Flush().has_value());
+    }
+
+    /// Allocate `count` pages and write each with its own id, so a read can tell them apart.
+    /// @return The pages, in allocation order.
+    [[nodiscard]] std::vector<CowTree::PageId> AllocateWritten(std::size_t count) const
+    {
+        std::vector<CowTree::PageId> ids;
+        std::vector<std::byte> page(GrowthPageSize, std::byte { 0 });
+        for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, count))
+        {
+            auto const id = store->Allocate();
+            REQUIRE(id.has_value());
+            PutNextLink(page, id->value);
+            REQUIRE(store->Write(*id, CowTree::BytesView { page.data(), page.size() }).has_value());
+            ids.push_back(*id);
+        }
+        return ids;
+    }
+};
+
+TEST_CASE("A batched store churning at a steady size keeps its page count flat",
+          "[filestore][durability][batched][freelist]")
+{
+    // The page store's half of the unbounded-file defect, with no FastCache present: a
+    // store that frees what it allocates must stop growing. Each round allocates
+    // `PagesPerRound` pages, frees the previous round's and flushes -- one group commit per
+    // round, which a cache at its byte bound does every 64 commits.
+    //
+    // The free list's own pages used to be taken by EXTENDING the file, and the previous
+    // list's pages went back to the free list. So every flush with anything free grew the
+    // file by a page while F stayed under one list page's 510 ids, and geometrically after.
+    // A 64 GiB disk tier measured 103 GB, 89 % free pages.
+    //
+    // The SLACK is what makes that reachable: more pages free than one round reallocates,
+    // so the free list is never empty at a flush. Without it the old code wrote no list at
+    // all, and this case could not fail.
+    //
+    // `Rounds` is sized to the defect, not to the diagnosis's 3000. The old code added one
+    // page per flush from the first, so 200 rounds leave it ~200 pages over a settled
+    // count; the 3000 would have asked for 6000 fsyncs to show the same line, longer.
+    constexpr std::size_t PagesPerRound = 4;
+    constexpr std::size_t SlackPages = 2 * PagesPerRound;
+    constexpr std::size_t Rounds = 200;
+
+    TempFile tmp;
+    FlushingStore s { tmp.path };
+    for (auto const id: s.AllocateWritten(SlackPages))
+        REQUIRE(s.store->Free(id).has_value());
+    s.CommitAndFlush();
+
+    std::vector<CowTree::PageId> previous;
+    std::vector<std::size_t> totals;
+    for ([[maybe_unused]] auto const round: std::views::iota(std::size_t { 0 }, Rounds))
+    {
+        auto current = s.AllocateWritten(PagesPerRound);
+        for (auto const id: previous)
+            REQUIRE(s.store->Free(id).has_value());
+        previous = std::move(current);
+        s.CommitAndFlush();
+        totals.push_back(s.store->TotalDataPages());
+    }
+
+    // Settled by round 2: round 1 still draws on the slack, and round 2's flush is the
+    // first with nothing left in `_freeList` to write its list into, so it extends once.
+    auto const settled = totals[1];
+    auto const [lowest, highest] = std::ranges::minmax(totals | std::views::drop(1));
+    INFO("pages after round 2: " << settled << ", after the last: " << totals.back() << ", range " << lowest << ".."
+                                 << highest);
+    CHECK(lowest == settled);
+    CHECK(highest == settled);
+    // The counter and the file agree, so the flatness is the FILE's and not a figure's.
+    CHECK(std::filesystem::file_size(tmp.path) == (2 + s.store->TotalDataPages()) * GrowthPageSize);
+}
+
+TEST_CASE("A batched store cuts its free tail and reopens over the shorter file",
+          "[filestore][durability][batched][freelist][persist]")
+{
+    // The file SHRINKS, so a store already past its bound converges with no operator
+    // action. Free the upper three quarters of a written store and flush three times: the
+    // first makes the freeing durable, the second still has the previous list's page at
+    // the top (it is pending, the superseded meta's `freeRoot`), and the third cuts
+    // everything above the two pages the alternating list lives in.
+    constexpr std::size_t LivePages = 16;
+    constexpr std::size_t FreedPages = 48;
+    constexpr std::size_t ListPages = 2;
+
+    TempFile tmp;
+    std::vector<CowTree::PageId> live;
+    std::size_t peak = 0;
+    {
+        FlushingStore s { tmp.path };
+        live = s.AllocateWritten(LivePages);
+        for (auto const id: s.AllocateWritten(FreedPages))
+            REQUIRE(s.store->Free(id).has_value());
+        s.CommitAndFlush();
+        peak = s.store->TotalDataPages();
+        s.CommitAndFlush();
+        s.CommitAndFlush();
+
+        INFO("pages at the peak: " << peak << ", after three flushes: " << s.store->TotalDataPages());
+        REQUIRE(peak > LivePages + FreedPages);
+        CHECK(s.store->TotalDataPages() == LivePages + ListPages);
+        CHECK(std::filesystem::file_size(tmp.path) == (2 + LivePages + ListPages) * GrowthPageSize);
+    }
+
+    // The durable list was written BEFORE the cut and still names the ids above the new
+    // end. Recovery skips such an ENTRY; refusing it as `Corrupt` would make every store
+    // that ever shrank unopenable.
+    FlushingStore s { tmp.path };
+    CHECK(s.store->TotalDataPages() == LivePages + ListPages);
+    for (auto const id: live)
+    {
+        auto const read = s.store->Read(id);
+        REQUIRE(read.has_value());
+        std::vector<std::byte> expected(GrowthPageSize, std::byte { 0 });
+        PutNextLink(expected, id.value);
+        CHECK(std::ranges::equal(*read, expected));
+    }
+    // The previous list's page is free in the reopened world, and it is the lowest free id.
+    auto const next = s.store->Allocate();
+    REQUIRE(next.has_value());
+    CHECK(next->value == LivePages + 1);
+}
+
 TEST_CASE("Durability=Batched flushes buffered writes on graceful close", "[filestore][durability][batched]")
 {
     TempFile tmp;
@@ -853,16 +1009,12 @@ TEST_CASE("An empty file that already existed is not blanked into a fresh store"
 // has no in-memory equivalent (#580). These three cases are that third one,
 // and they need a real file for it.
 //
-// What they are honest about, so nobody reads more into them: the chain is
-// seeded through `FilePageStore`'s own API because nothing else in this tree
-// writes one. `CowTree::CommitTxn` sets `Meta::freeRoot = PageId::None()`
-// unconditionally ("free list is in-memory only for v1"), and
-// `BootstrapNewFile` writes the same, so a store produced by `CowTreeStorage`
-// -- which is every store `fastcached` and `fastcache-compile-node` own --
-// carries an empty chain and the walk terminates on its first test. What
-// these cases pin is therefore the guard itself, on the layout
-// `RecoverExistingFile` is written to read, and not a refusal an operator can
-// reach today.
+// The chain is seeded through `FilePageStore`'s own API so a case can choose its
+// shape -- a damaged link has no other route. It is not the only writer: since #990 a
+// batched store writes a real list at every flush, so these refusals ARE reachable by
+// damage in the field. What none of them covers is an ENTRY past the end of the file,
+// which is not damage at all once the store cuts its free tail -- the reopen half of
+// "A batched store cuts its free tail" pins that one.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("An intact free-list chain is walked at Open and its pages are recycled", "[filestore][open][freelist]")

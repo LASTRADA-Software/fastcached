@@ -1042,26 +1042,57 @@ TEST_CASE("PurgeExpired on the disk tier is bounded and resumes", "[cowstorage][
 // Eviction & accounting
 // ============================================================================
 
+namespace
+{
+/// Page size the footprint cases build their store with: the smallest the store accepts,
+/// so a budget of a few pages is a few kilobytes of fixture rather than megabytes.
+///
+/// The disk budget is the store's PAGE footprint, so these cases are written in pages.
+constexpr std::size_t FootprintPageSize = 512;
+
+/// Bytes of an overflow page the value occupies: the page less its 16-byte header.
+constexpr std::size_t OverflowPayload = FootprintPageSize - 16;
+
+/// A value past the inline limit (a quarter page) and within one overflow page, so each
+/// entry costs exactly one page of its own and evicting it frees that page.
+constexpr std::size_t OnePageValueLen = 300;
+static_assert(OnePageValueLen > FootprintPageSize / 4 && OnePageValueLen <= OverflowPayload);
+
+/// The bytes `pages` pages occupy at `FootprintPageSize`.
+constexpr std::size_t Pages(std::size_t pages) noexcept
+{
+    return pages * FootprintPageSize;
+}
+
+/// A footprint case's store: small pages, uncompressed, at `maxBytes`.
+FastCache::CowTreeStorage::Options FootprintOptions(std::filesystem::path const& path, std::size_t maxBytes)
+{
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = path;
+    opts.pageSize = FootprintPageSize;
+    opts.maxBytes = maxBytes;
+    opts.compression = FastCache::CompressionCodec::Identity;
+    return opts;
+}
+} // namespace
+
 TEST_CASE("EvictToFit drops LRU tail when over maxBytes", "[cowstorage][eviction]")
 {
     TempFile tmp;
-    FastCache::CowTreeStorage::Options opts;
-    opts.path = tmp.path;
-    opts.maxBytes = 256;
+    auto const opts = FootprintOptions(tmp.path, Pages(16));
 
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
     core::platform::ManualClock clock;
 
-    // Insert until total bytes exceeds the cap; the cap+eviction model
-    // is best-effort soft.
+    // Fifty entries of a page each against a sixteen-page budget.
     for (auto const i: std::views::iota(0, 50))
-    {
-        auto const value = std::format("v-{:08d}", i); // 10 bytes each
         REQUIRE((*storage)
-                    ->Set(std::format("k-{:03d}", i), MakeBytes(value), 0, core::platform::SteadyTimePoint::max())
+                    ->Set(std::format("k-{:03d}", i),
+                          RandomBytes(OnePageValueLen, static_cast<std::uint64_t>(i)),
+                          0,
+                          core::platform::SteadyTimePoint::max())
                     .has_value());
-    }
     auto const stats = (*storage)->Snapshot();
     REQUIRE(stats.bytesUsed <= opts.maxBytes);
     REQUIRE(stats.evictions > 0U);
@@ -1075,32 +1106,27 @@ TEST_CASE("EvictToFit drops LRU tail when over maxBytes", "[cowstorage][eviction
 TEST_CASE("Resize shrinks budget and triggers immediate eviction", "[cowstorage][eviction]")
 {
     TempFile tmp;
-    FastCache::CowTreeStorage::Options opts;
-    opts.path = tmp.path;
-    opts.maxBytes = 1024 * 1024;
-
-    auto storage = FastCache::CowTreeStorage::Open(opts);
+    auto storage = FastCache::CowTreeStorage::Open(FootprintOptions(tmp.path, 1024 * 1024));
     REQUIRE(storage.has_value());
 
     for (auto const i: std::views::iota(0, 100))
         REQUIRE((*storage)
                     ->Set(std::format("k-{:03d}", i),
-                          RandomBytes(64, static_cast<std::uint64_t>(i)),
+                          RandomBytes(OnePageValueLen, static_cast<std::uint64_t>(i)),
                           0,
                           core::platform::SteadyTimePoint::max())
                     .has_value());
     auto const before = (*storage)->Snapshot();
     REQUIRE(before.itemCount == 100U);
 
-    (*storage)->Resize(1024);
+    (*storage)->Resize(Pages(16));
     auto const after = (*storage)->Snapshot();
-    REQUIRE(after.bytesUsed <= 1024U);
+    REQUIRE(after.bytesUsed <= Pages(16));
     REQUIRE(after.evictions > 0U);
+    // Down to the budget, not past it to nothing: an entry costs a page, so a sixteen-page
+    // budget still holds some.
+    CHECK(after.itemCount > 0U);
 }
-
-// ============================================================================
-// Persistence and reopen
-// ============================================================================
 
 TEST_CASE("Three Open/Close cycles preserve every entry", "[cowstorage][persist]")
 {
@@ -2582,7 +2608,6 @@ TEST_CASE("Converting a store costs a slice of headroom, not a multiple of the s
         REQUIRE(report.has_value());
         REQUIRE(std::cmp_equal(report->recordsConverted, total));
         auto const after = std::filesystem::file_size(tmp.path);
-        REQUIRE(after >= before);
 
         // ...and it converted everything, which is the other half of the claim:
         // a conversion that grew by nothing because it did nothing is not the
@@ -2597,7 +2622,11 @@ TEST_CASE("Converting a store costs a slice of headroom, not a multiple of the s
             REQUIRE(got->found);
             REQUIRE(FastCache::Testing::ValueOf(got->entry) == value);
         }
-        return after - before;
+        // Clamped, because a conversion can now SHORTEN the file: it frees every page it
+        // replaces, and the store cuts a free tail after each slice's flush. Headroom is
+        // what a conversion needs beyond the store it started with, and a shorter file
+        // needs none. Measured on Windows: 3,302,912 -> 1,726,464 bytes at 2000 records.
+        return after > before ? after - before : std::uintmax_t { 0 };
     };
 
     auto const small = growthFor(2000);
@@ -2606,7 +2635,9 @@ TEST_CASE("Converting a store costs a slice of headroom, not a multiple of the s
     // Four times the records. A conversion that allocated per record would
     // grow four times as much; one bounded by a slice grows about the same.
     INFO("growth: 2000 records -> " << small << " bytes, 8000 records -> " << large << " bytes");
-    REQUIRE(large < small * 2);
+    // `<=` rather than `<`: two conversions that both cost nothing satisfy the claim,
+    // and one whose growth still scales with the store fails it as before.
+    REQUIRE(large <= small * 2);
 }
 
 TEST_CASE("A record whose expiry does not fit the clock is decoded, not undefined", "[cowstorage][format]")
@@ -3670,24 +3701,208 @@ TEST_CASE("A store reuses the pages a previous session freed", "[cowstorage][fre
     CHECK(afterSecond < afterFirst * 3 / 2);
 }
 
+namespace
+{
+/// Page size the file-growth cases assume: `CowTreeStorage`'s default, which they use.
+constexpr std::uintmax_t GrowthStorePageSize = 16 * 1024;
+
+/// Value length the file-growth cases store, uncompressed so a page holds a known amount.
+constexpr std::size_t GrowthValueLen = 1024;
+
+/// The key the file-growth cases write `index`-th.
+///
+/// SCATTERED across the keyspace, the way a cache's digest keys are: a sequential key
+/// lands every write on the tree's right edge, so the rest of the tree is never rewritten,
+/// never moves down the file, and holds its tail whatever the page store does. The
+/// multiplier is odd, so the mapping is a bijection on 32 bits and no two indices collide.
+std::string GrowthKey(std::size_t index)
+{
+    return std::format("growth-{:08x}", static_cast<std::uint32_t>(index * 2654435761U));
+}
+
+/// The value stored under `GrowthKey(index)`: the key, padded, so a read names its key.
+std::string GrowthValue(std::size_t index)
+{
+    auto value = GrowthKey(index);
+    value.resize(GrowthValueLen, 'x');
+    return value;
+}
+
+/// A file-growth case's store: uncompressed, at `maxBytes`.
+FastCache::CowTreeStorage::Options GrowthOptions(std::filesystem::path const& path, std::size_t maxBytes)
+{
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = path;
+    opts.maxBytes = maxBytes;
+    opts.compression = FastCache::CompressionCodec::Identity;
+    return opts;
+}
+
+/// Set `GrowthKey(i)` for every `i` in `[first, first + count)`.
+void SetGrowthKeys(FastCache::CowTreeStorage& store, std::size_t first, std::size_t count)
+{
+    for (auto const i: std::views::iota(first, first + count))
+        REQUIRE(store.Set(GrowthKey(i), MakeBytes(GrowthValue(i)), 0, core::platform::SteadyTimePoint::max()).has_value());
+}
+} // namespace
+
+TEST_CASE("A store at its byte bound keeps its file size flat", "[cowstorage][freelist][capacity]")
+{
+    // The production half of the unbounded-file defect. A disk tier at its bound evicts
+    // about what each Set allocates, so data churn nets to zero -- and the file grew
+    // anyway, because every group commit EXTENDED the file to write the free list and
+    // handed the previous list's pages back to it: +1 page per flush while the list fit
+    // one page, geometric after. Measured on a node: a 64 GiB tier, a 103 GB file, 89 %
+    // free pages. The case beside this one runs 300 Sets with a 1.5x tolerance, which a
+    // drift of one page per flush cannot fail.
+    //
+    // Sized to the defect rather than to the diagnosis's 64 x 1000 commits: the drift is a
+    // page per 64 commits from the moment the store settles, so `ChurnSets` Sets -- each
+    // at least one commit, plus its eviction -- leave the old code dozens of pages over the
+    // slack below, in seconds rather than minutes.
+    constexpr std::size_t MaxBytes = 1024 * 1024; // 64 pages of footprint
+    constexpr std::size_t SettleSets = 1000;
+    constexpr std::size_t ChurnSets = 1500;
+    // What a settled store may still move by: the free list alternates between two pages,
+    // and a flush whose free pages all went to data extends once for its list.
+    constexpr std::uintmax_t SlackPages = 4;
+
+    TempFile tmp;
+    auto store = FastCache::CowTreeStorage::Open(GrowthOptions(tmp.path, MaxBytes));
+    REQUIRE(store.has_value());
+
+    SetGrowthKeys(**store, 0, SettleSets);
+    // Not vacuous: the store reached its bound and is evicting, which is the state the
+    // defect needs. A store under its bound frees nothing and could pass on any code.
+    REQUIRE((*store)->Snapshot().itemCount < SettleSets);
+    auto const settled = std::filesystem::file_size(tmp.path);
+
+    SetGrowthKeys(**store, SettleSets, ChurnSets);
+    auto const churned = std::filesystem::file_size(tmp.path);
+
+    INFO("file once settled: " << settled << " bytes, after " << ChurnSets << " more Sets: " << churned << " bytes");
+    CHECK(churned <= settled + (SlackPages * GrowthStorePageSize));
+
+    // The two figures an operator reads: `fileBytes` IS the file -- the gauge reports the
+    // filesystem's own answer, not a model of it -- and it is never below the footprint
+    // the budget bounds, which it exceeds only by free pages awaiting reuse.
+    auto const stats = (*store)->Snapshot();
+    CHECK(stats.fileBytes == churned);
+    CHECK(stats.bytesUsed <= MaxBytes);
+    CHECK(stats.fileBytes >= stats.bytesUsed);
+}
+
+TEST_CASE("A store over its bound shrinks its file as it churns, and loses no live key",
+          "[cowstorage][freelist][capacity][persist]")
+{
+    // The file SHRINKS, so a store already past its bound converges with no operator
+    // action -- which is the only relief a node that grew under the old code gets short of
+    // deleting its cache. The first session fills the file with no bound; the second
+    // reopens it at a small one, so its first Sets evict nearly everything and the durable
+    // free list dwarfs the live set; its churn then allocates the lowest free pages and the
+    // flushes cut the free tail.
+    constexpr std::size_t SeedSets = 2000;
+    constexpr std::size_t MaxBytes = 256 * 1024; // 16 pages of footprint
+    constexpr std::size_t ChurnSets = 1000;
+
+    TempFile tmp;
+    {
+        auto seed = FastCache::CowTreeStorage::Open(GrowthOptions(tmp.path, 0));
+        REQUIRE(seed.has_value());
+        SetGrowthKeys(**seed, 0, SeedSets);
+    }
+    auto const seeded = std::filesystem::file_size(tmp.path);
+
+    std::size_t live = 0;
+    {
+        auto churn = FastCache::CowTreeStorage::Open(GrowthOptions(tmp.path, MaxBytes));
+        REQUIRE(churn.has_value());
+        SetGrowthKeys(**churn, SeedSets, ChurnSets);
+        live = (*churn)->Snapshot().itemCount;
+    }
+    auto const churned = std::filesystem::file_size(tmp.path);
+
+    // A quarter, not merely "smaller": the seed holds ~2 MB of values and the bound 64 KiB,
+    // so a file that only trimmed a few tail pages is the defect still standing.
+    INFO("file after the seed: " << seeded << " bytes, after the bounded churn: " << churned << " bytes");
+    CHECK(churned < seeded / 4);
+
+    // The negative control: the cut never reaches a live page. Every key the store still
+    // holds is the newest it wrote, so the last `live` keys must all read back, intact.
+    REQUIRE(live > 0);
+    REQUIRE(live < ChurnSets);
+    auto reopened = FastCache::CowTreeStorage::Open(GrowthOptions(tmp.path, MaxBytes));
+    REQUIRE(reopened.has_value());
+    CHECK((*reopened)->Snapshot().itemCount == live);
+    core::platform::ManualClock clock;
+    for (auto const i: std::views::iota(SeedSets + ChurnSets - live, SeedSets + ChurnSets))
+    {
+        auto const got = (*reopened)->Get(GrowthKey(i), clock.now());
+        REQUIRE(got.has_value());
+        REQUIRE(got->found);
+        CHECK(std::ranges::equal(got->entry.ValueBytes(), MakeBytes(GrowthValue(i))));
+    }
+}
+
+TEST_CASE("A compressed disk tier holds more under the same budget", "[cowstorage][compression][capacity]")
+{
+    // The point of bounding the FOOTPRINT rather than the values' original lengths: a
+    // value costs what it occupies, so a codec that shrinks it lets the same budget hold
+    // more. Under the old denomination the two stores below held the same number of
+    // entries, because the budget charged each one its uncompressed length.
+    if (!FastCache::Compression::IsAvailable(FastCache::CompressionCodec::Zstd))
+        SKIP("this build has no zstd, so there is no codec to tell apart from none");
+
+    auto const holds = [](FastCache::CompressionCodec codec) {
+        // Inside the lambda rather than captured: `iota` takes its bounds by reference,
+        // which odr-uses a constexpr local, and MSVC then refuses an uncaptured one.
+        constexpr std::size_t Budget = 256 * 1024;
+        constexpr std::size_t Values = 1000;
+        constexpr std::size_t CompressibleLen = 2048;
+        TempFile tmp;
+        auto opts = GrowthOptions(tmp.path, Budget);
+        opts.compression = codec;
+        auto store = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(store.has_value());
+        std::size_t peak = 0;
+        for (auto const i: std::views::iota(std::size_t { 0 }, Values))
+        {
+            // Text that repeats, under a prefix that makes each value its own.
+            auto value = std::format("value-{:06}:", i);
+            while (value.size() < CompressibleLen)
+                value += "the build cache holds what the compiler wrote; ";
+            value.resize(CompressibleLen);
+            REQUIRE((*store)->Set(GrowthKey(i), MakeBytes(value), 0, core::platform::SteadyTimePoint::max()).has_value());
+            peak = std::max(peak, (*store)->Snapshot().bytesUsed);
+        }
+        INFO("codec " << static_cast<int>(codec) << ": peak footprint " << peak << " against " << Budget);
+        // The footprint is what is bounded, and after every Set it is within the budget.
+        CHECK(peak <= Budget);
+        return (*store)->Snapshot().itemCount;
+    };
+
+    auto const plain = holds(FastCache::CompressionCodec::Identity);
+    auto const packed = holds(FastCache::CompressionCodec::Zstd);
+    INFO("entries held: " << plain << " uncompressed, " << packed << " under zstd");
+    REQUIRE(plain > 0);
+    CHECK(packed > plain);
+}
 TEST_CASE("A reopened store's bytesUsed describes the STORE, and reads do not inflate it",
           "[cowstorage][bytesused][capacity]")
 {
-    // #1006, both halves, and the second is what nearly went wrong.
+    // #1006, both halves. The first: a reopened store reported 0 while it was full, so
+    // `--cache-disk` went unenforced until a whole budget had been rewritten. The second:
+    // `_bytesUsed` counts what this SESSION touched, so a fix seeding it from a durable
+    // total double-counted once the entries were read back.
     //
-    // `_bytesUsed` counts what this session has TOUCHED -- `TouchOrInsert` adds for any
-    // key not in the MIRROR, including one already on disk. So the obvious fix, seeding
-    // it at `Open` from a durable total, DOUBLE-COUNTS: measured, 8 objects of 1000
-    // bytes gave 8000, then 0 at reopen, then 8000 again after reading them back, so a
-    // seeded 8000 would have become 16000 and `EvictToFit` would have evicted a store
-    // twice the size it believed.
-    //
-    // The fix is therefore a SECOND counter that reads never touch, seeded from the
-    // meta. This case asserts both: that a reopened store knows its size, and that
-    // reading it all back does not change that number.
+    // Since the disk budget became the page footprint, the figure is the page store's
+    // count of pages in use -- known the moment the store opens, and moved by no read --
+    // so both halves are now structural. They are pinned anyway, because the defect they
+    // describe is the one a future "cheaper" figure would bring back.
     TempFile tmp;
     FastCache::CowTreeStorage::Options opts;
     opts.path = tmp.path;
+    opts.compression = FastCache::CompressionCodec::Identity;
 
     constexpr int Objects = 8;
     constexpr std::size_t ValueLen = 1000;
@@ -3701,16 +3916,15 @@ TEST_CASE("A reopened store's bytesUsed describes the STORE, and reads do not in
                               0,
                               core::platform::SteadyTimePoint::max())
                         .has_value());
-        REQUIRE((*first)->Snapshot().bytesUsed == Objects * ValueLen);
     }
 
     auto second = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(second.has_value());
 
-    // **The first half.** Before this the answer was 0 while the store was full, so
-    // `--cache-disk` was unenforced until a whole budget had been rewritten and the
-    // gauge operators watch read under the limit exactly while the store was over it.
-    CHECK((*second)->Snapshot().bytesUsed == Objects * ValueLen);
+    // **The first half.** The store holds the values uncompressed, so a footprint under
+    // their total would be a store that does not know what it holds.
+    auto const reopened = (*second)->Snapshot().bytesUsed;
+    CHECK(reopened >= Objects * ValueLen);
 
     core::platform::ManualClock clock;
     for (auto const i: std::views::iota(0, Objects))
@@ -3720,15 +3934,13 @@ TEST_CASE("A reopened store's bytesUsed describes the STORE, and reads do not in
         REQUIRE(got->found);
     }
 
-    // **The second half, and the one a seeding fix would have failed.** Reading every
-    // object back must not move the figure by a byte: those bytes were already counted
-    // when they were written.
-    CHECK((*second)->Snapshot().bytesUsed == Objects * ValueLen);
+    // **The second half.** Reading every object back must not move the figure by a byte.
+    CHECK((*second)->Snapshot().bytesUsed == reopened);
 }
 
 TEST_CASE("A reopened store over its bound evicts entries it has never touched", "[cowstorage][evict][capacity]")
 {
-    // #1012. #1006 made `_storeBytes` truthful at `Open`, so a reopened store finally
+    // #1012. #1006 made the byte figure truthful at `Open`, so a reopened store finally
     // KNEW it was over its bound -- and could still do nothing about it, because
     // `EvictToFit` names victims out of `_lru`, which only `TouchOrInsert` populates
     // and no `Open` path calls. The bound was observable and unenforceable at the same
@@ -3736,30 +3948,29 @@ TEST_CASE("A reopened store over its bound evicts entries it has never touched",
     // the store sat there.
     //
     // Two things are asserted, and the second is the one that makes this LRU rather
-    // than a scramble for anything erasable.
+    // than a scramble for anything erasable. Written in pages: each object costs one
+    // overflow page, so a budget five pages under the reopened footprint is five evictions.
     TempFile tmp;
-    FastCache::CowTreeStorage::Options opts;
-    opts.path = tmp.path;
+    auto const opts = FootprintOptions(tmp.path, 0);
 
     constexpr int Objects = 8;
-    constexpr std::size_t ValueLen = 1000;
-    constexpr std::size_t Budget = 3 * ValueLen;
+    constexpr std::size_t Evicted = 5;
     {
         auto first = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(first.has_value());
         for (auto const i: std::views::iota(0, Objects))
             REQUIRE((*first)
                         ->Set(std::format("k-{:02}", i),
-                              MakeBytes(std::string(ValueLen, 'x')),
+                              MakeBytes(std::string(OnePageValueLen, 'x')),
                               0,
                               core::platform::SteadyTimePoint::max())
                         .has_value());
-        REQUIRE((*first)->Snapshot().bytesUsed == Objects * ValueLen);
     }
 
     auto second = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(second.has_value());
-    REQUIRE((*second)->Snapshot().bytesUsed == Objects * ValueLen);
+    auto const reopened = (*second)->Snapshot().bytesUsed;
+    REQUIRE(reopened > Pages(Evicted));
 
     // Touched, so it is the one entry in the mirror. Everything else is cold, and cold
     // means "not used since this process started" -- strictly less recently used than
@@ -3769,22 +3980,18 @@ TEST_CASE("A reopened store over its bound evicts entries it has never touched",
     REQUIRE(warmed.has_value());
     REQUIRE(warmed->found);
 
-    (*second)->Resize(Budget);
+    auto const budget = reopened - Pages(Evicted);
+    (*second)->Resize(budget);
 
-    // **The first half.** Before #1012 this was still 8000: an empty mirror, nothing
-    // to name, and a `while` loop that never ran a single iteration.
-    CHECK((*second)->Snapshot().bytesUsed <= Budget);
+    // **The first half.** Before #1012 nothing went: an empty mirror, nothing to name,
+    // and a `while` loop that never ran a single iteration.
+    CHECK((*second)->Snapshot().bytesUsed <= budget);
 
     // **The second half**, and it turned out to describe a sharper defect than the
-    // first. Measured against the neutered fix: `bytesUsed` came back 7000, not 8000,
-    // and THIS key was the one missing. The mirror's only member after a reopen is
-    // whatever the session has touched, so the old loop evicted the entry that had
-    // just been read -- the single worst LRU choice available -- and then stopped,
-    // the mirror being empty again. So the bound went unenforced AND the warmest
-    // entry was thrown away, from one cause.
-    //
-    // It also keeps this case honest about the fix: without this assertion it would
-    // pass against an implementation that erased whatever the walk reached first.
+    // first. Measured against the neutered fix: THIS key was the one missing. The
+    // mirror's only member after a reopen is whatever the session has touched, so the
+    // old loop evicted the entry that had just been read -- the single worst LRU choice
+    // available -- and then stopped, the mirror being empty again.
     auto const survivor = (*second)->Get("k-00", clock.now());
     REQUIRE(survivor.has_value());
     CHECK(survivor->found);
@@ -3797,36 +4004,104 @@ TEST_CASE("A reopened store over its bound evicts entries it has never touched",
         if (got->found)
             ++present;
     }
-    CHECK(present == Budget / ValueLen);
+    CHECK(present == Objects - Evicted);
+}
+
+TEST_CASE("A reopened store over its bound strands no cold entry, so it keeps what it is handed next",
+          "[cowstorage][evict][capacity]")
+{
+    // The cold walk collects a slice of victims and erases only until the store fits.
+    // Its cursor used to jump to the last key the WALK reached, so every victim after the
+    // stopping point was skipped, and once the walk reached the end `_coldExhausted`
+    // stranded them for the session. Those strays then held the budget for good, and each
+    // new Set evicted the previous one -- the only warm entry -- so the store kept nothing
+    // it was handed but the newest. Found by the file-growth convergence case, whose file
+    // could not shrink past the pages the strays held.
+    //
+    // More seed entries than one slice holds, so the walk is several slices long and the
+    // last one stops partway. Each entry costs one overflow page; the budget holds a few
+    // dozen beside the tree and the free list's own pages, well over `Kept` and well under
+    // `Handed`, so a store that drained its cold set first must have drained ALL of it.
+    constexpr std::size_t Seeded = 600;
+    constexpr std::size_t Kept = 10;
+    constexpr std::size_t Handed = 100;
+
+    TempFile tmp;
+    auto opts = FootprintOptions(tmp.path, 0);
+    auto const set = [](FastCache::CowTreeStorage& store, std::string const& key) {
+        REQUIRE(store.Set(key, MakeBytes(std::string(OnePageValueLen, 'x')), 0, core::platform::SteadyTimePoint::max())
+                    .has_value());
+    };
+    {
+        auto seed = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(seed.has_value());
+        for (auto const i: std::views::iota(std::size_t { 0 }, Seeded))
+            set(**seed, std::format("seed-{:04}", i));
+    }
+
+    opts.maxBytes = Pages(60);
+    auto store = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(store.has_value());
+    for (auto const i: std::views::iota(std::size_t { 0 }, Handed))
+        set(**store, std::format("new-{:04}", i));
+
+    // Every cold entry has gone, and the budget holds the newest `Kept` it was handed.
+    // The old code kept a few seed entries and one new one here.
+    core::platform::ManualClock clock;
+    std::size_t seedLeft = 0;
+    for (auto const i: std::views::iota(std::size_t { 0 }, Seeded))
+    {
+        auto const got = (*store)->Get(std::format("seed-{:04}", i), clock.now());
+        REQUIRE(got.has_value());
+        seedLeft += got->found ? 1 : 0;
+    }
+    std::size_t newestKept = 0;
+    for (auto const i: std::views::iota(Handed - Kept, Handed))
+    {
+        auto const got = (*store)->Get(std::format("new-{:04}", i), clock.now());
+        REQUIRE(got.has_value());
+        newestKept += got->found ? 1 : 0;
+    }
+    CHECK(seedLeft == 0);
+    CHECK(newestKept == Kept);
+    // And the store, opened over its budget, came down to it: the first write evicts, not
+    // `Open`, which would hold a large store's startup for the whole drain.
+    CHECK((*store)->Snapshot().bytesUsed <= opts.maxBytes);
 }
 
 TEST_CASE("The store's byte total follows deletes and replaces, not just writes", "[cowstorage][bytesused][capacity]")
 {
-    // The counter is maintained in `StoreEntry` and `EraseEntry`, which every mutation
-    // funnels through -- so this asserts the arithmetic those two do rather than any
-    // one caller. A total that only ever grew would pass the case above and still
-    // evict a store it believed was full.
+    // The footprint is pages in use, so this asserts it page by page: a Set adds its leaf
+    // and its overflow pages, a replace swaps the old chain for the new one once the new
+    // value is durable, and deleting everything returns to the empty store's two meta
+    // pages and the leaf that holds the store's own format marker. A total that only ever
+    // grew would pass a bound check and still evict a store it believed was full.
     TempFile tmp;
-    FastCache::CowTreeStorage::Options opts;
-    opts.path = tmp.path;
-
-    auto store = FastCache::CowTreeStorage::Open(opts);
+    auto store = FastCache::CowTreeStorage::Open(FootprintOptions(tmp.path, 0));
     REQUIRE(store.has_value());
     core::platform::ManualClock clock;
 
-    REQUIRE((*store)->Set("a", MakeBytes(std::string(1000, 'x')), 0, core::platform::SteadyTimePoint::max()).has_value());
-    REQUIRE((*store)->Set("b", MakeBytes(std::string(1000, 'x')), 0, core::platform::SteadyTimePoint::max()).has_value());
-    CHECK((*store)->Snapshot().bytesUsed == 2000);
+    // A value three overflow pages long, and one a single page long.
+    constexpr std::size_t ThreePageValueLen = (2 * OverflowPayload) + 100;
+    auto const empty = (*store)->Snapshot().bytesUsed;
+    // The two meta slots and the one leaf holding the format marker `Open` writes. Every
+    // entry below shares that leaf, so what each step moves is its overflow chain alone.
+    CHECK(empty == Pages(3));
 
-    // A replace is a delta, not an addition.
-    REQUIRE((*store)->Set("a", MakeBytes(std::string(400, 'x')), 0, core::platform::SteadyTimePoint::max()).has_value());
-    CHECK((*store)->Snapshot().bytesUsed == 1400);
+    REQUIRE((*store)->Set("a", RandomBytes(ThreePageValueLen, 1), 0, core::platform::SteadyTimePoint::max()).has_value());
+    CHECK((*store)->Snapshot().bytesUsed == empty + Pages(3));
+    REQUIRE((*store)->Set("b", RandomBytes(ThreePageValueLen, 2), 0, core::platform::SteadyTimePoint::max()).has_value());
+    CHECK((*store)->Snapshot().bytesUsed == empty + Pages(3 + 3));
+
+    // A replace frees the three-page chain and keeps a one-page one.
+    REQUIRE((*store)->Set("a", RandomBytes(OnePageValueLen, 3), 0, core::platform::SteadyTimePoint::max()).has_value());
+    CHECK((*store)->Snapshot().bytesUsed == empty + Pages(1 + 3));
 
     REQUIRE((*store)->Delete("b", clock.now()).has_value());
-    CHECK((*store)->Snapshot().bytesUsed == 400);
+    CHECK((*store)->Snapshot().bytesUsed == empty + Pages(1));
 
     REQUIRE((*store)->Delete("a", clock.now()).has_value());
-    CHECK((*store)->Snapshot().bytesUsed == 0);
+    CHECK((*store)->Snapshot().bytesUsed == empty);
 }
 
 TEST_CASE("A reopened store projects what its index WILL cost, not what it costs now", "[cowstorage][index][capacity]")

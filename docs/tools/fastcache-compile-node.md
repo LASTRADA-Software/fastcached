@@ -796,12 +796,18 @@ information compress well. What it costs is a decompress on every read, paid on 
 hit path. That trade is worth making when the working set is larger than the budget
 and not when it fits comfortably inside it.
 
-**The two budgets are denominated differently, and it is worth knowing which.**
-`--cache-memory` bounds *compressed* bytes — what the tier occupies in RAM.
-`--cache-disk` bounds *logical* bytes: the store accounts a value at its
-pre-compression size, so a compressed disk tier reaches its cap holding that much
-original data while occupying less than that on the filesystem. `--cache-disk=36g`
-with zstd is therefore 36 GB of objects, not 36 GB of file.
+**Both budgets count what a value occupies after the codec ran.** `--cache-memory`
+bounds the compressed bytes the tier holds in RAM. `--cache-disk` bounds the store's
+on-disk footprint: the pages it has in use — tree, values, its free list's own
+pages and two meta pages — times the page size, so a compressed value costs its
+compressed size there too, and compression makes the same budget hold more objects.
+`--cache-disk=36g` with zstd is 36 GB of store, holding however many objects
+compress into it.
+
+The file can briefly be longer than that footprint: pages freed inside it are reused
+by later writes rather than counted, and each group commit cuts the free pages off
+its end. `fastcached_tier_bytes_used{tier="disk"}` reports the footprint and
+`fastcached_tier_file_bytes{tier="disk"}` the file's length, so both are visible.
 
 Changing a codec needs no migration and no `--migrate-cache`: every record carries
 the codec it was written under, so reads keep decoding correctly and only later
@@ -1001,8 +1007,9 @@ carries the split a merged view cannot:
 | Series | Says |
 |---|---|
 | `fastcached_tier_items{tier="memory"\|"disk"}` | Live entries in that tier. |
-| `fastcached_tier_bytes_used{tier=…}` | Bytes it holds. |
+| `fastcached_tier_bytes_used{tier=…}` | What its budget counts: the stored (compressed) value bytes for `memory`, the on-disk footprint — pages in use times the page size — for `disk`. |
 | `fastcached_tier_bytes_limit{tier=…}` | Its budget; `0` means unbounded. |
+| `fastcached_tier_file_bytes{tier="disk"}` | The length of the disk tier's file, free pages included. Can run ahead of `bytes_used` until a commit cuts the free pages off the end; never below it. No line for a tier with no file. |
 | `fastcached_tier_evictions_total{tier=…}` | Entries it dropped to stay inside that budget. |
 | `fastcached_tier_index_bytes{tier=…}` | Resident memory its key index costs. Always RAM, even for a disk tier, so it is **not** comparable with `bytes_limit` and must not be added to it. |
 

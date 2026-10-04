@@ -61,6 +61,9 @@ namespace
         std::string_view help;                                  ///< `# HELP` text.
         MetricType type;                                        ///< Counter or gauge.
         std::uint64_t (*project)(StorageStats const&) noexcept; ///< What to read off one tier.
+        /// Whether the series exists only for a tier backed by a file. A tier with no file
+        /// renders NO line rather than a zero, which would read as an empty file.
+        bool fileTiersOnly { false };
     };
 
     /// The per-tier series, and only the ones that mean something per tier.
@@ -83,13 +86,23 @@ namespace
                      .type = MetricType::Gauge,
                      .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.itemCount); } },
         TierMetric { .name = "fastcached_tier_bytes_used",
-                     .help = "Bytes this tier holds.",
+                     .help = "What this tier's budget counts: stored (post-compression) value bytes for the memory "
+                             "tier, the on-disk footprint (pages in use x page size) for the disk tier.",
                      .type = MetricType::Gauge,
                      .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.bytesUsed); } },
         TierMetric { .name = "fastcached_tier_bytes_limit",
                      .help = "This tier's configured byte budget (0 = unbounded).",
                      .type = MetricType::Gauge,
                      .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.bytesLimit); } },
+        // The disk tier's FILE, beside the footprint `bytes_used` reports. The budget bounds
+        // the footprint; the file can exceed it by free pages until a flush cuts the free
+        // tail, so an operator asking "what is this costing my disk" reads this one.
+        TierMetric { .name = "fastcached_tier_file_bytes",
+                     .help = "Length of the file backing this tier, free pages included. Can exceed "
+                             "fastcached_tier_bytes_used until a flush cuts the free tail; never below it.",
+                     .type = MetricType::Gauge,
+                     .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.fileBytes); },
+                     .fileTiersOnly = true },
         TierMetric { .name = "fastcached_tier_evictions_total",
                      .help = "Entries this tier dropped to stay within its budget.",
                      .type = MetricType::Counter,
@@ -335,7 +348,7 @@ static void AppendTierMetrics(std::string& out, TieredStorageStats const& tiers)
         for (auto const& tierRow: StorageTierTable)
         {
             auto const& stats = tiers[static_cast<std::size_t>(tierRow.tier)];
-            if (!stats.has_value())
+            if (!stats.has_value() || (row.fileTiersOnly && !tierRow.storedInFile))
                 continue;
             if (!wroteHeader)
             {

@@ -508,8 +508,9 @@ namespace
           .operand = "=<size>",
           .apply = AssignFrom<&Config::storageMaxDiskBytes, ParseStorageMaxDisk>(),
           .explicitBit = &CliResult::storageMaxDiskBytesExplicit,
-          .description = "cap the on-disk (L2) tier for --storage; the CoW tree evicts its LRU tail to fit "
-                         "(default 0 = unbounded). k/m/g suffixes accepted",
+          .description = "cap the on-disk (L2) tier for --storage at what it occupies on disk -- compressed "
+                         "values at their compressed size, so compression makes it hold more; the CoW tree "
+                         "evicts its LRU tail to fit (default 0 = unbounded). k/m/g suffixes accepted",
           .yamlKey = "storage_max_disk",
           .same = FieldEq<&Config::storageMaxDiskBytes>() },
         { .primary = "--compression",

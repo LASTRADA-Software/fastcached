@@ -92,8 +92,9 @@ struct Meta
     /// store, which is indistinguishable from empty and correct in both cases.
     ///
     /// **The tree neither computes nor interprets this.** It stores encoded records,
-    /// possibly compressed; what `--cache-disk` is compared against is the storage
-    /// layer's own count, which is a different number. Carried, not derived (#1006).
+    /// possibly compressed, and `--cache-disk` is no longer compared against it: the
+    /// budget is the store's page footprint (`IPageStore::PagesInUse`). Carried, not
+    /// derived (#1006), and kept true because it is recorded.
     std::uint64_t valueBytes { 0 };
 
     /// CRC-32C over all preceding bytes when encoded on disk. Not used

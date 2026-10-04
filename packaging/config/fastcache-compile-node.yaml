@@ -296,8 +296,9 @@
 #cache_memory:
 
 # cap this node's on-disk cache tier at this size (default 0, meaning grow
-# as needed). Only means anything with --cache-dir: without a path there is
-# no disk tier for a budget to bound.
+# as needed): what the store occupies on disk, compressed values at their
+# compressed size, so compression makes it hold more. Only means anything with
+# --cache-dir: without a path there is no disk tier for a budget to bound.
 #cache_disk:
 
 # cap the shared tier this node serves when the fleet's shared-cache setting

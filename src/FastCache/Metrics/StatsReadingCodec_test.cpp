@@ -611,7 +611,11 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // Moved when `raft_peer_dials_ended_silent` joined after `raft_peer_dials_ended_frame_bad_magic`
     // (W-3: a learner's two-way session ends at its idle bound). Read off the built test, never
     // computed by hand.
-    CHECK(StatsReadingLayout == 0xb33ff8a623388a04ULL);
+    //
+    // Moved when the disk budget became the store's page footprint: `StorageStats` gained
+    // `fileBytes`, the length of the file backing a tier, which every storage block now carries
+    // beside `bytesUsed`. Clients and nodes upgrade together. Read off the built test.
+    CHECK(StatsReadingLayout == 0xdf701fde48c24916ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

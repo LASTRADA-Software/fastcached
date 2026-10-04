@@ -84,6 +84,12 @@ struct StorageTierTraits
     /// alignment run, so this costs the row nothing.
     bool budgetIsResidentMemory;
 
+    /// Whether this tier is backed by a file, so `StorageStats::fileBytes` is a reading
+    /// rather than the zero a tier with no file reports. A column for the reason the one
+    /// above is: a renderer that asked `tier == StorageTier::Disk` would draw a plausible
+    /// zero for the next file-backed tier, or none at all. Same alignment run.
+    bool storedInFile;
+
     std::string_view name; ///< Spelling used as a metric label and in diagnostics.
 
     /// The budget a SHARED tier of this kind gets by default, or `nullopt`
@@ -102,6 +108,7 @@ inline constexpr EnumTable<StorageTier, StorageTierTraits> StorageTierTable { {
     // on a machine whose job is disk -- so a memory tier is never a shared one.
     { .tier = StorageTier::Memory,
       .budgetIsResidentMemory = true,
+      .storedInFile = false,
       .name = "memory",
       .sharedTierDefaultBytes = std::nullopt },
     // Its budget is bytes on a filesystem, so it is not RAM and does not belong in
@@ -113,6 +120,7 @@ inline constexpr EnumTable<StorageTier, StorageTierTraits> StorageTierTable { {
     // the ratio between them rather than by the index's size.
     { .tier = StorageTier::Disk,
       .budgetIsResidentMemory = false,
+      .storedInFile = true,
       .name = "disk",
       .sharedTierDefaultBytes = 64ULL * 1024 * 1024 * 1024 },
 } };

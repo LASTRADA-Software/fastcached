@@ -1441,9 +1441,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::cacheDiskBytes, ParseCacheDiskBytes>(),
             .explicitBit = &NodeConfig::cacheDiskBytesExplicit,
             .description = "cap this node's on-disk cache tier at this size\n"
-                           "(default 0, meaning grow as needed). Only means\n"
-                           "anything with --cache-dir: without a path there is\n"
-                           "no disk tier for a budget to bound.",
+                           "(default 0, meaning grow as needed): what the store\n"
+                           "occupies on disk, compressed values at their\n"
+                           "compressed size, so compression makes it hold more.\n"
+                           "Only means anything with --cache-dir: without a\n"
+                           "path there is no disk tier for a budget to bound.",
             .yamlKey = "cache_disk",
             .same = FieldEq<&NodeConfig::cacheDiskBytes>(),
         },
