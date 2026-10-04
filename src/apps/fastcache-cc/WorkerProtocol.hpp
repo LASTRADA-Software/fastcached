@@ -5,6 +5,7 @@
 #include "CodecEnvelope.hpp"
 #include "CompileJob.hpp"
 
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -237,8 +238,12 @@ using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, 
 ///        that is not a refusal and would otherwise be visible only in a log.
 /// @param roster Who may sign a grant, and whether that may be trusted now (#178). Read per
 ///        request, borrowed, and must outlive the validator -- as @p advertisedEndpoint must.
+/// @param identityKey This worker's own identity public key, the one it proves itself with: a
+///        grant naming another machine's key is refused (W-4). Copied; empty for a worker that
+///        holds none, which judges a grant by its endpoint alone.
 [[nodiscard]] LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
                                                   IAdvertisedEndpointSource const& advertisedEndpoint,
+                                                  std::span<std::byte const> identityKey,
                                                   core::platform::WallClockRef clock,
                                                   Distributed::WorkerLeaseState& lease,
                                                   IMetricsSink& metrics,
@@ -331,6 +336,11 @@ class WorkerProtocol
     ///        speak simply answers in a weaker codec; one built with a *wider* list
     ///        falls back to `Identity` rather than answering in a codec it cannot
     ///        produce.
+    /// @param replyKey The identity key this worker proves itself with, which every COMPILE reply
+    ///        is signed under (`SealCompileReply`, W-4) so the launcher can tell this worker from
+    ///        whatever else answers at its address; must outlive this. **Required and
+    ///        undefaulted**: null is a worker that signs nothing, whose every reply a launcher
+    ///        refuses and compiles locally, and that is a fact the call site states.
     /// @param metrics Where job outcomes are counted; must outlive this.
     ///
     /// The metrics sink is injected like every other collaborator rather than
@@ -349,6 +359,7 @@ class WorkerProtocol
     WorkerProtocol(ICompileJobRunner& jobs,
                    LeaseValidator validator,
                    CompileCacheWire::CodecList acceptedCodecs,
+                   Ed25519KeyPair const* replyKey,
                    IMetricsSink& metrics,
                    IJobRefusalObserver& refusals,
                    std::size_t maxDecompressedBytes = DefaultMaxDecompressedBytes);
@@ -367,6 +378,7 @@ class WorkerProtocol
     ICompileJobRunner& _jobs;
     LeaseValidator _validator;
     CompileCacheWire::CodecList _acceptedCodecs;
+    Ed25519KeyPair const* _replyKey; ///< What every reply is signed under; null signs nothing.
     IMetricsSink& _metrics;
     IJobRefusalObserver& _refusals; ///< Told which refusal, beside `_metrics`' how many.
     /// What a request's envelope may declare it expands to; see the constructor.

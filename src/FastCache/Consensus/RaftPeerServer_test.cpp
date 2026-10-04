@@ -705,12 +705,14 @@ TEST_CASE("Every ending of a session the acceptor reads moves its own row, and l
                   } },
     };
 
-    // Every ending but a close has a row here, so a new `SessionEnd` cannot go uncounted unnoticed.
+    // Every ending but a close has a row here, so a new `SessionEnd` cannot go uncounted unnoticed --
+    // and but `Silent`, which no frame produces and this end never names: an acceptor arms no idle
+    // bound (`SessionEndRows` says so by row; the dialler's case is in `RaftPeerTransport_test`).
     for (auto const ending: Enumerators<SessionEnd>())
     {
         INFO("SessionEnd " << static_cast<int>(ending));
         auto const covered = std::ranges::any_of(rows, [ending](Row const& row) { return row.end == ending; });
-        CHECK(covered == (ending != SessionEnd::PeerClosed));
+        CHECK(covered == (ending != SessionEnd::PeerClosed && ending != SessionEnd::Silent));
     }
 
     for (auto const& row: rows)

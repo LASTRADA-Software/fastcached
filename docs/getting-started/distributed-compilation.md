@@ -188,6 +188,15 @@ collision, a worker answering out of order — not against a hostile worker: the
 digest is unkeyed, so a worker that can return a wrong object can return a wrong
 digest as well.
 
+What it is NOT left to the digest is **which machine answered**. A worker's address
+can come to belong to another machine between its heartbeat and your compile — a VPN
+reconnect is enough — and that machine could return a perfectly formed object. So
+the grant names the identity key the worker proved when it registered, the worker
+signs its reply under that key, and the client checks the signature before it stores
+anything. A reply signed by anybody else, or by nobody, is refused the same way: the
+translation unit compiles locally, and `--show-stats` counts it as
+`UNAUTHENTICATED`.
+
 ---
 
 ## Setting it up

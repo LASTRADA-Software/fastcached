@@ -80,6 +80,10 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
         existing->second.info.observedHost = std::string { registration.observedHost };
         existing->second.info.interfaceAddresses.assign(registration.interfaceAddresses.begin(),
                                                         registration.interfaceAddresses.end());
+        // Refreshed for `observedHost`'s reason: the key the connection proves NOW is the one a
+        // grant must name, or a worker whose key was replaced signs replies nobody accepts.
+        existing->second.info.identityKey.assign(reinterpret_cast<char const*>(registration.identityKey.data()),
+                                                 registration.identityKey.size());
         // Reset rather than kept, both of them, and for one reason: a re-registering
         // worker has restarted, so whatever it was running is gone and whatever its
         // machine was doing is a reading from before that. Carrying either forward
@@ -121,20 +125,23 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
     auto id = std::format("w{}", _nextId++);
     _workers.emplace(
         id,
-        Entry { .info = WorkerInfo { .id = id,
-                                     .fingerprint = std::string { registration.fingerprint },
-                                     .endpoint = std::string { registration.endpoint },
-                                     .version = std::string { registration.version },
-                                     .toolchainLabel = std::string { registration.toolchainLabel },
-                                     .displayName = std::string { registration.displayName },
-                                     .slots = OfferableSlots(registration.capacity, RequestedSlots(registration)),
-                                     .inFlight = 0,
-                                     .capacity = registration.capacity,
-                                     .load = {},
-                                     .codecs = registration.codecs,
-                                     .observedHost = std::string { registration.observedHost },
-                                     .interfaceAddresses = { registration.interfaceAddresses.begin(),
-                                                             registration.interfaceAddresses.end() } },
+        Entry { .info =
+                    WorkerInfo { .id = id,
+                                 .fingerprint = std::string { registration.fingerprint },
+                                 .endpoint = std::string { registration.endpoint },
+                                 .version = std::string { registration.version },
+                                 .toolchainLabel = std::string { registration.toolchainLabel },
+                                 .displayName = std::string { registration.displayName },
+                                 .slots = OfferableSlots(registration.capacity, RequestedSlots(registration)),
+                                 .inFlight = 0,
+                                 .capacity = registration.capacity,
+                                 .load = {},
+                                 .codecs = registration.codecs,
+                                 .observedHost = std::string { registration.observedHost },
+                                 .interfaceAddresses = { registration.interfaceAddresses.begin(),
+                                                         registration.interfaceAddresses.end() },
+                                 .identityKey = std::string { reinterpret_cast<char const*>(registration.identityKey.data()),
+                                                              registration.identityKey.size() } },
                 .lastSeen = now,
                 .registeredAt = now,
                 // Disengaged, not `now`: nothing has been sent here yet,

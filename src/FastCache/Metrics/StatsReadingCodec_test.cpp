@@ -603,7 +603,15 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // `state_file_replaces_fell_back` (R-A), and again when it appended
     // `node_proofs_refused_roster_not_yet_applied` after that (M3). Read off the built test, never
     // computed by hand.
-    CHECK(StatsReadingLayout == 0x8c2f5a0c4a56c00fULL);
+    //
+    // Moved when the two `..._refused_operator_standing_required` counters joined after their
+    // identified-caller twins (W-1: a learner's ticket is no operator). Read off the built test,
+    // never computed by hand.
+    //
+    // Moved when `raft_peer_dials_ended_silent` joined after `raft_peer_dials_ended_frame_bad_magic`
+    // (W-3: a learner's two-way session ends at its idle bound). Read off the built test, never
+    // computed by hand.
+    CHECK(StatsReadingLayout == 0xb33ff8a623388a04ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

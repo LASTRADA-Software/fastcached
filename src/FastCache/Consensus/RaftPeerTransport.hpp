@@ -5,6 +5,7 @@
 #include <FastCache/Consensus/IRaftMessageSink.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/IRaftTransport.hpp>
+#include <FastCache/Consensus/RaftConfig.hpp>
 #include <FastCache/Consensus/RaftPeerRefusals.hpp>
 #include <FastCache/Consensus/RaftSessionLink.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
@@ -133,6 +134,58 @@ static_assert(RowsInEnumeratorOrder(DialBackoffTable, &DialBackoffRow::direction
     return DialBackoffTable[static_cast<std::size_t>(direction)];
 }
 
+/// How many of the leader's heartbeat intervals a learner's two-way session may hear nothing for
+/// before its dialler ends it and redials: 100, which is five seconds at `DefaultHeartbeatInterval`.
+///
+/// A leader writes every learner at least once per heartbeat (`RaftNode` replicates to both sets),
+/// so a hundred missed in a row is not a slow leader -- it is a session whose other end is gone.
+/// That is what a laptop wakes into: the leader aborted its end during the sleep and never dials a
+/// learner, so every send there is `SendDrop::NoSession`, and a reader with no bound parks on the
+/// half-open socket forever -- the roster, a forget and the `shared-cache` setting stop arriving
+/// until the process restarts (W-3). The bound must not depend on a power event, which a machine
+/// does not always report; this one is the session's own clock.
+///
+/// The cost is stated rather than hidden: a learner dials EVERY voter two-way, and a voter that is
+/// not leading writes it nothing, so those sessions end at this bound too and are redialled on the
+/// growing backoff (`DialBackoffTable`) -- one handshake per voter per half-minute or so. Counted as
+/// `DiallerRefusal::SessionSilent` and logged at Debug, because it is the ordinary life of such a
+/// session; a leader's session ending this way is the case the bound exists for.
+inline constexpr std::uint32_t LearnerSessionSilentHeartbeats = 100;
+
+/// How long a dialled session may hear nothing, for one shape of session.
+struct SessionIdleRow
+{
+    RaftWire::SessionDirection direction; ///< The shape of session this row bounds.
+
+    /// The bound, in the leader's heartbeat intervals; zero arms none.
+    std::uint32_t silentHeartbeats;
+};
+
+/// The idle bound a dialler holds its session's READER to, by the shape of session it dials --
+/// `DialBackoffTable`'s sibling, and for its reason a column per direction rather than a branch.
+///
+/// **A one-way session arms none, and must not.** Its dialler reads nothing after the verdict: it
+/// only writes, a dead peer fails one of those writes, and the reply rides the other member's own
+/// dial -- so silence on it is its normal state, and a bound there would end every voter's session
+/// every few seconds. Only a two-way dialler is the PASSIVE end of its session.
+inline constexpr EnumTable<RaftWire::SessionDirection, SessionIdleRow> SessionIdleTable { {
+    { .direction = RaftWire::SessionDirection::OneWay, .silentHeartbeats = 0 },
+    { .direction = RaftWire::SessionDirection::TwoWay, .silentHeartbeats = LearnerSessionSilentHeartbeats },
+} };
+
+static_assert(RowsInEnumeratorOrder(SessionIdleTable, &SessionIdleRow::direction),
+              "SessionIdleTable must hold one row per SessionDirection, in enumerator order");
+
+/// How long a dialled session of @p direction may hear nothing before its dialler ends it.
+/// @param direction The shape of session dialled; never `Last`.
+/// @param heartbeat The leader's heartbeat interval the bound is a multiple of.
+/// @return The bound; zero when the direction arms none.
+[[nodiscard]] constexpr std::chrono::milliseconds SessionIdleBound(RaftWire::SessionDirection direction,
+                                                                   std::chrono::milliseconds heartbeat) noexcept
+{
+    return heartbeat * SessionIdleTable[static_cast<std::size_t>(direction)].silentHeartbeats;
+}
+
 /// The wait after @p previous, for a session of @p direction: doubled, within the row's bounds.
 /// @param direction The shape of session being dialled.
 /// @param previous The wait just taken.
@@ -186,6 +239,11 @@ struct PeerTransportOptions
     /// `TwoWay` is a learner's, which nobody dials: the acceptor writes to it on the same
     /// connection, and this end reads what arrives there.
     RaftWire::SessionDirection direction { RaftWire::SessionDirection::OneWay };
+
+    /// The leader's heartbeat interval, which a dialled session's idle bound is a multiple of
+    /// (`SessionIdleBound`). `DefaultHeartbeatInterval`, which is `RaftConfig`'s default and what
+    /// production runs; a test states it so the bound is a number it can step the clock to.
+    std::chrono::milliseconds heartbeatInterval { DefaultHeartbeatInterval };
 };
 
 /// Told that an acceptor proved its id and answered, SIGNED, that this node's own key is revoked.

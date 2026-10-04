@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -26,23 +27,31 @@ namespace FastCache::Node
 
 /// Publish which identity keys @p state holds live and which it revoked, into @p keys.
 ///
-/// Members of either seat are live under their ids; a revoked key is
-/// revoked whatever id it was revoked under. In one swap, so a reader never sees a key admitted by
-/// one roster and revoked by the next as neither. The ONE derivation from state to key admission:
-/// `NodeMembership::PublishCluster` calls it, and so does a test fleet whose machines must admit
-/// exactly what production would, never a copy of this loop.
+/// Members of either seat are live under their ids; a revoked key is revoked whatever id it was
+/// revoked under. A member whose seat's standing VOTES (`Cluster::MemberSeatTable`) is published as
+/// a voter, which is what lets its key or ticket send an operator's control verbs; a learner's
+/// proves a machine and nothing more. In one swap, so a reader never sees a key admitted by one
+/// roster and revoked by the next as neither, nor a key from one state and its seat from another.
+/// The ONE derivation from state to key admission: `NodeMembership::PublishCluster` calls it, and so
+/// does a test fleet whose machines must admit exactly what production would, never a copy of this
+/// loop.
 /// @param keys The roster the surfaces consult.
 /// @param state The cluster state as of the latest commit.
 inline void PublishClusterKeys(Distributed::KeyRosterMembership& keys, Cluster::ClusterState const& state)
 {
     std::map<std::string, Ed25519PublicKey, std::less<>> live;
+    std::set<std::string, std::less<>> voters;
     for (auto const& member: state.members)
+    {
         live.emplace(member.id, member.publicKey);
+        if (Consensus::TraitsOf(Cluster::MemberSeatTable[static_cast<std::size_t>(member.seat)].standing).votes)
+            voters.insert(member.id);
+    }
     std::vector<Ed25519PublicKey> revoked;
     revoked.reserve(state.revokedKeys.size());
     for (auto const& entry: state.revokedKeys)
         revoked.push_back(entry.publicKey);
-    keys.Publish(std::move(live), std::move(revoked));
+    keys.Publish(std::move(live), std::move(revoked), std::move(voters));
 }
 
 /// This node's one answer to "who is this caller to us".

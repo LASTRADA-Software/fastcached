@@ -255,6 +255,11 @@ namespace
                       .tone = &StatsPalette::bad,
                       .outcome = DispatchOutcome::Mismatched,
                       .reach = FleetReach::Asked },
+        DispatchRow { .token = "UNAUTHENTICATED",
+                      .label = "unauthenticated reply",
+                      .tone = &StatsPalette::bad,
+                      .outcome = DispatchOutcome::Unauthenticated,
+                      .reach = FleetReach::Asked },
         DispatchRow { .token = "DISCARDED",
                       .label = "result discarded",
                       .tone = &StatsPalette::bad,
@@ -337,6 +342,12 @@ namespace
                                .status = DispatchStatus::DeniedHere,
                                .outcome = DispatchOutcome::Refused,
                                .specifics = Specifics::Refusal },
+        // No reason, for `Mismatched`'s: the launcher puts the sentence on the CACHE axis, and the
+        // state says it -- `unauthenticated reply` is a line no other state emits (W-4).
+        DispatchRecordingRow { .reason = {},
+                               .status = DispatchStatus::Unauthenticated,
+                               .outcome = DispatchOutcome::Unauthenticated,
+                               .specifics = Specifics::None },
     } };
     static_assert(RowsInEnumeratorOrder(DispatchRecordingTable, &DispatchRecordingRow::status),
                   "DispatchRecordingTable must hold exactly one row per DispatchStatus, in enumerator order");

@@ -95,17 +95,32 @@ namespace
     static_assert(RowsInEnumeratorOrder(EnrollmentEndpointRefusals, &EnrollmentEndpointRefusal::refusal),
                   "EnrollmentEndpointRefusals must hold one row per EndpointRefusal, in enumerator order");
 
-    /// An operator's control verb from a caller only `--fleet-open` admitted: the enrollment surface's
-    /// own row for `Distributed::IdentityRequirements`' refusal, so the rule is the table's and the
-    /// counter this surface's.
-    constexpr Cc::SurfaceRefusal ControlUnidentified {
-        .code = Wire::ErrorCode::IdentifiedCallerRequired,
-        .counter = IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired,
+    /// An operator's control verb from a caller that lacks what `Distributed::IdentityRequirements`
+    /// asks: the enrollment surface's own row for each requirement's refusal, so the rule is the
+    /// table's and the counter this surface's. One caller only `--fleet-open` admitted, the other an
+    /// identified machine -- a learner's ticket or key -- that holds no voter's seat.
+    constexpr std::array ControlRefusals {
+        Cc::SurfaceRefusal { .code = Wire::ErrorCode::IdentifiedCallerRequired,
+                             .counter = IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired },
+        Cc::SurfaceRefusal { .code = Wire::ErrorCode::OperatorStandingRequired,
+                             .counter = IMetricsSink::Counter::EnrollmentControlRefusedOperatorStandingRequired },
     };
 
-    static_assert(Distributed::RequirementRowOf(CompileCacheWire::IdentityRequirement::IdentifiedCaller).refusal
-                      == ControlUnidentified.code,
-                  "the enrollment surface refuses an unidentified caller under the code the requirement names");
+    /// @param code A requirement row's refusal.
+    /// @return This surface's row for it, or null when it has none.
+    [[nodiscard]] constexpr Cc::SurfaceRefusal const* ControlRefusalFor(Wire::ErrorCode code) noexcept
+    {
+        return core::findOrNull(ControlRefusals, code, &Cc::SurfaceRefusal::code);
+    }
+
+    static_assert(std::ranges::all_of(Distributed::IdentityRequirements,
+                                      [](Distributed::IdentityRequirementRow const& row) {
+                                          return row.requirement == CompileCacheWire::IdentityRequirement::AddressAdmits
+                                                 || row.requirement == CompileCacheWire::IdentityRequirement::ProvenNodeOnly
+                                                 || ControlRefusalFor(row.refusal) != nullptr;
+                                      }),
+                  "the enrollment surface counts every refusal an operator's control verb can be given, under the "
+                  "code the requirement names");
 
     /// The refusal answered when this node is not the leader.
     ///
@@ -199,10 +214,11 @@ std::optional<std::vector<std::byte>> EnrollmentResponder::RefuseUnidentified(Pe
     auto const caller = Context(peer);
     if (descriptor == nullptr || caller.membership != Distributed::Membership::Member)
         return std::nullopt;
-    auto const& row = Distributed::RequirementRowOf(descriptor->identity);
-    if (row.satisfiedBy(caller))
+    auto const* const unmet = Distributed::UnmetRequirement(descriptor->identity, caller);
+    if (unmet == nullptr)
         return std::nullopt;
-    return Cc::Refuse(_metrics, ControlUnidentified, std::format("{} {}", descriptor->name, row.remedy));
+    // Every row this can return has a surface row: the `static_assert` beside `ControlRefusals`.
+    return Cc::Refuse(_metrics, *ControlRefusalFor(unmet->refusal), std::format("{} {}", descriptor->name, unmet->remedy));
 }
 
 std::vector<std::byte> EnrollmentResponder::RefusalReply(Wire::PrePayloadDecision decision,

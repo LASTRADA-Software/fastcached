@@ -965,9 +965,11 @@ class FormationHarness
         CapturingLogger logger;                                   ///< Its log, which `LogOf` reads back.
         /// Its operator, admitted to the control verbs from `OperatorAddress`. `MachineTicket`: an
         /// operator's control verb needs a route that IDENTIFIES the caller, and `--fleet-open` admits
-        /// nobody to it -- the list stands in for the ticket the operator's own node mints.
+        /// nobody to it -- the list stands in for the ticket the operator's own node mints. A VOTER's
+        /// ticket, for a ticket proves a machine and only a voter's machine is an operator (W-1).
         ListedMembership membership { { std::string { OperatorAddress } },
-                                      Distributed::MembershipParticipant::MachineTicket };
+                                      Distributed::MembershipParticipant::MachineTicket,
+                                      Distributed::KeyEvidenceSet {}.Add(Distributed::KeyEvidence::MachineTicket) };
         /// The operator owners every built node merges (`SurfaceComponents`: never null), built as `main`
         /// builds them, over a source slot nothing attaches -- so each answers that it has nothing to
         /// read. Built for their place on the surface, whose ceiling is their fold.

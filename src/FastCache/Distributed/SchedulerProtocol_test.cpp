@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <span>
 #include <string>
@@ -45,11 +46,13 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 /// A machine the fleet has admitted by the identity it proved, which is what every verb a machine
-/// joins the fleet with needs since #178 -- and a proof identifies its caller, as an operator's
-/// control verbs require.
-CallerContext const Insider {
-    .membership = Membership::Member, .peerId = "peer-1", .provenNodeId = "node-1", .identified = true
-};
+/// joins the fleet with needs since #178 -- and a proof identifies its caller. A VOTER's, so it also
+/// has the operator's standing the control verbs require; a learner's is the W-1 case below.
+CallerContext const Insider { .membership = Membership::Member,
+                              .peerId = "peer-1",
+                              .provenNodeId = "node-1",
+                              .identified = true,
+                              .operatorStanding = true };
 
 /// A caller the fleet admits by its ADDRESS and that proved nothing: a client, which may lease and
 /// may not join.
@@ -1118,6 +1121,74 @@ TEST_CASE("The retired worker admission is an unknown opcode to a ticketed and a
     retired[2] = std::byte { static_cast<std::uint8_t>(Wire::Op::ClusterAdmitLearner) };
     CHECK(ErrorOf(fixture.protocol.Answer(retired, CallerContextOf(fold.admitted, Testing::OpenFleetFold::Proven())))
           != Wire::ErrorCode::UnknownOpcode);
+}
+
+TEST_CASE("An operator's control verb is refused a learner's ticket and a learner's proven key, by name and counted",
+          "[distributed][scheduler][protocol][admission][security][operator-standing]")
+{
+    // W-1: a machine ticket proves a fleet MACHINE, not an operator -- any process on an admitted laptop
+    // can have its node mint one. So the control verbs ask for an operator's standing: this machine,
+    // or an identity whose machine holds a voter's seat in the applied state. Every control verb
+    // this surface serves, read FROM THE TABLE, so a verb that joins the column is asked here too.
+    Fixture fixture;
+    Testing::OpenFleetFold fold;
+    auto const contextOf = [&fold](ConnectionFacts facts) {
+        return CallerContextOf(fold.admitted, std::move(facts));
+    };
+    std::vector<Wire::OpDescriptor> controlVerbs;
+    std::ranges::copy_if(Wire::OpTable, std::back_inserter(controlVerbs), [](Wire::OpDescriptor const& row) {
+        return row.identity == Wire::IdentityRequirement::OperatorStanding && row.family == Wire::VerbFamily::Scheduler;
+    });
+    REQUIRE(controlVerbs.size() == 4); // admit, admit-learner, forget, set (admit-worker is retired)
+    auto const counted = [&fixture] {
+        return fixture.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedOperatorStandingRequired);
+    };
+
+    auto refused = std::uint64_t { 0 };
+    for (auto const& [what, facts]: { std::pair { "a learner's ticket", Testing::OpenFleetFold::LearnerTicketed() },
+                                      std::pair { "a learner's proven key", Testing::OpenFleetFold::LearnerProven() } })
+    {
+        INFO(what);
+        auto const learner = contextOf(facts);
+        // Admitted and identified: the refusal is about STANDING, not about who the caller is.
+        REQUIRE(learner.membership == Membership::Member);
+        REQUIRE(learner.identified);
+        CHECK_FALSE(learner.operatorStanding);
+        for (auto const& row: controlVerbs)
+        {
+            INFO(row.name);
+            auto const refusal = fixture.protocol.RefusePeer(learner, static_cast<std::uint8_t>(row.code));
+            REQUIRE(refusal.has_value());
+            CHECK(ErrorOf(Unwrap(refusal)) == Wire::ErrorCode::OperatorStandingRequired);
+            CHECK(counted() == ++refused);
+        }
+        // A client verb is still served: a ticket admits a CALLER.
+        CHECK_FALSE(fixture.protocol.RefusePeer(learner, static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
+    }
+    // The anonymous caller's series did not move: these were identified callers.
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired) == 0);
+
+    // After the payload too, and the message names the remedy.
+    auto const late = fixture.protocol.Answer(Wire::EncodeClusterSet(Wire::ClusterSetRequest { .name = "k", .value = "v" }),
+                                              contextOf(Testing::OpenFleetFold::LearnerTicketed()));
+    CHECK(ErrorOf(late) == Wire::ErrorCode::OperatorStandingRequired);
+    auto const message = Wire::DecodeErrorPayload(PayloadOf(late));
+    REQUIRE(message.has_value());
+    CHECK(Unwrap(message).second.contains("run it on a voter, or promote this machine"));
+    CHECK(counted() == ++refused);
+
+    // A voter's ticket and this machine are accepted at every one of them.
+    for (auto const& [what, facts]: { std::pair { "a voter's ticket", Testing::OpenFleetFold::Ticketed() },
+                                      std::pair { "a voter's proven key", Testing::OpenFleetFold::Proven() },
+                                      std::pair { "loopback", Testing::OpenFleetFold::Local() } })
+    {
+        INFO(what);
+        auto const caller = contextOf(facts);
+        CHECK(caller.operatorStanding);
+        for (auto const& row: controlVerbs)
+            CHECK_FALSE(fixture.protocol.RefusePeer(caller, static_cast<std::uint8_t>(row.code)).has_value());
+    }
+    CHECK(counted() == refused);
 }
 
 TEST_CASE("Where a worker was seen and what it answers on cross the wire into a grant's dial hint",

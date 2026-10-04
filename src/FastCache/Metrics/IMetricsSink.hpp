@@ -1348,6 +1348,10 @@ class IMetricsSink
         RaftPeerDialsEndedFrameOverCap,
         /// A two-way Raft session this node dialled, ended on a frame whose header did not decode.
         RaftPeerDialsEndedFrameBadMagic,
+        /// A two-way Raft session this node dialled that carried nothing for its idle bound, so
+        /// this node closed it and redials (`SessionIdleTable`): a session to a voter that is not
+        /// leading, or a half-open one whose other end went away while this machine slept.
+        RaftPeerDialsEndedSilent,
         /// A Raft message dropped for a peer that dials in (a learner, by its seat's link) and has
         /// no session attached: offline, or not yet dialled.
         RaftSendsDroppedNoSession,
@@ -1481,6 +1485,15 @@ class IMetricsSink
         /// `--fleet-open` alone admitted: an anonymous caller trying to decide who joins. Kept apart
         /// from `EnrollmentControlRefusedNotAMember`, which is a caller nothing admitted at all.
         EnrollmentControlRefusedIdentifiedCallerRequired,
+        /// An operator's control verb -- a cluster admission, forget or setting -- from an IDENTIFIED
+        /// caller whose machine holds no voter's seat, refused `OperatorStandingRequired`: a learner's
+        /// machine ticket or proven key. A ticket proves a fleet machine, never an operator, so a rise
+        /// is a process on a fleet machine trying to decide the fleet.
+        SchedulerRequestsRefusedOperatorStandingRequired,
+        /// An `ENROLL-CONTROL` -- approve, reject, auto-approve, clear, list -- from an identified
+        /// caller whose machine holds no voter's seat: a learner deciding who joins. Kept apart from
+        /// `EnrollmentControlRefusedIdentifiedCallerRequired`, an anonymous caller.
+        EnrollmentControlRefusedOperatorStandingRequired,
 
         /// Lease requests refused because a string they carried -- the key, the toolchain
         /// fingerprint, or the label a person reads that toolchain by -- is not UTF-8. The lease-side

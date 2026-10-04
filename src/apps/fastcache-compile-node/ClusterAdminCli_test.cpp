@@ -39,12 +39,14 @@ namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
-/// A caller the fleet has admitted by a route that IDENTIFIES it -- the operator's machine, presenting
-/// the ticket its node mints -- which an operator's control verbs require (`IdentifiedCaller`). The
-/// caller only `--fleet-open` admits is `SchedulerProtocol_test`'s and `EnrollmentResponder_test`'s case.
-Distributed::CallerContext const Insider {
-    .membership = Distributed::Membership::Member, .peerId = "peer-1", .provenNodeId = std::nullopt, .identified = true
-};
+/// A caller with an operator's standing -- a voter's machine, presenting the ticket its node mints --
+/// which an operator's control verbs require (`OperatorStanding`). The caller only `--fleet-open`
+/// admits, and a learner's ticket, are `SchedulerProtocol_test`'s and `EnrollmentResponder_test`'s cases.
+Distributed::CallerContext const Insider { .membership = Distributed::Membership::Member,
+                                           .peerId = "peer-1",
+                                           .provenNodeId = std::nullopt,
+                                           .identified = true,
+                                           .operatorStanding = true };
 
 /// A cluster whose answers a test scripts.
 ///

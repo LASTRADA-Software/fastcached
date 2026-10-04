@@ -187,6 +187,7 @@ TEST_CASE("A worker that republishes its advertised address verifies grants nami
     auto validator = MakeWorkerLeaseValidator(cfg,
                                               &TestRoster(),
                                               state.advertised,
+                                              {},
                                               SocketActivation::No,
                                               LeaseClock,
                                               state.lease,
@@ -246,6 +247,7 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     auto validator = MakeWorkerLeaseValidator(cfg,
                                               &TestRoster(),
                                               state.advertised,
+                                              {},
                                               SocketActivation::No,
                                               LeaseClock,
                                               state.lease,
@@ -308,6 +310,7 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     auto validator = MakeWorkerLeaseValidator(cfg,
                                               &TestRoster(),
                                               state.advertised,
+                                              {},
                                               SocketActivation::No,
                                               LeaseClock,
                                               state.lease,
@@ -385,8 +388,16 @@ TEST_CASE("A node with no roster builds a validator that learns and spends nothi
     WorkerState state;
     CapturingLogger logger;
 
-    auto validator = MakeWorkerLeaseValidator(
-        cfg, nullptr, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, logger, state.inForce);
+    auto validator = MakeWorkerLeaseValidator(cfg,
+                                              nullptr,
+                                              state.advertised,
+                                              {},
+                                              SocketActivation::No,
+                                              LeaseClock,
+                                              state.lease,
+                                              state.metrics,
+                                              logger,
+                                              state.inForce);
     REQUIRE(validator.has_value());
     // What the reload guard reads: the factory recorded the check it built (review I-2b).
     CHECK(state.inForce.Current() == BuiltLeaseCheck::Unchecked);
@@ -418,6 +429,7 @@ TEST_CASE("A socket-activated worker that admits remote peers and holds no roste
     auto const refused = MakeWorkerLeaseValidator(cfg,
                                                   nullptr,
                                                   state.advertised,
+                                                  {},
                                                   SocketActivation::Yes,
                                                   LeaseClock,
                                                   state.lease,
@@ -438,6 +450,7 @@ TEST_CASE("A socket-activated worker that admits remote peers and holds no roste
     CHECK(MakeWorkerLeaseValidator(cfg,
                                    &TestRoster(),
                                    state.advertised,
+                                   {},
                                    SocketActivation::Yes,
                                    LeaseClock,
                                    state.lease,
@@ -468,6 +481,7 @@ TEST_CASE("A socket-activated worker with no roster is opened only by --fleet-op
     auto validator = MakeWorkerLeaseValidator(cfg,
                                               nullptr,
                                               state.advertised,
+                                              {},
                                               SocketActivation::Yes,
                                               LeaseClock,
                                               state.lease,
@@ -488,6 +502,7 @@ TEST_CASE("A socket-activated worker with no roster is opened only by --fleet-op
     auto const refused = MakeWorkerLeaseValidator(cfg,
                                                   nullptr,
                                                   opened.advertised,
+                                                  {},
                                                   SocketActivation::Yes,
                                                   LeaseClock,
                                                   opened.lease,
@@ -535,6 +550,7 @@ TEST_CASE("A learner verifies the grant its fleet's leader signed against the st
     auto validator = MakeWorkerLeaseValidator(cfg,
                                               roster.Lease(),
                                               state.advertised,
+                                              {},
                                               SocketActivation::No,
                                               LeaseClock,
                                               state.lease,
@@ -627,7 +643,7 @@ TEST_CASE("A node whose name reaches only itself grants its own worker a lease t
     AnnouncedEndpoint announced { advertised };
     LeaseCheckInForce inForce;
     auto validator = MakeWorkerLeaseValidator(
-        cfg, roster.Lease(), announced, SocketActivation::No, wall, lease, workerMetrics, workerLogger, inForce);
+        cfg, roster.Lease(), announced, {}, SocketActivation::No, wall, lease, workerMetrics, workerLogger, inForce);
     REQUIRE(validator.has_value());
     lease.fleet.Pin(std::string { ThisCluster });
     auto const said = [&workerLogger](std::string_view phrase) {

@@ -3248,6 +3248,32 @@ crossed pair (both directions, with an uncrossed control, or a client that refus
 real framing, with an empty argument and one containing a space. That last one is the
 only thing that would catch an encoding that drops a field on the way.
 
+**Against a machine that is NOT the worker, a COMPILE reply is SIGNED, and checked
+before anything is stored.** The correlation above is unkeyed, and an endpoint is a
+name: a VPN address reassigned between a heartbeat and a compile hands the job to
+whatever machine now answers there, which can return a well-formed, correctly
+correlated object -- stored here and written through to the shared tier, under a key
+every other machine fetches. So the grant names the identity key the worker's
+`REGISTER` connection PROVED (`LeaseGrant::workerKey`, from `CallerContext::provenKey`,
+never from anything the worker CLAIMS), the worker signs `(correlation, SHA-256 of the
+object as sent)` under `IdentityKeyPurpose::CompileReply` (`Protocol/CompileReplySeal.hpp`,
+one header both ends include), and `InterpretCompile` checks it FIRST -- before the
+correlation and before the envelope. Missing or wrong is `DispatchStatus::Unauthenticated`:
+compiled locally, released, its own `--show-stats` row and an unconditional stderr line,
+the same alarm shape as `Mismatched` for the same reason (no client metrics sink). A grant
+naming no key is refused BEFORE dialling: it names nobody whose reply could be accepted,
+so dialling it can only spend a worker's slot on an object that will be thrown away.
+
+**The key travels TWICE, and neither copy is redundant.** The clear copy is the
+CLIENT's, which verifies no lease claims. The copy inside the token's signed claims
+(layout 4, `fastcache-lease-v4`) is the WORKER's: a fleet worker that has come to hold
+ANOTHER worker's endpoint refuses `EndpointMismatch` naming *another identity key*,
+before a compiler runs. An honest-but-misrouted worker is caught at the worker; a
+machine outside the fleet is caught at the client -- remove either because the other
+exists and one of those two goes uncaught. The impostor case and its honest control are
+`FleetDialHint_test`'s `[reply-seal]` pair; neutering `CompileReplyIsSealedBy`'s call
+turns the impostor case red and leaves the control green.
+
 ## The cordon (#1303)
 
 <!-- agent-tripwire: A cordon is the worker PROCESS's state, never replicated and never persisted -->
@@ -3577,21 +3603,34 @@ request -- and never to what DECIDES the fleet. With the scheduler's password go
 the only gate on `CLUSTER-ADMIT` and on `ENROLL-CONTROL`, so on an open node an anonymous remote
 caller could approve its own enrollment or arm an auto-approve window. Two columns decide it,
 never an `if` at a handler:
-- `OpDescriptor::identity` names the verbs: `IdentityRequirement::IdentifiedCaller` on
+- `OpDescriptor::identity` names the verbs: `IdentityRequirement::OperatorStanding` on
   `ClusterSet`, `ClusterForget`, `ClusterAdmit`, `ClusterAdmitLearner`, `ClusterAdmitWorker` and
-  `EnrollControl`, pinned by `ControlVerbsNeedAnIdentifiedCaller`.
-- `Distributed::MembershipRoutes` names the routes: loopback, a proven key and a verified ticket
-  identify their caller; `OpenPolicy` does not.
+  `EnrollControl`, pinned by `ControlVerbsNeedOperatorStanding`; `IdentifiedCaller` is only its
+  PREREQUISITE (`IdentityRequirementRow::prerequisite`, walked by `UnmetRequirement`) and no verb
+  names it.
+- `Distributed::MembershipRoutes`' `standing` column names the routes: loopback is an `Operator`
+  at the node being asked, a proven key and a verified ticket identify a `MachineSeat`, and
+  `OpenPolicy` is `Anonymous`.
 
-`CallerContextOf` reads the second off the same fold that admitted the connection
-(`RestsOnIdentifiedCaller`). One table, `Distributed::IdentityRequirements`, answers the first for
-the scheduler (`RefuseUnlessIdentified`) and for the enrollment surface (`RefuseUnidentified`, at
-the door and again in `AnswerControl`).
+**A machine ticket proves a fleet MACHINE, never an operator** (W-1). Any process on an admitted
+laptop can have its node mint one over loopback, so a ticket that opened the control verbs made
+every process on every machine an operator of the whole fleet -- `cluster-set fleet-open=1`, the
+shared cache pointed at itself, a forget, a 24 h auto-approve window. A `MachineSeat` route
+therefore confers an operator's standing only while the machine it names holds a VOTER's seat in
+the applied state: `PublishClusterKeys` publishes the voters beside the keys, in one swap, and the
+key roster marks the evidence in `MembershipDecision::votedBy`, which the fold carries like
+`revokedBy`.
 
-The refusal is `IdentifiedCallerRequired` (0x2e), not `NotAMember`, because the caller IS admitted
-and the remedy is to identify itself. It is counted on each surface's own row. `Cordon` and
-`MintTicket` are not rows: each already answers this machine alone. A reviewer's neuter --
-`OpenPolicy` made to identify -- turns the refusal cases red.
+`CallerContextOf` reads both facts off the same fold that admitted the connection
+(`RestsOnIdentifiedCaller`, `RestsOnOperatorStanding`). One table, `Distributed::IdentityRequirements`,
+answers the first for the scheduler (`RefuseUnlessIdentified`) and for the enrollment surface
+(`RefuseUnidentified`, at the door and again in `AnswerControl`).
+
+The refusals are `IdentifiedCallerRequired` (0x2e) for a caller `--fleet-open` alone admitted, and
+`OperatorStandingRequired` (0x33) for an identified machine that is no voter -- not `NotAMember`,
+because the caller IS admitted -- each counted on each surface's own row. `Cordon` and `MintTicket`
+are not rows: each already answers this machine alone. A reviewer's neuter -- `OpenPolicy` made to
+identify, or a `MachineSeat` row made an `Operator` -- turns the matching refusal cases red.
 
 **A proof is worth nothing unless every frame after it is SEALED.** Without the seal, a machine on
 the path relays a genuine worker's handshake to the scheduler, watches it succeed, and writes a

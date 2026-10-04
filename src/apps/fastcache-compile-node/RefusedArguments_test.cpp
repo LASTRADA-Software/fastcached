@@ -24,6 +24,7 @@
 #include <Dispatch.hpp>
 #include <IProcessRunner.hpp>
 #include <WorkerProtocol.hpp>
+#include <tests/CompileReplyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache;
@@ -263,7 +264,9 @@ TEST_CASE("A worker refusing an argument on the wire raises the row that names i
         runner, scratch.Path(), { { "msvc", R"(C:\MSVC\bin\Hostx64\x64\cl.exe)" } }, Cc::ToolchainSurvey::Completed()
     };
     RefusedArgumentsReport report { conditions, logger, {} };
-    Cc::WorkerProtocol protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, report };
+    Cc::WorkerProtocol protocol {
+        jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(), metrics, report
+    };
 
     std::string const source = "int main(){return 0;}";
     auto const args = std::vector<std::string> { "/O2", "/analyze:plugin" };

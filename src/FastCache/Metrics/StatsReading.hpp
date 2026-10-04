@@ -510,22 +510,22 @@ struct CounterSoleWriter
 /// a row silently absent from the attribution and indistinguishable from one nobody had
 /// considered, cannot recur by omission ([#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)).
 ///
-/// **How the 227 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 58
-/// of them and would have rendered the other 169 absent -- the same defect as the bug, three
+/// **How the 230 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 58
+/// of them and would have rendered the other 172 absent -- the same defect as the bug, three
 /// times larger. The rows are written by five mechanisms, and reading only `SurfaceRefusal`
-/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 142 of the 169 and
+/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 145 of the 172 and
 /// leaves 27 looking unwritten:
 ///
 /// | mechanism | rows |
 /// |---|---|
-/// | a `.counter` table row, spent by `Refuse(row)`, `RefuseAs` or an outcome table's reader | 143 |
+/// | a `.counter` table row, spent by `Refuse(row)`, `RefuseAs` or an outcome table's reader | 146 |
 /// | a `LeaseToken.hpp` outcome row's `workerCounter` | 10 |
 /// | returned by a classifier for its caller to spend | 4 |
 /// | a `CacheTierProfile` member, spent by the tier built with it | 16 |
 /// | `Increment(Counter::X)` directly | 58 |
 ///
-/// The column sums past 227 because four rows are written two ways -- and the 142 above is not
-/// the 143 here: 143 rows HAVE a refusal row, and 142 of those have no increment site, which is
+/// The column sums past 230 because four rows are written two ways -- and the 145 above is not
+/// the 146 here: 146 rows HAVE a refusal row, and 145 of those have no increment site, which is
 /// what a `SurfaceRefusal`-only reading would reach. Two figures one apart, measuring different
 /// things, is exactly how a census comes to be quoted wrong, so both are asserted.
 ///
@@ -847,6 +847,8 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameBadMagic,
                         .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedSilent,
+                        .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftSendsDroppedNoSession,
                         .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftSendsDroppedUnknownPeer,
@@ -922,6 +924,10 @@ inline constexpr std::array CounterSoleWriterTable {
     CounterSoleWriter { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired,
                         .surface = MetricsSurface::CompileScheduler },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedOperatorStandingRequired,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentControlRefusedOperatorStandingRequired,
                         .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheHits, .surface = MetricsSurface::NodeSharedCache },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheMisses,
@@ -999,7 +1005,7 @@ inline constexpr std::array CounterSoleWriterTable {
 }
 
 /// A `consteval` fold rather than a size comparison, because `CounterSoleWriterTable.size()`
-/// counts (counter, surface) PAIRS: it is 228 for 227 counters today, and a row duplicated
+/// counts (counter, surface) PAIRS: it is 231 for 230 counters today, and a row duplicated
 /// while another went missing would leave any arithmetic on the size perfectly consistent.
 ///
 /// @return True when no enumerator is missing from the table.

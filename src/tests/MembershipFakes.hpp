@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -71,12 +72,28 @@ class ListedMembership final: public Distributed::IMembershipOracle
     ///        must not consolidate the fact each case states, which is why this is a
     ///        parameter rather than the route the four copies hardcoded.
     ///        Checked by `RequireHonestLabel`: `Loopback` lists this machine's spellings only.
-    /// @throws std::invalid_argument for a label no production route could carry.
-    ListedMembership(std::vector<std::string> members, Distributed::MembershipParticipant participant):
+    /// @param votedBy For a KEY route (`ProvenIdentity`, `MachineTicket`): the evidence whose machine
+    ///        the fake says holds a voter's seat -- what an operator's control verbs ask
+    ///        (`MembershipDecision::votedBy`). Empty by default, the direction that fails CLOSED: a
+    ///        listed caller is a machine and no operator unless the call site says it votes.
+    /// @throws std::invalid_argument for a label no production route could carry, or a voter's seat
+    ///         stated for a route that names no machine.
+    ListedMembership(std::vector<std::string> members,
+                     Distributed::MembershipParticipant participant,
+                     Distributed::KeyEvidenceSet votedBy = {}):
         _members { std::move(members) },
-        _participant { participant }
+        _participant { participant },
+        _votedBy { votedBy }
     {
         RequireHonestLabel(_participant, _members);
+        // Asked of the evidence table, never of `MembershipRoutes`' standing column: that column is
+        // what a case using this fake tests, and a guard reading it would refuse to build the fixture
+        // under a neuter of it rather than let the case go red.
+        if (_votedBy != Distributed::KeyEvidenceSet {}
+            && std::ranges::none_of(Distributed::KeyEvidenceRoutes, [this](Distributed::KeyEvidenceRow const& row) {
+                   return row.participant == _participant;
+               }))
+            throw std::invalid_argument("a membership fake states a voter's seat only for a route that names a machine");
     }
 
     /// @copydoc Distributed::IMembershipOracle::Explain
@@ -85,10 +102,13 @@ class ListedMembership final: public Distributed::IMembershipOracle
     /// refused a host it never mentioned (#1471).
     [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view peerAddress) const override
     {
-        return Distributed::DecidedBy(std::ranges::find(_members, peerAddress) != _members.end()
-                                          ? Distributed::Membership::Member
-                                          : Distributed::Membership::Outsider,
-                                      _participant);
+        auto decision = Distributed::DecidedBy(std::ranges::find(_members, peerAddress) != _members.end()
+                                                   ? Distributed::Membership::Member
+                                                   : Distributed::Membership::Outsider,
+                                               _participant);
+        if (decision.verdict == Distributed::Membership::Member)
+            decision.votedBy = _votedBy;
+        return decision;
     }
 
     /// No opinion: a host list knows no keys. A case about a key a connection established
@@ -119,6 +139,7 @@ class ListedMembership final: public Distributed::IMembershipOracle
   private:
     std::vector<std::string> _members;
     Distributed::MembershipParticipant _participant;
+    Distributed::KeyEvidenceSet _votedBy;
 };
 
 /// An oracle that answers one fixed verdict, whatever it is asked about.
@@ -205,7 +226,12 @@ struct RosterFold
 
     /// @param live The ids whose test keys are live.
     /// @param revoked The ids whose test keys are revoked.
-    explicit RosterFold(std::vector<std::string> const& live, std::vector<std::string> const& revoked = {})
+    /// @param voters The ids among @p live that hold a voter's seat -- what an operator's control verb
+    ///        asks of a key route (`MembershipDecision::votedBy`). None by default: a key proves a
+    ///        machine, and a case about operators says which machines are voters.
+    explicit RosterFold(std::vector<std::string> const& live,
+                        std::vector<std::string> const& revoked = {},
+                        std::vector<std::string> const& voters = {})
     {
         std::map<std::string, Ed25519PublicKey, std::less<>> liveKeys;
         for (auto const& id: live)
@@ -214,7 +240,9 @@ struct RosterFold
         revokedKeys.reserve(revoked.size());
         for (auto const& id: revoked)
             revokedKeys.push_back(TestKeyPair(id).PublicKey());
-        keys.Publish(std::move(liveKeys), std::move(revokedKeys));
+        keys.Publish(std::move(liveKeys),
+                     std::move(revokedKeys),
+                     std::set<std::string, std::less<>> { voters.begin(), voters.end() });
     }
 
     // The composite points into this object, so it is neither copied nor moved.
@@ -226,12 +254,13 @@ struct RosterFold
 };
 
 /// A `--fleet-open` node's admission, composed as `Node::NodeMembership` composes it under the flag:
-/// loopback, the open policy, and a key roster in which pc-07's test key is live.
+/// loopback, the open policy, and a key roster in which pc-07's test key is live in a VOTER's seat
+/// and lt-12's in a LEARNER's.
 ///
-/// Not a fake, for `RosterFold`'s reason: which ROUTE admitted a caller is exactly what an
-/// operator's control verb asks (`IdentityRequirement::IdentifiedCaller`), and only the production
-/// participants name their routes as production does. The four callers such a case needs are
-/// spelled once here, so each file asks about the same connections.
+/// Not a fake, for `RosterFold`'s reason: which ROUTE admitted a caller, and whether the machine it
+/// names votes, is exactly what an operator's control verb asks (`IdentityRequirement::
+/// OperatorStanding`), and only the production participants name their routes as production does.
+/// The callers such a case needs are spelled once here, so each file asks about the same connections.
 struct OpenFleetFold
 {
     Distributed::LoopbackMembership loopback;
@@ -240,12 +269,18 @@ struct OpenFleetFold
     /// Declared after the participants it borrows.
     Distributed::AnyOfMembership admitted { { &loopback, &open, &keys } };
 
-    /// The machine the roster holds.
+    /// The machine the roster holds in a voter's seat.
     static constexpr std::string_view Machine = "pc-07";
+
+    /// The machine the roster holds in a learner's seat: identified by its key or ticket, and no operator.
+    static constexpr std::string_view Learner = "lt-12";
 
     OpenFleetFold()
     {
-        keys.Publish({ { std::string { Machine }, TestKeyPair(std::string { Machine }).PublicKey() } }, {});
+        keys.Publish({ { std::string { Machine }, TestKeyPair(std::string { Machine }).PublicKey() },
+                       { std::string { Learner }, TestKeyPair(std::string { Learner }).PublicKey() } },
+                     {},
+                     { std::string { Machine } });
     }
 
     /// @return A caller on another machine that showed nothing: admitted by `--fleet-open` alone.
@@ -269,6 +304,23 @@ struct OpenFleetFold
         return ConnectionFacts { .host = "203.0.113.9",
                                  .proven = ProvenIdentity { .id = std::string { Machine },
                                                             .key = TestKeyPair(std::string { Machine }).PublicKey() } };
+    }
+
+    /// @return Another address, presenting a verified ticket for the learner the roster holds.
+    [[nodiscard]] static ConnectionFacts LearnerTicketed()
+    {
+        return ConnectionFacts { .host = "198.51.100.12",
+                                 .authenticatedMachine =
+                                     ProvenIdentity { .id = std::string { Learner },
+                                                      .key = TestKeyPair(std::string { Learner }).PublicKey() } };
+    }
+
+    /// @return That address, having proved the learner's key.
+    [[nodiscard]] static ConnectionFacts LearnerProven()
+    {
+        return ConnectionFacts { .host = "198.51.100.12",
+                                 .proven = ProvenIdentity { .id = std::string { Learner },
+                                                            .key = TestKeyPair(std::string { Learner }).PublicKey() } };
     }
 
     /// @return A caller on this machine that showed nothing.

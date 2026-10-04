@@ -33,6 +33,7 @@
 #include <vector>
 
 #include <core/async/SyncRun.hpp>
+#include <tests/CompileReplyFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
@@ -271,7 +272,7 @@ constexpr std::uint64_t GrantTerm = 4;
     // REGISTER reply said, so a validator built for a test has to be told the same way
     // a production one is. A case that wants the UNREGISTERED worker leaves it unpinned.
     lease.fleet.Pin(std::string { ThisCluster });
-    return SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics, slack);
+    return SignedLeaseValidator(TestRoster(), endpoint, {}, LeaseClock, lease, metrics, slack);
 }
 
 /// Remembers every refusal it is told of, in order; safe from the pool threads a worker runs on.
@@ -335,7 +336,12 @@ struct Fixture
                      LeasePolicy policy = LeasePolicy::Unchecked,
                      std::chrono::seconds slack = Distributed::LeaseTokenClockSkewSlack):
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
-        worker { jobs, MakeLeaseValidator(policy, lease, endpoint, metrics, slack), std::move(codecs), metrics, refusals }
+        worker { jobs,
+                 MakeLeaseValidator(policy, lease, endpoint, metrics, slack),
+                 std::move(codecs),
+                 &Testing::TestWorkerKey(),
+                 metrics,
+                 refusals }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -731,7 +737,8 @@ TEST_CASE("The envelope ceiling is the surface's own, not a figure this class as
     AtomicMetricsSink metrics;
     constexpr std::size_t TinyCap = 8;
     WorkerProtocol worker {
-        jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, IgnoreJobRefusals(), TinyCap
+        jobs,   UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(), metrics, IgnoreJobRefusals(),
+        TinyCap
     };
 
     // Well under the default ceiling, and over this worker's.
@@ -2087,7 +2094,8 @@ TEST_CASE("A reply carries the runner's own correlation, not one recomputed here
 
     LyingRunner runner { std::string { Sentinel } };
     AtomicMetricsSink metrics;
-    WorkerProtocol worker { runner, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, IgnoreJobRefusals() };
+    WorkerProtocol worker { runner,  UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+                            metrics, IgnoreJobRefusals() };
 
     auto const answer = worker.Answer(CompileFrame());
     REQUIRE(answer.has_value());
@@ -2114,7 +2122,8 @@ TEST_CASE("The real runner is what a correlation comes from", "[worker-protocol]
     FastCache::Testing::ScratchDirectory const scratch { "fc-wp-corr" };
     CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
     AtomicMetricsSink metrics;
-    WorkerProtocol worker { jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, IgnoreJobRefusals() };
+    WorkerProtocol worker { jobs,    UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+                            metrics, IgnoreJobRefusals() };
 
     constexpr std::string_view Source = "int main(){return 0;}";
     auto const answer = worker.Answer(CompileFrame("gcc-13", Source));
@@ -2268,10 +2277,14 @@ class LiveFleet final: public IEndpointExchange, public IFrameResponder
             return {};
         auto const* const descriptor = Wire::FindOp(header->opRaw);
         if (descriptor != nullptr && descriptor->code == Wire::Op::Lease)
-            return Wire::EncodeReply(Wire::Status::Ok,
-                                     Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = WorkerEndpoint,
-                                                                               .leaseToken = "l1",
-                                                                               .workerCodecs = { Wire::IdentityCodec } }));
+            return Wire::EncodeReply(
+                Wire::Status::Ok,
+                Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = WorkerEndpoint,
+                                                          .leaseToken = "l1",
+                                                          .workerCodecs = { Wire::IdentityCodec },
+                                                          .lifetime = {},
+                                                          .dialHint = {},
+                                                          .workerKey = Testing::TestWorkerPublicKey() }));
         // The RELEASE, which `Dispatch` sends on every path out of a compile and
         // whose answer it deliberately ignores.
         return Wire::EncodeReply(Wire::Status::Ok, {});
@@ -2409,7 +2422,7 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         // Deliberately NOT pinned: this is a worker whose first registration round has
         // not completed, which is every worker for the first moments of its life.
         MovingEndpoint const endpoint { ThisWorker };
-        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
+        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, {}, LeaseClock, lease, metrics);
 
         auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
         REQUIRE(refusal.has_value());
@@ -2425,7 +2438,7 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
         lease.fleet.Pin(std::string { ThisCluster });
         MovingEndpoint const endpoint { ThisWorker };
-        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
+        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, {}, LeaseClock, lease, metrics);
 
         CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").refusal.has_value());
     }
@@ -2439,7 +2452,7 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
         lease.fleet.Pin(std::string {});
         MovingEndpoint const endpoint { ThisWorker };
-        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
+        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, {}, LeaseClock, lease, metrics);
 
         CHECK_FALSE(
             validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ""), "gcc-13").refusal.has_value());
@@ -2466,7 +2479,7 @@ TEST_CASE("A worker whose roster is absent refuses every grant, and says so", "[
     lease.fleet.Pin(std::string { ThisCluster });
     MovingEndpoint const endpoint { ThisWorker };
     Testing::FixedLeaseRoster roster { { "scheduler" } };
-    auto const validator = SignedLeaseValidator(roster, endpoint, LeaseClock, lease, metrics);
+    auto const validator = SignedLeaseValidator(roster, endpoint, {}, LeaseClock, lease, metrics);
 
     SECTION("no roster at all")
     {
@@ -2496,7 +2509,7 @@ TEST_CASE("A grant from a scheduler the cluster revoked is refused by name at th
     lease.fleet.Pin(std::string { ThisCluster });
     MovingEndpoint const endpoint { ThisWorker };
     Testing::FixedLeaseRoster roster { { "scheduler" } };
-    auto const validator = SignedLeaseValidator(roster, endpoint, LeaseClock, lease, metrics);
+    auto const validator = SignedLeaseValidator(roster, endpoint, {}, LeaseClock, lease, metrics);
 
     auto const before = GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, GrantTerm, "50");
     auto const after = GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, GrantTerm, "51");
@@ -2525,9 +2538,10 @@ struct RosterWorker
     WorkerProtocol worker { jobs,
                             [this] {
                                 lease.fleet.Pin(std::string { ThisCluster });
-                                return SignedLeaseValidator(roster, endpoint, LeaseClock, lease, metrics);
+                                return SignedLeaseValidator(roster, endpoint, {}, LeaseClock, lease, metrics);
                             }(),
                             AvailableCodecs(),
+                            &Testing::TestWorkerKey(),
                             metrics,
                             IgnoreJobRefusals() };
 };
@@ -2595,7 +2609,7 @@ TEST_CASE("A worker that learns a new address verifies grants naming it, and sto
     lease.fleet.Pin(std::string { ThisCluster });
 
     MovingEndpoint endpoint { ThisWorker };
-    auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
+    auto const validator = SignedLeaseValidator(TestRoster(), endpoint, {}, LeaseClock, lease, metrics);
 
     // Minted up front, both of them, so nothing about WHEN a token was signed can
     // explain the difference in how it is answered -- the only thing that changes

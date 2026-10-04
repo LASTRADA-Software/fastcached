@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -116,6 +117,7 @@ constexpr void FoldMembership(MembershipDecision& decision, MembershipDecision c
     {
         decision.decidedBy.Add(answer.decidedBy);
         decision.revokedBy.Add(answer.revokedBy);
+        decision.votedBy.Add(answer.votedBy);
     }
 }
 
@@ -332,6 +334,23 @@ class AnyOfMembership final: public IMembershipOracle
     return decision;
 }
 
+/// Which admission route each kind of key evidence names: a table rather than a ternary, so a third
+/// kind of evidence is a row, and `RowsInEnumeratorOrder` fails the build if it arrives without one.
+struct KeyEvidenceRow
+{
+    KeyEvidence evidence;              ///< How a connection established a key.
+    MembershipParticipant participant; ///< The route a live key established that way admits by.
+};
+
+/// One row per `KeyEvidence`, in enumerator order.
+inline constexpr EnumTable<KeyEvidence, KeyEvidenceRow> KeyEvidenceRoutes { {
+    { .evidence = KeyEvidence::SessionProof, .participant = MembershipParticipant::ProvenIdentity },
+    { .evidence = KeyEvidence::MachineTicket, .participant = MembershipParticipant::MachineTicket },
+} };
+
+static_assert(RowsInEnumeratorOrder(KeyEvidenceRoutes, &KeyEvidenceRow::evidence),
+              "KeyEvidenceRoutes must hold one row per KeyEvidence, in enumerator order");
+
 /// Whether @p decision rests on a LIVE proven identity: the one fact the verbs a joining machine
 /// sends require (`CompileCacheWire::IdentityRequirement::ProvenNodeOnly`).
 ///
@@ -372,6 +391,30 @@ class AnyOfMembership final: public IMembershipOracle
     return decision.verdict == Membership::Member && AnyRouteIdentifies(decision.decidedBy);
 }
 
+/// Whether @p decision gives the caller an operator's STANDING: a route that is one by itself (this
+/// machine), or a key route whose machine holds a voter's seat in the applied state. What an
+/// operator's control verbs require (`CompileCacheWire::IdentityRequirement::OperatorStanding`).
+///
+/// Read off the same fold that admitted the connection, through the route table's `standing` column
+/// and the evidence each key route was shown by (`KeyEvidenceRoutes`), so a ticket from a learner
+/// admits a CALLER and confers no standing, and a revoked key -- which replaces the decision with a
+/// tombstone -- confers none either.
+/// @param decision What `ExplainConnection` concluded.
+/// @return True when this machine, or a voter's live key, is among the routes that admitted it.
+[[nodiscard]] constexpr bool RestsOnOperatorStanding(MembershipDecision const& decision) noexcept
+{
+    if (decision.verdict != Membership::Member)
+        return false;
+    auto const byItself = std::ranges::any_of(MembershipRoutes, [&decision](MembershipRouteTrait const& row) {
+        return row.standing == CallerStanding::Operator && decision.decidedBy.Has(row.route);
+    });
+    auto const byVotersKey = std::ranges::any_of(KeyEvidenceRoutes, [&decision](KeyEvidenceRow const& row) {
+        return StandingOfRoute(row.participant) == CallerStanding::MachineSeat && decision.decidedBy.Has(row.participant)
+               && decision.votedBy.Has(row.evidence);
+    });
+    return byItself || byVotersKey;
+}
+
 /// Who is asking, as a scheduler-side verb sees one connection: its admission verdict, its host,
 /// and the node id it proved when that identity is live.
 ///
@@ -386,30 +429,16 @@ class AnyOfMembership final: public IMembershipOracle
 [[nodiscard]] inline CallerContext CallerContextOf(IMembershipOracle const& oracle, ConnectionFacts facts)
 {
     auto const decision = ExplainConnection(oracle, facts);
-    auto provenNodeId =
-        RestsOnProvenIdentity(decision) && facts.proven.has_value() ? std::optional { facts.proven->id } : std::nullopt;
+    auto const proven = RestsOnProvenIdentity(decision) && facts.proven.has_value();
+    auto provenNodeId = proven ? std::optional { facts.proven->id } : std::nullopt;
+    auto provenKey = proven ? std::optional { facts.proven->key } : std::nullopt;
     return CallerContext { .membership = decision.verdict,
                            .peerId = std::move(facts.host),
                            .provenNodeId = std::move(provenNodeId),
-                           .identified = RestsOnIdentifiedCaller(decision) };
+                           .provenKey = provenKey,
+                           .identified = RestsOnIdentifiedCaller(decision),
+                           .operatorStanding = RestsOnOperatorStanding(decision) };
 }
-
-/// Which admission route each kind of key evidence names: a table rather than a ternary, so a third
-/// kind of evidence is a row, and `RowsInEnumeratorOrder` fails the build if it arrives without one.
-struct KeyEvidenceRow
-{
-    KeyEvidence evidence;              ///< How a connection established a key.
-    MembershipParticipant participant; ///< The route a live key established that way admits by.
-};
-
-/// One row per `KeyEvidence`, in enumerator order.
-inline constexpr EnumTable<KeyEvidence, KeyEvidenceRow> KeyEvidenceRoutes { {
-    { .evidence = KeyEvidence::SessionProof, .participant = MembershipParticipant::ProvenIdentity },
-    { .evidence = KeyEvidence::MachineTicket, .participant = MembershipParticipant::MachineTicket },
-} };
-
-static_assert(RowsInEnumeratorOrder(KeyEvidenceRoutes, &KeyEvidenceRow::evidence),
-              "KeyEvidenceRoutes must hold one row per KeyEvidence, in enumerator order");
 
 /// Which identity keys the cluster holds LIVE, and which it has REVOKED -- the one participant with
 /// an opinion about a key (#178).
@@ -426,14 +455,21 @@ class KeyRosterMembership final: public IMembershipOracle
     /// Replace what is live and what is revoked.
     ///
     /// Built outside the lock and swapped in, so a reader never sees half of one roster and half of
-    /// the next.
+    /// the next -- nor a key from one publish and its seat from another.
     /// @param live Every id's live key.
     /// @param revoked Every revoked key.
-    void Publish(std::map<std::string, Ed25519PublicKey, std::less<>> live, std::vector<Ed25519PublicKey> revoked)
+    /// @param voters The ids among @p live whose seat in the applied state is a voter's: what turns a
+    ///        key route into an operator's standing (`MembershipDecision::votedBy`). Empty by default,
+    ///        the direction a publisher that states no seats must fail in -- nobody stands as an
+    ///        operator by key.
+    void Publish(std::map<std::string, Ed25519PublicKey, std::less<>> live,
+                 std::vector<Ed25519PublicKey> revoked,
+                 std::set<std::string, std::less<>> voters = {})
     {
         std::unique_lock const guard { _mutex };
         _live = std::move(live);
         _revoked = std::move(revoked);
+        _voters = std::move(voters);
     }
 
     /// No opinion: a key roster knows no addresses.
@@ -446,15 +482,20 @@ class KeyRosterMembership final: public IMembershipOracle
     /// @param evidence How it established it, which names the route a live key admits by.
     /// @return `Forgotten` by `KeyTombstone`, shown by @p evidence, for a revoked key -- asked FIRST, so a key that is both
     ///         revoked and still recorded under some id is the removed machine -- `Member` by the
-    ///         evidence's route for the live key of that id, and no opinion otherwise.
+    ///         evidence's route for the live key of that id, carrying @p evidence in `votedBy` when
+    ///         that id holds a voter's seat, and no opinion otherwise.
     [[nodiscard]] MembershipDecision ExplainKey(ProvenIdentity const& identity, KeyEvidence evidence) const override
     {
         std::shared_lock const guard { _mutex };
         if (std::ranges::contains(_revoked, identity.key))
             return TombstoneShownBy(evidence);
-        if (auto const live = _live.find(identity.id); live != _live.end() && live->second == identity.key)
-            return DecidedBy(Membership::Member, KeyEvidenceRoutes[static_cast<std::size_t>(evidence)].participant);
-        return {};
+        auto const live = _live.find(identity.id);
+        if (live == _live.end() || live->second != identity.key)
+            return {};
+        auto decision = DecidedBy(Membership::Member, KeyEvidenceRoutes[static_cast<std::size_t>(evidence)].participant);
+        if (_voters.contains(identity.id))
+            decision.votedBy.Add(evidence);
+        return decision;
     }
 
     /// @param id The id to look up.
@@ -468,10 +509,11 @@ class KeyRosterMembership final: public IMembershipOracle
     }
 
   private:
-    /// Guards both sets. Mutable because `ExplainKey` is logically const and must still take it.
+    /// Guards every set. Mutable because `ExplainKey` is logically const and must still take it.
     mutable std::shared_mutex _mutex;
     std::map<std::string, Ed25519PublicKey, std::less<>> _live;
     std::vector<Ed25519PublicKey> _revoked;
+    std::set<std::string, std::less<>> _voters;
 };
 
 } // namespace FastCache::Distributed

@@ -198,6 +198,8 @@ namespace
           .refusal = DiallerRefusal::FrameUnreadable,
           .level = LogLevel::Warn,
           .sentence = "" },
+        // Named by this end's own idle bound (`SessionSilence`), never by `ReadProvenSession`.
+        { .end = SessionEnd::Silent, .refusal = DiallerRefusal::SessionSilent, .level = LogLevel::Debug, .sentence = "" },
     } };
 
     static_assert(RowsInEnumeratorOrder(DiallerSessionEndRows, &DiallerSessionEndRow::end),
@@ -522,6 +524,71 @@ struct PeerSenderAccess
 
 namespace
 {
+    /// A two-way session's idle bound (`SessionIdleTable`): armed as the reader starts, re-armed by
+    /// every frame it reads, and closing the socket when it runs out -- recording that it did, so
+    /// the reader's ending is named `SessionEnd::Silent` rather than read as the peer closing.
+    ///
+    /// A `DeadlineTimer` re-armed per frame rather than a coroutine sleeping beside the reader: a
+    /// sleep nothing can cancel would hold the session's end -- and `Stop()` -- until it woke, while
+    /// a timer is disarmed by its destructor. It lives in the reader's frame, declared after its
+    /// `ReaderEnding`, so it is disarmed before that closes the socket.
+    class SessionSilence
+    {
+      public:
+        /// @param loop The session's loop, whose clock the bound is measured on.
+        /// @param socket The session's socket, closed when the bound runs out; outlives this.
+        /// @param bound How long the session may read nothing; non-positive arms nothing.
+        SessionSilence(core::net::EventLoop& loop, core::net::ISocket* socket, std::chrono::milliseconds bound):
+            _loop { loop },
+            _target { .socket = socket },
+            _bound { bound }
+        {
+            Rearm();
+        }
+
+        SessionSilence(SessionSilence const&) = delete;
+        SessionSilence(SessionSilence&&) = delete;
+        SessionSilence& operator=(SessionSilence const&) = delete;
+        SessionSilence& operator=(SessionSilence&&) = delete;
+        ~SessionSilence() = default;
+
+        /// Start the bound again from now: a frame was read.
+        void Rearm()
+        {
+            _timer.reset();
+            if (_bound > std::chrono::milliseconds::zero())
+                _timer.emplace(_loop, _loop.clock().now() + _bound, &Expire, &_target);
+        }
+
+        /// @return Whether the bound ran out and closed the socket.
+        [[nodiscard]] bool Expired() const noexcept
+        {
+            return _target.expired;
+        }
+
+        /// @return The bound, for the log line.
+        [[nodiscard]] std::chrono::milliseconds Bound() const noexcept
+        {
+            return _bound;
+        }
+
+      private:
+        /// The timer's callback: recorded BEFORE the close, as `armSocketDeadline` records it, so the
+        /// reader the close resumes never sees a socket that shut without the reason attached.
+        /// @param state The `SocketDeadlineTarget`.
+        static void Expire(void* state)
+        {
+            auto& target = *static_cast<core::net::SocketDeadlineTarget*>(state);
+            target.expired = true;
+            target.socket->close();
+        }
+
+        core::net::EventLoop& _loop;
+        core::net::SocketDeadlineTarget _target;
+        std::chrono::milliseconds _bound;
+        std::optional<core::net::DeadlineTimer> _timer; ///< Declared last, so it is disarmed first.
+    };
+
     /// Feeds a two-way session's per-frame progress back to the session and the log, so
     /// `ReadProvenSession` itself never has to know either exists -- the dialling end's
     /// counterpart of the server's `SessionObserver`.
@@ -529,23 +596,28 @@ namespace
     {
       public:
         /// @param halves The session; outlives this, which lives in its reader's frame.
-        explicit DiallerSessionObserver(PeerSenderAccess::SessionHalves* halves) noexcept:
-            _halves { halves }
+        /// @param silence The session's idle bound, re-armed by every frame read; outlives this.
+        DiallerSessionObserver(PeerSenderAccess::SessionHalves* halves, SessionSilence* silence) noexcept:
+            _halves { halves },
+            _silence { silence }
         {
         }
 
         void OnDelivered() override
         {
             ++_halves->delivered;
+            _silence->Rearm();
         }
 
         void OnSkipped(ConsensusError const& error) override
         {
+            _silence->Rearm();
             PeerSenderAccess::NoteSkipped(_halves, error);
         }
 
       private:
         PeerSenderAccess::SessionHalves* _halves;
+        SessionSilence* _silence;
     };
 } // namespace
 
@@ -694,13 +766,24 @@ core::async::Task<void> PeerSenderAccess::ReadSession(SessionHalves* halves, Byt
     auto* const self = halves->self;
     FrameOpener opener { std::move(halves->proven.session.acceptorToDialler) };
     auto const who = ProvenSessionPeer { .id = halves->where.id, .key = halves->proven.provenKey };
-    DiallerSessionObserver observer { halves };
+
+    // This end is the PASSIVE one: it writes only what the leader asks of it, so a session whose
+    // other end went away while this machine slept would park here forever. The bound is the
+    // direction's column -- one-way arms none -- measured from the last frame read.
+    SessionSilence silence { self->_reactor,
+                             halves->peer->socket.get(),
+                             SessionIdleBound(self->_options.direction, self->_options.heartbeatInterval) };
+    DiallerSessionObserver observer { halves, &silence };
 
     // The acceptor's own loop, the one `RaftPeerServer` runs: the tag first, then `StillProves`,
     // then the sender -- so a forget closes this session at the acceptor's next frame, as it
     // does at this node's next one in the writer.
-    auto const ending =
+    auto ending =
         co_await ReadProvenSession(reader, &opener, &who, &self->_identity, &self->_sink, SessionReadLimits {}, &observer);
+    // Whatever the read reported, a close the bound made is the bound's: only its timer knows.
+    if (silence.Expired())
+        ending =
+            SessionEnding { .end = SessionEnd::Silent, .detail = std::format("nothing for {} ms", silence.Bound().count()) };
     NoteSessionEnd(halves, ending);
 }
 
@@ -1475,7 +1558,7 @@ void RaftPeerTransport::NoteDialRefusal(Peer& peer,
         return;
     peer.nextRefusalReport = now + RefusalReportInterval;
 
-    _logger.Log(LogLevel::Warn,
+    _logger.Log(row.level,
                 std::format("raft: gave up on peer {} at {}:{} because {}{}{} (every refusal is counted; this line repeats "
                             "at most once a minute per peer)",
                             where.id,

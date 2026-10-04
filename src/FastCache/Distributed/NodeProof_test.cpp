@@ -16,6 +16,7 @@
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/MachineTicket.hpp>
 #include <FastCache/Distributed/NodeProof.hpp>
+#include <FastCache/Protocol/CompileReplySeal.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -305,6 +306,8 @@ constexpr EnumTable<IdentityKeyPurpose, ConstructionBuilder> ConstructionBuilder
                                                 .nonce = samples.nonce,
                                                 .challenge = {} });
           } },
+    { .purpose = IdentityKeyPurpose::CompileReply,
+      .build = [](ConstructionSamples const& samples) { return CompileReplyMessage(samples.field, samples.field); } },
 } };
 
 static_assert(RowsInEnumeratorOrder(ConstructionBuilders, &ConstructionBuilder::purpose),

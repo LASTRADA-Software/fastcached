@@ -357,6 +357,15 @@ class NodeProofClient
         return _deferrals.load(std::memory_order_relaxed);
     }
 
+    /// The identity key this machine proves itself with: what a scheduler records for the worker
+    /// it registers, so the same key is what that worker signs its COMPILE replies under and what
+    /// its lease check holds a grant's named key to (W-4).
+    /// @return The key pair; borrowed, and it outlives this client.
+    [[nodiscard]] Ed25519KeyPair const& Key() const noexcept
+    {
+        return _key;
+    }
+
   private:
     /// Count @p attempt into `ConsecutiveDeferrals`, and hand it back.
     /// @param attempt What one proof came to.

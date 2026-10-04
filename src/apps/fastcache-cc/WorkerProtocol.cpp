@@ -5,6 +5,7 @@
 #include "WorkerProtocol.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Protocol/CompileReplySeal.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
@@ -137,6 +138,7 @@ namespace
 
 LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
                                     IAdvertisedEndpointSource const& advertisedEndpoint,
+                                    std::span<std::byte const> identityKey,
                                     core::platform::WallClockRef clock,
                                     Distributed::WorkerLeaseState& lease,
                                     IMetricsSink& metrics,
@@ -150,8 +152,15 @@ LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
     // The endpoint is the one capture that is a REFERENCE on purpose: it is read per
     // request, so what is captured is where to ask rather than the answer (#1279). It
     // outlives this validator by contract, exactly as `lease` does.
-    return [signers = &roster, endpoint = &advertisedEndpoint, clock, &lease, &metrics, slack](
-               std::string_view token, std::string_view fingerprint) -> LeaseDecision {
+    // The key by VALUE: it is this machine's, fixed for the process, and a copy is what lets the
+    // validator outlive whatever handed it over.
+    return [signers = &roster,
+            endpoint = &advertisedEndpoint,
+            ownKey = std::string { Wire::AsStringView(identityKey) },
+            clock,
+            &lease,
+            &metrics,
+            slack](std::string_view token, std::string_view fingerprint) -> LeaseDecision {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
         // that later, with `UnknownFingerprint`. So the two comparisons compose rather
@@ -215,7 +224,8 @@ LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
         auto verified = Distributed::VerifyLeaseToken(
             *signers,
             token,
-            Distributed::LeaseExpectation { .endpoint = advertised, .fingerprint = fingerprint, .clusterId = *cluster },
+            Distributed::LeaseExpectation {
+                .endpoint = advertised, .fingerprint = fingerprint, .clusterId = *cluster, .identityKey = ownKey },
             now,
             slack);
         if (verified.has_value())
@@ -336,12 +346,14 @@ IJobRefusalObserver& IgnoreJobRefusals() noexcept
 WorkerProtocol::WorkerProtocol(ICompileJobRunner& jobs,
                                LeaseValidator validator,
                                Wire::CodecList acceptedCodecs,
+                               Ed25519KeyPair const* replyKey,
                                IMetricsSink& metrics,
                                IJobRefusalObserver& refusals,
                                std::size_t maxDecompressedBytes):
     _jobs { jobs },
     _validator { std::move(validator) },
     _acceptedCodecs { std::move(acceptedCodecs) },
+    _replyKey { replyKey },
     _metrics { metrics },
     _refusals { refusals },
     _maxDecompressedBytes { maxDecompressedBytes }
@@ -604,15 +616,25 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     // carry the history.)
     auto const enveloped = Envelope(outcome->object, fields->acceptedCodecs, _acceptedCodecs);
 
-    return Wire::EncodeReply(
-        Wire::Status::Ok,
-        Wire::EncodeCompileResult(Wire::CompileResult { .exitCode = static_cast<std::uint32_t>(outcome->exitCode),
-                                                        .object = enveloped,
-                                                        .stdoutText = Wire::AsBytes(outcome->stdoutText),
-                                                        .stderrText = Wire::AsBytes(outcome->stderrText),
-                                                        // Carried through from the runner, never recomputed from
-                                                        // `fields` here -- see `ICompileJobRunner` (#280).
-                                                        .correlation = Wire::AsBytes(outcome->correlation) }));
+    // Signed over what is about to be SENT -- the correlation the runner produced and the object
+    // as enveloped -- so the launcher can tell this worker from whatever else has come to answer
+    // at its address, before the object reaches any cache (W-4). A worker holding no key signs
+    // nothing, and the launcher refuses the reply rather than trusting it.
+    auto const signature =
+        _replyKey != nullptr ? std::optional { SealCompileReply(*_replyKey, Wire::AsBytes(outcome->correlation), enveloped) }
+                             : std::nullopt;
+
+    return Wire::EncodeReply(Wire::Status::Ok,
+                             Wire::EncodeCompileResult(Wire::CompileResult {
+                                 .exitCode = static_cast<std::uint32_t>(outcome->exitCode),
+                                 .object = enveloped,
+                                 .stdoutText = Wire::AsBytes(outcome->stdoutText),
+                                 .stderrText = Wire::AsBytes(outcome->stderrText),
+                                 // Carried through from the runner, never recomputed from
+                                 // `fields` here -- see `ICompileJobRunner` (#280).
+                                 .correlation = Wire::AsBytes(outcome->correlation),
+                                 .signature = signature.has_value() ? std::span<std::byte const> { *signature }
+                                                                    : std::span<std::byte const> {} }));
 }
 
 core::async::Task<CacheOutcome> ExchangeWithSchedulerAsync(core::net::ISocket* scheduler, std::vector<std::byte> frame)

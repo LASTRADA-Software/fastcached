@@ -50,6 +50,7 @@
 #include <core/net/BlockingConnector.hpp>
 #include <core/net/BlockingSocket.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/CompileReplyFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/LocalityFakes.hpp>
 #include <tests/MembershipFakes.hpp>
@@ -132,7 +133,8 @@ struct Fixture
 
     Fixture():
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
-        protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, Cc::IgnoreJobRefusals() }
+        protocol { jobs,    Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+                   metrics, Cc::IgnoreJobRefusals() }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -434,13 +436,12 @@ TEST_CASE("A worker refuses a non-member its scheduler granted a lease to under 
     NodeConfig cfg;
     cfg.clusterId = std::string { fleet };
     auto validator = MakeWorkerLeaseValidator(
-        cfg, &roster, advertised, SocketActivation::No, wall, lease, fix.metrics, fix.logger, inForce);
+        cfg, &roster, advertised, {}, SocketActivation::No, wall, lease, fix.metrics, fix.logger, inForce);
     REQUIRE(validator.has_value());
     REQUIRE(inForce.Current() == BuiltLeaseCheck::Signed);
     lease.fleet.Pin(std::string { fleet });
-    Cc::WorkerProtocol checked {
-        fix.jobs, *std::move(validator), { Wire::IdentityCodec }, fix.metrics, Cc::IgnoreJobRefusals()
-    };
+    Cc::WorkerProtocol checked { fix.jobs,    *std::move(validator),  { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+                                 fix.metrics, Cc::IgnoreJobRefusals() };
 
     // What the scheduler granted: real, signed, naming this worker.
     auto const grant = [&wall](std::string_view serial) {
@@ -1153,7 +1154,8 @@ struct MergedWorker
     ///        seconds to observe one frame.
     MergedWorker(Fixture& fix, NodeIoLoop& io, std::chrono::milliseconds progressInterval = Wire::DefaultProgressInterval):
         jobs { runner, fix.scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
-        protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, fix.metrics, Cc::IgnoreJobRefusals() },
+        protocol { jobs,        Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+                   fix.metrics, Cc::IgnoreJobRefusals() },
         // **Five seconds rather than the thirty-second default: the NET, not the
         // diagnostic.** `DrainedWithin` above is what reports a slot that never came
         // back, as an ordinary red assertion with a number. This only bounds how long a

@@ -163,6 +163,16 @@ struct LeaseClaims
     /// rest of the grant.
     std::string signer;
 
+    /// The identity public key of the worker this grant is for, as the scheduler learned it
+    /// from that worker's proof at registration, or empty when it holds none (W-4).
+    ///
+    /// Inside the signature for `endpoint`'s reason, one layer tighter: an endpoint is a name,
+    /// and a name can come to answer on another machine -- a VPN address reassigned, a long-TTL
+    /// DNS record -- while a key cannot. The worker refuses a grant naming a key that is not its
+    /// own, and the client authenticates the reply against the same key, carried beside the
+    /// token in the grant (`CompileCacheWire::LeaseGrant::workerKey`). Raw bytes, not text.
+    std::string workerKey {};
+
     // Declared in wire order, matching `PackClaims`, so the struct reads in the order the
     // bytes do and a designated initializer lists them in the order it declares them.
 };
@@ -364,7 +374,11 @@ struct LeaseRefusal
 /// voter's identity key where it carried an HMAC under the cluster key. The envelope's
 /// second field changed width and meaning, so a version-2 grant is refused as malformed
 /// rather than read.
-inline constexpr std::uint8_t LeaseTokenVersion = 3;
+///
+/// **4 since W-4**: the claims name the granted worker's identity key, so a grant answered by
+/// whatever machine has come to hold its endpoint is refused there, and the reply is checked
+/// against that key by the client. A ninth-field version-3 grant is refused as malformed.
+inline constexpr std::uint8_t LeaseTokenVersion = 4;
 
 /// Who signs a grant: the issuing scheduler's identity (#178).
 ///
@@ -576,6 +590,7 @@ namespace Detail
             WireFields::AsBytes(claims.clusterId),
             std::span<std::byte const> { epoch },
             WireFields::AsBytes(claims.signer),
+            WireFields::AsBytes(claims.workerKey),
         });
     }
 
@@ -593,7 +608,7 @@ namespace Detail
     inline constexpr std::size_t EnvelopeFieldCount = 2;
 
     /// How many fields the packed claims hold.
-    inline constexpr std::size_t ClaimFieldCount = 9;
+    inline constexpr std::size_t ClaimFieldCount = 10;
 
     /// The largest expiry this host's wall clock can represent, in milliseconds.
     ///
@@ -704,7 +719,8 @@ namespace Detail
                              static_cast<std::int64_t>(*expiryMillis) } },
                          .clusterId = std::string { WireFields::AsStringView((*fields)[6]) },
                          .epoch = *epoch,
-                         .signer = std::string { WireFields::AsStringView((*fields)[8]) } };
+                         .signer = std::string { WireFields::AsStringView((*fields)[8]) },
+                         .workerKey = std::string { WireFields::AsStringView((*fields)[9]) } };
 }
 
 /// What learning a scheduler term did to a worker's picture of the fleet.
@@ -1126,6 +1142,14 @@ struct LeaseExpectation
     /// cluster id on both sides, which is why it agrees; an empty id matches only an
     /// empty one, and no node has that.
     std::string_view clusterId;
+
+    /// This worker's own identity public key, or empty when it holds none (W-4).
+    ///
+    /// A grant naming a key is good only at the machine holding it: an endpoint that has come
+    /// to answer on another machine is refused there as `EndpointMismatch` -- the grant was
+    /// issued for a different worker -- before a compiler runs. A grant naming no key is judged
+    /// by its endpoint alone, as before; the client refuses to send it anywhere.
+    std::string_view identityKey {};
 };
 
 /// Authenticate a grant and check it names this worker, this toolchain, and now.
@@ -1182,6 +1206,15 @@ struct LeaseExpectation
             .reason = LeaseRefusalReason::EndpointMismatch,
             .detail = std::format(
                 "this lease was issued for {}; this worker answers on {}", authentic->endpoint, expected.endpoint) } };
+
+    // The same question as the endpoint's, asked of what cannot move: a grant for the machine
+    // holding one key is not good at a machine holding another, whatever name both answer to.
+    if (!authentic->workerKey.empty() && authentic->workerKey != expected.identityKey)
+        return std::unexpected { LeaseRefusal {
+            .reason = LeaseRefusalReason::EndpointMismatch,
+            .detail = std::format("this lease was issued for {} on a machine holding another identity key; this "
+                                  "worker answers there now",
+                                  authentic->endpoint) } };
 
     if (authentic->fingerprint != expected.fingerprint)
         return std::unexpected { LeaseRefusal { .reason = LeaseRefusalReason::FingerprintMismatch, .detail = {} } };

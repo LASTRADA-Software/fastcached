@@ -1065,11 +1065,17 @@ fleet's.**
 "Fleet" here is what the scheduler **serves** -- a lease, a status. What **decides** the fleet --
 `--cluster-admit` in every form, `--cluster-forget`, `--cluster-set`, and the enrollment decisions
 (`--enroll-approve`, `--enroll-reject`, auto-approval, the list) -- is answered only to a caller
-this node can identify: a process on this machine, or a machine the roster admits. A caller
-that only `--fleet-open` admits is refused `identified-caller-required`, and it is counted on
+with an operator's standing: a process on this machine, or a **voter** of the cluster, by its
+proven key or the machine ticket its node mints. A caller that only `--fleet-open` admits is
+refused `identified-caller-required`, counted on
 `fastcache_scheduler_requests_refused_identified_caller_required_total` or
-`fastcache_enrollment_control_refused_identified_caller_required_total`. Otherwise, on an open
-node, anybody could approve their own enrollment.
+`fastcache_enrollment_control_refused_identified_caller_required_total`; otherwise, on an open
+node, anybody could approve their own enrollment. A machine the roster admits as a **learner** is
+refused `operator-standing-required`, counted on
+`fastcache_scheduler_requests_refused_operator_standing_required_total` or
+`fastcache_enrollment_control_refused_operator_standing_required_total`: a ticket proves a fleet
+machine, never an operator, and any process on that machine can have its node mint one. Run the
+verb on a voter -- the office PC, or any machine promoted to one -- or promote the machine.
 
 The cache column changed in
 [#287](https://github.com/LASTRADA-Software/fastcached/issues/287), and it is the
@@ -3589,6 +3595,7 @@ byte-budget refusal that fires in practice is a cache `STORE`.
 | `fastcache_enrollment_requests_refused_revoked_key_total` | An `ENROLL` asked under a key the cluster has revoked: a machine an operator forgot with `--cluster-forget`, asking to come back as itself. Refused at the door rather than listed, because no approval could admit a revoked key, and the refusal tells the machine to mint a new identity. Expected once after forgetting a machine that is still running; a steady rate is a removed machine nobody stopped. | `ENROLL` |
 | `fastcache_enrollment_control_refused_not_a_member_total` | An `ENROLL-CONTROL` from a host this node does not admit. The decision half of the family is the one that admits a key to the cluster, so it is gated twice — membership here, and `AUTH` in the row below — and this counter is the outer gate reporting. | `ENROLL-CONTROL` |
 | `fastcache_enrollment_control_refused_identified_caller_required_total` | An `ENROLL-CONTROL` -- approve, reject, auto-approve, clear, list -- from a caller only `--fleet-open` admitted: an anonymous caller trying to decide who joins. Never summed with the not-a-member series, a caller nothing admitted. |
+| `fastcache_enrollment_control_refused_operator_standing_required_total` | An `ENROLL-CONTROL` -- approve, reject, auto-approve, clear, list -- from a caller whose machine ticket or proven key names a machine that holds no voter's seat: a learner deciding who joins. Never summed with the identified-caller series, an anonymous caller. |
 
 **A Raft peer that could not prove which member it is, or proved it and still could not be served.** Every connection between consensus members opens with a handshake: the accepting node challenges, the dialling node signs that challenge with its own identity key and names the member it meant to dial, and the acceptor answers with a verdict signed with its own. Each end checks the other's signature against the key the cluster records for the id it claims. The `connections` and `frames` rows are counted by the node that ACCEPTED the connection, the `dials` rows by the node that DIALLED it — so one misconfigured machine shows on both, from opposite ends. See [cluster communication](../operations/cluster-communication.md#raft-peer-authentication).
 
@@ -3623,6 +3630,7 @@ byte-budget refusal that fires in practice is a cache `STORE`.
 | `fastcache_raft_peer_dials_ended_frame_unreadable_total` | Two-way Raft sessions this node dialled that it ended on a frame whose tag verified and which this build cannot read: a wire version other than the one the handshake settled, or a message out of place. A steady count names a peer running a different build. |
 | `fastcache_raft_peer_dials_ended_frame_over_cap_total` | Two-way Raft sessions this node dialled that it ended on a frame declaring more payload than this node buffers, refused before any of it was read. |
 | `fastcache_raft_peer_dials_ended_frame_bad_magic_total` | Two-way Raft sessions this node dialled that it ended on a frame whose header did not begin with this wire's magic, after which nothing on the connection can be framed. |
+| `fastcache_raft_peer_dials_ended_silent_total` | Two-way Raft sessions this node dialled -- a learner's -- that carried nothing for their idle bound, a hundred of the leader's heartbeat intervals, so this node closed them and redials on the learner's backoff. A steady trickle is the sessions to voters that are not leading, which write a learner nothing; one after a sleep is a half-open session to the leader, which without the bound would never end, so the roster and every forget would stop arriving until a restart. |
 | `fastcache_raft_sends_dropped_no_session_total` | Raft messages dropped for a peer that dials in -- a learner, which nobody dials -- while no session of its is attached: the learner is offline, or has not dialled yet. Raft retransmits, so a drop costs the leader nothing else. |
 | `fastcache_raft_sends_dropped_unknown_peer_total` | Raft messages dropped for a peer this node can place nowhere: it neither dials it nor was told it dials in, so nothing here can reach it however long it waits -- a member whose recorded address this node cannot dial, or an id it was never given an address for. |
 | `fastcache_raft_inbound_sessions_superseded_total` | Two-way Raft sessions a peer's newer session superseded: the same id proved a second session while its first was still attached, and the first was closed. One per reconnect is a roaming learner whose old connection had not yet been seen to end; a steady rate from one peer names two machines holding one identity key -- a copied --cluster-dir -- taking the session from each other. |
@@ -4377,6 +4385,7 @@ What a proof does reach is the membership half of both.
 | `fastcache_node_proofs_malformed_total` | A payload that would not decode. The same kind of mismatch, kept apart so an old client cannot hide a key search. |
 | `fastcache_scheduler_requests_refused_node_identity_required_total` | A joining verb sent on a connection that proved no identity: a node started without `--cluster-dir`, or an older build. |
 | `fastcache_scheduler_requests_refused_identified_caller_required_total` | A cluster control verb -- admit, forget, set -- from a caller only `--fleet-open` admitted. `--fleet-open` admits a caller to what the fleet serves, never to what decides it: send the verb from this machine, or from one whose node presents a machine ticket. |
+| `fastcache_scheduler_requests_refused_operator_standing_required_total` | A cluster control verb -- admit, forget, set -- from a caller whose machine ticket or proven key names a machine that holds no voter's seat. A ticket proves a fleet machine, never an operator: run the verb on a voter, or promote the machine. |
 
 **A refused ticket is told less than these counters say.** AUTH answers any address, and a
 ticket is checked under the roster's key for the id it claims -- so `forged`, `unknown_machine`

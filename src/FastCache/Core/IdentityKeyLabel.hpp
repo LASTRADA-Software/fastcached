@@ -41,6 +41,7 @@ enum class IdentityKeyPurpose : std::uint8_t
     MachineTicket,       ///< A machine ticket: this machine speaks, to ONE audience, for a minute.
     EnrollAdmission,     ///< An ENROLL answer to a joiner, of any outcome, over a nonce the JOINER chose.
     EnrollRequest,       ///< A joiner's ENROLL request, over every field it states, under the key it asks with.
+    CompileReply,        ///< A worker's COMPILE reply: what it compiled, and the digest of the object it returns.
     Last,                ///< Not a construction, and has no row: the length of a table keyed by one.
 };
 
@@ -68,10 +69,13 @@ struct IdentityKeyLabel
 /// - `ticket-v1`: new with its construction (spec §5), and the label tickets were first signed
 ///   under, so routing them through this table moved no byte on the wire.
 /// - `enroll-admission-v1`, `enroll-request-v1`: new with their constructions.
+/// - `lease-v4`: the claims gained the granted worker's identity key (W-4), versioned with the
+///   token as `lease-v3` was.
+/// - `compile-reply-v1`: new with its construction (W-4).
 inline constexpr EnumTable<IdentityKeyPurpose, IdentityKeyLabel> IdentityKeyLabels { {
     { .purpose = IdentityKeyPurpose::DiscoveryProof, .label = "fastcache-discovery-proof-v3" },
     { .purpose = IdentityKeyPurpose::FleetSummary, .label = "fastcache-fleet-summary-v1" },
-    { .purpose = IdentityKeyPurpose::Lease, .label = "fastcache-lease-v3" },
+    { .purpose = IdentityKeyPurpose::Lease, .label = "fastcache-lease-v4" },
     { .purpose = IdentityKeyPurpose::RaftDiallerProof, .label = "fastcache-raft-proof-v3" },
     { .purpose = IdentityKeyPurpose::RaftAcceptorVerdict, .label = "fastcache-raft-verdict-v3" },
     { .purpose = IdentityKeyPurpose::NodeServerChallenge, .label = "fastcache-node-challenge-v2" },
@@ -79,6 +83,7 @@ inline constexpr EnumTable<IdentityKeyPurpose, IdentityKeyLabel> IdentityKeyLabe
     { .purpose = IdentityKeyPurpose::MachineTicket, .label = "fastcache-ticket-v1" },
     { .purpose = IdentityKeyPurpose::EnrollAdmission, .label = "fastcache-enroll-admission-v1" },
     { .purpose = IdentityKeyPurpose::EnrollRequest, .label = "fastcache-enroll-request-v1" },
+    { .purpose = IdentityKeyPurpose::CompileReply, .label = "fastcache-compile-reply-v1" },
 } };
 
 static_assert(RowsInEnumeratorOrder(IdentityKeyLabels, &IdentityKeyLabel::purpose),
@@ -91,11 +96,13 @@ static_assert(RowsInEnumeratorOrder(IdentityKeyLabels, &IdentityKeyLabel::purpos
 /// The `-v1` discovery, lease, Raft and node-proof labels were the pre-shared key's MAC labels
 /// (#1308, #178); `discovery-proof-v2` signed an id and an endpoint rather than a summary; the Raft
 /// `-v2` pair signed a transcript with no session direction; `roster-endorsement-v1` signed a
-/// voter's endorsement of a certified roster, which no node uses any more.
-inline constexpr std::array<std::string_view, 9> RetiredIdentityKeyLabels {
+/// voter's endorsement of a certified roster, which no node uses any more; `lease-v3` signed a
+/// claim list that named no worker key.
+inline constexpr std::array<std::string_view, 10> RetiredIdentityKeyLabels {
     "fastcache-discovery-v1",    "fastcache-discovery-proof-v2", "fastcache-lease-v1",
     "fastcache-raft-proof-v1",   "fastcache-raft-verdict-v1",    "fastcache-raft-proof-v2",
     "fastcache-raft-verdict-v2", "fastcache-node-proof-v1",      "fastcache-roster-endorsement-v1",
+    "fastcache-lease-v3",
 };
 
 /// Whether every label is present, no two are the same, and none is retired.

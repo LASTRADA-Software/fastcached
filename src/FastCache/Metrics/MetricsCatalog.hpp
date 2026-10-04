@@ -1152,6 +1152,13 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Two-way Raft sessions this node dialled that it ended on a frame whose header did not begin with "
               "this wire's magic, after which nothing on the connection can be framed.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::RaftPeerDialsEndedSilent,
+      .prometheusName = "fastcache_raft_peer_dials_ended_silent_total",
+      .help = "Two-way Raft sessions this node dialled -- a learner's -- that carried nothing for their idle bound, "
+              "a multiple of the leader's heartbeat, so this node closed them and redials. A steady trickle is the "
+              "sessions to voters that are not leading; one after a sleep is a half-open session to the leader, "
+              "which without the bound would never end.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftSendsDroppedNoSession,
       .prometheusName = "fastcache_raft_sends_dropped_no_session_total",
       .help = "Raft messages dropped for a peer that dials in -- a learner, which nobody dials -- while no "
@@ -1383,6 +1390,20 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "--fleet-open admitted the caller: an anonymous caller trying to decide who joins, the one this "
               "refusal exists for. Never sum with fastcache_enrollment_control_refused_not_a_member_total, a "
               "caller nothing admitted at all.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedOperatorStandingRequired,
+      .prometheusName = "fastcache_scheduler_requests_refused_operator_standing_required_total",
+      .help = "Cluster control verbs -- admit, forget, set -- refused because the caller's machine ticket or proven "
+              "key names a machine that holds no voter's seat. A ticket proves a fleet machine, never an operator: "
+              "run the verb on a voter, or promote the machine. A rise is a process on a learner trying to decide "
+              "the fleet.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentControlRefusedOperatorStandingRequired,
+      .prometheusName = "fastcache_enrollment_control_refused_operator_standing_required_total",
+      .help = "Enrollment control verbs -- approve, reject, auto-approve, clear, list -- refused because the "
+              "caller's machine ticket or proven key names a machine that holds no voter's seat: a learner deciding "
+              "who joins. Never sum with fastcache_enrollment_control_refused_identified_caller_required_total, an "
+              "anonymous caller.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::DispatchLeasesMalformed,
       .prometheusName = "fastcached_dispatch_leases_malformed_total",

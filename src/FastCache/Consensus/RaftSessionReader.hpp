@@ -37,7 +37,13 @@ enum class SessionEnd : std::uint8_t
     KeyWithdrawn, ///< The roster no longer names the key this session was proved with.
     WrongSender,  ///< A verified message named a sender other than the proven peer.
     Unreadable,   ///< The payload decoded to nothing this build can read.
-    Last,         ///< Not an ending, and has no row.
+
+    /// Nothing was read for the session's idle bound, so this end closed it. Never produced by
+    /// `ReadProvenSession` itself: the end that ARMED the bound -- a two-way dialler
+    /// (`SessionIdleTable`) -- names it, since only its timer knows the close was its own.
+    Silent,
+
+    Last, ///< Not an ending, and has no row.
 };
 
 /// Why a session ended, and what a caller's log line says about it.

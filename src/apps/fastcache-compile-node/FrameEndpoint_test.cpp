@@ -93,6 +93,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/CompileReplyFakes.hpp>
 #include <tests/ConsensusStandingFakes.hpp>
 #include <tests/ExactAudience.hpp>
 #include <tests/FormationFakes.hpp>
@@ -4689,7 +4690,8 @@ struct TicketedNode
     Testing::ScratchDirectory const scratch { "fc-ticketed-node" };
     Cc::CompileJobRunner jobs { compiler, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() };
     Cc::WorkerProtocol worker {
-        jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, fleet.metrics, Cc::IgnoreJobRefusals()
+        jobs,          Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+        fleet.metrics, Cc::IgnoreJobRefusals()
     };
     core::async::ThreadPoolExecutor pool { 1 };
     CompileCapacity capacity { 1, WorkerMaxRequestBytes, std::chrono::seconds { 5 }, fleet.logger };

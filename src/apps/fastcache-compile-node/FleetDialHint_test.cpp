@@ -73,10 +73,13 @@ constexpr std::chrono::system_clock::time_point Noon { std::chrono::seconds { 1'
 }
 
 /// The reply an HONEST worker sends for `Ask`'s job: an object, and the correlation the
-/// launcher recomputes -- so a case asserting `Ran()` is asserting that the compile was
-/// accepted, not merely that some address answered.
+/// launcher recomputes, signed under the key the grant names (W-4) -- so a case asserting
+/// `Ran()` is asserting that the compile was accepted, not merely that some address answered.
+/// @param signer Whose identity key signs it: the registered worker's unless a case is about an
+///        impostor; empty for a reply nobody signed.
 /// @return The framed reply.
-[[nodiscard]] std::vector<std::byte> CompiledReply()
+[[nodiscard]] std::vector<std::byte> CompiledReply(std::optional<std::string> const& signer = std::string {
+                                                       Testing::FleetHarness::ProvenMachine })
 {
     constexpr std::string_view Object = "OBJ";
     auto const request = Ask({});
@@ -91,12 +94,15 @@ constexpr std::chrono::system_clock::time_point Noon { std::chrono::seconds { 1'
                                                        .sourceRootReplacement = request.sourceRootReplacement });
     auto const enveloped =
         Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(Object.size()), Wire::AsBytes(Object));
+    if (signer.has_value())
+        return Testing::FleetHarness::SignedWorkerReply(enveloped, correlation, *signer);
     return Wire::EncodeReply(Wire::Status::Ok,
                              Wire::EncodeCompileResult(Wire::CompileResult { .exitCode = 0,
                                                                              .object = enveloped,
                                                                              .stdoutText = {},
                                                                              .stderrText = {},
-                                                                             .correlation = Wire::AsBytes(correlation) }));
+                                                                             .correlation = Wire::AsBytes(correlation),
+                                                                             .signature = {} }));
 }
 
 /// A leader with the laptop registered under its NAME and last seen at `NewHost`, so every
@@ -227,6 +233,63 @@ TEST_CASE("After a VPN reconnect the compile reaches the laptop at its NEW addre
     CHECK_FALSE(fleet.IsInFlight(Sched, "k1"));
     // Nothing was unreachable that was ever dialled: the memo learns nothing.
     CHECK(Cc::ReachabilityMemo::Load(store).Fresh(Cc::MemoKind::WorkerUnreached, Noon).empty());
+}
+
+TEST_CASE("An impostor at the hint address answers with a valid-looking object, and it is refused and never stored",
+          "[node][fleet][dialhint][reply-seal]")
+{
+    // W-4: between the heartbeat and this compile the laptop's VPN address went to a machine that
+    // is NOT a fleet worker. It accepts the job and returns a well-formed, correctly correlated
+    // object -- which used to be cached here and written through to the fleet's shared tier. The
+    // grant names the laptop's key, so a reply signed by anybody else, or by nobody, is refused.
+    for (auto const& [what, signer]:
+         { std::pair { "signed by another machine's key", std::optional<std::string> { "impostor" } },
+           std::pair { "carrying no signature", std::optional<std::string> {} } })
+    {
+        INFO(what);
+        Testing::FleetHarness fleet;
+        Cc::Testing::InMemoryMemoStore store;
+        LaptopMovedTo(fleet);
+        fleet.SetWorkerUnreachable(Laptop, true);
+        fleet.AddWorkerAddress(std::string { NewAddress }, CompiledReply(signer));
+
+        auto const before = fleet.Calls().size();
+        auto const result = OneLauncher(fleet, store, "k-impostor");
+        // Refused by name, and its object is not used. This is the seam "nothing stored" is
+        // decided at: `Dispatch` itself sends no STORE either way, and the launcher stores a
+        // DISPATCHED object only from an outcome that `Ran()` -- a refused one compiles locally
+        // and stores that. So the next three assertions are what keep the impostor's object out
+        // of every tier, and the ones a neutered check turns red.
+        CHECK(result.status == Cc::DispatchStatus::Unauthenticated);
+        CHECK_FALSE(result.Ran());
+        CHECK(result.object.empty());
+        CHECK(result.detail.contains("not signed by the worker the grant named"));
+        // It did reach the impostor -- the refusal is the reply's, not the dial's -- and the name
+        // was not dialled after it: a second dial after a machine answered could compile twice.
+        CHECK(fleet.CompiledAt(before) == std::vector<std::string> { std::string { NewAddress } });
+        // Released like every other way out of a granted lease.
+        CHECK(ReleasesSince(fleet, before) == std::vector<std::string> { std::string { Sched } });
+        // Counted: the launcher's tally records it under a state of its own.
+        auto const recorded = Cc::RecordingFor(result.status, Cc::DeclineCause {});
+        CHECK(recorded.outcome == Cc::DispatchOutcome::Unauthenticated);
+        CHECK(Cc::ToStringView(recorded.outcome) == "UNAUTHENTICATED");
+    }
+}
+
+TEST_CASE("A grant names the key the worker proved at registration, and an honest reply under it is used",
+          "[node][fleet][dialhint][reply-seal]")
+{
+    // The control for the case above, through the SCHEDULER's own grant: the key it names is the
+    // one the worker's REGISTER connection proved, so the same worker's signed reply is accepted.
+    Testing::FleetHarness fleet;
+    Cc::Testing::InMemoryMemoStore store;
+    LaptopMovedTo(fleet);
+    fleet.SetWorkerUnreachable(Laptop, true);
+    fleet.AddWorkerAddress(std::string { NewAddress }, CompiledReply());
+
+    auto const result = OneLauncher(fleet, store, "k-honest");
+    REQUIRE(result.Ran());
+    CHECK(result.object == std::vector<std::byte> { std::byte { 'O' }, std::byte { 'B' }, std::byte { 'J' } });
 }
 
 TEST_CASE("A stale hint that lands on ANOTHER worker is refused there, and the name compiles", "[node][fleet][dialhint]")

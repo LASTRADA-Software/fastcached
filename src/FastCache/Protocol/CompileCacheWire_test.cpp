@@ -598,13 +598,14 @@ TEST_CASE("An operator's control verb is refused an unidentified caller under it
     CHECK(described->name == "identified-caller-required");
 
     // The column, asked of the rows one at a time so a failure names the verb; the set itself is
-    // `ControlVerbsNeedAnIdentifiedCaller`'s, a build failure.
+    // `ControlVerbsNeedOperatorStanding`'s, a build failure. An unidentified caller is refused on
+    // the way there: `IdentifiedCaller` is `OperatorStanding`'s prerequisite.
     for (auto const op: { Op::ClusterSet, Op::ClusterForget, Op::ClusterAdmit, Op::ClusterAdmitLearner, Op::EnrollControl })
     {
         auto const* const row = FindOp(static_cast<std::uint8_t>(op));
         REQUIRE(row != nullptr);
         INFO(row->name);
-        CHECK(row->identity == IdentityRequirement::IdentifiedCaller);
+        CHECK(row->identity == IdentityRequirement::OperatorStanding);
     }
     // And the verbs a client sends are not: a launcher on an open node leases and reads as before.
     for (auto const op: { Op::Lease, Op::Release, Op::ClusterStatus, Op::NodeStatus, Op::Fetch, Op::Enroll })
@@ -3421,7 +3422,7 @@ TEST_CASE("A LEASE grant carries a dial hint beside the endpoint the token signs
     // The BYTES are pinned with the version bump, over the final field order.
 
     // No hint is an EMPTY fifth field; a four-field reply is a peer this build cannot read,
-    // and so is a six-field one -- the split is exact in both directions.
+    // and so is a seven-field one -- the split is exact in both directions.
     auto const bare =
         DecodeLeaseGrant(EncodeLeaseGrant(LeaseGrant { .endpoint = "w:1", .leaseToken = "t", .workerCodecs = {} }));
     REQUIRE(bare.has_value());
@@ -3430,13 +3431,75 @@ TEST_CASE("A LEASE grant carries a dial hint beside the endpoint the token signs
     auto const fourFields = WireFields::Encode(
         { AsBytes("w:1"), AsBytes("t"), std::span<std::byte const> {}, std::span<std::byte const> { zero } });
     CHECK_FALSE(DecodeLeaseGrant(fourFields).has_value());
-    auto const sixFields = WireFields::Encode({ AsBytes("w:1"),
-                                                AsBytes("t"),
-                                                std::span<std::byte const> {},
-                                                std::span<std::byte const> { zero },
-                                                AsBytes("10.8.0.7:6676"),
-                                                AsBytes("extra") });
-    CHECK_FALSE(DecodeLeaseGrant(sixFields).has_value());
+    auto const sevenFields = WireFields::Encode({ AsBytes("w:1"),
+                                                  AsBytes("t"),
+                                                  std::span<std::byte const> {},
+                                                  std::span<std::byte const> { zero },
+                                                  AsBytes("10.8.0.7:6676"),
+                                                  std::span<std::byte const> {},
+                                                  AsBytes("extra") });
+    CHECK_FALSE(DecodeLeaseGrant(sevenFields).has_value());
+}
+
+TEST_CASE("A LEASE grant carries the worker's identity key as its sixth field, and a COMPILE reply its signature",
+          "[wire][lease][reply-seal]")
+{
+    // W-4. Pinned as POSITIONS in the field list and as widths, because both ends spell these
+    // through the same encoder and decoder and a test that only round-trips cannot see the two
+    // move together: the sixth field of a grant is the key, `IdentityPublicKeyBytes` of it or none,
+    // and the sixth field of a COMPILE reply is the signature, `NodeSignatureBytes` of it or none.
+    std::array<std::byte, IdentityPublicKeyBytes> key {};
+    key.fill(std::byte { 0x5A });
+    auto const grant = EncodeLeaseGrant(LeaseGrant { .endpoint = "laptop.corp:6676",
+                                                     .leaseToken = "t",
+                                                     .workerCodecs = {},
+                                                     .lifetime = std::chrono::milliseconds { 0 },
+                                                     .dialHint = {},
+                                                     .workerKey = key });
+    auto const grantFields = SplitFields(grant, 6);
+    REQUIRE(grantFields.has_value());
+    CHECK(std::ranges::equal(Unwrap(grantFields)[5], key));
+    auto const decoded = DecodeLeaseGrant(grant);
+    REQUIRE(decoded.has_value());
+    CHECK(std::ranges::equal(Unwrap(decoded).workerKey, key));
+    // A key of any other width is a sender this build cannot read, not a short key.
+    auto const zero = EncodeU32Field(0);
+    auto const shortKey = WireFields::Encode({ AsBytes("w:1"),
+                                               AsBytes("t"),
+                                               std::span<std::byte const> {},
+                                               std::span<std::byte const> { zero },
+                                               std::span<std::byte const> {},
+                                               std::span<std::byte const> { key }.first(IdentityPublicKeyBytes - 1) });
+    CHECK_FALSE(DecodeLeaseGrant(shortKey).has_value());
+
+    std::array<std::byte, NodeSignatureBytes> signature {};
+    signature.fill(std::byte { 0xA5 });
+    auto const reply = EncodeCompileResult(CompileResult { .exitCode = 0,
+                                                           .object = AsBytes("obj"),
+                                                           .stdoutText = {},
+                                                           .stderrText = {},
+                                                           .correlation = AsBytes("c0"),
+                                                           .signature = signature });
+    auto const replyFields = SplitFields(reply, 6);
+    REQUIRE(replyFields.has_value());
+    CHECK(std::ranges::equal(Unwrap(replyFields)[5], signature));
+    auto const result = DecodeCompileResult(reply);
+    REQUIRE(result.has_value());
+    CHECK(std::ranges::equal(Unwrap(result).signature, signature));
+    // An unsigned reply decodes, with an empty signature the launcher then refuses; a signature of
+    // any other width does not decode at all.
+    auto const unsigned_ = DecodeCompileResult(EncodeCompileResult(CompileResult {
+        .exitCode = 0, .object = AsBytes("obj"), .stdoutText = {}, .stderrText = {}, .correlation = AsBytes("c0") }));
+    REQUIRE(unsigned_.has_value());
+    CHECK(Unwrap(unsigned_).signature.empty());
+    auto const truncated = EncodeCompileResult(
+        CompileResult { .exitCode = 0,
+                        .object = AsBytes("obj"),
+                        .stdoutText = {},
+                        .stderrText = {},
+                        .correlation = AsBytes("c0"),
+                        .signature = std::span<std::byte const> { signature }.first(NodeSignatureBytes - 1) });
+    CHECK_FALSE(DecodeCompileResult(truncated).has_value());
 }
 
 TEST_CASE("A worker's interface addresses ride both REGISTER and HEARTBEAT, bounded", "[wire][dialhint]")
@@ -4541,6 +4604,18 @@ TEST_CASE("A join memo list is refused as malformed for each way it can be wrong
                     .has_value()); // one field where a memo is two
     CHECK(DecodeJoinMemos(listOf(std::vector(MaxAnnouncedJoinMemos, good))).has_value());
     CHECK_FALSE(DecodeJoinMemos(listOf(std::vector(MaxAnnouncedJoinMemos + 1, good))).has_value());
+}
+
+TEST_CASE("operator-standing-required is its own wire code, pinned as a byte", "[wire][admission]")
+{
+    // W-1: a machine ticket proves a fleet MACHINE, never an operator, so an identified caller whose
+    // machine holds no voter's seat is refused the control verbs under a code of its own -- the
+    // caller IS identified, and the remedy (a voter, or a promotion) is not identified-caller's.
+    CHECK(static_cast<std::uint8_t>(ErrorCode::OperatorStandingRequired) == 0x33);
+    auto const* const row = Describe(ErrorCode::OperatorStandingRequired);
+    REQUIRE(row != nullptr);
+    CHECK(row->name == "operator-standing-required");
+    CHECK_FALSE(row->retry.MayHelp());
 }
 
 TEST_CASE("grant-unverifiable is its own wire code, pinned as a byte, and roster-expired's is burnt", "[wire][roster]")

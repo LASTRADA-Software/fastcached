@@ -552,6 +552,16 @@ simpler design gets wrong.
     doubling to 30 s, back to 1 s after a session that carried a frame each way, because a laptop
     offline for hours should not dial every voter four times a second; a voter's row is flat at
     250 ms, because a partition heals on the next heartbeat.
+  - **A two-way dialler's READER has an idle bound; a one-way dialler's has none**
+    (`SessionIdleTable`, keyed by direction, `LearnerSessionSilentHeartbeats` leader heartbeats
+    measured from the last frame read). The learner is the PASSIVE end of its session: a laptop
+    that wakes on a session whose leader end was aborted during the sleep is never dialled and is
+    sent nothing (`NoSession`), so an unbounded read parks forever and the roster, every forget
+    and `shared-cache` stop arriving until a restart (W-3). The bound is a `DeadlineTimer` re-armed
+    per frame, never a sleep beside the reader and never a power event; it ends the session as
+    `SessionEnd::Silent`, counted `raft_peer_dials_ended_silent` at Debug, and the sender redials on
+    the backoff above. A voter that is not leading writes a learner nothing, so those sessions end at
+    the bound too: one handshake per voter per backoff cycle, the stated price.
 
 - **The acceptor goes first because its port is the surface anybody can reach.** It signs
   nothing until the other end has proved an id, so a stranger who connects learns a nonce

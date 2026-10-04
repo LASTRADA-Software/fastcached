@@ -7,6 +7,7 @@
 #include "TicketCredentials.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Protocol/CompileReplySeal.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -31,6 +32,7 @@
 #include <core/async/SyncRun.hpp>
 #include <core/net/KeepAlive.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/CompileReplyFakes.hpp>
 #include <tests/TicketFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -265,10 +267,13 @@ constexpr std::string_view Worker = "worker:6676";
 ///        file are about routing and codecs rather than about budgets.
 [[nodiscard]] std::vector<std::byte> GrantReply(Wire::CodecList codecs = {}, std::chrono::milliseconds lifetime = {})
 {
-    return Wire::EncodeReply(
-        Wire::Status::Ok,
-        Wire::EncodeLeaseGrant(Wire::LeaseGrant {
-            .endpoint = Worker, .leaseToken = "l1", .workerCodecs = std::move(codecs), .lifetime = lifetime }));
+    return Wire::EncodeReply(Wire::Status::Ok,
+                             Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = Worker,
+                                                                       .leaseToken = "l1",
+                                                                       .workerCodecs = std::move(codecs),
+                                                                       .lifetime = lifetime,
+                                                                       .dialHint = {},
+                                                                       .workerKey = Testing::TestWorkerPublicKey() }));
 }
 
 /// The source name as the client sends it and the worker digests it: the WHOLE path.
@@ -299,6 +304,9 @@ struct ReplyFields
     std::string_view correlation;           ///< What the worker claims it compiled.
     std::string_view err;                   ///< The remote compiler's stderr.
     std::uint32_t exitCode { 0 };           ///< What the remote compiler thought of the code.
+    /// Whose key signs it (W-4). The worker the grant names, `Testing::TestWorkerKey()`, unless a
+    /// case is about a reply somebody else signed -- or nobody did, which is null.
+    Ed25519KeyPair const* signer { &Testing::TestWorkerKey() };
 };
 
 /// Frame one COMPILE reply.
@@ -306,13 +314,19 @@ struct ReplyFields
 /// @return The framed reply.
 [[nodiscard]] std::vector<std::byte> ReplyFrom(ReplyFields const& fields)
 {
-    return Wire::EncodeReply(
-        Wire::Status::Ok,
-        Wire::EncodeCompileResult(Wire::CompileResult { .exitCode = fields.exitCode,
-                                                        .object = fields.objectField,
-                                                        .stdoutText = {},
-                                                        .stderrText = Wire::AsBytes(fields.err),
-                                                        .correlation = Wire::AsBytes(fields.correlation) }));
+    auto const signature =
+        fields.signer != nullptr
+            ? std::optional { SealCompileReply(*fields.signer, Wire::AsBytes(fields.correlation), fields.objectField) }
+            : std::nullopt;
+    return Wire::EncodeReply(Wire::Status::Ok,
+                             Wire::EncodeCompileResult(Wire::CompileResult {
+                                 .exitCode = fields.exitCode,
+                                 .object = fields.objectField,
+                                 .stdoutText = {},
+                                 .stderrText = Wire::AsBytes(fields.err),
+                                 .correlation = Wire::AsBytes(fields.correlation),
+                                 .signature = signature.has_value() ? std::span<std::byte const> { *signature }
+                                                                    : std::span<std::byte const> {} }));
 }
 
 /// What an honest worker would report having compiled, for `request`.
@@ -1448,8 +1462,12 @@ TEST_CASE("A compile refused despite a valid ticket is not explained by the rele
     {
         INFO(row.what);
         std::array<std::string, 1> const args { "-c" };
-        auto const grant = Wire::EncodeLeaseGrant(
-            Wire::LeaseGrant { .endpoint = row.worker, .leaseToken = "l1", .workerCodecs = {}, .lifetime = {} });
+        auto const grant = Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = row.worker,
+                                                                     .leaseToken = "l1",
+                                                                     .workerCodecs = {},
+                                                                     .lifetime = {},
+                                                                     .dialHint = {},
+                                                                     .workerKey = Testing::TestWorkerPublicKey() });
 
         AnswersInTurn fleet;
         fleet.answers = { ServedWith(grant),
@@ -1486,8 +1504,12 @@ TEST_CASE("A compile refused because its own mint failed is explained by that mi
     // The control for the case above: the same dispatch, with the COMPILE's mint failing and the
     // release served, is the refusal a missing ticket explains.
     std::array<std::string, 1> const args { "-c" };
-    auto const grant = Wire::EncodeLeaseGrant(
-        Wire::LeaseGrant { .endpoint = Worker, .leaseToken = "l1", .workerCodecs = {}, .lifetime = {} });
+    auto const grant = Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = Worker,
+                                                                 .leaseToken = "l1",
+                                                                 .workerCodecs = {},
+                                                                 .lifetime = {},
+                                                                 .dialHint = {},
+                                                                 .workerKey = Testing::TestWorkerPublicKey() });
     AnswersInTurn fleet;
     fleet.answers = { ServedWith(grant), RefusedWith(Wire::ErrorCode::NotAMember), ServedWith() };
 
@@ -2071,10 +2093,13 @@ constexpr std::string_view Hint = "10.8.0.7:6676";
 /// @return The framed reply.
 [[nodiscard]] std::vector<std::byte> GrantWithHint(std::string_view hint, std::chrono::milliseconds lifetime = {})
 {
-    return Wire::EncodeReply(
-        Wire::Status::Ok,
-        Wire::EncodeLeaseGrant(Wire::LeaseGrant {
-            .endpoint = Worker, .leaseToken = "l1", .workerCodecs = {}, .lifetime = lifetime, .dialHint = hint }));
+    return Wire::EncodeReply(Wire::Status::Ok,
+                             Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = Worker,
+                                                                       .leaseToken = "l1",
+                                                                       .workerCodecs = {},
+                                                                       .lifetime = lifetime,
+                                                                       .dialHint = hint,
+                                                                       .workerKey = Testing::TestWorkerPublicKey() }));
 }
 
 /// How many RELEASE frames reached the scheduler.

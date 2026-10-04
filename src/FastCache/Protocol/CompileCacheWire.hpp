@@ -1336,6 +1336,22 @@ enum class ErrorCode : std::uint8_t
     /// A statement about the ANSWERING node, never about the caller, so it is retriable: the prover
     /// asks again on a short bounded backoff (`Node::DeferredProofWait`).
     RosterNotYetApplied = 0x32,
+
+    /// An operator's CONTROL verb from a caller that is IDENTIFIED -- a proven node key or a verified
+    /// machine ticket -- whose machine holds no voter's seat in the state this node applied.
+    ///
+    /// A machine ticket proves a fleet MACHINE, never an operator: any process on a machine the
+    /// fleet admitted can have its node mint one, so a ticket that opened the control verbs made
+    /// every process on every laptop an operator of the whole fleet. What decides the fleet is
+    /// answered to this machine (loopback) and to a VOTER's identity alone
+    /// (`IdentityRequirement::OperatorStanding`). Its own code rather than `IdentifiedCallerRequired`,
+    /// because the caller IS identified and the remedy differs: run the verb on a voter, or have an
+    /// operator promote this machine.
+    ///
+    /// 0x33 rather than the next free byte here because 0x32 is `RosterNotYetApplied`, which the
+    /// batch this change lands beside assigns; two builds that each read 0x32 their own way would
+    /// disagree about a refusal while both looked correct.
+    OperatorStandingRequired = 0x33,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -1521,10 +1537,19 @@ enum class IdentityRequirement : std::uint8_t
     ProvenNodeOnly,
 
     /// Only a caller admitted by a route that IDENTIFIES it -- this machine, a proven node key or
-    /// a verified machine ticket -- and never by `--fleet-open` alone: an operator's CONTROL verbs,
-    /// which change who is in the fleet or how it is run. Which routes identify is a column of the
-    /// route table (`Distributed::MembershipRoutes`); `ErrorCode::IdentifiedCallerRequired` says why.
+    /// a verified machine ticket -- and never by `--fleet-open` alone. No verb names it any more: it
+    /// is `OperatorStanding`'s PREREQUISITE, asked first so a caller `--fleet-open` alone admitted is
+    /// still told that (`ErrorCode::IdentifiedCallerRequired`) rather than to go and find a voter.
+    /// Which routes identify is a column of the route table (`Distributed::MembershipRoutes`).
     IdentifiedCaller,
+
+    /// Only a caller with an operator's STANDING: this machine (loopback), or an identified machine
+    /// -- a proven node key or a verified ticket -- whose seat in the state the asked node applied
+    /// is a voter's. An operator's CONTROL verbs, which change who is in the fleet or how it is run.
+    /// A ticket proves a MACHINE, not an operator, so a learner's is refused
+    /// (`ErrorCode::OperatorStandingRequired`). Which routes may confer it is the route table's
+    /// `standing` column (`Distributed::MembershipRoutes`).
+    OperatorStanding,
 
     /// The count, for a table over this enum.
     Last,
@@ -2319,7 +2344,7 @@ inline constexpr std::array OpTable {
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
-                   .identity = IdentityRequirement::IdentifiedCaller },
+                   .identity = IdentityRequirement::OperatorStanding },
     OpDescriptor { .code = Op::ClusterForget,
                    .name = "cluster-forget",
                    .fieldCount = 1, // member id
@@ -2328,7 +2353,7 @@ inline constexpr std::array OpTable {
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
-                   .identity = IdentityRequirement::IdentifiedCaller },
+                   .identity = IdentityRequirement::OperatorStanding },
     OpDescriptor { .code = Op::ClusterAdmit,
                    .name = "cluster-admit",
                    .fieldCount = 3, // member id, consensus endpoint, identity key (#178)
@@ -2337,7 +2362,7 @@ inline constexpr std::array OpTable {
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
-                   .identity = IdentityRequirement::IdentifiedCaller },
+                   .identity = IdentityRequirement::OperatorStanding },
     OpDescriptor { .code = Op::ClusterAdmitLearner,
                    .name = "cluster-admit-learner",
                    .fieldCount = 3, // member id, consensus endpoint, identity key -- ClusterAdmit's
@@ -2346,7 +2371,7 @@ inline constexpr std::array OpTable {
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
-                   .identity = IdentityRequirement::IdentifiedCaller },
+                   .identity = IdentityRequirement::OperatorStanding },
     // The fleet cache verbs: their twins' shapes -- the same objects -- and their own family,
     // which is where their policy lives. `AddressAdmits` because admission is the fold's answer
     // (a proven key, a ticket, loopback), never a column of this table.
@@ -2455,7 +2480,7 @@ inline constexpr std::array OpTable {
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Enrollment,
-                   .identity = IdentityRequirement::IdentifiedCaller },
+                   .identity = IdentityRequirement::OperatorStanding },
 
     // Fleet formation, beside enrollment and for its reason: the row is pre-auth, so it stays out
     // of the distributed-execution block whose section comment says none of it is.
@@ -2668,26 +2693,30 @@ static_assert(EveryOpcodeIsDistinct(), "two verbs claim one wire byte; the later
 static_assert(JoiningVerbsNeedAnIdentity(),
               "exactly Register, NodeAnnounce, Heartbeat and Withdraw require a proven identity -- see IdentityRequirement");
 
-/// Whether exactly an operator's CONTROL verbs require an identified caller.
+/// Whether exactly an operator's CONTROL verbs require an operator's standing.
 ///
 /// The cluster verbs that change the fleet -- admit, admit as a learner, forget, set -- and the
 /// enrollment decisions (`EnrollControl`: approve, reject, arm or disarm auto-approval,
 /// clear, and the list that names the joiners' keys). Both directions: a control verb left at
 /// `AddressAdmits` is one an anonymous caller on a `--fleet-open` node sends, and any other verb
-/// marked here refuses every launcher on such a node. `Cordon` and `MintTicket` are not rows: each
-/// already answers this machine alone, a narrower rule its responder enforces.
+/// marked here refuses every launcher -- and every learner's client -- that asks it. `Cordon` and
+/// `MintTicket` are not rows: each already answers this machine alone, a narrower rule its
+/// responder enforces. And no verb names `IdentifiedCaller`, which is only `OperatorStanding`'s
+/// prerequisite: a verb that named it would let a learner's ticket decide the fleet again.
 /// @return True when the column names exactly those five.
-[[nodiscard]] constexpr bool ControlVerbsNeedAnIdentifiedCaller() noexcept
+[[nodiscard]] constexpr bool ControlVerbsNeedOperatorStanding() noexcept
 {
     return std::ranges::all_of(OpTable, [](OpDescriptor const& row) {
         auto const control = row.code == Op::ClusterSet || row.code == Op::ClusterForget || row.code == Op::ClusterAdmit
                              || row.code == Op::ClusterAdmitLearner || row.code == Op::EnrollControl;
-        return control == (row.identity == IdentityRequirement::IdentifiedCaller);
+        return control == (row.identity == IdentityRequirement::OperatorStanding)
+               && row.identity != IdentityRequirement::IdentifiedCaller;
     });
 }
 
-static_assert(ControlVerbsNeedAnIdentifiedCaller(),
-              "exactly the cluster control verbs and EnrollControl require an identified caller -- see IdentityRequirement");
+static_assert(ControlVerbsNeedOperatorStanding(),
+              "exactly the cluster control verbs and EnrollControl require an operator's standing, and no verb names "
+              "IdentifiedCaller -- see IdentityRequirement");
 
 /// Whether asking again, UNCHANGED, may be answered differently -- with nobody acting on the
 /// request in between.
@@ -2968,6 +2997,13 @@ inline constexpr std::array ErrorTable {
                                         "nobody to it",
                       .retry = RetryWillNotHelp,
                       .retryWhy = "who the caller is does not change by asking again" },
+    ErrorDescriptor { .code = ErrorCode::OperatorStandingRequired,
+                      .name = "operator-standing-required",
+                      .defaultMessage = "an operator's control verb needs this machine, or a voter's identity; a machine "
+                                        "ticket or key of a machine that holds no voter's seat proves a machine, not an "
+                                        "operator",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the caller's seat changes only when an operator promotes its machine" },
     ErrorDescriptor {
         .code = ErrorCode::NotSharedCache,
         .name = "not-shared-cache",
@@ -6094,6 +6130,20 @@ struct LeaseGrant
     /// `endpoint`, and the token signs `endpoint` -- never this -- so a stale hint that
     /// lands on another machine is refused `LeaseEndpointMismatch` rather than obeyed.
     std::string_view dialHint {};
+
+    /// The identity public key of the worker this grant names -- the key it proved itself with
+    /// when it registered -- `IdentityPublicKeyBytes` of it, or empty when the scheduler holds
+    /// none for it.
+    ///
+    /// **What the client authenticates the COMPILE reply against** (W-4). A hint or a name that
+    /// has come to answer on another machine -- a VPN address reassigned inside the heartbeat
+    /// window, a long-TTL DNS name -- accepted the job and returned whatever it liked, and the
+    /// object went into this machine's cache and through it into the fleet's shared one. The
+    /// worker signs its reply under this key (`IdentityKeyPurpose::CompileReply`), and the client
+    /// verifies that signature before the object reaches any tier. In the CLEAR beside the token
+    /// for `lifetime`'s reason -- the client verifies no claims -- and inside the token's signed
+    /// claims too, where the worker it names checks it is its own.
+    std::span<std::byte const> workerKey {};
 };
 
 /// Frame the payload of a successful LEASE reply.
@@ -6107,7 +6157,8 @@ struct LeaseGrant
                                 AsBytes(grant.leaseToken),
                                 std::span<std::byte const> { codecs },
                                 std::span<std::byte const> { lifetime },
-                                AsBytes(grant.dialHint) });
+                                AsBytes(grant.dialHint),
+                                grant.workerKey });
 }
 
 /// The fields of a LEASE grant, as views.
@@ -6118,18 +6169,23 @@ struct LeaseGrantView
     CodecList workerCodecs;
     std::chrono::milliseconds lifetime { 0 };
     std::span<std::byte const> dialHint; ///< Empty when the scheduler has no hint.
+    /// The named worker's identity key: `IdentityPublicKeyBytes`, or empty when none was named.
+    std::span<std::byte const> workerKey;
 };
 
 /// Split a LEASE reply payload.
 ///
-/// Exactly five fields: a reply is not stepped over the way a request is, so a grant
-/// of any other arity is a peer this build cannot read.
+/// Exactly six fields: a reply is not stepped over the way a request is, so a grant
+/// of any other arity is a peer this build cannot read. The worker key is empty or
+/// exactly a key's width; any other length is a sender this build cannot read either.
 /// @param payload The reply body.
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<LeaseGrantView> DecodeLeaseGrant(std::span<std::byte const> payload)
 {
-    auto const fields = SplitFields(payload, 5);
+    auto const fields = SplitFields(payload, 6);
     if (!fields.has_value())
+        return std::nullopt;
+    if (!(*fields)[5].empty() && (*fields)[5].size() != IdentityPublicKeyBytes)
         return std::nullopt;
     // Strict about the width, like every other numeric field here: a lifetime of
     // another length is a sender speaking a shape this build does not know, and
@@ -6141,7 +6197,8 @@ struct LeaseGrantView
                             .leaseToken = (*fields)[1],
                             .workerCodecs = DecodeCodecList((*fields)[2]),
                             .lifetime = std::chrono::milliseconds { *lifetime },
-                            .dialHint = (*fields)[4] };
+                            .dialHint = (*fields)[4],
+                            .workerKey = (*fields)[5] };
 }
 
 /// What a worker answers a COMPILE with.
@@ -6169,6 +6226,16 @@ struct CompileResult
     /// this layer two crossed requests are both still pristine, so a digest taken here
     /// agrees with whatever it is compared against.
     std::span<std::byte const> correlation;
+
+    /// The worker's signature, under its identity key, over `correlation` and the digest of
+    /// `object` (`IdentityKeyPurpose::CompileReply`): `NodeSignatureBytes` of it, or empty from
+    /// a worker that holds no key.
+    ///
+    /// What lets the client tell the worker its grant named from whatever answered at that
+    /// address (W-4). Over the correlation rather than the request, because the correlation is
+    /// already the worker's statement of what it compiled; over the object AS SENT, enveloped,
+    /// so the client checks it before expanding a byte.
+    std::span<std::byte const> signature {};
 };
 
 /// Frame the payload of a COMPILE reply.
@@ -6177,8 +6244,12 @@ struct CompileResult
 [[nodiscard]] inline std::vector<std::byte> EncodeCompileResult(CompileResult const& result)
 {
     auto const code = EncodeU32Field(result.exitCode);
-    return WireFields::Encode(
-        { std::span<std::byte const> { code }, result.object, result.stdoutText, result.stderrText, result.correlation });
+    return WireFields::Encode({ std::span<std::byte const> { code },
+                                result.object,
+                                result.stdoutText,
+                                result.stderrText,
+                                result.correlation,
+                                result.signature });
 }
 
 /// A decoded COMPILE reply, owning every byte of it.
@@ -6202,6 +6273,7 @@ struct CompileResultFields
     std::vector<std::byte> stdoutText;
     std::vector<std::byte> stderrText;
     std::vector<std::byte> correlation; ///< @see `CompileResult::correlation`.
+    std::vector<std::byte> signature;   ///< @see `CompileResult::signature`; empty or `NodeSignatureBytes`.
 };
 
 /// Split a COMPILE reply payload.
@@ -6209,11 +6281,13 @@ struct CompileResultFields
 /// @return The result, or nullopt when malformed.
 [[nodiscard]] inline std::optional<CompileResultFields> DecodeCompileResult(std::span<std::byte const> payload)
 {
-    auto const fields = SplitFields(payload, 5);
+    auto const fields = SplitFields(payload, 6);
     if (!fields.has_value())
         return std::nullopt;
     auto const code = DecodeU32Field((*fields)[0]);
     if (!code.has_value())
+        return std::nullopt;
+    if (!(*fields)[5].empty() && (*fields)[5].size() != NodeSignatureBytes)
         return std::nullopt;
     auto const own = [](std::span<std::byte const> f) {
         return std::vector<std::byte> { f.begin(), f.end() };
@@ -6222,7 +6296,8 @@ struct CompileResultFields
                                  .object = own((*fields)[1]),
                                  .stdoutText = own((*fields)[2]),
                                  .stderrText = own((*fields)[3]),
-                                 .correlation = own((*fields)[4]) };
+                                 .correlation = own((*fields)[4]),
+                                 .signature = own((*fields)[5]) };
 }
 
 // --- the operator verbs' replies ------------------------------------------------------

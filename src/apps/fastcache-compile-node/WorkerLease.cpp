@@ -19,6 +19,7 @@ namespace FastCache::Node
 std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
                                                                         Distributed::ILeaseRoster const* roster,
                                                                         Cc::IAdvertisedEndpointSource const& advertise,
+                                                                        std::span<std::byte const> identityKey,
                                                                         SocketActivation activation,
                                                                         core::platform::WallClockRef clock,
                                                                         Distributed::WorkerLeaseState& lease,
@@ -74,7 +75,7 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
                 // from a startup line that was true when it was printed.
                 advertise.Current());
     inForce.Record(BuiltLeaseCheck::Signed);
-    return Cc::SignedLeaseValidator(*roster, advertise, clock, lease, metrics);
+    return Cc::SignedLeaseValidator(*roster, advertise, identityKey, clock, lease, metrics);
 }
 
 bool ReloadWidensUncheckedWorker(NodeConfig const& previous, NodeConfig const& candidate, BuiltLeaseCheck built)

@@ -17,6 +17,7 @@
 #include <FastCache/Distributed/TicketVerifier.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/CompileReplySeal.hpp>
 #include <FastCache/Protocol/ProvenIdentity.hpp>
 
 #include <algorithm>
@@ -163,6 +164,11 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         /// The refusal, meaningful only when @ref kind is `Rejected`.
         CompileCacheWire::ErrorCode code;
     };
+
+    /// The id every admitted caller of this harness proved, and so the machine every worker it
+    /// registers is: its test key is the one each grant names (W-4). Public, so a case building a
+    /// worker's reply signs it as that machine -- or, on purpose, as another.
+    static constexpr std::string_view ProvenMachine = "harness-machine";
 
     /// The fleet every node in this harness belongs to.
     ///
@@ -412,6 +418,30 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     void OnCompile(std::function<void()> hook)
     {
         _onCompile = std::move(hook);
+    }
+
+    /// A successful COMPILE reply as the worker this harness registers sends it: signed under
+    /// `TestKeyPair(ProvenMachine)`, the key every grant here names (W-4).
+    ///
+    /// A case about an IMPOSTOR passes another machine's key as @p signer: the reply is then
+    /// well formed, correlated and signed -- by somebody the grant did not name.
+    /// @param object The object field, enveloped as a worker sends it.
+    /// @param correlation What the worker says it compiled.
+    /// @param signer Whose key signs it.
+    /// @return A complete reply frame.
+    [[nodiscard]] static std::vector<std::byte> SignedWorkerReply(std::span<std::byte const> object,
+                                                                  std::string_view correlation,
+                                                                  std::string const& signer = std::string { ProvenMachine })
+    {
+        auto const signature = SealCompileReply(TestKeyPair(signer), CompileCacheWire::AsBytes(correlation), object);
+        return CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok,
+                                             CompileCacheWire::EncodeCompileResult(CompileCacheWire::CompileResult {
+                                                 .exitCode = 0,
+                                                 .object = object,
+                                                 .stdoutText = {},
+                                                 .stderrText = {},
+                                                 .correlation = CompileCacheWire::AsBytes(correlation),
+                                                 .signature = std::span<std::byte const> { signature } }));
     }
 
     /// What a worker endpoint answers a COMPILE with.
@@ -705,7 +735,15 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             _leader { std::move(leader) },
             _roster { BuildRoster(_endpoint, _leader, fleet._clock) },
             _lease { Distributed::SchedulerTermRegressionNotice::Silent() },
-            _validator { Cc::SignedLeaseValidator(*_roster->Lease(), _advertised, fleet._wallClock, _lease, fleet._metrics) }
+            // The key every worker this harness registers proved (`SetupCaller`), so the key every
+            // grant names: copied by the validator inside this full expression (W-4).
+            _validator { Cc::SignedLeaseValidator(
+                *_roster->Lease(),
+                _advertised,
+                std::span<std::byte const> { TestKeyPair(std::string { ProvenMachine }).PublicKey() },
+                fleet._wallClock,
+                _lease,
+                fleet._metrics) }
         {
             // Registered into the harness's fleet, as a completed REGISTER round pins it (#401).
             _lease.fleet.Pin(std::string { ClusterId });
@@ -1085,10 +1123,15 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// @return A member calling from loopback.
     [[nodiscard]] static Distributed::CallerContext SetupCaller()
     {
+        // The key it proved too, as `CallerContextOf` engages both together: a worker registered
+        // through here is named in its grants by `TestKeyPair(ProvenMachine)`, which is the key a
+        // reply `SignedWorkerReply` builds is signed under (W-4).
         return Distributed::CallerContext { .membership = Distributed::Membership::Member,
                                             .peerId = "127.0.0.1",
                                             .provenNodeId = std::string { ProvenMachine },
-                                            .identified = true };
+                                            .provenKey = TestKeyPair(std::string { ProvenMachine }).PublicKey(),
+                                            .identified = true,
+                                            .operatorStanding = true };
     }
 
     /// The context handed to @p node's service for the current caller.
@@ -1117,14 +1160,20 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             node.membership != nullptr ? node.membership->Classify(_callerHost) : Distributed::Membership::Member;
         auto const admitted = verdict == Distributed::Membership::Member;
         auto proven = admitted ? std::optional { std::string { ProvenMachine } } : std::nullopt;
+        // The key comes with the id, as `CallerContextOf` engages both together -- so a worker that
+        // registers over this connection is named in its grants by `TestKeyPair(ProvenMachine)` (W-4).
+        auto const provenKey =
+            admitted ? std::optional { TestKeyPair(std::string { ProvenMachine }).PublicKey() } : std::nullopt;
         // A proof identifies its caller, so an admitted -- and therefore proven -- caller is identified.
-        return Distributed::CallerContext {
-            .membership = verdict, .peerId = _callerHost, .provenNodeId = std::move(proven), .identified = admitted
-        };
+        // And it stands as an operator: this branch has no roster to read a seat from, and the cases
+        // that ask whether a LEARNER may decide the fleet compose the production fold instead.
+        return Distributed::CallerContext { .membership = verdict,
+                                            .peerId = _callerHost,
+                                            .provenNodeId = std::move(proven),
+                                            .provenKey = provenKey,
+                                            .identified = admitted,
+                                            .operatorStanding = admitted };
     }
-
-    /// The id every admitted caller of this harness proved.
-    static constexpr std::string_view ProvenMachine = "harness-machine";
 
     /// The verb byte a framed request carries, for the call log.
     ///

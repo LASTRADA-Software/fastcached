@@ -1719,6 +1719,135 @@ TEST_CASE("A two-way session the acceptor ends wakes its idle writer", "[consens
     harness.RequestStopAndDrain();
 }
 
+TEST_CASE("A learner's idle bound is a hundred leader heartbeats, and a one-way session has none",
+          "[consensus][raft][transport][learner][idle]")
+{
+    // The column, pinned as numbers: a bound derived from the cadence, and none where the dialler
+    // is the WRITING end of its session -- a voter's, whose silence is its normal state.
+    CHECK(LearnerSessionSilentHeartbeats == 100);
+    CHECK(SessionIdleBound(RaftWire::SessionDirection::TwoWay, 50ms) == 5000ms);
+    CHECK(SessionIdleBound(RaftWire::SessionDirection::TwoWay, DefaultHeartbeatInterval)
+          == DefaultHeartbeatInterval * LearnerSessionSilentHeartbeats);
+    CHECK(SessionIdleBound(RaftWire::SessionDirection::OneWay, 50ms) == 0ms);
+    CHECK(PeerTransportOptions {}.heartbeatInterval == RaftConfig {}.heartbeatInterval);
+}
+
+TEST_CASE("A learner's session whose acceptor proves and then goes silent is ended at its idle bound and redialled",
+          "[consensus][raft][transport][learner][idle]")
+{
+    // W-3: a laptop wakes on a session whose leader end was aborted during the sleep. The leader never
+    // dials a learner and every send there is NoSession, so with no bound the reader parks on the
+    // half-open socket forever and the roster and every forget stop arriving. The acceptor here
+    // proves, writes one frame, and then says nothing at all -- a parked read nothing completes but
+    // a close -- and the clock is the test's own.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->writeBehindVerdict = LeaderAppend(6);
+        harness.record->holdSessionOpen = true;
+    }
+    // The bound the transport should arm, spelled from the constant rather than read back through
+    // the table, so a table that arms nothing is a red here rather than a bound of zero agreed with.
+    constexpr auto Heartbeat = 10ms;
+    constexpr auto Bound = Heartbeat * LearnerSessionSilentHeartbeats;
+    harness.Start(PeerTransportOptions {
+        .reconnectBackoff = 100ms, .direction = RaftWire::SessionDirection::TwoWay, .heartbeatInterval = Heartbeat });
+    REQUIRE(harness.connector.Attempts() == 1);
+    REQUIRE(harness.sink.received.size() == 1); // the frame behind the verdict: the session WAS live
+    REQUIRE(harness.transport->ConnectedPeers() == 1);
+    auto const silent = [&harness] {
+        return harness.Refused(DiallerRefusal::SessionSilent);
+    };
+
+    // One millisecond short of the bound, nothing happens.
+    harness.clock.advance(Bound - 1ms);
+    harness.reactor.drain();
+    CHECK(harness.transport->ConnectedPeers() == 1);
+    CHECK(silent() == 0);
+
+    // At the bound, the session ends -- whole, the idle writer included -- on its own row.
+    harness.clock.advance(1ms);
+    harness.reactor.drain();
+    CHECK(harness.transport->ConnectedPeers() == 0);
+    CHECK(silent() == 1);
+    CHECK(harness.connector.Attempts() == 1);
+    // Not read as the peer closing, nor as any refusal of the frames it sent.
+    CHECK(harness.Refused(DiallerRefusal::EndedByAcceptor) == 0);
+    CHECK(harness.Refused(DiallerRefusal::FrameTag) == 0);
+
+    // And redialled on the backoff, into a session that proves again.
+    harness.clock.advance(100ms);
+    harness.reactor.drain();
+    CHECK(harness.connector.Attempts() == 2);
+    CHECK(harness.transport->ConnectedPeers() == 1);
+    CHECK(harness.sink.received.size() == 2);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A learner's session that hears its leader every heartbeat is never ended by the idle bound",
+          "[consensus][raft][transport][learner][idle]")
+{
+    // The control for the case above: the bound runs from the LAST frame read, not from the session's
+    // start, so a leader writing well inside it keeps one session for as long as it writes -- here five
+    // bounds' worth -- and the bound ends it only once the writing stops.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->holdSessionOpen = true;
+    }
+    constexpr auto Heartbeat = 10ms;
+    constexpr auto Bound = Heartbeat * LearnerSessionSilentHeartbeats;
+    harness.Start(PeerTransportOptions {
+        .reconnectBackoff = 100ms, .direction = RaftWire::SessionDirection::TwoWay, .heartbeatInterval = Heartbeat });
+    REQUIRE(harness.transport->ConnectedPeers() == 1);
+
+    for (auto const term: std::views::iota(std::uint64_t { 1 }, std::uint64_t { 11 }))
+    {
+        harness.clock.advance(Bound / 2);
+        harness.reactor.drain();
+        harness.AcceptorWrites(RaftWire::Encode(LeaderAppend(term)), SealAs::Sealed);
+        harness.reactor.drain();
+    }
+    CHECK(harness.sink.received.size() == 10);
+    CHECK(harness.transport->ConnectedPeers() == 1);
+    CHECK(harness.connector.Attempts() == 1);
+    CHECK(harness.Refused(DiallerRefusal::SessionSilent) == 0);
+
+    harness.clock.advance(Bound);
+    harness.reactor.drain();
+    CHECK(harness.Refused(DiallerRefusal::SessionSilent) == 1);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A voter's one-way session is never ended by an idle bound, however long it reads nothing",
+          "[consensus][raft][transport][idle]")
+{
+    // A one-way dialler reads nothing after the verdict by design -- the reply rides the other
+    // member's own dial -- so silence is its normal state and a bound would end every voter's session
+    // every few seconds. The same silent acceptor as above, ten learner bounds of nothing.
+    Harness harness;
+    {
+        std::scoped_lock const guard { harness.record->mutex };
+        harness.record->holdSessionOpen = true;
+    }
+    constexpr auto Heartbeat = 10ms;
+    harness.Start(PeerTransportOptions { .reconnectBackoff = 100ms, .heartbeatInterval = Heartbeat });
+    harness.transport->Send("n2", Vote(1));
+    harness.reactor.drain();
+    REQUIRE(harness.Writes() == 1);
+    REQUIRE(harness.transport->ConnectedPeers() == 1);
+
+    harness.clock.advance(10 * Heartbeat * LearnerSessionSilentHeartbeats);
+    harness.reactor.drain();
+    CHECK(harness.transport->ConnectedPeers() == 1);
+    CHECK(harness.connector.Attempts() == 1);
+    CHECK(harness.Refused(DiallerRefusal::SessionSilent) == 0);
+
+    harness.RequestStopAndDrain();
+}
+
 TEST_CASE("A wake left behind by one two-way session does not end the next", "[consensus][raft][transport][learner]")
 {
     // A message is queued before the first session, so its writer is busy with it -- a write on a
@@ -1916,12 +2045,14 @@ TEST_CASE("A frame the acceptor writes that the dialler cannot use ends the sess
                   } },
     };
 
-    // Every ending but a close has a row here, so a new `SessionEnd` cannot go uncounted unnoticed.
+    // Every ending but a close has a row here, so a new `SessionEnd` cannot go uncounted unnoticed --
+    // and but `Silent`, which is no frame the acceptor writes but the ABSENCE of one: its own case is
+    // "A learner's session whose acceptor proves and then goes silent ...", above.
     for (auto const ending: Enumerators<SessionEnd>())
     {
         INFO("SessionEnd " << static_cast<int>(ending));
         auto const covered = std::ranges::any_of(rows, [ending](Row const& row) { return row.end == ending; });
-        CHECK(covered == (ending != SessionEnd::PeerClosed));
+        CHECK(covered == (ending != SessionEnd::PeerClosed && ending != SessionEnd::Silent));
     }
 
     for (auto const& row: rows)

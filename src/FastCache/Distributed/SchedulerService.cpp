@@ -76,6 +76,12 @@ namespace
         // somebody trying the decision half of the policy -- the refusal carrying the argument.
         RefusalDescriptor { .code = Wire::ErrorCode::IdentifiedCallerRequired,
                             .counter = IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired },
+        // An operator's control verb from an IDENTIFIED caller whose machine holds no voter's seat:
+        // a learner's ticket or key. Counted apart from the row above, because the two are different
+        // observations -- an anonymous caller trying the decision half of an open node, against a
+        // fleet machine (any process on it) trying to decide the fleet.
+        RefusalDescriptor { .code = Wire::ErrorCode::OperatorStandingRequired,
+                            .counter = IMetricsSink::Counter::SchedulerRequestsRefusedOperatorStandingRequired },
     };
 
     /// The refusals this service makes that deliberately move nothing.
@@ -715,7 +721,8 @@ SchedulerService::SchedulerService(core::platform::IClock& clock,
 
 std::string SchedulerService::MintGrantToken(Distributed::Lease const& lease,
                                              std::string_view endpoint,
-                                             std::string_view fingerprint)
+                                             std::string_view fingerprint,
+                                             std::string_view workerKey)
 {
     // The expiry comes from the LEASE, not from the table. A token that outlived its
     // lease would be a capability with no record anywhere; one that died first would
@@ -734,7 +741,8 @@ std::string SchedulerService::MintGrantToken(Distributed::Lease const& lease,
                                         .expiresAt = _wallClock.now() + lease.lifetime,
                                         .clusterId = _clusterId,
                                         .epoch = _epoch.load(std::memory_order_acquire),
-                                        .signer = {} });
+                                        .signer = {},
+                                        .workerKey = std::string { workerKey } });
 }
 
 std::chrono::milliseconds SchedulerService::AgreedLeaseLifetime() const
@@ -993,10 +1001,10 @@ std::optional<SchedulerReply> SchedulerService::RefuseUnlessIdentified(CallerCon
     auto const* const descriptor = Wire::FindOp(static_cast<std::uint8_t>(op));
     if (descriptor == nullptr || caller.membership != Membership::Member)
         return std::nullopt;
-    auto const& row = RequirementRowOf(descriptor->identity);
-    if (row.satisfiedBy(caller))
+    auto const* const unmet = UnmetRequirement(descriptor->identity, caller);
+    if (unmet == nullptr)
         return std::nullopt;
-    return Refuse(row.refusal, std::format("{} {}", descriptor->name, row.remedy));
+    return Refuse(unmet->refusal, std::format("{} {}", descriptor->name, unmet->remedy));
 }
 
 std::optional<Cluster::ClusterState> SchedulerService::AdministeredState() const
@@ -1112,6 +1120,10 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     // caller put in `observedHost` is overwritten with the connection's own peer.
     auto seen = registration;
     seen.observedHost = caller.peerId;
+    // And the key it PROVED, likewise the connection's: what a grant names so the client can tell
+    // this worker's reply from whatever else answers at its address (W-4).
+    seen.identityKey =
+        caller.provenKey.has_value() ? std::span<std::byte const> { *caller.provenKey } : std::span<std::byte const> {};
     auto const id = _workers.Register(seen);
 
     // A re-registration deliberately does NOT release this worker's leases, even
@@ -1421,7 +1433,7 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
     // claim against is its own registered fingerprint, so taking it from the same
     // record the endpoint comes from keeps both halves of the binding local to this
     // registry entry -- rather than resting on `Pick`'s comparison staying exact.
-    auto const token = MintGrantToken(*lease, picked->endpoint, picked->fingerprint);
+    auto const token = MintGrantToken(*lease, picked->endpoint, picked->fingerprint, picked->identityKey);
 
     // A hint BESIDE the name, never instead of it: the token above signs `picked->endpoint`,
     // so a hint that has gone stale onto another machine is refused `LeaseEndpointMismatch`
@@ -1442,7 +1454,10 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
                                                   // bound and the grant's cannot be two readings of one setting
                                                   // taken a moment apart.
                                                   .lifetime = lease->lifetime,
-                                                  .dialHint = hint }));
+                                                  .dialHint = hint,
+                                                  // The key it proved at registration, in the clear for the
+                                                  // client and signed into the token for the worker (W-4).
+                                                  .workerKey = Wire::AsBytes(picked->identityKey) }));
 }
 
 SchedulerReply SchedulerService::Release(CallerContext const& caller, std::string_view leaseToken, std::string_view key)

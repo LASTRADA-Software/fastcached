@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <cstdint>
@@ -54,6 +55,7 @@ enum class DiallerRefusal : std::uint8_t
     FrameUnreadable,    ///< On a two-way session: a verified frame this build cannot read.
     FrameOverCap,       ///< On a two-way session: a frame declared more payload than this end buffers.
     FrameBadMagic,      ///< On a two-way session: a frame's header did not decode.
+    SessionSilent,      ///< On a two-way session: nothing was read for the idle bound (`SessionIdleTable`).
     Last,               ///< Not a refusal, and has no row.
 };
 
@@ -71,6 +73,11 @@ struct DiallerRefusalRow
     DiallerRefusal refusal;        ///< The refusal this row describes.
     IMetricsSink::Counter counter; ///< The series it moves.
     std::string_view says;         ///< The log line's reason, completing "gave up ... because ".
+
+    /// The level that line is said at, once a minute per peer at most. `Warn` unless the row says
+    /// otherwise: every refusal but one is a fault somewhere, and the one that is not -- a silent
+    /// session, the ordinary life of a learner's session to a voter that is not leading -- says Debug.
+    LogLevel level { LogLevel::Warn };
 };
 
 /// One row per `AcceptorRefusal`, in enumerator order.
@@ -180,6 +187,12 @@ inline constexpr EnumTable<DiallerRefusal, DiallerRefusalRow> DiallerRefusals { 
       .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameBadMagic,
       .says = "a frame on the session this node dialled did not begin with this wire's magic, so nothing after "
               "it can be framed" },
+    { .refusal = DiallerRefusal::SessionSilent,
+      .counter = IMetricsSink::Counter::RaftPeerDialsEndedSilent,
+      .says = "the two-way session this node dialled carried nothing for its idle bound, so this node closed it and "
+              "will redial: the ordinary life of a session to a voter that is not leading, or one whose other end "
+              "went away while this machine slept",
+      .level = LogLevel::Debug },
 } };
 
 static_assert(RowsInEnumeratorOrder(DiallerRefusals, &DiallerRefusalRow::refusal),

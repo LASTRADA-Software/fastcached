@@ -284,6 +284,8 @@ std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> WorkerTier::Start(Worker
         MakeWorkerLeaseValidator(parts.cfg,
                                  parts.leaseRoster,
                                  parts.announced,
+                                 parts.prover != nullptr ? std::span<std::byte const> { parts.prover->Key().PublicKey() }
+                                                         : std::span<std::byte const> {},
                                  parts.activatedNodeEndpoint.has_value() ? SocketActivation::Yes : SocketActivation::No,
                                  core::platform::defaultSystemWallClock(),
                                  *leaseState,
@@ -335,8 +337,13 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     // The envelope ceiling is THIS surface's request cap, named rather than left to the
     // decoder's default. `AvailableCodecs()`, never a literal: this list is what the
     // worker answers a compile in, chosen against what the client accepts (#265).
+    // Every reply signed under the key this machine PROVES itself with -- the one the scheduler
+    // records at registration and names in each grant -- so a launcher can tell this worker from
+    // whatever else answers at its address (W-4). None where nothing proves: such a worker
+    // registers nowhere, so no grant names it.
     _protocol {
-        _jobs, std::move(validator), Cc::AvailableCodecs(), parts.metrics, _refusedArguments, WorkerMaxRequestBytes
+        _jobs,         std::move(validator), Cc::AvailableCodecs(), parts.prover != nullptr ? &parts.prover->Key() : nullptr,
+        parts.metrics, _refusedArguments,    WorkerMaxRequestBytes
     },
     _slots { slots },
     // Sized to the slot cap, which is what makes an admitted job always find a thread,

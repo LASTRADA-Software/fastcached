@@ -109,6 +109,7 @@
 #include <variant>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <core/net/TcpClient.hpp>
 
 #if defined(_WIN32)
@@ -781,6 +782,24 @@ void ApplyDispatchRecording(InvocationRecord& record, Cc::DispatchRecording cons
 /// line instead.
 constexpr std::string_view CrossedReplyReason = "a worker answered about a different compile";
 
+/// The reason recorded for a dispatched compile whose reply the worker its grant named did not
+/// sign (W-4): `UnauthenticatedReplyReason`'s place beside `CrossedReplyReason`, for its reason.
+constexpr std::string_view UnauthenticatedReplyReason = "a reply was not signed by the worker its grant named";
+
+/// The dispatch statuses that are a DEFECT rather than a fleet declining, each with the reason
+/// recorded on the cache axis and said unconditionally: a table, so a third such status is a row.
+struct RefusedReplyRow
+{
+    Cc::DispatchStatus status; ///< What `Dispatch` returned.
+    std::string_view reason;   ///< What the record and the stderr line say.
+};
+
+/// One row per refused-reply status.
+constexpr std::array RefusedReplyRows {
+    RefusedReplyRow { .status = Cc::DispatchStatus::Mismatched, .reason = CrossedReplyReason },
+    RefusedReplyRow { .status = Cc::DispatchStatus::Unauthenticated, .reason = UnauthenticatedReplyReason },
+};
+
 /// Report that a worker's reply did not belong to the request that asked for it,
 /// and that this client refused it (#280).
 ///
@@ -809,10 +828,11 @@ constexpr std::string_view CrossedReplyReason = "a worker answered about a diffe
 /// blame the cache and file the source under "never cached", both untrue.
 /// @param record The invocation record this updates.
 /// @param detail What the dispatch saw — the worker and the two correlations.
-void ReportCrossedReply(InvocationRecord& record, std::string_view detail)
+/// @param reason Which defect: a `RefusedReplyRows` row's reason.
+void ReportRefusedReply(InvocationRecord& record, std::string_view reason, std::string_view detail)
 {
-    record.outcomeDetail = CrossedReplyReason;
-    std::cerr << "fastcache-cc: " << CrossedReplyReason << " (" << detail
+    record.outcomeDetail = reason;
+    std::cerr << "fastcache-cc: " << reason << " (" << detail
               << "); refusing that object and compiling this translation unit locally\n";
 }
 
@@ -2489,13 +2509,14 @@ void RecordManifest(InvocationRecord const& record,
     auto const fleetAnswer = Cc::RecordedReason(outcome, credentialed.Refusals());
     record.dispatchSpecifics = Cc::SpecificsFor(outcome);
 
-    if (outcome.status == Cc::DispatchStatus::Mismatched)
+    if (auto const* const refusedReply = core::findOrNull(RefusedReplyRows, outcome.status, &RefusedReplyRow::status))
     {
         // Not one of the two below, and not reported like them: a worker answering
-        // about somebody else's compile is a defect rather than a fleet declining,
-        // so it is announced unconditionally and the sentence goes on the CACHE
-        // axis. That is why this is the one decline with no verbose line of its own.
-        ReportCrossedReply(record, outcome.detail);
+        // about somebody else's compile -- or an address answering that is not the worker
+        // at all (W-4) -- is a defect rather than a fleet declining, so it is announced
+        // unconditionally and the sentence goes on the CACHE axis. That is why these are
+        // the declines with no verbose line of their own.
+        ReportRefusedReply(record, refusedReply->reason, outcome.detail);
         return DeclineDispatch(record, fleetAnswer, std::nullopt);
     }
     if (!outcome.Ran())

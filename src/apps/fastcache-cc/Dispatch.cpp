@@ -4,6 +4,7 @@
 
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
+#include <FastCache/Protocol/CompileReplySeal.hpp>
 
 #include <algorithm>
 #include <format>
@@ -159,6 +160,9 @@ namespace
         /// as a worker this process trusts with its address space: a rogue or
         /// compromised fleet member answers this exchange too.
         std::size_t maxObjectBytes;
+        /// The identity key the grant named for `worker`: what its reply must be signed under, so
+        /// the object is used only when it came from that machine, whatever address answered (W-4).
+        std::span<std::byte const> workerKey;
     };
 
     /// How to name the machine a job went to, in a message an operator reads.
@@ -266,6 +270,21 @@ namespace
         auto const result = Wire::DecodeCompileResult(compileOutcome.value);
         if (!result.has_value())
             return Refused(DispatchStatus::Unavailable, "malformed compile result");
+
+        // --- is this reply from the worker the grant named? ----------------------
+        //
+        // FIRST, before anything the reply claims is acted on -- its correlation included -- and
+        // before a byte of the object is expanded: everything below is a claim, and a claim from a
+        // machine that cannot sign as the named worker is nobody's (W-4). A stale hint or a name
+        // that now answers elsewhere reaches a machine that accepted the job and could return any
+        // object; used, it would be cached here and written through to the fleet's shared tier.
+        // Refused, never used, and the build compiles locally.
+        if (!CompileReplyIsSealedBy(job.workerKey, result->correlation, result->object, result->signature))
+            return Refused(DispatchStatus::Unauthenticated,
+                           std::format("{} answered with a reply not signed by the worker the grant named{}; its "
+                                       "object is not used",
+                                       Where(job),
+                                       result->signature.empty() ? " (it carried no signature)" : ""));
 
         // --- is this a reply to THIS request? ---------------------------------
         //
@@ -559,6 +578,20 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
 
     auto const endpoint = std::string { Wire::AsStringView(grant->endpoint) };
     auto const token = std::string { Wire::AsStringView(grant->leaseToken) };
+
+    // A grant that names no key for its worker names nobody this client could authenticate a
+    // reply from, so no reply could be used and the translation unit is not sent at all (W-4).
+    // Released like every other way out of a granted lease.
+    if (grant->workerKey.size() != Wire::IdentityPublicKeyBytes)
+    {
+        auto refused = Refused(DispatchStatus::Unauthenticated,
+                               std::format("the grant for {} names no worker key, so no reply from it could be "
+                                           "authenticated; not dispatched",
+                                           endpoint));
+        refused.leaseEndpoint = lease.scheduler;
+        ReleaseLease(exchange, lease.scheduler, request, token, credential, budgets.control);
+        return refused;
+    }
     // A hint that is not an address to dial -- or that IS the name -- is no hint. The
     // same predicate `RedirectTarget` and `DialEndpoint` ask, so "may this be dialled"
     // has one answer (`Core/HostPort.hpp`).
@@ -589,7 +622,8 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
                            .credential = credential,
                            .request = request,
                            .sourceField = sourceField,
-                           .maxObjectBytes = budgets.maxDecompressedBytes };
+                           .maxObjectBytes = budgets.maxDecompressedBytes,
+                           .workerKey = grant->workerKey };
     };
     // What is LEFT of the grant's bound, not this process's and not the grant's whole
     // lifetime -- `UnderGrantedLease` carries the argument for both halves. Measured

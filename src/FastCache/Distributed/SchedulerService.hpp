@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cluster/SplitEvidence.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetSample.hpp>
@@ -248,36 +249,67 @@ struct MembershipParticipantSet
     [[nodiscard]] constexpr bool operator==(MembershipParticipantSet const&) const = default;
 };
 
+/// What an admission route says about WHO the caller is, which an operator's control verbs are
+/// decided from: the `standing` column of `MembershipRoutes`.
+///
+/// **A private, in-process enum** -- no wire and no file carries it -- so only the zero value is
+/// spelled, and the zero value is the one that confers nothing.
+enum class CallerStanding : std::uint8_t
+{
+    /// The route admits a caller without saying who it is: `--fleet-open`, a tombstone, no route.
+    Anonymous = 0,
+    /// The route names a MACHINE the roster holds -- a proven key or a verified ticket -- and that
+    /// machine has an operator's standing only while its seat in the applied state is a voter's
+    /// (`MembershipDecision::votedBy`). A ticket proves a machine, never an operator.
+    MachineSeat,
+    /// The route is an operator's standing by itself: the caller is on the asked node's own machine.
+    Operator,
+};
+
 /// One row of `MembershipRoutes`.
 struct MembershipRouteTrait
 {
     MembershipParticipant route; ///< The admission route.
-    bool identifiesCaller;       ///< Whether it says WHO the caller is, which an operator's control verb requires.
+    CallerStanding standing;     ///< What it says about who the caller is (`CallerStanding`).
 };
 
-/// Which admission routes IDENTIFY the caller they admit: the column an operator's CONTROL verbs
-/// are decided from (`CompileCacheWire::IdentityRequirement::IdentifiedCaller`).
+/// What each admission route says about WHO the caller it admits is: the column an operator's
+/// CONTROL verbs are decided from (`CompileCacheWire::IdentityRequirement::OperatorStanding`, and
+/// its prerequisite `IdentifiedCaller`).
 ///
-/// **`OpenPolicy` never does.** `--fleet-open` admits everybody, so a caller it admits is anybody
-/// who can route to the port -- a caller the fleet may SERVE, never one that may decide who is in
-/// it: on an open node, an anonymous caller that could approve its own enrollment is the whole
-/// admission policy undone by one flag. Loopback does: a process on this machine already has it. A
-/// proven key and a verified ticket do: each names a machine the roster holds. `KeyTombstone`
-/// admits nobody, and `Reserved` is no route.
+/// **`OpenPolicy` never identifies.** `--fleet-open` admits everybody, so a caller it admits is
+/// anybody who can route to the port -- a caller the fleet may SERVE, never one that may decide
+/// who is in it: on an open node, an anonymous caller that could approve its own enrollment is the
+/// whole admission policy undone by one flag. `KeyTombstone` admits nobody, and `Reserved` is no
+/// route.
+///
+/// **A proven key and a verified ticket identify a MACHINE, and that is all they do.** Any process
+/// on a machine the fleet admitted can have its node mint a ticket, so a ticket that stood for an
+/// operator made every process on every laptop an operator of the whole fleet -- `fleet-open`, the
+/// shared cache, a forget, an auto-approve window. So each confers an operator's standing only
+/// while the machine it names holds a voter's seat. **Loopback is an operator** at the node being
+/// asked: a process on this machine already has it.
 ///
 /// A COLUMN rather than a list at the gate, so a route added later answers this question by
 /// declaring its row -- `RowsInEnumeratorOrder` fails the build if it arrives without one.
 inline constexpr EnumTable<MembershipParticipant, MembershipRouteTrait> MembershipRoutes { {
-    { .route = MembershipParticipant::Reserved, .identifiesCaller = false },
-    { .route = MembershipParticipant::Loopback, .identifiesCaller = true },
-    { .route = MembershipParticipant::OpenPolicy, .identifiesCaller = false },
-    { .route = MembershipParticipant::ProvenIdentity, .identifiesCaller = true },
-    { .route = MembershipParticipant::MachineTicket, .identifiesCaller = true },
-    { .route = MembershipParticipant::KeyTombstone, .identifiesCaller = false },
+    { .route = MembershipParticipant::Reserved, .standing = CallerStanding::Anonymous },
+    { .route = MembershipParticipant::Loopback, .standing = CallerStanding::Operator },
+    { .route = MembershipParticipant::OpenPolicy, .standing = CallerStanding::Anonymous },
+    { .route = MembershipParticipant::ProvenIdentity, .standing = CallerStanding::MachineSeat },
+    { .route = MembershipParticipant::MachineTicket, .standing = CallerStanding::MachineSeat },
+    { .route = MembershipParticipant::KeyTombstone, .standing = CallerStanding::Anonymous },
 } };
 
 static_assert(RowsInEnumeratorOrder(MembershipRoutes, &MembershipRouteTrait::route),
               "MembershipRoutes must hold one row per MembershipParticipant, in enumerator order");
+
+/// @param route An admission route.
+/// @return What it says about who the caller is (`MembershipRoutes`).
+[[nodiscard]] constexpr CallerStanding StandingOfRoute(MembershipParticipant route) noexcept
+{
+    return MembershipRoutes[static_cast<std::size_t>(route)].standing;
+}
 
 /// Whether any route in @p routes identifies the caller it admitted.
 /// @param routes The routes that admitted a caller.
@@ -285,7 +317,7 @@ static_assert(RowsInEnumeratorOrder(MembershipRoutes, &MembershipRouteTrait::rou
 [[nodiscard]] constexpr bool AnyRouteIdentifies(MembershipParticipantSet routes) noexcept
 {
     return std::ranges::any_of(MembershipRoutes, [routes](MembershipRouteTrait const& row) {
-        return row.identifiesCaller && routes.Has(row.route);
+        return row.standing != CallerStanding::Anonymous && routes.Has(row.route);
     });
 }
 
@@ -298,6 +330,12 @@ struct MembershipDecision
     Membership verdict { Membership::Outsider }; ///< What the fold concluded.
     MembershipParticipantSet decidedBy {};       ///< Every route that concluded it.
     KeyEvidenceSet revokedBy {};                 ///< For `Forgotten`: how the revoked key was shown.
+
+    /// For `Member`: the key evidence whose machine holds a VOTER's seat in the applied state --
+    /// what turns a `CallerStanding::MachineSeat` route into an operator's standing. Set by the key
+    /// roster in the same answer as the route it attributes, so a key and its seat are never read
+    /// from two different publishes.
+    KeyEvidenceSet votedBy {};
 
     [[nodiscard]] bool operator==(MembershipDecision const&) const = default;
 };
@@ -433,6 +471,13 @@ struct CallerContext
     /// gate and the admission answer are read off one fold.
     std::optional<std::string> provenNodeId {};
 
+    /// The identity key that proof verified under, engaged exactly when `provenNodeId` is (W-4).
+    ///
+    /// What `Register` records for a worker, so a grant can name the key its reply must be signed
+    /// under. The connection's fact, never a claim in a frame: filled by `CallerContextOf` from the
+    /// same fold that engaged `provenNodeId`.
+    std::optional<Ed25519PublicKey> provenKey {};
+
     /// Whether a route that IDENTIFIES the caller admitted it -- this machine, a live proven key or
     /// a verified ticket (`MembershipRoutes`) -- rather than `--fleet-open` alone.
     ///
@@ -440,6 +485,15 @@ struct CallerContext
     /// IdentifiedCaller`). False by default, the direction a context nobody filled must fail in:
     /// `Distributed::CallerContextOf` fills it from the same fold that admitted the connection.
     bool identified { false };
+
+    /// Whether the caller has an operator's STANDING: a route that is one by itself (this machine),
+    /// or an identifying route whose machine holds a voter's seat in the applied state
+    /// (`MembershipRoutes`' `standing` column, `MembershipDecision::votedBy`).
+    ///
+    /// What an operator's control verbs require (`CompileCacheWire::IdentityRequirement::
+    /// OperatorStanding`). A machine ticket proves a MACHINE, never an operator, so a learner's
+    /// ticket leaves this false. False by default, for `identified`'s reason.
+    bool operatorStanding { false };
 };
 
 /// One row of `IdentityRequirements`: what a verb's identity column asks of a caller, and what a
@@ -450,6 +504,11 @@ struct IdentityRequirementRow
     bool (*satisfiedBy)(CallerContext const&) noexcept; ///< Whether @p caller meets it.
     CompileCacheWire::ErrorCode refusal;                ///< The code a caller that does not is refused.
     std::string_view remedy;                            ///< What follows the verb's name in that refusal's message.
+
+    /// The requirement asked FIRST, whose refusal a caller failing both is given: what lets one
+    /// requirement build on another without a gate learning the order. Always an earlier
+    /// enumerator (`PrerequisitesPrecede`), so the chain ends.
+    std::optional<CompileCacheWire::IdentityRequirement> prerequisite {};
 };
 
 /// What each identity requirement asks of a caller: the ONE reading every gate that enforces the
@@ -468,13 +527,29 @@ inline constexpr EnumTable<CompileCacheWire::IdentityRequirement, IdentityRequir
     { .requirement = CompileCacheWire::IdentityRequirement::IdentifiedCaller,
       .satisfiedBy = [](CallerContext const& caller) noexcept { return caller.identified; },
       .refusal = CompileCacheWire::ErrorCode::IdentifiedCallerRequired,
-      .remedy = "is an operator's control verb, and --fleet-open admits nobody to it: send it from this machine, or "
-                "from one the cluster holds, whose node mints the machine ticket fastcache-compile-node and "
-                "fastcache-cli present" },
+      .remedy = "is an operator's control verb, and --fleet-open admits nobody to it: run it on this machine, or "
+                "on a voter of the cluster" },
+    { .requirement = CompileCacheWire::IdentityRequirement::OperatorStanding,
+      .satisfiedBy = [](CallerContext const& caller) noexcept { return caller.operatorStanding; },
+      .refusal = CompileCacheWire::ErrorCode::OperatorStandingRequired,
+      .remedy = "is an operator's control verb, and a machine ticket or key proves a machine, not an operator: run "
+                "it on a voter, or promote this machine",
+      .prerequisite = CompileCacheWire::IdentityRequirement::IdentifiedCaller },
 } };
 
 static_assert(RowsInEnumeratorOrder(IdentityRequirements, &IdentityRequirementRow::requirement),
               "IdentityRequirements must hold one row per IdentityRequirement, in enumerator order");
+
+/// Whether every prerequisite is an EARLIER requirement, which is what ends `UnmetRequirement`'s walk.
+/// @return True when no row names itself or a later row as its prerequisite.
+[[nodiscard]] consteval bool PrerequisitesPrecede() noexcept
+{
+    return std::ranges::all_of(IdentityRequirements, [](IdentityRequirementRow const& row) {
+        return !row.prerequisite.has_value() || *row.prerequisite < row.requirement;
+    });
+}
+
+static_assert(PrerequisitesPrecede(), "an identity requirement's prerequisite must be an earlier requirement");
 
 /// @param requirement A verb's identity column.
 /// @return Its row.
@@ -482,6 +557,24 @@ static_assert(RowsInEnumeratorOrder(IdentityRequirements, &IdentityRequirementRo
     CompileCacheWire::IdentityRequirement requirement) noexcept
 {
     return IdentityRequirements[static_cast<std::size_t>(requirement)];
+}
+
+/// The row whose refusal @p caller is given for a verb requiring @p requirement: its prerequisites
+/// first, so a caller failing more than one is told the most basic thing it lacks.
+///
+/// The ONE reading both gates that enforce the verb column share -- the scheduler's
+/// `RefuseUnlessIdentified` and the enrollment surface's -- so the order is the table's.
+/// @param requirement A verb's identity column.
+/// @param caller Who is asking.
+/// @return The unmet row, or null when @p caller meets the requirement and every prerequisite.
+[[nodiscard]] constexpr IdentityRequirementRow const* UnmetRequirement(CompileCacheWire::IdentityRequirement requirement,
+                                                                       CallerContext const& caller) noexcept
+{
+    auto const& row = RequirementRowOf(requirement);
+    if (row.prerequisite.has_value())
+        if (auto const* const unmet = UnmetRequirement(*row.prerequisite, caller); unmet != nullptr)
+            return unmet;
+    return row.satisfiedBy(caller) ? nullptr : &row;
 }
 
 /// The leader acting on its own authority, for an admission an armed window made rather than a caller.
@@ -493,7 +586,11 @@ static_assert(RowsInEnumeratorOrder(IdentityRequirements, &IdentityRequirementRo
 [[nodiscard]] inline CallerContext SelfCaller()
 {
     return CallerContext {
-        .membership = Membership::Member, .peerId = "127.0.0.1", .provenNodeId = std::nullopt, .identified = true
+        .membership = Membership::Member,
+        .peerId = "127.0.0.1",
+        .provenNodeId = std::nullopt,
+        .identified = true,
+        .operatorStanding = true,
     };
 }
 
@@ -1097,10 +1194,12 @@ class SchedulerService final: public Cluster::IAnnouncedJoinMemos
     /// @param lease The lease just acquired.
     /// @param endpoint The worker it was granted on.
     /// @param fingerprint The toolchain it was granted against.
+    /// @param workerKey The identity key that worker proved at registration, raw, or empty (W-4).
     /// @return What the client presents to that worker.
     [[nodiscard]] std::string MintGrantToken(Distributed::Lease const& lease,
                                              std::string_view endpoint,
-                                             std::string_view fingerprint);
+                                             std::string_view fingerprint,
+                                             std::string_view workerKey);
 
     core::platform::WallClockRef _wallClock;
     IMetricsSink& _metrics;

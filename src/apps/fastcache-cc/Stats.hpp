@@ -115,6 +115,11 @@ enum class DispatchOutcome : std::uint8_t
     /// here is a fleet declining to help, and this one is a defect somebody has to
     /// look at. Folded in with `Unreachable` it would read as a network blip.
     Mismatched,
+    /// A reply to a dispatched compile was not signed by the worker its grant named, and this
+    /// client refused the object (W-4): an address answering on a machine that is not that
+    /// worker. Kept apart from `Mismatched`, which is a fleet machine confusing two jobs; this is
+    /// somebody else's machine, and its object would have poisoned the fleet's shared cache.
+    Unauthenticated,
     /// A worker ran the compiler and this client did not keep the object — a
     /// non-zero remote exit code retried locally, or an artefact that could not be
     /// written. The exchange worked and the compile was still done twice.

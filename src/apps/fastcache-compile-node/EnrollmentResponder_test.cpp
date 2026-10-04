@@ -241,9 +241,12 @@ struct Seed
     //
     // `MachineTicket`: an operator on another machine sends the enrollment decisions with the
     // ticket its own node mints, and an operator's control verb needs a route that IDENTIFIES the
-    // caller -- `--fleet-open` admits nobody to it. The list stands in for the ticket the endpoint
-    // verified; the open-policy caller is its own case below.
-    ListedMembership membership { { std::string { OperatorAddress } }, Distributed::MembershipParticipant::MachineTicket };
+    // caller -- `--fleet-open` admits nobody to it -- whose machine holds a VOTER's seat: a ticket
+    // proves a machine, not an operator (W-1). The list stands in for the ticket the endpoint
+    // verified; the open-policy caller and a learner's ticket are their own cases below.
+    ListedMembership membership { { std::string { OperatorAddress } },
+                                  Distributed::MembershipParticipant::MachineTicket,
+                                  Distributed::KeyEvidenceSet {}.Add(Distributed::KeyEvidence::MachineTicket) };
     NodeConditions conditions;
     // Bound as `main` binds it: the node's own sink and the wall clock the scheduler reads, never
     // the defaults a fixture finds more convenient.
@@ -1742,6 +1745,72 @@ TEST_CASE("An enrollment decision is refused a caller only --fleet-open admitted
     // And the open door stays open to the anonymous caller: `Enroll` is the one verb meant to admit it.
     CHECK_FALSE(
         responder.RefusePeer(Testing::OpenFleetFold::Anonymous(), static_cast<std::uint8_t>(Wire::Op::Enroll)).has_value());
+}
+
+TEST_CASE("An enrollment decision is refused a learner's ticket and a learner's proven key, by name and counted",
+          "[enrollment][responder][admission][security][operator-standing]")
+{
+    // W-1: a machine ticket proves a fleet MACHINE, not an operator. Without the operator's standing
+    // a process on any auto-approved laptop could approve, reject, or arm a 24 h auto-approve window
+    // through its own node's ticket. Every decision the verb carries, read FROM THE TABLE.
+    Seed seed;
+    Testing::OpenFleetFold fold;
+    NullLogger logger;
+    EnrollmentResponder responder { seed.window,   seed.service, fold.admitted, seed.self,
+                                    seed.identity, seed.random,  seed.metrics,  logger };
+    auto const control = static_cast<std::uint8_t>(Wire::Op::EnrollControl);
+    auto const counted = [&seed] {
+        return seed.metrics.Read(IMetricsSink::Counter::EnrollmentControlRefusedOperatorStandingRequired);
+    };
+    auto const frameFor = [](Wire::EnrollControlVerbRow const& row) {
+        switch (row.subject)
+        {
+            case Wire::EnrollSubject::None:
+                return Wire::EncodeEnrollControl(row.verb);
+            case Wire::EnrollSubject::NodeId:
+                return Wire::EncodeEnrollControl(row.verb, JoinerId);
+            case Wire::EnrollSubject::Seconds:
+                return Wire::EncodeEnrollControl(row.verb, "86400");
+            case Wire::EnrollSubject::NodeIdAndKey:
+                return Wire::EncodeEnrollApprove(JoinerId, JoinerKey());
+        }
+        throw std::logic_error { "every EnrollSubject has a frame" };
+    };
+
+    auto expected = std::uint64_t { 0 };
+    for (auto const& [what, facts]: { std::pair { "a learner's ticket", Testing::OpenFleetFold::LearnerTicketed() },
+                                      std::pair { "a learner's proven key", Testing::OpenFleetFold::LearnerProven() } })
+    {
+        INFO(what);
+        // At the door, before a payload is read.
+        auto const refused = responder.RefusePeer(facts, control);
+        REQUIRE(refused.has_value());
+        CHECK(RefusalIn(Unwrap(refused)) == Wire::ErrorCode::OperatorStandingRequired);
+        CHECK(RefusalSentenceIn(Unwrap(refused)).contains("run it on a voter, or promote this machine"));
+        CHECK(counted() == ++expected);
+        // And after it, for every decision the verb carries.
+        for (auto const& row: Wire::EnrollControlVerbTable)
+        {
+            INFO(row.name);
+            auto const reply = core::async::syncRun(responder.Answer(frameFor(row), facts)).bytes;
+            CHECK(RefusalIn(reply) == Wire::ErrorCode::OperatorStandingRequired);
+            CHECK(counted() == ++expected);
+        }
+        // Enroll stays the open door: a learner still polls for itself.
+        CHECK_FALSE(responder.RefusePeer(facts, static_cast<std::uint8_t>(Wire::Op::Enroll)).has_value());
+    }
+    // Not the anonymous caller's series: these callers were identified.
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired) == 0);
+
+    // A voter's ticket, a voter's proof and this machine pass the door, and nothing more is counted.
+    for (auto const& [what, facts]: { std::pair { "a voter's ticket", Testing::OpenFleetFold::Ticketed() },
+                                      std::pair { "a voter's proven key", Testing::OpenFleetFold::Proven() },
+                                      std::pair { "loopback", Testing::OpenFleetFold::Local() } })
+    {
+        INFO(what);
+        CHECK_FALSE(responder.RefusePeer(facts, control).has_value());
+    }
+    CHECK(counted() == expected);
 }
 
 TEST_CASE("A stranger reaching enrollment control through Answer is told not-a-member, as at the door",

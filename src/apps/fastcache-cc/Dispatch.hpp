@@ -402,6 +402,17 @@ enum class DispatchStatus : std::uint8_t
     /// refusal instead, beside the other command lines this launcher will not send.
     /// `refusal` names the argument.
     DeniedHere,
+    /// The reply to a COMPILE did not come from the worker the grant named: its signature does
+    /// not verify under the key the grant carried, it carries none, or the grant named no key to
+    /// check it against (W-4).
+    ///
+    /// **Its own status for `Mismatched`'s reason, and the more serious of the two.** A crossed
+    /// reply is a fleet machine confusing two jobs; this is an address -- a dial hint gone stale, a
+    /// VPN address reassigned, a long-TTL name -- answering on a machine that is not the worker at
+    /// all, and returning whatever it liked. Used, that object would be stored here and written
+    /// through to the fleet's shared cache, poisoning every machine that later fetches its key. So
+    /// the object is never used, the build compiles locally, and the sentence is unconditional.
+    Unauthenticated,
     /// The enumerator count, so a table over this enum takes its extent from the
     /// enum itself rather than from a literal. See `Core/EnumTable.hpp`: a length
     /// anchored on an enumerator by name is a guard that fires only when nothing is
@@ -624,6 +635,9 @@ inline constexpr std::array DeclineCauseTable {
     // control verb, so a compile cannot reach it; were one to, no retry clears it, which is
     // `NotPermitted`'s answer.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::IdentifiedCallerRequired, .cause = DeclineCause::NotPermitted },
+    // The same verbs from an identified caller whose machine is no voter: no compile reaches it, and
+    // no retry clears it until an operator promotes the machine, which is `NotPermitted` again.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::OperatorStandingRequired, .cause = DeclineCause::NotPermitted },
     // The fleet's shared cache, which no compile reaches: the launcher speaks FETCH and
     // STORE to its own machine and never the shared verbs, so meeting this means it reached a
     // surface it did not think it was talking to -- the enrollment rows' reasoning. A row so it

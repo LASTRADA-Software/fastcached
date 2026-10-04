@@ -143,6 +143,10 @@ namespace
           .refusal = AcceptorRefusal::FrameUnreadable,
           .level = LogLevel::Warn,
           .sentence = "" },
+        // Silent BY ROW: an acceptor arms no idle bound -- its dialler writes when it has
+        // something to say, and a one-way dialler says nothing on purpose -- so this end never
+        // names the ending. The row exists because the enum is shared with the dialler, which does.
+        { .end = SessionEnd::Silent, .refusal = std::nullopt, .level = std::nullopt, .sentence = "" },
     } };
 
     static_assert(RowsInEnumeratorOrder(SessionEndRows, &AcceptorSessionEndRow::end),

@@ -118,6 +118,9 @@ class LeaseCheckInForce
 ///        string the scheduler signs into a grant and the string this checks against
 ///        have to be one fact at every moment, not two readers of one file (#1279).
 ///        Borrowed by the validator, so it must outlive it.
+/// @param identityKey This node's identity public key, the one it proves itself with: a grant
+///        whose signed claims name another machine's key is refused (W-4). Copied; empty for a
+///        node that proves nothing.
 /// @param clock Where "now" comes from. A **wall** clock, not a steady one: the
 ///        expiry was stamped on another machine, and a steady instant means nothing
 ///        off the host that read it. Borrowed, so it must outlive the validator.
@@ -136,6 +139,7 @@ class LeaseCheckInForce
     NodeConfig const& cfg,
     Distributed::ILeaseRoster const* roster,
     Cc::IAdvertisedEndpointSource const& advertise,
+    std::span<std::byte const> identityKey,
     SocketActivation activation,
     core::platform::WallClockRef clock,
     Distributed::WorkerLeaseState& lease,

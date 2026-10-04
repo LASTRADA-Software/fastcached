@@ -120,11 +120,12 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x2b` | node-identity-required | A verb only a machine that **proved** its identity may send — REGISTER, NODE-ANNOUNCE, HEARTBEAT, WITHDRAW — arrived on a connection that has not, loopback included. A machine ticket admits a client and never satisfies these: a ticketed connection is not sealed. |
 | `0x2c` | enrollment-host-full | The request came from an address that already has as many enrollment requests waiting as one host may hold, counted by the address each request first came from, so it was not recorded. Its own code rather than enrollment-full, because one address asking a lot and many machines waiting are different problems; a joiner treats both as a wait. |
 | `0x2d` | ticket-refused | An AUTH presenting a machine ticket this node did not accept: a signature that does not verify, a machine the roster does not hold, a revoked key, an audience that is not this node, or an expiry passed. One code for all of them. The message names the reason when the caller could have checked it itself -- malformed bytes, a wrong audience, an expiry -- or when it is the node's own state; a forgery, a machine the roster does not hold and a revoked key all read `not admitted by this node`, because AUTH answers any address and those three would tell a stranger which ids the roster holds. The node still counts each of them apart. Not `unauthenticated`, which says a credential is still owed; this one says a credential was presented and judged. |
-| `0x2e` | identified-caller-required | An operator's **control** verb -- `CLUSTER-ADMIT` in every form, `CLUSTER-FORGET`, `CLUSTER-SET`, `ENROLL-CONTROL` -- from a caller admitted by `--fleet-open` alone. `--fleet-open` admits a caller to what the fleet serves and never to what decides the fleet; a caller on this machine, one that proved a node key, or one presenting a verified machine ticket is admitted to these verbs. Not `not-a-member`: the caller is admitted, and the remedy is to identify itself. |
+| `0x2e` | identified-caller-required | An operator's **control** verb -- `CLUSTER-ADMIT` in every form, `CLUSTER-FORGET`, `CLUSTER-SET`, `ENROLL-CONTROL` -- from a caller admitted by `--fleet-open` alone. `--fleet-open` admits a caller to what the fleet serves and never to what decides the fleet; a caller on this machine, one that proved a node key, or one presenting a verified machine ticket is past this refusal, and is then asked for an operator's standing (`operator-standing-required`). Not `not-a-member`: the caller is admitted, and the remedy is to identify itself. |
 | `0x2f` | not-shared-cache | A `SHARED-FETCH` or `SHARED-STORE` at a node that is not the fleet's shared cache right now: the `shared-cache` setting names another machine or none, or names this one and its tier could not be opened. Not `unknown-opcode`, since every node implements the verbs and a client told otherwise would conclude the build is too old; not `not-a-member`, which would tell a proven member it is not one. A `fastcached` answers it too, so a client has one refusal to read as a miss whichever wrong machine it reached. |
 | `0x30` | worker-rejected-argument | The worker will not pass one of the job's arguments to its compiler — it is not on the worker's per-driver-family allowlist, or a path-mapping value cannot be spelled into a rule — and the message names it. The frame was well formed: until this code existed the refusal was answered `malformed-frame`, and a launcher reported a flag this fleet does not dispatch as a version skew. Either add the argument on the workers with `--allow-compile-arg`, if it runs no program and names no path, or leave those compiles to run locally. |
 | `0x31` | grant-unverifiable | The worker can check nobody's lease right now: the state its own consensus applied names no voter yet, or no leader that state counts has spoken to it for longer than the silence bound. A statement about the worker, never about the lease — a fresh grant would get the same answer. |
 | `0x32` | roster-not-yet-applied | A node proof the answering node cannot judge **yet**: its consensus has not applied the log it recovered when it started -- a lone voter before its election commits, a follower before its leader first speaks -- so the key roster it judges by may lack a key its cluster holds. Answered instead of `node-key-unknown`, which would tell an operator to admit a machine the cluster already holds. A statement about the answering node: the proving node asks again on a short backoff, and nobody needs to act. A launcher never meets it -- it proves no identity. |
+| `0x33` | operator-standing-required | An operator's **control** verb -- `CLUSTER-ADMIT` in every form, `CLUSTER-FORGET`, `CLUSTER-SET`, `ENROLL-CONTROL` -- from a caller that IS identified, by a proven node key or a verified machine ticket, whose machine holds no **voter's** seat in the state the asked node applied. A ticket proves a fleet machine, never an operator: any process on an admitted laptop can have its node mint one. These verbs are answered to the asked node's own machine and to a voter's identity alone; run the verb on a voter, or promote this machine. A caller `--fleet-open` alone admitted is still told `identified-caller-required`. |
 
 Every one of these is a **refusal the client answers by compiling locally**,
 never by failing. They are distinct codes rather than one "no" because they mean
@@ -311,8 +312,9 @@ over anything.
 REGISTER   [fingerprint][endpoint][slots][codecs][capacity] -> [workerId]
 HEARTBEAT  [workerId][inFlight][load]                       -> Ok
 LEASE      [fingerprint][objectKey][codecs]                 -> [endpoint][leaseToken][workerCodecs][leaseLifetime]
+                                                               [dialHint][workerKey]
 COMPILE    [leaseToken][fingerprint][args][source][codecs][sourceName]
-                                              -> [exitCode][object][stdout][stderr][correlation]
+                                              -> [exitCode][object][stdout][stderr][correlation][signature]
 RELEASE    [leaseToken][objectKey]                          -> Ok
 ```
 
@@ -370,6 +372,31 @@ unkeyed, so a worker that can return a wrong object can return a wrong digest ju
 as easily. It also cannot see a runner that fed the right bytes and read back the
 wrong object file — there the metadata is honest and only the object is foreign, and
 the worker's exclusive scratch claim is what closes that.
+
+**Against a machine that is not the worker, the reply is SIGNED.** An endpoint is a
+name, and a name can come to answer on another machine — a VPN address reassigned
+between a heartbeat and a compile, a DNS record with a long TTL. Such a machine can
+accept the job and return a well-formed, correctly correlated object, and before the
+signature that object was stored here and written through to the fleet's shared tier.
+So the grant names the granted worker's identity public key — `workerKey`, the key the
+worker's `REGISTER` connection **proved**, 32 bytes — and the worker signs
+`(correlation, SHA-256 of the object as sent)` under that key, as the label
+`fastcache-compile-reply-v1` followed by the two fields length-prefixed: `signature`,
+64 bytes. The launcher checks it against the key the grant named **before** it opens
+the object envelope or stores anything; a missing or wrong signature is refused as
+`UNAUTHENTICATED` on `--show-stats`, the translation unit is compiled locally, and the
+lease is released like every other way out of a grant. A grant that names no key is
+refused the same way **before** anything is dialled, because it names nobody whose
+reply could be accepted.
+
+The key travels twice and the two copies answer different questions. In the clear on
+the grant it is what the **client** verifies against — a client verifies no lease
+claims. Inside the lease token's signed claims (token layout 4, label
+`fastcache-lease-v4`) it is what the **worker** checks against its own key, so a fleet
+worker that has come to hold another worker's endpoint refuses the job
+`lease-endpoint-mismatch`, naming *another identity key*, before a compiler runs.
+Neither field moved the wire version: the field counts of the grant and the reply are
+exact, and a peer of the other count is one this build does not read.
 
 Two rules carry the weight and neither is configurable. A job goes only to a
 worker whose fingerprint is **byte-identical**: an over-strict match costs a

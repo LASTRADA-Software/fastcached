@@ -129,6 +129,14 @@ struct WorkerInfo
     ///
     /// Owned: the exchange that carried them is gone by the time a lease reads them.
     std::vector<std::string> interfaceAddresses {};
+
+    /// The identity public key this worker's REGISTER connection proved, or empty when none was
+    /// recorded (W-4): what a grant names so the client can authenticate the worker's reply.
+    ///
+    /// The connection's fact, never the registration's claim -- `SchedulerService::Register`
+    /// sets it from `CallerContext::provenKey` -- and refreshed by every re-registration, so a
+    /// worker whose `node-key` was replaced is named by the key it proves now. Raw bytes.
+    std::string identityKey {};
 };
 
 /// One live worker, as a diagnostic rather than as a scheduling input.
@@ -360,6 +368,10 @@ struct WorkerRegistration
     /// From the capacity record; empty when it reported none. Borrowed for the call only:
     /// the registry copies it into `WorkerInfo::interfaceAddresses`.
     std::span<std::string const> interfaceAddresses {};
+
+    /// The identity key the REGISTER connection proved (`CallerContext::provenKey`), raw, or empty.
+    /// Set by `SchedulerService::Register` from the connection, never from anything the worker sent.
+    std::span<std::byte const> identityKey {};
 };
 
 /// Where a worker was SEEN and what it says it answers on, as one exchange carried them.

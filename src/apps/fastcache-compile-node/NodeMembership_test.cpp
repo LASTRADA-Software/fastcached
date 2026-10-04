@@ -440,6 +440,50 @@ TEST_CASE("A learner's verified ticket admits it once consensus publishes the cl
     CHECK(presenting("10.0.0.7") == Membership::Forgotten);
 }
 
+TEST_CASE("A voter's ticket stands as an operator and a learner's does not, from the seat the applied state records",
+          "[node][membership][ticket][operator-standing]")
+{
+    // W-1, at the production seam: `PublishCluster` is the one place a seat becomes an operator's
+    // standing, so a case that composed the roster by hand would pass over a publish that dropped
+    // the seats. Both machines are ADMITTED by their tickets; only the voter's decides the fleet,
+    // and promoting the learner -- a new seat in the applied state -- is what changes that.
+    NodeConfig cfg;
+    cfg.nodeId = "office";
+    NodeMembership membership { cfg, membershipLog };
+    auto const contextOf = [&membership](std::string const& id) {
+        return Distributed::CallerContextOf(membership.Oracle(),
+                                            ConnectionFacts { .host = "10.0.0.9", .authenticatedMachine = Proving(id) });
+    };
+    auto state = FastCache::Cluster::ClusterState {};
+    Admit(state, "pc-07", "10.0.0.7:6676", Proving("pc-07").key);
+    FastCache::Cluster::Apply(state,
+                              FastCache::Cluster::Command { .kind = FastCache::Cluster::CommandKind::AddLearner,
+                                                            .key = "lt-12",
+                                                            .value = {},
+                                                            .schedulerEndpoint = {},
+                                                            .publicKey = Proving("lt-12").key,
+                                                            .createdAtUnixSeconds = std::nullopt,
+                                                            .leaderKey = std::nullopt });
+    REQUIRE(state.members.size() == 2);
+    membership.PublishCluster(state);
+
+    auto const voter = contextOf("pc-07");
+    CHECK(voter.membership == Membership::Member);
+    CHECK(voter.operatorStanding);
+    auto const learner = contextOf("lt-12");
+    CHECK(learner.membership == Membership::Member);
+    CHECK(learner.identified);
+    CHECK_FALSE(learner.operatorStanding);
+
+    // Promoted: the same ticket, a voter's seat, an operator.
+    Admit(state, "lt-12", "10.0.0.12:6676", Proving("lt-12").key);
+    REQUIRE(std::ranges::all_of(state.members, [](FastCache::Cluster::ClusterMember const& member) {
+        return member.seat == FastCache::Cluster::MemberSeat::Voter;
+    }));
+    membership.PublishCluster(state);
+    CHECK(contextOf("lt-12").operatorStanding);
+}
+
 TEST_CASE("A revoked ticket's evidence refuses on an open node, whatever the key roster still says",
           "[node][membership][ticket][forget]")
 {
