@@ -434,6 +434,14 @@ namespace
     static_assert(MAXNS * ResolverRetransmitSeconds * ResolverPasses <= SrvLookupDeadline.count(),
                   "the POSIX resolver's configured worst case must fit inside SrvLookupDeadline");
 
+    /// The largest DNS message there is: its length travels in 16 bits (RFC 1035 4.2.2). Spelled
+    /// here rather than as `NS_MAXMSG`, which glibc's <arpa/nameser.h> defines and Apple's does
+    /// not -- the macOS build stopped at the first use of it.
+    constexpr std::size_t MaxDnsMessageBytes = 65535;
+    #if defined(NS_MAXMSG)
+    static_assert(MaxDnsMessageBytes == NS_MAXMSG, "the resolver headers disagree about a DNS message's ceiling");
+    #endif
+
     /// The resolver's state, as `res_ninit` fills it: named through the `res_state` pointer
     /// typedef rather than by its reserved struct tag.
     using ResolverStateData = std::remove_pointer_t<res_state>;
@@ -507,7 +515,7 @@ namespace
             state.options |= RES_IGNTC;
 
             auto const query = std::string { name };
-            auto answer = std::vector<std::uint8_t>(NS_MAXMSG);
+            auto answer = std::vector<std::uint8_t>(MaxDnsMessageBytes);
             auto const length =
                 res_nquery(&state, query.c_str(), ns_c_in, ns_t_srv, answer.data(), static_cast<int>(answer.size()));
             if (length < 0)

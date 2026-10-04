@@ -1298,3 +1298,153 @@ TEST_CASE(
         CHECK_FALSE(cfg.fleetPin.has_value());
     }
 }
+
+namespace
+{
+/// What one rollback `reg.exe` action of the fragment does to a remembered value.
+struct MsiRollbackWrite
+{
+    MsiRemembered value; ///< The value; `property` is the one written back, empty for a delete.
+};
+
+/// Every rollback action that writes or deletes a remembered value, read off the fragment: a
+/// `reg.exe add ... /d "[PROPERTY]"` puts the value back, a `reg.exe delete ... /v <name>` removes it.
+/// @param text The fragment.
+/// @return Each one, in document order.
+[[nodiscard]] std::vector<MsiRollbackWrite> ReadMsiRollbackWrites(std::string_view text)
+{
+    auto writes = std::vector<MsiRollbackWrite> {};
+    for (auto const& action: MsiElements(text, "<CustomAction ", "/>"))
+    {
+        if (MsiAttribute(action, "Execute") != "rollback")
+            continue;
+        auto command = MsiAttribute(action, "ExeCommand");
+        if (!command.contains("reg.exe"))
+            continue;
+        constexpr std::string_view Quote = "&quot;";
+        auto quote = command.find(Quote);
+        while (quote != std::string::npos)
+        {
+            command.replace(quote, Quote.size(), "\"");
+            quote = command.find(Quote, quote + 1);
+        }
+        auto const after = [&command](std::string_view marker) {
+            auto const at = command.find(marker);
+            REQUIRE(at != std::string::npos);
+            auto const start = at + marker.size();
+            return std::string { command.substr(start, command.find(' ', start) - start) };
+        };
+        auto const added = command.contains(" add ");
+        auto property = std::string {};
+        if (added)
+        {
+            auto const value = after(" /d ");
+            REQUIRE(value.size() > 2);
+            property = PlaceholderOf(std::string_view { value }.substr(1, value.size() - 2));
+            REQUIRE_FALSE(property.empty());
+        }
+        writes.push_back(MsiRollbackWrite { .value = MsiRemembered { .property = std::move(property),
+                                                                     .key = after(added ? " add " : " delete "),
+                                                                     .name = after(" /v ") } });
+    }
+    return writes;
+}
+} // namespace
+
+TEST_CASE("A failed MSI transaction puts back the remembered values and the node registration it found",
+          "[node][docs][service][msi]")
+{
+    // The node's sequence is validate, register, remember, start (ci-fix2 checks the registration and
+    // the start). A step that fails after a value was remembered or the node registered rolls the
+    // transaction back, and Windows Installer does not undo what a custom action did -- so each is
+    // undone by a ROLLBACK twin. Here the fragment's own rows run a transaction that states new values,
+    // "fails" after it remembered them, and runs every rollback write: what the registry holds must be
+    // exactly what it held before, and the registration the rollback makes again must be the one the
+    // values it found describe.
+    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    auto const text = MsiFragmentText(root);
+    auto const rows = ReadMsiRememberRows(text);
+    auto const rollback = ReadMsiRollbackWrites(text);
+
+    // Every value a transaction writes has BOTH twins, keyed on the same registry value -- one that
+    // writes it back from a property a RegistrySearch of that same value reads, and one that deletes it.
+    REQUIRE_FALSE(rows.writes.empty());
+    for (auto const& write: rows.writes)
+    {
+        INFO(write.name);
+        auto const restores = std::ranges::count_if(rollback, [&](MsiRollbackWrite const& undo) {
+            return undo.value.key == write.key && undo.value.name == write.name && !undo.value.property.empty()
+                   && std::ranges::any_of(rows.searches, [&](MsiRemembered const& search) {
+                          return search.property == undo.value.property && search.key == write.key
+                                 && search.name == write.name;
+                      });
+        });
+        auto const forgets = std::ranges::count_if(rollback, [&](MsiRollbackWrite const& undo) {
+            return undo.value.key == write.key && undo.value.name == write.name && undo.value.property.empty();
+        });
+        CHECK(restores == 1);
+        CHECK(forgets == 1);
+    }
+
+    // The twins as Windows Installer would run them: a write-back where the value was found, a delete
+    // where it was not (the conditions `check-wix-service-table` pins).
+    auto const rollBack = [&](std::map<std::string, std::string> const& properties, MsiRegistry& registry) {
+        for (auto const& undo: rollback)
+        {
+            auto const& value = undo.value;
+            auto const found = std::ranges::find_if(rollback, [&](MsiRollbackWrite const& other) {
+                return other.value.key == value.key && other.value.name == value.name && !other.value.property.empty();
+            });
+            REQUIRE(found != rollback.end());
+            auto const before = properties.find(found->value.property);
+            auto const wasThere = before != properties.end() && !before->second.empty();
+            if (!value.property.empty() && wasThere)
+                registry[{ value.key, value.name }] = before->second;
+            else if (value.property.empty() && !wasThere)
+                registry.erase({ value.key, value.name });
+        }
+    };
+
+    {
+        INFO("a repair stating new values fails after remembering them");
+        auto registry = MsiRegistry {};
+        (void) MsiTransact(rows,
+                           { { "FASTCACHE_FIREWALL_ALLOW", "10.0.0.0/8" },
+                             { "FASTCACHE_NODE_ADVERTISE", "worker-01.internal:6674" },
+                             { "FASTCACHE_FLEET_SEED", "office-a.vpn.example" },
+                             { "FASTCACHE_FLEET_ID", std::string { FirstPin } } },
+                           registry);
+        auto const found = registry;
+        auto const failed = MsiTransact(rows,
+                                        { { "FASTCACHE_FIREWALL_ALLOW", "192.168.0.0/16" },
+                                          { "FASTCACHE_FLEET_SEED", "office-b.vpn.example" },
+                                          { "FASTCACHE_FLEET_ID", std::string { SecondPin } } },
+                                        registry);
+        REQUIRE(registry != found); // the premise: the transaction did remember something new
+        rollBack(failed, registry);
+        CHECK(registry == found);
+
+        // And the registration the rollback makes again is the one the found values describe.
+        auto const restored = MsiFormattedCommand(text, "FastCacheNodeRestoreRegistration", failed);
+        INFO(restored);
+        REQUIRE_FALSE(restored.contains('['));
+        auto const arguments = SplitArguments(restored);
+        REQUIRE(arguments.size() > 1);
+        auto const parsed = ParsedFirstStart(std::span { arguments }.subspan(1));
+        REQUIRE(parsed.has_value());
+        auto const& cfg = Testing::Unwrap(parsed);
+        CHECK(cfg.installService);
+        CHECK(cfg.firewallAllow == std::vector<std::string> { "10.0.0.0/8" });
+        CHECK(cfg.advertise == "worker-01.internal:6674");
+        CHECK(cfg.fleetSeeds == std::vector<std::string> { "office-a.vpn.example:6674" });
+        CHECK(PinTextOf(cfg) == FirstPin);
+    }
+    {
+        INFO("a first install fails after remembering: nothing is left remembered");
+        auto registry = MsiRegistry {};
+        auto const failed = MsiTransact(rows, { { "FASTCACHE_FLEET_ID", std::string { FirstPin } } }, registry);
+        REQUIRE_FALSE(registry.empty());
+        rollBack(failed, registry);
+        CHECK(registry.empty());
+    }
+}

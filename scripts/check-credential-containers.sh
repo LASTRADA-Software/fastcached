@@ -197,14 +197,32 @@ SourceFiles() {
 # This tree's style puts a `*` on continuation lines, so the residue is narrow, and a prose
 # line has to look like a DECLARATION to produce a finding at all. Stated because a reader
 # who takes "comments are stripped" literally will over-trust it.
-CodeLines() {
-    awk '!/^[[:space:]]*(\/\/|\/\*|\*)/ { print NR ":" $0 }' "$1" 2>/dev/null
+#
+# And the identifiers are matched in the SAME awk, one process per file: each code line that
+# names an identifier as a whole word comes out as `<identifier index>:<line>:<text>`, grouped
+# by identifier in table order and in line order within one -- the order the per-identifier
+# `grep` this replaced produced them in. That grep was one fork and one spawn per (file,
+# identifier), 13 identifiers over every candidate file; with the per-(mention, type) grep
+# below, it took this check from 16 s on master to 79 s on one Git Bash host, and past the
+# ARM64 leg's TIMEOUT. POSIX awk has no `\b`, so a whole word is bounded by a non-word
+# character or the line's ends.
+# $1: the file. $2: the identifiers, one per line.
+MentionLines() {
+    awk -v ids="$2" '
+        BEGIN { n = split(ids, id, "\n") }
+        /^[[:space:]]*(\/\/|\/\*|\*)/ { next }
+        {
+            for (i = 1; i <= n; i++)
+                if (id[i] != "" && $0 ~ ("(^|[^[:alnum:]_])" id[i] "([^[:alnum:]_]|$)"))
+                    hits[i] = hits[i] (i - 1) ":" NR ":" $0 "\n"
+        }
+        END { for (i = 1; i <= n; i++) printf "%s", hits[i] }' "$1" 2>/dev/null
 }
 
 # $1: root. Prints "file:line:text" for every offending declaration; sets Matched counts.
 #
 # FILES OUTER, IDENTIFIERS INNER, and a candidate pass in front of both -- the cost fix
-# rather than a tidy-up (#1331). `CodeLines` is a property of the FILE alone, so running
+# rather than a tidy-up (#1331). `MentionLines` is a property of the FILE alone, so running
 # it inside the identifier loop re-derived the same stripped text once per identifier,
 # four times per file here and a fifth the day somebody adds a row.
 #
@@ -229,18 +247,20 @@ CodeLines() {
 ScanRoot() {
     local root="$1"
     local files identifier reason ownedType findings totalMatches file hits
-    local line text code index
+    local line text index declaration
 
     files=$(SourceFiles "$root")
     [ -n "$files" ] || Refuse "no source files under $root -- an empty population agrees with every rule"
 
     # The vocabulary, read once. `identCounts` is what the refusal below reads.
-    local identNames=() identReasons=() identCounts=() alternation=""
+    local identNames=() identReasons=() identCounts=() alternation="" identList=""
     while IFS='|' read -r identifier reason; do
         [ -n "$identifier" ] || continue
         identNames+=("$identifier")
         identReasons+=("$reason")
         identCounts+=(0)
+        identList="${identList}${identifier}
+"
         # Built with shell string ops rather than a `$( )`, because a subshell FORK
         # is the cost this whole function is now organised around: measured under
         # Git Bash, `x=$(true)` is 12.97 ms against 21.2 ms for an entire `grep`,
@@ -260,7 +280,7 @@ ScanRoot() {
     # count and can produce no finding, so excluding it changes no number this
     # function reports. It is a SUPERSET filter -- comments are not stripped here,
     # so a file mentioning an identifier only in a comment still gets opened and
-    # still contributes zero once `CodeLines` has stripped it. The anchoring is the
+    # still contributes zero once `MentionLines` has stripped it. The anchoring is the
     # same `\b` as below, so it cannot reach `clusterKeyFile` either.
     #
     # `find -exec ... {} +` rather than passing the file list as arguments: 765
@@ -279,24 +299,16 @@ ScanRoot() {
     while IFS= read -r file; do
         [ -n "$file" ] || continue
 
-        # ONCE per file, for every identifier that follows.
-        code=$(CodeLines "$file")
-        [ -n "$code" ] || continue
-
-        index=0
-        while [ "$index" -lt "${#identNames[@]}" ]; do
-            identifier="${identNames[$index]}"
-
-            # Every code line mentioning this identifier as a whole word. The matcher is
-            # unchanged: `\b`-anchored, so a row cannot reach `clusterKeyFile`.
-            hits=$(grep -E "\\b${identifier}\\b" <<< "$code" 2>/dev/null)
-            if [ -z "$hits" ]; then
-                index=$((index + 1))
-                continue
-            fi
+        # ONCE per file, for every identifier: each code line naming one as a whole word,
+        # bounded so a row cannot reach `clusterKeyFile`.
+        hits=$(MentionLines "$file" "$identList")
+        [ -n "$hits" ] || continue
 
             while IFS= read -r hit; do
                 [ -n "$hit" ] || continue
+                index="${hit%%:*}"
+                hit="${hit#*:}"
+                identifier="${identNames[$index]}"
                 identCounts[$index]=$(( ${identCounts[$index]} + 1 ))
                 totalMatches=$((totalMatches + 1))
                 line="${hit%%:*}"
@@ -313,18 +325,22 @@ ScanRoot() {
                 # matched inside `std::string_view` on the next one, because a substring
                 # search has no idea where a token ends. Both are the same mistake: a
                 # pattern is broader than its author reads it as.
+                #
+                # Matched with the shell's own `=~`, never a `grep` per (mention, type): that
+                # was one process per pair, and at 560 mentions and 5 types it was most of this
+                # check's cost -- 79 s against master's 16 s on one Git Bash host, past the
+                # ctest TIMEOUT on the ARM64 leg. POSIX ERE has no `\b`, so the identifier's
+                # end is spelled as a non-word character or the end of the line.
                 while IFS= read -r ownedType; do
                     [ -n "$ownedType" ] || continue
                     # <type> [const] [&|*] <identifier>, and nothing else between.
-                    if grep -qE "${ownedType}[[:space:]]+(const[[:space:]]*)?[&*]*[[:space:]]*${identifier}\\b" <<< "$text"; then
+                    declaration="${ownedType}[[:space:]]+(const[[:space:]]*)?[&*]*[[:space:]]*${identifier}([^[:alnum:]_]|\$)"
+                    if [[ "$text" =~ $declaration ]]; then
                         findings="${findings}${file}:${line}: ${identifier} declared as ${ownedType}
 "
                     fi
                 done <<< "$OwningTypes"
             done <<< "$hits"
-
-            index=$((index + 1))
-        done
     done <<< "$candidates"
 
     # The per-identifier verdict, unchanged in meaning and now asked after the walk

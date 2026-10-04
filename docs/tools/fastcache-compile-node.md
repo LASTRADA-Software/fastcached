@@ -2815,7 +2815,7 @@ alone; more than one goes under `fleet_seed:` in the configuration file.
 fleet, registered VERBATIM as `--fleet-id` and replayed at every start, so the node joins that fleet
 and no other. A pin is security material: one the node cannot parse fails the WHOLE transaction
 before anything is remembered or registered -- the MSI runs `--check-arguments` over the node's
-arguments first, and the check is `Return="check"` where the registration is not -- so a repair or
+arguments as its first step -- so a repair or
 upgrade keeps the registration and the remembered pin it had, rather than starting a node that
 trusts on first use. A malformed seed or advertised endpoint fails it the same way.
 `FASTCACHE_DISCOVERY_REPLY_PORT` defaults to `6682` and is passed as

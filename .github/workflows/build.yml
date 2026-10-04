@@ -3520,6 +3520,13 @@ jobs:
             -Notice @{ 3010 = "a restart is pending, so a file 0.3.0 held may be replaced only at the next boot and the services asserted below may still be running 0.3.0's binaries" } `
             -What "the upgrade from $release"
           Assert-InstalledProduct $family $productOf[$first]
+          # Each way the node could keep 0.3.0's registration, which it refuses at every start
+          # (--scheduler): 0.3.0's own uninstall-service ran FIRST (RemoveExistingProducts is
+          # scheduled afterInstallInitialize), this product's registration and its start ran AFTER
+          # it -- both checked, so either failing fails the transaction above rather than this --
+          # and what is registered now carries no --scheduler.
+          Assert-MsiActionOrder -Path 'upgrade.log' -Actions 'FastCacheNodeUninstallService', 'FastCacheNodeInstallService', 'FastCacheNodeStartService'
+          Assert-NodeRegistrationLacks '--scheduler'
           Assert-ServiceTable -Row NodeSelected -Log 'upgrade.log'
 
           # The upgrade re-applied an OLD, exposed 0.3.0 state directory: assert it is now

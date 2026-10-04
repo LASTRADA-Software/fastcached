@@ -21,13 +21,15 @@
 #      with "1". Those properties are written 0 and then 1, so a bare truth test
 #      reads "0" as true.
 #
-# The After= rows also pin that the remembered values are written BEFORE either
-# registration: a write that fails then rolls the transaction back before a service
-# is registered, where after them it left the services registered, and started,
-# over files the rollback removed. And that the node's arguments are CHECKED before
-# any of them (FastCacheNodeCheckArguments, Return="check"): the registration is
-# Return="ignore", so a fleet pin its parser refused left the old registration
-# running and the refused pin remembered (batch 3 review, B3-1).
+# The After= rows also pin the node's ONE sequence: validate, register, remember,
+# start. The node's arguments are CHECKED first (FastCacheNodeCheckArguments,
+# Return="check"), so a fleet pin its parser refuses fails the transaction with
+# nothing registered or remembered (batch 3 review, B3-1); the registration and the
+# waiting start are Return="check" (ci-fix2); and every step a later failure would
+# orphan has its ROLLBACK twin scheduled just before it -- a registration this
+# transaction created is removed, one it re-applied is registered again from what
+# was remembered, and each remembered value is written back or deleted as it was
+# found -- so a failed step leaves nothing behind from the steps before it.
 #
 # What it does NOT see: whether Windows Installer evaluates a condition the way it
 # reads, and anything about sequencing beyond the After= values pinned below. The
@@ -86,6 +88,11 @@ set(_table [=[
 <CustomAction Id="FastCacheNodeInstallService"|/>|--service-start=auto [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedArgument] [FastCacheFleetIdArgument]"
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--discovery-reply-port=
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--scheduler
+<CustomAction Id="FastCacheNodeInstallService"|/>|Return="check"
+<CustomAction Id="FastCacheNodeStartService"|/>|Return="check"
+<CustomAction Id="FastCacheNodeStartService"|/>|find.exe "RUNNING" >nul || [System64Folder]net.exe start FastCacheCompileNode) && 
+<CustomAction Id="FastCacheNodeStartService"|/>|ping.exe -n 6 127.0.0.1 >nul && [System64Folder]sc.exe query FastCacheCompileNode | [System64Folder]find.exe "RUNNING""
+<CustomAction Id="FastCacheNodeStartService"|/>|!sc.exe" start
 <CustomAction Id="FastCachedInstallService"|/>|!DiscoveryReply
 <Property Id="FASTCACHE_DISCOVERY_REPLY_PORT"|/>|Value="6682"
 <CustomAction Id="FastCachedInstallService"|/>|--service-start=[FASTCACHED_START_MODE] [FastCacheFirewallAllowArgument]"
@@ -187,13 +194,67 @@ set(_table [=[
 <Custom Action="FastCacheRememberNodeAdvertise"|/>|!FASTCACHED_SELECTED
 <Custom Action="FastCacheRememberFleetSeed"|/>|Condition="FASTCACHE_NODE_SELECTED = "1""
 <Custom Action="FastCacheRememberFleetSeed"|/>|!FASTCACHED_SELECTED
-<Custom Action="FastCacheRememberFleetSeed"|/>|After="FastCacheRememberNodeAdvertise"
 <Custom Action="FastCacheRememberFleetId"|/>|Condition="FASTCACHE_NODE_SELECTED = "1""
 <Custom Action="FastCacheRememberFleetId"|/>|!FASTCACHED_SELECTED
-<Custom Action="FastCacheRememberFleetId"|/>|After="FastCacheRememberFleetSeed"
-<Custom Action="FastCacheRememberFirewallAllow"|/>|After="FastCacheNodeCheckArguments"
-<Custom Action="FastCacheRememberNodeAdvertise"|/>|After="FastCacheRememberFirewallAllow"
-<Custom Action="FastCachedInstallService"|/>|After="FastCacheRememberFleetId"
+<Property Id="FastCacheFirewallAllowBefore"|</Property>|Key="SOFTWARE\fastcached\Installer"
+<Property Id="FastCacheFirewallAllowBefore"|</Property>|Name="FirewallAllow"
+<CustomAction Id="FastCacheRestoreFirewallAllow"|/>|reg.exe" add HKLM\SOFTWARE\fastcached\Installer /v FirewallAllow /t REG_SZ /d "[FastCacheFirewallAllowBefore]" /f /reg:64"
+<CustomAction Id="FastCacheRestoreFirewallAllow"|/>|Execute="rollback"
+<CustomAction Id="FastCacheForgetFirewallAllow"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\Installer /v FirewallAllow /f /reg:64"
+<CustomAction Id="FastCacheForgetFirewallAllow"|/>|Execute="rollback"
+<Custom Action="FastCacheRestoreFirewallAllow"|/>|After="FastCacheNodeInstallService"
+<Custom Action="FastCacheRestoreFirewallAllow"|/>|Condition="(FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1") AND FastCacheFirewallAllowBefore"
+<Custom Action="FastCacheForgetFirewallAllow"|/>|After="FastCacheRestoreFirewallAllow"
+<Custom Action="FastCacheForgetFirewallAllow"|/>|Condition="(FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1") AND NOT FastCacheFirewallAllowBefore"
+<Custom Action="FastCacheRememberFirewallAllow"|/>|After="FastCacheForgetFirewallAllow"
+<Property Id="FastCacheNodeAdvertiseBefore"|</Property>|Key="SOFTWARE\fastcached\Installer"
+<Property Id="FastCacheNodeAdvertiseBefore"|</Property>|Name="NodeAdvertise"
+<CustomAction Id="FastCacheRestoreNodeAdvertise"|/>|reg.exe" add HKLM\SOFTWARE\fastcached\Installer /v NodeAdvertise /t REG_SZ /d "[FastCacheNodeAdvertiseBefore]" /f /reg:64"
+<CustomAction Id="FastCacheRestoreNodeAdvertise"|/>|Execute="rollback"
+<CustomAction Id="FastCacheForgetNodeAdvertise"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\Installer /v NodeAdvertise /f /reg:64"
+<CustomAction Id="FastCacheForgetNodeAdvertise"|/>|Execute="rollback"
+<Custom Action="FastCacheRestoreNodeAdvertise"|/>|After="FastCacheRememberFirewallAllow"
+<Custom Action="FastCacheRestoreNodeAdvertise"|/>|Condition="(FASTCACHE_NODE_SELECTED = "1") AND FastCacheNodeAdvertiseBefore"
+<Custom Action="FastCacheForgetNodeAdvertise"|/>|After="FastCacheRestoreNodeAdvertise"
+<Custom Action="FastCacheForgetNodeAdvertise"|/>|Condition="(FASTCACHE_NODE_SELECTED = "1") AND NOT FastCacheNodeAdvertiseBefore"
+<Custom Action="FastCacheRememberNodeAdvertise"|/>|After="FastCacheForgetNodeAdvertise"
+<Property Id="FastCacheFleetSeedBefore"|</Property>|Key="SOFTWARE\fastcached\Installer"
+<Property Id="FastCacheFleetSeedBefore"|</Property>|Name="FleetSeed"
+<CustomAction Id="FastCacheRestoreFleetSeed"|/>|reg.exe" add HKLM\SOFTWARE\fastcached\Installer /v FleetSeed /t REG_SZ /d "[FastCacheFleetSeedBefore]" /f /reg:64"
+<CustomAction Id="FastCacheRestoreFleetSeed"|/>|Execute="rollback"
+<CustomAction Id="FastCacheForgetFleetSeed"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\Installer /v FleetSeed /f /reg:64"
+<CustomAction Id="FastCacheForgetFleetSeed"|/>|Execute="rollback"
+<Custom Action="FastCacheRestoreFleetSeed"|/>|After="FastCacheRememberNodeAdvertise"
+<Custom Action="FastCacheRestoreFleetSeed"|/>|Condition="(FASTCACHE_NODE_SELECTED = "1") AND FastCacheFleetSeedBefore"
+<Custom Action="FastCacheForgetFleetSeed"|/>|After="FastCacheRestoreFleetSeed"
+<Custom Action="FastCacheForgetFleetSeed"|/>|Condition="(FASTCACHE_NODE_SELECTED = "1") AND NOT FastCacheFleetSeedBefore"
+<Custom Action="FastCacheRememberFleetSeed"|/>|After="FastCacheForgetFleetSeed"
+<Property Id="FastCacheFleetIdBefore"|</Property>|Key="SOFTWARE\fastcached\Installer"
+<Property Id="FastCacheFleetIdBefore"|</Property>|Name="FleetId"
+<CustomAction Id="FastCacheRestoreFleetId"|/>|reg.exe" add HKLM\SOFTWARE\fastcached\Installer /v FleetId /t REG_SZ /d "[FastCacheFleetIdBefore]" /f /reg:64"
+<CustomAction Id="FastCacheRestoreFleetId"|/>|Execute="rollback"
+<CustomAction Id="FastCacheForgetFleetId"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\Installer /v FleetId /f /reg:64"
+<CustomAction Id="FastCacheForgetFleetId"|/>|Execute="rollback"
+<Custom Action="FastCacheRestoreFleetId"|/>|After="FastCacheRememberFleetSeed"
+<Custom Action="FastCacheRestoreFleetId"|/>|Condition="(FASTCACHE_NODE_SELECTED = "1") AND FastCacheFleetIdBefore"
+<Custom Action="FastCacheForgetFleetId"|/>|After="FastCacheRestoreFleetId"
+<Custom Action="FastCacheForgetFleetId"|/>|Condition="(FASTCACHE_NODE_SELECTED = "1") AND NOT FastCacheFleetIdBefore"
+<Custom Action="FastCacheRememberFleetId"|/>|After="FastCacheForgetFleetId"
+<CustomAction Id="FastCachedUndoRegistration"|/>|fastcached.exe" --uninstall-service"
+<CustomAction Id="FastCachedUndoRegistration"|/>|Execute="rollback"
+<Custom Action="FastCachedUndoRegistration"|/>|After="FastCacheNodeCheckArguments"
+<Custom Action="FastCachedUndoRegistration"|/>|Condition="FASTCACHED_SELECTED = "1" AND NOT FASTCACHED_IMAGEPATH"
+<Custom Action="FastCachedInstallService"|/>|After="FastCachedUndoRegistration"
+<CustomAction Id="FastCacheNodeUndoRegistration"|/>|fastcache-compile-node.exe" --uninstall-service"
+<CustomAction Id="FastCacheNodeUndoRegistration"|/>|Execute="rollback"
+<Custom Action="FastCacheNodeUndoRegistration"|/>|After="FastCachedStartService"
+<Custom Action="FastCacheNodeUndoRegistration"|/>|Condition="FASTCACHE_NODE_SELECTED = "1" AND NOT FASTCACHE_NODE_IMAGEPATH"
+<CustomAction Id="FastCacheNodeRestoreRegistration"|/>|--install-service --service-start=auto [FastCacheNodeAdvertiseBeforeArgument] [FastCacheFirewallAllowBeforeArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedBeforeArgument] [FastCacheFleetIdBeforeArgument]"
+<CustomAction Id="FastCacheNodeRestoreRegistration"|/>|Execute="rollback"
+<Custom Action="FastCacheNodeRestoreRegistration"|/>|After="FastCacheNodeUndoRegistration"
+<Custom Action="FastCacheNodeRestoreRegistration"|/>|Condition="FASTCACHE_NODE_SELECTED = "1" AND FASTCACHE_NODE_IMAGEPATH"
+<Custom Action="FastCacheNodeInstallService"|/>|After="FastCacheNodeRestoreRegistration"
+<Custom Action="FastCacheNodeStartService"|/>|After="FastCacheRememberFleetId"
 
 <SetProperty Action="SetFastCacheOwnImagePathPrefix"|/>|Value=""[INSTALL_ROOT]"
 <SetProperty Action="SetFastCacheOwnImagePathPrefix"|/>|After="CostFinalize"

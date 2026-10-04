@@ -677,15 +677,23 @@ readable and silently ignored. Every rule below has already been one of them.
   component only OWNS the key, since a feature change reinstalls no component). Four of them:
   `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE`, `FASTCACHE_FLEET_SEED` and `FASTCACHE_FLEET_ID`
   (passed VERBATIM, a pin being security material), each a row of `check-wix-service-table` and of the
-  remember case. **The writes run BEFORE either registration**: `Return="check"` exists to fail the
-  transaction loudly, and a failure AFTER the registrations rolled the files back under services it
-  had already registered and started. **And the node's arguments are CHECKED before the writes**
-  (`FastCacheNodeCheckArguments`, the node's own `--check-arguments` over the registration's own
-  argument list, `Return="check"`), because the registration is `Return="ignore"`: a pin its parse
-  refused left the OLD registration to be started and the refused pin remembered, replayed by every
-  later transaction and clearable by no empty property (batch 3 review, B3-1). The node's three
-  properties are remembered only by a transaction that keeps the node, so nothing the check did not
-  see is ever written; the `[msi]` refusal case and the MSI job's refused repair assert both halves. Not remembering them failed OPEN: a repair that left out
+  remember case. **The node's sequence is ONE: validate, register, remember, start**, every step
+  `Return="check"`. Validate is `FastCacheNodeCheckArguments`, the node's own `--check-arguments`
+  over the registration's own argument list: a pin its parse refuses fails the transaction with
+  nothing registered or remembered (batch 3 review, B3-1; before it the registration was
+  `Return="ignore"`, so the OLD registration was started and the refused pin remembered, replayed by
+  every later transaction and clearable by no empty property). The registration and the waiting
+  start, with its RUNNING recheck, are checked so an upgrade cannot succeed over a node that will
+  not start (ci-fix2). **And a failed step leaves nothing behind from the steps before it**, because
+  Windows Installer undoes no custom action: each registration and each remember write has a
+  ROLLBACK twin scheduled just before it -- a registration the transaction created is removed, one
+  it re-applied is registered again from the values it found remembered (`FastCache*Before`, read by
+  searches of their own, since AppSearch leaves a stated property alone where it finds nothing), and
+  each value is written back or deleted as found. Without the twins, remembering after registering
+  was R-B's defect: a failed write rolled the files back under services it had registered. The node's
+  three properties are remembered only by a transaction that keeps the node, so nothing the check
+  did not see is ever written; the `[msi]` refusal and rollback cases and the MSI job's refused
+  repair assert it. Not remembering them failed OPEN: a repair that left out
   `FASTCACHE_FIREWALL_ALLOW` opened the rules to any address. The `[msi]` remember case runs the
   fragment's own rows across install, repair, upgrade and repair. `FASTCACHE_NODE_ADVERTISE` is OPTIONAL and reaches
   the command line only through the derived `FastCacheNodeAdvertiseArgument`, so an absent one is

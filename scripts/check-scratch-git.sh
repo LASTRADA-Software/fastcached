@@ -423,38 +423,56 @@ if [ "${1:-}" = "--self-test" ]; then
     # alone (what git exports to a pre-commit hook), and asserts that victim's configuration and
     # index untouched AND the nested run green. The nested run skips this section, or it would
     # never end.
+    #
+    # The two nested runs go IN PARALLEL, each against a victim of its own so neither can be
+    # blamed for the other's write: run one after the other they were two of this self-test's
+    # three passes, and the whole took longer than its TIMEOUT on the ARM64 leg. Each is started
+    # as `env ... bash`, a process from the first instruction, so no subshell of this one exists
+    # to inherit its EXIT trap -- which is the scratch tree's removal.
     if [ -z "${FASTCACHED_SCRATCH_GIT_SELFTEST_NESTED:-}" ]; then
-        victim2="$scratch/victim2"
-        mkdir -p "$victim2"
-        scratch_git init -q "$victim2"
-        victim2Config="$(cat "$victim2/.git/config")"
+        # @param 1 what is exported, as NAME  @param 2 the victim  @param 3 the value, under it
+        # Sets `nestedPid`, in THIS shell: a pid printed through `$( )` would name a child of
+        # that subshell, which this shell cannot `wait` for.
+        StartNested() {
+            local name="$1" victim="$2" value="$3"
+            mkdir -p "$victim"
+            scratch_git init -q "$victim"
+            cat "$victim/.git/config" > "$victim.config-before"
+            env "${name}=${victim}/${value}" FASTCACHED_SCRATCH_GIT_SELFTEST_NESTED=1 \
+                bash "$me" --self-test --cmake "$SelfTestCmake" --git "$SelfTestGit" > "$victim.out" 2>&1 &
+            nestedPid="$!"
+        }
 
-        # @param 1 what is exported, as NAME  @param 2 its value
+        # @param 1 what was exported, as NAME  @param 2 the victim  @param 3 the run's pid
         NestedUntouched() {
-            local name="$1" value="$2" nestedOut nestedStatus=0 now
+            local name="$1" victim2="$2" pid="$3" nestedOut nestedStatus=0 now victim2Config
             selfTestCases=$((selfTestCases + 1))
-            nestedOut="$( export "${name}=${value}" FASTCACHED_SCRATCH_GIT_SELFTEST_NESTED=1
-                          bash "$me" --self-test --cmake "$SelfTestCmake" --git "$SelfTestGit" 2>&1 )" \
-                || nestedStatus=$?
+            wait "$pid" || nestedStatus=$?
+            nestedOut="$(cat "$victim2.out")"
+            victim2Config="$(cat "$victim2.config-before")"
             now="$(cat "$victim2/.git/config")"
             if [ "$now" != "$victim2Config" ]; then
-                Miss "this self-test under an exported ${name} WROTE the second victim's configuration" "$(diff <(printf '%s\n' "$victim2Config") <(printf '%s\n' "$now"))"
+                Miss "this self-test under an exported ${name} WROTE its victim's configuration" "$(diff <(printf '%s\n' "$victim2Config") <(printf '%s\n' "$now"))"
                 printf '%s\n' "$victim2Config" > "$victim2/.git/config"
             elif [ -e "$victim2/.git/index" ]; then
-                Miss "this self-test under an exported ${name} STAGED into the second victim, whose index must stay absent"
+                Miss "this self-test under an exported ${name} STAGED into its victim, whose index must stay absent"
             elif ! grep -Fq 'check-scratch-git --self-test: ' <<< "$nestedOut" \
                 || ! grep -Fq 'case(s) ran' <<< "$nestedOut"; then
                 Miss "this self-test under an exported ${name} did not run to its count line, so the victim being untouched says nothing" "$nestedOut"
             elif [ "$nestedStatus" -ne 0 ]; then
-                Miss "this self-test under an exported ${name} left the second victim untouched but did not pass (exit ${nestedStatus})" "$nestedOut"
+                Miss "this self-test under an exported ${name} left its victim untouched but did not pass (exit ${nestedStatus})" "$nestedOut"
             else
-                Pass "this self-test under an exported ${name} passed and left the second victim's configuration unchanged and its index absent"
+                Pass "this self-test under an exported ${name} passed and left its victim's configuration unchanged and its index absent"
             fi
             rm -f "$victim2/.git/index"
         }
 
-        NestedUntouched GIT_DIR "$victim2/.git"
-        NestedUntouched GIT_INDEX_FILE "$victim2/.git/index"
+        StartNested GIT_DIR "$scratch/victim2" .git
+        gitDirPid="$nestedPid"
+        StartNested GIT_INDEX_FILE "$scratch/victim3" .git/index
+        indexFilePid="$nestedPid"
+        NestedUntouched GIT_DIR "$scratch/victim2" "$gitDirPid"
+        NestedUntouched GIT_INDEX_FILE "$scratch/victim3" "$indexFilePid"
     fi
 
     echo "check-scratch-git --self-test: ${selfTestCases} case(s) ran"

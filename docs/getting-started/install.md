@@ -103,7 +103,10 @@ the log names the action `FastCacheNodeCheckArguments`; `fastcache-compile-node 
 the node's arguments before anything is remembered or registered, so a refused pin is never
 remembered, and a repair or upgrade leaves the existing registration and its remembered pin as they
 were rather than starting a node that trusts whichever fleet proves itself first. A malformed
-`FASTCACHE_FLEET_SEED` or `FASTCACHE_NODE_ADVERTISE` fails it the same way. The package also
+`FASTCACHE_FLEET_SEED` or `FASTCACHE_NODE_ADVERTISE` fails it the same way. So does a node registration
+that cannot be made, or a node that is not running five seconds after its start: the node is
+checked, registered, remembered and started in that order, each step failing the transaction, and a
+transaction that fails puts back the registration and the remembered values it found. The package also
 pins the node's discovery reply port, `FASTCACHE_DISCOVERY_REPLY_PORT=6682` unless you pass another
 (or pass it empty), so its firewall opens UDP 6682 rather than every local UDP port. A node run by
 hand leaves that port to the kernel, because two nodes on one machine each need one of their own;

@@ -1993,20 +1993,35 @@ constexpr std::chrono::seconds TierStopBound { 15 };
     return done.wait_for(TierStopBound) == std::future_status::ready;
 }
 
+/// How many of a stuck tier's last log records `StopTierOrExit` prints: enough for the stop's own
+/// phase lines and both drains' ceilings, few enough to read.
+constexpr std::size_t StuckTierRecordsShown = 40;
+
 /// `StopTierWithin` for a fixture's teardown, which has nothing to keep alive past itself and no case
 /// to fail: a tier that does not stop ENDS THE PROCESS saying which, rather than hanging it -- a
 /// suite timeout names nothing, and nothing after a stuck teardown could run anyway.
+///
+/// And it prints what the tier last SAID, because the one time this fired (cl-debug, the
+/// restarted-follower case) it said nothing else: the stop's phase lines and the drains' ceilings
+/// are where the tier names which part did not end, and a `NullLogger` threw them away.
 /// @param tier The tier; may be null.
 /// @param who Whose it is, for the line that names it.
-void StopTierOrExit(std::unique_ptr<ConsensusTier> tier, std::string_view who)
+/// @param said The tier's own logger, or null when nothing was kept.
+void StopTierOrExit(std::unique_ptr<ConsensusTier> tier, std::string_view who, CapturingLogger const* said)
 {
     if (StopTierWithin(std::move(tier), nullptr))
         return;
-    std::fputs(std::format("the consensus tier of {} did not stop within {}; ending the process rather than hanging it\n",
-                           who,
-                           TierStopBound)
-                   .c_str(),
-               stderr);
+    auto text = std::format(
+        "the consensus tier of {} did not stop within {}; ending the process rather than hanging it\n", who, TierStopBound);
+    if (said != nullptr)
+    {
+        auto const records = said->Snapshot();
+        auto const shown = std::min(records.size(), StuckTierRecordsShown);
+        text += std::format("its last {} of {} log record(s):\n", shown, records.size());
+        for (auto const& record: std::span { records }.last(shown))
+            text += std::format("  [{}] {}\n", static_cast<int>(record.level), record.message);
+    }
+    std::fputs(text.c_str(), stderr);
     std::_Exit(EXIT_FAILURE);
 }
 
@@ -2253,19 +2268,20 @@ struct TwoTierFleet
     /// Stops the joiner's tier, then the founder's, each within `TierStopBound` (`StopTierOrExit`).
     ~TwoTierFleet()
     {
-        StopTierOrExit(std::move(joinerTier), "n2");
-        StopTierOrExit(std::move(founderTier), "n1");
+        StopTierOrExit(std::move(joinerTier), "n2", &joinerLogger);
+        StopTierOrExit(std::move(founderTier), "n1", &founderLogger);
     }
 
     Testing::ScratchDirectory founderDirectory { "consensus-two-tier-founder" }; ///< `n1`'s state directory lives here.
     Testing::ScratchDirectory joinerDirectory { "consensus-two-tier-joiner" };   ///< `n2`'s.
-    NullLogger logger;                                                           ///< Where both tiers say what they do.
-    AtomicMetricsSink founderMetrics;                                            ///< What `n1` counts.
-    AtomicMetricsSink joinerMetrics;                                             ///< What `n2` counts.
-    NodeConfig founder;                                                          ///< `n1`'s configuration.
-    NodeConfig joiner;                                                           ///< `n2`'s, its formation applied.
-    std::unique_ptr<ConsensusTier> founderTier;                                  ///< `n1`, leading.
-    std::unique_ptr<ConsensusTier> joinerTier;                                   ///< `n2`, joined.
+    CapturingLogger founderLogger { LogLevel::Debug }; ///< What `n1` says, printed should it not stop.
+    CapturingLogger joinerLogger { LogLevel::Debug };  ///< What `n2` says, the same way.
+    AtomicMetricsSink founderMetrics;                  ///< What `n1` counts.
+    AtomicMetricsSink joinerMetrics;                   ///< What `n2` counts.
+    NodeConfig founder;                                ///< `n1`'s configuration.
+    NodeConfig joiner;                                 ///< `n2`'s, its formation applied.
+    std::unique_ptr<ConsensusTier> founderTier;        ///< `n1`, leading.
+    std::unique_ptr<ConsensusTier> joinerTier;         ///< `n2`, joined.
 };
 
 /// Start `n1` as a founder, and return once it leads its cluster of one: the half of a two-tier
@@ -2279,7 +2295,7 @@ void StartTwoTierFounder(TwoTierFleet& fleet)
     fleet.founder.raftListen = std::format("127.0.0.1:{}", UnansweredPort());
     fleet.founder.raftSelf = "127.0.0.1";
     fleet.founder.clusterDir = fleet.founderDirectory / "state";
-    auto founded = StartTier(fleet.founder, fleet.founderMetrics, fleet.logger);
+    auto founded = StartTier(fleet.founder, fleet.founderMetrics, fleet.founderLogger);
     INFO("the founder's start refused: " << RefusalOf(founded));
     REQUIRE(founded.has_value());
     fleet.founderTier = std::move(*founded);
@@ -2322,7 +2338,7 @@ void StartTwoTierFleet(TwoTierFleet& fleet, Cluster::MemberSeat seat, FormationH
     auto formation = Testing::Unwrap(fleet.joiner.formation);
     formation.clusterId = fleet.founder.clusterId;
     fleet.joiner.formation = std::move(formation);
-    auto joined = StartTier(fleet.joiner, fleet.joinerMetrics, fleet.logger, std::move(joinerHooks));
+    auto joined = StartTier(fleet.joiner, fleet.joinerMetrics, fleet.joinerLogger, std::move(joinerHooks));
     INFO("the joiner's start refused: " << RefusalOf(joined));
     REQUIRE(joined.has_value());
     fleet.joinerTier = std::move(*joined);
@@ -2414,7 +2430,7 @@ TEST_CASE("A restarted follower is behind until its leader speaks, then caught u
     REQUIRE(StopTierWithin(std::move(fleet.founderTier), nullptr));
     REQUIRE(StopTierWithin(std::move(fleet.joinerTier), nullptr));
 
-    auto restarted = StartTier(fleet.joiner, fleet.joinerMetrics, fleet.logger);
+    auto restarted = StartTier(fleet.joiner, fleet.joinerMetrics, fleet.joinerLogger);
     INFO("the follower's restart refused: " << RefusalOf(restarted));
     REQUIRE(restarted.has_value());
     fleet.joinerTier = std::move(*restarted);
@@ -2426,7 +2442,7 @@ TEST_CASE("A restarted follower is behind until its leader speaks, then caught u
     CHECK(joiner->CurrentAppliedState() == AppliedStateReading::Behind);
     CHECK_FALSE(joiner->Status().knownLeader.has_value());
 
-    auto founder = StartTier(fleet.founder, fleet.founderMetrics, fleet.logger);
+    auto founder = StartTier(fleet.founder, fleet.founderMetrics, fleet.founderLogger);
     INFO("the founder's restart refused: " << RefusalOf(founder));
     REQUIRE(founder.has_value());
     fleet.founderTier = std::move(*founder);
@@ -2662,7 +2678,7 @@ TEST_CASE("A learner enrolled through its leader's own route is recorded under t
     auto const applied = ApplyFormation(fleet.joiner, record, Cluster::FleetEndpoints {});
     INFO("the formation was refused: " << (applied.has_value() ? std::string {} : applied.error()));
     REQUIRE(applied.has_value());
-    auto joined = StartTier(fleet.joiner, fleet.joinerMetrics, fleet.logger);
+    auto joined = StartTier(fleet.joiner, fleet.joinerMetrics, fleet.joinerLogger);
     INFO("the joiner's start refused: " << RefusalOf(joined));
     REQUIRE(joined.has_value());
     fleet.joinerTier = std::move(*joined);

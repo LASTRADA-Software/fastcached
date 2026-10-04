@@ -1862,8 +1862,8 @@ ServiceControlResult ScmInstall(ServiceSpec const& spec, IScmCalls& calls, IDrai
     // A `Private` path is the opposite case, and it REFUSES: it holds the credential
     // the service mints at its first start, so a registration left in place is a
     // service that writes that credential where every local account can read it --
-    // and the MSI starts the node straight after this, whatever this returned
-    // (`FastCacheNodeStartService`, `Return="ignore"`). So a registration THIS call
+    // and any supervisor may start it -- the MSI's `FastCacheNodeStartService` runs
+    // straight after this, and only the MSI's own check stops it. So a registration THIS call
     // created is deleted again, and one it merely re-applied is left, as it found it,
     // with the message saying which.
     auto handover = CallsOwnedPathHandover { calls, logonName };

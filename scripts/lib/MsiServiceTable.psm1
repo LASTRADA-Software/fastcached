@@ -230,7 +230,61 @@ function Assert-ServiceTable {
         Assert-ServiceState -Expect $script:ServiceTable[$Row] -TimeoutSeconds $TimeoutSeconds -StableSeconds $StableSeconds
     } catch {
         if ($Log) { Show-MsiLog $Log }
+        foreach ($name in $script:ServiceTable[$Row].Keys) {
+            if ($null -ne $script:ServiceTable[$Row][$name]) { Show-ServiceDiagnosis $name }
+        }
         throw
+    }
+}
+
+# A registered command line as the arguments a process receives: a token is a run of
+# unquoted characters and quoted sections, with the quotes dropped -- not `"..."|\S+`,
+# whose alternation splits `--cache-dir="C:\dir with space"` into three.
+#
+# @param PathName The service's registered command line.
+# @return The program, then each argument. A single token comes back as a scalar, as
+#         PowerShell returns any one-element array, so a caller wraps the call in `@( )`.
+function Split-RegisteredCommandLine([string] $PathName) {
+    return @([regex]::Matches($PathName, '(?:[^\s"]|"[^"]*")+') | ForEach-Object { $_.Value -replace '"', '' })
+}
+
+# Everything a CI runner can say about why a service is not in the state its row
+# expects -- the run's only witness, since nothing on the runner survives the job.
+#
+# The registration and the exit code the SCM recorded (the node exits 78 on a startup
+# refusal); the service's own Application events, where `--daemon` logs; the SCM's System
+# events naming it; and the registered command line run in the FOREGROUND for 15 s without
+# `--daemon`, so a refusal arrives as its text. That last run is this account, not the
+# service's, so a cause that is the account's own -- a state file it cannot read -- shows
+# only in the events. Never throws: it runs on the way to a throw that matters more.
+#
+# @param Name The service name.
+function Show-ServiceDiagnosis([string] $Name) {
+    Write-Host "===== $Name (diagnosis) ====="
+    try {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'"
+        if (-not $svc) { Write-Host 'not registered'; return }
+        Write-Host "registered: $($svc.PathName)"
+        Write-Host "account $($svc.StartName); $($svc.StartMode), $($svc.State); exit code $($svc.ExitCode), service-specific $($svc.ServiceSpecificExitCode)"
+
+        Write-Host "--- Application events from $Name (last 10 min) ---"
+        Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = $Name; StartTime = (Get-Date).AddMinutes(-10) } `
+            -ErrorAction SilentlyContinue | Select-Object -First 20 | ForEach-Object { "$($_.TimeCreated) [$($_.LevelDisplayName)] $($_.Message)" }
+        Write-Host "--- System events naming $Name (last 10 min) ---"
+        Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = (Get-Date).AddMinutes(-10) } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match [regex]::Escape($Name) } | Select-Object -First 10 |
+            ForEach-Object { "$($_.TimeCreated) [$($_.Id)] $($_.Message)" }
+
+        if ($svc.State -eq 'Running') { return }
+        $argv = @(Split-RegisteredCommandLine $svc.PathName)
+        $out = Join-Path ([IO.Path]::GetTempPath()) "$Name-foreground.log"
+        $proc = Start-Process -FilePath $argv[0] -ArgumentList @($argv | Select-Object -Skip 1 | Where-Object { $_ -ne '--daemon' }) `
+            -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+        if ($proc.WaitForExit(15000)) { Write-Host "--- the registered command line in the foreground exited $($proc.ExitCode) ---" }
+        else { $proc.Kill(); Write-Host '--- the registered command line in the foreground was still running after 15 s, so it started ---' }
+        Get-Content $out, "$out.err" -ErrorAction SilentlyContinue | Select-Object -Last 40
+    } catch {
+        Write-Host "the diagnosis itself failed: $_"
     }
 }
 
@@ -434,6 +488,27 @@ function Assert-NodeRegistrationArgument([string] $Argument) {
     if ($verdict = Get-NodeRegistrationArgumentVerdict $svc.PathName $Argument) { throw $verdict }
 }
 
+# Does the node service's command line carry NO token for @p Prefix? The other direction of
+# the verdict above, for a flag an earlier package registered and this node refuses at every
+# start: a registration still carrying it was never replaced.
+# @param ImagePath The registration's command line.
+# @param Prefix The flag, e.g. `--scheduler`: a token equal to it, or it followed by `=`.
+# @return $null when no token carries it, else the command line that does.
+function Get-NodeRegistrationAbsentVerdict([string] $ImagePath, [string] $Prefix) {
+    $tokens = @([regex]::Matches($ImagePath, '"[^"]*"|\S+') | ForEach-Object { $_.Value.Trim('"') })
+    $carried = @($tokens | Where-Object { $_ -ceq $Prefix -or $_.StartsWith("$Prefix=", [StringComparison]::Ordinal) })
+    if ($carried.Count -eq 0) { return $null }
+    return "the node's registration still carries $Prefix, so it is the one an earlier package made: $ImagePath"
+}
+
+# The node's REAL registration carries no @p Prefix token. Fails CLOSED on no registration.
+function Assert-NodeRegistrationLacks([string] $Prefix) {
+    $svc = Get-CimInstance Win32_Service -Filter "Name='FastCacheCompileNode'"
+    if (-not $svc) { throw "no FastCacheCompileNode service is registered, so nothing says it lacks $Prefix" }
+    if ($verdict = Get-NodeRegistrationAbsentVerdict $svc.PathName $Prefix) { throw $verdict }
+    Write-Host "FastCacheCompileNode carries no $Prefix`: $($svc.PathName)"
+}
+
 # Is @p OwnerSid the Administrators SID? The state directory's owner must be, so whoever
 # created it first keeps no WRITE_DAC. A pure verdict so the self-test can drive it without a
 # real directory, the way the service verdicts are.
@@ -529,6 +604,13 @@ function Assert-NodeStatePrivate {
 function Show-MsiLog([string] $Path) {
     Write-Host "===== $Path (relevant lines) ====="
     if (-not (Test-Path $Path)) { Write-Host "no log at $Path"; return }
+    # Every line naming one of this package's service actions, from the whole log: the tail
+    # below is the property dump of a transaction that ended, and an action that ran with
+    # Return="ignore" -- the node's registration among them -- leaves its failure only here.
+    Write-Host '--- the service actions ---'
+    Select-String -Path $Path -Pattern 'FastCache\w*(Service|ForNode|Leftover)\b' |
+        Where-Object { $_.Line -match 'Action (start|ended)|returned actual error|CustomAction' } | ForEach-Object { $_.Line }
+    Write-Host '--- the tail ---'
     Select-String -Path $Path -Pattern `
         'Action (start|ended)', 'CustomAction', 'ServiceControl', 'FastCache', 'returned actual error',
         'Note: 1: 1(4|7)[0-9][0-9]', 'Installation (success|failed)', 'error' |
@@ -563,6 +645,9 @@ function Invoke-Msiexec {
     $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList $arguments
     if ($p.ExitCode -notin $Accept) {
         Show-MsiLog $logPath
+        # A checked service action that failed rolled the transaction back, and the service's
+        # own events are where its refusal was written: they outlive the rollback.
+        foreach ($name in 'FastCacheCompileNode', 'FastCached') { Show-ServiceDiagnosis $name }
         throw "$What exited $($p.ExitCode); accepted: $($Accept -join ', ')"
     }
     Write-Host "$What exited $($p.ExitCode)"
@@ -597,6 +682,42 @@ function Assert-MsiLog {
             throw "$Path has $($hits.Count) line(s) matching '$pattern'"
         }
     }
+}
+
+# Whether @p Actions each RAN, in that order, in a verbose log: the first record of each, in
+# the order given. A pure verdict over the lines, so the self-test drives it without a
+# transaction. An upgrade's log holds the old product's session too, so an action both
+# products name is found at its FIRST run -- the old product's, which is the point when the
+# question is whether the old registration was gone before this product made its own.
+#
+# @param Lines The log's lines.
+# @param Actions The actions, in the order they must have run.
+# @return $null when each ran, in order; else which did not, or which ran out of order.
+function Get-MsiActionOrderVerdict([string[]] $Lines, [string[]] $Actions) {
+    $previous = -1
+    $previousAction = ''
+    foreach ($action in $Actions) {
+        $pattern = Get-MsiActionRanPattern $action
+        $at = -1
+        foreach ($index in 0..($Lines.Count - 1)) {
+            if ($Lines[$index] -match $pattern) { $at = $index; break }
+        }
+        if ($at -lt 0) { return "$action never ran" }
+        if ($at -le $previous) { return "$action ran (line $($at + 1)) before $previousAction (line $($previous + 1))" }
+        $previous = $at
+        $previousAction = $action
+    }
+    return $null
+}
+
+# @p Actions each ran, in that order, in the verbose log at @p Path. An unreadable log throws.
+function Assert-MsiActionOrder([string] $Path, [string[]] $Actions) {
+    $lines = @(Get-Content -Path $Path -ErrorAction Stop)
+    if ($verdict = Get-MsiActionOrderVerdict $lines $Actions) {
+        Show-MsiLog $Path
+        throw "${Path}: $verdict"
+    }
+    Write-Host "$Path ran $($Actions -join ', then ')"
 }
 
 # The pattern for a verbose log's record that an action RAN: its condition held.
@@ -856,7 +977,54 @@ function Invoke-MsiServiceTableSelfTest {
         if ($verdict = Get-NodeRegistrationArgumentVerdict 'x.exe --fleet-seed=a:66740' '--fleet-seed=a:6674') { throw $verdict }
     } 'does not carry'
 
-    $expectedCases = 53
+    # The diagnosis's command-line split: a quoted program path with spaces is one token, and so
+    # is a value quoted after its `=`; the quotes are dropped either way.
+    $split = @(Split-RegisteredCommandLine '"C:\Program Files\fastcached\bin\fastcache-compile-node.exe" --daemon --cache-dir="C:\dir with space" --x=1')
+    if (($split -join '|') -ne 'C:\Program Files\fastcached\bin\fastcache-compile-node.exe|--daemon|--cache-dir=C:\dir with space|--x=1') {
+        throw "split: got '$($split -join '|')'"
+    }
+    Pass 'split: a quoted program path and a quoted value are one token each'
+    $single = @(Split-RegisteredCommandLine 'node.exe')
+    if ($single.Count -ne 1 -or $single[0] -ne 'node.exe') { throw "split: a bare program gave '$($single -join '|')'" }
+    Pass 'split: a bare program is one token'
+
+    # The diagnosis never throws, so it cannot replace the failure it runs beside: a name no host
+    # registers is reported as such.
+    $said = Show-ServiceDiagnosis 'FastCacheSelfTestNoSuchService' 6>&1 | Out-String
+    if ($said -notmatch 'not registered') { throw "diagnosis: an unregistered service said '$said'" }
+    Pass 'diagnosis: an unregistered service is reported, not thrown'
+
+    # The order verdict, over a synthetic upgrade log: the old product's uninstall, then this
+    # product's registration and start, passes; each way it can go wrong is named.
+    $upgradeLog = @(
+        'MSI (s) (7C:40) [10:00:00:001]: Doing action: FastCacheNodeUninstallService',
+        'MSI (s) (7C:40) [10:00:00:002]: Doing action: FastCacheNodeInstallService',
+        'MSI (s) (7C:40) [10:00:00:003]: Doing action: FastCacheNodeStartService')
+    $order = 'FastCacheNodeUninstallService', 'FastCacheNodeInstallService', 'FastCacheNodeStartService'
+    if ($null -ne ($v = Get-MsiActionOrderVerdict $upgradeLog $order)) { throw "order: the sequence as it must run was refused: $v" }
+    Pass 'order: the old uninstall, then the registration, then the start, passes'
+    ExpectThrow 'order: the old uninstall AFTER the registration is refused' {
+        if ($v = Get-MsiActionOrderVerdict @($upgradeLog[1], $upgradeLog[0], $upgradeLog[2]) $order) { throw $v }
+    } 'FastCacheNodeInstallService ran \(line 1\) before FastCacheNodeUninstallService'
+    ExpectThrow 'order: a registration that never ran is named' {
+        if ($v = Get-MsiActionOrderVerdict @($upgradeLog[0], $upgradeLog[2]) $order) { throw $v }
+    } 'FastCacheNodeInstallService never ran'
+    ExpectThrow 'order: a skipped action is not a run' {
+        if ($v = Get-MsiActionOrderVerdict @($upgradeLog[0], $upgradeLog[1], 'Skipping action: FastCacheNodeStartService (condition is false)') $order) { throw $v }
+    } 'FastCacheNodeStartService never ran'
+
+    # The absence verdict: 0.3.0's registration is refused, the new one passes, and a flag that
+    # merely shares the prefix is not the flag.
+    $old030 = '"C:\Program Files\fastcached\bin\fastcache-compile-node.exe" --daemon --service-name=FastCacheCompileNode --scheduler=127.0.0.1:6675 --advertise=127.0.0.1:6674'
+    ExpectThrow 'absent: a registration still carrying --scheduler is refused' {
+        if ($v = Get-NodeRegistrationAbsentVerdict $old030 '--scheduler') { throw $v }
+    } 'still carries --scheduler'
+    if ($null -ne (Get-NodeRegistrationAbsentVerdict '"C:\Program Files\x.exe" --daemon --schedulers-seen=1 --node-id=a' '--scheduler')) {
+        throw 'absent: a different flag sharing the prefix was taken for it'
+    }
+    Pass 'absent: a registration without it passes, and a longer flag name is not it'
+
+    $expectedCases = 62
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -868,4 +1036,5 @@ Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert
     Get-MsiActionRanPattern, Get-ServiceStabilityVerdict, Get-UpgradeVersionVerdict, Remove-FastCacheMachineState,
     Assert-NodeStatePrivate, Get-DirectoryOwnerVerdict, Get-NodeFirewallVerdict, Assert-NodeFirewall,
     Get-NodeFirewallScopeVerdict, Assert-NodeFirewallScope, Get-NodeRegistrationArgumentVerdict,
-    Assert-NodeRegistrationArgument, Invoke-MsiServiceTableSelfTest
+    Assert-NodeRegistrationArgument, Get-MsiActionOrderVerdict, Assert-MsiActionOrder,
+    Get-NodeRegistrationAbsentVerdict, Assert-NodeRegistrationLacks, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Invoke-MsiServiceTableSelfTest

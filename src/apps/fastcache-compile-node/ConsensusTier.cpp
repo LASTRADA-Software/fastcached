@@ -839,16 +839,24 @@ ConsensusTier::~ConsensusTier()
     // Stopping it early is safe: `Send` after a stop is already a no-op, and the
     // driver keeps ticking against a transport that drops for at most one
     // heartbeat interval, which `IRaftTransport` is best-effort about anyway.
+    //
+    // Each phase says it is over at Debug. Two of them are bounded drains that report their
+    // own ceiling at Error, and the third -- the joins below this body -- is not bounded at
+    // all, so a stop that does not finish is told apart by the LAST of these lines it left: a
+    // teardown hang on a CI leg, never reproduced locally, had nothing else to say which.
     if (_transport != nullptr)
         _transport->Stop();
+    _logger.Log(LogLevel::Debug, "consensus: stopping: the peer senders' drain is over");
     if (_peerServer != nullptr)
         _peerServer->Shutdown();
+    _logger.Log(LogLevel::Debug, "consensus: stopping: the peer server's drain is over");
     if (_driver != nullptr)
         _driver->Stop();
 
     // The request is the wakeup: the reconciler's wait takes part in its stop token
     // (`WaitForStopOr`), so nothing needs notifying beside it.
     _reconcileThread.request_stop();
+    _logger.Log(LogLevel::Debug, "consensus: stopping: joining the reconciler, then the reactor once its loops end");
 }
 
 std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluster::Command const& command)
