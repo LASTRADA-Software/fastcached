@@ -120,8 +120,8 @@ TEST_CASE("A worker that gave up while serving ends as a failure, so a compiler 
           "[node][worker-tier][exit]")
 {
     // A survey that found nothing finds the compiler installed since, so the supervisor restarts it.
-    // (A fleet other than the one `--cluster-id` named was the refusal here; that flag is gone, and
-    // the formation record is the one author of which fleet this node is in.)
+    // The formation record is the one author of which fleet this node is in, so no fleet mismatch
+    // ends a worker here.
     CHECK_FALSE(WorkerEnding(false).has_value());
     CHECK(WorkerEnding(true) == NodeRefusalCause::ToolchainSurvey);
     CHECK(ExitOf(NodeRefusalCause::ToolchainSurvey) == ProcessExit::Failed);

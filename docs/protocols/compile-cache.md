@@ -231,6 +231,40 @@ for the question about the connection. A reader refuses a verdict or a standing 
 name and keeps a route bit it cannot name, so a newer node's answer is never misreported as
 a healthy one.
 
+### FLEET-SUMMARY
+
+```
+[0xFC][ver][0x1f][u32 len]  payload: [nonce]
+reply:                               [summary][publicKey][signature]
+```
+
+Asks a node which fleet it is in. A machine deciding whether to join a fleet asks a seed
+before it is anybody's member, so the verb is **pre-auth**: nobody is refused at the door and
+no credential is asked for. The request is one 32-byte `nonce` the asker chose, and its
+ceiling is 64 bytes (`MaxFleetSummaryPayload`), the tightest on the table, since anybody who
+can route to the port may send it.
+
+The reply's `summary` is one nested field holding exactly the fields a discovery beacon
+carries, byte for byte: the cluster id, the fleet's state (`0x01` solitary, only its founder
+ever admitted; `0x02` established; `0x03` pending, on its way to another fleet), its creation
+time as a big-endian `u64` of Unix seconds, the leader's id and `0xFC` endpoint, the speaker's
+id and Raft endpoint, the member ids (as many as the reply carries, up to
+`MaxFleetSummaryReplyMembers`), the member total, the speaker's own `0xFC` endpoint and the
+leader's identity key. Under `0x03` the leader fields name the fleet the speaker **asked**,
+never its own. An empty field states that the speaker knows none.
+
+`publicKey` is the answering node's identity key and `signature` is its Ed25519 signature over
+the label `fastcache-fleet-summary-v1`, the asker's nonce, the summary and the key, as
+length-prefixed fields. A recorded answer replayed to a later asker names a nonce that asker
+never chose, so it verifies for nobody else. The signature proves who **spoke**, not that the
+fleet holds whom it names: a reader acts on the member list only beside a key it already holds.
+
+A node that runs no consensus belongs to no fleet and answers `no-cluster`, and so does one
+whose consensus address reaches only itself, since a peer told to dial it would dial itself. A
+`fastcached` answers `no-cluster` too: it is a cache and belongs to no fleet. A nonce that is
+not one 32-byte field is `malformed-frame`. None of these refusals is counted, because anybody
+can provoke them.
+
 ### SHARED-FETCH
 
 ```

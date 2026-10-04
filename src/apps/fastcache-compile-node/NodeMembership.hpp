@@ -222,7 +222,8 @@ class NodeMembership final: public Distributed::IMembershipOracle
         return _isOpen.load(std::memory_order_relaxed) ? _openly.LiveKeyOf(id) : _admitted.LiveKeyOf(id);
     }
 
-    /// How many `--cluster-forget-client` tombstones this node has APPLIED (#1471).
+    /// Publish what the cluster has committed: which identity keys are live and which are revoked,
+    /// and its `fleet-open` row (#1471, #178).
     ///
     /// The seam consensus drives. It writes the cluster's facts and only those, so a reload's
     /// `--fleet-open` survives every commit. A machine admitted at runtime is served without

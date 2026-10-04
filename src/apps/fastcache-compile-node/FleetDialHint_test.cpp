@@ -51,7 +51,8 @@ constexpr std::string_view OldHost = "10.8.0.7";          // where the laptop wa
 constexpr std::string_view NewHost = "10.8.0.42";         // where the VPN put it
 constexpr std::string_view NewAddress = "10.8.0.42:6677"; // the hint the scheduler derives from it
 constexpr std::string_view Toolchain = "msvc-19.44";
-constexpr std::string_view Builder = "builder"; // the machine whose launcher dispatches, by its id
+constexpr std::string_view Builder = "builder";      // the machine whose launcher dispatches, by its id
+constexpr std::string_view LaptopMachine = "laptop"; // the worker machine's id, which its audience names
 constexpr std::chrono::system_clock::time_point Noon { std::chrono::seconds { 1'767'225'600 } };
 
 /// The job every case dispatches, under its own key so duplicate suppression stays out.
@@ -444,14 +445,19 @@ TEST_CASE("A heartbeat reports what the audience accepts, so a hint names a new 
     fleet.ElectLeader(Sched);
     fleet.SetClusterStateAt(Sched, Testing::FleetHarness::StateOf({ std::string { Sched } }, {}, 1));
     fleet.AdmitMachine(std::string { Builder });
+    // The laptop is a fleet machine too: its presence round proves its own key, as production's
+    // does over a node proof -- the harness runs no handshake, so the case states the proof.
+    fleet.AdmitMachine(std::string { LaptopMachine });
 
     Testing::ScriptedHostAddresses machine { { std::string { OldHost } } };
     core::platform::ManualClock clock;
     CachedLocalityOracle const locality { machine, clock };
     Node::AnnouncedEndpoint const advertised { Laptop };
     Node::NodeAudience const audience { advertised, "laptop", { 6677 }, locality };
-    fleet.AddWorkerAddress(std::string { Laptop }, CompiledReply());
-    fleet.AddWorkerAddress(std::string { NewAddress }, CompiledReply());
+    // Signed as the laptop: its presence round proves the laptop's key, so that is the key its grants
+    // name and the key its replies must be signed under (W-4).
+    fleet.AddWorkerAddress(std::string { Laptop }, CompiledReply(std::string { LaptopMachine }));
+    fleet.AddWorkerAddress(std::string { NewAddress }, CompiledReply(std::string { LaptopMachine }));
     fleet.VerifyTicketsAtWorker(std::string { Laptop }, audience, Sched);
     fleet.VerifyTicketsAtWorker(std::string { NewAddress }, audience, Sched);
 
@@ -477,7 +483,7 @@ TEST_CASE("A heartbeat reports what the audience accepts, so a hint names a new 
                                        .addressCapNoticed = addressCapNoticed,
                                        .cacheTier = nullptr,
                                        .metrics = workerMetrics,
-                                       // Nothing proves over this harness's transport; see `Caller`.
+                                       // The harness runs no handshake: `announce` states the proof.
                                        .prover = nullptr,
                                        .lease = lease,
                                        .logger = logger,
@@ -486,7 +492,14 @@ TEST_CASE("A heartbeat reports what the audience accepts, so a hint names a new 
     // The reconnect: the machine answers at the new address, and its rounds arrive from there.
     machine.Publish({ std::string { NewHost } });
     fleet.SetCallerHost(std::string { NewHost });
-    REQUIRE(Node::AnnounceRound(round, link, fleet) == 1); // registers, reporting the oracle's set
+    auto const announce = [&] {
+        fleet.SetCallerIdentity(ProvenIdentity { .id = std::string { LaptopMachine },
+                                                 .key = Testing::TestKeyPair(std::string { LaptopMachine }).PublicKey() });
+        auto const registered = Node::AnnounceRound(round, link, fleet);
+        fleet.SetCallerIdentity(std::nullopt); // the launcher's exchanges prove nothing; its ticket speaks
+        return registered;
+    };
+    REQUIRE(announce() == 1); // registers, reporting the oracle's set
 
     TicketPerDial tickets { fleet, Builder };
     Cc::CredentialedExchange credentialed { fleet, tickets };
@@ -501,7 +514,7 @@ TEST_CASE("A heartbeat reports what the audience accepts, so a hint names a new 
     // The oracle's interval passes; the next heartbeat reports the new address, and a hinted
     // compile's ticket is accepted there.
     clock.advance(CachedLocalityOracle::DefaultRefreshInterval);
-    REQUIRE(Node::AnnounceRound(round, link, fleet) == 1);
+    REQUIRE(announce() == 1);
     before = fleet.Calls().size();
     auto const refreshed = Cc::Dispatch(credentialed, Ask("k8"));
     REQUIRE(refreshed.Ran());

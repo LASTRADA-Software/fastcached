@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Platform/HostEvents.hpp>
 
 #include <array>
 #include <chrono>
@@ -115,8 +116,22 @@ class ILocalityOracle
     [[nodiscard]] virtual std::vector<std::string> Addresses() const = 0;
 };
 
+/// Whether a host event makes `CachedLocalityOracle`'s address set due for a re-probe.
+struct LocalityExpiryRow
+{
+    HostEvent event;      ///< The event this row describes.
+    bool expires;         ///< Whether the set is re-probed at the next question after it.
+    std::string_view why; ///< The reason, in one sentence.
+};
+
+/// The row for @p event.
+/// @param event A host event.
+/// @return Its row.
+[[nodiscard]] LocalityExpiryRow const& LocalityExpiryFor(HostEvent event) noexcept;
+
 /// The production oracle: loopback answered outright, everything else against an
-/// address set refreshed on an interval.
+/// address set refreshed on an interval -- and at the first question after a host event that
+/// can move an address (`LocalityExpiryFor`).
 ///
 /// ## Fast by construction before it is fast by cache
 ///
@@ -155,6 +170,15 @@ class ILocalityOracle
 /// and on Windows that probe is milliseconds. Interval-guarded, a peer sending a
 /// million refusals still costs this machine one probe per interval.
 ///
+/// ## And on a NETWORK CHANGE, which is a host event rather than a miss
+///
+/// The interval bounds a stale set; a host event that says an address moved ends it. A VPN that
+/// re-addresses a laptop would otherwise leave the ticket audience accepting the address it lost
+/// for up to one interval -- and a machine ticket minted for that address, now another machine's,
+/// spendable once more here. The event only MARKS the set due: the probe still runs on the next
+/// question, on the thread that asks, so the event thread returns at once (`IHostEventSink`'s
+/// contract). No peer can raise a host event, so this is no amplifier.
+///
 /// Thread-safe. The lock is taken only past the loopback branch, so the common path
 /// never contends -- which is what makes a plain mutex right here rather than a shared
 /// one.
@@ -173,7 +197,7 @@ class ILocalityOracle
 /// the default bind it never runs at all. If a future surface asks this question at
 /// a rate where that stops being true, the fix is to refresh it from somewhere else
 /// and publish -- not to shorten the interval.
-class CachedLocalityOracle final: public ILocalityOracle
+class CachedLocalityOracle final: public ILocalityOracle, public IHostEventSink
 {
   public:
     /// How long an address set is served before the machine is asked again.
@@ -218,8 +242,14 @@ class CachedLocalityOracle final: public ILocalityOracle
     /// @return The current set.
     [[nodiscard]] std::vector<std::string> Addresses() const override;
 
+    /// Mark the set due when @p event can move an address (`LocalityExpiryFor`). Probes nothing:
+    /// the next question re-probes, on its own thread.
+    /// @param event What the host reported.
+    void OnHostEvent(HostEvent event) override;
+
   private:
-    /// Replace the set when the interval has passed since it was taken. Call with `_mutex` held.
+    /// Replace the set when the interval has passed since it was taken, or a host event marked it
+    /// due. Call with `_mutex` held.
     void RefreshIfDue() const;
 
     IHostAddressSource const& _source;
@@ -232,6 +262,7 @@ class CachedLocalityOracle final: public ILocalityOracle
     mutable std::mutex _mutex;
     mutable std::vector<std::string> _addresses;
     mutable core::platform::SteadyTimePoint _sampledAt;
+    mutable bool _due = false; ///< A host event said an address may have moved since `_sampledAt`.
 };
 
 /// One IPv4 address configured on one of this machine's interfaces, with what its link says.

@@ -674,9 +674,9 @@ readable and silently ignored. Every rule below has already been one of them.
   start -- so the OPTIONAL properties are REMEMBERED (the WiX remember-property pattern: saved
   before `AppSearch`, read back from `HKLM\SOFTWARE\fastcached\Installer`, restored, written
   again by a deferred `FastCacheRemember*` action on every transaction that registers; a root-feature
-  component only OWNS the key, since a feature change reinstalls no component). Four of them:
-  `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE`, `FASTCACHE_FLEET_SEED` and `FASTCACHE_FLEET_ID`
-  (passed VERBATIM, a pin being security material), each a row of `check-wix-service-table` and of the
+  component only OWNS the key, since a feature change reinstalls no component). Three of them:
+  `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_FLEET_SEED` and `FASTCACHE_FLEET_ID` (passed VERBATIM, a pin
+  being security material), each a row of `check-wix-service-table` and of the
   remember case. **The node's sequence is ONE: validate, register, remember, start**, every step
   `Return="check"`. Validate is `FastCacheNodeCheckArguments`, the node's own `--check-arguments`
   over the registration's own argument list: a pin its parse refuses fails the transaction with
@@ -691,13 +691,14 @@ readable and silently ignored. Every rule below has already been one of them.
   searches of their own, since AppSearch leaves a stated property alone where it finds nothing), and
   each value is written back or deleted as found. Without the twins, remembering after registering
   was R-B's defect: a failed write rolled the files back under services it had registered. The node's
-  three properties are remembered only by a transaction that keeps the node, so nothing the check
+  two properties are remembered only by a transaction that keeps the node, so nothing the check
   did not see is ever written; the `[msi]` refusal and rollback cases and the MSI job's refused
   repair assert it. Not remembering them failed OPEN: a repair that left out
   `FASTCACHE_FIREWALL_ALLOW` opened the rules to any address. The `[msi]` remember case runs the
-  fragment's own rows across install, repair, upgrade and repair. `FASTCACHE_NODE_ADVERTISE` is OPTIONAL and reaches
-  the command line only through the derived `FastCacheNodeAdvertiseArgument`, so an absent one is
-  no `--advertise` at all -- never an empty one -- and the node advertises its own name; the MSI
+  fragment's own rows across install, repair, upgrade and repair. **There is no advertised-endpoint
+  property** (W-10): an IP literal remembered across upgrades vetoed the dial hint for good on a
+  roaming laptop, so the registration carries no `--advertise`, the node advertises its own name,
+  and `FastCacheForgetNodeAdvertise` deletes the value an earlier package remembered; the MSI
   names no `--cluster-dir` either, since a registered value outranks the file's `cluster_dir`.
   `DocumentedCommandLines_test`'s `[msi]` case reads the `ExeCommand` out of the fragment and
   round-trips every shape, the no-property one first. The

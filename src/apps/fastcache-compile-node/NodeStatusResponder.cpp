@@ -302,6 +302,19 @@ std::vector<std::byte> NodeStatusResponder::ExplainAdmission(std::optional<std::
     if (auto refusal = RefuseStranger(peer); refusal.has_value())
         return *std::move(refusal);
 
+    // And only to a member that says WHO it is -- this machine, a proven key, a verified ticket. On
+    // a `--fleet-open` node membership admits everyone, so membership alone would hand an anonymous
+    // caller whether a third party is revoked, a learner or unknown: the distinction the ticket path
+    // above collapses for a captured ticket. Collapsed here the same way -- one answer whatever the
+    // machine's standing -- as the refusal the control verbs give for the same want.
+    if (!Distributed::RestsOnIdentifiedCaller(Distributed::ExplainConnection(_membership, peer)))
+        return Cc::RefuseWithoutCounter(
+            { .code = CompileCacheWire::ErrorCode::IdentifiedCallerRequired,
+              .rationale = "a diagnostic question, answered with its remedy; the event an operator watches for an "
+                           "unidentified caller is the control verbs' refusal, and this one changes nothing" },
+            "explain-admission about a machine describes a third party, so it is answered to a caller this node "
+            "can identify: from this machine, with a proven key, or with the machine ticket a fleet node mints");
+
     auto const roster = _standing.Roster();
     if (!roster.has_value())
         return Cc::RefuseWithoutCounter(

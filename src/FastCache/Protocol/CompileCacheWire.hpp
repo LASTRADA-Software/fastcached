@@ -6518,8 +6518,8 @@ enum class WireMembership : std::uint8_t
 /// Which routes concluded a verdict, as a BITMASK (#1471).
 ///
 /// **A set rather than one value, and that is the whole point of the verb.** Admission is a fold
-/// over several participants, and an operator who drops a host from `--fleet-member` and finds it
-/// still served needs to know the CLUSTER admits it. A single value could not say *both*, and
+/// over several participants, and an operator who turns `--fleet-open` off and finds a machine
+/// still served needs to know its KEY admits it too. A single value could not say *both*, and
 /// reporting only the winner would answer the question the operator did not ask.
 ///
 /// Empty is the honest answer for `Outsider`: `DecidedBy` never attributes it, because an oracle
@@ -7951,7 +7951,7 @@ inline constexpr std::array EnrollControlVerbTable {
 }
 
 static_assert(NoRetiredEnrollControlVerbIsReused(),
-              "0x01 was open and 0x02 was close; a retired verb byte is never reassigned");
+              "0x01 was open, 0x02 close and 0x04 approve-by-id-alone; a retired verb byte is never reassigned");
 
 /// A challenge a leader issues for one pending enrollment row: `NodeChallengeBytes` it drew, which
 /// the joiner's NEXT request must sign over for that request to refresh the row.

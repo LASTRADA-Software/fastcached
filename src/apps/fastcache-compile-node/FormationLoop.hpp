@@ -235,7 +235,7 @@ class ActivationHold
 /// reform starts from what the operator has configured now and the record alone -- never from what a
 /// previous body derived, and never from the START configuration: that one no reload changes, and a
 /// body shaped from it, published as the configuration in force, silently reverted every accepted
-/// reload -- a `--fleet-member` entry removed came back, a rotated `--requirepass` went back to the old
+/// reload -- a `--fleet-open` turned off came back on, a rotated `--requirepass` went back to the old
 /// one. Between two bodies the loop waits its `ReformBackoff` row, and a stop asked by then starts no
 /// further body.
 /// @param config The configuration in force, read before each body: the reloader's live snapshot when

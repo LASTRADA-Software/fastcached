@@ -77,6 +77,52 @@ TEST_CASE("The mode table states the spec's shape for each mode", "[cluster][for
     CHECK(NodeModeRowFor(Learner).announces == CompileCacheWire::FleetState::Established);
 }
 
+TEST_CASE("Each node mode keeps the byte every cluster dir already written holds, at the record's mode offset",
+          "[cluster][formation][mode][record]")
+{
+    // W-14. `NodeMode` is PERSISTED -- the formation record's mode byte -- and every caller spells the
+    // enumerator, so a consistent renumbering stays green everywhere else while every cluster dir
+    // already written reads as another mode. The raw enumerators are the anchor, pinned as literals;
+    // then the BYTE an encoded record carries at its mode offset, which is the persisted fact itself.
+    CHECK(static_cast<unsigned>(NodeMode::Solitary) == 0x01U);
+    CHECK(static_cast<unsigned>(NodeMode::Pending) == 0x02U);
+    CHECK(static_cast<unsigned>(NodeMode::Learner) == 0x03U);
+    CHECK(static_cast<unsigned>(NodeMode::Voter) == 0x04U);
+    // The offset is layout too: four magic bytes, the format byte, then the mode.
+    CHECK(FormationRecordModeOffset == 5U);
+
+    auto const inFleet = FleetMembership {
+        .clusterId = "fleet-c", .roster = { std::byte { 1 } }, .createdAtUnixSeconds = 1, .admittedBy = {}
+    };
+    auto const joining = JoinTarget { .summary = CompileCacheWire::FleetSummary { .clusterId = "fleet-c", .nodeId = "n-a" },
+                                      .provenKey = {},
+                                      .askedAtUnixSeconds = 9 };
+    struct Row
+    {
+        NodeMode mode;
+        std::uint8_t byte;
+    };
+    for (auto const& [mode, byte]: { Row { .mode = NodeMode::Solitary, .byte = 0x01 },
+                                     Row { .mode = NodeMode::Pending, .byte = 0x02 },
+                                     Row { .mode = NodeMode::Learner, .byte = 0x03 },
+                                     Row { .mode = NodeMode::Voter, .byte = 0x04 } })
+    {
+        INFO("mode " << NodeModeRowFor(mode).name);
+        auto record = SolitaryRecord("own-c", 10);
+        record.mode = mode;
+        if (mode == NodeMode::Pending)
+            record.joining = joining;
+        if (NodeModeRowFor(mode).consensus == ConsensusScope::Fleet)
+            record.fleet = inFleet;
+        auto const encoded = EncodeFormationRecord(record);
+        REQUIRE(encoded.size() > FormationRecordModeOffset);
+        CHECK(encoded[FormationRecordModeOffset] == std::byte { byte });
+        auto const decoded = DecodeFormationRecord(encoded);
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).mode == mode);
+    }
+}
+
 TEST_CASE("A minted solitary record holds a fresh cluster id and the wall-clock second", "[cluster][formation][record]")
 {
     Testing::ScriptedSecureRandom random { std::vector<std::byte>(ClusterIdBytes, std::byte { 0xAB }) };

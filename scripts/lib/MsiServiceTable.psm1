@@ -433,6 +433,27 @@ function Assert-NodeFirewall {
     }
 }
 
+# Is the firewall group @p Group empty? A pure verdict so the self-test can drive it without a real
+# firewall. W-11: an upgrade that deselects a feature deletes its service with sc.exe, which removes
+# no rule, so the fragment removes the group and this checks it went.
+# @param Seen The display names the group holds.
+# @param Group The group, for the message.
+# @return $null when it holds nothing, else what it still holds.
+function Get-FirewallGroupEmptyVerdict([string[]] $Seen, [string] $Group) {
+    $held = @($Seen | Where-Object { $_ })
+    if ($held.Count -eq 0) { return $null }
+    return "the firewall group '$Group' still holds [$($held -join ', ')] after its service was removed"
+}
+
+# The firewall group @p Group on the REAL Windows Firewall holds no rule. Reads a live firewall, so the
+# self-test reaches only the verdict above; fails CLOSED. Assert the group was POPULATED before the
+# transaction that must empty it (Assert-NodeFirewall), or an empty group here proves nothing.
+function Assert-FirewallGroupEmpty([string] $Group) {
+    $rules = @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue)
+    $rules | Format-Table DisplayName, Direction, Action, Profile | Out-String | Write-Host
+    if ($verdict = Get-FirewallGroupEmptyVerdict @($rules | ForEach-Object { $_.DisplayName }) $Group) { throw $verdict }
+}
+
 # Does every rule of the node's firewall group admit exactly @p Scope as its remote address? A pure
 # verdict so the self-test can drive it without a real firewall. Windows reports a prefix in mask
 # form (10.0.0.0/8 reads back as 10.0.0.0/255.0.0.0), so both spellings of the scope are accepted.
@@ -488,25 +509,28 @@ function Assert-NodeRegistrationArgument([string] $Argument) {
     if ($verdict = Get-NodeRegistrationArgumentVerdict $svc.PathName $Argument) { throw $verdict }
 }
 
-# Does the node service's command line carry NO token for @p Prefix? The other direction of
-# the verdict above, for a flag an earlier package registered and this node refuses at every
-# start: a registration still carrying it was never replaced.
-# @param ImagePath The registration's command line.
-# @param Prefix The flag, e.g. `--scheduler`: a token equal to it, or it followed by `=`.
-# @return $null when no token carries it, else the command line that does.
-function Get-NodeRegistrationAbsentVerdict([string] $ImagePath, [string] $Prefix) {
+# Does the node service's command line carry NO token for the flag @p Prefix -- the flag itself, or the
+# flag followed by `=`? A pure verdict so the self-test can drive it without a service. Two flags an
+# earlier package registered and this node must not keep: `--scheduler`, which it refuses at every
+# start (ci-fix2), and `--advertise`, from a remembered property this package no longer has (W-10).
+# A longer flag that merely shares the prefix is not the flag, and a quoted program path is one token.
+# @param ImagePath The registration's command line, as the service control manager reports it.
+# @param Prefix The flag, e.g. `--scheduler`.
+# @return $null when no token carries it, else the tokens and the command line.
+function Get-NodeRegistrationLacksVerdict([string] $ImagePath, [string] $Prefix) {
     $tokens = @([regex]::Matches($ImagePath, '"[^"]*"|\S+') | ForEach-Object { $_.Value.Trim('"') })
-    $carried = @($tokens | Where-Object { $_ -ceq $Prefix -or $_.StartsWith("$Prefix=", [StringComparison]::Ordinal) })
-    if ($carried.Count -eq 0) { return $null }
-    return "the node's registration still carries $Prefix, so it is the one an earlier package made: $ImagePath"
+    $hit = @($tokens | Where-Object { $_ -ceq $Prefix -or $_.StartsWith("$Prefix=", [StringComparison]::Ordinal) })
+    if ($hit.Count -eq 0) { return $null }
+    return "the node's registration still carries $($hit -join ' '), so it is the one an earlier package made: $ImagePath"
 }
 
-# The node's REAL registration carries no @p Prefix token. Fails CLOSED on no registration.
+# The node's REAL registration carries no token for @p Prefix. Reads a live service, so the self-test
+# reaches only the verdict above; fails CLOSED on no registration.
 function Assert-NodeRegistrationLacks([string] $Prefix) {
     $svc = Get-CimInstance Win32_Service -Filter "Name='FastCacheCompileNode'"
-    if (-not $svc) { throw "no FastCacheCompileNode service is registered, so nothing says it lacks $Prefix" }
-    if ($verdict = Get-NodeRegistrationAbsentVerdict $svc.PathName $Prefix) { throw $verdict }
-    Write-Host "FastCacheCompileNode carries no $Prefix`: $($svc.PathName)"
+    if (-not $svc) { throw "no FastCacheCompileNode service is registered, so nothing can be said about $Prefix" }
+    Write-Host "FastCacheCompileNode: $($svc.PathName)"
+    if ($verdict = Get-NodeRegistrationLacksVerdict $svc.PathName $Prefix) { throw $verdict }
 }
 
 # Is @p OwnerSid the Administrators SID? The state directory's owner must be, so whoever
@@ -1017,14 +1041,36 @@ function Invoke-MsiServiceTableSelfTest {
     # merely shares the prefix is not the flag.
     $old030 = '"C:\Program Files\fastcached\bin\fastcache-compile-node.exe" --daemon --service-name=FastCacheCompileNode --scheduler=127.0.0.1:6675 --advertise=127.0.0.1:6674'
     ExpectThrow 'absent: a registration still carrying --scheduler is refused' {
-        if ($v = Get-NodeRegistrationAbsentVerdict $old030 '--scheduler') { throw $v }
+        if ($v = Get-NodeRegistrationLacksVerdict $old030 '--scheduler') { throw $v }
     } 'still carries --scheduler'
-    if ($null -ne (Get-NodeRegistrationAbsentVerdict '"C:\Program Files\x.exe" --daemon --schedulers-seen=1 --node-id=a' '--scheduler')) {
+    if ($null -ne (Get-NodeRegistrationLacksVerdict '"C:\Program Files\x.exe" --daemon --schedulers-seen=1 --node-id=a' '--scheduler')) {
         throw 'absent: a different flag sharing the prefix was taken for it'
     }
     Pass 'absent: a registration without it passes, and a longer flag name is not it'
 
-    $expectedCases = 62
+    # The absence verdict Assert-NodeRegistrationLacks reads: a command line with no such token passes,
+    # one carrying it is refused naming the token, and a prefix inside a quoted program path is no token.
+    if ($null -ne (Get-NodeRegistrationLacksVerdict $imagePath '--advertise')) {
+        throw 'absence verdict: a registration with no advertise flag must pass'
+    }
+    Pass 'absence: a registration carrying no such token passes'
+    ExpectThrow 'absence: a registration still carrying the flag is refused, naming it' {
+        if ($verdict = Get-NodeRegistrationLacksVerdict "$imagePath --advertise=10.8.0.7:6674" '--advertise') { throw $verdict }
+    } 'still carries --advertise=10\.8\.0\.7:6674'
+    if ($null -ne (Get-NodeRegistrationLacksVerdict '"C:\--advertise dir\x.exe" --service' '--advertise')) {
+        throw 'absence verdict: the quoted program path is one token, and it does not start with the prefix'
+    }
+    Pass 'absence: a prefix inside the quoted program path is not a token of its own'
+
+    # The emptiness verdict Assert-FirewallGroupEmpty reads: no rule passes, one left behind is refused
+    # by name.
+    if ($null -ne (Get-FirewallGroupEmptyVerdict @() 'fastcached: X')) { throw 'group verdict: an empty group must pass' }
+    Pass 'group: an empty group passes'
+    ExpectThrow 'group: a rule left behind is refused, naming it' {
+        if ($verdict = Get-FirewallGroupEmptyVerdict @('X node tcp/6674') 'fastcached: X') { throw $verdict }
+    } "'fastcached: X' still holds \[X node tcp/6674\]"
+
+    $expectedCases = 67
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -1037,4 +1083,5 @@ Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert
     Assert-NodeStatePrivate, Get-DirectoryOwnerVerdict, Get-NodeFirewallVerdict, Assert-NodeFirewall,
     Get-NodeFirewallScopeVerdict, Assert-NodeFirewallScope, Get-NodeRegistrationArgumentVerdict,
     Assert-NodeRegistrationArgument, Get-MsiActionOrderVerdict, Assert-MsiActionOrder,
-    Get-NodeRegistrationAbsentVerdict, Assert-NodeRegistrationLacks, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Invoke-MsiServiceTableSelfTest
+    Get-NodeRegistrationLacksVerdict, Assert-NodeRegistrationLacks, Get-FirewallGroupEmptyVerdict,
+    Assert-FirewallGroupEmpty, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Invoke-MsiServiceTableSelfTest

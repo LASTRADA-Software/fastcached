@@ -168,12 +168,15 @@ TEST_CASE("A refused start and a failed one leave the process as different codes
     CHECK(FastCache::ExitCodeOf(ProcessExit::Refused) == 78);
     // A one-shot command's decline: the usage exit.
     CHECK(FastCache::ExitCodeOf(ProcessExit::Usage) == 2);
+    // EX_TEMPFAIL: a stop whose bounded drain ran out, the code `std::_Exit` is handed in `Core`.
+    CHECK(FastCache::ExitCodeOf(ProcessExit::Abandoned) == 75);
+    CHECK(FastCache::ExitCodeOf(ProcessExit::Abandoned) == FastCache::AbandonedDrainExitCode);
 
-    // A supervisor that can tell them apart restarts a failure and nothing else.
+    // A supervisor that can tell them apart restarts a failure and an abandoned stop, and nothing else.
     for (auto const& row: FastCache::ProcessExitRows)
     {
         INFO(row.meaning);
-        CHECK(row.restarted == (row.exit == ProcessExit::Failed));
+        CHECK(row.restarted == (row.exit == ProcessExit::Failed || row.exit == ProcessExit::Abandoned));
         CHECK(std::ranges::count(FastCache::ProcessExitRows, row.code, &FastCache::ProcessExitRow::code) == 1);
     }
 }
@@ -296,7 +299,7 @@ TEST_CASE("No step of a start gives up with a one-shot command's exit", "[platfo
     // a one-shot command's answer to an operator at a terminal -- whatever refused it. The column
     // says so, written out here so a row that changes its mind fails by name.
     CHECK_FALSE(FastCache::ProcessExitRows[static_cast<std::size_t>(ProcessExit::Usage)].endsAStart);
-    for (auto const exit: { ProcessExit::Served, ProcessExit::Failed, ProcessExit::Refused })
+    for (auto const exit: { ProcessExit::Served, ProcessExit::Failed, ProcessExit::Refused, ProcessExit::Abandoned })
         CHECK(FastCache::ProcessExitRows[static_cast<std::size_t>(exit)].endsAStart);
     for (auto const stage: FastCache::Enumerators<StartStage>())
     {

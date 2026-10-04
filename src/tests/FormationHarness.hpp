@@ -222,8 +222,12 @@ class FormationHarness
     /// a beacon each, and two formation beats.
     static constexpr std::chrono::seconds MeetWithin = BeaconEvery + 2 * TickEvery;
 
-    /// The address an operator's verbs come from: listed as a fleet member on every machine.
+    /// The address an operator's verbs come from. Admitted by nothing on its own: the operator
+    /// presents its machine's ticket (`OperatorMachine`), as `fastcache-compile-node` does.
     static constexpr std::string_view OperatorAddress = "10.9.9.9";
+
+    /// The machine the operator's node is, whose test key every machine's roster holds live.
+    static constexpr std::string_view OperatorMachine = "operator-pc";
 
     /// @param clock What every machine measures intervals on. Must outlive this.
     /// @param wall What every record's instants read. Must outlive this.
@@ -677,7 +681,8 @@ class FormationHarness
         /// Two inputs are fixed here rather than read, each for a stated reason: the in-flight budget is
         /// 0 because the harness answers one request at a time to completion, so nothing else is ever
         /// in flight on its surface; and no credential was accepted because no harness caller presents
-        /// one -- the operator is admitted by ADDRESS (`OperatorAddress`), as a fleet member is.
+        /// one -- the operator is admitted by the machine TICKET its connection carries
+        /// (`OperatorMachine`), which an AUTH verified before this frame, as production's is.
         /// @param surface The target's merged responder.
         /// @param sent One whole request frame.
         /// @param peer Who asks.
@@ -963,13 +968,13 @@ class FormationHarness
         Node::NodeConditions conditions;                          ///< Its rows; outlive every body.
         AtomicMetricsSink metrics;                                ///< Its counters.
         CapturingLogger logger;                                   ///< Its log, which `LogOf` reads back.
-        /// Its operator, admitted to the control verbs from `OperatorAddress`. `MachineTicket`: an
+        /// Its admission: the production fold, over a roster holding the operator machine's key. An
         /// operator's control verb needs a route that IDENTIFIES the caller, and `--fleet-open` admits
-        /// nobody to it -- the list stands in for the ticket the operator's own node mints. A VOTER's
-        /// ticket, for a ticket proves a machine and only a voter's machine is an operator (W-1).
-        ListedMembership membership { { std::string { OperatorAddress } },
-                                      Distributed::MembershipParticipant::MachineTicket,
-                                      Distributed::KeyEvidenceSet {}.Add(Distributed::KeyEvidence::MachineTicket) };
+        /// nobody to it, so the operator presents the ticket its own node mints (`Operate`) -- never a
+        /// host list labelled `MachineTicket`, which would admit an address with no ticket at all. A
+        /// VOTER's machine, for a ticket proves a machine and only a voter's machine is an operator (W-1).
+        Testing::RosterFold const operators { { std::string { OperatorMachine } }, {}, { std::string { OperatorMachine } } };
+        Distributed::IMembershipOracle const& membership = operators.admitted; ///< What its surfaces ask.
         /// The operator owners every built node merges (`SurfaceComponents`: never null), built as `main`
         /// builds them, over a source slot nothing attaches -- so each answers that it has nothing to
         /// read. Built for their place on the surface, whose ceiling is their fold.
@@ -1256,7 +1261,8 @@ class FormationHarness
         FAIL("the segment never went quiet in " << MaxRounds << " rounds");
     }
 
-    /// Answer an operator's control frame at @p machine's node port, from `OperatorAddress`.
+    /// Answer an operator's control frame at @p machine's node port, from `OperatorAddress`, over a
+    /// connection that presented `OperatorMachine`'s ticket.
     /// @param machine The machine leading the fleet.
     /// @param frame The control frame.
     /// @return The reply.
@@ -1265,7 +1271,10 @@ class FormationHarness
         INFO(machine.self.nodeId << " serves nothing: " << machine.refused.value_or("a reform is waiting its backoff"));
         REQUIRE(machine.body != nullptr);
         return AnsweringSocket::Gate(
-            machine.body->Surface(), frame, Node::PeerIdentity { .host = std::string { OperatorAddress } });
+            machine.body->Surface(),
+            frame,
+            Node::PeerIdentity { .host = std::string { OperatorAddress },
+                                 .authenticatedMachine = Testing::IdentityOf(std::string { OperatorMachine }) });
     }
 
     /// Require @p reply to be an answer rather than a refusal, saying which refusal it was.

@@ -3462,7 +3462,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
           # 0.3.0's installer registers its node only with a scheduler; this one takes none, and a
-          # node that serves refuses one.
+          # node that serves refuses one. Its advertise property is 0.3.0's; this package has none.
           $release030NodeProperties = @('FASTCACHE_NODE_SCHEDULER=127.0.0.1:6675', 'FASTCACHE_NODE_ADVERTISE=127.0.0.1:6674')
           $fastcachedOnly = 'ADDLOCAL=CM_C_Cli,CM_C_Daemon,CM_C_Launcher'
           $oldSession = 'Adding UPGRADINGPRODUCTCODE property|UPGRADINGPRODUCTCODE=\{'
@@ -3544,11 +3544,22 @@ jobs:
           # is replaced, so nothing is held and the exit is exactly 0. The old
           # product's half is in this log, which the first pattern proves, so the
           # absence of its uninstall-service actions is a finding and not a blind spot.
+          #
+          # And over the advertised endpoint an earlier package of this table REMEMBERED (W-10): planted as
+          # that package wrote it, an IP literal a roaming laptop once typed. The property is gone, so the
+          # upgrade must forget the value and register the node with no advertise flag at all.
+          $installerKey = 'HKLM:\SOFTWARE\fastcached\Installer'
+          New-Item -Path $installerKey -Force | Out-Null
+          New-ItemProperty -Path $installerKey -Name 'NodeAdvertise' -Value '10.8.0.7:6674' -PropertyType String -Force | Out-Null
           Invoke-Msiexec -Operation '/i' -Package $newer -Log 'upgrade-newer.log' -What 'an upgrade between two builds'
           Assert-InstalledProduct $family $productOf[$newer]
-          Assert-MsiLog -Path 'upgrade-newer.log' -Present $oldSession `
+          Assert-MsiLog -Path 'upgrade-newer.log' -Present $oldSession, (Get-MsiActionRanPattern 'FastCacheForgetNodeAdvertise') `
             -Absent (Get-MsiActionRanPattern 'FastCacheNodeUninstallService'), (Get-MsiActionRanPattern 'FastCachedUninstallService')
           Assert-ServiceTable -Row NodeSelected -Log 'upgrade-newer.log'
+          if ($null -ne (Get-ItemProperty -Path $installerKey -Name 'NodeAdvertise' -ErrorAction SilentlyContinue)) {
+            throw "the upgrade left the remembered NodeAdvertise value in $installerKey; nothing reads it, and the property is gone"
+          }
+          Assert-NodeRegistrationLacks '--advertise'
 
           # Dropping fastcached on an upgrade, the node kept without its properties:
           # the old product's half keeps fastcached's registration, the new product
@@ -3562,12 +3573,20 @@ jobs:
 
           # Dropping the node on an upgrade, the same way round: its leftover is
           # deleted by sc.exe, and fastcached is registered again, auto and started.
+          # And its FIREWALL GROUP goes with it (W-11): sc.exe removes no rule, so the fragment
+          # removes the group. Populated first, or an empty group afterwards would prove nothing.
+          # (fastcached's group is not asserted the other way round: the daemon binds loopback by
+          # default, opens no rule, and so leaves nothing to orphan here -- an empty group there is
+          # true whether or not its removal works.)
+          Assert-NodeFirewall
           Invoke-Msiexec -Operation '/i' -Package $newer -Log 'upgrade-deselect.log' -Properties $fastcachedOnly `
             -What 'an upgrade deselecting the node'
           Assert-InstalledProduct $family $productOf[$newer]
-          Assert-MsiLog -Path 'upgrade-deselect.log' -Present $oldSession, (Get-MsiActionRanPattern 'FastCacheNodeDeleteLeftover') `
+          Assert-MsiLog -Path 'upgrade-deselect.log' -Present $oldSession, (Get-MsiActionRanPattern 'FastCacheNodeDeleteLeftover'), `
+            (Get-MsiActionRanPattern 'FastCacheNodeDeleteLeftoverFirewall') `
             -Absent (Get-MsiActionRanPattern 'FastCacheNodeUninstallService')
           Assert-ServiceTable -Row DaemonAlone -Log 'upgrade-deselect.log'
+          Assert-FirewallGroupEmpty 'fastcached: FastCacheCompileNode'
 
           Invoke-Msiexec -Operation '/x' -Package $newer -Log 'uninstall-upgraded.log' -What 'uninstalling after the upgrades'
           Assert-InstalledProduct $family ''
@@ -3580,6 +3599,23 @@ jobs:
           Invoke-Msiexec -Operation '/x' -Package $first -Log 'uninstall-unstarted.log' -What 'uninstalling the unstarted install'
           Assert-InstalledProduct $family ''
           Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-unstarted.log'
+
+          # Host C, the shared-cache machine (W-12): installed fastcached-only, then upgraded by a
+          # double-click -- a plain /i of the newer package with NO ADDLOCAL. MigrateFeatureStates
+          # carries the old selection over, so it must stay fastcached-only: the node neither
+          # installed nor registered, and fastcached auto and started as before.
+          Invoke-Msiexec -Operation '/i' -Package $first -Log 'install-daemon-only.log' -Properties $fastcachedOnly `
+            -What 'a fastcached-only install, host C'
+          Assert-ServiceTable -Row DaemonAlone -Log 'install-daemon-only.log'
+          Invoke-Msiexec -Operation '/i' -Package $newer -Log 'upgrade-daemon-only.log' `
+            -What 'a plain upgrade of a fastcached-only install, no ADDLOCAL'
+          Assert-InstalledProduct $family $productOf[$newer]
+          Assert-MsiLog -Path 'upgrade-daemon-only.log' -Present $oldSession `
+            -Absent (Get-MsiActionRanPattern 'FastCacheNodeInstallService'), (Get-MsiActionRanPattern 'FastCacheNodeStartService')
+          Assert-ServiceTable -Row DaemonAlone -Log 'upgrade-daemon-only.log'
+          Invoke-Msiexec -Operation '/x' -Package $newer -Log 'uninstall-daemon-only.log' -What 'uninstalling host C'
+          Assert-InstalledProduct $family ''
+          Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-daemon-only.log'
 
           # The steps below start from a clean machine: what 0.3.0 seeded, and the
           # identity key the node minted, are not what they assert about.
@@ -3765,8 +3801,8 @@ jobs:
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
           $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
 
-          # No property at all: FASTCACHE_NODE_ADVERTISE is optional, and the upgrade steps above
-          # pass it, so this is the transaction that registers the node with no --advertise.
+          # No property at all: this package has no advertised-endpoint property (W-10), so the node is
+          # registered with no advertise flag and advertises this machine's name.
           Invoke-Msiexec -Operation '/i' -Package $msi -Log 'add-node.log' -What 'adding the node feature' `
             -Properties 'ADDLOCAL=CM_C_Node'
           Assert-ServiceTable -Row NodeSelected -Log 'add-node.log'

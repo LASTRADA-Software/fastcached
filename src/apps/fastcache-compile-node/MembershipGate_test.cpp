@@ -79,11 +79,17 @@ TEST_CASE("A revoked key is refused apart from a stranger, counted as the remove
     // forgotten arm still refuses this caller, still answers `NotAMember` on the wire,
     // and still reads as correct from the client's end -- what it loses is the
     // diagnosis, and the only thing that can see the difference is which series rose.
-    // A machine is forgotten by its key, so the key roster is the one author of `Forgotten`.
-    FixedMembership const oracle { Distributed::Membership::Forgotten, Distributed::MembershipParticipant::KeyTombstone };
+    // A machine is forgotten by its key, so the key roster is the one author of `Forgotten`: the
+    // production fold over a roster that revoked `gone`, asked by a connection that proved that key.
+    // Never a fixed `Forgotten` answered by host -- no route production has forgets an address.
+    Testing::RosterFold const fold { {}, { "gone" } };
     AtomicMetricsSink metrics;
 
-    auto const refusal = RefuseUnlessMember(oracle, metrics, PeerIdentity { .host = "10.0.0.7" }, Stranger, StrangerWhy);
+    auto const refusal = RefuseUnlessMember(fold.admitted,
+                                            metrics,
+                                            PeerIdentity { .host = "10.0.0.7", .proven = Testing::IdentityOf("gone") },
+                                            Stranger,
+                                            StrangerWhy);
     REQUIRE(refusal.has_value());
 
     CHECK(metrics.Read(KeyForgotten.counter) == 1);

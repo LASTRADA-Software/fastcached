@@ -839,8 +839,14 @@ using Node::NodeReloader;
     // scheduler hints a dial at a reported address, the client mints its ticket for that
     // address, and the ticket audience below answers from this same set -- so a hint can
     // never name an address this node would refuse the ticket for. No second probe.
+    //
+    // And re-probed at the first question after a NETWORK CHANGE or a wake, not only on its
+    // interval: a VPN re-address would otherwise leave the ticket audience accepting the address
+    // this machine just lost, for up to one interval (W-7). A host event, never a miss, so no
+    // peer can provoke the probe.
     auto const hostAddresses = MakeSystemHostAddresses();
-    CachedLocalityOracle const locality { *hostAddresses, cacheClock };
+    CachedLocalityOracle locality { *hostAddresses, cacheClock };
+    HostEventSubscription const localityRefresh { hostEvents, locality };
 
     // ONE source, and the one site that presents this worker's credential borrows it: the
     // cache tier's `--upstream` client, immediately below. Nothing that talks to a scheduler
@@ -1689,10 +1695,9 @@ using Node::NodeReloader;
     // in the gap finds it unreachable and compiles locally, which is the same
     // fallback every other refusal takes.
     logger.Logf(LogLevel::Info, "compile node stopped");
-    // A node that came up, served, and then found it had nothing to compile with -- or a fleet
-    // other than the one `--cluster-id` names -- exits late but with the same diagnostic, and a
-    // supervisor must not read either as a clean stop. Which exit is `WorkerEnding`'s: the fleet
-    // is a refusal, the survey a failure a compiler installed since would fix.
+    // A node that came up, served, and then found it had nothing to compile with exits late but
+    // with the same diagnostic, and a supervisor must not read that as a clean stop. Which exit is
+    // `WorkerEnding`'s: a failure a compiler installed since would fix.
     if (auto const ending = workerTier != nullptr ? workerTier->Ending() : std::nullopt; ending.has_value())
         return ExitCodeFor(*ending);
     return ExitCodeOf(ProcessExit::Served);

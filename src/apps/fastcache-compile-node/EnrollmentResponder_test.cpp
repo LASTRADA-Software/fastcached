@@ -191,8 +191,21 @@ class RecordingCluster final: public Distributed::IClusterAdmin
 /// The machine asking to join. Deliberately NOT on any member list.
 constexpr std::string_view JoinerAddress = "198.51.100.4";
 
-/// The operator's machine. On the member list, so it may decide.
+/// The operator's machine's address. Admitted by nothing on its own: the operator decides because
+/// it presents its machine's ticket (`Operator`).
 constexpr std::string_view OperatorAddress = "10.0.0.7";
+
+/// The machine the operator's node is, whose test key the seed's roster holds live.
+constexpr std::string_view OperatorMachine = "operator-pc";
+
+/// The operator as the seed meets it: its address, with the ticket its own node minted, which the
+/// endpoint's AUTH verified -- the identifying route an operator's control verb needs.
+/// @return The connection's facts.
+[[nodiscard]] PeerIdentity Operator()
+{
+    return PeerIdentity { .host = std::string { OperatorAddress },
+                          .authenticatedMachine = Testing::IdentityOf(std::string { OperatorMachine }) };
+}
 
 /// What a joiner claims about itself.
 ///
@@ -233,20 +246,20 @@ struct Seed
     Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
     RecordingCluster cluster;
-    // A LIST, not `OpenMembership`: a fake that admits everyone cannot tell *the gate is
-    // wired* from *the gate admits everyone*, and on this surface exactly one verb is meant
-    // to admit everyone -- so a fixture that could not see the difference would report the
-    // hole as correct. The route is named HERE rather than defaulted in the shared fake,
-    // because which route admits is this case's fact to state (#1497).
+    // The production fold, not `OpenMembership`: a fake that admits everyone cannot tell *the gate
+    // is wired* from *the gate admits everyone*, and on this surface exactly one verb is meant to
+    // admit everyone -- so a fixture that could not see the difference would report the hole as
+    // correct.
     //
-    // `MachineTicket`: an operator on another machine sends the enrollment decisions with the
-    // ticket its own node mints, and an operator's control verb needs a route that IDENTIFIES the
-    // caller -- `--fleet-open` admits nobody to it -- whose machine holds a VOTER's seat: a ticket
-    // proves a machine, not an operator (W-1). The list stands in for the ticket the endpoint
-    // verified; the open-policy caller and a learner's ticket are their own cases below.
-    ListedMembership membership { { std::string { OperatorAddress } },
-                                  Distributed::MembershipParticipant::MachineTicket,
-                                  Distributed::KeyEvidenceSet {}.Add(Distributed::KeyEvidence::MachineTicket) };
+    // An operator on another machine sends the enrollment decisions with the ticket its own node
+    // mints, and an operator's control verb needs a route that IDENTIFIES the caller --
+    // `--fleet-open` admits nobody to it -- whose machine holds a VOTER's seat: a ticket proves a
+    // machine, not an operator (W-1). So the roster holds the operator machine's key in a voter's
+    // seat and the operator PRESENTS the ticket (`Operator`): a host list labelled `MachineTicket`
+    // would admit an address with no ticket at all, a route production does not have. The
+    // open-policy caller and a learner's ticket are their own cases below.
+    Testing::RosterFold const operators { { std::string { OperatorMachine } }, {}, { std::string { OperatorMachine } } };
+    Distributed::IMembershipOracle const& membership = operators.admitted; ///< What every responder here asks.
     NodeConditions conditions;
     // Bound as `main` binds it: the node's own sink and the wall clock the scheduler reads, never
     // the defaults a fixture finds more convenient.
@@ -275,6 +288,19 @@ struct Seed
     // Nothing PROVED, which is what every case here is about: the enrollment pair is for a
     // machine the cluster has not admitted yet, so a proof is not a state a joiner can be in.
     return core::async::syncRun(responder.Answer(frame, PeerIdentity { .host = std::string { peer } })).bytes;
+}
+
+/// Drive one frame through the responder as a connection that established @p peer -- the operator
+/// presenting its machine's ticket.
+/// @param responder What answers.
+/// @param frame The request.
+/// @param peer What the connection established.
+/// @return The encoded reply.
+[[nodiscard]] std::vector<std::byte> AnswerNow(IFrameResponder& responder,
+                                               std::span<std::byte const> frame,
+                                               PeerIdentity const& peer)
+{
+    return core::async::syncRun(responder.Answer(frame, peer)).bytes;
 }
 
 /// The payload of a reply.
@@ -396,7 +422,7 @@ struct Seed
 /// @return The encoded reply.
 [[nodiscard]] std::vector<std::byte> ApproveUnder(Seed& seed, std::string_view id, Ed25519PublicKey const& key)
 {
-    return AnswerNow(seed.responder, Wire::EncodeEnrollApprove(id, key), OperatorAddress);
+    return AnswerNow(seed.responder, Wire::EncodeEnrollApprove(id, key), Operator());
 }
 
 /// One `EnrollControl` from the operator.
@@ -417,7 +443,7 @@ struct Seed
             seed.window.Find(subject)
                 .transform([](Wire::EnrollmentPendingEntry const& row) { return Ed25519PublicKey { row.publicKey }; })
                 .value_or(Ed25519PublicKey {}));
-    return AnswerNow(seed.responder, Wire::EncodeEnrollControl(verb, subject), OperatorAddress);
+    return AnswerNow(seed.responder, Wire::EncodeEnrollControl(verb, subject), Operator());
 }
 
 /// One `Enroll` from a machine asking to join as a LEARNER, under @p key.
@@ -947,10 +973,7 @@ TEST_CASE("Enrollment is reachable by a stranger and deciding it is not", "[enro
 
     // The operator's machine is admitted to both, so the refusal above is about the
     // peer rather than about the verb being closed to everybody.
-    CHECK(!seed.responder
-               .RefusePeer(PeerIdentity { .host = std::string { OperatorAddress } },
-                           static_cast<std::uint8_t>(Wire::Op::EnrollControl))
-               .has_value());
+    CHECK(!seed.responder.RefusePeer(Operator(), static_cast<std::uint8_t>(Wire::Op::EnrollControl)).has_value());
 }
 
 TEST_CASE("A follower answers enrollment with the leader's endpoint rather than a window of its own",
@@ -1035,7 +1058,7 @@ TEST_CASE("An armed window admits a learner as the leader and counts it apart fr
 {
     Seed seed;
     auto const laptopKey = KeyOf(0x6C);
-    REQUIRE(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(std::chrono::minutes { 10 }), OperatorAddress))
+    REQUIRE(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(std::chrono::minutes { 10 }), Operator()))
             == std::nullopt);
 
     // Admitted on the leader's own authority, and answered `Pending`: the roster is not applied
@@ -1069,7 +1092,7 @@ TEST_CASE("A demoted leader's window is disarmed and stays disarmed when it lead
     // responder installs: a leader that loses and regains leadership inside the deadline must
     // not resume admitting (RF-4).
     Seed seed;
-    REQUIRE(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(std::chrono::minutes { 10 }), OperatorAddress))
+    REQUIRE(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(std::chrono::minutes { 10 }), Operator()))
             == std::nullopt);
     seed.service.SetRole(Distributed::SchedulerRole::Follower, LeaderEndpoint, Distributed::StandaloneSchedulerTerm);
     seed.service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
@@ -1090,7 +1113,7 @@ TEST_CASE("The leader refuses a zero or over-ceiling duration with the table's s
                        AutoApproveRefusal::OverCeiling } })
     {
         INFO(duration.count());
-        auto const reply = AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(duration), OperatorAddress);
+        auto const reply = AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(duration), Operator());
         auto const header = Wire::DecodeReplyHeader(reply);
         REQUIRE(header.has_value());
         REQUIRE(Unwrap(header).status == Wire::Status::Error);
@@ -1106,7 +1129,7 @@ TEST_CASE("Off ends an armed window, and ending one that is not armed is answere
           "[enrollment][auto-approve][formation]")
 {
     Seed seed;
-    REQUIRE(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(std::chrono::minutes { 10 }), OperatorAddress))
+    REQUIRE(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(std::chrono::minutes { 10 }), Operator()))
             == std::nullopt);
     CHECK(seed.window.Summary().first == Wire::WireEnrollmentState::AutoApprove);
     CHECK(RefusalIn(Control(seed, Wire::EnrollControlVerb::AutoApproveOff)) == std::nullopt);
@@ -1122,10 +1145,10 @@ TEST_CASE("A control frame naming a subject the verb does not take is refused", 
     // The decoder's arity rule reaching the surface: `List` names nobody and `Approve`
     // must. Answering either by ignoring the mismatch is how an operator comes to
     // believe they approved somebody.
-    CHECK(RefusalIn(
-              AnswerNow(seed.responder, Wire::EncodeEnrollControl(Wire::EnrollControlVerb::List, JoinerId), OperatorAddress))
-          == Wire::ErrorCode::MalformedFrame);
-    CHECK(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollControl(Wire::EnrollControlVerb::Approve), OperatorAddress))
+    CHECK(
+        RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollControl(Wire::EnrollControlVerb::List, JoinerId), Operator()))
+        == Wire::ErrorCode::MalformedFrame);
+    CHECK(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollControl(Wire::EnrollControlVerb::Approve), Operator()))
           == Wire::ErrorCode::MalformedFrame);
 }
 
@@ -1224,8 +1247,8 @@ TEST_CASE("Rejecting a machine that was already approved says the cluster still 
             return AnswerNow(responder,
                              Wire::EncodeEnrollApprove(
                                  subject, seed.window.Find(subject).value_or(Wire::EnrollmentPendingEntry {}).publicKey),
-                             OperatorAddress);
-        return AnswerNow(responder, Wire::EncodeEnrollControl(verb, subject), OperatorAddress);
+                             Operator());
+        return AnswerNow(responder, Wire::EncodeEnrollControl(verb, subject), Operator());
     };
 
     REQUIRE(RefusalIn(AnswerNow(responder, JoinFrame(JoinerId, JoinerRole, JoinerKey()), JoinerAddress)) == std::nullopt);
@@ -1414,8 +1437,8 @@ TEST_CASE("Rejecting a machine that was only waiting says nothing, so the warnin
             return AnswerNow(responder,
                              Wire::EncodeEnrollApprove(
                                  subject, seed.window.Find(subject).value_or(Wire::EnrollmentPendingEntry {}).publicKey),
-                             OperatorAddress);
-        return AnswerNow(responder, Wire::EncodeEnrollControl(verb, subject), OperatorAddress);
+                             Operator());
+        return AnswerNow(responder, Wire::EncodeEnrollControl(verb, subject), Operator());
     };
 
     REQUIRE(RefusalIn(AnswerNow(responder, JoinFrame(JoinerId, JoinerRole, JoinerKey()), JoinerAddress)) == std::nullopt);
@@ -1546,8 +1569,8 @@ TEST_CASE("A surface built after its scheduler took a role answers the rows by t
         service.SetRole(role,
                         role == Distributed::SchedulerRole::Leader ? std::string_view {} : LeaderEndpoint,
                         Distributed::StandaloneSchedulerTerm);
-        ListedMembership membership { { std::string { OperatorAddress } },
-                                      Distributed::MembershipParticipant::MachineTicket };
+        Testing::RosterFold const operators { { std::string { OperatorMachine } } };
+        auto const& membership = operators.admitted;
         NodeConditions conditions;
         EnrollmentWindow window { clock, &conditions, &metrics, wallClock };
         Testing::ScriptedSummarySource self { Wire::FleetSummary { .clusterId = std::string { SeedClusterId } } };

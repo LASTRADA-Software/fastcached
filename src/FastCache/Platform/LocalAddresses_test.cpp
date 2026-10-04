@@ -111,6 +111,47 @@ TEST_CASE("An address this machine loses stays admitted for at most one interval
     CHECK_FALSE(locality.IsThisMachine("10.0.0.8"));
 }
 
+TEST_CASE("A network change or a wake re-probes at the next question, and a suspend or a miss does not",
+          "[platform][locality][host-events]")
+{
+    // W-7. A VPN re-address hands the address this machine lost to another, and until the set is
+    // re-probed the ticket audience still accepts it. The interval bounds that; a host event that
+    // says an address moved ends it -- at the next QUESTION, on the asking thread, so the event
+    // thread probes nothing. Through the production hub, as `main` subscribes it.
+    Testing::ScriptedHostAddresses machine { { "10.0.0.7", "10.0.0.8" } };
+    core::platform::ManualClock clock;
+    CachedLocalityOracle locality { machine, clock, Interval };
+    HostEventHub hub;
+    HostEventSubscription const refresh { hub, locality };
+    REQUIRE(machine.Calls() == 1);
+
+    // The VPN moves this machine off 10.0.0.8, and nothing has said so yet: still admitted.
+    machine.Publish({ "10.0.0.7" });
+    CHECK(locality.IsThisMachine("10.0.0.8"));
+
+    // A suspend moves nothing: no re-probe. The event itself probes nothing either.
+    hub.OnHostEvent(HostEvent::Suspending);
+    CHECK(machine.Calls() == 1);
+    CHECK(locality.IsThisMachine("10.0.0.8"));
+    CHECK(machine.Calls() == 1);
+
+    // The network change: still no probe on the event, and the next question re-probes, once.
+    hub.OnHostEvent(HostEvent::NetworkChanged);
+    CHECK(machine.Calls() == 1);
+    CHECK_FALSE(locality.IsThisMachine("10.0.0.8"));
+    CHECK(machine.Calls() == 2);
+    // And only once: a stranger missing afterwards forces nothing, inside the interval as ever.
+    for ([[maybe_unused]] auto const attempt: std::views::iota(0, 20))
+        CHECK_FALSE(locality.IsThisMachine("10.9.9.9"));
+    CHECK(machine.Calls() == 2);
+
+    // A wake can come back on another network too.
+    machine.Publish({ "10.0.0.7", "10.0.0.9" });
+    hub.OnHostEvent(HostEvent::Resumed);
+    CHECK(locality.Addresses() == std::vector<std::string> { "10.0.0.7", "10.0.0.9" });
+    CHECK(machine.Calls() == 3);
+}
+
 TEST_CASE("The set a heartbeat reports is the set IsThisMachine answers from, refreshed on the same interval",
           "[platform][locality]")
 {

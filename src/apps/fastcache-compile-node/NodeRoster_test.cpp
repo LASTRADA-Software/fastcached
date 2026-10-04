@@ -159,6 +159,49 @@ TEST_CASE("A consensus pass past the silence bound raises consensus-leader-silen
     CHECK(node.Lease()->Read(Noon).standing == Distributed::RosterStanding::Current);
 }
 
+TEST_CASE("A learner that slept past the silence bound refuses grants on waking, and its leader's first word restores them",
+          "[node][roster][isolation][sleep]")
+{
+    // Review focus 5, on the path every formation node runs (W-9): the certified roster and its
+    // expiry -- what the old sleep cases pinned -- are gone (c7f3b5610), and a node's roster is the
+    // state its own consensus applied, a `StateLeaseRoster`. A sleeping process runs no pass at all;
+    // what it wakes to is a steady clock that moved two hours at once. Its first pass hears nobody
+    // yet (the session is still re-forming), so every grant is refused `Isolated` -- never served
+    // against a roster nobody refreshed -- and the first reading from a leader the applied state
+    // counts restores it, with no host event involved. (That the reading ARRIVES after a sleep is
+    // the learner session's liveness, W-3, not this roster's.)
+    auto cfg = Worker();
+    cfg.raftListen = "127.0.0.1:6680";
+    core::platform::ManualClock clock;
+    NodeConditions conditions;
+    auto const roster = NodeRoster::Build(cfg, clock, &conditions);
+    REQUIRE(roster.has_value());
+    auto& node = *Testing::Unwrap(roster);
+    Cluster::ClusterState state;
+    state.members = { Cluster::ClusterMember { .id = "n1",
+                                               .raftEndpoint = "n1:6680",
+                                               .schedulerEndpoint = {},
+                                               .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                               .seat = Cluster::MemberSeat::Voter,
+                                               .publicKey = TestKeyPair("n1").PublicKey() } };
+    node.Applied(state);
+    auto const leaderSpoke =
+        Distributed::LeaderReading { .leads = false, .leader = "n1", .silentFor = std::chrono::seconds { 0 } };
+    node.ConsensusPass(leaderSpoke);
+    REQUIRE(node.Lease()->Read(Noon).standing == Distributed::RosterStanding::Current);
+
+    // Two hours asleep: no pass ran, and the steady clock moved at once.
+    clock.advance(std::chrono::hours { 2 });
+    node.ConsensusPass(Distributed::LeaderReading {});
+    CHECK(node.Lease()->Read(Noon + std::chrono::hours { 2 }).standing == Distributed::RosterStanding::Isolated);
+    CHECK(conditions.StateOf(NodeCondition::ConsensusLeaderSilent) == Wire::ConditionState::Raised);
+
+    // The leader's first word after the wake.
+    node.ConsensusPass(leaderSpoke);
+    CHECK(node.Lease()->Read(Noon + std::chrono::hours { 2 }).standing == Distributed::RosterStanding::Current);
+    CHECK(conditions.StateOf(NodeCondition::ConsensusLeaderSilent) == Wire::ConditionState::Clear);
+}
+
 TEST_CASE("A consensus member places a server only once its applied state names a voter's key", "[node][roster][proof]")
 {
     // #178 PR 6: a node proves itself only to a server its roster does not call a stranger. A

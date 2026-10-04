@@ -2541,8 +2541,10 @@ struct FounderEnrollment
     /// The machine asking to join: on no member list.
     static constexpr std::string_view JoinerAddress = "198.51.100.4";
 
-    /// The operator's machine: on the member list, so it may decide.
+    /// The operator's machine: where it dials from, and the node it is, whose key the roster holds in
+    /// a VOTER's seat, so the ticket it presents may decide (W-1).
     static constexpr std::string_view OperatorAddress = "10.0.0.7";
+    static constexpr std::string_view OperatorMachine = "operator-pc";
 
     core::platform::ManualClock clock;                                         ///< The window's clock.
     core::platform::ManualWallClock wallClock;                                 ///< The scheduler's wall clock.
@@ -2550,16 +2552,15 @@ struct FounderEnrollment
     NullLogger logger;                                                         ///< Where it says what it does.
     Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner(); ///< What the scheduler signs with.
     Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} }; ///< The founder's scheduler.
-    Testing::ListedMembership membership { { std::string { OperatorAddress } },
-                                           Distributed::MembershipParticipant::MachineTicket,
-                                           // A VOTER's ticket: the control verbs ask an operator's standing, which a ticket
-                                           // from a machine without a voter's seat does not carry (W-1).
-                                           Distributed::KeyEvidenceSet {}.Add(
-                                               Distributed::KeyEvidence::MachineTicket) }; ///< Who may decide.
-    NodeConditions conditions;                                                             ///< What the window raises.
-    EnrollmentWindow window { clock, &conditions, &metrics, wallClock };                   ///< The pending list.
-    Testing::ScriptedSummarySource self;                        ///< What the founder says about itself.
-    Ed25519KeyPair const identity = Testing::TestKeyPair("n1"); ///< The founder's identity key.
+    /// Who may decide: the production fold over a roster holding the operator machine's key in a
+    /// voter's seat. A host list labelled `MachineTicket` would admit an address with no ticket at all,
+    /// a route production does not have, so the operator PRESENTS its ticket (`Ask`).
+    Testing::RosterFold const operators { { std::string { OperatorMachine } }, {}, { std::string { OperatorMachine } } };
+    Distributed::IMembershipOracle const& membership = operators.admitted; ///< What the responder asks.
+    NodeConditions conditions;                                             ///< What the window raises.
+    EnrollmentWindow window { clock, &conditions, &metrics, wallClock };   ///< The pending list.
+    Testing::ScriptedSummarySource self;                                   ///< What the founder says about itself.
+    Ed25519KeyPair const identity = Testing::TestKeyPair("n1");            ///< The founder's identity key.
     Testing::ScriptedSecureRandom random { Testing::ScriptedSecureRandom::Ascending(256) }; ///< Each row's challenge.
     EnrollmentResponder responder { window, service, membership, self, identity, random, metrics, logger };
 
@@ -2569,8 +2570,14 @@ struct FounderEnrollment
     /// @return The reply, its payload copied out; a refusal fails the case.
     [[nodiscard]] std::vector<std::byte> Ask(std::span<std::byte const> frame, std::string_view peer)
     {
-        auto const reply =
-            core::async::syncRun(responder.Answer(frame, PeerIdentity { .host = std::string { peer } })).bytes;
+        // The operator's connection carries the ticket its own node minted, verified by the endpoint's
+        // AUTH; every other peer proves nothing.
+        auto const facts =
+            peer == OperatorAddress
+                ? PeerIdentity { .host = std::string { peer },
+                                 .authenticatedMachine = Testing::IdentityOf(std::string { OperatorMachine }) }
+                : PeerIdentity { .host = std::string { peer } };
+        auto const reply = core::async::syncRun(responder.Answer(frame, facts)).bytes;
         auto const header = CompileCacheWire::DecodeReplyHeader(reply);
         REQUIRE(header.has_value());
         REQUIRE(reply.size() >= CompileCacheWire::ReplyHeaderSize + Unwrap(header).payloadLength);

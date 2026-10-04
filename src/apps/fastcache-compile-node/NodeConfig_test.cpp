@@ -6274,7 +6274,7 @@ TEST_CASE("The flags that carried a cluster's shape are refused as flags this no
     //
     // Through the door `main` parses with, and each refusal names its row's step: a service
     // replaying one fails at every boot, and `unrecognised argument` is all its log would say.
-    CHECK(RetiredNodeFlags().size() == 8);
+    CHECK(RetiredNodeFlags().size() == 11);
     for (auto const& row: RetiredNodeFlags())
     {
         INFO(row.flag);
@@ -6510,29 +6510,40 @@ TEST_CASE("TLS material on a build that cannot serve it is refused by the startu
     }
 }
 
-TEST_CASE("The principal flags are unknown options", "[node][formation][principal]")
+TEST_CASE("The principal flags are retired, each refused with the step that replaces it",
+          "[node][formation][principal][retired]")
 {
     // A machine joins ONE way, as a learner: no flag admits a principal, anchors a roster it does
-    // not apply, or asks a seed to let it in. Refused as any flag this build never had is --
-    // `UnknownKey`, the parser's code for an unknown option -- and named as typed.
-    for (auto const* const flag: { "--enroll-from=office:6674", "--voter-key=ab", "--cluster-admit-worker=n1@ab" })
+    // not apply, or asks a seed to let it in. Each is refused as unknown -- `UnknownKey`, nothing
+    // parses -- but with its retired row's step, because an old service registration replays the
+    // flag at every boot and "unrecognised argument" is all its log would otherwise say. Named here
+    // rather than only walked by the table cases, so a row dropped from the table is a red here.
+    for (auto const& [flag, key]: { std::pair { "--enroll-from", "enroll_from" },
+                                    std::pair { "--voter-key", "voter_key" },
+                                    std::pair { "--cluster-admit-worker", "cluster_admit_worker" } })
     {
         INFO(flag);
-        auto const parsed = ParseNodeArgv({ flag });
+        auto const* const row =
+            core::findIfOrNull(RetiredNodeFlags(), [flag](RetiredNodeFlag const& retired) { return retired.flag == flag; });
+        REQUIRE(row != nullptr);
+        CHECK(row->fileKey == key);
+
+        // Through the door `main` parses with, as the table cases above do.
+        auto const typed = std::format("{}=x", flag);
+        auto cfg = Testing::FirstStart(NodeConfig {});
+        auto const argv = std::vector<char const*> { typed.c_str() };
+        auto const parsed = ParseNodeCommandLine(std::span<char const* const> { argv }, cfg);
         REQUIRE_FALSE(parsed.has_value());
         CHECK(parsed.error().code == ConfigErrorCode::UnknownKey);
-        CHECK(parsed.error().field == flag);
-        CHECK(parsed.error().context == "unrecognised argument");
-    }
+        CHECK(parsed.error().field == typed);
+        CHECK(parsed.error().context.starts_with(std::format("{} was retired", flag)));
+        CHECK(parsed.error().context.contains(row->step));
 
-    // And as configuration-file keys, refused the way the table refuses every key no row names.
-    for (auto const* const key: { "enroll_from", "voter_key", "cluster_admit_worker" })
-    {
-        INFO(key);
         auto const refused = FromFileAndArgv({ Setting(key, { "x" }) }, {});
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConfigErrorCode::UnknownKey);
         CHECK(refused.error().field == key);
+        CHECK(refused.error().context.starts_with(std::format("{} was retired", key)));
     }
 }
 

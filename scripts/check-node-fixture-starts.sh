@@ -34,8 +34,12 @@
 # Each statement is one of three:
 #
 #   one-shot   names a verb that answers and exits (`--print-surfaces`, `--cluster-status`,
-#              `--install-service`, ... -- `OneShotVerbs` below): nothing bound, nothing
-#              written. Passes.
+#              `--install-service`, ...): nothing bound, nothing written. Passes. The verbs
+#              are READ from the node's own table -- the `FileExclusion::Verb` rows of
+#              `notFromFile` in `src/apps/fastcache-compile-node/NodeConfig.cpp`, the list
+#              the build already holds every flag a file may not carry to -- so a verb the
+#              node retires stops passing here, and one it adds passes, with no edit to this
+#              script. A table this cannot read, or one naming no `--help`, is refused.
 #   mints      names `--print-identity`, which writes the identity. Needs
 #              `--cluster-dir`.
 #   runs       everything else. Needs `--cluster-dir`, and an EMPTY `--listen-raft=` (no
@@ -57,8 +61,11 @@
 #     `src/tests/CMakeLists.txt` hands the node binary must show at least one recognised
 #     start, or it is refused as "handed the node and started it some way this scan does
 #     not know".
-#   * A new one-shot verb is refused as a start until it is added to `OneShotVerbs`, which
-#     fails closed.
+#   * The verb list is a TEXT read of one C++ array, not the compiled table. A row whose
+#     kind and spelling the reader cannot find is not a verb to it, so a start naming that
+#     verb is refused as a start: that fails CLOSED. The reader requires the array and a
+#     `--help` row before it believes a list at all, so a moved or renamed array is a
+#     refusal (exit 2) rather than an empty list.
 #   * Starts from C++ are out of scope: no Catch2 case spawns the node (every CTest that runs
 #     it goes through a script this scan reads).
 #
@@ -88,13 +95,14 @@ FastCachedTable="${FASTCACHED_FIXTURE_STARTS_TABLE:-${FastCachedRoot}/scripts/ch
 . "${FastCachedRoot}/scripts/lib/third-party-roots.sh" \
     || { echo "check-node-fixture-starts: cannot read scripts/lib/third-party-roots.sh" >&2; exit 2; }
 
-# The node's verbs that answer and exit, as the option table spells them. A NAME list rather
-# than a pattern over `--cluster-`, because `--cluster-dir` is a setting.
-OneShotVerbs="print-surfaces help version cluster-status cluster-set cluster-admit cluster-admit-learner"
-OneShotVerbs="${OneShotVerbs} cluster-admit-client cluster-forget cluster-forget-client"
-OneShotVerbs="${OneShotVerbs} install-service uninstall-service enroll-list enroll-approve enroll-reject"
-OneShotVerbs="${OneShotVerbs} migrate-cache seed-config cordon uncordon"
-# The verb that writes this node's identity, and so needs `--cluster-dir` and nothing else.
+# Where the node's verbs are read from: the option table's own source. The one-shot list is
+# DERIVED from it (`NodeVerbs`), never restated here -- a restated list kept two retired verbs
+# and missed two new ones (whole-branch review W-15). A NAME list rather than a pattern over
+# `--cluster-`, because `--cluster-dir` is a setting.
+NodeTableSource="${FastCachedRoot}/src/apps/fastcache-compile-node/NodeConfig.cpp"
+# The verb that writes this node's identity, and so needs `--cluster-dir` and nothing else. A
+# property of what the verb DOES rather than of the table, so it is stated here, and taken out
+# of the derived one-shot list.
 MintingVerbs="print-identity"
 # How many lines one statement may span, backwards to its opener or forwards to its end.
 StatementCap=80
@@ -120,12 +128,28 @@ if [ "${1:-}" = "--self-test" ]; then
         cp "${me%/*}/lib/third-party-roots.sh" "$scratch/tree/scripts/lib/"
         cp "${me%/*}/lib/third-party-roots.txt" "$scratch/tree/scripts/lib/"
         : > "$scratch/tree/table.txt"
+        mkdir -p "$scratch/tree/src/apps/fastcache-compile-node"
+        NodeTable '"--print-surfaces"' '"--print-identity"' '"--help"' '"--cluster-status"'
         printf '%s\n' 'add_test(' '    NAME "fixture"' \
             '    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/fixture.sh"' \
             '        "$<TARGET_FILE:fastcache-compile-node>")' > "$scratch/tree/src/tests/CMakeLists.txt"
         scratch_git -C "$scratch/tree" init -q 2>/dev/null
     }
     Track() { scratch_git -C "$scratch/tree" add -A -f >/dev/null 2>&1; }
+    # The node's table as the reader meets it: each argument is one verb row's spelling, laid
+    # out the way clang-format wraps a long row -- kind and spelling on separate lines -- beside
+    # one Context row that must NOT read as a verb.
+    NodeTable() {
+        {
+            printf '%s\n' '    static constexpr auto notFromFile = std::to_array<NotFromFile>({'
+            printf '%s\n' '        { .kind = FileExclusion::Context, .flag = "--daemon", .reason = "how this process was started" },'
+            local verb
+            for verb in "$@"; do
+                printf '%s\n' '        { .kind = FileExclusion::Verb,' "          .flag = ${verb}," '          .reason = "answers and exits" },'
+            done
+            printf '%s\n' '    });'
+        } > "$scratch/tree/src/apps/fastcache-compile-node/NodeConfig.cpp"
+    }
 
     # @param 1 what is being staged  @param 2 want-pass|want-fail|want-refuse
     Case() {
@@ -176,6 +200,31 @@ if [ "${1:-}" = "--self-test" ]; then
     Stage
     Fixture 'node="$1"' 'out="$("$node" --print-surfaces 2>&1)"'
     Case "a one-shot verb passes with neither flag" want-pass
+
+    # The verb list is the node's table, read: a verb the table names passes, one it does not
+    # name is a start, and a Context row is not a verb.
+    Stage
+    NodeTable '"--print-surfaces"' '"--print-identity"' '"--help"' '"--enroll-clear"'
+    Fixture 'node="$1"' 'out="$("$node" --enroll-clear 2>&1)"'
+    Case "a verb the node's table names passes, with no edit to this script" want-pass
+
+    Stage
+    Fixture 'node="$1"' 'out="$("$node" --cluster-forget-client=pc-07 2>&1)"'
+    Case "a verb the node's table no longer names is a start, and is REFUSED" want-fail
+
+    Stage
+    Fixture 'node="$1"' '"$node" --daemon --listen-node=127.0.0.1:1 &'
+    Case "a Context row of the table is not a verb, so a start naming it is still judged -- REFUSED" want-fail
+
+    Stage
+    rm -f "$scratch/tree/src/apps/fastcache-compile-node/NodeConfig.cpp"
+    Fixture 'node="$1"' '"$node" --listen-raft= --cluster-dir="$w/s" &'
+    Case "a tree with no node table is REFUSED, never read as a list of no verbs" want-refuse
+
+    Stage
+    NodeTable '"--print-surfaces"' '"--cluster-status"'
+    Fixture 'node="$1"' '"$node" --listen-raft= --cluster-dir="$w/s" &'
+    Case "a table read naming no --help is REFUSED: the reader is not reading the table" want-refuse
 
     Stage
     Fixture 'node="$1"' 'id="$("$node" --print-identity --listen-raft=)"'
@@ -357,6 +406,49 @@ fi
 
 Problems=0
 Fail() { echo "  FAIL: $*" >&2; Problems=$((Problems + 1)); }
+
+# The node's one-shot verbs, space-separated and without their `--`, read out of the option
+# table's source: every `FileExclusion::Verb` row of the `notFromFile` array, less the minting
+# verbs. The array is flattened first, since clang-format puts a long row's kind and spelling
+# on separate lines. Returns 2, saying why, when the array is not there or names no `--help` --
+# the positive control that this read the table rather than something shaped like it.
+NodeVerbs() {
+    local verbs
+    [ -r "${NodeTableSource}" ] || {
+        echo "check-node-fixture-starts: cannot read the node's table at ${NodeTableSource#"${FastCachedRoot}/"}." >&2
+        echo "  Its one-shot verbs are read from there; refused rather than judged with none." >&2
+        return 2
+    }
+    verbs="$(awk -v minting=" ${MintingVerbs} " '
+        /std::to_array<NotFromFile>\(/ { inside = 1; found = 1 }
+        inside { text = text " " $0 }
+        inside && /^[ \t]*}\);/ { inside = 0 }
+        END {
+            if (!found) exit 3
+            while (match(text, /\.kind[ \t]*=[ \t]*FileExclusion::Verb,[ \t]*\.flag[ \t]*=[ \t]*"--[a-z][a-z-]*"/)) {
+                row = substr(text, RSTART, RLENGTH)
+                text = substr(text, RSTART + RLENGTH)
+                sub(/^[^"]*"--/, "", row)
+                sub(/"$/, "", row)
+                if (index(minting, " " row " ") == 0) printf "%s ", row
+            }
+        }
+    ' "${NodeTableSource}")" || {
+        echo "check-node-fixture-starts: no std::to_array<NotFromFile>( array in ${NodeTableSource#"${FastCachedRoot}/"}." >&2
+        echo "  The one-shot verbs are its FileExclusion::Verb rows; refused rather than judged with none." >&2
+        return 2
+    }
+    case " ${verbs}" in
+        *" help "*) ;;
+        *)
+            echo "check-node-fixture-starts: the node's table read as verbs [${verbs}], with no --help among them." >&2
+            echo "  Every node answers --help, so this read is not of the table; refused." >&2
+            return 2
+            ;;
+    esac
+    printf '%s\n' "${verbs% }"
+}
+OneShotVerbs="$(NodeVerbs)" || exit 2
 
 # Every first-party script a start could be in, one per line, through git.
 Subjects() {

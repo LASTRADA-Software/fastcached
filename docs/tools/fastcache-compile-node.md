@@ -2782,12 +2782,11 @@ run the install again once the cause is fixed.
 The MSI does that registration for you, with no property at all. A node registers its worker
 where its formation record says (its own scheduler on a first start, its fleet's once it has
 joined one), so there is no scheduler to name, and a node that serves is refused `--scheduler`.
-What an installer cannot guess is an address other machines must dial in place of this
-machine's own name, a machine of the fleet to ask when no beacon reaches this one, and the one
-fleet this machine may join; all three are optional:
+What an installer cannot guess is a machine of the fleet to ask when no beacon reaches this one,
+and the one fleet this machine may join; both are optional:
 
 ```
-msiexec /i fastcached.msi FASTCACHE_NODE_ADVERTISE=worker-01.internal:6674 FASTCACHE_FLEET_SEED=office-a.vpn.example FASTCACHE_FLEET_ID=<cluster-id>@<key>
+msiexec /i fastcached.msi FASTCACHE_FLEET_SEED=office-a.vpn.example FASTCACHE_FLEET_ID=<cluster-id>@<key>
 ```
 
 Select the **fastcache-compile-node** feature (silently: `ADDLOCAL=CM_C_Cli,CM_C_Node` on a
@@ -2795,18 +2794,19 @@ first install, `ADDLOCAL=CM_C_Node` to add it to one that is there). On a
 machine that also runs fastcached, the MSI makes `FastCached` manual and stops it,
 because both would answer on 6674. Every transaction that keeps the node -- a repair, a
 feature change, an upgrade -- registers it again, and the optional properties are
-remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE`, `FASTCACHE_FLEET_SEED` and
-`FASTCACHE_FLEET_ID` are kept under
+remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_FLEET_SEED` and `FASTCACHE_FLEET_ID` are kept under
 `HKLM\SOFTWARE\fastcached\Installer` and read back unless the transaction states a new
 value, so a repair that leaves them out keeps the firewall scope rather than opening the
 rules to any address. Registering again is also what clears the `--scheduler` an earlier
-package registered, which a node that serves now refuses.
+package registered, which a node that serves now refuses, and the `--advertise` an earlier
+package of this installer registered from the advertised-endpoint property it remembered.
 
-`FASTCACHE_NODE_ADVERTISE` is optional. Left out, the registration carries no
-`--advertise`, and the node advertises this machine's fully qualified name on its
-`--listen-node` port, resolved at every start, so a renamed machine or a new VPN
-address needs no reinstall; given, it is registered as typed. `FASTCACHE_FIREWALL_ALLOW`
-is optional too: it is passed as `--firewall-allow` (one address with an optional
+There is no such property any more. The registration carries no `--advertise`, and the node
+advertises this machine's fully qualified name on its `--listen-node` port, resolved at every
+start, so a renamed machine or a new VPN address needs no reinstall -- where a remembered IP
+literal on a roaming laptop vetoed every dial hint at every upgrade. An address that must be typed
+goes under `advertise:` in the configuration file. `FASTCACHE_FIREWALL_ALLOW`
+is optional: it is passed as `--firewall-allow` (one address with an optional
 `/prefix`) to this registration and to fastcached's, and left out the rules admit any
 address. `FASTCACHE_FLEET_SEED` is optional as well: one name or `name:port`, registered as
 `--fleet-seed` and replayed at every start, so a node across a VPN asks that machine while it is
@@ -2817,7 +2817,7 @@ and no other. A pin is security material: one the node cannot parse fails the WH
 before anything is remembered or registered -- the MSI runs `--check-arguments` over the node's
 arguments as its first step -- so a repair or
 upgrade keeps the registration and the remembered pin it had, rather than starting a node that
-trusts on first use. A malformed seed or advertised endpoint fails it the same way.
+trusts on first use. A malformed seed fails it the same way.
 `FASTCACHE_DISCOVERY_REPLY_PORT` defaults to `6682` and is passed as
 `--discovery-reply-port`, so the registration's firewall rule is `discovery-reply udp/6682`
 rather than the any-port rule above; pass another port to move it, or pass it empty to leave the

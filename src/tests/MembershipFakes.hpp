@@ -2,11 +2,13 @@
 #pragma once
 
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Protocol/ProvenIdentity.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <format>
 #include <functional>
 #include <map>
@@ -24,28 +26,77 @@
 namespace FastCache::Testing
 {
 
+/// Which hosts a route can honestly answer for when it answers by HOST -- the only question a
+/// host-answering fake (`ListedMembership`, `FixedMembership`) can be asked.
+///
+/// Private to these fakes: never transmitted or persisted.
+enum class HostReach : std::uint8_t
+{
+    None,        ///< Production never derives this route from a host: it needs a KEY the connection showed.
+    ThisMachine, ///< Admits this machine and nobody else.
+    AnyHost,     ///< Admits a host without a key.
+};
+
+/// One row of `HostLabels`.
+struct HostLabelRow
+{
+    Distributed::MembershipParticipant route; ///< The admission route.
+    std::string_view name;                    ///< How a refusal names it.
+    HostReach reach;                          ///< Which hosts a fake may label with it.
+};
+
+/// The routes a host-answering fake may stand for, and over which hosts.
+///
+/// **Only `Loopback` and `OpenPolicy` answer by host in production.** A proven key and a verified
+/// ticket are facts a CONNECTION established (`ConnectionFacts::proven`,
+/// `ConnectionFacts::authenticatedMachine`), asked of a key roster through `ExplainKey`; a revoked
+/// key is the same, refused. A host list labelled with one of those describes a route that does not
+/// exist -- an operator "admitted by ticket" from an address with no ticket at all -- and its cases
+/// pass over the gap. A case about one composes `RosterFold` and presents the key.
+inline constexpr EnumTable<Distributed::MembershipParticipant, HostLabelRow> HostLabels { {
+    { .route = Distributed::MembershipParticipant::Reserved, .name = "the reserved participant", .reach = HostReach::None },
+    { .route = Distributed::MembershipParticipant::Loopback, .name = "Loopback", .reach = HostReach::ThisMachine },
+    { .route = Distributed::MembershipParticipant::OpenPolicy, .name = "OpenPolicy", .reach = HostReach::AnyHost },
+    { .route = Distributed::MembershipParticipant::ProvenIdentity, .name = "ProvenIdentity", .reach = HostReach::None },
+    { .route = Distributed::MembershipParticipant::MachineTicket, .name = "MachineTicket", .reach = HostReach::None },
+    { .route = Distributed::MembershipParticipant::KeyTombstone, .name = "KeyTombstone", .reach = HostReach::None },
+} };
+
+static_assert(RowsInEnumeratorOrder(HostLabels, &HostLabelRow::route),
+              "HostLabels must hold one row per MembershipParticipant, in enumerator order");
+
 /// Refuse a route label a host-answering fake could not honestly carry.
 ///
 /// **A fake more permissive than the real thing makes its cases pass while describing a route that
-/// does not exist**, and nothing ever fails to find it. Two labels are such a fake by
-/// construction: `Reserved`, which no decision can name, and `Loopback` on any host that is not
-/// this machine -- loopback admits this machine and nobody else. A remote host a case must admit
-/// by address is `OpenPolicy`'s, the one route that admits a remote host without a key.
+/// does not exist**, and nothing ever fails to find it. `HostLabels` says which labels are such a
+/// fake by construction: every route production derives from a key rather than a host, `Reserved`,
+/// which no decision can name, and `Loopback` on any host that is not this machine -- loopback
+/// admits this machine and nobody else. A remote host a case must admit by address is
+/// `OpenPolicy`'s, the one route that admits a remote host without a key.
 /// @param participant The route the fake stands for.
 /// @param admitted The hosts it answers `Member` for.
-/// @throws std::invalid_argument naming the label and the host.
+/// @throws std::invalid_argument naming the label and, for `Loopback`, the host.
 inline void RequireHonestLabel(Distributed::MembershipParticipant participant, std::span<std::string const> admitted)
 {
-    if (participant == Distributed::MembershipParticipant::Reserved)
-        throw std::invalid_argument("a membership fake may not stand for the reserved participant");
-    if (participant != Distributed::MembershipParticipant::Loopback)
-        return;
-    for (auto const& host: admitted)
-        if (!IsLoopbackHost(host))
+    auto const& row = HostLabels[std::to_underlying(participant)];
+    switch (row.reach)
+    {
+        case HostReach::None:
             throw std::invalid_argument(
-                std::format("a membership fake labels {} Loopback, which admits only this machine; a remote host "
-                            "admitted by address is OpenPolicy's",
-                            host));
+                std::format("a membership fake that answers by host may not stand for {}: production never derives "
+                            "that route from a host. Compose Testing::RosterFold and present the key on the connection",
+                            row.name));
+        case HostReach::ThisMachine:
+            for (auto const& host: admitted)
+                if (!IsLoopbackHost(host))
+                    throw std::invalid_argument(
+                        std::format("a membership fake labels {} Loopback, which admits only this machine; a remote "
+                                    "host admitted by address is OpenPolicy's",
+                                    host));
+            return;
+        case HostReach::AnyHost:
+            return;
+    }
 }
 
 /// An oracle that admits whatever is in a host list.

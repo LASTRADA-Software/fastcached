@@ -136,6 +136,13 @@ key -- a node by the key it proves, a client by the machine ticket its own node 
 forgotten by that key with `--cluster-forget`. Each is refused by name, with the step that
 replaces it, on a command line, in a configuration file and in a service registration.
 
+The flags of the retired principal mode are gone the same way: `--enroll-from`,
+`--voter-key` and `--cluster-admit-worker`, with their keys `enroll_from`, `voter_key` and
+`cluster_admit_worker`. Every machine joins one way, as a learner holding its identity key:
+it finds its fleet by discovery or at the node `--fleet-seed` names, asks to enroll, and
+`--enroll-approve` admits it, or `--cluster-admit-learner` admits it by its key. No key anchors
+a roster, because every machine checks grants against the roster its own consensus applies.
+
 ## Signed leases, checked against the state each node applied
 
 **#178 signs every lease with the issuing scheduler's own identity key and has every

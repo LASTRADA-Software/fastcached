@@ -796,7 +796,7 @@ struct ReloadingRig
 };
 } // namespace
 
-TEST_CASE("A reform keeps a --fleet-member entry an accepted reload removed", "[node][formation][loop][reload]")
+TEST_CASE("A reform keeps the --fleet-open an accepted reload turned off", "[node][formation][loop][reload]")
 {
     // REMOVAL is the direction an admission path must get right: an operator turns `--fleet-open` off
     // and reloads, and the next move that reforms -- here a yield into a learner -- must not re-admit

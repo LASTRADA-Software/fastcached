@@ -365,16 +365,48 @@ std::unique_ptr<IHostAddressSource> MakeSystemHostAddresses()
     return std::make_unique<SystemHostAddresses>();
 }
 
+namespace
+{
+    constexpr auto LocalityExpiryRows = EnumTable<HostEvent, LocalityExpiryRow> { {
+        { .event = HostEvent::Suspending,
+          .expires = false,
+          .why = "nothing has moved yet, and the machine is about to stop asking" },
+        { .event = HostEvent::Resumed,
+          .expires = true,
+          .why = "a machine that slept may wake on another network, holding other addresses" },
+        { .event = HostEvent::NetworkChanged,
+          .expires = true,
+          .why = "an interface or an address came or went: the set may name an address another machine now holds" },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(LocalityExpiryRows, &LocalityExpiryRow::event),
+                  "every HostEvent needs a locality expiry row, at its own index");
+} // namespace
+
+LocalityExpiryRow const& LocalityExpiryFor(HostEvent event) noexcept
+{
+    return LocalityExpiryRows[static_cast<std::size_t>(event)];
+}
+
+void CachedLocalityOracle::OnHostEvent(HostEvent event)
+{
+    if (!LocalityExpiryFor(event).expires)
+        return;
+    std::scoped_lock const guard { _mutex };
+    _due = true;
+}
+
 void CachedLocalityOracle::RefreshIfDue() const
 {
-    // On an interval, never because a call did not find the address. A refresh a
-    // stranger can provoke is a probe a stranger can bill this machine for, once per
-    // request, and on Windows that probe costs milliseconds.
+    // On an interval or after a host event, never because a call did not find the
+    // address. A refresh a stranger can provoke is a probe a stranger can bill this
+    // machine for, once per request, and on Windows that probe costs milliseconds.
     auto const now = _clock.now();
-    if (now - _sampledAt >= _refreshInterval)
+    if (_due || now - _sampledAt >= _refreshInterval)
     {
         _addresses = _source.Addresses();
         _sampledAt = now;
+        _due = false;
     }
 }
 

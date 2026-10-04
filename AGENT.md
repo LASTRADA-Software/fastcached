@@ -1300,7 +1300,8 @@ and what they may assume.
 - A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`, and the membership oracles are
   `src/tests/MembershipFakes.hpp` (`ctest -R membership-fakes`). A WRONG fake makes its cases pass,
   so no failure ever finds it, and a copy's cost GROWS — the shared fake takes the participant
-  REQUIRED and undefaulted.
+  REQUIRED and undefaulted. A host-answering fake stands only for a route production answers by
+  HOST; a ticket, a proof or a revoked key is `Testing::RosterFold` with the key PRESENTED.
 - And a fake that resolves SYNCHRONOUSLY what production SUSPENDS on cannot exercise a suspension
   protocol, however correct its assertions: every property defined by parking is vacuous over
   `InMemorySocket`. The survey of which have a real-socket case is in the rules file.
@@ -1460,11 +1461,11 @@ triple is a wrong hit rather than a miss
 
 Where it IS safe, a cache still owes five things: **measure before choosing, on every platform**;
 **fast by construction before fast by cache** (`IsLoopbackHost` first and lock-free), so the cache
-bounds only the rare path; **refresh on an INTERVAL, never on a miss**, or a remote peer has a
-free amplifier — one expensive probe per request, just by asking; **name both staleness directions
-in the header**, which is what makes a longer interval defensible; and **an injected seam with an
-injected clock**, because a cache with a hidden clock is untestable by construction. Each is
-derived with its measurement in [`.agent/rules/compile-cache.md`](.agent/rules/compile-cache.md)
+bounds only the rare path; **refresh on an INTERVAL or on a HOST EVENT, never on a miss**, or a
+remote peer has a free amplifier — one expensive probe per request, just by asking; **name both
+staleness directions in the header**, which is what makes a longer interval defensible; and **an
+injected seam with an injected clock**, because a cache with a hidden clock is untestable by
+construction. Each is measured in [`.agent/rules/compile-cache.md`](.agent/rules/compile-cache.md)
 and [`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md).
 
 **A performance figure is a quantity UNDER CONDITIONS, and the two halves get lost

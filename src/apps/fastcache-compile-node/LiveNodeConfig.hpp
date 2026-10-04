@@ -13,7 +13,7 @@ namespace FastCache::Node
 /// The configuration this node runs by now, read at the moment it is needed.
 ///
 /// A seam because several of the flags a judgement reads are `Reloadable::Yes` (`--advertise`,
-/// `--fleet-member`, `--fleet-open`): a copy taken when a component was built goes on describing the
+/// `--fleet-open`, `--requirepass`): a copy taken when a component was built goes on describing the
 /// flags the body started with after an accepted reload has changed them. Read where it is used, as
 /// an outbound credential is (`ICredentialSource`).
 class INodeConfigSource

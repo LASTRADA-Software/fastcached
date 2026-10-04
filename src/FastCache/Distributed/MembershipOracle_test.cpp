@@ -286,6 +286,13 @@ TEST_CASE("A connection proving a key the record no longer holds is no proven no
 
 TEST_CASE("A membership fake refuses a label no production route could carry", "[distributed][membership]")
 {
+    // An admission production derives from a key is the production fold's to give: the key route
+    // the host labels below are refused, done honestly, admits the machine whose key it shows.
+    Fold const fold { { "m1" } };
+    CHECK(Distributed::ExplainConnection(fold.admitted,
+                                         ConnectionFacts { .host = "10.0.0.7", .authenticatedMachine = IdentityOf("m1") })
+              .decidedBy.Has(Distributed::MembershipParticipant::MachineTicket));
+
     // Loopback admits this machine and nobody else, so a fake that labels a remote host
     // `Loopback` models an admission production cannot produce -- a fake more permissive than the
     // real thing, whose cases pass while describing a route that does not exist.
@@ -297,6 +304,23 @@ TEST_CASE("A membership fake refuses a label no production route could carry", "
         std::invalid_argument);
     CHECK_THROWS_AS((Testing::ListedMembership { { "10.0.0.7" }, Distributed::MembershipParticipant::Reserved }),
                     std::invalid_argument);
+
+    // A proven key, a verified ticket and a revoked key are facts a CONNECTION established, asked of
+    // a key roster; no production route derives one from a host. A host list labelled with one
+    // admits an address that showed nothing -- refused for this machine's spellings too, since
+    // loopback is its own route.
+    for (auto const keyRoute: { Distributed::MembershipParticipant::ProvenIdentity,
+                                Distributed::MembershipParticipant::MachineTicket,
+                                Distributed::MembershipParticipant::KeyTombstone })
+    {
+        INFO(static_cast<int>(keyRoute));
+        CHECK_THROWS_AS((Testing::ListedMembership { { "10.0.0.7" }, keyRoute }), std::invalid_argument);
+        CHECK_THROWS_AS((Testing::ListedMembership { { "127.0.0.1" }, keyRoute }), std::invalid_argument);
+        CHECK_THROWS_AS((Testing::FixedMembership { Distributed::Membership::Member, keyRoute }), std::invalid_argument);
+    }
+    CHECK_THROWS_AS(
+        (Testing::FixedMembership { Distributed::Membership::Forgotten, Distributed::MembershipParticipant::KeyTombstone }),
+        std::invalid_argument);
 
     // The controls: this machine's spellings under `Loopback`, a remote host under the one route
     // that admits one by address, and loopback's honest opinion of a remote host -- none.

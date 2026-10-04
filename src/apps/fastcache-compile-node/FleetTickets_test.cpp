@@ -133,6 +133,51 @@ TEST_CASE("With no ticket the same machine is refused, by the same scheduler, as
     CHECK(RefusalCounts(office.fleet) == std::vector<std::uint64_t>(EnumeratorCount<Distributed::TicketRefusal>, 0));
 }
 
+TEST_CASE("The harness admits no caller a node would refuse: no oracle is the node's fold, and a password establishes "
+          "nothing",
+          "[fleet][ticket][admission][harness]")
+{
+    // W-8. Until it, a node the case gave no oracle made EVERY caller a proven, identified member,
+    // and a credential that was not a ticket answered Ok and passed the command through as that --
+    // more permissive than any node, so a fold or a publish regression stayed green over it. Here
+    // the case sets NO oracle: the node decides by the fold every node composes when it is not
+    // open -- loopback, and a key roster of the state it committed.
+    FleetHarness fleet;
+    fleet.SetCallerHost(VpnAddress);
+    fleet.AddScheduler(OfficeScheduler);
+    fleet.SetClusterStateAt(OfficeScheduler, FleetHarness::StateOf({ OfficeScheduler }, {}, 1));
+    fleet.ElectLeader(OfficeScheduler);
+    fleet.AdmitMachine(Laptop);
+    fleet.RegisterWorker(OfficeScheduler, Pc, Toolchain, /*slots=*/4); // room for every lease below
+    auto const lease = [&fleet](Cc::Credential const& credential, std::string const& key) {
+        return fleet.Exchange(OfficeScheduler,
+                              Wire::EncodeLease(Wire::LeaseRequest {
+                                  .fingerprint = std::string { Toolchain }, .key = key, .acceptedCodecs = {} }),
+                              credential,
+                              Cc::ExchangeBudget {});
+    };
+
+    // An address nobody listed, presenting nothing: a stranger.
+    auto const anonymous = lease(Cc::Credential {}, "k1");
+    CHECK(anonymous.kind == Cc::CacheOutcomeKind::Rejected);
+    CHECK(anonymous.code == Wire::ErrorCode::NotAMember);
+
+    // A PASSWORD: the node checks none (`NoPolicy`), so AUTH answers Ok and ESTABLISHES NOTHING --
+    // the command is decided as the anonymous one was.
+    auto const password = lease(
+        Cc::Credential { .kind = Wire::AuthKind::Password, .username = {}, .secret = SecureString { "a password" } }, "k2");
+    CHECK(password.kind == Cc::CacheOutcomeKind::Rejected);
+    CHECK(password.code == Wire::ErrorCode::NotAMember);
+
+    // The controls. The laptop's TICKET is folded in by that same default fold, over the keys the
+    // admission COMMITTED -- so the key roster was published at the commit, with no exchange
+    // between. And this machine, on loopback, is admitted with nothing presented.
+    auto const ticketed = lease(fleet.TicketFor(Laptop, OfficeScheduler), "k3");
+    CHECK(ticketed.kind == Cc::CacheOutcomeKind::Hit);
+    fleet.SetCallerHost("127.0.0.1");
+    CHECK(lease(Cc::Credential {}, "k4").kind == Cc::CacheOutcomeKind::Hit);
+}
+
 TEST_CASE("Every ticket refusal is named on the wire and counted apart, across the fleet", "[fleet][ticket][admission]")
 {
     struct Row

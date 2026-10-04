@@ -850,6 +850,21 @@ std::span<RetiredNodeFlag const> RetiredNodeFlags() noexcept
           .fileKey = "cluster_forget_client",
           .step = "remove it: a machine is forgotten by its key with --cluster-forget, which revokes that key from "
                   "every address" },
+        // Principal mode is retired: every machine joins ONE way, as a learner member holding its key, so the
+        // flags that named a seed to join through, anchored a roster nobody applied, or admitted a principal
+        // are gone with it.
+        { .flag = "--enroll-from",
+          .fileKey = "enroll_from",
+          .step = "remove it: a machine finds its fleet by discovery, or at the node --fleet-seed names, and asks "
+                  "to enroll there on its own" },
+        { .flag = "--voter-key",
+          .fileKey = "voter_key",
+          .step = "remove it: every machine joins as a learner and checks grants against the roster its own "
+                  "consensus applies, so no key anchors a roster" },
+        { .flag = "--cluster-admit-worker",
+          .fileKey = "cluster_admit_worker",
+          .step = "remove it: every machine joins as a learner holding its key -- it asks to enroll and "
+                  "--enroll-approve admits it, or --cluster-admit-learner admits it by that key" },
     });
     return rows;
 }
@@ -1896,46 +1911,92 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
     // the cluster a question, instead of serving. The rest are settings that
     // describe how this process was STARTED rather than what it does, and reading
     // them from the very file the start already found is circular.
-    static constexpr auto notFromFile = std::to_array<std::pair<std::string_view, std::string_view>>({
-        { "--config", "names the file being read; a key for it would name a file to read while reading one" },
-        { "--daemon",
-          "how this process was started, decided by whoever started it -- a service is already "
-          "supervised, and a file that forked an operator's foreground run would take away the "
-          "console they were watching" },
-        { "--service-name",
-          "the identity a registration is made under, read back from the file that "
-          "registration points at -- so the name would come from the file the name found" },
-        { "--service-scope", "the same circle as --service-name, for which supervisor the registration goes to" },
-        { "--service-start", "the same circle as --service-scope: how the supervisor starts the registration" },
-        { "--firewall-allow", "install-time only: it scopes the rules the registration creates" },
-        { "--install-service", "registers and exits; a key would re-register at every start" },
-        { "--uninstall-service", "removes the registration and exits; a key would remove it at every start" },
-        { "--migrate-cache",
-          "converts the store and exits; a key would convert at every start, on a store "
-          "that after the first run has nothing left to convert" },
-        { "--seed-config",
-          "installs the file a key would be read from, then exits; a key for it would re-seed at every start" },
-        { "--print-surfaces", "prints the ports and exits; a key would print them instead of serving them" },
-        { "--print-identity", "prints this node's identity and exits; a key would print it instead of serving" },
-        { "--cordon",
-          "cordons the running worker and exits; a key would cordon it at every start, which is a machine that "
-          "never comes back to the fleet" },
-        { "--uncordon", "lifts the running worker's cordon and exits" },
-        { "--cluster-status", "asks a running cluster a question and exits" },
-        { "--cluster-set", "changes a running cluster's settings and exits" },
-        { "--cluster-admit", "admits a member and exits" },
-        { "--cluster-admit-learner",
-          "admits a member as a learner and exits; a key would re-admit it at every start, demoting a "
-          "member somebody had since promoted" },
-        { "--cluster-forget", "removes a member and exits" },
-        { "--enroll-list", "prints what is waiting and exits" },
-        { "--enroll-approve", "admits one machine and exits; a key would re-admit it at every start" },
-        { "--enroll-reject", "refuses one machine and exits" },
-        { "--enroll-auto-approve", "arms or ends the auto-approve window and exits" },
-        { "--enroll-clear", "drops the undecided requests and exits" },
-        { "--help", "prints usage and exits" },
-        { "--version", "prints the version and exits" },
-        { "--check-arguments", "parses the command line and exits; a key would check instead of serving" },
+    //
+    // Which of those two objections a row is. `scripts/check-node-fixture-starts.sh` reads the
+    // `FileExclusion::Verb` rows' spellings as the node's one-shot verbs, so this column is the
+    // one list of them: a verb added, retired or renamed here is one the scan follows.
+    //
+    // Private: read by this function and by that script's text scan, by NAME, and never
+    // transmitted or persisted.
+    enum class FileExclusion : std::uint8_t
+    {
+        Verb,    ///< Answers and exits; a key would replay it at every start.
+        Context, ///< Describes how this process was started; a key would be circular.
+    };
+    struct NotFromFile
+    {
+        FileExclusion kind;      ///< Which objection.
+        std::string_view flag;   ///< The row's primary spelling.
+        std::string_view reason; ///< Why a file may not carry it.
+    };
+    static constexpr auto notFromFile = std::to_array<NotFromFile>({
+        { .kind = FileExclusion::Context,
+          .flag = "--config",
+          .reason = "names the file being read; a key for it would name a file to read while reading one" },
+        { .kind = FileExclusion::Context,
+          .flag = "--daemon",
+          .reason = "how this process was started, decided by whoever started it -- a service is already "
+                    "supervised, and a file that forked an operator's foreground run would take away the "
+                    "console they were watching" },
+        { .kind = FileExclusion::Context,
+          .flag = "--service-name",
+          .reason = "the identity a registration is made under, read back from the file that "
+                    "registration points at -- so the name would come from the file the name found" },
+        { .kind = FileExclusion::Context,
+          .flag = "--service-scope",
+          .reason = "the same circle as --service-name, for which supervisor the registration goes to" },
+        { .kind = FileExclusion::Context,
+          .flag = "--service-start",
+          .reason = "the same circle as --service-scope: how the supervisor starts the registration" },
+        { .kind = FileExclusion::Context,
+          .flag = "--firewall-allow",
+          .reason = "install-time only: it scopes the rules the registration creates" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--install-service",
+          .reason = "registers and exits; a key would re-register at every start" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--uninstall-service",
+          .reason = "removes the registration and exits; a key would remove it at every start" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--migrate-cache",
+          .reason = "converts the store and exits; a key would convert at every start, on a store "
+                    "that after the first run has nothing left to convert" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--seed-config",
+          .reason = "installs the file a key would be read from, then exits; a key for it would re-seed at every start" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--print-surfaces",
+          .reason = "prints the ports and exits; a key would print them instead of serving them" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--print-identity",
+          .reason = "prints this node's identity and exits; a key would print it instead of serving" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--cordon",
+          .reason = "cordons the running worker and exits; a key would cordon it at every start, which is a machine that "
+                    "never comes back to the fleet" },
+        { .kind = FileExclusion::Verb, .flag = "--uncordon", .reason = "lifts the running worker's cordon and exits" },
+        { .kind = FileExclusion::Verb, .flag = "--cluster-status", .reason = "asks a running cluster a question and exits" },
+        { .kind = FileExclusion::Verb, .flag = "--cluster-set", .reason = "changes a running cluster's settings and exits" },
+        { .kind = FileExclusion::Verb, .flag = "--cluster-admit", .reason = "admits a member and exits" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--cluster-admit-learner",
+          .reason = "admits a member as a learner and exits; a key would re-admit it at every start, demoting a "
+                    "member somebody had since promoted" },
+        { .kind = FileExclusion::Verb, .flag = "--cluster-forget", .reason = "removes a member and exits" },
+        { .kind = FileExclusion::Verb, .flag = "--enroll-list", .reason = "prints what is waiting and exits" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--enroll-approve",
+          .reason = "admits one machine and exits; a key would re-admit it at every start" },
+        { .kind = FileExclusion::Verb, .flag = "--enroll-reject", .reason = "refuses one machine and exits" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--enroll-auto-approve",
+          .reason = "arms or ends the auto-approve window and exits" },
+        { .kind = FileExclusion::Verb, .flag = "--enroll-clear", .reason = "drops the undecided requests and exits" },
+        { .kind = FileExclusion::Verb, .flag = "--help", .reason = "prints usage and exits" },
+        { .kind = FileExclusion::Verb, .flag = "--version", .reason = "prints the version and exits" },
+        { .kind = FileExclusion::Verb,
+          .flag = "--check-arguments",
+          .reason = "parses the command line and exits; a key would check instead of serving" },
     });
 
     // A row is reachable from the file or it is named above. Checked at compile
@@ -1946,7 +2007,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                                       [](OptionSpec<NodeConfig> const& spec) {
                                           return !spec.yamlKey.empty()
                                                  || std::ranges::any_of(notFromFile, [&spec](auto const& excluded) {
-                                                        return excluded.first == spec.primary;
+                                                        return excluded.flag == spec.primary;
                                                     });
                                       }),
                   "every --flag must carry a yamlKey or be listed in notFromFile with a reason");
@@ -1956,7 +2017,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
     static_assert(std::ranges::all_of(notFromFile,
                                       [](auto const& excluded) {
                                           return std::ranges::any_of(options, [&excluded](auto const& spec) {
-                                              return spec.primary == excluded.first && spec.yamlKey.empty();
+                                              return spec.primary == excluded.flag && spec.yamlKey.empty();
                                           });
                                       }),
                   "every notFromFile entry must name a real row that carries no yamlKey");

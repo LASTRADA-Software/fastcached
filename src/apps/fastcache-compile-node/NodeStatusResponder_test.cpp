@@ -1219,6 +1219,41 @@ TEST_CASE("explain-admission about a machine answers from the roster through the
         CHECK(ask(openly, "gone").verdict == Wire::WireMembership::Forgotten);
     }
 
+    SECTION("on an open node an anonymous caller is told nothing about a machine, the same for every standing")
+    {
+        // `--fleet-open` makes every caller a member, so membership alone would tell an anonymous
+        // remote caller which machines are revoked, learners or unknown -- third-party standing the
+        // ticket path collapses for a captured ticket. The machine form asks for an IDENTIFIED
+        // caller instead, and answers the same refusal whatever the machine's standing.
+        Distributed::OpenMembership const open;
+        Distributed::AnyOfMembership const openly { { &fold.loopback, &open, &fold.keys } };
+        NodeStatusResponder responder { fixture.status, readings, openly, standing, metrics };
+        auto const anonymous = PeerIdentity { .host = "10.0.0.7" };
+        REQUIRE(Distributed::ExplainConnection(openly, anonymous).verdict == Distributed::Membership::Member);
+
+        auto refusals = std::vector<std::vector<std::byte>> {};
+        for (auto const* const subject: { "pc-07", "gone", "new-pc", "nobody" })
+        {
+            INFO(subject);
+            auto const reply = AnswerFrom(responder, Wire::EncodeExplainAdmissionRequest(subject), anonymous);
+            auto const shape = ShapeOf(reply);
+            CHECK(shape.status == Wire::Status::Error);
+            CHECK(shape.code == Wire::ErrorCode::IdentifiedCallerRequired);
+            refusals.emplace_back(reply.begin(), reply.end());
+        }
+        // Byte for byte the same answer for a live, a revoked, a waiting and an unknown machine.
+        CHECK(std::ranges::all_of(refusals, [&refusals](auto const& reply) { return reply == refusals.front(); }));
+        CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 0);
+
+        // The control: the same remote host presenting a fleet machine's TICKET is identified, and
+        // is answered with the standing.
+        auto const ticketed = ExplanationOf(
+            AnswerFrom(responder,
+                       Wire::EncodeExplainAdmissionRequest("gone"),
+                       PeerIdentity { .host = "10.0.0.7", .authenticatedMachine = Testing::IdentityOf("pc-07") }));
+        CHECK(ticketed.standing == std::optional { Wire::WireMachineStanding::Revoked });
+    }
+
     SECTION("a stranger asking about a machine is refused, counted once, and told nothing about it")
     {
         NodeStatusResponder responder { fixture.status, readings, fold.admitted, standing, metrics };

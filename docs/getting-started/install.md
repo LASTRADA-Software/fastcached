@@ -88,10 +88,11 @@ registers the services that follow from the choice:
 
 The node needs no property to be registered: it finds its scheduler from the fleet it forms or
 joins (the [fastcache-compile-node page](../tools/fastcache-compile-node.md#macos-and-windows)
-has the details). The address clients reach the node at
-(`FASTCACHE_NODE_ADVERTISE`) is optional: left out, the node advertises this machine's fully
-qualified name. So is `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8`, which limits the firewall rules both
-registrations create to that remote range; left out, they admit any address. So is
+has the details). There is no property for the address clients reach the node at: the node
+advertises this machine's fully qualified name, resolved at every start, so a renamed machine or a
+new VPN address needs no reinstall; an address that must be typed goes under `advertise:` in the
+node's configuration file. `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8` is optional, and limits the
+firewall rules both registrations create to that remote range; left out, they admit any address. So is
 `FASTCACHE_FLEET_SEED=office-a.vpn.example`, one machine of the fleet for the node to ask when no
 discovery beacon reaches it, as across a VPN; it is registered as the node's `--fleet-seed`, and a
 node that needs more than one names them under `fleet_seed:` in its configuration file. So is
@@ -103,7 +104,7 @@ the log names the action `FastCacheNodeCheckArguments`; `fastcache-compile-node 
 the node's arguments before anything is remembered or registered, so a refused pin is never
 remembered, and a repair or upgrade leaves the existing registration and its remembered pin as they
 were rather than starting a node that trusts whichever fleet proves itself first. A malformed
-`FASTCACHE_FLEET_SEED` or `FASTCACHE_NODE_ADVERTISE` fails it the same way. So does a node registration
+`FASTCACHE_FLEET_SEED` fails it the same way. So does a node registration
 that cannot be made, or a node that is not running five seconds after its start: the node is
 checked, registered, remembered and started in that order, each step failing the transaction, and a
 transaction that fails puts back the registration and the remembered values it found. The package also
@@ -123,11 +124,11 @@ they are removed, and a major upgrade removes the old version first. The new ins
 `FastCached` and the node again from the table, the node with no property needed.
 
 Every transaction that keeps a service registers it again, and the optional properties are
-remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE`, `FASTCACHE_FLEET_SEED` and
-`FASTCACHE_FLEET_ID` are written to
+remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_FLEET_SEED` and `FASTCACHE_FLEET_ID` are written to
 `HKLM\SOFTWARE\fastcached\Installer` and read back by the next repair or upgrade, so one that
-leaves them out registers what was installed. The node's three are written only by a transaction
-that keeps the node, once its parser has accepted them. A transaction that states a new value replaces the
+leaves them out registers what was installed. The node's two are written only by a transaction
+that keeps the node, once its parser has accepted them. (An advertised endpoint an earlier package of this
+installer remembered there is forgotten by the next transaction, and that registration carries none.) A transaction that states a new value replaces the
 remembered one. An empty value counts as leaving the property out, so a remembered scope is kept;
 to drop it, uninstall (which forgets the values) and install again. An installer older than this
 remembering has nothing to read back, so the first upgrade from one registers what it states: with

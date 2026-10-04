@@ -1537,7 +1537,12 @@ Time moves only in `Step`. It is the fleet's counterpart to
 makes: rules about a **sequence** across two machines are not reached by any amount
 of single-transition testing.
 
-Three things about it are load-bearing.
+Three things about it are load-bearing, and a fourth is what keeps the other three honest: **the
+harness admits no caller a node would refuse** (W-8). A node given no oracle is decided by the fold
+every node composes when it is not open -- loopback and a key roster of its own applied state --
+never by "everybody is a proven member"; a password AUTH establishes nothing; and the roster is
+adopted at a COMMIT, never per exchange. A harness more permissive than production lets a fold or
+publish regression stay green, which is the defect a harness exists to catch.
 
 **It is in `src/tests/`, not beside `RaftClusterHarness`.** That header lives in
 `Consensus/` because everything it touches lives in `Consensus/`. A fleet spans

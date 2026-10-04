@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
@@ -33,6 +34,9 @@ enum class ProcessExit : std::uint8_t
     Failed,  ///< It gave up for a reason a retry may change: a port held, a store busy, a file mid-rotation.
     Refused, ///< It refused to start on its configuration, or on a defect in its own build; the same start refuses again.
     Usage,   ///< A one-shot command refused what an operator asked of it; nothing supervises it.
+    /// It was asked to stop and a bounded drain ran out with work still running, so it ended itself
+    /// rather than free what that work borrows (`EndProcessOnAbandonedDrain`).
+    Abandoned,
     Last,
 };
 
@@ -64,6 +68,12 @@ struct ProcessExitRow
 /// rules refuse -- and `Failed` when it began changing something and did not finish
 /// (`CommandEnding`). Both binaries reach it through `CommandExitCode`; no step of a start gives up
 /// with it (`ProcessExit_test`).
+///
+/// `Abandoned` is 75, `EX_TEMPFAIL`, and its code is `AbandonedDrainExitCode`'s, read rather than
+/// restated: a process asked to stop whose bounded drain ran out ends itself with `std::_Exit`, from
+/// `Core`, which cannot see this table. It is a row so that "every ending is a row" stays true and
+/// the codes stay distinct by construction; a supervisor restarts it, since a stop that ran long is
+/// nothing the next start meets again.
 inline constexpr auto ProcessExitRows = EnumTable<ProcessExit, ProcessExitRow> { {
     { .exit = ProcessExit::Served,
       .code = 0,
@@ -80,6 +90,10 @@ inline constexpr auto ProcessExitRows = EnumTable<ProcessExit, ProcessExitRow> {
       .restarted = false,
       .endsAStart = false,
       .meaning = "a one-shot command declined, having changed nothing; an operator reads it, not a supervisor" },
+    { .exit = ProcessExit::Abandoned,
+      .code = AbandonedDrainExitCode,
+      .restarted = true,
+      .meaning = "asked to stop, and a bounded drain ran out with work still running; it ended itself" },
 } };
 static_assert(RowsInEnumeratorOrder(ProcessExitRows, [](ProcessExitRow const& row) { return row.exit; }),
               "every ProcessExit needs a row, at its own index");
