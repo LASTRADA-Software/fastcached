@@ -88,6 +88,9 @@ enum class AcceptorScript : std::uint8_t
     Answers,         ///< Challenges, judges the proof honestly, and answers with the verdict.
     NeverChallenges, ///< Sends nothing and reads nothing: a build from before the handshake.
     SendsRaftFirst,  ///< Opens with a Raft message, as a build from before the handshake would send.
+    /// Challenges at version 4, the consensus wire before the flag day: the frame a version-5 dialler
+    /// meets first when it dials a member that has not been upgraded.
+    ChallengesAtVersion4,
 };
 
 /// A socket that is the acceptor's end of a connection: it answers the handshake,
@@ -260,6 +263,14 @@ class RecordingSocket final: public core::net::ISocket
                 Testing::TestPeerIdentity const anyone { "unused", Testing::TestKeyPair("unused"), _roster };
                 auto const challenge =
                     RaftWire::EncodeChallenge(AcceptorHandshake::Create(anyone, random).value().Challenge());
+                _inbound.insert(_inbound.end(), challenge.begin(), challenge.end());
+                break;
+            }
+            case AcceptorScript::ChallengesAtVersion4: {
+                Testing::ScriptedSecureRandom random { ConnectionNonceScript(_seed) };
+                Testing::TestPeerIdentity const anyone { "unused", Testing::TestKeyPair("unused"), _roster };
+                auto const challenge =
+                    RaftWire::EncodeChallenge(AcceptorHandshake::Create(anyone, random).value().Challenge(), 4);
                 _inbound.insert(_inbound.end(), challenge.begin(), challenge.end());
                 break;
             }
@@ -1524,6 +1535,33 @@ TEST_CASE("An acceptor that opens with a Raft message is not a challenge", "[con
 
     CHECK(harness.Refused(DiallerRefusal::NoChallenge) == 1);
     CHECK(harness.transport->ConnectedPeers() == 0);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("A member still at version 4 is refused at its challenge, and this dialler names the version",
+          "[consensus][raft][transport][handshake][version]")
+{
+    // What an upgraded member SEES of a member that is not, from the side that can see it at all:
+    // the acceptor challenges first, so a version-5 dialler meets the version-4 CHALLENGE, refuses it
+    // by version and sends no proof -- counted as `NoChallenge`
+    // (`fastcache_raft_peer_dials_refused_no_challenge_total`), with the version in the log line. The
+    // opposite direction is the server's case beside its silent peer: a version-4 dialler refuses the
+    // version-5 challenge and closes, and the acceptor counts nothing.
+    Harness harness;
+    harness.record->script = AcceptorScript::ChallengesAtVersion4;
+    harness.Start();
+
+    CHECK(harness.Refused(DiallerRefusal::NoChallenge) == 1);
+    for (auto const& row: DiallerRefusals)
+        if (row.refusal != DiallerRefusal::NoChallenge)
+            CHECK(harness.Refused(row.refusal) == 0);
+    CHECK(harness.transport->ConnectedPeers() == 0);
+    CHECK(harness.Writes() == 0);
+    auto const lines = harness.logger.Snapshot();
+    CHECK(std::ranges::any_of(lines, [](CapturingLogger::Record const& record) {
+        return record.message.contains("Challenge version 4 outside");
+    }));
 
     harness.RequestStopAndDrain();
 }

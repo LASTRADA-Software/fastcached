@@ -101,7 +101,7 @@ std::optional<CompileCacheWire::FleetSummary> DiscoveryService::AnnounceableSumm
 {
     // Cut to what a datagram carries HERE, the one door both the beacon and the proof leave by, so
     // the two never carry different lists and neither carries more than a reader accepts.
-    auto summary = CompileCacheWire::WithMembersAtMost(_self.Current(), CompileCacheWire::MaxFleetSummaryMembers);
+    auto summary = CompileCacheWire::CarriedSummary(_self.Current());
     auto const onlyHere = EndpointsOnlyThisMachine(summary);
     if (onlyHere.empty())
         return summary;

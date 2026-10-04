@@ -1300,8 +1300,10 @@ and what they may assume.
 - A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`, and the membership oracles are
   `src/tests/MembershipFakes.hpp` (`ctest -R membership-fakes`). A WRONG fake makes its cases pass,
   so no failure ever finds it, and a copy's cost GROWS — the shared fake takes the participant
-  REQUIRED and undefaulted. A host-answering fake stands only for a route production answers by
-  HOST; a ticket, a proof or a revoked key is `Testing::RosterFold` with the key PRESENTED.
+  REQUIRED and undefaulted. A host-answering fake may stand only for a route production answers by
+  HOST — Loopback for this machine, OpenPolicy for any (`HostLabels`); a ticket, a proof or a
+  revoked key is the production fold (`Testing::RosterFold`) with the key PRESENTED on the
+  connection.
 - And a fake that resolves SYNCHRONOUSLY what production SUSPENDS on cannot exercise a suspension
   protocol, however correct its assertions: every property defined by parking is vacuous over
   `InMemorySocket`. The survey of which have a real-socket case is in the rules file.
@@ -1385,11 +1387,10 @@ Three consequences, none of which follows from the headline:
   [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md) — *a ticket cannot
   be closed against a count that no longer describes the tree* — from counts to claims.
 
-When several sessions work this repository in parallel — a manager plus two or three
-developers — the lane ownership, rebase and merge protocol, review gates and the
-type-label check's cancelled-versus-failed distinction are in
-[`.agent/guides/team-run.md`](.agent/guides/team-run.md). It carries no board state by
-design; what is done and what is left lives in the issues.
+When several sessions work this repository in parallel — a manager plus two or three developers —
+the lane ownership, rebase and merge protocol, review gates and the type-label check's
+cancelled-versus-failed distinction are in [`.agent/guides/team-run.md`](.agent/guides/team-run.md).
+It carries no board state by design; what is done and what is left lives in the issues.
 
 ## Design Patterns & Principles
 
@@ -1451,22 +1452,23 @@ wrapper. `PooledBuffer` returns to its `BufferPool` on destruction; `Task<T>`'s
 
 ### Caching an expensive repeated answer
 **An answer that costs a spawn, a syscall or a walk, and is asked for more than once, is cached —
-but only where staleness degrades safely.** That second clause is the whole rule, so **decide
-safety FIRST, because it decides whether to cache at all**: staleness that costs a refusal, a miss
-or a retry is safe (it fails **closed** and self-heals), while staleness that produces a wrong
-answer which LOOKS right is not, however expensive the probe. **Expense is not the criterion; what
-a stale answer *does* is** — `DiscoverTargetTriple` is deliberately not memoized because a stale
-triple is a wrong hit rather than a miss
-([#188](https://github.com/LASTRADA-Software/fastcached/issues/188)).
+but only where staleness degrades safely.** That second clause is the whole rule, so **decide safety
+FIRST, because it decides whether to cache at all**: staleness that costs a refusal, a miss or a
+retry is safe (it fails **closed** and self-heals), while staleness that produces a wrong answer
+which LOOKS right is not, however expensive the probe. **Expense is not the criterion; what a stale
+answer *does* is** — `DiscoverTargetTriple` is deliberately not memoized because a stale triple is a
+wrong hit rather than a miss ([#188](https://github.com/LASTRADA-Software/fastcached/issues/188)).
 
 Where it IS safe, a cache still owes five things: **measure before choosing, on every platform**;
 **fast by construction before fast by cache** (`IsLoopbackHost` first and lock-free), so the cache
-bounds only the rare path; **refresh on an INTERVAL or on a HOST EVENT, never on a miss**, or a
-remote peer has a free amplifier — one expensive probe per request, just by asking; **name both
+bounds only the rare path; **refresh on an INTERVAL or on a HOST EVENT (a network change, a wake),
+never on a miss**: a host event is neither a miss nor something a peer can provoke, while a miss
+hands a remote peer a free amplifier — one expensive probe per request, just by asking; **name both
 staleness directions in the header**, which is what makes a longer interval defensible; and **an
 injected seam with an injected clock**, because a cache with a hidden clock is untestable by
-construction. Each is measured in [`.agent/rules/compile-cache.md`](.agent/rules/compile-cache.md)
-and [`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md).
+construction. Each is derived with its measurement in
+[`.agent/rules/compile-cache.md`](.agent/rules/compile-cache.md) and
+[`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md).
 
 **A performance figure is a quantity UNDER CONDITIONS, and the two halves get lost
 separately.** Attaching the conditions is necessary and **not sufficient: the citation
@@ -1541,14 +1543,13 @@ answers, so neither can carry "there was no probe".
 Line endings are LF everywhere, enforced by `.gitattributes` (`* text=auto eol=lf`) rather than by
 each developer's `core.autocrlf`. A CRLF `*.sh` does not misbehave — it fails to start at all.
 
-Dependency sources are shared across build trees per machine, so a fresh worktree does
-not re-clone Catch2, yaml-cpp, zstd and lz4 — which matters here because the work
-happens in throwaway worktrees, making that a per-BRANCH cost rather than a
-per-machine one. `CPM_SOURCE_CACHE` defaults to `%LOCALAPPDATA%\fastcached\cpm` or
-`~/.cache/fastcached/cpm`; anything that already set it wins, including the environment
-variable CI uses to point it inside the workspace for its own cache action. Override
-with `FASTCACHED_CPM_CACHE`, and a machine where no home directory can be found simply
-fetches into the build tree as before. What it saves is measured, with its conditions, in
+Dependency sources are shared across build trees per machine, so a fresh worktree does not re-clone
+Catch2, yaml-cpp, zstd and lz4 — which matters here because the work happens in throwaway worktrees,
+making that a per-BRANCH cost rather than a per-machine one. `CPM_SOURCE_CACHE` defaults to
+`%LOCALAPPDATA%\fastcached\cpm` or `~/.cache/fastcached/cpm`; anything that already set it wins,
+including the environment variable CI uses to point it inside the workspace for its own cache
+action. Override with `FASTCACHED_CPM_CACHE`, and a machine where no home directory can be found
+simply fetches into the build tree as before. What it saves is measured, with its conditions, in
 [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md) (#545).
 
 CMake presets live in `CMakePresets.json`. Common entry points:
@@ -1629,8 +1630,7 @@ are in [`.agent/rules/packaging-and-release.md`](.agent/rules/packaging-and-rele
 
 ## Profiling
 
-Tracy instrumentation is opt-in (`TRACY_ENABLE`, default OFF) and collapses to `(void) 0` when
-off. Instrument through the `FC_*` macros in `FastCache/Core/Profiling.hpp`, never Tracy directly
-— and never let `FC_ZONE_SCOPED*` straddle a `co_await`. Building the profiling daemon, adding
-zones and analysing a capture:
-[`.agent/guides/profiling-tracy.md`](.agent/guides/profiling-tracy.md).
+Tracy instrumentation is opt-in (`TRACY_ENABLE`, default OFF) and collapses to `(void) 0` when off.
+Instrument through the `FC_*` macros in `FastCache/Core/Profiling.hpp`, never Tracy directly — and
+never let `FC_ZONE_SCOPED*` straddle a `co_await`. Building the profiling daemon, adding zones and
+analysing a capture: [`.agent/guides/profiling-tracy.md`](.agent/guides/profiling-tracy.md).

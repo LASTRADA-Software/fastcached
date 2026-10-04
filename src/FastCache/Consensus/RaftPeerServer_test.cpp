@@ -810,7 +810,10 @@ TEST_CASE("A proof at a version before this grammar is refused", "[consensus][ra
 {
     // Version 1 authenticated nothing and version 3 proved the cluster's pre-shared key. A
     // server that read either would be the per-connection fallback #1308 and #178 refuse.
-    for (auto const version: { std::uint8_t { 1 }, std::uint8_t { 3 } })
+    // Version 4 was the wire before the flag day. A version-4 dialler never sends this proof -- it
+    // refuses the version-5 challenge first (the case below the silent peer's) -- so this row is the
+    // version check standing on its own.
+    for (auto const version: { std::uint8_t { 1 }, std::uint8_t { 3 }, std::uint8_t { 4 } })
     {
         CAPTURE(version);
         Dialler dialler;
@@ -1003,6 +1006,27 @@ TEST_CASE("A peer that sends nothing is challenged, closed, and not counted", "[
     auto const header = RaftWire::DecodeHeader(served.replied);
     REQUIRE(header.has_value());
     CHECK(Unwrap(header).kindRaw == static_cast<std::uint8_t>(RaftWire::MessageType::Challenge));
+}
+
+TEST_CASE("A version-4 dialler meets a version-5 challenge, closes unanswered, and this acceptor counts nothing",
+          "[consensus][raft][peerserver][handshake][version]")
+{
+    // What an upgraded acceptor sees of a member still at version 4: it challenges first, at version
+    // 5, and a version-4 dialler refuses that challenge by its version and closes without a proof. So
+    // nothing reaches the row a proof at another version would move (`NoHandshake`): the close is
+    // the silent peer's above, counted by no row here. The member that CAN see the mismatch is the
+    // dialler, under its own `NoChallenge` -- the transport's case.
+    RecordingSink sink;
+    auto const served = RunOnce({}, sink);
+
+    auto const header = RaftWire::DecodeHeader(served.replied);
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).kindRaw == static_cast<std::uint8_t>(RaftWire::MessageType::Challenge));
+    // The byte a version-4 reader refuses.
+    CHECK(Unwrap(header).version == 5);
+    CHECK_FALSE(RaftWire::IsSupported(4));
+    CHECK(served.Refused(AcceptorRefusal::NoHandshake) == 0);
+    CHECK(served.AnyRefusals() == 0);
 }
 
 TEST_CASE("A frame whose tag does not verify ends the connection and is counted", "[consensus][raft][peerserver][handshake]")

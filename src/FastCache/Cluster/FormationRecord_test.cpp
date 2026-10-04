@@ -225,15 +225,16 @@ TEST_CASE("A formation record round-trips every optional part", "[cluster][forma
     CHECK(Unwrap(second) == record);
 }
 
-TEST_CASE("A join target keeps the member list it was proven with, longer than a datagram carries",
+TEST_CASE("A join target keeps the member list it was proven with, at the one member cap and its total",
           "[cluster][formation][record]")
 {
-    // A target may have been proven by a seed's ANSWER, whose list is longer than a beacon's; the
-    // record keeps the summary as it was proven, so it reads at the reply's cap.
+    // A target is kept as it was proven, by a beacon or a seed's answer -- since 0xFC 15 both carry at
+    // most `MaxFleetSummaryMembers`, so that is the cap the record reads at, and the total says how many
+    // the fleet records.
     auto record = SolitaryRecord("c", 1);
     record.mode = NodeMode::Pending;
     auto summary = CompileCacheWire::FleetSummary { .clusterId = "fleet-c", .nodeId = "n-a" };
-    for (auto const index: std::views::iota(std::size_t { 0 }, CompileCacheWire::MaxFleetSummaryMembers + 9))
+    for (auto const index: std::views::iota(std::size_t { 0 }, CompileCacheWire::MaxFleetSummaryMembers))
         summary.members.push_back(std::format("n-{}", index));
     summary.memberTotal = 40;
     summary.nodeEndpoint = "office-a:6674";
@@ -243,7 +244,8 @@ TEST_CASE("A join target keeps the member list it was proven with, longer than a
     REQUIRE(decoded.has_value());
     CHECK(Unwrap(decoded) == record);
     REQUIRE(Unwrap(decoded).joining.has_value());
-    CHECK(Unwrap(Unwrap(decoded).joining).summary.members.size() == CompileCacheWire::MaxFleetSummaryMembers + 9);
+    CHECK(Unwrap(Unwrap(decoded).joining).summary.members.size() == CompileCacheWire::MaxFleetSummaryMembers);
+    CHECK(Unwrap(Unwrap(decoded).joining).summary.memberTotal == 40);
 }
 
 TEST_CASE("A formation record naming a cluster id past its bound is refused as damage, by name",
@@ -530,15 +532,20 @@ TEST_CASE("An earlier record format is another layout, refused by name, and neve
 {
     // Format 2 added the fleet's age and the asked fleets; format 3 nested a summary of eleven fields
     // and memos of four; format 4 embedded a version-2 roster in a fleet membership; format 5 kept the
-    // key that signed the admission; format 6 is this branch's unreleased layout -- the embedded roster
-    // is version 3, its principals group gone -- FINAL only at the lane-0 flag day (see
-    // `FormationRecordFormat`). An earlier record is intact and belongs to the build that wrote it:
-    // `UnsupportedFormatVersion`, which is what monitoring sees, never `MalformedFrame`.
-    static_assert(FormationRecordFormat == 6,
-                  "this case pins format 6, unreleased and final only at the lane-0 flag day; from then on a "
-                  "layout change moves the number and adds the old one below");
-    for (auto const format:
-         { std::uint8_t { 1 }, std::uint8_t { 2 }, std::uint8_t { 3 }, std::uint8_t { 4 }, std::uint8_t { 5 } })
+    // key that signed the admission; format 6 embedded a version-3 roster, its principals group gone,
+    // and read a joining summary at a seed reply's 512 members; format 7, the flag day's, reads it at
+    // the one carrier cap (see `FormationRecordFormat`). An earlier record is intact and belongs to the
+    // build that wrote it: `UnsupportedFormatVersion`, which is what monitoring sees, never
+    // `MalformedFrame`.
+    static_assert(FormationRecordFormat == 7,
+                  "this case pins format 7, the flag day's; a layout change moves the number and adds the old "
+                  "one below");
+    for (auto const format: { std::uint8_t { 1 },
+                              std::uint8_t { 2 },
+                              std::uint8_t { 3 },
+                              std::uint8_t { 4 },
+                              std::uint8_t { 5 },
+                              std::uint8_t { 6 } })
     {
         INFO("format " << int { format });
         auto older = EncodeFormationRecord(SolitaryRecord("c", 1));
@@ -548,6 +555,34 @@ TEST_CASE("An earlier record format is another layout, refused by name, and neve
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
         CHECK(refused.error().context.contains(std::format("format {}", format)));
     }
+}
+
+TEST_CASE("A format 6 record joining a fleet past the carrier cap is refused by number, not read as damage",
+          "[cluster][formation][record]")
+{
+    // Why format 7 exists. A format 6 build kept a seed-proven summary of up to 512 members; the flag
+    // day reads a joining summary at `MaxFleetSummaryMembers`. Such a record is INTACT, so it must be
+    // refused by its number -- and the control shows that is the only thing refusing it as intact:
+    // the same bytes under this build's number are malformed.
+    auto record = SolitaryRecord("c", 1);
+    record.mode = NodeMode::Pending;
+    auto summary = CompileCacheWire::FleetSummary { .clusterId = "fleet-c", .nodeId = "n-a" };
+    for (auto const index: std::views::iota(std::size_t { 0 }, CompileCacheWire::MaxFleetSummaryMembers + 1))
+        summary.members.push_back(std::format("n-{}", index));
+    summary.memberTotal = summary.members.size();
+    record.joining = JoinTarget { .summary = summary, .provenKey = {}, .askedAtUnixSeconds = 7 };
+    auto written = EncodeFormationRecord(record);
+
+    written[FormationRecordFormatOffset] = std::byte { 6 };
+    auto const older = DecodeFormationRecord(written);
+    REQUIRE_FALSE(older.has_value());
+    CHECK(older.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
+    CHECK(older.error().context.contains("format 6"));
+
+    written[FormationRecordFormatOffset] = std::byte { FormationRecordFormat };
+    auto const current = DecodeFormationRecord(written);
+    REQUIRE_FALSE(current.has_value());
+    CHECK(current.error().code == ConsensusErrorCode::MalformedFrame);
 }
 
 TEST_CASE("A learner's record holding the previous roster layout is refused by the record's own number",

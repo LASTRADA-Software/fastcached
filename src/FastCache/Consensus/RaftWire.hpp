@@ -146,21 +146,23 @@ using WireVersion = WireFrame::Version;
 /// session key nobody else holds. A version 3 peer's handshake is refused by its arity before
 /// any field is read -- and should it ever decode, it proves nothing this build can check.
 ///
-/// The proof has since gained a sixth field, the `SessionDirection` it asks for, which is a
-/// grammar change of the same kind, and this constant has NOT moved for it yet. So today a
-/// version 4 peer built before the field and one built after it name the same version, and
-/// each refuses the other's proof by its arity -- a mismatch detected, never misread, but
-/// reported as a malformed proof rather than as an unsupported version.
-inline constexpr WireVersion CurrentVersion = 4;
+/// 5 since the office-fleet flag day, and it is the grammar a fourth time: the proof carries a
+/// sixth field, the `SessionDirection` it asks for, and the session keys are derived per direction
+/// under their own label (`fastcache-raft-session-v3`). A version 4 peer's five-field proof is
+/// refused by its VERSION before any field is read, so the mismatch is reported as the unsupported
+/// version it is rather than as a malformed proof -- which is what a version 4 peer built before the
+/// field and one built after it said to each other while both named 4.
+inline constexpr WireVersion CurrentVersion = 5;
 
 /// The oldest version this build still accepts.
 ///
 /// Equal to `CurrentVersion`: a version 1 peer authenticates nothing, and accepting
 /// one would be the per-connection fallback #1308 exists to refuse; a version 2 peer
 /// spells a configuration this build cannot read (#1449); a version 3 peer proves only that
-/// it holds the key every member shares, which is exactly what #178 stopped accepting. So
-/// the consensus members of a fleet upgrade together.
-inline constexpr WireVersion MinSupportedVersion = 4;
+/// it holds the key every member shares, which is exactly what #178 stopped accepting; and a
+/// version 4 peer's proof names no session direction, so the two ends could not agree which keys
+/// seal which way. So the consensus members of a fleet upgrade together.
+inline constexpr WireVersion MinSupportedVersion = 5;
 
 /// Size of the fixed frame header: magic, version, type, payload length.
 inline constexpr std::size_t HeaderSize = WireFrame::HeaderSize;

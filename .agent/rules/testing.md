@@ -1069,6 +1069,15 @@ answer the only reachable one -- while the ONE reason a fixture had for using a 
 list rather than an open oracle stays at that fixture's construction site, in its own
 words. Those reasons differed across all four copies and were the only part that did.
 
+**And a host-answering fake may stand only for a route production answers by HOST** (W-15):
+Loopback for this machine and OpenPolicy for any caller, which `HostLabels` (`MembershipFakes.hpp`,
+an `EnumTable` over `MembershipParticipant`) says row by row, refusing the rest by exception at
+construction. A ticket, a proof or a revoked key is never derived from a host in production, so a
+host list labelled `MachineTicket` admitted an address that presented no ticket at all -- a route
+production does not have, and so a green case over it. Those routes are the production fold,
+`Testing::RosterFold` (loopback plus a key roster, with the voters a case about operators names),
+and the case PRESENTS the key or ticket on the connection.
+
 `ctest -R membership-fakes` enforces it, over every `*_test.cpp`, and the enforcement
 is a `class`/`struct` whose base clause names `IMembershipOracle` -- bounded by
 `[^;{]*`, so a declaration WRAPPED across lines is still one match. That bound is the

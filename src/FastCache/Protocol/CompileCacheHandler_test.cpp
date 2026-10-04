@@ -646,6 +646,32 @@ TEST_CASE("A foreign value generation and a malformed value are refused by DIFFE
     CHECK(replies.at(2).status == Wire::Status::Miss);
 }
 
+TEST_CASE("A version-14 AUTH in its own two-field grammar is refused by number, never read as malformed",
+          "[compile-cache][handler][version]")
+{
+    // What a client built before the office-fleet flag day sends: AUTH as two fields (username,
+    // secret), at version byte 0x0E. Refused on the NUMBER, before the payload is read -- so the
+    // answer names the range rather than calling a version mismatch a malformed frame, and no field is
+    // ever taken for the credential kind the version-15 grammar puts first.
+    CcFixture fix;
+    // clang-format off: the grid IS the old grammar -- one wire field per row.
+    auto const older = std::vector<std::byte> {
+        std::byte { 0xFC }, std::byte { 0x0E }, std::byte { 0x03 },             // magic, version 14, op = Auth
+        std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x0A }, // payload = (4+0) + (4+2)
+        std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, // username = ""
+        std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x02 }, // secret, 2 bytes
+        std::byte { 'p' }, std::byte { 'w' },
+    };
+    // clang-format on
+    auto const frame = SoleReply(Exchange(fix, older));
+    REQUIRE(frame.present);
+    auto const error = ErrorOf(frame);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::UnsupportedVersion);
+    CHECK(error.code != Wire::ErrorCode::MalformedFrame);
+    CHECK(error.message == "unsupported wire version 14; this server speaks 15..15");
+}
+
 TEST_CASE("A wire version change mid-connection is rejected", "[compile-cache][handler][version]")
 {
     CcFixture fix;

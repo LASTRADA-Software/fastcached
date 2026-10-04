@@ -658,10 +658,11 @@ readable and silently ignored. Every rule below has already been one of them.
     the new product has no binary left to run `--uninstall-service` with. Only a registration
     whose image path starts with this install root, quoted (`"[INSTALL_ROOT]`, in both spellings
     the raw registry search returns), is ours to delete; any other shape fails the test CLOSED
-    and is left alone. That path removes neither the service's firewall group nor its event
-    source -- an accepted residual: the rules name a program that is no longer installed, so
-    they admit nothing, and a reinstall that registers the service replaces the group. For
-    fastcached and for the node every reinstall does.
+    and is left alone. The same transaction removes the feature's firewall GROUP
+    (`Remove-NetFirewallRule -Group`, the `DeleteLeftoverFirewall` rows, W-11), named as the
+    binary files it, and CI asserts the node's group is empty after a deselecting upgrade. Its
+    event source stays -- an accepted residual: it belongs to a program that is no longer
+    installed, so nothing writes to it.
   - Deselecting a feature outside an upgrade (`REMOVE=CM_C_Node`, Settings > Apps > Modify, an
     uninstall) removes its service through its own binary, firewall rules included.
 - **The MSI's service table decides every start mode**, and is applied on every transaction that

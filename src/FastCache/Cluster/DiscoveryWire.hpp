@@ -34,47 +34,39 @@ inline constexpr std::byte Magic { 0xFD };
 
 /// Lowest wire version this build still decodes.
 ///
-/// Moved with `CurrentVersion`: a version-1 proof is a MAC under the shared key, which this
-/// build has nothing to verify against, so accepting one would be accepting a claim nobody can
-/// check.
-inline constexpr std::uint8_t MinimumVersion = 2;
+/// Moved with `CurrentVersion` every time. A version-1 proof is a MAC under the shared key, which
+/// this build has nothing to verify against; a version-2 beacon names an id and an endpoint where
+/// this build reads a signed fleet summary, and its proof signs neither the summary nor the nonce it
+/// answers. Accepting either would be accepting a claim nobody here can check.
+inline constexpr std::uint8_t MinimumVersion = 3;
 
 /// Wire version this build emits.
 ///
-/// **2 is a GRAMMAR change, and that is why it moved** (#178) -- the opposite of #402, which
-/// changed only what the MAC covered and rightly did not. A proof now carries the prover's
-/// public key and a 64-byte Ed25519 signature where it carried a 32-byte HMAC, so its arity and
-/// its field widths both changed: a version-1 reader would refuse the proof as malformed and
-/// report a peer that failed to prove a key it holds. The question is always which of the two
-/// changed, never whether a MAC did.
+/// **2 was a GRAMMAR change, and that is why it moved** (#178) -- the opposite of #402, which
+/// changed only what the MAC covered and rightly did not. A proof carried the prover's public key
+/// and a 64-byte Ed25519 signature where it carried a 32-byte HMAC, so its arity and its field
+/// widths both changed: a version-1 reader would refuse the proof as malformed and report a peer
+/// that failed to prove a key it holds. The question is always which of the two changed, never
+/// whether a MAC did.
 ///
-/// **The beacon and the proof below are a GRAMMAR change again, and this value has not moved
-/// with them yet.** Both now carry the node's fleet summary as one nested field where they
-/// carried an id and an endpoint -- a beacon is one field where it was three, a proof three where
-/// it was four -- and the proof signs that summary under a new label, so the answer to "which of
-/// the two changed" is both. The move is to 3, with `MinimumVersion` beside it. The challenge's
-/// grammar did not change and is still decoded, but a version-2 challenge is useless on its own:
-/// it answers a version-2 beacon and is answered by a version-2 proof, and this build reads
-/// neither. Until the value moves, a reader of the old grammar refuses these datagrams by ARITY
-/// rather than by version, and either service drops a datagram it cannot decode as `Ignored`,
-/// with no counter and no log line -- so the two builds fail closed and never misread, but
-/// silently never see each other on a shared segment.
+/// **3 is a grammar change again** (the office-fleet flag day), and every datagram moved:
+/// - the beacon and the proof carry the node's fleet summary as one nested field where they carried
+///   an id and an endpoint, and the proof signs that summary under its own label
+///   (`discovery-proof-v3`);
+/// - the beacon and the challenge are each padded by one trailing field, so a beacon is two fields
+///   and a challenge three (see `EncodeBeacon` and `EncodeChallenge` for why);
+/// - the proof ECHOES the nonce it answers -- four fields -- because a challenger keeps no table of
+///   what it asked: the nonce is a cookie it recomputes from what the proof claims
+///   (`ChallengeCookies`);
+/// - the summary both nest holds eleven fields -- the fleet's member ids, how many it records, the
+///   speaker's own `0xFC` endpoint and its leader's key among them -- with every dialled endpoint in
+///   it held to `ParseDialEndpoint`.
 ///
-/// **The same unmoved change pads the beacon and the challenge**, each by one trailing field,
-/// so the challenge's grammar changed after all: a beacon is two fields and a challenge three.
-/// It rides the one move to 3 rather than taking a version of its own -- neither grammar has
-/// shipped in between. See `EncodeBeacon` and `EncodeChallenge` for why.
-///
-/// **And the proof ECHOES the nonce it answers**, one more field -- four where it was three --
-/// because a challenger keeps no table of what it asked: the nonce is a cookie it recomputes from
-/// what the proof claims (`ChallengeCookies`), so the proof has to carry it back. The same one
-/// move to 3 carries that too.
-///
-/// **And the summary both nest grew from seven fields to ten** -- the fleet's member ids, how many
-/// it records, and the speaker's own `0xFC` endpoint -- with every dialled endpoint in it now held
-/// to `ParseDialEndpoint`. A seven-field reader refuses the ten-field summary by arity, and the proof
-/// signs all ten, so this too is a grammar change and rides the same one move to 3.
-inline constexpr std::uint8_t CurrentVersion = 2;
+/// A version-2 datagram is refused by NUMBER (`ClassifyDatagram`), never misread by arity. Both
+/// services drop a datagram they cannot classify as `Ignored`, with no counter and no log line, so a
+/// version-2 node and a version-3 node on one segment fail closed and silently never see each other:
+/// an upgrade finishes on every machine of a segment (`docs/operations/upgrading-a-fleet.md`).
+inline constexpr std::uint8_t CurrentVersion = 3;
 
 /// What a datagram is.
 ///
@@ -238,7 +230,7 @@ struct Proof
 [[nodiscard]] inline std::vector<std::byte> EncodeProof(Proof const& proof)
 {
     assert(proof.summary.members.size() <= CompileCacheWire::MaxFleetSummaryMembers
-           && "a datagram carries a cut list (`WithMembersAtMost`); a longer one is refused by every reader");
+           && "a datagram carries a cut list (`CarriedSummary`); a longer one is refused by every reader");
     auto const fields = CompileCacheWire::EncodeFleetSummaryFields(proof.summary);
     return Frame(Kind::Proof,
                  WireFields::Encode({ std::span<std::byte const> { fields },
@@ -299,7 +291,7 @@ static_assert(LargestUnpaddedChallenge() <= SmallestProofDatagram(),
 [[nodiscard]] inline std::vector<std::byte> EncodeBeacon(Beacon const& beacon)
 {
     assert(beacon.summary.members.size() <= CompileCacheWire::MaxFleetSummaryMembers
-           && "a datagram carries a cut list (`WithMembersAtMost`); a longer one is refused by every reader");
+           && "a datagram carries a cut list (`CarriedSummary`); a longer one is refused by every reader");
     auto const fields = CompileCacheWire::EncodeFleetSummaryFields(beacon.summary);
     auto const unpadded =
         WireFrame::HeaderSize
@@ -386,7 +378,7 @@ static_assert(LargestUnpaddedChallenge() <= SmallestProofDatagram(),
     if (!fields.has_value())
         return std::nullopt;
 
-    auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0], CompileCacheWire::MaxFleetSummaryMembers);
+    auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0]);
     if (!summary.has_value())
         return std::nullopt;
     return Beacon { .summary = *std::move(summary) };
@@ -436,7 +428,7 @@ static_assert(LargestUnpaddedChallenge() <= SmallestProofDatagram(),
     if (answers.size() != NonceBytes || key.size() != Ed25519PublicKeyBytes || signature.size() != Ed25519SignatureBytes)
         return std::nullopt;
 
-    auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0], CompileCacheWire::MaxFleetSummaryMembers);
+    auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0]);
     if (!summary.has_value())
         return std::nullopt;
 

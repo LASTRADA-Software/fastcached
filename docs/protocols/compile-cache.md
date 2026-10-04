@@ -24,7 +24,7 @@ declares:
 | Offset | Size | Field | Meaning |
 |--------|------|-------|---------|
 | 0 | 1 | magic | Always `0xFC`. |
-| 1 | 1 | version | Protocol version. Current: **14**, and the oldest accepted is also **14** — see [Versioning](#versioning). |
+| 1 | 1 | version | Protocol version. Current: **15**, and the oldest accepted is also **15** — see [Versioning](#versioning). |
 | 2 | 1 | op | `0x01` STORE, `0x02` FETCH, `0x03` AUTH; the rest are [distributed execution](#distributed-execution) and [node identity](#node-identity-and-sealed-frames). |
 | 3 | 4 | payloadLength | Bytes of payload following the header. |
 
@@ -248,8 +248,8 @@ The reply's `summary` is one nested field holding exactly the fields a discovery
 carries, byte for byte: the cluster id, the fleet's state (`0x01` solitary, only its founder
 ever admitted; `0x02` established; `0x03` pending, on its way to another fleet), its creation
 time as a big-endian `u64` of Unix seconds, the leader's id and `0xFC` endpoint, the speaker's
-id and Raft endpoint, the member ids (as many as the reply carries, up to
-`MaxFleetSummaryReplyMembers`), the member total, the speaker's own `0xFC` endpoint and the
+id and Raft endpoint, the member ids (at most `MaxFleetSummaryMembers`, ten, the cap a beacon
+holds: since version 15 every carrier holds one cap), the member total, the speaker's own `0xFC` endpoint and the
 leader's identity key. Under `0x03` the leader fields name the fleet the speaker **asked**,
 never its own. An empty field states that the speaker knows none.
 
@@ -691,7 +691,7 @@ through the daemon's connection logger, so a rejection is visible to the
 operator as well as to the client.
 
 An `unsupported-version` message names the offered version *and* the supported
-range (`unsupported wire version 13; this server speaks 14..14`). A rejection that
+range (`unsupported wire version 14; this server speaks 15..15`). A rejection that
 does not say what would have worked cannot be acted on, and this is the only
 message an operator with a mismatched install will ever see.
 

@@ -472,7 +472,9 @@ Every rule below has already been a bug.
   would have misdescribed the format. **#178 then moved it to 2**, and for the opposite
   reason: a key and a 64-byte signature where a 32-byte MAC was change the proof's
   arity and widths, which is grammar, and `MinimumVersion` moved with it because a
-  version-1 proof is a MAC nothing here can verify. It is also the better failure of the two: an older
+  version-1 proof is a MAC nothing here can verify. **The flag day moved it to 3**, for grammar again:
+  the beacon and the proof nest the signed fleet summary where an id and an endpoint were, the beacon
+  and the challenge are padded, and the proof echoes its nonce. It is also the better failure of the two: an older
   node reaches the proof step and is logged failing to prove the key, where an
   unsupported version is dropped by `ClassifyDatagram` and presents as peers seen
   and never admitted -- the same silence this file already records
@@ -742,13 +744,15 @@ simpler design gets wrong.
 
 - **The version is a property of the CONNECTION, and it moves when the GRAMMAR does** -- to 2
   for #1308's handshake and trailer, to 3 for #1449, whose `InstallSnapshot` carries a
-  configuration of two sets where it carried one list (see *Learners* below), and to 4 for
-  #178, whose challenge, proof and verdict carry ephemeral keys and signatures. The opposite of
+  configuration of two sets where it carried one list (see *Learners* below), to 4 for
+  #178, whose challenge, proof and verdict carry ephemeral keys and signatures, and to 5 at the
+  flag day, whose proof states the `SessionDirection` its session keys are derived for. The opposite of
   #402, where only discovery's MAC input changed and `DiscoveryWire::CurrentVersion` rightly
   stayed -- and the same as #178's discovery change, where a key and a signature replaced the
   MAC and that version moved to 2: the question is always WHICH changed. `MinSupportedVersion` moved with it every
-  time: a version 1 peer authenticates nothing, a version 3 peer proves the pre-shared key,
-  and accepting either is the per-connection fallback these tickets refuse -- so a fleet
+  time: a version 1 peer authenticates nothing, a version 3 peer proves the pre-shared key, a
+  version 4 peer names no direction for the keys that seal its session,
+  and accepting any is the per-connection fallback these tickets refuse -- so a fleet
   upgrades its consensus members together. A session frame whose version byte differs from
   the handshake's closes the connection, because stepping over it would mean guessing whether
   a trailer follows. `RaftWire.hpp`'s old "Why there is no handshake" section argued against a

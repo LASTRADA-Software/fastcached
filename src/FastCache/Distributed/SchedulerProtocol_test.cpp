@@ -201,6 +201,32 @@ TEST_CASE("A version outside the range is told what would have worked", "[distri
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion) == 1);
 }
 
+TEST_CASE("A version-14 LEASE in its own three-field grammar is refused by number, never read as malformed",
+          "[distributed][scheduler][protocol][version]")
+{
+    // What a launcher built before the office-fleet flag day sends: LEASE as three fields
+    // (fingerprint, key, codecs) at version byte 0x0E. The version-15 request is five, so a reader
+    // that got past the header would refuse it as malformed -- a version mismatch reported as a broken
+    // client. Refused on the NUMBER instead, naming the range, and counted as a version refusal.
+    Fixture fixture;
+    auto const payload = WireFields::Encode({ WireFields::AsBytes("fp"), WireFields::AsBytes("k"), {} });
+    auto frame = std::vector<std::byte>(Wire::RequestHeaderSize + payload.size());
+    WireFrame::PutHeader(frame,
+                         Wire::Magic,
+                         static_cast<Wire::WireVersion>(14),
+                         static_cast<std::uint8_t>(Wire::Op::Lease),
+                         static_cast<std::uint32_t>(payload.size()));
+    std::ranges::copy(payload, frame.begin() + static_cast<std::ptrdiff_t>(Wire::RequestHeaderSize));
+    REQUIRE(std::to_integer<unsigned>(frame[1]) == 0x0E);
+
+    auto const reply = fixture.protocol.Answer(frame, Insider);
+    REQUIRE(ErrorOf(reply) == Wire::ErrorCode::UnsupportedVersion);
+    auto const text = PayloadOf(reply).subspan(1);
+    CHECK(std::string_view { reinterpret_cast<char const*>(text.data()), text.size() } == "supported versions 15..15");
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion) == 1);
+    CHECK(ErrorOf(reply) != Wire::ErrorCode::MalformedFrame);
+}
+
 TEST_CASE("A frame that is not this protocol is the one condition that closes", "[distributed][scheduler][protocol]")
 {
     // Wrong magic means the peer is not speaking this protocol at all, and with no

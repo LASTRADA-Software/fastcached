@@ -232,7 +232,7 @@ TEST_CASE("A beacon or a proof whose summary the codec refuses is refused", "[cl
     REQUIRE(fields.has_value());
     auto const stateOffset = static_cast<std::size_t>(Unwrap(fields)[1].data() - summary.data());
     summary[stateOffset] = std::byte { 0x7F };
-    REQUIRE_FALSE(CompileCacheWire::DecodeFleetSummaryFields(summary, CompileCacheWire::MaxFleetSummaryMembers).has_value());
+    REQUIRE_FALSE(CompileCacheWire::DecodeFleetSummaryFields(summary).has_value());
 
     // In the beacon's own shape -- the summary, then padding -- so the refusal is the state byte's
     // and not the arity's; the honest summary in the same shape is the control.
@@ -339,10 +339,10 @@ TEST_CASE("A proof naming as many members as a datagram carries fits the tightes
     CHECK(size + WireFields::FieldPrefixSize + CompileCacheWire::MaxIdBytes > Ipv6MinimumMtuUdpPayload);
 }
 
-TEST_CASE("A datagram naming more members than a datagram carries is refused, and a reply reads the same summary",
+TEST_CASE("A datagram naming more members than a datagram carries is refused, and so is the same summary anywhere",
           "[cluster][discovery][wire][formation]")
 {
-    // Framed by hand, because the encoders refuse to write a list past the cap (`WithMembersAtMost`
+    // Framed by hand, because the encoders refuse to write a list past the cap (`CarriedSummary`
     // is where a sender cuts it); what is tested is that a reader refuses one a peer sent anyway.
     auto const listing = [](std::size_t count) {
         auto summary = Established();
@@ -360,7 +360,8 @@ TEST_CASE("A datagram naming more members than a datagram carries is refused, an
     auto const pastCap = listing(CompileCacheWire::MaxFleetSummaryMembers + 1);
     CHECK(DiscoveryWire::DecodeBeacon(beaconOf(atCap)).has_value());
     CHECK_FALSE(DiscoveryWire::DecodeBeacon(beaconOf(pastCap)).has_value());
-    CHECK(CompileCacheWire::DecodeFleetSummaryFields(pastCap, CompileCacheWire::MaxFleetSummaryReplyMembers).has_value());
+    // One cap for every carrier since 0xFC 15: the summary reader refuses it wherever it arrives.
+    CHECK_FALSE(CompileCacheWire::DecodeFleetSummaryFields(pastCap).has_value());
 }
 
 TEST_CASE("DiscoveryWire refuses what is not its datagram", "[cluster][discovery][wire]")
@@ -409,20 +410,34 @@ TEST_CASE("DiscoveryWire will not decode one kind as another", "[cluster][discov
     CHECK_FALSE(DiscoveryWire::DecodeBeacon(challenge).has_value());
 }
 
-TEST_CASE("Version 2 is a grammar change, so a version-1 datagram is refused rather than misread",
-          "[cluster][discovery][wire]")
+TEST_CASE("Version 3 is a grammar change, so a version-2 datagram is refused by number rather than misread",
+          "[cluster][discovery][wire][version]")
 {
-    // **Moved, and #402's did not** (#178). #402 changed only what the MAC covered and
-    // rightly left the version alone; this changes the proof's ARITY and its field widths
-    // -- a key and a 64-byte signature where a 32-byte MAC was -- so a version-1 reader
-    // would refuse the proof as malformed and report a peer failing to prove a key it
-    // holds. Pinned as values, since the question is always which of the two changed.
-    CHECK(DiscoveryWire::CurrentVersion == 2);
-    CHECK(DiscoveryWire::MinimumVersion == 2);
+    // **Moved, as 2 did and #402 did not.** The flag day changed every datagram's ARITY -- a beacon of
+    // two fields, a challenge of three, a proof of four echoing its nonce -- and the summary they nest,
+    // so the version moved and the floor with it. Pinned as values, since the question is always which
+    // of the two changed.
+    CHECK(DiscoveryWire::CurrentVersion == 3);
+    CHECK(DiscoveryWire::MinimumVersion == 3);
 
     auto good = DiscoveryWire::EncodeBeacon({ .summary = Speaking("n", "e:1") });
+    REQUIRE(good.size() > 1);
+    CHECK(std::to_integer<unsigned>(good[1]) == 0x03);
     REQUIRE(DiscoveryWire::ClassifyDatagram(good).has_value());
-    auto older = good;
+
+    // A version-2 beacon in its OWN grammar -- the cluster id, the node id and its endpoint, three
+    // fields -- is refused on the version byte, before any field is read.
+    auto const olderGrammar = DiscoveryWire::Frame(
+        DiscoveryWire::Kind::Beacon,
+        WireFields::Encode({ WireFields::AsBytes("c-1"), WireFields::AsBytes("n"), WireFields::AsBytes("e:1") }));
+    auto older = olderGrammar;
+    older[1] = std::byte { 2 };
+    CHECK_FALSE(DiscoveryWire::ClassifyDatagram(older).has_value());
+    // And the same bytes at version 3 are no beacon either: it is the arity that would catch them,
+    // which is why the version, not the arity, has to be what refuses a version-2 peer.
+    CHECK_FALSE(DiscoveryWire::DecodeBeacon(olderGrammar).has_value());
+
+    // And version 1, for the record.
     older[1] = std::byte { 1 };
     CHECK_FALSE(DiscoveryWire::ClassifyDatagram(older).has_value());
 }
@@ -599,4 +614,151 @@ TEST_CASE("A beacon carries nothing an eavesdropper can use", "[cluster][discove
     REQUIRE(decoded.has_value());
     auto const reencoded = DiscoveryWire::EncodeBeacon(Unwrap(decoded));
     CHECK(std::ranges::equal(encoded, reencoded));
+}
+
+// --- The flag day's goldens (discovery version 3) ------------------------------
+//
+// Every datagram at version 3, as literal bytes: the header, each field's length, and where the
+// padding sits. A key, a signature or a run of padding is one repeated byte, appended as a run.
+
+namespace
+{
+/// Literal bytes.
+/// @param values The bytes, each 0..255.
+/// @return The bytes.
+[[nodiscard]] std::vector<std::byte> Literal(std::initializer_list<int> values)
+{
+    auto out = std::vector<std::byte> {};
+    out.reserve(values.size());
+    for (auto const value: values)
+        out.push_back(static_cast<std::byte>(value));
+    return out;
+}
+
+/// @param count How many.
+/// @param value The byte.
+/// @return @p count copies of @p value.
+[[nodiscard]] std::vector<std::byte> Run(std::size_t count, int value)
+{
+    return std::vector<std::byte>(count, static_cast<std::byte>(value));
+}
+
+/// Concatenate golden parts.
+/// @param parts Byte grids and runs, in wire order.
+/// @return The bytes.
+[[nodiscard]] std::vector<std::byte> Join(std::initializer_list<std::vector<std::byte>> parts)
+{
+    auto out = std::vector<std::byte> {};
+    for (auto const& part: parts)
+        out.insert(out.end(), part.begin(), part.end());
+    return out;
+}
+
+/// The smallest summary a datagram carries: cluster "c", solitary, created at 1, speaker "n".
+/// @return The summary.
+[[nodiscard]] CompileCacheWire::FleetSummary MinimalSpeaker()
+{
+    return CompileCacheWire::FleetSummary {
+        .clusterId = "c", .state = CompileCacheWire::FleetState::Solitary, .createdAtUnixSeconds = 1, .nodeId = "n"
+    };
+}
+
+/// `MinimalSpeaker()`'s eleven fields as literal bytes: 63 of them (pinned on its own in
+/// `CompileCacheWire_test.cpp`; repeated here so a datagram's golden stands alone).
+/// @return The bytes.
+[[nodiscard]] std::vector<std::byte> MinimalSpeakerBytes()
+{
+    // clang-format off: the grid IS the specification -- one wire field per row.
+    return Literal({
+        0x00, 0x00, 0x00, 0x01, 'c',
+        0x00, 0x00, 0x00, 0x01, 0x01,
+        0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 'n',
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    });
+    // clang-format on
+}
+} // namespace
+
+TEST_CASE("A version-3 proof is its summary, the echoed nonce, the key and the signature, exactly these bytes",
+          "[cluster][discovery][wire]")
+{
+    auto proof = DiscoveryWire::Proof { .summary = MinimalSpeaker() };
+    proof.answers.fill(std::byte { 0x11 });
+    proof.publicKey.fill(std::byte { 0x22 });
+    proof.signature.fill(std::byte { 0x33 });
+    // clang-format off: the grid IS the specification -- one wire field per row.
+    auto const head = Literal({
+        0xFD, 0x03, 0x03,       // magic, version 3, kind = Proof
+        0x00, 0x00, 0x00, 0xCF, // payload = 67 + 36 + 36 + 68 = 207
+        0x00, 0x00, 0x00, 0x3F, // the summary: 63 bytes
+    });
+    // clang-format on
+    auto const golden = Join({ head,
+                               MinimalSpeakerBytes(),
+                               Literal({ 0x00, 0x00, 0x00, 0x20 }), // the nonce it answers
+                               Run(32, 0x11),
+                               Literal({ 0x00, 0x00, 0x00, 0x20 }), // its key
+                               Run(32, 0x22),
+                               Literal({ 0x00, 0x00, 0x00, 0x40 }), // its signature
+                               Run(64, 0x33) });
+    CHECK(DiscoveryWire::EncodeProof(proof) == golden);
+    auto const decoded = DiscoveryWire::DecodeProof(golden);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).summary == proof.summary);
+    CHECK(Unwrap(decoded).answers == proof.answers);
+}
+
+TEST_CASE("A version-3 beacon is its summary and the padding that makes it a proof's size, exactly these bytes",
+          "[cluster][discovery][wire]")
+{
+    // Padded to the proof it would be answered with (214 bytes here), so a challenge it draws never
+    // amplifies: the summary, then 136 zero bytes in the second field.
+    // clang-format off: the grid IS the specification -- one wire field per row.
+    auto const head = Literal({
+        0xFD, 0x03, 0x01,       // magic, version 3, kind = Beacon
+        0x00, 0x00, 0x00, 0xCF, // payload = 67 + 140 = 207
+        0x00, 0x00, 0x00, 0x3F, // the summary: 63 bytes
+    });
+    // clang-format on
+    auto const golden = Join({ head,
+                               MinimalSpeakerBytes(),
+                               Literal({ 0x00, 0x00, 0x00, 0x88 }), // padding: 136 bytes
+                               Run(136, 0x00) });
+    CHECK(DiscoveryWire::EncodeBeacon({ .summary = MinimalSpeaker() }) == golden);
+    auto const decoded = DiscoveryWire::DecodeBeacon(golden);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).summary == MinimalSpeaker());
+}
+
+TEST_CASE("A version-3 challenge is the cluster, the nonce and the padding to its beacon's size, exactly these bytes",
+          "[cluster][discovery][wire]")
+{
+    auto challenge = DiscoveryWire::Challenge { .clusterId = "p" };
+    challenge.nonce.fill(std::byte { 0x44 });
+    // clang-format off: the grid IS the specification -- one wire field per row.
+    auto const head = Literal({
+        0xFD, 0x03, 0x02,            // magic, version 3, kind = Challenge
+        0x00, 0x00, 0x00, 0xCF,      // payload = 5 + 36 + 166 = 207
+        0x00, 0x00, 0x00, 0x01, 'p', // the challenger's cluster
+        0x00, 0x00, 0x00, 0x20,      // the nonce
+    });
+    // clang-format on
+    auto const golden = Join({ head,
+                               Run(32, 0x44),
+                               Literal({ 0x00, 0x00, 0x00, 0xA2 }), // padding: 162 bytes
+                               Run(162, 0x00) });
+    auto const encoded = DiscoveryWire::EncodeChallenge(challenge, 214);
+    REQUIRE(encoded.has_value());
+    CHECK(Unwrap(encoded) == golden);
+    auto const decoded = DiscoveryWire::DecodeChallenge(golden);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).clusterId == "p");
+    CHECK(Unwrap(decoded).nonce == challenge.nonce);
 }

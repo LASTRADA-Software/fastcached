@@ -2716,9 +2716,12 @@ shapes and they are not a spectrum:
   `getifaddrs`, two orders of magnitude apart, so a design that is free on the platform
   you develop on can dominate a request on the one you ship to); **fast by construction
   before fast by cache** (`IsLoopbackHost` first and lock-free, so the cache bounds only
-  the rare path -- a far weaker thing to get right); **refresh on an INTERVAL, never on a
-  miss** (a miss-triggered refresh hands a remote peer a free amplifier: one expensive
-  probe per request, just by asking); and **an injected seam with an injected clock**,
+  the rare path -- a far weaker thing to get right); **refresh on an INTERVAL or on a HOST
+  EVENT (a network change, a wake), never on a miss** (a miss-triggered refresh hands a
+  remote peer a free amplifier: one expensive probe per request, just by asking; a host
+  event is neither a miss nor something a peer can provoke, so it adds no amplifier, and
+  without it a VPN re-address keeps a stale answer for a whole interval -- W-7,
+  `LocalityExpiryFor`); and **an injected seam with an injected clock**,
   because a cache with a hidden clock is untestable by construction.
   The node's unreachable-UPSTREAM memo is the same shape (`UpstreamReachability`,
   `RemoteUpstream.hpp`): a stale *unreachable* ignores a returned shared cache for at most one

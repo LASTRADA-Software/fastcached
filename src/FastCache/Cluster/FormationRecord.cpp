@@ -121,10 +121,10 @@ namespace
         auto const fields = WireFields::SplitExactly(body, JoinTargetFields);
         if (!fields.has_value())
             return std::nullopt;
-        // At the REPLY's cap, the larger: a target may have been proven by a seed's answer, and
-        // the record keeps the summary exactly as it was proven.
-        auto summary =
-            CompileCacheWire::DecodeFleetSummaryFields((*fields)[0], CompileCacheWire::MaxFleetSummaryReplyMembers);
+        // At the one member cap every carrier holds, the record keeping the summary exactly as it was
+        // proven. Format 7 is what makes that safe: a format 6 record, read at a seed reply's longer
+        // cap, is refused by its number before this runs.
+        auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0]);
         auto const asked = WireFields::FromBigEndian<std::uint64_t>((*fields)[2]);
         if (!summary.has_value() || (*fields)[1].size() != Ed25519PublicKeyBytes || !asked.has_value())
             return std::nullopt;

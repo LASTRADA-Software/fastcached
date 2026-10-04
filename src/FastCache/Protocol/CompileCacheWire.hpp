@@ -205,7 +205,23 @@ using WireVersion = std::uint8_t;
 /// a joining machine sends -- `Register`, `NodeAnnounce`, `Heartbeat`, `Withdraw` -- also now
 /// require that identity (`OpDescriptor::identity`), and a worker-admission verb (0x1D, since
 /// retired with principal mode) and three error codes are new.
-inline constexpr WireVersion CurrentVersion = 14;
+///
+/// **15 is the office-fleet flag day: zero-config formation, machine tickets and signed compile
+/// replies** (#178 and the formation lanes). Request arities moved -- AUTH carries its credential
+/// kind (2 -> 3 fields), LEASE the workers the client could not reach and its toolchain label
+/// (3 -> 5), ENROLL is signed over a challenge (4 -> 7) -- and so did replies: a LEASE grant names
+/// a dial hint and the worker's identity key (4 -> 6), a COMPILE reply carries that key's
+/// signature, an ENROLL reply carries the leader's challenge, key and signature, NODE-ANNOUNCE
+/// carries join memos where it carried a roster endorsement and answers with nothing, the
+/// NODE-STATUS runtime record holds 24 positions, its roster record closed up to three, and a
+/// FLEET-SUMMARY reply holds its member list to the datagram's cap. MINT-TICKET (0x1E),
+/// FLEET-SUMMARY (0x1F), SHARED-FETCH (0x20) and SHARED-STORE (0x21) are new verbs; 0x16, 0x17 and
+/// 0x1D are retired; error codes 0x2C..0x33 are new and 0x28 is retired. Every one of those is a
+/// shape an exact-arity decoder cannot step over in either direction: a version-14 reader would
+/// refuse the new requests as malformed and read the new replies' extra fields as a peer speaking
+/// nonsense, and a version-15 reader of a version-14 grant would hold no worker key and trust an
+/// unsigned compile.
+inline constexpr WireVersion CurrentVersion = 15;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -360,7 +376,13 @@ inline constexpr WireVersion CurrentVersion = 14;
 /// MAC under a key this build no longer holds, so accepting its request would either refuse the
 /// proof as a wrong key -- a confident wrong diagnosis for a version mismatch -- or keep a
 /// pre-shared-key path alive for it, which is the path #178 exists to retire.
-inline constexpr WireVersion MinSupportedVersion = 14;
+///
+/// Version 15 moves it for version 3's reason and two sharper ones: a version-14 LEASE grant names
+/// no worker key, so a version-15 client accepting one would take an UNSIGNED compile reply as
+/// served -- the very forgery a signed reply exists to refuse -- and a version-14 AUTH carries no
+/// credential kind, so a machine ticket and a password would be one field read two ways. Refused by
+/// number, the mismatch names the range before a byte of either is read.
+inline constexpr WireVersion MinSupportedVersion = 15;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -2018,8 +2040,8 @@ inline constexpr std::size_t MaxFleetSummaryReply = MaxRefusalReply;
 /// and generous against both. `DecodeFleetSummaryFields` refuses a longer field.
 inline constexpr std::size_t MaxFleetSummaryTextBytes = 1024;
 
-/// The most member ids a fleet summary carries in a discovery DATAGRAM -- a beacon, and the proof
-/// that answers its challenge.
+/// The most member ids a fleet summary carries, in EVERY carrier: a discovery datagram -- a beacon,
+/// and the proof that answers its challenge -- and a FLEET-SUMMARY reply.
 ///
 /// **A measured bound, not a derived one.** A proof naming this many ids at `MaxIdBytes`, beside a
 /// cluster, leader and speaker id at `MaxIdBytes`, three IPv4 endpoints at their longest spelling
@@ -2031,18 +2053,15 @@ inline constexpr std::size_t MaxFleetSummaryTextBytes = 1024;
 /// bound is a measurement under stated conditions, and `AnswerFits` still refuses to amplify.
 ///
 /// A fleet recording more machines says so (`FleetSummary::memberTotal`), so a reader never mistakes
-/// a cut list for a whole one; a seed's answer over TCP carries more of it
-/// (`MaxFleetSummaryReplyMembers`).
-inline constexpr std::size_t MaxFleetSummaryMembers = 10;
-
-/// The most member ids a FLEET-SUMMARY REPLY carries: the whole list a datagram had to cut.
+/// a cut list for a whole one.
 ///
-/// A parameter of the decoder rather than a second grammar, so one summary codec reads both
-/// carriers; the ceiling is asserted beside `LargestFleetSummaryReply` to fit
-/// `MaxFleetSummaryReply` with every other field at its largest, so raising either number fails the
-/// BUILD rather than the wire. A fleet recording more is past what a reply carries, and a reader
-/// says that rather than guessing (`memberTotal` names how many).
-inline constexpr std::size_t MaxFleetSummaryReplyMembers = 512;
+/// **One cap for every carrier since `0xFC` 15**, where a reply carried up to 512. The longer list
+/// had one reader, split evidence (C) (`Cluster::WeAskedAndTheyListUs`), and that evidence is told
+/// to an operator and moves nothing; the summary lists the ids it needs FIRST
+/// (`Cluster::SummaryMembers`), so the cut drops them last, and a beacon already cut there. A list
+/// no carrier needs is grammar nobody reads, so it went, and with it the per-carrier parameter
+/// every summary reader took.
+inline constexpr std::size_t MaxFleetSummaryMembers = 10;
 
 /// The longest an ID may be -- a cluster's or a node's -- wherever one enters: ONE bound for both.
 ///
@@ -6975,17 +6994,15 @@ namespace Detail
     }
 } // namespace Detail
 
-/// Fields a `NodeRosterFields` record carries. A reader accepts more, and ignores the surplus.
+/// Fields a `NodeRosterFields` record carries: the version, the voter count and the revoked count,
+/// in that order. A reader accepts more, and ignores the surplus.
 ///
-/// Four, of which the third is RESERVED: it carried the principal count (#178) and travels EMPTY,
-/// never read and never reassigned. Kept as a position rather than closed up, because this record
-/// is read POSITIONALLY with the surplus ignored -- closing the gap would have a reader take a
-/// principal count for the revoked one. The certification lapse that rode fifth is dropped
-/// outright: a trailing field a reader ignores as surplus.
-inline constexpr std::size_t NodeRosterFieldCount = 4;
-
-/// Where the retired principal count sat in a `NodeRosterFields` record: RESERVED, sent empty.
-inline constexpr std::size_t NodeRosterReservedField = 2;
+/// **Three since `0xFC` 15, closed up.** The record carried a principal count third and a
+/// certification lapse fifth (#178); the principal count's position was kept RESERVED and empty
+/// only so a reader of the older grammar would not take it for the revoked count -- a position held
+/// to avoid a version step. The version stepped, so a peer that would read the older positions is
+/// refused by NUMBER before this record is read, and the reserved position went with it.
+inline constexpr std::size_t NodeRosterFieldCount = 3;
 
 /// Encode a roster summary as one nested record.
 /// @param roster The summary.
@@ -6997,7 +7014,6 @@ inline constexpr std::size_t NodeRosterReservedField = 2;
     auto const revoked = WireFields::ToBigEndian<std::uint32_t>(roster.revoked);
     return WireFields::Encode({ std::span<std::byte const> { version },
                                 std::span<std::byte const> { voters },
-                                std::span<std::byte const> {}, // NodeRosterReservedField
                                 std::span<std::byte const> { revoked } });
 }
 
@@ -7055,7 +7071,7 @@ inline constexpr std::size_t NodeRosterReservedField = 2;
         return false;
     auto const version = WireFields::FromBigEndian<std::uint64_t>((*parts)[0]);
     auto const voters = WireFields::FromBigEndian<std::uint32_t>((*parts)[1]);
-    auto const revoked = WireFields::FromBigEndian<std::uint32_t>((*parts)[3]);
+    auto const revoked = WireFields::FromBigEndian<std::uint32_t>((*parts)[2]);
     if (!version.has_value() || !voters.has_value() || !revoked.has_value())
         return false;
     out = NodeRosterFields { .version = *version, .voters = *voters, .revoked = *revoked };
@@ -8825,18 +8841,18 @@ inline constexpr std::array<std::string FleetSummary::*, 3> FleetSummaryDialledE
     return texts;
 }
 
-/// @p summary as a carrier holding at most @p maxMembers ids carries it: the first ids kept, in the
-/// order the summary lists them, and `memberTotal` untouched, so a reader can tell it was cut.
+/// @p summary as every carrier carries it: at most `MaxFleetSummaryMembers` ids, the first ones
+/// kept in the order the summary lists them, and `memberTotal` untouched, so a reader can tell it
+/// was cut.
 ///
 /// The ONE place a list is cut, so the ids a reader most needs are the ones every carrier keeps:
 /// whoever builds the summary lists them first.
 /// @param summary The summary, its whole list.
-/// @param maxMembers The carrier's cap: `MaxFleetSummaryMembers` or `MaxFleetSummaryReplyMembers`.
-/// @return The summary as that carrier holds it.
-[[nodiscard]] inline FleetSummary WithMembersAtMost(FleetSummary summary, std::size_t maxMembers)
+/// @return The summary as a carrier holds it.
+[[nodiscard]] inline FleetSummary CarriedSummary(FleetSummary summary)
 {
-    if (summary.members.size() > maxMembers)
-        summary.members.resize(maxMembers);
+    if (summary.members.size() > MaxFleetSummaryMembers)
+        summary.members.resize(MaxFleetSummaryMembers);
     return summary;
 }
 
@@ -8906,41 +8922,38 @@ inline constexpr std::array<FleetSummaryTextField, 6> FleetSummaryTextFields { {
     { .index = 9, .maxBytes = MaxFleetSummaryTextBytes },
 } };
 
-/// The largest FLEET-SUMMARY reply payload a peer can send that `DecodeFleetSummaryReply` accepts
-/// when it reads at most @p maxMembers ids: the nested summary at its largest, the key and the
-/// signature, each behind its length prefix.
-/// @param maxMembers The member cap the reader holds the summary to.
+/// The largest FLEET-SUMMARY reply payload a peer can send that `DecodeFleetSummaryReply` accepts:
+/// the nested summary at its largest -- `MaxFleetSummaryMembers` ids at the id bound -- the key and
+/// the signature, each behind its length prefix.
 /// @return The size in bytes.
-[[nodiscard]] consteval std::size_t LargestFleetSummaryReply(std::size_t maxMembers) noexcept
+[[nodiscard]] consteval std::size_t LargestFleetSummaryReply() noexcept
 {
     auto text = std::size_t { 0 };
     for (auto const& field: FleetSummaryTextFields)
         text += field.maxBytes;
-    auto const members = maxMembers * (WireFields::FieldPrefixSize + MaxIdBytes);
+    auto const members = MaxFleetSummaryMembers * (WireFields::FieldPrefixSize + MaxIdBytes);
     auto const summary = (FleetSummaryFieldCount * WireFields::FieldPrefixSize) + text + 1       /* state */
                          + sizeof(std::uint64_t) /* created */ + members + sizeof(std::uint64_t) /* memberTotal */
                          + IdentityPublicKeyBytes /* leader key */;
     return (3 * WireFields::FieldPrefixSize) + summary + IdentityPublicKeyBytes + NodeSignatureBytes;
 }
 
-static_assert(LargestFleetSummaryReply(MaxFleetSummaryReplyMembers) <= MaxFleetSummaryReply,
+static_assert(LargestFleetSummaryReply() <= MaxFleetSummaryReply,
               "the fleet summary reply ceiling must hold the largest summary a peer can make -- every member a reply "
               "carries at the id bound -- with its key and signature");
 
-/// Read the member ids of a summary back, holding them to @p maxMembers.
+/// Read the member ids of a summary back, holding them to `MaxFleetSummaryMembers`.
 ///
-/// Refuses more than @p maxMembers ids, an empty id, one past `MaxIdBytes`, one that is not UTF-8
+/// Refuses more than `MaxFleetSummaryMembers` ids, an empty id, one past `MaxIdBytes`, one that is not UTF-8
 /// -- an id is text a peer sent, and a fleet page renders it -- and an id named twice, which would
 /// make a count of the list say more than the fleet does. Walked at most one id past the cap, so a
 /// hostile list of empty fields costs the cap and no more.
 /// @param field The nested field `EncodeFleetSummaryFields` wrote.
-/// @param maxMembers The carrier's cap.
 /// @return The ids, owned, or nullopt when malformed.
-[[nodiscard]] inline std::optional<std::vector<std::string>> DecodeFleetSummaryMembers(std::span<std::byte const> field,
-                                                                                       std::size_t maxMembers)
+[[nodiscard]] inline std::optional<std::vector<std::string>> DecodeFleetSummaryMembers(std::span<std::byte const> field)
 {
-    auto const ids = WireFields::Detail::SplitUpTo(field, maxMembers + 1);
-    if (!ids.has_value() || ids->size() > maxMembers || WireFields::EncodedSize(*ids) != field.size())
+    auto const ids = WireFields::Detail::SplitUpTo(field, MaxFleetSummaryMembers + 1);
+    if (!ids.has_value() || ids->size() > MaxFleetSummaryMembers || WireFields::EncodedSize(*ids) != field.size())
         return std::nullopt;
     auto members = std::vector<std::string> {};
     members.reserve(ids->size());
@@ -8969,11 +8982,8 @@ static_assert(LargestFleetSummaryReply(MaxFleetSummaryReplyMembers) <= MaxFleetS
 /// as one, it would sort below every real id and win every same-second tie-break a yield decision
 /// makes, and two of them would read as the same fleet.
 /// @param blob What `EncodeFleetSummaryFields` wrote.
-/// @param maxMembers The most member ids the carrier holds: `MaxFleetSummaryMembers` for a
-///        datagram, `MaxFleetSummaryReplyMembers` for a reply. No default, so each carrier says.
 /// @return The summary, owning every field, or nullopt when malformed.
-[[nodiscard]] inline std::optional<FleetSummary> DecodeFleetSummaryFields(std::span<std::byte const> blob,
-                                                                          std::size_t maxMembers)
+[[nodiscard]] inline std::optional<FleetSummary> DecodeFleetSummaryFields(std::span<std::byte const> blob)
 {
     auto const fields = WireFields::SplitExactly(blob, FleetSummaryFieldCount);
     if (!fields.has_value() || (*fields)[0].empty())
@@ -8989,7 +8999,7 @@ static_assert(LargestFleetSummaryReply(MaxFleetSummaryReplyMembers) <= MaxFleetS
         return std::nullopt;
     auto const created = DecodeU64Field((*fields)[2]);
     auto const total = DecodeU64Field((*fields)[FleetSummaryMemberTotalField]);
-    auto members = DecodeFleetSummaryMembers((*fields)[FleetSummaryMembersField], maxMembers);
+    auto members = DecodeFleetSummaryMembers((*fields)[FleetSummaryMembersField]);
     auto const keyField = (*fields)[FleetSummaryLeaderKeyField];
     if (!created.has_value() || !total.has_value() || !members.has_value() || *total < members->size()
         || (!keyField.empty() && keyField.size() != IdentityPublicKeyBytes))
@@ -9089,7 +9099,7 @@ struct FleetSummaryReply
 ///
 /// Refuses a key or a signature that is not exactly one wide -- a prefix of a signature verifies
 /// nothing, and a caller must not be handed one to try -- and a summary `DecodeFleetSummaryFields`
-/// refuses at the reply's member cap, `MaxFleetSummaryReplyMembers`.
+/// refuses, at the one member cap every carrier holds.
 /// @param payload The reply payload.
 /// @return The reply, owning every field, or nullopt when malformed.
 [[nodiscard]] inline std::optional<FleetSummaryReply> DecodeFleetSummaryReply(std::span<std::byte const> payload)
@@ -9097,7 +9107,7 @@ struct FleetSummaryReply
     auto const fields = WireFields::SplitExactly(payload, 3);
     if (!fields.has_value() || (*fields)[1].size() != IdentityPublicKeyBytes || (*fields)[2].size() != NodeSignatureBytes)
         return std::nullopt;
-    auto summary = DecodeFleetSummaryFields((*fields)[0], MaxFleetSummaryReplyMembers);
+    auto summary = DecodeFleetSummaryFields((*fields)[0]);
     if (!summary.has_value())
         return std::nullopt;
     auto reply = FleetSummaryReply { .summary = *std::move(summary) };

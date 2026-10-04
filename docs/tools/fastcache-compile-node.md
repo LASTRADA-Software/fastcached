@@ -2166,9 +2166,9 @@ What the signature covers matters as much as who signs. It covers the `(node,
 endpoint)` **pair** and the key: signing the nonce alone would let anyone who observed
 one valid proof replay it with a different endpoint substituted, pointing a known id
 at an attacker's address. The datagram grammar changed with it — a key and a 64-byte
-signature where a 32-byte MAC was — so the discovery wire moved to version 2, and a
-node on an older build is refused rather than misread; upgrade a segment's consensus
-members together.
+signature where a 32-byte MAC was — so the discovery wire moved to version 2 (it is 3
+since the beacon came to carry the fleet's signed summary), and a node on an older build
+is refused rather than misread; upgrade a segment's nodes together.
 
 **There is no cluster key any more.** The pre-shared `--cluster-key-file` every member
 used to hold -- which signed lease grants, proved a node on the node port and, before

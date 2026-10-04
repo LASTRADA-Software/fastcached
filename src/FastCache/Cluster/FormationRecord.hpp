@@ -179,13 +179,18 @@ struct FormationRecord
 /// left with principal mode: a format 5 record is intact and holds a version-2 roster, refused here by
 /// the record's own number before anything decodes the roster.
 ///
-/// **Format 6 is this branch's own, UNRELEASED definition, and is FINAL only at the lane-0 flag
-/// day.** Format 3 changed twice without moving -- an asked-fleet memo went from three fields to
-/// four, and the nested summary from ten fields to eleven -- because no build that wrote those
-/// shapes ever shipped; the embedded roster moved it to 4 and to 6, and the admitting key to 5,
-/// because a learner's record is on disk on the one installation there is. From the flag day on, every change
-/// to this layout -- nested codecs included -- moves this number.
-inline constexpr std::uint8_t FormationRecordFormat = 6;
+/// 7 at the lane-0 flag day, because what a record ACCEPTS narrowed: the joining target's summary is
+/// read at the one member cap every carrier holds since `0xFC` 15 (`MaxFleetSummaryMembers`), where
+/// format 6 read it at a seed reply's 512. A format 6 record holding a seed-proven summary longer than
+/// that is intact, so it is refused here by its number -- `UnsupportedFormatVersion` -- and never
+/// read as damage. A decode-acceptance change is a layout change for this purpose.
+///
+/// Format 3 changed twice without moving -- an asked-fleet memo went from three fields to four, and
+/// the nested summary from ten fields to eleven -- because no build that wrote those shapes ever
+/// shipped; the embedded roster moved it to 4 and to 6, the admitting key to 5, and the flag day to 7,
+/// because a learner's record is on disk on the one installation there is. **From format 7 on, every
+/// change to this layout -- nested codecs and what a reader accepts included -- moves this number.**
+inline constexpr std::uint8_t FormationRecordFormat = 7;
 
 /// The four bytes every formation record starts with, so a file that is not one is told apart
 /// from one in another layout.

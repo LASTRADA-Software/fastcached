@@ -916,19 +916,25 @@ The pre-shared `--cluster-key-file` a consensus node once also needed is gone: t
 and the node port prove identity keys too
 ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
 
-**Upgrading.** The consensus wire moved to version 4 with identity keys (it was 2 with the
-first handshake, which proved the cluster key, and 3 with learners). A version 4 node and an
-older one cannot talk at all — there is no compatibility mode, on purpose, because an older
-peer proves only the cluster key and accepting one would be the fallback the handshake
-exists to refuse. So:
+**Upgrading.** The consensus wire is version 5: it moved to 4 with identity keys (it was 2
+with the first handshake, which proved the cluster key, and 3 with learners), and to 5 when
+the proof came to state the session direction it asks for, with the session keys derived
+per direction. A version 5 node and an older one cannot talk at all — there is no
+compatibility mode, on purpose: an older peer proves only the cluster key, or names no
+direction for the keys that seal its session, and accepting one would be the fallback the
+handshake exists to refuse. A version 4 member is refused at the handshake, by version, and
+only the dialling side can see it, because the acceptor challenges first: an upgraded member
+dialling an old one counts `fastcache_raft_peer_dials_refused_no_challenge_total`, while an
+old member dialling an upgraded one refuses its challenge and closes before a proof, which the
+upgraded acceptor counts nowhere. So:
 
 - on the build that introduced it, whose members still named one another with the
   since-retired `--raft-peer`, every member's list was given every other member's
   `@<key>` first — a cluster whose members cannot verify each other does not form;
 - then upgrade **all** consensus members together. A mixed cluster shows as
   `fastcache_raft_peer_dials_refused_no_challenge_total` on the new nodes (an older peer's
-  challenge is at another version) and `fastcache_raft_peer_connections_refused_no_handshake_total`
-  on them as well (an older peer's proof is at another version).
+  challenge is at another version). Their accepting side counts nothing: an older dialler
+  refuses the newer challenge and closes before it sends a proof.
 
 **How long a handshake may take.** Five seconds, at either end. An accepting node closes
 a connection that has not proved an id by then — before, a connection that sent nothing

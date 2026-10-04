@@ -33,6 +33,46 @@ What makes it a *fleet* problem rather than a daemon problem is that a fleet has
 than one process. A cache daemon is upgraded, restarted, and done; twenty nodes cannot
 be.
 
+## This release: 0xFC version 15, discovery version 3, consensus version 5
+
+Every one of the three wires changed its grammar, so every node, every `fastcached` serving
+`0xFC`, every `fastcache-cc` and every `fastcache-cli` moves together (the supported procedure
+below).
+
+- **`0xFC` 15:**
+  - AUTH carries a credential kind, so a launcher presents a machine ticket.
+  - LEASE carries the workers the client could not reach (at most 16) and the client's
+    toolchain label.
+  - A grant carries a dial hint (the address the scheduler last saw the worker at, when the
+    worker reports it as its own) and the worker's identity key, and a compile reply is signed
+    by that key.
+  - Workers report their interface addresses in REGISTER and HEARTBEAT.
+  - ENROLL is signed and challenged.
+  - New verbs: MINT-TICKET, FLEET-SUMMARY, SHARED-FETCH and SHARED-STORE. Retired:
+    CLUSTER-ADMIT-CLIENT, CLUSTER-FORGET-CLIENT and CLUSTER-ADMIT-WORKER.
+  - A version-14 peer is refused `unsupported-version`, on the four counters below.
+- **Discovery 3:** a beacon carries the fleet's signed summary. **A mismatch is silent:** each
+  build drops the other's datagrams without a counter or a log line, so the two simply never see
+  each other on a shared segment. Finish the upgrade on every machine on a segment.
+- **Consensus 5:** see [the consensus peer wire](#the-consensus-peer-wire-version-5).
+- **Every cached object misses once.** The launcher's key moved (`objkey-v7`, `manifest-v7`,
+  value generation 7). This costs one cold build per fleet and needs no step.
+- **`fastcache-cli live-stats` from an older build** refuses the newer layout. Upgrade the
+  clients too.
+
+### What refuses to start after the upgrade, and the step
+
+| What | Refused as | Step |
+|---|---|---|
+| A state directory whose `node-key` other accounts can read (an older install) | the identity-key refusal (`Exposed`), naming the file | Delete the state directory (`%ProgramData%\fastcache-node` on Windows). The key counts as disclosed. The node mints a new identity; forget the old id with `--cluster-forget`. |
+| A Raft snapshot older than state version 10, a log entry older than command version 6, or one holding a retired command kind (3, 4 or 6) | `UnsupportedFormatVersion` (the held state's start refusal), or the retired kind by name, naming the directory | Move `raft-state`, `raft-log` and `raft-snapshot` aside ([the consensus state directory](#the-consensus-state-directory)) |
+| `<cluster-dir>/roster` left behind | an entry this build keeps nothing for | Delete that file alone ([signed leases](#signed-leases-checked-against-the-state-each-node-applied)) |
+| A formation record below format 7 (builds of this branch only; no release wrote one) | `UnsupportedFormatVersion` | Move `formation` aside. The node re-forms as a new solitary cluster: re-enroll it. |
+| A configuration file naming `scheduler` (on a serving node), `fleet_member`, `scheduler_token_file`, `cluster_admit_client`, `cluster_forget_client`, `raft_peer`, `raft_join`, `cluster_id`, `serve_scheduler`, `voter_key`, `enroll_from` or `cluster_admit_worker` | refused by name, with its step | Remove the key |
+| A service registration replaying any of those flags, or `--scheduler` on a node that serves | refuses to start under the service manager | `--install-service` again. The MSI does this on upgrade. |
+| `fastcached` with `--storage-max-disk` and `--storage-durability=fsync` or `none` | refused at startup | Use `batched` (the default), or drop the budget |
+| MSI properties `FASTCACHE_NODE_SCHEDULER` and `FASTCACHE_NODE_ADVERTISE` | not read; an upgrade forgets the remembered advertised endpoint | Drop them from scripted installs |
+
 ## The supported procedure
 
 1. **Stop the builds.** Anything running `fastcache-cc` against the fleet should be
@@ -89,7 +129,20 @@ And a fleet on **one wire at two builds** is refused by nothing at all, so none 
 counters above moves. The leader raises the `mixed-node-versions` condition for that,
 naming each build and the machines running it (`fastcache-cli fleet`, its conditions section).
 
-## The consensus peer wire, version 4
+## The consensus peer wire, version 5
+
+**Version 5's proof states the session direction it asks for, and the session keys are
+derived per direction.** A version-4 member names no direction for the keys that would seal
+its session, so the two refuse each other at the handshake, by version. **Only the dialling
+side can see it**, because the acceptor challenges first:
+
+- an upgraded member DIALLING a version-4 member meets its version-4 challenge, refuses it,
+  and counts `fastcache_raft_peer_dials_refused_no_challenge_total`, with the version in the
+  log line;
+- a version-4 member dialling an upgraded one refuses the version-5 challenge and closes
+  without a proof, so the upgraded ACCEPTOR counts nothing at all.
+
+The consensus members of a fleet upgrade together; nothing else is needed for this step.
 
 **#178 made every consensus connection prove each member's OWN identity key**, where it
 proved the cluster's shared key, so the peer wire moved from version 3 to 4 and the two
@@ -110,7 +163,9 @@ A member left out of step 2 is refused by the others as a key never given
 (`fastcache_raft_peer_connections_refused_unknown_key_total`) until the cluster records its
 key -- which the leader does for itself when it leads, and which `--cluster-admit` with
 `@<key>` does for anybody else. A mixed cluster shows as
-`fastcache_raft_peer_connections_refused_no_handshake_total` on the new nodes.
+`fastcache_raft_peer_dials_refused_no_challenge_total` on the new nodes, counted where they
+dial an old one; the acceptor challenges first, so an old node dialling a new one closes
+before its proof and the new node counts nothing.
 
 ## The flags that carried a cluster's shape
 
@@ -147,9 +202,10 @@ a roster, because every machine checks grants against the roster its own consens
 
 **#178 signs every lease with the issuing scheduler's own identity key and has every
 worker check it against the cluster's voters**, where a lease was an HMAC under the
-shared key. `0xFC` moved to version 13 for it, the replicated commands to version 4
+shared key. `0xFC` moved to version 13 for it (15 now), the replicated commands to version 4
 (`--cluster-forget` now revokes the key of what it forgets, #1555), and the lease format
-to 3. The certified roster that first carried the voters to a worker -- endorsements on
+to 3. The lease format is **4** since a grant names the worker's key and a compile reply is
+signed by it: a version-3 grant does not verify. The certified roster that first carried the voters to a worker -- endorsements on
 NODE-ANNOUNCE, `--voter-key` anchors, a kept roster file and the `roster-expired` refusal --
 is **retired**: every worker is now a member of its fleet, a learner or a voter, and checks a
 grant against the state its own consensus applied. Nothing older reads any of it, so this is
@@ -158,7 +214,7 @@ the whole-fleet step above, and what each machine is started with gets simpler:
 1. **Every node runs consensus, by default.** A first start is a cluster of one, on
    `--listen-raft`'s default port `6680`, with this machine's name as its consensus address;
    nothing is added to a command line. `--voter-key` is gone, and a command line naming it is
-   refused as a flag this node does not have.
+   refused by name, with its step.
 2. **Every other machine joins the fleet as a learner.** It finds the fleet by beacon, or by
    `--fleet-seed=<host>` where no beacon reaches, asks to join, and is approved on a voter with
    `--enroll-approve` (or under `--enroll-auto-approve`); see
@@ -189,7 +245,8 @@ moved, each refused by name rather than misread:
 |---|---|---|
 | The Raft store in `--cluster-dir` (`raft-state`, `raft-log`, `raft-snapshot`) | format 2: a configuration carries voters and learners, and every log record carries the format it was written in | `UnsupportedFormatVersion` — never the damage code — naming the format it found and the one it reads |
 | The consensus peer wire | version 3 (4 since #178, above) | refused at the handshake by its version, never read as this layout -- a fleet's consensus members upgrade together |
-| The replicated cluster state (a snapshot, and the `--cluster-status` reply) | version 5 for #1449, which records each member's seat; this build writes version 9 | `UnsupportedVersion`, naming both versions |
+| The replicated cluster state (a snapshot, and the `--cluster-status` reply) | version 5 for #1449, which records each member's seat; this build writes version 10 | `UnsupportedVersion`, naming both versions |
+| The replicated commands (each log entry) | version 6: a retired command kind (3, 4 or 6) is refused by name | `UnsupportedFormatVersion` at start, naming both versions |
 
 The store has **no conversion**, and a node started on an older one refuses to start,
 saying so. **So does a node whose store is this build's but whose snapshot or retained

@@ -211,13 +211,20 @@ program-scoped rule itself (`… discovery-reply udp/any`), or a rule for the pi
 
 ## The wire version, and why it moved
 
-The discovery wire is **version 2**, and version 1 is refused. A proof used to carry a
-32-byte HMAC under the shared key; it now carries a 32-byte public key and a 64-byte
-signature, so its arity and its field widths changed — a GRAMMAR change, which a version-1
-reader could only refuse as malformed. That is the opposite of
-[#402](https://github.com/LASTRADA-Software/fastcached/issues/402), which changed only what
-the MAC covered and rightly left the version alone. Upgrade a segment's nodes together; a
-node on an older build is refused rather than misread.
+The discovery wire is **version 3**, and versions 1 and 2 are refused. Each move was a
+GRAMMAR change, which an older reader could only refuse as malformed:
+
+- **2** replaced the proof's 32-byte HMAC under the shared key with a 32-byte public key and
+  a 64-byte signature, so its arity and its field widths changed. That is the opposite of
+  [#402](https://github.com/LASTRADA-Software/fastcached/issues/402), which changed only
+  what the MAC covered and rightly left the version alone.
+- **3** put the fleet's signed summary in the beacon and the proof where an id and an
+  endpoint were, padded the beacon and the challenge by one field each, and made the proof
+  echo the nonce it answers.
+
+A datagram of another version is refused on its version byte, and refused **silently**: no
+counter and no log line, so a node on an older build and one on this build simply never see
+each other on a shared segment. Upgrade a segment's nodes together.
 
 ## What it deliberately does not do
 

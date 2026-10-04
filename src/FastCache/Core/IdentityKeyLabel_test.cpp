@@ -190,3 +190,35 @@ TEST_CASE("Every call named Sign in the tree is a row saying why it does not sig
         CHECK(std::ranges::contains(census.hits, row.file, [](auto const& hit) { return std::string_view { hit.first }; }));
     }
 }
+
+TEST_CASE("Every live identity-key label is pinned as the literal a peer signs under", "[core][identity-key][wire]")
+{
+    // A label IS a wire constant: every signature under it is over its bytes, and a peer built elsewhere
+    // verifies against the same literal. So each is written out here, beside its purpose, rather than
+    // read back through `LabelOf` -- a renamed label would otherwise pass every case that spells the
+    // table. One row per purpose, and the count says none was left out.
+    struct Row
+    {
+        IdentityKeyPurpose purpose;
+        std::string_view literal;
+    };
+    auto const rows = std::to_array<Row>({
+        { .purpose = IdentityKeyPurpose::DiscoveryProof, .literal = "fastcache-discovery-proof-v3" },
+        { .purpose = IdentityKeyPurpose::FleetSummary, .literal = "fastcache-fleet-summary-v1" },
+        { .purpose = IdentityKeyPurpose::Lease, .literal = "fastcache-lease-v4" },
+        { .purpose = IdentityKeyPurpose::RaftDiallerProof, .literal = "fastcache-raft-proof-v3" },
+        { .purpose = IdentityKeyPurpose::RaftAcceptorVerdict, .literal = "fastcache-raft-verdict-v3" },
+        { .purpose = IdentityKeyPurpose::NodeServerChallenge, .literal = "fastcache-node-challenge-v2" },
+        { .purpose = IdentityKeyPurpose::NodeProof, .literal = "fastcache-node-proof-v2" },
+        { .purpose = IdentityKeyPurpose::MachineTicket, .literal = "fastcache-ticket-v1" },
+        { .purpose = IdentityKeyPurpose::EnrollAdmission, .literal = "fastcache-enroll-admission-v1" },
+        { .purpose = IdentityKeyPurpose::EnrollRequest, .literal = "fastcache-enroll-request-v1" },
+        { .purpose = IdentityKeyPurpose::CompileReply, .literal = "fastcache-compile-reply-v1" },
+    });
+    CHECK(rows.size() == EnumeratorCount<IdentityKeyPurpose>);
+    for (auto const& row: rows)
+    {
+        INFO(row.literal);
+        CHECK(LabelOf(row.purpose) == row.literal);
+    }
+}

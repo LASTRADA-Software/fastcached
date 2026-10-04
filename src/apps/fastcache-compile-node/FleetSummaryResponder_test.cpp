@@ -134,14 +134,13 @@ TEST_CASE("A node with no fleet to offer refuses NoCluster rather than signing o
           == std::optional { Wire::Status::Ok });
 }
 
-TEST_CASE("A reply carries the member list up to its own cap and says how many the fleet records",
+TEST_CASE("A reply carries the member list up to the one member cap and says how many the fleet records",
           "[node][formation][summary]")
 {
-    // The reply is how a reader holding this node's key learns the members a datagram left out, so
-    // it carries the whole list up to `MaxFleetSummaryReplyMembers` -- cut here, the first ids kept --
-    // and the total, so a fleet past even that is said rather than guessed.
+    // The reply carries the list up to `MaxFleetSummaryMembers`, as a datagram does -- cut here, the
+    // first ids kept -- and the total, so a fleet past the cap is said rather than guessed.
     auto summary = FleetSummary { .clusterId = "c-office", .state = FleetState::Established, .nodeId = "n-office" };
-    for (auto const index: std::views::iota(std::size_t { 0 }, Wire::MaxFleetSummaryReplyMembers + 88))
+    for (auto const index: std::views::iota(std::size_t { 0 }, Wire::MaxFleetSummaryMembers + 88))
         summary.members.push_back(std::format("n-{}", index));
     summary.memberTotal = summary.members.size();
     Testing::ScriptedSummarySource self { summary };
@@ -154,10 +153,10 @@ TEST_CASE("A reply carries the member list up to its own cap and says how many t
         OkPayloadOf(AnswerSync(responder, Wire::EncodeFleetSummaryRequest(nonce), Stranger())));
     REQUIRE(decoded.has_value());
     auto const& carried = Unwrap(decoded).summary;
-    REQUIRE(carried.members.size() == Wire::MaxFleetSummaryReplyMembers);
+    REQUIRE(carried.members.size() == Wire::MaxFleetSummaryMembers);
     CHECK(carried.members.front() == "n-0");
-    CHECK(carried.members.back() == std::format("n-{}", Wire::MaxFleetSummaryReplyMembers - 1));
-    CHECK(carried.memberTotal == Wire::MaxFleetSummaryReplyMembers + 88);
+    CHECK(carried.members.back() == std::format("n-{}", Wire::MaxFleetSummaryMembers - 1));
+    CHECK(carried.memberTotal == Wire::MaxFleetSummaryMembers + 88);
 
     // And it is what was signed: the cut list proves under the node's key.
     auto const proven =

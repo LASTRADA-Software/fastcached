@@ -366,7 +366,11 @@ Consequences that are each load-bearing:
     loopback — never touches the address set, and the cache bounds only the rare
     path. Loopback is NOT the whole answer, though: a local client dialling this node
     at its own routable address on a widened bind is still this machine.
-  - **Refreshed on an INTERVAL, never on a miss.** A miss-triggered refresh hands a
+  - **Refreshed on an INTERVAL or on a HOST EVENT, never on a miss.** A host event -- a network
+    change or a wake, `LocalityExpiryFor`'s rows; a suspend is not one -- MARKS the set due and the
+    next question re-probes on the asking thread (W-7): no peer can raise one, so it is no
+    amplifier, and without it a VPN re-address kept accepting tickets minted for an address another
+    machine now holds for up to one interval. A miss-triggered refresh hands a
     remote peer a free amplifier: one probe per request, just by asking, and
     `GetAdaptersAddresses` measured **2.04 ms** against `getifaddrs`' **0.0086 ms** —
     238×, so a design that is free on Linux dominates a request on Windows. Nothing

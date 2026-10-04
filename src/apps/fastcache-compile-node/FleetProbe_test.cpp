@@ -96,16 +96,17 @@ TEST_CASE("A probe asks a seed with a fresh nonce and holds only what its signat
     CHECK(std::ranges::equal(Unwrap(asked), script));
 }
 
-TEST_CASE("A summary question returns the whole list a reply carries, proven and claiming no origin",
+TEST_CASE("A summary question returns the list a reply carries, proven and claiming no origin",
           "[node][formation][summary][split]")
 {
-    // The full-list question a split's evidence may need: the same exchange as a seed's, its answer
-    // held to the same signature over the same fresh nonce -- and a list past a datagram's cut.
+    // The question a pointer is followed and a leader's key is vouched with: the same exchange as a
+    // seed's, its answer held to the same signature over the same fresh nonce -- and a list at the one
+    // member cap every carrier holds, with a total past it.
     auto const script = NonceScript();
     auto summary = Office();
-    for (auto const index: std::views::iota(std::size_t { 0 }, Wire::MaxFleetSummaryMembers + 9))
+    for (auto const index: std::views::iota(std::size_t { 0 }, Wire::MaxFleetSummaryMembers))
         summary.members.push_back(std::format("n-{}", index));
-    summary.memberTotal = summary.members.size();
+    summary.memberTotal = summary.members.size() + 9;
     auto const key = Testing::TestKeyPair("n-office");
     auto reply = Wire::FleetSummaryReply { .summary = summary };
     reply.publicKey = key.PublicKey();
