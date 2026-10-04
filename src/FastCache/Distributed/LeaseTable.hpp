@@ -353,7 +353,7 @@ class LeaseTable
     /// how one of them comes to evict the client that replaced an expired lease.
     /// Caller holds `_mutex`.
     /// @param entry The token entry to remove; invalidated by the call.
-    void Forget(std::unordered_map<std::string, Entry>::iterator entry);
+    void Forget(std::unordered_map<std::string, Entry>::iterator const& entry);
 
     core::platform::IClock& _clock;
     std::chrono::milliseconds _leaseTimeout;

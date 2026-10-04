@@ -2875,6 +2875,29 @@ else()
         "not Windows: the MSI service table helpers read the service control manager and Windows Installer")
 endif()
 
+# Every custom action of the MSI, run the way Windows Installer runs it, installing nothing
+# (scripts/check-msi-custom-actions.ps1): formatted, started IN its Directory in the phase it runs
+# in, its PowerShell parsed by Windows PowerShell 5.1, and the read-only waits started for real in
+# both directions. The WiX build looks at none of that, and an action started in an install root an
+# upgrade had just removed failed the 0.3.0 upgrade on CI in under 100 ms (round 5).
+if(WIN32 AND FASTCACHED_PWSH)
+    add_test(
+        NAME "msi-custom-action-commands"
+        COMMAND "${FASTCACHED_PWSH}" -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/check-msi-custom-actions.ps1"
+                -SourceDir "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties("msi-custom-action-commands" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 180
+    )
+elseif(WIN32)
+    fastcached_register_skipped_test("msi-custom-action-commands"
+        "no PowerShell 7 interpreter found (pwsh, pwsh-preview), so the MSI's custom actions were not run")
+else()
+    fastcached_register_skipped_test("msi-custom-action-commands"
+        "not Windows: the MSI's custom actions are Windows command lines")
+endif()
+
 # ---------------------------------------------------------------------------
 # The operator port docs against `NodeSurfaceTable()`. Fails when a document
 # claims a surface the table does not declare, omits one it does, or states a

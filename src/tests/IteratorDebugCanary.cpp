@@ -37,8 +37,8 @@
 // static analyser flags it, that analyser is working; exclude the file rather
 // than repairing it.
 
-#include <cstdio>
 #include <cstdlib>
+#include <print>
 #include <vector>
 
 int main()
@@ -48,7 +48,7 @@ int main()
     // time, and a canary the optimiser deletes reports exactly what a missing
     // debug runtime reports.
     std::vector<int> values(4, 7);
-    auto const index = static_cast<std::size_t>(std::atoi("9"));
+    auto const index = static_cast<std::size_t>(std::strtoul("9", nullptr, 10));
 
     // With `_ITERATOR_DEBUG_LEVEL=2` this is `_STL_VERIFY`, which reports and
     // aborts. Without it, this is undefined behaviour that in practice reads
@@ -56,10 +56,10 @@ int main()
     // outcomes are what tell the levels apart.
     auto const observed = values[index];
 
-    std::printf("iterator-debug-canary: read %d past the end of a %zu-element vector "
-                "and SURVIVED -- the debug runtime did not trap it\n",
-                observed,
-                values.size());
+    std::println("iterator-debug-canary: read {} past the end of a {}-element vector "
+                 "and SURVIVED -- the debug runtime did not trap it",
+                 observed,
+                 values.size());
 
     // Exit 0 on survival, so the gate's verdict is unambiguous: this program
     // returning normally IS the failure being reported.

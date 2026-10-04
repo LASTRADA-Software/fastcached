@@ -445,6 +445,29 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
     return {};
 }
 
+#if defined(_WIN32)
+namespace
+{
+    /// An `OVERLAPPED` addressing @p offset, with no event.
+    ///
+    /// Built by aggregate initialisation rather than by assigning `Offset` and `OffsetHigh`: both sit in an
+    /// anonymous union inside `OVERLAPPED`, and this tree's analyser refuses member access through a union
+    /// (`cppcoreguidelines-pro-type-union-access`). The union's first member is the offset pair, so the
+    /// initialiser's inner braces write exactly those two fields; the union itself has no name to designate.
+    /// @param offset The file offset the transfer starts at.
+    /// @return The structure to hand to `ReadFile` / `WriteFile`.
+    [[nodiscard]] OVERLAPPED OverlappedAt(std::uint64_t offset) noexcept
+    {
+        return OVERLAPPED {
+            0,
+            0,
+            { { .Offset = static_cast<DWORD>(offset & 0xFFFFFFFFU), .OffsetHigh = static_cast<DWORD>(offset >> 32) } },
+            nullptr,
+        };
+    }
+} // namespace
+#endif
+
 std::uint64_t FilePageStore::DataPageOffset(PageId id) const noexcept
 {
     return (2 + (id.value - 1)) * static_cast<std::uint64_t>(_pageSize);
@@ -458,9 +481,7 @@ std::uint64_t FilePageStore::MetaSlotOffset(MetaSlot slot) const noexcept
 auto FilePageStore::ReadAt(std::uint64_t offset, BytesSpan data) const -> std::expected<void, CowTreeError>
 {
 #if defined(_WIN32)
-    OVERLAPPED ov {};
-    ov.Offset = static_cast<DWORD>(offset & 0xFFFFFFFFU);
-    ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    auto ov = OverlappedAt(offset);
     DWORD read = 0;
     if (!::ReadFile(_handle, data.data(), static_cast<DWORD>(data.size()), &read, &ov))
         return std::unexpected(CowTreeError::IoError);
@@ -489,9 +510,7 @@ auto FilePageStore::ReadAt(std::uint64_t offset, BytesSpan data) const -> std::e
 auto FilePageStore::WriteAt(std::uint64_t offset, BytesView data) const -> std::expected<void, CowTreeError>
 {
 #if defined(_WIN32)
-    OVERLAPPED ov {};
-    ov.Offset = static_cast<DWORD>(offset & 0xFFFFFFFFU);
-    ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    auto ov = OverlappedAt(offset);
     DWORD wrote = 0;
     if (!::WriteFile(_handle, data.data(), static_cast<DWORD>(data.size()), &wrote, &ov))
         return std::unexpected(CowTreeError::IoError);

@@ -292,6 +292,8 @@ set(_table [=[
 <CustomAction Id="FastCacheAwaitServiceExit"|/>|Execute="deferred"
 <CustomAction Id="FastCacheAwaitServiceExit"|/>|Impersonate="no"
 <CustomAction Id="FastCacheAwaitServiceExit"|/>|Return="check"
+<CustomAction Id="FastCacheAwaitServiceExit"|/>|Directory="System64Folder"
+<CustomAction Id="FastCacheAwaitServiceExit"|/>|!Directory="INSTALL_ROOT"
 <Custom Action="FastCacheAwaitServiceExit"|/>|Before="InstallFiles"
 <Custom Action="FastCacheAwaitServiceExit"|/>|Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE"
 <CustomAction Id="FastCachedAwaitExitForNode"|/>|bin\fastcached.exe\"

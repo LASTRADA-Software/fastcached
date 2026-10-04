@@ -165,6 +165,25 @@ TEST_CASE("LRU eviction kicks in when byte budget exceeded", "[cache]")
     REQUIRE(storage.Snapshot().evictions == 1);
 }
 
+TEST_CASE("InMemoryLruStorage an overwrite larger than the whole budget evicts itself and still answers", "[cache]")
+{
+    // The rewritten entry is at the FRONT, but the eviction runs until the budget fits, so a value larger than the
+    // whole budget evicts the very node it was written into. Its CAS is the answer to the SET, and reading it from
+    // the node after the eviction read freed memory: an orphaned-iterator abort under MSVC's debug runtime, a
+    // heap-use-after-free under ASan. A fresh key of the same size takes the insert path, which never did.
+    FastCache::InMemoryLruStorage storage { 4 }; // 4 bytes total
+    core::platform::ManualClock clock;
+    REQUIRE(storage.Set("k", MakeBytes("xx"), 0, core::platform::SteadyTimePoint::max()).has_value());
+
+    auto const cas = storage.Set("k", MakeBytes("too large"), 0, core::platform::SteadyTimePoint::max());
+
+    REQUIRE(cas.has_value());
+    CHECK_FALSE(storage.Get("k", clock.now())->found);
+    auto const stats = storage.Snapshot();
+    CHECK(stats.bytesUsed == 0);
+    CHECK(stats.evictions == 1);
+}
+
 TEST_CASE("FlushWithGeneration hides existing entries immediately", "[cache]")
 {
     FastCache::InMemoryLruStorage storage;

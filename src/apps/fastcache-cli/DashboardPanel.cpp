@@ -229,12 +229,12 @@ namespace
     /// How one `FigureSource` is computed.
     struct FigureSourceSpec
     {
-        FigureSource source; ///< The enumerator this row describes.
+        FigureSource source {}; ///< The enumerator this row describes.
         /// The computation, over the primary and second fields, for the whole cache or one tier.
         Series (*compute)(std::deque<HistoryEntry> const& history,
                           ReadingField field,
                           ReadingField other,
-                          std::optional<StorageTier> tier);
+                          std::optional<StorageTier> tier) = nullptr;
         /// Whether a figure's `addends` add their rates to what `compute` made.
         bool takesAddends { false };
     };
@@ -1317,7 +1317,7 @@ namespace
     /// The frame's word for one of the leader's cell tones.
     struct CellToneDress
     {
-        Distributed::CellTone tone;     ///< The enumerator this row describes.
+        Distributed::CellTone tone {};  ///< The enumerator this row describes.
         std::optional<FrameTone> frame; ///< How the frame dresses it; none for plain.
     };
 
@@ -1461,8 +1461,8 @@ namespace
     /// alert as a refusal is. A severity this build cannot name is plain, since a colour would be a guess.
     struct SeverityTone
     {
-        CompileCacheWire::ConditionSeverity severity; ///< The enumerator this row describes.
-        std::optional<FrameTone> tone;                ///< How an id of that severity is dressed; none for plain.
+        CompileCacheWire::ConditionSeverity severity {}; ///< The enumerator this row describes.
+        std::optional<FrameTone> tone;                   ///< How an id of that severity is dressed; none for plain.
     };
     constexpr EnumTable<CompileCacheWire::ConditionSeverity, SeverityTone> SeverityTones { {
         { .severity = CompileCacheWire::ConditionSeverity::Notice, .tone = std::nullopt },

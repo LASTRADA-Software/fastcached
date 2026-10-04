@@ -79,10 +79,8 @@ namespace
     [[nodiscard]] std::expected<std::size_t, SecureRandomError> FillOnce(std::span<std::byte> out)
     {
 #if defined(_WIN32)
-        auto const status = ::BCryptGenRandom(nullptr,
-                                              static_cast<PUCHAR>(static_cast<void*>(out.data())),
-                                              static_cast<ULONG>(out.size()),
-                                              BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        auto const status = ::BCryptGenRandom(
+            nullptr, reinterpret_cast<PUCHAR>(out.data()), static_cast<ULONG>(out.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         if (!BCRYPT_SUCCESS(status))
             return std::unexpected { SecureRandomError {
                 .primitive = "BCryptGenRandom",

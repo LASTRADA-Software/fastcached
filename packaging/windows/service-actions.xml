@@ -473,9 +473,17 @@
          the old product's removal. Matched by executable PATH, so a copy of
          either binary run by hand from this install root is waited for too:
          its files are the ones being replaced. Return="check", 1460 past 120
-         seconds. -->
+         seconds.
+
+         Its working directory is System64Folder, never INSTALL_ROOT: a type 34
+         action is started IN its Directory, and before InstallFiles on an
+         upgrade from 0.3.0 the old product's removal has just deleted the
+         install root, so the process could not even be created (ERROR_DIRECTORY,
+         logged as Error 1721) and the upgrade failed in under 100 ms
+         (batch 5 CI, round 5). The msi-custom-action-commands test starts every
+         action in the directory it would have. -->
     <CustomAction Id="FastCacheAwaitServiceExit"
-                  Directory="INSTALL_ROOT"
+                  Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$p=@(\&quot;[INSTALL_ROOT]bin\fastcached.exe\&quot;,\&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe\&quot;);$w=New-Object Diagnostics.Stopwatch;$w.Start();while(Get-Process -Name fastcached,fastcache-compile-node -ErrorAction SilentlyContinue|Where-Object Path -In $p)[\{]if($w.Elapsed.TotalSeconds -gt 120)[\{]exit 1460[\}];Start-Sleep -Milliseconds 250[\}]&quot;"
                   Execute="deferred" Impersonate="no" Return="check" />
 

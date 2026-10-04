@@ -625,15 +625,39 @@ function Assert-NodeStatePrivate {
 # property dump.
 #
 # @param Path The log.
+# The lines of a verbose log that say what FAILED, each with the lines just before it: the error
+# Windows Installer reports for an action, whatever form it takes. A deferred action that could not
+# even be STARTED is logged as `Error 1721. ... Action: <name>, location: <its directory>`, which
+# names no CustomAction and returns no code, so a filter for either missed the failure that ended
+# the 0.3.0 upgrade (round 5). A pure function over the lines, so the self-test drives it.
+#
+# @param Lines The log's lines.
+# @param Before How many lines before each failure to keep.
+# @return The failure lines and their context, in log order, each line once.
+function Get-MsiFailureLines([string[]] $Lines, [int] $Before = 3) {
+    $pattern = 'returned actual error code|Error 1[0-9]{3}\b|Return value 3\b|Error in rollback|Installation failed|failed to (start|run)'
+    $keep = [System.Collections.Generic.SortedSet[int]]::new()
+    foreach ($index in 0..($Lines.Count - 1)) {
+        if ($Lines[$index] -match $pattern) {
+            foreach ($context in ([Math]::Max(0, $index - $Before))..$index) { [void] $keep.Add($context) }
+        }
+    }
+    return @($keep | ForEach-Object { $Lines[$_] })
+}
+
 function Show-MsiLog([string] $Path) {
     Write-Host "===== $Path (relevant lines) ====="
     if (-not (Test-Path $Path)) { Write-Host "no log at $Path"; return }
-    # Every line naming one of this package's service actions, from the whole log: the tail
-    # below is the property dump of a transaction that ended, and an action that ran with
-    # Return="ignore" -- the node's registration among them -- leaves its failure only here.
-    Write-Host '--- the service actions ---'
-    Select-String -Path $Path -Pattern 'FastCache\w*(Service|ForNode|Leftover|Registration|Exactly|AfterStop|ForRestart|Exit|RollbackState)\b' |
-        Where-Object { $_.Line -match 'Action (start|ended)|returned actual error|CustomAction' } | ForEach-Object { $_.Line }
+    # What failed, FIRST and from the whole log: the tail below fills with the rollback's own
+    # records, which pushed the one error line out of it.
+    Write-Host '--- what failed ---'
+    Get-MsiFailureLines @(Get-Content -Path $Path) | ForEach-Object { $_ }
+    # Every line naming one of this package's actions, from the whole log: the tail below is the
+    # property dump of a transaction that ended, and an action that ran with Return="ignore" -- the
+    # node's registration among them -- leaves its failure only here.
+    Write-Host '--- the package actions ---'
+    Select-String -Path $Path -Pattern 'FastCache\w+' |
+        Where-Object { $_.Line -match 'Action (start|ended)|returned actual error|CustomAction|Error 1[0-9]{3}' } | ForEach-Object { $_.Line }
     Write-Host '--- the tail ---'
     Select-String -Path $Path -Pattern `
         'Action (start|ended)', 'CustomAction', 'ServiceControl', 'FastCache', 'returned actual error',
@@ -1092,7 +1116,25 @@ function Invoke-MsiServiceTableSelfTest {
         if ($verdict = Get-FirewallGroupEmptyVerdict @('X node tcp/6674') 'fastcached: X') { throw $verdict }
     } "'fastcached: X' still holds \[X node tcp/6674\]"
 
-    $expectedCases = 67
+    # What failed, read whatever shape Windows Installer gave it: an action that could not START names
+    # no CustomAction and no code (round 5), one that ran and failed does, and a clean log says nothing.
+    $startFailure = @('Action start 5:34:04: InstallFiles.', 'noise', 'noise', 'noise',
+        'MSI (s) (88:AC) [05:34:04:780]: Product: fastcached -- Error 1721. There is a problem with this Windows Installer package. Action: FastCacheAwaitServiceExit, location: C:\Program Files\fastcached\, command: ...',
+        'after')
+    $found = @(Get-MsiFailureLines $startFailure)
+    if ($found.Count -ne 4 -or $found[-1] -notmatch 'Error 1721.*FastCacheAwaitServiceExit' -or $found -contains 'after') {
+        throw "failure lines: an action that could not start was not reported with its context: $($found -join ' | ')"
+    }
+    Pass 'failure lines: an action that could not start is reported, with the lines before it'
+    $ranAndFailed = @('CustomAction FastCacheNodeStartService returned actual error code 2 (note this may not be 100% accurate)')
+    if (@(Get-MsiFailureLines $ranAndFailed).Count -ne 1) { throw 'failure lines: an action that ran and failed was not reported' }
+    Pass 'failure lines: an action that ran and failed is reported'
+    if (@(Get-MsiFailureLines @('Action ended 5:34:04: FastCacheNodeStartService. Return value 1.', 'Installation success or error status: 0.')).Count -ne 0) {
+        throw 'failure lines: a clean log reported a failure'
+    }
+    Pass 'failure lines: a clean log reports nothing'
+
+    $expectedCases = 70
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }

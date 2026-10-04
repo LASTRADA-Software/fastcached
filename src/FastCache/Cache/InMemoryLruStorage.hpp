@@ -277,7 +277,7 @@ class InMemoryLruStorage final: public IStorage
     /// promotes the entry to the front of the LRU. Bumps CAS. The value bytes
     /// are copied into a fresh immutable buffer (copy-on-write).
     /// @return New CAS token.
-    CasToken MutateExisting(Iterator it,
+    CasToken MutateExisting(Iterator const& it,
                             std::span<std::byte const> value,
                             std::uint32_t flags,
                             core::platform::SteadyTimePoint expiry);
@@ -290,8 +290,11 @@ class InMemoryLruStorage final: public IStorage
     /// The single erase point for this tier, and `_sweepCursor` is why that
     /// matters: it is the one iterator that outlives the call which produced
     /// it, so this is the only place that can leave it dangling.
-    /// @param it Entry to erase.
-    void EraseAt(Iterator it);
+    ///
+    /// @p at may be `_sweepCursor` itself or the `_index` value naming the node,
+    /// both of which this call changes; it is read once, before either does.
+    /// @param at Entry to erase.
+    void EraseAt(Iterator const& at);
 
     /// True if a value of `size` bytes exceeds the configured per-value
     /// cap. Always false when the cap is disabled (`_maxValueBytes == 0`).

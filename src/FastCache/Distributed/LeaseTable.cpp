@@ -66,7 +66,7 @@ std::optional<Lease> LeaseTable::Find(std::string_view token) const
     return it->second.lease;
 }
 
-void LeaseTable::Forget(std::unordered_map<std::string, Entry>::iterator entry)
+void LeaseTable::Forget(std::unordered_map<std::string, Entry>::iterator const& entry)
 {
     // Erase the key index only when it still points AT THIS token. An expired
     // lease's key may already have been re-leased to somebody else, and removing

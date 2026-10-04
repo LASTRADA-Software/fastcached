@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cstdint>
 #include <expected>
+#include <iterator>
 #include <span>
 #include <string>
 #include <string_view>
@@ -64,7 +65,7 @@ InMemoryLruStorage::Iterator InMemoryLruStorage::FindAlive(std::string_view key,
     if (indexIt == _index.end())
         return _lru.end();
 
-    auto const nodeIt = indexIt->second;
+    auto nodeIt = indexIt->second;
     if (!IsAlive(nodeIt->entry, _liveGeneration, now))
     {
         // Lazy reclaim during lookup. Attribute a never-fetched expiry to
@@ -101,19 +102,27 @@ CacheEntry const* InMemoryLruStorage::FindAliveReadOnly(std::string_view key, co
     return &entry;
 }
 
-void InMemoryLruStorage::EraseAt(Iterator it)
+void InMemoryLruStorage::EraseAt(Iterator const& at)
 {
+    // `at` may BE `_sweepCursor`, or the `_index` value naming this node, and this
+    // function moves the one and destroys the other. So it is read here, before
+    // either changes, and never again: everything below works from the node and
+    // its successor, which neither change touches.
+    auto const& node = *at;
+    auto const next = std::next(at);
+    auto const cursorOnNode = _sweepCursor == at;
+
     // Advanced rather than reset: dropping the sweep back to begin() on every
     // eviction would restart the pass on a cache under memory pressure, which
     // is exactly the workload where it matters that the pass finishes.
-    if (_sweepCursor == it)
-        ++_sweepCursor;
-    _bytesUsed -= it->entry.ValueSize();
+    if (cursorOnNode)
+        _sweepCursor = next;
+    _bytesUsed -= node.entry.ValueSize();
     // Before the erase, because the key it is measured from lives in the node being
     // dropped.
-    _indexBytes -= IndexBytesFor(it->key.size());
-    _index.erase(it->key);
-    _lru.erase(it);
+    _indexBytes -= IndexBytesFor(node.key.size());
+    _index.erase(node.key);
+    _lru.erase(std::prev(next));
 }
 
 void InMemoryLruStorage::EvictToFit()
@@ -173,7 +182,7 @@ CasToken InMemoryLruStorage::InsertNew(std::string key,
     return cas;
 }
 
-CasToken InMemoryLruStorage::MutateExisting(Iterator it,
+CasToken InMemoryLruStorage::MutateExisting(Iterator const& it,
                                             std::span<std::byte const> value,
                                             std::uint32_t flags,
                                             core::platform::SteadyTimePoint expiry)
@@ -194,8 +203,11 @@ CasToken InMemoryLruStorage::MutateExisting(Iterator it,
     it->entry.fetched = false;
     _bytesUsed += it->entry.ValueSize();
     _lru.splice(_lru.begin(), _lru, it);
+    // Read before the eviction, which may drop this very node -- a value larger than
+    // the whole budget evicts itself -- and with it the `_index` value `it` may be.
+    auto const cas = it->entry.cas;
     EvictToFit();
-    return it->entry.cas;
+    return cas;
 }
 
 SharedValue InMemoryLruStorage::EncodeForStorage(std::span<std::byte const> value,
