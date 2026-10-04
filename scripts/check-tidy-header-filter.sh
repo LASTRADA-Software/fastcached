@@ -295,6 +295,18 @@ src/CowTree/Tree.hpp"
             'CPMAddPackage(NAME foo@1 VERSION 1.0)\n' "CMakeLists.txt:1 (foo@1)"
         RefusedAsMalformed "a NAME running on into an escaped ; is refused" \
             'CPMAddPackage(NAME foo\\;bar VERSION 1.0)\n' 'CMakeLists.txt:1 (foo\;bar)'
+        # The selection's own grep failing is the CHECK failing, and is SAID: a grep killed by a
+        # signal prints nothing, and this refusal alone used to return 2 in silence -- round 8's
+        # "status 2 and []", which nobody could attribute. A grep that fails is shadowed here.
+        cases=$((cases + 1))
+        printf 'CPMAddPackage(NAME Foo VERSION 1.0)\n' > "$tree/CMakeLists.txt"
+        got="$(grep() { return 2; }; header_filter_declared_packages "$tree" 2>&1 >/dev/null)" && status=0 || status=$?
+        if [[ "$status" == 2 && "$got" == *"grep exited 2"*"the CHECK failing"* ]]; then
+            echo "   ok   a selection grep that fails is refused naming grep, never in silence"
+        else
+            echo "   FAIL a selection grep that fails is refused naming grep, never in silence: status $status, [$got]"
+            failures=$((failures + 1))
+        fi
         cases=$((cases + 1))
         printf 'CPMAddPackage(NAME [[Foo]] VERSION 1.0)\n' > "$tree/CMakeLists.txt"
         got="$(header_filter_declared_packages "$tree" 2>&1 >/dev/null)" && status=0 || status=$?

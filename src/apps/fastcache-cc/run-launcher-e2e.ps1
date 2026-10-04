@@ -297,6 +297,17 @@ function New-MoveTree([string]$root) {
     return $src
 }
 
+# Wait for the launcher process ITSELF and return it. Never `Start-Process -Wait`, which in
+# PowerShell 7 waits for every descendant too: `cl.exe` on a machine with Visual Studio's
+# telemetry on leaves VCTIP.EXE running for minutes after the compile, and the first case sat at
+# its first compile for 12 minutes until that one process was stopped (measured, a developer
+# machine; CI's images start no VCTIP). The streams are files, so nothing is left unread.
+function Wait-LauncherProcess($process) {
+    $null = $process.Handle
+    $process.WaitForExit()
+    return $process
+}
+
 # Run the launcher once; return @{ code; stderr } and capture whether it was a
 # HIT or MISS from the verbose trace.
 function Invoke-Launcher([string]$compiler, [string]$srcRoot, [string]$buildTree, [string]$obj) {
@@ -306,11 +317,11 @@ function Invoke-Launcher([string]$compiler, [string]$srcRoot, [string]$buildTree
     $env:FASTCACHE_VERBOSE    = "1"
     $source = Join-Path $srcRoot "u.cpp"
     $errFile = New-TemporaryFile
-    $p = Use-E2ELauncherState $launcherState {
+    $p = Wait-LauncherProcess (Use-E2ELauncherState $launcherState {
         Start-Process -FilePath $Launcher `
             -ArgumentList $compiler,"/nologo","/c","/showIncludes","/Fo$obj",$source `
-            -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile
-    }
+            -NoNewWindow -PassThru -RedirectStandardError $errFile
+    })
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
     Remove-Item $errFile -ErrorAction SilentlyContinue
     return @{ code = $p.ExitCode; stderr = $err }
@@ -456,11 +467,11 @@ function Invoke-LauncherStreams([string]$compiler, [string]$srcRoot, [string]$bu
     $source = Join-Path $srcRoot "u.cpp"
     $outFile = New-TemporaryFile
     $errFile = New-TemporaryFile
-    $p = Use-E2ELauncherState $launcherState {
+    $p = Wait-LauncherProcess (Use-E2ELauncherState $launcherState {
         Start-Process -FilePath $Launcher `
             -ArgumentList $compiler,"/nologo","/c","/showIncludes","/Fo$obj",$source `
-            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-    }
+            -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    })
     $out = Get-Content -Raw $outFile -ErrorAction SilentlyContinue
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
     Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
@@ -484,10 +495,10 @@ function Invoke-LauncherIn([string]$cwd, [string]$srcRoot, [string]$buildTree, [
     $env:FASTCACHE_VERBOSE    = "1"
     $outFile = New-TemporaryFile
     $errFile = New-TemporaryFile
-    $p = Use-E2ELauncherState $launcherState {
+    $p = Wait-LauncherProcess (Use-E2ELauncherState $launcherState {
         Start-Process -FilePath $Launcher -ArgumentList $compileArgs -WorkingDirectory $cwd `
-            -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile -RedirectStandardOutput $outFile
-    }
+            -NoNewWindow -PassThru -RedirectStandardError $errFile -RedirectStandardOutput $outFile
+    })
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
     Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
     return @{ code = $p.ExitCode; stderr = [string]$err }
@@ -563,13 +574,22 @@ $DeadPeerExchanges = 2
 #   never-accepting    the connect completes into the backlog, so the exchange runs out TOTAL
 #   refused            the dial fails: at once on Linux, after SYN retries on Windows, never past CONNECT
 #   accept-then-reset  the RST arrives at once; at most CONNECT
-# A shape's bound is baseline + N x cost + cost / 2: N exchanges fit with half an exchange to
+# A shape's EXCHANGE bound is N x cost + cost / 2: N exchanges fit with half an exchange to
 # spare, and ONE exchange more overshoots it by half an exchange of that shape. The shared
 # bound this replaces, baseline + N x (connect + total), left never-accepting -- which never
 # spends a connect -- exactly one whole exchange of slack, so a launcher retrying a failed
 # fetch once passed it (review I-1: green by 89 and 8 ms on Windows). A shape whose exchanges
 # cost NOTHING in practice -- the reset, and a refusal on Linux -- cannot be held to a count by
-# time at all; the reset leg counts its exchanges instead.
+# time at all; the reset leg counts its exchanges instead, and so does never-accepting, whose
+# listener keeps every connection the launcher made in its backlog (measured on Windows: a
+# connection closed or reset before it is accepted is still accepted afterwards).
+#
+# That bound is judged on the time the LAUNCHER says it spent on the cache -- `direct-ms` plus
+# `cache-ms`, from its own invocation record -- never on the wall clock, which also carries the
+# compile and the process start. Those are what a loaded runner delays: round 8 put two legs
+# past a wall-clock bound with half an exchange of slack (refused, never-accepting), on a tree
+# whose launcher and fixture had passed seven Windows legs unchanged. The wall clock keeps a
+# bound of its own, as the HANG detector, wide enough that load does not reach it.
 $DeadPeerShapeCostMs = [ordered]@{
     'refused'           = $DeadPeerConnectMs
     'never-accepting'   = $DeadPeerTotalMs
@@ -583,6 +603,11 @@ function Get-ObjectDigest([string]$path) {
     if ($bytes.Length -ge 8) { [Array]::Clear($bytes, 4, 4) }
     return [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes))
 }
+
+# What the wall clock may run past a leg's exchange bound before the leg is called a hang: the
+# compile, two process starts and the scheduling a loaded runner adds to them, none of which an
+# exchange bound measures.
+$DeadPeerWallSlackMs = 10000
 
 # A loopback port nothing listens on: bound, read and released. What connects to it is refused.
 function Get-RefusedPort {
@@ -603,10 +628,12 @@ function New-SilentListener {
 
 # Run the launcher against $addr under the dead-peer deadlines, stopping it once $boundMs of a
 # MONOTONIC clock has passed. With $resetOn, every connection that listener takes while the
-# launcher runs is accepted and then reset (a zero linger turns the close into an RST).
-# Returns @{ code; stderr; elapsedMs; timedOut; resets }.
+# launcher runs is accepted and then reset (a zero linger turns the close into an RST). The
+# launcher records into $state, a directory of this leg's own, so its one record is read back.
+# Returns @{ code; stderr; elapsedMs; timedOut; resets; spentMs }, `spentMs` being the
+# launcher's own `direct-ms` + `cache-ms`, or $null when it left not exactly one record.
 function Invoke-LauncherDeadPeer([string]$compiler, [string]$srcRoot, [string]$buildTree, [string]$obj,
-                                 [string]$addr, [long]$boundMs, $resetOn) {
+                                 [string]$addr, [long]$boundMs, $resetOn, [string]$state) {
     $env:FASTCACHE_ADDR            = $addr
     $env:FASTCACHE_SOURCE_DIR      = $srcRoot
     $env:FASTCACHE_BINARY_DIR      = $buildTree
@@ -616,13 +643,21 @@ function Invoke-LauncherDeadPeer([string]$compiler, [string]$srcRoot, [string]$b
     $errFile = New-TemporaryFile
     try {
         $source = Join-Path $srcRoot "u.cpp"
+        Remove-Item -Recurse -Force $state -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force $state | Out-Null
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
         # Unwaited, as in Invoke-LauncherBounded: the child took its environment when it
-        # started, and the wait below is the caller's.
-        $p = Use-E2ELauncherState $launcherState {
-            Start-Process -FilePath $Launcher `
-                -ArgumentList $compiler,"/nologo","/c","/Fo$obj",$source `
-                -NoNewWindow -PassThru -RedirectStandardError $errFile
+        # started, and the wait below is the caller's. Under a state root of the leg's own,
+        # re-pointed on the handle as the verified-hit case does.
+        $launcherState.Root = $state
+        try {
+            $p = Use-E2ELauncherState $launcherState {
+                Start-Process -FilePath $Launcher `
+                    -ArgumentList $compiler,"/nologo","/c","/Fo$obj",$source `
+                    -NoNewWindow -PassThru -RedirectStandardError $errFile
+            }
+        } finally {
+            $launcherState.Root = $launcherState.RunRoot
         }
         # Read now, or an unwaited Start-Process leaves ExitCode empty once the process is gone.
         $null = $p.Handle
@@ -645,7 +680,11 @@ function Invoke-LauncherDeadPeer([string]$compiler, [string]$srcRoot, [string]$b
         }
         $err = [string](Get-Content -Raw $errFile -ErrorAction SilentlyContinue)
         $code = if ($timedOut) { -1 } else { $p.ExitCode }
-        return @{ code = $code; stderr = $err; elapsedMs = $elapsed; timedOut = $timedOut; resets = $resets }
+        $records = @(Get-Content (Join-Path $state "fastcache-cc\invocations.log") -ErrorAction SilentlyContinue)
+        $spent = if ($records.Count -eq 1) {
+            [long](Get-E2ELauncherLogField $records[0] 'direct-ms') + [long](Get-E2ELauncherLogField $records[0] 'cache-ms')
+        } else { $null }
+        return @{ code = $code; stderr = $err; elapsedMs = $elapsed; timedOut = $timedOut; resets = $resets; spentMs = $spent }
     } finally {
         Remove-Item $errFile -ErrorAction SilentlyContinue
         Remove-Item Env:\FASTCACHE_CONNECT_TIMEOUT, Env:\FASTCACHE_TIMEOUT -ErrorAction SilentlyContinue
@@ -671,7 +710,8 @@ function Test-DeadPeers([string]$compiler) {
         $build = Join-Path $root "build"; New-Item -ItemType Directory -Force $build | Out-Null
         $obj = Join-Path $build "u.obj"
 
-        $base = Invoke-LauncherDeadPeer $compiler $src $build $obj "127.0.0.1:$Port" 300000 $null
+        $state = Join-Path $root "state"
+        $base = Invoke-LauncherDeadPeer $compiler $src $build $obj "127.0.0.1:$Port" 300000 $null $state
         if ($base.code -ne 0 -or -not (Test-Path $obj)) {
             Write-Host "  DEAD-PEER FAIL ($compiler): the live baseline did not compile (exit $($base.code), timed out $($base.timedOut))" -ForegroundColor Red
             Write-Host $base.stderr
@@ -683,8 +723,9 @@ function Test-DeadPeers([string]$compiler) {
         $ok = $true
         foreach ($shape in $DeadPeerShapeCostMs.Keys) {
             $costMs = $DeadPeerShapeCostMs[$shape]
-            $boundMs = $base.elapsedMs + $DeadPeerExchanges * $costMs + [long]($costMs / 2)
-            Write-Host "  $shape : bound $boundMs ms = baseline + $DeadPeerExchanges x $costMs + $costMs / 2 ms"
+            $exchangeBoundMs = $DeadPeerExchanges * $costMs + [long]($costMs / 2)
+            $boundMs = $base.elapsedMs + $exchangeBoundMs + $DeadPeerWallSlackMs
+            Write-Host "  $shape : exchange bound $exchangeBoundMs ms = $DeadPeerExchanges x $costMs + $costMs / 2 ms; hang bound $boundMs ms = baseline + that + $DeadPeerWallSlackMs ms"
             Remove-Item $obj -Force -ErrorAction SilentlyContinue
             $listener = $null
             try {
@@ -693,7 +734,12 @@ function Test-DeadPeers([string]$compiler) {
                     default   { $listener = New-SilentListener; "127.0.0.1:$($listener.LocalEndpoint.Port)" }
                 }
                 $resetOn = if ($shape -eq 'accept-then-reset') { $listener } else { $null }
-                $r = Invoke-LauncherDeadPeer $compiler $src $build $obj $addr $boundMs $resetOn
+                $r = Invoke-LauncherDeadPeer $compiler $src $build $obj $addr $boundMs $resetOn $state
+                # A listener nothing accepted from still holds every connection the launcher
+                # made: drained, each one is an exchange, counted as the reset leg counts its own.
+                if ($shape -eq 'never-accepting') {
+                    while ($listener.Pending()) { $listener.AcceptTcpClient().Close(); $r.resets++ }
+                }
             } finally {
                 if ($listener) { $listener.Stop() }
             }
@@ -703,18 +749,22 @@ function Test-DeadPeers([string]$compiler) {
             # too many on a shape whose exchanges cost nothing -- a launcher that retried a failed
             # fetch once would pass every bound here and still fail this.
             $fellBack = $r.stderr -match '\(fetch exchange failed\)'
-            $reached = ($shape -ne 'accept-then-reset') -or $r.resets -eq $DeadPeerExchanges
+            $counted = $shape -in @('accept-then-reset', 'never-accepting')
+            $reached = (-not $counted) -or $r.resets -eq $DeadPeerExchanges
+            $withinExchanges = ($null -ne $r.spentMs) -and $r.spentMs -le $exchangeBoundMs
             $built = (Test-Path $obj) -and ((Get-ObjectDigest $obj) -eq $expected)
-            if (-not $r.timedOut -and $r.code -eq 0 -and $built -and $fellBack -and $reached) {
-                Write-Host "  $shape : compiled locally in $($r.elapsedMs) ms (bound $boundMs), object matches the baseline: OK ($compiler)" -ForegroundColor Green
+            if (-not $r.timedOut -and $r.code -eq 0 -and $built -and $fellBack -and $reached -and $withinExchanges) {
+                Write-Host "  $shape : compiled locally in $($r.elapsedMs) ms, $($r.spentMs) ms of it on the cache (bound $exchangeBoundMs), object matches the baseline: OK ($compiler)" -ForegroundColor Green
                 continue
             }
-            $why = if ($r.timedOut) { "still running at the $boundMs ms bound, stopped" }
+            $why = if ($r.timedOut) { "still running at the $boundMs ms hang bound, stopped" }
                    elseif ($r.code -ne 0) { "exit $($r.code)" }
                    elseif (-not $built) { "no object, or not the baseline's" }
                    elseif (-not $fellBack) { "no 'fetch exchange failed' fall-back, so the peer was never asked" }
-                   else { "the reset peer accepted $($r.resets) connection(s), want exactly $DeadPeerExchanges -- one per exchange" }
-            Write-Host "  DEAD-PEER FAIL ($compiler, $shape): $why; $($r.elapsedMs) ms, $($r.resets) reset(s)" -ForegroundColor Red
+                   elseif (-not $reached) { "the peer took $($r.resets) connection(s), want exactly $DeadPeerExchanges -- one per exchange" }
+                   elseif ($null -eq $r.spentMs) { "the launcher left no single invocation record, so the time it spent on the cache is unknown" }
+                   else { "the launcher spent $($r.spentMs) ms on the cache, past the $exchangeBoundMs ms that $DeadPeerExchanges exchange(s) may take -- one exchange too many" }
+            Write-Host "  DEAD-PEER FAIL ($compiler, $shape): $why; $($r.elapsedMs) ms, $($r.resets) connection(s)" -ForegroundColor Red
             Write-Host $r.stderr
             $ok = $false
         }

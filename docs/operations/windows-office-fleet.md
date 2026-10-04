@@ -404,7 +404,9 @@ The go-live upgrade starts every machine afresh. On **every** machine, A include
    remembered nothing, so this first upgrade registers only what it states: pass
    `FASTCACHE_FIREWALL_ALLOW` and `FASTCACHE_FLEET_SEED` again here if you use them. The
    properties `FASTCACHE_NODE_SCHEDULER` and `FASTCACHE_NODE_ADVERTISE` are no longer read; drop
-   them from scripted installs.
+   them from scripted installs. A failed upgrade puts both services back as 0.3.0 had them, unless
+   rollback is disabled (the `DisableRollback` policy, or `DISABLEROLLBACK=1` on the command
+   line): then both services are left unregistered, and running the upgrade again is the remedy.
 
 Then follow steps 1 to 4 above, in order: A founds the new fleet and prints its new `fleet-id`
 (the pin from before cannot be reused, since the cluster is new), every PC is upgraded with

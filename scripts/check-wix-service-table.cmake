@@ -310,7 +310,7 @@ set(_table [=[
 
 <CustomAction Id="FastCacheClearRollbackState"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
 <CustomAction Id="FastCacheClearRollbackState"|/>|Execute="deferred"
-<Custom Action="FastCacheClearRollbackState"|/>|After="WriteRegistryValues"
+<Custom Action="FastCacheClearRollbackState"|/>|Before="FastCacheUndoRollbackState"
 <CustomAction Id="FastCacheClearRollbackState"|/>|Directory="System64Folder"
 <CustomAction Id="FastCacheDiscardRollbackState"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
 <CustomAction Id="FastCacheDiscardRollbackState"|/>|Execute="deferred"
@@ -346,7 +346,7 @@ set(_table [=[
 <CustomAction Id="FastCachedStashRegistration"|/>|reg.exe" copy HKLM\SYSTEM\CurrentControlSet\Services\FastCached HKLM\SOFTWARE\fastcached\InstallerRollback\FastCached /s /f /reg:64"
 <CustomAction Id="FastCachedStashFromCopy"|/>|reg.exe query HKLM\SYSTEM\CurrentControlSet\Services\FastCached /reg:64 >nul 2>&1 || [System64Folder]reg.exe copy HKLM\SOFTWARE\fastcached\InstallerRegistrationCopy\FastCached HKLM\SOFTWARE\fastcached\InstallerRollback\FastCached /s /f /reg:64)"
 <CustomAction Id="FastCachedStashRegistration"|/>|Execute="deferred"
-<Custom Action="FastCachedStashRegistration"|/>|After="FastCacheClearRollbackState"
+<Custom Action="FastCachedStashRegistration"|/>|After="WriteRegistryValues"
 <Custom Action="FastCachedStashFromCopy"|/>|After="FastCachedStashRegistration"
 <Custom Action="FastCachedStashFromCopy"|/>|AND WIX_UPGRADE_DETECTED"
 <CustomAction Id="FastCachedStashRegistration"|/>|Directory="System64Folder"

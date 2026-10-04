@@ -108,7 +108,14 @@ _third_party_select() {
     # `grep`'s own status is still what `$?` reports, which a `producer | grep` would lose.
     selected="$(grep -E ${1:+"$1"} -- "$pattern" < <(printf '%s\n' "$3"))" || status=$?
     # grep answers 1 for "selected nothing", which is an answer; anything above it is
-    # the instrument failing, and must not read as an empty selection.
-    [ "$status" -le 1 ] || return 2
+    # the instrument failing, and must not read as an empty selection. And it SAYS so:
+    # a grep killed by a signal prints nothing, and this was the one refusal on the path
+    # that did not, so a caller reported "status 2 and []" -- an outcome nobody could
+    # attribute (round 8, tidy-header-filter-selftest on Windows-cl-debug, once in five
+    # runs of an unchanged tree).
+    if [ "$status" -gt 1 ]; then
+        echo "third-party roots: grep exited ${status} selecting paths against the roots of ${2}, so which files are this project's own is not known -- this is the CHECK failing, not a verdict about the tree" >&2
+        return 2
+    fi
     [ -z "$selected" ] || printf '%s\n' "$selected"
 }

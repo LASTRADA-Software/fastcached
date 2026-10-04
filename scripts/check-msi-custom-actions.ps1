@@ -37,7 +37,10 @@
 #      window from RemoveExistingProducts through WriteRegistryValues cannot be covered, and the
 #      one checked action of ours in it is a stated residual (`ChecksBeforeTheRestores`);
 #  10. a rollback action that STARTS a service is scheduled before InstallFiles, so the rollback,
-#      which runs in reverse, starts it only after InstallFiles' rollback restored the files.
+#      which runs in reverse, starts it only after InstallFiles' rollback restored the files. That
+#      holds for a maintenance transaction; in an upgrade the old files return only with
+#      RemoveExistingProducts' rollback, after the restarts, and no mark is written there to start
+#      anything (StopServices has stopped both services first).
 # Every other action changes a service, the registry or the firewall, and is never started here.
 #
 # Usage: pwsh -NoProfile -File scripts/check-msi-custom-actions.ps1 -SourceDir <repository root>

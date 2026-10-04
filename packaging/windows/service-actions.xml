@@ -830,8 +830,10 @@
 
     <!-- The rollback state, emptied before the transaction writes any and after
          it succeeds: a copy or a was-running mark from an earlier transaction
-         must never be what a later one restores. The emptying runs first after
-         WriteRegistryValues, before any stash, mark or checked step. -->
+         must never be what a later one restores. The emptying runs FIRST after
+         RemoveExistingProducts, before the undo and the restarts enter the
+         script: a failure at FastCacheAwaitServiceExit then rolls back through
+         restarts that find no mark an earlier, interrupted transaction left. -->
     <CustomAction Id="FastCacheClearRollbackState"
                   Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
@@ -921,7 +923,17 @@
            rollback has restored the previous files: each service's restart, and
            ahead of those the rollback state's undo, so a rollback deletes the
            key LAST, after every action that reads it. Both are rollback actions,
-           which write the script and so stay after RemoveExistingProducts. -->
+           which write the script and so stay after RemoveExistingProducts.
+           "The files that were there" holds for a maintenance transaction. In an
+           upgrade the old product's files come back only with
+           RemoveExistingProducts' own rollback, AFTER these restarts, and that
+           is harmless only because an upgrade writes no mark: StopServices has
+           stopped both services before the mark writers ask.
+
+           And first of all the rollback state's clear, so no mark or stash an
+           earlier, interrupted transaction left is there for them to read. -->
+      <Custom Action="FastCacheClearRollbackState" Before="FastCacheUndoRollbackState"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheUndoRollbackState" Before="FastCachedRestartAfterStop"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCachedRestartAfterStop" Before="FastCacheNodeRestartAfterStop"
@@ -930,8 +942,8 @@
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
       <!-- FIRST after WriteRegistryValues, and before any step that can fail
-           (Return="check"): the rollback is ARMED. The rollback state is emptied,
-           each registration is stashed, and each service's rollback twins are
+           (Return="check"): the rollback is ARMED. Each registration is
+           stashed, and each service's rollback twins are
            in the script, so a failure at ANY checked step that follows puts
            both services back. That is the property an upgrade from 0.3.0 needs
            most: its uninstall-service deleted both services inside
@@ -946,12 +958,12 @@
            exact restore then reads the stash BEFORE WriteRegistryValues' own
            rollback removes the copy.
 
-           The order inside, each for its reason: the clear first; then per
-           service: stash, fallback, exact restore, undo or re-register, so a
-           rollback runs the re-register BEFORE the exact restore that corrects
-           it. The undo and the restarts are NOT here: they sit before
-           InstallFiles (above), so a rollback runs them after the files and
-           every registration are back.
+           The order inside, each for its reason: per service, stash, fallback,
+           exact restore, undo or re-register, so a rollback runs the
+           re-register BEFORE the exact restore that corrects it. The clear, the
+           undo and the restarts are NOT here: they sit before InstallFiles
+           (above), so a rollback runs the restarts after the files and every
+           registration are back.
 
            THE RESIDUAL, stated: a failure in ANY action from
            RemoveExistingProducts through WriteRegistryValues (the old
@@ -965,9 +977,7 @@
            a re-registration needs do not exist before InstallFiles. The remedy
            is to run the upgrade again; msi-custom-action-commands names the
            one checked action allowed there. -->
-      <Custom Action="FastCacheClearRollbackState" After="WriteRegistryValues"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCachedStashRegistration" After="FastCacheClearRollbackState"
+      <Custom Action="FastCachedStashRegistration" After="WriteRegistryValues"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
       <Custom Action="FastCachedStashFromCopy" After="FastCachedStashRegistration"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH AND WIX_UPGRADE_DETECTED" />

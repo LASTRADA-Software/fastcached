@@ -678,7 +678,14 @@ readable and silently ignored. Every rule below has already been one of them.
   - **A rollback that STARTS a service is scheduled BEFORE `InstallFiles`**, and the rollback
     state's undo before it: a rollback runs in reverse, so a start scheduled after the files runs
     before `InstallFiles`' rollback restores them, starting the new binary over the old one being
-    put back. Step 10 of `msi-custom-action-commands` refuses it.
+    put back. Step 10 of `msi-custom-action-commands` refuses it. That restores "the files that
+    were there" in a MAINTENANCE transaction only; in an upgrade the old files return with
+    `RemoveExistingProducts`' rollback, after the restarts, and it is harmless only because an
+    upgrade writes no was-running mark (`StopServices` stopped both services first).
+  - **With rollback DISABLED** (the `DisableRollback` policy, `DISABLEROLLBACK=1`) no rollback
+    custom action runs, so a failed upgrade from 0.3.0 leaves both services unregistered. That is
+    not refused: an administrator who disabled rollback opted out of it, and the runbook names
+    running the upgrade again as the remedy.
   - A feature an upgrade no longer installs has its leftover registration deleted by the NEW
     product (`sc delete`, the `DeleteLeftover` rows), because the old half never removes one and
     the new product has no binary left to run `--uninstall-service` with. Only a registration

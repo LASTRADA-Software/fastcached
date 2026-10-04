@@ -4046,6 +4046,12 @@ jobs:
       # registration creates is inbound, allowing, every profile, scoped to the program, the
       # service and --firewall-allow; a second install replaces rather than duplicates it; an
       # uninstall removes it. A script, because the Windows Filtering Platform is the subject.
+      #
+      # It names a configuration file of its OWN. Without one the daemon reads the machine-wide
+      # file, and the steps above leave the product installed with `port: 6699` written into it:
+      # beside this step's `--listen` that is a startup refusal ("--port (or its key) cannot be
+      # combined with --listen"), so the registration was refused -- correctly, since the
+      # service would refuse every start (round 8, the first run that reached this step).
       - name: "Install-service creates the firewall rules and uninstall-service removes them"
         shell: pwsh
         working-directory: out/build/cl-release
@@ -4054,11 +4060,13 @@ jobs:
           $exe = (Resolve-Path 'target/fastcached.exe').Path
           $name = 'FastCachedFirewallProbe'
           $group = "fastcached: $name"
+          $config = Join-Path $env:RUNNER_TEMP 'firewall-probe.yaml'
+          Set-Content -LiteralPath $config -Value '# The firewall probe: named so no machine-wide configuration is read.'
           if (@(Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue).Count -ne 0) {
             throw "rules for '$group' exist before the install, so this step cannot tell creation from leftovers"
           }
 
-          & $exe --install-service --service-name=$name --service-start=manual --listen=0.0.0.0:6698 --firewall-allow=10.0.0.0/8 --firewall-allow=fd00::/8
+          & $exe --install-service --service-name=$name --service-start=manual --config=$config --listen=0.0.0.0:6698 --firewall-allow=10.0.0.0/8 --firewall-allow=fd00::/8
           if ($LASTEXITCODE -ne 0) { throw "install-service failed with $LASTEXITCODE, expected 0" }
           try {
             $rules = @(Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue)
@@ -4091,7 +4099,7 @@ jobs:
               throw "rule remote scope is '$($addr.RemoteAddress -join ',')', expected 10.0.0.0/255.0.0.0 and fd00::/8"
             }
 
-            & $exe --install-service --service-name=$name --service-start=manual --listen=0.0.0.0:6698 --firewall-allow=10.0.0.0/8 --firewall-allow=fd00::/8
+            & $exe --install-service --service-name=$name --service-start=manual --config=$config --listen=0.0.0.0:6698 --firewall-allow=10.0.0.0/8 --firewall-allow=fd00::/8
             if ($LASTEXITCODE -ne 0) { throw "re-running install-service failed with $LASTEXITCODE, expected 0" }
             $again = @(Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue)
             if ($again.Count -ne 1) { throw "a second install left $($again.Count) rule(s) in '$group', expected 1: it must replace rather than duplicate" }
