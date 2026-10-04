@@ -45,6 +45,14 @@ set -uo pipefail
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 library="${source_dir}/scripts/lib/e2e-common.sh"
 
+# How many lanes each table of cases runs in (`start_case_lanes` says why), and the tables
+# that run in lanes AT ONCE -- every one of them, since each lane gets a slice of the port
+# range of its own and two tables' lanes run side by side. Up here because the `port-*`
+# cases read them too, and a case body runs long before the driver's code does.
+CaseLanes=8
+CaseLaneTables=(cases socket_cases)
+CaseLaneSlices=$(( CaseLanes * ${#CaseLaneTables[@]} ))
+
 # Which files are third-party (#1370), for the one census here that lists the whole
 # repository rather than walking `scripts/`.
 # shellcheck source=lib/third-party-roots.sh
@@ -588,10 +596,14 @@ run_case() {
     ports)
         drawn=""
         n=0
+        # The range this case draws from: its lane's slice, else the whole range.
+        range="$(e2e_port_range)"
+        floor="${range% *}"
+        ceiling="${range#* }"
         while [ "$n" -lt 40 ]; do
             p="$(free_port)"
-            [ "$p" -ge 20000 ] || fail "drew ${p}, below the floor of 20000"
-            [ "$p" -lt 32000 ] || fail "drew ${p}, at or above the ceiling of 32000"
+            [ "$p" -ge "$floor" ] || fail "drew ${p}, below the floor of ${floor}"
+            [ "$p" -lt "$ceiling" ] || fail "drew ${p}, at or above the ceiling of ${ceiling}"
             case " ${drawn} " in
                 *" ${p} "*) fail "drew ${p} twice; the issued-port ledger is not working" ;;
             esac
@@ -619,18 +631,25 @@ run_case() {
     # substitution, so two draws from one seed are two different streams.
     #
     # So the ledger is PRE-LOADED instead, with every port in the range but the
-    # top thousand. A draw that consults it can only come back from that
-    # thousand; a draw that does not has eleven chances in twelve of coming back
-    # from below it, and five draws make that 4 in 10^6. Nothing is listening on
-    # any of them -- which is the whole point, and exactly the situation the
-    # ledger exists for: a port issued a moment ago, whose server has not bound
+    # top TWELFTH. A draw that consults it can only come back from that band; a draw
+    # that does not comes back from below it eleven times in twelve, and five draws
+    # make that 4 in 10^6 -- whatever the range, a lane's slice or all of it. The band
+    # is a FRACTION, not a count: a fixed hundred was 0.8% of the whole range, so run
+    # alone (`--case`, no slice) a draw that DID consult the ledger missed it often
+    # enough to exhaust `free_port`'s tries most of the time (round 6, I2). Nothing is
+    # listening on any of them -- which is the whole point, and exactly the situation
+    # the ledger exists for: a port issued a moment ago, whose server has not bound
     # yet, probes free.
     ports-ledger)
-        seq 20000 30999 > "${scratch}/.issued-ports"
+        range="$(e2e_port_range)"
+        floor="${range% *}"
+        ceiling="${range#* }"
+        keep=$(( (ceiling - floor) / 12 ))
+        seq "$floor" $(( ceiling - keep - 1 )) > "${scratch}/.issued-ports"
         n=0
         while [ "$n" -lt 5 ]; do
             p="$(free_port)"
-            [ "$p" -ge 31000 ] \
+            [ "$p" -ge $(( ceiling - keep )) ] \
                 || fail "drew ${p}, which the ledger already held; the ledger is not consulted"
             n=$(( n + 1 ))
         done
@@ -647,6 +666,72 @@ run_case() {
             fail "port_answers said something is listening on the unbound port ${p}"
         fi
         echo "port_answers is false for an unbound port"
+        ;;
+
+    # --- the lanes' slices of the port range ----------------------------------
+    #
+    # Disjoint and inside the range, for the lane count the driver uses: adjacent
+    # slices share a boundary and no port, the first starts at the floor and none
+    # passes the ceiling. Two slices that overlapped would put two lanes back on one
+    # number, which is the collision the slices exist to remove.
+    port-slices)
+        expected_floor="$E2ePortFloor"
+        n=0
+        while [ "$n" -lt "$CaseLaneSlices" ]; do
+            slice="$(e2e_port_slice "$n" "$CaseLaneSlices")"
+            [ "${slice%-*}" = "$expected_floor" ] \
+                || fail "slice ${n} of ${CaseLaneSlices} is ${slice}; it should start at ${expected_floor}"
+            [ "${slice#*-}" -gt "${slice%-*}" ] || fail "slice ${n} of ${CaseLaneSlices} is empty: ${slice}"
+            [ "${slice#*-}" -le "$E2ePortCeiling" ] || fail "slice ${n} of ${CaseLaneSlices} passes the ceiling: ${slice}"
+            expected_floor="${slice#*-}"
+            n=$(( n + 1 ))
+        done
+        echo "${CaseLaneSlices} slices of ${E2ePortFloor}-${E2ePortCeiling}, disjoint and inside it"
+        ;;
+
+    # A draw stays inside the slice it was handed. A ten-port slice and five draws:
+    # one that ignored it would come back from the other 11990 numbers almost surely.
+    # The ten are the first of the range this case already draws from, its lane's, so
+    # its probes never connect to a listener another lane staged.
+    port-range-honoured)
+        range="$(e2e_port_range)"
+        floor="${range% *}"
+        E2E_PORT_RANGE="${floor}-$(( floor + 10 ))"
+        export E2E_PORT_RANGE
+        n=0
+        while [ "$n" -lt 5 ]; do
+            p="$(free_port)"
+            { [ "$p" -ge "$floor" ] && [ "$p" -lt $(( floor + 10 )) ]; } || fail "drew ${p}, outside the slice ${E2E_PORT_RANGE}"
+            n=$(( n + 1 ))
+        done
+        echo "five draws stayed inside the slice they were handed"
+        ;;
+
+    # And a slice that is not one ends the run by name, rather than drawing from
+    # somewhere a neighbouring lane may be drawing too.
+    port-range-refused)
+        E2E_PORT_RANGE=1000-2000
+        export E2E_PORT_RANGE
+        p="$(free_port)"
+        echo "BUG: drew ${p} from a slice outside the range"
+        ;;
+
+    # The WIRING: the driver handed THIS lane a slice, and it is one of the lanes'.
+    # Run through the lanes only; run alone it has no lane, and says so.
+    port-range-of-this-lane)
+        [ -n "${E2E_PORT_RANGE:-}" ] \
+            || fail "E2E_PORT_RANGE is unset: this case runs under the self-test's lanes, which hand each its own slice"
+        n=0
+        found=""
+        while [ "$n" -lt "$CaseLaneSlices" ]; do
+            [ "$(e2e_port_slice "$n" "$CaseLaneSlices")" != "$E2E_PORT_RANGE" ] || found="$n"
+            n=$(( n + 1 ))
+        done
+        if [ -n "$found" ]; then
+            echo "this lane draws from slice ${found} of ${CaseLaneSlices}"
+        else
+            echo "BUG: E2E_PORT_RANGE='${E2E_PORT_RANGE}' is none of the lanes' slices"
+        fi
         ;;
 
     # --- a stop that must END CLEANLY ------------------------------------------
@@ -2702,7 +2787,14 @@ note_failure() {
 # minutes alone on a WSL host, against a 120 s ctest TIMEOUT the whole test has to
 # fit in (the conditions are in the filemacro lane's Job 3 report). Every case is
 # its own `bash --case` process with its own scratch directory, port ledger and job
-# table, so running them side by side changes nothing a case can see.
+# table, so running them side by side changes nothing a case can see -- except the
+# PORTS, which a per-run ledger cannot keep apart: two lanes drew one number, one bound
+# it, and the other's `node-ready-refuses-unbound` found a listener nobody had staged
+# (Linux arm64, round 6). So each lane draws from its OWN slice of the range
+# (`E2E_PORT_RANGE`, `e2e_port_slice`), numbered across EVERY table in `CaseLaneTables`:
+# the shell and the socket tables run at once, and numbering each from zero gave lane k
+# of both one slice. `lane-slices-disjoint` asserts that across the lanes actually
+# started, and `port-range-of-this-lane` that a case sees its lane's.
 #
 # `start_case_lanes` deals the records round-robin into `CaseLanes` lanes; each lane
 # runs its cases one after another in the background, while the scans below go on
@@ -2713,24 +2805,43 @@ note_failure() {
 # a verdict, and is a failure by name rather than a silent gap.
 #
 # Lanes rather than a job pool because bash 3.2 has no `wait -n`. Each lane clears
-# the traps it inherited before it does anything else.
-CaseLanes=8
+# the traps it inherited before it does anything else. `CaseLanes` is set at the top.
 
 # Start the lanes for a table of case records.
 # Sets `started_lanes` to the lanes' directory, which `judge_case_lanes` takes; a
-# directory that could not be created is the empty string, and judging it fails
-# every case by name.
+# directory that could not be created, or a table `CaseLaneTables` does not name, is
+# the empty string, and judging it fails every case by name.
+# @param 1 the table's name, a row of `CaseLaneTables`
 # @param ... the case records
 start_case_lanes() {
-    local record lane index=0
+    local table="$1" record lane index=0 ordinal=-1 n=0
+    shift
+    for record in "${CaseLaneTables[@]}"; do
+        [ "$record" != "$table" ] || ordinal="$n"
+        n=$(( n + 1 ))
+    done
+    if [ "$ordinal" -lt 0 ]; then
+        echo "start_case_lanes: '${table}' is not a row of CaseLaneTables, so it has no slices of the port range" >&2
+        started_lanes=""
+        return 0
+    fi
     started_lanes="$(mktemp -d)" || { started_lanes=""; return 0; }
     for record in "$@"; do
         printf '%s\n' "${record%%|*}" >> "${started_lanes}/lane-$(( index % CaseLanes ))"
         index=$(( index + 1 ))
     done
     for lane in "${started_lanes}"/lane-*; do
+        # The slice is the lane's number across EVERY table -- the lane's file suffix, so it
+        # is the lane's and not the order the glob listed them in -- written down here, in
+        # the driver, so `lane-slices-disjoint` reads what each lane was handed.
+        ( . "$library" && e2e_port_slice $(( ordinal * CaseLanes + ${lane##*/lane-} )) "$CaseLaneSlices" ) \
+            > "${started_lanes}/slice.${lane##*/lane-}" 2>/dev/null \
+            || rm -f "${started_lanes}/slice.${lane##*/lane-}"
         (
             trap - EXIT TERM INT HUP
+            E2E_PORT_RANGE="$(cat "${started_lanes}/slice.${lane##*/lane-}" 2>/dev/null)"
+            [ -n "$E2E_PORT_RANGE" ] || { echo "lane ${lane##*/}: no slice of the port range" >&2; exit 1; }
+            export E2E_PORT_RANGE
             while IFS= read -r name; do
                 bash "${BASH_SOURCE[0]}" --case "$name" > "${started_lanes}/out.${name}" 2>&1
                 echo "$?" > "${started_lanes}/status.${name}"
@@ -3208,6 +3319,10 @@ cases=(
     "ports|0|40 distinct ports, all in range, all recorded"
     "ports-ledger|0|the ledger confined five draws to the ports it had not issued"
     "port-answers-closed|0|port_answers is false for an unbound port"
+    "port-slices|0|${CaseLaneSlices} slices of 20000-32000, disjoint and inside it"
+    "port-range-honoured|0|five draws stayed inside the slice they were handed|!BUG:"
+    "port-range-refused|1|E2E_PORT_RANGE='1000-2000' is not a slice of 20000-32000|!BUG:"
+    "port-range-of-this-lane|0|this lane draws from slice|!BUG:"
     "launcher-log-field|0|outcomes: MISS HIT |sources: /tree/v.cpp /tree/old.cpp |a foreign version: status 3, []|an unknown column: status 2|a short line: status 4, []|an odd column name: status 2|!BUG:"
     "launcher-damage-unread|0|the control found this run's record|a failed count is reported, not clean|!BUG:"
     "launcher-damage-unread-tail|0|the control found this run's record|a failed count is reported, not clean|!BUG:"
@@ -3727,14 +3842,35 @@ sed -n -e 's/^[0-9][0-9]* immediate/   &/p' -e 's/^SLOW:/   &/p' <<< "$out"
 # is expensive -- measured, and it passed there with the lanes started after them.
 # The scans read files and time nothing. The listener cases need perl to stage a
 # listener, asked once, here, for both places that act on it.
-start_case_lanes "${cases[@]}"
+start_case_lanes cases "${cases[@]}"
 shell_case_lanes="$started_lanes"
 socket_case_lanes=""
 socket_cases_runnable=no
 if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then # perl-lifetime: a foreground availability probe; it exits at once and is never backgrounded
     socket_cases_runnable=yes
-    start_case_lanes "${socket_cases[@]}"
+    start_case_lanes socket_cases "${socket_cases[@]}"
     socket_case_lanes="$started_lanes"
+fi
+
+# --- the lanes' slices are disjoint ACROSS the tables ----------------------
+#
+# The wiring the per-case `port-range-of-this-lane` cannot see: that no two lanes
+# running now were handed one slice. Read from what `start_case_lanes` wrote down,
+# over every table that started, so a second table numbering its lanes from zero
+# again -- round 6's defect -- is a duplicate here.
+ran=$(( ran + 1 ))
+lane_slices="$(cat "${shell_case_lanes:-/nonexistent}"/slice.* ${socket_case_lanes:+"$socket_case_lanes"/slice.*} 2>/dev/null)"
+lane_count="$(printf '%s\n' "$lane_slices" | grep -c .)"
+lane_unique="$(printf '%s\n' "$lane_slices" | grep . | sort -u | grep -c .)"
+# As many as there are lanes, counted from the lane files themselves: a table with fewer
+# records than `CaseLanes` starts fewer lanes, and a product of the two would overstate it.
+lane_expected="$(ls "${shell_case_lanes:-/nonexistent}" ${socket_case_lanes:+"$socket_case_lanes"} 2>/dev/null | grep -c '^lane-')"
+if [ "$lane_expected" -eq 0 ] || [ "$lane_count" -ne "$lane_expected" ] || [ "$lane_unique" -ne "$lane_count" ]; then
+    echo "FAIL lane-slices-disjoint: ${lane_count} lane(s) were handed ${lane_unique} distinct slice(s), expected ${lane_expected} distinct:" >&2
+    printf '%s\n' "$lane_slices" | sed 's/^/     | /' >&2
+    note_failure "lane-slices-disjoint"
+else
+    echo "lane-slices-disjoint: ${lane_count} lanes, ${lane_unique} distinct slices of ${CaseLaneSlices}"
 fi
 echo "== the helpers: ${#cases[@]} case(s), and the listener cases, started in lanes; judged at the end"
 

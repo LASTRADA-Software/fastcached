@@ -280,10 +280,24 @@ port_answers() {
 # 32000 would need this to move with it, and
 # `cat /proc/sys/net/ipv4/ip_local_port_range` is the check.
 #
+# The ledger is per RUN, so it says nothing about a process drawing beside this one
+# from the same range: two of them can each draw a number the other is about to
+# bind. `check-e2e-helpers.sh` runs its cases in lanes at once, and a case that
+# needs a port NOBODY binds -- `node-ready-refuses-unbound` -- found another lane's
+# listener on it (Linux arm64, round 6). So a caller that runs draws side by side
+# hands each its own SLICE of the range in `E2E_PORT_RANGE` (`e2e_port_slice`).
+# Draws from two slices cannot meet whatever the timing -- PROVIDED the caller numbers
+# its slices across everything it runs at once: two tables of lanes each numbered from
+# zero handed lane k of both one slice, which is how the first version of this left the
+# collision in place.
+#
 # @return echoes the port
 free_port() {
     local port ledger="${_e2e_workdir}/.issued-ports"
-    local floor=20000 ceiling=32000
+    local range floor ceiling
+    range="$(e2e_port_range)" || exit 1
+    floor="${range% *}"
+    ceiling="${range#* }"
     for _ in $(seq 1 200); do
         port=$(( floor + RANDOM % (ceiling - floor) ))
         if grep -qx "$port" "$ledger" 2>/dev/null; then
@@ -296,6 +310,52 @@ free_port() {
         fi
     done
     fail "could not find a free port in ${floor}-${ceiling}"
+}
+
+# The range every draw comes from, the ephemeral floor's reasons above.
+E2ePortFloor=20000
+E2ePortCeiling=32000
+
+# Slice @1 of @2 equal, disjoint slices of that range, as `E2E_PORT_RANGE` spells it.
+#
+# @param 1 the slice, from 0
+# @param 2 how many slices
+# @return echoes `<floor>-<ceiling>`, the ceiling exclusive
+e2e_port_slice() {
+    local index="$1" count="$2" width floor
+    case "${index}:${count}" in
+        *[!0-9:]* | :* | *:) fail "e2e_port_slice takes a slice and a count, not '${index}' and '${count}'" ;;
+    esac
+    [ "$count" -gt 0 ] && [ "$index" -lt "$count" ] \
+        || fail "e2e_port_slice: there is no slice ${index} of ${count}"
+    width=$(( (E2ePortCeiling - E2ePortFloor) / count ))
+    floor=$(( E2ePortFloor + index * width ))
+    echo "${floor}-$(( floor + width ))"
+}
+
+# The range THIS process draws from: `E2E_PORT_RANGE` when a caller handed it a slice,
+# else the whole of it.
+#
+# A slice that is not one -- not two numbers, empty, or reaching outside the range -- ends
+# the run by name rather than drawing from somewhere else: the slice is what keeps one
+# lane's ports from another's, and a draw from the wrong one is the collision it exists
+# to prevent, arriving silently.
+#
+# @return echoes `<floor> <ceiling>`, the ceiling exclusive
+e2e_port_range() {
+    local slice="${E2E_PORT_RANGE:-}" floor ceiling
+    if [ -z "$slice" ]; then
+        echo "${E2ePortFloor} ${E2ePortCeiling}"
+        return 0
+    fi
+    floor="${slice%-*}"
+    ceiling="${slice#*-}"
+    case "${floor}:${ceiling}" in
+        *[!0-9:]* | :* | *:) fail "E2E_PORT_RANGE='${slice}' is not <floor>-<ceiling>" ;;
+    esac
+    [ "$floor" -ge "$E2ePortFloor" ] && [ "$ceiling" -le "$E2ePortCeiling" ] && [ "$floor" -lt "$ceiling" ] \
+        || fail "E2E_PORT_RANGE='${slice}' is not a slice of ${E2ePortFloor}-${E2ePortCeiling}"
+    echo "${floor} ${ceiling}"
 }
 
 # ---------------------------------------------------------------------------

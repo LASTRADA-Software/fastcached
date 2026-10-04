@@ -918,6 +918,19 @@ readable and silently ignored. Every rule below has already been one of them.
     keeps `WRITE_DAC` unless an OWNER RIGHTS entry says otherwise. Measured on this host:
     a non-elevated owner of a file whose protected list named only SYSTEM and
     Administrators granted itself full control with `icacls /grant`.
+  - **That OWNER RIGHTS entry is the DIRECTORY's alone, never inherited**, or the service
+    cannot mint anything there. A principal whose only grant is the service's Modify entry --
+    no `WRITE_DAC`, by design -- is refused `ERROR_ACCESS_DENIED` on every create that SUPPLIES
+    a security descriptor once an inheritable OWNER RIGHTS entry withholds `WRITE_DAC`; a create
+    that inherits one still succeeds, which is why nothing but the key and the owner-only
+    directories failed. Measured (2026-10-04, NTFS and ReFS, unelevated): the same create
+    succeeds with the entry on the directory alone. The 0.3.0 upgrade's node died on exactly
+    this ("cannot create ...\node-key: Access is denied"), and the elevated test that asserted
+    the list never saw it, because an elevated process creates through Administrators' full
+    control. `FileTrust: the service's own entry lets it create owner-only state in its
+    directory` creates as a token with Administrators DENY-ONLY, with a control proving it.
+    The residual, stated: the service keeps `WRITE_DAC` over every entry it creates there, so
+    its own entry holding no `WRITE_DAC` constrains the DIRECTORY's list only.
   - **What is already inside is covered by inheritance, then CHECKED.** Setting a
     directory's list recomputes the inherited entries of everything under it, and a key
     the old service minted with default security carries only inherited entries -- the

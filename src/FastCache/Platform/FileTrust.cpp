@@ -155,16 +155,32 @@ namespace
     /// inherited by everything created inside, and `P` so `%ProgramData%`'s
     /// `BUILTIN\Users` read cannot flow in.
     ///
-    /// **And `OW` (OWNER RIGHTS, S-1-3-4) held to `RC`**, which is not decoration. An
-    /// owner keeps `READ_CONTROL` and `WRITE_DAC` whatever the entries say, unless an
-    /// OWNER RIGHTS entry names what it keeps instead -- and `%ProgramData%` lets any
-    /// standard account CREATE a subdirectory, so the state directory may be owned by
-    /// whoever made it first. With `WRITE_DAC` that account re-opens the directory,
-    /// deletes the key, and reads the one the node mints to replace it. Held to `RC`,
-    /// the owner may read the list and change nothing; every account that should
-    /// write here has an entry of its own. Inherited, so a file the service creates
-    /// holds its owner -- the service -- to the same, where its own entry grants the rest.
-    constexpr auto ServiceDirectoryDacl = L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;RC;;;OW)";
+    /// **And `OW` (OWNER RIGHTS, S-1-3-4) held to `RC` on the DIRECTORY**, which is not
+    /// decoration. An owner keeps `READ_CONTROL` and `WRITE_DAC` whatever the entries say,
+    /// unless an OWNER RIGHTS entry names what it keeps instead -- and `%ProgramData%` lets
+    /// any standard account CREATE a subdirectory, so the state directory may be owned by
+    /// whoever made it first. With `WRITE_DAC` that account re-opens the directory, deletes
+    /// the key, and reads the one the node mints to replace it. Held to `RC`, the owner may
+    /// read the list and change nothing; every account that should write here has an entry
+    /// of its own.
+    ///
+    /// **And NOT inherited, or the service cannot mint anything here.** Measured (Windows 11,
+    /// NTFS and ReFS alike, 2026-10-04): with this entry inheritable, a principal whose only
+    /// grant is the service's Modify entry -- which deliberately lacks `WRITE_DAC` -- is refused
+    /// `ERROR_ACCESS_DENIED` on every create that SUPPLIES a security descriptor, while a create
+    /// that inherits one succeeds; the same list with this entry on the directory alone, or with
+    /// the service granted `WRITE_DAC`, creates both. Which is every state file this node keeps
+    /// its owner's alone: the identity key (`CreateStateFile`) and every owner-only directory
+    /// (`CreateOwnerOnlyDirectory`) -- so the 0.3.0 upgrade's node refused to start with
+    /// "cannot create ...\node-key: Access is denied". The mechanism is inferred, not measured:
+    /// assigning a list at create is a `WRITE_DAC` over the new entry, which its creator holds
+    /// only as its owner, and the inherited entry takes exactly that away. What not inheriting
+    /// it gives up is small: a file the service creates is the service's, so it keeps
+    /// `WRITE_DAC` over that file -- which `OwnerOnlySecretFileDacl` grants the key's owner in
+    /// full anyway -- and never over this directory, which it does not own.
+    /// `FileTrust: the service's own entry lets it create owner-only state in its directory`
+    /// creates both through the service's entry alone.
+    constexpr auto ServiceDirectoryDacl = L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;RC;;;OW)";
 
     /// @param path Entry to inspect.
     /// @return Whether its access list is protected from inheritance, nullopt when the
@@ -1257,6 +1273,16 @@ std::string DirectoryWritersHint(std::filesystem::path const& directory, Directo
     return {};
 }
 
+#if defined(_WIN32)
+std::expected<std::wstring, std::string> Detail::ServiceDirectoryAccessList(std::string const& account)
+{
+    if (account.empty())
+        return std::wstring { ServiceDirectoryDacl };
+    return ServiceAccountEntry(account).transform(
+        [](std::wstring const& entry) { return std::wstring { ServiceDirectoryDacl } + entry; });
+}
+#endif
+
 std::expected<void, std::string> SecureDirectoryForService(std::filesystem::path const& directory,
                                                            std::string const& account,
                                                            std::span<std::filesystem::path const> credentialLeaves)
@@ -1296,18 +1322,16 @@ std::expected<void, std::string> Detail::SecureDirectoryForService(std::filesyst
     // The account's SID, resolved once BEFORE anything is applied -- a list whose service
     // entry could not be spelled would lock the service out of its own directory -- and kept
     // to judge who owns what is already inside.
+    auto const dacl = ServiceDirectoryAccessList(account);
+    if (!dacl)
+        return std::unexpected(dacl.error());
     std::array<std::byte, SECURITY_MAX_SID_SIZE> serviceSidBuffer {};
     std::span<std::byte const> serviceSid;
-    auto dacl = std::wstring { ServiceDirectoryDacl };
     if (!account.empty())
     {
-        auto const entry = ServiceAccountEntry(account);
-        if (!entry)
-            return std::unexpected(entry.error());
         if (!ResolveAccountSid(account, serviceSidBuffer))
             return std::unexpected(std::format("the account '{}' did not resolve (error {})", account, ::GetLastError()));
         serviceSid = std::span<std::byte const> { serviceSidBuffer };
-        dacl += *entry;
     }
 
     // The structure of one entry: not a reparse point, owned by SYSTEM/Administrators/the
@@ -1380,7 +1404,7 @@ std::expected<void, std::string> Detail::SecureDirectoryForService(std::filesyst
     // everything under it. A key the service minted under the old list was created with
     // default security, so every entry it carries is inherited -- the upgrade from today's
     // MSI -- and after this it carries the new ones instead.
-    if (auto const rc = ApplyProtectedDacl(directory, dacl.c_str(), administrators.data()); rc != ERROR_SUCCESS)
+    if (auto const rc = ApplyProtectedDacl(directory, dacl->c_str(), administrators.data()); rc != ERROR_SUCCESS)
         return std::unexpected(std::format("its access list could not be replaced (error {})", rc));
 
     // The property, not the syscall. Windows lets every account bypass traverse checking, so

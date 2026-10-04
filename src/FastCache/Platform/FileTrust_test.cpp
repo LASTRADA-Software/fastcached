@@ -1006,7 +1006,10 @@ TEST_CASE("FileTrust: a service's private directory keeps nothing for a broad pr
     INFO(dacl);
     CHECK(dacl.starts_with("D:P"));
     CHECK_FALSE(dacl.contains(";;;BU)"));
-    CHECK(dacl.contains("(A;OICI;RC;;;OW)"));
+    // On the directory ALONE: inherited, it refuses the service every create that supplies a
+    // list of its own ("the service's own entry lets it create owner-only state", below).
+    CHECK(dacl.contains("(A;;RC;;;OW)"));
+    CHECK_FALSE(dacl.contains("(A;OICI;RC;;;OW)"));
 
     // C1(b): the OWNER is Administrators (S-1-5-32-544), so whoever created the directory
     // first no longer keeps WRITE_DAC over it.
@@ -1238,6 +1241,137 @@ TEST_CASE("FileTrust: a service account that does not resolve applies nothing", 
     REQUIRE_FALSE(secured.has_value());
     CHECK(secured.error().contains(account));
     CHECK(DaclText(directory) == before);
+}
+
+namespace
+{
+/// This thread, impersonating the process's own account with `BUILTIN\Administrators` made
+/// DENY-ONLY and the account itself as the owner of what it creates: a principal that holds
+/// exactly what a list grants the ACCOUNT, as a service's virtual account does.
+///
+/// Without it the case below proves nothing where it matters most. The `windows` job runs the
+/// suite elevated, where Administrators' full-control entry grants every right the service's
+/// own entry lacks -- `WRITE_DAC` among them -- so every create succeeds whatever the service
+/// could do. An unelevated developer box holds Administrators deny-only already, and this
+/// changes nothing there but the spelling.
+class ImpersonatingWithoutAdministrators
+{
+    /// Closes a token handle.
+    struct HandleCloser
+    {
+        /// @param handle What to close.
+        void operator()(HANDLE handle) const noexcept
+        {
+            ::CloseHandle(handle);
+        }
+    };
+
+  public:
+    ImpersonatingWithoutAdministrators()
+    {
+        HANDLE process = nullptr;
+        REQUIRE(::OpenProcessToken(::GetCurrentProcess(),
+                                   TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT
+                                       | TOKEN_IMPERSONATE,
+                                   &process)
+                != FALSE);
+        std::array<std::byte, SECURITY_MAX_SID_SIZE> administrators {};
+        auto administratorsSize = static_cast<DWORD>(administrators.size());
+        auto const built =
+            ::CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administrators.data(), &administratorsSize);
+        auto disabled = SID_AND_ATTRIBUTES { .Sid = administrators.data(), .Attributes = 0 };
+        HANDLE restricted = nullptr;
+        auto const created =
+            built != FALSE
+            && ::CreateRestrictedToken(process, 0, 1, &disabled, 0, nullptr, 0, nullptr, &restricted) != FALSE;
+        ::CloseHandle(process);
+        REQUIRE(created);
+        // Owned before anything below can fail: a constructor that throws runs no destructor,
+        // but it does destroy the members it had constructed.
+        _token.reset(restricted);
+
+        // An elevated token's default owner is Administrators, which a deny-only group cannot
+        // be: the account is the owner of what it creates, as the service is.
+        alignas(TOKEN_USER) std::array<std::byte, 256> user {};
+        DWORD size = 0;
+        REQUIRE(::GetTokenInformation(_token.get(), TokenUser, user.data(), static_cast<DWORD>(user.size()), &size)
+                != FALSE);
+        auto owner = TOKEN_OWNER { .Owner = reinterpret_cast<TOKEN_USER const*>(user.data())->User.Sid };
+        REQUIRE(::SetTokenInformation(_token.get(), TokenOwner, &owner, sizeof(owner)) != FALSE);
+        REQUIRE(::ImpersonateLoggedOnUser(_token.get()) != FALSE);
+    }
+
+    ImpersonatingWithoutAdministrators(ImpersonatingWithoutAdministrators const&) = delete;
+    ImpersonatingWithoutAdministrators& operator=(ImpersonatingWithoutAdministrators const&) = delete;
+    ImpersonatingWithoutAdministrators(ImpersonatingWithoutAdministrators&&) = delete;
+    ImpersonatingWithoutAdministrators& operator=(ImpersonatingWithoutAdministrators&&) = delete;
+
+    ~ImpersonatingWithoutAdministrators()
+    {
+        ::RevertToSelf();
+    }
+
+  private:
+    std::unique_ptr<void, HandleCloser> _token;
+};
+} // namespace
+
+// The 0.3.0 upgrade's node refused to start with "cannot create ...\node-key: Access is denied"
+// (round 6): the directory's OWNER RIGHTS entry was inheritable, and a principal holding only
+// the service's Modify entry -- no `WRITE_DAC`, by design -- is refused every create that
+// supplies a list of its own. The very list an install applies, created in by such a principal.
+// Applied without changing the owner, which needs elevation, so this runs on every Windows box.
+TEST_CASE("FileTrust: the service's own entry lets it create owner-only state in its directory",
+          "[platform][filetrust][secret]")
+{
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-service-creates" };
+    auto const directory = scratch.Path() / "state";
+    std::filesystem::create_directories(directory);
+    auto const dacl = FastCache::Detail::ServiceDirectoryAccessList(CurrentAccountName());
+    INFO(dacl.error_or(std::string {}));
+    REQUIRE(dacl.has_value());
+    REQUIRE(FastCache::Testing::ApplyAccessList(directory, dacl->c_str()));
+
+    // The control: a directory only Administrators may add to. Refused here, or the principal
+    // below still reaches through Administrators and every create after it proves nothing.
+    auto const administratorsOnly = scratch.Path() / "administrators-only";
+    std::filesystem::create_directories(administratorsOnly);
+    REQUIRE(FastCache::Testing::ApplyAccessList(administratorsOnly, L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"));
+
+    // Observed while impersonating, asserted after: nothing is created as anybody else.
+    auto const keyPath = directory / "node-key";
+    auto controlRefused = false;
+    std::error_code keyError;
+    std::error_code directoryError;
+    auto inheritedWritten = false;
+    {
+        ImpersonatingWithoutAdministrators const asTheService;
+        controlRefused = !FastCache::CreateStateFile(administratorsOnly / "planted", FastCache::StateFile::Key);
+
+        // The identity key: created with a list of its own (`OwnerOnlySecretFileDacl`).
+        if (auto key = FastCache::CreateStateFile(keyPath, FastCache::StateFile::Key); !key.has_value())
+            keyError = key.error();
+        // An owner-only directory, as the consensus store and the formation record make.
+        if (auto const made = FastCache::CreateOwnerOnlyDirectory(directory / "cluster"); !made.has_value())
+            directoryError = made.error();
+        // And a file that inherits the directory's list, which the inherited entry never refused.
+        inheritedWritten = std::ofstream { directory / "inherited" }.is_open();
+    }
+    // Opened again for the scratch directory's own cleanup, which lists before it deletes; its
+    // owner -- this account -- still holds WRITE_DAC over it.
+    CHECK(FastCache::Testing::ApplyAccessList(administratorsOnly, L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)"));
+
+    CHECK(controlRefused);
+    // REQUIRE: the key is what the node failed on, and one failed assertion keeps a regression's
+    // exit code clear of the 4 ctest reads as a skip (#1152) -- this case fails four otherwise.
+    INFO("node-key: " << keyError.message());
+    REQUIRE_FALSE(keyError);
+    INFO("cluster: " << directoryError.message());
+    CHECK_FALSE(directoryError);
+    CHECK(std::filesystem::is_directory(directory / "cluster"));
+    CHECK(inheritedWritten);
+    // Owner-only once made, so the read-back the node then asks of it agrees.
+    CHECK(FastCache::SecretFileExposure(keyPath) == SecretExposure::None);
 }
 
 #endif

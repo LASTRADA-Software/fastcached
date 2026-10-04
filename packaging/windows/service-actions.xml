@@ -444,11 +444,11 @@
          install, or a feature change adding the node). net.exe waits for the
          stop, which sc.exe does not, so the node does not start into a port
          fastcached still holds. Whether it WAS running is written down first
-         (Installer\Rollback, FastCachedWasRunning), so a transaction that fails
+         (InstallerRollback, FastCachedWasRunning), so a transaction that fails
          after this starts it again (FastCachedRestartAfterStop). -->
     <CustomAction Id="FastCachedStopForNode"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c ([System64Folder]sc.exe query FastCached | [System64Folder]find.exe &quot;RUNNING&quot; &gt;nul &amp;&amp; [System64Folder]reg.exe add HKLM\SOFTWARE\fastcached\Installer\Rollback /v FastCachedWasRunning /t REG_DWORD /d 1 /f /reg:64 &gt;nul) &amp; [System64Folder]net.exe stop FastCached"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c ([System64Folder]sc.exe query FastCached | [System64Folder]find.exe &quot;RUNNING&quot; &gt;nul &amp;&amp; [System64Folder]reg.exe add HKLM\SOFTWARE\fastcached\InstallerRollback /v FastCachedWasRunning /t REG_DWORD /d 1 /f /reg:64 &gt;nul) &amp; [System64Folder]net.exe stop FastCached"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <!-- And its PROCESS gone, bounded, before the node starts: a service reports
@@ -535,7 +535,7 @@
          running answers that it was not started. -->
     <CustomAction Id="FastCacheNodeStopForRestart"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c ([System64Folder]sc.exe query FastCacheCompileNode | [System64Folder]find.exe &quot;RUNNING&quot; &gt;nul &amp;&amp; [System64Folder]reg.exe add HKLM\SOFTWARE\fastcached\Installer\Rollback /v NodeWasRunning /t REG_DWORD /d 1 /f /reg:64 &gt;nul) &amp; [System64Folder]net.exe stop FastCacheCompileNode"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c ([System64Folder]sc.exe query FastCacheCompileNode | [System64Folder]find.exe &quot;RUNNING&quot; &gt;nul &amp;&amp; [System64Folder]reg.exe add HKLM\SOFTWARE\fastcached\InstallerRollback /v NodeWasRunning /t REG_DWORD /d 1 /f /reg:64 &gt;nul) &amp; [System64Folder]net.exe stop FastCacheCompileNode"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <!-- Started, WAITED FOR, and checked, for the same reason: sc.exe returns
@@ -664,19 +664,34 @@
                   ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --service-start=[FastCacheNodeStartModeBefore] [FastCacheFirewallAllowBeforeArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedBeforeArgument] [FastCacheFleetIdBeforeArgument]"
                   Execute="rollback" Impersonate="no" Return="ignore" />
 
-    <!-- The copy each exact restore reads: the service's whole key, taken
-         before the step that changes it, under Installer\Rollback, which every
-         transaction empties first (FastCacheClearRollbackState) so no copy from
-         an earlier one is ever restored. Return="ignore": after an upgrade from
-         0.3.0 the old uninstall has deleted the service, so there is nothing to
-         copy, and nothing an exact restore could put back. -->
+    <!-- The copy each exact restore reads: the service's whole key, under
+         SOFTWARE\fastcached\InstallerRollback, which every transaction empties
+         first (FastCacheClearRollbackState) so no copy from an earlier one is
+         ever restored. Return="ignore": a fresh install has no service to copy.
+
+         A key NO component owns, and not one under SOFTWARE\fastcached\Installer:
+         FastCacheRememberedProperties removes that key on uninstall, and an
+         upgrade's RemoveExistingProducts IS an uninstall of the old product, run
+         after the copy below, so the copy taken by an upgrade FROM this build
+         would be deleted before anything could restore it.
+         msi-custom-action-commands refuses a registry element of this package
+         that covers it.
+
+         Taken BEFORE RemoveExistingProducts, not before the step that changes
+         the registration. An upgrade runs the OLD product's uninstall-service
+         there, and 0.3.0's deletes both services: a copy taken after it found
+         nothing, so a failed upgrade from 0.3.0 left the restored 0.3.0 binary
+         registered with THIS package's command line, which 0.3.0 refuses at
+         every start (round 6). Directory="System64Folder", because before
+         InstallFiles a fresh install has no INSTALL_ROOT to start a process in.
+         msi-custom-action-commands refuses either placement coming back. -->
     <CustomAction Id="FastCachedStashRegistration"
-                  Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]reg.exe&quot; copy HKLM\SYSTEM\CurrentControlSet\Services\FastCached HKLM\SOFTWARE\fastcached\Installer\Rollback\FastCached /s /f /reg:64"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; copy HKLM\SYSTEM\CurrentControlSet\Services\FastCached HKLM\SOFTWARE\fastcached\InstallerRollback\FastCached /s /f /reg:64"
                   Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheNodeStashRegistration"
-                  Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]reg.exe&quot; copy HKLM\SYSTEM\CurrentControlSet\Services\FastCacheCompileNode HKLM\SOFTWARE\fastcached\Installer\Rollback\FastCacheCompileNode /s /f /reg:64"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; copy HKLM\SYSTEM\CurrentControlSet\Services\FastCacheCompileNode HKLM\SOFTWARE\fastcached\InstallerRollback\FastCacheCompileNode /s /f /reg:64"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <!-- The exact restore: the copied command line through the service manager
@@ -686,11 +701,11 @@
          boot. -->
     <CustomAction Id="FastCachedRestoreRegistrationExactly"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$k=Get-Item -LiteralPath 'HKLM:\SOFTWARE\fastcached\Installer\Rollback\FastCached' -ErrorAction Stop;$s=Get-CimInstance Win32_Service -Filter 'Name=''FastCached''';$null=Invoke-CimMethod -InputObject $s -MethodName Change -Arguments @[\{]PathName=$k.GetValue('ImagePath','','DoNotExpandEnvironmentNames')[\}];$m=@('boot','system','auto','demand','disabled').GetValue($k.GetValue('Start'));if($m -eq 'auto' -and $k.GetValue('DelayedAutostart') -eq 1)[\{]$m='delayed-auto'[\}];&amp; sc.exe config FastCached start= $m&quot;"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$k=Get-Item -LiteralPath 'HKLM:\SOFTWARE\fastcached\InstallerRollback\FastCached' -ErrorAction Stop;$s=Get-CimInstance Win32_Service -Filter 'Name=''FastCached''';$null=Invoke-CimMethod -InputObject $s -MethodName Change -Arguments @[\{]PathName=$k.GetValue('ImagePath','','DoNotExpandEnvironmentNames')[\}];$m=@('boot','system','auto','demand','disabled').GetValue($k.GetValue('Start'));if($m -eq 'auto' -and $k.GetValue('DelayedAutostart') -eq 1)[\{]$m='delayed-auto'[\}];&amp; sc.exe config FastCached start= $m&quot;"
                   Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheNodeRestoreRegistrationExactly"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$k=Get-Item -LiteralPath 'HKLM:\SOFTWARE\fastcached\Installer\Rollback\FastCacheCompileNode' -ErrorAction Stop;$s=Get-CimInstance Win32_Service -Filter 'Name=''FastCacheCompileNode''';$null=Invoke-CimMethod -InputObject $s -MethodName Change -Arguments @[\{]PathName=$k.GetValue('ImagePath','','DoNotExpandEnvironmentNames')[\}];$m=@('boot','system','auto','demand','disabled').GetValue($k.GetValue('Start'));if($m -eq 'auto' -and $k.GetValue('DelayedAutostart') -eq 1)[\{]$m='delayed-auto'[\}];&amp; sc.exe config FastCacheCompileNode start= $m&quot;"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$k=Get-Item -LiteralPath 'HKLM:\SOFTWARE\fastcached\InstallerRollback\FastCacheCompileNode' -ErrorAction Stop;$s=Get-CimInstance Win32_Service -Filter 'Name=''FastCacheCompileNode''';$null=Invoke-CimMethod -InputObject $s -MethodName Change -Arguments @[\{]PathName=$k.GetValue('ImagePath','','DoNotExpandEnvironmentNames')[\}];$m=@('boot','system','auto','demand','disabled').GetValue($k.GetValue('Start'));if($m -eq 'auto' -and $k.GetValue('DelayedAutostart') -eq 1)[\{]$m='delayed-auto'[\}];&amp; sc.exe config FastCacheCompileNode start= $m&quot;"
                   Execute="rollback" Impersonate="no" Return="ignore" />
 
     <!-- And each service started again if the transaction stopped it while it
@@ -700,23 +715,38 @@
          back, never under the one that failed. -->
     <CustomAction Id="FastCachedRestartAfterStop"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]reg.exe query HKLM\SOFTWARE\fastcached\Installer\Rollback /v FastCachedWasRunning /reg:64 &gt;nul 2&gt;&amp;1 &amp;&amp; [System64Folder]sc.exe start FastCached"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]reg.exe query HKLM\SOFTWARE\fastcached\InstallerRollback /v FastCachedWasRunning /reg:64 &gt;nul 2&gt;&amp;1 &amp;&amp; [System64Folder]sc.exe start FastCached"
                   Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheNodeRestartAfterStop"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]reg.exe query HKLM\SOFTWARE\fastcached\Installer\Rollback /v NodeWasRunning /reg:64 &gt;nul 2&gt;&amp;1 &amp;&amp; [System64Folder]sc.exe start FastCacheCompileNode"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]reg.exe query HKLM\SOFTWARE\fastcached\InstallerRollback /v NodeWasRunning /reg:64 &gt;nul 2&gt;&amp;1 &amp;&amp; [System64Folder]sc.exe start FastCacheCompileNode"
                   Execute="rollback" Impersonate="no" Return="ignore" />
 
     <!-- The rollback state, emptied before the transaction writes any and after
          it succeeds: a copy or a was-running mark from an earlier transaction
-         must never be what a later one restores. -->
+         must never be what a later one restores. The emptying runs FIRST, before
+         the copies and so before RemoveExistingProducts, in System64Folder for
+         their reason. -->
     <CustomAction Id="FastCacheClearRollbackState"
-                  Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\Installer\Rollback /f /reg:64"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- And the KEY itself, which no component owns and so nothing else removes: by
+         a FAILED transaction, as the last step of its rollback (scheduled first, so
+         every restore that reads the key runs before it), and by an uninstall that
+         is not an upgrade's removal of the old product. Without these a failed
+         install followed by an uninstall left the key on the machine for good. -->
+    <CustomAction Id="FastCacheUndoRollbackState"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="FastCacheRemoveRollbackState"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
                   Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheDiscardRollbackState"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\Installer\Rollback /f /reg:64"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <!-- And each remembered value as the transaction found it: written back
@@ -770,6 +800,19 @@
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <InstallExecuteSequence>
+      <!-- Before the OLD product's removal (MajorUpgrade schedules
+           RemoveExistingProducts after InstallInitialize, and these push it
+           later): the rollback state is emptied, then each registration is
+           copied while the old product's is still there. -->
+      <Custom Action="FastCacheUndoRollbackState" Before="FastCacheClearRollbackState"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCacheClearRollbackState" Before="FastCachedStashRegistration"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCachedStashRegistration" Before="FastCacheNodeStashRegistration"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
+      <Custom Action="FastCacheNodeStashRegistration" Before="RemoveExistingProducts"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
+
       <!-- Before the files: an upgrade waits for the old product's service
            processes to exit, so nothing it replaces is held (B4-2). -->
       <Custom Action="FastCacheAwaitServiceExit" Before="InstallFiles"
@@ -784,9 +827,7 @@
            step. -->
       <Custom Action="FastCacheNodeCheckArguments" After="InstallFiles"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCacheClearRollbackState" After="FastCacheNodeCheckArguments"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCachedRestartAfterStop" After="FastCacheClearRollbackState"
+      <Custom Action="FastCachedRestartAfterStop" After="FastCacheNodeCheckArguments"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheNodeRestartAfterStop" After="FastCachedRestartAfterStop"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
@@ -796,9 +837,7 @@
       <Custom Action="FastCacheNodeSeedConfig" After="FastCachedSeedConfig"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
-      <Custom Action="FastCachedStashRegistration" After="FastCacheNodeSeedConfig"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
-      <Custom Action="FastCachedRestoreRegistrationExactly" After="FastCachedStashRegistration"
+      <Custom Action="FastCachedRestoreRegistrationExactly" After="FastCacheNodeSeedConfig"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
       <Custom Action="FastCachedUndoRegistration" After="FastCachedRestoreRegistrationExactly"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND NOT FASTCACHED_IMAGEPATH" />
@@ -832,9 +871,7 @@
            registration that could not be made, or a node that will not serve,
            fails the transaction rather than letting it succeed over a stopped
            service. -->
-      <Custom Action="FastCacheNodeStashRegistration" After="FastCachedStartService"
-              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
-      <Custom Action="FastCacheNodeRestoreRegistrationExactly" After="FastCacheNodeStashRegistration"
+      <Custom Action="FastCacheNodeRestoreRegistrationExactly" After="FastCachedStartService"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
       <Custom Action="FastCacheNodeUndoRegistration" After="FastCacheNodeRestoreRegistrationExactly"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND NOT FASTCACHE_NODE_IMAGEPATH" />
@@ -895,6 +932,8 @@
               Condition="(&amp;CM_C_Node = 2) AND (!CM_C_Node = 3) AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="FastCachedUninstallService" Before="RemoveFiles"
               Condition="(&amp;CM_C_Daemon = 2) AND (!CM_C_Daemon = 3) AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="FastCacheRemoveRollbackState" After="FastCachedUninstallService"
+              Condition="REMOVE = &quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
 
   </CPackWiXFragment>

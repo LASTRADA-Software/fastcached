@@ -551,9 +551,53 @@ function Get-DirectoryOwnerVerdict([string] $OwnerSid) {
 # the self-test cannot reach it; that is a third blind spot of the same kind as the
 # two named at the top of this module, and it fails CLOSED -- it throws.
 #
+# Whether the node's service reaches its state directory and its key the way the install means it
+# to: it may ADD to the directory -- it mints the key there -- and may NOT rewrite the directory's
+# list (M1), since this process compiles input that arrived over the network and the directory's
+# list is what keeps every other account from planting a file it trusts; and it reads its key.
+#
+# The key is created with a list of its own (`OwnerOnlySecretFileDacl`: SYSTEM, Administrators and
+# OWNER RIGHTS), so the service reaches it as its OWNER rather than through an entry naming it;
+# either route counts. Only entries that apply to the object ITSELF count: an inherit-only entry
+# grants its rights to what is created inside, not to the directory.
+#
+# A function over two paths and a SID, so the self-test drives it over a real access list under
+# this module's strict mode -- where `.Count` on a pipeline's lone result is an error, which is how
+# the inline version of this threw on exactly the list the install produces (round 6, C1).
+#
+# @param State The state directory.
+# @param Key The identity key inside it.
+# @param ServiceSid The service's SID, as a string.
+# @return $null when the service reaches both as intended, else why not.
+function Get-NodeServiceAccessVerdict([string] $State, [string] $Key, [string] $ServiceSid) {
+    $rights = [Security.AccessControl.FileSystemRights]
+    $allowsOf = { param($Path, $Sid) @((Get-Acl $Path).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
+                  Where-Object { $_.IdentityReference.Value -eq $Sid -and $_.AccessControlType -eq 'Allow' -and
+                                 -not ($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) }) }
+    $rightsOf = { param($Rules) $union = [int64]0; foreach ($rule in $Rules) { $union = $union -bor [int64]$rule.FileSystemRights }; $union }
+
+    $inDirectory = @(& $allowsOf $State $ServiceSid)
+    if ($inDirectory.Count -eq 0) { return "nothing in $State's list names the service ($ServiceSid)" }
+    if (((& $rightsOf $inDirectory) -band [int64]$rights::CreateFiles) -eq 0) {
+        return "the service may not add a file to $State, so it cannot mint its key: $($inDirectory.FileSystemRights)"
+    }
+    $writeList = [int64]$rights::ChangePermissions -bor [int64]$rights::TakeOwnership
+    if (((& $rightsOf $inDirectory) -band $writeList) -ne 0) {
+        return "the service may rewrite $State's access list: $($inDirectory.FileSystemRights)"
+    }
+
+    $keyOwner = (Get-Acl $Key).GetOwner([Security.Principal.SecurityIdentifier]).Value
+    $reach = @(& $allowsOf $Key $ServiceSid)
+    if ($keyOwner -eq $ServiceSid) { $reach += @(& $allowsOf $Key 'S-1-3-4') }
+    if (((& $rightsOf $reach) -band [int64]$rights::ReadData) -eq 0) {
+        return "the service cannot read its own key: owned by $keyOwner, entries $(((Get-Acl $Key).Access | ForEach-Object { "$($_.IdentityReference)=$($_.FileSystemRights)" }) -join ', ')"
+    }
+    return $null
+}
+
 # BOTH directions: nothing broad reads or plants, the list is protected, its owner
-# keeps only READ_CONTROL, and the service still reaches its key with read but not
-# the right to rewrite the list.
+# keeps only READ_CONTROL, the service may add to the directory but not rewrite its
+# list, and the service still reaches its key (`Get-NodeServiceAccessVerdict`).
 function Assert-NodeStatePrivate {
     $state = Join-Path $env:ProgramData 'fastcache-node'
     $key = Join-Path $state 'node-key'
@@ -594,26 +638,16 @@ function Assert-NodeStatePrivate {
     # The owner keeps only READ_CONTROL: whoever created the directory first must not keep
     # WRITE_DAC. OWNER RIGHTS (S-1-3-4) with nothing beyond reading the list.
     $ownerRights = @((Get-Acl $state).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
-                     Where-Object { $_.IdentityReference.Value -eq 'S-1-3-4' -and $_.AccessControlType -eq 'Allow' })
+                     Where-Object { $_.IdentityReference.Value -eq 'S-1-3-4' -and $_.AccessControlType -eq 'Allow' -and
+                                    -not ($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) })
     $beyondReading = (-bnot ([int64]$rights::ReadPermissions -bor [int64]$rights::Synchronize)) -band $lowWord
     if ($ownerRights.Count -eq 0) { throw "$state carries no OWNER RIGHTS entry, so its owner keeps WRITE_DAC" }
     if (@($ownerRights | Where-Object { ((([int64]$_.FileSystemRights) -band $lowWord) -band $beyondReading) -ne 0 }).Count -gt 0) {
         throw "$state lets its owner do more than read the access list: $($ownerRights.FileSystemRights)"
     }
 
-    # The service reaches its key -- with READ, and NOT the right to rewrite the list (M1):
-    # this process compiles input that arrived over the network.
     $serviceSid = (New-Object Security.Principal.NTAccount 'NT SERVICE\FastCacheCompileNode').Translate([Security.Principal.SecurityIdentifier]).Value
-    $own = @((Get-Acl $key).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
-             Where-Object { $_.IdentityReference.Value -eq $serviceSid -and $_.AccessControlType -eq 'Allow' })
-    if ($own.Count -eq 0) { throw 'nothing grants NT SERVICE\FastCacheCompileNode access to its own key' }
-    if (@($own | Where-Object { (([int64]$_.FileSystemRights) -band [int64]$rights::ReadData) -ne 0 }).Count -eq 0) {
-        throw "NT SERVICE\FastCacheCompileNode cannot read its own key: $($own.FileSystemRights)"
-    }
-    $writeList = [int64]$rights::ChangePermissions -bor [int64]$rights::TakeOwnership
-    if (@($own | Where-Object { (([int64]$_.FileSystemRights) -band $writeList) -ne 0 }).Count -gt 0) {
-        throw "NT SERVICE\FastCacheCompileNode may rewrite its key's access list: $($own.FileSystemRights)"
-    }
+    if ($verdict = Get-NodeServiceAccessVerdict $state $key $serviceSid) { throw "NT SERVICE\FastCacheCompileNode: $verdict" }
     Write-Host "$state and its identity key answer to nobody but SYSTEM, Administrators and the service"
 }
 
@@ -621,30 +655,37 @@ function Assert-NodeStatePrivate {
 # msiexec and its log
 # ---------------------------------------------------------------------------
 
-# The lines of a verbose log that name what happened, since its tail is only the
-# property dump.
-#
-# @param Path The log.
 # The lines of a verbose log that say what FAILED, each with the lines just before it: the error
 # Windows Installer reports for an action, whatever form it takes. A deferred action that could not
 # even be STARTED is logged as `Error 1721. ... Action: <name>, location: <its directory>`, which
 # names no CustomAction and returns no code, so a filter for either missed the failure that ended
 # the 0.3.0 upgrade (round 5). A pure function over the lines, so the self-test drives it.
 #
+# An action marked Return="ignore" that returned non-zero is logged as `returned actual error code
+# N but will be translated to success` -- and is NOT a failure: a `reg delete` of a value that is not
+# there is the ordinary case. Counted as one, eight of them stood ahead of the node's failed start in
+# round 6's log, and the one line that ended the transaction read as the ninth. They still appear
+# under "the package actions", and as context when they stand just before a real failure.
+#
 # @param Lines The log's lines.
 # @param Before How many lines before each failure to keep.
 # @return The failure lines and their context, in log order, each line once.
 function Get-MsiFailureLines([string[]] $Lines, [int] $Before = 3) {
     $pattern = 'returned actual error code|Error 1[0-9]{3}\b|Return value 3\b|Error in rollback|Installation failed|failed to (start|run)'
+    $ignored = 'will be translated to success'
     $keep = [System.Collections.Generic.SortedSet[int]]::new()
     foreach ($index in 0..($Lines.Count - 1)) {
-        if ($Lines[$index] -match $pattern) {
+        if ($Lines[$index] -match $pattern -and $Lines[$index] -notmatch $ignored) {
             foreach ($context in ([Math]::Max(0, $index - $Before))..$index) { [void] $keep.Add($context) }
         }
     }
     return @($keep | ForEach-Object { $Lines[$_] })
 }
 
+# The lines of a verbose log that name what happened, since its tail is only the
+# property dump.
+#
+# @param Path The log.
 function Show-MsiLog([string] $Path) {
     Write-Host "===== $Path (relevant lines) ====="
     if (-not (Test-Path $Path)) { Write-Host "no log at $Path"; return }
@@ -1129,12 +1170,62 @@ function Invoke-MsiServiceTableSelfTest {
     $ranAndFailed = @('CustomAction FastCacheNodeStartService returned actual error code 2 (note this may not be 100% accurate)')
     if (@(Get-MsiFailureLines $ranAndFailed).Count -ne 1) { throw 'failure lines: an action that ran and failed was not reported' }
     Pass 'failure lines: an action that ran and failed is reported'
+    $ignoredThenFailed = @('CustomAction FastCacheClearRollbackState returned actual error code 1 but will be translated to success due to continue marking',
+        'one', 'two', 'three', 'four', $ranAndFailed[0])
+    $found = @(Get-MsiFailureLines $ignoredThenFailed)
+    if ($found.Count -ne 4 -or $found[0] -ne 'two' -or $found[-1] -ne $ranAndFailed[0]) {
+        throw "failure lines: an ignored action's non-zero code was reported as a failure: $($found -join ' | ')"
+    }
+    Pass 'failure lines: an action translated to success is not a failure, and the real one is'
     if (@(Get-MsiFailureLines @('Action ended 5:34:04: FastCacheNodeStartService. Return value 1.', 'Installation success or error status: 0.')).Count -ne 0) {
         throw 'failure lines: a clean log reported a failure'
     }
     Pass 'failure lines: a clean log reports nothing'
 
-    $expectedCases = 70
+    # How the node's service reaches its state, over REAL access lists and under this module's strict
+    # mode, which is where the inline version threw (round 6, C1): ONE entry naming the service is
+    # exactly the list the install produces, and `.Count` on that lone pipeline result was an
+    # error. The current account stands in for the service; its key inherits the directory's entry.
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $fsRights = [Security.AccessControl.FileSystemRights]
+    $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $newStateDirectory = {
+        param([object[]] $Entries)
+        $directory = Join-Path ([IO.Path]::GetTempPath()) ("msi-selftest-state-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $directory | Out-Null
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($entry in $Entries) { $acl.AddAccessRule($entry) }
+        Set-Acl -LiteralPath $directory -AclObject $acl
+        # Nothing else: the account created the directory, so as its owner it keeps the
+        # READ_CONTROL and WRITE_DAC that let it set this list, and each case's entries let it
+        # delete what it made.
+        Set-Content -LiteralPath (Join-Path $directory 'node-key') -Value 'seed'
+        return $directory
+    }
+    $modify = New-Object Security.AccessControl.FileSystemAccessRule($me, [Security.AccessControl.FileSystemRights]0x1301bf, $inherit, 'None', 'Allow')
+    $reachCases = @(
+        @{ Name = 'one inherited Modify entry, as installed'; Entries = @($modify); Want = $null },
+        @{ Name = 'an entry that may rewrite the list'; Entries = @((New-Object Security.AccessControl.FileSystemAccessRule($me, [Security.AccessControl.FileSystemRights]0x1701bf, $inherit, 'None', 'Allow')));
+           Want = 'may rewrite' },
+        @{ Name = 'an INHERIT-ONLY entry that may rewrite, beside the Modify one'; Entries = @($modify,
+               (New-Object Security.AccessControl.FileSystemAccessRule($me, $fsRights::ChangePermissions, $inherit, 'InheritOnly', 'Allow'))); Want = $null }
+    )
+    foreach ($case in $reachCases) {
+        $directory = & $newStateDirectory $case.Entries
+        try {
+            $verdict = Get-NodeServiceAccessVerdict $directory (Join-Path $directory 'node-key') $me.Value
+            if ($null -eq $case.Want -and $null -ne $verdict) { throw "service access: '$($case.Name)' was refused: $verdict" }
+            if ($null -ne $case.Want -and ($null -eq $verdict -or $verdict -notmatch $case.Want)) {
+                throw "service access: '$($case.Name)' answered '$verdict', expected '$($case.Want)'"
+            }
+            Pass "service access: $($case.Name) is $(if ($null -eq $case.Want) { 'accepted' } else { 'refused by name' })"
+        } finally {
+            Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $expectedCases = 74
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -1144,7 +1235,7 @@ function Invoke-MsiServiceTableSelfTest {
 Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert-ServiceState, Assert-ServiceTable,
     Get-MsiProperty, Get-InstalledProductCodes, Assert-InstalledProduct, Show-MsiLog, Invoke-Msiexec, Assert-MsiLog,
     Get-MsiActionRanPattern, Get-ServiceStabilityVerdict, Get-UpgradeVersionVerdict, Remove-FastCacheMachineState,
-    Assert-NodeStatePrivate, Get-DirectoryOwnerVerdict, Get-NodeFirewallVerdict, Assert-NodeFirewall,
+    Assert-NodeStatePrivate, Get-NodeServiceAccessVerdict, Get-DirectoryOwnerVerdict, Get-NodeFirewallVerdict, Assert-NodeFirewall,
     Get-NodeFirewallScopeVerdict, Assert-NodeFirewallScope, Get-NodeRegistrationArgumentVerdict,
     Assert-NodeRegistrationArgument, Get-MsiActionOrderVerdict, Assert-MsiActionOrder,
     Get-NodeRegistrationLacksVerdict, Assert-NodeRegistrationLacks, Get-FirewallGroupEmptyVerdict,

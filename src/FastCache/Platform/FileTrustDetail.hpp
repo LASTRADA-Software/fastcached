@@ -29,4 +29,18 @@ namespace FastCache::Detail
     std::span<std::filesystem::path const> credentialLeaves,
     std::function<void()> const& afterPreCheck);
 
+#if defined(_WIN32)
+/// The access list `FastCache::SecureDirectoryForService` gives a service's private directory,
+/// as SDDL: SYSTEM and Administrators in full, the directory's owner held to reading the list,
+/// and @p account's Modify entry, inherited by what is created inside.
+///
+/// Its own function so a test can apply the very list an install applies without the right to
+/// set an owner, which `SecureDirectoryForService` needs and an unelevated process lacks -- and
+/// then create in it as a principal holding nothing but @p account's entry.
+/// @param account The service's account, or empty for a LocalSystem service, which the list
+///        names already.
+/// @return The list, or why @p account did not resolve.
+[[nodiscard]] std::expected<std::wstring, std::string> ServiceDirectoryAccessList(std::string const& account);
+#endif
+
 } // namespace FastCache::Detail

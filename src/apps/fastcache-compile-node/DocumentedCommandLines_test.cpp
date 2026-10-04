@@ -851,6 +851,33 @@ TEST_CASE("The MSI's node registration installs with no property, never with a t
         // The pinned reply port is worker state: the registration replays it at every start.
         CHECK(std::to_string(Testing::Unwrap(reparsed).discoveryReplyPort) == shape.replyPort);
         CHECK(Testing::Unwrap(reparsed).fleetSeeds == seeds);
+
+        // And the command line the SCM is handed, as the SCM tokenizes it: `--daemon` at its front
+        // and the identity the install resolves, which `AdoptNodeIdentity` writes into the
+        // registration before it is built -- the two arguments `spec.arguments` above does not
+        // carry. The failed start of the 0.3.0 upgrade (round 6) was read as this line being
+        // refused by this parser. It was not -- the foreground re-run that exited 2 ran the 0.3.0
+        // binary the rollback had restored -- and a rule that did refuse it would fail here, before
+        // any package is built.
+        constexpr std::string_view ResolvedId = "2e407297e87c4828f54639bf9dcbdff2";
+        auto registration = cfg;
+        registration.nodeId = std::string { ResolvedId };
+        auto const commandLine = BuildServiceCommandLine(MakeNodeServiceSpec(
+            std::filesystem::path { "fastcache-compile-node" }, registration, Testing::InstallerPathProbe()));
+        INFO("registered: " << commandLine);
+        auto const registered = SplitArguments(commandLine);
+        REQUIRE(registered.size() > 1);
+        CHECK(registered[1] == "--daemon");
+        CHECK(std::ranges::contains(registered, std::format("--node-id={}", ResolvedId)));
+        auto const started = ParsedFirstStart(std::span { registered }.subspan(1));
+        REQUIRE(started.has_value());
+        CHECK(Testing::Unwrap(started).daemon);
+        CHECK(Testing::Unwrap(started).nodeId == ResolvedId);
+        auto const serviceRefusal = StartupPolicyRejection(Testing::Unwrap(started));
+        INFO(serviceRefusal.value_or(std::string {}));
+        // REQUIRE: one refusal per shape would fail as many assertions as there are shapes, and
+        // four is the exit code ctest reads as a skip (#1152).
+        REQUIRE_FALSE(serviceRefusal.has_value());
     }
 }
 
@@ -1362,6 +1389,11 @@ struct MsiRollbackWrite
         // A rollback that only READS the registry -- the restart twins ask whether a service was
         // running -- writes no remembered value back and deletes none.
         if (!command.contains(" add ") && !command.contains(" delete "))
+            continue;
+        // Nor does the delete of the rollback state's own KEY, emptied once a failed
+        // transaction has restored everything, which names no value. That key ONLY: a
+        // whole-key delete of anything else still reaches the reading below, and fails it.
+        if (command.contains(R"(\InstallerRollback )") && !command.contains(" /v "))
             continue;
         constexpr std::string_view Quote = "&quot;";
         auto quote = command.find(Quote);

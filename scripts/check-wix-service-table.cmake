@@ -308,16 +308,17 @@ set(_table [=[
 <Custom Action="FastCachedStopForNode"|/>|After="FastCachedInstallService"
 <Custom Action="FastCachedStartService"|/>|After="FastCachedAwaitExitForNode"
 
-<CustomAction Id="FastCacheClearRollbackState"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\Installer\Rollback /f /reg:64"
+<CustomAction Id="FastCacheClearRollbackState"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
 <CustomAction Id="FastCacheClearRollbackState"|/>|Execute="deferred"
-<Custom Action="FastCacheClearRollbackState"|/>|After="FastCacheNodeCheckArguments"
-<CustomAction Id="FastCacheDiscardRollbackState"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\Installer\Rollback /f /reg:64"
+<Custom Action="FastCacheClearRollbackState"|/>|Before="FastCachedStashRegistration"
+<CustomAction Id="FastCacheClearRollbackState"|/>|Directory="System64Folder"
+<CustomAction Id="FastCacheDiscardRollbackState"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
 <CustomAction Id="FastCacheDiscardRollbackState"|/>|Execute="deferred"
 <Custom Action="FastCacheDiscardRollbackState"|/>|After="FastCacheNodeStartService"
 <CustomAction Id="FastCachedRestartAfterStop"|/>|/v FastCachedWasRunning
 <CustomAction Id="FastCachedRestartAfterStop"|/>|sc.exe start FastCached"
 <CustomAction Id="FastCachedRestartAfterStop"|/>|Execute="rollback"
-<Custom Action="FastCachedRestartAfterStop"|/>|After="FastCacheClearRollbackState"
+<Custom Action="FastCachedRestartAfterStop"|/>|After="FastCacheNodeCheckArguments"
 <Custom Action="FastCachedRestartAfterStop"|/>|Condition="FASTCACHED_SELECTED = "1" AND FASTCACHE_NODE_SELECTED = "1""
 <CustomAction Id="FastCacheNodeRestartAfterStop"|/>|/v NodeWasRunning
 <CustomAction Id="FastCacheNodeRestartAfterStop"|/>|sc.exe start FastCacheCompileNode"
@@ -339,27 +340,29 @@ set(_table [=[
 <SetProperty Action="SetFastCacheNodeStartModeBeforeAuto"|/>|Condition="FASTCACHE_NODE_START_BEFORE = "#2""
 <SetProperty Action="SetFastCacheNodeStartModeBeforeManual"|/>|Condition="NOT (FASTCACHE_NODE_START_BEFORE = "#2")"
 
-<CustomAction Id="FastCachedStashRegistration"|/>|reg.exe" copy HKLM\SYSTEM\CurrentControlSet\Services\FastCached HKLM\SOFTWARE\fastcached\Installer\Rollback\FastCached /s /f /reg:64"
+<CustomAction Id="FastCachedStashRegistration"|/>|reg.exe" copy HKLM\SYSTEM\CurrentControlSet\Services\FastCached HKLM\SOFTWARE\fastcached\InstallerRollback\FastCached /s /f /reg:64"
 <CustomAction Id="FastCachedStashRegistration"|/>|Execute="deferred"
-<Custom Action="FastCachedStashRegistration"|/>|After="FastCacheNodeSeedConfig"
+<Custom Action="FastCachedStashRegistration"|/>|Before="FastCacheNodeStashRegistration"
+<CustomAction Id="FastCachedStashRegistration"|/>|Directory="System64Folder"
 <Custom Action="FastCachedStashRegistration"|/>|Condition="FASTCACHED_SELECTED = "1" AND FASTCACHED_IMAGEPATH"
 <CustomAction Id="FastCachedRestoreRegistrationExactly"|/>|Rollback\FastCached'
 <CustomAction Id="FastCachedRestoreRegistrationExactly"|/>|Invoke-CimMethod
 <CustomAction Id="FastCachedRestoreRegistrationExactly"|/>|sc.exe config FastCached start=
 <CustomAction Id="FastCachedRestoreRegistrationExactly"|/>|Execute="rollback"
-<Custom Action="FastCachedRestoreRegistrationExactly"|/>|After="FastCachedStashRegistration"
+<Custom Action="FastCachedRestoreRegistrationExactly"|/>|After="FastCacheNodeSeedConfig"
 <Custom Action="FastCachedRestoreRegistrationExactly"|/>|Condition="FASTCACHED_SELECTED = "1" AND FASTCACHED_IMAGEPATH"
 <CustomAction Id="FastCachedRestoreRegistration"|/>|fastcached.exe" --install-service --service-start=[FastCachedStartModeBefore] [FastCacheFirewallAllowBeforeArgument]"
 <CustomAction Id="FastCachedRestoreRegistration"|/>|Execute="rollback"
 <Custom Action="FastCachedRestoreRegistration"|/>|After="FastCachedUndoRegistration"
 <Custom Action="FastCachedRestoreRegistration"|/>|Condition="FASTCACHED_SELECTED = "1" AND FASTCACHED_IMAGEPATH"
-<CustomAction Id="FastCacheNodeStashRegistration"|/>|reg.exe" copy HKLM\SYSTEM\CurrentControlSet\Services\FastCacheCompileNode HKLM\SOFTWARE\fastcached\Installer\Rollback\FastCacheCompileNode /s /f /reg:64"
-<Custom Action="FastCacheNodeStashRegistration"|/>|After="FastCachedStartService"
+<CustomAction Id="FastCacheNodeStashRegistration"|/>|reg.exe" copy HKLM\SYSTEM\CurrentControlSet\Services\FastCacheCompileNode HKLM\SOFTWARE\fastcached\InstallerRollback\FastCacheCompileNode /s /f /reg:64"
+<Custom Action="FastCacheNodeStashRegistration"|/>|Before="RemoveExistingProducts"
+<CustomAction Id="FastCacheNodeStashRegistration"|/>|Directory="System64Folder"
 <Custom Action="FastCacheNodeStashRegistration"|/>|Condition="FASTCACHE_NODE_SELECTED = "1" AND FASTCACHE_NODE_IMAGEPATH"
 <CustomAction Id="FastCacheNodeRestoreRegistrationExactly"|/>|Rollback\FastCacheCompileNode'
 <CustomAction Id="FastCacheNodeRestoreRegistrationExactly"|/>|sc.exe config FastCacheCompileNode start=
 <CustomAction Id="FastCacheNodeRestoreRegistrationExactly"|/>|Execute="rollback"
-<Custom Action="FastCacheNodeRestoreRegistrationExactly"|/>|After="FastCacheNodeStashRegistration"
+<Custom Action="FastCacheNodeRestoreRegistrationExactly"|/>|After="FastCachedStartService"
 <Custom Action="FastCacheNodeRestoreRegistrationExactly"|/>|Condition="FASTCACHE_NODE_SELECTED = "1" AND FASTCACHE_NODE_IMAGEPATH"
 <CustomAction Id="FastCacheNodeRestoreRegistration"|/>|--service-start=[FastCacheNodeStartModeBefore]
 <CustomAction Id="FastCacheNodeRestoreRegistration"|/>|!--service-start=auto
