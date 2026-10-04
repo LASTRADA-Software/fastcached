@@ -122,7 +122,7 @@ namespace
         // so it outlives every caller and is destroyed last -- which is also what
         // makes its "readiness was never announced" line reachable on the bind-failure
         // path below.
-        ReadinessAnnouncer announcer { logger, std::format("{} bind(s)", options.binds.size()) };
+        ReadinessAnnouncer announcer { logger, std::format("{} bind(s)", options.binds.size()), options.onServing };
 
         std::vector<std::unique_ptr<core::net::IListener>> listeners;
         std::vector<std::unique_ptr<Server>> servers;
@@ -406,7 +406,9 @@ namespace
         // total stated as `binds + reactors` that came out too high would stop the
         // line ever being emitted, on the platform this cannot be executed on. See
         // `ExpectAcceptor`.
-        ReadinessAnnouncer announcer { logger, std::format("{} bind(s) x {} reactors", options.binds.size(), reactorCount) };
+        ReadinessAnnouncer announcer { logger,
+                                       std::format("{} bind(s) x {} reactors", options.binds.size(), reactorCount),
+                                       options.onServing };
 
         std::vector<std::unique_ptr<core::net::PlatformLoop>> reactors;
         reactors.reserve(reactorCount);
@@ -599,7 +601,9 @@ namespace
 
         // Declared before the servers it counts and before any reactor thread, so it
         // outlives every caller of `AcceptorArmed`.
-        ReadinessAnnouncer announcer { logger, std::format("{} bind(s) x {} reactors", bindCount, reactorCount) };
+        ReadinessAnnouncer announcer { logger,
+                                       std::format("{} bind(s) x {} reactors", bindCount, reactorCount),
+                                       options.onServing };
 
         for (auto const i: std::views::iota(0U, reactorCount))
         {

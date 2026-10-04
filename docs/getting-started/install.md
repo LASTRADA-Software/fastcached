@@ -105,9 +105,13 @@ the node's arguments before anything is remembered or registered, so a refused p
 remembered, and a repair or upgrade leaves the existing registration and its remembered pin as they
 were rather than starting a node that trusts whichever fleet proves itself first. A malformed
 `FASTCACHE_FLEET_SEED` fails it the same way. So does a node registration
-that cannot be made, or a node that is not running five seconds after its start: the node is
-checked, registered, remembered and started in that order, each step failing the transaction, and a
-transaction that fails puts back the registration and the remembered values it found. The package also
+that cannot be made, or a node that does not come up serving: the service reports running only once
+the node serves (its `compile node ready` line), so a node that cannot bind its port fails the start
+rather than passing it. The node is checked, registered, remembered and started in that order, each
+step failing the transaction, and every transaction that keeps the node stops and restarts it, so a
+new pin or seed is what the running node has. A transaction that fails leaves each service as it
+found it: its registration put back exactly (command line and start type), started again if the
+transaction had stopped it while it ran, and the remembered values written back. The package also
 pins the node's discovery reply port, `FASTCACHE_DISCOVERY_REPLY_PORT=6682` unless you pass another
 (or pass it empty), so its firewall opens UDP 6682 rather than every local UDP port. A node run by
 hand leaves that port to the kernel, because two nodes on one machine each need one of their own;
@@ -121,7 +125,12 @@ installs.
 
 **Upgrading from 0.3.0 or earlier is the exception.** Those installers delete both services when
 they are removed, and a major upgrade removes the old version first. The new installer registers
-`FastCached` and the node again from the table, the node with no property needed.
+`FastCached` and the node again from the table, the node with no property needed. It waits for
+0.3.0's service processes to exit before it replaces a file (0.3.0 stops them without waiting), so
+the upgrade needs no restart. **A failed upgrade from 0.3.0 does not restore 0.3.0's services**:
+the rollback puts 0.3.0's files back, but 0.3.0's own uninstall deleted its registrations before
+this installer ran, so they come back as this installer registers them, which 0.3.0's binaries may
+refuse. Run the upgrade again once its cause is fixed, or reinstall 0.3.0.
 
 Every transaction that keeps a service registers it again, and the optional properties are
 remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_FLEET_SEED` and `FASTCACHE_FLEET_ID` are written to

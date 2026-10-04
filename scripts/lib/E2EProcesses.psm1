@@ -169,7 +169,29 @@ function Get-E2EProcessCommandLines {
             })
         return @{ Listed = $true; Processes = $all }
     }
+    # macOS has no /proc, so it is asked of `ps`; `-ww` stops it cutting the command line
+    # at the terminal width, which would cut off the very root being searched for.
+    $ps = Get-Command -Name ps -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $ps) {
+        $lines = @(& $ps.Source -A -ww -o "pid=" -o "command=" 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            return @{ Listed = $true; Processes = @(ConvertFrom-E2EPsListing $lines) }
+        }
+    }
     return @{ Listed = $false; Processes = @() }
+}
+
+# `ps -o pid= -o command=` output as processes: the PID right-aligned, then the command line.
+# A line that is not that shape is no process, never one with a PID of zero.
+#
+# @param Lines The listing, one process per line.
+# @return @(@{ Id; CommandLine }...)
+function ConvertFrom-E2EPsListing([string[]]$Lines) {
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*([0-9]+)\s+(\S.*)$') {
+            [pscustomobject]@{ Id = [int]$Matches[1]; CommandLine = $Matches[2].Trim() }
+        }
+    }
 }
 
 # Remove the roots earlier runs left under `Base`, and REPORT each one that would not go.
@@ -323,6 +345,11 @@ function Invoke-E2EProcessesSelfTest {
     } finally {
         Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
     }
+
+    # The `ps` listing a host with no /proc is read from, driven on every platform: the
+    # PID's padding, a command line with spaces kept whole, and a line naming no process.
+    $parsed = @(ConvertFrom-E2EPsListing @("    1 /sbin/launchd", "  4242 /usr/local/bin/fastcache-compile-node --cluster-dir=/tmp/run old/x ", "PID COMMAND", "   17"))
+    Check ($parsed.Count -eq 2 -and $parsed[0].Id -eq 1 -and $parsed[0].CommandLine -eq "/sbin/launchd" -and $parsed[1].Id -eq 4242 -and $parsed[1].CommandLine -eq "/usr/local/bin/fastcache-compile-node --cluster-dir=/tmp/run old/x") "a ps listing reads as processes, each command line whole, and a line naming none as none"
 
     # The real lister, asked for something it must find: this very process.
     $listing = Get-E2EProcessCommandLines

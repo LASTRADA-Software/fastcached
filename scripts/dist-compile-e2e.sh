@@ -1246,14 +1246,17 @@ bound_compile "$bound_a" "${workdir}/case7b-a2.log" \
 # spared is a real hazard rather than a portable object. Every broken property is
 # named, not only the last one checked.
 bound_why=""
-grep -qaF "$bound_a" "${bound_a}/build/u.o" || bound_why+="; a's object does not name a (the case exercises nothing)"
+# `LC_ALL=C` on every byte search over an object: in a UTF-8 locale macOS's grep matches
+# nothing on a "line" holding bytes that are not UTF-8, which every object has around the
+# path -- a positive search then fails CLOSED and a NEGATIVE one fails open, passing forever.
+LC_ALL=C grep -qaF "$bound_a" "${bound_a}/build/u.o" || bound_why+="; a's object does not name a (the case exercises nothing)"
 grep -q "DISPATCHED to " "${workdir}/case7b-a.log" || bound_why+="; a was not dispatched"
 grep -q "root-bound object" "${workdir}/case7b-a.log" || bound_why+="; a's dispatched object was not stored bound"
 grep -Eq "fastcache-cc: MISS key=[^ ]+ \(root-bound:" "${workdir}/case7b-b.log" \
     || bound_why+="; b did not miss through a's marker"
 grep -q "DISPATCHED to " "${workdir}/case7b-b.log" || bound_why+="; b was not dispatched"
 [[ -f "${bound_b}/build/u.o" ]] || bound_why+="; b wrote no object"
-if grep -qaF "$bound_a" "${bound_b}/build/u.o" 2>/dev/null; then bound_why+="; b's object names checkout a"; fi
+if LC_ALL=C grep -qaF "$bound_a" "${bound_b}/build/u.o" 2>/dev/null; then bound_why+="; b's object names checkout a"; fi
 grep -Eq "fastcache-cc: HIT key=[^ ]+ \(root-bound:" "${workdir}/case7b-a2.log" \
     || bound_why+="; a was not served its own bound copy"
 if grep -q "DISPATCHED to " "${workdir}/case7b-a2.log"; then bound_why+="; a's second compile was dispatched again"; fi

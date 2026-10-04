@@ -136,6 +136,29 @@ class ScriptedNodeKeyGuard final: public Node::INodeKeyFileGuard
         return _script.afterProtect;
     }
 
+    /// Answer every later `SyncDirectory` with @p failure, as a volume or a failing disk would.
+    /// @param failure Which call refused, and what it said.
+    void DirectorySyncFails(Consensus::DirectorySyncFailure failure)
+    {
+        _syncFailure = failure;
+    }
+
+    /// @copydoc Node::INodeKeyFileGuard::SyncDirectory
+    [[nodiscard]] std::expected<void, Consensus::DirectorySyncFailure> SyncDirectory(
+        std::filesystem::path const& directory) override
+    {
+        _synced.push_back(directory);
+        if (_syncFailure.has_value())
+            return std::unexpected { *_syncFailure };
+        return {};
+    }
+
+    /// @return Every directory `SyncDirectory` was asked to sync, in order.
+    [[nodiscard]] std::vector<std::filesystem::path> const& Synced() const noexcept
+    {
+        return _synced;
+    }
+
     /// A size `file_size` could not read.
     static constexpr std::uintmax_t UnknownSize = static_cast<std::uintmax_t>(-1);
 
@@ -180,6 +203,8 @@ class ScriptedNodeKeyGuard final: public Node::INodeKeyFileGuard
     std::vector<std::filesystem::path> _owners;
     std::vector<std::filesystem::path> _directories;
     std::vector<ProtectCall> _protected;
+    std::vector<std::filesystem::path> _synced;
+    std::optional<Consensus::DirectorySyncFailure> _syncFailure;
 };
 
 } // namespace FastCache::Testing

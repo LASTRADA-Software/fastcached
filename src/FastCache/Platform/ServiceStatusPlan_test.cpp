@@ -223,3 +223,55 @@ TEST_CASE("No daemonizing main refuses a start without telling its service host"
         }
     }
 }
+
+TEST_CASE("A start told to wait reports only starting before its body and its readiness names that start",
+          "[platform][service]")
+{
+    // The row a daemon that says when it serves walks: starting, and NOTHING more before the body --
+    // RUNNING then comes from the body's own "I serve" (B4-6). And the readiness a host is told picks
+    // the row, so `BodyStart` is still the old plan and nothing that asked for neither changed.
+    auto const& waiting = ServiceHostStartTable[static_cast<std::size_t>(ServiceHostStart::ServingWhenReady)];
+    auto const states = waiting.beforeStop | std::views::transform(&ServiceStateReport::state);
+    CHECK(std::ranges::equal(states, std::array { ServiceState::StartPending }));
+    CHECK(waiting.awaitsServing);
+    CHECK_FALSE(ServiceHostStartTable[static_cast<std::size_t>(ServiceHostStart::Serving)].awaitsServing);
+    CHECK_FALSE(ServiceHostStartTable[static_cast<std::size_t>(ServiceHostStart::Refused)].awaitsServing);
+
+    CHECK(ServiceReadinessTable[static_cast<std::size_t>(ServiceReadiness::BodyStart)].start == ServiceHostStart::Serving);
+    CHECK(ServiceReadinessTable[static_cast<std::size_t>(ServiceReadiness::BodySignals)].start
+          == ServiceHostStart::ServingWhenReady);
+    CHECK(ServiceHostOptions {}.readiness == ServiceReadiness::BodyStart);
+
+    // A ceiling past one wait hint, or a waiter gives up before the checkpoint ever advanced.
+    CHECK(DefaultStartPendingPlan.ceiling > DefaultStartPendingPlan.waitHint);
+    CHECK(DefaultStartPendingPlan.checkpointEvery < DefaultStartPendingPlan.waitHint);
+}
+
+TEST_CASE("Every daemonizing main asks its service host to wait for serving and says when it serves", "[platform][service]")
+{
+    // `main` is in no test target, so its wiring is asserted here: a host told `BodySignals` whose body
+    // never marks serving would sit in START_PENDING, and one that marks but was never told would report
+    // RUNNING as the body began -- each half is useless without the other, so both are required.
+    struct Wiring
+    {
+        std::string_view file;  ///< Path under the repository root.
+        std::string_view marks; ///< How this binary tells the host it serves.
+    };
+    constexpr std::array Wirings {
+        Wiring { .file = "src/apps/fastcache-compile-node/main.cpp", .marks = "DaemonControls::Instance().MarkServing()" },
+        Wiring { .file = "src/apps/fastcached/main.cpp", .marks = "serverOpts.onServing" },
+    };
+    for (auto const& wiring: Wirings)
+    {
+        INFO(wiring.file);
+        auto const path = std::filesystem::path { FASTCACHED_SOURCE_DIR } / wiring.file;
+        REQUIRE(std::filesystem::exists(path));
+        std::ifstream in { path, std::ios::binary };
+        REQUIRE(in);
+        std::ostringstream contents;
+        contents << in.rdbuf();
+        auto const text = WithoutCommentLines(std::move(contents).str());
+        CHECK(Occurrences(text, "ServiceReadiness::BodySignals") == 1);
+        CHECK(Occurrences(text, wiring.marks) == 1);
+    }
+}

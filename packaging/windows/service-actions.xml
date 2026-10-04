@@ -43,6 +43,12 @@
     again, the node with no property needed. Such an installer remembered
     nothing, so that first upgrade registers only what it states.
 
+    A transaction that FAILS leaves each service as it found it: registered
+    as it was (the exact command line and start type, put back from a copy
+    taken before the step that changed them), and running if it was running.
+    The one exception is an upgrade from 0.3.0, whose own uninstall deletes
+    both services before anything here runs; install.md says so.
+
     The registration drives each binary's own install-service and
     uninstall-service code path rather than a WiX ServiceInstall element, so the
     command line, the virtual account, the restart policy and the owned paths
@@ -110,20 +116,22 @@
     <!-- What was REMEMBERED before this transaction, read on its own: AppSearch
          leaves a property alone where its search finds nothing, so the public
          properties above cannot tell "nothing was remembered" from "this
-         transaction states a value". Private, and read only by the rollback
-         actions (FastCacheRollbackRestore and FastCacheRollbackDelete), which put back exactly
-         what a failed transaction found. -->
-    <Property Id="FastCacheFirewallAllowBefore">
+         transaction states a value". Read only by the rollback actions
+         (FastCacheRollbackRestore and FastCacheRollbackDelete), which put back
+         exactly what a failed transaction found. PUBLIC (upper case) because
+         WiX requires a property a search sets to be one: WIX0012 failed the
+         package build when these were spelled in mixed case. -->
+    <Property Id="FASTCACHE_FIREWALL_ALLOW_BEFORE" Secure="yes">
       <RegistrySearch Id="FastCacheRememberedFirewallAllowBefore" Root="HKLM"
                       Key="SOFTWARE\fastcached\Installer"
                       Name="FirewallAllow" Type="raw" Bitness="always64" />
     </Property>
-    <Property Id="FastCacheFleetSeedBefore">
+    <Property Id="FASTCACHE_FLEET_SEED_BEFORE" Secure="yes">
       <RegistrySearch Id="FastCacheRememberedFleetSeedBefore" Root="HKLM"
                       Key="SOFTWARE\fastcached\Installer"
                       Name="FleetSeed" Type="raw" Bitness="always64" />
     </Property>
-    <Property Id="FastCacheFleetIdBefore">
+    <Property Id="FASTCACHE_FLEET_ID_BEFORE" Secure="yes">
       <RegistrySearch Id="FastCacheRememberedFleetIdBefore" Root="HKLM"
                       Key="SOFTWARE\fastcached\Installer"
                       Name="FleetId" Type="raw" Bitness="always64" />
@@ -207,6 +215,21 @@
       <RegistrySearch Id="FastCachedImagePathSearch" Root="HKLM"
                       Key="SYSTEM\CurrentControlSet\Services\FastCached"
                       Name="ImagePath" Type="raw" Bitness="always64" />
+    </Property>
+
+    <!-- And the start type each registration had, as the raw search spells a
+         DWORD: #2 for auto, #3 for manual. What the binary's own restore is told
+         when a failed transaction puts a re-applied registration back
+         (FastCachedRestoreRegistration, FastCacheNodeRestoreRegistration). -->
+    <Property Id="FASTCACHED_START_BEFORE" Secure="yes">
+      <RegistrySearch Id="FastCachedStartBeforeSearch" Root="HKLM"
+                      Key="SYSTEM\CurrentControlSet\Services\FastCached"
+                      Name="Start" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="FASTCACHE_NODE_START_BEFORE" Secure="yes">
+      <RegistrySearch Id="FastCacheNodeStartBeforeSearch" Root="HKLM"
+                      Key="SYSTEM\CurrentControlSet\Services\FastCacheCompileNode"
+                      Name="Start" Type="raw" Bitness="always64" />
     </Property>
 
     <!-- The machine-wide config directory, with an access list of its own,
@@ -357,17 +380,33 @@
          registers again when a later step fails and the transaction rolls back
          over a registration that was there before it. -->
     <SetProperty Action="SetFastCacheFirewallAllowBeforeArgument" Id="FastCacheFirewallAllowBeforeArgument"
-                 Value="--firewall-allow=[FastCacheFirewallAllowBefore]"
+                 Value="--firewall-allow=[FASTCACHE_FIREWALL_ALLOW_BEFORE]"
                  After="SetFastCacheFleetIdArgument" Sequence="execute"
-                 Condition="FastCacheFirewallAllowBefore" />
+                 Condition="FASTCACHE_FIREWALL_ALLOW_BEFORE" />
     <SetProperty Action="SetFastCacheFleetSeedBeforeArgument" Id="FastCacheFleetSeedBeforeArgument"
-                 Value="--fleet-seed=[FastCacheFleetSeedBefore]"
+                 Value="--fleet-seed=[FASTCACHE_FLEET_SEED_BEFORE]"
                  After="SetFastCacheFleetIdArgument" Sequence="execute"
-                 Condition="FastCacheFleetSeedBefore" />
+                 Condition="FASTCACHE_FLEET_SEED_BEFORE" />
     <SetProperty Action="SetFastCacheFleetIdBeforeArgument" Id="FastCacheFleetIdBeforeArgument"
-                 Value="--fleet-id=[FastCacheFleetIdBefore]"
+                 Value="--fleet-id=[FASTCACHE_FLEET_ID_BEFORE]"
                  After="SetFastCacheFleetSeedBeforeArgument" Sequence="execute"
-                 Condition="FastCacheFleetIdBefore" />
+                 Condition="FASTCACHE_FLEET_ID_BEFORE" />
+
+    <!-- The start type each binary's restore registers, one row per case: auto
+         when the search read auto, manual otherwise. The exact restore after it
+         puts back whatever start type was there, a disabled one included. -->
+    <SetProperty Action="SetFastCachedStartModeBeforeAuto" Id="FastCachedStartModeBefore" Value="auto"
+                 After="SetFastCacheFleetIdBeforeArgument" Sequence="execute"
+                 Condition="FASTCACHED_START_BEFORE = &quot;#2&quot;" />
+    <SetProperty Action="SetFastCachedStartModeBeforeManual" Id="FastCachedStartModeBefore" Value="manual"
+                 After="SetFastCachedStartModeBeforeAuto" Sequence="execute"
+                 Condition="NOT (FASTCACHED_START_BEFORE = &quot;#2&quot;)" />
+    <SetProperty Action="SetFastCacheNodeStartModeBeforeAuto" Id="FastCacheNodeStartModeBefore" Value="auto"
+                 After="SetFastCachedStartModeBeforeManual" Sequence="execute"
+                 Condition="FASTCACHE_NODE_START_BEFORE = &quot;#2&quot;" />
+    <SetProperty Action="SetFastCacheNodeStartModeBeforeManual" Id="FastCacheNodeStartModeBefore" Value="manual"
+                 After="SetFastCacheNodeStartModeBeforeAuto" Sequence="execute"
+                 Condition="NOT (FASTCACHE_NODE_START_BEFORE = &quot;#2&quot;)" />
 
     <!-- Seed each machine-wide config from its template, only when absent, so
          an upgrade never discards operator edits. The binary seeds its OWN
@@ -404,11 +443,41 @@
     <!-- fastcached made manual may still be running from before (an earlier
          install, or a feature change adding the node). net.exe waits for the
          stop, which sc.exe does not, so the node does not start into a port
-         fastcached still holds. -->
+         fastcached still holds. Whether it WAS running is written down first
+         (Installer\Rollback, FastCachedWasRunning), so a transaction that fails
+         after this starts it again (FastCachedRestartAfterStop). -->
     <CustomAction Id="FastCachedStopForNode"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]net.exe&quot; stop FastCached"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c ([System64Folder]sc.exe query FastCached | [System64Folder]find.exe &quot;RUNNING&quot; &gt;nul &amp;&amp; [System64Folder]reg.exe add HKLM\SOFTWARE\fastcached\Installer\Rollback /v FastCachedWasRunning /t REG_DWORD /d 1 /f /reg:64 &gt;nul) &amp; [System64Folder]net.exe stop FastCached"
                   Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- And its PROCESS gone, bounded, before the node starts: a service reports
+         STOPPED before its process has exited, and the process holds the port
+         until it does. An upgrade from 0.3.0 is the case that made this a rule
+         (batch 4 review, B4-2): 0.3.0's uninstall stops FastCached without
+         waiting, and the node, which binds 6674 exclusively, refused into a
+         port the old process still held. Matched by executable path, so a
+         fastcached run by hand from elsewhere is not waited for. Return="check":
+         past 60 seconds the node would refuse anyway, and this names why, as
+         exit code 1460 (ERROR_TIMEOUT) on this action. -->
+    <CustomAction Id="FastCachedAwaitExitForNode"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$p=@(\&quot;[INSTALL_ROOT]bin\fastcached.exe\&quot;);$w=New-Object Diagnostics.Stopwatch;$w.Start();while(Get-Process -Name fastcached -ErrorAction SilentlyContinue|Where-Object Path -In $p)[\{]if($w.Elapsed.TotalSeconds -gt 60)[\{]exit 1460[\}];Start-Sleep -Milliseconds 250[\}]&quot;"
+                  Execute="deferred" Impersonate="no" Return="check" />
+
+    <!-- An upgrade's files are replaced only once the old product's service
+         processes have EXITED, bounded: 0.3.0's uninstall stops its services
+         without waiting, and a file a process still held was replaced at the
+         next boot (exit 3010), with the node's checked steps then running
+         whichever binary was on the disk. Scheduled before InstallFiles, after
+         the old product's removal. Matched by executable PATH, so a copy of
+         either binary run by hand from this install root is waited for too:
+         its files are the ones being replaced. Return="check", 1460 past 120
+         seconds. -->
+    <CustomAction Id="FastCacheAwaitServiceExit"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$p=@(\&quot;[INSTALL_ROOT]bin\fastcached.exe\&quot;,\&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe\&quot;);$w=New-Object Diagnostics.Stopwatch;$w.Start();while(Get-Process -Name fastcached,fastcache-compile-node -ErrorAction SilentlyContinue|Where-Object Path -In $p)[\{]if($w.Elapsed.TotalSeconds -gt 120)[\{]exit 1460[\}];Start-Sleep -Milliseconds 250[\}]&quot;"
+                  Execute="deferred" Impersonate="no" Return="check" />
 
     <CustomAction Id="FastCachedStartService"
                   Directory="INSTALL_ROOT"
@@ -448,22 +517,31 @@
                   ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --check-arguments --service-start=auto [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedArgument] [FastCacheFleetIdArgument]"
                   Execute="deferred" Impersonate="no" Return="check" />
 
-    <!-- Started, WAITED FOR, and checked, for the same reason: sc.exe returns
-         once the start is requested, so a node that refused its configuration a
-         moment later left a successful transaction and a stopped service.
-         net.exe waits until the service leaves START_PENDING and fails when it
-         stopped instead. A node already running, after a feature change that
-         did not replace its files, is not started again, which net.exe would refuse;
-         RUNNING is the state word of sc.exe's query, which is not localized.
+    <!-- STOPPED first and started again, so a registration this transaction
+         changed is the one the running node has (batch 4 review, B4-5): a
+         feature change that leaves the node's files alone but re-registers it
+         with a new pin or seed reported success over a process still running
+         the old command line. Whether it was running is written down first,
+         so a transaction that fails after this starts it again
+         (FastCacheNodeRestartAfterStop). Return="ignore": a node that was not
+         running answers that it was not started. -->
+    <CustomAction Id="FastCacheNodeStopForRestart"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c ([System64Folder]sc.exe query FastCacheCompileNode | [System64Folder]find.exe &quot;RUNNING&quot; &gt;nul &amp;&amp; [System64Folder]reg.exe add HKLM\SOFTWARE\fastcached\Installer\Rollback /v NodeWasRunning /t REG_DWORD /d 1 /f /reg:64 &gt;nul) &amp; [System64Folder]net.exe stop FastCacheCompileNode"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
 
-         And it is asked AGAIN after five seconds, because RUNNING is reported
-         as the node's body begins (ServingReports, ServiceStatusPlan.hpp): a
-         refusal from inside the body, a port it cannot bind among them, comes
-         after RUNNING, and net.exe has returned success by then. ping.exe is
-         the wait, since timeout.exe refuses to run without a console. -->
+    <!-- Started, WAITED FOR, and checked, for the same reason: sc.exe returns
+         once the start is requested. net.exe waits until the service leaves
+         START_PENDING and fails when it stopped instead, and the node reports
+         RUNNING only once it SERVES (ServiceReadiness::BodySignals, the readiness
+         line's own fact), so a refusal from inside its body, a port it cannot
+         bind among them, is a STOPPED that net.exe reports, never a RUNNING it
+         believed (B4-6). Bounded by the node's start ceiling: past it the
+         checkpoint stops advancing and net.exe gives up. RUNNING is then asked
+         once more, as the state word of sc.exe's query, which is not localized. -->
     <CustomAction Id="FastCacheNodeStartService"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c ([System64Folder]sc.exe query FastCacheCompileNode | [System64Folder]find.exe &quot;RUNNING&quot; &gt;nul || [System64Folder]net.exe start FastCacheCompileNode) &amp;&amp; [System64Folder]ping.exe -n 6 127.0.0.1 &gt;nul &amp;&amp; [System64Folder]sc.exe query FastCacheCompileNode | [System64Folder]find.exe &quot;RUNNING&quot;"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]net.exe start FastCacheCompileNode &amp;&amp; [System64Folder]sc.exe query FastCacheCompileNode | [System64Folder]find.exe &quot;RUNNING&quot;"
                   Execute="deferred" Impersonate="no" Return="check" />
 
     <!-- A registration left behind by an upgrade that DESELECTED its feature.
@@ -552,13 +630,22 @@
          of the rollback.
 
          A registration this transaction CREATED (none was there before it) is
-         removed. A registration it RE-APPLIED is registered again from the
-         values it found remembered, which is what the transaction that made it
-         registered; an installer that predates remembering leaves nothing to
-         read, so that case restores the node with no optional argument. -->
+         removed. One it RE-APPLIED is put back in two steps, run in this order
+         by the rollback: the binary's own install-service, with the start type
+         and the firewall scope found before (so its firewall rules and its
+         account are the binary's), and then the EXACT command line and start
+         type that were registered, from a copy of the service's key taken
+         before the step that changed it (the Stash and RestoreRegistrationExactly
+         actions, batch 4 review B4-1 and B4-4). The copy is what makes a flag
+         outside the remembered values survive: rebuilding the command line from
+         those dropped it. -->
     <CustomAction Id="FastCachedUndoRegistration"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --uninstall-service"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="FastCachedRestoreRegistration"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcached.exe&quot; --install-service --service-start=[FastCachedStartModeBefore] [FastCacheFirewallAllowBeforeArgument]"
                   Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheNodeUndoRegistration"
                   Directory="INSTALL_ROOT"
@@ -566,15 +653,70 @@
                   Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheNodeRestoreRegistration"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --service-start=auto [FastCacheFirewallAllowBeforeArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedBeforeArgument] [FastCacheFleetIdBeforeArgument]"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --service-start=[FastCacheNodeStartModeBefore] [FastCacheFirewallAllowBeforeArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedBeforeArgument] [FastCacheFleetIdBeforeArgument]"
                   Execute="rollback" Impersonate="no" Return="ignore" />
+
+    <!-- The copy each exact restore reads: the service's whole key, taken
+         before the step that changes it, under Installer\Rollback, which every
+         transaction empties first (FastCacheClearRollbackState) so no copy from
+         an earlier one is ever restored. Return="ignore": after an upgrade from
+         0.3.0 the old uninstall has deleted the service, so there is nothing to
+         copy, and nothing an exact restore could put back. -->
+    <CustomAction Id="FastCachedStashRegistration"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; copy HKLM\SYSTEM\CurrentControlSet\Services\FastCached HKLM\SOFTWARE\fastcached\Installer\Rollback\FastCached /s /f /reg:64"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="FastCacheNodeStashRegistration"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; copy HKLM\SYSTEM\CurrentControlSet\Services\FastCacheCompileNode HKLM\SOFTWARE\fastcached\Installer\Rollback\FastCacheCompileNode /s /f /reg:64"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- The exact restore: the copied command line through the service manager
+         (Win32_Service.Change, which takes the text whole, where sc.exe would
+         need its quotes escaped), and the copied start type through sc.exe.
+         Never by writing the service's key: the manager reads that only at
+         boot. -->
+    <CustomAction Id="FastCachedRestoreRegistrationExactly"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$k=Get-Item -LiteralPath 'HKLM:\SOFTWARE\fastcached\Installer\Rollback\FastCached' -ErrorAction Stop;$s=Get-CimInstance Win32_Service -Filter 'Name=''FastCached''';$null=Invoke-CimMethod -InputObject $s -MethodName Change -Arguments @[\{]PathName=$k.GetValue('ImagePath','','DoNotExpandEnvironmentNames')[\}];$m=@('boot','system','auto','demand','disabled').GetValue($k.GetValue('Start'));if($m -eq 'auto' -and $k.GetValue('DelayedAutostart') -eq 1)[\{]$m='delayed-auto'[\}];&amp; sc.exe config FastCached start= $m&quot;"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="FastCacheNodeRestoreRegistrationExactly"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$k=Get-Item -LiteralPath 'HKLM:\SOFTWARE\fastcached\Installer\Rollback\FastCacheCompileNode' -ErrorAction Stop;$s=Get-CimInstance Win32_Service -Filter 'Name=''FastCacheCompileNode''';$null=Invoke-CimMethod -InputObject $s -MethodName Change -Arguments @[\{]PathName=$k.GetValue('ImagePath','','DoNotExpandEnvironmentNames')[\}];$m=@('boot','system','auto','demand','disabled').GetValue($k.GetValue('Start'));if($m -eq 'auto' -and $k.GetValue('DelayedAutostart') -eq 1)[\{]$m='delayed-auto'[\}];&amp; sc.exe config FastCacheCompileNode start= $m&quot;"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+
+    <!-- And each service started again if the transaction stopped it while it
+         ran (FastCachedStopForNode, FastCacheNodeStopForRestart wrote that
+         down). Scheduled EARLY, before the registration steps, so the rollback
+         runs them LAST: the service starts under the registration that was put
+         back, never under the one that failed. -->
+    <CustomAction Id="FastCachedRestartAfterStop"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]reg.exe query HKLM\SOFTWARE\fastcached\Installer\Rollback /v FastCachedWasRunning /reg:64 &gt;nul 2&gt;&amp;1 &amp;&amp; [System64Folder]sc.exe start FastCached"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="FastCacheNodeRestartAfterStop"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c [System64Folder]reg.exe query HKLM\SOFTWARE\fastcached\Installer\Rollback /v NodeWasRunning /reg:64 &gt;nul 2&gt;&amp;1 &amp;&amp; [System64Folder]sc.exe start FastCacheCompileNode"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+
+    <!-- The rollback state, emptied before the transaction writes any and after
+         it succeeds: a copy or a was-running mark from an earlier transaction
+         must never be what a later one restores. -->
+    <CustomAction Id="FastCacheClearRollbackState"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\Installer\Rollback /f /reg:64"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="FastCacheDiscardRollbackState"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\Installer\Rollback /f /reg:64"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
 
     <!-- And each remembered value as the transaction found it: written back
          when there was one, deleted when there was none, so a failed
          transaction leaves no value a later one would replay. -->
     <CustomAction Id="FastCacheRollbackRestoreFirewallAllow"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]reg.exe&quot; add HKLM\SOFTWARE\fastcached\Installer /v FirewallAllow /t REG_SZ /d &quot;[FastCacheFirewallAllowBefore]&quot; /f /reg:64"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; add HKLM\SOFTWARE\fastcached\Installer /v FirewallAllow /t REG_SZ /d &quot;[FASTCACHE_FIREWALL_ALLOW_BEFORE]&quot; /f /reg:64"
                   Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheRollbackDeleteFirewallAllow"
                   Directory="INSTALL_ROOT"
@@ -582,7 +724,7 @@
                   Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheRollbackRestoreFleetSeed"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]reg.exe&quot; add HKLM\SOFTWARE\fastcached\Installer /v FleetSeed /t REG_SZ /d &quot;[FastCacheFleetSeedBefore]&quot; /f /reg:64"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; add HKLM\SOFTWARE\fastcached\Installer /v FleetSeed /t REG_SZ /d &quot;[FASTCACHE_FLEET_SEED_BEFORE]&quot; /f /reg:64"
                   Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheRollbackDeleteFleetSeed"
                   Directory="INSTALL_ROOT"
@@ -590,7 +732,7 @@
                   Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheRollbackRestoreFleetId"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]reg.exe&quot; add HKLM\SOFTWARE\fastcached\Installer /v FleetId /t REG_SZ /d &quot;[FastCacheFleetIdBefore]&quot; /f /reg:64"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; add HKLM\SOFTWARE\fastcached\Installer /v FleetId /t REG_SZ /d &quot;[FASTCACHE_FLEET_ID_BEFORE]&quot; /f /reg:64"
                   Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="FastCacheRollbackDeleteFleetId"
                   Directory="INSTALL_ROOT"
@@ -620,40 +762,47 @@
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <InstallExecuteSequence>
-      <!-- Only on an upgrade (WIX_UPGRADE_DETECTED), only for a feature this
-           transaction does not leave installed, never in the old product's own
-           half, and only for a registration whose executable is in THIS
-           install root (a prefix test, case-insensitive): a service registered
-           by hand from another directory is not ours. -->
-      <Custom Action="FastCacheNodeDeleteLeftover" After="InstallFiles"
-              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE AND NOT (FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHE_NODE_REGISTERED_HERE = &quot;1&quot;" />
-      <Custom Action="FastCacheNodeDeleteLeftoverFirewall" After="FastCacheNodeDeleteLeftover"
-              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE AND NOT (FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHE_NODE_REGISTERED_HERE = &quot;1&quot;" />
-      <Custom Action="FastCachedDeleteLeftover" After="FastCacheNodeDeleteLeftoverFirewall"
-              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE AND NOT (FASTCACHED_SELECTED = &quot;1&quot;) AND FASTCACHED_REGISTERED_HERE = &quot;1&quot;" />
-      <Custom Action="FastCachedDeleteLeftoverFirewall" After="FastCachedDeleteLeftover"
-              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE AND NOT (FASTCACHED_SELECTED = &quot;1&quot;) AND FASTCACHED_REGISTERED_HERE = &quot;1&quot;" />
+      <!-- Before the files: an upgrade waits for the old product's service
+           processes to exit, so nothing it replaces is held (B4-2). -->
+      <Custom Action="FastCacheAwaitServiceExit" Before="InstallFiles"
+              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE" />
 
-      <Custom Action="FastCachedSeedConfig" After="FastCachedDeleteLeftoverFirewall"
+      <!-- ONE sequence: validate, register, remember, start, and only then
+           delete. The node's arguments are checked FIRST, directly after the
+           files, so a value its parser refuses fails the transaction before
+           anything is changed (B4-3: a leftover was once deleted before the
+           check, and no rollback could restore it); every later step that fails
+           rolls back through the rollback twin scheduled before each earlier
+           step. -->
+      <Custom Action="FastCacheNodeCheckArguments" After="InstallFiles"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCacheClearRollbackState" After="FastCacheNodeCheckArguments"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCachedRestartAfterStop" After="FastCacheClearRollbackState"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCacheNodeRestartAfterStop" After="FastCachedRestartAfterStop"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+
+      <Custom Action="FastCachedSeedConfig" After="FastCacheNodeRestartAfterStop"
               Condition="FASTCACHED_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheNodeSeedConfig" After="FastCachedSeedConfig"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
-      <!-- ONE sequence: validate, register, remember, start. The node's
-           arguments are checked first of all, so a value its parser refuses
-           fails the transaction before anything is registered or remembered;
-           every later step that fails rolls back through the rollback twin
-           scheduled before each earlier step. -->
-      <Custom Action="FastCacheNodeCheckArguments" After="FastCacheNodeSeedConfig"
-              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-
-      <Custom Action="FastCachedUndoRegistration" After="FastCacheNodeCheckArguments"
+      <Custom Action="FastCachedStashRegistration" After="FastCacheNodeSeedConfig"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
+      <Custom Action="FastCachedRestoreRegistrationExactly" After="FastCachedStashRegistration"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
+      <Custom Action="FastCachedUndoRegistration" After="FastCachedRestoreRegistrationExactly"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND NOT FASTCACHED_IMAGEPATH" />
-      <Custom Action="FastCachedInstallService" After="FastCachedUndoRegistration"
+      <Custom Action="FastCachedRestoreRegistration" After="FastCachedUndoRegistration"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHED_IMAGEPATH" />
+      <Custom Action="FastCachedInstallService" After="FastCachedRestoreRegistration"
               Condition="FASTCACHED_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCachedStopForNode" After="FastCachedInstallService"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCachedStartService" After="FastCachedStopForNode"
+      <Custom Action="FastCachedAwaitExitForNode" After="FastCachedStopForNode"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCachedStartService" After="FastCachedAwaitExitForNode"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND NOT (FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHED_START_SERVICE = &quot;1&quot;" />
 
       <!-- The node is (re)registered on every transaction that leaves it
@@ -671,12 +820,15 @@
            remembering has nothing to read back, and an upgrade from one still
            registers the node, with what it states.
 
-           The start is conditioned on the feature alone too: the
-           ServiceControl row below stopped the service before replacing its
-           files. Both are CHECKED (above): a registration that could not be
-           made, or a node that will not start, fails the transaction rather
-           than letting it succeed over a stopped service. -->
-      <Custom Action="FastCacheNodeUndoRegistration" After="FastCachedStartService"
+           Both the registration and the start are CHECKED (above): a
+           registration that could not be made, or a node that will not serve,
+           fails the transaction rather than letting it succeed over a stopped
+           service. -->
+      <Custom Action="FastCacheNodeStashRegistration" After="FastCachedStartService"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
+      <Custom Action="FastCacheNodeRestoreRegistrationExactly" After="FastCacheNodeStashRegistration"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
+      <Custom Action="FastCacheNodeUndoRegistration" After="FastCacheNodeRestoreRegistrationExactly"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND NOT FASTCACHE_NODE_IMAGEPATH" />
       <Custom Action="FastCacheNodeRestoreRegistration" After="FastCacheNodeUndoRegistration"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_IMAGEPATH" />
@@ -686,29 +838,48 @@
       <!-- Remembered once the registrations were accepted, each write behind
            the rollback twins that put the value back as it was found. -->
       <Custom Action="FastCacheRollbackRestoreFirewallAllow" After="FastCacheNodeInstallService"
-              Condition="(FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FastCacheFirewallAllowBefore" />
+              Condition="(FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHE_FIREWALL_ALLOW_BEFORE" />
       <Custom Action="FastCacheRollbackDeleteFirewallAllow" After="FastCacheRollbackRestoreFirewallAllow"
-              Condition="(FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND NOT FastCacheFirewallAllowBefore" />
+              Condition="(FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND NOT FASTCACHE_FIREWALL_ALLOW_BEFORE" />
       <Custom Action="FastCacheRememberFirewallAllow" After="FastCacheRollbackDeleteFirewallAllow"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheRollbackRestoreFleetSeed" After="FastCacheRememberFirewallAllow"
-              Condition="(FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FastCacheFleetSeedBefore" />
+              Condition="(FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHE_FLEET_SEED_BEFORE" />
       <Custom Action="FastCacheRollbackDeleteFleetSeed" After="FastCacheRollbackRestoreFleetSeed"
-              Condition="(FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND NOT FastCacheFleetSeedBefore" />
+              Condition="(FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND NOT FASTCACHE_FLEET_SEED_BEFORE" />
       <Custom Action="FastCacheRememberFleetSeed" After="FastCacheRollbackDeleteFleetSeed"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheRollbackRestoreFleetId" After="FastCacheRememberFleetSeed"
-              Condition="(FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FastCacheFleetIdBefore" />
+              Condition="(FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHE_FLEET_ID_BEFORE" />
       <Custom Action="FastCacheRollbackDeleteFleetId" After="FastCacheRollbackRestoreFleetId"
-              Condition="(FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND NOT FastCacheFleetIdBefore" />
+              Condition="(FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND NOT FASTCACHE_FLEET_ID_BEFORE" />
       <Custom Action="FastCacheRememberFleetId" After="FastCacheRollbackDeleteFleetId"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
       <Custom Action="FastCacheForgetNodeAdvertise" After="FastCacheRememberFleetId"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
-      <Custom Action="FastCacheNodeStartService" After="FastCacheForgetNodeAdvertise"
+      <Custom Action="FastCacheNodeStopForRestart" After="FastCacheForgetNodeAdvertise"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCacheNodeStartService" After="FastCacheNodeStopForRestart"
+              Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCacheDiscardRollbackState" After="FastCacheNodeStartService"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+
+      <!-- LAST, behind every checked step, because nothing restores a deleted
+           service (B4-3). Only on an upgrade (WIX_UPGRADE_DETECTED), only for a
+           feature this transaction does not leave installed, never in the old
+           product's own half, and only for a registration whose executable is
+           in THIS install root (a prefix test, case-insensitive): a service
+           registered by hand from another directory is not ours. -->
+      <Custom Action="FastCacheNodeDeleteLeftover" After="FastCacheDiscardRollbackState"
+              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE AND NOT (FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHE_NODE_REGISTERED_HERE = &quot;1&quot;" />
+      <Custom Action="FastCacheNodeDeleteLeftoverFirewall" After="FastCacheNodeDeleteLeftover"
+              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE AND NOT (FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHE_NODE_REGISTERED_HERE = &quot;1&quot;" />
+      <Custom Action="FastCachedDeleteLeftover" After="FastCacheNodeDeleteLeftoverFirewall"
+              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE AND NOT (FASTCACHED_SELECTED = &quot;1&quot;) AND FASTCACHED_REGISTERED_HERE = &quot;1&quot;" />
+      <Custom Action="FastCachedDeleteLeftoverFirewall" After="FastCachedDeleteLeftover"
+              Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE AND NOT (FASTCACHED_SELECTED = &quot;1&quot;) AND FASTCACHED_REGISTERED_HERE = &quot;1&quot;" />
 
       <!-- A feature being removed, and not the old product's half of an
            upgrade: an upgrade keeps the registration and re-applies it. -->

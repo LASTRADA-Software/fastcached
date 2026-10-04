@@ -525,9 +525,15 @@ while IFS="$FieldSep" read -r leg stepUses runsOn cacheKey unresolved; do
         continue
     fi
 
-    # The replacement quoted, as every one is: bash 5.2's `patsub_replacement` reads an unquoted `&`
-    # in it as the matched pattern. A runner OS name holds none, so this was not a live defect.
-    resolvedKey="${cacheKey//"$osPattern"/"$runnerOs"}"
+    # A loop, never `${cacheKey//pattern/replacement}`: no spelling of that replacement serves
+    # both shells. Unquoted, bash 5.2's `patsub_replacement` reads a `&` in it as the matched
+    # pattern; quoted, bash 3.2 keeps the quotes, and every key resolved to `..."Linux"...`.
+    resolvedKey="" keyRest="$cacheKey"
+    while [[ "$keyRest" == *"$osPattern"* ]]; do
+        resolvedKey="${resolvedKey}${keyRest%%"$osPattern"*}${runnerOs}"
+        keyRest="${keyRest#*"$osPattern"}"
+    done
+    resolvedKey="${resolvedKey}${keyRest}"
     if [[ "$resolvedKey" == *'${{ runner.'* ]]; then
         Fail "job '$leg' has a cache key this check cannot resolve -- key: $resolvedKey. It names a \`runner.\` field other than \`os\`, so $question cannot be decided in either direction."
         continue
@@ -978,8 +984,12 @@ REQ
     Generate "${scratch}/wf.yml" safe yes ungated required none all none single
     Case "rule F: one job writing one key" want-pass
 
+    # The SENTENCE, not only the exit: it names the key as `runner.os` resolved it, and a
+    # resolution bash 3.2 left the replacement's quotes in -- `cpm-"Linux"-x` -- still collides.
     Generate "${scratch}/wf.yml" safe yes ungated required none all none twowriters
-    Case "rule F: two jobs on one runner WRITING one key -- the loser discards an archive it has already built and uploaded (#318)" want-fail
+    CaseSaying "rule F: two jobs on one runner WRITING one key -- the loser discards an archive it has already built and uploaded (#318)" \
+        "the cache key 'cpm-Linux-x' is WRITTEN by more than one job" \
+        '"Linux"'
 
     Generate "${scratch}/wf.yml" safe yes ungated required none all none writerreader
     Case "rule F: one writer and one \`${CacheRestoreAction}\` reader on the same key -- the fix shape, which must PASS" want-pass

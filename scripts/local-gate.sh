@@ -3247,21 +3247,27 @@ src/apps/fastcached/Main.hpp"
     _p3="$(header_filter_match '.*\\src\\(CowTree|FastCache|apps|tests)\\.*' "" /w/fastcached <<< "$_hdrs")"
     expect "P3: a backslash-only filter's miss is named in the posix spelling" \
         "0/2 src/FastCache/Core/Base64.hpp (posix spelling)" "$_p3"
+    # `if`, never `case`, inside `$( )`: bash 3.2 reads a case pattern's `)` as the
+    # substitution's end (#1224) -- at RUN time, which `check-bash32-parse.sh` cannot see.
+    _p3_report="$(header_filter_report /w/.clang-tidy "$_p3" 2>&1)"
     expect "P3: ... and the report never claims the headers were taken as POSIX paths" \
         "absent" \
-        "$(case "$(header_filter_report /w/.clang-tidy "$_p3" 2>&1)" in
-               *"as POSIX paths"*) echo "said as POSIX paths" ;;
-               *"in the posix spelling -- it takes them in another spelling"*) echo absent ;;
-               *) echo "said neither" ;;
-           esac)"
+        "$(if [[ "$_p3_report" == *"as POSIX paths"* ]]; then
+               echo "said as POSIX paths"
+           elif [[ "$_p3_report" == *"in the posix spelling -- it takes them in another spelling"* ]]; then
+               echo absent
+           else
+               echo "said neither"
+           fi)"
     expect "the separator remedy prints the class as .clang-tidy spells it" \
         "said|1" "$(report_says 'Accept either separator ([/\\])' header_filter_report /w/.clang-tidy '0/285 src/x.hpp (windows spelling)')"
     expect "... and never as where the checkout lives, which would send the reader to the wrong cause" \
         "absent" \
-        "$(case "$(header_filter_report /w/.clang-tidy '0/285 src/x.hpp (windows spelling)' 2>&1)" in
-               *LIVES*) echo "said LIVES" ;;
-               *) echo absent ;;
-           esac)"
+        "$(if [[ "$(header_filter_report /w/.clang-tidy '0/285 src/x.hpp (windows spelling)' 2>&1)" == *LIVES* ]]; then
+               echo "said LIVES"
+           else
+               echo absent
+           fi)"
     expect "partial coverage refuses, naming the count and an example" \
         "said|1" "$(report_says 'matches only 200 of this tree' header_filter_report /w/.clang-tidy '200/285 src/apps/x.hpp')"
     expect "a partial miss naming no spelling points at #1040, the location cause" \

@@ -206,10 +206,14 @@ SourceFiles() {
 # below, it took this check from 16 s on master to 79 s on one Git Bash host, and past the
 # ARM64 leg's TIMEOUT. POSIX awk has no `\b`, so a whole word is bounded by a non-word
 # character or the line's ends.
+#
+# The identifiers arrive through the ENVIRONMENT, never `-v`: macOS's awk (the one true awk)
+# refuses a `-v` value holding a newline ("newline in string"), and the list is one identifier
+# per line -- which took this check and its self-test red on the macOS leg only.
 # $1: the file. $2: the identifiers, one per line.
 MentionLines() {
-    awk -v ids="$2" '
-        BEGIN { n = split(ids, id, "\n") }
+    FASTCACHED_CREDENTIAL_IDENTIFIERS="$2" awk '
+        BEGIN { n = split(ENVIRON["FASTCACHED_CREDENTIAL_IDENTIFIERS"], id, "\n") }
         /^[[:space:]]*(\/\/|\/\*|\*)/ { next }
         {
             for (i = 1; i <= n; i++)

@@ -7,9 +7,12 @@
 namespace FastCache
 {
 
-ReadinessAnnouncer::ReadinessAnnouncer(ILogger& logger, std::string endpointSummary) noexcept:
+ReadinessAnnouncer::ReadinessAnnouncer(ILogger& logger,
+                                       std::string endpointSummary,
+                                       std::function<void()> onAnnounced) noexcept:
     _logger { logger },
-    _endpointSummary { std::move(endpointSummary) }
+    _endpointSummary { std::move(endpointSummary) },
+    _onAnnounced { std::move(onAnnounced) }
 {
 }
 
@@ -122,6 +125,9 @@ void ReadinessAnnouncer::MaybeAnnounce()
     // own. A copy in this file would be a second source of truth for a published
     // interface -- the very defect the table exists to close.
     _logger.Logf(LogLevel::Info, "{} ({})", ReadinessMarkerText(ReadinessMarker::Daemon), _endpointSummary);
+    // After the line, never before it: whoever is told the daemon serves may act on it at once.
+    if (_onAnnounced)
+        _onAnnounced();
 }
 
 bool ReadinessAnnouncer::Announced() const noexcept

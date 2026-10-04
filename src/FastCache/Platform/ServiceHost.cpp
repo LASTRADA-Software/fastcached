@@ -61,7 +61,8 @@ ServiceHost::~ServiceHost()
 
 int ServiceHost::Run(Body body)
 {
-    auto const outcome = _manager->Dispatch(_name, [this, &body] { ServiceMainFor(ServiceHostStart::Serving, body); });
+    auto const start = ServiceReadinessTable[static_cast<std::size_t>(_options.readiness)].start;
+    auto const outcome = _manager->Dispatch(_name, [this, start, &body] { ServiceMainFor(start, body); });
     if (outcome != DispatchOutcome::Dispatched)
         return ServiceNotDispatchedExit;
     return _exitCode.load(std::memory_order_acquire);
@@ -84,16 +85,21 @@ void ServiceHost::ServiceMainFor(ServiceHostStart start, Body const& body)
             return gate->Deliver(request, eventType);
         }))
         return;
-    for (auto const& report: ServiceHostStartTable[static_cast<std::size_t>(start)].beforeStop)
+    auto const& row = ServiceHostStartTable[static_cast<std::size_t>(start)];
+    for (auto const& report: row.beforeStop)
         Report(report.state, report.waitHintMs, 0);
+    if (row.awaitsServing)
+        _startReporter = std::jthread { [this] { ReportStartUntilServing(); } };
 
     if (body)
         _exitCode.store(body(), std::memory_order_release);
 
-    // The reporter ends on the body's return, and is joined BEFORE the stop: a checkpoint it
+    // Both reporters end on the body's return, and are joined BEFORE the stop: a checkpoint either
     // reported after `Stopped` would be the out-of-order report `Report` refuses anyway, but one
     // racing the stop would leave the manager's last word to chance.
     _bodyReturned.store(true, std::memory_order_release);
+    if (_startReporter.joinable())
+        _startReporter.join();
     {
         std::scoped_lock const guard { _reporterMutex };
         if (_stopReporter.joinable())
@@ -150,6 +156,35 @@ bool ServiceHost::HandleControl(ServiceControlRequest request, std::uint32_t eve
             break;
     }
     return false;
+}
+
+void ServiceHost::ReportStartUntilServing()
+{
+    auto const served = [this] {
+        return _controls.Serving();
+    };
+    auto const returned = [this] {
+        return _bodyReturned.load(std::memory_order_acquire);
+    };
+    // The ceiling is MEASURED on the wait's own clock rather than counted in checkpoints: a sleep
+    // costs what the host's timer grants, not what was asked (`DrainWithin`'s reason).
+    auto const began = _stopWait.Now();
+    auto const pastCeiling = [this, began] {
+        return _stopWait.Now() - began >= _options.start.ceiling;
+    };
+    std::ignore = ReportStopProgress(
+        StopPendingPlan { .waitHint = _options.start.waitHint, .checkpointEvery = _options.start.checkpointEvery },
+        [&] { return served() || returned() || pastCeiling(); },
+        [this](std::uint32_t checkPoint, std::chrono::milliseconds hint) {
+            Report(ServiceState::StartPending, WaitHintMs(hint), 0, checkPoint);
+        },
+        _stopWait);
+    // Past the ceiling the checkpoint stands still, so whoever waits on the start gives up -- but the
+    // start goes on, and a body that serves late is still reported RUNNING, or it could never be stopped.
+    while (!served() && !returned())
+        _stopWait.Sleep(_options.start.checkpointEvery);
+    if (served() && !returned())
+        Report(ServiceState::Running, 0, 0);
 }
 
 void ServiceHost::Report(ServiceState state, std::uint32_t waitHintMs, int exitCode, std::uint32_t checkPoint)

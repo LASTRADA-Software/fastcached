@@ -632,13 +632,34 @@ function Show-MsiLog([string] $Path) {
     # below is the property dump of a transaction that ended, and an action that ran with
     # Return="ignore" -- the node's registration among them -- leaves its failure only here.
     Write-Host '--- the service actions ---'
-    Select-String -Path $Path -Pattern 'FastCache\w*(Service|ForNode|Leftover)\b' |
+    Select-String -Path $Path -Pattern 'FastCache\w*(Service|ForNode|Leftover|Registration|Exactly|AfterStop|ForRestart|Exit|RollbackState)\b' |
         Where-Object { $_.Line -match 'Action (start|ended)|returned actual error|CustomAction' } | ForEach-Object { $_.Line }
     Write-Host '--- the tail ---'
     Select-String -Path $Path -Pattern `
         'Action (start|ended)', 'CustomAction', 'ServiceControl', 'FastCache', 'returned actual error',
         'Note: 1: 1(4|7)[0-9][0-9]', 'Installation (success|failed)', 'error' |
         Select-Object -Last 60 | ForEach-Object { $_.Line }
+}
+
+# Who listens on @p Port and which of this package's service processes are alive: the holder of
+# the node's port is the first thing a failed start needs named (batch 4 review, B4-2), and nothing
+# on the runner survives the job to ask later. Never throws: it runs on the way to a throw that
+# matters more.
+#
+# @param Port The TCP port.
+function Show-PortHolders([int] $Port) {
+    Write-Host "===== who holds $Port, and the service processes ====="
+    try {
+        foreach ($listener in @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) {
+            $owner = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+            Write-Host "$($listener.LocalAddress):$Port held by PID $($listener.OwningProcess): $($owner.Path)"
+        }
+        foreach ($process in @(Get-Process -Name fastcached, fastcache-compile-node -ErrorAction SilentlyContinue)) {
+            Write-Host "running: PID $($process.Id) $($process.Path), started $($process.StartTime)"
+        }
+    } catch {
+        Write-Host "the listing itself failed: $_"
+    }
 }
 
 # Runs one silent, verbosely logged msiexec transaction and refuses an exit code
@@ -672,6 +693,7 @@ function Invoke-Msiexec {
         # A checked service action that failed rolled the transaction back, and the service's
         # own events are where its refusal was written: they outlive the rollback.
         foreach ($name in 'FastCacheCompileNode', 'FastCached') { Show-ServiceDiagnosis $name }
+        Show-PortHolders 6674
         throw "$What exited $($p.ExitCode); accepted: $($Accept -join ', ')"
     }
     Write-Host "$What exited $($p.ExitCode)"

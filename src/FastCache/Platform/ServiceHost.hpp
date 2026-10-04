@@ -103,6 +103,10 @@ class ServiceHost final: public IDaemonHost
     /// Report @p state, unless the stop has been reported already.
     void Report(ServiceState state, std::uint32_t waitHintMs, int exitCode, std::uint32_t checkPoint = 0);
 
+    /// Advance the start's checkpoint until the body serves or returns, within the plan's ceiling,
+    /// and report RUNNING if it serves first. Runs on `_startReporter`.
+    void ReportStartUntilServing();
+
     std::string _name;
     std::unique_ptr<IServiceControlManager> _manager;
     DaemonControls& _controls;
@@ -117,6 +121,9 @@ class ServiceHost final: public IDaemonHost
     std::shared_ptr<ServiceControlGate> _gate;
     /// Set once the body has returned, which is what ends the stop reporter.
     std::atomic<bool> _bodyReturned { false };
+    /// Advances the start checkpoint until the body serves or returns; started by a start whose row
+    /// awaits serving, joined by the service main before the stop.
+    std::jthread _startReporter;
     /// Guards `_stopReporter`, which the control handler starts and the service main joins.
     std::mutex _reporterMutex;
     /// Advances the stop checkpoint until the body returns; started by the first stop control.

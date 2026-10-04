@@ -793,8 +793,10 @@ ${launcher_reader_dir}/branches.cpp|2|3"
             ran=$(( ran + 1 ))
             if [ "$launcher_platform" = windows ]; then launcher_index="$launcher_on_windows"; else launcher_index="$launcher_on_posix"; fi
             launcher_bash_rows="$(_launcher_bash_answer "$launcher_index")"
+            # `if`, never `case`, inside `$( )`: bash 3.2 reads a case pattern's `)` as the
+            # substitution's end (#1224) -- at RUN time, which `check-bash32-parse.sh` cannot see.
             launcher_pwsh_rows="$(while IFS= read -r launcher_line; do
-                case "$launcher_line" in "${launcher_pwsh_index}:"*) printf '%s\n' "${launcher_line#*:}" ;; esac
+                if [[ "$launcher_line" == "${launcher_pwsh_index}:"* ]]; then printf '%s\n' "${launcher_line#*:}"; fi
             done <<< "$launcher_pwsh_all")"
             if [ -z "$launcher_bash_rows" ] || [ "$launcher_bash_rows" = refused ] || [ "$launcher_bash_rows" != "$launcher_pwsh_rows" ]; then
                 echo "FAIL launcher-state-readers-agree: the two readers of $(basename "$launcher_source") disagree on ${launcher_platform}" >&2
@@ -878,10 +880,11 @@ case "${1-}" in
     *) if [ -z "${FASTCACHE_NO_STATS-}" ]; then
            mkdir -p "${base}/fastcache-cc"
            for last in "$@"; do :; done
-           # The replacement QUOTED: bash 5.2's `patsub_replacement` reads an unquoted `&` in it as
-           # the matched pattern, so a source path holding one was recorded as another path. bash
-           # 3.2 has no such option, and the quotes change nothing there.
-           printf '%s\n' "${log_line/@SOURCE@/"$last"}" >> "$log"
+           # Split at the marker, never `${log_line/@SOURCE@/...}`: no spelling of that replacement
+           # serves both shells. Unquoted, bash 5.2's `patsub_replacement` reads a `&` in it as the
+           # matched pattern; quoted, bash 3.2 keeps the quotes, so every record named a source
+           # inside literal `"`s and no tree's prefix matched it -- measured, on macOS.
+           printf '%s\n' "${log_line%%@SOURCE@*}${last}${log_line#*@SOURCE@}" >> "$log"
        fi ;;
 esac
 FAKE

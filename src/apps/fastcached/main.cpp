@@ -1092,6 +1092,10 @@ int DaemonBody(FastCache::Config const& effective,
     // Hand the reactors the very clock the engine reads, so their per-iteration
     // refresh is what keeps it current.
     serverOpts.clock = &clock;
+    // The readiness line's fact, handed to the service host: it reports RUNNING on it.
+    serverOpts.onServing = [] {
+        FastCache::DaemonControls::Instance().MarkServing();
+    };
     // Listener endpoints: prefer the explicit list when given, otherwise
     // synthesise one from the legacy single-bind fields. This keeps the
     // common single-port case working without an explicit --listen, and
@@ -1506,8 +1510,12 @@ int main(int argc, char const* const* argv)
     if (effective.daemon)
     {
 #if defined(_WIN32)
+        // RUNNING once every acceptor is armed (`serverOpts.onServing` below), so `net start` answers
+        // for a daemon that serves rather than for a process that is up.
         host = FastCache::MakeWindowsServiceHost(
-            effective.serviceName, FastCache::ServiceHostOptions { .stop = FastCache::StopPendingPlanFor(std::nullopt) });
+            effective.serviceName,
+            FastCache::ServiceHostOptions { .stop = FastCache::StopPendingPlanFor(std::nullopt),
+                                            .readiness = FastCache::ServiceReadiness::BodySignals });
 #else
         // `/`, stated rather than defaulted. This daemon executes nothing, so no
         // path-mapping rule is ever derived from its working directory and the

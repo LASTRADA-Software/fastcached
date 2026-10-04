@@ -3,6 +3,7 @@
 
 #include "NodeConfig.hpp"
 
+#include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
@@ -207,6 +208,13 @@ class INodeKeyFileGuard
     /// @param file A key file this process has just created, still empty.
     /// @return Who may read it afterwards, as READ BACK rather than as the call reported.
     [[nodiscard]] virtual SecretExposure Protect(std::filesystem::path const& file) = 0;
+
+    /// Make the entry of a key file just written in @p directory survive a power loss.
+    /// @param directory The state directory.
+    /// @return Nothing, or which call refused and why -- which the mint judges against the table of
+    ///         filesystems that cannot sync a directory (`Consensus::MeansDirectorySyncUnsupported`).
+    [[nodiscard]] virtual std::expected<void, Consensus::DirectorySyncFailure> SyncDirectory(
+        std::filesystem::path const& directory) = 0;
 };
 
 /// The production guard: `Platform/FileTrust`'s secrecy half, and nothing of its own.
@@ -230,6 +238,10 @@ class FileTrustNodeKeyGuard final: public INodeKeyFileGuard
 
     /// @copydoc INodeKeyFileGuard::Protect
     [[nodiscard]] SecretExposure Protect(std::filesystem::path const& file) override;
+
+    /// @copydoc INodeKeyFileGuard::SyncDirectory
+    [[nodiscard]] std::expected<void, Consensus::DirectorySyncFailure> SyncDirectory(
+        std::filesystem::path const& directory) override;
 };
 
 /// When a key file's exposure is judged: the rule differs in one cell, deliberately.

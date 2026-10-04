@@ -16,6 +16,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -750,6 +751,23 @@ TEST_CASE("Adopting a descriptor that is not a stream socket is refused by name"
     INFO("the refusal was: " << refused->BindError());
     CHECK(refused->BindError().contains(std::format("socket type {}", static_cast<int>(SOCK_DGRAM))));
 }
+
+#if !defined(_WIN32)
+TEST_CASE("A descriptor the socket options cannot be asked of is refused in the OS's own words", "[net][listener]")
+{
+    // The adopt refusal once named macOS's ENOPROTOOPT "connection reset": it read the error back
+    // through the accept loop's table, where that number is a pending-error row. A regular file
+    // answers ENOTSOCK to the very first option asked, so the refusal must carry the platform's own
+    // message for ENOTSOCK -- which the accept table's label for it does not.
+    auto const file = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    REQUIRE(file >= 0);
+    // Owned by `Adopt` from here, refused or not.
+    auto const refused = FastCache::BlockingListener::Adopt(file);
+    CHECK_FALSE(refused->IsBound());
+    INFO("the refusal was: " << refused->BindError());
+    CHECK(refused->BindError().contains("getsockopt: " + std::generic_category().message(ENOTSOCK)));
+}
+#endif
 
 TEST_CASE("A supervisor's descriptor that is not a stream socket is refused by name", "[net][listener]")
 {

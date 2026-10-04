@@ -42,11 +42,26 @@ class DaemonControls
         return _reload.exchange(false, std::memory_order_acq_rel);
     }
 
-    /// Reset both flags. Tests / restart scenarios only.
+    /// Mark that the daemon SERVES: every listener it opens is accepting. Idempotent; safe from any
+    /// thread. Called where the readiness line is logged, never earlier -- a service host told to
+    /// (`ServiceReadiness::BodySignals`) reports RUNNING on it, which is what `net start` answers.
+    void MarkServing() noexcept
+    {
+        _serving.store(true, std::memory_order_release);
+    }
+
+    /// @return true once the daemon has said it serves.
+    [[nodiscard]] bool Serving() const noexcept
+    {
+        return _serving.load(std::memory_order_acquire);
+    }
+
+    /// Reset every flag. Tests / restart scenarios only.
     void Reset() noexcept
     {
         _stop.store(false, std::memory_order_release);
         _reload.store(false, std::memory_order_release);
+        _serving.store(false, std::memory_order_release);
     }
 
     /// Direct atomic access for callers that want to share the bool with
@@ -59,6 +74,7 @@ class DaemonControls
   private:
     std::atomic<bool> _stop { false };
     std::atomic<bool> _reload { false };
+    std::atomic<bool> _serving { false };
 };
 
 } // namespace FastCache

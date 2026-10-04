@@ -3512,20 +3512,21 @@ jobs:
           Assert-InstalledProduct $family $productOf[$previous]
           Assert-ServiceTable -Row Release030WithNode -Log 'previous.log'
 
-          # FROM 0.3.0 ONLY: 3010 is success with a restart pending, because that
-          # installer stops its services without waiting and a file they still held
-          # is replaced at the next boot. Every other upgrade here must exit 0.
+          # Exactly 0, as every upgrade here: 0.3.0 stops its services WITHOUT waiting, and this
+          # package waits for their processes to exit before it replaces a file
+          # (FastCacheAwaitServiceExit) -- 3010 was a file one of them still held, replaced at the
+          # next boot, with the node's checked steps then running whichever binary was on the disk.
           # No property: the node registration exists and runs afterwards all the same.
-          Invoke-Msiexec -Operation '/i' -Package $first -Log 'upgrade.log' -Accept 0, 3010 `
-            -Notice @{ 3010 = "a restart is pending, so a file 0.3.0 held may be replaced only at the next boot and the services asserted below may still be running 0.3.0's binaries" } `
-            -What "the upgrade from $release"
+          Invoke-Msiexec -Operation '/i' -Package $first -Log 'upgrade.log' -What "the upgrade from $release"
           Assert-InstalledProduct $family $productOf[$first]
-          # Each way the node could keep 0.3.0's registration, which it refuses at every start
-          # (--scheduler): 0.3.0's own uninstall-service ran FIRST (RemoveExistingProducts is
-          # scheduled afterInstallInitialize), this product's registration and its start ran AFTER
-          # it -- both checked, so either failing fails the transaction above rather than this --
-          # and what is registered now carries no --scheduler.
-          Assert-MsiActionOrder -Path 'upgrade.log' -Actions 'FastCacheNodeUninstallService', 'FastCacheNodeInstallService', 'FastCacheNodeStartService'
+          # The ORDER is the fix (batch 4 review, B4-2): 0.3.0's own uninstall-service ran FIRST
+          # (RemoveExistingProducts is scheduled afterInstallInitialize); the files waited for 0.3.0's
+          # service processes; FastCached, kept and made manual, was stopped and its PROCESS waited
+          # for -- it held 6674, which the node binds exclusively; and only then was the node
+          # registered and started, both checked, so either failing fails the transaction above. And
+          # what is registered now carries no --scheduler, which the node refuses at every start.
+          Assert-MsiActionOrder -Path 'upgrade.log' -Actions 'FastCacheNodeUninstallService', 'FastCacheAwaitServiceExit', `
+            'FastCachedAwaitExitForNode', 'FastCacheNodeInstallService', 'FastCacheNodeStartService'
           Assert-NodeRegistrationLacks '--scheduler'
           Assert-ServiceTable -Row NodeSelected -Log 'upgrade.log'
 
@@ -3801,6 +3802,37 @@ jobs:
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
           $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
 
+          # A node that cannot START on a fastcached machine (batch 4 review, B4-1): the transaction
+          # fails, and the rollback leaves fastcached exactly as it found it -- auto again (the node
+          # had made it manual), RUNNING again (the transaction stopped it for the node), and its
+          # command line and remembered scope unchanged. fastcached serves on 6699 here (the step
+          # above moved it), so a listener this step holds on 6674 is what the node cannot bind: it
+          # refuses inside its body, never reports RUNNING (it reports running once it serves), and
+          # its checked start fails. Empty and absent are one remembered scope (install.md).
+          $fastcachedBefore = Get-CimInstance Win32_Service -Filter "Name='FastCached'"
+          $scopeBefore = "$((Get-ItemProperty -Path 'HKLM:\SOFTWARE\fastcached\Installer' -ErrorAction SilentlyContinue).FirewallAllow)"
+          $hold = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, 6674)
+          $hold.ExclusiveAddressUse = $true
+          $hold.Start()
+          try {
+            Invoke-Msiexec -Operation '/i' -Package $msi -Log 'add-node-refused.log' -What 'adding the node while 6674 is held' `
+              -Properties 'ADDLOCAL=CM_C_Node', 'FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8' -Accept @(1603)
+          } finally {
+            $hold.Stop()
+          }
+          Assert-MsiLog -Path 'add-node-refused.log' -Present 'CustomAction FastCacheNodeStartService returned actual error code', `
+            (Get-MsiActionRanPattern 'FastCachedStopForNode'), (Get-MsiActionRanPattern 'FastCachedAwaitExitForNode')
+          Assert-ServiceTable -Row DaemonAlone -Log 'add-node-refused.log'
+          $fastcachedAfter = Get-CimInstance Win32_Service -Filter "Name='FastCached'"
+          if ($fastcachedAfter.PathName -cne $fastcachedBefore.PathName) {
+            throw "the failed node install left fastcached registered as '$($fastcachedAfter.PathName)', not '$($fastcachedBefore.PathName)'"
+          }
+          $scopeAfter = "$((Get-ItemProperty -Path 'HKLM:\SOFTWARE\fastcached\Installer' -ErrorAction SilentlyContinue).FirewallAllow)"
+          if ($scopeAfter -cne $scopeBefore) {
+            throw "the failed node install left the remembered firewall scope '$scopeAfter', not '$scopeBefore'"
+          }
+          Write-Host "the node that could not start rolled back to fastcached auto, running and registered as before"
+
           # No property at all: this package has no advertised-endpoint property (W-10), so the node is
           # registered with no advertise flag and advertises this machine's name.
           Invoke-Msiexec -Operation '/i' -Package $msi -Log 'add-node.log' -What 'adding the node feature' `
@@ -3831,11 +3863,12 @@ jobs:
           Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
 
           # A pin the node's parser REFUSES fails the transaction (batch 3 review, B3-1): the node's
-          # arguments are checked before anything is remembered or registered, and the registration
-          # itself ignores its own failure, so without the check the repair "succeeded", kept the old
-          # registration running and remembered the refused pin for every later transaction. Both
-          # halves are asserted: the transaction is refused BY THE CHECK, and what the machine had
-          # survives it -- the registration's pin and the remembered one.
+          # arguments are checked first, before anything is remembered or registered, so the repair
+          # neither "succeeds" over the old registration nor remembers the refused pin for every later
+          # transaction. All three halves are asserted: the transaction is refused BY THE CHECK, what
+          # the machine had survives it -- the registration's pin and the remembered one -- and the
+          # node is RUNNING again (B4-6): the repair stopped it to replace its files, and only the
+          # rollback's restart brings it back.
           Invoke-Msiexec -Operation '/i' -Package $msi -Log 'refused-pin.log' -What 'a repair stating a pin the node refuses' `
             -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus', 'FASTCACHE_FLEET_ID=0123456789abcdef0123456789abcdef' `
             -Accept @(1603)
@@ -3845,7 +3878,26 @@ jobs:
           if ($remembered -cne $pin) {
             throw "the refused repair changed the remembered fleet pin: '$remembered', expected '$pin'"
           }
-          Write-Host "the refused pin failed the repair; the registration and the remembered pin are unchanged"
+          Assert-ServiceTable -Row NodeSelected -Log 'refused-pin.log'
+          Write-Host "the refused pin failed the repair; the registration and the remembered pin are unchanged, and the node runs"
+
+          # A transaction that re-registers a RUNNING node without replacing its files restarts it
+          # (B4-5): a new seed on an already-installed node is a feature change that copies nothing,
+          # and the process it left running had the old command line until its next restart. The PID
+          # is the witness, and the log proves no ServiceControl row stopped the node, so a new PID
+          # is the transaction's own restart rather than a file replacement's.
+          $nodeBefore = (Get-CimInstance Win32_Service -Filter "Name='FastCacheCompileNode'").ProcessId
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'reseed-node.log' -What 'a feature change giving the node a new seed' `
+            -Properties 'ADDLOCAL=CM_C_Node', 'FASTCACHE_FLEET_SEED=seed2.example.invalid'
+          Assert-MsiLog -Path 'reseed-node.log' -Present (Get-MsiActionRanPattern 'FastCacheNodeStopForRestart') `
+            -Absent 'ServiceControl\(.*Name=FastCacheCompileNode'
+          Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed2.example.invalid:6674'
+          Assert-ServiceTable -Row NodeSelected -Log 'reseed-node.log'
+          $nodeAfter = (Get-CimInstance Win32_Service -Filter "Name='FastCacheCompileNode'").ProcessId
+          if ($nodeAfter -eq $nodeBefore) {
+            throw "the node was re-registered with a new seed and kept running as PID $nodeBefore, with the old command line"
+          }
+          Write-Host "the re-registered node was restarted (PID $nodeBefore, then $nodeAfter)"
 
           Invoke-Msiexec -Operation '/i' -Package $msi -Log 'remove-node.log' -Properties 'REMOVE=CM_C_Node' `
             -What 'removing the node feature'

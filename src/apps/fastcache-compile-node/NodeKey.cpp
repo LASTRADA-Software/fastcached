@@ -255,7 +255,14 @@ namespace
         // And the directory, or a power loss can take back the ENTRY of a key whose bytes are on the
         // disk: the next start finds no key, mints another, and the machine the fleet knew is gone
         // (`Consensus::SyncDirectoryToDisk`). The key is written, so the next start reads it.
-        if (auto const synced = Consensus::SyncDirectoryToDisk(path.parent_path()); !synced.has_value())
+        //
+        // Except on a filesystem that cannot sync a directory at all, which is DEGRADED here as every
+        // state write degrades it (`Consensus::MeansDirectorySyncUnsupported`): refused, the first start
+        // on such a volume failed while the second read the key it had written and ran degraded -- one
+        // volume, two answers. The start's replace probe raises `state-directory-unsynced` for the same
+        // directory, so the degradation is said once, there, rather than twice.
+        if (auto const synced = guard.SyncDirectory(path.parent_path());
+            !synced.has_value() && !Consensus::MeansDirectorySyncUnsupported(synced.error()))
             return Refuse(NodeKeyFault::WriteFailed,
                           std::format("wrote {}, but cannot sync its directory: {}; it is not known to survive a power "
                                       "loss. The next start reads the key that was written",
@@ -283,6 +290,12 @@ DirectoryWriters FileTrustNodeKeyGuard::WritersOf(std::filesystem::path const& d
 bool FileTrustNodeKeyGuard::IsLink(std::filesystem::path const& entry)
 {
     return IsLinkEntry(entry);
+}
+
+std::expected<void, Consensus::DirectorySyncFailure> FileTrustNodeKeyGuard::SyncDirectory(
+    std::filesystem::path const& directory)
+{
+    return Consensus::SyncDirectoryToDisk(directory);
 }
 
 std::expected<bool, std::error_code> FileTrustNodeKeyGuard::OthersMayWrite(std::filesystem::path const& entry)

@@ -1472,9 +1472,10 @@ check_root_bound() {
     if [[ "$kind" == none ]]; then
         cmp "${dir}/a.o" "${b}/build/u.o" \
             || fail "root-bound ${kind}/direct ${direct}: a path-free object was not served into the other checkout"
-    elif grep -qaF "$a" "${b}/build/u.o"; then
+    elif LC_ALL=C grep -qaF "$a" "${b}/build/u.o"; then
         # `if` rather than `grep && fail`: under `set -e` a non-matching grep would
-        # end the script on the SUCCESS path.
+        # end the script on the SUCCESS path. `LC_ALL=C`, or macOS's grep matches nothing
+        # on an object's non-UTF-8 bytes and this negative search passes forever.
         fail "root-bound ${kind}/direct ${direct}: checkout b's object names checkout a"
     fi
     echo "   ${kind}, direct ${direct}: a=${oa} b=${ob} a-again=${oa2}"

@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <tuple>
 #include <utility>
 
@@ -36,6 +37,12 @@
     #include <arpa/inet.h>
     #include <netinet/in.h>
     #include <netinet/tcp.h>
+
+    #if defined(__APPLE__)
+        #include <sys/proc_info.h>
+
+        #include <libproc.h>
+    #endif
 #endif
 
 namespace FastCache
@@ -235,6 +242,21 @@ namespace
         return std::format("socket type {}", type);
     }
 
+    /// What the OS said about the call that just failed, in its own words: @p call, the platform's
+    /// message for the error and its number.
+    ///
+    /// **Never through `SocketErrors`**: that table answers what an ACCEPT LOOP does with a code,
+    /// and read back as a description it named macOS's `ENOPROTOOPT` from `getsockopt` "connection
+    /// reset" -- the accept(2) pending-error row it shares a number with -- in the one line that
+    /// reported every adoption on macOS refused.
+    /// @param call The call that failed, e.g. `getsockopt`.
+    /// @return The text.
+    [[nodiscard]] std::string OsErrorText(std::string_view call)
+    {
+        auto const osError = LastSocketError();
+        return std::format("{}: {} [{}]", call, std::system_category().message(osError), osError);
+    }
+
     /// One integer `SOL_SOCKET` option of @p socket.
     /// @param socket The descriptor to ask.
     /// @param option The option, e.g. `SO_TYPE`.
@@ -248,8 +270,33 @@ namespace
         auto length = static_cast<AddrLen>(sizeof(value));
         if (::getsockopt(ToSocket(socket), SOL_SOCKET, option, reinterpret_cast<char*>(&value), &length) != 0)
             return std::unexpected { std::format(
-                "adopt: the descriptor could not be asked {} ({})", what, SystemError("getsockopt").toString()) };
+                "adopt: the descriptor could not be asked {} ({})", what, OsErrorText("getsockopt")) };
         return value;
+    }
+
+    /// Whether @p socket listens: non-zero when it does, as `SO_ACCEPTCONN` reads.
+    ///
+    /// **XNU does not answer `getsockopt(SO_ACCEPTCONN)`**: macOS refuses it with `ENOPROTOOPT`, so
+    /// every adoption there was refused, a listening socket included -- the macOS job's socket
+    /// activation and consensus cases, all at once. The flag is still the kernel's: `listen(2)` sets
+    /// it in the socket's options, and libproc reports those options for a descriptor this process
+    /// holds (`soi_options`), which is where macOS answers the same question.
+    /// @param socket The descriptor being adopted.
+    /// @return Non-zero when it listens, zero when it does not, or the refusal naming what could
+    ///         not be asked.
+    [[nodiscard]] std::expected<int, std::string> ListeningFlag(core::platform::NativeHandle socket)
+    {
+#if defined(__APPLE__)
+        struct socket_fdinfo info {};
+
+        auto const size = ::proc_pidfdinfo(::getpid(), socket, PROC_PIDFDSOCKETINFO, &info, sizeof(info));
+        if (size != static_cast<int>(sizeof(info)))
+            return std::unexpected { std::format("adopt: the descriptor could not be asked whether it listens ({})",
+                                                 OsErrorText("proc_pidfdinfo")) };
+        return (info.psi.soi_options & SO_ACCEPTCONN) != 0 ? 1 : 0;
+#else
+        return SocketOption(socket, SO_ACCEPTCONN, "whether it listens");
+#endif
     }
 
     /// Why @p socket cannot be an accept loop's listener, or nothing when it can.
@@ -274,7 +321,7 @@ namespace
             return std::format("adopt: the descriptor is {}, not SOCK_STREAM; accept() on it would fail "
                                "forever, so it cannot be a listener",
                                SocketTypeText(*type));
-        auto const listening = SocketOption(socket, SO_ACCEPTCONN, "whether it listens");
+        auto const listening = ListeningFlag(socket);
         if (!listening.has_value())
             return listening.error();
         if (*listening == 0)

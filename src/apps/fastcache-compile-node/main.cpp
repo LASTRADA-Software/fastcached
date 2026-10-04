@@ -1640,6 +1640,9 @@ using Node::NodeReloader;
                                             workerTier != nullptr ? std::optional { workerTier->Slots() } : std::nullopt,
                                             workerTier != nullptr ? workerTier->StartupToolchainCount() : 0),
                 Node::AdmissionSummary(cfg));
+    // The line's fact, handed to the service host, which reports RUNNING on it. After the line, so
+    // whoever is told the node serves finds the line already written.
+    DaemonControls::Instance().MarkServing();
 
     // **Main waits here now, and there is no accept loop to interrupt.** This was
     // `core::async::syncRun(server.Run())` -- the dedicated listener's accept loop, which blocked
@@ -2448,9 +2451,13 @@ int main(int argc, char** argv)
     // The host's events hub is declared with it, since the Windows host is handed it here and
     // both outlive the body the host runs; the network watcher that feeds it starts below.
     HostEventHub hostEvents;
+    // RUNNING once the node serves (`MarkServing` beside the readiness line), never as its body
+    // begins: a node that then could not bind its port had already been reported started, and an
+    // installer's start action answered success over it (B4-6).
     auto serviceHost = cfg.daemon ? MakeWindowsServiceHost(cfg.serviceName,
                                                            ServiceHostOptions { .stop = StopPendingPlanFor(cfg.drainTimeout),
-                                                                                .hostEvents = &hostEvents })
+                                                                                .hostEvents = &hostEvents,
+                                                                                .readiness = ServiceReadiness::BodySignals })
                                   : nullptr;
     ForegroundHost foreground;
     IDaemonHost& startHost = serviceHost ? *serviceHost : static_cast<IDaemonHost&>(foreground);

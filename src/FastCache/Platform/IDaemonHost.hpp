@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Platform/ServiceStatusPlan.hpp>
 #include <FastCache/Platform/StopPending.hpp>
 
 #include <functional>
@@ -134,6 +135,14 @@ struct ServiceHostOptions
     /// Where power events (suspend, resume) are delivered, or null to not accept them. Must
     /// outlive `Run`. A hint only: see `HostEvent` for why nothing may depend on one arriving.
     IHostEventSink* hostEvents { nullptr };
+
+    /// When RUNNING is reported. `BodyStart` is what a host told nothing does; a daemon whose body
+    /// says when it serves passes `BodySignals`, so `net start` and an installer's start action
+    /// answer for a service that serves rather than for a process that is up.
+    ServiceReadiness readiness { ServiceReadiness::BodyStart };
+
+    /// How a `BodySignals` start reports while it waits for the body to serve.
+    StartPendingPlan start { DefaultStartPendingPlan };
 };
 
 /// Construct a Windows Service host registered with the SCM. Returns

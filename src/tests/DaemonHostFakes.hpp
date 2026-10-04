@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -85,8 +86,8 @@ enum class ServiceManagerPresence : std::uint8_t
 /// **A fake more permissive than the manager it stands for makes its cases pass over a defect**,
 /// so every rule the SCM enforces or documents is a recorded VIOLATION here: one dispatch per
 /// process, no status before the control handler is registered, the handler registered once and
-/// only from inside the service main, a legal order of states, a stop's checkpoint that only ever
-/// advances, and nothing at all after `STOPPED`. A case asserts `Violations()` is empty beside
+/// only from inside the service main, a legal order of states, a start's and a stop's checkpoint
+/// that only ever advance, and nothing at all after `STOPPED`. A case asserts `Violations()` is empty beside
 /// what it asserts about the reports. Thread-safe where the SCM is reached from more than one
 /// thread -- a stop's progress is reported from a reporter of its own while the body runs -- so a
 /// case may read the reports while they arrive.
@@ -157,9 +158,10 @@ class ScriptedServiceControlManager final: public IServiceControlManager
             _violations.emplace_back("a status was set after STOPPED");
         if (!LegalAfter(report.state))
             _violations.emplace_back("a status was set out of order");
-        if (report.state == ServiceState::StopPending && !_reports.empty()
-            && _reports.back().state == ServiceState::StopPending && report.checkPoint <= _reports.back().checkPoint)
-            _violations.emplace_back("a stop's checkpoint did not advance");
+        for (auto const& rule: PendingRules)
+            if (report.state == rule.state && !_reports.empty() && _reports.back().state == rule.state
+                && report.checkPoint <= _reports.back().checkPoint)
+                _violations.emplace_back(rule.violation);
         _stopped = _stopped || report.state == ServiceState::Stopped;
         _reports.push_back(report);
         // Outside this fake's own lock: the action stands in for the world after the dispatcher
@@ -234,6 +236,19 @@ class ScriptedServiceControlManager final: public IServiceControlManager
     {
         std::optional<ServiceState> from; ///< The last state reported, or none yet.
         ServiceState to;                  ///< The state that may follow it.
+    };
+
+    /// A pending state, whose checkpoint must advance from one report of it to the next, and the
+    /// violation that names one that did not.
+    struct PendingRule
+    {
+        ServiceState state;         ///< The pending state.
+        std::string_view violation; ///< What a checkpoint that stood still is recorded as.
+    };
+
+    static constexpr std::array PendingRules {
+        PendingRule { .state = ServiceState::StartPending, .violation = "a start's checkpoint did not advance" },
+        PendingRule { .state = ServiceState::StopPending, .violation = "a stop's checkpoint did not advance" },
     };
 
     static constexpr std::array LegalTransitions {

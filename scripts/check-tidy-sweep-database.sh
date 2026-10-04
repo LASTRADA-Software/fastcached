@@ -564,9 +564,11 @@ and again, three hundred lines further down:
         "$(printf '%s\n' "$got" | sed -n 's/^\(refused\):.*/\1/p')"
 
     # No scratch file for the search's stderr is a REFUSAL line too, never an exit from inside
-    # the process substitution: `mktemp` pointed at a directory that does not exist.
+    # the process substitution. The failure is a function shadowing `mktemp`, never a `TMPDIR`
+    # naming a directory that does not exist: macOS's `mktemp` made its file anyway, and the
+    # case read a missing refusal on a run that never reached the arm it tests.
     printf 'vendor/upstream\n' > "$tree/scripts/lib/third-party-roots.txt"
-    got="$( cd "$tree" && TMPDIR="$scratch/no-such-directory" DocumentationSites 2>/dev/null )"
+    got="$( cd "$tree" && mktemp() { return 1; } && DocumentationSites 2>/dev/null )"
     Report "scan with no scratch file for stderr refuses as a line" "refused:no scratch file" \
         "$(printf '%s\n' "$got" | grep -o '^refused:no scratch file' || true)"
 

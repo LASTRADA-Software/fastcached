@@ -424,6 +424,47 @@ TEST_CASE("A mint whose key file cannot be made its owner's alone writes no key 
     }
 }
 
+TEST_CASE("A mint on a volume that cannot sync a directory keeps its key and any other failed sync refuses it",
+          "[node][identity][key]")
+{
+    // B4-7: the mint judges its directory sync by the table every state write uses. Refused on such
+    // a volume, the FIRST start failed while the second read the key it had written and ran degraded.
+    // Every row of this platform's table, so a row the mint does not honour cannot hide behind another.
+    for (auto const& code: Consensus::UnsupportedDirectorySyncAnswers())
+    {
+        CAPTURE(code.value());
+        ScratchDirectory const scratch { "node-key-unsyncable" };
+        auto guard = ScriptedNodeKeyGuard::OwnerOnly();
+        guard.DirectorySyncFails({ .step = Consensus::DirectorySyncStep::Flush, .code = code });
+        ScriptedSecureRandom random { ScriptedSecureRandom::Ascending(Ed25519SeedBytes, 0x20) };
+
+        auto const minted = Resolved(scratch.Path(), random, guard);
+        CHECK(minted.origin == NodeKeyOrigin::Minted);
+        CHECK(guard.Synced() == std::vector { scratch.Path() });
+        CHECK(BytesOf(scratch.Path() / NodeKeyFileName).size() == NodeKeyFileBytes);
+    }
+
+    // The control, both ways: a sync that FAILED rather than one the volume does not offer -- an I/O
+    // error from the flush, and a table code from the OPEN, which is a bad request rather than a
+    // volume property -- still refuses, so the table did not turn into "ignore the sync".
+    for (auto const failure:
+         { Consensus::DirectorySyncFailure { .step = Consensus::DirectorySyncStep::Flush,
+                                             .code = std::make_error_code(std::errc::io_error) },
+           Consensus::DirectorySyncFailure { .step = Consensus::DirectorySyncStep::Open,
+                                             .code = Consensus::UnsupportedDirectorySyncAnswers().front() } })
+    {
+        CAPTURE(failure.code.value());
+        ScratchDirectory const scratch { "node-key-sync-failed" };
+        auto guard = ScriptedNodeKeyGuard::OwnerOnly();
+        guard.DirectorySyncFails(failure);
+        ScriptedSecureRandom random { ScriptedSecureRandom::Ascending(Ed25519SeedBytes, 0x20) };
+
+        auto const refusal = Refused(scratch.Path(), random, guard);
+        CHECK(refusal.fault == NodeKeyFault::WriteFailed);
+        CHECK(refusal.message.contains("cannot sync its directory"));
+    }
+}
+
 TEST_CASE("One exposure rule judges a key at both ends and differs in one cell", "[node][identity][key][secret]")
 {
     // Walked over the enumeration, so a new exposure is judged here with no edit. Refused at read
@@ -735,6 +776,11 @@ class RacingReaderGuard final: public INodeKeyFileGuard
     [[nodiscard]] std::expected<bool, std::error_code> OthersMayWrite(std::filesystem::path const& entry) override
     {
         return _real.OthersMayWrite(entry);
+    }
+    [[nodiscard]] std::expected<void, Consensus::DirectorySyncFailure> SyncDirectory(
+        std::filesystem::path const& directory) override
+    {
+        return _real.SyncDirectory(directory);
     }
     [[nodiscard]] SecretExposure Protect(std::filesystem::path const& file) override
     {

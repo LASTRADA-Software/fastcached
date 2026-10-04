@@ -1062,8 +1062,42 @@ using MsiRegistry = std::map<std::pair<std::string, std::string>, std::string>;
     return properties;
 }
 
+/// Whether @p condition holds over @p properties, for the shapes the fragment's DERIVED rows use: a
+/// bare property (set and not empty), `NAME = "value"`, and `NOT (NAME = "value")`.
+/// @param condition The row's Condition attribute, entities as the fragment spells them.
+/// @param properties What the transaction holds.
+/// @return Whether the row sets its property.
+[[nodiscard]] bool MsiConditionHolds(std::string condition, std::map<std::string, std::string>& properties)
+{
+    constexpr std::string_view Quote = "&quot;";
+    auto at = condition.find(Quote);
+    while (at != std::string::npos)
+    {
+        condition.replace(at, Quote.size(), "\"");
+        at = condition.find(Quote, at + 1);
+    }
+    auto const negated = condition.starts_with("NOT (") && condition.ends_with(")");
+    if (negated)
+        condition = condition.substr(5, condition.size() - 6);
+    auto holds = false;
+    if (auto const equals = condition.find(" = \""); equals != std::string::npos && condition.ends_with('"'))
+        holds = properties[condition.substr(0, equals)] == condition.substr(equals + 4, condition.size() - equals - 5);
+    else
+        holds = !properties[condition].empty();
+    return negated ? !holds : holds;
+}
+
+/// Whether a `SetProperty` row of the fragment DERIVES a value a command is formatted with: an
+/// argument row (`SetFastCache...Argument`) or the start type a restore registers.
+/// @param id The row's Id.
+/// @return Whether `MsiFormattedCommand` derives it.
+[[nodiscard]] bool MsiDerivedProperty(std::string_view id)
+{
+    return id.ends_with("Argument") || id.ends_with("StartModeBefore");
+}
+
 /// The command an `ExeCommand` of the fragment runs, formatted over @p properties, with the
-/// fragment's own argument rows (`SetFastCache...Argument`) derived first.
+/// fragment's own derived rows (`MsiDerivedProperty`) applied first.
 /// @param text The fragment.
 /// @param action The custom action's Id.
 /// @param properties What the transaction ended with.
@@ -1079,10 +1113,9 @@ using MsiRegistry = std::map<std::pair<std::string, std::string>, std::string>;
     for (auto const& element: MsiElements(text, "<SetProperty ", "/>"))
     {
         auto const id = MsiAttribute(element, "Id");
-        if (!id.ends_with("Argument"))
+        if (!MsiDerivedProperty(id))
             continue;
-        auto const condition = MsiAttribute(element, "Condition");
-        if (properties[condition].empty())
+        if (!MsiConditionHolds(MsiAttribute(element, "Condition"), properties))
             continue;
         auto value = MsiAttribute(element, "Value");
         for (auto const& [name, held]: properties)
@@ -1104,9 +1137,9 @@ using MsiRegistry = std::map<std::pair<std::string, std::string>, std::string>;
     // Every property the transaction knows, the derived arguments included; one it never set is empty.
     for (auto const& [name, held]: properties)
         command = Formatted(std::move(command), name, held);
-    // A derived argument whose condition did not hold is empty: each one the fragment declares.
+    // A derived value whose condition did not hold is empty: each one the fragment declares.
     for (auto const& element: MsiElements(text, "<SetProperty ", "/>"))
-        if (auto const id = MsiAttribute(element, "Id"); id.ends_with("Argument"))
+        if (auto const id = MsiAttribute(element, "Id"); MsiDerivedProperty(id))
             command = Formatted(std::move(command), id, "");
     return command;
 }
@@ -1326,6 +1359,10 @@ struct MsiRollbackWrite
         auto command = MsiAttribute(action, "ExeCommand");
         if (!command.contains("reg.exe"))
             continue;
+        // A rollback that only READS the registry -- the restart twins ask whether a service was
+        // running -- writes no remembered value back and deletes none.
+        if (!command.contains(" add ") && !command.contains(" delete "))
+            continue;
         constexpr std::string_view Quote = "&quot;";
         auto quote = command.find(Quote);
         while (quote != std::string::npos)
@@ -1442,6 +1479,21 @@ TEST_CASE("A failed MSI transaction puts back the remembered values and the node
         CHECK_FALSE(cfg.advertiseExplicit);
         CHECK(cfg.fleetSeeds == std::vector<std::string> { "office-a.vpn.example:6674" });
         CHECK(PinTextOf(cfg) == FirstPin);
+
+        // And the start type it found, never always auto (B4-4): a manual node restored auto would
+        // start at the next boot although nobody asked it to. The raw search spells a DWORD `#3`.
+        for (auto const& [spelled, wanted]:
+             { std::pair { "#2", ServiceStart::Auto }, std::pair { "#3", ServiceStart::Manual } })
+        {
+            INFO(spelled);
+            auto withStart = failed;
+            withStart["FASTCACHE_NODE_START_BEFORE"] = spelled;
+            auto const again = SplitArguments(MsiFormattedCommand(text, "FastCacheNodeRestoreRegistration", withStart));
+            REQUIRE(again.size() > 1);
+            auto const reparsed = ParsedFirstStart(std::span { again }.subspan(1));
+            REQUIRE(reparsed.has_value());
+            CHECK(Testing::Unwrap(reparsed).serviceStart == wanted);
+        }
     }
     {
         INFO("a first install fails after remembering: nothing is left remembered");

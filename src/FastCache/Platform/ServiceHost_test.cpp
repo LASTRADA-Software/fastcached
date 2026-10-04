@@ -24,6 +24,7 @@
 
 #include <tests/BoundedWait.hpp>
 #include <tests/DaemonHostFakes.hpp>
+#include <tests/SteppedDrainWait.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -79,6 +80,44 @@ struct ScriptedService
     ScriptedServiceControlManager* manager = nullptr; ///< Owned by `host`.
     std::unique_ptr<ServiceHost> host;                ///< The subject.
 };
+
+/// A start that waits for its body to serve: a checkpoint a case can see advance, and a ceiling far
+/// enough off that only the ceiling case meets it.
+constexpr StartPendingPlan TestStartPlan { .waitHint = std::chrono::milliseconds { 9'000 },
+                                           .checkpointEvery = std::chrono::milliseconds { 1 },
+                                           .ceiling = std::chrono::hours { 1 } };
+
+/// A service host told to report RUNNING when its body serves, over a scripted manager.
+struct ServingWhenReadyService
+{
+    /// @param plan How the start reports while it waits.
+    /// @param wait Where the start's reporter spends its gaps; must outlive this.
+    ServingWhenReadyService(StartPendingPlan plan, IDrainWait& wait)
+    {
+        auto owned = std::make_unique<ScriptedServiceControlManager>(ServiceManagerPresence::Present);
+        manager = owned.get();
+        host = std::make_unique<ServiceHost>(
+            "FastCachedTest",
+            std::move(owned),
+            controls,
+            ServiceHostOptions { .stop = TestStopPlan, .readiness = ServiceReadiness::BodySignals, .start = plan },
+            wait);
+    }
+
+    DaemonControls controls;                          ///< What the body marks serving.
+    ScriptedServiceControlManager* manager = nullptr; ///< Owned by `host`.
+    std::unique_ptr<ServiceHost> host;                ///< The subject.
+};
+
+/// @return The checkpoints of every `StartPending` report, in order.
+[[nodiscard]] std::vector<std::uint32_t> StartCheckpoints(ScriptedServiceControlManager const& manager)
+{
+    std::vector<std::uint32_t> points;
+    for (auto const& report: manager.Reports())
+        if (report.state == ServiceState::StartPending)
+            points.push_back(report.checkPoint);
+    return points;
+}
 
 /// @p states with every run of one state folded to one: a stop reports `StopPending` as often as
 /// its checkpoint advances, which depends on how long the body takes to return.
@@ -150,6 +189,111 @@ TEST_CASE("A serving start reports starting and running before its body and its 
         REQUIRE_FALSE(clean.manager->Reports().empty());
         CHECK(clean.manager->Reports().back().exit == ServiceExit { .win32ExitCode = 0, .serviceSpecificExitCode = 0 });
     }
+}
+
+TEST_CASE("A start told to wait reports RUNNING only once its body serves and advances its checkpoint until then",
+          "[platform][service]")
+{
+    // B4-6: `net start` and an installer's start action return when the service leaves START_PENDING.
+    // Reported as the body began, RUNNING answered for a node that then could not bind its port. So
+    // the body's own "I serve" is what RUNNING waits for, and the wait shows progress meanwhile.
+    ServingWhenReadyService service { TestStartPlan, DefaultDrainWait() };
+    auto progressed = false;
+    auto runningBeforeServing = true;
+    auto runningAfterServing = false;
+
+    CHECK(service.host->Run([&] {
+        progressed = Testing::WaitUntil(
+            "the start's checkpoint to reach 3",
+            [&service] { return std::ranges::contains(StartCheckpoints(*service.manager), 3U); },
+            [&service] { return std::format("{} StartPending report(s)", StartCheckpoints(*service.manager).size()); });
+        runningBeforeServing = std::ranges::contains(service.manager->States(), ServiceState::Running);
+        service.controls.MarkServing();
+        runningAfterServing = Testing::WaitUntil(
+            "RUNNING after the body served",
+            [&service] { return std::ranges::contains(service.manager->States(), ServiceState::Running); },
+            [&service] { return std::format("{} report(s)", service.manager->Reports().size()); });
+        return 0;
+    }) == 0);
+
+    CHECK(progressed);
+    CHECK_FALSE(runningBeforeServing);
+    CHECK(runningAfterServing);
+    CHECK(service.manager->Violations().empty());
+    CHECK(Collapsed(service.manager->States())
+          == std::vector { ServiceState::StartPending, ServiceState::Running, ServiceState::Stopped });
+    auto const points = StartCheckpoints(*service.manager);
+    CHECK(points.front() == 0);
+    CHECK(std::ranges::is_sorted(points));
+    CHECK(std::ranges::adjacent_find(points) == points.end());
+    for (auto const& report: service.manager->Reports())
+    {
+        if (report.state == ServiceState::StartPending)
+            CHECK_FALSE(report.acceptsControls);
+        if (report.state == ServiceState::StartPending && report.checkPoint > 0)
+            CHECK(report.waitHintMs == TestStartPlan.waitHint.count());
+        if (report.state == ServiceState::Running)
+            CHECK(report.acceptsControls);
+    }
+}
+
+TEST_CASE("A start told to wait whose body returns before serving is reported stopped and never running",
+          "[platform][service][refusal]")
+{
+    // The case that made the wait worth having: a body that refuses inside itself -- a port it cannot
+    // bind -- must leave `net start` failing, so RUNNING must never have been said.
+    ServingWhenReadyService service { TestStartPlan, DefaultDrainWait() };
+
+    CHECK(service.host->Run([&service] {
+        std::ignore = Testing::WaitUntil(
+            "the start's first checkpoint",
+            [&service] { return std::ranges::contains(StartCheckpoints(*service.manager), 1U); },
+            [&service] { return std::format("{} report(s)", service.manager->Reports().size()); });
+        return 78;
+    }) == 78);
+
+    CHECK(service.manager->Violations().empty());
+    CHECK(Collapsed(service.manager->States()) == std::vector { ServiceState::StartPending, ServiceState::Stopped });
+    CHECK(service.manager->Reports().back().exit
+          == ServiceExit { .win32ExitCode = ServiceSpecificError, .serviceSpecificExitCode = 78 });
+}
+
+TEST_CASE("Past its ceiling a start's checkpoint stands still and a body that serves late is still reported running",
+          "[platform][service]")
+{
+    // The ceiling bounds a WAITER, never the start: an installer's `net start` gives up one hint after
+    // the checkpoint stops, and a body that serves after that must still reach RUNNING, or nothing could
+    // ever stop it. On a stepped clock, so the ceiling is met at once and the count is exact.
+    constexpr auto Ceiling = std::chrono::milliseconds { 10 };
+    constexpr auto SleepsBeforeServing = 40;
+    DaemonControls* controls = nullptr;
+    Testing::SteppedDrainWait wait { [&controls, &wait] {
+        if (wait.Sleeps() == SleepsBeforeServing && controls != nullptr)
+            controls->MarkServing();
+    } };
+    ServingWhenReadyService service { StartPendingPlan { .waitHint = std::chrono::milliseconds { 9'000 },
+                                                         .checkpointEvery = std::chrono::milliseconds { 1 },
+                                                         .ceiling = Ceiling },
+                                      wait };
+    controls = &service.controls;
+    auto running = false;
+
+    CHECK(service.host->Run([&service, &running] {
+        running = Testing::WaitUntil(
+            "RUNNING after the late serve",
+            [&service] { return std::ranges::contains(service.manager->States(), ServiceState::Running); },
+            [&service] { return std::format("{} report(s)", service.manager->Reports().size()); });
+        return 0;
+    }) == 0);
+
+    CHECK(running);
+    CHECK(service.manager->Violations().empty());
+    CHECK(Collapsed(service.manager->States())
+          == std::vector { ServiceState::StartPending, ServiceState::Running, ServiceState::Stopped });
+    // One checkpoint per millisecond of the ceiling and none after it, though the reporter went on
+    // polling until the body served.
+    CHECK(StartCheckpoints(*service.manager).back() == Ceiling.count());
+    CHECK(wait.Sleeps() >= SleepsBeforeServing);
 }
 
 TEST_CASE("A service stops and reloads on the controls its manager delivers", "[platform][service]")
@@ -317,6 +461,16 @@ TEST_CASE("The scripted service manager holds a caller to the SCM's rules", "[pl
               "a status was set after STOPPED",
               "a status was set out of order",
           });
+
+    // And a start's checkpoint, which a start that waits for its body to serve advances.
+    ScriptedServiceControlManager starting { ServiceManagerPresence::Present };
+    CHECK(starting.Dispatch("x", [&starting] {
+        std::ignore = starting.RegisterHandler("x", [](ServiceControlRequest, std::uint32_t) { return true; });
+        starting.SetStatus(ServiceStatusReport { .state = ServiceState::StartPending, .waitHintMs = 0, .checkPoint = 2 });
+        starting.SetStatus(ServiceStatusReport { .state = ServiceState::StartPending, .waitHintMs = 0, .checkPoint = 2 });
+        starting.SetStatus(ServiceStatusReport { .state = ServiceState::Stopped, .waitHintMs = 0 });
+    }) == DispatchOutcome::Dispatched);
+    CHECK(starting.Violations() == std::vector<std::string> { "a start's checkpoint did not advance" });
 }
 
 TEST_CASE("A stop reports its progress until the body returns, and a second stop does not restart it", "[platform][service]")

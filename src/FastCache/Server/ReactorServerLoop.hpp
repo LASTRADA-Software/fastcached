@@ -92,6 +92,10 @@ struct ReactorServerOptions
     ///
     /// Must outlive the run.
     core::platform::IClock* clock { nullptr };
+
+    /// Run once every acceptor is armed, right after the readiness line (`ReadinessAnnouncer`):
+    /// how the daemon tells its service host it serves (`DaemonControls::MarkServing`). Empty for none.
+    std::function<void()> onServing {};
 };
 
 /// Run the reactor-driven server loop using the platform's native
