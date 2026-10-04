@@ -2021,17 +2021,26 @@ TEST_CASE("The operator's surface judges an admission against the roster before 
     // #178. `Offer` asks `ValidateAgainst` with the state the scheduler reads, so a refusal
     // only the ROSTER can answer reaches the operator who typed the command -- rather than
     // the command being appended, replicated and then dropped by `Apply` where nobody reads
-    // it. The reachable one through this verb: an id the cluster admits by key as a
-    // principal is not also a member.
+    // it. The reachable one through this verb: a key another id already holds -- one key proves
+    // one identity.
     Admitting fleet;
-    fleet.cluster.state.principals.push_back(
-        Cluster::ClusterPrincipal { .id = "worker-1", .publicKey = {}, .role = Cluster::PrincipalRole::Worker });
+    fleet.cluster.state.members.push_back(
+        Cluster::ClusterMember { .id = "worker-1",
+                                 .raftEndpoint = {},
+                                 .schedulerEndpoint = {},
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                 .seat = Cluster::MemberSeat::Learner,
+                                 .publicKey = Testing::TestKeyPair("worker-1").PublicKey() });
 
-    auto const refused = fleet.Service().ClusterAdmit(
-        Insider, "worker-1", "10.0.0.9:6675", std::nullopt, std::nullopt, Cluster::MemberSeat::Voter);
+    auto const refused = fleet.Service().ClusterAdmit(Insider,
+                                                      "worker-2",
+                                                      "10.0.0.9:6675",
+                                                      std::nullopt,
+                                                      std::string_view { KeyTextOf("worker-1") },
+                                                      Cluster::MemberSeat::Voter);
     REQUIRE(refused.status == Wire::Status::Error);
     CHECK(refused.error == Wire::ErrorCode::InvalidClusterChange);
-    CHECK(refused.message.contains("is a principal"));
+    CHECK(refused.message.contains("is already worker-1's key"));
     CHECK(fleet.cluster.proposed.empty());
     CHECK(refused.payload.empty());
 
@@ -2169,14 +2178,14 @@ TEST_CASE("An admission whose key is not one is refused and counted before anyth
     CHECK(counted(fleet) == expected);
 }
 
-TEST_CASE("An admission under a small-order or non-canonical key is refused by name, whichever verb carries it",
+TEST_CASE("An admission under a small-order or non-canonical key is refused by name",
           "[distributed][scheduler][cluster-admit][identity][security]")
 {
-    // Three doors onto the leader: a member's key as TEXT, a worker's as TEXT, and a principal's
-    // as BYTES, which is how an enrollment approval hands over the key its row holds and which the
-    // one parser never sees. Each refuses before anything is proposed, on the malformed-key row,
-    // naming the fault -- a small-order key admitted is one anybody can prove. The control is a
-    // real key through the same three doors, proposed and counting nothing.
+    // The one door onto the leader that admits a machine -- a member's key as TEXT; the principal
+    // door, which took a key as bytes, retired with principal mode -- refuses a key that parses but
+    // proves nothing before anything is proposed, on the malformed-key row, naming the fault: a
+    // small-order key admitted is one anybody can prove. The control is a real key through the
+    // same door, proposed and counting nothing.
     auto const smallOrder = Ed25519PublicKey {};
     auto const nonCanonical = [] {
         auto key = Ed25519PublicKey {};
@@ -2185,25 +2194,19 @@ TEST_CASE("An admission under a small-order or non-canonical key is refused by n
         key.back() = std::byte { 0x7F };
         return key;
     }();
-    auto const admitThrough = [](SchedulerService& service, std::string_view door, Ed25519PublicKey const& key) {
+    auto const admitThrough = [](SchedulerService& service, Ed25519PublicKey const& key) {
         auto const text = FormatEd25519PublicKey(key);
-        if (door == "member")
-            return service.ClusterAdmit(
-                Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::string_view { text }, Cluster::MemberSeat::Voter);
-        if (door == "worker")
-            return service.ClusterAdmitWorker(Insider, "worker-c", text);
-        return service.AdmitPrincipal(Insider, "worker-c", key, Cluster::PrincipalRole::Worker);
+        return service.ClusterAdmit(
+            Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::string_view { text }, Cluster::MemberSeat::Voter);
     };
 
-    for (auto const door: { std::string_view { "member" }, std::string_view { "worker" }, std::string_view { "principal" } })
     {
-        INFO("door: " << door);
         Admitting fleet;
         auto expected = std::uint64_t { 0 };
         for (auto const& [key, fault]: { std::pair { smallOrder, PublicKeyFault::SmallOrder },
                                          std::pair { nonCanonical, PublicKeyFault::NonCanonical } })
         {
-            auto const reply = admitThrough(fleet.Service(), door, key);
+            auto const reply = admitThrough(fleet.Service(), key);
             REQUIRE(reply.status == Wire::Status::Error);
             CHECK(reply.error == Wire::ErrorCode::InvalidClusterChange);
             CHECK(reply.message.contains(DescribePublicKeyFault(fault)));
@@ -2211,7 +2214,7 @@ TEST_CASE("An admission under a small-order or non-canonical key is refused by n
             CHECK(fleet.leading.metrics.Read(IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey) == ++expected);
         }
 
-        auto const accepted = admitThrough(fleet.Service(), door, Testing::TestKeyPair("node-c").PublicKey());
+        auto const accepted = admitThrough(fleet.Service(), Testing::TestKeyPair("node-c").PublicKey());
         CHECK(accepted.status == Wire::Status::Ok);
         CHECK(fleet.cluster.proposed.size() == 1);
         CHECK(fleet.leading.metrics.Read(IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey) == expected);

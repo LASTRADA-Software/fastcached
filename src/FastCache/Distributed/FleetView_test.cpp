@@ -153,7 +153,6 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
         .members = { Cluster::ClusterMember {
             .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = "10.0.0.2:6676", .publicKey = {} } },
         .settings = {},
-        .principals = {},
         // A revocation for the tier's reason: this case walks the TABLES, and a
         // section rendering from an empty vector would be covered by asserting
         // almost nothing about it.
@@ -810,22 +809,19 @@ TEST_CASE("A member that never announced and one a re-admit cleared render diffe
                              .key = "quiet",
                              .value = "10.0.0.1:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = keyOf(0x51),
-                             .role = std::nullopt });
+                             .publicKey = keyOf(0x51) });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "moved",
                              .value = "10.0.0.2:6675",
                              .schedulerEndpoint = "10.0.0.2:6676",
-                             .publicKey = keyOf(0x52),
-                             .role = std::nullopt });
+                             .publicKey = keyOf(0x52) });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "moved",
                              .value = "10.0.0.2:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = std::nullopt,
-                             .role = std::nullopt });
+                             .publicKey = std::nullopt });
     snapshot.cluster = state;
 
     // The text section: one row each, and the rows differ in the state column while
@@ -1717,7 +1713,6 @@ TEST_CASE("A peer that got its bytes past the door cannot make the whole fleet's
         .members = { Cluster::ClusterMember {
             .id = "n\x80\x80", .raftEndpoint = "10.0.0.2:6675\xC3", .schedulerEndpoint = "\xE2\x82", .publicKey = {} } },
         .settings = {},
-        .principals = {},
         // And the id a revocation carries, which is the
         // id the forgotten record held -- the same door.
         .revokedKeys = { Cluster::RevokedKey { .id = "n\x80gone", .publicKey = {} } }
@@ -2236,19 +2231,17 @@ TEST_CASE("The revoked keys reach every surface, and absent is not the same as n
              { std::pair { "w7", std::uint8_t { 0x77 } }, std::pair { "w8", std::uint8_t { 0x88 } } })
         {
             Apply(state,
-                  Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
+                  Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
                                      .key = id,
                                      .value = {},
                                      .schedulerEndpoint = {},
-                                     .publicKey = keyOf(fill),
-                                     .role = Cluster::PrincipalRole::Worker });
+                                     .publicKey = keyOf(fill) });
             Apply(state,
                   Cluster::Command { .kind = Cluster::CommandKind::Forget,
                                      .key = id,
                                      .value = {},
                                      .schedulerEndpoint = {},
-                                     .publicKey = std::nullopt,
-                                     .role = std::nullopt });
+                                     .publicKey = std::nullopt });
         }
         REQUIRE(state.revokedKeys.size() == 2);
         snapshot.cluster = state;

@@ -260,7 +260,6 @@ TEST_CASE("An approval remembers each voter where the cluster recorded its 0xFC 
                                              .publicKey = Testing::TestKeyPair("n-laptop").PublicKey(),
                                              .schedulerEndpoint = "laptop:6674" },
                      voter("n-office", "office.corp.example:6676") },
-        .principals = {},
         .revoked = {},
     };
     Testing::InMemoryFormationStore store;

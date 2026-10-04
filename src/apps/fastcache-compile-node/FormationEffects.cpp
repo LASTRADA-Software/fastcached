@@ -111,7 +111,7 @@ std::expected<void, std::string> CheckAdmission(JoinerIdentity const& self,
     if (!decoded.has_value())
         return std::unexpected { std::format(
             "the fleet admitted {} with a roster this build cannot read: {}", self.nodeId, decoded.error().context) };
-    if (!RosterRecordsJoiner(*decoded, self.nodeId, self.publicKey, self.role))
+    if (!RosterRecordsJoiner(*decoded, self.nodeId, self.publicKey))
         return std::unexpected { std::format("the fleet said {} was admitted, and the roster it sent does not record "
                                              "{} as a {} under this machine's key: an operator approved another key "
                                              "for this id",

@@ -42,10 +42,9 @@ inline constexpr std::chrono::minutes LeaderSilenceBound { 65 };
 /// What `--node-status` says about the roster a node verifies grants against (#178).
 struct RosterSummary
 {
-    std::uint64_t version {};    ///< `ClusterState::rosterVersion`.
-    std::uint32_t voters {};     ///< Members that vote.
-    std::uint32_t principals {}; ///< Machines admitted by key.
-    std::uint32_t revoked {};    ///< Keys the cluster will never admit again.
+    std::uint64_t version {}; ///< `ClusterState::rosterVersion`.
+    std::uint32_t voters {};  ///< Members that vote.
+    std::uint32_t revoked {}; ///< Keys the cluster will never admit again.
     /// The identity keys of the voters that have one, in id order: what `NODE-STATUS` offers as the
     /// keys a `--fleet-id` pin names.
     std::vector<Ed25519PublicKey> voterKeys;

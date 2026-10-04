@@ -134,8 +134,7 @@ struct Fixture
                               .key = std::move(key),
                               .value = std::move(value),
                               .schedulerEndpoint = std::move(scheduler),
-                              .publicKey = std::nullopt,
-                              .role = std::nullopt };
+                              .publicKey = std::nullopt };
 }
 
 /// The identity key a case admits @p id under: a member is never admitted without one.
@@ -898,19 +897,17 @@ TEST_CASE("A status report shows a learner recorded with no consensus endpoint a
     CHECK(rendered.contains("seat=voter raft=10.0.0.1:6680"));
 }
 
-TEST_CASE("A status report shows each member's key, the principals and the revoked keys", "[node][clusteradmin][identity]")
+TEST_CASE("A status report shows each member's key and the revoked keys, and no principals section",
+          "[node][clusteradmin][identity]")
 {
-    // #178. Whole keys, in the one spelling `--node-status` prints on the machine itself, and
+    // #178. Whole keys, in the one spelling `fastcache-cli node` prints on the machine itself, and
     // ABSENT as the dash every other absent field here is -- never an empty `key=` somebody
-    // could read as a key. The two new sections say "(none)" when empty, for the members'
-    // reason: after a revocation an operator needs "none" to be an answer.
+    // could read as a key. The revoked section says "(none)" when empty, for the members'
+    // reason: after a revocation an operator needs "none" to be an answer. Principal mode is
+    // retired, so no state carries one and the report has no section for them.
     auto keyed = Cmd(Cluster::CommandKind::AddMember, "keyed", "10.0.0.1:6680");
     keyed.publicKey = Ed25519PublicKey {};
     keyed.publicKey->fill(std::byte { 0x2B });
-    // A principal an earlier build admitted: no verb this build sends records one, and the state
-    // may still carry it, so it is placed in the state directly.
-    auto principal = Cluster::ClusterPrincipal { .id = "worker-1", .publicKey = {} };
-    principal.publicKey.fill(std::byte { 0x2C });
     // Revoked the one way a key is: its holder was forgotten (#1555).
     auto revoked = Cmd(Cluster::CommandKind::AddLearner, "gone", "");
     revoked.publicKey = Ed25519PublicKey {};
@@ -922,7 +919,7 @@ TEST_CASE("A status report shows each member's key, the principals and the revok
         Apply(state, Admitted(Cluster::CommandKind::AddMember, "plain", "10.0.0.2:6680"));
         auto const rendered = RenderClusterState(state);
         CHECK(rendered.contains(std::format("key={}", FormatEd25519PublicKey(KeyOf("plain")))));
-        CHECK(rendered.contains("principals (0):\n  (none)"));
+        CHECK_FALSE(rendered.contains("principals"));
         CHECK(rendered.contains("revoked keys (0):\n  (none)"));
     }
 
@@ -930,16 +927,12 @@ TEST_CASE("A status report shows each member's key, the principals and the revok
     {
         Cluster::ClusterState state;
         Apply(state, keyed);
-        state.principals.push_back(principal);
         Apply(state, revoked);
         Apply(state, Cmd(Cluster::CommandKind::Forget, "gone"));
         auto const rendered = InterpretClusterReply(ClusterAction::Status, Cluster::Encode(state));
         REQUIRE(rendered.has_value());
         INFO(*rendered);
         CHECK(rendered->contains(std::format("key={}", FormatEd25519PublicKey(*keyed.publicKey))));
-        CHECK(rendered->contains("principals (1):"));
-        CHECK(rendered->contains("principals (1):\n  worker-1 "));
-        CHECK(rendered->contains(std::format(" key={}\n", FormatEd25519PublicKey(principal.publicKey))));
         CHECK(rendered->contains("revoked keys (1):"));
         CHECK(rendered->contains(std::format("key={}", FormatEd25519PublicKey(*revoked.publicKey))));
     }

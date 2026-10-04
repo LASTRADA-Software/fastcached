@@ -817,16 +817,16 @@ class SchedulerService final: public Cluster::IAnnouncedJoinMemos
     /// @return `Ok` once the entry is appended, or a refusal.
     [[nodiscard]] SchedulerReply ClusterSet(CallerContext const& caller, std::string_view name, std::string_view value);
 
-    /// Forget a machine: remove the id wherever the cluster records it, as a member or as
-    /// an enrolled principal, and revoke the key it was admitted under (#1555).
+    /// Forget a machine: remove the id's member record and revoke the key it was admitted
+    /// under (#1555).
     ///
     /// The one membership change nothing automatic makes: discovery only ever
     /// adds, because a peer vanishes from a broadcast far more often than it
     /// leaves. Removing is an operator's decision and this is where they make it.
-    /// One verb for both lists and for the key, because they are one intention --
+    /// One verb for the record and for the key, because they are one intention --
     /// see `Cluster::CommandKind::Forget`.
     /// @param caller Who is asking.
-    /// @param memberId Who to forget: a member's id or a principal's.
+    /// @param memberId Who to forget: a member's id.
     /// @return `Ok` once the entry is appended, or a refusal.
     [[nodiscard]] SchedulerReply ClusterForget(CallerContext const& caller, std::string_view memberId);
 
@@ -890,38 +890,6 @@ class SchedulerService final: public Cluster::IAnnouncedJoinMemos
                                               std::optional<std::string_view> schedulerEndpoint,
                                               std::optional<std::string_view> publicKey,
                                               std::optional<Cluster::MemberSeat> seat);
-
-    /// Admit a PRINCIPAL: a machine the cluster knows by its key and never counts (#178).
-    ///
-    /// The verb an approved `Worker` enrollment reaches, beside `ClusterAdmit` for a
-    /// `Member` one, and gated exactly as it is -- leadership, membership and the credential
-    /// -- because what it changes is replicated state. It takes the key as a KEY rather than
-    /// as text: its one caller read it off the wire as 32 bytes, and a round trip through a
-    /// spelling would be a second parser to be wrong in. A key the cluster has revoked, or
-    /// holds under another id, is `Cluster::ValidateAgainst`'s refusal, in `Offer`.
-    /// @param caller Who is asking.
-    /// @param principalId The principal's identity.
-    /// @param publicKey The key it proves that identity with.
-    /// @param role What it is admitted to do.
-    /// @return `Ok` once the entry is appended, or a refusal.
-    [[nodiscard]] SchedulerReply AdmitPrincipal(CallerContext const& caller,
-                                                std::string_view principalId,
-                                                Ed25519PublicKey const& publicKey,
-                                                Cluster::PrincipalRole role);
-
-    /// Admit a WORKER principal an operator names by id and key, with no enrollment window (#178).
-    ///
-    /// `AdmitPrincipal` behind the one parser for a key an operator typed: the text arrives as
-    /// `ClusterAdmit`'s does and is refused by `MalformedAdmissionKey`'s row when it is not a key.
-    /// Answered with `ClusterAdmitReceipt`, the endpoint field empty, spelling back the key the
-    /// command RECORDED.
-    /// @param caller Who is asking.
-    /// @param workerId The id the worker minted into its `--cluster-dir`.
-    /// @param publicKey Its key, as `--print-identity` printed it.
-    /// @return The receipt, or why it was refused.
-    [[nodiscard]] SchedulerReply ClusterAdmitWorker(CallerContext const& caller,
-                                                    std::string_view workerId,
-                                                    std::string_view publicKey);
 
     /// Refuse a verb only a machine that proved its identity may send, unless @p caller did (#178).
     ///

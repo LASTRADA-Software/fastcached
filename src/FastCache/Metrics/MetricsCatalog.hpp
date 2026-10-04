@@ -1307,9 +1307,8 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
     { .counter = IMetricsSink::Counter::NodeTicketsRefusedUnknownMachine,
       .prometheusName = "fastcache_node_tickets_refused_unknown_machine_total",
       .help = "Machine tickets naming a machine this node's current roster holds no live key for, and signed by no "
-              "key it revoked. Two causes: a machine not admitted, or an enrolled principal, which this node does "
-              "not check tickets against, so find out which before admitting anything. Distinct from no_roster, "
-              "which checked nothing.",
+              "key it revoked: a machine the cluster has not admitted. Distinct from no_roster, which checked "
+              "nothing.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeTicketsRefusedForged,
       .prometheusName = "fastcache_node_tickets_refused_forged_total",

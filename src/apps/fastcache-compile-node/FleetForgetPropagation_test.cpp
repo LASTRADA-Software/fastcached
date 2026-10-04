@@ -105,7 +105,7 @@ struct Machine
     NullLogger logger;
     NodeMembership membership { cfg, logger };
 
-    /// Apply a committed forget of @p id, as consensus would: its principal record gone and its
+    /// Apply a committed forget of @p id, as consensus would: its learner record gone and its
     /// key revoked -- `Apply` over the admission and the forget, so the state is one the cluster
     /// could hold.
     /// @param id The machine forgotten.
@@ -114,19 +114,17 @@ struct Machine
         auto state = Cluster::ClusterState {};
         auto const machine = std::string { id };
         Cluster::Apply(state,
-                       Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
+                       Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
                                           .key = machine,
                                           .value = {},
                                           .schedulerEndpoint = {},
-                                          .publicKey = Testing::TestKeyPair(machine).PublicKey(),
-                                          .role = Cluster::PrincipalRole::Worker });
+                                          .publicKey = Testing::TestKeyPair(machine).PublicKey() });
         Cluster::Apply(state,
                        Cluster::Command { .kind = Cluster::CommandKind::Forget,
                                           .key = machine,
                                           .value = {},
                                           .schedulerEndpoint = {},
-                                          .publicKey = std::nullopt,
-                                          .role = std::nullopt });
+                                          .publicKey = std::nullopt });
         membership.PublishCluster(state);
     }
 };

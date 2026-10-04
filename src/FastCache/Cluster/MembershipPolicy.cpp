@@ -182,8 +182,7 @@ MembershipPlan MembershipProposals(ClusterState const& state,
                                            .key = member.id,
                                            .value = member.raftEndpoint,
                                            .schedulerEndpoint = scheduler,
-                                           .publicKey = member.publicKey,
-                                           .role = std::nullopt });
+                                           .publicKey = member.publicKey });
     }
     return plan;
 }
@@ -414,10 +413,9 @@ std::expected<Command, ConsensusError> PrepareForget(ClusterState const& state,
 
     // A forget that would revoke NOTHING is no forget: a machine is forgotten by its key, so
     // one with no key recorded and none held live here would lose its record and nothing
-    // else -- and the next observation of it would admit it again. A member and a principal
-    // always hold a key; an id recorded as neither has only the key this node holds live.
-    auto const recorded = std::ranges::contains(state.members, id, &ClusterMember::id)
-                          || std::ranges::contains(state.principals, id, &ClusterPrincipal::id);
+    // else -- and the next observation of it would admit it again. A member always holds a key;
+    // an id recorded as none has only the key this node holds live.
+    auto const recorded = std::ranges::contains(state.members, id, &ClusterMember::id);
     if (!recorded && !liveKey.has_value())
         return std::unexpected { ConsensusError {
             .code = ConsensusErrorCode::InvalidConfiguration,
@@ -426,12 +424,7 @@ std::expected<Command, ConsensusError> PrepareForget(ClusterState const& state,
                                    id),
             .knownLeader = std::nullopt } };
 
-    return Command { .kind = CommandKind::Forget,
-                     .key = id,
-                     .value = {},
-                     .schedulerEndpoint = {},
-                     .publicKey = liveKey,
-                     .role = std::nullopt };
+    return Command { .kind = CommandKind::Forget, .key = id, .value = {}, .schedulerEndpoint = {}, .publicKey = liveKey };
 }
 
 } // namespace FastCache::Cluster

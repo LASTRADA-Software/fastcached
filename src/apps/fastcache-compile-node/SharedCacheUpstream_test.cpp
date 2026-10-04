@@ -122,8 +122,7 @@ class CountingHome final: public IReactorHome
                                       .key = machine,
                                       .value = "10.0.0.3:6680",
                                       .schedulerEndpoint = std::format("127.0.0.1:{}", port),
-                                      .publicKey = Testing::TestKeyPair(machine).PublicKey(),
-                                      .role = std::nullopt });
+                                      .publicKey = Testing::TestKeyPair(machine).PublicKey() });
     state.settings.push_back(Cluster::Setting { .name = std::string { Cluster::SharedCacheSetting }, .value = machine });
     return state;
 }

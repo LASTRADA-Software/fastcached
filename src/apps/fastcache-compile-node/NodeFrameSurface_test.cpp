@@ -995,8 +995,7 @@ TEST_CASE("On an open fleet, a forgotten machine's revoked ticket refuses the ve
                                       .key = "pc-07",
                                       .value = "10.0.0.7:6676",
                                       .schedulerEndpoint = {},
-                                      .publicKey = Testing::TestKeyPair("pc-07").PublicKey(),
-                                      .role = std::nullopt });
+                                      .publicKey = Testing::TestKeyPair("pc-07").PublicKey() });
     membership.PublishCluster(state);
 
     NamedResponder node { "node" };

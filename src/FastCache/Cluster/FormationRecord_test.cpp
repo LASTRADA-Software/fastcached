@@ -483,15 +483,16 @@ TEST_CASE("An earlier record format is another layout, refused by name, and neve
           "[cluster][formation][record]")
 {
     // Format 2 added the fleet's age and the asked fleets; format 3 nested a summary of eleven fields
-    // and memos of four; format 4 embedded a version-2 roster in a fleet membership; format 5 is this
-    // branch's unreleased layout -- the membership keeps the key that signed the admission -- FINAL only
-    // at the lane-0 flag day (see `FormationRecordFormat`). An earlier record is intact and belongs to
-    // the build that wrote it: `UnsupportedFormatVersion`, which is what monitoring sees, never
-    // `MalformedFrame`.
-    static_assert(FormationRecordFormat == 5,
-                  "this case pins format 5, unreleased and final only at the lane-0 flag day; from then on a "
+    // and memos of four; format 4 embedded a version-2 roster in a fleet membership; format 5 kept the
+    // key that signed the admission; format 6 is this branch's unreleased layout -- the embedded roster
+    // is version 3, its principals group gone -- FINAL only at the lane-0 flag day (see
+    // `FormationRecordFormat`). An earlier record is intact and belongs to the build that wrote it:
+    // `UnsupportedFormatVersion`, which is what monitoring sees, never `MalformedFrame`.
+    static_assert(FormationRecordFormat == 6,
+                  "this case pins format 6, unreleased and final only at the lane-0 flag day; from then on a "
                   "layout change moves the number and adds the old one below");
-    for (auto const format: { std::uint8_t { 1 }, std::uint8_t { 2 }, std::uint8_t { 3 }, std::uint8_t { 4 } })
+    for (auto const format:
+         { std::uint8_t { 1 }, std::uint8_t { 2 }, std::uint8_t { 3 }, std::uint8_t { 4 }, std::uint8_t { 5 } })
     {
         INFO("format " << int { format });
         auto older = EncodeFormationRecord(SolitaryRecord("c", 1));

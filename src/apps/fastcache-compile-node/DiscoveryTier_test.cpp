@@ -434,8 +434,7 @@ TEST_CASE("A peer discovery proves is recorded as a learner", "[node][discovery]
                                 .key = "n2",
                                 .value = "n2.local:6675",
                                 .schedulerEndpoint = {},
-                                .publicKey = std::nullopt,
-                                .role = std::nullopt });
+                                .publicKey = std::nullopt });
     CHECK(plan.forgotten.empty());
 }
 

@@ -44,14 +44,13 @@ struct RosterMember
 /// Who the cluster says its machines are, projected out of `ClusterState` (#178).
 ///
 /// The one shape a roster has: what an approval hands a joiner, which then applies its fleet's
-/// replicated state. Sorted exactly as `ClusterState` sorts -- members and principals by id, revoked
-/// keys by id and then key -- so every node projecting the same state produces the same bytes, and
+/// replicated state. Sorted exactly as `ClusterState` sorts -- members by id, revoked keys by id and
+/// then key -- so every node projecting the same state produces the same bytes, and
 /// the fingerprint a joiner prints is the one the leader's list shows.
 struct Roster
 {
-    std::vector<RosterMember> members;        ///< Every member, voters and learners.
-    std::vector<ClusterPrincipal> principals; ///< Machines admitted by key rather than as members.
-    std::vector<RevokedKey> revoked;          ///< Keys the cluster will never admit again.
+    std::vector<RosterMember> members; ///< Every member, voters and learners.
+    std::vector<RevokedKey> revoked;   ///< Keys the cluster will never admit again.
 
     [[nodiscard]] friend bool operator==(Roster const&, Roster const&) = default;
 };
@@ -71,7 +70,10 @@ struct Roster
 /// for the wire's flag day because a roster is PERSISTED: a learner's formation record keeps its
 /// approval's (`FormationRecord::fleet`), and a start decoding a version-1 record as this layout would
 /// report damage that is not there.
-inline constexpr std::uint8_t RosterFormatVersion = 2;
+///
+/// **3** since the principals group left the encoding with principal mode: a version-2 roster is
+/// three groups, this one two.
+inline constexpr std::uint8_t RosterFormatVersion = 3;
 
 /// Encode @p roster canonically: one encoding per roster, whoever encodes it.
 /// @param roster The roster.
@@ -81,9 +83,8 @@ inline constexpr std::uint8_t RosterFormatVersion = 2;
 /// Decode a roster.
 ///
 /// Refuses another layout version by NAME (`UnsupportedVersion`), and anything else that is not
-/// a roster as `MalformedFrame`: a wrong width, a seat or role this build does not know, a
-/// revoked entry with no key -- and a member or principal with no key, or the all-zero one,
-/// each refused by name.
+/// a roster as `MalformedFrame`: a wrong width, a seat this build does not know, a revoked entry
+/// with no key -- and a member with no key, or the all-zero one, refused by name.
 /// @param bytes The encoding.
 /// @return The roster, or why the bytes are not one.
 [[nodiscard]] std::expected<Roster, ConsensusError> DecodeRoster(std::span<std::byte const> bytes);

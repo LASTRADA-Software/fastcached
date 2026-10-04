@@ -1009,15 +1009,13 @@ TEST_CASE("cluster-members reports who the cluster agreed on, and an unled membe
                              .key = "node-a",
                              .value = "10.0.0.7:6675",
                              .schedulerEndpoint = "10.0.0.7:6674",
-                             .publicKey = MemberKey("node-a"),
-                             .role = std::nullopt });
+                             .publicKey = MemberKey("node-a") });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "node-b",
                              .value = "10.0.0.8:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = MemberKey("node-b"),
-                             .role = std::nullopt });
+                             .publicKey = MemberKey("node-b") });
     ScriptedNodeExchange node { { ClusterStatusReply(state) } };
 
     auto const answer = RunNodeVerb("cluster-members", node);
@@ -1057,8 +1055,7 @@ TEST_CASE("cluster-members says which absence a scheduler endpoint is: never ann
                                  .key = std::move(id),
                                  .value = std::move(raft),
                                  .schedulerEndpoint = std::move(scheduler),
-                                 .publicKey = key,
-                                 .role = std::nullopt });
+                                 .publicKey = key });
     };
     admit("node-b", "10.0.0.8:6675", {});
     admit("node-c", "10.0.0.9:6675", "10.0.0.9:6674");
@@ -1093,15 +1090,13 @@ TEST_CASE("cluster-members reports a learner recorded with no consensus endpoint
                              .key = "office",
                              .value = "10.0.0.7:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = MemberKey("office"),
-                             .role = std::nullopt });
+                             .publicKey = MemberKey("office") });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
                              .key = "laptop",
                              .value = {},
                              .schedulerEndpoint = {},
-                             .publicKey = MemberKey("laptop"),
-                             .role = std::nullopt });
+                             .publicKey = MemberKey("laptop") });
     ScriptedNodeExchange node { { ClusterStatusReply(state) } };
 
     auto const answer = RunNodeVerb("cluster-members", node);
@@ -1132,15 +1127,13 @@ TEST_CASE("cluster-members shows each member's key whole", "[cli][node][cluster]
                              .key = "node-b",
                              .value = "10.0.0.8:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = key,
-                             .role = std::nullopt });
+                             .publicKey = key });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "node-c",
                              .value = "10.0.0.9:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = MemberKey("node-c"),
-                             .role = std::nullopt });
+                             .publicKey = MemberKey("node-c") });
 
     ScriptedNodeExchange node { { ClusterStatusReply(state) } };
     auto const answer = RunNodeVerb("cluster-members", node);
@@ -1161,8 +1154,7 @@ TEST_CASE("cluster-settings names every key this build knows, set or not", "[cli
     REQUIRE_FALSE(Cluster::SettingTable.empty());
     auto const known = std::string { Cluster::SettingTable[0].name };
 
-    ScriptedNodeExchange node { { ClusterStatusReply(
-        { .members = {}, .settings = {}, .principals = {}, .revokedKeys = {} }) } };
+    ScriptedNodeExchange node { { ClusterStatusReply({ .members = {}, .settings = {}, .revokedKeys = {} }) } };
 
     auto const answer = RunNodeVerb("cluster-settings", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -1187,10 +1179,8 @@ TEST_CASE("cluster-settings keeps a setting this build does not know", "[cli][no
     // client's table has never heard of. Dropping the row would hide a live fact
     // because the READER is the older binary -- and the operator would be told the
     // cluster agrees something it does not.
-    ScriptedNodeExchange node { { ClusterStatusReply({ .members = {},
-                                                       .settings = { { .name = "a-key-from-a-newer-build", .value = "7" } },
-                                                       .principals = {},
-                                                       .revokedKeys = {} }) } };
+    ScriptedNodeExchange node { { ClusterStatusReply(
+        { .members = {}, .settings = { { .name = "a-key-from-a-newer-build", .value = "7" } }, .revokedKeys = {} }) } };
 
     auto const answer = RunNodeVerb("cluster-settings", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -1398,8 +1388,7 @@ TEST_CASE("a cluster reply another build encoded is refused by its version", "[c
     // The same refusal as above, for the cause an upgrade produces -- and it says so,
     // because *cannot read* alone fits a damaged body too and the two send an operator
     // to different machines.
-    auto body =
-        Cluster::Encode(Cluster::ClusterState { .members = {}, .settings = {}, .principals = {}, .revokedKeys = {} });
+    auto body = Cluster::Encode(Cluster::ClusterState { .members = {}, .settings = {}, .revokedKeys = {} });
     // The state's version is the first field's only byte, after its u32 length prefix.
     REQUIRE(body.size() > 4);
     body[4] = std::byte { 2 };
@@ -1435,8 +1424,7 @@ TEST_CASE("the cluster verbs send the opcodes the wire table names", "[cli][node
                          .op = CacheWire::Op::ClusterAdmitLearner } })
     {
         INFO("verb: " << expectation.verb);
-        ScriptedNodeExchange node { { ClusterStatusReply(
-            { .members = {}, .settings = {}, .principals = {}, .revokedKeys = {} }) } };
+        ScriptedNodeExchange node { { ClusterStatusReply({ .members = {}, .settings = {}, .revokedKeys = {} }) } };
         (void) RunNodeVerb(expectation.verb, node, expectation.operands);
 
         REQUIRE(node.Sent().size() == 1);
@@ -2562,12 +2550,8 @@ TEST_CASE("cluster-members says which seat each member was admitted into", "[cli
     auto const admit = [&state](Cluster::CommandKind kind, std::string id, std::string raft) {
         auto const key = MemberKey(id);
         Apply(state,
-              Cluster::Command { .kind = kind,
-                                 .key = std::move(id),
-                                 .value = std::move(raft),
-                                 .schedulerEndpoint = {},
-                                 .publicKey = key,
-                                 .role = std::nullopt });
+              Cluster::Command {
+                  .kind = kind, .key = std::move(id), .value = std::move(raft), .schedulerEndpoint = {}, .publicKey = key });
     };
     admit(Cluster::CommandKind::AddMember, "node-a", "10.0.0.7:6675");
     admit(Cluster::CommandKind::AddLearner, "node-b", "10.0.0.8:6675");

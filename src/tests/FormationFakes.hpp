@@ -282,7 +282,6 @@ inline constexpr std::uint64_t OfficeCreatedAt = 100;
                                              .seat = Cluster::MemberSeat::Learner,
                                              .publicKey = TestKeyPair(id).PublicKey(),
                                              .schedulerEndpoint = {} } },
-        .principals = {},
         .revoked = {},
     };
     std::ranges::sort(roster.members, {}, &Cluster::RosterMember::id); // sorted as `ClusterState` sorts

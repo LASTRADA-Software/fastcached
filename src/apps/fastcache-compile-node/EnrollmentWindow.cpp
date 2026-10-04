@@ -15,13 +15,8 @@ namespace FastCache::Node
 
 namespace Wire = CompileCacheWire;
 
-bool RosterRecordsJoiner(Cluster::Roster const& roster,
-                         std::string_view nodeId,
-                         Ed25519PublicKey const& key,
-                         Wire::EnrollRole role)
+bool RosterRecordsJoiner(Cluster::Roster const& roster, std::string_view nodeId, Ed25519PublicKey const& key)
 {
-    if (!ServesEnrollRole(role))
-        return false;
     return std::ranges::any_of(
         roster.members, [&](Cluster::RosterMember const& member) { return member.id == nodeId && member.publicKey == key; });
 }

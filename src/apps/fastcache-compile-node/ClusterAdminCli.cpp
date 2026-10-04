@@ -129,16 +129,6 @@ std::string RenderClusterState(Cluster::ClusterState const& state)
                            FormatEd25519PublicKey(member.publicKey));
     }
 
-    // Said out loud when empty, for the members' reason: an operator reading this after a
-    // revocation needs "none" to be an answer rather than a section that failed to render. No
-    // verb this build sends admits one; a state an older build wrote may still hold some, and
-    // `--cluster-forget` removes each.
-    out += std::format("principals ({}):\n", state.principals.size());
-    if (state.principals.empty())
-        out += "  (none)\n";
-    for (auto const& principal: state.principals)
-        out += std::format("  {:<{}} key={}\n", principal.id, IdColumn, FormatEd25519PublicKey(principal.publicKey));
-
     out += std::format("revoked keys ({}):\n", state.revokedKeys.size());
     if (state.revokedKeys.empty())
         out += "  (none)\n";

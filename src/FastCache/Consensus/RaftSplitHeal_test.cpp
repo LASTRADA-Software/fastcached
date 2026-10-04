@@ -83,7 +83,6 @@ void Record(RaftClusterHarness& cluster, NodeId const& leader, NodeId const& id,
                                             .value = seat == Cluster::MemberSeat::Voter ? id + ":6680" : std::string {},
                                             .schedulerEndpoint = {},
                                             .publicKey = Testing::TestKeyPair(id).PublicKey(),
-                                            .role = std::nullopt,
                                             .createdAtUnixSeconds = std::nullopt };
     REQUIRE(cluster.ProposeOnLeaderOf(leader, Cluster::Encode(command)).has_value());
     cluster.Run(50);
@@ -186,7 +185,6 @@ void FormFleet(RaftClusterHarness& cluster, NodeId const& voter, NodeId const& l
                               .value = summary.leaderNodeEndpoint,
                               .schedulerEndpoint = {},
                               .publicKey = seen.Key(),
-                              .role = std::nullopt,
                               .createdAtUnixSeconds = summary.createdAtUnixSeconds,
                               .leaderKey = leaderKey };
 }

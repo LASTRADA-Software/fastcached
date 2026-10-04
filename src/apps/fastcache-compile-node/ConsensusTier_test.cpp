@@ -30,6 +30,7 @@
 #include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <array>
@@ -840,8 +841,7 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
                                                                    .key = "n1",
                                                                    .value = {},
                                                                    .schedulerEndpoint = {},
-                                                                   .publicKey = std::nullopt,
-                                                                   .role = std::nullopt });
+                                                                   .publicKey = std::nullopt });
     CHECK_FALSE(refused.has_value());
     if (!refused.has_value())
     {
@@ -856,8 +856,7 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
                                                       .key = "lease-lifetime",
                                                       .value = "20min",
                                                       .schedulerEndpoint = {},
-                                                      .publicKey = std::nullopt,
-                                                      .role = std::nullopt })
+                                                      .publicKey = std::nullopt })
                 .has_value());
     REQUIRE(Testing::WaitUntil(
         "the sentinel setting to commit",
@@ -938,8 +937,7 @@ TEST_CASE("Every state a consensus tier applies reaches the shared-cache directo
                                                       .key = std::string { Cluster::SharedCacheSetting },
                                                       .value = "n1",
                                                       .schedulerEndpoint = {},
-                                                      .publicKey = std::nullopt,
-                                                      .role = std::nullopt })
+                                                      .publicKey = std::nullopt })
                 .has_value());
     // Reconciled on this thread, as `ReconcileOn::Caller` means: what is waited for is the APPLY
     // reaching the host, and the host acts only when asked.
@@ -1076,8 +1074,7 @@ TEST_CASE("A leader counts its sends to a learner with no endpoint as a learner 
                                                       .key = "laptop",
                                                       .value = {},
                                                       .schedulerEndpoint = {},
-                                                      .publicKey = Testing::TestKeyPair("laptop").PublicKey(),
-                                                      .role = std::nullopt })
+                                                      .publicKey = Testing::TestKeyPair("laptop").PublicKey() })
                 .has_value());
 
     // The reconciler adds it to the configuration as a learner, and the leader then has
@@ -1109,15 +1106,13 @@ TEST_CASE("The peers that dial in are read from the record and from the configur
                              .key = "tablet",
                              .value = {},
                              .schedulerEndpoint = {},
-                             .publicKey = Testing::TestKeyPair("tablet").PublicKey(),
-                             .role = std::nullopt });
+                             .publicKey = Testing::TestKeyPair("tablet").PublicKey() });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "n1",
                              .value = "10.0.0.1:6680",
                              .schedulerEndpoint = {},
-                             .publicKey = Testing::TestKeyPair("n1").PublicKey(),
-                             .role = std::nullopt });
+                             .publicKey = Testing::TestKeyPair("n1").PublicKey() });
     auto const configuration = Consensus::Configuration { .voters = { "n1", "n2" }, .learners = { "laptop" } };
 
     // `laptop` from the configuration, `tablet` from the record; neither voter.
@@ -1191,8 +1186,7 @@ TEST_CASE("A restarted leader counts its sends to a learner it has not re-applie
                                                           .key = "laptop",
                                                           .value = {},
                                                           .schedulerEndpoint = {},
-                                                          .publicKey = Testing::TestKeyPair("laptop").PublicKey(),
-                                                          .role = std::nullopt })
+                                                          .publicKey = Testing::TestKeyPair("laptop").PublicKey() })
                     .has_value());
         REQUIRE(Testing::WaitUntil(
             "the learner to join the configuration",
@@ -1225,27 +1219,25 @@ TEST_CASE("A restarted leader counts its sends to a learner it has not re-applie
 
 namespace
 {
-/// A worker principal admitted under its own test key: a roster fact that is not a member.
-/// @param id The principal's id.
+/// A forget revoking @p id's own test key, which no member holds: a roster fact that moves no
+/// member and asks consensus to dial nobody.
+/// @param id Whose key is revoked.
 /// @return The command.
-[[nodiscard]] Cluster::Command PrincipalCommand(std::string id)
+[[nodiscard]] Cluster::Command RevocationCommand(std::string id)
 {
     auto const key = Testing::TestKeyPair(id).PublicKey();
-    return Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
-                              .key = std::move(id),
-                              .value = {},
-                              .schedulerEndpoint = {},
-                              .publicKey = key,
-                              .role = Cluster::PrincipalRole::Worker };
+    return Cluster::Command {
+        .kind = Cluster::CommandKind::Forget, .key = std::move(id), .value = {}, .schedulerEndpoint = {}, .publicKey = key
+    };
 }
 
-/// Whether @p state records a principal under @p id.
+/// Whether @p state records a key revoked under @p id.
 /// @param state The state.
 /// @param id The id.
-/// @return True when a principal carries it.
-[[nodiscard]] bool HasPrincipal(Cluster::ClusterState const& state, std::string_view id)
+/// @return True when a revocation carries it.
+[[nodiscard]] bool HasRevocation(Cluster::ClusterState const& state, std::string_view id)
 {
-    return std::ranges::contains(state.principals, id, &Cluster::ClusterPrincipal::id);
+    return std::ranges::contains(state.revokedKeys, id, &Cluster::RevokedKey::id);
 }
 
 /// Write a node's own consensus state into @p directory, as a node that ran would have left it.
@@ -1269,7 +1261,7 @@ void PlantConsensusState(std::filesystem::path const& directory,
     INFO("state refused: " << RefusalOf(saved));
     REQUIRE(saved.has_value());
 
-    auto const covered = Cluster::Encode(PrincipalCommand("w0"));
+    auto const covered = Cluster::Encode(RevocationCommand("w0"));
     auto entries = std::vector<Consensus::LogEntry> {};
     for ([[maybe_unused]] auto const index: std::views::iota(1, 4))
         entries.push_back(Consensus::LogEntry { .term = term, .kind = Consensus::EntryKind::Command, .payload = covered });
@@ -1327,12 +1319,12 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
     cfg.clusterDir = scratch / "state";
     auto const directory = NodeStateDirectory(cfg);
 
-    // A principal in the snapshot and an admission above it: what a node that ran on an
-    // unread snapshot loses, and what one that skipped an unread command loses.
+    // A revocation in the snapshot and another above it: what a node that ran on an unread
+    // snapshot loses, and what one that skipped an unread command loses.
     auto current = Cluster::ClusterState {};
-    Cluster::Apply(current, PrincipalCommand("w1"));
+    Cluster::Apply(current, RevocationCommand("w1"));
     auto const currentSnapshot = Cluster::Encode(current);
-    auto const currentCommand = Cluster::Encode(PrincipalCommand("w2"));
+    auto const currentCommand = Cluster::Encode(RevocationCommand("w2"));
 
     // Anything published at all is something applied: the observer is how the member set
     // reaches the fleet's oracle.
@@ -1361,13 +1353,13 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         auto const& tier = *started;
 
         // Restored when the driver was built, before either loop ran.
-        CHECK(HasPrincipal(tier->ClusterState(), "w1"));
+        CHECK(HasRevocation(tier->ClusterState(), "w1"));
         CHECK(published->load() > 0);
 
         // And the entry above it, once the node leads again and commits it.
         CHECK(Testing::WaitUntil(
             "the retained admission to commit",
-            [&tier] { return HasPrincipal(tier->ClusterState(), "w2"); },
+            [&tier] { return HasRevocation(tier->ClusterState(), "w2"); },
             [&tier] { return std::format("commit index {}", tier->Status().commitIndex.value); }));
     }
 
@@ -1383,7 +1375,7 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         CHECK(refusal.contains(directory.string()));
         CHECK(refusal.contains("the snapshot as of log entry 3"));
         CHECK(refusal.contains(std::format("cluster state encoding version {}", Testing::PreviousClusterStateVersion)));
-        CHECK(refusal.contains("reads 9"));
+        CHECK(refusal.contains("reads 10"));
         CHECK(refusal.contains("it is intact, and there is no conversion"));
         CHECK(refusal.contains(Consensus::UnreadableStateRemedy));
         CHECK(published->load() == 0);
@@ -1402,22 +1394,25 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         CHECK(refusal.contains(directory.string()));
         CHECK(refusal.contains("log entry 4"));
         CHECK(refusal.contains(std::format("cluster command encoding version {}", Testing::PreviousClusterCommandVersion)));
-        CHECK(refusal.contains("reads 5"));
+        CHECK(refusal.contains("reads 6"));
         CHECK(refusal.contains(Consensus::UnreadableStateRemedy));
         CHECK(published->load() == 0);
     }
 
     SECTION("a retained command carrying a retired verb refuses the start, naming the retirement")
     {
-        // Byte 3 was a client verb an earlier build committed: this build's command version
-        // and layout, and a verb it retired. Applied as nothing it would leave this node
-        // holding a state its log says otherwise about, so it refuses the start by name.
-        auto const retired = Cluster::Encode(Cluster::Command { .kind = Cluster::CommandKind::RetiredForgetClient,
-                                                                .key = "10.0.0.7",
-                                                                .value = {},
-                                                                .schedulerEndpoint = {},
-                                                                .publicKey = std::nullopt,
-                                                                .role = std::nullopt });
+        // Byte 4 was a client verb an earlier build committed, and byte 6 the admission of a
+        // principal by its key: this build's command version and layout, and a verb it retired.
+        // Applied as nothing it would leave this node holding a state its log says otherwise
+        // about -- a principal it would never record -- so it refuses the start by name.
+        auto const [kind, key, publicKey] =
+            GENERATE(table<Cluster::CommandKind, std::string, std::optional<Ed25519PublicKey>>({
+                { Cluster::CommandKind::RetiredForgetClient, "10.0.0.7", std::nullopt },
+                { Cluster::CommandKind::RetiredAdmitPrincipal, "w9", Testing::TestKeyPair("w9").PublicKey() },
+            }));
+        INFO("verb " << static_cast<unsigned>(kind));
+        auto const retired = Cluster::Encode(
+            Cluster::Command { .kind = kind, .key = key, .value = {}, .schedulerEndpoint = {}, .publicKey = publicKey });
         PlantConsensusState(directory, currentSnapshot, retired);
         auto const started = start();
         REQUIRE_FALSE(started.has_value());
@@ -1425,7 +1420,7 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         CAPTURE(refusal.reason);
         CHECK(refusal.reason.contains(directory.string()));
         CHECK(refusal.reason.contains("log entry 4"));
-        CHECK(refusal.reason.contains("verb 4 is retired"));
+        CHECK(refusal.reason.contains(std::format("verb {} is retired", static_cast<unsigned>(kind))));
         CHECK(refusal.reason.contains(Consensus::UnreadableStateRemedy));
         CHECK(published->load() == 0);
     }
@@ -1705,11 +1700,11 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
     SECTION("control: a snapshot this build reads is taken on, and nothing is raised")
     {
         auto current = Cluster::ClusterState {};
-        Cluster::Apply(current, PrincipalCommand("w7"));
+        Cluster::Apply(current, RevocationCommand("w7"));
         auto const connection = OfferAsLeader(self, offer(Cluster::Encode(current)));
 
         REQUIRE(Testing::WaitUntil(
-            "the offered snapshot to be taken on", [&tier] { return HasPrincipal(tier->ClusterState(), "w7"); }, commit));
+            "the offered snapshot to be taken on", [&tier] { return HasRevocation(tier->ClusterState(), "w7"); }, commit));
         CHECK(conditions.StateOf(NodeCondition::UnreadableLeaderSnapshot) == CompileCacheWire::ConditionState::Clear);
         connection->close();
     }
@@ -1732,7 +1727,7 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
         CHECK(row->detail.contains("leader n1"));
         CHECK(row->detail.contains("log entry 3"));
         CHECK(row->detail.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
-        CHECK(row->detail.contains("reads 9"));
+        CHECK(row->detail.contains("reads 10"));
 
         // Nothing taken on: not the previous build's member, not a moved commit index.
         CHECK_FALSE(tier->ClusterState().RaftEndpointOf("n1").has_value());
@@ -2143,15 +2138,13 @@ TEST_CASE("A leader dials the voters its state records and never a learner", "[n
                                                       .key = "n-laptop",
                                                       .value = std::format("127.0.0.1:{}", UnansweredPort()),
                                                       .schedulerEndpoint = {},
-                                                      .publicKey = Testing::TestKeyPair("n-laptop").PublicKey(),
-                                                      .role = std::nullopt })
+                                                      .publicKey = Testing::TestKeyPair("n-laptop").PublicKey() })
                 .has_value());
     REQUIRE(tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                                                       .key = "n3",
                                                       .value = std::format("127.0.0.1:{}", UnansweredPort()),
                                                       .schedulerEndpoint = {},
-                                                      .publicKey = Testing::TestKeyPair("n3").PublicKey(),
-                                                      .role = std::nullopt })
+                                                      .publicKey = Testing::TestKeyPair("n3").PublicKey() })
                 .has_value());
 
     REQUIRE(Testing::WaitUntil(
@@ -2226,8 +2219,7 @@ TEST_CASE("A tier tells its formation every applied state with its cluster and w
                                                       .value = cfg.raftListen,
                                                       .schedulerEndpoint = leaderNodeEndpoint,
                                                       // A member record carries its key: the state refuses one without.
-                                                      .publicKey = Testing::TestKeyPair("n1").PublicKey(),
-                                                      .role = std::nullopt })
+                                                      .publicKey = Testing::TestKeyPair("n1").PublicKey() })
                 .has_value());
     auto const toldEndpoint = [&told] {
         std::scoped_lock const lock { told.lock };
@@ -2315,7 +2307,6 @@ void StartTwoTierFleet(TwoTierFleet& fleet, Cluster::MemberSeat seat, FormationH
         .value = joinerRaft,
         .schedulerEndpoint = {},
         .publicKey = Testing::TestKeyPair("n2").PublicKey(),
-        .role = std::nullopt,
         .createdAtUnixSeconds = std::nullopt });
     INFO("the admission was refused: " << (admitted.has_value() ? std::string {} : admitted.error().context));
     REQUIRE(admitted.has_value());

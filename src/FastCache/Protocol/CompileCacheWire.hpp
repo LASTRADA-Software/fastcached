@@ -203,8 +203,8 @@ using WireVersion = std::uint8_t;
 /// node would refuse every version-14 challenge as malformed, and a version-14 node reading a
 /// version-13 proof would be asked to verify a MAC under a key it no longer has. The four verbs
 /// a joining machine sends -- `Register`, `NodeAnnounce`, `Heartbeat`, `Withdraw` -- also now
-/// require that identity (`OpDescriptor::identity`), and `ClusterAdmitWorker` and three error
-/// codes are new.
+/// require that identity (`OpDescriptor::identity`), and a worker-admission verb (0x1D, since
+/// retired with principal mode) and three error codes are new.
 inline constexpr WireVersion CurrentVersion = 14;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
@@ -431,7 +431,7 @@ enum class Op : std::uint8_t
     // questions the gate asks are exactly the two that matter.
     ClusterStatus = 0x08, ///< Operator asks what the cluster has agreed.
     ClusterSet = 0x09,    ///< Operator changes a replicated setting.
-    ClusterForget = 0x0A, ///< Operator forgets a member or a principal, revoking its key.
+    ClusterForget = 0x0A, ///< Operator forgets a member, revoking its key.
     ClusterAdmit = 0x0B,  ///< Operator adds a member, or moves one.
     // 0x16 and 0x17 are RETIRED and must never be reassigned -- see `RetiredOpcodes`.
 
@@ -754,14 +754,9 @@ enum class Op : std::uint8_t
     /// promotes it: the seat follows the verb, as `Cluster::MemberSeatTable` says.
     ClusterAdmitLearner = 0x1C,
 
-    /// Admit a WORKER principal: a machine that joins the fleet under an identity key and never
-    /// joins consensus (#178).
-    ///
-    /// `AdmitPrincipal` without an enrollment window, for an operator who already has the id and
-    /// the key -- `--print-identity` prints both on the worker -- and would otherwise open a window
-    /// only to approve the one request it expects. Answered with `ClusterAdmitReceipt`, the
-    /// endpoint field empty: a principal has no consensus endpoint.
-    ClusterAdmitWorker = 0x1D,
+    // 0x1D is RETIRED and never reused -- it was CLUSTER-ADMIT-WORKER, which admitted a worker
+    // PRINCIPAL by key. Principal mode is retired: every machine that joins is a learner member
+    // holding a key. See `RetiredOpcodes`.
 
     /// This machine asks its own node for a machine ticket to one audience.
     ///
@@ -2352,15 +2347,6 @@ inline constexpr std::array OpTable {
                    .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::IdentifiedCaller },
-    OpDescriptor { .code = Op::ClusterAdmitWorker,
-                   .name = "cluster-admit-worker",
-                   .fieldCount = 2, // principal id, identity key
-                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = RequiresAuth,
-                   .maxPayload = BoundedTo(MaxControlPayload),
-                   .maxReply = ReplyBoundedTo(MaxReportReply),
-                   .family = VerbFamily::Scheduler,
-                   .identity = IdentityRequirement::IdentifiedCaller },
     // The fleet cache verbs: their twins' shapes -- the same objects -- and their own family,
     // which is where their policy lives. `AddressAdmits` because admission is the fold's answer
     // (a proven key, a ticket, loopback), never a column of this table.
@@ -2684,19 +2670,18 @@ static_assert(JoiningVerbsNeedAnIdentity(),
 
 /// Whether exactly an operator's CONTROL verbs require an identified caller.
 ///
-/// The cluster verbs that change the fleet -- admit, admit as a learner, admit a worker, forget, set
-/// -- and the enrollment decisions (`EnrollControl`: approve, reject, arm or disarm auto-approval,
+/// The cluster verbs that change the fleet -- admit, admit as a learner, forget, set -- and the
+/// enrollment decisions (`EnrollControl`: approve, reject, arm or disarm auto-approval,
 /// clear, and the list that names the joiners' keys). Both directions: a control verb left at
 /// `AddressAdmits` is one an anonymous caller on a `--fleet-open` node sends, and any other verb
 /// marked here refuses every launcher on such a node. `Cordon` and `MintTicket` are not rows: each
 /// already answers this machine alone, a narrower rule its responder enforces.
-/// @return True when the column names exactly those six.
+/// @return True when the column names exactly those five.
 [[nodiscard]] constexpr bool ControlVerbsNeedAnIdentifiedCaller() noexcept
 {
     return std::ranges::all_of(OpTable, [](OpDescriptor const& row) {
         auto const control = row.code == Op::ClusterSet || row.code == Op::ClusterForget || row.code == Op::ClusterAdmit
-                             || row.code == Op::ClusterAdmitLearner || row.code == Op::ClusterAdmitWorker
-                             || row.code == Op::EnrollControl;
+                             || row.code == Op::ClusterAdmitLearner || row.code == Op::EnrollControl;
         return control == (row.identity == IdentityRequirement::IdentifiedCaller);
     });
 }
@@ -3092,14 +3077,15 @@ static_assert(NoRetiredErrorCodeIsReused(),
 
 /// Opcodes that once meant something and must never mean anything again: 0x16 was
 /// CLUSTER-ADMIT-CLIENT and 0x17 CLUSTER-FORGET-CLIENT (#1309), retired when a machine
-/// became admitted and forgotten by its key rather than by its host.
+/// became admitted and forgotten by its key rather than by its host; 0x1D was
+/// CLUSTER-ADMIT-WORKER, retired with principal mode -- every machine that joins is a learner.
 ///
 /// `RetiredErrorCodes`' reason, one table over: a peer built before the retirement still
 /// sends the byte, and a NEW verb assigned to it would be read by that peer's operator as
 /// admitting or forgetting a host. A frame naming a retired byte is an unknown opcode --
 /// `FindOp` answers nullptr and every surface refuses it `UnknownOpcode`, as it would any
 /// byte no row claims.
-inline constexpr std::array<std::uint8_t, 2> RetiredOpcodes { 0x16, 0x17 };
+inline constexpr std::array<std::uint8_t, 3> RetiredOpcodes { 0x16, 0x17, 0x1D };
 
 /// Whether the op table has kept clear of every retired opcode.
 ///
@@ -3115,7 +3101,8 @@ inline constexpr std::array<std::uint8_t, 2> RetiredOpcodes { 0x16, 0x17 };
 
 static_assert(NoRetiredOpcodeIsReused(),
               "a retired opcode must never be reassigned -- a peer built against an older header still sends it "
-              "(0x16 was cluster-admit-client and 0x17 cluster-forget-client, see #1309)");
+              "(0x16 was cluster-admit-client and 0x17 cluster-forget-client, see #1309; 0x1D was "
+              "cluster-admit-worker)");
 
 /// What a compile-family verb is told at an endpoint that runs no compile worker.
 ///
@@ -5995,47 +5982,6 @@ struct ClusterAdmitReceipt
                                      key.empty() ? std::nullopt : std::optional { std::string { AsStringView(key) } } };
 }
 
-/// What an operator asks when admitting a WORKER principal (#178).
-///
-/// Borrowed views: the encoder copies them into the frame before it returns.
-struct ClusterAdmitWorkerRequest
-{
-    std::string_view workerId;  ///< The id the worker minted into its `--cluster-dir`.
-    std::string_view publicKey; ///< Its identity key, as `--print-identity` printed it.
-};
-
-/// A CLUSTER-ADMIT-WORKER payload, as views into it. Read in scope by the one handler.
-struct ClusterAdmitWorkerView
-{
-    std::span<std::byte const> workerId;  ///< As received.
-    std::span<std::byte const> publicKey; ///< As received: TEXT, parsed by the leader.
-};
-
-/// Frame a CLUSTER-ADMIT-WORKER request.
-///
-/// The key travels as the TEXT an operator typed, as `ClusterAdmit`'s does, so the one parser that
-/// decides what a key is runs where the command is proposed -- the leader -- whatever client sent it.
-/// @param request The worker's id and key.
-/// @param version Version to advertise.
-/// @return The framed request.
-[[nodiscard]] inline std::vector<std::byte> EncodeClusterAdmitWorker(ClusterAdmitWorkerRequest const& request,
-                                                                     WireVersion version = CurrentVersion)
-{
-    return Detail::EncodeRequest(version, Op::ClusterAdmitWorker, { AsBytes(request.workerId), AsBytes(request.publicKey) });
-}
-
-/// Split a CLUSTER-ADMIT-WORKER payload.
-/// @param payload The bytes following the request header.
-/// @return The fields, or nullopt when malformed.
-[[nodiscard]] inline std::optional<ClusterAdmitWorkerView> DecodeClusterAdmitWorkerPayload(
-    std::span<std::byte const> payload)
-{
-    auto const fields = SplitFields(payload, OpFieldCount(Op::ClusterAdmitWorker));
-    if (!fields.has_value())
-        return std::nullopt;
-    return ClusterAdmitWorkerView { .workerId = (*fields)[0], .publicKey = (*fields)[1] };
-}
-
 /// Frame a MINT-TICKET request.
 /// @param audience Who the minted ticket will be presented to.
 /// @param version Version to advertise; overridable so tests can offer a version the peer does not
@@ -7760,8 +7706,8 @@ enum class EnrollOutcome : std::uint8_t
     Pending = 0x01,
 
     /// The cluster records this joiner, and the payload's second field IS the roster
-    /// (`Cluster::EncodeRoster`): every member's id, consensus endpoint, seat and key, every
-    /// principal, every revoked key. **No secret, so no spend** (#178): the answer is the same
+    /// (`Cluster::EncodeRoster`): every member's id, consensus endpoint, seat and key, and every
+    /// revoked key. **No secret, so no spend** (#178): the answer is the same
     /// on every poll, and a joiner whose reply was lost simply asks again.
     ///
     /// Answered only once the LEADER's applied roster records the joiner under the key it
@@ -7783,11 +7729,10 @@ enum class EnrollRole : std::uint8_t
     // 0x01 was `Member`: a joiner that stated the endpoint its consensus port answers on and
     // was recorded as a voter. A zero-config joiner is recorded as a LEARNER and states no
     // consensus endpoint, so the byte is RETIRED and never reused.
-
-    /// A worker principal: a machine that never joins consensus -- a roaming worker whose
-    /// address a VPN reassigns -- admitted by its key alone. It states NO endpoint, because it
-    /// has none anybody dials.
-    Worker = 0x02,
+    //
+    // 0x02 was `Worker`: a principal admitted by its key alone, never joining consensus.
+    // Principal mode is retired -- every machine that joins is a learner member holding a key
+    // -- so the byte is RETIRED and never reused.
 
     /// A consensus learner: an approval records it as a member in the learner seat, holding the
     /// key it asked with. It states no CONSENSUS endpoint -- a learner dials the leader rather
@@ -7797,12 +7742,12 @@ enum class EnrollRole : std::uint8_t
 
 /// Every role this build implements, as ONE list, for `KnownEnrollmentDecisions`' reason: the
 /// decoder refuses a byte outside it and the renderer asserts a label for every member.
-inline constexpr std::array KnownEnrollRoles { EnrollRole::Learner, EnrollRole::Worker };
+inline constexpr std::array KnownEnrollRoles { EnrollRole::Learner };
 
 /// Role bytes that once meant something and must never mean anything again, for
 /// `RetiredErrorCodes`' reason: a peer built before the retirement still names the byte, and
 /// would admit a new role under it as the old one.
-inline constexpr std::array<std::uint8_t, 1> RetiredEnrollRoles { 0x01 };
+inline constexpr std::array<std::uint8_t, 2> RetiredEnrollRoles { 0x01, 0x02 };
 
 /// Whether the role list has kept clear of every retired byte.
 /// @return True when no known role claims a retired byte.
@@ -7813,7 +7758,8 @@ inline constexpr std::array<std::uint8_t, 1> RetiredEnrollRoles { 0x01 };
     });
 }
 
-static_assert(NoRetiredEnrollRoleIsReused(), "0x01 was member; a retired enrollment-role byte is never reassigned");
+static_assert(NoRetiredEnrollRoleIsReused(),
+              "0x01 was member and 0x02 worker; a retired enrollment-role byte is never reassigned");
 
 /// Whether @p raw names a role this build understands.
 /// @param raw The role byte, as received.

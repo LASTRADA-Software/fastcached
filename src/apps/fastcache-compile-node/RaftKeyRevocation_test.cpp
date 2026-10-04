@@ -302,8 +302,7 @@ TEST_CASE("After --cluster-forget=n3, n3's session closes and its redial is refu
                                       .key = "n3",
                                       .value = {},
                                       .schedulerEndpoint = {},
-                                      .publicKey = std::nullopt,
-                                      .role = std::nullopt });
+                                      .publicKey = std::nullopt });
     REQUIRE(state.IsRevoked(n3.PublicKey()));
     // And the configuration drops n3, which is when the revocation takes effect on this wire:
     // a member still counted keeps its key for itself until then (`RosterKeys`, #1555).

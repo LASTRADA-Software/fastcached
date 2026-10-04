@@ -51,7 +51,6 @@ constexpr auto ThisNode = "this-pc";
                                                                   .seat = Cluster::MemberSeat::Learner,
                                                                   .publicKey = Testing::TestKeyPair(ThisNode).PublicKey(),
                                                                   .schedulerEndpoint = {} } },
-                             .principals = {},
                              .revoked = {} };
 }
 

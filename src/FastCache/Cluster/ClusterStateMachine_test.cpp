@@ -3,9 +3,11 @@
 #include <FastCache/Core/Logger.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <optional>
 #include <ranges>
@@ -46,8 +48,7 @@ namespace
                      .key = std::move(key),
                      .value = std::move(value),
                      .schedulerEndpoint = std::move(scheduler),
-                     .publicKey = publicKey,
-                     .role = std::nullopt };
+                     .publicKey = publicKey };
 }
 
 /// One applied entry carrying a command.
@@ -183,15 +184,21 @@ TEST_CASE("A committed verb this build does not know is skipped by name, and the
 TEST_CASE("A retired verb a peer committed is skipped by name, and one this node holds refuses the start",
           "[cluster][statemachine][retired]")
 {
-    // Byte 3 is a retired client verb: a known enumerator, reserved so it is never read as
-    // another verb. An earlier build committed entries carrying it, and this build applies
-    // none of them -- a PEER's is skipped by name, as a verb this build lacks is, and one this
-    // node's OWN log holds is refused before the node starts (#1542), in the storage rule's
-    // code for intact bytes another build wrote.
-    REQUIRE(static_cast<unsigned>(CommandKind::RetiredAdmitClient) == 3U);
-    auto const retired = Encode(Cmd(CommandKind::RetiredAdmitClient, "10.0.0.7"));
+    // Byte 3 is a retired client verb and byte 6 the retired principal admission: known
+    // enumerators, reserved so they are never read as another verb. An earlier build committed
+    // entries carrying them, and this build applies none of them -- a PEER's is skipped by name,
+    // as a verb this build lacks is, and one this node's OWN log holds is refused before the
+    // node starts (#1542), in the storage rule's code for intact bytes another build wrote.
+    auto const [kind, byte] = GENERATE(table<CommandKind, unsigned>({
+        { CommandKind::RetiredAdmitClient, 3U },
+        { CommandKind::RetiredAdmitPrincipal, 6U },
+    }));
+    INFO("verb " << byte);
+    REQUIRE(static_cast<unsigned>(kind) == byte);
+    auto const retired = Encode(Cmd(kind, "10.0.0.7"));
     REQUIRE(retired.size() > 5);
-    REQUIRE(retired[5] == std::byte { 3 });
+    REQUIRE(retired[5] == static_cast<std::byte>(byte));
+    auto const named = std::format("verb {} is retired", byte);
 
     SECTION("a peer's entry is skipped by name, and the log goes on applying")
     {
@@ -203,8 +210,8 @@ TEST_CASE("A retired verb a peer committed is skipped by name, and one this node
         CHECK(machine.State() == ClusterState {});
         CHECK(published.empty());
         auto const records = logger.Snapshot();
-        CHECK(std::ranges::any_of(records, [](auto const& record) {
-            return record.message.contains("entry 1") && record.message.contains("verb 3 is retired");
+        CHECK(std::ranges::any_of(records, [&named](auto const& record) {
+            return record.message.contains("entry 1") && record.message.contains(named);
         }));
 
         machine.Apply(Entry(2, Cmd(CommandKind::SetSetting, "fleet-open", "1")));
@@ -219,7 +226,7 @@ TEST_CASE("A retired verb a peer committed is skipped by name, and one this node
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
         CHECK(refused.error().code != ConsensusErrorCode::StorageFailure);
-        CHECK(refused.error().context.contains("verb 3 is retired"));
+        CHECK(refused.error().context.contains(named));
         CHECK(watched.machine.State() == ClusterState {});
         CHECK(watched.published.empty());
     }
@@ -335,7 +342,7 @@ TEST_CASE("A snapshot the previous build wrote, in its own layout, is refused by
     CHECK(std::ranges::any_of(records, [](auto const& record) {
         return record.message.contains("cannot decode")
                && record.message.contains(std::format("version {}", Testing::PreviousClusterStateVersion))
-               && record.message.contains("reads 9");
+               && record.message.contains("reads 10");
     }));
 }
 
@@ -403,7 +410,7 @@ TEST_CASE("Whether a command can be applied is asked without applying it, in the
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
         CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterCommandVersion)));
-        CHECK(refused.error().context.contains("reads 5"));
+        CHECK(refused.error().context.contains("reads 6"));
     }
 
     SECTION("bytes that are no command at all are damage")
@@ -432,13 +439,19 @@ TEST_CASE("Whether a snapshot can be restored is asked without restoring it, in 
         CHECK(watched.machine.CanRestore(Encode(other)).has_value());
     }
 
-    SECTION("the previous build's state is another build's format, both versions named")
+    SECTION("an older build's state is another build's format, both versions named")
     {
-        auto const refused = watched.machine.CanRestore(Testing::EncodePreviousClusterState());
+        // The principal era's layout (what the one installation holds) and the one before it.
+        auto const [older, version] = GENERATE(table<std::vector<std::byte>, std::uint8_t>({
+            { Testing::EncodePrincipalEraClusterState(), Testing::PrincipalEraClusterStateVersion },
+            { Testing::EncodePreviousClusterState(), Testing::PreviousClusterStateVersion },
+        }));
+        INFO("state version " << static_cast<unsigned>(version));
+        auto const refused = watched.machine.CanRestore(older);
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
-        CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
-        CHECK(refused.error().context.contains("reads 9"));
+        CHECK(refused.error().context.contains(std::format("version {}", version)));
+        CHECK(refused.error().context.contains("reads 10"));
     }
 
     SECTION("bytes that are no state at all are damage")

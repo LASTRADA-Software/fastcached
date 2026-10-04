@@ -863,8 +863,7 @@ SchedulerReply SchedulerService::ClusterSet(CallerContext const& caller, std::st
                                     .key = std::string { name },
                                     .value = std::string { value },
                                     .schedulerEndpoint = {},
-                                    .publicKey = std::nullopt,
-                                    .role = std::nullopt });
+                                    .publicKey = std::nullopt });
 }
 
 SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std::string_view memberId)
@@ -878,8 +877,7 @@ SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std:
                                     .key = std::string { memberId },
                                     .value = {},
                                     .schedulerEndpoint = {},
-                                    .publicKey = std::nullopt,
-                                    .role = std::nullopt });
+                                    .publicKey = std::nullopt });
 }
 
 SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
@@ -940,8 +938,7 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
                                             .key = std::string { memberId },
                                             .value = std::string { raftEndpoint },
                                             .schedulerEndpoint = std::move(endpoint),
-                                            .publicKey = key,
-                                            .role = std::nullopt };
+                                            .publicKey = key };
 
     auto reply = Offer(command);
     if (reply.status != Wire::Status::Ok)
@@ -984,66 +981,6 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
                                     .publicKey = command.publicKey.transform([](Ed25519PublicKey const& recorded) {
                                         return FormatEd25519PublicKey(recorded);
                                     }) });
-    return reply;
-}
-
-SchedulerReply SchedulerService::AdmitPrincipal(CallerContext const& caller,
-                                                std::string_view principalId,
-                                                Ed25519PublicKey const& publicKey,
-                                                Cluster::PrincipalRole role)
-{
-    if (auto refusal = Gate(caller); refusal.has_value())
-        return std::move(*refusal);
-    if (_admin == nullptr)
-        return Refuse(Wire::ErrorCode::NoCluster);
-
-    // The key arrives as BYTES here -- an enrollment approval hands over the key its row holds --
-    // so the one parser has not seen it, and the question it would have asked of the point is asked
-    // now, before anything is proposed: a small-order key admitted is a key anybody can prove.
-    if (auto const fault = Ed25519PublicKeyFaultOf(publicKey); fault.has_value())
-    {
-        _metrics.Increment(MalformedAdmissionKey.counter);
-        return Refuse(MalformedAdmissionKey.code,
-                      std::format("{} was sent with a key that is not usable ({}): {}",
-                                  principalId,
-                                  FormatEd25519PublicKey(publicKey),
-                                  DescribePublicKeyFault(*fault)));
-    }
-
-    // No value and no scheduler endpoint: a principal has no address anybody dials, which is
-    // the difference between it and a member (`ClusterPrincipal`).
-    return Offer(Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
-                                    .key = std::string { principalId },
-                                    .value = {},
-                                    .schedulerEndpoint = {},
-                                    .publicKey = publicKey,
-                                    .role = role });
-}
-
-SchedulerReply SchedulerService::ClusterAdmitWorker(CallerContext const& caller,
-                                                    std::string_view workerId,
-                                                    std::string_view publicKey)
-{
-    // The gate before the parse, so a stranger learns nothing about what a key looks like here.
-    if (auto refusal = Gate(caller); refusal.has_value())
-        return std::move(*refusal);
-
-    auto const parsed = ParseEd25519PublicKey(publicKey);
-    if (!parsed.has_value())
-        return RefuseAs(_metrics,
-                        MalformedAdmissionKey,
-                        std::format("{} was sent with a key that is not one ({}): {}",
-                                    workerId,
-                                    publicKey,
-                                    DescribePublicKeyFault(parsed.error())));
-
-    auto reply = AdmitPrincipal(caller, workerId, *parsed, Cluster::PrincipalRole::Worker);
-    if (reply.status != Wire::Status::Ok)
-        return reply;
-    // The receipt spells back the key the command RECORDED, through the one encoder, for
-    // `ClusterAdmit`'s reason; a principal has no consensus endpoint, so that field is empty.
-    reply.payload = Wire::EncodeClusterAdmitReceipt(Wire::ClusterAdmitReceipt {
-        .memberId = std::string { workerId }, .raftEndpoint = {}, .publicKey = FormatEd25519PublicKey(*parsed) });
     return reply;
 }
 

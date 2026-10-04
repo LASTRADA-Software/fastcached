@@ -162,59 +162,6 @@ struct ClusterMember
     [[nodiscard]] friend bool operator==(ClusterMember const&, ClusterMember const&) = default;
 };
 
-/// What a principal is admitted to do (#178).
-///
-/// **Persisted and transmitted**: one byte per principal in a snapshot and in every
-/// `ClusterStatus` reply, and one byte in an `AdmitPrincipal` command. The ordinals are
-/// explicit and append only, and `Last` never travels.
-enum class PrincipalRole : std::uint8_t
-{
-    Worker = 0, ///< Registers with the scheduler and runs compiles; never joins consensus.
-    Last = 1,   ///< Not a role, and never travels. See `DecodeWireEnum`.
-};
-
-/// How one `PrincipalRole` is spelled.
-struct PrincipalRoleRow
-{
-    PrincipalRole role;    ///< The role this row describes.
-    std::string_view name; ///< Its one spelling: a table cell, a JSON value and a report word alike.
-};
-
-/// One row per `PrincipalRole`, in enumerator order.
-inline constexpr EnumTable<PrincipalRole, PrincipalRoleRow> PrincipalRoleTable { {
-    { .role = PrincipalRole::Worker, .name = "worker" },
-} };
-
-static_assert(RowsInEnumeratorOrder(PrincipalRoleTable, &PrincipalRoleRow::role),
-              "PrincipalRoleTable must hold one row per PrincipalRole, in enumerator order");
-
-/// The spelling of `role`, from `PrincipalRoleTable`.
-/// @param role A role.
-/// @return Its row's name.
-[[nodiscard]] constexpr std::string_view PrincipalRoleName(PrincipalRole role) noexcept
-{
-    return PrincipalRoleTable[static_cast<std::size_t>(role)].name;
-}
-
-/// A machine the cluster admits by its KEY without counting it (#178).
-///
-/// **Not a member**, and the difference is the whole reason this is a second list rather
-/// than a third `MemberSeat`. A member is somewhere consensus replicates to -- it has a Raft
-/// endpoint every other member dials -- while a principal is a machine that never joins
-/// consensus at all: a roaming worker whose address the VPN reassigns. What the cluster
-/// records about it is the one thing that does not move, its key, and what it may do.
-///
-/// An id is a member or a principal, never both; `Apply` holds that, and `DecodeState`
-/// refuses a state that breaks it.
-struct ClusterPrincipal
-{
-    Consensus::NodeId id;                         ///< Its identity, as it names itself.
-    Ed25519PublicKey publicKey {};                ///< The key it proves that identity with.
-    PrincipalRole role { PrincipalRole::Worker }; ///< What it is admitted to do.
-
-    [[nodiscard]] friend bool operator==(ClusterPrincipal const&, ClusterPrincipal const&) = default;
-};
-
 /// A key the cluster will never admit again, and whose it was (#178).
 ///
 /// **The whole key, never a digest or a prefix**: a revoked machine still holds every byte
@@ -635,12 +582,6 @@ struct ClusterState
     /// Settings, sorted by name for the same reason.
     std::vector<Setting> settings;
 
-    /// Machines admitted by key rather than as members, sorted by id (#178).
-    ///
-    /// Written by `AdmitPrincipal`, which enrollment proposes for a worker (#178 PR 4), and
-    /// removed by `Forget`, which revokes the key with it (#1555).
-    std::vector<ClusterPrincipal> principals;
-
     /// Keys the cluster will never admit again, sorted by id and then key, one entry per
     /// key (#178).
     ///
@@ -650,19 +591,18 @@ struct ClusterState
     /// back, and the property is that it cannot.
     std::vector<RevokedKey> revokedKeys;
 
-    /// How many times the ROSTER has changed: the members' ids, endpoints, seats and keys,
-    /// the principals and the revoked keys (#178).
+    /// How many times the ROSTER has changed: the members' ids, endpoints, seats and keys, and
+    /// the revoked keys (#178).
     ///
     /// **Derived by `Apply`, never carried by a command**, and bumped only when the roster's
-    /// projection actually differs afterwards -- so every voter applying the same log reaches
-    /// the same number for the same roster, which is what lets their endorsements of it add
-    /// up to a majority. The applied log INDEX is the rejected alternative: two voters a
-    /// moment apart would endorse one roster under two versions, and neither would ever
-    /// reach a majority.
+    /// projection actually differs afterwards -- so every node applying the same log reports
+    /// the same number for the same roster, and an operator comparing two nodes'
+    /// `roster-version` compares rosters rather than log positions. The applied log INDEX is
+    /// the rejected alternative: two nodes a moment apart would report one roster under two
+    /// numbers.
     ///
-    /// A worker adopts only a version at least as new as the one it holds, so this is also
-    /// what stops a replayed old roster -- endorsed when it was current -- from winding a
-    /// worker back.
+    /// It once also let voters' endorsements of a certified roster add up to a majority. That
+    /// roster is retired: every node reads the roster its own consensus applied.
     std::uint64_t rosterVersion {};
 
     /// The last dissolve this fleet decided, if any (`CommandKind::DissolveInto`): every member that
@@ -698,9 +638,9 @@ struct ClusterState
     /// @return True when a `revokedKeys` entry holds it.
     [[nodiscard]] bool IsRevoked(Ed25519PublicKey const& key) const;
 
-    /// Who holds `key` LIVE, as a member or as a principal.
+    /// Which member holds `key` LIVE.
     /// @param key A public key.
-    /// @return The holder's id, or nullopt when no member and no principal holds it.
+    /// @return The holder's id, or nullopt when no member holds it.
     [[nodiscard]] std::optional<std::string> HolderOf(Ed25519PublicKey const& key) const;
 };
 
@@ -752,8 +692,8 @@ enum class CommandKind : std::uint8_t
     /// would leave a window in which the cluster has agreed it does not exist.
     AddMember = 0,
 
-    /// Forget an id: remove it wherever the cluster records it, as a member or as a
-    /// principal, and REVOKE the key that record held (#1555). `--cluster-forget`.
+    /// Forget an id: remove its member record, and REVOKE the key that record held (#1555).
+    /// `--cluster-forget`.
     ///
     /// **One act, because an operator removing a machine has one intention.** The two
     /// halves apart are a state nobody asked for: a record gone and its key live is a
@@ -801,14 +741,11 @@ enum class CommandKind : std::uint8_t
     /// `AddMember` promotes it. `MemberSeatTable` says which verb writes which seat.
     AddLearner,
 
-    /// Admit a machine by its key, as a principal rather than a member (#178).
-    ///
-    /// Refused for a key that is revoked, for a key another id holds, and for an id that
-    /// is a member. Re-admitting a principal's id replaces its record, which is how a
-    /// principal's key is rotated -- the old key is then simply nobody's, refused on every
-    /// wire as a key nobody holds. A key an operator wants refused FOR GOOD is revoked by
-    /// forgetting the id before it is admitted again under its new one (`Forget`).
-    AdmitPrincipal,
+    /// RETIRED (was AdmitPrincipal, #178): admitted a machine by its key as a principal rather
+    /// than a member. Principal mode is retired -- every machine that joins is a learner member
+    /// holding a key -- so the byte stays reserved, `Validate` refuses it by name, and a node
+    /// whose own log holds one refuses to start rather than replay it.
+    RetiredAdmitPrincipal,
 
     /// Dissolve this fleet into another: record the `DissolveOrder` every member leaves on.
     ///
@@ -934,8 +871,7 @@ struct Command
 {
     CommandKind kind { CommandKind::AddMember };
     /// The member id for `AddMember`/`AddLearner`, the setting name for `SetSetting`, the
-    /// principal's id for `AdmitPrincipal`, and the id -- a member's or a principal's -- for
-    /// `Forget`.
+    /// member's id for `Forget`, and the survivor's id for `DissolveInto`.
     std::string key;
     /// The consensus endpoint for `AddMember`/`AddLearner`, the value for `SetSetting`,
     /// empty otherwise.
@@ -954,15 +890,11 @@ struct Command
     std::string schedulerEndpoint;
 
     /// The key the verb acts on (#178): the member's for `AddMember`/`AddLearner`, where
-    /// absent is NO OPINION and keeps what is recorded; the principal's for
-    /// `AdmitPrincipal`, where it is required; and for `Forget`, the key the proposing leader
+    /// absent is NO OPINION and keeps what is recorded; the survivor's proven key for
+    /// `DissolveInto`, where it is required; and for `Forget`, the key the proposing leader
     /// holds live for the id, revoked beside whatever the record holds (`PrepareForget`).
     /// Refused for every other verb.
     std::optional<Ed25519PublicKey> publicKey;
-
-    /// `AdmitPrincipal` only, and required there: what the principal may do. Refused for
-    /// every other verb.
-    std::optional<PrincipalRole> role;
 
     /// `DissolveInto` only, and required there: when the survivor was created, as proven. Refused for
     /// every other verb.
@@ -1040,7 +972,8 @@ void Apply(ClusterState& state, Command const& command);
 /// type, and that member would count towards quorum forever -- which is the trap
 /// #159 records.
 ///
-/// The two RETIRED verbs (`RetiredAdmitClient`, `RetiredForgetClient`) are refused by name,
+/// The RETIRED verbs (`RetiredAdmitClient`, `RetiredForgetClient`, `RetiredAdmitPrincipal`) are
+/// refused by name,
 /// whatever they carry: their bytes stay reserved so an old entry is never read as a
 /// different verb.
 ///
@@ -1054,8 +987,8 @@ void Apply(ClusterState& state, Command const& command);
 ///
 /// `Validate`, and then the rules only the state can answer, which are all about KEYS: a
 /// revoked key is never admitted again (`KeyRevoked`, a refusal of the command -- nothing
-/// the state can later do un-revokes it); a key is held by one id at a time; an id is a
-/// member or a principal, never both; and a member is never admitted with NO key, stated
+/// the state can later do un-revokes it); a key is held by one id at a time; and a member is
+/// never admitted with NO key, stated
 /// or recorded -- a machine is forgotten by revoking its key, so one admitted without one
 /// could never be forgotten for good. Every proposer asks this -- the leader before it
 /// appends, and the scheduler surface an operator types at -- so the refusal reaches whoever

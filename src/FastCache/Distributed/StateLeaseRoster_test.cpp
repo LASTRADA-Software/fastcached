@@ -114,8 +114,7 @@ TEST_CASE("A grant signed by a voter the cluster has since forgotten is refused 
                                   .key = id,
                                   .value = id + ":6680",
                                   .schedulerEndpoint = {},
-                                  .publicKey = TestKeyPair(id).PublicKey(),
-                                  .role = std::nullopt };
+                                  .publicKey = TestKeyPair(id).PublicKey() };
     };
     auto const forget = [](Cluster::ClusterState& state, std::string const& id) {
         Cluster::Apply(state,
@@ -123,8 +122,7 @@ TEST_CASE("A grant signed by a voter the cluster has since forgotten is refused 
                                           .key = id,
                                           .value = {},
                                           .schedulerEndpoint = {},
-                                          .publicKey = std::nullopt,
-                                          .role = std::nullopt });
+                                          .publicKey = std::nullopt });
     };
     auto const grant = LeaseClaims { .serial = "17",
                                      .endpoint = "10.0.0.7:6675",

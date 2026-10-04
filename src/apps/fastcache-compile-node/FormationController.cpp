@@ -469,7 +469,6 @@ std::optional<Cluster::Command> FormationController::ProposalLocked(Wire::FleetS
                               .value = summary.leaderNodeEndpoint,
                               .schedulerEndpoint = {},
                               .publicKey = seen.Key(),
-                              .role = std::nullopt,
                               .createdAtUnixSeconds = summary.createdAtUnixSeconds,
                               .leaderKey = leaderKey };
 }

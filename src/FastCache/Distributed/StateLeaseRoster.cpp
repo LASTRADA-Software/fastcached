@@ -66,7 +66,6 @@ void StateLeaseRoster::Adopt(Cluster::ClusterState const& state)
         .version = state.rosterVersion,
         .voters = static_cast<std::uint32_t>(
             std::ranges::count(roster.members, Cluster::MemberSeat::Voter, &Cluster::RosterMember::seat)),
-        .principals = static_cast<std::uint32_t>(roster.principals.size()),
         .revoked = static_cast<std::uint32_t>(roster.revoked.size()),
         .voterKeys = std::move(voterKeys),
     };

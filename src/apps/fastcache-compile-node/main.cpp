@@ -1228,7 +1228,7 @@ using Node::NodeReloader;
                                     logger);
 
     // The identity prover (#178), built wherever this node runs CONSENSUS: a proof is judged
-    // against the cluster's applied roster -- members, enrolled principals and revoked keys --
+    // against the cluster's applied roster -- members and revoked keys --
     // which only a consensus member holds, and it is asked of `membership`, whose `ExplainKey` is
     // the one door to that answer for the proof and for every later verb alike. A consensus node
     // holds an identity key, as every node does.

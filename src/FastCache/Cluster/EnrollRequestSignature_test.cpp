@@ -45,10 +45,11 @@ TEST_CASE("An enroll request's signature covers every field it states, so none c
     // leader's challenge among them, answered or not -- a first ask's signature refreshes no row.
     auto const otherNonce = std::array<std::byte, Wire::NodeChallengeBytes> { std::byte { 0x3D } };
     auto const challenge = std::array<std::byte, Wire::NodeChallengeBytes> { std::byte { 0x5E } };
-    auto const changes = std::array<std::function<void(EnrollRequestClaim&)>, 6> {
+    // The role is signed too, but a learner is the one role a request may state -- a retired byte is
+    // refused by the decoder before any signature is asked -- so no second role can be tried here.
+    auto const changes = std::array<std::function<void(EnrollRequestClaim&)>, 5> {
         [](EnrollRequestClaim& c) { c.nodeId = "n-desk"; },
         [](EnrollRequestClaim& c) { c.nodeEndpoint = "attacker:6674"; },
-        [](EnrollRequestClaim& c) { c.role = Wire::EnrollRole::Worker; },
         [](EnrollRequestClaim& c) { c.publicKey = Testing::TestKeyPair("n-desk").PublicKey(); },
         [&otherNonce](EnrollRequestClaim& c) { c.nonce = otherNonce; },
         [&challenge](EnrollRequestClaim& c) { c.challenge = challenge; },

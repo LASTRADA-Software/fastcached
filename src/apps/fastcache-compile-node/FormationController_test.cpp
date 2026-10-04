@@ -143,7 +143,6 @@ constexpr std::chrono::seconds MachineStartsAt { 1'700'000'000 };
     auto roster = Cluster::Roster { .members = { member("n-evil", MemberSeat::Voter),
                                                  member("n-laptop", MemberSeat::Learner),
                                                  member("n-office", seat) },
-                                    .principals = {},
                                     .revoked = {} };
     return Cluster::EncodeRoster(roster);
 }

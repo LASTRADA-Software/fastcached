@@ -414,9 +414,9 @@ static_assert(RowsInEnumeratorOrder(KeyEvidenceRoutes, &KeyEvidenceRow::evidence
 /// Which identity keys the cluster holds LIVE, and which it has REVOKED -- the one participant with
 /// an opinion about a key (#178).
 ///
-/// Published from the applied `ClusterState` wholesale: members of either seat and enrolled
-/// principals are live under their ids, and every revoked key is revoked whatever id it was revoked
-/// under -- the key is the fact, and the id a revocation carries is a label.
+/// Published from the applied `ClusterState` wholesale: members of either seat are live under their
+/// ids, and every revoked key is revoked whatever id it was revoked under -- the key is the fact, and
+/// the id a revocation carries is a label.
 ///
 /// It admits no ADDRESS. Composed into `AnyOfMembership` it answers `Explain` with silence, so
 /// adding it cannot widen who is admitted by where they dial from.
@@ -458,7 +458,7 @@ class KeyRosterMembership final: public IMembershipOracle
     }
 
     /// @param id The id to look up.
-    /// @return Its live key, or nothing when no member or principal is recorded under it.
+    /// @return Its live key, or nothing when no member is recorded under it.
     [[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view id) const override
     {
         std::shared_lock const guard { _mutex };

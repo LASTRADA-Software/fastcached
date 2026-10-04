@@ -26,7 +26,7 @@ namespace FastCache::Node
 
 /// Publish which identity keys @p state holds live and which it revoked, into @p keys.
 ///
-/// Members of either seat and enrolled principals are live under their ids; a revoked key is
+/// Members of either seat are live under their ids; a revoked key is
 /// revoked whatever id it was revoked under. In one swap, so a reader never sees a key admitted by
 /// one roster and revoked by the next as neither. The ONE derivation from state to key admission:
 /// `NodeMembership::PublishCluster` calls it, and so does a test fleet whose machines must admit
@@ -38,8 +38,6 @@ inline void PublishClusterKeys(Distributed::KeyRosterMembership& keys, Cluster::
     std::map<std::string, Ed25519PublicKey, std::less<>> live;
     for (auto const& member: state.members)
         live.emplace(member.id, member.publicKey);
-    for (auto const& principal: state.principals)
-        live.emplace(principal.id, principal.publicKey);
     std::vector<Ed25519PublicKey> revoked;
     revoked.reserve(state.revokedKeys.size());
     for (auto const& entry: state.revokedKeys)

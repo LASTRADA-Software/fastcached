@@ -237,16 +237,8 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
         return Cc::Refuse(_metrics,
                           { .code = Wire::ErrorCode::MalformedFrame,
                             .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed },
-                          "an enroll request names an id, an endpoint, a role this build knows, a 32-byte "
-                          "identity key and a 32-byte nonce");
-
-    // A machine joins ONE way, as a learner. A role the wire still decodes and no row names is
-    // refused here, before anything is recorded, so no later step reads a row for it.
-    if (!ServesEnrollRole(fields->role))
-        return Cc::Refuse(_metrics,
-                          { .code = Wire::ErrorCode::MalformedFrame,
-                            .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed },
-                          "a machine enrolls as a learner; no other role is admitted");
+                          "an enroll request names an id, an endpoint, a role this build knows -- a learner, the one "
+                          "role a machine enrolls as -- a 32-byte identity key and a 32-byte nonce");
 
     auto const nodeId = Wire::AsStringView(fields->nodeId);
     auto const nodeEndpoint = Wire::AsStringView(fields->nodeEndpoint);
@@ -279,8 +271,8 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
     // the approval, because the list is what a PERSON reads and a row they cannot act on is
     // one they should never be shown. A learner states where its `0xFC` port answers, and the
     // approval records it, so it must be one ANOTHER machine could dial -- the one rule every route
-    // into a member record asks (`IsPeerDialableEndpoint`); a worker principal is dialled by
-    // nobody, so an endpoint from one is a claim the record it becomes has nowhere to keep.
+    // into a member record asks (`IsPeerDialableEndpoint`) -- and a request stating none would
+    // become a record no other machine of the fleet could resolve.
     if (nodeId.empty() || role.statesEndpoint == nodeEndpoint.empty()
         || (role.statesEndpoint && !IsPeerDialableEndpoint(nodeEndpoint)))
         return Cc::Refuse(_metrics,
@@ -349,8 +341,7 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
         if (_window.Find(nodeId).has_value())
             return false;
         auto const state = _scheduler.AdministeredState();
-        return state.has_value()
-               && RosterRecordsJoiner(Cluster::ProjectRoster(*state), nodeId, fields->publicKey, fields->role);
+        return state.has_value() && RosterRecordsJoiner(Cluster::ProjectRoster(*state), nodeId, fields->publicKey);
     }();
 
     // A challenge for the row this request may create or refresh, drawn BEFORE the window decides,
@@ -438,7 +429,7 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
     if (!state.has_value())
         return answer(Wire::EnrollOutcome::Pending);
     auto const projected = Cluster::ProjectRoster(*state);
-    if (!RosterRecordsJoiner(projected, nodeId, fields->publicKey, fields->role))
+    if (!RosterRecordsJoiner(projected, nodeId, fields->publicKey))
         return answer(Wire::EnrollOutcome::Pending);
 
     // The roster, and no secret: it is every member's PUBLIC key, and nothing in it lets its

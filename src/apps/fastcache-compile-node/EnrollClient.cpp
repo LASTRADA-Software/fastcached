@@ -391,7 +391,7 @@ std::expected<std::string, std::string> DescribeAdmission(JoinerIdentity const& 
                                              decoded.error().context) };
 
     auto const& row = EnrollRoleRowFor(self.role);
-    if (!RosterRecordsJoiner(*decoded, self.nodeId, self.publicKey, self.role))
+    if (!RosterRecordsJoiner(*decoded, self.nodeId, self.publicKey))
         return std::unexpected { std::format(
             "the seed said {} was admitted, and the roster it sent does not record {} as a {} under this machine's key "
             "{}. Either an operator approved a different key for this id, or something between this machine and the "

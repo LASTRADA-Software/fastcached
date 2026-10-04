@@ -791,8 +791,8 @@ TEST_CASE("The claim fields are framed, not joined", "[distributed][lease][token
 
 TEST_CASE("A signature over the claims without the lease's label is not a lease", "[distributed][lease][token]")
 {
-    // A node's identity key signs more than grants: every Raft handshake transcript and every
-    // roster endorsement too (#178). One key serving several constructions is how a signature
+    // A node's identity key signs more than grants: every Raft handshake transcript, node proof
+    // and fleet summary too (#178). One key serving several constructions is how a signature
     // produced for one comes to be accepted for another, so a grant's message starts with its
     // own label. A signature over the bare packed claims -- what a construction with no label,
     // or another's, would produce -- verifies under the right key and is still no grant.

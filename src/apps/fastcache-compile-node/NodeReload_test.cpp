@@ -414,8 +414,7 @@ TEST_CASE("A reload never revokes what the cluster agreed", "[node][membership][
                                       .key = "m50",
                                       .value = "10.0.0.50:6676",
                                       .schedulerEndpoint = {},
-                                      .publicKey = key,
-                                      .role = std::nullopt });
+                                      .publicKey = key });
     membership.PublishCluster(state);
     auto const member = ConnectionFacts { .host = "10.0.0.50", .proven = ProvenIdentity { .id = "m50", .key = key } };
     REQUIRE(Distributed::ExplainConnection(oracle, member).verdict == Distributed::Membership::Member);

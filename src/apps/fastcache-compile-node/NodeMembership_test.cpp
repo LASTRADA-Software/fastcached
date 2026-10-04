@@ -59,8 +59,7 @@ void Forget(FastCache::Cluster::ClusterState& state, std::string const& id)
                                                             .key = id,
                                                             .value = {},
                                                             .schedulerEndpoint = {},
-                                                            .publicKey = std::nullopt,
-                                                            .role = std::nullopt });
+                                                            .publicKey = std::nullopt });
 }
 
 /// Apply a committed `--cluster-admit=<id>=<endpoint>@<key>` to @p state, as consensus would.
@@ -78,8 +77,7 @@ void Admit(FastCache::Cluster::ClusterState& state,
                                                             .key = id,
                                                             .value = endpoint,
                                                             .schedulerEndpoint = {},
-                                                            .publicKey = key,
-                                                            .role = std::nullopt });
+                                                            .publicKey = key });
 }
 } // namespace
 
@@ -385,7 +383,13 @@ TEST_CASE("A rosterless node that runs no consensus admits no other machine, by 
     // And the control that makes the key half able to fail: the same key IS admitted, by proof and
     // by ticket, once a roster names it -- which only a node running consensus is ever handed.
     auto state = FastCache::Cluster::ClusterState {};
-    state.principals.push_back(FastCache::Cluster::ClusterPrincipal { .id = "n9", .publicKey = proven->key });
+    state.members.push_back(FastCache::Cluster::ClusterMember {
+        .id = "n9",
+        .raftEndpoint = {},
+        .schedulerEndpoint = {},
+        .schedulerEndpointHistory = FastCache::Cluster::SchedulerEndpointHistory::NeverAnnounced,
+        .seat = FastCache::Cluster::MemberSeat::Learner,
+        .publicKey = proven->key });
     membership.PublishCluster(state);
     CHECK(Distributed::ExplainConnection(oracle, ConnectionFacts { .host = "10.0.0.7", .proven = proven }).verdict
           == Membership::Member);
@@ -421,8 +425,7 @@ TEST_CASE("A learner's verified ticket admits it once consensus publishes the cl
                                                             .key = machine.id,
                                                             .value = "10.0.0.7:6676",
                                                             .schedulerEndpoint = {},
-                                                            .publicKey = machine.key,
-                                                            .role = std::nullopt });
+                                                            .publicKey = machine.key });
     REQUIRE(state.members.size() == 1);
     REQUIRE(state.members.front().seat == FastCache::Cluster::MemberSeat::Learner);
     membership.PublishCluster(state);

@@ -31,8 +31,7 @@ namespace
                                           .key = machine,
                                           .value = "10.0.0.3:6680",
                                           .schedulerEndpoint = std::string { machine } + ".office.example:6674",
-                                          .publicKey = Testing::TestKeyPair(machine).PublicKey(),
-                                          .role = std::nullopt });
+                                          .publicKey = Testing::TestKeyPair(machine).PublicKey() });
     }
     state.settings.push_back(Cluster::Setting { .name = std::string { Cluster::SharedCacheSetting }, .value = named });
     return state;

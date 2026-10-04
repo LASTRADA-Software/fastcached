@@ -104,12 +104,8 @@ TEST_CASE("A typed key the cluster revoked is revoked, whatever the command line
     ClusterState state;
     state.members = { Recorded("n2", KeyOf("n2")) };
     Apply(state,
-          Command { .kind = CommandKind::Forget,
-                    .key = "n2",
-                    .value = {},
-                    .schedulerEndpoint = {},
-                    .publicKey = std::nullopt,
-                    .role = std::nullopt });
+          Command {
+              .kind = CommandKind::Forget, .key = "n2", .value = {}, .schedulerEndpoint = {}, .publicKey = std::nullopt });
     REQUIRE(state.IsRevoked(KeyOf("n2")));
     roster.Adopt(state);
 
@@ -136,12 +132,8 @@ TEST_CASE("A forgotten machine is reported as itself whatever id it claims", "[c
     ClusterState state;
     state.members = RecordedAsTyped(bootstrap);
     Apply(state,
-          Command { .kind = CommandKind::Forget,
-                    .key = "n3",
-                    .value = {},
-                    .schedulerEndpoint = {},
-                    .publicKey = std::nullopt,
-                    .role = std::nullopt });
+          Command {
+              .kind = CommandKind::Forget, .key = "n3", .value = {}, .schedulerEndpoint = {}, .publicKey = std::nullopt });
     REQUIRE(state.IsRevoked(KeyOf("n3")));
     roster.Adopt(state);
 
@@ -189,12 +181,8 @@ TEST_CASE("A forgotten member keeps its own key here until the configuration dro
     ClusterState state;
     state.members = RecordedAsTyped(bootstrap);
     Apply(state,
-          Command { .kind = CommandKind::Forget,
-                    .key = "n3",
-                    .value = {},
-                    .schedulerEndpoint = {},
-                    .publicKey = std::nullopt,
-                    .role = std::nullopt });
+          Command {
+              .kind = CommandKind::Forget, .key = "n3", .value = {}, .schedulerEndpoint = {}, .publicKey = std::nullopt });
     REQUIRE(state.IsRevoked(KeyOf("n3")));
     roster.Adopt(state);
     roster.AdoptConfiguration(Consensus::Configuration { .voters = { "n1", "n2", "n3" }, .learners = {} });
@@ -216,19 +204,6 @@ TEST_CASE("A forgotten member keeps its own key here until the configuration dro
     roster.AdoptConfiguration(Consensus::Configuration { .voters = { "n1", "n2" }, .learners = {} });
     CHECK_FALSE(identity.StillProves("n3", KeyOf("n3")));
     CHECK(std::ranges::contains(roster.KeysOf("n3").revoked, KeyOf("n3")));
-}
-
-TEST_CASE("A principal is a stranger on the Raft peer wire", "[cluster][roster]")
-{
-    // A principal never joins consensus, so its admitted key proves nothing here.
-    auto const bootstrap = Bootstrap();
-    RosterKeys roster { TestKeyPair("n1"), bootstrap };
-
-    ClusterState state;
-    state.principals = { ClusterPrincipal { .id = "w1", .publicKey = KeyOf("w1"), .role = PrincipalRole::Worker } };
-    roster.Adopt(state);
-
-    CHECK_FALSE(roster.KeysOf("w1").live.has_value());
 }
 
 TEST_CASE("A roster signs as its own key and nothing else", "[cluster][roster]")
@@ -263,12 +238,8 @@ TEST_CASE("An applied forget withdraws the key from every session it proved, tho
     REQUIRE(identity.StillProves("n3", KeyOf("n3")));
 
     Apply(state,
-          Command { .kind = CommandKind::Forget,
-                    .key = "n3",
-                    .value = {},
-                    .schedulerEndpoint = {},
-                    .publicKey = std::nullopt,
-                    .role = std::nullopt });
+          Command {
+              .kind = CommandKind::Forget, .key = "n3", .value = {}, .schedulerEndpoint = {}, .publicKey = std::nullopt });
     REQUIRE(std::ranges::none_of(state.members, [](ClusterMember const& m) { return m.id == "n3"; }));
     roster.Adopt(state);
     // And the configuration no longer counts n3 -- the removal the forget leads to, which the

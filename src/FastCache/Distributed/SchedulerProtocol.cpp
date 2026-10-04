@@ -31,9 +31,9 @@ namespace
     /// derived from it: a verb that reaches this class without a row is refused
     /// rather than served, which is the direction a mistake has to fail in.
     constexpr std::array SchedulerOps {
-        Wire::Op::Register,      Wire::Op::NodeAnnounce, Wire::Op::Heartbeat,           Wire::Op::Withdraw,
-        Wire::Op::Lease,         Wire::Op::Release,      Wire::Op::ClusterStatus,       Wire::Op::ClusterSet,
-        Wire::Op::ClusterForget, Wire::Op::ClusterAdmit, Wire::Op::ClusterAdmitLearner, Wire::Op::ClusterAdmitWorker
+        Wire::Op::Register,      Wire::Op::NodeAnnounce, Wire::Op::Heartbeat,          Wire::Op::Withdraw,
+        Wire::Op::Lease,         Wire::Op::Release,      Wire::Op::ClusterStatus,      Wire::Op::ClusterSet,
+        Wire::Op::ClusterForget, Wire::Op::ClusterAdmit, Wire::Op::ClusterAdmitLearner
     };
 
     /// Whether this scheduler serves @p op at all.
@@ -514,13 +514,6 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                          Cluster::MemberSeat::Learner);
         }
 
-        case Wire::Op::ClusterAdmitWorker: {
-            auto const fields = Wire::DecodeClusterAdmitWorkerPayload(payload);
-            if (!fields.has_value())
-                return SchedulerReply::Malformed();
-            return _service.ClusterAdmitWorker(
-                caller, Wire::AsStringView(fields->workerId), Wire::AsStringView(fields->publicKey));
-        }
         default:
             // Unreachable: `IsSchedulerVerb` has already refused everything else.
             // Kept as a refusal rather than an assertion because a verb added to

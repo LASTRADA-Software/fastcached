@@ -1437,8 +1437,7 @@ class IMetricsSink
         /// A machine ticket refused because this node holds no current roster to check it against.
         NodeTicketsRefusedNoRoster,
         /// A machine ticket naming a machine the roster holds no live key for, signed by no revoked
-        /// key: a machine not admitted, or an enrolled principal, whose tickets the lease roster
-        /// does not check (it holds members of either seat only).
+        /// key: a machine not admitted.
         NodeTicketsRefusedUnknownMachine,
         /// A machine ticket naming an admitted machine and not signed by that machine's key.
         NodeTicketsRefusedForged,

@@ -5785,8 +5785,7 @@ TEST_CASE("The cluster-status verb reads a live node's cluster over its node por
                                       .value = "10.0.0.1:6680",
                                       .schedulerEndpoint = "10.0.0.1:6675",
                                       // A member record carries its key: `Apply` records none without.
-                                      .publicKey = Testing::TestKeyPair("n1").PublicKey(),
-                                      .role = std::nullopt });
+                                      .publicKey = Testing::TestKeyPair("n1").PublicKey() });
     REQUIRE(cluster.state.members.size() == 1);
     fleet.service.AdministerWith(cluster);
     MergedResponder merged { SurfaceComponents { .scheduler = &fleet.responder } };

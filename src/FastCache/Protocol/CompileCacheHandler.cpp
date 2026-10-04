@@ -1262,7 +1262,6 @@ core::async::Task<void> CompileCacheHandler::Run(core::net::ISocket* socket,
             case Wire::Op::ClusterForget:
             case Wire::Op::ClusterAdmit:
             case Wire::Op::ClusterAdmitLearner:
-            case Wire::Op::ClusterAdmitWorker:
             // The operator verbs, answered by a compile node and refused HERE by name.
             // Sharing the arm above is right rather than convenient: `HandleDistributed`
             // is the one door to `RefusalFor`, which is the table that says which code

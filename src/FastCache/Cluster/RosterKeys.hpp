@@ -43,11 +43,7 @@ namespace FastCache::Cluster
 /// id stays live FOR THAT ID while this node's configuration counts it (`AdoptConfiguration`),
 /// and is refused the moment the configuration drops it -- which is Raft's own rule for a
 /// removed server, stated about keys. Nothing else is graced: the same key under any other id
-/// is refused, a forgotten member the configuration never counted is refused at once, and so
-/// is every principal, which consensus never counts.
-///
-/// Principals are NOT read: a principal never joins consensus (`ClusterPrincipal`), so an id
-/// that names one is a stranger on this wire.
+/// is refused, and a forgotten member the configuration never counted is refused at once.
 ///
 /// ## Every revoked key, whatever id is asked about
 ///

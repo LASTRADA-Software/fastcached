@@ -53,8 +53,8 @@ namespace FastCache::Node
 ///
 /// ## It is built only on a node that runs CONSENSUS
 ///
-/// A proof is judged against the cluster's applied roster -- members, enrolled principals and
-/// revoked keys -- which only a node running consensus holds. Every other node leaves the component
+/// A proof is judged against the cluster's applied roster -- members and revoked keys -- which
+/// only a node running consensus holds. Every other node leaves the component
 /// null and `MergedResponder` answers the whole family `NoCluster` -- never `UnimplementedVerb`,
 /// which a caller reads as *this node's build is too old* and acts on by upgrading a machine that
 /// is already current.

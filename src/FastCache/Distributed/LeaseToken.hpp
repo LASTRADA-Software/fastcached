@@ -398,7 +398,7 @@ class ILeaseSigner
 struct LeaseSignerKeys
 {
     /// The key the id signs with NOW -- present only for a VOTER the roster records a key
-    /// for. A learner, a principal and a stranger have none: a grant is a scheduler's, and
+    /// for. A learner and a stranger have none: a grant is a scheduler's, and
     /// only a voter can lead.
     std::optional<Ed25519PublicKey> live;
 

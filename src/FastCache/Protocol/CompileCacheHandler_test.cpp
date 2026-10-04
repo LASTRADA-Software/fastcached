@@ -506,7 +506,7 @@ TEST_CASE("An unknown opcode is rejected but the connection survives", "[compile
 TEST_CASE("A retired opcode is refused UnknownOpcode at the surface, counted, and the connection survives",
           "[compile-cache][handler][retired]")
 {
-    // `RetiredOpcodes` pins that no ROW claims 0x16 or 0x17; this pins what a SURFACE answers a
+    // `RetiredOpcodes` pins that no ROW claims 0x16, 0x17 or 0x1D; this pins what a SURFACE answers a
     // frame naming one: `UnknownOpcode`, as for any byte no row claims -- never a friendlier
     // refusal special-cased for the retired verbs, which a peer built before the retirement
     // would read under the old verb's name.

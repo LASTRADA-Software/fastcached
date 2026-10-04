@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstddef>
+#include <format>
 #include <optional>
 #include <span>
 #include <string>
@@ -36,7 +37,7 @@ namespace
                            .publicKey = TestKeyPair(id).PublicKey() };
 }
 
-/// Three voters, a learner, a worker principal and one revocation.
+/// Three voters, a learner and one revocation.
 [[nodiscard]] ClusterState SampleState()
 {
     ClusterState state;
@@ -44,8 +45,6 @@ namespace
                       Member("n2", MemberSeat::Voter),
                       Member("n3", MemberSeat::Voter),
                       Member("n4", MemberSeat::Learner) };
-    state.principals = { ClusterPrincipal {
-        .id = "w1", .publicKey = TestKeyPair("w1").PublicKey(), .role = PrincipalRole::Worker } };
     state.revokedKeys = { RevokedKey { .id = "n0", .publicKey = TestKeyPair("n0").PublicKey() } };
     return state;
 }
@@ -76,7 +75,6 @@ TEST_CASE("A roster is projected from the state it describes, seats and keys inc
     CHECK(roster.members[0].publicKey == TestKeyPair("n1").PublicKey());
     CHECK(roster.members[2].publicKey == TestKeyPair("n3").PublicKey());
     CHECK(roster.members[3].seat == MemberSeat::Learner);
-    CHECK(roster.principals == state.principals);
     CHECK(roster.revoked == state.revokedKeys);
 }
 
@@ -133,11 +131,13 @@ TEST_CASE("A roster another build laid out is refused by name, and a damaged one
     auto const& fields = Testing::Unwrap(split);
     REQUIRE(fields[0].size() == 1);
 
-    // The byte, pinned as well as the name: the version is the first field's only byte. 2 since a
-    // member carries its recorded `0xFC` endpoint: a roster is PERSISTED (a learner's formation record
-    // keeps its approval's), so a layout change without a bump would read an old record as damage.
-    CHECK(fields[0][0] == std::byte { 0x02 });
-    static_assert(RosterFormatVersion == 2);
+    // The byte, pinned as well as the name: the version is the first field's only byte. 3 since the
+    // principals group left with principal mode (2 added each member's recorded `0xFC` endpoint): a
+    // roster is PERSISTED (a learner's formation record keeps its approval's), so a layout change
+    // without a bump would read an old record as damage.
+    CHECK(fields[0][0] == std::byte { 0x03 });
+    CHECK(fields.size() == 3); // the version, the members, the revoked keys
+    static_assert(RosterFormatVersion == 3);
 
     SECTION("the previous layout, a record written before members carried an endpoint")
     {
@@ -156,7 +156,24 @@ TEST_CASE("A roster another build laid out is refused by name, and a damaged one
         auto const decoded = DecodeRoster(old);
         REQUIRE_FALSE(decoded.has_value());
         CHECK(decoded.error().code == ConsensusErrorCode::UnsupportedVersion);
-        CHECK(decoded.error().context.contains("roster encoding version 1 (this build reads 2)"));
+        CHECK(decoded.error().context.contains(
+            std::format("roster encoding version 1 (this build reads {})", RosterFormatVersion)));
+    }
+
+    SECTION("the previous layout, a record written while principals were a group of their own")
+    {
+        // Built by hand as version 2 wrote it -- members, principals, revoked keys -- and refused by
+        // NAME, so a learner whose record holds one is told which build wrote it.
+        auto const empty = WireFields::Encode(WireFields::FieldList {});
+        auto const old = WireFields::Encode({ std::span<std::byte const> { std::array { std::byte { 0x02 } } },
+                                              std::span<std::byte const> { empty },
+                                              std::span<std::byte const> { empty },
+                                              std::span<std::byte const> { empty } });
+        auto const decoded = DecodeRoster(old);
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == ConsensusErrorCode::UnsupportedVersion);
+        CHECK(decoded.error().context.contains(
+            std::format("roster encoding version 2 (this build reads {})", RosterFormatVersion)));
     }
 
     SECTION("another layout version")
@@ -180,10 +197,10 @@ TEST_CASE("A roster another build laid out is refused by name, and a damaged one
 TEST_CASE("A roster holding a small-order or non-canonical live key is refused, naming its holder",
           "[cluster][roster][identity][security]")
 {
-    // A roster is what a worker checks grants and endorsements against, so a small-order voter key
+    // A roster is what a worker checks grants against, so a small-order voter key
     // in one is a voter anybody can sign as -- under it a small-order signature verifies every
-    // message. Refused on decode by the holder's name, as a member's key and as a principal's; the
-    // control is the same key REVOKED, which grants nothing and is kept.
+    // message. Refused on decode by the holder's name; the control is the same key REVOKED, which
+    // grants nothing and is kept.
     auto nonCanonical = Ed25519PublicKey {};
     nonCanonical.fill(std::byte { 0xFF });
     nonCanonical.back() = std::byte { 0x7F };
@@ -192,18 +209,15 @@ TEST_CASE("A roster holding a small-order or non-canonical live key is refused, 
                                      std::pair { nonCanonical, PublicKeyFault::NonCanonical } })
     {
         INFO("key " << FormatEd25519PublicKey(key));
-        auto asMember = ProjectRoster(SampleState());
-        asMember.members[1].publicKey = key;
-        auto asPrincipal = ProjectRoster(SampleState());
-        asPrincipal.principals[0].publicKey = key;
-
-        for (auto const& [roster, holder]:
-             { std::pair { asMember, std::string_view { "n2" } }, std::pair { asPrincipal, std::string_view { "w1" } } })
+        for (auto const holder: { std::size_t { 1 }, std::size_t { 3 } }) // a voter, and the learner
         {
+            auto roster = ProjectRoster(SampleState());
+            roster.members[holder].publicKey = key;
+            INFO("holder " << roster.members[holder].id);
             auto const decoded = DecodeRoster(EncodeRoster(roster));
             REQUIRE_FALSE(decoded.has_value());
             CHECK(decoded.error().code == ConsensusErrorCode::MalformedFrame);
-            CHECK(decoded.error().context.contains(std::string { holder } + "'s key"));
+            CHECK(decoded.error().context.contains(roster.members[holder].id + "'s key"));
             CHECK(decoded.error().context.contains(DescribePublicKeyFault(fault)));
         }
 
@@ -219,7 +233,7 @@ TEST_CASE("A roster member with an empty or all-zero key is refused by name", "[
 {
     // A member holds a key by type, so no `Roster` can carry one without -- and the bytes still
     // can, since the field is a length-prefixed run like every other. Built from the bytes: one
-    // member, with no recorded `0xFC` endpoint, no principals, no revocations.
+    // member, with no recorded `0xFC` endpoint, no revocations.
     auto const version = std::array { static_cast<std::byte>(RosterFormatVersion) };
     auto const seat = std::array { static_cast<std::byte>(MemberSeat::Voter) };
     auto const key = TestKeyPair("n1").PublicKey();
@@ -232,7 +246,6 @@ TEST_CASE("A roster member with an empty or all-zero key is refused by name", "[
         auto const members = WireFields::Encode({ std::span<std::byte const> { member } });
         return WireFields::Encode({ std::span<std::byte const> { version },
                                     std::span<std::byte const> { members },
-                                    std::span<std::byte const> {},
                                     std::span<std::byte const> {} });
     };
 
@@ -261,43 +274,6 @@ TEST_CASE("A roster member with an empty or all-zero key is refused by name", "[
     CHECK(damaged.error().context.contains("a roster entry is malformed"));
 }
 
-TEST_CASE("A roster principal with an empty or all-zero key is refused by name", "[cluster][roster]")
-{
-    // The state never records a principal without a key or under the all-zero one, so no roster
-    // projected out of one carries it -- and a kept roster that does is named, as a member is.
-    // Built from the bytes: no members, one principal, no revocations.
-    auto const version = std::array { static_cast<std::byte>(RosterFormatVersion) };
-    auto const role = std::array { static_cast<std::byte>(PrincipalRole::Worker) };
-    auto const key = TestKeyPair("w1").PublicKey();
-    auto const encodeWith = [&](std::span<std::byte const> keyField) {
-        auto const principal = WireFields::Encode(
-            { WireFields::AsBytes(std::string_view { "w1" }), keyField, std::span<std::byte const> { role } });
-        auto const principals = WireFields::Encode({ std::span<std::byte const> { principal } });
-        return WireFields::Encode({ std::span<std::byte const> { version },
-                                    std::span<std::byte const> {},
-                                    std::span<std::byte const> { principals },
-                                    std::span<std::byte const> {} });
-    };
-
-    // WHAT DISTINGUISHES: the same bytes under a real key decode.
-    REQUIRE(DecodeRoster(encodeWith(std::span<std::byte const> { key })).has_value());
-
-    auto const zero = Ed25519PublicKey {};
-    for (auto const keyField: { std::span<std::byte const> {}, std::span<std::byte const> { zero } })
-    {
-        INFO("key field of " << keyField.size() << " bytes");
-        auto const refused = DecodeRoster(encodeWith(keyField));
-        REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().code == ConsensusErrorCode::MalformedFrame);
-        CHECK(refused.error().context.contains("a roster principal holds no identity key"));
-    }
-
-    // And a principal entry malformed some other way is not reported as keyless.
-    auto const damaged = DecodeRoster(encodeWith(std::span<std::byte const> { key }.first(Ed25519PublicKeyBytes - 1)));
-    REQUIRE_FALSE(damaged.has_value());
-    CHECK(damaged.error().context.contains("a roster entry is malformed"));
-}
-
 TEST_CASE("A roster fingerprint is the whole digest, in one spelling", "[cluster][roster]")
 {
     auto const state = SampleState();
@@ -306,6 +282,6 @@ TEST_CASE("A roster fingerprint is the whole digest, in one spelling", "[cluster
     CHECK(text.size() == std::string_view { "SHA256:" }.size() + 43);
 
     auto other = state;
-    other.principals.clear();
+    other.revokedKeys.clear();
     CHECK(RenderRosterFingerprint(DigestOfRoster(ProjectRoster(other))) != text);
 }

@@ -599,12 +599,7 @@ TEST_CASE("An operator's control verb is refused an unidentified caller under it
 
     // The column, asked of the rows one at a time so a failure names the verb; the set itself is
     // `ControlVerbsNeedAnIdentifiedCaller`'s, a build failure.
-    for (auto const op: { Op::ClusterSet,
-                          Op::ClusterForget,
-                          Op::ClusterAdmit,
-                          Op::ClusterAdmitLearner,
-                          Op::ClusterAdmitWorker,
-                          Op::EnrollControl })
+    for (auto const op: { Op::ClusterSet, Op::ClusterForget, Op::ClusterAdmit, Op::ClusterAdmitLearner, Op::EnrollControl })
     {
         auto const* const row = FindOp(static_cast<std::uint8_t>(op));
         REQUIRE(row != nullptr);
@@ -2037,7 +2032,7 @@ TEST_CASE("An enroll request round-trips, and a payload of the wrong arity is re
     signature.fill(std::byte { 0x5C });
     auto const frame = EncodeEnroll(EnrollRequest { .nodeId = "joiner-a",
                                                     .nodeEndpoint = "10.0.0.9:6674",
-                                                    .role = EnrollRole::Worker,
+                                                    .role = EnrollRole::Learner,
                                                     .publicKey = key,
                                                     .nonce = nonce,
                                                     .challenge = {},
@@ -2051,7 +2046,7 @@ TEST_CASE("An enroll request round-trips, and a payload of the wrong arity is re
     REQUIRE(fields.has_value());
     CHECK(AsStringView(Unwrap(fields).nodeId) == "joiner-a");
     CHECK(AsStringView(Unwrap(fields).nodeEndpoint) == "10.0.0.9:6674");
-    CHECK(Unwrap(fields).role == EnrollRole::Worker);
+    CHECK(Unwrap(fields).role == EnrollRole::Learner);
     CHECK(Unwrap(fields).publicKey == key);
     CHECK(Unwrap(fields).nonce == nonce);
     CHECK_FALSE(Unwrap(fields).challenge.has_value()); // a first ask answers none
@@ -2071,8 +2066,7 @@ TEST_CASE("An enroll request round-trips, and a payload of the wrong arity is re
     REQUIRE(refreshed.has_value());
     CHECK(Unwrap(refreshed).challenge == answered);
 
-    // The role's BYTES, since they travel: a symbol both ends spell tests only the name.
-    CHECK(static_cast<std::uint8_t>(EnrollRole::Worker) == 0x02);
+    // The role's BYTE, since it travels: a symbol both ends spell tests only the name.
     CHECK(static_cast<std::uint8_t>(EnrollRole::Learner) == 0x03);
 
     // Two fields where seven are declared -- a version-11 request's shape -- refused on the
@@ -2255,7 +2249,7 @@ TEST_CASE("An enrollment report round-trips every row, ages included", "[wire][e
                                                                           .attempts = 6,
                                                                           .claimsChanged = 3,
                                                                           .decision = EnrollmentDecision::Approved,
-                                                                          .role = EnrollRole::Worker,
+                                                                          .role = EnrollRole::Learner,
                                                                           .publicKey = keyB,
                                                                           .rosterFingerprint = fingerprint,
                                                                           .autoApprovedArmedSecondsAgo = 4,
@@ -2299,7 +2293,7 @@ TEST_CASE("An enrollment report round-trips every row, ages included", "[wire][e
     CHECK(second.claimsChanged == 3);
     CHECK(second.decision == EnrollmentDecision::Approved);
     CHECK(second.nodeEndpoint.empty());
-    CHECK(second.role == EnrollRole::Worker);
+    CHECK(second.role == EnrollRole::Learner);
     CHECK(second.publicKey == keyB);
     CHECK(second.rosterFingerprint == fingerprint);
     CHECK(second.autoApprovedArmedSecondsAgo == std::optional<std::uint64_t> { 4 });
@@ -2499,11 +2493,40 @@ TEST_CASE("An older peer's runtime record reads without the enrollment fields, a
     CHECK(Unwrap(ahead).toolchainsServed == 4);
 }
 
+TEST_CASE("Only a learner may ask to enroll and the retired roles are refused by byte", "[wire][enroll][formation]")
+{
+    // 0x01 was `Member` and 0x02 `Worker`, a principal. A request carrying either is refused by the
+    // DECODER, so no door has to remember to ask -- the control is the same request as a learner.
+    auto key = Ed25519PublicKey {};
+    key.fill(std::byte { 0x4A });
+    auto const nonce = std::array<std::byte, NodeChallengeBytes> {};
+    auto const signature = std::array<std::byte, NodeSignatureBytes> {};
+    auto const frame = EncodeEnroll(EnrollRequest { .nodeId = "n1",
+                                                    .nodeEndpoint = "n1.example:6674",
+                                                    .role = EnrollRole::Learner,
+                                                    .publicKey = key,
+                                                    .nonce = nonce,
+                                                    .challenge = {},
+                                                    .signature = signature });
+    auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+    REQUIRE(DecodeEnrollPayload(payload).has_value());
+    auto parts = Unwrap(WireFields::SplitAll(payload));
+    REQUIRE(parts.size() == OpFieldCount(Op::Enroll));
+    REQUIRE(parts[2].size() == 1); // the role, one byte
+    for (auto const retired: RetiredEnrollRoles)
+    {
+        INFO(static_cast<int>(retired));
+        auto const role = std::array { static_cast<std::byte>(retired) };
+        parts[2] = role;
+        CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode(WireFields::FieldList { parts })).has_value());
+    }
+}
+
 TEST_CASE("Enrollment bytes for learners and auto-approve are pinned and the retired ones stay retired",
           "[wire][enrollment][formation]")
 {
     CHECK(static_cast<std::uint8_t>(EnrollRole::Learner) == 0x03);
-    CHECK(static_cast<std::uint8_t>(EnrollRole::Worker) == 0x02);
+    CHECK(RetiredEnrollRoles == std::array<std::uint8_t, 2> { 0x01, 0x02 });
     CHECK(static_cast<std::uint8_t>(EnrollControlVerb::AutoApprove) == 0x06);
     CHECK(static_cast<std::uint8_t>(EnrollControlVerb::AutoApproveOff) == 0x07);
     CHECK(static_cast<std::uint8_t>(EnrollControlVerb::Clear) == 0x08);
@@ -4002,12 +4025,13 @@ TEST_CASE("A consensus standing travels as its pinned byte, and one this build c
     CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
 }
 
-TEST_CASE("The retired client verbs' bytes are claimed by no row, and never will be", "[wire][retired]")
+TEST_CASE("The retired client and principal verbs' bytes are claimed by no row, and never will be",
+          "[wire][retired][formation]")
 {
-    // 0x16 was CLUSTER-ADMIT-CLIENT and 0x17 CLUSTER-FORGET-CLIENT (#1309). The bytes are
-    // pinned as well as the table's silence about them: a table that forgot the array would
-    // pass the loop over nothing.
-    CHECK(RetiredOpcodes == std::array<std::uint8_t, 2> { 0x16, 0x17 });
+    // 0x16 was CLUSTER-ADMIT-CLIENT and 0x17 CLUSTER-FORGET-CLIENT (#1309); 0x1D was
+    // CLUSTER-ADMIT-WORKER, retired with principal mode. The bytes are pinned as well as the
+    // table's silence about them: a table that forgot the array would pass the loop over nothing.
+    CHECK(RetiredOpcodes == std::array<std::uint8_t, 3> { 0x16, 0x17, 0x1D });
     for (auto const byte: RetiredOpcodes)
     {
         INFO(static_cast<int>(byte));
@@ -4635,12 +4659,10 @@ TEST_CASE("The node handshake's widths, verbs and refusals are pinned as bytes",
 
     CHECK(static_cast<std::uint8_t>(Op::NodeChallenge) == 0x18);
     CHECK(static_cast<std::uint8_t>(Op::ProveNode) == 0x19);
-    CHECK(static_cast<std::uint8_t>(Op::ClusterAdmitWorker) == 0x1D);
     CHECK(static_cast<std::uint8_t>(Op::SharedFetch) == 0x20);
     CHECK(static_cast<std::uint8_t>(Op::SharedStore) == 0x21);
     CHECK(OpFieldCount(Op::NodeChallenge) == 2);
     CHECK(OpFieldCount(Op::ProveNode) == 3);
-    CHECK(OpFieldCount(Op::ClusterAdmitWorker) == 2);
 
     struct Pinned
     {
@@ -4839,21 +4861,6 @@ TEST_CASE("An enroll reply hands a challenge as its third field, exactly one wid
     auto const cut = std::span<std::byte const> { challenge }.first(NodeChallengeBytes - 1);
     CHECK_FALSE(DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, {}, cut, {}, {} })).has_value());
     CHECK(DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, {}, challenge, {}, {} })).has_value());
-}
-
-TEST_CASE("cluster-admit-worker carries the worker's id and its key as text", "[wire][nodeproof]")
-{
-    // The key travels as the text `--print-identity` printed, and the LEADER parses it -- so a
-    // mistyped key is refused by the one parser every door reaches, in its own words.
-    auto const frame = EncodeClusterAdmitWorker(ClusterAdmitWorkerRequest { .workerId = "w-1", .publicKey = "key-text" });
-    auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
-    auto const decoded = DecodeClusterAdmitWorkerPayload(payload);
-    REQUIRE(decoded.has_value());
-    CHECK(AsStringView(Unwrap(decoded).workerId) == "w-1");
-    CHECK(AsStringView(Unwrap(decoded).publicKey) == "key-text");
-
-    auto const idOnly = WireFields::Encode({ AsBytes(std::string_view { "w-1" }) });
-    CHECK_FALSE(DecodeClusterAdmitWorkerPayload(idOnly).has_value());
 }
 
 TEST_CASE("The ticket mint occupies the byte it was assigned, in the session family", "[wire][ticket]")

@@ -114,8 +114,9 @@ struct EnrollRoleRow
 /// One row per role a joiner may ask for: a machine joins ONE way, as a learner.
 ///
 /// A plain array rather than an `EnumTable`, for `KnownEnrollmentDecisions`' reason: a WIRE enum
-/// carries no `Last`. Every row names a role the wire knows; a role the wire still decodes and no
-/// row names is one this build refuses at the door (`ServesEnrollRole`).
+/// carries no `Last`. Every row names a role the wire knows, and every role the wire knows has a
+/// row -- so a retired role is refused by the DECODER (`RetiredEnrollRoles`), never at a door
+/// that would have to remember to ask.
 inline constexpr std::array EnrollRoleTable {
     EnrollRoleRow { .role = CompileCacheWire::EnrollRole::Learner,
                     .name = "learner",
@@ -123,30 +124,27 @@ inline constexpr std::array EnrollRoleTable {
                     .seat = Cluster::MemberSeat::Learner },
 };
 
-/// Whether every row names a role the wire knows, and no role has two rows.
+/// Whether the table and the wire's roles are one set: every row names a role the wire knows, and
+/// every role the wire knows has exactly one row.
 /// @return True when `EnrollRoleTable` is well formed.
-[[nodiscard]] consteval bool EveryEnrollRoleRowIsKnownAndUnique() noexcept
+[[nodiscard]] consteval bool EnrollRoleTableMatchesTheWire() noexcept
 {
-    return std::ranges::all_of(EnrollRoleTable, [](EnrollRoleRow const& row) {
-        return std::ranges::count(CompileCacheWire::KnownEnrollRoles, row.role) == 1
-               && std::ranges::count(EnrollRoleTable, row.role, &EnrollRoleRow::role) == 1;
-    });
+    return std::ranges::all_of(EnrollRoleTable,
+                               [](EnrollRoleRow const& row) {
+                                   return std::ranges::count(CompileCacheWire::KnownEnrollRoles, row.role) == 1;
+                               })
+           && std::ranges::all_of(CompileCacheWire::KnownEnrollRoles, [](CompileCacheWire::EnrollRole role) {
+                  return std::ranges::count(EnrollRoleTable, role, &EnrollRoleRow::role) == 1;
+              });
 }
 
-static_assert(EveryEnrollRoleRowIsKnownAndUnique(), "every EnrollRoleTable row names one role the wire knows, once");
-
-/// Whether a joiner may ask to be @p role: a row names it.
-/// @param role A role the decoder accepted.
-/// @return True when this build admits a joiner in that role.
-[[nodiscard]] constexpr bool ServesEnrollRole(CompileCacheWire::EnrollRole role) noexcept
-{
-    return std::ranges::count(EnrollRoleTable, role, &EnrollRoleRow::role) == 1;
-}
+static_assert(EnrollRoleTableMatchesTheWire(),
+              "every EnrollRoleTable row names one role the wire knows, and every role the wire knows has a row");
 
 /// The row for @p role.
-/// @param role A role `ServesEnrollRole` accepted.
-/// @return Its row; the first row for a value no row names, which the enrollment door refuses before
-///         anything asks.
+/// @param role A role the decoder accepted.
+/// @return Its row; the first row for a value no row names, which `EnrollRoleTableMatchesTheWire`
+///         makes unreachable.
 [[nodiscard]] constexpr EnrollRoleRow const& EnrollRoleRowFor(CompileCacheWire::EnrollRole role) noexcept
 {
     for (auto const& row: EnrollRoleTable)
@@ -155,7 +153,7 @@ static_assert(EveryEnrollRoleRowIsKnownAndUnique(), "every EnrollRoleTable row n
     return EnrollRoleTable.front();
 }
 
-/// Whether @p roster records @p nodeId holding @p key as a member, in @p role.
+/// Whether @p roster records @p nodeId holding @p key as a member.
 ///
 /// What the leader asks of its own roster before it answers `Approved`, and what the joiner asks
 /// of the roster it is handed before it believes it was admitted: one question, so the two ends
@@ -163,12 +161,8 @@ static_assert(EveryEnrollRoleRowIsKnownAndUnique(), "every EnrollRoleTable row n
 /// @param roster The roster.
 /// @param nodeId The joiner's id.
 /// @param key The key it asked under.
-/// @param role What it asked to be.
 /// @return True when the roster says exactly that.
-[[nodiscard]] bool RosterRecordsJoiner(Cluster::Roster const& roster,
-                                       std::string_view nodeId,
-                                       Ed25519PublicKey const& key,
-                                       CompileCacheWire::EnrollRole role);
+[[nodiscard]] bool RosterRecordsJoiner(Cluster::Roster const& roster, std::string_view nodeId, Ed25519PublicKey const& key);
 
 /// What one joiner claims about itself, as a single request carried it.
 ///

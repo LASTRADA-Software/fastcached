@@ -25,9 +25,8 @@ namespace FastCache::Distributed
 /// **PRIVATE: persisted and transmitted nowhere.** It travels as `WireMachineStanding`, through
 /// `MachineStandingWire`, so these ordinals carry no contract.
 ///
-/// No `Principal`: a principal is admitted by key without a seat, and principal mode is retired
-/// (#178) -- every joined machine is a learner member. A principal a state still records reads
-/// `Unknown` here, and fails closed.
+/// No `Principal`: principal mode is retired -- every joined machine is a learner member, and no
+/// state records a principal.
 enum class MachineStanding : std::uint8_t
 {
     Voter,   ///< A member counted by every quorum.

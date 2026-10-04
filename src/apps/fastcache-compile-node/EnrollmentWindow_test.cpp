@@ -464,19 +464,10 @@ TEST_CASE("A roster records a joiner only as a member under the key it asked wit
                                                      .publicKey = KeyOf(0x01),
                                                      .schedulerEndpoint = {} });
 
-    CHECK(RosterRecordsJoiner(roster, "n1", KeyOf(0x01), Wire::EnrollRole::Learner));
+    CHECK(RosterRecordsJoiner(roster, "n1", KeyOf(0x01)));
 
     // Another key under the same id is not this machine.
-    CHECK_FALSE(RosterRecordsJoiner(roster, "n1", KeyOf(0x99), Wire::EnrollRole::Learner));
-
-    // A role no row serves is admitted as nothing, whatever the roster records under its id: the
-    // wire still decodes the retired roles, and none of them is a member.
-    for (auto const role: Wire::KnownEnrollRoles)
-    {
-        INFO("role byte " << static_cast<int>(role));
-        if (!ServesEnrollRole(role))
-            CHECK_FALSE(RosterRecordsJoiner(roster, "n1", KeyOf(0x01), role));
-    }
+    CHECK_FALSE(RosterRecordsJoiner(roster, "n1", KeyOf(0x99)));
 }
 
 TEST_CASE("The role table has one row and it seats a learner", "[enrollment][window][formation]")
@@ -490,15 +481,8 @@ TEST_CASE("The role table has one row and it seats a learner", "[enrollment][win
     CHECK(learner.statesEndpoint); // recorded as its member endpoint at approval
     CHECK(learner.seat == Cluster::MemberSeat::Learner);
 
-    // Every other role the wire still decodes is one this build refuses, and the learner is not.
-    auto served = 0;
-    for (auto const role: Wire::KnownEnrollRoles)
-    {
-        INFO("role byte " << static_cast<int>(role));
-        CHECK(ServesEnrollRole(role) == (role == Wire::EnrollRole::Learner));
-        served += ServesEnrollRole(role) ? 1 : 0;
-    }
-    CHECK(served == 1);
+    // And the wire decodes no other role: the retired ones are the decoder's to refuse.
+    CHECK(Wire::KnownEnrollRoles == std::array { Wire::EnrollRole::Learner });
 }
 
 TEST_CASE("A second decision about a settled id is refused rather than repeated", "[enrollment][window]")

@@ -390,7 +390,7 @@ struct QuorumPlan
 /// (`RosterKeys::KeysOf`).
 ///
 /// **Whether the forget revokes anything at all.** A machine is forgotten by its key, so a
-/// forget of an id the state records no key for -- as a member or as a principal -- and
+/// forget of an id the state records no member key for -- and
 /// this node holds none live for would remove a record and nothing else, and the next
 /// observation of the machine would admit it again. Refused by NAME instead.
 /// @param state The replicated state as this node last applied it: what records a key for
@@ -398,7 +398,7 @@ struct QuorumPlan
 /// @param active The configuration consensus currently holds.
 /// @param id The machine to be forgotten.
 /// @param liveKey The key this node holds live for @p id (`Consensus::IRaftPeerKeys::KeysOf`),
-///        or nullopt when it holds none -- a principal, which consensus never dials, is one.
+///        or nullopt when it holds none.
 /// @return The command to propose; `InvalidConfiguration`, naming the member, when it is
 ///         the only voter or when the forget would revoke nothing.
 [[nodiscard]] std::expected<Command, ConsensusError> PrepareForget(ClusterState const& state,

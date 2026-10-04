@@ -493,37 +493,6 @@ TEST_CASE("A joiner is recorded under its key and answered with no roster bytes"
     CHECK(Unwrap(row).role == JoinerRole);
 }
 
-TEST_CASE("A request in a role no row serves is refused at the door and nothing is recorded",
-          "[enrollment][responder][formation]")
-{
-    // A machine joins ONE way, as a learner. The wire still decodes the retired roles, so the
-    // door refuses them by name -- MalformedFrame, counted -- before the list records a row an
-    // operator could approve into a record no build reads.
-    Seed seed;
-    auto refused = 0;
-    for (auto const role: Wire::KnownEnrollRoles)
-    {
-        if (ServesEnrollRole(role))
-            continue;
-        INFO("role byte " << static_cast<int>(role));
-        auto const reply = AnswerNow(seed.responder, EnrollFrame("w", "", role, JoinerKey()), JoinerAddress);
-        CHECK(RefusalIn(reply) == Wire::ErrorCode::MalformedFrame);
-        CHECK(Unwrap(Wire::DecodeErrorPayload(PayloadOf(reply))).second.contains("learner"));
-        ++refused;
-    }
-    if (refused == 0)
-        SKIP("the wire decodes no role this build refuses; the decoder now refuses a retired role itself");
-    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed)
-          == static_cast<std::uint64_t>(refused));
-    CHECK(seed.window.Summary().second == 0);
-    CHECK(seed.cluster.Proposed().empty());
-
-    // The control: the same request as a learner is recorded, so the refusal is the role's.
-    CHECK(RefusalIn(AnswerNow(seed.responder, JoinFrame("w", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
-          == std::nullopt);
-    CHECK(seed.window.Summary().second == 1);
-}
-
 TEST_CASE("A role that does not suit the endpoint is refused before it reaches the list", "[enrollment][responder]")
 {
     Seed seed;
@@ -776,10 +745,16 @@ TEST_CASE("The approve reply carries no private key, and a planted one IS found 
     CHECK(Carries(Cluster::Encode(seed.cluster.ClusterState()), secrets[2]));
 
     // And a key planted where a roster DOES travel is found in the reply, raw and as text:
-    // the seed's base64url as a principal's id, and its raw bytes as a revoked key. Without
+    // the seed's base64url as a learner's id, and its raw bytes as a revoked key. Without
     // this, every check above passes under a scan that cannot see into the roster at all.
     auto planted = seed.cluster.ClusterState();
-    planted.principals.push_back(Cluster::ClusterPrincipal { .id = Base64UrlEncode(secrets[0]), .publicKey = Filled(0x33) });
+    planted.members.push_back(
+        Cluster::ClusterMember { .id = Base64UrlEncode(secrets[0]),
+                                 .raftEndpoint = {},
+                                 .schedulerEndpoint = {},
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                 .seat = Cluster::MemberSeat::Learner,
+                                 .publicKey = Filled(0x33) });
     planted.revokedKeys.push_back(Cluster::RevokedKey { .id = "planted", .publicKey = leaderSeed });
     seed.cluster.SetState(planted);
     auto const leaking = Enroll(seed);
@@ -1336,6 +1311,32 @@ TEST_CASE("A forgotten learner's key is revoked: its next enrollment is refused 
     CHECK_FALSE(recorded("laptop-a"));
 }
 
+TEST_CASE("A request carrying a retired role byte is refused as malformed and nothing is recorded",
+          "[enrollment][responder][formation]")
+{
+    // A machine joins ONE way, as a learner; 0x01 (member) and 0x02 (worker, a principal) are
+    // retired, and the DECODER refuses them -- so the door answers MalformedFrame, counted, before
+    // the list records a row an operator could approve into a record no build reads.
+    Seed seed;
+    for (auto const retired: Wire::RetiredEnrollRoles)
+    {
+        INFO("role byte " << static_cast<int>(retired));
+        auto const reply = AnswerNow(seed.responder,
+                                     EnrollFrame("w", "w.example:6674", static_cast<Wire::EnrollRole>(retired), JoinerKey()),
+                                     JoinerAddress);
+        CHECK(RefusalIn(reply) == Wire::ErrorCode::MalformedFrame);
+        CHECK(Unwrap(Wire::DecodeErrorPayload(PayloadOf(reply))).second.contains("learner"));
+    }
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == Wire::RetiredEnrollRoles.size());
+    CHECK(seed.window.Summary().second == 0);
+    CHECK(seed.cluster.Proposed().empty());
+
+    // The control: the same request as a learner is recorded, so the refusal is the role's.
+    CHECK(RefusalIn(AnswerNow(seed.responder, JoinFrame("w", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
+          == std::nullopt);
+    CHECK(seed.window.Summary().second == 1);
+}
+
 TEST_CASE("A joiner asking under a small-order or non-canonical key is refused at the door, by name",
           "[enrollment][responder][security][identity]")
 {
@@ -1343,7 +1344,7 @@ TEST_CASE("A joiner asking under a small-order or non-canonical key is refused a
     // small-order key the all-zero signature verifies every message -- so the approval would admit
     // whoever cares to claim it. Refused before the window records anything, on the malformed row:
     // no build of this software mints such a key. Asked as a LEARNER, the one role a machine enrolls
-    // as -- any other is refused before its key is read (`ServesEnrollRole`). The control is an
+    // as -- the decoder refuses any other byte (`RetiredEnrollRoles`). The control is an
     // ordinary key asking the same way, which the window records.
     auto const nonCanonical = [] {
         auto key = Filled(0xFF);

@@ -243,8 +243,7 @@ class Fleet
                                               .key = id,
                                               .value = EndpointOf(id),
                                               .schedulerEndpoint = {},
-                                              .publicKey = KeyOf(id),
-                                              .role = std::nullopt }))
+                                              .publicKey = KeyOf(id) }))
             .has_value();
     }
 
@@ -262,8 +261,7 @@ class Fleet
                                               .key = id,
                                               .value = {},
                                               .schedulerEndpoint = std::move(schedulerEndpoint),
-                                              .publicKey = key,
-                                              .role = std::nullopt }))
+                                              .publicKey = key }))
             .has_value();
     }
 
@@ -385,8 +383,7 @@ void Fleet::Reconcile(std::size_t passes)
                             .key = "lease-lifetime",
                             .value = std::move(value),
                             .schedulerEndpoint = {},
-                            .publicKey = std::nullopt,
-                            .role = std::nullopt });
+                            .publicKey = std::nullopt });
 }
 } // namespace
 
@@ -467,8 +464,7 @@ TEST_CASE("A cluster that forgets its leader commits a configuration without it,
                                                   .key = "lease-lifetime",
                                                   .value = "20min",
                                                   .schedulerEndpoint = {},
-                                                  .publicKey = std::nullopt,
-                                                  .role = std::nullopt }))
+                                                  .publicKey = std::nullopt }))
                 .has_value());
     fleet.Cluster().Run(60);
     CHECK(fleet.StateAt(successor).SettingOf("lease-lifetime") == "20min");

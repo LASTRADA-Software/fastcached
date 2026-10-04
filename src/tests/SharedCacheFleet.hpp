@@ -499,8 +499,7 @@ class SharedCacheFleet
                                   .key = std::string { Cluster::SharedCacheSetting },
                                   .value = id,
                                   .schedulerEndpoint = {},
-                                  .publicKey = std::nullopt,
-                                  .role = std::nullopt });
+                                  .publicKey = std::nullopt });
     }
 
     /// Record @p id's `0xFC` endpoint as its own port, as a machine announcing itself does.
@@ -523,8 +522,7 @@ class SharedCacheFleet
                                   .key = id,
                                   .value = member->raftEndpoint,
                                   .schedulerEndpoint = std::format("{}:{}", FleetHost, Machine(signsAs).port),
-                                  .publicKey = TestKeyPair(id).PublicKey(),
-                                  .role = std::nullopt });
+                                  .publicKey = TestKeyPair(id).PublicKey() });
     }
 
     /// Forget @p id: its record goes and its key is revoked, as `--cluster-forget` does.
@@ -535,8 +533,7 @@ class SharedCacheFleet
                                   .key = id,
                                   .value = {},
                                   .schedulerEndpoint = {},
-                                  .publicKey = std::nullopt,
-                                  .role = std::nullopt });
+                                  .publicKey = std::nullopt });
     }
 
     /// Apply the state everywhere, in production's order: every machine takes its keys and its
@@ -586,8 +583,7 @@ class SharedCacheFleet
                                   .key = id,
                                   .value = std::format("10.0.0.{}:6680", _admitted),
                                   .schedulerEndpoint = {},
-                                  .publicKey = TestKeyPair(id).PublicKey(),
-                                  .role = std::nullopt });
+                                  .publicKey = TestKeyPair(id).PublicKey() });
     }
 
     /// Validate @p command against the state as production would, then apply it.

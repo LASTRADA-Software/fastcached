@@ -76,7 +76,7 @@ namespace
 /// @return The state.
 [[nodiscard]] ClusterState StateOf(std::vector<ClusterMember> members)
 {
-    return ClusterState { .members = std::move(members), .settings = {}, .principals = {}, .revokedKeys = {} };
+    return ClusterState { .members = std::move(members), .settings = {}, .revokedKeys = {} };
 }
 
 /// The identity key @p id holds: the shared test key, so two ids never hold one key.
@@ -223,15 +223,13 @@ TEST_CASE("A member the state has never heard of is proposed", "[cluster][member
                        .key = "n1",
                        .value = "10.0.0.1:6675",
                        .schedulerEndpoint = "10.0.0.1:7000",
-                       .publicKey = std::nullopt,
-                       .role = std::nullopt });
+                       .publicKey = std::nullopt });
     CHECK(proposals[1]
           == Command { .kind = CommandKind::AddLearner,
                        .key = "n2",
                        .value = "10.0.0.2:6675",
                        .schedulerEndpoint = {},
-                       .publicKey = std::nullopt,
-                       .role = std::nullopt });
+                       .publicKey = std::nullopt });
 }
 
 TEST_CASE("A record that differs in any field is re-proposed", "[cluster][membership]")
@@ -828,12 +826,9 @@ struct Leader
 /// @return The command.
 [[nodiscard]] Command Forget(std::string id)
 {
-    return Command { .kind = CommandKind::Forget,
-                     .key = std::move(id),
-                     .value = {},
-                     .schedulerEndpoint = {},
-                     .publicKey = std::nullopt,
-                     .role = std::nullopt };
+    return Command {
+        .kind = CommandKind::Forget, .key = std::move(id), .value = {}, .schedulerEndpoint = {}, .publicKey = std::nullopt
+    };
 }
 } // namespace
 
@@ -876,8 +871,7 @@ TEST_CASE("A desire for an id whose key a forget revoked is refused, wherever it
                     .key = "n2",
                     .value = "10.0.0.2:6680",
                     .schedulerEndpoint = {},
-                    .publicKey = Key("n2"),
-                    .role = std::nullopt });
+                    .publicKey = Key("n2") });
     Apply(state, Forget("n2"));
     auto const active = Voters({ "n1" });
     auto const desire = DesiredMember {
@@ -915,8 +909,7 @@ TEST_CASE("A machine re-admitted under a new key is served again, and its revoke
                     .key = "n2",
                     .value = "10.0.0.2:6680",
                     .schedulerEndpoint = {},
-                    .publicKey = readmitted,
-                    .role = std::nullopt });
+                    .publicKey = readmitted });
     REQUIRE(state.IsRevoked(Key("n2")));
     REQUIRE(std::ranges::contains(state.revokedKeys, "n2", &RevokedKey::id));
 
@@ -1017,8 +1010,7 @@ TEST_CASE("Only an operator's admit brings a forgotten member back", "[cluster][
                              .key = "n3",
                              .value = "10.0.0.3:6680",
                              .schedulerEndpoint = {},
-                             .publicKey = Key("n3"),
-                             .role = std::nullopt };
+                             .publicKey = Key("n3") };
     // The revoked key is refused for good, and names whose it was.
     auto const refused = ValidateAgainst(leader.state, readmit);
     REQUIRE_FALSE(refused.has_value());
@@ -1051,8 +1043,7 @@ namespace
                      .key = std::move(id),
                      .value = std::move(raft),
                      .schedulerEndpoint = {},
-                     .publicKey = std::nullopt,
-                     .role = std::nullopt };
+                     .publicKey = std::nullopt };
 }
 } // namespace
 
@@ -1208,7 +1199,7 @@ TEST_CASE("The last voter is never removed, and forgetting it is refused by name
 
     // And the forget names the key this node holds live for the id (#1555), which is what
     // revokes a bootstrap member named with its key. None held, none named -- the record's own
-    // key is what `Apply` revokes then, as it is for a principal.
+    // key is what `Apply` revokes then.
     auto typed = Ed25519PublicKey {};
     typed.fill(std::byte { 0x29 });
     auto const withLive = PrepareForget(StateOf({}), Voters({ "n1", "n2" }), "n2", typed);
@@ -1216,9 +1207,8 @@ TEST_CASE("The last voter is never removed, and forgetting it is refused by name
     CHECK(withLive.value().kind == CommandKind::Forget);
     CHECK(withLive.value().key == "n2");
     CHECK(withLive.value().publicKey == std::optional { typed });
-    auto principal = StateOf({});
-    principal.principals.push_back(ClusterPrincipal { .id = "w1", .publicKey = Key("w1"), .role = PrincipalRole::Worker });
-    auto const recordOnly = PrepareForget(principal, Voters({ "n1", "n2" }), "w1", std::nullopt);
+    auto const recorded = StateOf({ Member("w1", "10.0.0.9:6680") });
+    auto const recordOnly = PrepareForget(recorded, Voters({ "n1", "n2" }), "w1", std::nullopt);
     REQUIRE(recordOnly.has_value());
     CHECK_FALSE(recordOnly.value().publicKey.has_value());
 }
@@ -1236,8 +1226,7 @@ TEST_CASE("A forget with nothing to revoke is refused by name before it is propo
     CHECK(refused.error().context.contains("cannot forget n2"));
     CHECK(refused.error().context.contains("would revoke nothing"));
 
-    // A typed key suffices, and so does a key the state records -- a member's or a
-    // principal's.
+    // A typed key suffices, and so does a key the state records for a member.
     CHECK(PrepareForget(state, active, "n2", Key("n2")).has_value());
     CHECK(PrepareForget(StateOf({ Member("n2", "10.0.0.2:6680") }), active, "n2", std::nullopt).has_value());
 }

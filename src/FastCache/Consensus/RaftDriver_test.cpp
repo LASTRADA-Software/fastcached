@@ -1089,7 +1089,7 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
 {
     // #1542 at the production seam: the store `ConsensusTier` opens, the state machine
     // it applies to, and a driver built the way it builds one. A node compacted past a
-    // member, a principal, a setting and a forget's revoked key, then restarted. Before the
+    // member, a learner, a setting and a forget's revoked key, then restarted. Before the
     // fix the recovered node's applied index sat at the snapshot's boundary and nothing
     // handed the snapshot to the application, so all of them were gone -- and a forgotten
     // machine's key was admitted again, with nothing reporting it: removal failing OPEN.
@@ -1098,19 +1098,18 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
     NoPeers transport;
     ScriptedRandomSource random { { 0 } };
 
-    // A key per principal, distinct by fill so one read from the wrong place cannot match.
+    // A key per learner, distinct by fill so one read from the wrong place cannot match.
     auto const keyOf = [](std::uint8_t fill) {
         auto key = Ed25519PublicKey {};
         key.fill(static_cast<std::byte>(fill));
         return key;
     };
-    auto const admitPrincipal = [&keyOf](std::string id, std::uint8_t fill) {
-        return Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
+    auto const admitLearner = [&keyOf](std::string id, std::uint8_t fill) {
+        return Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
                                   .key = std::move(id),
                                   .value = {},
                                   .schedulerEndpoint = {},
-                                  .publicKey = keyOf(fill),
-                                  .role = Cluster::PrincipalRole::Worker };
+                                  .publicKey = keyOf(fill) };
     };
 
     auto forgottenAt = LogIndex {};
@@ -1130,26 +1129,23 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
                                                  .key = "n2",
                                                  .value = "10.0.0.2:6675",
                                                  .schedulerEndpoint = {},
-                                                 .publicKey = keyOf(0x22),
-                                                 .role = std::nullopt },
+                                                 .publicKey = keyOf(0x22) },
                               at);
-        (void) ProposeCommand(*driver, admitPrincipal("w1", 0x31), at);
-        (void) ProposeCommand(*driver, admitPrincipal("w9", 0x39), at);
+        (void) ProposeCommand(*driver, admitLearner("w1", 0x31), at);
+        (void) ProposeCommand(*driver, admitLearner("w9", 0x39), at);
         forgottenAt = ProposeCommand(*driver,
                                      Cluster::Command { .kind = Cluster::CommandKind::Forget,
                                                         .key = "w9",
                                                         .value = {},
                                                         .schedulerEndpoint = {},
-                                                        .publicKey = std::nullopt,
-                                                        .role = std::nullopt },
+                                                        .publicKey = std::nullopt },
                                      at);
         (void) ProposeCommand(*driver,
                               Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
                                                  .key = std::string { Cluster::LeaseLifetimeSetting },
                                                  .value = "40min",
                                                  .schedulerEndpoint = {},
-                                                 .publicKey = std::nullopt,
-                                                 .role = std::nullopt },
+                                                 .publicKey = std::nullopt },
                               at);
 
         // Padded until the snapshot covers the revocation -- counted by the boundary
@@ -1165,15 +1161,14 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
                                                      .key = std::string { Cluster::FleetOpenSetting },
                                                      .value = step % 2 == 0 ? "1" : "0",
                                                      .schedulerEndpoint = {},
-                                                     .publicKey = std::nullopt,
-                                                     .role = std::nullopt },
+                                                     .publicKey = std::nullopt },
                                   at);
         }
         REQUIRE(driver->Node().SnapshotIndex() >= forgottenAt);
 
         // And one fact ABOVE the snapshot, which a restart re-applies rather than
         // restores -- so the case sees both halves of recovery, in their order.
-        aboveAt = ProposeCommand(*driver, admitPrincipal("w2", 0x32), at);
+        aboveAt = ProposeCommand(*driver, admitLearner("w2", 0x32), at);
         REQUIRE(driver->Node().SnapshotIndex() < aboveAt);
 
         before = machine.State();

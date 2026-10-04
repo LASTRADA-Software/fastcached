@@ -1039,8 +1039,10 @@ TEST_CASE("An operator's control verb is refused a caller only --fleet-open admi
     CHECK_FALSE(anonymous.identified);
 
     constexpr auto ControlVerbs = std::array {
-        Wire::Op::ClusterSet,          Wire::Op::ClusterForget,      Wire::Op::ClusterAdmit,
-        Wire::Op::ClusterAdmitLearner, Wire::Op::ClusterAdmitWorker,
+        Wire::Op::ClusterSet,
+        Wire::Op::ClusterForget,
+        Wire::Op::ClusterAdmit,
+        Wire::Op::ClusterAdmitLearner,
     };
     auto refused = std::uint64_t { 0 };
     for (auto const op: ControlVerbs)
@@ -1072,6 +1074,50 @@ TEST_CASE("An operator's control verb is refused a caller only --fleet-open admi
 
     // And the verbs a client sends are not control verbs: the anonymous caller still leases.
     CHECK_FALSE(fixture.protocol.RefusePeer(anonymous, static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
+}
+
+TEST_CASE("The retired worker admission is an unknown opcode to a ticketed and a proven caller alike",
+          "[distributed][scheduler][protocol][admission][retired]")
+{
+    // 0x1D was CLUSTER-ADMIT-WORKER, which admitted a principal by its key. Principal mode is
+    // retired, so the byte is in `RetiredOpcodes` and no row claims it. A caller that identifies
+    // itself -- by a ticket, or by a proven key, either of which passed the identified-caller
+    // door this verb once asked -- is refused it as an unknown opcode by name, counted as one,
+    // and never as a refusal about WHO asked: no identity can make a retired verb run.
+    Fixture fixture;
+    Testing::OpenFleetFold fold;
+    REQUIRE(std::ranges::contains(Wire::RetiredOpcodes, std::uint8_t { 0x1D }));
+    REQUIRE(Wire::FindOp(0x1D) == nullptr);
+
+    // What an earlier build sent: an admission's fields under the retired byte.
+    auto retired = Wire::EncodeClusterAdmit<Wire::Op::ClusterAdmitLearner>(
+        Wire::ClusterAdmitRequest { .memberId = "w9", .raftEndpoint = {}, .publicKey = std::nullopt });
+    REQUIRE(retired[2] == std::byte { static_cast<std::uint8_t>(Wire::Op::ClusterAdmitLearner) });
+    retired[2] = std::byte { 0x1D };
+
+    auto refusedUnknown = std::uint64_t { 0 };
+    for (auto const& [what, facts]: { std::pair { "a ticket", Testing::OpenFleetFold::Ticketed() },
+                                      std::pair { "a proof", Testing::OpenFleetFold::Proven() } })
+    {
+        INFO(what);
+        auto const caller = CallerContextOf(fold.admitted, facts);
+        REQUIRE(caller.identified);
+
+        // The door asks no identity of a byte no row claims; the refusal comes after the header.
+        CHECK_FALSE(fixture.protocol.RefusePeer(caller, 0x1D).has_value());
+        auto const reply = fixture.protocol.Answer(retired, caller);
+        CHECK(StatusOf(reply) == Wire::Status::Error);
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::UnknownOpcode);
+        ++refusedUnknown;
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnknownOpcode) == refusedUnknown);
+    }
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired) == 0);
+
+    // The control: the same bytes under the learner admission's own opcode are a verb this
+    // scheduler knows, so they are NOT refused as unknown.
+    retired[2] = std::byte { static_cast<std::uint8_t>(Wire::Op::ClusterAdmitLearner) };
+    CHECK(ErrorOf(fixture.protocol.Answer(retired, CallerContextOf(fold.admitted, Testing::OpenFleetFold::Proven())))
+          != Wire::ErrorCode::UnknownOpcode);
 }
 
 TEST_CASE("Where a worker was seen and what it answers on cross the wire into a grant's dial hint",

@@ -128,9 +128,6 @@ inline constexpr std::array ExchangeLogTable {
     VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmitLearner,
                  .level = LogLevel::Info,
                  .rationale = "adds, moves or demotes a member; same audit argument as cluster-admit" },
-    VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmitWorker,
-                 .level = LogLevel::Info,
-                 .rationale = "admits a machine's identity key as a worker; same audit argument as cluster-admit" },
     // The fleet cache verbs at their private twins' level, for their twins' reason: the
     // shared cache is asked once or more per translation unit by every machine in the fleet.
     VerbLogRow { .code = CompileCacheWire::Op::SharedStore,

@@ -55,7 +55,7 @@ using MachineTicketNonce = std::array<std::byte, MachineTicketNonceBytes>;
 /// What a ticket claims.
 struct MachineTicketClaims
 {
-    std::string machineId;                 ///< The machine it speaks for: a member or principal id.
+    std::string machineId;                 ///< The machine it speaks for: a member id.
     std::string audience;                  ///< The endpoint it may be presented to, as the presenter dialled it.
     std::uint64_t expiresAtUnixSeconds {}; ///< When it stops being good, in Unix seconds.
     MachineTicketNonce nonce {};           ///< Distinguishes two tickets with otherwise equal claims.

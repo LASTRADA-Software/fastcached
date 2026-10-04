@@ -27,8 +27,7 @@ namespace
                      .key = std::move(id),
                      .value = "10.0.0.3:6680",
                      .schedulerEndpoint = std::move(nodeEndpoint),
-                     .publicKey = key,
-                     .role = std::nullopt };
+                     .publicKey = key };
 }
 
 [[nodiscard]] Command Set(std::string value)
@@ -37,8 +36,7 @@ namespace
                      .key = std::string { SharedCacheSetting },
                      .value = std::move(value),
                      .schedulerEndpoint = {},
-                     .publicKey = std::nullopt,
-                     .role = std::nullopt };
+                     .publicKey = std::nullopt };
 }
 
 /// A fleet whose shared cache is C, fully resolvable.
@@ -97,8 +95,7 @@ TEST_CASE("Each way the setting cannot be used resolves to its own answer", "[cl
                     .key = "cache-c",
                     .value = {},
                     .schedulerEndpoint = {},
-                    .publicKey = std::nullopt,
-                    .role = std::nullopt });
+                    .publicKey = std::nullopt });
     auto const gone = ResolveSharedCache(forgotten, "pc-7");
     CHECK(gone.resolution == SharedCacheResolution::UnknownMachine);
     CHECK(gone.machineId == "cache-c");

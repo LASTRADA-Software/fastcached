@@ -175,13 +175,17 @@ struct FormationRecord
 /// record is intact and holds a membership of three fields, and nothing in it says which key signed
 /// the approval, so it is refused by number rather than judged by the roster's claims.
 ///
-/// **Format 5 is this branch's own, UNRELEASED definition, and is FINAL only at the lane-0 flag
+/// 6 because the embedded roster moved to `Cluster::RosterFormatVersion` 3 when its principals group
+/// left with principal mode: a format 5 record is intact and holds a version-2 roster, refused here by
+/// the record's own number before anything decodes the roster.
+///
+/// **Format 6 is this branch's own, UNRELEASED definition, and is FINAL only at the lane-0 flag
 /// day.** Format 3 changed twice without moving -- an asked-fleet memo went from three fields to
 /// four, and the nested summary from ten fields to eleven -- because no build that wrote those
-/// shapes ever shipped; the embedded roster moved it to 4, and the admitting key to 5, because a
-/// learner's record is on disk on the one installation there is. From the flag day on, every change
+/// shapes ever shipped; the embedded roster moved it to 4 and to 6, and the admitting key to 5,
+/// because a learner's record is on disk on the one installation there is. From the flag day on, every change
 /// to this layout -- nested codecs included -- moves this number.
-inline constexpr std::uint8_t FormationRecordFormat = 5;
+inline constexpr std::uint8_t FormationRecordFormat = 6;
 
 /// The four bytes every formation record starts with, so a file that is not one is told apart
 /// from one in another layout.
