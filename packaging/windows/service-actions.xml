@@ -535,12 +535,28 @@
          (batch 4 review, B4-2): 0.3.0's uninstall stops FastCached without
          waiting, and the node, which binds 6674 exclusively, refused into a
          port the old process still held. Matched by executable path, so a
-         fastcached run by hand from elsewhere is not waited for. Return="check":
-         past 60 seconds the node would refuse anyway, and this names why, as
-         exit code 1460 (ERROR_TIMEOUT) on this action. -->
+         fastcached run by hand from elsewhere is not waited for: the path in
+         THIS install root, and the one the OLD registration named (below).
+         Return="check": past 60 seconds the node would refuse anyway, and this
+         names why, as exit code 1460 (ERROR_TIMEOUT) on this action.
+
+         The old registration's directory too (batch 4 review, R4-1): CPack
+         remembers no custom install directory, so an upgrade from a 0.3.0
+         installed elsewhere installs to the default root, and a wait matching
+         the new root alone missed 0.3.0's lingering fastcached; the node then
+         refused into its port, a 1603 and a rollback. FASTCACHED_IMAGEPATH and
+         FASTCACHE_NODE_IMAGEPATH hold the old registrations' command lines,
+         read by AppSearch before RemoveExistingProducts deleted them. Both carry
+         double quotes, which no quoting of a -Command argument survives, so they
+         ride AFTER a `#` inside it: PowerShell reads them as a comment, and the
+         script reads its own command line back, raw, through Win32_Process (not
+         [Environment], whose `[` the formatter, and msi-custom-action-commands'
+         leftover-token rule, would take for a property). The markers are
+         spelled in two halves in the script, so the only whole copy of each is
+         the one in the comment. -->
     <CustomAction Id="FastCachedAwaitExitForNode"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$p=@(\&quot;[INSTALL_ROOT]bin\fastcached.exe\&quot;);$w=New-Object Diagnostics.Stopwatch;$w.Start();while(Get-Process -Name fastcached -ErrorAction SilentlyContinue|Where-Object Path -In $p)[\{]if($w.Elapsed.TotalSeconds -gt 60)[\{]exit 1460[\}];Start-Sleep -Milliseconds 250[\}]&quot;"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$p=@(\&quot;[INSTALL_ROOT]bin\fastcached.exe\&quot;);$c=(Get-CimInstance Win32_Process -Filter \&quot;ProcessId=$PID\&quot;).CommandLine;$n=$c.LastIndexOf(' FastCacheNode'+'ImagePath:');$f=$c.LastIndexOf(' FastCached'+'ImagePath:');if($f -ge 0 -and $n -gt $f)[\{]foreach($s in $c.Substring($f,$n-$f),$c.Substring($n))[\{]$a=$s.IndexOf('\&quot;');$b=$s.IndexOf('\&quot;',$a+1);if($a -ge 0 -and $b -gt $a)[\{]$d=Split-Path -Parent $s.Substring($a+1,$b-$a-1);$p+=\&quot;$d\fastcached.exe\&quot;[\}][\}][\}];$w=New-Object Diagnostics.Stopwatch;$w.Start();while(Get-Process -Name fastcached -ErrorAction SilentlyContinue|Where-Object Path -In $p)[\{]if($w.Elapsed.TotalSeconds -gt 60)[\{]exit 1460[\}];Start-Sleep -Milliseconds 250[\}] # FastCachedImagePath:[FASTCACHED_IMAGEPATH] FastCacheNodeImagePath:[FASTCACHE_NODE_IMAGEPATH]&quot;"
                   Execute="deferred" Impersonate="no" Return="check" />
 
     <!-- An upgrade's files are replaced only once the old product's service
@@ -550,8 +566,11 @@
          whichever binary was on the disk. Scheduled before InstallFiles, after
          the old product's removal. Matched by executable PATH, so a copy of
          either binary run by hand from this install root is waited for too:
-         its files are the ones being replaced. Return="check", 1460 past 120
-         seconds.
+         its files are the ones being replaced. And by the directory each OLD
+         registration named, read from its command line as
+         FastCachedAwaitExitForNode reads it (R4-1: a 0.3.0 in a custom
+         directory is upgraded into the default root). Return="check", 1460
+         past 120 seconds.
 
          Its working directory is System64Folder, never INSTALL_ROOT: a type 34
          action is started IN its Directory, and before InstallFiles on an
@@ -562,7 +581,7 @@
          action in the directory it would have. -->
     <CustomAction Id="FastCacheAwaitServiceExit"
                   Directory="System64Folder"
-                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$p=@(\&quot;[INSTALL_ROOT]bin\fastcached.exe\&quot;,\&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe\&quot;);$w=New-Object Diagnostics.Stopwatch;$w.Start();while(Get-Process -Name fastcached,fastcache-compile-node -ErrorAction SilentlyContinue|Where-Object Path -In $p)[\{]if($w.Elapsed.TotalSeconds -gt 120)[\{]exit 1460[\}];Start-Sleep -Milliseconds 250[\}]&quot;"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$p=@(\&quot;[INSTALL_ROOT]bin\fastcached.exe\&quot;,\&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe\&quot;);$c=(Get-CimInstance Win32_Process -Filter \&quot;ProcessId=$PID\&quot;).CommandLine;$n=$c.LastIndexOf(' FastCacheNode'+'ImagePath:');$f=$c.LastIndexOf(' FastCached'+'ImagePath:');if($f -ge 0 -and $n -gt $f)[\{]foreach($s in $c.Substring($f,$n-$f),$c.Substring($n))[\{]$a=$s.IndexOf('\&quot;');$b=$s.IndexOf('\&quot;',$a+1);if($a -ge 0 -and $b -gt $a)[\{]$d=Split-Path -Parent $s.Substring($a+1,$b-$a-1);$p+=\&quot;$d\fastcached.exe\&quot;,\&quot;$d\fastcache-compile-node.exe\&quot;[\}][\}][\}];$w=New-Object Diagnostics.Stopwatch;$w.Start();while(Get-Process -Name fastcached,fastcache-compile-node -ErrorAction SilentlyContinue|Where-Object Path -In $p)[\{]if($w.Elapsed.TotalSeconds -gt 120)[\{]exit 1460[\}];Start-Sleep -Milliseconds 250[\}] # FastCachedImagePath:[FASTCACHED_IMAGEPATH] FastCacheNodeImagePath:[FASTCACHE_NODE_IMAGEPATH]&quot;"
                   Execute="deferred" Impersonate="no" Return="check" />
 
     <CustomAction Id="FastCachedStartService"

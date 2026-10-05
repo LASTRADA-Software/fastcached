@@ -903,10 +903,15 @@ cat "${workdir}/fallback.log"
 #
 # Time still judges what a slow host cannot fake. never-accepting, whose exchanges can end only at
 # TOTAL, holds the launcher's OWN reported time (`direct-ms` + `cache-ms`) to a FLOOR of N x TOTAL
-# less a timer's resolution -- a timer reading 0 fails it -- and a CEILING of (N + 1) x TOTAL: an
-# exchange that ignored or doubled its configured deadline reports 2 x N x TOTAL and fails it,
-# while a stall of up to one whole TOTAL still passes. The `dead_shapes` table's third column
-# names the deadline a shape is held to that way, or `-`.
+# less a timer's resolution -- a timer reading 0 fails it -- and a CEILING of (2N - 1/2) x TOTAL,
+# 7000 ms at N = 2 and TOTAL = 2000. An exchange that DOUBLED its deadline reports 2N x TOTAL =
+# 8000 (measured 8006-8017 by run-launcher-e2e.ps1) and fails it by TOTAL / 2 = 1000 ms; one that
+# IGNORED FASTCACHE_TIMEOUT falls back to the default total of 10000 ms per exchange and reports
+# about 20000. A stall of up to (N - 1/2) x TOTAL = 3000 ms past the floor still passes: a stall
+# belongs to the HOST, and the host's worst measured overrun is +1616 ms (round 9, on the refused
+# leg). The former (N + 1) x TOTAL, 6000 ms, tolerated a stall of 2000, only 384 above that
+# overrun, and at N = 1 it would equal a doubled TOTAL and catch nothing. The `dead_shapes`
+# table's third column names the deadline a shape is held to that way, or `-`.
 #
 # BLIND SPOTS, failing OPEN. A retry INSIDE one exchange -- in the dial, below the door -- is one
 # trace line, seen only as an extra accept on the reset leg. A WAIT anywhere is judged only by the
@@ -1042,6 +1047,11 @@ while read -r shape dead_cost_name dead_held_name <&3; do
         *)
             fail "dead peers: no peer for the shape '${shape}'" ;;
     esac
+    # How many records the run's log holds BEFORE this compile, so the one read below is proven to
+    # be this compile's own (round 10 review, M5).
+    dead_log="$(e2e_launcher_state_log)"
+    dead_records_before=0
+    [[ -f "$dead_log" ]] && dead_records_before="$(count_lines "$dead_log")"
     dead_compile "$addr" "$dead_bound_ms" "the launcher against the ${shape} peer to finish"
     if [[ -n "$dead_peer_pid" ]]; then
         # KILL, never TERM: it covers the window the `trap -` inside `dead_peer` cannot -- a
@@ -1068,17 +1078,25 @@ while read -r shape dead_cost_name dead_held_name <&3; do
     # end before their deadline. Read from the record this compile appended to the run's log.
     if [[ "$dead_held_name" != - ]]; then
         dead_held_ms="${!dead_held_name}"
-        dead_record="$(tail -n 1 "$(e2e_launcher_state_log)")"
-        dead_direct_ms="$(e2e_launcher_log_field direct-ms <<< "$dead_record")"             || fail "dead peers: ${shape}: the launcher's record could not be read for direct-ms: ${dead_record}"
-        dead_cache_ms="$(e2e_launcher_log_field cache-ms <<< "$dead_record")"             || fail "dead peers: ${shape}: the launcher's record could not be read for cache-ms: ${dead_record}"
-        [[ "$dead_direct_ms" =~ ^[0-9]+$ && "$dead_cache_ms" =~ ^[0-9]+$ ]]             || fail "dead peers: ${shape}: the launcher's record carries no times (direct-ms '${dead_direct_ms}', cache-ms '${dead_cache_ms}')"
+        # Exactly ONE record more than before: the last line is then this compile's, never the
+        # accept-then-reset leg's judged under a cause that is not its own.
+        dead_records_after="$(count_lines "$dead_log")"
+        [[ "$dead_records_after" -eq $(( dead_records_before + 1 )) ]] \
+            || fail "dead peers: ${shape}: the launcher's log went from ${dead_records_before} to ${dead_records_after} record(s), want exactly one more -- the times read below would not be this compile's"
+        dead_record="$(tail -n 1 "$dead_log")"
+        dead_direct_ms="$(e2e_launcher_log_field direct-ms <<< "$dead_record")" \
+            || fail "dead peers: ${shape}: the launcher's record could not be read for direct-ms: ${dead_record}"
+        dead_cache_ms="$(e2e_launcher_log_field cache-ms <<< "$dead_record")" \
+            || fail "dead peers: ${shape}: the launcher's record could not be read for cache-ms: ${dead_record}"
+        [[ "$dead_direct_ms" =~ ^[0-9]+$ && "$dead_cache_ms" =~ ^[0-9]+$ ]] \
+            || fail "dead peers: ${shape}: the launcher's record carries no times (direct-ms '${dead_direct_ms}', cache-ms '${dead_cache_ms}')"
         dead_spent_ms=$(( dead_direct_ms + dead_cache_ms ))
         dead_floor_ms=$(( dead_exchanges * dead_held_ms - dead_timer_tolerance_ms ))
-        dead_ceiling_ms=$(( (dead_exchanges + 1) * dead_held_ms ))
+        dead_ceiling_ms=$(( (4 * dead_exchanges - 1) * dead_held_ms / 2 ))
         [[ "$dead_spent_ms" -ge "$dead_floor_ms" ]] \
             || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the launcher reported ${dead_spent_ms} ms on the cache, under the ${dead_floor_ms} ms that ${dead_exchanges} exchange(s) with a silent peer cannot end before -- its own timer is not measuring the exchanges"; }
         [[ "$dead_spent_ms" -le "$dead_ceiling_ms" ]] \
-            || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the launcher reported ${dead_spent_ms} ms on the cache, past the ${dead_ceiling_ms} ms ceiling of ${dead_exchanges} exchange(s) and one more deadline -- an exchange overran its configured deadline"; }
+            || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the launcher reported ${dead_spent_ms} ms on the cache, past the ${dead_ceiling_ms} ms ceiling, (2N - 1/2) x its deadline for ${dead_exchanges} exchange(s) -- an exchange overran its configured deadline by as much as a doubled one does"; }
         echo "   ${shape}: ${dead_spent_ms} ms reported on the cache (floor ${dead_floor_ms}, ceiling ${dead_ceiling_ms})"
     fi
     # And on the reset leg, where every exchange is a connection the peer accepts, the PEER's

@@ -166,6 +166,11 @@ void ServiceHost::ReportStartUntilServing()
     auto const returned = [this] {
         return _bodyReturned.load(std::memory_order_acquire);
     };
+    // A stop accepted while the start is pending ends the start: the stop's own reporter takes over,
+    // and nothing this one would say after it is reported (`Report` never goes behind STOP_PENDING).
+    auto const stopping = [this] {
+        return _controls.StopRequested();
+    };
     // The ceiling is MEASURED on the wait's own clock rather than counted in checkpoints: a sleep
     // costs what the host's timer grants, not what was asked (`DrainWithin`'s reason).
     auto const began = _stopWait.Now();
@@ -174,35 +179,43 @@ void ServiceHost::ReportStartUntilServing()
     };
     std::ignore = ReportStopProgress(
         StopPendingPlan { .waitHint = _options.start.waitHint, .checkpointEvery = _options.start.checkpointEvery },
-        [&] { return served() || returned() || pastCeiling(); },
+        [&] { return served() || returned() || stopping() || pastCeiling(); },
         [this](std::uint32_t checkPoint, std::chrono::milliseconds hint) {
             Report(ServiceState::StartPending, WaitHintMs(hint), 0, checkPoint);
         },
         _stopWait);
     // Past the ceiling the checkpoint stands still, so whoever waits on the start gives up -- but the
     // start goes on, and a body that serves late is still reported RUNNING, or it could never be stopped.
-    while (!served() && !returned())
+    while (!served() && !returned() && !stopping())
         _stopWait.Sleep(_options.start.checkpointEvery);
+    // A stop can land between that test and this report; `Report` is what refuses RUNNING after it.
     if (served() && !returned())
         Report(ServiceState::Running, 0, 0);
 }
 
 void ServiceHost::Report(ServiceState state, std::uint32_t waitHintMs, int exitCode, std::uint32_t checkPoint)
 {
+    auto const& accepts = ServiceStateTable[static_cast<std::size_t>(state)];
     auto const report = ServiceStatusReport {
         .state = state,
         .waitHintMs = waitHintMs,
         .exit = ServiceExitFor(state == ServiceState::Stopped ? exitCode : 0),
         .checkPoint = checkPoint,
-        .acceptsControls = state == ServiceState::Running,
-        .acceptsPowerEvents = state == ServiceState::Running && _options.hostEvents != nullptr,
+        .acceptsStop = accepts.acceptsStop,
+        .acceptsReload = accepts.acceptsReload,
+        .acceptsPowerEvents = accepts.acceptsPowerEvents && _options.hostEvents != nullptr,
     };
     if (state != ServiceState::Stopped)
     {
-        // Reported UNDER the lock, so the stop below cannot overtake it.
+        // Reported UNDER the lock, so the stop below cannot overtake it -- and never BEHIND the last
+        // state reported: a stop accepted while the start is pending reports STOP_PENDING from the
+        // control handler while the start's reporter may still be about to say START_PENDING or
+        // RUNNING. Either, after the stop, would tell the manager the service started over.
         std::scoped_lock const guard { _statusMutex };
-        if (!_stopReported)
-            _manager->SetStatus(report);
+        if (_stopReported || (_lastReported.has_value() && state < *_lastReported))
+            return;
+        _lastReported = state;
+        _manager->SetStatus(report);
         return;
     }
 

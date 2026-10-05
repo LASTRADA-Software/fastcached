@@ -120,9 +120,12 @@ pipe_lines_into() {
 # descriptor 3 and @p 2 on stdin, both through pipes whose writers are this shell's children, so
 # the caller names them `/dev/fd/3` and `-`:
 #   pipe_pair_into "$a"$'\n' "$b"$'\n' comm -23 /dev/fd/3 -
-# `/dev/fd` is what bash's own process substitution opened, so it asks nothing new of the host:
-# `echo <(true)` answers `/dev/fd/63` on Git Bash and on Linux bash 5 and 3.2 (measured; macOS
-# not), and a host without it could not have run the `<(...)` this replaced. Both are drained
+# `/dev/fd/3` is a requirement on the host: `echo <(true)` answers `/dev/fd/63` on Git Bash and
+# on Linux bash 5 and 3.2 (measured), and macOS was not measured. Running the `<(...)` this
+# replaced proves nothing about it, since bash falls back to named pipes where `/dev/fd` is
+# absent. What guards a host without it is the `pipe_pair_into` case of
+# check-tidy-header-filter.sh's self-test, which feeds both descriptors and fails CLOSED when
+# either one does not arrive. Both are drained
 # concurrently, so a filter that reads one input to its end before the other -- `diff` does --
 # cannot deadlock on the other's 64 KiB.
 #

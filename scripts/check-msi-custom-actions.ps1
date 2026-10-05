@@ -19,7 +19,8 @@
 #   4. a PowerShell body is parsed by Windows PowerShell 5.1, which is what the action runs;
 #   5. the actions that only READ (`RunnableActions`) are started for real, in the directory they
 #      would have, and must exit 0 over a root no process runs from -- and, the control that keeps
-#      that 0 honest, 1460 while a process DOES run from it;
+#      that 0 honest, 1460 while a process DOES run from it, or from the directory the OLD
+#      registrations name (R4-1: a 0.3.0 in a custom directory is upgraded into the default root);
 #   6. Windows Installer's own rule for RemoveExistingProducts scheduled after InstallInitialize
 #      (as MajorUpgrade's afterInstallInitialize does): NO action that writes to the execution
 #      script -- deferred, rollback or commit -- may come before it, or the package is refused at
@@ -92,6 +93,8 @@ $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ("msi-custom-actions-" + 
 $root = Join-Path $scratch 'Program Files Probe\fastcached\'
 $system64 = Join-Path $env:SystemRoot 'System32\'
 $knownDirectories = @{ INSTALL_ROOT = $root; System64Folder = $system64 }
+# Properties a case sets, beside the directories; empty but for the old-registration control below.
+$knownProperties = @{}
 
 # Windows Installer's formatting, for what these targets use: [Property] and [\x]. A property
 # no row sets formats to nothing, as Windows Installer formats it.
@@ -101,6 +104,7 @@ function Format-Target([string] $text) {
             $token = $m.Groups[1].Value
             if ($token.StartsWith('\')) { return $token.Substring(1) }
             if ($knownDirectories.ContainsKey($token)) { return $knownDirectories[$token] }
+            if ($knownProperties.ContainsKey($token)) { return $knownProperties[$token] }
             return ''
         })
 }
@@ -197,6 +201,39 @@ try {
             if ($held -ne 1460) { Fail "$id exited $held while a process ran from the root; 1460 is the timed-out wait" } else { Pass "$id waits while a process runs from the root, and says 1460 at its bound" }
         } finally {
             foreach ($holder in $holders) { Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue; $holder.WaitForExit() }
+        }
+
+        # R4-1's control: the OLD registrations named another directory -- a 0.3.0 installed
+        # elsewhere, upgraded into the default root -- and a process running from THERE keeps the
+        # wait waiting too, with nothing running from the new root. Each registration in a spelling
+        # AppSearch was measured or documented to return (service-actions.xml): fastcached's bare,
+        # the node's raw with `#%`, and both with a space in the path, as a custom one may have.
+        $oldBin = Join-Path $scratch 'Old Custom Root\fastcached\bin'
+        New-Item -ItemType Directory -Force -Path $oldBin | Out-Null
+        $knownProperties['FASTCACHED_IMAGEPATH'] = '"' + (Join-Path $oldBin 'fastcached.exe') + '" --daemon --service-name=FastCached'
+        $knownProperties['FASTCACHE_NODE_IMAGEPATH'] = '#%"' + (Join-Path $oldBin 'fastcache-compile-node.exe') + '" --daemon'
+        try {
+            $oldTarget = Format-Target $action.ExeCommand
+            $quiet = Start-Target $oldTarget $workingDirectory
+            if ($quiet -ne 0) { Fail "$id exited $quiet with old registrations named and no process running; 0 is the no-op" }
+            $holders = @()
+            foreach ($image in $RunnableActions[$id].ControlImages) {
+                $copy = Join-Path $oldBin $image
+                Copy-Item -Force (Join-Path $system64 'PING.EXE') $copy
+                $holders += Start-Process -FilePath $copy -ArgumentList '-n', '60', '127.0.0.1' -PassThru -WindowStyle Hidden
+            }
+            try {
+                $held = Start-Target ([regex]::Replace($oldTarget, '-gt \d+\)', '-gt 2)')) $workingDirectory
+                if ($held -ne 1460) {
+                    Fail "$id exited $held while a process ran from the directory the OLD registration named; 1460 is the timed-out wait (R4-1: an upgrade from a 0.3.0 in a custom directory)"
+                } elseif ($quiet -eq 0) {
+                    Pass "$id waits for a process running from the directory the old registration named, not only the new root"
+                }
+            } finally {
+                foreach ($holder in $holders) { Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue; $holder.WaitForExit() }
+            }
+        } finally {
+            $knownProperties.Clear()
         }
         if ($phase -eq 'RootAbsent') { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
     }

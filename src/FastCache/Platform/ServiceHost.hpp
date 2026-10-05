@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -117,6 +118,9 @@ class ServiceHost final: public IDaemonHost
     /// service main runs the body on another, and the stop reporter reports from a third.
     std::mutex _statusMutex;
     bool _stopReported { false }; ///< Guarded by `_statusMutex`.
+    /// The last state reported before the stop, which no later report may go behind. Guarded by
+    /// `_statusMutex`.
+    std::optional<ServiceState> _lastReported;
     /// What the manager's control-handler registration holds instead of this object.
     std::shared_ptr<ServiceControlGate> _gate;
     /// Set once the body has returned, which is what ends the stop reporter.

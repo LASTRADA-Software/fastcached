@@ -251,7 +251,7 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "names why: a machine at the announced address that proved another key (an address reassigned, or an "
                 "impostor -- nothing was sent to it), the named machine refusing this node's key (its roster does not "
                 "hold it, or holds it revoked), one that did not answer, or a setting naming a machine this cluster "
-                "cannot reach by key. Check --cluster-status and the named machine's own --node-status." },
+                "cannot reach by key. Check --cluster-status, and run fastcache-cli node on the named machine." },
     { .condition = NodeCondition::SchedulerUnreachable,
       .id = "scheduler-unreachable",
       .persistence = CompileCacheWire::ConditionPersistence::Live,

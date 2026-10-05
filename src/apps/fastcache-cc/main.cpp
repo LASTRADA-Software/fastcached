@@ -1659,8 +1659,9 @@ struct ProbedDependencies
 /// slow the machine is.
 ///
 /// Two fixtures PARSE the trace's `cache exchange (` prefix -- `run-launcher-e2e.ps1` and
-/// `scripts/compile-cache-e2e.sh` -- so it is changed with them, and `check-cache-flow-continuations.sh`
-/// refuses a `Cc::RunOneExchange` anywhere in this file but here, so no exchange goes uncounted.
+/// `scripts/compile-cache-e2e.sh` -- so it is changed with them. `check-cache-flow-continuations.sh`
+/// refuses a `Cc::RunOneExchange` anywhere in this file but here, and a `Cc::MakeTcpExchange` site
+/// it has no row for; an exchange reached under any other name is its stated blind spot.
 /// @param record The invocation record, for the trace's verbosity.
 /// @param what Which exchange, for the trace: `manifest fetch`, `marker-follow fetch`,
 ///             `direct-mode object fetch`, `fetch`, `store`, `manifest store`.

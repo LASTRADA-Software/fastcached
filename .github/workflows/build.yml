@@ -3818,9 +3818,28 @@ jobs:
           # command line and remembered scope unchanged. fastcached serves on 6699 here (the step
           # above moved it), so a listener this step holds on 6674 is what the node cannot bind: it
           # refuses inside its body, never reports RUNNING (it reports running once it serves), and
-          # its checked start fails. Empty and absent are one remembered scope (install.md).
-          $fastcachedBefore = Get-CimInstance Win32_Service -Filter "Name='FastCached'"
+          # its checked start fails. Empty and absent are one remembered scope (install.md). And its
+          # LIVE firewall rules (R4-3): the transaction re-registered fastcached with a scope of
+          # 10.0.0.0/8, which rewrites them, so the remembered scope coming back says nothing about
+          # what the firewall admits.
+          #
+          # A loopback-only fastcached -- the shipped default -- has NO rules, and an empty group
+          # unchanged proves nothing, so for this case alone it faces the network: `bind: 0.0.0.0`
+          # in the machine-wide file, which the transaction's registration and the rollback's both
+          # derive the rules from (a --bind in the command line would come back with the exact
+          # restore and never be re-derived), registered as FastCachedInstallService registers it,
+          # with the remembered scope. Undone after the case, so later steps see loopback again.
           $scopeBefore = "$((Get-ItemProperty -Path 'HKLM:\SOFTWARE\fastcached\Installer' -ErrorAction SilentlyContinue).FirewallAllow)"
+          $cfg = "$env:ProgramData\fastcached\fastcached.yaml"
+          $cfgBefore = Get-Content -Raw -LiteralPath $cfg
+          $fastcachedExe = @(Split-RegisteredCommandLine (Get-CimInstance Win32_Service -Filter "Name='FastCached'").PathName)[0]
+          $register = @('--install-service', '--service-start=auto') + @(if ($scopeBefore) { "--firewall-allow=$scopeBefore" })
+          Add-Content -Path $cfg -Value "`nbind: 0.0.0.0"
+          & $fastcachedExe @register
+          if ($LASTEXITCODE -ne 0) { throw "re-registering fastcached to face the network exited $LASTEXITCODE" }
+          $fastcachedBefore = Get-CimInstance Win32_Service -Filter "Name='FastCached'"
+          $fastcachedFirewallBefore = Get-FirewallGroupSnapshot 'fastcached: FastCached'
+          $fastcachedFirewallBefore | ForEach-Object { Write-Host "  before: $_" }
           $hold = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, 6674)
           $hold.ExclusiveAddressUse = $true
           $hold.Start()
@@ -3841,7 +3860,14 @@ jobs:
           if ($scopeAfter -cne $scopeBefore) {
             throw "the failed node install left the remembered firewall scope '$scopeAfter', not '$scopeBefore'"
           }
-          Write-Host "the node that could not start rolled back to fastcached auto, running and registered as before"
+          Assert-FirewallGroupUnchanged -Group 'fastcached: FastCached' -Before $fastcachedFirewallBefore
+          Write-Host "the node that could not start rolled back to fastcached auto, running and registered as before, its firewall rules unchanged"
+          # Loopback again, as every later step expects: the file as it was, and a registration that
+          # removes the rules the case opened.
+          Set-Content -LiteralPath $cfg -Value $cfgBefore -NoNewline
+          & $fastcachedExe @register
+          if ($LASTEXITCODE -ne 0) { throw "re-registering fastcached on loopback exited $LASTEXITCODE" }
+          Assert-FirewallGroupEmpty 'fastcached: FastCached'
 
           # No property at all: this package has no advertised-endpoint property (W-10), so the node is
           # registered with no advertise flag and advertises this machine's name.

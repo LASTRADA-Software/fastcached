@@ -296,6 +296,12 @@ set(_table [=[
 <CustomAction Id="FastCacheAwaitServiceExit"|/>|!Directory="INSTALL_ROOT"
 <Custom Action="FastCacheAwaitServiceExit"|/>|Before="InstallFiles"
 <Custom Action="FastCacheAwaitServiceExit"|/>|Condition="WIX_UPGRADE_DETECTED AND NOT UPGRADINGPRODUCTCODE"
+<CustomAction Id="FastCacheAwaitServiceExit"|/>|# FastCachedImagePath:[FASTCACHED_IMAGEPATH] FastCacheNodeImagePath:[FASTCACHE_NODE_IMAGEPATH]"
+<CustomAction Id="FastCacheAwaitServiceExit"|/>|(Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").CommandLine
+<CustomAction Id="FastCacheAwaitServiceExit"|/>|$p+=\"$d\fastcached.exe\",\"$d\fastcache-compile-node.exe\"
+<CustomAction Id="FastCachedAwaitExitForNode"|/>|# FastCachedImagePath:[FASTCACHED_IMAGEPATH] FastCacheNodeImagePath:[FASTCACHE_NODE_IMAGEPATH]"
+<CustomAction Id="FastCachedAwaitExitForNode"|/>|(Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").CommandLine
+<CustomAction Id="FastCachedAwaitExitForNode"|/>|$p+=\"$d\fastcached.exe\"
 <CustomAction Id="FastCachedAwaitExitForNode"|/>|bin\fastcached.exe\"
 <CustomAction Id="FastCachedAwaitExitForNode"|/>|!fastcache-compile-node
 <CustomAction Id="FastCachedAwaitExitForNode"|/>|exit 1460

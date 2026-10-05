@@ -4367,30 +4367,57 @@ fi
 
 # --- no external filter reads a process substitution ------------------------
 #
-# `grep PATTERN < <(printf ...)` makes the FILTER the parent of the substitution's writer, and
-# twice on a GitHub Windows runner such a grep came back killed: round 8 silently, round 10 as
-# exit 148, 128 + 20, and 20 is SIGCHLD in the MSYS2 runtime (#1630). That the writer's exit is
-# what killed it is INFERRED (it did not reproduce locally). The parentage is MEASURED, each
-# writer reading its own PPID out of /proc on Git Bash 5.2.37 and bash 3.2.57: the filter is the
-# writer's parent for `cmd < <(w)` and `$(cmd < <(w))`, and for an ARGUMENT `cmd <(w)` inside
-# `$( )` or a pipeline -- the `diff <(a) <(b) | sed` and `$(comm -23 <(a) <(b))` this tree had.
-# A top-level `cmd <(w)` measured a sibling, and `done < <(cmd <(w))` a parent on 5.2 and a
-# sibling on 3.2: whether a line is safe depends on a construct around it and on the bash
-# version, neither of which a line shows. So the rule is the one a line CAN show -- no external
-# filter reads a process substitution, in either position -- and the remedy is a pipe, whose
-# writer is the shell's child in every context measured: `pipe_lines_into` for one input,
+# `grep PATTERN < <(printf ...)` can make the FILTER the parent of the substitution's writer, and
+# on a GitHub Windows runner a grep fed that way came back with exit 148, 128 + 20, and 20 is
+# SIGCHLD in the MSYS2 runtime (#1630, round 10). Round 8 was a status-2 refusal from the same
+# kind of grep whose status was never printed, read as a kill but not measured as one. That the
+# writer's exit is what killed it is INFERRED (it did not reproduce locally). The parentage is
+# MEASURED, each writer reading its own PPID out of /proc on Git Bash 5.2.37 and bash 3.2.57: the
+# filter is the writer's parent for `cmd < <(w)` and `$(cmd < <(w))`, and for an ARGUMENT
+# `cmd <(w)` inside `$( )` or a pipeline -- the `diff <(a) <(b) | sed` and `$(comm -23 <(a) <(b))`
+# this tree had. A top-level `cmd <(w)` measured a sibling, and `done < <(cmd <(w))` a parent on
+# 5.2 and a sibling on 3.2: whether a line is safe depends on a construct around it and on the
+# bash version, neither of which a line shows. So the rule is the one a line CAN show -- no
+# external filter reads a process substitution, in either position -- and the remedy is a pipe,
+# whose writer is the shell's child in every context measured: `pipe_lines_into` for one input,
 # `pipe_pair_into` for two (scripts/lib/third-party-roots.sh). A `while read ...; done < <(...)`,
 # `mapfile` or a shell function is the SHELL reading, and is not matched; nor is a filter named
 # inside a string, since the command must be in COMMAND position.
 #
-# BLIND SPOTS, all failing OPEN -- the line passes: a filter not in the list below, one invoked
-# through a variable (`"$python3_bin" x.py < <(...)`), and one whose `<(` sits on a continuation
-# line after a `\`. None is in the tree today; the census that said so was every `<(` in
-# `scripts/`, classified by hand, not this regex.
+# The arguments between the filter and its `<(` are read QUOTE-AWARE: a `|`, `;` or `&` inside a
+# quoted argument -- `grep -E 'a|b'`, an awk program's `;` -- does not end the command, and `2>&1`
+# is a redirection rather than a separator. And the prefixes a command may carry are allowed in
+# front of the filter: `VAR=value`, `timeout N`, `command`, `env`, and a backtick substitution.
+# The first version stopped at the first `|`, `;` or `&` anywhere, quotes included, and missed
+# nine everyday shapes no blind spot named (round 10 review, I3); each is a canary row below.
+#
+# BLIND SPOTS, all failing OPEN -- the line passes:
+#   - a filter not in the list below;
+#   - one invoked through a variable (`"$python3_bin" x.py < <(...)`);
+#   - one whose `<(` sits on a continuation line after a `\`;
+#   - a quoted argument holding an escaped quote of its own kind (`"a\"|b"`), which ends the
+#     quoted run early, and any other quoting this class does not model ($'...', nested $( ));
+#   - every `run:` block of `.github/workflows`, which `_shell_scripts` does not walk;
+#   - a file the scan's own grep failed on, whose empty answer the `|| true` keeps -- the house
+#     idiom of every extractor here, open as #1631.
+# None is in the tree today; the census that said so was every `<(` in `scripts/` and in
+# `.github/workflows`, classified by hand (and by the round 10 review), not this regex.
+#
+# READ THROUGH ITS REGIONS: this file states the scan's own pattern and canary lines, so they sit
+# in a `procsub-scan` data region and the file is scanned like any other -- never exempted whole,
+# which would blind the scan to its 5700 lines (#492's shape; round 10 review, I4).
+# procsub-scan: data-begin
+_procsub_pattern() {
+    local sq="'" dq='"'
+    local position='(^|[$][(]|[;&|!{(`]|(^|[[:space:]])(then|do|if|else|elif|while|until|command|exec))[[:space:]]*'
+    local prefixes='(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|timeout[[:space:]]+[^[:space:]]+|command|env)[[:space:]]+)*'
+    local filters='(grep|egrep|fgrep|sort|sed|awk|cut|wc|tr|uniq|head|tail|cat|comm|diff|cmp|paste|join|tee|nl|od|base64|sha256sum|md5sum|iconv|jq|xargs|git|perl|python3?|sh|bash)'
+    local arguments="([[:space:]]([^|;&${sq}${dq}]|${sq}[^${sq}]*${sq}|${dq}[^${dq}]*${dq}|[0-9]?>&[0-9-])*)?"
+    printf '%s' "${position}${prefixes}${filters}${arguments}[[:space:]]<\\("
+}
+ProcsubPattern="$(_procsub_pattern)"
 _external_reads_procsub() {
-    grep -nE '(^|[$][(]|[;&|!{(]|(^|[[:space:]])(then|do|if|else|elif|while|until))[[:space:]]*(grep|egrep|fgrep|sort|sed|awk|cut|wc|tr|uniq|head|tail|cat|comm|diff|cmp|paste|join|tee|nl|od|base64|sha256sum|md5sum|iconv|jq|xargs|git|perl|python3?|sh|bash)([[:space:]][^|;&]*)?[[:space:]]<\(' "$1" 2>/dev/null \
-        | grep -v '^[0-9][0-9]*: *#' \
-        || true
+    _readable_dropping_regions "procsub-scan" "$1" | grep -nE "$ProcsubPattern" 2>/dev/null || true
 }
 
 procsub_canary_dir="$(mktemp -d)"
@@ -4405,6 +4432,15 @@ diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed 's/^/     | /' >&2
 Miss "it WROTE the configuration" "$(diff <(printf '%s\n' "$before") <(printf '%s\n' "$now"))"
 done < <(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
 gap="$(comm -23 <(printf '%s\n' "$literals") <(printf '%s\n' "$reached" | sort -u))"
+grep -E 'alpha|beta' < <(printf '%s\n' "$x")
+awk '{ n++; print }' < <(printf '%s\n' "$x")
+x="$(sed -e 's/a/b/;s/c/d/' < <(printf '%s\n' "$y"))"
+grep -E "a|b" <(printf '%s\n' "$x") | cat
+grep -c x 2>&1 < <(printf '%s\n' "$x")
+LC_ALL=C sort -u < <(printf '%s\n' "$x")
+command grep -q x < <(printf '%s\n' "$x")
+timeout 5 grep -q x < <(printf '%s\n' "$x")
+v=`grep -c x < <(printf '%s\n' "$x")`
 CANARY
 cat > "${procsub_canary_dir}/must-not-catch.sh" <<'CANARY'
 done < <(printf '%s\n' "$paths")
@@ -4419,33 +4455,57 @@ done < <(grep -v '^[[:space:]]*#' "$onlyList" | grep . | sort -u)
 grep -c . "$file"
 diff "$want" "$got"
 collect_lines < <(printf '%s\n' "$x")
+echo 'grep -E "a|b" < <(printf x) is the shape' >&2
+LC_ALL=C pipe_lines_into "$x"$'\n' sort -u
 CANARY
 _scan_canary "procsub-reader-scan-canary" _external_reads_procsub \
     "${procsub_canary_dir}/must-catch.sh" "${procsub_canary_dir}/must-not-catch.sh" \
-    10 "external filters reading a process substitution" "a shell read, a remedy or a string"
+    19 "external filters reading a process substitution" "a shell read, a remedy or a string"
 rm -rf "$procsub_canary_dir"
+# procsub-scan: data-end
 
-procsub_allowed="check-e2e-helpers.sh:this file, which stages the scan's own canary lines above. They are heredoc text and run nothing; the canary asserting all ten are caught is what covers them."
+# And the region is a REGION: a canary line staged in this file OUTSIDE it is read, and caught.
+procsub_region_canary="$(mktemp -d)"
+{
+    printf '%s\n' '# procsub-scan: data-begin' 'grep -q x < <(printf y)' '# procsub-scan: data-end'
+    printf '%s\n' 'sort -u < <(printf y)'
+} > "${procsub_region_canary}/regioned.sh"
+ran=$(( ran + 1 ))
+procsub_region_hits="$(_external_reads_procsub "${procsub_region_canary}/regioned.sh")"
+if [ "$procsub_region_hits" != "4:sort -u < <(printf y)" ]; then
+    echo "FAIL procsub-region-canary: the region must hide exactly the line inside it and no line after" >&2
+    echo "     it, so the scan should report line 4 alone; it reported [${procsub_region_hits}]" >&2
+    note_failure "procsub-region-canary"
+fi
+rm -rf "$procsub_region_canary"
+
 procsub_scanned=0
+procsub_regions=""
 while IFS= read -r script; do
     [ -n "$script" ] || continue
     base="${script##*/}"
-    _scan_exempt "$base" "$procsub_allowed" && continue
+    ran=$(( ran + 1 ))
+    _region_ok "procsub-reader-scan" "procsub-scan" "$script" "$base" || continue
+    case "$(grep -c '^[[:space:]]*# procsub-scan: data-begin[[:space:]]*$' "$script")" in
+        0) ;;
+        *) procsub_regions="${procsub_regions:+${procsub_regions}, }${base}" ;;
+    esac
     procsub_scanned=$(( procsub_scanned + 1 ))
     ran=$(( ran + 1 ))
     hits="$(_external_reads_procsub "$script")"
     if [ -n "$hits" ]; then
         echo "FAIL procsub-reader-scan: ${base} feeds an external filter through a process substitution." >&2
-        echo "     That makes the filter the PARENT of the writer -- measured for < <(...) and for an" >&2
-        echo "     argument <(...) inside \$( ) or a pipeline -- and on a Windows runner such a grep" >&2
-        echo "     came back killed, exit 148 -- 128 + SIGCHLD in the MSYS2 runtime (#1630)." >&2
-        echo "     Feed it through a PIPE from scripts/lib/third-party-roots.sh (source it if the" >&2
-        echo "     script does not), which answers with the FILTER's status:" >&2
+        echo "     That can make the filter the PARENT of the writer -- measured for < <(...) and for" >&2
+        echo "     an argument <(...) inside \$( ) or a pipeline -- and on a Windows runner a grep fed" >&2
+        echo "     that way came back with exit 148, 128 + SIGCHLD in the MSYS2 runtime (#1630; the" >&2
+        echo "     cause INFERRED). Feed it through a PIPE from scripts/lib/third-party-roots.sh" >&2
+        echo "     (source it if the script does not), which answers with the FILTER's status:" >&2
         echo "       one input:   pipe_lines_into \"\$text\"\$'\\n' grep -E PATTERN" >&2
         echo "       two inputs:  pipe_pair_into \"\$a\"\$'\\n' \"\$b\"\$'\\n' comm -23 /dev/fd/3 -" >&2
         echo "     and CHECK that status where the output decides anything: a filter that failed" >&2
         echo "     printed nothing, and nothing reads as 'none found'. A while-read loop or a shell" >&2
-        echo "     function over < <(...) is the shell reading and is fine as it is." >&2
+        echo "     function over < <(...) is the shell reading and is fine as it is. A line that is" >&2
+        echo "     DATA for this scan -- a canary -- goes in a '# procsub-scan: data-begin/end' region." >&2
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
         note_failure "procsub-reader-scan"
     fi
@@ -4455,6 +4515,8 @@ if [ "$procsub_scanned" -lt 1 ]; then
     echo "FAIL procsub-reader-scan: no script was read, so every script 'passed' without being read." >&2
     note_failure "procsub-reader-scan"
 fi
+echo "   procsub: scanned ${procsub_scanned} script(s) under scripts/ (walked, not listed)"
+[ -z "$procsub_regions" ] || echo "   procsub: declared data region(s) in: ${procsub_regions}"
 
 # --- no script captures a `wc` count without normalising it -----------------
 #

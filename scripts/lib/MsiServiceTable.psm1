@@ -454,6 +454,44 @@ function Assert-FirewallGroupEmpty([string] $Group) {
     if ($verdict = Get-FirewallGroupEmptyVerdict @($rules | ForEach-Object { $_.DisplayName }) $Group) { throw $verdict }
 }
 
+# The firewall group @p Group on the REAL Windows Firewall, one line per rule: every property a
+# registration's firewall step sets -- name, enabled, direction, action, protocol, local port and
+# remote address -- sorted, so two snapshots compare as text. What Assert-FirewallGroupUnchanged reads.
+# @param Group The group, `fastcached: <service>`.
+# @return The lines; none for an empty or absent group.
+function Get-FirewallGroupSnapshot([string] $Group) {
+    return @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue | ForEach-Object {
+            $port = $_ | Get-NetFirewallPortFilter
+            $address = $_ | Get-NetFirewallAddressFilter
+            "$($_.DisplayName) | enabled=$($_.Enabled) $($_.Direction) $($_.Action) | $($port.Protocol)/$(@($port.LocalPort) -join ',') | remote=$(@($address.RemoteAddress) -join ',')"
+        } | Sort-Object)
+}
+
+# Does the group hold, after a transaction, exactly what it held before? A pure verdict so the
+# self-test can drive it without a firewall. An EMPTY before is refused rather than compared: two
+# empty snapshots agree perfectly, and a group that was never populated says nothing about a rollback.
+# @param Before The snapshot taken before the transaction.
+# @param After The snapshot taken after it.
+# @param Group The group, for the message.
+# @return $null when they agree, else what the rollback lost and what it left behind.
+function Get-FirewallGroupUnchangedVerdict([string[]] $Before, [string[]] $After, [string] $Group) {
+    $before = @($Before | Where-Object { $_ })
+    $after = @($After | Where-Object { $_ })
+    if ($before.Count -eq 0) { return "the firewall group '$Group' held no rule BEFORE the transaction, so an unchanged group proves nothing" }
+    $lost = @($before | Where-Object { $after -cnotcontains $_ })
+    $left = @($after | Where-Object { $before -cnotcontains $_ })
+    if ($lost.Count -eq 0 -and $left.Count -eq 0) { return $null }
+    return "the firewall group '$Group' changed: it lost [$($lost -join '; ')] and holds [$($left -join '; ')] it did not"
+}
+
+# The live firewall group @p Group holds exactly @p Before. Reads a live firewall, so the self-test
+# reaches only the verdict above; fails CLOSED.
+function Assert-FirewallGroupUnchanged([string] $Group, [string[]] $Before) {
+    $after = Get-FirewallGroupSnapshot $Group
+    $after | ForEach-Object { Write-Host "  $_" }
+    if ($verdict = Get-FirewallGroupUnchangedVerdict $Before $after $Group) { throw $verdict }
+}
+
 # Does every rule of the node's firewall group admit exactly @p Scope as its remote address? A pure
 # verdict so the self-test can drive it without a real firewall. Windows reports a prefix in mask
 # form (10.0.0.0/8 reads back as 10.0.0.0/255.0.0.0), so both spellings of the scope are accepted.
@@ -1157,6 +1195,23 @@ function Invoke-MsiServiceTableSelfTest {
         if ($verdict = Get-FirewallGroupEmptyVerdict @('X node tcp/6674') 'fastcached: X') { throw $verdict }
     } "'fastcached: X' still holds \[X node tcp/6674\]"
 
+    # The before-and-after verdict Assert-FirewallGroupUnchanged reads (R4-3): the same rules pass in
+    # any order, a scope the rollback did not put back is refused naming both lines, and an empty
+    # BEFORE is refused rather than compared.
+    $rule = 'FastCached cache tcp/6674 | enabled=True Inbound Allow | TCP/6674 | remote=Any'
+    $scoped = 'FastCached cache tcp/6674 | enabled=True Inbound Allow | TCP/6674 | remote=10.0.0.0/255.0.0.0'
+    $other = 'FastCached admin tcp/6675 | enabled=True Inbound Allow | TCP/6675 | remote=Any'
+    if ($null -ne (Get-FirewallGroupUnchangedVerdict @($rule, $other) @($other, $rule) 'fastcached: X')) {
+        throw 'unchanged verdict: the same rules in another order must pass'
+    }
+    Pass 'unchanged: the same rules in another order pass'
+    ExpectThrow 'unchanged: a scope the rollback left in place is refused, naming what was lost and what is held' {
+        if ($verdict = Get-FirewallGroupUnchangedVerdict @($rule) @($scoped) 'fastcached: X') { throw $verdict }
+    } 'lost \[FastCached cache tcp/6674 .*remote=Any\] and holds \[FastCached cache tcp/6674 .*remote=10\.0\.0\.0'
+    ExpectThrow 'unchanged: an empty group before the transaction proves nothing, and is refused' {
+        if ($verdict = Get-FirewallGroupUnchangedVerdict @() @() 'fastcached: X') { throw $verdict }
+    } 'held no rule BEFORE the transaction'
+
     # What failed, read whatever shape Windows Installer gave it: an action that could not START names
     # no CustomAction and no code (round 5), one that ran and failed does, and a clean log says nothing.
     $startFailure = @('Action start 5:34:04: InstallFiles.', 'noise', 'noise', 'noise',
@@ -1225,7 +1280,7 @@ function Invoke-MsiServiceTableSelfTest {
         }
     }
 
-    $expectedCases = 74
+    $expectedCases = 77
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -1239,4 +1294,5 @@ Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert
     Get-NodeFirewallScopeVerdict, Assert-NodeFirewallScope, Get-NodeRegistrationArgumentVerdict,
     Assert-NodeRegistrationArgument, Get-MsiActionOrderVerdict, Assert-MsiActionOrder,
     Get-NodeRegistrationLacksVerdict, Assert-NodeRegistrationLacks, Get-FirewallGroupEmptyVerdict,
-    Assert-FirewallGroupEmpty, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Invoke-MsiServiceTableSelfTest
+    Assert-FirewallGroupEmpty, Get-FirewallGroupSnapshot, Get-FirewallGroupUnchangedVerdict,
+    Assert-FirewallGroupUnchanged, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Invoke-MsiServiceTableSelfTest

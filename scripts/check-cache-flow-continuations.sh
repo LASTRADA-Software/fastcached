@@ -28,7 +28,9 @@
 # judge, since time measured the host rather than the launcher (round 9). A
 # `Cc::RunOneExchange` written anywhere else in the file is an exchange the trace never says,
 # so it UNDERCOUNTS on the leg whose peer cannot count (refused): fails OPEN. So every call
-# outside the door is refused, and a door with no call in it, or no door, is refused too.
+# outside the door is refused, and a door with no call in it, or no door, is refused too. So
+# is a route around it it has no row for (`DoorRoutes`); what it cannot see, and which way that
+# fails, is stated at `run_door`.
 #
 # bash 3.2: macOS ships a 2007 /bin/bash and this runs in the default ctest set.
 set -u
@@ -60,6 +62,15 @@ FetchObservation::HitObjectUnwritable|Warn|the STORED entry is good; the local w
 RecordedReason|WarnAndCarryOn|the daemon refused: carry on so a MISS can store
 fetch exchange failed|WarnAndCarryOn|unreached: carry on so a MISS can store
 DecodeFailureReason|WarnAndCarryOn|an UNUSABLE value sits under this key and must be overwritten
+'
+
+# The OTHER route to an exchange: `Cc::MakeTcpExchange(...)` builds one, and `->Exchange(...)` on
+# it reaches the cache without the door (round 10 review, M4). Every site that builds one is a
+# row here, <text the line carries>|<why it is not a cache exchange>, so a third is refused
+# rather than passed -- the run_scan rule: exact about the sites it knows, a REFUSAL for the rest.
+DoorRoutes='
+static auto const raw = Cc::MakeTcpExchange|ticket minting: an exchange with the local node, never the cache
+auto const exchange = Cc::MakeTcpExchange|dispatch: the scheduler and the worker, never the cache
 '
 # cache-flow-scan: data-end
 
@@ -167,40 +178,84 @@ EOF
     return $rc
 }
 
-# The door's verdict over $1's main.cpp: every `RunOneExchange(` call, comments stripped, must
-# sit inside the body of the ONE `CacheExchange` definition. Prints findings; returns 0, 1 for
-# a finding, or 2 when there is nothing to judge (no door, no call in it).
+# The door's verdict over $1's main.cpp: every `RunOneExchange` -- a call, or the name taken as a
+# pointer or an alias -- comments stripped, must sit inside the body of the ONE `CacheExchange`
+# definition, and every `MakeTcpExchange(` site must be a row of `DoorRoutes`. Prints findings;
+# returns 0, 1 for a finding, or 2 when there is nothing to judge (no door, no call in it) or the
+# reader itself failed.
+#
+# The reader's lines are classified in THIS shell, never by a `grep ... || true` per kind: a grep
+# that failed printed nothing, and "nothing outside the door" was the pass (round 10 review, I2).
+# And awk's own status is read, since one that died mid-file printed a partial answer.
+#
+# BLIND SPOTS, both failing OPEN (an uncounted exchange passes): an exchange reached through a
+# factory or wrapper that names neither `RunOneExchange` nor `MakeTcpExchange` -- one added to
+# another file and called here under a new name -- and any use of `IEndpointExchange` handed in
+# from outside this file. The two spellings this file has ever used are the ones it watches.
 run_door() {
-    local tree="$1" found doors inside outside
+    local tree="$1" found reader=0 doors=0 inside=0 outside="" routes="" kind lineno text row anchor why used=""
     if [ ! -f "$tree/$Subject" ]; then
         echo "REFUSED: $Subject is missing; the door rule has no subject and cannot pass"
         return 2
     fi
     found="$(awk '
         { line = $0; sub(/\/\/.*$/, "", line) }
-        line ~ /Cc::CacheOutcome[ \t]+CacheExchange[ \t]*\(/ { print "door|" FNR; inDoor = 1 }
-        line ~ /(^|[^A-Za-z_])RunOneExchange[ \t]*\(/ { print (inDoor ? "inside|" : "outside|") FNR }
+        line ~ /Cc::CacheOutcome[ \t]+CacheExchange[ \t]*\(/ { print "door|" FNR "|"; inDoor = 1 }
+        line ~ /(^|[^A-Za-z_])RunOneExchange([^A-Za-z0-9_]|$)/ { print (inDoor ? "inside|" : "outside|") FNR "|" }
+        line ~ /(^|[^A-Za-z_])MakeTcpExchange[ \t]*\(/ { print "route|" FNR "|" line }
         inDoor && /^}/ { inDoor = 0 }
-    ' "$tree/$Subject" 2>/dev/null)"
-    doors="$(printf '%s\n' "$found" | grep -c '^door|' || true)"
-    inside="$(printf '%s\n' "$found" | grep -c '^inside|' || true)"
-    outside="$(printf '%s\n' "$found" | grep '^outside|' || true)"
-    if [ "$doors" != 1 ]; then
-        echo "REFUSED: found ${doors:-no} CacheExchange definition(s) in $Subject, want exactly one -- the door the trace count rests on is gone or doubled"
+    ' "$tree/$Subject")" || reader=$?
+    if [ "$reader" -ne 0 ]; then
+        echo "REFUSED: awk exited $reader reading $Subject, so where its exchanges sit is not known -- the CHECK failing, not a verdict about the file"
         return 2
     fi
-    if [ "$inside" = 0 ] || [ -z "$inside" ]; then
+    while IFS='|' read -r kind lineno text; do
+        case "$kind" in
+            door) doors=$((doors + 1)) ;;
+            inside) inside=$((inside + 1)) ;;
+            outside) outside="${outside}${lineno} " ;;
+            route)
+                why=""
+                while IFS='|' read -r anchor row; do
+                    [ -n "$anchor" ] || continue
+                    case "$text" in *"$anchor"*) why="$row"; used="${used}${anchor}|" ;; esac
+                done <<EOF
+$DoorRoutes
+EOF
+                [ -n "$why" ] || routes="${routes}${lineno} "
+                ;;
+        esac
+    done <<EOF
+$found
+EOF
+    if [ "$doors" != 1 ]; then
+        echo "REFUSED: found ${doors} CacheExchange definition(s) in $Subject, want exactly one -- the door the trace count rests on is gone or doubled"
+        return 2
+    fi
+    if [ "$inside" -eq 0 ]; then
         echo "REFUSED: CacheExchange makes no Cc::RunOneExchange call, so the door rule judged nothing"
         return 2
     fi
-    if [ -n "$outside" ]; then
-        printf '%s\n' "$outside" | while IFS='|' read -r _ lineno; do
-            echo "  OUTSIDE THE DOOR  $Subject:$lineno  Cc::RunOneExchange(...) -- route it through CacheExchange, or its exchange is one the trace never counts"
-        done
-        return 1
-    fi
-    echo "  $inside Cc::RunOneExchange call(s), all inside CacheExchange"
-    return 0
+    local rc=0
+    for lineno in $outside; do
+        echo "  OUTSIDE THE DOOR  $Subject:$lineno  Cc::RunOneExchange -- route it through CacheExchange, or its exchange is one the trace never counts"
+        rc=1
+    done
+    for lineno in $routes; do
+        echo "  UNCLASSIFIED ROUTE  $Subject:$lineno  Cc::MakeTcpExchange(...) -- a cache exchange belongs in CacheExchange; anything else is a DoorRoutes row saying why"
+        rc=1
+    done
+    while IFS='|' read -r anchor row; do
+        [ -n "$anchor" ] || continue
+        case "$used" in *"${anchor}|"*) ;; *)
+            echo "  STALE ROUTE ROW  '$anchor' matches no Cc::MakeTcpExchange site in $Subject -- delete the row, or it reads as coverage of a site nothing writes"
+            rc=1 ;;
+        esac
+    done <<EOF
+$DoorRoutes
+EOF
+    [ "$rc" -eq 0 ] && echo "  $inside Cc::RunOneExchange call(s), all inside CacheExchange; every Cc::MakeTcpExchange site classified"
+    return "$rc"
 }
 
 if [ "$selftest" -eq 1 ]; then
@@ -287,14 +342,18 @@ SRC
     run_scan "$tmp/nosubject" >/dev/null 2>&1
     [ $? -eq 2 ] && echo "  case 6 (subject missing)       PASS" || { echo "  case 6 (subject missing)       FAIL"; fail=1; }
 
-    # The door: a correct file, a planted second call, a mention only in a comment, no door.
+    # The door: a correct file, a planted second call, a mention only in a comment, no door. With
+    # the two classified `MakeTcpExchange` routes the real file has, since a row matching no site
+    # is a refusal of its own.
     door() {
         cat <<'SRC'
+    static auto const raw = Cc::MakeTcpExchange(Notice(verbose));
 [[nodiscard]] Cc::CacheOutcome CacheExchange(InvocationRecord const& record, std::string_view what)
 {
     auto outcome = Cc::RunOneExchange(addr, Notice(record.verbose), std::move(frame), credential, budget);
     return outcome;
 }
+    auto const exchange = Cc::MakeTcpExchange(Notice(record.verbose));
 SRC
     }
     { baseline; door; } | stage doorGood
@@ -314,6 +373,42 @@ SRC
     cases=$((cases+1))
     run_door "$tmp/doorGone" >/dev/null 2>&1
     [ $? -eq 2 ] && echo "  case 12 (no door -> refuse)   PASS" || { echo "  case 12 (no door -> refuse)   FAIL"; fail=1; }
+
+    # The routes around the door (round 10 review, M4): a cache fetch through a THIRD built
+    # exchange, and the door's callee taken as a pointer. Both reached the cache uncounted and
+    # passed.
+    { baseline; door; echo '    auto const fetcher = Cc::MakeTcpExchange(Notice(record.verbose)); fetcher->Exchange(cfg.addr, frame);'; } | stage doorRoute
+    cases=$((cases+1))
+    run_door "$tmp/doorRoute" >/dev/null 2>&1
+    [ $? -eq 1 ] && echo "  case 13 (unclassified route)  PASS" || { echo "  case 13 (unclassified route)  FAIL -- not caught"; fail=1; }
+
+    { baseline; door; echo '    auto const run = &Cc::RunOneExchange;'; } | stage doorPointer
+    cases=$((cases+1))
+    run_door "$tmp/doorPointer" >/dev/null 2>&1
+    [ $? -eq 1 ] && echo "  case 14 (callee as a pointer) PASS" || { echo "  case 14 (callee as a pointer) FAIL -- not caught"; fail=1; }
+
+    { baseline; door | grep -v 'auto const exchange'; } | stage doorStaleRoute
+    cases=$((cases+1))
+    run_door "$tmp/doorStaleRoute" >/dev/null 2>&1
+    [ $? -eq 1 ] && echo "  case 15 (stale route row)     PASS" || { echo "  case 15 (stale route row)     FAIL -- not caught"; fail=1; }
+
+    # The READER failing (round 10 review, I2): an awk that fails is the check failing (2), and a
+    # grep that fails changes nothing, since no verdict rests on one -- over the planted tree, whose
+    # right answer is a finding (1), so a pass can only come from the instrument. The failing awk
+    # dies AFTER printing everything but the `outside|` line, the review's scenario: one that
+    # printed nothing would be refused by the door count anyway, and prove nothing about the status.
+    cases=$((cases+1))
+    ( awk() {
+          printf '%s\n' 'door|1|' 'inside|2|' \
+              'route|3|static auto const raw = Cc::MakeTcpExchange(' \
+              'route|4|auto const exchange = Cc::MakeTcpExchange('
+          return 2
+      }
+      run_door "$tmp/doorPlanted" ) >/dev/null 2>&1
+    [ $? -eq 2 ] && echo "  case 16 (awk fails -> refuse)  PASS" || { echo "  case 16 (awk fails -> refuse)  FAIL"; fail=1; }
+    cases=$((cases+1))
+    ( grep() { return 148; }; run_door "$tmp/doorPlanted" ) >/dev/null 2>&1
+    [ $? -eq 1 ] && echo "  case 17 (grep killed: still 1) PASS" || { echo "  case 17 (grep killed: still 1) FAIL"; fail=1; }
 
     echo "self-test: $cases cases run"
     [ "$fail" -eq 0 ] && echo "SELFTEST OK" || echo "SELFTEST FAILED"

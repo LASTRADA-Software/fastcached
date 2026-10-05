@@ -1292,21 +1292,23 @@ determinism rests on.
       suite's total was 583.63 s against 593.45 s and 576.26 s on passing runs of the
       same leg, with 5260 of 5282 tests normal. **The two that timed out take 2.5 s and
       5.5 s -- they were not slow, they were deadlocked, and raising a `TIMEOUT` would
-      have buried it** (#1515). The remedy is process substitution, whose reader drains
-      concurrently and which still reports `grep`'s own status rather than a producer's:
-      `< <(printf '%s
-' "$x")`. The audit of the sites still under the boundary, and
-      the scan that should refuse the next one, are
+      have buried it** (#1515). The remedy THEN was process substitution, whose reader
+      drains concurrently and which still reports `grep`'s own status rather than a
+      producer's: `< <(printf '%s\n' "$x")` -- **superseded below for an EXTERNAL
+      reader**, and kept only where the SHELL reads. The audit of the sites still under
+      the boundary, and the scan that should refuse the next one, are
       [#1591](https://github.com/LASTRADA-Software/fastcached/issues/1591).
     - **And process substitution was itself the next defect, for an EXTERNAL reader.**
-      `grep < <(printf ...)` makes grep the PARENT of the writer, and twice on a GitHub
-      Windows runner such a grep came back killed: round 8 in `_third_party_select`,
-      silently, and round 10 in `header_filter_taken_lines` as **exit 148**, 128 + 20,
-      where 20 is **SIGCHLD** in the MSYS2 runtime (`cygwin/signal.h`; `kill -l 20` says
+      `grep < <(printf ...)` makes grep the PARENT of the writer, and on a GitHub Windows
+      runner such a grep came back **exit 148** in round 10, in `header_filter_taken_lines`:
+      128 + 20, where 20 is **SIGCHLD** in the MSYS2 runtime (`cygwin/signal.h`; `kill -l 20` says
       CHLD), not Linux's SIGTSTP. That the writer's exit is what killed it is INFERRED:
       neither the micro shape nor the real path reproduced locally, under load, on Git for
       Windows 2.51 (MSYS 3.6.5, bash 5.2) or 2.55 (MSYS 3.6.10, bash 5.3, the runner's)
-      ([#1630](https://github.com/LASTRADA-Software/fastcached/issues/1630)).
+      ([#1630](https://github.com/LASTRADA-Software/fastcached/issues/1630)). Round 8,
+      in `_third_party_select`, was a **status-2 refusal** whose grep status was never
+      printed; it was READ as a kill and was not measured as one, so it is not a second
+      instance.
     - The parentage is MEASURED, each writer reading its own PPID out of `/proc`, on Git
       Bash 5.2.37 and on bash 3.2.57. The filter is the writer's parent for `cmd < <(w)`
       and `$(cmd < <(w))`, **and for an ARGUMENT `cmd <(w)` inside `$( )` or a
@@ -1322,9 +1324,16 @@ determinism rests on.
       fed through `pipe_lines_into`, or `pipe_pair_into` for a two-input `comm`/`diff`
       (`/dev/fd/3` and `-`), both in `scripts/lib/third-party-roots.sh`; a `while read` loop
       or a shell function is the SHELL reading, and stays on `< <(...)`.
-      `procsub-reader-scan` in `check-e2e-helpers.sh` refuses both shapes and names its
-      blind spots (a filter off its list, one invoked through a variable, a `<(` on a
-      continuation line), all failing OPEN.
+      `procsub-reader-scan` in `check-e2e-helpers.sh` refuses both shapes, reading the
+      arguments QUOTE-AWARE and allowing the prefixes a command carries (`VAR=x`,
+      `timeout N`, `command`, `env`, a backtick), and names its blind spots, all failing
+      OPEN: a filter off its list; one invoked through a variable; a `<(` on a
+      continuation line; a quoted argument holding an escaped quote of its own kind, and
+      any quoting it does not model (`$'...'`, nested `$( )`); and the `run:` blocks of
+      `.github/workflows`, which it does not walk; and a file its own grep failed on
+      ([#1631](https://github.com/LASTRADA-Software/fastcached/issues/1631)). Its own pattern and canary lines sit
+      in a `procsub-scan` data REGION, so `check-e2e-helpers.sh` is scanned like any
+      other file rather than exempted whole.
     - **The status, once read, has to carry WHOSE failure it is.** Round 10's red was
       `status 1 and [uncovered ]`: `Judge` read the coverage without its status, so a killed
       grep blamed the filter. Fixing that with one status for every refusal would have blamed
@@ -6891,6 +6900,13 @@ clang-tidy discards. That is the reason to keep the filter to classes, alternati
   that does not. The issue names the candidate sites. It also wants the boundary
   itself pinned by a case, so the bash or platform that moves it is a red rather than
   a Windows leg that hangs with no diagnosis.
+
+- **[#1631](https://github.com/LASTRADA-Software/fastcached/issues/1631)** — every
+  per-file scan in `check-e2e-helpers.sh`, `procsub-reader-scan` among them, reads
+  through an extractor ending in `|| true`, so a grep that fails on ONE file passes that
+  file: #1630's shape, failing OPEN. The canary before each scan catches only a failure
+  that empties every file. The house idiom across seven extractors, so it is a design
+  change of its own rather than a line of PR #1600.
 
 - **[#1567](https://github.com/LASTRADA-Software/fastcached/issues/1567)** — `## A correction is a search,
   not a recollection` has no `AGENT.md` tripwire. The nearest bullet is `testing.md`'s

@@ -2522,14 +2522,15 @@ gate_reached_tests() {
         | awk '/^[ \t]*Test[ \t]+#[0-9]+:/ { sub(/^[^:]*:[ \t]*/, ""); if (length($0)) print }'
 }
 
-# How many non-blank lines @p 1 holds, counted in THIS shell. Not `grep -c . || true`: a grep
+# How many non-EMPTY lines @p 1 holds -- a line of spaces counts, as it did for the `grep -c .`
+# this replaced -- counted in THIS shell. Not `grep -c . || true`: a grep
 # that failed or was killed printed nothing, the `|| true` kept the empty answer, and an empty
 # count is `-eq 0` -- "every one reachable" over a gap that named tests (#1630). No subprocess
 # here, so nothing can be killed into answering "none". Not `e2e-common.sh`'s `count_lines`,
 # which counts a FILE with `wc`. The lines arrive through a process substitution the SHELL
 # reads, never a herestring, which deadlocks at 64 KiB on Git Bash (#1591).
 # @param 1 The text. @return The count, on stdout.
-nonblank_line_count() {
+nonempty_line_count() {
     local line n=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -n "$line" ]] && n=$((n + 1))
@@ -2583,7 +2584,7 @@ coverage_gap() {
         echo "==   registers nothing and not 'everything is reachable'."
         return 1
     fi
-    count="$(nonblank_line_count "$literals")"
+    count="$(nonempty_line_count "$literals")"
 
     if [[ "$count" -eq 0 ]]; then
         echo "== coverage: REFUSED -- no test registrations were found in the CMake sources."
@@ -2615,7 +2616,7 @@ coverage_gap() {
         echo "==   not 'everything is reachable'."
         return 1
     fi
-    gapCount="$(nonblank_line_count "$gap")"
+    gapCount="$(nonempty_line_count "$gap")"
 
     if [[ "$gapCount" -eq 0 ]]; then
         echo "== coverage: ${count} declared test(s), every one reachable in at least one of the"
@@ -2644,7 +2645,7 @@ coverage_gap() {
 
     if [[ -n "$unresolved" ]]; then
         local ucount
-        ucount="$(nonblank_line_count "$unresolved")"
+        ucount="$(nonempty_line_count "$unresolved")"
         echo "==   plus ${ucount} registration(s) whose name is built from a variable, which this"
         echo "==   derivation cannot resolve and does not claim to have checked:"
         local u

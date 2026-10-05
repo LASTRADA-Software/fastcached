@@ -414,22 +414,26 @@ LoadNotOurRoots() {
 # source created but not added yet is exactly the code nothing has ever checked, and
 # dropping it here would drop it silently.
 #
-# PURE -- it filters and returns, and refuses nothing. One call site reads it through
-# a process substitution, where an `exit` ends only the subshell: the outer script
-# would carry on with a truncated list and a clean status, which is this script's own
-# nightmare wearing the costume of the guard against it. The assertion that the
-# exclusion still works lives at top level, once, in `AssertNotOurRootsExcluded`.
+# It never EXITS, and every caller reads it into a FILE at the top level and checks the
+# status there: inside a process substitution an `exit` ends only the subshell, and the
+# outer script would carry on with a truncated list and a clean status, which is this
+# script's own nightmare wearing the costume of the guard against it. The assertion
+# that the exclusion still works lives at top level, once, in `AssertNotOurRootsExcluded`.
 #
 # @param @ Optional `git ls-files` pathspec globs.
+# @return 0 with the files on stdout -- none is an answer: the filter's 1 -- or 2 when
+#         `git ls-files` or the filter FAILED (above 1, a kill included: #1630). Read
+#         behind `|| true`, a failure was an empty list, and an `--only` sweep then
+#         planned nothing and exited 0 over nothing analysed (round 10 review, I1).
 FirstPartyFiles() {
-    local listed
-    listed="$(git ls-files --cached --others --exclude-standard "$@")"
+    local listed status=0
+    listed="$(git ls-files --cached --others --exclude-standard "$@")" || return 2
     # Not a herestring: this is the whole `git ls-files` listing, which is past the
     # 64 KiB pipe buffer where Git Bash's `<<<` deadlocks. Nor `grep < <(...)`, which
     # makes grep the writer's parent (#1630). See `pipe_lines_into` in
     # `scripts/lib/third-party-roots.sh`.
-    pipe_lines_into "$listed"$'
-' grep -vE "$NotOurPattern" || true
+    pipe_lines_into "$listed"$'\n' grep -vE "$NotOurPattern" || status=$?
+    [[ "$status" -le 1 ]] || return 2
 }
 
 # Every tracked-or-new file UNDER the roots: exactly what `FirstPartyFiles` declines.
@@ -437,12 +441,13 @@ FirstPartyFiles() {
 # reader having to trust that it did.
 #
 # @param @ Optional `git ls-files` pathspec globs.
+# @return As `FirstPartyFiles`.
 DeclinedThirdPartyFiles() {
-    local listed
-    listed="$(git ls-files --cached --others --exclude-standard "$@")"
+    local listed status=0
+    listed="$(git ls-files --cached --others --exclude-standard "$@")" || return 2
     # Same listing, same boundary.
-    pipe_lines_into "$listed"$'
-' grep -E "$NotOurPattern" || true
+    pipe_lines_into "$listed"$'\n' grep -E "$NotOurPattern" || status=$?
+    [[ "$status" -le 1 ]] || return 2
 }
 
 # That the exclusion above still bites. Called once, from the top level, where a
@@ -454,16 +459,24 @@ DeclinedThirdPartyFiles() {
 # nobody here wrote. So for every root that exists AND carries tracked files,
 # dropping it must actually reduce the set.
 AssertNotOurRootsExcluded() {
-    local root all kept
+    local root all kept status
     for root in "${NotOurRoots[@]}"; do
         [[ -d "$root" ]] || continue
         [[ -n "$(git ls-files "$root")" ]] || continue
-        all="$(git ls-files --cached --others --exclude-standard)"
-        # Same listing, same boundary, twice.
-        pipe_lines_into "$all"$'
-' grep -q "^${root}/" || continue
-        kept="$(pipe_lines_into "$all"$'
-' grep -v "^${root}/" || true)"
+        all="$(git ls-files --cached --others --exclude-standard)" \
+            || fatal "git ls-files failed, so whether the '${root}/' exclusion still bites cannot be asked"
+        # Same listing, same boundary, twice -- and each grep's status READ: a grep that
+        # failed took `|| continue` and skipped the assertion, or left `kept` empty, which
+        # differs from `all` and passed it (round 10 review, I1).
+        status=0
+        pipe_lines_into "$all"$'\n' grep -q "^${root}/" || status=$?
+        [[ "$status" -le 1 ]] \
+            || fatal "grep exited ${status} looking for '${root}/' in the listing, so whether its exclusion still bites is not known -- the CHECK failing"
+        [[ "$status" -eq 0 ]] || continue
+        status=0
+        kept="$(pipe_lines_into "$all"$'\n' grep -v "^${root}/")" || status=$?
+        [[ "$status" -le 1 ]] \
+            || fatal "grep exited ${status} dropping '${root}/' from the listing, so whether its exclusion still bites is not known -- the CHECK failing"
         [[ "$kept" != "$all" ]] \
             || fatal "the '${root}/' exclusion matched nothing while ${root}/ holds tracked files, so this sweep would analyse code this repository does not own"
     done
@@ -1005,6 +1018,20 @@ OnlyCoverageVerdict() {
     echo ok
 }
 
+# `nothing` or `refuse`: may a run of `$1` mode whose plan came back EMPTY exit 0 saying
+# there is nothing to sweep? Only a mode that derived its set from a diff may: `--all`
+# sweeps the whole database, and `--only` NAMES its files -- the units a leg exists to
+# reach -- so an empty plan there is a sweep of nothing, which would report clean (round
+# 10 review, I1). Pure, for the reason `OnlyCoverageVerdict` is.
+#
+# @param 1 Sweep mode (`all`, `ci` or `only`).
+EmptyPlanVerdict() {
+    case "$1" in
+        all|only) echo refuse ;;
+        *) echo nothing ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
@@ -1133,7 +1160,7 @@ TidyUnitVerdict() {
 # that stopped early -- a helper that `return`ed, a block skipped by a failed
 # precondition, a row deleted by mistake -- would otherwise print PASSED over fewer
 # judgements than it claims. Change it in the same edit that adds or removes a row.
-SelfTestCases=104
+SelfTestCases=113
 
 # The HEADER canary's decision: was a finding planted in each named header REPORTED?
 #
@@ -1573,6 +1600,11 @@ STUB
     # And the modes that CHOSE their own set are unaffected: an empty unit there is
     # a platform-gated file on the other platform, which is the guard working.
     Expect "--all tolerates an empty unit"   "ok" "$(OnlyCoverageVerdict all 3 0)"
+    # An EMPTY PLAN is "nothing to sweep" only where the set came from a diff: `--only` named
+    # its files, and a plan holding none of them is a sweep of nothing (round 10 review, I1).
+    Expect "--only refuses an empty plan"    "refuse"  "$(EmptyPlanVerdict only)"
+    Expect "--all refuses an empty plan"     "refuse"  "$(EmptyPlanVerdict all)"
+    Expect "--ci may find nothing to sweep"  "nothing" "$(EmptyPlanVerdict ci)"
     Expect "--ci tolerates an unknown unit"  "ok" "$(OnlyCoverageVerdict ci 0 3)"
     # NOT asserted here, deliberately: that the preprocessed dump is created inside
     # $scratch rather than $TMPDIR. Both paths delete it on the way out, so the
@@ -1788,6 +1820,28 @@ C:/Temp/src\\FastCache/${hdrInc}:4:1: error: variable is non-const [cppcoreguide
         Expect "a planted third-party source is declined, and the first-party one kept" \
                "src/a.cpp"$'\t'"vendor/upstream/b.cpp" \
                "$(cd "$tp" && LoadNotOurRoots "$tp" && printf '%s\t%s' "$(FirstPartyFiles '*.cpp')" "$(DeclinedThirdPartyFiles '*.cpp')")"
+        # And a listing that FAILED is refused, never an empty set (round 10 review, I1): a
+        # filter grep killed (148, #1630's status), and `git ls-files` failing, each answer 2
+        # from both enumerators -- while a filter that selects nothing (1) is an answer, 0.
+        Expect "a killed filter grep is refused by both enumerators (2), never read as no files" "2 2" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && grep() { return 148; } \
+                  && { FirstPartyFiles '*.cpp' > /dev/null; a=$?; DeclinedThirdPartyFiles '*.cpp' > /dev/null; echo "$a $?"; })"
+        Expect "a failing git ls-files is refused by both enumerators (2), never read as no files" "2 2" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && git() { return 128; } \
+                  && { FirstPartyFiles '*.cpp' > /dev/null; a=$?; DeclinedThirdPartyFiles '*.cpp' > /dev/null; echo "$a $?"; })"
+        Expect "a filter selecting nothing is an answer (0), not a refusal" "0" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && grep() { return 1; } && { FirstPartyFiles '*.cpp' > /dev/null; echo "$?"; })"
+        # And the assertion that the exclusion bites: each of its two greps killed is a FATAL
+        # (2), never a skipped root or an empty `kept` that differs from the listing and passes.
+        # The control first, so a 2 below is the grep's and not the tree's.
+        Expect "the exclusion assertion passes on the planted tree" "0" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && { (AssertNotOurRootsExcluded) > /dev/null 2>&1; echo "$?"; })"
+        Expect "the exclusion assertion is fatal when its root-finding grep is killed" "2" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && grep() { [ "$1" = -q ] && return 148; command grep "$@"; } \
+                  && { (AssertNotOurRootsExcluded) > /dev/null 2>&1; echo "$?"; })"
+        Expect "the exclusion assertion is fatal when its root-dropping grep is killed" "2" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && grep() { [ "$1" = -v ] && return 148; command grep "$@"; } \
+                  && { (AssertNotOurRootsExcluded) > /dev/null 2>&1; echo "$?"; })"
     else
         echo "  FAIL third-party roots: git could not stage the scratch repository, so the planted case did not run"
         status=1
@@ -2196,7 +2250,8 @@ fi
 # Before either enumeration below reaches `FirstPartyFiles`, and at the top level so
 # a refusal can stop the run.
 AssertNotOurRootsExcluded
-declinedFiles="$(DeclinedThirdPartyFiles)"
+declinedFiles="$(DeclinedThirdPartyFiles)" \
+    || fatal "which files are third-party could not be listed (git ls-files or its filter failed)"
 [[ -z "$declinedFiles" ]] || echo "TIDY SWEEP: $(third_party_declined_summary 'file(s)' "$declinedFiles")"
 
 if [[ "$mode" != all && "$mode" != only ]]; then
@@ -2223,11 +2278,13 @@ if [[ "$mode" != all && "$mode" != only ]]; then
     #
     # Filtered to what is actually on disk, because `--cached` also lists a tracked
     # file deleted from the worktree and not yet staged, and the include scan now
-    # treats a file it cannot read as fatal rather than as an empty graph.
-    mapfile -t sources < <(FirstPartyFiles "${globs[@]}" \
-                           | while IFS= read -r candidate; do
-                                 [[ -f "$candidate" ]] && printf '%s\n' "$candidate"
-                             done)
+    # treats a file it cannot read as fatal rather than as an empty graph. Into a FILE
+    # first, at the top level, where its refusal can stop the run.
+    FirstPartyFiles "${globs[@]}" > "${scratch}/sources-listed" \
+        || fatal "the first-party sources could not be listed (git ls-files or its filter failed)"
+    while IFS= read -r candidate; do
+        [[ -f "$candidate" ]] && sources+=("$candidate")
+    done < "${scratch}/sources-listed"
     for path in "${changed[@]}"; do
         for extension in "${SourceExtensions[@]}"; do
             [[ "$path" == *".${extension}" ]] && { touched+=("$path"); break; }
@@ -2243,7 +2300,8 @@ if [[ "$mode" != all && "$mode" != only ]]; then
     echo "TIDY SWEEP: ${#touched[@]} changed source(s) reach $(wc -l < "$selection" | tr -d ' ') candidate file(s)"
 fi
 
-FirstPartyFiles > "${scratch}/first-party"
+FirstPartyFiles > "${scratch}/first-party" \
+    || fatal "the first-party files could not be listed (git ls-files or its filter failed), so no plan could be read as complete"
 
 # Through a file, so the plan's exit status is OBSERVED. `mapfile < <(PlanUnits …)`
 # discards it, and every way the plan can fail -- a compile database this build
@@ -2256,7 +2314,9 @@ if ! PlanUnits "$selection" "${scratch}/first-party" > "${scratch}/plan"; then
 fi
 mapfile -t plan < "${scratch}/plan"
 if [[ "${#plan[@]}" -eq 0 ]]; then
-    if [[ "$mode" == all ]]; then
+    if [[ "$(EmptyPlanVerdict "$mode")" != nothing ]]; then
+        [[ "$mode" != only ]] \
+            || fatal "--only=${onlyList} names ${#onlyPaths[@]} file(s) and none is a first-party translation unit in ${DB}/compile_commands.json; a sweep of nothing would report clean"
         fatal "no first-party translation units in ${DB}/compile_commands.json"
     fi
     echo "TIDY SWEEP: nothing changed here reaches a translation unit this platform"

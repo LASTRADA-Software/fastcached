@@ -190,13 +190,28 @@ class ScriptedServiceControlManager final: public IServiceControlManager
         return _handler;
     }
 
-    /// Deliver @p request to the registered handler, as the SCM does on a thread of its own.
+    /// Deliver @p request to the registered handler, as the SCM does on a thread of its own: a
+    /// control the manager has ALREADY accepted, so it reaches the handler whatever is reported now
+    /// -- which is how a stop arrives after STOPPED. `Request` is the call that asks first.
     /// @param request The control.
     /// @param eventType The manager's event type: a `PBT_*` value for a power event.
     /// @return What the handler answered; false when none is registered.
     [[nodiscard]] bool Deliver(ServiceControlRequest request, std::uint32_t eventType = 0) const
     {
         return _handler && _handler(request, eventType);
+    }
+
+    /// Send @p request the way `sc stop`, an MSI ServiceControl or a power broadcast does: the
+    /// manager hands the service only a control its LAST report accepted, and refuses any other
+    /// itself (`ERROR_INVALID_SERVICE_CONTROL`, 1052), with the handler never called.
+    /// @param request The control.
+    /// @param eventType The manager's event type: a `PBT_*` value for a power event.
+    /// @return What the handler answered, or nothing when the manager refused the control itself.
+    [[nodiscard]] std::optional<bool> Request(ServiceControlRequest request, std::uint32_t eventType = 0) const
+    {
+        if (!Accepted(request))
+            return std::nullopt;
+        return Deliver(request, eventType);
     }
 
     /// @return Every status reported so far, in order.
@@ -256,12 +271,39 @@ class ScriptedServiceControlManager final: public IServiceControlManager
         Transition { .from = std::nullopt, .to = ServiceState::Stopped },
         Transition { .from = ServiceState::StartPending, .to = ServiceState::StartPending },
         Transition { .from = ServiceState::StartPending, .to = ServiceState::Running },
+        Transition { .from = ServiceState::StartPending, .to = ServiceState::StopPending },
         Transition { .from = ServiceState::StartPending, .to = ServiceState::Stopped },
         Transition { .from = ServiceState::Running, .to = ServiceState::StopPending },
         Transition { .from = ServiceState::Running, .to = ServiceState::Stopped },
         Transition { .from = ServiceState::StopPending, .to = ServiceState::StopPending },
         Transition { .from = ServiceState::StopPending, .to = ServiceState::Stopped },
     };
+
+    /// @return Whether the last report accepted @p request; nothing reported accepts nothing but an
+    ///         interrogation, which the SCM answers itself.
+    [[nodiscard]] bool Accepted(ServiceControlRequest request) const
+    {
+        std::scoped_lock const lock { _mutex };
+        if (request == ServiceControlRequest::Interrogate)
+            return true;
+        if (_reports.empty())
+            return false;
+        auto const& last = _reports.back();
+        switch (request)
+        {
+            case ServiceControlRequest::Stop:
+            case ServiceControlRequest::Shutdown:
+                return last.acceptsStop;
+            case ServiceControlRequest::ParamChange:
+                return last.acceptsReload;
+            case ServiceControlRequest::PowerEvent:
+                return last.acceptsPowerEvents;
+            case ServiceControlRequest::Interrogate:
+            case ServiceControlRequest::Unsupported:
+                break;
+        }
+        return false;
+    }
 
     /// @return Whether @p next may follow the last state reported.
     [[nodiscard]] bool LegalAfter(ServiceState next) const

@@ -5756,9 +5756,13 @@ set_tests_properties("cache-flow-continuations" PROPERTIES
     TIMEOUT 60
 )
 
-# Six cases, including the defect itself (the undecodable arm choosing no-STORE)
-# and the two ways this check could pass while guarding nothing: the helpers
-# renamed away so it matches nothing, and its subject file gone.
+# Both rules, in both directions: for the continuations, the defect itself (the
+# undecodable arm choosing no-STORE) and the two ways this check could pass while
+# guarding nothing -- the helpers renamed away so it matches nothing, and its
+# subject file gone; for the one door to the cache, a call outside it, the routes
+# around it (a built exchange, the callee as a pointer), a stale route row, and its
+# own reader failing. No count here: the self-test prints how many cases it ran,
+# and a count beside the list is a second claim that goes stale (round 10, M6).
 add_test(
     NAME "cache-flow-continuations-selftest"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cache-flow-continuations.sh" --self-test

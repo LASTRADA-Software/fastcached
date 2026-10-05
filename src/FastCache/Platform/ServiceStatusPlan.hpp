@@ -50,14 +50,41 @@ enum class ServiceHostStart : std::uint8_t
 /// A state the SCM is told, as `SERVICE_STATUS::dwCurrentState` spells it on Windows.
 ///
 /// **PRIVATE: persisted and transmitted nowhere** -- mapped to the Win32 constant in
-/// `WindowsServiceHost.cpp`, never cast.
+/// `WindowsServiceHost.cpp`, never cast. **In LIFECYCLE order**, which the host relies on: it
+/// never reports a state that comes before the last one it reported (`ServiceHost::Report`).
 enum class ServiceState : std::uint8_t
 {
     StartPending, ///< `SERVICE_START_PENDING`.
     Running,      ///< `SERVICE_RUNNING`.
     StopPending,  ///< `SERVICE_STOP_PENDING`.
     Stopped,      ///< `SERVICE_STOPPED`.
+    Last,         ///< Not a state.
 };
+
+/// What the manager may deliver while one state is reported.
+struct ServiceStateRow
+{
+    ServiceState state { ServiceState::Last }; ///< The enumerator this row describes.
+    bool acceptsStop { false };                ///< Stop and shutdown.
+    bool acceptsReload { false };              ///< A parameter change: the reload.
+    bool acceptsPowerEvents { false };         ///< Power broadcasts, to a host handed a sink for them.
+};
+
+/// Every state, in enumerator order.
+///
+/// **A STOP is accepted while the start is pending** (batch 4 review, R4-2): a start that waits for
+/// its body to serve (`ServiceReadiness::BodySignals`) can be long -- a large disk tier opening,
+/// consensus recovering -- and one that accepted nothing then could be stopped by no `sc stop`,
+/// MSI ServiceControl or uninstall until it served. A reload and a power event wait for RUNNING:
+/// neither has anything to act on before the body serves.
+inline constexpr EnumTable<ServiceState, ServiceStateRow> ServiceStateTable { {
+    { .state = ServiceState::StartPending, .acceptsStop = true, .acceptsReload = false, .acceptsPowerEvents = false },
+    { .state = ServiceState::Running, .acceptsStop = true, .acceptsReload = true, .acceptsPowerEvents = true },
+    { .state = ServiceState::StopPending, .acceptsStop = false, .acceptsReload = false, .acceptsPowerEvents = false },
+    { .state = ServiceState::Stopped, .acceptsStop = false, .acceptsReload = false, .acceptsPowerEvents = false },
+} };
+static_assert(RowsInEnumeratorOrder(ServiceStateTable, &ServiceStateRow::state),
+              "ServiceStateTable must hold one row per ServiceState, in enumerator order");
 
 /// One report made before the body runs.
 struct ServiceStateReport

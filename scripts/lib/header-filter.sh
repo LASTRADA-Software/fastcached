@@ -31,6 +31,11 @@
 # check (see `header_filter_coverage` in `local-gate.sh`).
 #
 # bash 3.2, because a hygiene script `ctest` runs is constrained to it.
+#
+# REQUIRES `scripts/lib/third-party-roots.sh` sourced first, for the core predicate as well as
+# for `header_filter_declared_packages`: every classifier feeds grep through its
+# `pipe_lines_into`. Unsourced, that is exit 127, which the classifiers would then report as
+# the CHECK failing -- closed, but naming the wrong cause.
 
 # Every spelling a supported build opens a header by. A NAME per row; `header_filter_spell`
 # renders one. A name it does not know is refused rather than skipped, since a skipped spelling

@@ -156,7 +156,7 @@ TEST_CASE("A refused service start reports one stop carrying its exit code", "[p
                                     .waitHintMs = 0,
                                     .exit =
                                         ServiceExit { .win32ExitCode = ServiceSpecificError, .serviceSpecificExitCode = 2 },
-                                    .acceptsControls = false },
+                                    .acceptsStop = false },
           });
     CHECK_FALSE(service.controls.StopRequested());
 }
@@ -178,7 +178,8 @@ TEST_CASE("A serving start reports starting and running before its body and its 
     CHECK(service.manager->States()
           == std::vector { ServiceState::StartPending, ServiceState::Running, ServiceState::Stopped });
     REQUIRE(service.manager->Reports().size() == 3);
-    CHECK(service.manager->Reports()[1].acceptsControls);
+    CHECK(service.manager->Reports()[1].acceptsStop);
+    CHECK(service.manager->Reports()[1].acceptsReload);
     CHECK(service.manager->Reports().back().exit
           == ServiceExit { .win32ExitCode = ServiceSpecificError, .serviceSpecificExitCode = 3 });
 
@@ -228,12 +229,19 @@ TEST_CASE("A start told to wait reports RUNNING only once its body serves and ad
     CHECK(std::ranges::adjacent_find(points) == points.end());
     for (auto const& report: service.manager->Reports())
     {
+        // Starting, a stop is accepted (R4-2) and a reload is not: it has nothing to act on yet.
         if (report.state == ServiceState::StartPending)
-            CHECK_FALSE(report.acceptsControls);
+        {
+            CHECK(report.acceptsStop);
+            CHECK_FALSE(report.acceptsReload);
+        }
         if (report.state == ServiceState::StartPending && report.checkPoint > 0)
             CHECK(report.waitHintMs == TestStartPlan.waitHint.count());
         if (report.state == ServiceState::Running)
-            CHECK(report.acceptsControls);
+        {
+            CHECK(report.acceptsStop);
+            CHECK(report.acceptsReload);
+        }
     }
 }
 
@@ -294,6 +302,82 @@ TEST_CASE("Past its ceiling a start's checkpoint stands still and a body that se
     // polling until the body served.
     CHECK(StartCheckpoints(*service.manager).back() == Ceiling.count());
     CHECK(wait.Sleeps() >= SleepsBeforeServing);
+}
+
+TEST_CASE("A start told to wait accepts a stop, and the service ends stopped without ever running", "[platform][service]")
+{
+    // R4-2: a start that waits for its body to serve can be long -- a large disk tier opening,
+    // consensus recovering -- and one that accepted nothing while it started could be stopped by no
+    // `sc stop`, MSI ServiceControl or uninstall until it served. Sent the way they send it, which
+    // the manager refuses itself (1052) for a control the last report did not accept.
+    ServingWhenReadyService service { TestStartPlan, DefaultDrainWait() };
+    std::optional<bool> reloadWhileStarting;
+    std::optional<bool> stopWhileStarting;
+    auto stopProgressed = false;
+
+    CHECK(service.host->Run([&] {
+        std::ignore = Testing::WaitUntil(
+            "the start's checkpoint to reach 2",
+            [&service] { return std::ranges::contains(StartCheckpoints(*service.manager), 2U); },
+            [&service] { return std::format("{} StartPending report(s)", StartCheckpoints(*service.manager).size()); });
+        reloadWhileStarting = service.manager->Request(ServiceControlRequest::ParamChange);
+        stopWhileStarting = service.manager->Request(ServiceControlRequest::Stop);
+        // The stop is under way while the body is still starting: its checkpoint advances.
+        stopProgressed = Testing::WaitUntil(
+            "the stop's checkpoint to reach 2",
+            [&service] { return std::ranges::contains(StopCheckpoints(*service.manager), 2U); },
+            [&service] { return std::format("{} StopPending report(s)", StopCheckpoints(*service.manager).size()); });
+        // A body that sees the stop ends its start rather than serving.
+        return service.controls.StopRequested() ? 0 : 1;
+    }) == 0);
+
+    CHECK_FALSE(reloadWhileStarting.has_value());
+    REQUIRE(stopWhileStarting.has_value());
+    CHECK(Testing::Unwrap(stopWhileStarting));
+    CHECK(stopProgressed);
+    CHECK(service.controls.StopRequested());
+    CHECK(service.manager->Violations().empty());
+    CHECK(Collapsed(service.manager->States())
+          == std::vector { ServiceState::StartPending, ServiceState::StopPending, ServiceState::Stopped });
+    CHECK(service.manager->Reports().back().exit == ServiceExit { .win32ExitCode = 0, .serviceSpecificExitCode = 0 });
+}
+
+TEST_CASE("A stop accepted while starting is never followed by RUNNING, even from a body that serves at that moment",
+          "[platform][service]")
+{
+    // The race the stop opens: the start's reporter has seen the body serve and is about to say
+    // RUNNING when the control handler reports STOP_PENDING. RUNNING after it would tell the
+    // manager the service started over. Placed rather than waited for: on a stepped wait, the
+    // reporter's third sleep is where the body serves AND the stop arrives, so its RUNNING comes
+    // after the STOP_PENDING every time.
+    constexpr auto SleepOfTheRace = 3;
+    std::atomic<bool> raced { false };
+    std::atomic<ServingWhenReadyService*> raceIn { nullptr };
+    Testing::SteppedDrainWait wait { [&raced, &raceIn, &wait] {
+        auto* const service = raceIn.load();
+        if (service == nullptr || wait.Sleeps() != SleepOfTheRace || raced.exchange(true))
+            return;
+        service->controls.MarkServing();
+        std::ignore = service->manager->Request(ServiceControlRequest::Stop);
+    } };
+    ServingWhenReadyService service { TestStartPlan, wait };
+    raceIn.store(&service);
+    auto stopped = false;
+
+    CHECK(service.host->Run([&service, &stopped] {
+        stopped = Testing::WaitUntil(
+            "the stop to be requested",
+            [&service] { return service.controls.StopRequested(); },
+            [&service] { return std::format("{} report(s)", service.manager->Reports().size()); });
+        return 0;
+    }) == 0);
+
+    CHECK(raced.load());
+    CHECK(stopped);
+    CHECK(service.manager->Violations().empty());
+    CHECK_FALSE(std::ranges::contains(service.manager->States(), ServiceState::Running));
+    CHECK(Collapsed(service.manager->States())
+          == std::vector { ServiceState::StartPending, ServiceState::StopPending, ServiceState::Stopped });
 }
 
 TEST_CASE("A service stops and reloads on the controls its manager delivers", "[platform][service]")
@@ -442,14 +526,14 @@ TEST_CASE("The scripted service manager holds a caller to the SCM's rules", "[pl
     ScriptedServiceControlManager manager { ServiceManagerPresence::Present };
     CHECK(manager.Dispatch("x", [&manager] {
         manager.SetStatus(
-            ServiceStatusReport { .state = ServiceState::Running, .waitHintMs = 0, .exit = {}, .acceptsControls = false });
+            ServiceStatusReport { .state = ServiceState::Running, .waitHintMs = 0, .exit = {}, .acceptsStop = false });
         std::ignore = manager.RegisterHandler("x", [](ServiceControlRequest, std::uint32_t) { return true; });
         manager.SetStatus(ServiceStatusReport { .state = ServiceState::StopPending, .waitHintMs = 0, .checkPoint = 1 });
         manager.SetStatus(ServiceStatusReport { .state = ServiceState::StopPending, .waitHintMs = 0, .checkPoint = 1 });
         manager.SetStatus(
-            ServiceStatusReport { .state = ServiceState::Stopped, .waitHintMs = 0, .exit = {}, .acceptsControls = false });
-        manager.SetStatus(ServiceStatusReport {
-            .state = ServiceState::StopPending, .waitHintMs = 0, .exit = {}, .acceptsControls = false });
+            ServiceStatusReport { .state = ServiceState::Stopped, .waitHintMs = 0, .exit = {}, .acceptsStop = false });
+        manager.SetStatus(
+            ServiceStatusReport { .state = ServiceState::StopPending, .waitHintMs = 0, .exit = {}, .acceptsStop = false });
     }) == DispatchOutcome::Dispatched);
     CHECK(manager.Dispatch("x", [] {}) == DispatchOutcome::AlreadyRunning);
 
@@ -471,6 +555,28 @@ TEST_CASE("The scripted service manager holds a caller to the SCM's rules", "[pl
         starting.SetStatus(ServiceStatusReport { .state = ServiceState::Stopped, .waitHintMs = 0 });
     }) == DispatchOutcome::Dispatched);
     CHECK(starting.Violations() == std::vector<std::string> { "a start's checkpoint did not advance" });
+
+    // And a control the last report did not accept is refused by the manager itself (1052) and never
+    // reaches the handler -- the rule the stop-while-starting case above stands on.
+    ScriptedServiceControlManager refusing { ServiceManagerPresence::Present };
+    std::vector<std::optional<bool>> answers;
+    auto handled = 0;
+    CHECK(refusing.Dispatch("x", [&] {
+        std::ignore = refusing.RegisterHandler("x", [&handled](ServiceControlRequest, std::uint32_t) {
+            ++handled;
+            return true;
+        });
+        answers.push_back(refusing.Request(ServiceControlRequest::Stop)); // nothing reported yet
+        refusing.SetStatus(ServiceStatusReport { .state = ServiceState::StartPending, .waitHintMs = 0 });
+        answers.push_back(refusing.Request(ServiceControlRequest::Stop)); // a start that accepts nothing
+        refusing.SetStatus(ServiceStatusReport { .state = ServiceState::Running, .waitHintMs = 0, .acceptsStop = true });
+        answers.push_back(refusing.Request(ServiceControlRequest::ParamChange)); // stop accepted, reload not
+        answers.push_back(refusing.Request(ServiceControlRequest::Stop));
+        refusing.SetStatus(ServiceStatusReport { .state = ServiceState::Stopped, .waitHintMs = 0 });
+    }) == DispatchOutcome::Dispatched);
+    CHECK(answers == std::vector<std::optional<bool>> { std::nullopt, std::nullopt, std::nullopt, true });
+    CHECK(handled == 1);
+    CHECK(refusing.Violations().empty());
 }
 
 TEST_CASE("A stop reports its progress until the body returns, and a second stop does not restart it", "[platform][service]")

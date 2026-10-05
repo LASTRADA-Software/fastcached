@@ -124,9 +124,8 @@ namespace
                 if (row.state == report.state)
                     status.dwCurrentState = row.code;
             status.dwControlsAccepted =
-                (report.acceptsControls
-                     ? DWORD { SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PARAMCHANGE }
-                     : DWORD { 0 })
+                (report.acceptsStop ? DWORD { SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN } : DWORD { 0 })
+                | (report.acceptsReload ? DWORD { SERVICE_ACCEPT_PARAMCHANGE } : DWORD { 0 })
                 | (report.acceptsPowerEvents ? DWORD { SERVICE_ACCEPT_POWEREVENT } : DWORD { 0 });
             status.dwWin32ExitCode = report.exit.win32ExitCode;
             status.dwServiceSpecificExitCode = report.exit.serviceSpecificExitCode;

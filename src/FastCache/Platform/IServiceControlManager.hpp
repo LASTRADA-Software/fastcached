@@ -41,7 +41,8 @@ struct ServiceStatusReport
     std::uint32_t waitHintMs { 0 };               ///< How long a pending state expects to take.
     ServiceExit exit {};                          ///< Why it stopped; zero unless `Stopped`.
     std::uint32_t checkPoint { 0 };               ///< The stop's progress; zero outside `StopPending`.
-    bool acceptsControls { false };               ///< Whether stop, shutdown and reload are accepted.
+    bool acceptsStop { false };                   ///< Whether stop and shutdown are accepted.
+    bool acceptsReload { false };                 ///< Whether a parameter change -- a reload -- is accepted.
     bool acceptsPowerEvents { false };            ///< Whether power broadcasts are accepted as well.
 
     [[nodiscard]] friend bool operator==(ServiceStatusReport const&, ServiceStatusReport const&) = default;

@@ -597,11 +597,15 @@ $DeadPeerExchanges = 2
 # answers ends each exchange only at TOTAL, and load can only lengthen it -- so a launcher whose
 # `cache-ms` reads 0, or is taken at the wrong point, fails it. Refused has no floor although
 # Windows runs a refused dial out to CONNECT: that is Windows' SYN-retry behaviour, not this
-# launcher's. The reset's exchanges end at once. That shape has a CEILING too, (N + 1) x TOTAL:
-# an exchange that ignored or doubled its configured deadline -- a broken FASTCACHE_TIMEOUT read, a
-# default creeping in -- reports 2 x N x TOTAL and fails it, while a stall of up to one whole TOTAL
-# still passes (CI's worst on that leg was +435 ms). And the wall clock bounds the whole leg as the
-# HANG detector: N x cost + cost / 2, plus the baseline, plus $DeadPeerWallSlackMs.
+# launcher's. The reset's exchanges end at once. That shape has a CEILING too, (2N - 1/2) x TOTAL,
+# 7000 ms at N = 2 and TOTAL = 2000. An exchange that DOUBLED its deadline reports 2N x TOTAL =
+# 8000 (measured 8006-8017) and fails it by TOTAL / 2 = 1000 ms; one that IGNORED FASTCACHE_TIMEOUT
+# falls back to the default total of 10000 ms per exchange and reports about 20000. A stall of up
+# to (N - 1/2) x TOTAL = 3000 ms past the floor still passes: a stall belongs to the HOST, not to a
+# leg, and the host's worst measured overrun is +1616 ms (round 9, on the refused leg; this leg's
+# own +435 is the wrong quantity to size it by, round 10 review, I5). Neither a counted retry nor a
+# default substitution has the 1.5x shape this lets through. And the wall clock bounds the whole
+# leg as the HANG detector: N x cost + cost / 2, plus the baseline, plus $DeadPeerWallSlackMs.
 #
 # BLIND SPOTS, failing OPEN. A retry INSIDE one exchange -- below the door, in the dial -- is one
 # trace line: the counted shapes see it as an extra connection, refused does not see it at all.
@@ -617,7 +621,7 @@ $DeadPeerShapeCostMs = [ordered]@{
     'accept-then-reset' = $DeadPeerConnectMs
 }
 # What ONE exchange may take AT MOST against each shape, as the launcher reports it, for the
-# ceiling of (N + 1) x this; 0 is no ceiling.
+# ceiling of (2N - 1/2) x this; 0 is no ceiling.
 $DeadPeerShapeCeilingMs = [ordered]@{
     'refused'           = 0
     'never-accepting'   = $DeadPeerTotalMs
@@ -762,7 +766,7 @@ function Test-DeadPeers([string]$compiler) {
             $costMs = $DeadPeerShapeCostMs[$shape]
             $exchangeBoundMs = $DeadPeerExchanges * $costMs + [long]($costMs / 2)
             $exchangeFloorMs = if ($DeadPeerShapeFloorMs[$shape] -gt 0) { $DeadPeerExchanges * $DeadPeerShapeFloorMs[$shape] - $DeadPeerTimerToleranceMs } else { 0 }
-            $exchangeCeilingMs = if ($DeadPeerShapeCeilingMs[$shape] -gt 0) { ($DeadPeerExchanges + 1) * $DeadPeerShapeCeilingMs[$shape] } else { 0 }
+            $exchangeCeilingMs = if ($DeadPeerShapeCeilingMs[$shape] -gt 0) { [int][math]::Floor((4 * $DeadPeerExchanges - 1) * $DeadPeerShapeCeilingMs[$shape] / 2) } else { 0 }
             $boundMs = $base.elapsedMs + $exchangeBoundMs + $DeadPeerWallSlackMs
             Write-Host "  $shape : exactly $DeadPeerExchanges exchange(s); hang bound $boundMs ms = baseline + $DeadPeerExchanges x $costMs + $costMs / 2 + $DeadPeerWallSlackMs ms"
             Remove-Item $obj -Force -ErrorAction SilentlyContinue
@@ -806,7 +810,7 @@ function Test-DeadPeers([string]$compiler) {
                    elseif (-not $reached) { "the peer took $($r.resets) connection(s) while the launcher traced $($r.exchanges) exchange(s) -- its own count is not to be trusted" }
                    elseif ($null -eq $r.spentMs) { "the launcher left no single invocation record, so the time it spent on the cache is unknown" }
                    elseif (-not $aboveFloor) { "the launcher reported $($r.spentMs) ms on the cache, under the $exchangeFloorMs ms that $DeadPeerExchanges exchange(s) with a silent peer cannot end before -- its own timer is not measuring the exchanges" }
-                   else { "the launcher reported $($r.spentMs) ms on the cache, past the $exchangeCeilingMs ms ceiling of $DeadPeerExchanges exchange(s) and one more deadline -- an exchange overran its configured deadline" }
+                   else { "the launcher reported $($r.spentMs) ms on the cache, past the $exchangeCeilingMs ms ceiling, (2N - 1/2) x its deadline for $DeadPeerExchanges exchange(s) -- an exchange overran its configured deadline by as much as a doubled one does" }
             Write-Host "  DEAD-PEER FAIL ($compiler, $shape): $why; $($r.elapsedMs) ms, $($r.exchanges) traced exchange(s), $($r.resets) connection(s)" -ForegroundColor Red
             Write-Host $r.stderr
             $ok = $false

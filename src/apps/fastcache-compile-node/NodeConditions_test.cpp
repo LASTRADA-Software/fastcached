@@ -7,6 +7,7 @@
 #include "FormationRuntime.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
+#include "NodeConfig.hpp"
 #include "NodeDefaults.hpp"
 #include "NodeMembership.hpp"
 #include "NodeProofClient.hpp"
@@ -41,6 +42,7 @@
 #include <latch>
 #include <optional>
 #include <ranges>
+#include <regex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -689,4 +691,43 @@ TEST_CASE("Two loops reporting at once leave surface-accept-degraded as the regi
         shown += line + "; ";
     INFO("rounds that ended wrong: " << wrong.size() << " of " << AcceptLoopRaceRounds << ", the first: " << shown);
     CHECK(wrong.empty());
+}
+
+TEST_CASE("Every flag a condition's remedy names is one this node parses", "[node][conditions]")
+{
+    // A remedy is the part of a condition an operator ACTS on, and nothing else reads it: the one
+    // `shared-cache-unproven` carried sent them to `--node-status`, which no binary parses -- a node's
+    // status is `fastcache-cli node`. So every `--flag` a remedy names is a spelling of
+    // `NodeOptions()`, the table this binary parses its command line through.
+    std::vector<std::string_view> spellings;
+    for (auto const& option: NodeOptions())
+    {
+        spellings.push_back(option.primary);
+        if (!option.alias.empty())
+            spellings.push_back(option.alias);
+    }
+    static std::regex const flag { "--[a-z][a-z0-9-]*" };
+    std::vector<std::string> named;
+    std::vector<std::string> unknown;
+    for (auto const& row: NodeConditionTable)
+    {
+        auto const remedy = std::string { row.remedy };
+        for (auto const& match:
+             std::ranges::subrange(std::sregex_iterator { remedy.begin(), remedy.end(), flag }, std::sregex_iterator {}))
+        {
+            named.push_back(match.str());
+            if (!std::ranges::contains(spellings, std::string_view { named.back() }))
+                unknown.push_back(std::format("{} names {}", row.id, named.back()));
+        }
+    }
+
+    // The control: the scan found the flags remedies are known to name, so an empty `unknown` is a
+    // verdict and not a regex that matched nothing.
+    CHECK(std::ranges::contains(named, std::string { "--cluster-status" }));
+    CHECK(std::ranges::contains(named, std::string { "--cluster-forget" }));
+    for (auto const& line: unknown)
+        UNSCOPED_INFO(line);
+    CHECK(unknown.empty());
+    CHECK(std::string_view { NodeConditionTable[static_cast<std::size_t>(NodeCondition::SharedCacheUnproven)].remedy }
+              .contains("fastcache-cli node"));
 }
