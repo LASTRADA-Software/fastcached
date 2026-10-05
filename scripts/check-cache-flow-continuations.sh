@@ -22,6 +22,14 @@
 # sites it knows and silent about the ones it does not, and silence reads
 # identically to complete coverage (#492).
 #
+# And ONE door to the cache, for the same reason of a file no suite reaches. Every cache
+# exchange in `main.cpp` goes through `CacheExchange`, whose verbose trace line is the
+# launcher's own COUNT of its exchanges -- the count the dead-peer legs of both e2e fixtures
+# judge, since time measured the host rather than the launcher (round 9). A
+# `Cc::RunOneExchange` written anywhere else in the file is an exchange the trace never says,
+# so it UNDERCOUNTS on the leg whose peer cannot count (refused): fails OPEN. So every call
+# outside the door is refused, and a door with no call in it, or no door, is refused too.
+#
 # bash 3.2: macOS ships a 2007 /bin/bash and this runs in the default ctest set.
 set -u
 
@@ -159,6 +167,42 @@ EOF
     return $rc
 }
 
+# The door's verdict over $1's main.cpp: every `RunOneExchange(` call, comments stripped, must
+# sit inside the body of the ONE `CacheExchange` definition. Prints findings; returns 0, 1 for
+# a finding, or 2 when there is nothing to judge (no door, no call in it).
+run_door() {
+    local tree="$1" found doors inside outside
+    if [ ! -f "$tree/$Subject" ]; then
+        echo "REFUSED: $Subject is missing; the door rule has no subject and cannot pass"
+        return 2
+    fi
+    found="$(awk '
+        { line = $0; sub(/\/\/.*$/, "", line) }
+        line ~ /Cc::CacheOutcome[ \t]+CacheExchange[ \t]*\(/ { print "door|" FNR; inDoor = 1 }
+        line ~ /(^|[^A-Za-z_])RunOneExchange[ \t]*\(/ { print (inDoor ? "inside|" : "outside|") FNR }
+        inDoor && /^}/ { inDoor = 0 }
+    ' "$tree/$Subject" 2>/dev/null)"
+    doors="$(printf '%s\n' "$found" | grep -c '^door|' || true)"
+    inside="$(printf '%s\n' "$found" | grep -c '^inside|' || true)"
+    outside="$(printf '%s\n' "$found" | grep '^outside|' || true)"
+    if [ "$doors" != 1 ]; then
+        echo "REFUSED: found ${doors:-no} CacheExchange definition(s) in $Subject, want exactly one -- the door the trace count rests on is gone or doubled"
+        return 2
+    fi
+    if [ "$inside" = 0 ] || [ -z "$inside" ]; then
+        echo "REFUSED: CacheExchange makes no Cc::RunOneExchange call, so the door rule judged nothing"
+        return 2
+    fi
+    if [ -n "$outside" ]; then
+        printf '%s\n' "$outside" | while IFS='|' read -r _ lineno; do
+            echo "  OUTSIDE THE DOOR  $Subject:$lineno  Cc::RunOneExchange(...) -- route it through CacheExchange, or its exchange is one the trace never counts"
+        done
+        return 1
+    fi
+    echo "  $inside Cc::RunOneExchange call(s), all inside CacheExchange"
+    return 0
+}
+
 if [ "$selftest" -eq 1 ]; then
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
     fail=0; cases=0
@@ -243,6 +287,34 @@ SRC
     run_scan "$tmp/nosubject" >/dev/null 2>&1
     [ $? -eq 2 ] && echo "  case 6 (subject missing)       PASS" || { echo "  case 6 (subject missing)       FAIL"; fail=1; }
 
+    # The door: a correct file, a planted second call, a mention only in a comment, no door.
+    door() {
+        cat <<'SRC'
+[[nodiscard]] Cc::CacheOutcome CacheExchange(InvocationRecord const& record, std::string_view what)
+{
+    auto outcome = Cc::RunOneExchange(addr, Notice(record.verbose), std::move(frame), credential, budget);
+    return outcome;
+}
+SRC
+    }
+    { baseline; door; } | stage doorGood
+    cases=$((cases+1))
+    if run_door "$tmp/doorGood" >/dev/null 2>&1; then echo "  case 9 (door: one call inside) PASS"; else echo "  case 9 (door: one call inside) FAIL"; fail=1; fi
+
+    { baseline; door; echo '    auto const outcome = Cc::RunOneExchange(cfg.addr, Notice(record.verbose), Wire::EncodeFetch(key), credential, BudgetOf(cfg));'; } | stage doorPlanted
+    cases=$((cases+1))
+    run_door "$tmp/doorPlanted" >/dev/null 2>&1
+    [ $? -eq 1 ] && echo "  case 10 (call outside door)   PASS" || { echo "  case 10 (call outside door)   FAIL -- not caught"; fail=1; }
+
+    { baseline; door; echo '/// refuses a `Cc::RunOneExchange(...)` anywhere but the door'; } | stage doorComment
+    cases=$((cases+1))
+    if run_door "$tmp/doorComment" >/dev/null 2>&1; then echo "  case 11 (comment mention ok)  PASS"; else echo "  case 11 (comment mention ok)  FAIL"; fail=1; fi
+
+    baseline | stage doorGone
+    cases=$((cases+1))
+    run_door "$tmp/doorGone" >/dev/null 2>&1
+    [ $? -eq 2 ] && echo "  case 12 (no door -> refuse)   PASS" || { echo "  case 12 (no door -> refuse)   FAIL"; fail=1; }
+
     echo "self-test: $cases cases run"
     [ "$fail" -eq 0 ] && echo "SELFTEST OK" || echo "SELFTEST FAILED"
     exit "$fail"
@@ -252,6 +324,15 @@ echo "checking cache-flow continuations in $Subject"
 run_scan "$root"
 rc=$?
 [ "$rc" -eq 2 ] && exit 1
+echo "checking that every cache exchange in $Subject goes through CacheExchange"
+run_door "$root"
+door_rc=$?
+if [ "$door_rc" -ne 0 ]; then
+    echo "FAILED: a cache exchange in $Subject bypasses CacheExchange, or the door itself is gone."
+    echo "        The dead-peer legs count exchanges from CacheExchange's trace line; one made"
+    echo "        elsewhere is never counted. Route it through CacheExchange."
+    exit 1
+fi
 if [ "$rc" -ne 0 ]; then
     echo "FAILED: a cache-flow fall-back is unclassified or takes the wrong continuation."
     echo "        Ask: does the cache now hold a value that must be REPLACED?"

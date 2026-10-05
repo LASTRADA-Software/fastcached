@@ -4345,9 +4345,11 @@ while IFS= read -r script; do
         echo "     But NOT for an operand of 64 KiB or more: Git Bash writes a herestring into a" >&2
         echo "     pipe IN FULL before it starts the reader, so it deadlocks at the buffer -- 65535" >&2
         echo "     bytes completes and 65536 hangs, measured. A repository-wide listing is already" >&2
-        echo "     past it, so feed one through process substitution, whose reader drains" >&2
-        echo "     concurrently and which still reports the MATCHER's status:" >&2
-        echo "       grep -q PATTERN < <(printf '%s\\n' \"\$text\")        (#1591)" >&2
+        echo "     past it, so feed one through pipe_lines_into (scripts/lib/third-party-roots.sh)," >&2
+        echo "     a pipe whose reader drains concurrently and which reports the MATCHER's status:" >&2
+        echo "       pipe_lines_into \"\$text\"\$'\\n' grep -q PATTERN        (#1591)" >&2
+        echo "     Never grep < <(printf ...): that makes grep the writer's PARENT, and on a" >&2
+        echo "     Windows runner such a grep came back killed, exit 148 (#1630)." >&2
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
         note_failure "early-exit-scan"
     fi
@@ -4361,6 +4363,97 @@ if [ "$earlyexit_scanned" -lt 1 ]; then
     echo "     Either the walk found no files or the pipefail predicate stopped matching;" >&2
     echo "     either way every script 'passed' without being read." >&2
     note_failure "early-exit-scan"
+fi
+
+# --- no external filter reads a process substitution ------------------------
+#
+# `grep PATTERN < <(printf ...)` makes the FILTER the parent of the substitution's writer, and
+# twice on a GitHub Windows runner such a grep came back killed: round 8 silently, round 10 as
+# exit 148, 128 + 20, and 20 is SIGCHLD in the MSYS2 runtime (#1630). That the writer's exit is
+# what killed it is INFERRED (it did not reproduce locally). The parentage is MEASURED, each
+# writer reading its own PPID out of /proc on Git Bash 5.2.37 and bash 3.2.57: the filter is the
+# writer's parent for `cmd < <(w)` and `$(cmd < <(w))`, and for an ARGUMENT `cmd <(w)` inside
+# `$( )` or a pipeline -- the `diff <(a) <(b) | sed` and `$(comm -23 <(a) <(b))` this tree had.
+# A top-level `cmd <(w)` measured a sibling, and `done < <(cmd <(w))` a parent on 5.2 and a
+# sibling on 3.2: whether a line is safe depends on a construct around it and on the bash
+# version, neither of which a line shows. So the rule is the one a line CAN show -- no external
+# filter reads a process substitution, in either position -- and the remedy is a pipe, whose
+# writer is the shell's child in every context measured: `pipe_lines_into` for one input,
+# `pipe_pair_into` for two (scripts/lib/third-party-roots.sh). A `while read ...; done < <(...)`,
+# `mapfile` or a shell function is the SHELL reading, and is not matched; nor is a filter named
+# inside a string, since the command must be in COMMAND position.
+#
+# BLIND SPOTS, all failing OPEN -- the line passes: a filter not in the list below, one invoked
+# through a variable (`"$python3_bin" x.py < <(...)`), and one whose `<(` sits on a continuation
+# line after a `\`. None is in the tree today; the census that said so was every `<(` in
+# `scripts/`, classified by hand, not this regex.
+_external_reads_procsub() {
+    grep -nE '(^|[$][(]|[;&|!{(]|(^|[[:space:]])(then|do|if|else|elif|while|until))[[:space:]]*(grep|egrep|fgrep|sort|sed|awk|cut|wc|tr|uniq|head|tail|cat|comm|diff|cmp|paste|join|tee|nl|od|base64|sha256sum|md5sum|iconv|jq|xargs|git|perl|python3?|sh|bash)([[:space:]][^|;&]*)?[[:space:]]<\(' "$1" 2>/dev/null \
+        | grep -v '^[0-9][0-9]*: *#' \
+        || true
+}
+
+procsub_canary_dir="$(mktemp -d)"
+cat > "${procsub_canary_dir}/must-catch.sh" <<'CANARY'
+selected="$(grep -E -- "$pattern" < <(printf '%s\n' "$3"))" || status=$?
+grep -q "^${root}/" < <(printf '%s\n' "$all") || continue
+names="$(sort -u < <(printf '%s' "$named"))"
+if grep -qx -- "$leg" < <(printf '%s\n' "$legs"); then :; fi
+count=$(wc -l < <(producer))
+awk '{print $1}' < <(git ls-files)
+diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed 's/^/     | /' >&2
+Miss "it WROTE the configuration" "$(diff <(printf '%s\n' "$before") <(printf '%s\n' "$now"))"
+done < <(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
+gap="$(comm -23 <(printf '%s\n' "$literals") <(printf '%s\n' "$reached" | sort -u))"
+CANARY
+cat > "${procsub_canary_dir}/must-not-catch.sh" <<'CANARY'
+done < <(printf '%s\n' "$paths")
+while IFS= read -r line; do :; done < <(grep -n x "$f")
+selected="$(pipe_lines_into "$3"$'\n' grep -E -- "$pattern")" || status=$?
+unanalysed="$(pipe_pair_into "$expected"$'\n' "$actual"$'\n' comm -13 /dev/fd/3 -)" || comm_status=$?
+echo "     Never grep < <(printf ...): that makes grep the writer's PARENT" >&2
+echo "  diff <(a) <(b) is the same shape as an argument" >&2
+# grep -q x < <(printf '%s\n' "$y")
+header_filter_read_paths paths total < <(printf '%s\n' "$x")
+done < <(grep -v '^[[:space:]]*#' "$onlyList" | grep . | sort -u)
+grep -c . "$file"
+diff "$want" "$got"
+collect_lines < <(printf '%s\n' "$x")
+CANARY
+_scan_canary "procsub-reader-scan-canary" _external_reads_procsub \
+    "${procsub_canary_dir}/must-catch.sh" "${procsub_canary_dir}/must-not-catch.sh" \
+    10 "external filters reading a process substitution" "a shell read, a remedy or a string"
+rm -rf "$procsub_canary_dir"
+
+procsub_allowed="check-e2e-helpers.sh:this file, which stages the scan's own canary lines above. They are heredoc text and run nothing; the canary asserting all ten are caught is what covers them."
+procsub_scanned=0
+while IFS= read -r script; do
+    [ -n "$script" ] || continue
+    base="${script##*/}"
+    _scan_exempt "$base" "$procsub_allowed" && continue
+    procsub_scanned=$(( procsub_scanned + 1 ))
+    ran=$(( ran + 1 ))
+    hits="$(_external_reads_procsub "$script")"
+    if [ -n "$hits" ]; then
+        echo "FAIL procsub-reader-scan: ${base} feeds an external filter through a process substitution." >&2
+        echo "     That makes the filter the PARENT of the writer -- measured for < <(...) and for an" >&2
+        echo "     argument <(...) inside \$( ) or a pipeline -- and on a Windows runner such a grep" >&2
+        echo "     came back killed, exit 148 -- 128 + SIGCHLD in the MSYS2 runtime (#1630)." >&2
+        echo "     Feed it through a PIPE from scripts/lib/third-party-roots.sh (source it if the" >&2
+        echo "     script does not), which answers with the FILTER's status:" >&2
+        echo "       one input:   pipe_lines_into \"\$text\"\$'\\n' grep -E PATTERN" >&2
+        echo "       two inputs:  pipe_pair_into \"\$a\"\$'\\n' \"\$b\"\$'\\n' comm -23 /dev/fd/3 -" >&2
+        echo "     and CHECK that status where the output decides anything: a filter that failed" >&2
+        echo "     printed nothing, and nothing reads as 'none found'. A while-read loop or a shell" >&2
+        echo "     function over < <(...) is the shell reading and is fine as it is." >&2
+        printf '%s\n' "$hits" | sed 's/^/     | /' >&2
+        note_failure "procsub-reader-scan"
+    fi
+done < <( _shell_scripts )
+ran=$(( ran + 1 ))
+if [ "$procsub_scanned" -lt 1 ]; then
+    echo "FAIL procsub-reader-scan: no script was read, so every script 'passed' without being read." >&2
+    note_failure "procsub-reader-scan"
 fi
 
 # --- no script captures a `wc` count without normalising it -----------------

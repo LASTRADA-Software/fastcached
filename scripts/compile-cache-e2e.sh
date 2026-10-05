@@ -901,9 +901,19 @@ cat "${workdir}/fallback.log"
 # its count is the same however slow the machine is. run-launcher-e2e.ps1 holds the same legs,
 # with the never-accepting peer counting too and a floor on that leg's reported time.
 #
+# Time still judges what a slow host cannot fake. never-accepting, whose exchanges can end only at
+# TOTAL, holds the launcher's OWN reported time (`direct-ms` + `cache-ms`) to a FLOOR of N x TOTAL
+# less a timer's resolution -- a timer reading 0 fails it -- and a CEILING of (N + 1) x TOTAL: an
+# exchange that ignored or doubled its configured deadline reports 2 x N x TOTAL and fails it,
+# while a stall of up to one whole TOTAL still passes. The `dead_shapes` table's third column
+# names the deadline a shape is held to that way, or `-`.
+#
 # BLIND SPOTS, failing OPEN. A retry INSIDE one exchange -- in the dial, below the door -- is one
 # trace line, seen only as an extra accept on the reset leg. A WAIT anywhere is judged only by the
-# hang bound.
+# hang bound. And whether CONNECT is honoured end to end is judged by no leg: a stall moves a
+# refused dial past any ceiling tight enough to see a doubled CONNECT (round 9, +1616 ms on
+# Windows); the deadline MECHANICS are ReactorExchange_test's, and only the environment-to-budget
+# wiring of CONNECT is left to the hang bound.
 #
 # The peers and the clock are perl, because bash can neither listen nor read a monotonic
 # clock (`SECONDS` is the wall clock, which this host steps). A missing perl, or a missing core
@@ -914,12 +924,14 @@ dead_exchanges=2
 # What the wall clock may run past the most N exchanges may take before a leg is a hang: the
 # compile, two process starts and whatever a starved runner adds to them.
 dead_wall_slack_ms=10000
+# A timer firing early by its resolution, for the floor.
+dead_timer_tolerance_ms=50
 # shape, then the NAME of the deadline one exchange against it can spend. The silent shape
 # LAST: this fixture stops at its first failure, and a hang there is the regression the bound
 # exists for, so the other two have reported by the time it can fire.
-dead_shapes="refused dead_connect_ms
-accept-then-reset dead_connect_ms
-never-accepting dead_total_ms"
+dead_shapes="refused dead_connect_ms -
+accept-then-reset dead_connect_ms -
+never-accepting dead_total_ms dead_total_ms"
 dead_peer_pid=""
 dead_launch_pid=""
 dead_ended_ms=0
@@ -1013,7 +1025,7 @@ dead_baseline_ms="$dead_elapsed_ms"
 echo "   baseline ${dead_baseline_ms} ms against the live daemon"
 
 # fd 3, so nothing the body runs can read the table as its stdin.
-while read -r shape dead_cost_name <&3; do
+while read -r shape dead_cost_name dead_held_name <&3; do
     dead_cost_ms="${!dead_cost_name}"
     dead_bound_ms=$(( dead_baseline_ms + dead_exchanges * dead_cost_ms + dead_cost_ms / 2 + dead_wall_slack_ms ))
     echo "   ${shape}: exactly ${dead_exchanges} exchange(s); hang bound ${dead_bound_ms} ms = baseline + ${dead_exchanges} x ${dead_cost_ms} + ${dead_cost_ms} / 2 + ${dead_wall_slack_ms} ms"
@@ -1052,6 +1064,23 @@ while read -r shape dead_cost_name <&3; do
     # What tells this leg from one that never reached the peer: the launcher says it fell back.
     grep -qF "(fetch exchange failed)" "${workdir}/dead.log" \
         || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: no 'fetch exchange failed' fall-back, so the peer was never asked"; }
+    # The launcher's OWN time, between a floor and a ceiling, on the shape whose exchanges cannot
+    # end before their deadline. Read from the record this compile appended to the run's log.
+    if [[ "$dead_held_name" != - ]]; then
+        dead_held_ms="${!dead_held_name}"
+        dead_record="$(tail -n 1 "$(e2e_launcher_state_log)")"
+        dead_direct_ms="$(e2e_launcher_log_field direct-ms <<< "$dead_record")"             || fail "dead peers: ${shape}: the launcher's record could not be read for direct-ms: ${dead_record}"
+        dead_cache_ms="$(e2e_launcher_log_field cache-ms <<< "$dead_record")"             || fail "dead peers: ${shape}: the launcher's record could not be read for cache-ms: ${dead_record}"
+        [[ "$dead_direct_ms" =~ ^[0-9]+$ && "$dead_cache_ms" =~ ^[0-9]+$ ]]             || fail "dead peers: ${shape}: the launcher's record carries no times (direct-ms '${dead_direct_ms}', cache-ms '${dead_cache_ms}')"
+        dead_spent_ms=$(( dead_direct_ms + dead_cache_ms ))
+        dead_floor_ms=$(( dead_exchanges * dead_held_ms - dead_timer_tolerance_ms ))
+        dead_ceiling_ms=$(( (dead_exchanges + 1) * dead_held_ms ))
+        [[ "$dead_spent_ms" -ge "$dead_floor_ms" ]] \
+            || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the launcher reported ${dead_spent_ms} ms on the cache, under the ${dead_floor_ms} ms that ${dead_exchanges} exchange(s) with a silent peer cannot end before -- its own timer is not measuring the exchanges"; }
+        [[ "$dead_spent_ms" -le "$dead_ceiling_ms" ]] \
+            || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the launcher reported ${dead_spent_ms} ms on the cache, past the ${dead_ceiling_ms} ms ceiling of ${dead_exchanges} exchange(s) and one more deadline -- an exchange overran its configured deadline"; }
+        echo "   ${shape}: ${dead_spent_ms} ms reported on the cache (floor ${dead_floor_ms}, ceiling ${dead_ceiling_ms})"
+    fi
     # And on the reset leg, where every exchange is a connection the peer accepts, the PEER's
     # count, which must agree with the trace: what makes the launcher's own count trustworthy on
     # the shapes whose peer cannot count.

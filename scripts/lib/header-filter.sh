@@ -37,6 +37,25 @@
 # is one nothing checked.
 HeaderFilterSpellings="posix windows msvc"
 
+# The two ways a classifier below refuses, as its status. They are different verdicts and must
+# not share a number: a filter that does not COMPILE is a fact about the FILTER, while anything
+# else above grep's 1 -- a grep killed, a spelling not in the table -- is the CHECK failing. One
+# status for both left a consumer to pick, and it picked one sentence for both (#1630).
+HeaderFilterCheckFailed=2
+HeaderFilterDoesNotCompile=3
+
+# The verdict word a consumer reports for a classifier's refusal: `does-not-compile`, or
+# `check-failed <what>`. One mapping, so the two consumers -- `check-tidy-header-filter.sh` and
+# `local-gate.sh` -- cannot each pick a wording, and one of them the wrong cause.
+# @param 1 The classifier's status. @param 2 What was being asked: `coverage`, `dependency reach`.
+header_filter_refusal() {
+    if [[ "$1" -eq "$HeaderFilterDoesNotCompile" ]]; then
+        echo "does-not-compile"
+    else
+        echo "check-failed $2"
+    fi
+}
+
 # Spell @p 2, an absolute POSIX path, the way spelling @p 1 opens it, into `HeaderFilterSpelled`
 # -- a variable rather than stdout, so a loop over every header forks nothing per path. Measured:
 # the per-path `$(...)` and `grep` it replaces cost 56 s for 363 headers on Git Bash, where a
@@ -85,14 +104,16 @@ header_filter_spell() {
 # grep that fails there too names the filter; one that compiles it names the check. grep's own
 # message, if it printed one, is above.
 # @param 1 `include` or `exclude`. @param 2 The regex. @param 3 The status the match exited with.
+# @return `HeaderFilterDoesNotCompile` or `HeaderFilterCheckFailed`, saying which it found.
 header_filter_grep_failure() {
     local probe=0
     grep -E -- "$2" < /dev/null > /dev/null 2>&1 || probe=$?
     if [[ "$probe" -gt 1 ]]; then
         echo "header-filter: the $1 filter '$2' does not compile as an extended regular expression (grep exited $3, and $probe again over no input) -- this is a verdict about the FILTER, not the tree" >&2
-    else
-        echo "header-filter: grep exited $3 matching the $1 filter, which compiles (grep exited $probe over no input), so which headers it selects is not known -- this is the CHECK failing, not a verdict about the filter" >&2
+        return "$HeaderFilterDoesNotCompile"
     fi
+    echo "header-filter: grep exited $3 matching the $1 filter, which compiles (grep exited $probe over no input), so which headers it selects is not known -- this is the CHECK failing, not a verdict about the filter" >&2
+    return "$HeaderFilterCheckFailed"
 }
 
 # Which of @p 4's paths the filter takes in ONE spelling, as `,<line>,<line>,` -- 1-based input
@@ -100,13 +121,14 @@ header_filter_grep_failure() {
 # list, never one per path.
 # @param 1 The include regex. @param 2 The exclude regex, possibly empty.
 # @param 3 The root. @param 4 The spelling. @param 5 Repo-relative paths, one per line, no blanks.
+# @return 0, or `HeaderFilterDoesNotCompile` / `HeaderFilterCheckFailed` with the reason on stderr.
 header_filter_taken_lines() {
     local include="$1" exclude="$2" root="$3" spelling="$4" paths="$5" path spelled="" line taken excluded set=","
     while IFS= read -r path; do
         # Blank lines are skipped here as the callers' classifying loops skip them, so a line
         # number and a path's index are the same count.
         [[ -n "$path" ]] || continue
-        header_filter_spell_into "$spelling" "$root/$path" || return 2
+        header_filter_spell_into "$spelling" "$root/$path" || return "$HeaderFilterCheckFailed"
         spelled="${spelled}${HeaderFilterSpelled}"$'\n'
     done < <(printf '%s\n' "$paths")
     # Each grep's status is CHECKED, and the line numbers are cut in this shell: grep answers 1
@@ -114,17 +136,19 @@ header_filter_taken_lines() {
     # left an empty set behind `|| true`, which reads as "the filter takes nothing" (or "excludes
     # nothing") and decides the verdict in whichever direction that happens to point.
     local status matched=""
-    taken="$(grep -nE -- "$include" < <(printf '%s' "$spelled"))" && status=0 || status=$?
+    # Through `pipe_lines_into` (third-party-roots.sh), never `grep < <(...)`: round 10's grep
+    # killed with 148 was this line in that shape.
+    taken="$(pipe_lines_into "$spelled" grep -nE -- "$include")" && status=0 || status=$?
     if [[ "$status" -gt 1 ]]; then
         header_filter_grep_failure include "$include" "$status"
-        return 2
+        return
     fi
     excluded=","
     if [[ -n "$exclude" ]]; then
-        matched="$(grep -nE -- "$exclude" < <(printf '%s' "$spelled"))" && status=0 || status=$?
+        matched="$(pipe_lines_into "$spelled" grep -nE -- "$exclude")" && status=0 || status=$?
         if [[ "$status" -gt 1 ]]; then
             header_filter_grep_failure exclude "$exclude" "$status"
-            return 2
+            return
         fi
         while IFS= read -r line; do
             [[ -n "$line" ]] && excluded="${excluded}${line%%:*},"
@@ -160,6 +184,8 @@ header_filter_read_paths() {
 # @param 3 The root the paths live under -- the filter sees absolute paths.
 # @param 4 The spellings to ask, default all of `HeaderFilterSpellings`. A case about where a
 #          checkout LIVES passes `posix`, so it asserts that and not the separators.
+# @return 0, or `header_filter_taken_lines`' refusal UNCHANGED, printing nothing: a consumer
+#         names it through `header_filter_refusal`, never as a count.
 header_filter_match() {
     local include="$1" exclude="$2" root="$3" spellings="${4:-$HeaderFilterSpellings}"
     local paths total matched=0 firstMissed="" path spelling index=0 k missedIn takenIn
@@ -167,7 +193,7 @@ header_filter_match() {
     header_filter_read_paths paths total
     k=0
     for spelling in $spellings; do
-        sets[k]="$(header_filter_taken_lines "$include" "$exclude" "$root" "$spelling" "$paths")" || return 2
+        sets[k]="$(header_filter_taken_lines "$include" "$exclude" "$root" "$spelling" "$paths")" || return
         names[k]="$spelling"
         k=$((k + 1))
     done
@@ -201,6 +227,7 @@ header_filter_match() {
 #
 # @param 1 The include regex. @param 2 The exclude regex, possibly empty.
 # @param 3 The root. @param 4 The spellings, default all.
+# @return As `header_filter_match`.
 header_filter_reach() {
     local include="$1" exclude="$2" root="$3" spellings="${4:-$HeaderFilterSpellings}"
     local paths total reached=0 firstReached="" path spelling index=0 k
@@ -208,7 +235,7 @@ header_filter_reach() {
     header_filter_read_paths paths total
     k=0
     for spelling in $spellings; do
-        sets[k]="$(header_filter_taken_lines "$include" "$exclude" "$root" "$spelling" "$paths")" || return 2
+        sets[k]="$(header_filter_taken_lines "$include" "$exclude" "$root" "$spelling" "$paths")" || return
         names[k]="$spelling"
         k=$((k + 1))
     done
@@ -466,7 +493,7 @@ header_filter_declared_packages() {
     names=""
     if [[ -n "$named" ]]; then
         local sorted=0
-        names="$(sort -u < <(printf '%s' "$named"))" || sorted=$?
+        names="$(pipe_lines_into "$named" sort -u)" || sorted=$?
         if [[ "$sorted" != 0 || -z "$names" ]]; then
             echo "header-filter: sort exited ${sorted} over the package names derived under ${root}, so which packages the tree declares is not known -- this is the CHECK failing, not a verdict about the tree" >&2
             return 2

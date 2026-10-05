@@ -1657,8 +1657,13 @@ struct ProbedDependencies
 /// takes includes whatever the host does to this process meanwhile -- a starved CI runner put a
 /// refused leg 1616 ms past two 1000 ms dials (round 9) -- while the count is the same however
 /// slow the machine is.
+///
+/// Two fixtures PARSE the trace's `cache exchange (` prefix -- `run-launcher-e2e.ps1` and
+/// `scripts/compile-cache-e2e.sh` -- so it is changed with them, and `check-cache-flow-continuations.sh`
+/// refuses a `Cc::RunOneExchange` anywhere in this file but here, so no exchange goes uncounted.
 /// @param record The invocation record, for the trace's verbosity.
-/// @param what Which exchange, for the trace: `manifest fetch`, `fetch`, `store`, `manifest store`.
+/// @param what Which exchange, for the trace: `manifest fetch`, `marker-follow fetch`,
+///             `direct-mode object fetch`, `fetch`, `store`, `manifest store`.
 /// @param addr The daemon's address.
 /// @param frame The request.
 /// @param credential Presented with the request.
@@ -1682,21 +1687,23 @@ struct ProbedDependencies
 }
 
 /// FETCH one key and return its raw stored bytes, or nullopt on miss or any
-/// transport failure. Used for manifests, whose payload is not a compile-value.
+/// transport failure. Used for manifests, and for the object values a manifest or a
+/// marker points at.
 /// @param record The invocation record; read here, never written.
 /// @param cfg  Launcher config (daemon address and socket deadline).
+/// @param what Which fetch this is, for the trace and a refusal's warning.
 /// @param key  The key to fetch.
 /// @return The stored bytes on hit.
 [[nodiscard]] std::optional<std::vector<std::byte>> FetchRaw(InvocationRecord const& record,
                                                              Config const& cfg,
+                                                             std::string_view what,
                                                              std::string const& key)
 {
     auto const presented = Tickets(cfg, record.verbose).Present(cfg.addr);
-    auto outcome =
-        CacheExchange(record, "manifest fetch", cfg.addr, Wire::EncodeFetch(key), presented.credential, BudgetOf(cfg));
+    auto outcome = CacheExchange(record, what, cfg.addr, Wire::EncodeFetch(key), presented.credential, BudgetOf(cfg));
     if (!outcome.IsHit())
     {
-        WarnIfRejected(record, outcome, presented.missing, "manifest fetch", key);
+        WarnIfRejected(record, outcome, presented.missing, what, key);
         return std::nullopt;
     }
     return std::move(outcome.value);
@@ -1709,7 +1716,7 @@ struct ProbedDependencies
 [[nodiscard]] Cc::ValueFetch BoundFetch(InvocationRecord const& record, Config const& cfg)
 {
     return [&record, &cfg](std::string const& key) {
-        return FetchRaw(record, cfg, key);
+        return FetchRaw(record, cfg, "marker-follow fetch", key);
     };
 }
 
@@ -1928,7 +1935,7 @@ struct MaterializedHit
                                                    std::filesystem::path const& workingDirectory,
                                                    Cc::CheckoutRoots const& checkout)
 {
-    auto const payload = FetchRaw(record, cfg, key);
+    auto const payload = FetchRaw(record, cfg, "direct-mode object fetch", key);
     if (!payload.has_value())
         return std::nullopt;
 
@@ -2232,7 +2239,7 @@ void RecordManifest(InvocationRecord const& record,
         return giveUp();
 
     auto const manifestKey = Cc::ComputeManifestKey(*canonicalSource, relativizedArgs, toolchainStamp);
-    auto const manifestBytes = FetchRaw(record, cfg, manifestKey);
+    auto const manifestBytes = FetchRaw(record, cfg, "manifest fetch", manifestKey);
     if (!manifestBytes.has_value())
         return giveUp();
 

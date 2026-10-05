@@ -1751,7 +1751,13 @@ header_filter_coverage() {
     local dependencies depHit
     third_party_path_pattern "$root" > /dev/null || { echo "no-roots"; return 0; }
     dependencies="$(header_filter_dependency_paths "$root")" || { echo "no-dependencies"; return 0; }
-    depHit="$(header_filter_reach "$include" "$exclude" "$root" < <(printf '%s\n' "$dependencies"))"
+    # Each classifier's status CHECKED, here and below: one that refused printed nothing, and an
+    # empty count is not `0/...`, so it read as `deps-leak` -- the filter blamed for the check
+    # failing, round 10's collapse in `check-tidy-header-filter.sh` (#1630). The refusal is
+    # named through `header_filter_refusal`, which keeps a filter that does not compile the
+    # FILTER's fault.
+    depHit="$(header_filter_reach "$include" "$exclude" "$root" < <(printf '%s\n' "$dependencies"))" \
+        || { header_filter_refusal "$?" "dependency reach"; return 0; }
     if [[ "${depHit%%/*}" != 0 ]]; then
         echo "deps-leak"
         return 0
@@ -1780,8 +1786,12 @@ header_filter_coverage() {
     # the wrong cause, whose remedy is to widen the filter over vendored code.
     local pattern vendored firstParty thirdPartyRoot
     pattern="$(third_party_path_pattern "$root")" || { echo "no-roots"; return 0; }
-    vendored="$(grep -E "$pattern" <<< "$headers" || true)"
-    firstParty="$(grep -vE "$pattern" <<< "$headers" || true)"
+    # Through the library's own selection, never a `grep ... || true` here: that turned a
+    # grep that failed into an empty set, so no vendored header was asked about.
+    vendored="$(third_party_paths "$root" "$headers")" \
+        || { echo "check-failed third-party selection"; return 0; }
+    firstParty="$(first_party_paths "$root" "$headers")" \
+        || { echo "check-failed first-party selection"; return 0; }
 
     # A convention that has stopped describing anything reads exactly like one that
     # is being honoured: if a root's directory is there, it must carry tracked files,
@@ -1814,7 +1824,8 @@ header_filter_coverage() {
     # three sites to correct instead of one. An empty vendored set answers `0/0`, so
     # a tree with no vendored headers takes no special case.
     local vendorHit
-    vendorHit="$(header_filter_reach "$include" "$exclude" "$root" <<< "$vendored")"
+    vendorHit="$(header_filter_reach "$include" "$exclude" "$root" <<< "$vendored")" \
+        || { header_filter_refusal "$?" "third-party reach"; return 0; }
     if [[ "${vendorHit%%/*}" != 0 ]]; then
         echo "third-party-leak ${vendorHit%% *}"
         return 0
@@ -1825,7 +1836,8 @@ header_filter_coverage() {
     # is not a tree this gate can report on.
     [[ -n "$firstParty" ]] || { echo "no-headers"; return 0; }
 
-    header_filter_match "$include" "$exclude" "$root" <<< "$firstParty"
+    header_filter_match "$include" "$exclude" "$root" <<< "$firstParty" \
+        || header_filter_refusal "$?" coverage
 }
 
 # The matching itself is `header_filter_match` (coverage, every spelling) and
@@ -1891,6 +1903,14 @@ header_filter_report() {
             echo "scripts/lib/third-party-roots.txt could not be read under the tree being measured, or names no root (the reader says which on stderr above), so which tracked headers are third-party cannot be answered. Read as none, every vendored header would count as first-party and the filter declining them would present as a PARTIAL match, whose remedy is to widen the filter over vendored code. This is the CHECK refusing to report, not a verdict about the filter"
             return 1
             ;;
+        check-failed*)
+            echo "the header-filter coverage check could not answer for $config: the ${verdict#* } failed, and the step that failed says why on stderr above -- a grep that exited above 1 or was killed, or a roots file that could not be read. This is the CHECK failing, not a verdict about the filter: read as one, an empty answer named a dependency leak or a miss nothing measured (#1630). A filter that does not compile is not this outcome; it is named as the filter's own fault"
+            return 1
+            ;;
+        does-not-compile)
+            echo "clang-tidy's header filter in $config does not compile as an extended regular expression -- the line above says which of HeaderFilterRegex and ExcludeHeaderFilterRegex, and grep's own complaint is above that. That is a verdict about the FILTER: clang-tidy would refuse it too, so fix the pattern"
+            return 1
+            ;;
         0/*' spelling)')
             echo "clang-tidy's HeaderFilterRegex in $config matches NONE of this tree's $total tracked first-party headers in the ${spelling} -- it takes them in another spelling, so a build that opens them by this one discards every header finding as non-user code while reading clean. Measured on Windows, where the MSVC database's include directories are backslashed: a planted header violation reported 0 times under a /-only filter. Accept either separator ([/\\\\]) in the pattern rather than adding a second copy of it for one platform; ctest -R tidy-header-filter asks the same question on every platform"
             return 1
@@ -1900,6 +1920,14 @@ header_filter_report() {
             return 1
             ;;
     esac
+
+    # What is left must be a COUNT. A word no arm above names -- a verdict added to the reader
+    # and not here -- splits into `matched` and `total` as the same word, compares equal, and
+    # read as "covers all <word> tracked first-party headers": a pass.
+    if [[ -z "$matched" || -z "$total" || "$matched$total" == *[!0-9]* ]]; then
+        echo "the header-filter coverage check answered '$verdict' for $config, which is neither a count nor a word this reporter knows. That is a bug in the GATE, not a verdict about this tree: header_filter_coverage gained an answer header_filter_report has no arm for"
+        return 1
+    fi
 
     if [[ "$matched" == "$total" ]]; then
         echo "== clang-tidy header filter covers all $total tracked first-party headers"
@@ -2494,6 +2522,21 @@ gate_reached_tests() {
         | awk '/^[ \t]*Test[ \t]+#[0-9]+:/ { sub(/^[^:]*:[ \t]*/, ""); if (length($0)) print }'
 }
 
+# How many non-blank lines @p 1 holds, counted in THIS shell. Not `grep -c . || true`: a grep
+# that failed or was killed printed nothing, the `|| true` kept the empty answer, and an empty
+# count is `-eq 0` -- "every one reachable" over a gap that named tests (#1630). No subprocess
+# here, so nothing can be killed into answering "none". Not `e2e-common.sh`'s `count_lines`,
+# which counts a FILE with `wc`. The lines arrive through a process substitution the SHELL
+# reads, never a herestring, which deadlocks at 64 KiB on Git Bash (#1591).
+# @param 1 The text. @return The count, on stdout.
+nonblank_line_count() {
+    local line n=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] && n=$((n + 1))
+    done < <(printf '%s\n' "$1")
+    echo "$n"
+}
+
 # The report: which declared tests no gate configuration registers.
 #
 # PURE. It reads no clock, opens no file and runs no ctest -- everything it says
@@ -2525,9 +2568,22 @@ coverage_gap() {
     local declared="$1" reached="$2" contributed="$3" asked="$4"
     local literals unresolved names count gap gapCount
 
-    literals="$(printf '%s\n' "$declared" | awk '$1 == "literal" { print $2 }' | sort -u)"
-    unresolved="$(printf '%s\n' "$declared" | awk '$1 == "unresolved" { print $2 }' | sort -u)"
-    count="$(printf '%s\n' "$literals" | grep -c . || true)"
+    # Each derivation's status CHECKED (#1630): an awk or sort that failed printed nothing, or
+    # part of its answer. An empty `literals` read as "no registrations", blaming the work
+    # tree; a SHORT one dropped names the gap would have named, and an empty `unresolved`
+    # dropped the disclosure below -- both a pass. `pipefail` makes the status the pipeline's.
+    local derived=0
+    literals="$(printf '%s\n' "$declared" | awk '$1 == "literal" { print $2 }' | sort -u)" || derived=$?
+    if [[ "$derived" -eq 0 ]]; then
+        unresolved="$(printf '%s\n' "$declared" | awk '$1 == "unresolved" { print $2 }' | sort -u)" || derived=$?
+    fi
+    if [[ "$derived" -ne 0 ]]; then
+        echo "== coverage: REFUSED -- deriving the declared tests exited ${derived}, so which tests the"
+        echo "==   CMake sources register is not known. This is the CHECK failing, not a tree that"
+        echo "==   registers nothing and not 'everything is reachable'."
+        return 1
+    fi
+    count="$(nonblank_line_count "$literals")"
 
     if [[ "$count" -eq 0 ]]; then
         echo "== coverage: REFUSED -- no test registrations were found in the CMake sources."
@@ -2544,8 +2600,22 @@ coverage_gap() {
         return 1
     fi
 
-    gap="$(comm -23 <(printf '%s\n' "$literals") <(printf '%s\n' "$reached" | sort -u))"
-    gapCount="$(printf '%s\n' "$gap" | grep -c . || true)"
+    # `comm` through `pipe_pair_into`, never `comm <(...) <(...)` inside `$( )`, which makes
+    # comm the PARENT of both writers -- the shape a Windows runner killed a grep in (#1630) --
+    # and CHECKED: a sort or comm that failed printed nothing, which reads below as "every
+    # one reachable".
+    local reachedSorted compared=0
+    reachedSorted="$(pipe_lines_into "$reached"$'\n' sort -u)" || compared=$?
+    if [[ "$compared" -eq 0 ]]; then
+        gap="$(pipe_pair_into "$literals"$'\n' "$reachedSorted"$'\n' comm -23 /dev/fd/3 -)" || compared=$?
+    fi
+    if [[ "$compared" -ne 0 ]]; then
+        echo "== coverage: REFUSED -- sorting or comparing the reached tests exited ${compared}, so which"
+        echo "==   declared tests no configuration reaches is not known. This is the CHECK failing,"
+        echo "==   not 'everything is reachable'."
+        return 1
+    fi
+    gapCount="$(nonblank_line_count "$gap")"
 
     if [[ "$gapCount" -eq 0 ]]; then
         echo "== coverage: ${count} declared test(s), every one reachable in at least one of the"
@@ -2574,7 +2644,7 @@ coverage_gap() {
 
     if [[ -n "$unresolved" ]]; then
         local ucount
-        ucount="$(printf '%s\n' "$unresolved" | grep -c . || true)"
+        ucount="$(nonblank_line_count "$unresolved")"
         echo "==   plus ${ucount} registration(s) whose name is built from a variable, which this"
         echo "==   derivation cannot resolve and does not claim to have checked:"
         local u
@@ -3309,6 +3379,12 @@ src/apps/fastcached/Main.hpp"
         "said|1" "$(report_says 'the third-party root thirdparty/ named in' header_filter_report /w/.clang-tidy 'third-party-untracked thirdparty')"
     expect "an unreadable roots file refuses as the CHECK, never as a partial match" \
         "said|1" "$(report_says 'which tracked headers are third-party cannot be answered' header_filter_report /w/.clang-tidy no-roots)"
+    expect "a classifier that could not answer refuses as the CHECK, naming which, never as a leak" \
+        "said|1" "$(report_says 'the dependency reach failed' header_filter_report /w/.clang-tidy 'check-failed dependency reach')"
+    expect "a filter that does not compile refuses as the FILTER's fault, never as the check failing" \
+        "said|1" "$(report_says 'That is a verdict about the FILTER' header_filter_report /w/.clang-tidy does-not-compile)"
+    expect "a verdict no arm names is refused as the GATE's bug, never read as full coverage" \
+        "said|1" "$(report_says 'neither a count nor a word this reporter knows' header_filter_report /w/.clang-tidy 'some-new-word detail')"
 
     # -----------------------------------------------------------------------
     # The vendored/first-party SPLIT, driven through `header_filter_coverage` at a
@@ -3384,6 +3460,18 @@ src/apps/fastcached/Main.hpp"
         _hf_config '.*[/\\]src[/\\].*'
         expect "a filter reaching a declared package's headers is caught" \
             "deps-leak" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
+        # PLANTED: under the clean filter, the reach's grep KILLED (148, #1630's status) over
+        # the dependency paths alone. Its status unread, the empty answer was `deps-leak` --
+        # the filter blamed for the check failing.
+        _hf_config "$_hf_clean"
+        expect "a dependency-reach grep killed is the CHECK failing, never a leak" \
+            "check-failed dependency reach" \
+            "$(grep() { local input; input="$(cat)"; [[ "$input" != *_deps* ]] || return 148; printf '%s' "$input" | command grep "$@"; }
+               header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null < /dev/null)"
+        # And the other direction: a filter that does not compile is the FILTER's fault.
+        _hf_config 'src/(a'
+        expect "a filter that does not compile is named as the filter's fault, never the check's" \
+            "does-not-compile" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
         # PLANTED: nothing declared. Refused as its own word, never read as "no dependencies".
         _hf_config "$_hf_clean"
         cp "$_hf_tree/CMakeLists.txt" "$_hf_tree/CMakeLists.txt.kept"
@@ -4349,6 +4437,35 @@ beta' 2 2)" == *"every one reachable in at least one"* ]] && echo yes || echo no
         "$([[ "$(coverage_gap 'literal alpha' '' 0 2)" == *"it is 'nothing is known'"* ]] && echo yes || echo no)"
     expect "a gate that built nothing refuses the run" \
         "1" "$(coverage_gap 'literal alpha' '' 0 2 >/dev/null; echo $?)"
+    # The comparison's own `comm` failing is a THIRD refusal (#1630): it printed nothing,
+    # which read as "every one reachable". Over a tree with a real gap, so the pass can only
+    # come from the unchecked status.
+    expect "a comm that fails is REFUSED as the check failing, never 'every one reachable'" \
+        "yes" \
+        "$([[ "$(comm() { return 2; }; coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2)" == *"REFUSED -- sorting or comparing the reached tests exited 2"* ]] && echo yes || echo no)"
+    expect "and it refuses the run" \
+        "1" "$(comm() { return 2; }; coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2 >/dev/null; echo $?)"
+    # The COUNT is taken in this shell: a grep killed (148, #1630's status) once counted the
+    # gap as empty, `-eq 0`, and the gap's names were reported as "every one reachable".
+    expect "a gap is counted with no subprocess, so a killed grep cannot make it 'every one reachable'" \
+        "yes" \
+        "$([[ "$(grep() { return 148; }; coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2)" == *"1 of 2 declared test(s) are registered by NEITHER"* ]] && echo yes || echo no)"
+    # The DERIVATION's status: an awk that failed printed nothing, which read as "no test
+    # registrations" -- a refusal blaming the work tree -- and, over the unresolved names
+    # alone, silently dropped the disclosure that some registrations were never checked.
+    expect "a declared-test derivation that fails is REFUSED as the check, never as a tree with none" \
+        "yes" \
+        "$([[ "$(awk() { [[ "$1" != *'"literal"'* ]] || return 2; command awk "$@"; }
+                 coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2)" == *"REFUSED -- deriving the declared tests exited 2"* ]] && echo yes || echo no)"
+    expect "an unresolved-name derivation that fails is REFUSED, never a dropped disclosure" \
+        "yes" \
+        "$([[ "$(awk() { [[ "$1" != *unresolved* ]] || return 2; command awk "$@"; }
+                 coverage_gap 'literal alpha
+unresolved ${name}' 'alpha' 2 2)" == *"REFUSED -- deriving the declared tests exited 2"* ]] && echo yes || echo no)"
     # The two refusals are two sentences. Sharing one would satisfy every row
     # above while collapsing the states they exist to keep apart.
     #

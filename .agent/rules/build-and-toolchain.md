@@ -1298,6 +1298,39 @@ determinism rests on.
 ' "$x")`. The audit of the sites still under the boundary, and
       the scan that should refuse the next one, are
       [#1591](https://github.com/LASTRADA-Software/fastcached/issues/1591).
+    - **And process substitution was itself the next defect, for an EXTERNAL reader.**
+      `grep < <(printf ...)` makes grep the PARENT of the writer, and twice on a GitHub
+      Windows runner such a grep came back killed: round 8 in `_third_party_select`,
+      silently, and round 10 in `header_filter_taken_lines` as **exit 148**, 128 + 20,
+      where 20 is **SIGCHLD** in the MSYS2 runtime (`cygwin/signal.h`; `kill -l 20` says
+      CHLD), not Linux's SIGTSTP. That the writer's exit is what killed it is INFERRED:
+      neither the micro shape nor the real path reproduced locally, under load, on Git for
+      Windows 2.51 (MSYS 3.6.5, bash 5.2) or 2.55 (MSYS 3.6.10, bash 5.3, the runner's)
+      ([#1630](https://github.com/LASTRADA-Software/fastcached/issues/1630)).
+    - The parentage is MEASURED, each writer reading its own PPID out of `/proc`, on Git
+      Bash 5.2.37 and on bash 3.2.57. The filter is the writer's parent for `cmd < <(w)`
+      and `$(cmd < <(w))`, **and for an ARGUMENT `cmd <(w)` inside `$( )` or a
+      pipeline** -- the `diff <(a) <(b) | sed` and `$(comm -23 <(a) <(b))` this tree had
+      eight of, two of them deciding a verdict with comm's status unread. A top-level
+      `cmd <(w)` is a sibling, and `done < <(cmd <(w))` is a parent on 5.2 and a sibling on
+      3.2: **safety that depends on the construct around a line and on the bash version is
+      not a property a line can show**, so the rule is the one it can -- no external filter
+      reads a process substitution, in either position.
+    - What does not depend on the inference: in a PIPE the writer is the child of the shell
+      running the pipeline in every context measured, it drains concurrently, and
+      `PIPESTATUS[1]` is the filter's status even under `pipefail`. So an external filter is
+      fed through `pipe_lines_into`, or `pipe_pair_into` for a two-input `comm`/`diff`
+      (`/dev/fd/3` and `-`), both in `scripts/lib/third-party-roots.sh`; a `while read` loop
+      or a shell function is the SHELL reading, and stays on `< <(...)`.
+      `procsub-reader-scan` in `check-e2e-helpers.sh` refuses both shapes and names its
+      blind spots (a filter off its list, one invoked through a variable, a `<(` on a
+      continuation line), all failing OPEN.
+    - **The status, once read, has to carry WHOSE failure it is.** Round 10's red was
+      `status 1 and [uncovered ]`: `Judge` read the coverage without its status, so a killed
+      grep blamed the filter. Fixing that with one status for every refusal would have blamed
+      the CHECK for a filter that does not compile, the other half of f6511b92b. So the
+      classifiers refuse with `HeaderFilterDoesNotCompile` (3) or `HeaderFilterCheckFailed`
+      (2), and both consumers name them through one `header_filter_refusal`.
     - So it is a **SCAN** now, in `check-e2e-helpers.sh` beside the `timeout` and
       bash-3.2 ones, off the same `_shell_scripts` enumeration. Five scripts already
       carried a comment explaining why they do NOT do this, and it spread anyway:

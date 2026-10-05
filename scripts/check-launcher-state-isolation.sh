@@ -624,7 +624,7 @@ ran=$(( ran + 1 ))
 launcher_canary_got="$(_launcher_fixture_verdicts "$launcher_canary" "$launcher_canary_list")"
 if [ "$launcher_canary_got" != "$launcher_canary_want" ]; then
     echo "FAIL launcher-state-scan-canary: the scan's verdicts on the planted tree are not the staged ones" >&2
-    diff <(printf '%s\n' "$launcher_canary_want") <(printf '%s\n' "$launcher_canary_got") | sed 's/^/     | /' >&2
+    pipe_pair_into "$launcher_canary_want"$'\n' "$launcher_canary_got"$'\n' diff /dev/fd/3 - | sed 's/^/     | /' >&2
     note_failure "launcher-state-scan-canary"
 fi
 rm -rf "$launcher_canary"
@@ -800,7 +800,7 @@ ${launcher_reader_dir}/branches.cpp|2|3"
             done <<< "$launcher_pwsh_all")"
             if [ -z "$launcher_bash_rows" ] || [ "$launcher_bash_rows" = refused ] || [ "$launcher_bash_rows" != "$launcher_pwsh_rows" ]; then
                 echo "FAIL launcher-state-readers-agree: the two readers of $(basename "$launcher_source") disagree on ${launcher_platform}" >&2
-                diff <(printf '%s\n' "$launcher_bash_rows") <(printf '%s\n' "$launcher_pwsh_rows") | sed 's/^/     | /' >&2
+                pipe_pair_into "$launcher_bash_rows"$'\n' "$launcher_pwsh_rows"$'\n' diff /dev/fd/3 - | sed 's/^/     | /' >&2
                 note_failure "launcher-state-readers-agree"
             fi
             launcher_pwsh_index=$(( launcher_pwsh_index + 1 ))

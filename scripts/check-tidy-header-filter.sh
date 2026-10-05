@@ -39,7 +39,22 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # shellcheck source=lib/git-scrub.sh
 . scripts/lib/git-scrub.sh
 
-# Judge one filter. Prints one line per failure, or `ok <n>`; returns 1 on any failure.
+# A classifier's refusal, as Judge reports it: its word from `header_filter_refusal`, and the
+# status Judge returns -- 1 for a filter that does not compile, which IS a verdict about the
+# filter, and 2 for the CHECK failing, which is not one.
+# @param 1 The classifier's status. @param 2 What it was asked: `coverage`, `dependency reach`.
+Refused() {
+    header_filter_refusal "$1" "$2"
+    [[ "$1" -eq "$HeaderFilterDoesNotCompile" ]] && return 1
+    return 2
+}
+
+# Judge one filter. Prints one line per failure, or `ok <n>`; returns 1 on any failure, and 2
+# -- printing `check-failed <what>`, the classifier's own reason being on stderr -- when a
+# classifier could not answer. That third outcome is not a verdict about the filter: round 10's
+# killed grep came back as "status 1 and [uncovered ]", a filter blamed for the check failing,
+# because the coverage was read without its status (#1630). A filter that does not compile is
+# still the FILTER's fault: `does-not-compile`, status 1.
 # @param 1 The include regex. @param 2 The exclude regex, possibly empty. @param 3 The root.
 # @param 4 First-party headers, repo-relative. @param 5 Third-party headers, possibly empty.
 # @param 6 Dependency paths no spelling may reach -- `header_filter_dependency_paths`' answer.
@@ -50,12 +65,17 @@ Judge() {
         echo "no-regex"
         return 1
     fi
-    count="$(printf '%s\n' "$firstParty" | grep -c .)" || count=0
+    # Into names of Judge's own: `header_filter_read_paths` keeps a local `count`, and a
+    # `printf -v count` from inside it would set THAT one, leaving this one empty.
+    local judgedPaths judgedCount
+    header_filter_read_paths judgedPaths judgedCount < <(printf '%s\n' "$firstParty")
+    count="$judgedCount"
     if [[ "$count" -eq 0 ]]; then
         echo "no-headers"
         return 1
     fi
-    coverage="$(header_filter_match "$include" "$exclude" "$root" < <(printf '%s\n' "$firstParty"))"
+    coverage="$(header_filter_match "$include" "$exclude" "$root" < <(printf '%s\n' "$firstParty"))" \
+        || { Refused "$?" coverage; return; }
     if [[ "${coverage%%/*}" != "$count" ]]; then
         echo "uncovered $coverage"
         failed=1
@@ -64,13 +84,15 @@ Judge() {
         echo "no-dependencies"
         return 1
     fi
-    reach="$(header_filter_reach "$include" "$exclude" "$root" < <(printf '%s\n' "$dependencies"))"
+    reach="$(header_filter_reach "$include" "$exclude" "$root" < <(printf '%s\n' "$dependencies"))" \
+        || { Refused "$?" "dependency reach"; return; }
     if [[ "${reach%%/*}" != 0 ]]; then
         echo "dependency $reach"
         failed=1
     fi
     if [[ -n "$thirdParty" ]]; then
-        reach="$(header_filter_reach "$include" "$exclude" "$root" < <(printf '%s\n' "$thirdParty"))"
+        reach="$(header_filter_reach "$include" "$exclude" "$root" < <(printf '%s\n' "$thirdParty"))" \
+            || { Refused "$?" "third-party reach"; return; }
         if [[ "${reach%%/*}" != 0 ]]; then
             echo "third-party $reach"
             failed=1
@@ -113,6 +135,76 @@ src/CowTree/Tree.hpp"
     Expect "a /-only filter misses the backslash spelling" 1 \
         "uncovered 0/4 src/FastCache/Core/Base64.hpp (windows spelling)" \
         '.*/src/(CowTree|FastCache|apps|tests)/.*' "$lane" "$planted"
+    # `pipe_lines_into`, the one way these libraries hand a string to an external filter
+    # (#1630): it answers with the FILTER's status under this script's `set -euo pipefail` --
+    # 0, 1, an error, a signal's 128+n -- and a `grep -q` that stops at its first line over
+    # far more than the 64 KiB a herestring deadlocks at still answers 0 rather than the
+    # writer's SIGPIPE (a plain pipeline answers 141 there, measured on Git Bash).
+    piped=""
+    for want in 0 1 2 148; do
+        pipe_lines_into $'a\n' sh -c "cat >/dev/null; exit $want" && got=0 || got=$?
+        piped="${piped}${got} "
+    done
+    # 200000 LINES, so grep -q stops at the first and the writer is left mid-write; one long
+    # line would be read whole before grep could answer, and the case would test nothing.
+    big="$(printf '0\n%.0s' $(seq 1 200000))"
+    pipe_lines_into "$big"$'\n' grep -q 0 && bigStatus=0 || bigStatus=$?
+    cases=$((cases + 1))
+    if [[ "$piped" == "0 1 2 148 " && "$bigStatus" == 0 ]]; then
+        echo "   ok   pipe_lines_into answers with the filter's status, and a grep -q stopping early over 400 KB with 0"
+    else
+        echo "   FAIL pipe_lines_into answers with the filter's status, and a grep -q stopping early over 400 KB with 0: got [${piped}] and ${bigStatus}"
+        failures=$((failures + 1))
+    fi
+    # And its two-input sibling, which `comm` and `diff` take: the first input on fd 3, the
+    # second on stdin, the FILTER's status whatever either writer did, and two inputs each past
+    # 64 KiB through `diff`, which reads its first to the end before its second -- a pair that
+    # shared one drain would deadlock there, and this case would hang to ctest's TIMEOUT.
+    paired=""
+    for want in 0 1 2 148; do
+        pipe_pair_into $'a\n' $'b\n' sh -c "cat /dev/fd/3 - >/dev/null; exit $want" && got=0 || got=$?
+        paired="${paired}${got} "
+    done
+    onlyFirst="$(pipe_pair_into $'a\nb\nc\n' $'b\nc\nd\n' comm -23 /dev/fd/3 -)" || onlyFirst="comm failed"
+    onlySecond="$(pipe_pair_into $'a\nb\nc\n' $'b\nc\nd\n' comm -13 /dev/fd/3 -)" || onlySecond="comm failed"
+    pipe_pair_into "x"$'\n'"$big"$'\n' "y"$'\n'"$big"$'\n' diff /dev/fd/3 - > /dev/null && bigDiff=0 || bigDiff=$?
+    # A filter that reads NEITHER input leaves both writers to SIGPIPE; under `pipefail` only
+    # the two `PIPESTATUS` reads keep that from being the answer.
+    pipe_pair_into "$big"$'\n' "$big"$'\n' sh -c 'exit 0' && unread=0 || unread=$?
+    cases=$((cases + 1))
+    if [[ "$paired" == "0 1 2 148 " && "$onlyFirst" == a && "$onlySecond" == d && "$bigDiff" == 1 && "$unread" == 0 ]]; then
+        echo "   ok   pipe_pair_into feeds fd 3 and stdin, answers with the filter's status, and drains two 400 KB inputs"
+    else
+        echo "   FAIL pipe_pair_into feeds fd 3 and stdin, answers with the filter's status, and drains two 400 KB inputs: got [${paired}], comm -23 [${onlyFirst}], comm -13 [${onlySecond}], diff ${bigDiff}, unread ${unread}"
+        failures=$((failures + 1))
+    fi
+    # A classifier that cannot answer is the CHECK failing, and Judge says so with status 2 --
+    # never "status 1 and [uncovered ]", round 10's collapse, which blamed the filter. One case
+    # per classifier, each a grep KILLED (148, round 10's status) only over the input naming
+    # `$1`, so the others answer and the refusal is the one being asked about. The no-input
+    # probe that tells a killed grep from an uncompilable pattern reaches the real grep.
+    KilledOver() { # name, input substring the grep is killed over, wanted line
+        local killedOver="$2"
+        cases=$((cases + 1))
+        got="$(grep() { local input; input="$(cat)"; [[ "$input" != *"$killedOver"* ]] || return 148; printf '%s' "$input" | command grep "$@"; }
+               Judge "$configured" "" "$lane" "$planted" "$vendored" "$planteddeps" 2>/dev/null < /dev/null)" && status=0 || status=$?
+        if [[ "$status" == 2 && "$got" == "$3" ]]; then
+            echo "   ok   $1"
+        else
+            echo "   FAIL $1: wanted status 2 and [$3], got status $status and [$got]"
+            failures=$((failures + 1))
+        fi
+    }
+    KilledOver "a coverage grep killed is the check failing (status 2), never 'uncovered'" \
+        "FastCache" "check-failed coverage"
+    KilledOver "a dependency-reach grep killed is the check failing, never a leak" \
+        "_deps" "check-failed dependency reach"
+    KilledOver "a third-party-reach grep killed is the check failing, never a leak" \
+        "monocypher" "check-failed third-party reach"
+    # And the other direction, which a status-2-for-everything fix would have broken: a filter
+    # that does not compile is the FILTER's fault, status 1, and never `check-failed`.
+    Expect "a filter that does not compile is the filter's fault (status 1), never the check's" 1 \
+        "does-not-compile" 'src/(CowTree' "$lane" "$planted"
     # PLANTED: both separators as two separate copies, which the remedy warns against --
     # still blind to MSVC's backslashed include directory and slashed `#include` name.
     Expect "two copies of the pattern miss the MSVC mix" 1 \
@@ -338,7 +430,7 @@ src/CowTree/Tree.hpp"
         # FILTER's fault, said so, never blamed on the check.
         cases=$((cases + 1))
         got="$(header_filter_taken_lines 'src/(a' '' "$tree" posix 'src/a.h' 2>&1 >/dev/null)" && status=0 || status=$?
-        if [[ "$status" == 2 && "$got" == *"the include filter 'src/(a' does not compile"*"verdict about the FILTER"* && "$got" != *"the CHECK failing"* ]]; then
+        if [[ "$status" == "$HeaderFilterDoesNotCompile" && "$got" == *"the include filter 'src/(a' does not compile"*"verdict about the FILTER"* && "$got" != *"the CHECK failing"* ]]; then
             echo "   ok   a filter that does not compile is refused as the filter's fault, not the check's"
         else
             echo "   FAIL a filter that does not compile is refused as the filter's fault, not the check's: status $status, [$got]"
@@ -446,9 +538,14 @@ fi
 
 include="$(header_filter_config .clang-tidy HeaderFilterRegex)"
 exclude="$(header_filter_config .clang-tidy ExcludeHeaderFilterRegex)"
-tracked="$(git ls-files -- '*.hpp' '*.h')"
-firstParty="$(first_party_paths "$(pwd)" "$tracked")"
-thirdParty="$(third_party_paths "$(pwd)" "$tracked")"
+# Each acquisition CHECKED: an empty answer from a step that failed reads as "no headers" or
+# "nothing third-party", and the verdict below would then blame the filter.
+tracked="$(git ls-files -- '*.hpp' '*.h')" \
+    || { echo "check-tidy-header-filter: git ls-files failed, so which headers are tracked is not known -- the CHECK failing, not the filter" >&2; exit 1; }
+firstParty="$(first_party_paths "$(pwd)" "$tracked")" \
+    || { echo "check-tidy-header-filter: which tracked headers are first-party is not known (above) -- the CHECK failing, not the filter" >&2; exit 1; }
+thirdParty="$(third_party_paths "$(pwd)" "$tracked")" \
+    || { echo "check-tidy-header-filter: which tracked headers are third-party is not known (above) -- the CHECK failing, not the filter" >&2; exit 1; }
 [[ -z "$thirdParty" ]] || echo "check-tidy-header-filter: $(third_party_declined_summary 'header(s)' "$thirdParty"), and asks that none is reached"
 root="$(pwd)"
 if ! dependencies="$(header_filter_dependency_paths "$root")"; then
@@ -457,6 +554,10 @@ if ! dependencies="$(header_filter_dependency_paths "$root")"; then
 fi
 status=0
 verdict="$(Judge "$include" "$exclude" "$root" "$firstParty" "$thirdParty" "$dependencies")" || status=$?
+if [[ "$status" -eq 2 ]]; then
+    echo "check-tidy-header-filter: the check could not judge the HeaderFilterRegex ($verdict; the reason is above) -- this is the CHECK failing, not a verdict about the filter" >&2
+    exit 1
+fi
 if [[ "$status" -ne 0 ]]; then
     echo "check-tidy-header-filter: the HeaderFilterRegex in .clang-tidy ('$include'), asked at $root, fails:" >&2
     printf '  %s\n' "$verdict" >&2

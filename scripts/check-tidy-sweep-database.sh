@@ -338,10 +338,11 @@ CompareConfigure() {
     echo "  FAIL: $label does not document what the clang-tidy job configures." >&2
     echo "        A person following it gets a database whose flags and target set differ from CI's," >&2
     echo "        so the sweep reports findings CI suppresses and misses findings CI raises." >&2
-    # `diff` on process substitutions rather than a pipeline into `grep`: under
-    # `pipefail` a short-circuiting reader kills the producer with SIGPIPE and the
-    # pipeline then reports the PRODUCER's status.
-    diff <(printf '%s\n' "$ciNormal") <(printf '%s\n' "$docNormal") \
+    # `diff` through `pipe_pair_into` rather than a pipeline into `grep`: under `pipefail`
+    # a short-circuiting reader kills the producer with SIGPIPE and the pipeline then
+    # reports the PRODUCER's status. Nor `diff <(...) <(...)`, which in this pipeline makes
+    # diff the PARENT of both writers -- the shape a Windows runner killed a grep in (#1630).
+    pipe_pair_into "$ciNormal"$'\n' "$docNormal"$'\n' diff /dev/fd/3 - \
         | sed 's/^/          /' >&2 || true
     return 1
 }

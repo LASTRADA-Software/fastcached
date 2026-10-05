@@ -257,7 +257,7 @@ if [ "${1:-}" = "--self-test" ]; then
         local now whose="${2:-the exported GIT_DIR}"
         now="$(cat "$victim/.git/config")"
         if [ "$now" != "$victimConfig" ]; then
-            Miss "$1 WROTE ${whose}'s configuration, which it must leave unchanged" "$(diff <(printf '%s\n' "$victimConfig") <(printf '%s\n' "$now"))"
+            Miss "$1 WROTE ${whose}'s configuration, which it must leave unchanged" "$(pipe_pair_into "$victimConfig"$'\n' "$now"$'\n' diff /dev/fd/3 -)"
             printf '%s\n' "$victimConfig" > "$victim/.git/config"
             return
         fi
@@ -452,7 +452,7 @@ if [ "${1:-}" = "--self-test" ]; then
             victim2Config="$(cat "$victim2.config-before")"
             now="$(cat "$victim2/.git/config")"
             if [ "$now" != "$victim2Config" ]; then
-                Miss "this self-test under an exported ${name} WROTE its victim's configuration" "$(diff <(printf '%s\n' "$victim2Config") <(printf '%s\n' "$now"))"
+                Miss "this self-test under an exported ${name} WROTE its victim's configuration" "$(pipe_pair_into "$victim2Config"$'\n' "$now"$'\n' diff /dev/fd/3 -)"
                 printf '%s\n' "$victim2Config" > "$victim2/.git/config"
             elif [ -e "$victim2/.git/index" ]; then
                 Miss "this self-test under an exported ${name} STAGED into its victim, whose index must stay absent"

@@ -86,6 +86,55 @@ third_party_paths() {
     _third_party_select "" "$1" "${2-}"
 }
 
+# Run a FILTER command over @p 1's bytes and answer with the FILTER's own status: the one way
+# this library and `header-filter.sh` hand a string to an external program.
+#
+# A PIPE, and the filter is a SIBLING of the writer. Never `filter < <(printf ...)`: under that
+# shape the filter process is the PARENT of the process-substitution writer, and twice on a
+# GitHub Windows runner such a grep came back killed -- round 8 silently, round 10 as exit 148,
+# which is 128 + 20, and 20 is SIGCHLD in the MSYS2 runtime (cygwin/signal.h; `kill -l 20`
+# answers CHLD). That SIGCHLD is how it died is INFERRED: neither shape reproduced locally (see
+# #1630). The parentage is MEASURED, each writer reading its own PPID out of /proc, on Git Bash
+# 5.2.37 and on bash 3.2.57: the filter is the writer's parent for `cmd < <(w)`, for
+# `$(cmd < <(w))`, and for an ARGUMENT `cmd <(w)` inside `$( )` or a pipeline; a top-level
+# `cmd <(w)` is a sibling, and `done < <(cmd <(w))` is a parent on 5.2 and a sibling on 3.2. A
+# pipe's writer is a child of the shell running the pipeline in every one of those contexts.
+# Never a herestring either, which deadlocks at 64 KiB on Git Bash (#1591): a pipe's reader drains
+# it concurrently. `PIPESTATUS[1]` is the filter's status whatever `pipefail` says -- under it, a
+# `grep -q` that stops reading early would otherwise answer with the writer's SIGPIPE. The
+# pipeline sits in an `&& ... ||` list so a caller's `set -e` cannot end the shell on the
+# filter's ordinary 1 before the status is read.
+#
+# @param 1 The bytes, verbatim: a caller wanting a final newline passes one.
+# @param @ The filter and its arguments.
+# @return The filter's exit status; its output on stdout.
+pipe_lines_into() {
+    local text="$1"
+    shift
+    printf '%s' "$text" | "$@" && return 0 || return "${PIPESTATUS[1]}"
+}
+
+# `pipe_lines_into` for a filter of TWO inputs -- `comm`, `diff` -- which `cmd <(a) <(b)` fed
+# before #1630, and which is that shape as an argument: the filter is the writers' parent inside
+# `$( )` or a pipeline, which is where every such site in this tree sat. @p 1 arrives on file
+# descriptor 3 and @p 2 on stdin, both through pipes whose writers are this shell's children, so
+# the caller names them `/dev/fd/3` and `-`:
+#   pipe_pair_into "$a"$'\n' "$b"$'\n' comm -23 /dev/fd/3 -
+# `/dev/fd` is what bash's own process substitution opened, so it asks nothing new of the host:
+# `echo <(true)` answers `/dev/fd/63` on Git Bash and on Linux bash 5 and 3.2 (measured; macOS
+# not), and a host without it could not have run the `<(...)` this replaced. Both are drained
+# concurrently, so a filter that reads one input to its end before the other -- `diff` does --
+# cannot deadlock on the other's 64 KiB.
+#
+# @param 1 The first input's bytes, verbatim. @param 2 The second's.
+# @param @ The filter and its arguments, naming `/dev/fd/3` and `-`.
+# @return The filter's exit status; its output on stdout.
+pipe_pair_into() {
+    local first="$1" second="$2"
+    shift 2
+    printf '%s' "$first" | { pipe_lines_into "$second" "$@"; } 3<&0 && return 0 || return "${PIPESTATUS[1]}"
+}
+
 # One line naming what an enumerator declined, or nothing when it declined nothing.
 #
 # @param 1 What the enumerator lists, for the sentence: `shell script(s)`.
@@ -93,7 +142,7 @@ third_party_paths() {
 third_party_declined_summary() {
     [ -n "${2-}" ] || return 0
     printf 'declined %s third-party %s under the roots in scripts/lib/third-party-roots.txt, first %s\n' \
-        "$(grep -c . < <(printf '%s\n' "$2"))" "$1" "${2%%$'\n'*}"
+        "$(pipe_lines_into "$2"$'\n' grep -c .)" "$1" "${2%%$'\n'*}"
 }
 
 # @param 1 `-v` to keep what is NOT under a root, empty to keep what is.
@@ -102,20 +151,15 @@ _third_party_select() {
     local pattern selected status=0
     pattern="$(third_party_path_pattern "$2")" || return 2
     [ -n "$3" ] || return 0
-    # Process substitution rather than a herestring, and that is a PLATFORM fact rather
-    # than a preference. Git Bash's bash implements `<<<` with a PIPE and writes the whole
-    # string before it starts the reader, so an operand of 65536 bytes or more deadlocks:
-    # the write blocks at the 64 KiB pipe buffer and nothing is draining it. Measured on
-    # bash 5.2.37 to the byte -- 65535 completes, 65536 hangs, deterministic 5/5 either way
-    # -- and it is SIZE, not content: this repository's own tracked-file list padded past
-    # the boundary hangs, and the larger list truncated below it does not.
-    #
-    # This helper takes the WHOLE tracked-file listing, which was 65028 bytes here when
-    # that was measured. Five hundred bytes of new files was the entire margin, so the
-    # next few additions would have hung every tracked-file enumerator on Windows and
-    # nowhere else. A pipe's reader runs CONCURRENTLY and drains it, so no size deadlocks;
-    # `grep`'s own status is still what `$?` reports, which a `producer | grep` would lose.
-    selected="$(grep -E ${1:+"$1"} -- "$pattern" < <(printf '%s\n' "$3"))" || status=$?
+    # Through `pipe_lines_into`, never a herestring: Git Bash's bash implements `<<<` with a
+    # PIPE and writes the whole string before it starts the reader, so an operand of 65536
+    # bytes or more deadlocks -- measured on bash 5.2.37 to the byte, 65535 completes, 65536
+    # hangs, deterministic 5/5 -- and it is SIZE, not content. This helper takes the WHOLE
+    # tracked-file listing, which was 65028 bytes here when that was measured. Nor process
+    # substitution, which made grep the writer's parent (`pipe_lines_into` says why that
+    # matters). A pipe's reader drains it concurrently, so no size deadlocks, and the helper
+    # answers with grep's own status.
+    selected="$(pipe_lines_into "$3"$'\n' grep -E ${1:+"$1"} -- "$pattern")" || status=$?
     # grep answers 1 for "selected nothing", which is an answer; anything above it is
     # the instrument failing, and must not read as an empty selection. And it SAYS so:
     # a grep killed by a signal prints nothing, and this was the one refusal on the path

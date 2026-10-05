@@ -997,9 +997,9 @@ what differs between compilers, standard libraries, hosts and tool versions.
   unique" both fire — and a generator that produced nothing fails rather than reporting success.
   Report what changed, not that the script finished.
 - Its mirror on the other side of the same pipe: **a `<<<` operand of 64 KiB or more
-  DEADLOCKS on Git Bash** — bash writes a herestring into a PIPE in full before starting the
-  reader. Measured to the byte, and it is SIZE rather than content, so feed a LISTING through
-  `< <(printf '%s\n' "$x")`. Master's tracked-file list sat 508 bytes short (#1591).
+  DEADLOCKS on Git Bash** (#1591), SIZE not content. Feed an external filter through
+  `pipe_lines_into` (two inputs: `pipe_pair_into`), a pipe answering with the FILTER's status —
+  never a `<(...)`, stdin OR argument: it makes the filter the writer's PARENT, killed twice (#1630).
 - `producer | grep -q` is a false **negative** under `set -o pipefail`, and it fails on the
   SUCCESS path; it is a SCAN in `check-e2e-helpers.sh`, since a rule stated in the files that obey
   it reaches no file that does not. The remedy is a HERESTRING, which is not a pipe.
