@@ -16,8 +16,13 @@ namespace
 /// Every observation, so a case can walk the enum rather than list what somebody
 /// remembered. `Last` is the length and is not one of them.
 constexpr FetchObservation AllObservations[] = {
-    FetchObservation::NotServing, FetchObservation::Miss,        FetchObservation::HitUndecodable,
-    FetchObservation::HitServed,  FetchObservation::HitUnusable, FetchObservation::HitStale,
+    FetchObservation::NotServing,
+    FetchObservation::Miss,
+    FetchObservation::HitUndecodable,
+    FetchObservation::HitServed,
+    FetchObservation::HitObjectUnwritable,
+    FetchObservation::HitDepFileUnwritable,
+    FetchObservation::HitStale,
 };
 
 static_assert(std::size(AllObservations) == static_cast<std::size_t>(FetchObservation::Last),
@@ -68,10 +73,12 @@ TEST_CASE("a served hit is the only observation that compiles nothing", "[cache-
 
 // The only state that must NOT store, and the reason it is one state rather than
 // being folded in with the others: a machine that could not write the object will
-// not be able to write a store either.
-TEST_CASE("an unusable hit compiles without storing", "[cache-decision]")
+// not be able to write a store either. A depfile this build's own location refused
+// says nothing against the cache, so that one compiles as a miss would.
+TEST_CASE("an unwritable object compiles without storing; an unwritable depfile compiles as a miss", "[cache-decision]")
 {
-    CHECK(DecideCacheAction(FetchObservation::HitUnusable) == CacheAction::CompileWithoutStoring);
+    CHECK(DecideCacheAction(FetchObservation::HitObjectUnwritable) == CacheAction::CompileWithoutStoring);
+    CHECK(DecideCacheAction(FetchObservation::HitDepFileUnwritable) == CacheAction::CompileAndStore);
     CHECK(CompilesForReal(CacheAction::CompileWithoutStoring));
     CHECK_FALSE(StoresResult(CacheAction::CompileWithoutStoring));
 }
@@ -133,13 +140,13 @@ TEST_CASE("a non-serving exchange is NotServing whatever else is true", "[cache-
     for (auto const kind: { CacheOutcomeKind::Rejected, CacheOutcomeKind::Transport })
     {
         CHECK(ObserveFetch(kind, true, true, HitDisposition::Served) == FetchObservation::NotServing);
-        CHECK(ObserveFetch(kind, false, false, HitDisposition::Unusable) == FetchObservation::NotServing);
+        CHECK(ObserveFetch(kind, false, false, HitDisposition::ObjectUnwritable) == FetchObservation::NotServing);
     }
 }
 
 TEST_CASE("a serving exchange with no value is a miss", "[cache-decision]")
 {
-    CHECK(ObserveFetch(CacheOutcomeKind::Miss, false, false, HitDisposition::Unusable) == FetchObservation::Miss);
+    CHECK(ObserveFetch(CacheOutcomeKind::Miss, false, false, HitDisposition::ObjectUnwritable) == FetchObservation::Miss);
     // `decoded` and `disposition` are not read on a miss, so a caller passing
     // anything for them must still get Miss.
     CHECK(ObserveFetch(CacheOutcomeKind::Miss, false, true, HitDisposition::Served) == FetchObservation::Miss);
@@ -147,7 +154,7 @@ TEST_CASE("a serving exchange with no value is a miss", "[cache-decision]")
 
 TEST_CASE("a hit that did not decode is HitUndecodable whatever its disposition", "[cache-decision]")
 {
-    for (auto const disposition: { HitDisposition::Served, HitDisposition::Stale, HitDisposition::Unusable })
+    for (auto const disposition: { HitDisposition::Served, HitDisposition::Stale, HitDisposition::ObjectUnwritable })
         CHECK(ObserveFetch(CacheOutcomeKind::Hit, true, false, disposition) == FetchObservation::HitUndecodable);
 }
 
@@ -155,7 +162,21 @@ TEST_CASE("a decoded hit takes its state from the disposition", "[cache-decision
 {
     CHECK(ObserveFetch(CacheOutcomeKind::Hit, true, true, HitDisposition::Served) == FetchObservation::HitServed);
     CHECK(ObserveFetch(CacheOutcomeKind::Hit, true, true, HitDisposition::Stale) == FetchObservation::HitStale);
-    CHECK(ObserveFetch(CacheOutcomeKind::Hit, true, true, HitDisposition::Unusable) == FetchObservation::HitUnusable);
+    CHECK(ObserveFetch(CacheOutcomeKind::Hit, true, true, HitDisposition::ObjectUnwritable)
+          == FetchObservation::HitObjectUnwritable);
+    CHECK(ObserveFetch(CacheOutcomeKind::Hit, true, true, HitDisposition::DepFileUnwritable)
+          == FetchObservation::HitDepFileUnwritable);
+}
+
+TEST_CASE("a depfile that could not be written is reported as the depfile", "[cache-decision]")
+{
+    // The combined re-review's M3, measured: a depfile write that failed was reported as
+    // "the object could not be written here ... not usable on this machine" -- wrong in
+    // both halves. Each file has its own reason.
+    auto const depfile = CacheActionReason(FetchObservation::HitDepFileUnwritable);
+    CHECK(depfile.contains("depfile"));
+    CHECK_FALSE(depfile.contains("not usable on this machine"));
+    CHECK(CacheActionReason(FetchObservation::HitObjectUnwritable).contains("object could not be written"));
 }
 
 // The whole path, end to end, in the one arrangement the ticket is about: a daemon
@@ -165,7 +186,7 @@ TEST_CASE("the generation-bump path stores, from the raw facts", "[cache-decisio
     auto const observation = ObserveFetch(CacheOutcomeKind::Hit,
                                           /*isHit=*/true,
                                           /*decoded=*/false,
-                                          /*disposition=*/HitDisposition::Unusable);
+                                          /*disposition=*/HitDisposition::ObjectUnwritable);
 
     REQUIRE(observation == FetchObservation::HitUndecodable);
     CHECK(StoresResult(DecideCacheAction(observation)));

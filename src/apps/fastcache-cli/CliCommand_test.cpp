@@ -147,8 +147,8 @@ TEST_CASE("the help text sends an operator to fastcache-compile-node for what on
     REQUIRE(notes != std::string::npos);
     auto const tail = std::string_view { help }.substr(notes);
     CHECK(tail.contains("fastcache-compile-node"));
-    CHECK(tail.contains("--enroll-open"));
-    CHECK(tail.contains("--enroll-from"));
+    CHECK(tail.contains("--enroll-list"));
+    CHECK(tail.contains("--fleet-seed"));
     CHECK(tail.contains("--print-surfaces"));
     CHECK(tail.contains("--cluster-status"));
 }
@@ -587,7 +587,7 @@ TEST_CASE("a malformed address in the environment is refused, naming the variabl
 TEST_CASE("the credential comes from the environment", "[cli][command]")
 {
     auto const token = WithEnvironment("FASTCACHE_TOKEN", "s3cret");
-    CHECK(token.credential.secret == "s3cret");
+    CHECK(token.credential.secret.View() == "s3cret");
     CHECK(token.credential.Configured());
 
     auto const user = WithEnvironment("FASTCACHE_USER", "someone");
@@ -617,6 +617,26 @@ TEST_CASE("the dashboard credential is its own file, and no environment variable
     // No variable spells it: the environment's lesser route is not offered to a new secret.
     for (auto const& variable: CliEnvironment())
         CHECK_FALSE(variable.name.contains("DASHBOARD"));
+}
+
+TEST_CASE("The mint source is what --mint-from names, and the token stays with --addr", "[cli][command][ticket]")
+{
+    // Unset by default: the mint then goes to the dialled node's port, on loopback.
+    auto const plain = Parse({ "--addr=node.example.com:7000", "node-status" });
+    CHECK_FALSE(plain.mintFrom.Configured());
+    auto const plainCredentials = NodeCredentialsOf(plain);
+    CHECK(plainCredentials.mintFrom.port == 0);
+    // The token belongs to the endpoint `--addr` named, spelled as a dial compares it.
+    CHECK(plainCredentials.passwordFor == "node.example.com:7000");
+    CHECK(plainCredentials.password == &plain.credential);
+
+    auto const named = Parse({ "--mint-from=127.0.0.1:7700", "node-status" });
+    CHECK(named.mintFrom.host == "127.0.0.1");
+    CHECK(named.mintFrom.port == 7700);
+    CHECK(NodeCredentialsOf(named).mintFrom.port == 7700);
+
+    // A bare port names no machine, as for `--addr`.
+    CHECK(Parse({ "--mint-from=7700", "node-status" }).action == Action::UsageError);
 }
 
 TEST_CASE("the admin address is unset by default and says so", "[cli][command]")

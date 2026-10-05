@@ -137,9 +137,9 @@ lapses.** Everything below follows from that.
   one `0xFC` wire version, so the moment one end moves every peer on the old version is
   refused. Upgrading is a flag day: stop everything, upgrade every node *and every
   client*, start again. A mismatch never fails a build — the launcher treats an unusable
-  cache as a miss — so the cost is silent, and the only signal is server-side counters.
-  The procedure and the counters to watch are in
-  [Upgrading a fleet](upgrading-a-fleet.md).
+  cache as a miss — so the cost is quiet: the counted signal is server-side, and what a
+  client says about it is said on its own machine, not yours. The procedure and what to
+  watch are in [Upgrading a fleet](upgrading-a-fleet.md).
 
 See also [Compatibility with upstream](../protocols/compatibility-with-upstream.md)
 for a per-protocol completeness scorecard.

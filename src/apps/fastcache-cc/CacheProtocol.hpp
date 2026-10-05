@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -48,6 +50,9 @@ enum class CacheOutcomeKind : std::uint8_t
 /// It matters more since #223 made the compile budget minutes long, and more again
 /// now that keepalive answers a dead host in seconds: without a name for what
 /// happened, the improvement is invisible -- the same non-answer, sooner.
+///
+/// PRIVATE to this process: never transmitted and never persisted, so no enumerator
+/// carries an explicit value.
 enum class TransportFailure : std::uint8_t
 {
     /// No transport failure; the exchange completed. The default, because a
@@ -86,31 +91,81 @@ enum class TransportFailure : std::uint8_t
     /// its appearance is itself information: this worker said it would keep talking and
     /// then did not.
     Silent,
+    /// The enumerator count, so `TransportFailureTable` takes its extent from the enum.
+    /// Never a failure an outcome carries.
+    Last,
 };
 
-/// A phrase naming @p failure, for the sentence a fall-back is recorded under.
+/// What one `TransportFailure` says, to an operator and to the reachability memo.
+struct TransportFailureRow
+{
+    TransportFailure failure; ///< The failure this row describes.
+    /// The phrase a fall-back is recorded under; never empty.
+    std::string_view phrase;
+    /// Whether the peer is to be remembered as UNREACHABLE -- excluded from the next
+    /// leases, or not dialled again for a while.
+    ///
+    /// True for exactly the failure where no connection was ever made. Every other
+    /// row reached a live peer: a peer that broke mid-exchange, outran its budget or
+    /// went quiet is a machine that is UP, and remembering it as down would steer
+    /// the fleet away from a worker whose only fault was one slow compile. So the
+    /// memo errs NARROW: a missed entry costs one more dial, a wrong one costs every
+    /// launcher a working machine for a whole TTL.
+    bool marksUnreachable;
+};
+
+/// One row per `TransportFailure`: its phrase, and whether it marks the peer unreachable.
 ///
-/// A table rather than a `switch` at the one call site that needs it today: the
-/// next consumer -- `--show-stats`, a log line -- must say the same words, and two
-/// places spelling one taxonomy is how they drift.
+/// A table rather than a `switch` at the call sites: the phrase has two readers (the
+/// dispatch sentence and the enrollment client) and the verdict two (the lease leg's
+/// scheduler and the compile leg's worker), and two places spelling one taxonomy is
+/// how they drift. Every outcome that COMPLETED an exchange -- a compile that ran,
+/// failing or not, a job the worker refused, a lease the scheduler declined -- is
+/// `None`, and so is never a reason to remember anybody.
+inline constexpr EnumTable<TransportFailure, TransportFailureRow> TransportFailureTable { {
+    { .failure = TransportFailure::None, .phrase = "completed", .marksUnreachable = false },
+    { .failure = TransportFailure::Unreached, .phrase = "could not be reached", .marksUnreachable = true },
+    { .failure = TransportFailure::PeerLost, .phrase = "went away mid-exchange", .marksUnreachable = false },
+    { .failure = TransportFailure::Expired, .phrase = "ran out of budget", .marksUnreachable = false },
+    { .failure = TransportFailure::Silent, .phrase = "stopped reporting progress", .marksUnreachable = false },
+} };
+
+static_assert(RowsInEnumeratorOrder(TransportFailureTable, &TransportFailureRow::failure),
+              "TransportFailureTable must hold one row per TransportFailure, in order");
+
+/// What a value past the table answers: `Last`, or a cast from outside the enum.
+///
+/// It keeps the phrase the `switch` this table replaced fell back to, so an operator
+/// still reads a sentence. Its verdict is NOT `Unreached`'s, because the memo errs
+/// NARROW: a value nobody classified is no evidence that a peer is down, and treating
+/// it as such would steer every launcher off a machine for a whole TTL.
+inline constexpr TransportFailureRow UnclassifiedTransportFailure { .failure = TransportFailure::Last,
+                                                                    .phrase = "could not be reached",
+                                                                    .marksUnreachable = false };
+
+/// The row for @p failure, or `UnclassifiedTransportFailure` for a value past the table.
+/// @param failure What went wrong.
+/// @return Its row.
+[[nodiscard]] constexpr TransportFailureRow const& TransportFailureRowOf(TransportFailure failure) noexcept
+{
+    auto const index = static_cast<std::size_t>(failure);
+    return index < EnumeratorCount<TransportFailure> ? TransportFailureTable[index] : UnclassifiedTransportFailure;
+}
+
+/// A phrase naming @p failure, for the sentence a fall-back is recorded under.
 /// @param failure What went wrong.
 /// @return A phrase, always non-empty, so a caller never has to handle a gap.
 [[nodiscard]] constexpr std::string_view DescribeTransportFailure(TransportFailure failure) noexcept
 {
-    switch (failure)
-    {
-        case TransportFailure::None:
-            return "completed";
-        case TransportFailure::Unreached:
-            return "could not be reached";
-        case TransportFailure::PeerLost:
-            return "went away mid-exchange";
-        case TransportFailure::Expired:
-            return "ran out of budget";
-        case TransportFailure::Silent:
-            return "stopped reporting progress";
-    }
-    return "could not be reached";
+    return TransportFailureRowOf(failure).phrase;
+}
+
+/// Whether @p failure means the peer is to be remembered as unreachable.
+/// @param failure How an exchange with that peer ended.
+/// @return True only when no connection was ever made; see `TransportFailureRow`.
+[[nodiscard]] constexpr bool MarksUnreachable(TransportFailure failure) noexcept
+{
+    return TransportFailureRowOf(failure).marksUnreachable;
 }
 
 /// The result of one FETCH or STORE.
@@ -263,10 +318,16 @@ class CredentialNotice
 /// then sends exactly the bytes it always did. That is what keeps a launcher that
 /// has never heard of authentication byte-compatible on the wire with one that
 /// has: the AUTH frame exists only when there is something to put in it.
+///
+/// Two kinds, and the KIND travels: a password for a `fastcached --requirepass` cache, and a
+/// machine ticket minted by this machine's node (`TicketCredentials`). The secret is a
+/// `SecureString` either way; where it lands on its way out -- `Wire::AuthRequest`'s views and the
+/// encoded AUTH frame -- is the stated boundary `check-credential-containers.sh` names.
 struct Credential
 {
-    std::string username; ///< Empty selects the default user (the `requirepass` form).
-    std::string secret;   ///< Empty means no credential is configured.
+    CompileCacheWire::AuthKind kind { CompileCacheWire::AuthKind::Password }; ///< Which credential `secret` is.
+    std::string username; ///< Password kind only; empty selects the default user (the `requirepass` form).
+    SecureString secret;  ///< The password, or the machine ticket's bytes; empty means none is configured.
 
     /// @return True when a credential should be presented.
     [[nodiscard]] bool Configured() const noexcept
@@ -482,26 +543,38 @@ struct ExchangeBudget
 /// `Unauthenticated`), because that is the answer the caller acts on; the AUTH
 /// reply is consumed first so the two never desynchronise.
 ///
+/// **One client for both upstream kinds**: @p verbs picks which pair frames the request, so a
+/// daemon or a node's private tier is asked FETCH and the fleet's shared cache SHARED-FETCH by the
+/// same code. The default is the daemon's pair, which is what every caller sent before the
+/// parameter existed.
+///
 /// @param client Connected transport; not owned.
 /// @param key The key to look up.
 /// @param credential Credential to present; default-constructed sends none.
+/// @param verbs The verb pair the upstream answers; its fetch verb frames the request.
 /// @return The outcome; `value` holds the stored bytes on a hit.
-[[nodiscard]] core::async::Task<CacheOutcome> CacheFetch(core::net::ISocket* client,
-                                                         CredentialNotice* notice,
-                                                         std::string_view key,
-                                                         Credential credential = {});
+[[nodiscard]] core::async::Task<CacheOutcome> CacheFetch(
+    core::net::ISocket* client,
+    CredentialNotice* notice,
+    std::string_view key,
+    Credential credential = {},
+    CompileCacheWire::CacheVerbs verbs = CompileCacheWire::DaemonCacheVerbs);
 
 /// STORE one entry over an already-connected client.
 ///
-/// Pipelines AUTH the same way `CacheFetch` does, for the same reason.
+/// Pipelines AUTH the same way `CacheFetch` does, for the same reason, and takes the verb pair
+/// for its reason too.
 /// @param client Connected transport; not owned.
 /// @param request The fields to send.
 /// @param credential Credential to present; default-constructed sends none.
+/// @param verbs The verb pair the upstream answers; its store verb frames the request.
 /// @return The outcome; `kind == Hit` means the daemon acknowledged the write.
-[[nodiscard]] core::async::Task<CacheOutcome> CacheStore(core::net::ISocket* client,
-                                                         CredentialNotice* notice,
-                                                         CompileCacheWire::StoreRequest request,
-                                                         Credential credential = {});
+[[nodiscard]] core::async::Task<CacheOutcome> CacheStore(
+    core::net::ISocket* client,
+    CredentialNotice* notice,
+    CompileCacheWire::StoreRequest request,
+    Credential credential = {},
+    CompileCacheWire::CacheVerbs verbs = CompileCacheWire::DaemonCacheVerbs);
 
 /// Default ceiling on a value the launcher will offer to the daemon.
 ///

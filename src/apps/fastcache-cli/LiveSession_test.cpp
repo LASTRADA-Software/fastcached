@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -40,6 +41,7 @@
 #include <core/net/PlatformLoop.hpp>
 #include <core/net/testing/TestLoop.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/SteppedDrainWait.hpp>
 
 #if !defined(_WIN32)
     #include <csignal>
@@ -48,6 +50,7 @@
 using namespace FastCache;
 using namespace FastCache::Cli;
 using namespace FastCache::Cli::Testing;
+using FastCache::Testing::SteppedDrainWait;
 
 namespace
 {
@@ -497,47 +500,6 @@ void StepReads(Rig& rig, ScriptedSubscription const& subscription, std::size_t r
 constexpr auto SixelTerminal = TerminalCapabilities { .sixel = SixelAnswer::Advertised,
                                                       .encoding = TerminalTextEncoding::Utf8,
                                                       .cellPixels = CellPixelSize { .width = 10, .height = 20 } };
-
-/// A drain wait whose time passes only when the drain sleeps, and which can let the rig run
-/// after a chosen number of sleeps -- so a source drains for real, mid-drain.
-///
-/// **No real time passes**: the drain's ceiling is measured on this clock, so a five-second
-/// ceiling costs a loop of five hundred iterations and nothing else.
-class SteppedDrainWait final: public IDrainWait
-{
-  public:
-    /// @param settle The rig to settle after @p settleAfter sleeps; null to settle nothing.
-    /// @param settleAfter How many sleeps pass before it is.
-    explicit SteppedDrainWait(Rig* settle = nullptr, int settleAfter = 0) noexcept:
-        _settle { settle },
-        _settleAfter { settleAfter }
-    {
-    }
-
-    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
-    {
-        return _now;
-    }
-
-    void Sleep(std::chrono::milliseconds requested) noexcept override
-    {
-        _now += requested;
-        ++_sleeps;
-        if (_settle != nullptr && _sleeps == _settleAfter)
-            _settle->Settle();
-    }
-
-    [[nodiscard]] int Sleeps() const noexcept
-    {
-        return _sleeps;
-    }
-
-  private:
-    Rig* _settle;
-    int _settleAfter;
-    core::platform::SteadyTimePoint _now {};
-    int _sleeps { 0 };
-};
 
 /// The bound every drain case uses.
 constexpr auto Bound = DrainBound { .ceiling = std::chrono::seconds { 5 }, .poll = std::chrono::milliseconds { 10 } };
@@ -1273,7 +1235,12 @@ TEST_CASE("a dial that returns inside the bound drains and abandons nothing", "[
     rig.reactor.drain();
     source.Close();
 
-    auto wait = SteppedDrainWait { &rig, 3 };
+    // The rig settles on the third poll: a source that drains for real, mid-drain. The hook runs
+    // after each poll is counted, so its own call count is the poll count.
+    auto wait = SteppedDrainWait { [&rig, polls = 0]() mutable {
+        if (++polls == 3)
+            rig.Settle();
+    } };
     CHECK_FALSE(DrainSession(source, Bound, wait).has_value());
     CHECK(wait.Sleeps() == 3);
     CHECK(rig.subscription.Opens() == 1);
@@ -1351,18 +1318,19 @@ class StopOnDemandInstaller final: public IStopSignalInstaller
     std::atomic<bool> _pressedUnarmed { false };
 };
 
-/// A subscription whose dial presses Ctrl-C and then waits for the case to open a gate: a dial that is
-/// out when the operator stops, for as long as the case says. Past the gate it streams the rig's stream.
+/// A subscription whose dial ends the session -- presses Ctrl-C, or sends the terminal away -- and then
+/// waits for the case to open a gate: a dial that is out when the session ends, for as long as the case
+/// says. Past the gate it streams the rig's stream.
 ///
-/// Pressed FROM the dial so the order is fixed rather than raced: the stop cannot arrive before the dial
-/// is out. And leaving it releases nothing, as a node that never answers the goodbye does not: only the
-/// gate returns the dial.
+/// The ending is caused FROM the dial so the order is fixed rather than raced: it cannot arrive before
+/// the dial is out. And leaving it releases nothing, as a node that never answers the goodbye does not:
+/// only the gate returns the dial.
 class GatedSubscription final: public ILiveSubscription
 {
   public:
-    /// @param stop What the dial presses, or null for a dial that only waits.
-    explicit GatedSubscription(StopOnDemandInstaller* stop) noexcept:
-        _stop { stop }
+    /// @param endSession What the first dial does to end the session before it waits; empty for none.
+    explicit GatedSubscription(std::function<void()> endSession) noexcept:
+        _endSession { std::move(endSession) }
     {
     }
 
@@ -1370,8 +1338,8 @@ class GatedSubscription final: public ILiveSubscription
                                                           CompileCacheWire::SubscribeRequest const& request) override
     {
         ++_calls;
-        if (_stop != nullptr && !_pressed.exchange(true))
-            _stop->Press();
+        if (_endSession && !_ended.exchange(true))
+            _endSession();
         _gate.acquire();
         return _stream.Open(where, request);
     }
@@ -1408,8 +1376,8 @@ class GatedSubscription final: public ILiveSubscription
   private:
     static constexpr auto GateWidth = 64;
     std::atomic<int> _calls { 0 };
-    StopOnDemandInstaller* _stop;
-    std::atomic<bool> _pressed { false };
+    std::function<void()> _endSession;
+    std::atomic<bool> _ended { false };
     std::counting_semaphore<GateWidth> _gate { 0 };
     std::atomic<bool> _opened { false };
     ScriptedSubscription _stream { { CacheStream({ ReadingOpened(1) }) } };
@@ -1590,9 +1558,16 @@ struct RunningSeat
     ThreadDrainWait drainWait;
     /// Three readings on one stream, so a budget of up to three is met with no gap between them.
     ScriptedSubscription subscription { { CacheStream({ ReadingOpened(1), ReadingOpened(2), ReadingOpened(3) }) } };
-    GatedSubscription gated { &onDemand };
-    GatedSubscription stuck { nullptr };
-    ScriptedAcquisition acquiring { reactor, SixelTerminal, true };
+    /// Presses Ctrl-C from its dial.
+    GatedSubscription gated { [this] { onDemand.Press(); } };
+    /// Sends `acquiring`'s terminal away from its dial. That terminal is acquired before the source
+    /// that dials exists, and the dial is reached through the pool's queue, so it is there to send.
+    GatedSubscription stuck { [this] {
+        if (auto* const spoken = acquiring.Spoken(); spoken != nullptr)
+            spoken->GoAway();
+    } };
+    /// A terminal that stays until something sends it away: `stuck`'s dial, in the case that uses both.
+    ScriptedAcquisition acquiring { reactor, SixelTerminal, false };
     std::optional<LiveEventSource> source;
     std::jthread thread;
 };
@@ -1725,6 +1700,11 @@ TEST_CASE("an interactive live-stats session abandoned with a dial stuck hands m
     // bound. The events are not destroyed on this ending -- the process ends without unwinding --
     // so the restore handle is the only thing that can leave raw mode and the alternate screen, and
     // the session hands it over uncalled: calling it is `main`'s, first, before any output.
+    //
+    // The terminal is sent away FROM the dial, as the Ctrl-C case presses from it. It used to go
+    // away at acquisition, before the source that dials existed, which left "the dial is out" to
+    // the pool thread winning a race with the 50 ms drain -- lost twice in sixty loaded runs of the
+    // suite, as `stuck.Calls() == 0` beside an ending that was still `Abandoned`.
     auto seat = RunningSeat { RenderOptions { .format = OutputFormat::Human }, true };
     seat.terminalsOverride = &seat.acquiring;
     seat.subscriptionOverride = &seat.stuck;

@@ -178,9 +178,11 @@ TEST_CASE("A machine somebody else is using withdraws that capacity", "[distribu
     static_assert(registered == 14);
 
     // Half the machine busy, nothing of it ours: eight of the sixteen cores are
-    // somebody else's, so eight come off the fourteen it registered with.
+    // somebody else's, which leaves eight idle -- fewer than the fourteen it
+    // registered with, so eight. Not six: the two reserved cores are part of the
+    // eight the owner is using, and are not held back a second time.
     constexpr auto busy = WithCpu(0, 500);
-    CHECK(AvailableSlots(desk, registered, busy) == 6);
+    CHECK(AvailableSlots(desk, registered, busy) == 8);
 
     // An idle machine keeps everything it registered with. Zero is a measurement,
     // not an absence, and must not be treated as one.
@@ -223,6 +225,113 @@ TEST_CASE("A saturated machine withdraws entirely, and may reach zero", "[distri
     constexpr auto hammered = WithCpu(0, 1000);
 
     CHECK(AvailableSlots(desk, OfferableSlots(desk, std::nullopt), hammered) == 0);
+}
+
+TEST_CASE("The CPU ceiling charges only the external cores beyond the headroom the slots leave",
+          "[distributed][nodepolicy][slotlimit]")
+{
+    // Slots are the share of a machine the fleet may have. Subtracting ALL of somebody
+    // else's cores from that share charged the whole of their work against it: every
+    // developer PC in an office fleet is busy with its own work, and under that
+    // arithmetic a PC offering a few slots was withdrawn the moment its owner used as
+    // many cores as it offered, however many sat idle. Capping at the idle cores
+    // instead broke the other end, oversubscription, so both ends are pinned here.
+    constexpr NodeCapacity desk { .logicalCores = 32 };
+
+    SECTION("a few slots on a big machine survive light use by its owner")
+    {
+        // 125 permille of 32 cores is 4 busy, none ours: 28 idle, capped at the 4
+        // slots offered. The old `slots - external` gave 4 - 4 = 0.
+        constexpr auto ceilings = SlotCeilingsFor(desk, 4, WithCpu(0, 125));
+        STATIC_REQUIRE(ceilings.byExternalCpu == 4U);
+        STATIC_REQUIRE(ceilings.available == 4);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Registered);
+    }
+
+    SECTION("the same slots give way only once the owner reaches into them")
+    {
+        // 937 permille is 29 busy: 3 idle, below the 4 offered, so the CPU binds.
+        constexpr auto ceilings = SlotCeilingsFor(desk, 4, WithCpu(0, 937));
+        STATIC_REQUIRE(ceilings.byExternalCpu == 3U);
+        STATIC_REQUIRE(ceilings.available == 3);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::ExternalCpu);
+    }
+
+    SECTION("an owner using exactly the reserved cores costs the fleet nothing")
+    {
+        // `--reserve-cores=4` registers 28 of 32. The owner using 4 cores (125
+        // permille) is using what the reserve holds back, so all 28 stay. The old
+        // arithmetic spent the reserve twice and offered 24.
+        constexpr NodeCapacity reserving { .logicalCores = 32, .reservedCores = 4, .reserveIsExplicit = true };
+        constexpr auto registered = OfferableSlots(reserving, std::nullopt);
+        STATIC_REQUIRE(registered == 28);
+        constexpr auto ceilings = SlotCeilingsFor(reserving, registered, WithCpu(0, 125));
+        STATIC_REQUIRE(ceilings.byExternalCpu == 28U);
+        STATIC_REQUIRE(ceilings.available == 28);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Registered);
+    }
+
+    SECTION("an oversubscribed machine keeps every slot it was promised while it is idle")
+    {
+        // `--slots=64` on 16 cores is the operator's promise, and `OfferableSlots`
+        // takes it untouched. Capping at the idle cores gave 16 here, named
+        // `external-cpu` on a machine nobody else was touching.
+        constexpr NodeCapacity sixteen { .logicalCores = 16 };
+        constexpr auto ceilings = SlotCeilingsFor(sixteen, 64, WithCpu(0, 0));
+        STATIC_REQUIRE(ceilings.byExternalCpu == 64U);
+        STATIC_REQUIRE(ceilings.available == 64);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::Registered);
+    }
+
+    SECTION("and gives up one slot per external core, having no headroom to absorb them")
+    {
+        // 500 permille of 16 cores is 8 busy, none ours: 64 - 8 = 56.
+        constexpr NodeCapacity sixteen { .logicalCores = 16 };
+        constexpr auto ceilings = SlotCeilingsFor(sixteen, 64, WithCpu(0, 500));
+        STATIC_REQUIRE(ceilings.byExternalCpu == 56U);
+        STATIC_REQUIRE(ceilings.available == 56);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::ExternalCpu);
+    }
+
+    SECTION("one slot above the cores survives a machine every core of which is somebody else's")
+    {
+        // The premise the dist-compile fixtures size their worker on: there are at most
+        // `logicalCores` external cores, so `--slots` one above the core count can lose all
+        // but one of them to a saturated host and never the last. At the core count exactly,
+        // which is what the fixtures offered before, the same host takes every slot.
+        constexpr NodeCapacity sixteen { .logicalCores = 16 };
+        constexpr auto oneAbove = SlotCeilingsFor(sixteen, 17, WithCpu(0, 1000));
+        STATIC_REQUIRE(oneAbove.byExternalCpu == 1U);
+        STATIC_REQUIRE(oneAbove.available == 1);
+        STATIC_REQUIRE(oneAbove.binding == SlotLimit::ExternalCpu);
+        constexpr auto atTheCores = SlotCeilingsFor(sixteen, 16, WithCpu(0, 1000));
+        STATIC_REQUIRE(atTheCores.byExternalCpu == 0U);
+        STATIC_REQUIRE(atTheCores.available == 0);
+    }
+
+    SECTION("a machine that reported no cores is scheduled as one core, idle or busy")
+    {
+        // Zero cores is "did not say", counted as one, so 8 slots are already
+        // oversubscribed: idle keeps all 8 (a cap at the idle cores gave 1, named
+        // `external-cpu`), and a fully busy core costs one of them.
+        constexpr NodeCapacity silent {};
+        constexpr auto idle = SlotCeilingsFor(silent, 8, WithCpu(0, 0));
+        STATIC_REQUIRE(idle.available == 8);
+        STATIC_REQUIRE(idle.binding == SlotLimit::Registered);
+        constexpr auto busy = SlotCeilingsFor(silent, 8, WithCpu(0, 1000));
+        STATIC_REQUIRE(busy.available == 7);
+        STATIC_REQUIRE(busy.binding == SlotLimit::ExternalCpu);
+    }
+
+    SECTION("no idle core is still no slot")
+    {
+        // The saturated host: 1000 permille leaves nothing idle, so even one slot
+        // offered on 32 cores is withdrawn -- which is the rule working, not failing.
+        constexpr auto ceilings = SlotCeilingsFor(desk, 1, WithCpu(0, 1000));
+        STATIC_REQUIRE(ceilings.byExternalCpu == 0U);
+        STATIC_REQUIRE(ceilings.available == 0);
+        STATIC_REQUIRE(ceilings.binding == SlotLimit::ExternalCpu);
+    }
 }
 
 TEST_CASE("A worker whose scratch disk has filled stops being offered work", "[distributed][nodepolicy]")
@@ -307,12 +416,12 @@ TEST_CASE("Naming the limit that withdrew a machine's slots", "[distributed][nod
 
     SECTION("somebody else is using the machine")
     {
-        // 500 permille of 32 cores is 16 busy, less the 2 this fleet runs = 14
-        // external, so 16 registered - 14 = 2.
-        constexpr auto ceilings = SlotCeilingsFor(machine, 16, WithCpu(2, 500));
+        // 970 permille of 32 cores is 31 busy, less the 2 this fleet runs = 29
+        // external, so 3 cores idle -- below the 16 registered, so 3.
+        constexpr auto ceilings = SlotCeilingsFor(machine, 16, WithCpu(2, 970));
         STATIC_REQUIRE(ceilings.binding == SlotLimit::ExternalCpu);
-        STATIC_REQUIRE(ceilings.available == 2);
-        STATIC_REQUIRE(ceilings.byExternalCpu == 2U);
+        STATIC_REQUIRE(ceilings.available == 3);
+        STATIC_REQUIRE(ceilings.byExternalCpu == 3U);
         STATIC_REQUIRE(!ceilings.byMemory.has_value());
     }
 
@@ -338,11 +447,11 @@ TEST_CASE("Naming the limit that withdrew a machine's slots", "[distributed][nod
     SECTION("the lowest of several ceilings binds, and each is still reported")
     {
         constexpr NodeLoad crowded { .inFlight = 1,
-                                     .cpuBusyPermille = 250,             // 8 busy - 1 ours = 7 external -> 9
+                                     .cpuBusyPermille = 660,             // 21 busy - 1 ours = 20 external -> 12 idle
                                      .availableMemoryBytes = 7ULL << 30, // 7 + 1 = 8
                                      .freeScratchBytes = 384ULL << 20 }; // 3 + 1 = 4
         constexpr auto ceilings = SlotCeilingsFor(machine, 16, crowded);
-        STATIC_REQUIRE(ceilings.byExternalCpu == 9U);
+        STATIC_REQUIRE(ceilings.byExternalCpu == 12U);
         STATIC_REQUIRE(ceilings.byMemory == 8U);
         STATIC_REQUIRE(ceilings.byScratch == 4U);
         STATIC_REQUIRE(ceilings.available == 4);

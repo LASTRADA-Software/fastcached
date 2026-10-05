@@ -23,6 +23,7 @@
 #include <functional>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -32,6 +33,7 @@
 #include <vector>
 
 #include <core/async/SyncRun.hpp>
+#include <tests/CompileReplyFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
@@ -270,8 +272,30 @@ constexpr std::uint64_t GrantTerm = 4;
     // REGISTER reply said, so a validator built for a test has to be told the same way
     // a production one is. A case that wants the UNREGISTERED worker leaves it unpinned.
     lease.fleet.Pin(std::string { ThisCluster });
-    return SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics, slack);
+    return SignedLeaseValidator(TestRoster(), endpoint, {}, LeaseClock, lease, metrics, slack);
 }
+
+/// Remembers every refusal it is told of, in order; safe from the pool threads a worker runs on.
+class RecordingRefusals final: public IJobRefusalObserver
+{
+  public:
+    void OnJobRefused(JobError const& error) override
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        _seen.push_back(error);
+    }
+
+    /// @return What was reported so far.
+    [[nodiscard]] std::vector<JobError> Seen() const
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        return _seen;
+    }
+
+  private:
+    mutable std::mutex _mutex;
+    std::vector<JobError> _seen;
+};
 
 struct Fixture
 {
@@ -294,6 +318,10 @@ struct Fixture
     /// a rule somebody remembers is what keeps the borrow alive.
     MovingEndpoint endpoint { ThisWorker };
 
+    /// Every job the runner refused, as the worker reported it -- declared before `worker`, which
+    /// borrows it, for `lease`'s reason.
+    RecordingRefusals refusals;
+
     WorkerProtocol worker;
 
     /// @param codecs What this worker can produce and decode; the production node
@@ -308,7 +336,12 @@ struct Fixture
                      LeasePolicy policy = LeasePolicy::Unchecked,
                      std::chrono::seconds slack = Distributed::LeaseTokenClockSkewSlack):
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
-        worker { jobs, MakeLeaseValidator(policy, lease, endpoint, metrics, slack), std::move(codecs), metrics }
+        worker { jobs,
+                 MakeLeaseValidator(policy, lease, endpoint, metrics, slack),
+                 std::move(codecs),
+                 &Testing::TestWorkerKey(),
+                 metrics,
+                 refusals }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -703,7 +736,10 @@ TEST_CASE("The envelope ceiling is the surface's own, not a figure this class as
     CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
     AtomicMetricsSink metrics;
     constexpr std::size_t TinyCap = 8;
-    WorkerProtocol worker { jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, TinyCap };
+    WorkerProtocol worker {
+        jobs,   UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(), metrics, IgnoreJobRefusals(),
+        TinyCap
+    };
 
     // Well under the default ceiling, and over this worker's.
     auto const answer = worker.Answer(CompileFrame("gcc-13", "int main(){return 0;}"));
@@ -1733,7 +1769,7 @@ namespace
 /// A registrar with the fields every case below shares.
 [[nodiscard]] WorkerRegistrar MakeRegistrar()
 {
-    return WorkerRegistrar { Unwatched(), "gcc-14", "10.0.0.2:6677", 4, Wire::CodecList {}, Wire::CapacityFields {} };
+    return WorkerRegistrar { "gcc-14", "10.0.0.2:6677", 4, Wire::CodecList {}, Wire::CapacityFields {} };
 }
 
 /// A successful REGISTER reply, in the shape wire version 4 gives it.
@@ -1766,7 +1802,7 @@ TEST_CASE("A NotLeader refusal reaches the node as an endpoint, not as prose", "
     auto registrar = MakeRegistrar();
     Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") };
 
-    auto const outcome = registrar.Register(scheduler);
+    auto const outcome = registrar.Register(scheduler, {});
     REQUIRE_FALSE(outcome.has_value());
     REQUIRE(outcome.error().leader.has_value());
     CHECK(Unwrap(outcome.error().leader) == "10.0.0.7:6676");
@@ -1782,7 +1818,7 @@ TEST_CASE("A refusal that is not a redirect names no leader", "[cc][registrar][n
     auto registrar = MakeRegistrar();
     Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not in this cluster") };
 
-    auto const outcome = registrar.Register(scheduler);
+    auto const outcome = registrar.Register(scheduler, {});
     REQUIRE_FALSE(outcome.has_value());
     CHECK_FALSE(outcome.error().leader.has_value());
 }
@@ -1795,7 +1831,7 @@ TEST_CASE("A NotLeader whose message is prose is not a redirect", "[cc][registra
     auto registrar = MakeRegistrar();
     Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "no leader: try again") };
 
-    auto const outcome = registrar.Register(scheduler);
+    auto const outcome = registrar.Register(scheduler, {});
     REQUIRE_FALSE(outcome.has_value());
     CHECK_FALSE(outcome.error().leader.has_value());
 }
@@ -1813,7 +1849,7 @@ TEST_CASE("A heartbeat refused NotLeader keeps its worker id", "[cc][registrar][
     Testing::ScriptedSocket scheduler { Testing::Replies(
         { RegisterOk("w-1"), Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") }) };
 
-    REQUIRE(registrar.Register(scheduler).has_value());
+    REQUIRE(registrar.Register(scheduler, {}).has_value());
     REQUIRE(registrar.WorkerId() == "w-1");
 
     auto const beat = registrar.Heartbeat(scheduler, 0);
@@ -1843,7 +1879,7 @@ TEST_CASE("A withdrawal an older scheduler cannot answer is survivable", "[cc][r
     Testing::ScriptedSocket scheduler { Testing::Replies(
         { RegisterOk("w-1"), Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode, {}) }) };
 
-    REQUIRE(registrar.Register(scheduler).has_value());
+    REQUIRE(registrar.Register(scheduler, {}).has_value());
     REQUIRE(registrar.WorkerId() == "w-1");
 
     auto const retired = registrar.Withdraw(scheduler);
@@ -1868,13 +1904,89 @@ TEST_CASE("A registrar that never registered has nothing to withdraw", "[cc][reg
     CHECK(scheduler.Sent().empty());
 }
 
+namespace
+{
+
+/// The interface addresses the one REGISTER sent on @p scheduler carried.
+/// @param scheduler A socket a registrar has registered over once.
+/// @return The list, or nullopt when what was sent is not one REGISTER that decodes.
+[[nodiscard]] std::optional<std::vector<std::string>> RegisteredAddressesOn(Testing::ScriptedSocket const& scheduler)
+{
+    auto const sent = std::span<std::byte const> { scheduler.Sent() };
+    auto const header = Wire::DecodeRequestHeader(sent);
+    if (!header.has_value() || header->opRaw != static_cast<std::uint8_t>(Wire::Op::Register)
+        || sent.size() != Wire::RequestHeaderSize + std::size_t { header->payloadLength })
+        return std::nullopt;
+    auto const decoded = Wire::DecodeRegisterPayload(sent.subspan(Wire::RequestHeaderSize));
+    if (!decoded.has_value())
+        return std::nullopt;
+    return decoded->capacity.interfaceAddresses;
+}
+
+} // namespace
+
+TEST_CASE("A registration carries the addresses it is handed, and the next one does not inherit them",
+          "[cc][registrar][dialhint]")
+{
+    // The addresses are the round's and the capacity is the registrar's: a registrar that
+    // folded one round's list into its own capacity would re-register after a VPN reconnect
+    // still naming the address the machine no longer has.
+    auto registrar = MakeRegistrar();
+    auto const addresses = std::vector<std::string> { "10.8.0.7", "192.168.1.20" };
+
+    Testing::ScriptedSocket first { RegisterOk("w-1") };
+    REQUIRE(registrar.Register(first, addresses).has_value());
+    CHECK(RegisteredAddressesOn(first) == std::optional { addresses });
+
+    Testing::ScriptedSocket second { RegisterOk("w-1") };
+    REQUIRE(registrar.Register(second, {}).has_value());
+    CHECK(RegisteredAddressesOn(second) == std::optional { std::vector<std::string> {} });
+}
+
+TEST_CASE("A registration never carries a label a scheduler would refuse it for", "[cc][registrar][label]")
+{
+    // The registration twin of the lease's rule. A scheduler refuses the WHOLE registration over a
+    // label that is not text or is longer than it records, and the label is display only -- so
+    // sending it would keep this worker out of the fleet for a name. It goes out empty instead, and
+    // the worker registers under its fingerprint as before.
+    struct Case
+    {
+        std::string_view why;
+        std::string label;
+        std::string sent;
+    };
+    auto const atBound = std::string(Wire::MaxToolchainLabelBytes, 'x');
+    auto const cases = std::array {
+        Case { .why = "not text", .label = "g++ \xff 14.2.0", .sent = "" },
+        Case { .why = "over the bound", .label = atBound + "x", .sent = "" },
+        // The control, which a guard dropping every label would fail.
+        Case { .why = "at the bound", .label = atBound, .sent = atBound },
+    };
+
+    for (auto const& [why, label, sent]: cases)
+    {
+        INFO(why);
+        auto registrar = WorkerRegistrar {
+            "gcc-14", "10.0.0.2:6677", 4, Wire::CodecList {}, Wire::CapacityFields { .toolchainLabel = label }
+        };
+        Testing::ScriptedSocket scheduler { RegisterOk("w-1") };
+        REQUIRE(registrar.Register(scheduler, {}).has_value());
+
+        auto const& frame = scheduler.Sent();
+        REQUIRE(frame.size() >= Wire::RequestHeaderSize);
+        auto const registration = Wire::DecodeRegisterPayload(std::span { frame }.subspan(Wire::RequestHeaderSize));
+        REQUIRE(registration.has_value());
+        CHECK(Unwrap(registration).capacity.toolchainLabel == sent);
+    }
+}
+
 TEST_CASE("A heartbeat refused UnknownLease forgets its worker id and names no leader", "[cc][registrar][notleader]")
 {
     auto registrar = MakeRegistrar();
     Testing::ScriptedSocket scheduler { Testing::Replies(
         { RegisterOk("w-1"), Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}) }) };
 
-    REQUIRE(registrar.Register(scheduler).has_value());
+    REQUIRE(registrar.Register(scheduler, {}).has_value());
     auto const beat = registrar.Heartbeat(scheduler, 0);
     REQUIRE_FALSE(beat.has_value());
     CHECK_FALSE(beat.error().leader.has_value());
@@ -1982,7 +2094,8 @@ TEST_CASE("A reply carries the runner's own correlation, not one recomputed here
 
     LyingRunner runner { std::string { Sentinel } };
     AtomicMetricsSink metrics;
-    WorkerProtocol worker { runner, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
+    WorkerProtocol worker { runner,  UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+                            metrics, IgnoreJobRefusals() };
 
     auto const answer = worker.Answer(CompileFrame());
     REQUIRE(answer.has_value());
@@ -2009,7 +2122,8 @@ TEST_CASE("The real runner is what a correlation comes from", "[worker-protocol]
     FastCache::Testing::ScratchDirectory const scratch { "fc-wp-corr" };
     CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
     AtomicMetricsSink metrics;
-    WorkerProtocol worker { jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
+    WorkerProtocol worker { jobs,    UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+                            metrics, IgnoreJobRefusals() };
 
     constexpr std::string_view Source = "int main(){return 0;}";
     auto const answer = worker.Answer(CompileFrame("gcc-13", Source));
@@ -2163,10 +2277,14 @@ class LiveFleet final: public IEndpointExchange, public IFrameResponder
             return {};
         auto const* const descriptor = Wire::FindOp(header->opRaw);
         if (descriptor != nullptr && descriptor->code == Wire::Op::Lease)
-            return Wire::EncodeReply(Wire::Status::Ok,
-                                     Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = WorkerEndpoint,
-                                                                               .leaseToken = "l1",
-                                                                               .workerCodecs = { Wire::IdentityCodec } }));
+            return Wire::EncodeReply(
+                Wire::Status::Ok,
+                Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = WorkerEndpoint,
+                                                          .leaseToken = "l1",
+                                                          .workerCodecs = { Wire::IdentityCodec },
+                                                          .lifetime = {},
+                                                          .dialHint = {},
+                                                          .workerKey = Testing::TestWorkerPublicKey() }));
         // The RELEASE, which `Dispatch` sends on every path out of a compile and
         // whose answer it deliberately ignores.
         return Wire::EncodeReply(Wire::Status::Ok, {});
@@ -2201,6 +2319,7 @@ TEST_CASE("A worker's reply is accepted by the client that asked for it", "[work
                                            .fingerprint = "gcc-13",
                                            .objectKey = "objkey",
                                            .args = args,
+                                           .family = DriverFamily::Gnu,
                                            .preprocessed = "int main(){return 0;}",
                                            .sourceName = "/home/dev/checkout/src/Widget.cpp",
                                            .compileDir = {},
@@ -2214,6 +2333,69 @@ TEST_CASE("A worker's reply is accepted by the client that asked for it", "[work
     REQUIRE(result.status == DispatchStatus::Compiled);
     CHECK(result.exitCode == 0);
     CHECK_FALSE(result.object.empty());
+}
+
+TEST_CASE("A worker refusing an argument is read by the client as exactly that, naming it", "[worker-protocol][decline]")
+{
+    // Both ends, in one process, because the defect lived BETWEEN them: the worker answered a
+    // refused argument `malformed-frame`, each half was consistent with itself, and the launcher
+    // read that code as "this launcher and the fleet disagree about the wire" -- a version skew,
+    // reported 122 times by a cl-debug build whose client and node were one build. What the
+    // worker says and what the client makes of it are asserted against each other.
+    Fixture fixture { { Wire::IdentityCodec } };
+    LiveFleet fleet { fixture.worker };
+
+    std::vector<std::string> const args { "-O2", "-fanalyzer" };
+    auto const request = DispatchRequest { .schedulerEndpoint = SchedulerEndpoint,
+                                           .fingerprint = "gcc-13",
+                                           .objectKey = "objkey",
+                                           .args = args,
+                                           .family = DriverFamily::Gnu,
+                                           .preprocessed = "int main(){return 0;}",
+                                           .sourceName = "a.cpp",
+                                           .compileDir = {},
+                                           .compileDirReplacement = {},
+                                           .sourceRoot = {},
+                                           .sourceRootReplacement = {} };
+
+    auto const result = Dispatch(fleet, request);
+    INFO("dispatch said: " << result.detail);
+
+    // The worker's half: refused, counted under the argument row, and NOT as a frame fault.
+    REQUIRE(result.status == DispatchStatus::Declined);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedRejectedArgument) == 1);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::WorkerFramesRefusedMalformedPayload) == 0);
+    CHECK(result.detail.contains("worker-rejected-argument"));
+
+    // The client's half: WHICH decline. Not the protocol row, and not the one-machine row
+    // either -- every worker of this build refuses the same flag.
+    CHECK(result.decline == DeclineCause::ArgumentRefused);
+    CHECK(result.decline != DeclineCause::ProtocolMismatch);
+    CHECK(result.decline != DeclineCause::WorkerRefused);
+
+    // And the argument travels in the peer's words, without the endpoint `detail` wraps them in,
+    // which is what the invocation log records.
+    CHECK(result.refusal.contains("-fanalyzer"));
+    CHECK_FALSE(result.refusal.contains(WorkerEndpoint));
+
+    // And the node is told WHICH, beside the counter's how many: the argument alone, which is
+    // what it lists where an operator looks.
+    auto const seen = fixture.refusals.Seen();
+    REQUIRE(seen.size() == 1);
+    CHECK(seen.front().reason == JobRefusal::RejectedArgument);
+    CHECK(seen.front().subject == "-fanalyzer");
+}
+
+TEST_CASE("A refusal that names no argument reaches the observer with no subject", "[worker-protocol][decline]")
+{
+    // The observer is told of EVERY runner refusal, so a node that keys on the reason is not
+    // handed a fingerprint mismatch dressed as an argument.
+    Fixture fix;
+    REQUIRE(fix.worker.Answer(CompileFrame("clang-19")).has_value());
+    auto const seen = fix.refusals.Seen();
+    REQUIRE(seen.size() == 1);
+    CHECK(seen.front().reason == JobRefusal::UnknownFingerprint);
+    CHECK(seen.front().subject.empty());
 }
 
 TEST_CASE("A worker that has not registered honours no grant, however authentic", "[cc][lease][fleet]")
@@ -2240,7 +2422,7 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         // Deliberately NOT pinned: this is a worker whose first registration round has
         // not completed, which is every worker for the first moments of its life.
         MovingEndpoint const endpoint { ThisWorker };
-        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
+        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, {}, LeaseClock, lease, metrics);
 
         auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
         REQUIRE(refusal.has_value());
@@ -2256,21 +2438,21 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
         lease.fleet.Pin(std::string { ThisCluster });
         MovingEndpoint const endpoint { ThisWorker };
-        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
+        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, {}, LeaseClock, lease, metrics);
 
         CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").refusal.has_value());
     }
 
     SECTION("registered into a fleet that names none still compiles, and only for grants naming none")
     {
-        // The control. A scheduler with no `--cluster-id` sends an empty identity, and
-        // an engaged-but-empty pin is a fleet that names none -- which is why this is
-        // an optional rather than a string. A change that refused it would pass both
-        // SECTIONs above and break every single-machine install.
+        // The control. An engaged-but-empty pin is a registration, not the absence of
+        // one -- which is why this is an optional rather than a string. No node sends an
+        // empty identity now (the formation record mints one), but the codec carries it, and
+        // equality must still pair it with a grant that names none and nothing else.
         Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
         lease.fleet.Pin(std::string {});
         MovingEndpoint const endpoint { ThisWorker };
-        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
+        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, {}, LeaseClock, lease, metrics);
 
         CHECK_FALSE(
             validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ""), "gcc-13").refusal.has_value());
@@ -2282,15 +2464,12 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
     }
 }
 
-TEST_CASE("A worker whose roster is absent or lapsed refuses every grant, and says which",
-          "[worker-protocol][lease][roster]")
+TEST_CASE("A worker whose roster is absent refuses every grant, and says so", "[worker-protocol][lease][roster]")
 {
-    // #178. A grant is verified against the roster, so a worker with none -- or one whose
-    // certification has lapsed -- has nothing it could honour a grant against, however
-    // perfect the grant. Both answers travel on ONE wire code, `roster-expired`, because the
-    // client's move is the same (compile locally), and on two counters, because the
-    // operator's is not: NO roster never reached a leader its anchors certify, an EXPIRED one
-    // did and has since been cut off.
+    // #178. A grant is verified against the roster -- the state this node applied -- so a worker
+    // whose state records no voter's key has nothing it could honour a grant against, however
+    // perfect the grant, and says so on its own wire code and counter: the fact is about THIS
+    // worker, never the grant.
     //
     // The control is the same grant through the same validator once the roster is current:
     // accepted. Without it both refusals would pass against a validator that refused
@@ -2300,7 +2479,7 @@ TEST_CASE("A worker whose roster is absent or lapsed refuses every grant, and sa
     lease.fleet.Pin(std::string { ThisCluster });
     MovingEndpoint const endpoint { ThisWorker };
     Testing::FixedLeaseRoster roster { { "scheduler" } };
-    auto const validator = SignedLeaseValidator(roster, endpoint, LeaseClock, lease, metrics);
+    auto const validator = SignedLeaseValidator(roster, endpoint, {}, LeaseClock, lease, metrics);
 
     SECTION("no roster at all")
     {
@@ -2308,29 +2487,14 @@ TEST_CASE("A worker whose roster is absent or lapsed refuses every grant, and sa
         auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::NoRoster);
-        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::RosterExpired);
+        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::GrantUnverifiable);
         CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).workerCounter
               == IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster);
     }
 
-    SECTION("a roster whose certification lapsed")
-    {
-        auto const lapsed = LeaseClock.now() - std::chrono::hours { 1 };
-        roster.SetStanding(Distributed::RosterStanding::Expired, lapsed);
-        auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
-        REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::RosterExpired);
-        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::RosterExpired);
-        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).workerCounter
-              == IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired);
-        // The detail names WHEN, because the actionable version of "expired" is "this worker
-        // has not heard a certified roster since then".
-        CHECK_FALSE(Unwrap(refusal).detail.empty());
-    }
-
     SECTION("the control: a current roster accepts the same grant")
     {
-        roster.SetStanding(Distributed::RosterStanding::Current, LeaseClock.now() + std::chrono::minutes { 45 });
+        roster.SetStanding(Distributed::RosterStanding::Current);
         CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").refusal.has_value());
     }
 }
@@ -2345,7 +2509,7 @@ TEST_CASE("A grant from a scheduler the cluster revoked is refused by name at th
     lease.fleet.Pin(std::string { ThisCluster });
     MovingEndpoint const endpoint { ThisWorker };
     Testing::FixedLeaseRoster roster { { "scheduler" } };
-    auto const validator = SignedLeaseValidator(roster, endpoint, LeaseClock, lease, metrics);
+    auto const validator = SignedLeaseValidator(roster, endpoint, {}, LeaseClock, lease, metrics);
 
     auto const before = GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, GrantTerm, "50");
     auto const after = GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, GrantTerm, "51");
@@ -2356,6 +2520,74 @@ TEST_CASE("A grant from a scheduler the cluster revoked is refused by name at th
     REQUIRE(refusal.has_value());
     CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::SignerRevoked);
     CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::LeaseUnauthorized);
+}
+
+namespace
+{
+/// A worker over a roster the case OWNS, so it can revoke a signer or silence the leader without
+/// touching the shared `TestRoster` -- the surface that answers, refusal counters and all.
+struct RosterWorker
+{
+    StubRunner runner;
+    FastCache::Testing::ScratchDirectory scratch { "fc-wp-roster" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
+    AtomicMetricsSink metrics;
+    Testing::FixedLeaseRoster roster { { "scheduler" } }; ///< Declared before `worker`, which borrows it.
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    MovingEndpoint endpoint { ThisWorker };
+    WorkerProtocol worker { jobs,
+                            [this] {
+                                lease.fleet.Pin(std::string { ThisCluster });
+                                return SignedLeaseValidator(roster, endpoint, {}, LeaseClock, lease, metrics);
+                            }(),
+                            AvailableCodecs(),
+                            &Testing::TestWorkerKey(),
+                            metrics,
+                            IgnoreJobRefusals() };
+};
+} // namespace
+
+TEST_CASE("A revoked signer's grant moves the SignerRevoked counter at the surface that refuses it",
+          "[worker-protocol][lease][roster]")
+{
+    // The validator chooses the row; the SURFACE spends it. A case on the row alone passes with the
+    // increment unwired, so this one asks the counter the operator reads -- and that no other moved.
+    RosterWorker fix;
+    fix.roster.Revoke("scheduler");
+    auto const answer =
+        fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker)));
+    REQUIRE(answer.has_value());
+    CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::LeaseUnauthorized);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseSignerRevoked) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+}
+
+TEST_CASE("A worker no counted leader has spoken to refuses every grant as isolated, and counts it",
+          "[worker-protocol][lease][roster][isolation]")
+{
+    // `Isolated` is a fact about THIS worker, answered before the signature: WHICH refusal is
+    // asserted, not merely that one happened -- `NoRoster` shares its wire code and is a different
+    // operator action. The control is the same grant once a leader speaks again.
+    RosterWorker fix;
+    fix.roster.SetStanding(Distributed::RosterStanding::Isolated);
+    auto const refused =
+        fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker)));
+    REQUIRE(refused.has_value());
+    CHECK(ErrorOf(Unwrap(refused)) == Wire::ErrorCode::GrantUnverifiable);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseIsolated) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+
+    fix.roster.SetStanding(Distributed::RosterStanding::Current);
+    auto const honoured = fix.worker.Answer(
+        CompileFrame("gcc-13",
+                     DefaultSource,
+                     { Wire::IdentityCodec },
+                     GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, GrantTerm, "77")));
+    REQUIRE(honoured.has_value());
+    CHECK(Decode(Unwrap(honoured)).status != Wire::Status::Error);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseIsolated) == 1);
 }
 
 TEST_CASE("A worker that learns a new address verifies grants naming it, and stops honouring the old one",
@@ -2377,7 +2609,7 @@ TEST_CASE("A worker that learns a new address verifies grants naming it, and sto
     lease.fleet.Pin(std::string { ThisCluster });
 
     MovingEndpoint endpoint { ThisWorker };
-    auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
+    auto const validator = SignedLeaseValidator(TestRoster(), endpoint, {}, LeaseClock, lease, metrics);
 
     // Minted up front, both of them, so nothing about WHEN a token was signed can
     // explain the difference in how it is answered -- the only thing that changes
@@ -2511,4 +2743,22 @@ TEST_CASE("A compile inside its grant is served, and one from a keyless worker i
         REQUIRE(answer.has_value());
         CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
     }
+}
+
+TEST_CASE("An exchange with a scheduler sends the command alone, awaited or run to completion",
+          "[worker][protocol][credential]")
+{
+    // The seam a node's every scheduler verb and its proof go through presents NO credential, and
+    // the awaited twin is the same exchange: the bytes on the wire are the request, with no AUTH
+    // pipelined ahead of it. The guarantee is the signature -- neither takes a credential -- so
+    // what is asserted is that the one place spelling the credential spells none.
+    auto const frame = Wire::EncodeHeartbeat("w-1", /*inFlight=*/0, Wire::LoadFields {});
+
+    Testing::ScriptedSocket blocking { Wire::EncodeReply(Wire::Status::Ok, {}) };
+    CHECK(Cc::ExchangeWithScheduler(blocking, frame).IsHit());
+    CHECK(blocking.Sent() == frame);
+
+    Testing::ScriptedSocket awaited { Wire::EncodeReply(Wire::Status::Ok, {}) };
+    CHECK(core::async::syncRun(Cc::ExchangeWithSchedulerAsync(&awaited, frame)).IsHit());
+    CHECK(awaited.Sent() == frame);
 }

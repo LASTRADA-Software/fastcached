@@ -392,10 +392,9 @@ std::expected<void, StorageError> CowTreeStorage::Initialize()
     if (auto const r = _tree->Open(); !r.has_value())
         return std::unexpected(TranslateError(r.error(), "CowTree::Open"));
 
-    // **Seeded from the meta, which is what makes `--cache-disk` mean anything after a
-    // restart** (#1006). Zero on a store written before the field existed, which is
-    // indistinguishable from an empty one and leaves that store behaving exactly as it
-    // did -- so no cache in the field is discarded or misread.
+    // Seeded from the meta (#1006). The budget no longer reads `_storeBytes` -- it is the
+    // footprint, which the page store knows from the moment it opens -- but the meta
+    // carries both totals and they are kept true.
     //
     // Note what is NOT seeded: `_bytesUsed`, the mirror's total. Seeding that would
     // double-count, because reads add to it for keys already on disk.
@@ -628,8 +627,13 @@ std::expected<void, StorageError> CowTreeStorage::EnsureFormatVersion()
     return {};
 }
 
-std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Migrate(Options const& options)
+std::expected<CowTreeStorage::MigrationReport, CowTreeStorage::MigrationFailure> CowTreeStorage::Migrate(
+    Options const& options)
 {
+    // Every refusal before `MigrateStore` is one before anything was rewritten.
+    auto const refused = [](StorageError error) {
+        return std::unexpected(MigrationFailure { .error = std::move(error), .rewriting = false });
+    };
     // `FilePageStore::Open` creates what it cannot find, which is right for a
     // daemon starting up and wrong here: it would turn a mistyped path into a
     // brand-new empty store, report "nothing to convert" over it, and leave the
@@ -637,8 +641,7 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
     // at every start with no hint that they converted something else.
     auto error = std::error_code {};
     if (!std::filesystem::exists(options.path, error) || error)
-        return std::unexpected(
-            MakeError(StorageErrorCode::IoError, std::format("no storage file at '{}'", options.path.string())));
+        return refused(MakeError(StorageErrorCode::IoError, std::format("no storage file at '{}'", options.path.string())));
 
     CowTree::FilePageStore::Options pageOpts;
     pageOpts.path = options.path;
@@ -654,8 +657,8 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
 
     auto store = CowTree::FilePageStore::Open(pageOpts);
     if (!store.has_value())
-        return std::unexpected(TranslateError(
-            store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error().cause))));
+        return refused(TranslateError(store.error(),
+                                      std::format("cannot open the store: {}", CowTree::ToStringView(store.error().cause))));
 
     // Opening had to assume a page size in order to know where the second meta
     // slot even is, and the file gets to overrule that. When it does, the slot
@@ -670,13 +673,23 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
         store->reset();
         store = CowTree::FilePageStore::Open(pageOpts);
         if (!store.has_value())
-            return std::unexpected(TranslateError(
+            return refused(TranslateError(
                 store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error().cause))));
     }
     return MigrateStore(**store);
 }
 
-std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::MigrateStore(CowTree::IPageStore& store)
+std::expected<CowTreeStorage::MigrationReport, CowTreeStorage::MigrationFailure> CowTreeStorage::MigrateStore(
+    CowTree::IPageStore& store)
+{
+    auto rewriting = false;
+    return ConvertStore(store, rewriting).transform_error([&rewriting](StorageError error) {
+        return MigrationFailure { .error = std::move(error), .rewriting = rewriting };
+    });
+}
+
+std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::ConvertStore(CowTree::IPageStore& store,
+                                                                                          bool& rewriting)
 {
     CowTree::CowTree tree { store };
     if (auto const r = tree.Open(); !r.has_value())
@@ -762,6 +775,10 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
         if (invalid.has_value())
             return std::unexpected(*invalid);
     }
+
+    // Everything above read; everything below rewrites. A failure from here on has left the store
+    // part-way, which is what an operator's exit code has to say.
+    rewriting = true;
 
     // Converted in slices rather than in one transaction; see
     // `MigrationChunkRecords` for why a single transaction is not an option.
@@ -1529,8 +1546,16 @@ void CowTreeStorage::EraseFromLru(std::string_view key)
     EraseNode(it->second);
 }
 
-void CowTreeStorage::EraseNode(Iterator it)
+void CowTreeStorage::EraseNode(Iterator const& it)
 {
+    // **`it` may live inside the index entry this erases** -- `EraseFromLru` passes
+    // `_index`'s own value -- so the order below is load-bearing. The entry is found
+    // FIRST, while the key it is looked up by is still there; the list node goes while
+    // that entry, and so `it`, still lives; and the entry goes LAST, by iterator, after
+    // which `it` is never read. Erasing the entry by key first -- the order this had --
+    // drops the map node that holds `it`, and the list erase after it reads freed memory.
+    auto const entry = _index.find(it->key);
+
     // Advanced rather than reset, for the reason spelled out on the in-memory
     // tier: restarting the sweep whenever eviction runs would leave the pass
     // permanently unfinished on a cache that is under pressure.
@@ -1543,8 +1568,9 @@ void CowTreeStorage::EraseNode(Iterator it)
     // and for the same reason.
     _indexBytes -= IndexBytesFor(it->key.size());
 
-    _index.erase(it->key);
     _lru.erase(it);
+    if (entry != _index.end())
+        _index.erase(entry);
 }
 
 void CowTreeStorage::ReclaimDeadRecord(std::string_view key, CacheEntry const& entry, core::platform::SteadyTimePoint now)
@@ -1620,16 +1646,20 @@ bool CowTreeStorage::EvictColdSlice()
             return false;
     }
 
-    if (!lastKey.empty())
-        _coldCursor = lastKey;
-    if (reachedEnd)
-        _coldExhausted = true;
-
+    // The cursor moves past what this slice CONSUMED, never past what it walked. The
+    // loop below stops as soon as the store fits, usually long before the last victim,
+    // and a cursor at the walk's last key skipped every victim after the stopping
+    // point -- and once the walk had reached the end, `_coldExhausted` stranded them for
+    // the session. Measured: a store reopened over its bound kept 63 cold entries
+    // forever and evicted every new Set but the newest, and the file could not shrink
+    // past the pages those strays held.
+    std::size_t consumed = 0;
     std::size_t erased = 0;
     for (auto const& key: victims)
     {
-        if (_storeBytes <= _options.maxBytes)
+        if (FootprintBytes() <= _options.maxBytes)
             break;
+        ++consumed;
         if (auto const r = EraseEntry(key); !r.has_value())
             continue;
         // Reported unconditionally, where the mirror path asks about the generation
@@ -1643,7 +1673,29 @@ bool CowTreeStorage::EvictColdSlice()
         // data does not support. It undercounts, which is the honest direction.
         ++erased;
     }
+
+    if (consumed == victims.size())
+    {
+        if (!lastKey.empty())
+            _coldCursor = lastKey;
+        if (reachedEnd)
+            _coldExhausted = true;
+    }
+    else if (consumed != 0)
+    {
+        // Strictly after the last victim taken, so the next walk starts at the first one
+        // left. A victim whose erase failed was taken too: retrying it every call would
+        // spin on a key the disk will not let go of.
+        auto const& last = victims[consumed - 1];
+        auto const bytes = std::as_bytes(std::span { last.data(), last.size() });
+        _coldCursor.assign(bytes.begin(), bytes.end());
+    }
     return erased != 0;
+}
+
+std::uint64_t CowTreeStorage::FootprintBytes() const noexcept
+{
+    return static_cast<std::uint64_t>(_store->PagesInUse()) * static_cast<std::uint64_t>(_store->PageSize());
 }
 
 void CowTreeStorage::EvictToFit()
@@ -1665,9 +1717,9 @@ void CowTreeStorage::EvictToFit()
     // been used since startup, so it is genuinely the least recently used thing in the
     // store, and taking it first is what LRU means here. Draining it also converges,
     // because the slice erases whole entries rather than rotating a fixed set.
-    while (_storeBytes > _options.maxBytes && EvictColdSlice())
+    while (FootprintBytes() > _options.maxBytes && EvictColdSlice())
         ;
-    while (_storeBytes > _options.maxBytes && !_lru.empty() && remainingAttempts != 0)
+    while (FootprintBytes() > _options.maxBytes && !_lru.empty() && remainingAttempts != 0)
     {
         auto victim = std::prev(_lru.end());
         auto const keyCopy = victim->key;
@@ -2260,10 +2312,12 @@ StorageStats CowTreeStorage::Snapshot() const noexcept
     // than wrap to eighteen quintillion.
     auto const treeRecords = _tree->ItemCount();
     _stats.itemCount = static_cast<std::size_t>(treeRecords - std::min(treeRecords, ReservedRecordsOnAnOpenedStore()));
-    // The STORE's total, not the mirror's -- which is the point of #1006: an
-    // operator watching this against `--cache-disk` was told what this session had
-    // touched, and after a restart that is zero while the store is full.
-    _stats.bytesUsed = _storeBytes;
+    // The STORE's footprint, the figure `--cache-disk` bounds -- never the mirror's total
+    // (#1006), and since the denomination change never the sum of the values' original
+    // lengths either. The file's own length travels beside it, so an operator sees both
+    // the budget's figure and what the filesystem is charged.
+    _stats.bytesUsed = static_cast<std::size_t>(FootprintBytes());
+    _stats.fileBytes = static_cast<std::size_t>((CowTree::MetaSlotCount + _store->PageCount()) * _store->PageSize());
     _stats.bytesLimit = _options.maxBytes;
     _stats.indexBytes = _indexBytes;
 
@@ -2297,14 +2351,21 @@ std::optional<CowTree::FilePageStore::LockState> CowTreeStorage::StoreLockState(
     return _storeLockState;
 }
 
-std::string DescribeMigration(std::filesystem::path const& path,
-                              std::expected<CowTreeStorage::MigrationReport, StorageError> const& outcome)
+std::string DescribeMigration(
+    std::filesystem::path const& path,
+    std::expected<CowTreeStorage::MigrationReport, CowTreeStorage::MigrationFailure> const& outcome)
 {
     if (!outcome.has_value())
         // The code as well as the context: several failure paths carry only the
         // label of the step that failed, and "CowTree::Open" on its own tells an
-        // operator nothing about which kind of problem to go looking for.
-        return std::format("{}: {}: {}", path.string(), ToStringView(outcome.error().code), outcome.error().context);
+        // operator nothing about which kind of problem to go looking for. And
+        // whether it had begun: a part-way store is refused until a re-run finishes it.
+        return std::format("{}: {}: {}{}",
+                           path.string(),
+                           ToStringView(outcome.error().error.code),
+                           outcome.error().error.context,
+                           outcome.error().rewriting ? " (stopped part-way; run the conversion again to finish it)"
+                                                     : " (nothing was changed)");
 
     if (outcome->fromVersion == outcome->toVersion)
         return std::format(

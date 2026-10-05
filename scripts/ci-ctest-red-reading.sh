@@ -62,10 +62,19 @@ set -euo pipefail
 
 # ctest's summary: `99% tests passed, 1 tests failed out of 4834`.
 SummaryPattern='^[0-9]+% tests passed, ([0-9]+) tests? failed out of ([0-9]+)'
-# A row of the FAILED list: `	  4673 - mkdocs-validation (Timeout)`. The LAST
-# parenthesised group is ctest's classification, so a name that itself contains
-# parentheses -- or the word Timeout -- is not misread.
-RowPattern='^[[:space:]]+[0-9]+ - (.+) \(([^()]+)\)[[:space:]]*$'
+# A row of the FAILED list: `	  4673 - mkdocs-validation (Timeout)`, and -- for a
+# test that carries LABELS -- the same row followed by padding and the labels,
+# space-separated and sorted: `	5020 - e2e-helpers-selftest (Timeout)    hygiene`.
+# Probed with ctest 4.2.3 against tests with no label, one and two; the labelled
+# form is what a Linux gate log carried, and a model without it read that log's one
+# row as unreadable and answered `unparsed` exactly when a timeout needed naming.
+#
+# The classification is the LAST parenthesised group before the labels, so a name
+# that itself contains parentheses -- or the word Timeout -- is not misread. A
+# label holds no parenthesis, which is what keeps that unambiguous: a trailing
+# `(Failed)` can only be the classification. A row whose trailing words are not
+# labels of that shape is still unreadable, and still refused as `unparsed`.
+RowPattern='^[[:space:]]+[0-9]+ - (.+) \(([^()]+)\)([[:space:]]+[^()[:space:]]+)*[[:space:]]*$'
 FailedHeader='The following tests FAILED:'
 
 # How many timed-out names an annotation lists before it says how many more.
@@ -263,6 +272,28 @@ SelfTest() {
         'The following tests FAILED:' \
         '	  12 - one (Failed)' \
         'something ctest never prints'
+    # The row a Linux gate log carried, byte for byte: a labelled test that timed out.
+    Stage labelled \
+        '99% tests passed, 1 tests failed out of 5208' \
+        'The following tests FAILED:' \
+        $'\t5020 - e2e-helpers-selftest (Timeout)                    hygiene' \
+        'Errors while running CTest'
+    # Labelled failures, one and two labels, as ctest 4.2.3 prints them, and a name
+    # spelling Timeout that carries a label: none of them is a timeout.
+    Stage labelledFailed \
+        '97% tests passed, 3 tests failed out of 10' \
+        'The following tests FAILED:' \
+        $'\t  2 - one-label (Failed)                                hygiene' \
+        $'\t  3 - two-labels (Failed)                               docs-subject hygiene' \
+        $'\t  7 - Timeout (bounded) handling is honoured (Failed)    hygiene' \
+        'Errors while running CTest'
+    # A row cut off before its classification closes -- a log truncated mid-write --
+    # is still unreadable, so the list is shorter than ctest's count and nothing is
+    # concluded from it: the third outcome survives the wider model.
+    Stage unreadable \
+        '99% tests passed, 1 tests failed out of 10' \
+        'The following tests FAILED:' \
+        $'\t5020 - e2e-helpers-selftest (Timeo'
     Stage empty
     local many=()
     local i
@@ -289,16 +320,20 @@ SelfTest() {
     Expect "no log at all" no-log absent ok
     Expect "a FAILED list shorter than ctest's count is refused" unparsed short ok
     Expect "twelve timeouts are all counted" timeouts many ok
+    Expect "a labelled timeout row is read, as a Linux gate log prints it" timeouts labelled ok
+    Expect "labelled failures are read, and a labelled name spelling Timeout is not one" tree labelledFailed ok
+    Expect "a row cut off before its classification is still unreadable" unparsed unreadable ok
 
     # The log as Windows writes it: every line CR-terminated.
     local crlf
-    for crlf in issue1515 failed skipped green; do
+    for crlf in issue1515 failed skipped green labelled; do
         sed 's/$/\r/' "$dir/$crlf.log" > "$dir/$crlf-crlf.log"
     done
     Expect "CRLF: the #1515 shape" timeouts issue1515-crlf ok
     Expect "CRLF: failed assertions" tree failed-crlf ok
     Expect "CRLF: the did-not-run list" tree skipped-crlf ok
     Expect "CRLF: green" ctest-green green-crlf ok
+    Expect "CRLF: a labelled timeout row" timeouts labelled-crlf ok
 
     # What the annotations SAY, not only which verdict: the three sentences #1515 is
     # about. `tree` must be the only verdict telling a reader to blame the tree.

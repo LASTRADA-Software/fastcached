@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -195,6 +196,20 @@ class FilePageStore final: public IPageStore
 
     [[nodiscard]] auto PageCount() const noexcept -> std::size_t override;
 
+    /// The footprint a byte budget is enforced against; see `IPageStore::PagesInUse`.
+    ///
+    /// **And what holds the FILE to it.** The file's length is `2 + PageCount()` pages,
+    /// so it exceeds this figure by exactly the free pages inside it. Three things keep
+    /// that gap small: the free list's pages come out of the free pages rather than
+    /// extending the file, `Allocate` takes the lowest free id so live pages collect at
+    /// the front, and each durable flush cuts the free tail. Both directions of the
+    /// relation: the file is NEVER shorter than the pages in use, and it may be LONGER by
+    /// its free pages -- those at the end until a flush cuts them, those in the interior
+    /// until later writes reuse them. That is a batch of copy-on-write pages at steady
+    /// state, and every page a large eviction freed in the middle of the file until churn
+    /// migrates live data below them.
+    [[nodiscard]] auto PagesInUse() const noexcept -> std::size_t override;
+
     /// @return Current durability mode.
     [[nodiscard]] Durability DurabilityMode() const noexcept;
 
@@ -225,16 +240,64 @@ class FilePageStore final: public IPageStore
     ///
     /// Private: `freeRoot` is the STORE's business, and the flush is the only moment
     /// at which a list is consistent with the meta that will name it.
+    ///
+    /// **The list's own pages come FROM `_freeList`, and the file is extended only for
+    /// the shortfall** -- when `_freeList` holds fewer pages than the list needs to
+    /// describe everything else. Taking them by extension instead grew the file by
+    /// `ceil(F / idsPerPage)` pages at every flush and handed the previous list's pages
+    /// back to `F`, so a store sitting at its byte bound grew geometrically and never
+    /// shrank: a 64 GiB tier became a 103 GB file, 89 % of it free pages.
+    ///
+    /// Taking one is safe for exactly the reason a data `Allocate` taking one is: a page
+    /// in `_freeList` is free in the world of the last DURABLE meta and in the world of
+    /// the meta about to be written, so neither recovery reads it and overwriting it
+    /// damages nothing. Two kinds of page are NOT in `_freeList`, and both are refused
+    /// for the same reason -- the last durable meta still needs them until the one this
+    /// flush writes is durable:
+    ///
+    /// - a **pending** free (`_pendingFree`): its freeing is not durable yet, and the
+    ///   last durable meta's tree still references it;
+    /// - a page of the **previous** list (`_freeListPages`): the last durable meta's
+    ///   `freeRoot` names it.
+    ///
+    /// The list NAMES every page that is free in the new meta's world -- what stays in
+    /// `_freeList`, the pending frees and the previous list's pages -- so a reopen
+    /// rebuilds exactly the free state this process holds once the flush lands, rather
+    /// than marking the last batch's frees live forever. Naming a page is not taking it.
+    ///
+    /// On failure every member is as it was, so a retried flush starts from the same
+    /// state; a page the shortfall already extended is returned to `_freeList`.
     /// @return The head of the new chain, or `PageId::None()` when nothing is free.
     [[nodiscard]] auto WriteFreeListLocked() -> std::expected<PageId, CowTreeError>;
 
-    /// Extend the file by one page, without drawing on the free list.
+    /// Extend the file by one page.
     ///
-    /// **The recursion guard.** The free list's own pages may not come from the free
-    /// list: allocating one would change the very set being written, which is where
-    /// btrfs shipped real bugs in its free space tree.
+    /// The only operation that lengthens the file. The page counter and the live set move
+    /// only once the page's write has LANDED: moving them first left a phantom live page
+    /// behind every failed extend, which on a full disk is every extend.
     /// @return The new page.
     [[nodiscard]] auto ExtendLocked() -> std::expected<PageId, CowTreeError>;
+
+    /// Cut the file back to its highest page that is not free, after a durable flush.
+    ///
+    /// The truncatable tail is the run of highest ids that are in `_freeList` -- free in
+    /// the meta just made durable AND in the one it superseded, which is the meta a
+    /// damaged slot falls back to. So it is called BEFORE the pending frees graduate:
+    /// those are still referenced by the superseded meta's tree, and the previous list's
+    /// pages, which travel with them, are still that meta's `freeRoot`. Both metas may
+    /// still NAME a cut page as a free-list entry; recovery skips an entry past the end of
+    /// the file for that reason, while a LINK past the end stays `Corrupt`, since no list
+    /// page a surviving meta names is ever cut.
+    ///
+    /// Not fatal when the length cannot be changed: the flush is already durable, the
+    /// pages stay in `_freeList`, and the next flush tries again.
+    /// @return Empty when the file is as short as it can be; the I/O error otherwise.
+    [[nodiscard]] auto TruncateFreeTailLocked() -> std::expected<void, CowTreeError>;
+
+    /// Set the backing file's length to `bytes`, position-independently.
+    /// @param bytes New length in bytes.
+    /// @return Empty on success; CowTreeError::IoError otherwise.
+    [[nodiscard]] auto SetFileLength(std::uint64_t bytes) const -> std::expected<void, CowTreeError>;
 
     explicit FilePageStore(Options options) noexcept;
 
@@ -298,13 +361,60 @@ class FilePageStore final: public IPageStore
     /// what makes that reader correct rather than merely quiet.
     std::atomic<std::size_t> _totalDataPages { 0 };
 
+    /// A set of page ids that keeps its own size readable without the lock.
+    ///
+    /// `PagesInUse()` is a `noexcept` interface member, so it cannot lock (see
+    /// `_lastDurableSlot`), and reading an `unordered_set`'s size unlocked while a
+    /// writer rehashes it is a data race. Folding the count into the only three
+    /// operations that change membership is what keeps it exact: no call site can
+    /// change the set and forget the counter.
+    class LivePages
+    {
+      public:
+        /// @param id A page id.
+        /// @return Whether it is live.
+        [[nodiscard]] bool Contains(std::uint64_t id) const
+        {
+            return _ids.contains(id);
+        }
+
+        /// Mark `id` live.
+        void Insert(std::uint64_t id)
+        {
+            _ids.insert(id);
+            _count = _ids.size();
+        }
+
+        /// Mark `id` not live.
+        void Erase(std::uint64_t id)
+        {
+            _ids.erase(id);
+            _count = _ids.size();
+        }
+
+        /// @return How many ids are live, readable from any thread.
+        [[nodiscard]] std::size_t Count() const noexcept
+        {
+            return _count;
+        }
+
+      private:
+        std::unordered_set<std::uint64_t> _ids;
+        std::atomic<std::size_t> _count { 0 };
+    };
+
     /// Currently-allocated data page indices (1-based). Tracked so Read
-    /// of a freed page can be rejected.
-    std::unordered_set<std::uint64_t> _live;
+    /// of a freed page can be rejected, and counted for `PagesInUse()`.
+    LivePages _live;
 
     /// In-memory free list of recyclable page ids. Populated from the
     /// on-disk free-list chain on Open and updated on Free/Allocate.
-    std::vector<std::uint64_t> _freeList;
+    ///
+    /// ORDERED, and `Allocate` hands out the LOWEST id, so live data migrates to the
+    /// front of the file as it is rewritten and the free pages collect at the end, where
+    /// `TruncateFreeTailLocked` can cut them. A LIFO list handed back whatever was freed
+    /// last, wherever it was, so a store's file never got shorter.
+    std::set<std::uint64_t> _freeList;
 
     /// Pages holding the free list that the LAST DURABLE meta points at.
     ///

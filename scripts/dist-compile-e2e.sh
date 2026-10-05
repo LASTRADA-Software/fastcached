@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# End-to-end test of distributed compilation (POSIX). Starts a fastcached with a
-# dispatch listener, one or more fastcache-compile-node workers, and drives real
-# compiles through fastcache-cc.
+# End-to-end test of distributed compilation (POSIX). Starts a fastcached cache and
+# fastcache-compile-node processes, and drives real compiles through fastcache-cc.
+#
+# EVERY NODE HERE IS SOLITARY. A zero-config node is a fleet of its own: it serves the
+# scheduler, its own worker registers with it, and its scheduler leases that worker --
+# so each node a case starts is ONE process that leases, verifies and compiles, and the
+# client asks it directly. A second node cannot join a first over loopback, which is
+# how these nodes bind, and that is production behaviour rather than a gap: a fleet is
+# never offered at an address only this machine reaches. The properties that need two
+# MACHINES are asserted in process,
+# where an interleaving can be placed rather than hoped for -- each named at the case it
+# came out of, and all of them listed in the report of the change that moved them:
+# a lease landing on another machine and released to its issuer (`FleetLeaseRouting_test`),
+# a learner verifying the grant its fleet's leader signed (`WorkerLease_test`), a worker
+# refusing a caller its scheduler admitted (#235, `CompileResponder_test`), and a
+# registration that proves the machine's key (`NodeProofResponder_test`).
 #
 # The properties asserted here are the ones no unit test can reach, because each
-# needs three real processes and a real compiler:
+# needs real processes and a real compiler:
 #
 #   1. Byte-identical      — an object compiled on a WORKER equals the one this
 #                            machine's compiler produces locally. This is the whole
@@ -41,6 +54,13 @@
 #                            hands over preprocessed text, and taking that from the
 #                            extension alone is wrong for exactly this shape — a
 #                            wrong object rather than a failed one.
+#  7b. Root-bound           — a dispatched object naming its checkout (the builtin
+#                            `source_location` is made of) is not served into a second
+#                            checkout, and is served back to the first. The worker
+#                            compiles text whose line markers name the CLIENT's paths,
+#                            so the object names the client's checkout and no key sees
+#                            it; the launcher scans a dispatched object as it scans a
+#                            local one. The Windows fixture's case 3b is its twin.
 #   8. Graceful stop        — a worker asked to stop does, promptly, rather than
 #                            waiting for a supervisor to escalate.
 #  12. Cache independence   — a cache the launcher cannot reach does not stop the
@@ -60,13 +80,14 @@
 # for a CI runner shared with the other smoke tests to collide — a failure that
 # reads as "distribution is broken" when it means "something else was listening".
 #
-# All twelve of those are loopback end to end, and `--case membership` is the one
-# body of assertions that is not. Its own block below carries the whole argument;
-# `.agent/rules/testing.md` carries the rule it came from.
+# All twelve of those are loopback end to end. Who a worker admits from ANOTHER
+# address is not asked here: `FleetTickets_test` and `FrameEndpoint_test` ask it in
+# process, over a real endpoint whose peer reports a non-loopback host (#235).
 #
 # Usage:
 #   dist-compile-e2e.sh --fastcached <path> --node <path> --launcher <path>
-#                       [--compiler <cxx>] [--case suite|membership]
+#                       [--compiler <cxx>] [--case suite|self-test]
+#                       [--cli <fastcache-cli>]
 #
 # Exit codes: 0 = all assertions held; 1 = a failure; 77 = a runtime prerequisite
 # was missing (skip).
@@ -76,11 +97,13 @@ fastcached=""
 node=""
 launcher=""
 compiler="${CXX:-c++}"
+# Optional: how the scheduler's record of a withdrawn worker is read. Without it a
+# withdrawal still fails, and cannot say which limit took the slots; see
+# `fail_if_withdrawn`.
+cli=""
 
-# Which body of assertions to run. `suite` is the twelve cases above; `membership`
-# is the pair that needs a non-loopback address and is registered as its own ctest
-# test. See the block that runs it for why it is a MODE rather than a thirteenth
-# case in the same run.
+# Which body of assertions to run: `suite` is the twelve cases above, and `self-test`
+# drives the pure verdict decisions below with no binary built.
 mode="suite"
 
 while [[ $# -gt 0 ]]; do
@@ -89,6 +112,7 @@ while [[ $# -gt 0 ]]; do
         --node)       node="$2";       shift 2 ;;
         --launcher)   launcher="$2";   shift 2 ;;
         --compiler)   compiler="$2";   shift 2 ;;
+        --cli)        cli="$2";        shift 2 ;;
         --case)       mode="$2";       shift 2 ;;
         --self-test)  mode="self-test"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -96,8 +120,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$mode" in
-    suite|membership|self-test) ;;
-    *) echo "unknown --case: ${mode} (expected 'suite', 'membership' or 'self-test')" >&2; exit 2 ;;
+    suite|self-test) ;;
+    *) echo "unknown --case: ${mode} (expected 'suite' or 'self-test')" >&2; exit 2 ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -166,7 +190,37 @@ source_name_of() {
     dwarf_attr_of "$1" "AT_name"
 }
 
-# Drive every decision above over staged text. No process, no port, no compiler.
+# --- a worker that withdrew its slots -------------------------------------------
+#
+# The worker every dispatching case uses is offered one slot above this host's core
+# count (see `worker_slots`), so CPU used outside this fleet cannot withdraw it: a
+# `rejected (withdrawn)` is a FAILURE, never a skip, and the useful thing to say is
+# WHICH limit took the slots -- memory and scratch still can, and should, on a starved
+# host. Load-driven withdrawal itself is the product's behaviour and is covered where
+# it lives: `NodePolicy_test.cpp`'s `SlotCeilingsFor` cases, and the `Withdrawn`
+# refusal in `SchedulerProtocol_test.cpp` and `WorkerRegistry_test.cpp`.
+
+# Whether a launcher's output is the scheduler refusing a lease because every matching
+# worker withdrew. Pure, so the self-test drives it without a process.
+# @param 1 the launcher's output for a compile that was not dispatched
+is_withdrawn_refusal() {
+    [[ "$1" == *"not dispatched (rejected (withdrawn)"* ]]
+}
+
+# The scheduler's `limited-by` for one worker, out of `fleet workers` as TSV. The
+# columns are found by their header, not by position.
+# @param 1 what `fastcache-cli --format=tsv fleet workers` printed
+# @param 2 the worker's advertised endpoint
+# @param 3 the toolchain the lease asked for
+# Prints the `limited-by` text, or nothing when no such worker is in the record.
+worker_limit_from_tsv() {
+    awk -F'\t' -v ep="$2" -v fp="$3" '
+        NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+        ("endpoint" in col) && ("toolchain" in col) && ("limited-by" in col) &&
+            $col["endpoint"] == ep && $col["toolchain"] == fp { print $col["limited-by"]; exit }
+    ' <<< "$1"
+}
+
 _selftest_cases=0
 _selftest_failures=0
 
@@ -246,6 +300,25 @@ run_self_test() {
     # An attribute the dump does not carry is EMPTY rather than the next line's value.
     _check "$(_is "$(dwarf_attr_of "$llvm_dump" "AT_ranges")" "")" "a missing attribute reads empty"
 
+    # ---- is_withdrawn_refusal ---------------------------------------------
+    local withdrawn="fastcache-cc: not dispatched (rejected (withdrawn): every matching worker has withdrawn its capacity); compiling locally"
+    local no_worker="fastcache-cc: not dispatched (rejected (no-worker): no worker serves this toolchain); compiling locally"
+    _check "$(is_withdrawn_refusal "$withdrawn" && echo y || echo n)" "a withdrawn refusal is recognised"
+    _check "$(is_withdrawn_refusal "$no_worker" && echo n || echo y)" "a different refusal is not a withdrawal"
+    _check "$(is_withdrawn_refusal "" && echo n || echo y)" "nor is a compile that said nothing"
+
+    # The scheduler's record as `fastcache-cli --format=tsv fleet workers` prints it,
+    # captured from a real run with a second row added, so the reader is asked WHICH
+    # worker it is looking at rather than whether a `limited-by` exists.
+    local fleet_tsv
+    fleet_tsv="$(printf '%s\t' id toolchain compiler endpoint slots in-flight available limited-by heartbeat-age registered-age; printf 'last-picked-age\n')"
+    fleet_tsv+=$'\n'"$(printf 'w1\t3f5d2a3eca09d20f79b8bf9217019b87\tcl 19.51.36252\t127.0.0.1:25271\t32\t0\t0\texternal-cpu\t2078\t2078\t')"
+    fleet_tsv+=$'\n'"$(printf 'w2\t3f5d2a3eca09d20f79b8bf9217019b87\tcl 19.51.36252\t127.0.0.1:25999\t4\t0\t4\tregistered\t10\t10\t')"
+    _check "$(_is "$(worker_limit_from_tsv "$fleet_tsv" 127.0.0.1:25271 3f5d2a3eca09d20f79b8bf9217019b87)" external-cpu)" "the worker's own row is read"
+    _check "$(_is "$(worker_limit_from_tsv "$fleet_tsv" 127.0.0.1:25999 3f5d2a3eca09d20f79b8bf9217019b87)" registered)" "and not its neighbour's"
+    _check "$(_is "$(worker_limit_from_tsv "$fleet_tsv" 127.0.0.1:25271 9e5d3aaa03c5f0c2564bda4c6c68f021)" "")" "another toolchain at that endpoint is not this worker"
+    _check "$(_is "$(worker_limit_from_tsv "not a table" 127.0.0.1:25271 3f5d2a3eca09d20f79b8bf9217019b87)" "")" "an unreadable record is absent, not a limit"
+
     # A self-test states how many cases it RAN: a run that stopped early must not look
     # like one that judged something, and a scan that matched nothing must not read as
     # a clean tree.
@@ -267,29 +340,26 @@ readonly SKIP=77
 [[ -n "$fastcached" && -x "$fastcached" ]] || { echo "fastcached not found: '$fastcached'; skipping"; exit "$SKIP"; }
 [[ -n "$node"       && -x "$node"       ]] || { echo "fastcache-compile-node not found: '$node'; skipping"; exit "$SKIP"; }
 
-# Every node below except the cache-tier case turns its own cache port OFF.
-# `--listen-node` defaults to 127.0.0.1:6674 -- where `fastcache-cc` looks --
+# Every node below except the cache-tier cases (9 and 11) and case 8's worker, whose
+# stop asserts the teardown of a private tier, turns its own cache OFF.
+# `--listen-node` defaults to 0.0.0.0:6674 -- 6674 being where `fastcache-cc` looks --
 # which is right for the one node per machine a real deployment runs and wrong
 # here, where several share a host and would race for it. Said explicitly rather
 # than left to the default's warn-and-continue, so a node that failed to bind for
 # some OTHER reason still shows up as the fault it is.
 no_local_cache="--cache-memory=0"
-[[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
 command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler'; skipping"; exit "$SKIP"; }
 
 workdir="$(mktemp -d)"
 
-# No key file (#178 PR 6): every scheduler signs with its own identity key, what makes a
-# worker CHECK the signature is the `--voter-key` `start_node` hands it, and what lets a
-# worker join at all is an identity key of its own that the scheduler's cluster admitted --
-# see there.
+# No key file (#178 PR 6): every node's scheduler signs with the node's own identity key,
+# and its worker CHECKS the signature against the cluster state the node's own consensus
+# applies -- no key is typed anywhere, and nothing has to be admitted by hand.
 #
-# With both, every case below is a real client presenting a real signed grant to a real
-# worker over a real socket, checked against a roster that worker adopted from its
-# scheduler, and the grant's signature covers the endpoint that worker advertised. A
-# worker advertising an address the scheduler did not grant fails every case rather
-# than none, which is the property no in-process test can show: the unit tests mint and
-# verify inside one process.
+# So every case below is a real client presenting a real signed grant to a real worker
+# over a real socket, and the grant's signature covers the endpoint that worker
+# advertised. A worker advertising an address its scheduler did not grant fails every
+# case rather than none.
 cleanup() {
     # Every spawned process, not just the ones a happy path reaps: a `fail`
     # anywhere exits the script, and a daemon or worker left holding a port makes
@@ -323,6 +393,9 @@ cleanup() {
     # were left running until now.
     reap_background_jobs 5
     rm -rf "$workdir"
+    # A job that outlived SIGKILL was named on stderr; it must not pass for a
+    # clean exit either.
+    e2e_exit_if_reap_left_survivors
 }
 
 # The shared helpers: `fail`, `free_port`, `wait_for_port`, `wait_for_log`,
@@ -390,8 +463,14 @@ e2e_begin "dist-compile E2E" "$workdir"
 # triage survived the conversion rather than being traded for the budget.
 e2e_wait_seconds 30
 
-# Statistics are per-user state; keep this run out of the developer's real log.
-export XDG_STATE_HOME="${workdir}/state"
+# After `e2e_begin`, whose snapshot of the caller's statistics must precede every use of
+# the launcher variable -- `launcher-state-isolation` refuses one above it.
+[[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
+
+# Every launcher this fixture runs records into a state directory of the run's own,
+# through the shim `e2e_launcher_state_enter` (scripts/lib/e2e-common.sh) puts in
+# front of it. Before any launcher runs, and after `e2e_begin`, whose workdir holds it.
+e2e_launcher_state_enter launcher
 export FASTCACHE_VERBOSE=1
 
 # --- helpers ----------------------------------------------------------------
@@ -451,10 +530,23 @@ started_pid=""
 # failure need not respell the tag.
 started_log=""
 
-# And the port it bound, for the caller that drew the port itself and has to name
-# it again later. The membership mode's leg 3 dials the listener leg 1 compiled
-# on, which is the only reader today.
-started_port=""
+# Every grant a worker runs is CHECKED: its own startup line says which lease check it built
+# (`MakeWorkerLeaseValidator`). A worker that fell back to the check verifying nothing would pass
+# every case below -- its compiles still run -- so the line is waited for, and its opposite asserted
+# absent. WAITED for rather than read: the worker tier is built after the scheduler that logs
+# `scheduling for the fleet`, so that marker says nothing about whether this line is out yet.
+#
+# @param 1 the node's pid
+# @param 2 tag, for the message
+# @param 3 the node's log
+assert_checks_leases() {
+    local pid="$1" tag="$2" log="$3"
+    wait_for_log "verifying lease signatures against the state this node's consensus applies" "$pid" "$tag" "$log"
+    if grep -qF "compiling WITHOUT verifying" "$log"; then
+        cat "$log" >&2
+        fail "the ${tag} worker compiles WITHOUT verifying lease signatures"
+    fi
+}
 
 # Start one compile node, and wait for it to be SERVING.
 #
@@ -476,7 +568,8 @@ started_port=""
 # rather than inherits (#380), and the bind, which is also what is advertised -- a node
 # that advertised something else would be describing an endpoint the lease signature
 # then covers and no client can reach. What makes every dispatch here a SIGNED and
-# CHECKED one (#282) is the `--voter-key` each worker is handed, below.
+# CHECKED one (#282) is that every node runs consensus: its worker checks each grant
+# against the state that consensus applies.
 #
 # Everything else is a flag the caller passes, INCLUDING the cache tier and the log
 # level. Neither gets a default here, because a default plus an override is the
@@ -508,132 +601,42 @@ started_port=""
 #          mapping from one to the other
 # @param 2 host to bind, advertise and probe
 # @param 3 port to bind, advertise and probe
-# @param 4.. every flag that differs between the nodes this fixture starts
+# @param 4.. every flag that differs between the nodes this fixture starts. Which node
+#          serves a scheduler is no flag's business: every one does, because a first start
+#          is a cluster of one and its mode serves one while it runs consensus.
 start_node() {
     local tag="$1" host="$2" port="$3"
     shift 3
-    local log="${workdir}/${tag}.log" pid="" arg="" identity="" key="" worker="yes" voterKeyFile="" schedulerAt=""
+    local log="${workdir}/${tag}.log" pid="" arg=""
     : > "$log"
     # The stated drain is a WORKER's setting, so a node running none (`--slots=0`,
     # #206) is not handed it: it refuses a worker-only setting by name, and it has no
     # compile to drain.
     local drain=("$stated_drain")
-    # A scheduler is a consensus member even alone (#178): it signs every lease with an
-    # identity key it keeps in a state directory, and runs a cluster of one to hold the
-    # roster its workers check those signatures against. Its consensus port is bound to
-    # loopback, where nothing dials it.
-    local consensus=()
     for arg in ${@+"$@"}; do
-        case "$arg" in
-            --slots=0)
-                drain=()
-                worker=""
-                ;;
-            --serve-scheduler)
-                consensus=(--listen-raft="127.0.0.1:$(free_port)" --raft-self=127.0.0.1
-                    --cluster-dir="${workdir}/${tag}.state")
-                ;;
-            --scheduler=*)
-                voterKeyFile="${workdir}/scheduler-${arg##*:}.key"
-                schedulerAt="${arg#--scheduler=}"
-                ;;
-        esac
+        [ "$arg" = "--slots=0" ] && drain=()
     done
-    # Minted BEFORE the start, by `--print-identity` over the same state directory, and
-    # filed under the port its workers name; the start then reads the same files back
-    # rather than minting a second identity.
-    if [ -n "${consensus[*]+x}" ]; then
-        identity="$("$node" --print-identity "${consensus[@]}" 2>> "$log")" \
-            || { cat "$log" >&2; fail "${tag}: --print-identity could not mint this scheduler's identity"; }
-        key="$(sed -n 's/^public-key //p' <<< "$identity")"
-        [ -n "$key" ] || fail "${tag}: --print-identity printed no public-key line: ${identity}"
-        printf '%s\n' "$key" > "${workdir}/scheduler-${port}.key"
-    fi
-    # And every worker is told its scheduler's key, which is what puts this fixture's
-    # dispatches on the CHECKED path: a worker with no --voter-key that only this machine
-    # can reach verifies no lease at all, so without it every compile below would run
-    # through the unchecked validator and exercise none of the signature, the roster or
-    # its adoption (#282, #178). A worker naming a scheduler this fixture did not start
-    # has no file, and checks nothing.
-    local voter=()
-    if [ -n "$worker" ] && [ -n "$voterKeyFile" ] && [ -f "$voterKeyFile" ]; then
-        voter=(--voter-key="$(cat "$voterKeyFile")")
-    fi
-    # And a node that names a scheduler and runs no consensus proves its OWN identity on every
-    # connection to it (#178 PR 6): the scheduler refuses registering, announcing and
-    # heartbeating from a machine that proved nothing, loopback included. So it keeps a state
-    # directory -- the start refuses one that names a scheduler without -- and, when this
-    # fixture started that scheduler, is admitted there BEFORE it starts, or its first rounds
-    # are refused and it registers a heartbeat interval late.
-    local state=()
-    if [ -n "$schedulerAt" ] && [ -z "${consensus[*]+x}" ]; then
-        state=(--cluster-dir="${workdir}/${tag}.state")
-        if [ -f "$voterKeyFile" ]; then
-            admit_worker "$tag" "$schedulerAt" "$log" "${state[@]}"
-        fi
-    fi
+    # Every node runs consensus, a cluster of one (#178): its scheduler signs every lease
+    # with the identity key the node keeps in its state directory, and a node running a
+    # worker with its consensus closed would have no scheduler to register with and is
+    # refused at startup. Bound to loopback, where nothing dials it, under `--raft-self`
+    # so it names itself -- and with no discovery, which is on beside consensus by
+    # default and would put a beacon on the port every other fixture on this machine
+    # shares.
+    #
+    # And EVERY node keeps its state in this fixture's directory: a node naming no
+    # `--cluster-dir` keeps its identity in the platform's default, which for this
+    # process is the account's own -- real state this fixture must not touch, and one
+    # identity every such node would share.
+    local consensus=(--listen-raft="127.0.0.1:$(free_port)" --raft-self=127.0.0.1 --discovery=
+        --cluster-dir="${workdir}/${tag}.state")
     "$node" ${drain[@]+"${drain[@]}"} \
         --listen-node="${host}:${port}" --advertise="${host}:${port}" \
-        ${consensus[@]+"${consensus[@]}"} ${voter[@]+"${voter[@]}"} ${state[@]+"${state[@]}"} \
-        ${@+"$@"} >> "$log" 2>&1 &
+        "${consensus[@]}" ${@+"$@"} >> "$log" 2>&1 &
     pid=$!
     started_pid="$pid"
     started_log="$log"
-    started_port="$port"
     wait_for_node_ready "$host" "$port" "$pid" "$tag" "$log"
-    # A lease reaching a worker before it holds a roster is refused `roster-expired` and
-    # compiled locally, which every case below would report as a dispatch that never
-    # happened -- so a checking worker is not started until it holds one.
-    if [ -n "${voter[*]+x}" ]; then
-        wait_for_log "roster: adopted roster version" "$pid" "$tag" "$log"
-    fi
-}
-
-# Admit a node that runs no consensus to the cluster its scheduler leads, under the identity
-# it will prove there (#178 PR 6), and wait until the admission is APPLIED.
-#
-# What an operator runs, in the order an operator runs it: `--print-identity` mints the
-# node's id and key into its state directory and prints the `--cluster-admit-worker` line,
-# and that line goes to the scheduler. The start then reads the same files back, so the
-# identity it proves is the one admitted.
-#
-# Applied rather than accepted, because the receipt says only that the leader APPENDED the
-# entry: a worker that dialled in before it was applied is refused `node-key-unknown`, and
-# its next round is a heartbeat interval away -- longer than the roster wait in
-# `start_node`. So the wait reads the key back out of `--cluster-status`, which is the
-# leader's applied state. Retried, because a scheduler that has just started may not lead
-# its cluster of one yet, and answers `not-leader` until it does.
-#
-# @param 1 tag: whose log the attempts are appended to, and every message about it
-# @param 2 the scheduler endpoint the node names
-# @param 3 its log
-# @param 4.. its state directory flag
-admit_worker() {
-    local tag="$1" scheduler="$2" log="$3"
-    shift 3
-    local identity=""
-    identity="$("$node" --print-identity "$@" 2>> "$log")" \
-        || { cat "$log" >&2; fail "${tag}: --print-identity could not mint this node's identity"; }
-    admitting_token="$(sed -n 's/^cluster-admit-worker //p' <<< "$identity")"
-    admitting_key="$(sed -n 's/^public-key //p' <<< "$identity")"
-    [ -n "$admitting_token" ] && [ -n "$admitting_key" ] \
-        || fail "${tag}: --print-identity printed no cluster-admit-worker line and key: ${identity}"
-    admitting_scheduler="$scheduler"
-    admitting_log="$log"
-    wait_until admission_recorded "the scheduler at ${scheduler} to admit ${tag}" - "$log" 30
-    wait_until admission_applied "the scheduler at ${scheduler} to apply ${tag}'s admission" - "$log" 30
-}
-
-# One attempt to record the admission `admit_worker` stated. A predicate for `wait_until`.
-admission_recorded() {
-    "$node" --scheduler="$admitting_scheduler" --cluster-admit-worker="$admitting_token" >> "$admitting_log" 2>&1
-}
-
-# Whether the leader's applied state holds the admitted key yet. A predicate for `wait_until`.
-admission_applied() {
-    local status=""
-    status="$("$node" --scheduler="$admitting_scheduler" --cluster-status 2>> "$admitting_log")" || return 1
-    grep -Fq "key=${admitting_key}" <<< "$status"
 }
 
 # Start one `fastcached` daemon, and wait for it to be ACCEPTING.
@@ -687,7 +690,6 @@ start_daemon() {
     pid=$!
     started_pid="$pid"
     started_log="$log"
-    started_port="$port"
     wait_for_daemon_ready "$host" "$port" "$pid" "$tag" "$log"
 }
 
@@ -771,619 +773,65 @@ run_launcher() {
 # counter that never moved used to end the run only because `set -e` happened to
 # notice a command substitution's status.
 
-# Slots enough that background CPU cannot withdraw all of them.
+# ONE slot above the node's own core count, so no amount of CPU used outside this fleet can
+# withdraw the worker these cases dispatch to.
 #
-# `AvailableSlots` reduces a worker's ceiling by the cores its machine is busy
-# with OUTSIDE this fleet -- `cpuBusyPermille * logicalCores / 1000`, less this
-# fleet's own in-flight jobs -- so a worker offering two slots on a many-core
-# machine withdraws both as soon as a few percent of that machine is doing
-# something else. This fixture IS that something else: it runs local reference
-# compiles on the same box, and on CI the rest of the suite runs beside it. The
-# dispatch then comes back `rejected (withdrawn)` and the case fails as "the
-# compile was not dispatched to a worker", which reads as a fault in dispatch and
-# is a fault in the fixture's sizing.
+# `SlotCeilingsFor` charges other work only past the headroom the slots leave, and with the
+# slots above the cores there is no headroom: every external core is charged. There are at
+# most `logicalCores` of them, so the ceiling never falls below `slots - logicalCores`, which
+# is one. With the slots AT the core count it fell to zero on any host with no idle core,
+# and a host running other builds beside this suite is exactly that: the worker withdrew
+# `external-cpu`, and case 12 -- whose subject is an unreachable CACHE -- ended as a skip or a
+# failure about a withdrawal it was never about. A case that asserts nothing whenever the
+# host is busy is not tested where it is most often run.
 #
-# Offering the whole machine puts the ceiling at cores-minus-external, which
-# reaches zero only when the host really is saturated -- and is what a node
-# dedicating this machine to the fleet would advertise anyway. The `--slots=1`
-# workers elsewhere in this file are deliberate and stay: their cases are ABOUT
-# a worker having exactly one.
+# Oversubscribing is a supported configuration rather than a trick: `OfferableSlots` takes an
+# operator's `--slots` untouched, precisely so a machine can be offered more jobs than it
+# has cores. The other two ceilings are not covered and should not be: a host with under
+# 1 GiB of memory or 128 MiB of scratch left is starved, not busy, and still withdraws.
 #
-# Above the mode split rather than beside the first worker that uses it, because
-# the membership mode below starts workers too and both want the same number.
-worker_slots="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
+# Counted the way the node counts, `sysconf(_SC_NPROCESSORS_ONLN)`, which is what `getconf`
+# asks. `nproc` honours this process's affinity mask and so can only be LOWER -- under
+# `taskset` or a container's cpuset it would put the floor below one slot again. No count at
+# all is a refusal, since the floor cannot then be established.
+#
+# The `--slots=1` workers elsewhere in this file are deliberate and stay: their cases are
+# ABOUT a worker having exactly one.
+host_cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+[[ "$host_cores" =~ ^[1-9][0-9]*$ ]] \
+    || fail "could not read this host's online core count (getconf _NPROCESSORS_ONLN said '${host_cores}'), so the worker cannot be sized above it"
+worker_slots="$((host_cores + 1))"
 
-# --- mode: a compile arriving from an address that is NOT loopback -------------
-#
-# Every case in the suite below this block is loopback end to end, and that is why
-# #235 -- a worker that admitted only its own machine and refused every dispatched
-# compile -- survived all of them. `ClusterMembership::Classify` admits loopback
-# unconditionally and deliberately, so a client that is always local never reaches
-# the branch underneath:
-#
-#     if (IsLoopbackHost(peerAddress))
-#         return Membership::Member;                            <- every case below
-#     ...
-#     return any_of(_hosts, SameHost) ? Member : Outsider;      <- this mode
-#
-# A second loopback address does not reach it either, and that was checked rather
-# than assumed: `IsLoopbackHost` matches the whole of `127.0.0.0/8` rather than
-# `127.0.0.1` alone, and says so in its own comment. What does reach it is this
-# host's OWN non-loopback address. Bind the worker there, let the scheduler grant
-# that endpoint, and the connection the worker accepts arrives from an address
-# outside 127/8 -- with no second machine, no container and no alias involved.
-#
-# ## Three legs, and the first two prove nothing apart
-#
-#   admitted   the address IS in the worker's `--fleet-member`: the compile is
-#              dispatched and that worker's job counter moves.
-#   refused    the address is NOT in the worker's policy: the worker answers
-#              `not-a-member`, the launcher compiles locally, and
-#              `fastcache_worker_jobs_refused_not_a_member_total` moves. That
-#              counter is the assertion #235 needed and did not have.
-#   served     the SAME address, the SAME listener, the other verb: it fetches from
-#              the admitting worker's own cache tier and is SERVED, because that
-#              address is this machine. #290's rule, which the merge is what put at
-#              risk -- see leg 3, which carries the argument in full.
-#
-# The admitted leg on its own would pass over loopback too -- loopback is admitted
-# by the branch ABOVE the list -- so it cannot show that the peer address ever
-# reached the list. The refused leg is what shows it: a loopback peer would have
-# been admitted there as well, and the leg would fail. Neither is worth running
-# without the other, which is why they are one mode rather than two.
-#
-# Leg 3 is the odd one and is deliberately not symmetric with them: membership is a
-# list an operator writes, locality is a fact about the host, and after #290 both are
-# decided on one socket. It runs against leg 1's worker for that reason.
-#
-# In BOTH legs the scheduler admits the client. #235's shape is a lease that is
-# granted and then a worker that refuses it, so no scheduler counter moves and the
-# fleet looks healthy from the only side anybody watches; a refusal coming from the
-# scheduler instead would be a different test passing under the same name.
-#
-# ## What binding on that address does and does not expose
-#
-# Both workers are started with their scheduler's `--voter-key`, so every grant is
-# signed and checked. Leg 1's worker admits exactly one host -- the address the machine
-# already answers on -- and leg 2's admits none but its own loopback, so for the
-# few seconds these ports are open the set of callers either would serve is
-# {this machine}. A peer address is the kernel's, not a claim in a frame, so
-# nothing on the network can present that address without being this machine.
-#
-# ## Why this is a mode and not a thirteenth case
-#
-# It is the only assertion here with a prerequisite the machine may not have, and a
-# host with no non-loopback address has to report SKIPPED rather than passed. A
-# script exits once, so a thirteenth case could do no more than print a line and
-# let the run go green -- a pass reported for a case that never ran, which is
-# precisely the defect #252 is about. As its own ctest test it has its own state,
-# while the helpers, the bounded waits and the port ledger stay shared rather than
-# copied.
-if [[ "$mode" == "membership" ]]; then
-    # Every way this host might name a non-loopback address of its own. A list of
-    # probes rather than one command because none of them is portable: `ip` is
-    # Linux-only, `hostname -I` is Linux-only and absent from busybox, and
-    # `ifconfig` prints three layouts across macOS and two vintages of net-tools.
-    # Each row is allowed to fail and the first usable answer wins; the loop below
-    # word-splits, so a row may print one candidate per line (`ip`, `ifconfig`) or
-    # all of them on one line (`hostname -I`) and neither has to be normalised.
-    #
-    # This asks the SHELL a question the tree already answers in C++:
-    # `Platform/LocalAddresses.hpp`'s `QueryLocalAddresses()` is the authority, and
-    # is what the node's own locality oracle consults. Nothing exposes it to a
-    # script -- `--print-surfaces` prints configured surfaces, not the machine's
-    # addresses -- so this is a second definition of one question, and the two could
-    # disagree about a host neither of them was written for. Naming the authority
-    # here is what makes that visible when it happens.
-    #
-    # `up` is part of the `ip` filter, and it is not tidiness: an address on an
-    # administratively-down interface is still enumerated, and binding it succeeds
-    # while the local route is gone -- so the fixture's own `wait_for_port` would
-    # never connect and the run would FAIL where its contract says SKIP. A laptop on
-    # Wi-Fi with a configured wired NIC unplugged is the ordinary way to meet that.
-    #
-    # The other two rows cannot all be filtered the same way, and saying they can
-    # would be a comment describing something the code does not do: `hostname -I`
-    # reports only up interfaces, but macOS's `ifconfig` with no arguments lists
-    # every interface rather than only the up ones. That residual is why a chosen
-    # address that will not carry a connection is a named FAIL naming the address --
-    # `${tag} never listened on <addr>:<port>` -- rather than anything silent.
-    probe_ip_addr() { ip -4 -o addr show scope global up 2>/dev/null | awk '{ print $4 }' | cut -d/ -f1; }
-    probe_ifconfig() { ifconfig 2>/dev/null | awk '$1 == "inet" { print $2 }' | sed 's/^addr://'; }
-    probe_hostname() { hostname -I 2>/dev/null; }
-
-    # The first address that is a bare IPv4 literal and is neither loopback nor
-    # link-local. Link-local is excluded because a 169.254 address means DHCP did
-    # not answer -- it is routable by nothing and would fail the bind or the dial
-    # for a reason that has nothing to do with membership.
-    first_non_loopback_address() {
-        local probe out addr
-        for probe in probe_ip_addr probe_ifconfig probe_hostname; do
-            out="$("$probe" || true)"
-            for addr in $out; do
-                case "$addr" in
-                    127.*|169.254.*|0.0.0.0) continue ;;
-                    *[!0-9.]*) continue ;;
-                    *.*.*.*) printf '%s\n' "$addr"; return 0 ;;
-                esac
-            done
-        done
-        return 1
-    }
-
-    lan_address="$(first_non_loopback_address || true)"
-    if [[ -z "$lan_address" ]]; then
-        # Loudly, and never a quiet fall back to 127.0.0.1. A run over loopback
-        # here would exercise the branch ABOVE the member list, pass, and report a
-        # result for a property it did not test -- this ticket's own failure mode
-        # wearing a different hat.
-        echo "dist-compile membership E2E SKIPPED: this host reports no non-loopback IPv4 address"
-        echo "  probed: 'ip -4 -o addr show scope global up', 'ifconfig', 'hostname -I'"
-        echo "  Without one, every connection to this machine's own worker arrives from 127.0.0.0/8,"
-        echo "  which ClusterMembership::Classify admits before it ever consults the member list. There"
-        echo "  is no arrangement of loopback addresses that reaches that list (127.0.0.2 included), so"
-        echo "  running anyway would report a pass for a case that never ran (#252)."
-        exit "$SKIP"
+# Called where a dispatch the case needed did not happen. A withdrawal FAILS, naming
+# the limit the scheduler's record gives -- the worker is sized so CPU used outside this
+# fleet cannot cause one (`worker_slots`), so whatever did is the finding. Anything else
+# returns, and the caller's own failure stands.
+# @param 1 the launcher's log for that compile
+# @param 2 the scheduler endpoint
+# @param 3 the worker's advertised endpoint
+# @param 4 the toolchain fingerprint
+fail_if_withdrawn() {
+    local text limit=""
+    text="$(cat "$1")"
+    is_withdrawn_refusal "$text" || return 0
+    # Bounded, because this runs on a path that is already failing and an unbounded
+    # ask here turns a named refusal into a hang. The client's own ceilings are 5 s to
+    # connect and 10 s per read and write, so the bound is their sum; an expiry is
+    # SAID, naming what was waited for, and reads as an absent record. stderr is left
+    # out of the capture, which is the table `worker_limit_from_tsv` parses.
+    if [[ -n "$cli" && -x "$cli" ]]; then
+        local records="" asked=0 cli_read_seconds=15
+        records="$(run_bounded "$cli_read_seconds" bash -c 'exec "$0" "$@" 2>/dev/null' \
+            "$cli" "--addr=$2" --format=tsv fleet workers)" || asked=$?
+        if [[ "$(e2e_bound_outcome)" == "$E2eBoundOutcomeExceeded" ]]; then
+            echo "the scheduler's record was not read: fastcache-cli fleet workers against $2 did not answer within ${cli_read_seconds}s" >&2
+        elif [[ "$asked" -eq 0 ]]; then
+            limit="$(worker_limit_from_tsv "$records" "$3" "$4")"
+        fi
     fi
-
-    echo "== membership: a dispatched compile arriving from ${lan_address}, which is not loopback"
-
-    # A cache of this mode's own, and a real one rather than a drawn port nothing
-    # binds.
-    #
-    # Nothing here asserts anything about the cache, so an unreachable one would
-    # also do -- case 12 proves a compile still dispatches around one. What that
-    # would give up is the control: with a daemon answering, the admitted leg walks
-    # exactly the path the suite's case 1 walks (fetch, miss, dispatch, store), so
-    # the refusing leg differs from it in ONE flag rather than in a flag and a
-    # cache. Leaving `FASTCACHE_ADDR` unset is the option that is simply wrong: it
-    # sends the launcher to 127.0.0.1:6674, which on a developer machine is very
-    # likely a real node serving real builds.
-    mem_cache_port="$(free_port)"
-    start_daemon "mem-daemon" 127.0.0.1 "$mem_cache_port" \
-        --storage-max-value=64M --log-level=info
-    mem_daemon_pid="$started_pid"
-    export FASTCACHE_ADDR="127.0.0.1:${mem_cache_port}"
-
-    proj="${workdir}/memproj"
-    mkdir -p "${proj}/build"
-    export FASTCACHE_SOURCE_DIR="${proj}"
-    export FASTCACHE_BINARY_DIR="${proj}/build"
-
-    # Start a scheduler that admits this host's non-loopback address.
-    #
-    # Both legs get one of their own, so that each leg's worker is the ONLY match
-    # its scheduler has: sharing one would leave the admitting worker available to
-    # the refusing leg and turn a refusal into a second dispatch. The scheduler's
-    # own worker surface names a toolchain nothing here compiles with, for the same
-    # reason the suite's does.
-    #
-    # `--fleet-member` rather than `--fleet-open`, so the scheduler's own gate is
-    # reached from a non-loopback address too. The client dials it at $lan_address,
-    # and so does the worker when it registers.
-    #
-    # @param 1 tag, for the log file and the messages
-    # @param 2 dispatch (`--listen-node`) port
-    start_membership_scheduler() {
-        local tag="$1" dispatch="$2"
-        # `--slots=0`: it runs no worker, so every lease lands on the worker under
-        # test and it names no `--scheduler` of its own to register with (#206).
-        start_node "$tag" "$lan_address" "$dispatch" \
-            "$no_local_cache" \
-            --serve-scheduler \
-            --fleet-member="$lan_address" \
-            --slots=0 --log-level=debug
-        wait_for_log "scheduling for the fleet" "$started_pid" "$tag" "$started_log"
-    }
-
-    # Start a worker bound on this host's non-loopback address.
-    #
-    # The toolchain fingerprint is PINNED to the one the launcher reported rather
-    # than probed, which is the whole of `--toolchain=<fingerprint>=<compiler>`. It
-    # matches for the same reason the suite's bare `--toolchain` does -- the suite
-    # asserts that agreement, once, and this mode is not about it -- and it skips an
-    # include-tree walk per worker, which is the expensive part of starting one.
-    #
-    # That also takes away the one stall these waits could not diagnose. A walk logs
-    # nothing while it runs, so a slow one and a wedge produce identical logs and
-    # need the CPU classifier `node-scratch-isolation-e2e` carries; with the
-    # fingerprint pinned there is no walk here, and a worker that has not logged
-    # `compile node ready` within the bound has not started.
-    #
-    # The cache tier is a PARAMETER rather than a constant in the body, because the
-    # two legs want opposite answers to it and a flag repeated with a different value
-    # would leave which one wins to the option table's overwrite order -- a fixture
-    # asserting a property it never states. Leg 1's worker holds a tier, so leg 3 can
-    # ask it for an object over the same socket; leg 2's holds none, because a refusal
-    # is all that leg reads and a tier there is a second thing to go wrong.
-    #
-    # @param 1 tag, for the log file and the messages
-    # @param 2 dispatch port to register with
-    # @param 3 admin port
-    # @param 4 the cache-tier flag: `--cache-memory=<n>`, or `$no_local_cache` for none
-    # @param 5.. the membership flags under test, if any
-    start_membership_worker() {
-        local tag="$1" dispatch="$2" admin="$3" tier="$4"
-        shift 4
-        # The compile port is the worker's own business, since the client is told
-        # where to dial by the lease rather than by this fixture. `start_node`
-        # hands it back as `started_port`, which leg 3 reads.
-        start_node "$tag" "$lan_address" "$(free_port)" \
-            "$tier" \
-            --scheduler="${lan_address}:${dispatch}" \
-            --admin-listen="$admin" \
-            --toolchain="${fingerprint}=${compiler}" --slots="$worker_slots" --log-level=debug \
-            ${@+"$@"}
-        # Registration is waited for separately from the bind and the readiness
-        # `start_node` covers, because a stall in one is a different fault from a
-        # stall in the other and a fixture that folds them cannot say which
-        # happened.
-        wait_for_registration "$started_pid" "$tag" "$started_log"
-
-        # THERE IS NO WAIT FOR THE ADMIN PORT, and the absence is the point (#655).
-        # One stood here and could not fail. `main.cpp` binds the admin surface in
-        # `StartAdminSurfaceOrExplain`, synchronously through `BlockingListener::Bind`
-        # and about four hundred lines BEFORE it logs `compile node ready`; a bind
-        # that fails is `return ExitUsage`, so the marker is unreachable without it.
-        # `start_node` waits for that marker since #634 and `wait_for_registration`
-        # above waits for a heartbeat round, which is later still -- so by here the
-        # port has been listening for two waits.
-        #
-        # Deleting it also improves the failure it appeared to guard: an admin port
-        # this node could not bind is now a DEATH inside `start_node`, reported with
-        # the node's log and its exit status, where the wait would have spent its
-        # budget and then said a healthy-looking process never listened.
-        #
-        # What DOES establish that the surface answers is the first `wait_for_counter`
-        # against it, whose three terminal states begin with `nothing ever answered a
-        # /metrics request`. An unfalsifiable wait is not free: it reads as an
-        # assertion, and gets copied into a fixture where the ordering does not hold.
-    }
-
-    # A COMPLETE `/metrics` body, or WHICH of three things stopped it (#1184).
-    #
-    # This leg failed on macOS with *the refusing worker exports no
-    # fastcache_worker_jobs_refused_not_a_member_total series*, on the BEFORE
-    # reading, one poll after the admin port began listening. That sentence is a
-    # claim about the EXPORTER, and it was the only sentence the fixture could
-    # produce -- so it made that claim for a scrape that never arrived, for a
-    # response that was not a metrics body, and for a body that was cut short,
-    # all three alike.
-    #
-    # It is very unlikely to be the claim it makes, because the exporter cannot
-    # omit that row. `RenderPrometheus` walks `CounterTable` unconditionally --
-    # "every counter the sink knows, without exception" -- and appends
-    # `fastcached_uptime_seconds` AFTER the loop. So the terminator is a
-    # completeness test that needs nothing from the HTTP layer: a body carrying
-    # that gauge carried the whole counter table ahead of it, and a body without
-    # it was cut short whatever the transport thinks.
-    #
-    # The acquisition CAN report this for itself now, and this test stays anyway.
-    # `http_get` returns `$E2eHttpTruncated` for a response its own read bound cut
-    # short, and `_http_drain_fd3` takes the sticky-EOF probe whenever the status
-    # cannot decide rather than only when the body is empty -- which is what made
-    # a partial body report `peer`, *the server answered*, on macOS's bash 3.2
-    # (#1257). The loop below reads that status and names it.
-    #
-    # The terminator test is KEPT because it answers a different question. The
-    # transport can only say whether OUR bound ended the read; it cannot say the
-    # exporter finished writing, and a body can be complete-on-the-wire and still
-    # be a body this fixture cannot conclude from. Two readings, two failures, and
-    # the one that fires says which.
-    #
-    # BOUNDED and retried, because a scrape that did not complete is a failure of
-    # the instrument rather than evidence about the worker -- and the findings say
-    # how many attempts were made and what the last one looked like, because a
-    # retry that hides its own failures is how this class of defect stays
-    # invisible.
-    E2eMetricsBody=""
-    scrape_metrics() {
-        local host="$1" port="$2" what="$3" pid="$4" logfile="$5"
-        local seconds="${6:-15}"
-        local attempts=0 lastOutcome="nothing was attempted" lastBytes=0 lastSeries=0
-
-        E2eMetricsBody=""
-
-        _metrics_body_ready() {
-            local body="" statusLine=""
-            attempts=$(( attempts + 1 ))
-            local getStatus=0
-            body="$(http_get "$host" "$port" /metrics 2>/dev/null)" || getStatus=$?
-            if [ "$getStatus" -ne "$E2eHttpAnswered" ]; then
-                # NAMED, never "the connection was refused" for every non-zero.
-                # Refused and cut-short are facts about different machines, and
-                # this loop retries both -- so the one it reports has to be the
-                # one that happened (#1257).
-                lastOutcome="$(e2e_http_outcome "$getStatus" "the scrape")"
-                return 1
-            fi
-            lastBytes=${#body}
-            if [ "$lastBytes" -eq 0 ]; then
-                lastOutcome="the endpoint accepted the connection and said nothing"
-                return 1
-            fi
-            statusLine="$(sed -n '1s/\r$//p' <<< "$body")"
-            case "$statusLine" in
-                *" 200 "*) ;;
-                *)
-                    lastOutcome="the endpoint answered '${statusLine}' rather than 200"
-                    return 1
-                    ;;
-            esac
-            # `|| true`: `grep -c` exits 1 on a count of zero, and this file runs
-            # under `set -e` with `pipefail`. A herestring, never a pipe.
-            lastSeries="$(grep -a -c '^fastcache' <<< "$body" || true)"
-            if ! grep -q '^fastcached_uptime_seconds ' <<< "$body"; then
-                lastOutcome="the body stopped before its last line (${lastBytes} bytes, ${lastSeries} series, no fastcached_uptime_seconds), so it was CUT SHORT rather than short of a counter"
-                return 1
-            fi
-            E2eMetricsBody="$body"
-            return 0
-        }
-        _metrics_body_findings() {
-            echo "   METRICS: ${attempts} scrape attempt(s); the last one: ${lastOutcome}"
-            echo "            A complete body ends with fastcached_uptime_seconds, because"
-            echo "            RenderPrometheus appends it after the whole counter table. Not"
-            echo "            reaching that line says the SCRAPE did not finish, which is not"
-            echo "            a statement about any counter."
-        }
-
-        wait_until _metrics_body_ready "${what} to answer a COMPLETE /metrics body" \
-            "$pid" "$logfile" "$seconds" "" _metrics_body_findings
-        lastOutcome="a complete 200 body, ${lastBytes} bytes, ${lastSeries} series, after ${attempts} attempt(s)"
-    }
-
-    # --- leg 1: the address is a member, and the compile is served ---------------
-    echo "== membership leg 1: ${lan_address} listed as a member"
-    admit_dispatch_port="$(free_port)"
-    admit_admin_port="$(free_port)"
-
-    start_membership_scheduler "mem-admit-scheduler" "$admit_dispatch_port"
-    start_membership_worker "mem-admit-worker" "$admit_dispatch_port" "$admit_admin_port" \
-        --cache-memory=64m \
-        --fleet-member="$lan_address"
-    admit_worker_pid="$started_pid"
-    admit_worker_port="$started_port"
-
-    # The policy the worker actually adopted, from its own ready line. Asserted
-    # because the two legs differ in exactly one flag, and a leg that silently
-    # started with the OTHER leg's policy would still produce a plausible result.
-    grep -q "this machine plus 1 member host(s)" "${workdir}/mem-admit-worker.log" \
-        || { cat "${workdir}/mem-admit-worker.log" >&2; fail "the admitting worker did not report a member list"; }
-
-    write_source "${proj}/admitted.cpp" "memberadmitted"
-    "$compiler" -std=c++17 -O1 -c "${proj}/admitted.cpp" -o "${proj}/build/admitted-ref.o" \
-        || fail "the membership reference compile failed"
-
-    export FASTCACHE_SCHEDULER="${lan_address}:${admit_dispatch_port}"
-    run_launcher "${workdir}/mem-admitted.log" -std=c++17 -O1 -c "${proj}/admitted.cpp" -o "${proj}/build/admitted.o" \
-        || { cat "${workdir}/mem-admitted.log" >&2; fail "the compile from a member address failed"; }
-
-    grep -q "DISPATCHED to " "${workdir}/mem-admitted.log" \
-        || {
-            cat "${workdir}/mem-admitted.log" >&2
-            echo "--- worker log ---" >&2
-            cat "${workdir}/mem-admit-worker.log" >&2
-            fail "a compile from a listed member address was not dispatched"
-        }
-    cmp -s "${proj}/build/admitted-ref.o" "${proj}/build/admitted.o" \
-        || fail "the object built for a member address differs from the local one"
-
-    # The job counter is polled and the refusal counter is read from the same
-    # instant -- one scrape, two series. The worker completes a job on the thread
-    # that ran it, after the client already has its object, so a single read of
-    # `jobs_completed_total` races the reply; and the two readings must come from
-    # ONE body, because "it served a job and refused nobody" is a statement about a
-    # moment rather than about two scrapes a round trip apart.
-    #
-    # The zero is read rather than assumed, and it is the assertion that this
-    # worker served the dispatched compile without refusing anything on the way --
-    # a leg that dispatched AND refused would be describing two different callers
-    # and would not be the clean control leg 2 is measured against.
-    wait_for_counter 127.0.0.1 "$admit_admin_port" fastcache_worker_jobs_completed_total 1 \
-        "$admit_worker_pid" "the admitting worker" "${workdir}/mem-admit-worker.log"
-    admit_completed="$E2eCounterReading"
-    scrape_metrics 127.0.0.1 "$admit_admin_port" "the admitting worker" "$admit_worker_pid" "${workdir}/mem-admit-worker.log"
-    admit_metrics="$E2eMetricsBody"
-    admit_refused="$(metric_value "$admit_metrics" fastcache_worker_jobs_refused_not_a_member_total)"
-    # Absent is not zero, and here it would read as one: an empty string compares
-    # unequal to "0" and the failure would name a count nobody exported.
-    [[ -n "$admit_refused" ]] \
-        || fail "the admitting worker answered a COMPLETE /metrics body that carries no fastcache_worker_jobs_refused_not_a_member_total series. The body reached its last line, so this is the EXPORTER and not the scrape: RenderPrometheus walks CounterTable without exception, so a row it does not emit is a defect in the catalogue rather than a counter that has not moved."
-    [[ "$admit_refused" == "0" ]] \
-        || fail "the admitting worker refused ${admit_refused} caller(s) as not-a-member"
-    echo "   dispatched and served: ${admit_completed} job(s), 0 refused"
-
-    # --- leg 3: the same peer, the same listener, and its CACHE verb is SERVED ----
-    #
-    # #290's acceptance criterion at deployment scale, and it is the half that can be
-    # reached from one host. The ticket states the property as a FETCH refused while a
-    # compile from the same peer succeeds; the refusing direction cannot be built here,
-    # because `CachedLocalityOracle::IsThisMachine` answers true for every address this
-    # machine answers on and $lan_address is one of them by construction. That contrast
-    # is a unit case (`NodeFrameSurface_test`, "(#290) one peer on one listener"), which
-    # injects the oracle and can therefore have a peer that is genuinely somebody else.
-    #
-    # What is left is the OTHER direction, and it is the one a bind change breaks in
-    # silence. Until stage 3 the cache tier and the compiler sat behind two listeners,
-    # and "who may do this" was answered by which socket a frame arrived on. They now
-    # share one, and what replaced the socket is that locality is a property of the
-    # VERB: this worker must serve its tier to $lan_address -- which IS this machine --
-    # while deciding the compile by membership instead. A merge that gated the cache on
-    # `IsLoopbackHost` alone would satisfy every other assertion in this file and fail
-    # only here. Nothing else would notice: objects would stay correct, the fleet would
-    # keep dispatching, and the tier would simply stop answering the address an
-    # operator bound it to.
-    #
-    # The SAME worker as leg 1, deliberately, rather than a fourth process. The claim
-    # is about one listener answering two verbs two ways, so a second worker would be a
-    # second socket and would give up the property being asserted.
-    echo "== membership leg 3: ${lan_address} fetching from the listener that just compiled for it"
-
-    write_source "${proj}/tiered.cpp" "membertiered"
-    "$compiler" -std=c++17 -O1 -c "${proj}/tiered.cpp" -o "${proj}/build/tiered-ref.o" \
-        || fail "the leg 3 reference compile failed"
-
-    # Pointed at the WORKER's node port, at $lan_address, with no scheduler: this is a
-    # cache exchange and nothing else, so a dispatch cannot stand in for a hit.
-    (
-        export FASTCACHE_ADDR="${lan_address}:${admit_worker_port}"
-        unset FASTCACHE_SCHEDULER
-        run_launcher "${workdir}/mem-tier-store.log" -std=c++17 -O1 -c "${proj}/tiered.cpp" -o "${proj}/build/tiered.o"
-    ) || {
-        cat "${workdir}/mem-tier-store.log" >&2
-        echo "--- worker log ---" >&2
-        cat "${workdir}/mem-admit-worker.log" >&2
-        fail "a compile storing into the worker's tier at ${lan_address} failed"
-    }
-
-    rm -f "${proj}/build/tiered.o"
-    (
-        export FASTCACHE_ADDR="${lan_address}:${admit_worker_port}"
-        unset FASTCACHE_SCHEDULER
-        run_launcher "${workdir}/mem-tier-hit.log" -std=c++17 -O1 -c "${proj}/tiered.cpp" -o "${proj}/build/tiered.o"
-    ) || {
-        cat "${workdir}/mem-tier-hit.log" >&2
-        fail "a second compile against the worker's tier at ${lan_address} failed"
-    }
-
-    # The POSITIVE, asserted on its own. A refusal counter that stayed at zero says
-    # only that nothing was refused, and "no refusals" is not "it was served" -- the
-    # launcher steps over a refused FETCH and compiles, so a tier that answered nobody
-    # would leave both the build green and that counter flat.
-    grep -q "fastcache-cc: HIT" "${workdir}/mem-tier-hit.log" \
-        || {
-            cat "${workdir}/mem-tier-hit.log" >&2
-            echo "--- worker log ---" >&2
-            cat "${workdir}/mem-admit-worker.log" >&2
-            fail "the worker's tier did not serve ${lan_address} an object it holds"
-        }
-    cmp -s "${proj}/build/tiered-ref.o" "${proj}/build/tiered.o" \
-        || fail "the object served from the worker's tier to ${lan_address} is wrong"
-
-    # And the worker's own side of the same exchange. The hit is what says the tier
-    # answered; the flat refusal counter is what says WHICH rule let it through, and
-    # after the merge those two refusals share a wire code -- a caller that is not on
-    # this machine and a caller with no claim on its CPU both answer `not-a-member` --
-    # so the counters are the only place they are told apart.
-    wait_for_counter 127.0.0.1 "$admit_admin_port" fastcache_node_cache_hits_total 1 \
-        "$admit_worker_pid" "the admitting worker's cache tier" "${workdir}/mem-admit-worker.log"
-    tier_hits="$E2eCounterReading"
-    scrape_metrics 127.0.0.1 "$admit_admin_port" "the admitting worker" "$admit_worker_pid" "${workdir}/mem-admit-worker.log"
-    tier_metrics="$E2eMetricsBody"
-    tier_refused="$(metric_value "$tier_metrics" fastcache_node_cache_requests_refused_not_local_total)"
-    # Absent is not zero. A worker with no tier exports no such series, and an empty
-    # string would compare unequal to "0" and fail naming a count nobody published --
-    # which is also the check that catches leg 1 losing its `--cache-memory`.
-    [[ -n "$tier_refused" ]] \
-        || fail "the admitting worker answered a COMPLETE /metrics body that carries no fastcache_node_cache_requests_refused_not_local_total series. The body reached its last line, so this is the EXPORTER and not the scrape: RenderPrometheus walks CounterTable without exception, so a row it does not emit is a defect in the catalogue rather than a counter that has not moved."
-    [[ "$tier_refused" == "0" ]] \
-        || fail "the worker refused ${tier_refused} cache request(s) from ${lan_address} as not-local"
-    echo "   its tier served ${lan_address} ${tier_hits} hit(s), refusing 0 as not-local"
-
-    # --- leg 2: the same address, not a member, and the worker says so -----------
-    #
-    # The worker is started with NO membership flags at all, which is the default
-    # and admits this machine's loopback and nothing else. Its scheduler still lists
-    # $lan_address, so the lease IS granted -- #235's shape exactly -- and the
-    # refusal has to come from the worker.
-    echo "== membership leg 2: ${lan_address} absent from the worker's policy"
-    refuse_dispatch_port="$(free_port)"
-    refuse_admin_port="$(free_port)"
-
-    start_membership_scheduler "mem-refuse-scheduler" "$refuse_dispatch_port"
-    start_membership_worker "mem-refuse-worker" "$refuse_dispatch_port" "$refuse_admin_port" \
-        "$no_local_cache"
-    refuse_worker_pid="$started_pid"
-
-    grep -q "this machine only" "${workdir}/mem-refuse-worker.log" \
-        || { cat "${workdir}/mem-refuse-worker.log" >&2; fail "the refusing worker did not report a loopback-only policy"; }
-
-    # The reading BEFORE the compile, and it is ZERO -- which it did not used to be,
-    # and the reason is a behaviour change #290 stage 3 made deliberately.
-    #
-    # This wait used to poll for >= 1, and the thing it was waiting for was this
-    # fixture's own `wait_for_port`: the dedicated compile listener refused a
-    # non-member at ACCEPT -- `WorkerServer`'s accept loop classified
-    # `socket->PeerAddress()` before a byte was read -- so a bare connect-and-close
-    # from $lan_address was itself a counted refusal.
-    #
-    # Stage 3 retired that listener. The compile verbs now arrive on the merged 0xFC
-    # surface, where the peer gate is asked per FRAME rather than per accept, at the
-    # first point the verb is known. That is not an oversight and could not be undone
-    # without breaking the merge: membership is the policy of the compile VERBS, not
-    # of the socket, and the same socket serves cache verbs that answer locality
-    # instead -- an accept-time membership gate would decide both. A connection that
-    # sends nothing is therefore refused by nothing, and the probe no longer counts.
-    #
-    # What that costs this leg is a corroborating reading, not the leg itself. The
-    # compile below still arrives from $lan_address, and loopback would still be
-    # admitted by the branch above the member list, so the 0 -> 1 delta discriminates
-    # exactly as the old 1 -> 2 did. The baseline is ASSERTED to be zero rather than
-    # merely recorded: a worker already refusing this address for some other reason
-    # would otherwise be indistinguishable from one refusing the compile.
-    scrape_metrics 127.0.0.1 "$refuse_admin_port" "the refusing worker" "$refuse_worker_pid" "${workdir}/mem-refuse-worker.log"
-    refuse_metrics_before="$E2eMetricsBody"
-    refuse_before="$(metric_value "$refuse_metrics_before" fastcache_worker_jobs_refused_not_a_member_total)"
-    # Absent is not zero: an unexported series would read as an empty string here and
-    # make the delta below compare against nothing.
-    [[ -n "$refuse_before" ]] \
-        || fail "the refusing worker answered a COMPLETE /metrics body that carries no fastcache_worker_jobs_refused_not_a_member_total series. The body reached its last line, so this is the EXPORTER and not the scrape: RenderPrometheus walks CounterTable without exception, so a row it does not emit is a defect in the catalogue rather than a counter that has not moved."
-    [[ "$refuse_before" == "0" ]] \
-        || fail "the refusing worker had already refused ${refuse_before} caller(s) before the compile"
-
-    write_source "${proj}/refused.cpp" "memberrefused"
-
-    export FASTCACHE_SCHEDULER="${lan_address}:${refuse_dispatch_port}"
-    run_launcher "${workdir}/mem-refused.log" -std=c++17 -O1 -c "${proj}/refused.cpp" -o "${proj}/build/refused.o" \
-        || { cat "${workdir}/mem-refused.log" >&2; fail "a build refused by a worker did not survive"; }
-
-    # The client's half: a typed refusal naming the reason, and a local compile.
-    # `refused the job:` is part of the match rather than `rejected (not-a-member)`
-    # alone, because that phrase is what says the refusal came from the WORKER the
-    # lease named -- a scheduler declining the lease would be a different failure
-    # reported in a different sentence, and this leg would then be asserting the
-    # gate it deliberately arranged NOT to test.
-    grep -q "refused the job: rejected (not-a-member)" "${workdir}/mem-refused.log" \
-        || {
-            cat "${workdir}/mem-refused.log" >&2
-            echo "--- worker log ---" >&2
-            cat "${workdir}/mem-refuse-worker.log" >&2
-            fail "a compile from an unlisted address was not refused as not-a-member by the worker"
-        }
-    grep -q "; compiling locally" "${workdir}/mem-refused.log" \
-        || { cat "${workdir}/mem-refused.log" >&2; fail "a refused compile did not fall back to a local one"; }
-    # An object exists and is not empty, and deliberately no `cmp` against a
-    # reference. Both sides of such a comparison would be this machine's own
-    # compiler on the same source with the same flags, so it asserts compiler
-    # determinism at the price of a second full compile; that the local fallback
-    # produces a CORRECT object is case 4's, which owns it.
-    [[ -s "${proj}/build/refused.o" ]] \
-        || fail "no object was written after a membership refusal"
-
-    # The worker's half, and the reason this leg exists. #235 was invisible from
-    # every other vantage point -- the lease was granted, so no scheduler counter
-    # moved and the build went green -- and this counter was the one signal that
-    # would have named it. Bounded rather than read once, because the refusal is
-    # counted on the worker's accept loop and the client has its answer first.
-    wait_for_counter 127.0.0.1 "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total \
-        $(( refuse_before + 1 )) "$refuse_worker_pid" \
-        "the refusing worker (it refused the compile and the counter never moved past ${refuse_before})" \
-        "${workdir}/mem-refuse-worker.log"
-    refuse_after="$E2eCounterReading"
-    scrape_metrics 127.0.0.1 "$refuse_admin_port" "the refusing worker" "$refuse_worker_pid" "${workdir}/mem-refuse-worker.log"
-    refuse_metrics="$E2eMetricsBody"
-    refuse_completed="$(metric_value "$refuse_metrics" fastcache_worker_jobs_completed_total)"
-    [[ -n "$refuse_completed" ]] \
-        || fail "the refusing worker answered a COMPLETE /metrics body that carries no fastcache_worker_jobs_completed_total series. The body reached its last line, so this is the EXPORTER and not the scrape: RenderPrometheus walks CounterTable without exception, so a row it does not emit is a defect in the catalogue rather than a counter that has not moved."
-    [[ "$refuse_completed" == "0" ]] \
-        || fail "a worker that refused the caller still completed ${refuse_completed} job(s)"
-    echo "   refused as not-a-member (counter ${refuse_before} -> ${refuse_after}), and the build compiled locally"
-
-    echo
-    echo "dist-compile membership E2E PASSED"
-    exit 0
-fi
+    printf '%s\n' "$text" >&2
+    fail "the worker withdrew its slots (the scheduler's record says it is limited by '${limit:-unreadable}'), which it is sized never to do for CPU used outside this fleet -- see worker_slots"
+}
 
 # --- start the cache ---------------------------------------------------------
 # One listener now, and only the cache. `fastcached` used to carry the scheduler
@@ -1403,39 +851,29 @@ daemon_pid="$started_pid"
 
 export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 
-# --- start the scheduler -----------------------------------------------------
-# A compile node running the fleet's scheduler. --fleet-open because every peer
-# here is loopback -- and because the policy has to be STATED: a node with no
-# member list refuses everybody, which is the right default and not a working
-# configuration, so it is refused at startup rather than discovered later as a
-# fleet that silently distributes nothing.
+# --- start the node ------------------------------------------------------------
+# One compile node. It serves the fleet's scheduler -- a first start is a cluster of
+# one, and its mode serves one -- and its own worker registers with it, so the
+# scheduler that leases this worker is the one in the same process: what every
+# zero-config machine runs. A serving node is refused `--scheduler`, so there is no
+# second process to point at it. `--fleet-open` because the policy has to be STATED:
+# the clients here are this machine and admitted either way, and the flag keeps the
+# node's scheduler answering the shape this fixture always asserted against.
 #
-# It runs no worker, deliberately (`--slots=0`, #206). A scheduler is a worker
-# too unless told otherwise, and a second MATCHING worker would make "which
-# worker ran this job" a race, which the cases below assert against by reading
-# one worker's counters. That a scheduler CAN also take work is the point of the
-# architecture; it is simply not what these cases are measuring. Running none, it
-# registers with nobody, so it names no --scheduler of its own either.
-dispatch_port="$(free_port)"
-
-start_node "scheduler" 127.0.0.1 "$dispatch_port" \
-    "$no_local_cache" \
-    --serve-scheduler --fleet-open \
-    --slots=0 --log-level=debug
-scheduler_pid="$started_pid"
-
-wait_for_log "scheduling for the fleet" "$scheduler_pid" "scheduler" "${workdir}/scheduler.log"
-
-# --- start a worker ----------------------------------------------------------
-
+# The node is the ONLY worker its scheduler has, so "which worker ran this job" is
+# never a race: the cases below read this one worker's counters.
 worker_port="$(free_port)"
 worker_admin_port="$(free_port)"
 start_node "worker" 127.0.0.1 "$worker_port" \
     "$no_local_cache" \
-    --scheduler="127.0.0.1:${dispatch_port}" \
+    --fleet-open \
     --admin-listen="$worker_admin_port" \
     --toolchain="${compiler}" --slots="$worker_slots" --log-level=debug
 worker_pid="$started_pid"
+dispatch_port="$worker_port"
+
+wait_for_log "scheduling for the fleet" "$worker_pid" "worker" "${workdir}/worker.log"
+assert_checks_leases "$worker_pid" "worker" "${workdir}/worker.log"
 
 # Registration is the worker's own outbound step and completes after it listens,
 # so the port being up is not enough to start dispatching against.
@@ -1535,6 +973,7 @@ run_launcher "${workdir}/case1.log" -std=c++17 -O1 -c "${proj}/one.cpp" -o "${pr
 
 grep -q "DISPATCHED to " "${workdir}/case1.log" \
     || {
+        fail_if_withdrawn "${workdir}/case1.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
         cat "${workdir}/case1.log" >&2
         # The worker's side as well. A refusal reaches the client as one line
         # naming a wire error code; WHY it happened is only visible on the worker.
@@ -1592,27 +1031,19 @@ echo "   worker metrics moved: ${completed} job(s), ${millis}ms, ${bytes} bytes 
 
 # --- 3: a worker for a different toolchain is never chosen -------------------
 echo "== case 3: fingerprint isolation"
-# A second cache and a second SCHEDULER, so the mismatched worker is the ONLY
-# one registered with it. Reusing the first scheduler would leave the matching
-# worker available and the case would pass without testing anything.
-#
-# The scheduler node runs no worker (`--slots=0`, #206), for the same reason: a
-# scheduler that also served the real compiler would be a second matching worker,
-# which is exactly what this case must not have.
+# A second cache and a second NODE, so the mismatched worker is the ONLY one its
+# scheduler has: the node's own, serving a toolchain this client does not use.
+# Reusing the first node would leave the matching worker available and the case
+# would pass without testing anything.
 iso_cache_port="$(free_port)"
-iso_dispatch_port="$(free_port)"
 start_daemon "iso-daemon" 127.0.0.1 "$iso_cache_port" --log-level=info
 iso_daemon_pid="$started_pid"
 
-start_node "iso-scheduler" 127.0.0.1 "$iso_dispatch_port" \
-    "$no_local_cache" \
-    --serve-scheduler --fleet-open \
-    --slots=0 --log-level=debug
-
 iso_worker_port="$(free_port)"
+iso_dispatch_port="$iso_worker_port"
 start_node "iso-worker" 127.0.0.1 "$iso_worker_port" \
     "$no_local_cache" \
-    --scheduler="127.0.0.1:${iso_dispatch_port}" \
+    --fleet-open \
     --toolchain="not-the-compiler-this-client-uses=${compiler}" --slots=2 --log-level=debug
 iso_worker_pid="$started_pid"
 wait_for_registration "$iso_worker_pid" "iso-worker" "${workdir}/iso-worker.log"
@@ -1649,13 +1080,15 @@ write_source "${proj}/four.cpp" "casefour"
     run_launcher "${workdir}/case4.log" -std=c++17 -O1 -c "${proj}/four.cpp" -o "${proj}/build/four.o"
 ) || { cat "${workdir}/case4.log" >&2; fail "the build did not survive every worker being dead"; }
 
-# Either refusal is correct and which one fires is a race with heartbeat expiry:
-# the scheduler may still believe the worker is alive and lease it (the client
-# then finds it unreachable), or may already have expired it (no-worker). Both
-# end at a local compile, which is the property; asserting one of the two would
-# be asserting the timing.
-grep -qE "not dispatched \((rejected \(no-worker\)|worker .* unreachable)" "${workdir}/case4.log" \
-    || { cat "${workdir}/case4.log" >&2; fail "expected a refusal naming the unavailable worker"; }
+# The worker and the scheduler were one process, so the scheduler is gone too and
+# the client is told so by the transport: `scheduler exchange failed`, then a
+# local compile, which is the property. A scheduler that outlives its worker --
+# leasing a dead endpoint until the heartbeat lapses, then answering no-worker --
+# is the two-machine shape, asserted in process: the client's fallback on a worker
+# that does not answer is `fastcache-cc`'s Dispatch cases, and the expiry is
+# `ExpireStale`'s.
+grep -q "not dispatched (scheduler exchange failed)" "${workdir}/case4.log" \
+    || { cat "${workdir}/case4.log" >&2; fail "expected the client to report the unreachable scheduler"; }
 cmp -s "${proj}/build/four-ref.o" "${proj}/build/four.o" \
     || fail "the failover object is wrong"
 echo "   the build succeeded locally with no worker alive"
@@ -1693,22 +1126,16 @@ echo "== case 6: concurrency beyond the fleet's slot count"
 # WorkerRegistry_test against a ManualClock; what needs three processes to observe
 # is that pressure produces neither a hang nor a wrong object.
 cap_cache_port="$(free_port)"
-cap_dispatch_port="$(free_port)"
 start_daemon "cap-daemon" 127.0.0.1 "$cap_cache_port" --log-level=info
 cap_daemon_pid="$started_pid"
 
-# The scheduler node runs no worker, deliberately (`--slots=0`, #206). A scheduler
-# is a worker too unless told otherwise, and a second MATCHING worker would give
-# this fleet two slots when the whole point of the case is that it has one.
-start_node "cap-scheduler" 127.0.0.1 "$cap_dispatch_port" \
-    "$no_local_cache" \
-    --serve-scheduler --fleet-open \
-    --slots=0 --log-level=debug
-
+# One node, whose own worker is the fleet's only one: one slot, which is the
+# whole point of the case.
 cap_worker_port="$(free_port)"
+cap_dispatch_port="$cap_worker_port"
 start_node "cap-worker" 127.0.0.1 "$cap_worker_port" \
     "$no_local_cache" \
-    --scheduler="127.0.0.1:${cap_dispatch_port}" \
+    --fleet-open \
     --toolchain="${compiler}" --slots=1 --log-level=debug
 cap_worker_pid="$started_pid"
 wait_for_registration "$cap_worker_pid" "cap-worker" "${workdir}/cap-worker.log"
@@ -1769,7 +1196,12 @@ EOF
 "$compiler" -O1 -c "${proj}/seven.c" -o "${proj}/build/seven-ref.o"     || fail "the case 7 reference compile failed"
 
 run_launcher "${workdir}/case7.log" -O1 -c "${proj}/seven.c" -o "${proj}/build/seven.o"     || { cat "${workdir}/case7.log" >&2; fail "the .c compile failed"; }
-grep -q "DISPATCHED to " "${workdir}/case7.log"     || { cat "${workdir}/case7.log" >&2; fail "the .c compile was not dispatched"; }
+grep -q "DISPATCHED to " "${workdir}/case7.log" \
+    || {
+        fail_if_withdrawn "${workdir}/case7.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
+        cat "${workdir}/case7.log" >&2
+        fail "the .c compile was not dispatched"
+    }
 cmp -s "${proj}/build/seven-ref.o" "${proj}/build/seven.o"     || {
         # C compiled as C++ differs in far more than a byte: this source has
         # external linkage, so the symbol names themselves are mangled.
@@ -1778,6 +1210,64 @@ cmp -s "${proj}/build/seven-ref.o" "${proj}/build/seven.o"     || {
         fail "a .c source did not come back compiled the way this driver compiles it"
     }
 echo "   a .c source came back matching what this driver produces locally"
+
+# --- 7b: a dispatched object naming its checkout stays with it ------------------
+echo "== case 7b: a dispatched root-bound object is kept with its checkout"
+# Two checkouts of one tree, each exporting its own roots. The source is compiled by
+# its ABSOLUTE path, so `__builtin_FILE()` names the checkout -- and the worker, which
+# resolves it from the client's line markers, writes the client's path, not its own.
+# A second checkout must MISS through the first one's marker and dispatch its own
+# compile; the first must still HIT its own copy without dispatching. Before root
+# binding the second checkout was served the first one's object.
+bound_compile() {
+    local root="$1" logfile="$2"
+    FASTCACHE_SOURCE_DIR="$root" FASTCACHE_BINARY_DIR="${root}/build" \
+        run_launcher "$logfile" -std=c++17 -O1 -c "${root}/u.cpp" -o "${root}/build/u.o"
+}
+bound_a="${workdir}/bound/checkout-a"
+bound_b="${workdir}/bound/checkout-b"
+for bound_root in "$bound_a" "$bound_b"; do
+    mkdir -p "${bound_root}/build" "${bound_root}/inc"
+    printf '#pragma once\ninline int One() { return 1; }\n' > "${bound_root}/inc/h1.h"
+    printf '%s\n' '#include "inc/h1.h"' \
+        'char const* Tag() { return "dist-case-bound"; }' \
+        'char const* Where() { return __builtin_FILE(); }' \
+        'int G() { return One(); }' > "${bound_root}/u.cpp"
+done
+bound_compile "$bound_a" "${workdir}/case7b-a.log" \
+    || { cat "${workdir}/case7b-a.log" >&2; fail "case 7b: checkout a's compile failed"; }
+bound_compile "$bound_b" "${workdir}/case7b-b.log" \
+    || { cat "${workdir}/case7b-b.log" >&2; fail "case 7b: checkout b's compile failed"; }
+rm -f "${bound_a}/build/u.o"
+bound_compile "$bound_a" "${workdir}/case7b-a2.log" \
+    || { cat "${workdir}/case7b-a2.log" >&2; fail "case 7b: checkout a's second compile failed"; }
+
+# The control that keeps the case honest: a's own object DOES name a, so what b is
+# spared is a real hazard rather than a portable object. Every broken property is
+# named, not only the last one checked.
+bound_why=""
+# `LC_ALL=C` on every byte search over an object: in a UTF-8 locale macOS's grep matches
+# nothing on a "line" holding bytes that are not UTF-8, which every object has around the
+# path -- a positive search then fails CLOSED and a NEGATIVE one fails open, passing forever.
+LC_ALL=C grep -qaF "$bound_a" "${bound_a}/build/u.o" || bound_why+="; a's object does not name a (the case exercises nothing)"
+grep -q "DISPATCHED to " "${workdir}/case7b-a.log" || bound_why+="; a was not dispatched"
+grep -q "root-bound object" "${workdir}/case7b-a.log" || bound_why+="; a's dispatched object was not stored bound"
+grep -Eq "fastcache-cc: MISS key=[^ ]+ \(root-bound:" "${workdir}/case7b-b.log" \
+    || bound_why+="; b did not miss through a's marker"
+grep -q "DISPATCHED to " "${workdir}/case7b-b.log" || bound_why+="; b was not dispatched"
+[[ -f "${bound_b}/build/u.o" ]] || bound_why+="; b wrote no object"
+if LC_ALL=C grep -qaF "$bound_a" "${bound_b}/build/u.o" 2>/dev/null; then bound_why+="; b's object names checkout a"; fi
+grep -Eq "fastcache-cc: HIT key=[^ ]+ \(root-bound:" "${workdir}/case7b-a2.log" \
+    || bound_why+="; a was not served its own bound copy"
+if grep -q "DISPATCHED to " "${workdir}/case7b-a2.log"; then bound_why+="; a's second compile was dispatched again"; fi
+if [[ -n "$bound_why" ]]; then
+    for leg in a b a2; do
+        echo "--- ${leg} ---" >&2
+        cat "${workdir}/case7b-${leg}.log" >&2
+    done
+    fail "case 7b: a dispatched root-bound object was not kept with its checkout${bound_why}"
+fi
+echo "   a dispatched object naming its checkout was kept with it, and served back to it"
 
 # --- 8: a worker stops when it is asked to --------------------------------------
 echo "== case 8: a worker exits on SIGTERM"
@@ -1791,8 +1281,11 @@ echo "== case 8: a worker exits on SIGTERM"
 # is why this is asserted here and not left to a developer machine.
 #
 # Its fingerprint is PINNED and unique, like every other single-purpose worker here,
-# and that is not cosmetic. This worker registers with the shared scheduler and is
-# then deliberately killed -- but the scheduler only learns a worker is gone when its
+# and that is not cosmetic. It is a node of its own now, registering with its own
+# scheduler, so its corpse is leasable by nobody -- but the reasoning below is why it
+# was pinned when it registered with the shared one, and it is kept for the day a
+# worker here joins a scheduler it does not run. A worker is deliberately
+# killed -- and a scheduler only learns a worker is gone when its
 # heartbeat lapses, which is by design: a polite goodbye would be a second path to
 # "this worker is alive", exercised on exactly the shutdowns that are already
 # harmless and never on the crash that matters (the reasoning is at the end of
@@ -1809,12 +1302,23 @@ echo "== case 8: a worker exits on SIGTERM"
 # Pinning removes the overlap rather than papering over it: nothing leases
 # `graceful-stop-only`, so a corpse under that name is inert. Loosening case 12 to
 # accept a local fallback would have deleted the #236 assertion it exists for.
+#
+# And it holds a private cache tier and names no `--upstream`, which is the DEFAULT
+# shape of a node -- the one shape whose stop can crash AFTER it looks graceful. Such a
+# node reads through to the fleet's shared cache, and when that is this machine's own
+# tier it reads it in process, borrowing the host `main` declares first so it is
+# destroyed last. Reverse the two and `~SharedCacheHost` aborts at every stop, after
+# "compile node stopped" is already logged; only the exit STATUS says so, which is why
+# this stop is `stop_and_require_clean_exit`.
 stop_port="$(free_port)"
 start_node "stop-worker" 127.0.0.1 "$stop_port" \
-    "$no_local_cache" \
-    --scheduler="127.0.0.1:${dispatch_port}" \
+    --cache-memory=16m \
     --toolchain="graceful-stop-only=${compiler}" --slots=1 --log-level=info
 stop_worker_pid="$started_pid"
+# The shape is asserted, not assumed: a node that built no fleet upstream holds no
+# borrow, and its clean exit would prove nothing about the order.
+grep -q "upstream shared-cache (the fleet setting; resolved at every apply)" "${workdir}/stop-worker.log" \
+    || { cat "${workdir}/stop-worker.log" >&2; fail "the worker under test did not build the fleet's shared-cache upstream, so its stop cannot show the teardown order"; }
 
 # A TERM is sent only once `start_node` has seen `compile node ready`, and that is
 # not incidental: this is the case whose failure measured the bind-to-ready window,
@@ -1822,7 +1326,7 @@ stop_worker_pid="$started_pid"
 # assertions below report "did not report a graceful stop" about a worker that was
 # never asked to. The wait is in `start_node` because the hole is not this case's;
 # the argument is there in full.
-stop_and_require_exit "$stop_worker_pid" "the worker under test" "$stop_bound_seconds"
+stop_and_require_clean_exit "$stop_worker_pid" "the worker under test" "$stop_bound_seconds" "${workdir}/stop-worker.log"
 
 # Exiting is necessary but not sufficient: a worker that died of the signal also
 # "exits". These lines are what distinguish a graceful stop from a death, and
@@ -1902,7 +1406,6 @@ echo "== case 10: a worker sizes itself from its node class"
 sizing_port="$(free_port)"
 start_node "sizing" 127.0.0.1 "$sizing_port" \
     "$no_local_cache" \
-    --scheduler="127.0.0.1:${dispatch_port}" \
     --toolchain="self-sizing=${compiler}" \
     --node-class=dedicated --reserve-cores=0 --log-level=debug
 sizing_pid="$started_pid"
@@ -2065,6 +1568,7 @@ fi
 
 grep -q "DISPATCHED to " "${workdir}/case12.log" \
     || {
+        fail_if_withdrawn "${workdir}/case12.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
         cat "${workdir}/case12.log" >&2
         echo "--- worker log ---" >&2
         cat "${workdir}/worker.log" >&2
@@ -2180,6 +1684,7 @@ case13_at() {
 
     grep -q "DISPATCHED to " "${workdir}/case13-${label}.log" \
         || {
+            fail_if_withdrawn "${workdir}/case13-${label}.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
             cat "${workdir}/case13-${label}.log" >&2 || true
             echo "--- worker log ---" >&2
             cat "${workdir}/worker.log" >&2 || true
@@ -2452,6 +1957,7 @@ else
 
         grep -q "DISPATCHED to " "${workdir}/case14.log" \
             || {
+                fail_if_withdrawn "${workdir}/case14.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
                 cat "${workdir}/case14.log" >&2 || true
                 fail "case 14 was not dispatched, so it says nothing about a dispatched object"
             }
@@ -2498,5 +2004,7 @@ else
         echo "            ${compiler} object here, so the compilation directory cannot be read"
     fi
 fi
+e2e_launcher_state_assert_used
+e2e_launcher_state_assert_caller_untouched
 echo
 echo "dist-compile E2E PASSED"

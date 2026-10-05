@@ -1,8 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CacheTier.hpp"
+#include "EnrollmentResponder.hpp"
+#include "FleetSummaryResponder.hpp"
+#include "FleetTextResponder.hpp"
+#include "LiveStatsResponder.hpp"
 #include "NodeConfig.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeProofResponder.hpp"
+#include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
+#include "SchedulerTier.hpp"
+#include "SessionResponder.hpp"
+#include "SharedCacheResponder.hpp"
+#include "WorkerTier.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
 
@@ -12,6 +23,40 @@
 
 namespace FastCache::Node
 {
+
+SurfaceComponents ComposeSurfaceComponents(CacheTier* cache,
+                                           SchedulerTier* scheduler,
+                                           WorkerTier* worker,
+                                           NodeStatusResponder& node,
+                                           EnrollmentOwner enrollment,
+                                           LiveStatsResponder& live,
+                                           FleetTextResponder& fleet,
+                                           NodeProofResponder* nodeProof,
+                                           FleetSummaryResponder* formation,
+                                           SessionResponder& session,
+                                           SharedCacheService& sharedCache) noexcept
+{
+    // Designated, so the NAME travels with each pointer: two of these are one family's owner
+    // placed in another's slot otherwise, and a transposed pair routes every cache verb to the
+    // scheduler -- which answers *served nowhere* for traffic this node holds a tier for.
+    return SurfaceComponents { .cache = cache != nullptr ? &cache->Responder() : nullptr,
+                               .scheduler = scheduler != nullptr ? &scheduler->Responder() : nullptr,
+                               // Absent on a node running no worker (#206): the router then answers
+                               // the compile family's refusal for a node without one.
+                               .compile = worker != nullptr ? &worker->Responder() : nullptr,
+                               .node = &node,
+                               .enrollment = enrollment.value_or(nullptr),
+                               // Read only while `enrollment` is null, so a served family's is never read.
+                               .enrollmentAbsence = enrollment.error_or(EnrollmentAbsence::NoConsensus),
+                               .live = &live,
+                               .fleet = &fleet,
+                               // Absent on a node running no consensus: the router then answers
+                               // the node-proof family `NoCluster`.
+                               .nodeProof = nodeProof,
+                               .formation = formation,
+                               .session = &session,
+                               .sharedCache = &sharedCache.Responder() };
+}
 
 std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
                                                         NodeConfig const& cfg,
@@ -26,12 +71,12 @@ std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
     // process can already observe.
     //
     // On the ordinary path: the surface, not an address. Where a bare port lands is
-    // the row's answer -- loopback on a worker, the wildcard on a node that schedules
-    // -- so the address bound here, the one an install-time refusal judges and the one
-    // `--print-surfaces` prints are one computation rather than three that agree
-    // today. Under activation there is no such computation to do: the unit bound the
-    // port, and `--advertise` -- mandatory there, and refused at startup when absent
-    // -- is the only thing that can say where clients should go.
+    // the row's answer -- the wildcard, on every node -- so the address bound here, the
+    // one an install-time refusal judges and the one `--print-surfaces` prints are one
+    // computation rather than three that agree today. Under activation there is no such
+    // computation to do: the unit bound the port, and `--advertise` -- mandatory there,
+    // and refused at startup when absent -- is the only thing that can say where
+    // clients should go.
     auto started = inherited.has_value()
                        ? FrameEndpoint::StartAdopted(io,
                                                      NodeSurface::Node,
@@ -49,7 +94,7 @@ std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
     return {};
 }
 
-std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(NodeIoLoop& io,
+std::expected<std::unique_ptr<NodeFrameSurface>, NodeRefusal> StartNodeSurfaceOrExplain(NodeIoLoop& io,
                                                                                         NodeConfig const& cfg,
                                                                                         SurfaceComponents const& components,
                                                                                         std::optional<int> inherited,
@@ -76,6 +121,16 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
         logger.Logf(LogLevel::Info, "no component answers any verb family; serving no 0xFC port");
         return std::unique_ptr<NodeFrameSurface> {};
     }
+    // Refused BY NAME rather than served: a family every built node answers, left unrouted, is
+    // answered `UnimplementedVerb` -- *this node is too old* -- to every client that asks, with
+    // nothing to say the node was assembled wrong. The operator families and the fleet's shared
+    // cache are such families, and this is the one place `main`'s routing of them is asked.
+    if (auto const* const missing = MissingEveryNodeOwner(components); missing != nullptr)
+        return std::unexpected { Refusal(
+            NodeRefusalCause::BuildDefect,
+            std::format("the 0xFC listener was assembled without its {} component, which every built node serves; "
+                        "this is a defect in how this build wires its surfaces, not in its configuration",
+                        missing->component)) };
     // Asked BEFORE the row, because under activation the row answers about a flag
     // that configured nothing. An operator who enables the `.socket` unit and leaves
     // `--listen-node` empty has not asked for a closed port -- the unit is the port --
@@ -113,8 +168,8 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     // tolerated, and correctly: the worker had a compile port of its own to fall back
     // to, so what was lost was a cache tier nobody had asked for. #290 stage 3 retired
     // that port, which deleted the branch's PREMISE rather than showing the branch
-    // wrong -- so the provenance bit stopped deciding this and `--serve-scheduler`
-    // stopped being the one flag that escalated it. Both were answering "is this port
+    // wrong -- so the provenance bit stopped deciding this and serving the scheduler
+    // stopped being the one thing that escalated it. Both were answering "is this port
     // load-bearing", and since the merge the answer is yes unconditionally.
     //
     // And the sentence below, which names the REMEDY rather than the diagnosis:
@@ -125,7 +180,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     auto judged = JudgeBindFailure(
         RowFor(NodeSurface::Node),
         std::format("--listen-node: {}. this node opens exactly one 0xFC port, so without it there is nowhere for a "
-                    "dispatched compile to arrive -- and it would still register with --scheduler and advertise an "
+                    "dispatched compile to arrive -- and it would still register its worker and advertise an "
                     "address nothing answers, which every client meets as a failed connection and a silent local "
                     "compile. the usual cause is a fastcached holding that port on this machine: stop it, or give "
                     "--listen-node a port of its own. a node needs no daemon beside it -- it answers every verb the "
@@ -133,7 +188,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
                     bound.error()),
         logger);
     if (!judged.has_value())
-        return std::unexpected { std::move(judged).error() };
+        return std::unexpected { Refusal(NodeRefusalCause::Listener, std::move(judged).error()) };
 
     // The row called it tolerable and this opener cannot carry that, so it says so
     // rather than fabricating one (#352). A null here is `StartNodeSurfaceOrExplain`'s
@@ -141,10 +196,11 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     // that way and goes on to advertise the CONFIGURED endpoint, so returning one
     // after a failed bind would announce an address nothing answers. That is the node
     // row's own reason arriving through the door meant for a different fact.
-    return std::unexpected { BindToleranceUnsupported(RowFor(NodeSurface::Node),
-                                                      "a null surface here already means \"no component needs the "
-                                                      "port\", and the node would advertise its configured endpoint "
-                                                      "regardless") };
+    return std::unexpected { Refusal(NodeRefusalCause::Listener,
+                                     BindToleranceUnsupported(RowFor(NodeSurface::Node),
+                                                              "a null surface here already means \"no component needs the "
+                                                              "port\", and the node would advertise its configured endpoint "
+                                                              "regardless")) };
 }
 
 } // namespace FastCache::Node

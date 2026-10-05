@@ -119,17 +119,13 @@ SKIP=77
 # green, and it is not there.
 skip() { echo "launcher-replay-e2e: $* -- skipping"; exit "$SKIP"; }
 
-for pair in "fastcached:$fastcached" "launcher:$launcher"; do
-    path="${pair#*:}"
-    [ -n "$path" ] && [ -x "$path" ] || skip "${pair%%:*} was not given an executable"
-done
+[ -n "$fastcached" ] && [ -x "$fastcached" ] || skip "fastcached was not given an executable"
 [ -n "$compiler" ] && command -v "$compiler" >/dev/null 2>&1 || skip "no usable compiler ($compiler)"
 command -v cmake  >/dev/null 2>&1 || skip "cmake is not on PATH"
 command -v ninja  >/dev/null 2>&1 || skip "ninja is not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 is not on PATH"
 
 fastcached="$(cd "$(dirname "$fastcached")" && pwd)/$(basename "$fastcached")"
-launcher="$(cd "$(dirname "$launcher")" && pwd)/$(basename "$launcher")"
 
 workdir="$(mktemp -d)"
 daemon_pid=""
@@ -145,6 +141,17 @@ trap cleanup EXIT
 # goes. The label is what every `FAILED:` line is prefixed with, so it is the
 # spelling this fixture's own messages have always carried.
 e2e_begin "launcher-replay-e2e" "$workdir"
+
+# After `e2e_begin`, whose snapshot of the caller's statistics must precede every use of
+# the launcher variable -- `launcher-state-isolation` refuses one above it.
+[ -n "$launcher" ] && [ -x "$launcher" ] || skip "launcher was not given an executable"
+launcher="$(cd "$(dirname "$launcher")" && pwd)/$(basename "$launcher")"
+
+# Before the compiler-launcher wrapper below is written, so the path it `exec`s is the shim.
+# Every launcher this fixture runs records into a state directory of the run's own,
+# through the shim `e2e_launcher_state_enter` (scripts/lib/e2e-common.sh) puts in
+# front of it. Before any launcher runs, and after `e2e_begin`, whose workdir holds it.
+e2e_launcher_state_enter launcher "$source_dir"
 
 # The port, DRAWN when the caller named none (#1254).
 #
@@ -360,8 +367,27 @@ e2e_note "warm, third-party under _deps:  ${warm_deps_hits} hit(s), ${warm_deps_
 # the case this fixture is for: 106 of 221 units missing looks alarming and was
 # entirely Catch2, while a single project unit missing would have been invisible
 # inside the same number and is the actual regression shape.
-[ "$warm_project_misses" = "0" ] \
-    || fail "${warm_project_misses} of this project's own unit(s) missed on the warm build; the same source in a different build directory must replay, and that is what path canonicalization is for"
+if [ "$warm_project_misses" != "0" ]; then
+    # Which units, and the launcher's own reason for each: a count alone cannot say
+    # whether this is canonicalization or the root binding keying a unit apart.
+    python3 - "${workdir}/warm.build" <<'PY' >&2
+import sys
+
+current = None
+for line in open(sys.argv[1], errors="replace").read().splitlines():
+    marker = line.find("fastcache-cc-fixture: unit=")
+    if marker >= 0:
+        current = line[marker + len("fastcache-cc-fixture: unit="):].strip()
+        continue
+    if "fastcache-cc: MISS" in line:
+        if current is not None and "/_deps/" not in current:
+            print("   MISSED: %s\n     %s" % (current, line.strip()))
+        current = None
+    elif "fastcache-cc: HIT" in line:
+        current = None
+PY
+    fail "${warm_project_misses} of this project's own unit(s) missed on the warm build; the same source in a different build directory must replay, and that is what path canonicalization is for"
+fi
 
 if [ "$warm_deps_misses" -gt 0 ]; then
     e2e_note "note: ${warm_deps_misses} third-party unit(s) missed; their sources live UNDER the build directory, so the two builds really do compile different paths"
@@ -466,10 +492,14 @@ TEST_CASE("launcher-replay canary: this object does not match its source", "[can
 EOF
 
     # Compiled with the build's own command line, minus the launcher, so the only
-    # difference from the real object is the source it came from.
-    canary_cmd="${victim_cmd/${victim_src}/${workdir}/canary.cpp}"
-    canary_cmd="${canary_cmd//${launcher_wrapper} /}"
-    canary_cmd="${canary_cmd//${launcher} /}"
+    # difference from the real object is the source it came from. Every pattern and
+    # replacement QUOTED: an unquoted pattern is a glob, so a path holding `*`, `?` or `[`
+    # matched something other than itself -- or nothing, leaving the launcher in the
+    # command -- and an unquoted replacement holding `&` reads as the match under bash
+    # 5.2's `patsub_replacement`.
+    canary_cmd="${victim_cmd/"${victim_src}"/"${workdir}/canary.cpp"}"
+    canary_cmd="${canary_cmd//"${launcher_wrapper} "/}"
+    canary_cmd="${canary_cmd//"${launcher} "/}"
     # The copy compiles from the workdir, so a quoted include no longer resolves
     # relative to the file that writes it -- `#include "CmdLine.hpp"` next to the
     # original is a fatal error next to the copy. The unit's own directory joins
@@ -507,4 +537,6 @@ EOF
     e2e_note "canary: the suite went red on a wrong object, as it must"
 fi
 
+e2e_launcher_state_assert_used
+e2e_launcher_state_assert_caller_untouched
 echo "launcher-replay-e2e: a real target replayed from cache passes its own tests"

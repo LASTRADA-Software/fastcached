@@ -1,27 +1,55 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "AnnounceTestFixture.hpp"
+#include "CacheProxy.hpp"
+#include "ClusterAdminCli.hpp"
+#include "CompileCapacity.hpp"
+#include "CompileResponder.hpp"
+#include "EndpointDialer.hpp"
 #include "EndpointWriters.hpp"
+#include "EnrollmentResponder.hpp"
+#include "EnrollmentWindow.hpp"
+#include "FleetTextResponder.hpp"
 #include "FrameEndpoint.hpp"
 #include "LiveStatsResponder.hpp"
+#include "LocalCache.hpp"
+#include "MachineStandingTestUtils.hpp"
+#include "NodeAnnounce.hpp"
+#include "NodeConfig.hpp"
+#include "NodeCredential.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeMembership.hpp"
 #include "NodeProofClient.hpp"
 #include "NodeProofResponder.hpp"
+#include "NodeStatusResponder.hpp"
+#include "PrivateTierProfile.hpp"
 #include "Responders.hpp"
+#include "SessionResponder.hpp"
+#include "SharedCacheHost.hpp"
+#include "SharedCacheResponder.hpp"
+#include "SharedCacheTier.hpp"
 
-#include <FastCache/Auth/AuthPolicy.hpp>
+#include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Distributed/MachineTicket.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/NodeProof.hpp>
+#include <FastCache/Distributed/StateLeaseRoster.hpp>
+#include <FastCache/Distributed/TicketVerifier.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
+#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/SealedFrameSocket.hpp>
 #include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <array>
@@ -35,6 +63,8 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -49,18 +79,31 @@
 #include <vector>
 
 #include <CacheProtocol.hpp>
+#include <CompileJob.hpp>
+#include <StubObjectTestSupport.hpp>
+#include <WorkerProtocol.hpp>
 #include <core/async/SyncRun.hpp>
+#include <core/async/ThreadPoolExecutor.hpp>
 #include <core/net/BlockingConnector.hpp>
 #include <core/net/BlockingSocket.hpp>
 #include <core/net/IListener.hpp>
 #include <core/net/ISocket.hpp>
 #include <core/net/Sockets.hpp>
+#include <core/net/testing/FailingListener.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/CompileReplyFakes.hpp>
+#include <tests/ConsensusStandingFakes.hpp>
+#include <tests/ExactAudience.hpp>
+#include <tests/FormationFakes.hpp>
 #include <tests/HalfClose.hpp>
 #include <tests/LeaseRosterFakes.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
+#include <tests/RelabelledPeerListener.hpp>
+#include <tests/ScratchPath.hpp>
+#include <tests/TicketFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -99,10 +142,9 @@ struct Fleet
     Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
     Distributed::SchedulerProtocol protocol { service, metrics };
-    // Loopback, because that is the host a test connection arrives from. The
-    // endpoint is given with a port so the constructor's host/endpoint collapse is
-    // exercised rather than bypassed.
-    Distributed::ClusterMembership membership { Distributed::MembershipParticipant::FleetMemberList, { "127.0.0.1:7000" } };
+    // This machine, which is the host every test connection arrives from, and nobody else: the
+    // node's own participant, with no list to configure.
+    Distributed::LoopbackMembership membership;
     SchedulerResponder responder { protocol, membership, metrics };
     NullLogger logger;
 
@@ -505,7 +547,7 @@ class Conversation
 /// Loopback is spelled out rather than left to the surface's own default, and that
 /// is deliberate: the node port's default host is the WILDCARD once the node
 /// schedules, so a bare port here would bind every interface on a developer's machine
-/// and on CI the moment a case sets `--serve-scheduler`.
+/// and on CI the moment a case serves a scheduler.
 /// @param surface Which surface to configure.
 /// @param port The port it should serve.
 /// @return A configuration serving that surface on loopback.
@@ -586,7 +628,8 @@ TEST_CASE("Destroying the frame endpoint stops it, with nothing to remember", "[
     });
 
     REQUIRE(stopped.wait_for(15s) == std::future_status::ready);
-    REQUIRE(stopped.get());
+    auto const stoppedCleanly = stopped.get();
+    REQUIRE(stoppedCleanly);
 
     // And the port is free again, which is only true if the listener was really closed
     // rather than leaked with its thread still parked on it.
@@ -635,18 +678,14 @@ TEST_CASE("A member that proved nothing is refused registration over a real sock
     CHECK(ErrorOf(Exchange(port, lease)) == Wire::ErrorCode::NoWorker);
 }
 
-TEST_CASE("This machine is admitted whatever the member list says", "[node][scheduler]")
+TEST_CASE("This machine is admitted, and a stranger is refused, with no list anywhere", "[node][scheduler]")
 {
     // The rule that makes an unconfigured node useful and still closed. Anti-leeching
     // exists to stop OTHER machines spending capacity they do not contribute; a
     // process on this host already has this host's CPU, and the `fastcache-cc` a
     // developer runs against their own node is the whole reason the node is there.
-    //
-    // The member list names only a remote host, so before this rule a node whose
-    // operator had listed their peers would have refused their own builds -- a fleet
-    // that looks configured and serves nobody locally.
+    // Nothing is listed anywhere: this machine is admitted as itself.
     Fleet fleet;
-    fleet.membership.Publish({ "10.0.0.1:7000" });
 
     auto const port = FreePort();
     auto started = FrameEndpoint::Start(
@@ -665,25 +704,79 @@ TEST_CASE("This machine is admitted whatever the member list says", "[node][sche
     // than the gate refusing to hear it. `NotAMember` here would be the regression.
     auto const frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
     CHECK(ErrorOf(Exchange(port, frame)) == Wire::ErrorCode::NoWorker);
-}
 
-TEST_CASE("A stranger is refused the fleet", "[node][scheduler]")
-{
-    // Not over a socket, and that is a consequence of the rule above rather than a
-    // weaker test: every connection a test can make to itself arrives from loopback,
-    // and loopback is now a member by construction. Naming the peer directly is the
-    // only way left to express "a different machine" -- and it is the same string the
-    // transport would have handed over, so nothing is being simulated away.
-    Fleet fleet;
-    fleet.membership.Publish({ "10.0.0.1:7000" });
-
-    auto const frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
-
+    // And a different machine, which proved nothing and presented nothing, is refused. Not over
+    // a socket: every connection a test can make to itself arrives from loopback, so naming the
+    // peer directly is the only way to express "a different machine" -- and it is the same
+    // string the transport would have handed over, so nothing is being simulated away.
     CHECK(ErrorOf(core::async::syncRun(fleet.responder.Answer(frame, PeerIdentity { .host = "10.9.9.9" })).bytes)
           == Wire::ErrorCode::NotAMember);
-    // And a listed peer gets past the gate to the fleet's own answer.
-    CHECK(ErrorOf(core::async::syncRun(fleet.responder.Answer(frame, PeerIdentity { .host = "10.0.0.1" })).bytes)
-          == Wire::ErrorCode::NoWorker);
+}
+
+namespace
+{
+/// How the last body's client connection stood when that body ended. **Private**: never transmitted
+/// or persisted.
+enum class LastBodyClient : std::uint8_t
+{
+    HungUpFirst,      ///< The client closed before the body ended: the client side holds TIME_WAIT.
+    OpenAcrossTheEnd, ///< Still open when the body closed its listener and its connections, and after.
+};
+
+/// One way the last body's connection ended, as the reform case walks them.
+struct LastBodyShape
+{
+    LastBodyClient client; ///< How the client connection stood.
+    std::string_view name; ///< What the case says it is.
+};
+} // namespace
+
+TEST_CASE("A reformed body serves its fixed port again, however the last body's connections ended", "[node][frame][reform]")
+{
+    // A reform ends a body -- its reactor, its listener and every connection it accepted -- and the next
+    // body BINDS THE SAME PORT again, at once. Rebinding rather than keeping one socket across bodies
+    // is the design because the other cannot work on Windows: a completion-port association belongs to
+    // the SOCKET, so a duplicate handed to the next body's reactor is refused (error 87, measured on
+    // Windows 11 build 26200; `ActivationHold`). What a rebind risks there is `SO_EXCLUSIVEADDRUSE`
+    // refusing a port the last body's connections still hold, so each shape is one the measurement
+    // covered: a client that hung up first, and one still open when the body closed its side.
+    auto const shapes = std::array {
+        LastBodyShape { .client = LastBodyClient::HungUpFirst, .name = "the client hung up first" },
+        LastBodyShape { .client = LastBodyClient::OpenAcrossTheEnd, .name = "a client still open across the end" },
+    };
+    auto const lease = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+    for (auto const& shape: shapes)
+    {
+        INFO(shape.name);
+        auto const port = FreePort();
+        auto held = std::optional<Conversation> {};
+        {
+            Fleet first;
+            auto body = FrameEndpoint::Start(first.io,
+                                             NodeSurface::Node,
+                                             LoopbackFor(NodeSurface::Node, port),
+                                             first.responder,
+                                             first.metrics,
+                                             first.logger);
+            REQUIRE(body.has_value());
+            first.Serve();
+            held.emplace(port);
+            REQUIRE(ErrorOf(held->Send(lease)) == Wire::ErrorCode::NoWorker); // served, over an accepted connection
+            if (shape.client == LastBodyClient::HungUpFirst)
+                held.reset();
+            body->reset(); // the body ends: its listener goes, and the connections it holds
+        }
+
+        // The next body, at once, on the same port.
+        Fleet next;
+        auto reformed = FrameEndpoint::Start(
+            next.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), next.responder, next.metrics, next.logger);
+        INFO((reformed.has_value() ? std::string { "(bound)" } : reformed.error()));
+        REQUIRE(reformed.has_value());
+        next.Serve();
+        CHECK(ErrorOf(Exchange(port, lease)) == Wire::ErrorCode::NoWorker);
+        held.reset();
+    }
 }
 
 TEST_CASE("An oversize frame is refused with both numbers, and never buffered", "[node][scheduler]")
@@ -795,52 +888,24 @@ class HoldableResponder final: public IFrameResponder
         return Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not admitted");
     }
 
-    /// @copydoc IFrameResponder::AuthRequired
-    ///
-    /// Off by default, so every case written before #289 keeps asserting what it did.
-    /// A case that turns it on is asking about the credential gate specifically.
-    ///
-    /// Answers per verb when a case named one (#290), because that is the only shape
-    /// a merged listener can have: the same connection must be able to carry an
-    /// unauthenticated cache FETCH and a scheduler verb that is refused without a
-    /// credential. `AuthRequired(true)` on such a surface locks out every local build;
-    /// `false` undoes #289.
-    [[nodiscard]] bool AuthRequired(std::uint8_t opRaw) const noexcept override
-    {
-        if (auto const only = _gatedVerb.load(std::memory_order_acquire); only >= 0)
-            return opRaw == static_cast<std::uint8_t>(only);
-        return _authRequired.load(std::memory_order_acquire);
-    }
-
     /// @copydoc IFrameResponder::CheckCredential
     ///
-    /// Answers whatever the case placed, and counts the calls. The count is not
-    /// decoration: what separates a working gate from a door that is simply shut is
-    /// that the ACCEPTED path is reached at all, so a case has to be able to say the
-    /// credential was consulted rather than bypassed.
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> /*payload*/) const override
+    /// `NoPolicy`: this fake stands for a surface that is never routed an `AUTH`.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
     {
-        _credentialChecks.fetch_add(1, std::memory_order_acq_rel);
-        return _outcome;
+        return NotTheSessionSurface();
     }
 
     /// @copydoc IFrameResponder::RefusalReply
     ///
-    /// Counts only the unauthenticated arm, mirroring `SchedulerResponder`: a size or
-    /// opcode refusal says the caller is confused, an unauthenticated one says
-    /// somebody is reaching for verbs they hold no secret for, and summing them would
-    /// hide the second in the first.
-    ///
-    /// Records the verb as well, which is what a merged listener has to get right: the
-    /// refusal is counted against the surface that OWNED the verb, so a case can assert
-    /// the attribution rather than only the reply (#290).
+    /// Records the verb, which is what a merged listener has to get right: the refusal is
+    /// counted against the surface that OWNED the verb, so a case can assert the
+    /// attribution rather than only the reply (#290).
     [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision,
                                                       std::uint8_t opRaw,
                                                       std::string_view detail) const override
     {
         _refusedOp.store(static_cast<int>(opRaw), std::memory_order_release);
-        if (decision == Wire::PrePayloadDecision::Unauthenticated)
-            _unauthenticatedRefusals.fetch_add(1, std::memory_order_acq_rel);
         return Wire::EncodeErrorReply(Wire::ErrorCodeFor(decision), detail);
     }
 
@@ -1097,42 +1162,6 @@ class HoldableResponder final: public IFrameResponder
         _refusedVerb.store(op.has_value() ? static_cast<int>(*op) : -1, std::memory_order_release);
     }
 
-    /// Require a credential before every gated verb.
-    void RequireAuth(bool required) noexcept
-    {
-        _authRequired.store(required, std::memory_order_release);
-    }
-
-    /// Require a credential before exactly one verb, leaving the rest open.
-    ///
-    /// The merged-listener shape (#290): a surface serving the cache AND the scheduler
-    /// has no surface-wide answer that is right, because the cache's `false` is a
-    /// property of its verbs -- a credential every local build can read is not a
-    /// credential -- and not of the port they arrive on. Overrides `RequireAuth`.
-    /// @param op The verb to gate, or nullopt to go back to the surface-wide answer.
-    void RequireAuthOnlyFor(std::optional<Wire::Op> op) noexcept
-    {
-        _gatedVerb.store(op.has_value() ? static_cast<int>(*op) : -1, std::memory_order_release);
-    }
-
-    /// What the next `CheckCredential` will answer.
-    void CredentialAnswers(CredentialOutcome outcome) noexcept
-    {
-        _outcome = outcome;
-    }
-
-    /// @return How many times the credential was actually consulted.
-    [[nodiscard]] std::size_t CredentialChecks() const noexcept
-    {
-        return _credentialChecks.load(std::memory_order_acquire);
-    }
-
-    /// @return How many frames were refused for holding no accepted credential.
-    [[nodiscard]] std::size_t UnauthenticatedRefusals() const noexcept
-    {
-        return _unauthenticatedRefusals.load(std::memory_order_acquire);
-    }
-
     /// @return How many requests were refused at the door.
     [[nodiscard]] std::size_t PeerRefusals() const noexcept
     {
@@ -1172,17 +1201,10 @@ class HoldableResponder final: public IFrameResponder
     // often it was asked must not make it look like a mutator.
     mutable std::atomic<std::size_t> _peerRefusals { 0 };
     mutable std::atomic<std::size_t> _peerChecks { 0 };
-    std::atomic<bool> _authRequired { false };
-    /// The one verb to gate, or -1 for the surface-wide answer. An `int` for the same
-    /// reason `_refusedVerb` is one.
-    std::atomic<int> _gatedVerb { -1 };
-    CredentialOutcome _outcome { CredentialOutcome::NoPolicy };
-    mutable std::atomic<std::size_t> _credentialChecks { 0 };
-    mutable std::atomic<std::size_t> _unauthenticatedRefusals { 0 };
     mutable std::atomic<std::size_t> _endpointRefusals { 0 };
     mutable std::atomic<int> _lastEndpointRefusal { -1 };
-    /// The verb of the last refusal, or -1. An `int` for the same reason the two
-    /// verb selectors above are.
+    /// The verb of the last refusal, or -1. An `int` for the same reason the verb
+    /// selector above is.
     mutable std::atomic<int> _refusedOp { -1 };
     std::atomic<std::size_t> _entered { 0 };
     std::atomic<std::size_t> _answered { 0 };
@@ -1366,92 +1388,6 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     CHECK(stillOpen);
 }
 
-TEST_CASE("An unauthenticated peer never gets its payload read either", "[node][frame]")
-{
-    // #289, and the same instrument as the peer gate above for the same reason: "the
-    // stranger is refused" passes while the bug is live, because the refusal happens
-    // either way -- just after the frame has been read. Declare a payload, send none
-    // of it, and only a header-decided refusal can answer at all.
-    //
-    // Separate from the peer case rather than folded into it: this gate reads the
-    // VERB and per-connection state, the other reads only the peer, and a case that
-    // could not tell them apart would pass if one were deleted.
-    Fleet fleet;
-    HoldableResponder responder;
-    responder.UseReactor(fleet.io.Reactor());
-    responder.RequireAuth(true);
-    // The peer gate must NOT be what refuses this, or the case proves nothing about
-    // the credential.
-    responder.RefuseEveryPeer(false);
-
-    auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
-    REQUIRE(endpoint.has_value());
-    fleet.Serve();
-
-    // Comfortably inside `MaxRequestBytes()`, so the size ceiling cannot be what
-    // refuses it -- and `Fetch` is a gated verb, so the credential has to be.
-    constexpr std::uint32_t Declared = 32ULL * 1024ULL;
-    std::array<std::byte, Wire::RequestHeaderSize> frame {};
-    WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Fetch), Declared);
-
-    auto const startedAt = std::chrono::steady_clock::now();
-    auto const reply = Exchange(port, frame);
-    auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
-
-    INFO("waited " << waited.count() << "ms for a refusal that costs no work; this surface's deadline is "
-                   << FrameServer::HeaderTimeout.count() << "ms. An EMPTY reply near that figure is the server "
-                   << "blocked in ReadExactly for a payload it should never have asked for; an empty reply well "
-                   << "under it is something else, and a late but PRESENT reply is only a slow machine.");
-    REQUIRE_FALSE(reply.empty());
-    CHECK(ErrorOf(reply) == Wire::ErrorCode::Unauthenticated);
-
-    // The allocation claim rather than the refusal claim.
-    CHECK(responder.Entered() == 0);
-    // Counted once. An uncounted refusal and a double-counted one are both worse than
-    // the bug, because this number is what tells an operator the gate is working.
-    CHECK(responder.UnauthenticatedRefusals() == 1);
-}
-
-TEST_CASE("An authenticated peer is served the same verb", "[node][frame]")
-{
-    // The control, and the half that a gate refusing EVERYTHING would fail. Without
-    // it the case above is satisfied by a surface that serves nobody.
-    Fleet fleet;
-    HoldableResponder responder;
-    responder.UseReactor(fleet.io.Reactor());
-    responder.RequireAuth(true);
-    responder.CredentialAnswers(CredentialOutcome::Accepted);
-
-    auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
-    REQUIRE(endpoint.has_value());
-    fleet.Serve();
-
-    // AUTH first -- itself reachable before a credential exists, or the gate would be
-    // a deadlock -- then the gated verb, on the SAME connection, because that is
-    // where the accepted credential lives.
-    Conversation conversation { port };
-
-    auto const authReply = conversation.Send(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" }));
-    REQUIRE_FALSE(authReply.empty());
-    CHECK(ErrorOf(authReply) == std::nullopt);
-
-    // The gated verb, on the SAME connection, because that is where the accepted
-    // credential lives -- a second connection would start unauthenticated again,
-    // which is itself the property that keeps one client's secret from blessing
-    // everybody else's connection to a shared responder.
-    auto const fetchReply = conversation.Send(Wire::EncodeFetch("k"));
-    REQUIRE_FALSE(fetchReply.empty());
-    CHECK(ErrorOf(fetchReply) == std::nullopt);
-    CHECK(responder.CredentialChecks() == 1);
-    CHECK(responder.UnauthenticatedRefusals() == 0);
-    // Reached, which is the whole point: the gate let a credentialled caller through.
-    CHECK(responder.Entered() == 1);
-}
-
 TEST_CASE("One peer is refused one verb and served another on the same listener", "[node][frame]")
 {
     // #290's acceptance criterion, made expressible. The merge's own test is
@@ -1502,56 +1438,6 @@ TEST_CASE("One peer is refused one verb and served another on the same listener"
     CHECK(responder.Entered() == 1);
 }
 
-TEST_CASE("One verb needs a credential and another does not on the same listener", "[node][frame]")
-{
-    // The second half of what a merged listener needs, and the half that is easy to
-    // land wrong. `RefusePeer` decides admission; this decides the CREDENTIAL, and on
-    // one surface the two production answers are opposite and both correct: the
-    // scheduler requires a credential when one is configured, the cache requires none
-    // because a credential every local build can read is not a credential.
-    //
-    // A surface-wide answer therefore has no right value once they merge. `true`
-    // refuses every local `fastcache-cc` FETCH with `Unauthenticated` -- a total
-    // outage that looks like a permissions bug -- and `false` silently undoes #289,
-    // leaving the scheduler verbs open on a port that faces the network, which is
-    // exactly the hole #289 closed and which nothing would fail to notice.
-    //
-    // So, as with the verb-aware `RefusePeer` above: no merge here, just the seam
-    // proven able to carry the distinction before the bind changes underneath it.
-    Fleet fleet;
-    HoldableResponder responder;
-    responder.UseReactor(fleet.io.Reactor());
-    responder.RequireAuthOnlyFor(Wire::Op::Lease);
-
-    auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
-    REQUIRE(endpoint.has_value());
-    fleet.Serve();
-
-    Conversation conversation { port };
-
-    // A scheduler verb, unauthenticated: refused. Both verbs are `RequiresAuth` in the
-    // wire table, so nothing here is decided by `PreAuth` -- if it were, this case
-    // would pass with `AuthRequired` ignoring its argument entirely.
-    std::array<std::byte, Wire::RequestHeaderSize> leaseHeader {};
-    WireFrame::PutHeader(leaseHeader, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Lease), 0);
-    auto const refused = conversation.Send(leaseHeader);
-    REQUIRE_FALSE(refused.empty());
-    CHECK(ErrorOf(refused) == Wire::ErrorCode::Unauthenticated);
-    // Counted as the credential arm specifically -- the operator reading this counter
-    // is asking whether somebody is reaching for verbs they hold no secret for, which
-    // a size or opcode refusal does not answer.
-    CHECK(responder.UnauthenticatedRefusals() == 1);
-    CHECK(responder.Entered() == 0);
-
-    // The same connection, still unauthenticated, a cache verb: served.
-    auto const served = conversation.Send(Wire::EncodeFetch("k"));
-    REQUIRE_FALSE(served.empty());
-    CHECK(ErrorOf(served) == std::nullopt);
-    CHECK(responder.Entered() == 1);
-}
-
 TEST_CASE("A refusal is reported with the verb that caused it", "[node][frame]")
 {
     // The third and last seam #290 has to widen, and the only one that is about the
@@ -1561,13 +1447,12 @@ TEST_CASE("A refusal is reported with the verb that caused it", "[node][frame]")
     // names the wrong subsystem, and naming the subsystem is the entire job of these
     // counters.
     //
-    // The wording stays verb-blind, which is a separate decision and still the right
-    // one: a peer that failed to authenticate learns nothing from being told which
-    // verb it failed to reach.
+    // Triggered by the verb's OWN ceiling -- `ProveNode` is bounded to `MaxNodeProofPayload` by
+    // its `OpTable` row, far below this surface's cap -- so the refusal is decided per verb and
+    // the endpoint has to hand the verb over for anybody to count it against the right surface.
     Fleet fleet;
     HoldableResponder responder;
     responder.UseReactor(fleet.io.Reactor());
-    responder.RequireAuth(true);
 
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(
@@ -1577,16 +1462,19 @@ TEST_CASE("A refusal is reported with the verb that caused it", "[node][frame]")
 
     CHECK(responder.LastRefusedOp() == std::nullopt);
 
-    std::array<std::byte, Wire::RequestHeaderSize> leaseHeader {};
-    WireFrame::PutHeader(leaseHeader, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Lease), 0);
+    constexpr auto Declared = static_cast<std::uint32_t>(Wire::MaxNodeProofPayload + 1);
+    REQUIRE(Declared <= responder.MaxRequestBytes());
+    std::array<std::byte, Wire::RequestHeaderSize> proofHeader {};
+    WireFrame::PutHeader(
+        proofHeader, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::ProveNode), Declared);
     Conversation conversation { port };
-    auto const refused = conversation.Send(leaseHeader);
+    auto const refused = conversation.Send(proofHeader);
     REQUIRE_FALSE(refused.empty());
-    CHECK(ErrorOf(refused) == Wire::ErrorCode::Unauthenticated);
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::PayloadTooLarge);
 
     // The verb, not merely that something was refused. Without this the widening is
     // satisfied by a parameter nothing reads.
-    CHECK(responder.LastRefusedOp() == static_cast<std::uint8_t>(Wire::Op::Lease));
+    CHECK(responder.LastRefusedOp() == static_cast<std::uint8_t>(Wire::Op::ProveNode));
 }
 
 TEST_CASE("An admitted peer is asked once and served normally", "[node][frame]")
@@ -1650,8 +1538,14 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
     // timeout naming nothing.
     REQUIRE(first.wait_for(15s) == std::future_status::ready);
     REQUIRE(second.wait_for(15s) == std::future_status::ready);
-    CHECK_FALSE(ReplyFrom(first).empty());
-    CHECK_FALSE(ReplyFrom(second).empty());
+    // Both collected before either is judged: `ReplyFrom` REQUIREs, so a first helper that could not connect ended
+    // the case before the second was reported at all.
+    auto const firstOutcome = first.get();
+    auto const secondOutcome = second.get();
+    CHECK(firstOutcome.has_value());  // the first helper could not connect
+    CHECK(secondOutcome.has_value()); // the second helper could not connect
+    CHECK_FALSE(Unwrap(firstOutcome).empty());
+    CHECK_FALSE(Unwrap(secondOutcome).empty());
 }
 
 TEST_CASE("Two requests on one connection are both answered", "[node][frame]")
@@ -1722,69 +1616,6 @@ TEST_CASE("A connection survives a recoverable refusal", "[node][frame]")
     auto const after = conversation.Send(Wire::EncodeFetch("after-the-refusal"));
     REQUIRE_FALSE(after.empty());
     CHECK(Wire::DecodeReplyHeader(after).has_value());
-}
-
-TEST_CASE("A wrong token is counted apart from never having presented one", "[node][scheduler]")
-{
-    // Issue #447, and the half of it that is a security-observability hole rather than
-    // bookkeeping. `SchedulerRequestsRefusedUnauthenticated` says "somebody is reaching
-    // for verbs they hold no secret for", and its own documentation tells an operator
-    // that zero there on a non-loopback bind means the port is open. What it could not
-    // say is that somebody had presented a secret and got it WRONG: the endpoint
-    // encoded that refusal itself, so credential guessing against a token-configured
-    // scheduler moved nothing at all, on the exact series an operator would go
-    // looking at.
-    //
-    // Three outcomes, three counters, and the case asserts all three together --
-    // separately, any one of them passes against an implementation that sums them.
-    Fleet fleet;
-    auto const policy = std::make_shared<AuthPolicy const>(std::string {}, std::string { "the-real-token" });
-    SchedulerResponder responder { fleet.protocol, fleet.membership, fleet.metrics, policy };
-
-    auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
-    REQUIRE(endpoint.has_value());
-    fleet.Serve();
-
-    Conversation conversation { port };
-
-    // A well-formed credential that is simply wrong. The connection survives it, which
-    // is what lets the same peer go on to get it right -- and what lets this case send
-    // the malformed one down the same connection.
-    auto const rejected = conversation.Send(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "guessing" }));
-    REQUIRE_FALSE(rejected.empty());
-    CHECK(ErrorOf(rejected) == Wire::ErrorCode::Unauthenticated);
-    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerCredentialsRejected) == 1);
-
-    // An AUTH payload that will not decode at all: one field where the verb needs two.
-    // A different operator problem -- a client built against another release -- and so
-    // a different row, or an old client in the fleet hides every wrong secret inside
-    // its own noise.
-    std::vector<std::byte> stunted(Wire::RequestHeaderSize + 1, std::byte { 0 });
-    WireFrame::PutHeader(std::span<std::byte> { stunted }.first(Wire::RequestHeaderSize),
-                         Wire::Magic,
-                         Wire::CurrentVersion,
-                         static_cast<std::uint8_t>(Wire::Op::Auth),
-                         1);
-    auto const malformed = conversation.Send(stunted);
-    REQUIRE_FALSE(malformed.empty());
-    CHECK(ErrorOf(malformed) == Wire::ErrorCode::MalformedFrame);
-    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerCredentialsMalformed) == 1);
-
-    // Neither is the pre-payload refusal, which nothing here has triggered: no verb was
-    // reached before a credential. Summed with either of the above, "is my scheduler
-    // port being probed" stops being answerable.
-    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated) == 0);
-
-    // And the right secret still works, so none of the counting is in the way of the
-    // thing being counted.
-    auto const accepted =
-        conversation.Send(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "the-real-token" }));
-    auto const header = Wire::DecodeReplyHeader(accepted);
-    REQUIRE(header.has_value());
-    CHECK(Unwrap(header).status == Wire::Status::Ok);
-    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerCredentialsRejected) == 1);
 }
 
 TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
@@ -2049,7 +1880,8 @@ TEST_CASE("A self-accounting surface stops holding the endpoint's budget while i
 
     responder.Release();
     REQUIRE(client.wait_for(15s) == std::future_status::ready);
-    CHECK_FALSE(ReplyFrom(client).empty());
+    auto const reply = ReplyFrom(client);
+    CHECK_FALSE(reply.empty());
 }
 
 TEST_CASE("A surface that does not account for itself keeps the endpoint's budget", "[node][frame]")
@@ -2091,7 +1923,8 @@ TEST_CASE("A surface that does not account for itself keeps the endpoint's budge
 
     responder.Release();
     REQUIRE(client.wait_for(15s) == std::future_status::ready);
-    CHECK_FALSE(ReplyFrom(client).empty());
+    auto const reply = ReplyFrom(client);
+    CHECK_FALSE(reply.empty());
 }
 
 TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing its listener", "[node][frame]")
@@ -2148,8 +1981,14 @@ TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing
     REQUIRE(small.wait_for(15s) == std::future_status::ready);
     // Collected here, on the case's thread: a helper that failed to connect used to throw
     // inside a future nobody read, so these two were never reported at all.
-    CHECK_FALSE(ReplyFrom(firstBig).empty());
-    CHECK_FALSE(ReplyFrom(secondBig).empty());
+    // Both collected before either is judged, which is what "these two" above needs: `ReplyFrom` REQUIREs, so the
+    // first helper failing to connect ended the case before the second was reported at all.
+    auto const firstBigOutcome = firstBig.get();
+    auto const secondBigOutcome = secondBig.get();
+    CHECK(firstBigOutcome.has_value());  // the first helper could not connect
+    CHECK(secondBigOutcome.has_value()); // the second helper could not connect
+    CHECK_FALSE(Unwrap(firstBigOutcome).empty());
+    CHECK_FALSE(Unwrap(secondBigOutcome).empty());
 
     // And it was SERVED, not refused: reaching the responder and being answered are
     // two facts, and only the pair rules out a busy signal encoded further along.
@@ -2996,20 +2835,32 @@ TEST_CASE("A pulsed answer is preceded by pulses and ends with the reply", "[nod
     REQUIRE(client.SendOnly(Fetch("a-key-whose-answer-is-held-while-the-pulse-runs")));
     REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
 
-    // Several intervals, so what is asserted is a CADENCE rather than one frame that
-    // could have been an accident of scheduling.
-    std::this_thread::sleep_for(Interval * 8);
+    // **Released once the client has READ pulses, never after a wall-clock hold.** A hold
+    // counts this thread's time and the pulse counts the REACTOR's turns, and under load the
+    // two part company: a reactor that gets no CPU from before the first pulse is due until
+    // after the release finds the answer ready as well, and sending the reply rather than a
+    // pulse in front of it is right -- which a timed hold read as a missing pulse, once in a
+    // whole-binary run at 100% CPU. Reading them first makes the release come AFTER the
+    // pulses, so no schedule can leave fewer on the wire. Several, so what is asserted is a
+    // CADENCE rather than one frame that could have been an accident of scheduling.
+    //
+    // A build that never pulses cannot hang here: the hold gives up at its bound and answers
+    // `Miss`, the reads after it see EOF, and `Release()` names the hold that ran out.
+    constexpr std::size_t PulsesBeforeRelease = 3;
+    std::vector<std::byte> stream;
+    for ([[maybe_unused]] auto const pulse: std::views::iota(std::size_t { 0 }, PulsesBeforeRelease))
+        std::ranges::copy(client.ReadReply(), std::back_inserter(stream));
     responder.Release();
 
-    auto const stream = client.ReadRest();
+    std::ranges::copy(client.ReadRest(), std::back_inserter(stream));
     REQUIRE_FALSE(stream.empty());
     auto const statuses = StatusSequence(stream);
     INFO("frames: " << statuses.size());
 
-    // At least one pulse AND the reply, or the two claims below say nothing: with one
+    // The pulses read above AND the reply, or the two claims below say nothing: with one
     // frame the last IS the reply and the run before it is empty, so a build that never
     // pulsed would pass an ordering test about pulses.
-    REQUIRE(statuses.size() >= 2);
+    REQUIRE(statuses.size() >= PulsesBeforeRelease + 1);
     CHECK(statuses.back() == Wire::Status::Miss);
     CHECK(std::ranges::all_of(std::span { statuses }.first(statuses.size() - 1),
                               [](Wire::Status status) { return status == Wire::Status::Progress; }));
@@ -3046,8 +2897,11 @@ TEST_CASE("A surface that asks for no pulse writes exactly one frame", "[node][f
     REQUIRE(client.SendOnly(Fetch("a-key-whose-answer-is-held-and-never-pulsed")));
     REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
 
-    // The same wall-clock hold the case above uses, so the difference between them is
-    // the cadence and not the timing.
+    // Eight of the case above's intervals, through which a pulsing surface writes several
+    // frames. A wall-clock hold rather than an event, because what is asserted is an
+    // ABSENCE and there is nothing to wait on; and unlike the case above it cannot go red
+    // under load, since a starved reactor only writes FEWER frames -- it gets weaker, which
+    // is the direction the case above no longer depends on.
     std::this_thread::sleep_for(160ms);
     responder.Release();
 
@@ -3301,7 +3155,7 @@ class TimelineListener final: public core::net::IListener
   public:
     /// @param inner The bound listener (owned).
     /// @param timeline Where its sockets note their operations.
-    TimelineListener(std::unique_ptr<core::net::IListener> inner, std::shared_ptr<ConnectionTimeline> timeline) noexcept:
+    TimelineListener(std::unique_ptr<core::net::IListener> inner, std::shared_ptr<ConnectionTimeline> timeline):
         _inner { std::move(inner) },
         _timeline { std::move(timeline) }
     {
@@ -3316,14 +3170,15 @@ class TimelineListener final: public core::net::IListener
         co_return core::net::AcceptResult { std::make_unique<TimelineSocket>(std::move(*accepted), _timeline) };
     }
 
-    void close() noexcept override
-    {
-        _inner->close();
-    }
-
     [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return _inner->boundPort();
+    }
+
+  protected:
+    void doClose() noexcept override
+    {
+        _inner->close();
     }
 
   private:
@@ -3439,7 +3294,7 @@ class WitnessListener final: public core::net::IListener
   public:
     /// @param reactor The reactor this listener belongs to; asked, never driven.
     /// @param witness Where the destructor reports. Must outlive the reactor's loop.
-    WitnessListener(core::net::EventLoop& reactor, std::shared_ptr<TeardownWitness> witness) noexcept:
+    WitnessListener(core::net::EventLoop& reactor, std::shared_ptr<TeardownWitness> witness):
         _reactor { reactor },
         _witness { std::move(witness) }
     {
@@ -3463,23 +3318,27 @@ class WitnessListener final: public core::net::IListener
     WitnessListener& operator=(WitnessListener const&) = delete;
     WitnessListener& operator=(WitnessListener&&) = delete;
 
-    /// Ends the accept loop at once, with an error that is not `WouldBlock`.
+    /// Ends the accept loop at once, the way a closed listener does: `Cancelled`.
     ///
     /// This case is about teardown; an accept that parked would add a wait to it and
-    /// change nothing, since `Shutdown()` waits for the sweeper either way.
+    /// change nothing, since `Shutdown()` waits for the sweeper either way. It used to answer
+    /// `Eof`, which ended the loop only because EVERY failed accept did -- the defect that kept
+    /// the installed node's 0xFC surface dark for nine hours. Only a closed or vanished listener
+    /// ends a loop now (core-cpp's `AcceptErrorTable`), so that is what this says.
     [[nodiscard]] core::async::Task<core::net::AcceptResult> accept() override
     {
         co_return core::net::AcceptResult {
-            std::unexpect, core::net::NetError { .code = core::net::NetErrorCode::Eof, .systemCode = 0, .context = {} }
+            std::unexpect, core::net::NetError { .code = core::net::NetErrorCode::Cancelled, .systemCode = 0, .context = {} }
         };
     }
-
-    void close() noexcept override {}
 
     [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return 0;
     }
+
+  protected:
+    void doClose() noexcept override {}
 
   private:
     core::net::EventLoop& _reactor;
@@ -4101,13 +3960,20 @@ struct ProvingFleet
         Testing::PublishKeyRoster(keys, { std::string { ProvingMachine } }, { std::string { RetiredMachine } });
     }
 
+    /// The id this node signs as, and whose test key it signs under.
+    static constexpr std::string_view ServerName = "scheduler";
+
     Fleet fleet;
     Distributed::KeyRosterMembership keys;
     Distributed::AnyOfMembership oracle { { &fleet.membership, &keys } };
     SchedulerResponder scheduler { fleet.protocol, oracle, fleet.metrics };
-    Ed25519KeyPair const identity = Testing::TestKeyPair("scheduler");
+    Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { ServerName });
     Testing::ScriptedSecureRandom random { Testing::ServerHandshakeScript() };
-    NodeProofResponder prover { "scheduler", identity, oracle, random, fleet.metrics, fleet.logger };
+    /// Caught up, unless a case says otherwise: a key the roster lacks is one the cluster lacks.
+    Testing::ScriptedAppliedState consensus { AppliedStateReading::CaughtUp };
+    NodeProofResponder prover {
+        std::string { ServerName }, identity, oracle, consensus, random, fleet.metrics, fleet.logger
+    };
     MergedResponder merged { SurfaceComponents { .scheduler = &scheduler, .nodeProof = &prover } };
 
     /// Start an endpoint on a free port, serving this node's surface.
@@ -4126,6 +3992,18 @@ struct ProvingFleet
     [[nodiscard]] std::uint64_t Read(IMetricsSink::Counter counter) const noexcept
     {
         return fleet.metrics.Read(counter);
+    }
+
+    /// @return The id this node's responder signs its challenges as.
+    [[nodiscard]] std::string ServerId() const
+    {
+        return std::string { ServerName };
+    }
+
+    /// @return The identity key this node's responder signs its challenges under.
+    [[nodiscard]] Ed25519PublicKey ServerKey() const
+    {
+        return identity.PublicKey();
     }
 };
 
@@ -4301,6 +4179,12 @@ class FixedServerTrust final: public IServerTrust
         return _standing;
     }
 
+    /// @copydoc IServerTrust::Expected
+    [[nodiscard]] std::string_view Expected() const override
+    {
+        return "a voter";
+    }
+
   private:
     ServerStanding _standing;
 };
@@ -4314,7 +4198,8 @@ class FixedServerTrust final: public IServerTrust
     auto socket =
         core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     REQUIRE(socket.has_value());
-    return std::make_unique<SealedFrameSocket>(*std::move(socket), SealedFrameEnd::Caller, Wire::MaxSealedReplyPayload);
+    return std::make_unique<SealedFrameSocket>(
+        *std::move(socket), SealedFrameEnd::Caller, Wire::MaxSealedReplyPayload, nullptr);
 }
 
 } // namespace
@@ -4372,6 +4257,122 @@ TEST_CASE("A relayed handshake followed by an injected verb is refused by the se
 
     CHECK(WaitFor([&rig] { return rig.Read(IMetricsSink::Counter::NodeSealedFramesRefused) == 1; }));
     CHECK(rig.fleet.service.Workers().LiveWorkers().empty());
+}
+
+namespace
+{
+
+/// A shared tier nobody names: the component answers, dormant, and is here for its CEILINGS --
+/// every node folds 256 MiB of them into its listener, which is what a sealed frame could be.
+class NeverNamedOpener final: public ISharedTierOpener
+{
+  public:
+    [[nodiscard]] std::expected<std::shared_ptr<SharedCacheTier>, std::string> Open() override
+    {
+        return std::unexpected { std::string { "this case names no shared cache" } };
+    }
+};
+
+/// `ProvingFleet` as every node now is: the fleet's shared cache on the listener too, so the
+/// surface takes a frame of an object's size -- and a server script for two handshakes.
+struct SharedCacheProvingFleet
+{
+    SharedCacheProvingFleet()
+    {
+        Testing::PublishKeyRoster(keys, { std::string { ProvingMachine } });
+    }
+
+    Fleet fleet;
+    Distributed::KeyRosterMembership keys;
+    Distributed::AnyOfMembership oracle { { &fleet.membership, &keys } };
+    SchedulerResponder scheduler { fleet.protocol, oracle, fleet.metrics };
+    Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { ProvingFleet::ServerName });
+    Testing::ScriptedSecureRandom random { Testing::ScriptedSecureRandom::Ascending(4 * NonceBytes, 0x00) };
+    Testing::ScriptedAppliedState consensus { AppliedStateReading::CaughtUp };
+    NodeProofResponder prover {
+        std::string { ProvingFleet::ServerName }, identity, oracle, consensus, random, fleet.metrics, fleet.logger
+    };
+    NeverNamedOpener opener;
+    SharedCacheHost host { "cache-c", opener, nullptr, fleet.logger, ReconcileOn::Caller };
+    SharedCacheResponder shared { host, oracle, fleet.metrics };
+    MergedResponder merged { SurfaceComponents { .scheduler = &scheduler, .nodeProof = &prover, .sharedCache = &shared } };
+
+    [[nodiscard]] std::pair<std::unique_ptr<FrameEndpoint>, std::uint16_t> Serve()
+    {
+        auto const port = FreePort();
+        auto endpoint = FrameEndpoint::Start(
+            fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), merged, fleet.metrics, fleet.logger);
+        REQUIRE(endpoint.has_value());
+        fleet.Serve();
+        return { *std::move(endpoint), port };
+    }
+};
+
+/// A request header alone, naming @p op and declaring @p payload bytes it never sends.
+/// @param op The verb it names.
+/// @param payload The declared length.
+/// @return The header.
+[[nodiscard]] std::vector<std::byte> HeaderDeclaring(Wire::Op op, std::uint32_t payload)
+{
+    auto header = std::vector<std::byte>(Wire::RequestHeaderSize);
+    WireFrame::PutHeader(
+        std::span<std::byte> { header }, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(op), payload);
+    return header;
+}
+
+} // namespace
+
+TEST_CASE("A sealed frame the in-flight budget has no room for is answered busy and never held",
+          "[node][frame][proof][seal][budget]")
+{
+    // A sealed frame is held whole before its seal can be checked, so before the surface's own
+    // byte budget can be asked -- and since every node folds the shared cache's 256 MiB into its
+    // listener, that is 256 MiB a proven peer could park per connection. So the holding is charged
+    // to the same budget: one proven connection gathering a large frame holds its size, and a
+    // second whose frame would pass the budget is refused BEFORE a byte of it is kept -- answered
+    // busy by the component that owns the verb, never counted as a broken seal.
+    //
+    // The late frame's verb is a byte nobody verified, so it may name a verb nothing on this node
+    // owns -- a STORE, with no local cache in this rig. That one is answered busy too, by the owner
+    // whose budget ran out, and counted on ITS row: answered unserved, it moved no counter at all.
+    //
+    // Neutered -- the sealing layer charging nothing -- the first hold never shows in the budget
+    // and the second frame is gathered rather than refused. Neutered to answer an unowned verb
+    // unserved, only the STORE run goes red.
+    auto const lateVerb = GENERATE(Wire::Op::SharedStore, Wire::Op::Store);
+    CAPTURE(static_cast<int>(lateVerb));
+    SharedCacheProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    auto const budget = rig.merged.MaxInFlightBytes();
+    REQUIRE(budget == 256ULL * 1024ULL * 1024ULL);
+
+    constexpr std::uint32_t Large = 200U * 1024U * 1024U;
+    HandshakeCaller holder { port, ProvingMachine, 0x80 };
+    REQUIRE(holder.Challenge());
+    REQUIRE(Testing::StatusOf(holder.Prove()) == Wire::Status::Ok);
+    REQUIRE(holder.Connection().SendOnly(HeaderDeclaring(Wire::Op::SharedStore, Large)));
+    constexpr auto held = Wire::RequestHeaderSize + Large + SessionTagBytes;
+    REQUIRE(WaitFor([&endpoint] { return endpoint->InFlightBytes() == held; }));
+
+    constexpr std::uint32_t Second = 100U * 1024U * 1024U;
+    HandshakeCaller late { port, ProvingMachine, 0xC0 };
+    REQUIRE(late.Challenge());
+    REQUIRE(Testing::StatusOf(late.Prove()) == Wire::Status::Ok);
+    REQUIRE(late.Connection().SendOnly(HeaderDeclaring(lateVerb, Second)));
+    auto const refused = late.ReadSealedReply();
+    REQUIRE_FALSE(refused.empty());
+    CHECK(late.LastTagVerified());
+    CHECK(Testing::ErrorOf(refused) == Wire::ErrorCode::EndpointBusy);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeSharedCacheRequestsRefusedEndpointBusy) == 1);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeSealedFramesRefused) == 0);
+    // Nothing of the refused frame was charged: the budget holds the first frame alone.
+    CHECK(endpoint->InFlightBytes() == held);
+    // And the connection ends: a sealed stream cannot be stepped over a frame whose seal was never read.
+    CHECK(late.Connection().ReadReply().empty());
+
+    // The holder goes away mid-frame, and what it held is given back.
+    holder.Connection().CloseNow();
+    CHECK(WaitFor([&endpoint] { return endpoint->InFlightBytes() == 0; }));
 }
 
 TEST_CASE("A sealed frame replayed on its own connection is refused by the seal", "[node][frame][proof][seal]")
@@ -4541,15 +4542,14 @@ TEST_CASE("A worker proves itself through the client a node runs, and then speak
     FixedServerTrust const trust { ServerStanding::Voter };
     Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
     auto const key = Testing::TestKeyPair(std::string { ProvingMachine });
-    NodeProofClient const client { std::string { ProvingMachine }, key, trust, random };
-    auto notice = Cc::CredentialNotice::Silent();
+    NodeProofClient const client { std::string { ProvingMachine }, key, trust, nullptr, nullptr, random };
 
-    auto const attempt = client.Prove(*sealed, notice, Cc::Credential {});
+    auto const attempt = client.Prove(*sealed);
     INFO(attempt.reason);
     REQUIRE(attempt.result == NodeProofResult::Proved);
     CHECK(sealed->Sealed());
 
-    auto const registered = core::async::syncRun(Cc::ExchangeFramed(sealed.get(), &notice, RegisterFrame()));
+    auto const registered = Cc::ExchangeWithScheduler(*sealed, RegisterFrame());
     CHECK(registered.IsHit());
     CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
 }
@@ -4562,17 +4562,18 @@ TEST_CASE("A worker proves nothing to a server its roster does not hold as a vot
     ProvingFleet rig;
     auto const [endpoint, port] = rig.Serve();
     auto const key = Testing::TestKeyPair(std::string { ProvingMachine });
-    auto notice = Cc::CredentialNotice::Silent();
 
     for (auto const standing: { ServerStanding::NotVoter, ServerStanding::Revoked })
     {
         auto sealed = DialSealed(port);
         FixedServerTrust const trust { standing };
         Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
-        NodeProofClient const client { std::string { ProvingMachine }, key, trust, random };
-        auto const attempt = client.Prove(*sealed, notice, Cc::Credential {});
+        NodeProofClient const client { std::string { ProvingMachine }, key, trust, nullptr, nullptr, random };
+        auto const attempt = client.Prove(*sealed);
         CHECK(attempt.result == NodeProofResult::Untrusted);
         CHECK_FALSE(sealed->Sealed());
+        CHECK(attempt.reason.contains(rig.ServerId()));
+        CHECK(attempt.reason.contains("expected a voter"));
         if (standing == ServerStanding::Revoked)
             CHECK(attempt.reason.contains("REVOKED"));
     }
@@ -4587,8 +4588,8 @@ TEST_CASE("A worker proves nothing to a server its roster does not hold as a vot
     auto sealed = DialSealed(port);
     FixedServerTrust const unchecked { ServerStanding::Unchecked };
     Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
-    NodeProofClient const client { std::string { ProvingMachine }, key, unchecked, random };
-    CHECK(client.Prove(*sealed, notice, Cc::Credential {}).result == NodeProofResult::Proved);
+    NodeProofClient const client { std::string { ProvingMachine }, key, unchecked, nullptr, nullptr, random };
+    CHECK(client.Prove(*sealed).result == NodeProofResult::Proved);
 }
 
 TEST_CASE("A worker told the node serves no proof reads it as no scheduler, not as a refusal",
@@ -4608,7 +4609,1204 @@ TEST_CASE("A worker told the node serves no proof reads it as no scheduler, not 
     FixedServerTrust const trust { ServerStanding::Voter };
     Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
     auto const key = Testing::TestKeyPair(std::string { ProvingMachine });
-    NodeProofClient const client { std::string { ProvingMachine }, key, trust, random };
-    auto notice = Cc::CredentialNotice::Silent();
-    CHECK(client.Prove(*sealed, notice, Cc::Credential {}).result == NodeProofResult::NotOffered);
+    NodeProofClient const client { std::string { ProvingMachine }, key, trust, nullptr, nullptr, random };
+    CHECK(client.Prove(*sealed).result == NodeProofResult::NotOffered);
+}
+
+// ---- Machines admitted by ticket, from an address nobody listed (#235, rebuilt) ----
+
+namespace
+{
+
+/// The machine the ticketed cases' caller is: admitted to the cluster by key, listed nowhere.
+constexpr std::string_view TicketMachine = "pc-07";
+
+/// Where the ticketed node answers, as its callers dial it: the audience every ticket here names.
+constexpr std::string_view TicketedEndpoint = "node.corp:6674";
+
+/// The voter every state the ticketed node applies records: a state naming no voter is one this
+/// node has not applied yet, and a verifier over it answers `NoRoster` to every ticket.
+constexpr std::string_view TicketedVoter = "scheduler.corp";
+
+/// What every relabelled connection reports as its peer: on no list, and not this machine unless
+/// a case builds the node as answering there too (leg 3 of #235).
+constexpr std::string_view RemoteHost = "10.0.0.7";
+
+/// A compiler that writes a canned object and counts what it was asked to compile.
+///
+/// The one stand-in on the compile path: admission, the lease check, the hop onto the pool, the
+/// reply and its codec are the worker's production code, so a COMPILE this node serves is one the
+/// production rules admitted.
+class StubCompiler final: public Cc::IProcessRunner
+{
+  public:
+    Cc::CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureSplit(argv);
+    }
+
+    Cc::CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+    {
+        _runs.fetch_add(1, std::memory_order_acq_rel);
+        Cc::Test::WriteStubObject(argv);
+        return Cc::CompileRun { .exitCode = 0, .out = {}, .err = {} };
+    }
+
+    /// @return How many compiles were spawned.
+    [[nodiscard]] std::size_t Runs() const noexcept
+    {
+        return _runs.load(std::memory_order_acquire);
+    }
+
+  private:
+    std::atomic<std::size_t> _runs { 0 };
+};
+
+/// A node serving every door a machine is refused at -- COMPILE, NODE-STATUS, SUBSCRIBE,
+/// FLEET-TEXT and ENROLL-CONTROL -- behind the production session component, each door's
+/// membership the production `NodeMembership` and the ticket verifier's roster the SAME applied
+/// state, as one node's applied change reaches both. And its own cache tier, which asks no
+/// membership: it answers this machine, by the ONE locality oracle the compile surface shares, as
+/// production wires them.
+///
+/// Declared before the endpoints a case starts from it, so the endpoints go first: the reactor in
+/// `fleet` must still be turning when an endpoint posts its closes.
+struct TicketedNode
+{
+    Fleet fleet;
+    NodeConfig const cfg {};
+    NodeMembership membership { cfg, fleet.logger };
+
+    /// On the fleet's clock, which nothing here advances: the start counts as leader contact, so a
+    /// case never reaches `LeaderSilenceBound`.
+    Distributed::StateLeaseRoster roster { fleet.clock };
+    Distributed::SpentTickets spent;
+    Testing::ExactAudience const audience { std::string { TicketedEndpoint } };
+    Distributed::TicketVerifier const verifier { &roster, audience, spent };
+    Testing::ScriptedSecureRandom random;
+    SessionResponder session { verifier, SessionKeys {}, random, fleet.wallClock, fleet.metrics };
+
+    StubCompiler compiler;
+    Testing::ScratchDirectory const scratch { "fc-ticketed-node" };
+    Cc::CompileJobRunner jobs { compiler, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() };
+    Cc::WorkerProtocol worker {
+        jobs,          Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+        fleet.metrics, Cc::IgnoreJobRefusals()
+    };
+    core::async::ThreadPoolExecutor pool { 1 };
+    CompileCapacity capacity { 1, WorkerMaxRequestBytes, std::chrono::seconds { 5 }, fleet.logger };
+    /// The addresses this machine answers on beyond loopback; set by the constructor.
+    Testing::ScriptedHostAddresses const machine;
+    /// The production oracle over them, as `main` binds it: loopback first, then the set.
+    CachedLocalityOracle const locality { machine, fleet.clock };
+    CompileResponder compile { worker, capacity,           membership.Oracle(), locality,
+                               pool,   fleet.io.Reactor(), fleet.metrics,       fleet.logger };
+
+    /// On the heap: its hit counters are cache-line aligned, and held inline they pad this fixture
+    /// far past what `optin.performance.Padding` allows.
+    std::unique_ptr<InMemoryLruStorage> local = std::make_unique<InMemoryLruStorage>(64 * 1024);
+    NoUpstream upstream;
+    LocalCache cache { *local, upstream, fleet.clock, fleet.metrics, PrivateTierProfile };
+    CacheProxy proxy { cache, fleet.metrics };
+    CacheResponder cacheTier { proxy, locality, fleet.metrics };
+
+    Testing::SilentNodeStatus const identity;
+    SizedLiveSources const readings { 64 };
+    Testing::FixedStanding const standing;
+    NodeStatusResponder node { identity, readings, membership.Oracle(), standing, fleet.metrics };
+    LiveStatsResponder live { readings, membership.Oracle(), AdminCredential {}, fleet.io.Reactor(), fleet.metrics };
+    FleetTextResponder fleetText { readings, membership.Oracle(), AdminCredential {}, fleet.metrics };
+    EnrollmentWindow window { fleet.clock };
+    /// What this node says about itself, and the key every admission it answers is signed with.
+    Testing::ScriptedSummarySource const self { Wire::FleetSummary { .clusterId = "c-ticketed", .nodeId = "n-ticketed" } };
+    Ed25519KeyPair const signingKey = Testing::TestKeyPair("n-ticketed");
+    Testing::ScriptedSecureRandom enrollRandom;
+    EnrollmentResponder enrollment { window,     fleet.service, membership.Oracle(), self,
+                                     signingKey, enrollRandom,  fleet.metrics,       fleet.logger };
+
+    MergedResponder merged { SurfaceComponents { .cache = &cacheTier,
+                                                 .compile = &compile,
+                                                 .node = &node,
+                                                 .enrollment = &enrollment,
+                                                 .live = &live,
+                                                 .fleet = &fleetText,
+                                                 .session = &session } };
+
+    /// @param addresses What this machine answers on beyond loopback: nothing, unless a case binds
+    ///        the node to an address of its own host's.
+    explicit TicketedNode(std::vector<std::string> addresses = {}):
+        machine { std::move(addresses) }
+    {
+        Publish(AdmittedState());
+    }
+
+    /// The voter every applied state records, under its test key.
+    /// @return Its record.
+    [[nodiscard]] static Cluster::ClusterMember VoterRecord()
+    {
+        return Cluster::ClusterMember { .id = std::string { TicketedVoter },
+                                        .raftEndpoint = std::string { TicketedVoter },
+                                        .schedulerEndpoint = {},
+                                        .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                        .seat = Cluster::MemberSeat::Voter,
+                                        .publicKey = Testing::TestKeyPair(std::string { TicketedVoter }).PublicKey() };
+    }
+
+    /// The cluster as this node applied it: `pc-07` a learner under its test key, beside the voter.
+    /// @return The state.
+    [[nodiscard]] static Cluster::ClusterState AdmittedState()
+    {
+        auto state = Cluster::ClusterState {};
+        state.members.push_back(VoterRecord());
+        state.members.push_back(
+            Cluster::ClusterMember { .id = std::string { TicketMachine },
+                                     .raftEndpoint = std::string { TicketMachine },
+                                     .schedulerEndpoint = {},
+                                     .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                     .seat = Cluster::MemberSeat::Learner,
+                                     .publicKey = Testing::TestKeyPair(std::string { TicketMachine }).PublicKey() });
+        state.rosterVersion = 1;
+        return state;
+    }
+
+    /// The cluster once an applied forget removed `pc-07`: its record gone and its key revoked in
+    /// the same entry (#1555). The voter stays.
+    /// @return The state.
+    [[nodiscard]] static Cluster::ClusterState ForgottenState()
+    {
+        auto state = Cluster::ClusterState {};
+        state.members.push_back(VoterRecord());
+        state.revokedKeys.push_back(
+            Cluster::RevokedKey { .id = std::string { TicketMachine },
+                                  .publicKey = Testing::TestKeyPair(std::string { TicketMachine }).PublicKey() });
+        state.rosterVersion = 2;
+        return state;
+    }
+
+    /// Apply @p state, as this node's applied change reaches the verifier's roster and the doors.
+    /// @param state What the cluster now says.
+    void Publish(Cluster::ClusterState const& state)
+    {
+        roster.Adopt(state);
+        membership.PublishCluster(state);
+    }
+
+    /// An AUTH presenting @p claimed's ticket for this node, signed by @p signer.
+    /// @param claimed Who the ticket says it speaks for.
+    /// @param signer Whose key signs it: @p claimed's own for a genuine ticket.
+    /// @param nonce Distinguishes two tickets otherwise equal: this node spends each once.
+    /// @param kind The credential kind the AUTH declares; a ticket's own unless a case is about
+    ///        the kind.
+    /// @return The framed AUTH.
+    [[nodiscard]] std::vector<std::byte> TicketAuth(std::string_view claimed,
+                                                    std::string_view signer,
+                                                    std::uint8_t nonce,
+                                                    Wire::AuthKind kind = Wire::AuthKind::MachineTicket) const
+    {
+        auto claims = Distributed::MachineTicketClaims {
+            .machineId = std::string { claimed },
+            .audience = std::string { TicketedEndpoint },
+            .expiresAtUnixSeconds = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    (fleet.wallClock.now() + Distributed::MachineTicketLifetime).time_since_epoch())
+                    .count()),
+            .nonce = {},
+        };
+        claims.nonce.front() = std::byte { nonce };
+        auto const ticket = Distributed::MintMachineTicket(Testing::TestKeyPair(std::string { signer }), claims);
+        return Wire::EncodeAuth(Wire::AuthRequest { .kind = kind, .username = {}, .secret = ticket.View() });
+    }
+
+    /// Bind a listener for this node's surface, relabelled to @p relabelAs when given.
+    ///
+    /// Not started: `Start` is called once every endpoint of the case has bound, as `Fleet::Serve`
+    /// requires.
+    /// @param relabelAs What every accepted connection reports as its peer, or nothing for the
+    ///        real loopback peer.
+    /// @return The endpoint and its port.
+    [[nodiscard]] std::pair<std::unique_ptr<FrameEndpoint>, std::uint16_t> Listen(std::optional<std::string_view> relabelAs)
+    {
+        auto listened = core::net::listen(fleet.io.Reactor(), core::net::ListenOptions { .host = "127.0.0.1", .port = 0 });
+        REQUIRE(listened.has_value());
+        auto const port = (*listened)->boundPort();
+        auto listener = std::unique_ptr<core::net::IListener> { std::move(*listened) };
+        if (relabelAs.has_value())
+            listener = std::make_unique<Testing::RelabelledPeerListener>(std::move(listener), std::string { *relabelAs });
+        auto endpoint = FrameEndpoint::StartWithListener(fleet.io,
+                                                         NodeSurface::Node,
+                                                         std::move(listener),
+                                                         std::format("127.0.0.1:{}", port),
+                                                         merged,
+                                                         fleet.metrics,
+                                                         fleet.logger);
+        REQUIRE(endpoint != nullptr);
+        return { std::move(endpoint), port };
+    }
+
+    /// Start the loop every endpoint of the case accepts on.
+    void Start()
+    {
+        fleet.Serve();
+    }
+
+    /// @return What @p counter reads.
+    [[nodiscard]] std::uint64_t Read(IMetricsSink::Counter counter) const noexcept
+    {
+        return fleet.metrics.Read(counter);
+    }
+};
+
+/// A COMPILE this node's stub compiler can serve.
+/// @return The framed request.
+[[nodiscard]] std::vector<std::byte> TicketedCompileFrame()
+{
+    constexpr std::string_view Source = "int main(){return 0;}";
+    auto const enveloped =
+        Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(Source.size()), Wire::AsBytes(Source));
+    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                      .fingerprint = "gcc-13",
+                                                      .args = {},
+                                                      .source = enveloped,
+                                                      .acceptedCodecs = { Wire::IdentityCodec },
+                                                      .sourceName = "a.cpp",
+                                                      .compileDir = {},
+                                                      .compileDirReplacement = {},
+                                                      .sourceRoot = {},
+                                                      .sourceRootReplacement = {} });
+}
+
+/// @param frames Requests, in order.
+/// @return Them, as one write carries them.
+[[nodiscard]] std::vector<std::byte> Pipelined(std::initializer_list<std::vector<std::byte>> frames)
+{
+    auto joined = std::vector<std::byte> {};
+    for (auto const& frame: frames)
+        joined.insert(joined.end(), frame.begin(), frame.end());
+    return joined;
+}
+
+/// @param reply A refusal.
+/// @return The text it carries, or empty when it carries none.
+[[nodiscard]] std::string RefusalTextOf(std::span<std::byte const> reply)
+{
+    auto const decoded = Wire::DecodeErrorPayload(Testing::PayloadOf(reply));
+    return decoded.has_value() ? std::string { decoded->second } : std::string {};
+}
+
+} // namespace
+
+TEST_CASE("(#235, rebuilt) a dispatched compile from another machine is served on a ticket and refused without one",
+          "[node][frame][ticket][admission]")
+{
+    // The membership leg `dist-compile-e2e.sh` used to drive across separate processes and this
+    // host's own LAN address, in process: a real endpoint whose peer REPORTS a non-loopback host, so
+    // the loopback route -- asked first -- admits nothing, and only a ticket can.
+    //
+    // RED when `CallerContextOf`/`ExplainConnection` stops folding the ticket's machine in (leg 1
+    // refused), and when the relabelling is removed (leg 2 served). The CONTROL is what keeps the
+    // second from being assumed: the same COMPILE on the same node through a listener NOT relabelled
+    // is served as this machine's.
+    //
+    // Every leg asserts what IT moved, read before and after, never a counter's absolute value: an
+    // absolute reading is what the legs before it left behind, so it states their outcome again and
+    // can pass while this leg did nothing -- or the wrong thing -- for exactly the count they left.
+    TicketedNode node;
+    auto [remote, remotePort] = node.Listen(RemoteHost);
+    auto [local, localPort] = node.Listen(std::nullopt);
+    node.Start();
+
+    /// What one leg is measured against: the compiles run and the two counters, read before it.
+    struct Reading
+    {
+        std::size_t runs;
+        std::uint64_t accepted;
+        std::uint64_t refused;
+    };
+    auto const read = [&node] {
+        return Reading { .runs = node.compiler.Runs(),
+                         .accepted = node.Read(IMetricsSink::Counter::NodeTicketsAccepted),
+                         .refused = node.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) };
+    };
+
+    // Leg 1: AUTH with pc-07's ticket and the COMPILE behind it, in one write, as a launcher sends them.
+    {
+        auto const before = read();
+        Conversation client { remotePort };
+        REQUIRE(client.SendOnly(Pipelined({ node.TicketAuth(TicketMachine, TicketMachine, 1), TicketedCompileFrame() })));
+        CHECK(Testing::StatusOf(client.ReadReply()) == Wire::Status::Ok);
+        CHECK(Testing::StatusOf(client.ReadReply()) == Wire::Status::Ok);
+        auto const after = read();
+        CHECK(after.runs - before.runs == 1);
+        CHECK(after.accepted - before.accepted == 1);
+        CHECK(after.refused - before.refused == 0);
+    }
+
+    // Leg 2: the same COMPILE from the same address with no ticket.
+    {
+        auto const before = read();
+        Conversation client { remotePort };
+        auto const refused = client.Send(TicketedCompileFrame());
+        CHECK(ErrorOf(refused) == Wire::ErrorCode::NotAMember);
+        auto const after = read();
+        CHECK(after.runs - before.runs == 0);
+        CHECK(after.refused - before.refused == 1);
+    }
+
+    // Control: leg 2 on a listener that is NOT relabelled is this machine's, and served.
+    {
+        auto const before = read();
+        Conversation client { localPort };
+        CHECK(Testing::StatusOf(client.Send(TicketedCompileFrame())) == Wire::Status::Ok);
+        auto const after = read();
+        CHECK(after.runs - before.runs == 1);
+        CHECK(after.refused - before.refused == 0);
+    }
+
+    // A compile's slot rides its reply until the endpoint has written it; both came back before the
+    // endpoints go (`CompileResponder_test`'s drain rule).
+    CHECK(WaitFor([&node] { return node.capacity.InFlight() == 0; }));
+}
+
+TEST_CASE("(#235, rebuilt) the same peer on the same listener is served the cache as this machine",
+          "[node][frame][ticket][cache-locality]")
+{
+    // Leg 3 of the membership mode `dist-compile-e2e.sh` used to run, and the SERVED direction of
+    // #290's rule. This node answers on 10.0.0.7 as well as loopback -- an address of its own host,
+    // the one an operator bound it to -- so a caller there IS this machine. The cache verb answers by
+    // locality and is served; the compile verb on the same connection answers by membership, which
+    // no address satisfies, and is refused. The refusing direction of the cache rule needs a peer
+    // that is genuinely somebody else, and is `NodeFrameSurface_test`'s "(#290) one peer on one
+    // listener".
+    //
+    // A cache gated on `IsLoopbackHost` alone passes every other case in this file and fails only
+    // here: objects stay correct, the fleet keeps dispatching, and the tier stops answering the
+    // address an operator bound it to. RED when the tier stops asking the locality oracle -- the FETCH
+    // is refused and `NodeCacheRequestsRefusedNotLocal` moves.
+    TicketedNode node { std::vector<std::string> { std::string { RemoteHost } } };
+    auto [lan, lanPort] = node.Listen(RemoteHost);
+    node.Start();
+
+    auto const notLocal = node.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal);
+    auto const notMember = node.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember);
+    auto const stored = std::vector<std::byte> { std::byte { 0x42 }, std::byte { 0x07 } };
+
+    Conversation client { lanPort };
+    CHECK(Testing::StatusOf(client.Send(Wire::EncodeStore(Wire::StoreRequest {
+              .key = "k", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = stored })))
+          == Wire::Status::Ok);
+    // The POSITIVE, asserted on its own: a refusal counter that stayed flat says only that nothing
+    // was refused, and a launcher steps over a refused FETCH and compiles.
+    auto const fetched = client.Send(Wire::EncodeFetch("k"));
+    REQUIRE(Testing::StatusOf(fetched) == Wire::Status::Ok);
+    CHECK(std::ranges::equal(Testing::PayloadOf(fetched), stored));
+    CHECK(node.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) - notLocal == 0);
+
+    // The same peer, the same connection, the other verb: membership decides, and refuses.
+    CHECK(ErrorOf(client.Send(TicketedCompileFrame())) == Wire::ErrorCode::NotAMember);
+    CHECK(node.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) - notMember == 1);
+    CHECK(node.compiler.Runs() == 0);
+}
+
+TEST_CASE("A refused AUTH clears what an earlier AUTH on the connection established", "[node][frame][ticket]")
+{
+    // Review Focus 3. One connection, one write: a good ticket, then a forged one, then a gated verb.
+    // The forged AUTH is refused, and the verb behind it must be refused too -- the machine the first
+    // AUTH established is ASSIGNED away by the second, never kept beside it.
+    //
+    // RED when an AUTH no longer clears what the connection held: the NODE-STATUS is served as
+    // pc-07's. Two guards say so, and this case needs BOTH removed -- the reset when an AUTH's header
+    // is read, and `AnswerAuth` ASSIGNING rather than merging -- because the reset alone already
+    // clears it for every AUTH that reaches `AnswerAuth`; the reset's own reason, a refused header
+    // that never reaches it, is `NodeFrameSurface_test`'s.
+    TicketedNode node;
+    auto [endpoint, port] = node.Listen(RemoteHost);
+    node.Start();
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Pipelined({ node.TicketAuth(TicketMachine, TicketMachine, 1),
+                                        node.TicketAuth(TicketMachine, "impostor", 2),
+                                        Wire::EncodeNodeStatusRequest() })));
+    CHECK(Testing::StatusOf(client.ReadReply()) == Wire::Status::Ok);
+    auto const forged = client.ReadReply();
+    CHECK(ErrorOf(forged) == Wire::ErrorCode::TicketRefused);
+    CHECK(RefusalTextOf(forged) == Distributed::TicketNotAdmittedMessage);
+    CHECK(ErrorOf(client.ReadReply()) == Wire::ErrorCode::NotAMember);
+
+    CHECK(node.Read(IMetricsSink::Counter::NodeTicketsAccepted) == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeTicketsRefusedForged) == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 1);
+}
+
+TEST_CASE("AUTH answered Ok by a node with nothing to verify admits no machine", "[node][frame][ticket]")
+{
+    // Review Focus 3's second half. A password AUTH is answered `Ok` so a launcher configured with a
+    // token is not broken by a node that requires none -- and that `Ok` must establish nothing, even
+    // when the secret it carries is pc-07's GENUINE ticket: the declared kind decides what is
+    // verified, and a password is verified by nothing here.
+    //
+    // RED when the session component verifies a credential whatever kind it declares: the password
+    // AUTH is then a ticket, and the NODE-STATUS behind it is served. A password answered `Accepted`
+    // with a machine but no verified key stays refused HERE -- the fold asks the roster for that
+    // machine's key -- which is why that neuter is caught at the connection's state by
+    // `SessionResponder_test` and `NodeFrameSurface_test`, and not by this case.
+    TicketedNode node;
+    auto [endpoint, port] = node.Listen(RemoteHost);
+    node.Start();
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Pipelined(
+        { node.TicketAuth(TicketMachine, TicketMachine, 1, Wire::AuthKind::Password), Wire::EncodeNodeStatusRequest() })));
+    CHECK(Testing::StatusOf(client.ReadReply()) == Wire::Status::Ok);
+    CHECK(ErrorOf(client.ReadReply()) == Wire::ErrorCode::NotAMember);
+    CHECK(node.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeTicketsAccepted) == 0);
+}
+
+TEST_CASE("A revoked machine is refused at every door of a node", "[node][frame][ticket][admission]")
+{
+    // Removal is the direction that fails OPEN, so it is asked at every door rather than at one: after
+    // an applied forget, pc-07's genuine ticket is refused as revoked, and the verb behind it is refused
+    // as the forgotten machine's -- counted on that row, never on the door's stranger row.
+    //
+    // RED when the fold stops reading the revocation the ticket carried (`revokedMachine`): each verb
+    // is then refused as a stranger's, and `NodeRequestsRefusedKeyRevoked` stays at zero.
+    struct Door
+    {
+        char const* verb;
+        std::vector<std::byte> frame;
+        IMetricsSink::Counter strangerRow;
+    };
+    auto const doors = std::vector<Door> {
+        { .verb = "compile",
+          .frame = TicketedCompileFrame(),
+          .strangerRow = IMetricsSink::Counter::WorkerJobsRefusedNotAMember },
+        { .verb = "node-status",
+          .frame = Wire::EncodeNodeStatusRequest(),
+          .strangerRow = IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember },
+        { .verb = "fleet-text",
+          .frame = Wire::EncodeFleetTextRequest(Wire::FleetTextRequest {}),
+          .strangerRow = IMetricsSink::Counter::FleetTextRequestsRefusedNotAMember },
+        { .verb = "enroll-control",
+          .frame = Wire::EncodeEnrollControl(Wire::EnrollControlVerb::List),
+          .strangerRow = IMetricsSink::Counter::EnrollmentControlRefusedNotAMember },
+        { .verb = "subscribe",
+          .frame = SubscribeToNode(),
+          .strangerRow = IMetricsSink::Counter::LiveSubscriptionsRefusedNotAMember },
+    };
+
+    TicketedNode node;
+    node.Publish(TicketedNode::ForgottenState());
+    auto [endpoint, port] = node.Listen(RemoteHost);
+    node.Start();
+
+    auto nonce = std::uint8_t { 0 };
+    for (auto const& door: doors)
+    {
+        INFO(door.verb);
+        ++nonce;
+        Conversation client { port };
+        REQUIRE(client.SendOnly(Pipelined({ node.TicketAuth(TicketMachine, TicketMachine, nonce), door.frame })));
+        auto const auth = client.ReadReply();
+        CHECK(ErrorOf(auth) == Wire::ErrorCode::TicketRefused);
+        CHECK(RefusalTextOf(auth) == Distributed::TicketNotAdmittedMessage);
+        CHECK(ErrorOf(client.ReadReply()) == Wire::ErrorCode::NotAMember);
+        CHECK(node.Read(door.strangerRow) == 0);
+        CHECK(node.Read(IMetricsSink::Counter::NodeTicketsRefusedRevoked) == nonce);
+        CHECK(node.Read(IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked) == nonce);
+    }
+    CHECK(node.compiler.Runs() == 0);
+    CHECK(node.Read(IMetricsSink::Counter::NodeTicketsAccepted) == 0);
+}
+
+TEST_CASE("A key revoked while its ticketed connection is open refuses the next verb", "[node][frame][ticket]")
+{
+    // Review Focus 4: no restart and no reconnect. The fold re-reads the roster on every verb from the
+    // identity the ticket established, so a forget applied while the connection is open refuses the
+    // connection's next verb, counted as the revoked key's.
+    //
+    // RED when a published forget no longer reaches the fold's key roster (`PublishCluster` leaving it
+    // as it was): the second NODE-STATUS is served.
+    TicketedNode node;
+    auto [endpoint, port] = node.Listen(RemoteHost);
+    node.Start();
+
+    Conversation client { port };
+    REQUIRE(
+        client.SendOnly(Pipelined({ node.TicketAuth(TicketMachine, TicketMachine, 1), Wire::EncodeNodeStatusRequest() })));
+    CHECK(Testing::StatusOf(client.ReadReply()) == Wire::Status::Ok);
+    CHECK(Testing::StatusOf(client.ReadReply()) == Wire::Status::Ok);
+
+    node.Publish(TicketedNode::ForgottenState());
+    CHECK(ErrorOf(client.Send(Wire::EncodeNodeStatusRequest())) == Wire::ErrorCode::NotAMember);
+    CHECK(node.Read(IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked) == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 0);
+}
+
+TEST_CASE("Every server standing states whether a machine proves itself to it", "[node][proof][client][shared-cache]")
+{
+    static_assert(RowsInEnumeratorOrder(ServerStandingTable, &ServerStandingRow::standing));
+    // Exactly the three acceptances; every refusal carries a sentence naming both sides.
+    for (auto const& row: ServerStandingTable)
+    {
+        CHECK(row.provesTo == row.refusal.empty());
+        CHECK((row.provesTo || (row.refusal.contains("{0}") && row.refusal.contains("{1}"))));
+    }
+    CHECK(std::ranges::count_if(ServerStandingTable, &ServerStandingRow::provesTo) == 3);
+    CHECK(ServerStandingTable[static_cast<std::size_t>(ServerStanding::Named)].provesTo);
+    CHECK_FALSE(ServerStandingTable[static_cast<std::size_t>(ServerStanding::NotNamed)].provesTo);
+    CHECK_FALSE(ServerStandingTable[static_cast<std::size_t>(ServerStanding::NamedUnderOtherKey)].provesTo);
+    // The two shared-cache refusals are different diagnoses, so they are different sentences.
+    CHECK(ServerStandingTable[static_cast<std::size_t>(ServerStanding::NotNamed)].refusal
+          != ServerStandingTable[static_cast<std::size_t>(ServerStanding::NamedUnderOtherKey)].refusal);
+}
+
+TEST_CASE("A named-machine trust accepts that machine's key and nothing else", "[node][proof][client][shared-cache]")
+{
+    auto const key = Testing::TestKeyPair("cache-c").PublicKey();
+    NamedMachineTrust const trust { "cache-c", key };
+    CHECK(trust.Expected() == "cache-c");
+    CHECK(trust.StandingOf("cache-c", key) == ServerStanding::Named);
+    // Another machine of the same fleet, with ITS live key: still not the shared cache.
+    CHECK(trust.StandingOf("pc-9", Testing::TestKeyPair("pc-9").PublicKey()) == ServerStanding::NotNamed);
+    // The right name under another key: an impostor, or a re-keyed host the roster has not caught up
+    // with -- a different answer, because the remedy is not the address.
+    CHECK(trust.StandingOf("cache-c", Testing::TestKeyPair("pc-9").PublicKey()) == ServerStanding::NamedUnderOtherKey);
+    // Never "Unchecked": a named trust always has something to check against.
+}
+
+TEST_CASE("A node proves itself to the named machine and to no other", "[node][frame][proof][client][shared-cache]")
+{
+    // The real endpoint of the fixture signs as `ProvingFleet`'s server id under its own key.
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    auto const clientKey = Testing::TestKeyPair(std::string { ProvingMachine });
+
+    // Named correctly: proved, and sealed both ways, over the coroutine.
+    {
+        auto sealed = DialSealed(port);
+        Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+        FixedServerTrust const voter { ServerStanding::Voter }; // the client's own trust; unused by ProveAsync here
+        NodeProofClient const client { std::string { ProvingMachine }, clientKey, voter, nullptr, nullptr, random };
+        NamedMachineTrust const named { rig.ServerId(), rig.ServerKey() };
+        auto const attempt = core::async::syncRun(client.ProveAsync(sealed.get(), &named));
+        INFO(attempt.reason);
+        CHECK(attempt.result == NodeProofResult::Proved);
+        CHECK(attempt.standing == std::optional { ServerStanding::Named });
+        CHECK(sealed->Sealed());
+    }
+    auto const acceptedBefore = rig.Read(IMetricsSink::Counter::NodeProofsAccepted);
+
+    // Named as somebody else, or as this server's id under another key -- an impostor that typed
+    // the right name: untrusted, and NO proof reaches the server. Each refusal names who answered
+    // AND whom this node expected, and says which of the two mistakes it is.
+    struct Refusal
+    {
+        std::string namedId;        ///< Whom the trust expects.
+        ServerStanding standing;    ///< What the trust answers.
+        std::string_view diagnosis; ///< The words only this refusal's sentence carries.
+    };
+    auto const anotherKey = Testing::TestKeyPair("cache-c").PublicKey();
+    for (auto const& refusal:
+         { Refusal {
+               .namedId = "cache-c", .standing = ServerStanding::NotNamed, .diagnosis = "now reaches another machine" },
+           Refusal { .namedId = rig.ServerId(),
+                     .standing = ServerStanding::NamedUnderOtherKey,
+                     .diagnosis = "--cluster-admit=scheduler=<endpoint>@<key>" } })
+    {
+        INFO("named " << refusal.namedId);
+        auto sealed = DialSealed(port);
+        Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+        FixedServerTrust const voter { ServerStanding::Voter }; // the client's own trust; unused by ProveAsync here
+        NodeProofClient const client { std::string { ProvingMachine }, clientKey, voter, nullptr, nullptr, random };
+        NamedMachineTrust const other { refusal.namedId, anotherKey };
+        auto const attempt = core::async::syncRun(client.ProveAsync(sealed.get(), &other));
+        INFO(attempt.reason);
+        CHECK(attempt.result == NodeProofResult::Untrusted);
+        CHECK(attempt.standing == std::optional { refusal.standing });
+        // WHICH refusal: the server that answered, the machine this node expected, and the diagnosis.
+        CHECK(attempt.reason.contains(rig.ServerId()));
+        CHECK(attempt.reason.contains(refusal.namedId));
+        CHECK(attempt.reason.contains(refusal.diagnosis));
+        CHECK_FALSE(sealed->Sealed());
+    }
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == acceptedBefore);
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsRejected) == 0);
+}
+
+// --- The round's proof, against a real node (#178) --------------------------------------------
+
+namespace
+{
+
+/// This machine's half of the proof, as a node holds it: its test key, a trust that states every
+/// server's standing outright, a random source of its own, and the client over them.
+struct ProvingClient
+{
+    /// @param standing What every server is to this machine.
+    explicit ProvingClient(ServerStanding standing):
+        trust { standing }
+    {
+    }
+
+    FixedServerTrust trust;                                                          ///< Whom it proves itself to.
+    Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };       ///< Its ephemeral draws.
+    Ed25519KeyPair const key = Testing::TestKeyPair(std::string { ProvingMachine }); ///< Its identity.
+    NodeProofClient const client {
+        std::string { ProvingMachine }, key, trust, nullptr, nullptr, random
+    }; ///< What a round proves with.
+};
+
+/// @param port A loopback port.
+/// @return The `--scheduler` value naming it.
+[[nodiscard]] std::string LoopbackScheduler(std::uint16_t port)
+{
+    return std::format("127.0.0.1:{}", port);
+}
+
+/// @param logger What a round logged into.
+/// @param phrase A substring.
+/// @return How many captured lines carry it, at any level.
+[[nodiscard]] std::ptrdiff_t LinesCarrying(CapturingLogger const& logger, std::string_view phrase)
+{
+    auto const records = logger.Snapshot();
+    return std::ranges::count_if(
+        records, [phrase](CapturingLogger::Record const& record) { return record.message.contains(phrase); });
+}
+
+} // namespace
+
+TEST_CASE("A heartbeat round to a real node proves this machine first, and registers it", "[node][announce][proof]")
+{
+    // The proving arm driven THROUGH `AnnounceRound` rather than beside it. A registration is
+    // `ProvenNodeOnly`, so a round whose connection skipped the proof is refused here -- which no
+    // scripted fleet can show, because a scripted fleet serves no handshake.
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    ProvingClient machine { ServerStanding::Voter };
+    AnnounceTesting::AnnounceFixture fix;
+    fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { LoopbackScheduler(port) });
+    fix.prover = &machine.client;
+    auto link = AnnounceTesting::LinkOver(SchedulersOf(fix.cfg, AsConfigured));
+    BlockingEndpointDialer dialer { HeartbeatIoTimeout };
+
+    CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
+    CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
+}
+
+TEST_CASE("A round whose proof does not seal says so in the proof's own words, and falls back", "[node][announce][proof]")
+{
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    AnnounceTesting::AnnounceFixture fix;
+    BlockingEndpointDialer dialer { HeartbeatIoTimeout };
+
+    SECTION("a server this machine will not prove itself to is that, not unreachable and not a refusal")
+    {
+        ProvingClient machine { ServerStanding::Revoked };
+        fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { LoopbackScheduler(port) });
+        fix.prover = &machine.client;
+        auto link = AnnounceTesting::LinkOver(SchedulersOf(fix.cfg, AsConfigured));
+
+        CHECK(AnnounceRound(fix.Round(), link, dialer) == 0);
+        CHECK(rig.fleet.service.Workers().LiveWorkers().empty());
+        // The proof row's sentence, through `reachability.Failed` -- the words a skipped proof or a
+        // proof outcome filed under another row could not produce.
+        CHECK(LinesCarrying(fix.logger, std::format("this machine will not prove itself to {}", LoopbackScheduler(port)))
+              == 1);
+        CHECK(LinesCarrying(fix.logger, "unreachable") == 0);
+        CHECK(LinesCarrying(fix.logger, "did not register") == 0);
+    }
+
+    SECTION("a first scheduler that serves no handshake is passed over for the next, in the same round")
+    {
+        Fleet plain;
+        MergedResponder plainMerged { SurfaceComponents { .scheduler = &plain.responder, .nodeProof = nullptr } };
+        auto const plainPort = FreePort();
+        auto plainEndpoint = FrameEndpoint::Start(plain.io,
+                                                  NodeSurface::Node,
+                                                  LoopbackFor(NodeSurface::Node, plainPort),
+                                                  plainMerged,
+                                                  plain.metrics,
+                                                  plain.logger);
+        REQUIRE(plainEndpoint.has_value());
+        plain.Serve();
+
+        ProvingClient machine { ServerStanding::Voter };
+        fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { LoopbackScheduler(plainPort), LoopbackScheduler(port) });
+        fix.prover = &machine.client;
+        auto link = AnnounceTesting::LinkOver(SchedulersOf(fix.cfg, AsConfigured));
+
+        CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
+        CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
+        CHECK(plain.service.Workers().LiveWorkers().empty());
+        CHECK(link.Target() == LoopbackScheduler(port));
+        CHECK(LinesCarrying(fix.logger, "serves no identity handshake") == 1);
+        CHECK(LinesCarrying(fix.logger, std::format("; trying {}", LoopbackScheduler(port))) == 1);
+    }
+}
+
+TEST_CASE("A suspend's withdrawal proves this machine too, and a refused identity stays out of the tracker",
+          "[node][announce][proof]")
+{
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    ProvingClient machine { ServerStanding::Voter };
+    AnnounceTesting::AnnounceFixture fix;
+    fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { LoopbackScheduler(port) });
+    fix.prover = &machine.client;
+    auto link = AnnounceTesting::LinkOver(SchedulersOf(fix.cfg, AsConfigured));
+    BlockingEndpointDialer dialer { HeartbeatIoTimeout };
+    REQUIRE(AnnounceRound(fix.Round(), link, dialer) == 1);
+    REQUIRE(rig.fleet.service.Workers().LiveWorkers().size() == 1);
+
+    std::vector<Cc::WorkerRegistrar> rebuilt;
+    rebuilt.push_back(AnnounceTesting::Registrar("gcc-14"));
+    RetireAllRegistrations(std::move(rebuilt), fix.registrars, fix.withdrawals);
+    REQUIRE(fix.withdrawals.size() == 1);
+
+    SECTION("proved, the scheduler retires the registration")
+    {
+        CHECK(WithdrawOnce(fix.Round(), link, dialer) == 1);
+        CHECK(rig.fleet.service.Workers().LiveWorkers().empty());
+    }
+
+    SECTION("refused, nothing is retired, it is said once, and not in the tracker's words")
+    {
+        ProvingClient revoked { ServerStanding::Revoked };
+        fix.prover = &revoked.client;
+
+        CHECK(WithdrawOnce(fix.Round(), link, dialer) == 0);
+        CHECK(fix.withdrawals.empty());
+        CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
+        CHECK(LinesCarrying(fix.logger, "did not accept this machine's identity before it sleeps") == 1);
+        // A machine going to sleep is not a scheduler setback: through `round.reachability` this
+        // would be the proof row's sentence, spending that scheduler's Warn.
+        CHECK(LinesCarrying(fix.logger, "will not prove itself") == 0);
+    }
+}
+
+namespace
+{
+
+/// The id of a node that schedules for itself: the one machine in these cases that is both ends.
+constexpr std::string_view SelfSchedulingMachine = "self-01";
+
+/// A node whose own worker announces to its own scheduler, before and after its own consensus
+/// records it.
+///
+/// **One identity at both ends, and one roster behind both**, which is how `main` wires a node that
+/// names itself in `--scheduler`: the responder proves as the node's id under the node's key, the
+/// client proves as the same id under the same key, and both ask the one admission oracle -- whose
+/// key roster is what the node's consensus publishes from its applied state, and holds nothing until
+/// that consensus has recorded this node.
+struct SelfSchedulingNode
+{
+    Fleet fleet;
+    Distributed::KeyRosterMembership keys;
+    Distributed::AnyOfMembership oracle { { &fleet.membership, &keys } };
+    SchedulerResponder scheduler { fleet.protocol, oracle, fleet.metrics };
+    Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { SelfSchedulingMachine });
+    Testing::ScriptedSecureRandom serverRandom { Testing::ServerHandshakeScript() };
+    /// Whether this node's consensus has applied the log it recovered: caught up unless a case says not.
+    Testing::ScriptedAppliedState consensus { AppliedStateReading::CaughtUp };
+    NodeProofResponder responder {
+        std::string { SelfSchedulingMachine }, identity, oracle, consensus, serverRandom, fleet.metrics, fleet.logger
+    };
+    MergedResponder merged { SurfaceComponents { .scheduler = &scheduler, .nodeProof = &responder } };
+    NodeConditions conditions; ///< Where the node's prover answers `own-record-awaited`.
+
+    /// Start the node's one listener.
+    /// @return The endpoint and its port.
+    [[nodiscard]] std::pair<std::unique_ptr<FrameEndpoint>, std::uint16_t> Serve()
+    {
+        auto const port = FreePort();
+        auto endpoint = FrameEndpoint::Start(
+            fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), merged, fleet.metrics, fleet.logger);
+        REQUIRE(endpoint.has_value());
+        fleet.Serve();
+        return { *std::move(endpoint), port };
+    }
+
+    /// What this node's consensus does a moment after it elects itself: record this node, key and
+    /// all, and publish that into the roster every surface asks.
+    void RecordSelf()
+    {
+        Testing::PublishKeyRoster(keys, { std::string { SelfSchedulingMachine } });
+    }
+
+    /// @return What @p counter reads.
+    [[nodiscard]] std::uint64_t Read(IMetricsSink::Counter counter) const noexcept
+    {
+        return fleet.metrics.Read(counter);
+    }
+};
+
+/// An announcement that says nothing and counts how often it was reached: what these cases ask is
+/// WHETHER a round got as far as speaking, not what it said.
+class CountingAnnouncement final: public IAnnouncement
+{
+  public:
+    /// @copydoc IAnnouncement::Attempt
+    [[nodiscard]] AnnounceOutcome Attempt(core::net::ISocket& /*client*/, std::string_view /*endpoint*/) override
+    {
+        ++attempts;
+        return AnnounceOutcome { .accepted = 1, .leader = std::nullopt };
+    }
+
+    std::size_t attempts = 0; ///< How many rounds reached the announcement.
+};
+
+/// @return Whether any record @p logger captured contains @p text.
+[[nodiscard]] bool Logged(CapturingLogger const& logger, std::string_view text)
+{
+    return std::ranges::any_of(logger.Snapshot(), [text](auto const& record) { return record.message.contains(text); });
+}
+
+/// @return How many records @p logger captured at @p level.
+[[nodiscard]] std::size_t LoggedAt(CapturingLogger const& logger, LogLevel level)
+{
+    return static_cast<std::size_t>(std::ranges::count(logger.Snapshot(), level, &CapturingLogger::Record::level));
+}
+
+} // namespace
+
+TEST_CASE("A node that schedules for itself does not announce before its own consensus records it",
+          "[node][frame][proof][client][self-record]")
+{
+    // The order every such node logged at start: its worker (and its presence loop) proved itself to
+    // its OWN scheduler before its own consensus had elected and recorded it, was refused
+    // `node-key-unknown`, and warned "admit it with --enroll-from or --cluster-admit-worker" -- a
+    // remedy telling an operator to admit this machine to its own cluster, one second before the
+    // node recorded itself. Driven through `DialAndAnnounce`, the one seam both loops dial through,
+    // against the node's real endpoint and responder.
+    SelfSchedulingNode node;
+    auto const [endpoint, port] = node.Serve();
+
+    auto const configured = SchedulerLink::For({ std::format("127.0.0.1:{}", port) });
+    REQUIRE(configured.has_value());
+    auto link = Unwrap(configured);
+    BlockingEndpointDialer dialer { 5s };
+    CapturingLogger logger;
+    Testing::ScriptedSecureRandom callerRandom { Testing::CallerHandshakeScript() };
+    auto const trust = FixedServerTrust { ServerStanding::Unchecked };
+    auto const client = NodeProofClient {
+        std::string { SelfSchedulingMachine }, node.identity, trust, &node.oracle, &node.conditions, callerRandom
+    };
+    auto const proof = AnnounceProof { .prover = &client };
+    core::platform::ManualClock reachabilityClock;
+    SchedulerReachability reachability { reachabilityClock };
+
+    // Before the record: nothing dialled, nothing refused, and nothing an operator is told to do.
+    CountingAnnouncement early;
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, early, proof) == 0);
+    CHECK(early.attempts == 0);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 0);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
+    CHECK_FALSE(Logged(logger, "did not accept this machine's identity"));
+    CHECK_FALSE(Logged(logger, "--enroll-approve"));
+    CHECK(LoggedAt(logger, LogLevel::Warn) == 0);
+    CHECK(Logged(logger, "has not recorded this node yet"));
+
+    // The record lands, and the next round proves and speaks -- the half without which a gate that
+    // never opened would pass everything above.
+    node.RecordSelf();
+    CountingAnnouncement late;
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, late, proof) == 1);
+    CHECK(late.attempts == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 0);
+    CHECK(LoggedAt(logger, LogLevel::Warn) == 0);
+    // An ordinary hold, one ask long, raises nothing an operator must act on.
+    CHECK(node.conditions.StateOf(NodeCondition::OwnRecordAwaited) == Wire::ConditionState::Clear);
+}
+
+TEST_CASE("A machine proving to a scheduler that has not caught up is told not yet, and asks again soon",
+          "[node][frame][proof][client][boot-order]")
+{
+    // Batch 3's M3 end to end, over the node's real endpoint and responder and through
+    // `DialAndAnnounce`, the one seam both loops dial through. Another machine proves to a scheduler
+    // whose consensus has not applied the log it recovered: the answer is `roster-not-yet-applied`,
+    // never `node-key-unknown` -- nothing is counted as an unknown key and no operator is told to
+    // admit anybody -- and the prover's next round comes after `DeferredProofWait`, not a whole
+    // interval. Then the scheduler catches up and holds the key, and the next round proves.
+    SelfSchedulingNode node;
+    node.consensus.Set(AppliedStateReading::Behind);
+    auto const [endpoint, port] = node.Serve();
+
+    constexpr std::string_view Other = "learner-01";
+    auto const configured = SchedulerLink::For({ std::format("127.0.0.1:{}", port) });
+    REQUIRE(configured.has_value());
+    auto link = Unwrap(configured);
+    BlockingEndpointDialer dialer { 5s };
+    CapturingLogger logger;
+    Testing::ScriptedSecureRandom callerRandom { Testing::CallerHandshakeScript() };
+    auto const trust = FixedServerTrust { ServerStanding::Unchecked };
+    auto const otherKey = Testing::TestKeyPair(std::string { Other });
+    // No cluster of its own to hold it back: what decides here is the SCHEDULER's answer.
+    auto const client = NodeProofClient { std::string { Other }, otherKey, trust, nullptr, nullptr, callerRandom };
+    auto const proof = AnnounceProof { .prover = &client };
+    core::platform::ManualClock reachabilityClock;
+    SchedulerReachability reachability { reachabilityClock };
+
+    CountingAnnouncement early;
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, early, proof) == 0);
+    CHECK(early.attempts == 0);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied) == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 0);
+    CHECK(client.ConsecutiveDeferrals() == 1);
+    CHECK(NextAnnounceWait(&client) == DeferredProofWait(1));
+    CHECK(Logged(logger, "cannot judge this machine's identity yet"));
+    CHECK_FALSE(Logged(logger, "--enroll-approve"));
+
+    // Still behind: the backoff doubles.
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, early, proof) == 0);
+    CHECK(client.ConsecutiveDeferrals() == 2);
+    CHECK(NextAnnounceWait(&client) == DeferredProofWait(2));
+
+    // Caught up, and the state it applied holds this machine's key: the next round proves, and the
+    // ordinary interval returns -- the half without which a responder that never deferred anything
+    // would pass the first half by refusing for some other reason.
+    Testing::PublishKeyRoster(node.keys, { std::string { Other } });
+    node.consensus.Set(AppliedStateReading::CaughtUp);
+    CountingAnnouncement late;
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, late, proof) == 1);
+    CHECK(late.attempts == 1);
+    CHECK(client.ConsecutiveDeferrals() == 0);
+    CHECK(NextAnnounceWait(&client) == NodeAnnounceInterval);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 0);
+}
+
+TEST_CASE("A scheduler that has caught up and lacks the key still answers unknown, and the wait is the ordinary one",
+          "[node][frame][proof][client][boot-order]")
+{
+    // The control: once the state has caught up, an absent key IS an absent member, and the remedy
+    // is the operator's -- so `node-key-unknown`, and no short backoff hammering a refusal no retry
+    // clears.
+    SelfSchedulingNode node;
+    auto const [endpoint, port] = node.Serve();
+
+    constexpr std::string_view Other = "learner-01";
+    auto const configured = SchedulerLink::For({ std::format("127.0.0.1:{}", port) });
+    REQUIRE(configured.has_value());
+    auto link = Unwrap(configured);
+    BlockingEndpointDialer dialer { 5s };
+    CapturingLogger logger;
+    Testing::ScriptedSecureRandom callerRandom { Testing::CallerHandshakeScript() };
+    auto const trust = FixedServerTrust { ServerStanding::Unchecked };
+    auto const otherKey = Testing::TestKeyPair(std::string { Other });
+    auto const client = NodeProofClient { std::string { Other }, otherKey, trust, nullptr, nullptr, callerRandom };
+    auto const proof = AnnounceProof { .prover = &client };
+    core::platform::ManualClock reachabilityClock;
+    SchedulerReachability reachability { reachabilityClock };
+
+    CountingAnnouncement refused;
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, refused, proof) == 0);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied) == 0);
+    CHECK(client.ConsecutiveDeferrals() == 0);
+    CHECK(NextAnnounceWait(&client) == NodeAnnounceInterval);
+}
+
+namespace
+{
+
+/// `TryExchange` with the reply's read BOUNDED.
+///
+/// A surface whose accept loop has ended still completes the handshake -- the kernel queues the
+/// connection in a backlog nobody drains -- so an unbounded read waits forever, and the defect
+/// these cases exist for would turn a red into a hang. An empty reply is what it reads as.
+/// @param port Where the endpoint is listening. @param frame The request, header included.
+/// @return The reply; empty when none came within the bound; `nullopt` when no connection was made.
+[[nodiscard]] std::optional<std::vector<std::byte>> BoundedExchange(std::uint16_t port, std::span<std::byte const> frame)
+{
+    core::net::BlockingConnector connector;
+    auto socket =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
+    if (!socket.has_value())
+        return std::nullopt;
+    (*socket)->setReceiveDeadline(5s);
+    auto reply = core::async::syncRun(
+        [](core::net::ISocket* peer, std::vector<std::byte> request) -> core::async::Task<std::vector<std::byte>> {
+            auto const written = co_await peer->write(std::span<std::byte const> { request });
+            if (!written.has_value())
+                co_return std::vector<std::byte> {};
+            co_return co_await ReadOneReply(peer);
+        }((*socket).get(), std::vector<std::byte> { frame.begin(), frame.end() }));
+    (*socket)->close();
+    return reply;
+}
+
+/// How many captured lines at @p level contain @p needle.
+/// @param logger The capture. @param level The level. @param needle The text.
+/// @return The count.
+[[nodiscard]] std::size_t LinesAt(CapturingLogger const& logger, LogLevel level, std::string_view needle)
+{
+    return static_cast<std::size_t>(std::ranges::count_if(logger.Snapshot(), [&](CapturingLogger::Record const& record) {
+        return record.level == level && record.message.contains(needle);
+    }));
+}
+
+/// Start the node surface over a listener that fails its first accepts with @p failures.
+/// @param fleet The fixture; its reactor is started here.
+/// @param logger Where the endpoint logs.
+/// @param failures What the first accepts answer.
+/// @return The endpoint and the port a client dials.
+[[nodiscard]] std::pair<std::unique_ptr<FrameEndpoint>, std::uint16_t> StartFailingFirst(
+    Fleet& fleet, ILogger& logger, std::vector<core::net::NetErrorCode> const& failures)
+{
+    auto listened = core::net::listen(fleet.io.Reactor(), core::net::ListenOptions { .host = "127.0.0.1", .port = 0 });
+    REQUIRE(listened.has_value());
+    auto const port = (*listened)->boundPort();
+    auto errors = std::vector<core::net::NetError> {};
+    for (auto const code: failures)
+        errors.push_back(core::net::makeNetError(code, 0, "AcceptEx"));
+    auto endpoint = FrameEndpoint::StartWithListener(
+        fleet.io,
+        NodeSurface::Node,
+        std::make_unique<core::net::testing::FailingListener>(std::move(*listened), std::move(errors)),
+        std::format("127.0.0.1:{}", port),
+        fleet.responder,
+        fleet.metrics,
+        logger);
+    REQUIRE(endpoint != nullptr);
+    fleet.Serve();
+    return { std::move(endpoint), port };
+}
+
+} // namespace
+
+TEST_CASE("A connection a peer reset before it was accepted does not stop the surface", "[node][frame][accept-loop]")
+{
+    // The installed node's nine hours: one `WSAECONNRESET` out of `AcceptEx` ended this loop at
+    // `Debug`, the listener stayed open, and every later connect was refused. A client served
+    // AFTER the failures is the whole assertion; the warning and the empty health registry say
+    // the surface knew it failed a connection and did not think itself stopped.
+    Fleet fleet;
+    CapturingLogger logger { LogLevel::Debug };
+    auto const [endpoint, port] =
+        StartFailingFirst(fleet, logger, { core::net::NetErrorCode::ConnReset, core::net::NetErrorCode::ConnReset });
+
+    auto const lease = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+    auto const reply = BoundedExchange(port, lease);
+    REQUIRE(reply.has_value());
+    // Empty is a surface that took the connection into its backlog and never accepted it.
+    REQUIRE_FALSE(Unwrap(reply).empty());
+    CHECK(ErrorOf(Unwrap(reply)) == Wire::ErrorCode::NoWorker);
+
+    // Said once for the two, not once per failure: the second is inside the rate limit.
+    CHECK(LinesAt(logger, LogLevel::Warn, "an accept failed (connection reset") == 1);
+    CHECK(LinesAt(logger, LogLevel::Error, "accept loop ended") == 0);
+    CHECK(fleet.io.AcceptLoops().snapshot().empty());
+}
+
+TEST_CASE("An accept that ran out of something backs off and then serves", "[node][frame][accept-loop]")
+{
+    // `ResourceExhausted` stands for `EMFILE`, `ENOBUFS` and `WSA_NOT_ENOUGH_MEMORY`: accepting again
+    // at once would only spin, so the loop waits on the reactor's clock -- and must still serve after.
+    Fleet fleet;
+    CapturingLogger logger { LogLevel::Debug };
+    auto const [endpoint, port] = StartFailingFirst(
+        fleet, logger, { core::net::NetErrorCode::ResourceExhausted, core::net::NetErrorCode::ResourceExhausted });
+
+    auto const lease = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+    auto const reply = BoundedExchange(port, lease);
+    REQUIRE(reply.has_value());
+    // Empty is a surface that took the connection into its backlog and never accepted it.
+    REQUIRE_FALSE(Unwrap(reply).empty());
+    CHECK(ErrorOf(Unwrap(reply)) == Wire::ErrorCode::NoWorker);
+    CHECK(LinesAt(logger, LogLevel::Warn, "accepting again in 10 ms") == 1);
+    CHECK(fleet.io.AcceptLoops().snapshot().empty());
+}
+
+TEST_CASE("A surface whose listener is gone says it stopped at Error and to the health registry",
+          "[node][frame][accept-loop]")
+{
+    // The one way a loop may still end while serving: the listening handle is closed or invalid.
+    // That must never again be a `Debug` line -- it is the surface going dark -- so it is said at
+    // `Error` and recorded where the node's liveness probe reads.
+    Fleet fleet;
+    CapturingLogger logger { LogLevel::Debug };
+    auto const [endpoint, port] = StartFailingFirst(fleet, logger, { core::net::NetErrorCode::BadHandle });
+
+    REQUIRE(Testing::WaitUntil(
+        "the node surface's accept loop to report that it stopped",
+        [&fleet] { return !fleet.io.AcceptLoops().snapshot().empty(); },
+        [&fleet] { return std::format("{} surface(s) reported stopped", fleet.io.AcceptLoops().snapshot().size()); }));
+    auto const stopped = fleet.io.AcceptLoops().snapshot();
+    REQUIRE(stopped.size() == 1);
+    CHECK(stopped.front().surface == RowFor(NodeSurface::Node).name);
+    CHECK(stopped.front().reason.contains("AcceptEx"));
+    CHECK(LinesAt(logger, LogLevel::Error, "accept loop ended") == 1);
+}
+
+TEST_CASE("A surface shutting down ends its accept loop without calling itself stopped", "[node][frame][accept-loop]")
+{
+    // The control for the case above: the ordinary ending is a close, and it must not read as a
+    // surface gone dark, or every clean shutdown would raise the condition on its way out.
+    Fleet fleet;
+    CapturingLogger logger { LogLevel::Debug };
+    {
+        auto [endpoint, port] = StartFailingFirst(fleet, logger, {});
+        auto const lease =
+            Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+        REQUIRE(BoundedExchange(port, lease).has_value());
+    }
+    CHECK(fleet.io.AcceptLoops().snapshot().empty());
+    CHECK(LinesAt(logger, LogLevel::Error, "accept loop ended") == 0);
+}
+
+TEST_CASE("The cluster-status verb reads a live node's cluster over its node port through the production client",
+          "[node][frame][clusteradmin]")
+{
+    // The one-shot verb's LIVE path, in process: the production client (`RunClusterAdmin`, with the
+    // dialler production uses) over a real loopback socket to the real endpoint, whose scheduler
+    // answers from the cluster state it administers. The e2e fixtures no longer run a cluster verb
+    // against a node, and --scheduler now defaults to this machine's own node for exactly these verbs.
+    struct LiveCluster final: public Distributed::IClusterAdmin
+    {
+        Cluster::ClusterState state;
+
+        [[nodiscard]] Cluster::ClusterState ClusterState() const override
+        {
+            return state;
+        }
+
+        [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& /*command*/) override
+        {
+            return {};
+        }
+
+        void NoteAnnouncedEndpoint(Consensus::NodeId const& /*member*/, std::string /*endpoint*/) override {}
+    };
+    Fleet fleet;
+    LiveCluster cluster;
+    Cluster::Apply(cluster.state,
+                   Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                                      .key = "n1",
+                                      .value = "10.0.0.1:6680",
+                                      .schedulerEndpoint = "10.0.0.1:6675",
+                                      // A member record carries its key: `Apply` records none without.
+                                      .publicKey = Testing::TestKeyPair("n1").PublicKey() });
+    REQUIRE(cluster.state.members.size() == 1);
+    fleet.service.AdministerWith(cluster);
+    MergedResponder merged { SurfaceComponents { .scheduler = &fleet.responder } };
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), merged, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    NodeConfig cfg;
+    cfg.schedulers = { FormatHostPort("127.0.0.1", port) };
+    // Asked per endpoint (`Cc::ICredentialFor`); a loopback operator presents nothing.
+    Testing::PresentsNothing credential;
+    auto const rendered = RunClusterAdmin(
+        cfg,
+        ClusterRequest { .action = ClusterAction::Status, .key = {}, .value = {}, .publicKey = std::nullopt },
+        credential);
+    INFO((rendered.has_value() ? std::string {} : rendered.error().reason));
+    REQUIRE(rendered.has_value());
+    CHECK(Unwrap(rendered).contains("n1"));
+    CHECK(Unwrap(rendered).contains("10.0.0.1:6675"));
 }

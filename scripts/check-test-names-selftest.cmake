@@ -93,6 +93,12 @@ set(file_unknown_macro "FASTCACHE_TEST_CASE(\"gamma stays distinct\", \"[t]\")\n
 # A macro that opens and never produces a literal within the lookahead.
 set(file_unreadable "TEST_CASE(\n    MakeName(1),\n    MakeTags(2),\n    3,\n    4,\n    5,\n    6,\n    7,\n    8,\n    9,\n    10)\n${body}")
 
+# Three declarations of one name behind a prelude, the middle one wrapped. The sites
+# the refusal names are LINE NUMBERS, and the reader steps over whole runs of lines
+# that name no case in one move: a run miscounted by one moves every site after it,
+# and leaves the verdict and the count exactly right. Sites 6, 11 and 18.
+set(file_duplicate_sites "#include <catch2/catch_test_macros.hpp>\n\nnamespace\n{\n}\nTEST_CASE(\"alpha stays distinct\", \"[t]\")\n${body}\nTEST_CASE(\n    \"alpha stays distinct\",\n    \"[u]\")\n${body}\nTEST_CASE(\"alpha stays distinct\", \"[v]\")\n${body}")
+
 # No macro at all: an ordinary source file.
 set(file_no_cases "int Answer()\n{\n    return 42;\n}\n")
 
@@ -201,6 +207,8 @@ set(cases
     # --- the refusing direction ----------------------------------------------
     "dash|src/Alpha_test.cpp=dash|-|refuse|begin with '-'|-"
     "duplicate|src/Alpha_test.cpp=duplicate|-|refuse|declared more than once|-"
+    # WHERE, not only whether: the sites are asserted as line numbers.
+    "duplicate-sites|src/Alpha_test.cpp=duplicate_sites|-|refuse|\\(3 cases\\) +src/Alpha_test\\.cpp:6 +src/Alpha_test\\.cpp:11 +src/Alpha_test\\.cpp:18[^0-9]|-"
 
     # --- the three #1261 regressions -----------------------------------------
     "wrapped-duplicate|src/Alpha_test.cpp=wrapped_duplicate|-|refuse|declared more than once|-"

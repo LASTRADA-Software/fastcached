@@ -288,8 +288,15 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # tag that matches nothing is exactly what this gate refuses below. The code they exercised is
 # still under this gate: it is linked here as core-cpp's archives, which the instrumentation
 # check above reads by name, and its own tests are core-cpp's to run under its `clang-tsan`.
+#
+# **`[host-events]` joined the first row MEASURED, not blind**: the host-event hub hands a delivery
+# turn between producer threads and waits on a condition variable in `Unsubscribe`, and the network
+# relay delivers from a thread of its own. Linux, clang-22, a Debug `ENABLE_SANITIZER_THREAD`
+# build, this gate's own TSAN_OPTIONS and suppressions file: the four host-event objects each carry
+# an undefined `__tsan_init`, the canary exits 66 with its race reported, and 20 runs of
+# `[host-events]` (15 cases) came back clean with 0 warnings. A bound, not an absence.
 TARGETS=(
-    "FastCacheTest|[consensus],[distributed],[reactor],[net],[tls],[sharded],[expiry],[clock],[wait],[pubsub],[server]|first-party"
+    "FastCacheTest|[consensus],[distributed],[reactor],[net],[tls],[sharded],[expiry],[clock],[wait],[pubsub],[server],[host-events]|first-party"
     "fastcache-compile-node-tests||first-party"
     "fastcache-cc-tests||first-party"
     "fastcache-cli-tests||first-party"

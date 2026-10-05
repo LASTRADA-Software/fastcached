@@ -61,20 +61,12 @@ class FleetTextResponder final: public IFrameResponder
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t opRaw) const override;
 
-    /// @copydoc IFrameResponder::AuthRequired
-    ///
-    /// **No**, for `LiveStatsResponder::AuthRequired`'s reason: the credential on this listener is
-    /// the scheduler's, and a surface must not require a secret it cannot verify. The fleet's own
-    /// secret is the dashboard credential, which the request carries.
-    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return false;
-    }
-
     /// @copydoc IFrameResponder::CheckCredential
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    ///
+    /// `NoPolicy`: AUTH is the Session family's; this surface is never routed one.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
     {
-        return FastCache::CheckCredential(nullptr, payload);
+        return NotTheSessionSurface();
     }
 
     /// @copydoc IFrameResponder::RefusalReply

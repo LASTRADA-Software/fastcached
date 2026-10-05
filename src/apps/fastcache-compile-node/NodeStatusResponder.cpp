@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "MembershipGate.hpp"
+#include "NodeIdentity.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Distributed/MachineStanding.hpp>
 #include <FastCache/Distributed/MembershipWire.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <ranges>
+#include <span>
+#include <string>
 #include <utility>
 
 namespace FastCache::Node
@@ -18,6 +24,22 @@ namespace FastCache::Node
 
 namespace
 {
+    /// Who a connection is, as its own `explain-admission` names it: the id it proved, else the
+    /// machine its ticket spoke for, else the forgotten machine whose revoked ticket it presented,
+    /// else the host the kernel reported.
+    /// @param peer The connection.
+    /// @return Its subject.
+    [[nodiscard]] std::string SubjectOf(PeerIdentity const& peer)
+    {
+        if (peer.proven.has_value())
+            return peer.proven->id;
+        if (peer.authenticatedMachine.has_value())
+            return peer.authenticatedMachine->id;
+        if (peer.revokedMachine.has_value())
+            return std::string { peer.revokedMachine->Id() };
+        return peer.host;
+    }
+
     /// A `NodeMetrics` asked of a node whose sources are detached: it is stopping.
     constexpr Cc::UncountedRefusal NodeIsStopping {
         .code = CompileCacheWire::ErrorCode::EndpointBusy,
@@ -135,10 +157,7 @@ namespace
                                       "with no OpTable row is Unset -- so an unknown one is answered UnservedReply at "
                                       "the door and never reaches this surface" };
             case CompileCacheWire::PrePayloadDecision::Unauthenticated:
-                return { .counter = std::nullopt,
-                         .rationale = "AuthRequired() is false here by decision -- the credential on this listener is "
-                                      "the scheduler's -- and DecidePrePayload yields this only for a surface that "
-                                      "requires one" };
+                return { .counter = std::nullopt, .rationale = NodeChecksNoPasswordRationale };
             case CompileCacheWire::PrePayloadDecision::Serve:
                 break;
         }
@@ -173,16 +192,6 @@ namespace
         RefusalPolicy policy;    ///< What this surface does about it.
     };
 
-    /// Why neither credential arm counts, stated once for the two rows that share it.
-    ///
-    /// The enumerators are separate because a client is told different things about
-    /// them; the ARGUMENT is one argument about one fact -- whose credential this
-    /// listener carries -- so it is one sentence rather than two literals that can drift
-    /// on any edit with nothing to catch it.
-    constexpr std::string_view CredentialIsTheSchedulersRationale =
-        "AUTH is the Session family, which MergedResponder routes to the scheduler; no credential outcome is ever "
-        "decided against this surface";
-
     /// What this surface does about each endpoint-decided refusal.
     ///
     /// `.rationale` is spelled out as empty on the counted row rather than left to
@@ -198,9 +207,9 @@ namespace
           // be the worst possible moment to have one.
           .policy = { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedEndpointBusy, .rationale = {} } },
         { .refusal = EndpointRefusal::CredentialMalformed,
-          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
+          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSessionsRationale } },
         { .refusal = EndpointRefusal::CredentialRejected,
-          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
+          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSessionsRationale } },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .policy = { .counter = std::nullopt, .rationale = AnswerDeadlineIsTheEndpointsRationale } },
         { .refusal = EndpointRefusal::NodeProofUnchallenged,
@@ -239,14 +248,91 @@ std::vector<std::byte> NodeStatusResponder::EndpointRefusalReply(EndpointRefusal
     return AnswerRefusal(_metrics, ErrorCodeFor(refusal), row.policy, detail);
 }
 
-std::optional<std::vector<std::byte>> NodeStatusResponder::RefusePeer(PeerIdentity const& peer, std::uint8_t /*opRaw*/) const
+std::optional<std::vector<std::byte>> NodeStatusResponder::RefuseStranger(PeerIdentity const& peer) const
 {
     return RefuseUnlessMember(_membership,
                               _metrics,
                               peer,
                               { .code = CompileCacheWire::ErrorCode::NotAMember,
                                 .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember },
-                              "this node reports its identity and counters to fleet members only");
+                              "this node reports its identity, its counters and its roster to fleet members only");
+}
+
+std::optional<std::vector<std::byte>> NodeStatusResponder::RefusePeer(PeerIdentity const& peer, std::uint8_t opRaw) const
+{
+    // The self form of `explain-admission` must reach a caller this node refuses, or it could
+    // never report the refusal; its machine form is refused inside `Answer`, by `RefuseStranger`.
+    if (opRaw == static_cast<std::uint8_t>(CompileCacheWire::Op::ExplainAdmission))
+        return std::nullopt;
+    return RefuseStranger(peer);
+}
+
+std::vector<std::byte> NodeStatusResponder::ExplainAdmission(std::optional<std::span<std::byte const>> payload,
+                                                             PeerIdentity const& peer) const
+{
+    auto const subject = payload.has_value() ? CompileCacheWire::DecodeExplainAdmissionPayload(*payload) : std::nullopt;
+    if (!subject.has_value())
+        return Cc::Refuse(_metrics,
+                          { .code = CompileCacheWire::ErrorCode::MalformedFrame,
+                            .counter = IMetricsSink::Counter::NodeAdmissionExplanationsRefusedMalformed },
+                          "explain-admission takes exactly one field: a machine id or key, or nothing to ask about "
+                          "this connection");
+
+    // #1471. Either form is the fold the SURFACES enforce, `ExplainConnection` through the same
+    // `_membership` oracle they bind -- never a second walk, or the reported answer and the
+    // enforced one can disagree, which is the defect this verb exists to make visible.
+    if (subject->empty())
+    {
+        // About the caller's own connection, and only what it established: its host, the key it
+        // proved, the ticket it presented. Answered to a caller this node refuses, uncounted --
+        // "refused, by no route" is what every gated verb already tells it.
+        auto const decision = Distributed::ExplainConnection(_membership, peer);
+        auto fields = Distributed::OnTheWire(decision);
+        fields.subject = SubjectOf(peer);
+        // A key only a TICKET showed revoked is answered as a stranger is -- its host, refused, by
+        // nobody -- the way every gated verb answers it (`AnswerMembership`): the ticket may be a
+        // captured one, and `key-revoked` would tell its holder a third party was forgotten.
+        if (decision.verdict == Distributed::Membership::Forgotten && !Distributed::RevocationIsProven(decision))
+            fields = { .verdict = CompileCacheWire::WireMembership::Outsider, .decidedBy = 0, .subject = peer.host };
+        return CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok,
+                                             CompileCacheWire::EncodeAdmissionExplanation(fields));
+    }
+
+    // About a MACHINE, which reads the roster and so describes a third party: members only.
+    if (auto refusal = RefuseStranger(peer); refusal.has_value())
+        return *std::move(refusal);
+
+    // And only to a member that says WHO it is -- this machine, a proven key, a verified ticket. On
+    // a `--fleet-open` node membership admits everyone, so membership alone would hand an anonymous
+    // caller whether a third party is revoked, a learner or unknown: the distinction the ticket path
+    // above collapses for a captured ticket. Collapsed here the same way -- one answer whatever the
+    // machine's standing -- as the refusal the control verbs give for the same want.
+    if (!Distributed::RestsOnIdentifiedCaller(Distributed::ExplainConnection(_membership, peer)))
+        return Cc::RefuseWithoutCounter(
+            { .code = CompileCacheWire::ErrorCode::IdentifiedCallerRequired,
+              .rationale = "a diagnostic question, answered with its remedy; the event an operator watches for an "
+                           "unidentified caller is the control verbs' refusal, and this one changes nothing" },
+            "explain-admission about a machine describes a third party, so it is answered to a caller this node "
+            "can identify: from this machine, with a proven key, or with the machine ticket a fleet node mints");
+
+    auto const roster = _standing.Roster();
+    if (!roster.has_value())
+        return Cc::RefuseWithoutCounter(
+            { .code = CompileCacheWire::ErrorCode::NoCluster,
+              .rationale = "a healthy answer on a node that holds no roster: it has nothing to say about a machine, "
+                           "which is not the same as the machine being unknown" },
+            "this node holds no roster to answer a machine question from");
+
+    // The routes are those the surfaces would enforce for a connection presenting that machine's
+    // key -- as a proof and as a ticket, from no address -- so a live key reports both key routes,
+    // a revoked one the tombstone, and an unknown one only what admits an anonymous connection.
+    auto const key = Distributed::KeyOfMachine(*roster, *subject);
+    auto fields = Distributed::OnTheWire(Distributed::ExplainConnection(
+        _membership,
+        ConnectionFacts { .host = {}, .proven = key, .authenticatedMachine = key, .revokedMachine = std::nullopt }));
+    fields.standing = Distributed::OnTheWire(Distributed::StandingOfMachine(*roster, *subject, _standing.Pending(*subject)));
+    fields.subject = *subject;
+    return CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok, CompileCacheWire::EncodeAdmissionExplanation(fields));
 }
 
 core::async::Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
@@ -285,23 +371,9 @@ core::async::Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte co
             co_return CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok, capture->body);
         }
         case CompileCacheWire::Op::ExplainAdmission: {
-            // #1471. The fold the SURFACES enforce, through the same `_membership` oracle they
-            // bind -- never a second walk over the same three participants, or the reported
-            // answer and the enforced one can disagree, which is the defect this verb exists to
-            // make visible rather than to add to.
             auto const payload = frame.subspan(CompileCacheWire::RequestHeaderSize);
-            auto const host = payload.size() == header->payloadLength
-                                  ? CompileCacheWire::DecodeExplainAdmissionPayload(payload)
-                                  : std::nullopt;
-            if (!host.has_value())
-                co_return Cc::Refuse(_metrics,
-                                     { .code = CompileCacheWire::ErrorCode::MalformedFrame,
-                                       .counter = IMetricsSink::Counter::NodeAdmissionExplanationsRefusedMalformed },
-                                     "explain-admission takes exactly one field, the host to ask about");
-
-            co_return CompileCacheWire::EncodeReply(
-                CompileCacheWire::Status::Ok,
-                CompileCacheWire::EncodeAdmissionExplanation(Distributed::OnTheWire(_membership.Explain(*host))));
+            co_return ExplainAdmission(payload.size() == header->payloadLength ? std::optional { payload } : std::nullopt,
+                                       peer);
         }
         default:
             break;
@@ -457,11 +529,11 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     }
 
     // The one state in this record an operator may act on within seconds of reading it:
-    // while it is `Open`, any machine that can route to this node's 0xFC port may ask to
-    // join, and approving one hands it this cluster's key in cleartext. Reported here
-    // rather than left to the repeating log line, because that line reaches only
-    // whoever is reading THIS node's log -- and an operator who opened a window and
-    // walked away has no other way to find out.
+    // while an auto-approve window is armed, any machine that can route to this node's 0xFC
+    // port and asks is admitted as a learner under the key it asks with, with nobody
+    // comparing it. Reported here rather than left to the condition's log line, because that
+    // line reaches only whoever is reading THIS node's log -- and an operator who armed a
+    // window and walked away has no other way to find out.
     //
     // Both halves together, and both absent on a node that runs no window: a count with
     // no state beside it cannot say whether a zero means nobody has found the window yet
@@ -471,15 +543,11 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
         auto const [state, pending] = _sources.enrollment->Summary();
         fields.runtime.enrollment = state;
         fields.runtime.enrollmentPending = pending;
+        // The seconds an armed auto-approve deadline has left, and absent when none is armed --
+        // never a zero, which would read as a window that ends this instant.
+        fields.runtime.enrollmentAutoApproveSecondsLeft = _sources.enrollment->AutoApproveLeft().transform(
+            [](std::chrono::seconds left) { return static_cast<std::uint64_t>(left.count()); });
     }
-
-    // How many client tombstones this node is ENFORCING (#1471). Absent on a node with no
-    // source, which is a node running no consensus: there is no committed set for a forget to
-    // have reached, and a `0` there would answer a different question than "the cluster forgets
-    // nobody". Read per request like the rest of this record, so a forget applied a moment ago
-    // is visible on the next `--node-status` rather than at the next restart.
-    if (_sources.membership != nullptr)
-        fields.runtime.forgottenClients = static_cast<std::uint32_t>(_sources.membership->ForgottenClientCount());
 
     // Where peers DIAL this node's consensus port, beside the surfaces it BOUND below
     // (#1328). The operator bringing a machine in compares this against the endpoint
@@ -491,6 +559,28 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     // it -- and were it, absent is the honest reading of an address nobody stated.
     if (auto dial = ConsensusDialAddressOf(_cfg); dial.has_value())
         fields.runtime.consensusEndpoint = std::move(*dial);
+
+    // Where this node keeps its identity, and why there. One machine can hold two identities --
+    // the service's in the machine-wide directory and a hand-started node's in the account's
+    // own -- and an operator who finds both needs the reason beside each path to tell them
+    // apart. Both or neither, like the fields say.
+    if (auto chosen = ChosenStateDirectory(_cfg); chosen.has_value())
+    {
+        fields.runtime.stateDirectory = chosen->path.string();
+        fields.runtime.stateDirectoryReason = std::string { DescribeStateDirectoryOrigin(chosen->origin) };
+    }
+
+    // Which pin this node trusts by, and the one another machine is to paste to trust THIS fleet: its
+    // cluster and the keys of the voters its applied state records, through the one formatter
+    // `--fleet-id` parses back. The pin is stated on every node, unpinned included -- that IS the
+    // answer an operator asks for. The fleet id needs a roster to name voters from.
+    if (auto const roster = _sources.roster != nullptr ? _sources.roster->Summary() : std::nullopt;
+        roster.has_value() && !roster->voterKeys.empty() && _cfg.formation.has_value() && !_cfg.formation->clusterId.empty())
+        fields.runtime.fleetId = Cluster::FormatPinnedFleet(
+            Cluster::PinnedFleet { .clusterId = _cfg.formation->clusterId, .voterKeys = roster->voterKeys });
+    fields.runtime.fleetPin = CompileCacheWire::NodeFleetPinFields {
+        .fleet = _cfg.fleetPin.has_value() ? std::optional { Cluster::FormatPinnedFleet(*_cfg.fleetPin) } : std::nullopt
+    };
 
     // Where this node sits in the configuration consensus holds (#1449): a learner and a
     // following voter are one role and one component mask, and only one of them stands
@@ -507,20 +597,18 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     if (_sources.conditions != nullptr)
         fields.runtime.conditions = _sources.conditions->Snapshot();
 
-    // The roster, when this node holds one (#178). Its lapse travels as an INSTANT rather than a
-    // countdown, so a reader far from this node renders it against its own clock and a copy
-    // taken a minute ago still says when it lapses rather than how long it had then.
+    // The roster, when this node holds one (#178): the state it applied.
     if (auto const summary = _sources.roster != nullptr ? _sources.roster->Summary() : std::nullopt)
         fields.runtime.roster = CompileCacheWire::NodeRosterFields {
             .version = summary->version,
             .voters = summary->voters,
-            .principals = summary->principals,
             .revoked = summary->revoked,
-            .certifiedUntilMillis = summary->certifiedUntil.transform([](std::chrono::system_clock::time_point until) {
-                return static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(until.time_since_epoch()).count());
-            }),
         };
+
+    // What this node reads through to, or serves, as the fleet's shared cache -- asked per request,
+    // like everything above, so an apply that moves the setting shows on the next answer.
+    if (_sources.sharedCache != nullptr)
+        fields.runtime.sharedCache = _sources.sharedCache->Report();
 
     for (auto const& mapping: mappings)
     {

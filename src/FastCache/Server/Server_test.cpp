@@ -8,6 +8,7 @@
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
 #include <core/net/IAdmissionControl.hpp>
+#include <core/net/testing/FailingListener.hpp>
 #include <core/net/testing/InMemorySocket.hpp>
 #include <core/net/testing/TestLoop.hpp>
 #include <core/platform/Clock.hpp>
@@ -25,12 +26,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <new>
 #include <optional>
 #include <ranges>
 #include <span>
 #include <string>
+#include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 namespace
@@ -169,6 +173,30 @@ class ThrowOnGetStorage final: public FastCache::IStorage
 
 } // namespace
 
+namespace
+{
+/// The name every Server under test reports under.
+constexpr std::string_view TestSurface = "cache 127.0.0.1:11211";
+
+// The `/healthz` registry and the loop's name are REQUIRED. They used to trail every defaulted
+// collaborator as `core::net::AcceptLoopHealth* = nullptr`, so a construction site that left the registry out
+// compiled, and its loop's end reached no `/healthz` at all. A constructor that can be called
+// without either brings that back, and fails here rather than in a review.
+static_assert(
+    !std::is_constructible_v<FastCache::Server, core::net::IListener&, FastCache::CacheEngine&, FastCache::ILogger&>);
+static_assert(!std::is_constructible_v<FastCache::Server,
+                                       core::net::IListener&,
+                                       FastCache::CacheEngine&,
+                                       FastCache::ILogger&,
+                                       core::net::AcceptLoopHealth&>);
+static_assert(std::is_constructible_v<FastCache::Server,
+                                      core::net::IListener&,
+                                      FastCache::CacheEngine&,
+                                      FastCache::ILogger&,
+                                      core::net::AcceptLoopHealth&,
+                                      std::string>);
+} // namespace
+
 TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[server]")
 {
     core::platform::ManualClock clock;
@@ -176,7 +204,8 @@ TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[serv
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
     core::net::testing::InMemoryListener listener;
-    FastCache::Server server { listener, engine, logger };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener, engine, logger, acceptLoops, std::string { TestSurface } };
 
     // Stage a client BEFORE running the server so Accept resolves
     // synchronously on the first iteration.
@@ -204,9 +233,17 @@ TEST_CASE("Server with LogSource::Yes prefixes connection logs with the client I
     FastCache::CacheEngine engine { storage, clock };
     FastCache::CapturingLogger logger; // captures from Trace up
     core::net::testing::InMemoryListener listener;
-    FastCache::Server server {
-        listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
-    };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener,
+                               engine,
+                               logger,
+                               acceptLoops,
+                               std::string { TestSurface },
+                               nullptr,
+                               nullptr,
+                               FastCache::SessionContext {},
+                               nullptr,
+                               FastCache::LogSource::Yes };
 
     auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
     REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value()); // EOF with no bytes -> autodetect fails -> Debug log
@@ -230,9 +267,17 @@ TEST_CASE("Server with LogSource::Yes prefixes the storage trace line with the c
     FastCache::TracingStorage storage { lru, logger, clock };
     FastCache::CacheEngine engine { storage, clock };
     core::net::testing::InMemoryListener listener;
-    FastCache::Server server {
-        listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
-    };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener,
+                               engine,
+                               logger,
+                               acceptLoops,
+                               std::string { TestSurface },
+                               nullptr,
+                               nullptr,
+                               FastCache::SessionContext {},
+                               nullptr,
+                               FastCache::LogSource::Yes };
 
     auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
     REQUIRE(core::async::syncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
@@ -260,7 +305,10 @@ TEST_CASE("Server without --log-source leaves the storage trace line unprefixed"
     FastCache::TracingStorage storage { lru, logger, clock };
     FastCache::CacheEngine engine { storage, clock };
     core::net::testing::InMemoryListener listener;
-    FastCache::Server server { listener, engine, logger }; // LogSource defaults to No
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server {
+        listener, engine, logger, acceptLoops, std::string { TestSurface }
+    }; // LogSource defaults to No
 
     auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
     REQUIRE(core::async::syncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
@@ -288,7 +336,9 @@ TEST_CASE("Server: non-data commands are logged only under --log-everything", "[
         core::net::testing::InMemoryListener listener;
         FastCache::SessionContext session {};
         session.logEverything = logEverything;
-        FastCache::Server server { listener, engine, logger, nullptr, nullptr, session, nullptr, FastCache::LogSource::Yes };
+        core::net::AcceptLoopHealth acceptLoops;
+        FastCache::Server server { listener, engine,  logger,  acceptLoops, std::string { TestSurface },
+                                   nullptr,  nullptr, session, nullptr,     FastCache::LogSource::Yes };
 
         auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
         REQUIRE(core::async::syncRun(Send(client.get(), "version\r\nset foo 0 0 5\r\nhello\r\n")));
@@ -325,9 +375,17 @@ TEST_CASE("Server: command logging is silent at the default Info level", "[serve
     FastCache::TracingStorage storage { lru, logger, clock };
     FastCache::CacheEngine engine { storage, clock };
     core::net::testing::InMemoryListener listener;
-    FastCache::Server server {
-        listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
-    };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener,
+                               engine,
+                               logger,
+                               acceptLoops,
+                               std::string { TestSurface },
+                               nullptr,
+                               nullptr,
+                               FastCache::SessionContext {},
+                               nullptr,
+                               FastCache::LogSource::Yes };
 
     auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
     REQUIRE(core::async::syncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
@@ -348,7 +406,10 @@ TEST_CASE("Server with LogSource::No leaves connection logs unprefixed", "[serve
     FastCache::CacheEngine engine { storage, clock };
     FastCache::CapturingLogger logger;
     core::net::testing::InMemoryListener listener;
-    FastCache::Server server { listener, engine, logger }; // LogSource defaults to No
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server {
+        listener, engine, logger, acceptLoops, std::string { TestSurface }
+    }; // LogSource defaults to No
 
     auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
     REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
@@ -370,7 +431,8 @@ TEST_CASE("Server drops a connection whose handler throws instead of terminating
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
     core::net::testing::InMemoryListener listener;
-    FastCache::Server server { listener, engine, logger };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener, engine, logger, acceptLoops, std::string { TestSurface } };
 
     auto client = listener.connectClient();
     REQUIRE(core::async::syncRun(Send(client.get(), "get foo\r\n")));
@@ -401,7 +463,10 @@ TEST_CASE("Server: a refusal over a request the connection did not finish readin
     core::net::testing::InMemoryListener listener;
     FastCache::SessionContext session {};
     session.maxPayloadBytes = 1024;
-    FastCache::Server server { listener, engine, logger, nullptr, nullptr, session };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server {
+        listener, engine, logger, acceptLoops, std::string { TestSurface }, nullptr, nullptr, session
+    };
 
     auto client = listener.connectClient();
     std::string const value(4096, 'x');
@@ -432,7 +497,9 @@ TEST_CASE("Server: a lingering connection holds its admission slot until it clos
     FastCache::SessionContext session {};
     session.maxPayloadBytes = 1024;
     session.reactor = &reactor;
-    FastCache::Server server { listener, engine, logger, &admission, nullptr, session };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener,   engine,  logger, acceptLoops, std::string { TestSurface },
+                               &admission, nullptr, session };
 
     auto client = listener.connectClient();
     std::string const value(4096, 'x');
@@ -460,7 +527,8 @@ TEST_CASE("Server::Shutdown closes the listener", "[server]")
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
     core::net::testing::InMemoryListener listener;
-    FastCache::Server server { listener, engine, logger };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener, engine, logger, acceptLoops, std::string { TestSurface } };
 
     auto serverTask = server.Run();
     server.Shutdown();
@@ -497,7 +565,8 @@ TEST_CASE("Server rejects connections when admission denies", "[server][admissio
     core::net::testing::InMemoryListener listener;
     AlwaysDenyAdmission admission;
     FastCache::AtomicMetricsSink metrics;
-    FastCache::Server server { listener, engine, logger, &admission, &metrics };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener, engine, logger, acceptLoops, std::string { TestSurface }, &admission, &metrics };
 
     auto c1 = listener.connectClient();
     auto c2 = listener.connectClient();
@@ -523,7 +592,8 @@ TEST_CASE("Server admits + tracks ConnectionsTotal", "[server][admission]")
     core::net::testing::InMemoryListener listener;
     core::net::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
     FastCache::AtomicMetricsSink metrics;
-    FastCache::Server server { listener, engine, logger, &admission, &metrics };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener, engine, logger, acceptLoops, std::string { TestSurface }, &admission, &metrics };
 
     auto c1 = listener.connectClient();
     auto c2 = listener.connectClient();
@@ -570,7 +640,9 @@ TEST_CASE("Server: ConnectionsTotalTls / ConnectionsAdmissionRejectedTls bumped 
     core::net::testing::InMemoryListener listener;
     core::net::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
     FastCache::AtomicMetricsSink metrics;
-    FastCache::Server server { listener, engine, logger, &admission, &metrics, /*session*/ {}, tlsContext.get() };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener,   engine,   logger,         acceptLoops,     std::string { TestSurface },
+                               &admission, &metrics, /*session*/ {}, tlsContext.get() };
 
     auto c1 = listener.connectClient();
     auto c2 = listener.connectClient();
@@ -586,3 +658,65 @@ TEST_CASE("Server: ConnectionsTotalTls / ConnectionsAdmissionRejectedTls bumped 
     REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsAdmissionRejectedTls) == 0);
 }
 #endif
+
+TEST_CASE("Server goes on accepting past a connection a peer reset before it was accepted", "[server][accept-loop]")
+{
+    // The daemon's loop ended on ANY failed accept, at `Debug`, and a bind whose loop has ended
+    // still listens -- so the kernel queues every later client into a backlog nobody drains, then
+    // refuses them. The client staged BEHIND the failure being served is the whole assertion.
+    core::platform::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Debug };
+    core::net::testing::InMemoryListener inner;
+    core::net::testing::FailingListener listener {
+        inner, core::net::testing::repeatedFailures(core::net::NetErrorCode::ConnReset, 1)
+    };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener, engine, logger, acceptLoops, std::string { TestSurface } };
+
+    auto client = inner.connectClient();
+    REQUIRE(core::async::syncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
+    inner.close();
+    core::async::syncRun(server.Run());
+
+    CHECK(listener.failuresAnswered() == 1);
+    CHECK(core::async::syncRun(ReadResponse(client.get())) == "STORED\r\nVALUE foo 0 5\r\nhello\r\nEND\r\n");
+    CHECK(server.AcceptedCount() == 1);
+    CHECK(std::ranges::count_if(logger.Snapshot(),
+                                [](FastCache::CapturingLogger::Record const& record) {
+                                    return record.level == FastCache::LogLevel::Warn
+                                           && record.message.contains(std::format("{}: an accept failed", TestSurface));
+                                })
+          == 1);
+}
+
+TEST_CASE("Server reports an accept loop that ended while serving under its own name", "[server][accept-loop]")
+{
+    // Every Server reported as `cache`, whichever bind it accepted on, while its log line named no
+    // bind at all -- so `/healthz` could not say which one had stopped. The name it is given is the
+    // name the registry records.
+    core::platform::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Debug };
+    core::net::testing::InMemoryListener inner;
+    core::net::testing::FailingListener listener {
+        inner, core::net::testing::repeatedFailures(core::net::NetErrorCode::BadHandle, 1)
+    };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::Server server { listener, engine, logger, acceptLoops, "cache 0.0.0.0:6380 (TLS)" };
+
+    core::async::syncRun(server.Run());
+
+    auto const stopped = acceptLoops.snapshot();
+    REQUIRE(stopped.size() == 1);
+    CHECK(stopped.front().surface == "cache 0.0.0.0:6380 (TLS)");
+    CHECK(std::ranges::count_if(logger.Snapshot(),
+                                [](FastCache::CapturingLogger::Record const& record) {
+                                    return record.level == FastCache::LogLevel::Error
+                                           && record.message.starts_with("cache 0.0.0.0:6380 (TLS): accept loop ended");
+                                })
+          == 1);
+}

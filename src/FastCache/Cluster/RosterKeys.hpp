@@ -19,7 +19,7 @@ namespace FastCache::Cluster
 ///
 /// ## Two sources, and which one wins
 ///
-/// - **The bootstrap members** -- `--raft-peer id=host:port@<key>` -- are what a node knows
+/// - **The bootstrap members** -- the roster its formation record starts it from -- are what a node knows
 ///   before the cluster has told it anything. They are the only keys a cluster that has not
 ///   yet elected can verify, so a fresh cluster whose members were given none cannot form, and
 ///   says so in its refusal counters rather than trusting whoever answers first.
@@ -29,8 +29,8 @@ namespace FastCache::Cluster
 ///
 /// A bootstrap key the state has REVOKED is revoked, whatever the command line says: a
 /// revocation that a restart with the original command line could undo would be removal
-/// failing open. A member the state records with no key -- admitted before it stated one --
-/// falls back to its bootstrap key only when that key is not revoked.
+/// failing open. A member the state does not record falls back to its bootstrap key only when
+/// that key is not revoked.
 ///
 /// ## A forgotten member keeps its key here until the configuration drops it
 ///
@@ -43,11 +43,7 @@ namespace FastCache::Cluster
 /// id stays live FOR THAT ID while this node's configuration counts it (`AdoptConfiguration`),
 /// and is refused the moment the configuration drops it -- which is Raft's own rule for a
 /// removed server, stated about keys. Nothing else is graced: the same key under any other id
-/// is refused, a forgotten member the configuration never counted is refused at once, and so
-/// is every principal, which consensus never counts.
-///
-/// Principals are NOT read: a principal never joins consensus (`ClusterPrincipal`), so an id
-/// that names one is a stranger on this wire.
+/// is refused, and a forgotten member the configuration never counted is refused at once.
 ///
 /// ## Every revoked key, whatever id is asked about
 ///
@@ -68,7 +64,7 @@ class RosterKeys final: public Consensus::IRaftPeerKeys
     /// @param own This node's identity key pair. Its secret half never leaves this object.
     /// @param bootstrap Every member this node's command line names, with the keys it typed
     ///        for them where it typed any. This node's own entry is ignored: its key is @p own.
-    RosterKeys(Ed25519KeyPair own, std::span<ClusterMember const> bootstrap);
+    RosterKeys(Ed25519KeyPair own, std::span<MemberSpec const> bootstrap);
 
     /// Adopt what the cluster now says. Called on every applied change.
     /// @param state The replicated state.
@@ -84,7 +80,7 @@ class RosterKeys final: public Consensus::IRaftPeerKeys
 
     [[nodiscard]] Ed25519PublicKey OwnPublicKey() const override;
 
-    [[nodiscard]] Ed25519Signature SignAsSelf(std::span<std::byte const> message) const override;
+    [[nodiscard]] Ed25519Signature SignAsSelf(LabelledMessage const& message) const override;
 
     [[nodiscard]] Consensus::PeerKeys KeysOf(Consensus::NodeId const& peer) const override;
 

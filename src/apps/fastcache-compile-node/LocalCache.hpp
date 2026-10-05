@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "CacheTierProfile.hpp"
+
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -16,6 +18,9 @@
 
 namespace FastCache::Node
 {
+
+// Declared, not included: an upstream hands one out and says nothing else about it.
+class ISharedCacheStatusSource;
 
 /// What became of one object offered to the shared cache.
 ///
@@ -97,11 +102,46 @@ class ICacheUpstream
     /// rather than about one -- and it has to be askable that way, because the store
     /// counters are cumulative: a node with no upstream and a node with one it has
     /// not written to yet both report zero, so neither counter can answer it. Both
-    /// are properties of the implementation rather than of any state, so they cannot
-    /// drift apart: an implementation answering `false` here answers `NotConfigured`
-    /// there, always.
+    /// are answered from the same fact -- fixed at construction for most upstreams,
+    /// the current target for the shared cache's, which follows the replicated
+    /// setting -- so they cannot drift apart: an implementation answering `false` here
+    /// answers `NotConfigured` there for the same target.
     /// @return True when a shared cache is configured.
     [[nodiscard]] virtual bool Configured() const noexcept = 0;
+
+    /// Told that the cluster just applied a state, AFTER whatever this upstream reads its target
+    /// from was told the same.
+    ///
+    /// For an upstream whose target follows the replicated state, which re-judges what it reports
+    /// now rather than at its next operation: a live condition that lagged the state it describes
+    /// until a build happened to miss would be a stale answer on the surface an operator reads.
+    /// On the consensus apply callback: never blocks.
+    ///
+    /// **Who cares, today: only the fleet half.** `SharedCacheUpstream` re-judges
+    /// `shared-cache-unproven` from the directory -- out of the setting, unresolved, or a newly
+    /// resolved machine -- reached through the node's `ProvenSharedCacheUpstream` and, where this
+    /// machine may hold the shared tier itself, `SwitchingSharedUpstream`, which forward it. The
+    /// rest take the default, each for its own reason: `RemoteUpstream` is built on its `--upstream`
+    /// endpoint, which no applied state moves; `NoUpstream` has none; and `InProcessSharedUpstream` reports no
+    /// condition and asks its host for the published tier on every call, so there is no judgement
+    /// of its own to go stale. An upstream that keeps a verdict about a target the replicated state
+    /// can move is the next implementer.
+    virtual void StateApplied() {}
+
+    /// How reaching the fleet's shared cache went, for `--node-status` -- where this upstream keeps
+    /// such a verdict.
+    ///
+    /// **A seam rather than a downcast**: the half that knows is `SharedCacheUpstream`, and the
+    /// node never holds one bare -- it sits behind `ProvenSharedCacheUpstream` and, where this
+    /// machine may hold the tier itself, `SwitchingSharedUpstream`, which forward this as they
+    /// forward `StateApplied`. Every other upstream keeps no such verdict and answers null:
+    /// `RemoteUpstream` proves nothing, `NoUpstream` reaches nothing, and `InProcessSharedUpstream`
+    /// is this machine's own tier, whose state the host reports.
+    /// @return The fleet half's status, or null; it lives as long as this upstream.
+    [[nodiscard]] virtual ISharedCacheStatusSource const* SharedCacheStatus() const noexcept
+    {
+        return nullptr;
+    }
 };
 
 /// An upstream that is not there.
@@ -183,7 +223,31 @@ class LocalCache
     /// @param upstream The shared cache; must outlive this.
     /// @param clock Time source for the local tier's expiry; must outlive this.
     /// @param metrics Where hits, misses and upstream outcomes are counted.
-    LocalCache(IStorage& local, ICacheUpstream& upstream, core::platform::IClock& clock, IMetricsSink& metrics) noexcept;
+    /// @param profile Which tier this is, and so which counters it moves. Copied: the row is a
+    ///        handful of bytes, and a copy cannot outlive what it was read from. It must count
+    ///        EVERY upstream outcome (`UpstreamCountingOf`): an upstream that can read or store
+    ///        paired with a profile counting none of it would do both in silence.
+    /// @throws std::invalid_argument When @p profile does not count every upstream outcome.
+    LocalCache(IStorage& local,
+               ICacheUpstream& upstream,
+               core::platform::IClock& clock,
+               IMetricsSink& metrics,
+               CacheTierProfile const& profile);
+
+    /// A tier that reads through to nothing -- the fleet's shared tier, which is the top of the
+    /// fleet's cache.
+    /// @param local The tier; must outlive this.
+    /// @param upstream Nothing, by type; must outlive this.
+    /// @param clock Time source for the tier's expiry; must outlive this.
+    /// @param metrics Where hits, misses and refusals are counted.
+    /// @param profile Which tier this is. It may count every upstream outcome or none -- none of
+    ///        them happens here -- but not some.
+    /// @throws std::invalid_argument When @p profile counts some upstream outcomes and not others.
+    LocalCache(IStorage& local,
+               NoUpstream& upstream,
+               core::platform::IClock& clock,
+               IMetricsSink& metrics,
+               CacheTierProfile const& profile);
 
     /// Look one key up, reading through to the shared cache on a local miss.
     /// @param key The object key.
@@ -213,11 +277,23 @@ class LocalCache
     /// @return Which of the three things happened.
     [[nodiscard]] CacheDropOutcome Drop(std::string_view key);
 
+    /// Which tier this is: the row it was built with.
+    ///
+    /// Read by the `CacheProxy` in front of it rather than passed to that proxy a second time,
+    /// so the verbs a tier answers and the counters its storage moves come from ONE row and
+    /// cannot name two different tiers.
+    /// @return The profile.
+    [[nodiscard]] CacheTierProfile const& Profile() const noexcept
+    {
+        return _counters;
+    }
+
   private:
     IStorage& _local;
     ICacheUpstream& _upstream;
     core::platform::IClock& _clock;
     IMetricsSink& _metrics;
+    CacheTierProfile _counters;
 };
 
 } // namespace FastCache::Node

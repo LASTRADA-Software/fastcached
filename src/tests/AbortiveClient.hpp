@@ -201,7 +201,10 @@ class AbortiveClient
     {
         core::platform::ensureWinsockInitialized();
         auto const raw = ::socket(AF_INET, SOCK_STREAM, 0);
-        auto const fd = Native(raw);
+        // Named rather than `auto`: `NativeHandle` is `void*` on Windows and `int` elsewhere, so an
+        // `auto` here draws readability-qualified-auto on one platform, and its `auto *` fix does not
+        // compile on the other.
+        core::platform::NativeHandle const fd = Native(raw);
         if (fd == core::platform::InvalidHandle)
             return core::platform::InvalidHandle;
 #if defined(SO_NOSIGPIPE)

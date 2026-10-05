@@ -7,6 +7,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -272,7 +274,13 @@ TEST_CASE("The real host answers for the machine, and agrees with a second readi
     // on the ARM64 one, so it is deliberately not the comparison.
     SYSTEM_INFO info {};
     ::GetNativeSystemInfo(&info);
-    switch (info.wProcessorArchitecture)
+    // By offset, not as `info.wProcessorArchitecture`: the field is in an anonymous union, and member access
+    // through one is refused by this tree's analyser (`cppcoreguidelines-pro-type-union-access`).
+    auto nativeArchitecture = WORD { PROCESSOR_ARCHITECTURE_UNKNOWN };
+    std::memcpy(&nativeArchitecture,
+                reinterpret_cast<std::byte const*>(&info) + offsetof(SYSTEM_INFO, wProcessorArchitecture),
+                sizeof nativeArchitecture);
+    switch (nativeArchitecture)
     {
         case PROCESSOR_ARCHITECTURE_ARM64:
             CHECK(architecture == HostArchitecture::Arm64);

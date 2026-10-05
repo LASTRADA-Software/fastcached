@@ -10,6 +10,8 @@ file(GLOB_RECURSE FASTCACHE_TEST_SOURCES
 
 add_executable(FastCacheTest
     test_main.cpp
+    # The shared test helpers' own cases: not under src/FastCache, so the glob above cannot reach them.
+    ScratchPath_test.cpp
     ${FASTCACHE_TEST_SOURCES}
 )
 
@@ -948,6 +950,28 @@ set_tests_properties("version-fallback-warning" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
+)
+
+# A git query that does not answer is never read as its negative: an unanswered dirty check
+# is `-dirty-unknown` and never "clean", an unanswered distance fails the git-tag row and never
+# yields the bare tag, and either makes the version Provisional, so
+# FASTCACHED_REQUIRE_EXACT_VERSION refuses it. Drives the real GetVersionInformation against a
+# stub git (a `.cmd` on Windows, a shell script elsewhere) that holds one chosen query past an
+# injected bound. The all-answer cases are the positive control that the stub ran. PASS as well
+# as FAIL: the script refuses when fewer cases ran than it calls, and the count line must be
+# printed at all, so a run that stopped before judging anything is not a pass.
+add_test(
+    NAME "version-git-unanswered"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/version-git-unanswered"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-version-git-unanswered.cmake"
+)
+set_tests_properties("version-git-unanswered" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    PASS_REGULAR_EXPRESSION "version-git-unanswered: [0-9]+ case\\(s\\) run"
+    LABELS "hygiene"
+    TIMEOUT 180
 )
 
 # ---------------------------------------------------------------------------
@@ -2188,10 +2212,11 @@ set_tests_properties("pedantic-suppressions" PROPERTIES
 # And the half that proves the above can refuse. It was watched failing on
 # 0db96dc8, naming exactly the four suppressions once per GNU-style persona -- but
 # that is a fact about one commit and stops reproducing the moment the fix lands.
-# This runs ten cases instead -- eight synthetic subjects plus two absent inputs --
-# and names each one on every run, because a stated figure that disagrees with what
-# the tool prints is the defect #723 exists to prevent. Three are shapes an
-# unwatched guard accepts: the suppression COPIED outside rather than moved, a
+# This runs fourteen cases instead -- twelve synthetic subjects plus two absent
+# inputs -- and names each one on every run, because a stated figure that disagrees
+# with what the tool prints is the defect #723 exists to prevent. Four are shapes an
+# unwatched guard accepts: the suppression COPIED outside rather than moved, one
+# added outside every condition (in four spellings: `-Wno-X`, `-wdN`, `/w`, `-w`), a
 # subject that no longer adds `-pedantic`, and an MSVC arm that adds nothing.
 #
 # The copied one is why the check compares flag COUNTS rather than membership: a
@@ -2357,6 +2382,58 @@ else()
     fastcached_register_skipped_test("e2e-helpers-selftest"
         "the helper library is POSIX and serves POSIX fixtures; on msys2 bash a /dev/tcp connect to an unbound loopback port can SUCCEED, so its socket cases would pass against a listener that is not there")
 endif()
+
+# Every fixture handed a launcher -- `$<TARGET_FILE:fastcache-cc>` on its registration, or
+# a launcher parameter it declares -- calls the launcher-state seam, so the launcher
+# records into the run's own state directory rather than the developer's. The Windows
+# launcher e2e deleted the developer's statistics (`-z`) on every run, and three fixtures
+# appended their records to them.
+#
+# On EVERY platform, and deliberately not a case of `e2e-helpers-selftest`, which is not
+# run on Windows: the `.ps1` fixtures this is mostly about run nowhere else. Neither needs
+# a build. TWO registrations of one script, because they answer two questions:
+# `launcher-state-isolation` scans the REAL tree and holds the two readers of Stats.cpp's
+# state variables -- the bash one and the PowerShell one -- to one answer per platform;
+# `launcher-state-isolation-selftest` is the check's proof that it can fail -- a planted
+# tree that must earn every verdict -- and DRIVES both seams against a stand-in launcher
+# and a caller log that is present, empty and absent. The PowerShell halves need pwsh and
+# are named skips without it.
+#
+# Their cost is PROCESS SPAWNS, which Git Bash makes expensive: a version that ran a `grep`
+# per CMake file and each seam case one after another took 37-47s on an idle Windows host
+# and 114-175s with 24 busy loops on its 32 cores. One `awk`/`grep` per pass over all the
+# files, the seam cases in lanes and one reader subshell brought the whole to 11s idle and
+# 22-29s under the same load (Git Bash 5.2); a reviewer then measured 182s at 32 busy
+# loops, and the split is the answer to that rather than a larger bound. Judging every
+# `.sh` fixture in ONE awk rather than a handful of processes each then measured 21s for
+# the self-test and 8s for the tree under 32 busy loops with 2-4 other compilers running
+# (39.8s and 11.9s before it). With the other lanes' builds on top -- up to ~30 compilers
+# as well as the loops -- the self-test measured 80-126s, AT its bound, before and after:
+# on a host that saturated, every Git Bash spawn costs an order of magnitude more, and the
+# self-test is hundreds of them. That is harsher than any real run. The load that DECIDES
+# is the gate's own shape, `ctest -L hygiene -j32` beside it on the same 32-CPU host, and
+# there the self-test measured up to 83s while its seam cases cost ~1,170 processes. With
+# the seam library cut to ~830, five such runs on Windows measured the self-test at
+# 14-48s and the tree at 7-20s, started anywhere from 79th to 173rd of 202 and with 0 to
+# 34 other lanes' compilers running; in WSL 2s (the pwsh half a named skip) and 10s.
+# Each bound is for a check that stops ending; if a run approaches it, make the check
+# cheaper again rather than raising it.
+add_test(
+    NAME "launcher-state-isolation"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-launcher-state-isolation.sh"
+)
+set_tests_properties("launcher-state-isolation" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+add_test(
+    NAME "launcher-state-isolation-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-launcher-state-isolation.sh" --self-test
+)
+set_tests_properties("launcher-state-isolation-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
 
 # ---------------------------------------------------------------------------
 # The ELF guard that keeps a vendored library out of what ships (#1538).
@@ -2758,6 +2835,69 @@ set_tests_properties("wix-fragment" PROPERTIES
     TIMEOUT 60
 )
 
+# The same fragment's service table, element by element: the guards on the action
+# that deletes a leftover registration, the clear-then-set feature properties, and
+# that every condition reading one compares it with "1". Pinned in the source because
+# only the Windows packaging job ever runs the package, and a lost clause still builds.
+add_test(
+    NAME "wix-service-table"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-wix-service-table.cmake"
+)
+set_tests_properties("wix-service-table" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# What the Windows packaging job asserts that service table THROUGH: the expected rows,
+# the verdict on one service, the bounded wait, the package reader and the log checks
+# (scripts/lib/MsiServiceTable.psm1). Only that job runs a package, so a helper that
+# could not say "wrong" would pass every transaction there unseen. This drives each one
+# in both directions against the real service control manager and an MSI database it
+# creates, and installs nothing. Windows only: those two exist nowhere else.
+if(WIN32 AND FASTCACHED_PWSH)
+    add_test(
+        NAME "msi-service-table-selftest"
+        COMMAND "${FASTCACHED_PWSH}" -NoProfile -Command
+                "Import-Module '${CMAKE_SOURCE_DIR}/scripts/lib/MsiServiceTable.psm1'; Invoke-MsiServiceTableSelfTest"
+    )
+    set_tests_properties("msi-service-table-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+elseif(WIN32)
+    fastcached_register_skipped_test("msi-service-table-selftest"
+        "no PowerShell 7 interpreter found (pwsh, pwsh-preview), so the MSI service table helpers were not exercised on this host")
+else()
+    fastcached_register_skipped_test("msi-service-table-selftest"
+        "not Windows: the MSI service table helpers read the service control manager and Windows Installer")
+endif()
+
+# Every custom action of the MSI, run the way Windows Installer runs it, installing nothing
+# (scripts/check-msi-custom-actions.ps1): formatted, started IN its Directory in the phase it runs
+# in, its PowerShell parsed by Windows PowerShell 5.1, and the read-only waits started for real in
+# both directions. The WiX build looks at none of that, and an action started in an install root an
+# upgrade had just removed failed the 0.3.0 upgrade on CI in under 100 ms (round 5).
+if(WIN32 AND FASTCACHED_PWSH)
+    add_test(
+        NAME "msi-custom-action-commands"
+        COMMAND "${FASTCACHED_PWSH}" -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/check-msi-custom-actions.ps1"
+                -SourceDir "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties("msi-custom-action-commands" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 180
+    )
+elseif(WIN32)
+    fastcached_register_skipped_test("msi-custom-action-commands"
+        "no PowerShell 7 interpreter found (pwsh, pwsh-preview), so the MSI's custom actions were not run")
+else()
+    fastcached_register_skipped_test("msi-custom-action-commands"
+        "not Windows: the MSI's custom actions are Windows command lines")
+endif()
+
 # ---------------------------------------------------------------------------
 # The operator port docs against `NodeSurfaceTable()`. Fails when a document
 # claims a surface the table does not declare, omits one it does, or states a
@@ -2918,7 +3058,7 @@ set_tests_properties("tsan-scope-selftest" PROPERTIES
 # asserts nothing about the tree it runs in and works from an exported tarball --
 # and, unlike `repository-hygiene`, needs no readable git worktree of its own.
 #
-# `if(NOT WIN32)` for the reason `cluster-e2e` carries the same guard: the script
+# `if(NOT WIN32)` for the reason `fleet-dashboard-e2e` carries the same guard: the script
 # is POSIX and a Windows counterpart would be a translation rather than new
 # coverage. The rule it protects is platform-independent and the Linux jobs run it.
 if(NOT WIN32)
@@ -3166,6 +3306,57 @@ add_test(
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-walk-sole.sh" --self-test
 )
 set_tests_properties("workflow-walk-sole-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
+# Every git WRITE a script or fixture runs goes through `scratch_git` (scripts/lib/git-scrub.sh)
+# or `fastcached_scratch_git` (scripts/lib/CheckCommon.cmake), which remove the inherited
+# `GIT_DIR` and the rest of scripts/lib/git-scrub-variables.txt from that one command. An
+# exported `GIT_DIR` around a ctest run once made every self-test's scratch `git init` write
+# `core.worktree` into the configuration all worktrees share. The header carries the pattern and
+# what it cannot see; the self-test replays that run against a SCRATCH repository, one bash and
+# one `cmake -P` self-test, and prints how many cases ran.
+add_test(
+    NAME "scratch-git"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-scratch-git.sh"
+)
+set_tests_properties("scratch-git" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+add_test(
+    NAME "scratch-git-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-scratch-git.sh" --self-test
+        --cmake "${CMAKE_COMMAND}" --git "${GIT_EXECUTABLE}"
+)
+set_tests_properties("scratch-git-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
+# ---------------------------------------------------------------------------
+# Every fixture that starts `fastcache-compile-node` names `--cluster-dir` and turns off the
+# default fleet features it does not test (`--listen-raft=`, or `--discovery=` on a consensus
+# node). A node with no flags is a fleet member on shared default ports, keeping its identity in
+# the real per-user state directory; the rule stated in the files that obey it reaches no file
+# that does not, so this is the scan. Its header carries the pattern and what it cannot see.
+add_test(
+    NAME "node-fixture-starts"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-node-fixture-starts.sh"
+)
+set_tests_properties("node-fixture-starts" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+add_test(
+    NAME "node-fixture-starts-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-node-fixture-starts.sh" --self-test
+)
+set_tests_properties("node-fixture-starts-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
@@ -3888,9 +4079,17 @@ if(NOT WIN32)
             NAME "tidy-sweep-selftest"
             COMMAND ${FASTCACHED_BASH44} "${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh" --self-test
         )
+        # `PASS_REGULAR_EXPRESSION` replaces the exit status as the verdict, and that is
+        # the point: an EARLY STOP -- a `return 0` planted at the top of `SelfTest`, a helper
+        # that returns before its block -- exits 0 having judged nothing, and ctest scored
+        # it green on the exit code alone (measured). The script prints the line only once
+        # every case ran, the case count agreed with `SelfTestCases`, and nothing failed.
+        # `FASTCACHED_SCRIPT_CHECK_FAILED` is the tree's one spelling for a `cmake -P`
+        # check's verdict and does not apply: this is a bash self-test naming its own pass.
         set_tests_properties("tidy-sweep-selftest" PROPERTIES
             LABELS "hygiene"
             SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "TIDY SWEEP SELF-TEST PASSED"
             TIMEOUT 60
         )
     else()
@@ -4274,6 +4473,66 @@ set_tests_properties("compile-cache-caveat" PROPERTIES
     TIMEOUT 600
 )
 
+# ---------------------------------------------------------------------------
+# compile-cache-dispatch: configure's `[cache] dispatch:` line is true of the build.
+#
+# fastcache-cc dispatched a miss only when the environment of whatever ran the BUILD named
+# FASTCACHE_SCHEDULER, so a developer who set it in one shell and built from another compiled
+# everything locally while configure said only that fastcache-cc was the launcher -- measured:
+# 341 misses, `NOT_CONFIGURED` on each. The module now decides at configure, bakes it into the
+# launcher and says so; this asserts the decision over every source combination, and then
+# configures the fixture with a stand-in launcher it builds and compares the printed line with
+# the `FASTCACHE_SCHEDULER=` every generated LAUNCHER line carries. Both states, both sources,
+# reconfigures with and without a -D from shells with and without the variable, and ninja's own
+# regeneration -- where a first version of the fix turned dispatch off, and a retarget turned an
+# explicit -DFASTCACHE_SCHEDULER= back on. FASTCACHE_ADDR is held by the same rule and pinned
+# the same way.
+#
+# Runs on Windows as well -- the stand-in is compiled, not a script -- and reports a toolchain
+# that cannot build it with `SKIP: `, as compile-cache-caveat does -- unless a decision failed,
+# which is FAILED on every host, because the decisions need no toolchain. "hygiene" for that
+# check's reason: no daemon, no socket.
+add_test(
+    NAME "compile-cache-dispatch"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-cache-dispatch"
+        "-DFASTCACHED_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-dispatch.cmake"
+)
+set_tests_properties("compile-cache-dispatch" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    TIMEOUT 600
+)
+
+# How ctest SCORES the check above when its wiring cannot run. ctest lets SKIP_REGULAR_EXPRESSION
+# outrank FAIL_REGULAR_EXPRESSION, so a decision failure printed beside the skip marker scored
+# `***Skipped` -- measured. This runs the real check with a planted decision failure and no
+# usable compiler, under the two patterns the registration above carries -- read back from this
+# build tree through `ctest --show-only=json-v1`, never restated -- through a nested ctest, and
+# requires FAILED at both exits before the wiring and SKIPPED for the clean controls. No skip
+# pattern of its own: a verdict pin that could be scored skipped would repeat the defect.
+add_test(
+    NAME "compile-cache-dispatch-verdict"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-cache-dispatch-verdict"
+        "-DFASTCACHED_CTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
+        "-DFASTCACHED_BUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-dispatch-verdict.cmake"
+)
+set_tests_properties("compile-cache-dispatch-verdict" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 900
+)
+
 # The other half: that it can actually install one. Serves a synthetic release
 # over file:// through FASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE — the same seam an
 # organisation uses to install from an internal mirror — so the happy path is
@@ -4431,6 +4690,36 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# exit-codes-e2e: what each daemon EXITS with, through the real binaries.
+#
+# Who reads an exit decides it -- a supervisor a start's 1 or 78, an operator a
+# one-shot command's 2, a container runtime a probe's 0 or 1 -- and the tables that
+# say so are unit-tested. The ROUTING in each `main` is not, since neither is in a
+# test target: a site handing the refusal a start's outcome for an install's command
+# line stayed green under every Catch2 case. Names both executables, so it lives here.
+#
+# NOT labelled "smoke": every case is a refusal that exits before anything is opened,
+# bound or registered.
+if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node)
+    message(STATUS "exit-codes-e2e: fastcached or the compile node not built -- skipping")
+elseif(WIN32)
+    # REGISTERED and skipped, never omitted (#1355), for `e2e-helpers-selftest`'s reason: the
+    # bounded runner every case goes through is the shared POSIX library.
+    fastcached_register_skipped_test("exit-codes-e2e"
+        "every case is bounded by scripts/lib/e2e-common.sh's run_bounded, and that library is POSIX; the tables it drives are unit-tested on every platform")
+else()
+    add_test(
+        NAME "exit-codes-e2e"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/exit-codes-e2e.sh"
+            "$<TARGET_FILE:fastcached>" "$<TARGET_FILE:fastcache-compile-node>"
+    )
+    set_tests_properties("exit-codes-e2e" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 300
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # fleet-dashboard-e2e: the leader's dashboard, over a real socket.
 #
 # Registered HERE rather than beside the node for the reason `dist-compile-e2e`
@@ -4445,7 +4734,7 @@ endif()
 if(NOT TARGET fastcache-compile-node)
     message(STATUS "fleet-dashboard-e2e: compile node not built — skipping")
 elseif(WIN32)
-    # POSIX-only for now, the way `cluster-e2e` records for itself: the fixture is
+    # POSIX-only for now: the fixture is
     # `/dev/tcp` and bash, and a PowerShell twin is a translation rather than new
     # coverage.
     message(STATUS "fleet-dashboard-e2e: POSIX-only fixture — skipping on Windows")
@@ -4774,27 +5063,40 @@ else()
         # broken -- and one was taken: `dist-compile E2E PASSED` against
         # `out/build/clangcl-release`, 2026-09-11. It is simply not the evidence
         # the change rests on.
+        #
+        # The client is how the fixture reads the scheduler's own record of a worker
+        # whose lease came back `withdrawn` -- one of the two readings a SKIP on a
+        # host saturated by other work requires. Optional, and guarded rather than
+        # required: without it that reading is absent, and absent confirms nothing,
+        # so a withdrawal stays a failure rather than the test disappearing.
+        set(_fc_dist_e2e_cli)
+        if(TARGET fastcache-cli)
+            set(_fc_dist_e2e_cli -Cli "$<TARGET_FILE:fastcache-cli>")
+        endif()
         add_test(
             NAME "dist-compile-e2e"
             COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.ps1"
                 -Fastcached "$<TARGET_FILE:fastcached>"
                 -Node "$<TARGET_FILE:fastcache-compile-node>"
                 -Launcher "$<TARGET_FILE:fastcache-cc>"
+                ${_fc_dist_e2e_cli}
         )
     else()
-        # The three binaries and the compiler, named once. Both POSIX entries below
-        # pass exactly this and differ only in `--case`, which is the whole point of
-        # there being two of them.
-        set(_fc_dist_e2e_args
-            --fastcached "$<TARGET_FILE:fastcached>"
-            --node "$<TARGET_FILE:fastcache-compile-node>"
-            --launcher "$<TARGET_FILE:fastcache-cc>"
-            --compiler "${CMAKE_CXX_COMPILER}"
-        )
+        # The client reads the scheduler's record of a worker whose lease came back
+        # `withdrawn`, for the reason the Windows registration above gives.
+        set(_fc_dist_e2e_cli)
+        if(TARGET fastcache-cli)
+            set(_fc_dist_e2e_cli --cli "$<TARGET_FILE:fastcache-cli>")
+        endif()
         add_test(
             NAME "dist-compile-e2e"
             COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
-                ${_fc_dist_e2e_args} --case suite
+                --fastcached "$<TARGET_FILE:fastcached>"
+                --node "$<TARGET_FILE:fastcache-compile-node>"
+                --launcher "$<TARGET_FILE:fastcache-cc>"
+                --compiler "${CMAKE_CXX_COMPILER}"
+                ${_fc_dist_e2e_cli}
+                --case suite
         )
     endif()
     # Spawns three daemons and several workers and drives real compiles, so it
@@ -4823,54 +5125,6 @@ else()
         RUN_SERIAL TRUE
         TIMEOUT 1200
     )
-
-    # The one body of assertions in that fixture that is NOT loopback: it binds a
-    # worker on this host's own non-loopback address, so the peer address the
-    # worker classifies falls outside the 127.0.0.0/8 that
-    # `ClusterMembership::Classify` admits before ever reading a member list. That
-    # is why the suite could not have noticed #235, and the full argument -- both
-    # legs, why the pair is needed, and why a host without such an address must
-    # report SKIPPED -- is in `.agent/rules/testing.md` and in the script's own
-    # block. Its own test rather than a thirteenth case, because a script exits
-    # once and a case inside the suite could only print a line and let the run go
-    # green.
-    #
-    # POSIX-only for now, the way `cluster-e2e` records for itself: the property is
-    # platform-independent and the fixture is not, and `dist-compile-e2e.ps1`
-    # carries no such mode, so a Windows entry would be a translation rather than
-    # new coverage.
-    if(NOT WIN32)
-        add_test(
-            NAME "dist-compile-membership-e2e"
-            COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
-                ${_fc_dist_e2e_args} --case membership
-        )
-        # RUN_SERIAL for CPU rather than for ports: `free_port` and its ledger
-        # already make concurrent binding safe, but each worker advertises the whole
-        # machine, and `AvailableSlots` withdraws slots for the cores something else
-        # is using -- so a parallel ctest job makes this fail as "not dispatched".
-        #
-        # TIMEOUT 600 against a ~7 s warm run, which is deliberate and is not slack.
-        # The script bounds every one of its own waits (30 s each -- `start_node`
-        # waits twice per node since #451, so fifteen of them across five
-        # processes -- plus three 10 s counter polls, which is 480 s) and every
-        # bound names what it was waiting for. A ctest timeout below the sum fires
-        # BEFORE the fixture can say which participant never came up, and this
-        # repository has already paid for that once -- `dist-compile-e2e ***Timeout
-        # 900.10 sec`, in three jobs, naming nothing. It is a backstop for a stall
-        # the script cannot see, so it sits above the script's own ceiling.
-        set_tests_properties("dist-compile-membership-e2e" PROPERTIES
-            LABELS "smoke"
-            SKIP_RETURN_CODE 77
-            RUN_SERIAL TRUE
-            TIMEOUT 600
-        )
-    else()
-        # Said out loud, the way `cluster-e2e` and `fleet-dashboard-e2e` say it. A
-        # platform guard with no `else()` is a test that does not exist on that
-        # platform with nothing in the configure log to say so.
-        message(STATUS "dist-compile-membership-e2e: POSIX-only — skipping")
-    endif()
 
     # The POSIX fixture's own verdict arithmetic, against synthetic text.
     #
@@ -4935,51 +5189,6 @@ else()
     else()
         fastcached_register_skipped_test("dist-compile-e2e-selftest"
             "no PowerShell 7 interpreter found (pwsh, pwsh-preview), so the object-comparison decision table was not exercised on this host")
-    endif()
-endif()
-
-# ---------------------------------------------------------------------------
-# A three-node cluster, elected and administered for real.
-#
-# Every consensus rule this repository has is asserted against a simulated
-# cluster in one process, which is the right place for them -- a scripted
-# partition is not something three real processes can be made to reproduce. What
-# a simulation cannot reach is the wire, the transport, the timers and the
-# operator's own command line all having their first say at once, and this is
-# where those meet: three processes elect a leader, a follower's refusal names an
-# endpoint that a client then successfully dials, a setting replicates, and the
-# cluster re-forms after its leader is killed.
-#
-# POSIX only for now. The properties are platform-independent and the fixture is
-# not -- it wants a shell, `/dev/tcp` and process control -- so a Windows
-# counterpart is a translation rather than new coverage, and the unit tests carry
-# the rules on both.
-#
-# Registered here rather than beside the node for the reason dist-compile-e2e is:
-# `src/apps` walks its app table in order, so a test registered next to one
-# binary cannot name one that comes later -- and a `$<TARGET_FILE:>` guard on a
-# target that does not exist yet does not fail, it silently skips the test
-# forever.
-if(NOT WIN32)
-    # `fastcache-cli` as well since #1308: section 1b reads the nodes' refusal counters
-    # with `node-metrics`, over the port they already serve.
-    if(NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cli)
-        message(STATUS "cluster-e2e: compile node or fastcache-cli not built — skipping")
-    else()
-        add_test(
-            NAME "cluster-e2e"
-            COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/cluster-e2e.sh"
-                --node "$<TARGET_FILE:fastcache-compile-node>"
-                --cli "$<TARGET_FILE:fastcache-cli>"
-        )
-        # Starts three nodes that hold six ports between them and drives an
-        # election, so it must not race the other server-starting smoke tests.
-        set_tests_properties("cluster-e2e" PROPERTIES
-            LABELS "smoke"
-            SKIP_RETURN_CODE 77
-            RUN_SERIAL TRUE
-            TIMEOUT 300
-        )
     endif()
 endif()
 
@@ -5547,9 +5756,13 @@ set_tests_properties("cache-flow-continuations" PROPERTIES
     TIMEOUT 60
 )
 
-# Six cases, including the defect itself (the undecodable arm choosing no-STORE)
-# and the two ways this check could pass while guarding nothing: the helpers
-# renamed away so it matches nothing, and its subject file gone.
+# Both rules, in both directions: for the continuations, the defect itself (the
+# undecodable arm choosing no-STORE) and the two ways this check could pass while
+# guarding nothing -- the helpers renamed away so it matches nothing, and its
+# subject file gone; for the one door to the cache, a call outside it, the routes
+# around it (a built exchange, the callee as a pointer), a stale route row, and its
+# own reader failing. No count here: the self-test prints how many cases it ran,
+# and a count beside the list is a second claim that goes stale (round 10, M6).
 add_test(
     NAME "cache-flow-continuations-selftest"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cache-flow-continuations.sh" --self-test
@@ -5763,6 +5976,41 @@ set_tests_properties("crypto-seam-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# Exactly one first-party file opens a UDP socket: `DiscoveryTier.cpp`. The compile node's
+# Windows firewall rule for a kernel-chosen discovery reply port admits EVERY local UDP port of
+# the program (`discovery-reply udp/any`), so "it exposes discovery alone" -- which the docs and
+# the rulebook say -- holds only while discovery is the only UDP socket there is. The permitted
+# row is the positive control: it must be seen opening one, or it is refused as stale.
+add_test(
+    NAME "udp-opener"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-udp-opener.cmake"
+)
+set_tests_properties("udp-opener" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And it must be SEEN to refuse a second opener through each primitive it names, to stay quiet
+# over a comment, a test file and a vendored file, and to refuse a stale row and an empty tree --
+# by directory walk and by a staged git index. It prints how many cases ran.
+add_test(
+    NAME "udp-opener-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/udp-opener-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-udp-opener-selftest.cmake"
+)
+set_tests_properties("udp-opener-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
 # No first-party C++ walks an enum's enumerators by hand now that `Enumerators<Enum>()`
 # exists (#1476). Ten sites spelled the same walk before #1441 -- `views::iota` from zero to
 # `EnumeratorCount<Enum>` plus a `static_cast<Enum>(index)` in the body -- and NOTHING refused
@@ -5935,6 +6183,36 @@ add_test(
 set_tests_properties("wall-clock-borrow-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 180
+)
+
+# clang-tidy's HeaderFilterRegex takes every tracked first-party header in each spelling a
+# supported build opens it by -- POSIX, all-backslash, and MSVC's backslash include directory
+# with a slash include -- and no spelling of a dependency path. Registered on EVERY platform
+# and needing no build: the question is about Windows, and a check that ran only where the
+# answer was already right would report nothing where it is asked.
+#
+# Before this, `.clang-tidy` spelled every separator `/`, and a Windows tidy run discarded
+# every header finding while reporting clean. The self-test plants that filter (red, naming
+# both backslash spellings) and the widening a separator fix tempts, `[/\\]src[/\\].*` (red,
+# naming catch2), beside the configured one (green) -- and it reads the configured one, so it
+# goes red too when `.clang-tidy` regresses. Its predicate and spellings are
+# `scripts/lib/header-filter.sh`, which `local-gate.sh`'s coverage check shares: this asks at
+# the real root on every platform, the gate asks the same thing before its tidy sweep.
+add_test(
+    NAME "tidy-header-filter"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-header-filter.sh"
+)
+set_tests_properties("tidy-header-filter" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+add_test(
+    NAME "tidy-header-filter-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-header-filter.sh" --self-test
+)
+set_tests_properties("tidy-header-filter-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
 )
 
 # The macOS package fixture's failure-path diagnostic, driven against a SYNTHESISED
@@ -6304,25 +6582,33 @@ set_tests_properties("credential-containers-selftest" PROPERTIES
 # status is taken from. It cannot fire on a healthy run -- the tally line says `failed`
 # in lower case and carries no colon.
 #
-# `if(NOT WIN32)` for the reason `local-gate-selftest` carries it, and here the guard
-# is LOAD-BEARING rather than conventional -- measured, not assumed. Under Git Bash
-# this self-test fails: `ps -Ao pid=,ppid=`, which `gate_ppid_of` walks, is answered
-# by MSYS2's `ps` with `unknown option -- A`. The ancestry walk therefore returns
-# nothing, the caller is not protected, and the one case that matters goes red:
-# `and the WRAPPER that invoked it -- a candidate by cwd -- survives: expected
-# 'alive', got 'gone'`. That is the script's own macOS warning arriving one platform
-# over -- *a usage error that prints nothing reads exactly like a process with no
-# ancestors* -- and its consequence is that the reaper would kill its own invoker.
-# So this is not merely untested on Windows: do not hand `reap-my-gate.sh` to a
-# Windows lane until that is fixed.
+# `if(NOT WIN32)` for the reason `local-gate-selftest` carries it: the script is POSIX.
+# It USED to be load-bearing as well. Under Git Bash, `gate_ppid_of` asked
+# `ps -o ppid=`, which MSYS2's `ps` answers with a usage error and no parent, so the
+# ancestry walk stopped at `$$`, the caller was not protected, and the reaper killed its
+# own invoker -- `and the WRAPPER that invoked it -- a candidate by cwd -- survives:
+# expected 'alive', got 'gone'`, on 20 of 20 Git Bash runs. The ancestry and the process
+# table are now read from `/proc/<pid>/stat`, which MSYS2 writes as Linux does; the
+# self-test asks the parent lookup against `$PPID` so the next such platform fails a row
+# of its own. Git Bash is exercised through `local-gate.sh --self-test`, which drives
+# this self-test and runs there -- and there the reaper now REFUSES by design: on
+# Cygwin/MSYS a parent of 1 is a native process, so no chain is walkable to its root,
+# the real-process half is SKIPPED (exit 77) and only the native-intermediary refusal
+# and the staged rows run.
 #
-# Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04, 14 cases and no case skipped.
-# A range rather than a number, because the two readings differ by the load and a
-# single figure would silently claim whichever condition the reader assumes: **2.69 s**
-# on a quiet box, **6.87 s** with two other lanes' full gates running. `TIMEOUT 60` is
-# the figure its two neighbours carry rather than a new one, so the margin is ~9x at
-# the worst reading taken here. It is a wall-clock reading and this host steps
-# CLOCK_REALTIME, so treat it as an order of magnitude, not a budget.
+# Measured 2026-09-29, three runs each, as a table of conditions rather than a number:
+#
+#   host                          checks  outcome        duration     clock
+#   WSL2/Ubuntu-24.04, nice -n 10     23  passed         5.56-5.63 s  /proc/uptime (monotonic)
+#   Git Bash (MSYS2), Windows 11       17  skipped (77)   1.14-1.25 s  date +%N (wall)
+#   Git Bash, BEFORE the I1 refusal   23  passed         9.8 s        the reviewer's, wall
+#
+# Most of the WSL figure is the fixture's own 0.5 s stage delay (three staged
+# processes) and the reaper's 2 s TERM grace. The 2026-09-10 figures (14 cases, 2.69 s
+# quiet, 6.87 s under two other lanes' gates) predate the staging waits and are
+# superseded. `TIMEOUT 60` is the figure its two neighbours carry rather than a new one,
+# a margin of ~10x over the slowest reading here; a wall reading on this host can step,
+# so treat the Git Bash rows as an order of magnitude, not a budget.
 if(NOT WIN32)
     add_test(
         NAME "reap-my-gate-selftest"
@@ -6331,6 +6617,7 @@ if(NOT WIN32)
     set_tests_properties("reap-my-gate-selftest" PROPERTIES
         FAIL_REGULAR_EXPRESSION "REAP SELF-TEST FAILED:"
         LABELS "hygiene"
+        SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
 endif()
@@ -6384,18 +6671,29 @@ endif()
 # Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04: 23 cases, 0.06 s wall, neither
 # skip arm taken. `TIMEOUT 60` is its neighbours' figure; the margin is enormous and
 # the alternative is inventing a number nobody can check.
-if(NOT WIN32)
-    add_test(
-        NAME "repair-worktree-pointers-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/repair-worktree-pointers.sh" --self-test
-    )
-    set_tests_properties("repair-worktree-pointers-selftest" PROPERTIES
-        FAIL_REGULAR_EXPRESSION "REPAIR SELF-TEST FAILED:"
-        LABELS "hygiene"
-        SKIP_RETURN_CODE 77
-        TIMEOUT 60
-    )
-endif()
+#
+# Registered on EVERY platform. It was `if(NOT WIN32)` while its fixture's positive
+# control knew only the POSIX spelling of an absolute pointer: Windows git writes
+# `gitdir: C:/...` even under Git Bash, so the self-test failed one case on every
+# Windows host and nothing registered it there to say so. The control now asks the
+# script's own `pointer_is_absolute`, and Windows is where the defect this script
+# repairs is CREATED, so it is the last platform to leave unchecked.
+add_test(
+    NAME "repair-worktree-pointers-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/repair-worktree-pointers.sh" --self-test
+)
+# `PASS_REGULAR_EXPRESSION` as well, for `tidy-sweep-selftest`'s reason: an EARLY
+# STOP exits 0 having judged nothing (a planted `return 0` printed nothing and ctest
+# said Passed, measured), and the script prints its pass line only once the count of
+# checks matched `RepairSelfTestChecks` and none failed. The skip arms' lines end
+# `-- SKIPPED: ...` and cannot match it, and SKIP_RETURN_CODE still decides a skip.
+set_tests_properties("repair-worktree-pointers-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "REPAIR SELF-TEST FAILED:"
+    PASS_REGULAR_EXPRESSION "REPAIR SELF-TEST PASSED"
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 60
+)
 
 # ---------------------------------------------------------------------------
 # The consumer of `check-merge-queue-contexts.sh`'s `RequiredContexts` table:
@@ -6851,7 +7149,7 @@ set_tests_properties("required-context-table" PROPERTIES
     TIMEOUT 60
 )
 
-# Fifteen cases, both directions for every rule. The ACCEPTING arms are not decoration:
+# Sixteen cases, both directions for every rule. The ACCEPTING arms are not decoration:
 # a guard that refuses every tree passes every negative case, and one stood here for two
 # days (#1031). Case 13 is the accepting arm of the data-REGION mechanism, which is the
 # one part of this check that can reduce its own coverage.
@@ -7296,6 +7594,38 @@ set_tests_properties("error-popup-coverage-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
+# No MSVC-style link in a debug-info configuration is incremental (cmake/IncrementalLink.cmake
+# says why, and what it costs). `incremental-link` reads the GENERATED build.ninja -- the
+# module's configure output is its claim, the link line the artefact -- and SKIPs by name on a
+# toolchain or configuration with no `/INCREMENTAL` to judge. Its self-test stages both
+# directions, since a guard nobody has watched refuse is not known to work.
+add_test(
+    NAME "incremental-link"
+    COMMAND ${CMAKE_COMMAND}
+        "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DCONFIG=$<CONFIG>"
+        "-DMSVC_STYLE=$<BOOL:${MSVC}>"
+        -DANCHOR=FastCacheTest
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-incremental-link.cmake"
+)
+set_tests_properties("incremental-link" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+add_test(
+    NAME "incremental-link-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/incremental-link-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-incremental-link-selftest.cmake"
+)
+set_tests_properties("incremental-link-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_executable(error-popup-canary ErrorPopupCanary.cpp)
     target_link_libraries(error-popup-canary PRIVATE Catch2::Catch2WithMain)
@@ -7702,10 +8032,11 @@ if(TARGET FastCacheTest)
         # the assertion that could not have failed while this ticket was open: 69
         # cases ran, and 69 is non-zero.
         #
-        # 169 = 119 (CompileCacheWire) + 23 (RaftWire) + 16 (ClusterState)
-        #     + 9 (DiscoveryWire) + 1 (RaftTypes) + 1 (SchedulerService).
+        # 260 = 189 (CompileCacheWire) + 26 (RaftWire) + 17 (ClusterState)
+        #     + 23 (DiscoveryWire) + 1 (RaftTypes) + 1 (SchedulerService)
+        #     + 1 (MachineTicket) + 1 (MachineStanding) + 1 (IdentityKeyLabel).
         # The first four files are wholly wire subject and are the scan's table; the
-        # last two carry wire cases among others, which is why the scan cannot cover
+        # last five carry wire cases among others, which is why the scan cannot cover
         # them and why this number is the only thing that watches them.
         #
         # `[(]` rather than `\(`: CMake reads `\(` in a quoted argument as an escape
@@ -7718,7 +8049,7 @@ if(TARGET FastCacheTest)
         # anything matches nothing. No `SKIP_RETURN_CODE` here -- Catch2's exit code
         # is its failed-assertion count clamped at 255 (#1152), and the pattern has
         # already replaced the status.
-        PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in 169 test cases[)]"
+        PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in 260 test cases[)]"
         LABELS "hygiene"
         TIMEOUT 300
     )

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "NodeDefaults.hpp"
+#include "NodeFormation.hpp"
+
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
@@ -51,28 +55,10 @@ enum class ClusterAction : std::uint8_t
     Forget,   ///< Remove a member.
     Admit,    ///< Add a member, or record that one has moved.
 
-    /// Admit a client host to the fleet, and clear any tombstone for it (#1309).
-    ///
-    /// A CLIENT, never a member: it never joins consensus and is never counted towards
-    /// quorum, so this takes a bare host where `Admit` takes `<id>=<host>:<port>`.
-    AdmitClient,
-
-    /// Forget a client host, so every node refuses it from the next commit (#1309).
-    ///
-    /// The replicated alternative to editing `--fleet-member` on every other machine,
-    /// which is the direction that fails OPEN -- miss one and it serves the retired host
-    /// indefinitely, with admission succeeding being the ordinary case.
-    ForgetClient,
-
     /// `Admit`, recording the member as a LEARNER (#1449): replicated to, counted by no
     /// quorum, never a candidate. On a voter this demotes it; `Admit` on a learner
     /// promotes it.
     AdmitLearner,
-
-    /// Admit a WORKER principal by its id and identity key, with no enrollment window (#178):
-    /// `--cluster-admit-worker=<id>@<key>`, with the two lines the worker's `--print-identity`
-    /// printed.
-    AdmitWorker,
 };
 
 /// One cluster-administration request, as parsed from the command line.
@@ -81,8 +67,7 @@ struct ClusterRequest
     ClusterAction action { ClusterAction::None };
 
     /// The setting name for `Set`, the member id for `Forget`, `Admit` and
-    /// `AdmitLearner`, the worker's id for `AdmitWorker`, the client's host for `AdmitClient`
-    /// and `ForgetClient`.
+    /// `AdmitLearner`.
     std::string key;
 
     /// The setting's new value for `Set`, the consensus endpoint for `Admit` and
@@ -91,8 +76,7 @@ struct ClusterRequest
 
     /// The member's identity key for `Admit` and `AdmitLearner` when the operator typed
     /// `@<key>` (#178), disengaged otherwise -- which the leader reads as *no opinion* and
-    /// which keeps whatever key is recorded, never as a key to clear. Always engaged for
-    /// `AdmitWorker`, whose grammar requires the key: a worker is admitted BY it.
+    /// which keeps whatever key is recorded, never as a key to clear.
     std::optional<Ed25519PublicKey> publicKey;
 };
 
@@ -111,12 +95,13 @@ struct ClusterRequest
 /// that says neither reads as either (#308).
 enum class EnrollAction : std::uint8_t
 {
-    None = 0, ///< Serve, rather than administer a window.
-    Open,     ///< Start accepting enrollment requests.
-    Close,    ///< Stop accepting them, and forget what was waiting.
-    List,     ///< Print the window and everything waiting.
-    Approve,  ///< Admit the named machine and let it collect the roster.
-    Reject,   ///< Refuse the named machine.
+    None = 0,       ///< Serve, rather than administer a window.
+    List,           ///< Print the window and everything waiting.
+    Approve,        ///< Admit the named machine and let it collect the roster.
+    Reject,         ///< Refuse the named machine.
+    AutoApprove,    ///< Arm the leader's auto-approve deadline, or re-arm it from now.
+    AutoApproveOff, ///< End the leader's auto-approve deadline.
+    Clear,          ///< Drop every request nobody decided about.
 
     Last, ///< Not an action: the length of a table keyed by one.
 };
@@ -141,6 +126,13 @@ struct EnrollCommand
 
     /// The joiner's id for `Approve` and `Reject`; empty for the rest.
     std::string subject;
+
+    /// The key an `Approve` admits -- the one the operator compared, named with the id so a row
+    /// that was replaced under that id is refused rather than admitted. Absent for the rest.
+    std::optional<Ed25519PublicKey> key {};
+
+    /// How long to arm the deadline for, for `AutoApprove`; zero for the rest.
+    std::chrono::seconds duration {};
 };
 
 /// Split `name=value` as `--cluster-set` takes it.
@@ -153,27 +145,39 @@ struct EnrollCommand
 /// @return The pair, or nullopt when it is not one.
 [[nodiscard]] std::optional<std::pair<std::string, std::string>> ParseSettingAssignment(std::string_view text);
 
+// The Disk row is REQUIRED to carry a shared-cache default: `DefaultSharedCacheDiskBytes`
+// below has no other answer to give, and 0 is not a safe stand-in -- it is
+// `--cache-memory`'s spelling of UNBOUNDED, so a fallback to it would let the shared
+// tier grow until the disk is full rather than fail. Asserted here, at compile time,
+// against the table itself, so the function's runtime check can never actually be
+// false: the check stays (clang-tidy's `bugprone-unchecked-optional-access` cannot see
+// a static_assert two declarations away), but what it guards is unreachable.
+static_assert(TraitsFor(StorageTier::Disk).sharedTierDefaultBytes.has_value(),
+              "the Disk tier must carry a shared-cache default byte budget");
+
+/// `StorageTierTable`'s default byte budget for the shared tier this node may serve:
+/// `TraitsFor(StorageTier::Disk).sharedTierDefaultBytes`, unwrapped.
+///
+/// A CHECKED read rather than a bare dereference, which is what keeps this clean under
+/// `bugprone-unchecked-optional-access` -- the analyser has no way to know the
+/// static_assert above already rules the empty case out. It is ruled out there and not
+/// answered here with a fallback value, because 0 reads as UNBOUNDED for this budget:
+/// the only correct answer to "the Disk row has no default" is a build that never
+/// produces this binary, not a large number silently standing in for a small one.
+/// @return The Disk tier's shared-cache default in bytes.
+[[nodiscard]] std::uint64_t DefaultSharedCacheDiskBytes() noexcept;
+
 struct NodeConfig
 {
-    /// host:port of the scheduler's dispatch endpoint, repeatable, in the order tried.
+    /// Where a one-shot verb is sent: `--scheduler`, repeatable, in the order tried.
     ///
-    /// A LIST because a registration replays its command line forever (#1310): one
-    /// value is one machine's address baked into every unit file of the fleet, and
-    /// retiring that machine then means re-registering every service. Several values
-    /// are fallbacks for REACHING the fleet, never several fleets -- the heartbeat walks
-    /// them in one round until one answers, and a `NotLeader` from any of them is
-    /// followed to the endpoint it names without consulting this list.
+    /// The target of the `--cluster-*` and `--enroll-*` verbs and of nothing else. A node
+    /// that SERVES is refused it (`OneShotVerbComponent`): where its worker registers is its
+    /// formation record's answer (`SchedulersOf`), never a flag. Several values are
+    /// fallbacks for REACHING the fleet, never several fleets, and a `NotLeader` from any
+    /// of them is followed to the endpoint it names without consulting this list. Empty
+    /// means this machine's own node (`AdminTargetsOf`).
     std::vector<std::string> schedulers;
-
-    /// The identity keys of the cluster's voters, as a worker that runs no consensus is
-    /// told them: `--voter-key`, repeatable (#178).
-    ///
-    /// Its trust ROOT and nothing more: the first roster it adopts must be endorsed by a
-    /// strict majority of these, and from then on the roster it holds certifies its successor
-    /// and these are never read again -- as the replicated state wins over the keys
-    /// `--raft-peer` typed. Keys and not addresses, because `--scheduler` may be a name that
-    /// fronts several machines, and a key belongs to exactly one.
-    std::vector<Ed25519PublicKey> voterKeys;
     std::string advertise; ///< host:port clients should reach this worker on.
 
     /// fingerprint=compilerPath, repeatable. An OVERRIDE: naming any pins this
@@ -283,28 +287,6 @@ struct NodeConfig
     /// accident.
     std::filesystem::path dashboardTokenFile;
 
-    /// File holding the credential the SCHEDULER verbs require, or empty for none.
-    ///
-    /// The inbound half of `--requirepass`, which is outbound only -- that flag is
-    /// the secret this node *presents* when it registers, and until #289 nothing on
-    /// the receiving side ever checked one. So a scheduler port reachable from the
-    /// network served `Register`, `Lease` and the cluster verbs to anyone who could
-    /// open a socket to it; membership is an anti-leeching rule about which hosts an
-    /// operator listed, not a credential.
-    ///
-    /// A FILE for the reason `dashboardTokenFile` is one: a command line is readable
-    /// through `ps`. Unlike the dashboard's, this secret is deliberately the SAME one
-    /// every member already holds as `--requirepass` -- that is what it is for, and a
-    /// separate one would mean distributing two.
-    ///
-    /// **A bearer token, so its confidentiality rests on the transport.** Anyone who
-    /// can read the wire can replay it, exactly as for `--requirepass` and the
-    /// dashboard credential. That is a property of the scheme rather than a defect in
-    /// it, and a MAC would not fix it: this credential authenticates a connection
-    /// this process terminates, so there is nothing for a signature to bind that the
-    /// connection does not already establish.
-    std::filesystem::path schedulerTokenFile;
-
     /// Certificate the admin surface serves TLS with, or empty for plaintext.
     ///
     /// Spelled as the daemon spells it, because an operator copies these between
@@ -315,40 +297,6 @@ struct NodeConfig
 
     /// Private key for `tlsCertFile`. Both or neither.
     std::filesystem::path tlsKeyFile;
-
-    /// Whether this node serves the fleet's scheduler verbs.
-    ///
-    /// Off by default and for the same reason `--admin-listen` is: handing out other
-    /// machines' CPU time is an operator's decision, not something they get by
-    /// starting a worker.
-    ///
-    /// A flag rather than an address since the surfaces merged (#290) -- the scheduler
-    /// verbs are answered on `nodeListen`, beside the cache verbs, so there is no
-    /// second address left for it to name. What it still decides is where a bare
-    /// `--listen-node` binds: a node that schedules takes the WILDCARD, because a
-    /// scheduler no peer can dial is a scheduler that does nothing, and one that does
-    /// not takes loopback. See `NodeListenDefaultHost`.
-    bool serveScheduler { false };
-
-    /// Peers this node serves, as `host:port`; repeatable.
-    ///
-    /// Gates **all three** of this node's surfaces through one `NodeMembership`: the
-    /// scheduler decides who may spend the fleet's CPU, the compile port decides who
-    /// may spend *this machine's*, and the cache tier decides who may read what those
-    /// compiles produced. So a plain worker running no scheduler needs this exactly
-    /// as much as a scheduler does -- without it, its compile port admits its own
-    /// machine and refuses every dispatched job (#235).
-    ///
-    /// Only the host part is used -- a peer connecting comes from an ephemeral source
-    /// port, so an endpoint is not something a connection can be matched against. The
-    /// endpoint form is accepted because it is what discovery produces and what an
-    /// operator has written down.
-    ///
-    /// Kept for the process's life on a clustered node too: consensus ADDS its member
-    /// set to what is listed here rather than replacing it, because this list is how a
-    /// machine that never joins consensus -- a developer's laptop, a CI runner -- is
-    /// admitted at all (#251).
-    std::vector<std::string> fleetMembers;
 
     /// Where this node keeps its own cache tier, or empty for memory only.
     ///
@@ -391,6 +339,18 @@ struct NodeConfig
     /// is the flag that exists because that default is not always the right one.
     std::uint64_t cacheDiskBytes { 0 };
 
+    /// Bytes the SHARED tier this node serves may hold, when the fleet's
+    /// `shared-cache` setting names this machine.
+    ///
+    /// Defaults from `StorageTierTable`'s own column rather than a literal here, so
+    /// the one place that answers "how large by default" stays the table. A present
+    /// zero means "grow as needed", `--cache-memory`'s rule and not `cacheDiskBytes`'s
+    /// -- the private tier defaults to unbounded because a cache asked to survive
+    /// restarts is usually asked to keep what it has, while the shared tier defaults
+    /// to a cap because it answers other machines' builds, on a filesystem an
+    /// operator did not necessarily size for the whole fleet.
+    std::uint64_t sharedCacheDiskBytes { DefaultSharedCacheDiskBytes() };
+
     /// Codec effort for the on-disk tier, and for the in-memory one.
     ///
     /// Both default to 3, zstd's speed/ratio knee and the value
@@ -423,19 +383,13 @@ struct NodeConfig
     /// `FASTCACHE_ADDR` they then have to point at it — is two steps to get the
     /// behaviour that is the point of running the program.
     ///
-    /// Loopback on a node that does not schedule, the wildcard on one that does, and
-    /// that asymmetry is the anti-leeching rule rather than a preference: a scheduler
-    /// no peer can dial does nothing, while a cache any host can dial is this machine's
-    /// entire build output served to strangers. It used to be a difference between two
-    /// surfaces; since they merged (#290) it is a difference between two
-    /// configurations of one, and `NodeListenDefaultHost` is where it is decided.
-    ///
-    /// Widening it is an operator's decision, and even then `CacheResponder` admits
-    /// only THIS MACHINE (#287) -- not this cluster's members, which is what it
-    /// admitted until locality became a property of the verb. So widening this address
-    /// buys reaching the tier from this host under another address, and nothing else:
-    /// on a scheduling node, whose port faces the network by default, the cache verbs
-    /// are closed by that policy alone rather than by the socket.
+    /// **The wildcard on every node** (`DefaultNodeListen`), because every node is a fleet
+    /// participant: a worker bound to loopback would advertise an address no other machine
+    /// can dial. It was loopback on a node that did not schedule until the zero-config
+    /// defaults; what keeps that safe is admission rather than the socket. `CacheResponder`
+    /// admits only THIS MACHINE to the cache verbs (#287), whatever this address is, and
+    /// every other verb refuses a caller that is not a member -- listing nobody refuses
+    /// everybody.
     ///
     /// A port already taken is fatal when the operator **named** it and a warning when
     /// it is this default. Typed, it is a promise, and a broken promise is fatal;
@@ -448,7 +402,7 @@ struct NodeConfig
     /// `--admin-listen` needs no such bit and draws no such distinction -- its default
     /// is *empty*, so there is no address to arrive at without asking, and every bind
     /// failure on it is unconditionally fatal.
-    std::string nodeListen { "127.0.0.1:6674" };
+    std::string nodeListen { DefaultNodeListen };
 
     /// The shared `fastcached` this node reads through to, or empty for none.
     ///
@@ -459,10 +413,9 @@ struct NodeConfig
     /// The credential this node PRESENTS, from `--requirepass`.
     ///
     /// Outbound only: it is what the launcher half of this binary sends to an
-    /// upstream `fastcached`, and what a worker sends when it registers. What this
-    /// node REQUIRES of its own callers is `--scheduler-token-file`, and the two are
-    /// deliberately separate settings -- a node that presented and demanded the same
-    /// secret would make every client of its cache a peer of its scheduler.
+    /// upstream `fastcached`, and what a worker sends when it registers. This node
+    /// REQUIRES no password of its own callers: a machine is admitted by the key it proves
+    /// or the ticket it presents, never by a shared secret.
     ///
     /// There is no username beside it. One was declared here, parsed by nothing and
     /// read by nothing, and it is removed rather than left: a dead field next to a
@@ -496,61 +449,73 @@ struct NodeConfig
     /// for itself and nobody else -- and requiring an operator to configure a
     /// one-member cluster to get that would be ceremony for the ordinary case.
     ///
-    /// Given, it must appear in the cluster with an endpoint, which is what
-    /// `--raft-peer` supplies.
+    /// Given, it is recorded, and consensus runs under it; the endpoint peers dial it at
+    /// is `--raft-self` and `--listen-raft`'s.
     std::string nodeId;
 
     /// Where this node answers its peers' Raft traffic.
     ///
-    /// A bare port binds the WILDCARD, like a scheduling node's `--listen-node`
-    /// and unlike a worker's: peers are on other machines by definition, so a loopback
-    /// default would be one that silently cannot work.
+    /// A bare port binds the WILDCARD, like `--listen-node`: peers are on other machines by
+    /// definition, so a loopback default would be one that silently cannot work.
     ///
-    /// Giving it is what turns consensus ON (#1022); see `RunsConsensus`.
-    std::string raftListen;
+    /// **On by default** (`DefaultRaftListen`): a node with no flags is a one-voter cluster
+    /// of itself. The formation record decides whether the port OPENS (`RunsConsensus`, the
+    /// mode's `raftListener` column); this says where, and an empty `--listen-raft=` closes it,
+    /// which on a mode that listens is a node running no consensus.
+    std::string raftListen { DefaultRaftListen };
 
     /// The HOST this node's peers dial it at, from `--raft-self=<host>`.
     ///
     /// **Not a duplicate of `raftListen`, and the difference is why this flag has to
     /// exist at all.** A bare `--listen-raft` binds the wildcard, so the address this
     /// node BINDS is routinely not one any peer could dial -- and a member must name
-    /// the endpoint its peers dial. That is what `--raft-peer=<id>=<host>:<port>` says
-    /// about every other member, and it is unwritable for this one since #1024, because
-    /// the id is minted rather than typed. So the host is stated here and the port
-    /// comes from `--listen-raft`, and `ApplyNodeIdentity` is where the two become a
-    /// member.
+    /// the endpoint its peers dial. So the host is stated here and the port comes from
+    /// `--listen-raft`, and `ConsensusDialAddressOf` is where the two become one.
     ///
     /// A HOST and never an endpoint: the port is not the operator's to repeat, and a
     /// value carrying one would produce `host:port:port`. No grammar row for the same
     /// reason `--bind` has none -- a host is only checkable by binding it.
     std::string raftSelf;
 
-    /// The cluster's members, from `--raft-peer=<id>=<host>:<port>`; repeatable.
-    ///
-    /// Both halves in one token because they are one fact. A member id without an
-    /// address is a node the cluster counts towards quorum and cannot reach -- the
-    /// residual `RaftMembership` recorded, and the reason `Cluster::ClusterMember`
-    /// pairs them.
-    ///
-    /// Stored PARSED rather than as the tokens an operator typed, which is what makes
-    /// a malformed one unrepresentable: the grammar is `Cluster::ParseMemberSpec` and
-    /// it runs in the option table, so a token that names no member is refused where
-    /// it was typed. It used to be refused inside `ConsensusTier::Start` instead -- a
-    /// layer `--install-service` returns long before reaching, so a registration
-    /// carrying one was written happily and then died at every boot (#168).
-    ///
-    /// This is the BOOTSTRAP set only. Once the cluster is running, membership is a
-    /// replicated log entry and this list is not consulted again -- which is what
-    /// makes a node that was admitted at runtime survive a restart without anybody
-    /// editing a config file on every other machine.
-    std::vector<Cluster::ClusterMember> raftPeers;
-
-    /// Where consensus keeps its durable state, empty for a default beside the cache.
+    /// This node's state directory as the operator named it, empty for the platform's default.
     ///
     /// Durable by necessity rather than by preference: a node that answered a vote
     /// and forgot it would vote twice in one term after a restart, which is two
-    /// leaders in one term.
+    /// leaders in one term. Empty is not "no directory": every node has one now, and
+    /// `stateDirectory` holds the default this one resolved. `ChosenStateDirectory` (and
+    /// `NodeStateDirectory` over it) is the one reader of the two for anything the node
+    /// keeps; this field alone answers only what the operator TYPED -- the option row, and
+    /// what a service registration replays and hands over.
     std::filesystem::path clusterDir;
+
+    /// The state directory this process resolved for a node that names no `--cluster-dir`,
+    /// and why that one.
+    ///
+    /// **Not a flag**: `ApplyNodeStateDirectory` writes it from the environment and the
+    /// process's privilege at startup, into every configuration this process builds, as
+    /// `ApplyNodeIdentity` writes the id. Disengaged until then -- and left so when nothing
+    /// resolves, which the start refuses by name. A registration never carries it: the next
+    /// start resolves it again, as the process it will be.
+    std::optional<NodeStateDirectoryChoice> stateDirectory;
+
+    /// This host's DNS names as the start resolved them, or disengaged before it has.
+    ///
+    /// **Not a flag.** `ApplyHostNaming` writes it into every configuration this process
+    /// builds. Disengaged means *not resolved yet* -- a parse, an install, a
+    /// `--print-surfaces` -- and every rule judging an address derived from it answers that as
+    /// *supplied at startup* rather than as a name that is missing. What `--advertise` and
+    /// `--raft-self` fall back to.
+    std::optional<NodeHostNames> hostNames;
+
+    /// What the formation record says, as this configuration reads it, or disengaged when no
+    /// record shaped it.
+    ///
+    /// **Not a flag.** `ApplyFormation` writes it, into every configuration this process builds,
+    /// before any rule judges one or any tier starts: the record where one is kept, and before
+    /// the first start mints one, the solitary record that start will mint. Disengaged is a
+    /// configuration nothing formed -- a bare test configuration -- and it runs no consensus,
+    /// because there is no mode to say it should (`RunsConsensus`).
+    std::optional<NodeFormationView> formation;
 
     /// Which fleet this node belongs to.
     ///
@@ -571,11 +536,12 @@ struct NodeConfig
 
     /// Where discovery beacons go, empty to leave discovery off.
     ///
-    /// Off by default because a cluster does not need it: `--raft-peer` is a list
-    /// an operator typed, and that works. Discovery is what makes a *changing*
-    /// fleet possible -- a machine that joins without anybody editing a file on
-    /// every other machine.
-    std::string discoveryAddress;
+    /// **On by default** (`DefaultDiscoveryAddress`'s port, sent to every up interface's directed
+    /// broadcast; a NAMED address is used exactly -- `BeaconDestinationsFor`): discovery is
+    /// what makes a fleet with no configuration possible -- a machine that joins without
+    /// anybody editing a file on any machine. It runs only beside consensus, so a node that
+    /// turns consensus off turns this off with it; only a TYPED `--discovery` is refused there.
+    std::string discoveryAddress { DefaultDiscoveryAddress };
 
     /// Port this node's peers unicast their challenges and proofs to; 0 lets the
     /// kernel choose.
@@ -594,12 +560,41 @@ struct NodeConfig
     /// node on the machine, since two nodes cannot share it.
     std::uint16_t discoveryReplyPort { 0 };
 
+    /// Machines in the fleet to ask, `host:port` each, normalized by `Cluster::NormalizeSeed`.
+    ///
+    /// For the office no beacon reaches -- across a VPN, or a routed segment. Tried after the
+    /// fleet this node remembers and before the domain's SRV record, and only while the node is
+    /// alone. A seed is somewhere to ASK, never a member: what it answers is joined by approval.
+    ///
+    /// No provenance bit, for `schedulers`' reason: a list's default is empty, so every value
+    /// present is one the operator typed and a registration replays each of them.
+    std::vector<std::string> fleetSeeds;
+
+    /// The one cluster this node may belong to and the voters it takes that cluster's word from
+    /// (`--fleet-id=<cluster-id>@<key>[,<key>...]`), or absent to trust on first use.
+    ///
+    /// **Zero-config discovery is trust-on-first-use**, and this is the operator's remedy for it
+    /// (`Cluster::FleetPin`): a pinned node yields to no fleet but this one as a pinned voter signs
+    /// it, accepts no answer or leader another key signed on its way in, follows no dissolve, and
+    /// refuses to start on a formation record committing it elsewhere. A KEY pin, because a cluster
+    /// id is a name every beacon carries. It anchors the JOIN: once joined, the fleet's applied state
+    /// is the authority.
+    ///
+    /// No provenance bit: the `optional` IS its provenance (`PresentIn`), and absent is the
+    /// instruction a registration must carry by saying nothing.
+    std::optional<Cluster::PinnedFleet> fleetPin;
+
     /// The name the platform's supervisor keys this worker's registration on.
     ///
     /// Distinct from the daemon's `FastCached` by default, because the two are
     /// separate services that a machine may well run both of -- sharing a name
     /// would make installing one silently displace the other.
     std::string serviceName { "FastCacheCompileNode" };
+
+    /// `--firewall-allow` scopes: the remote addresses the firewall rules `--install-service`
+    /// creates admit; empty admits any address. Install-time only, never replayed into the
+    /// registration. A vector, so it sits outside the byte-wide run below.
+    std::vector<std::string> firewallAllow;
 
     /// Where a POSIX daemonized run writes its pid, empty for none.
     std::string pidfile;
@@ -661,6 +656,9 @@ struct NodeConfig
     /// Which supervisor domain `--install-service` registers into.
     ServiceScope serviceScope { ServiceScope::System };
 
+    /// How `--install-service` registers this worker; never replayed into the registration.
+    ServiceStart serviceStart { ServiceStart::Auto };
+
     /// Whether `--cache-memory` was typed rather than derived.
     ///
     /// **Provenance, not value.** `MakeNodeServiceSpec` emits a flag only when it
@@ -680,7 +678,7 @@ struct NodeConfig
     /// **Provenance, not value**, like `cacheMemoryExplicit` above -- and here it
     /// decides whether the node STARTS at all. What the two answers are, and why they
     /// differ, is on `nodeListen`; this is the bit that picks between them, and it
-    /// has to be a bit, because `--listen-node=127.0.0.1:6674` is a promise whose
+    /// has to be a bit, because `--listen-node=0.0.0.0:6674` (`DefaultNodeListen`) is a promise whose
     /// value equals the default (#286).
     bool nodeListenExplicit { false };
 
@@ -709,9 +707,9 @@ struct NodeConfig
     bool toolchainDiscoveryExplicit { false };
     bool adminListenExplicit { false };
     bool cacheDiskBytesExplicit { false };
+    bool sharedCacheDiskBytesExplicit { false };
     bool raftListenExplicit { false };
     bool raftSelfExplicit { false };
-    bool clusterIdExplicit { false };
     bool discoveryAddressExplicit { false };
     bool discoveryReplyPortExplicit { false };
     bool upstreamExplicit { false };
@@ -774,37 +772,16 @@ struct NodeConfig
     /// off loopback for exactly that reason.
     bool tlsSelfSigned { false };
 
-    /// Admit every caller to this node, rather than only `--fleet-member` hosts.
+    /// Admit every caller to this node, keyed or not, rather than only this machine and
+    /// the machines the roster admits by key or ticket.
     ///
-    /// The right answer for a fleet whose network reachability is already its
-    /// boundary. Like `--fleet-member` it governs every surface this node serves,
-    /// worker included. It is a *flag* rather than the behaviour you get by listing
-    /// no members, because "no policy" and "a policy that admits everybody" have to
-    /// be the same explicit decision -- listing nobody refuses everybody, and a node
-    /// that quietly served strangers would look identical to a healthy one from both
-    /// ends.
+    /// The right answer for one machine, or for a fleet whose network reachability is
+    /// already its boundary. It governs every surface this node serves, worker
+    /// included. It is a *flag* rather than the behaviour an absent roster decays to,
+    /// because a node that quietly served strangers would look identical to a healthy
+    /// one from both ends. A revoked key is still refused under it.
     bool fleetOpen { false };
 
-    /// Start with no cluster and wait to be admitted to one.
-    ///
-    /// The shape a machine being added to a running fleet has to have, and the only
-    /// one that can be added at all. Without it a node named in `--raft-peer`
-    /// bootstraps a cluster of its own: it elects itself, takes a term and a log,
-    /// and afterwards refuses `AppendEntries` from every leader its configuration
-    /// does not name — so the cluster that admitted it would be counting towards
-    /// quorum a node that answers nobody. Two clusters cannot be merged by any local
-    /// rule, which is why the joining node must never form one.
-    ///
-    /// It changes what `--raft-peer` MEANS rather than how much of it there is:
-    /// those entries become nodes this one can reach rather than a cluster it
-    /// belongs to. It still needs the cluster's addresses, because a leader
-    /// admitting a member starts replicating at its own last index and only walks
-    /// back to the beginning when the joiner's refusal reaches it.
-    ///
-    /// Additive rather than a change of meaning for the flag's absence: every
-    /// existing deployment bootstraps, and inverting that would turn the documented
-    /// single-node cluster into a node waiting forever for an invitation.
-    bool raftJoin { false };
     bool daemon { false };           ///< Fork into the background / run under the SCM.
     bool installService { false };   ///< Register with the platform's supervisor and exit.
     bool uninstallService { false }; ///< Remove that registration and exit.
@@ -819,6 +796,15 @@ struct NodeConfig
     bool migrateCache { false };
     bool help { false };
     bool version { false };
+
+    /// `--check-arguments`: parse the command line, and exit -- answered before any file is read.
+    ///
+    /// The PARSE is the whole check: a value its row refuses has already exited naming the flag, so
+    /// reaching this field at all is the answer. What the installer asks of the arguments it is about
+    /// to remember and register, before either (batch 3 review, B3-1): a fleet pin the parser refuses
+    /// must fail the transaction, never be remembered and replayed into a registration that ignores
+    /// the refusal.
+    bool checkArguments { false };
 
     /// List every port this configuration would open, and exit.
     ///
@@ -844,10 +830,10 @@ struct NodeConfig
 
     bool printSurfaces { false };
 
-    /// `--print-identity`: print this node's id, its public key and the `--raft-peer` token
-    /// its peers type, minting whatever the state directory does not hold yet, and exit
-    /// (#178). What an operator bootstrapping a cluster needs from every member BEFORE any of
-    /// them starts, since each member's `--raft-peer` has to name every other member's key.
+    /// `--print-identity`: print this node's id, its public key and the `--cluster-admit` line
+    /// that admits it, minting whatever the state directory does not hold yet, and exit
+    /// (#178). What an operator admitting a member needs from it BEFORE it is admitted, since
+    /// an admission names the key the cluster will verify it by.
     bool printIdentity { false };
 
     /// This node's identity key as the start resolved it, or absent on a node that holds
@@ -881,28 +867,16 @@ struct NodeConfig
     /// every boot would replay one operator's decision forever.
     ClusterRequest cluster;
 
-    /// The seed to ask for admission, instead of serving, when non-empty.
-    ///
-    /// A mode rather than a serving option, exactly as `cluster` above is: this
-    /// process mints its identity, asks one machine to let it in, waits for a person,
-    /// writes the key it is given, and exits. It opens NO surface at all while doing
-    /// it, which is what keeps it out of every widening question a running node has.
-    ///
-    /// Deliberately NOT part of a service registration and deliberately unreachable
-    /// from a configuration file: a worker that re-enrolled at every boot would ask
-    /// forever after the one time it needed to.
-    std::string enrollFrom;
-
     /// What to do to a seed's enrollment window instead of serving, when anything.
     ///
-    /// The OPERATOR's half of the pair `enrollFrom` is the joiner's half of: that one
-    /// is a machine asking to be let in, this one is a person at a terminal deciding
-    /// whether to let it. Asked of `--scheduler`, like every other cluster verb.
+    /// A person at a terminal deciding whether to let a machine in -- the machine itself
+    /// asks through its formation controller, never through a verb. Asked of
+    /// `--scheduler`, like every other cluster verb.
     ///
     /// A mode rather than a serving option, and out of every service registration for
-    /// the same reason the cluster verbs are: a worker that opened an enrollment window
+    /// the same reason the cluster verbs are: a node that armed an auto-approve window
     /// at every boot would replay one operator's decision forever, on the one surface
-    /// where the consequence is handing a stranger the fleet's key.
+    /// where the consequence is admitting a machine nobody compared.
     EnrollCommand enroll;
 };
 
@@ -923,12 +897,11 @@ struct NodeConfig
 /// one** -- the rule this function exists to hold, and the one it got wrong. The
 /// memory a node holds back from compiles is the memory its tier actually holds, and
 /// `cacheMemoryBytes` is only ever the request: `--listen-node=` builds no tier at
-/// all, `--cache-memory 0` builds no memory half, and a DEFAULT cache port already
-/// held by a `fastcached` on the same machine is a warning the node carries on past.
-/// None of the three is visible in the flag, so sizing from it reserved a quarter of
-/// RAM for a tier that was never built and offered the fleet fewer slots than the
-/// machine has -- silently, since nothing reports a reservation for a tier that does
-/// not exist (#167).
+/// all, and `--cache-memory 0` builds no memory half. Neither is visible in the flag
+/// (a held port no longer is a third: it refuses the start), so sizing from it
+/// reserved a quarter of RAM for a tier that was never built and offered the fleet
+/// fewer slots than the machine has -- silently, since nothing reports a reservation
+/// for a tier that does not exist (#167).
 ///
 /// Hence a **required** parameter rather than a defaulted convenience: a caller that
 /// could omit it is a caller that can quietly go back to guessing. It must also be
@@ -994,6 +967,52 @@ struct NodeConfig
 /// @return The table; stable for the life of the process.
 [[nodiscard]] std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept;
 
+/// A flag this binary retired, and the step that replaced it.
+///
+/// **Not a shim**: nothing here is accepted. A retired flag is refused exactly as any unknown one
+/// is; the row only says, in that refusal, what to do instead -- because a service registration
+/// replays its command line at every boot, and `unrecognised argument` is all an operator reading
+/// that log would otherwise get.
+struct RetiredNodeFlag
+{
+    std::string_view flag; ///< Its spelling on a command line, e.g. `--raft-join`.
+    /// Its configuration-file key, e.g. `raft_join`. Not named `yamlKey`: that column is what
+    /// `check-node-config-reference` reads as a key the shipped reference must document.
+    std::string_view fileKey;
+    std::string_view step; ///< What replaced it, as the operator's next step.
+};
+
+/// Where the retired flags and their steps are written up for an operator.
+inline constexpr std::string_view RetiredNodeFlagsGuide =
+    "docs/operations/upgrading-a-fleet.md, \"The flags that carried a cluster's shape\"";
+
+/// Every flag this binary retired, one row each.
+///
+/// Consulted ONLY where a flag or a key has already been refused as unknown
+/// (`ExplainRetiredNodeOption`), so a row can never make anything parse.
+/// @return The rows; stable for the life of the process.
+[[nodiscard]] std::span<RetiredNodeFlag const> RetiredNodeFlags() noexcept;
+
+/// An unknown-flag or unknown-key refusal, with the retired row's step when it names a retired
+/// flag or key; every other error unchanged.
+///
+/// The code and the field stay what the parser said, so whatever reads them reads the same
+/// refusal; only the words an operator reads gain the step.
+/// @param error What the parser refused.
+/// @return The same refusal, explained when a retired row names it.
+[[nodiscard]] ConfigError ExplainRetiredNodeOption(ConfigError error);
+
+/// Parse this binary's command line through `NodeOptions()`, a retired flag's refusal explained
+/// (`ExplainRetiredNodeOption`).
+///
+/// The one door `main` parses argv through, so what an operator reads for a retired flag is what
+/// a test reads.
+/// @param args The command line, program name already removed.
+/// @param result Populated as the flags are applied.
+/// @return Whether to keep going, or the first refusal.
+[[nodiscard]] std::expected<ParseFlow, ConfigError> ParseNodeCommandLine(std::span<char const* const> args,
+                                                                         NodeConfig& result);
+
 /// Every setting a candidate configuration changes that cannot take effect live.
 ///
 /// **EVERY one, never the first.** A reload that reports one unreloadable field and
@@ -1035,8 +1054,24 @@ struct NodeConfig
 /// can read them.
 /// @param exePath Absolute path to the fastcache-compile-node executable.
 /// @param cfg Effective configuration to embed in the launch arguments.
+/// @param probe Where the machine-wide state directory the registration owns is resolved.
 /// @return The spec a supervisor is registered from.
-[[nodiscard]] ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig const& cfg);
+[[nodiscard]] ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath,
+                                              NodeConfig const& cfg,
+                                              IConfigPathProbe const& probe);
+
+/// The state directory a service registration of @p registration owns and secures.
+///
+/// The `--cluster-dir` the registration names, else the machine-wide default. ONE derivation
+/// for both halves of an install: `MakeNodeServiceSpec` hands this directory over and secures it,
+/// and the install reads the formation record from this directory and no other
+/// (`InstallNodeService`). Two derivations disagreed: the reader took the MERGED configuration's
+/// directory, so a `cluster_dir:` in the file had the install read a directory nothing secured.
+/// @param registration The command-line configuration a registration is built from.
+/// @param probe Where the machine-wide default is resolved.
+/// @return The directory, or none where no machine-wide default resolves.
+[[nodiscard]] std::optional<std::filesystem::path> RegisteredStateDirectory(NodeConfig const& registration,
+                                                                            IConfigPathProbe const& probe);
 
 /// Why @p cfg must not be registered as a service, if it must not.
 ///
@@ -1113,13 +1148,13 @@ inline constexpr std::array<std::string_view, 1> AddressReloadableFlags { "--adv
 /// include trees at the same moment is the one way to turn a routine rotation into
 /// an incident.
 ///
-/// `--fleet-member` and `--fleet-open` are local for the reason `--allow-compile-arg`
-/// is, and the parallel is exact: both decide what this worker will do for a caller,
-/// and a registration describes the TOOLCHAINS it serves rather than whom it serves
-/// them to. The scheduler has no field for either, so re-registering on a change would
-/// tell the fleet nothing it could act on -- at the price of an include-tree walk.
-inline constexpr std::array<std::string_view, 5> LocalReloadableFlags {
-    "--log-level", "--allow-compile-arg", "--requirepass", "--fleet-member", "--fleet-open"
+/// `--fleet-open` is local for the reason `--allow-compile-arg` is, and the parallel is
+/// exact: both decide what this worker will do for a caller, and a registration
+/// describes the TOOLCHAINS it serves rather than whom it serves them to. The scheduler
+/// has no field for it, so re-registering on a change would tell the fleet nothing it
+/// could act on -- at the price of an include-tree walk.
+inline constexpr std::array<std::string_view, 4> LocalReloadableFlags {
+    "--log-level", "--allow-compile-arg", "--requirepass", "--fleet-open"
 };
 
 /// Both reloadable-flag lists, so the guards walk a derived SET rather than naming
@@ -1207,19 +1242,19 @@ enum class AllowlistMoment : std::uint8_t
 ///
 /// **The narrowing half is what this is for, and it is the half a silent
 /// implementation drops** ([#405](https://github.com/LASTRADA-Software/fastcached/issues/405)).
-/// An operator who ADDS a member finds out it worked the moment that machine's build
-/// is distributed. An operator who REVOKES one has no such signal: admission
-/// succeeding is the ordinary case, so a revocation that did not take looks exactly
-/// like one that did, forever. So the hosts that are no longer admitted are named
-/// individually, and the ones added are only counted -- what a reader needs to check
-/// is the list they meant to shorten.
+/// The one admission setting a reload can move is `--fleet-open`, and both directions
+/// are said. Turning it ON announces itself the moment a stranger's build is served.
+/// Turning it OFF has no such signal: admission succeeding is the ordinary case, so a
+/// narrowing that did not take looks exactly like one that did, forever -- and every
+/// caller the roster does not admit has just been refused, which no list can
+/// enumerate. So that direction says so in words.
 ///
 /// A pure function, here rather than an expression in `main.cpp`, for
 /// `AllowlistAnnouncement`'s reason: that file is in no test target (#909), so a rule
 /// written there can only be checked by reading it. And this is a SECURITY
 /// announcement, the kind that is wrong silently.
 ///
-/// A reload that touched neither flag says nothing, because a reload is a routine
+/// A reload that left the flag alone says nothing, because a reload is a routine
 /// event and a `--log-level` change must not narrate a policy nobody edited.
 /// @param previous The admission policy that was in force.
 /// @param current The one just adopted.
@@ -1246,14 +1281,23 @@ enum class AllowlistMoment : std::uint8_t
 /// unauthenticated or make `--dashboard-token-file` mandatory on every install.
 ///
 /// **The fleet question is `AdmitsRemotePeers`, an EXISTING spelling rather than a
-/// fourth one.** `NodeListenDefaultHost` records that *is this a fleet participant*
-/// already has three that deliberately disagree, and that a value decided by one
+/// fourth one.** *Is this a fleet participant* already has three spellings that
+/// deliberately disagree, and a value decided by one
 /// predicate and judged by another is how they come apart. What this needs is *does
 /// this node's policy admit a machine that is not this one*, which is that function's
 /// exact subject. It is also what keeps the remark off the single-machine install:
 /// `--scheduler` is required of EVERY shape -- a scheduler registers with itself --
 /// so naming one says nothing about a fleet, and a predicate reading it would fire on
-/// every node there is.
+/// every node there is. And a key route alone is no evidence either: every node naming
+/// `--scheduler` keeps a state directory, so it could hold a roster on the single-machine
+/// install too. So it asks `CompileVerbsReachOtherMachines`, which adds that the node port
+/// faces the network. That is no longer the difference on its own, since every node binds
+/// the wildcard by default; what makes a node a fleet's is its members, and a node running
+/// consensus knows them from its formation record (`RosterPresence::Formed`): a solitary
+/// node serves its own machine only, a pending, learner or voter node serves a fleet. Any
+/// other node is asked with `RosterPresence::Unknown`: this is said at startup, before any
+/// roster has been read, and a remark erring towards being said costs one line where erring
+/// the other way costs the probe an operator never set up.
 ///
 /// Whether the surface is on is asked of its own ROW, for the reason the
 /// dashboard-credential rule gives: a second reader of that question eventually judges
@@ -1277,77 +1321,19 @@ enum class AllowlistMoment : std::uint8_t
 /// they disagreed about is a row accepting what the tier then refuses.
 inline constexpr std::string_view RaftListenDefaultHost = "0.0.0.0";
 
-/// What a bare `--listen-node` binds on a node that serves the scheduler verbs.
+/// What a bare `--listen-node` binds: the wildcard, on every node.
 ///
-/// The wildcard, for the reason `--listen-raft` takes one: a scheduler hands out other
-/// machines' work, so the callers are on other machines by definition.
-inline constexpr std::string_view SchedulingNodeListenDefaultHost = "0.0.0.0";
-
-/// What a bare `--listen-node` binds on a node that does not.
-///
-/// Loopback, the OPPOSITE of the two above and deliberately: this is the surface
-/// `fastcache-cc` on this machine talks to, and a node's private cache reachable from
-/// the network is a decision rather than something an operator gets by typing a port.
-inline constexpr std::string_view WorkerNodeListenDefaultHost = "127.0.0.1";
-
-/// Where a bare `--listen-node` binds under @p cfg.
-///
-/// **One surface, two defaults**, which is the shape #290 left behind. The cache verbs
-/// and the scheduler verbs are answered on one listener now, and they pulled its
-/// address in opposite directions while they had one each: a scheduler no peer can
-/// dial does nothing, and a cache every host can dial is this machine's whole build
-/// output served to strangers.
-///
-/// Making it follow `--serve-scheduler` keeps BOTH of the answers the two surfaces
-/// gave. A worker or a plain cache node binds loopback exactly as `--listen-cache`
-/// did; a scheduling node binds the wildcard exactly as `--listen-scheduler` did. What
-/// changes is only that a scheduling node's cache verbs are now closed by
-/// `CacheResponder`'s locality rule (#287) rather than additionally by the socket --
-/// and that node's scheduler port faced the network before the merge anyway.
-///
-/// A function rather than a constant because a surface row's `defaultHost` is one
-/// value and this depends on the configuration; the row delegates here rather than
-/// carrying a second copy of the rule.
-///
-/// **It follows `--serve-scheduler` and NOT "is this node a fleet participant",** which
-/// #463 asked for and which is deliberately refused here rather than left unwritten:
-///
-/// - It would save one flag, and only for an operator who has already typed three.
-///   Widening the bind is what makes `CompilePortFacesTheNetwork` true, so the
-///   roster row starts refusing; and the widened bind becomes the advertised endpoint,
-///   so `AdvertisesWildcard` refuses until `--advertise` is named too. The participant
-///   still cannot start without `--scheduler`, a membership flag, `--advertise`, a
-///   `--cluster-dir` to keep its identity in and a roster to check grants against.
-/// - It would silence the refusal that teaches. `AdvertisesPastALoopbackBind` answers
-///   the operator who named `--advertise` and left the bind alone, and its message is
-///   `--listen-node=0.0.0.0:6674` -- the ergonomics fix, delivered while they are
-///   watching.
-/// - **A defaulted `--listen-node` whose port is taken is a WARNING, not fatal**, and
-///   such a node runs with no `0xFC` port at all while still registering and
-///   advertising. Today a fleet worker must TYPE the address, so that collision is
-///   fatal; under a widened default the fleet-facing case would land on the warning
-///   path, be leased out, and answer nothing.
-/// - "Is this a fleet participant" already has three spellings that deliberately
-///   disagree -- the reachability rows' gate, `AdmitsRemotePeers` (which excludes a
-///   loopback-only member list and includes `--raft-join`) and
-///   `CompilePortFacesTheNetwork`. A default computed from a fourth would be a bind
-///   decided by one predicate and judged by another.
-///
-/// What the ticket correctly found is that a worker typing neither flag was refused by
-/// nothing; that is `AdvertisesLoopbackToARemoteScheduler`, a row rather than a wider
-/// default.
-/// @param cfg What the operator asked for.
-/// @return The host a bare port falls back to.
-[[nodiscard]] inline std::string_view NodeListenDefaultHost(NodeConfig const& cfg) noexcept
-{
-    return cfg.serveScheduler ? SchedulingNodeListenDefaultHost : WorkerNodeListenDefaultHost;
-}
+/// It was loopback on a node that did not schedule and the wildcard on one that did, until
+/// the zero-config defaults made every node a fleet participant: a worker bound to loopback
+/// advertises an address no other machine can dial. The cache verbs answer this machine alone
+/// whatever the bind (#287), and every other verb refuses a caller that is not a member.
+inline constexpr std::string_view NodeSurfaceDefaultHost = "0.0.0.0";
 
 /// The endpoint this node tells other machines to dial.
 ///
 /// **One derivation, because three consumers must agree or the fleet breaks in a way
 /// none of them can see.** What a lease's MAC covers is this endpoint, so the property
-/// the compile surface's `AuthRequired == false` rests on is:
+/// the compile surface's needing no connection credential rests on is:
 ///
 ///   the endpoint the scheduler SIGNS == the endpoint the worker VERIFIES ==
 ///   the endpoint clients actually REACH
@@ -1361,9 +1347,166 @@ inline constexpr std::string_view WorkerNodeListenDefaultHost = "127.0.0.1";
 ///
 /// Judged on the endpoint the node WOULD advertise rather than on whether the flag was
 /// typed, so an operator who spells the default out is answered identically.
+///
+/// `--advertise` when given; otherwise the node surface, with a WILDCARD host replaced by
+/// this machine's fully qualified name once the start has resolved it (`hostNames`).
 /// @param cfg What the operator asked for.
 /// @return The advertised `host:port`.
 [[nodiscard]] std::string AdvertisedEndpoint(NodeConfig const& cfg);
+
+/// Whether the advertised endpoint is still waiting for this machine's name.
+///
+/// True for a node that names no `--advertise`, binds the wildcard, and has not resolved its
+/// names yet -- a parse, an install, `--print-surfaces`. `AdvertisedEndpoint` then answers the
+/// wildcard it binds, which the start will replace; a rule refusing an undialable advertised
+/// address asks this first, so it refuses a RESOLVED answer and never the placeholder.
+/// @param cfg What the operator asked for.
+/// @return True while the name is awaited.
+[[nodiscard]] bool AdvertisedNameAwaited(NodeConfig const& cfg);
+
+/// Whether the advertised endpoint is WITHHELD: this node names no `--advertise`, binds the
+/// wildcard, and this machine's name reaches only itself (`NodeHostNames::withheld`).
+/// `AdvertisedEndpoint` then offers no peer that name: loopback to a scheduler on this machine,
+/// which reaches it there, and nothing at all to one elsewhere, which is refused
+/// (`WorkerNameReachesOnlyThisMachineRefusal`).
+/// @param cfg The configuration, with its host names applied.
+/// @return True while there is no name to advertise.
+[[nodiscard]] bool AdvertisedNameWithheld(NodeConfig const& cfg);
+
+/// Where the readiness line says this node listens: the node surface as it binds, or the socket a
+/// supervisor handed it, which no setting describes.
+/// @param cfg The resolved configuration.
+/// @param socketHandedOver Whether the node surface was adopted rather than bound.
+/// @return The text, never empty.
+[[nodiscard]] std::string DescribeListeningEndpoint(NodeConfig const& cfg, bool socketHandedOver);
+
+/// What the readiness line says this node advertises: the endpoint, or why there is none --
+/// `withheld (<name>)` for a name that reaches only this machine, never an empty field.
+/// @param cfg The resolved configuration, its host names applied.
+/// @return The text, never empty.
+[[nodiscard]] std::string DescribeAdvertisedEndpoint(NodeConfig const& cfg);
+
+/// Whether some scheduler this worker registers with (`SchedulersOf`) is on another machine.
+///
+/// ANY of them, never the first (#1310): the heartbeat falls back through every one. A host is this
+/// machine when it reaches only this machine (`NamesOnlyThisMachine`), or names this node's own
+/// address through `SameHost`: the one address its node surface binds, the host a typed
+/// `--advertise` names, or the name a wildcard bind is advertised under -- so a node bound to its
+/// LAN address, whose own scheduler is dialled there, is not told it has a remote one. A value
+/// that is not `host:port` is not counted; `ParseDialEndpoint` answers its shape.
+/// @param cfg The parsed configuration.
+/// @return True when a scheduler on another machine would be handed this worker's address.
+[[nodiscard]] bool SchedulerIsRemote(NodeConfig const& cfg);
+
+/// Whether the consensus address is WITHHELD: this node names no `--raft-self`, and this
+/// machine's name reaches only itself. A node whose `--listen-raft` is defaulted then runs its
+/// consensus confined to this machine (`ConsensusConfinedToThisMachine`), and one that asked for
+/// consensus other machines dial is refused by name.
+/// @param cfg The configuration, with its host names applied.
+/// @return True while there is no address to offer peers.
+[[nodiscard]] bool ConsensusNameWithheld(NodeConfig const& cfg);
+
+/// Whether this node runs its consensus SOLITARY on loopback, because the name peers would dial
+/// reaches only this machine: a mode that opens the Raft port, a `--listen-raft` never typed, and a
+/// withheld consensus name (`ConsensusNameWithheld`).
+///
+/// It is a fleet of its own and nothing more. The Raft surface binds loopback at its port, so its
+/// scheduler signs grants and its worker registers there and checks them against the state it
+/// applies -- local dispatch works -- while every way of becoming more than one machine is shut:
+/// discovery stands down (a beacon would send every peer to itself), the formation controller asks
+/// no seed and polls no fleet, the enrollment family is refused, and a FLEET-SUMMARY is withheld
+/// (`Cluster::AnnouncesOnlyThisMachine`). `host-name-reaches-only-this-machine` says so, with the
+/// remedy. A TYPED `--listen-raft`, or a mode other machines dial, is refused by name instead.
+/// @param cfg The configuration, its formation and host names applied.
+/// @return True while this node's consensus is confined to this machine.
+[[nodiscard]] bool ConsensusConfinedToThisMachine(NodeConfig const& cfg);
+
+/// One setting an operator chooses that needs OTHER machines to reach this node's consensus.
+///
+/// A row per setting, because every one of them meets a downstream refusal if consensus stands
+/// down on a withheld name -- `--discovery` "needs --listen-raft" -- which sends the operator to
+/// add a flag and only then tells them the cause.
+/// So the named refusal (`ConsensusNameReachesOnlyThisMachineRefusal`) keys on the table, and
+/// the refusal's own text names every row's `setting`, which a test holds it to.
+struct ConsensusPeerAsk
+{
+    std::string_view setting;            ///< How the refusal names it.
+    bool (*asks)(NodeConfig const& cfg); ///< Whether this configuration chose it.
+};
+
+/// Every setting that needs other machines to reach this node's consensus.
+/// @return The rows.
+[[nodiscard]] std::span<ConsensusPeerAsk const> ConsensusPeerAsks() noexcept;
+
+/// Whether @p cfg chose any setting of `ConsensusPeerAsks()`.
+/// @param cfg The configuration, its formation applied.
+/// @return True when some row asks.
+[[nodiscard]] bool AsksPeersToReachConsensus(NodeConfig const& cfg);
+
+/// Whether peers are told to dial this node's consensus port at a host off this machine while
+/// `--listen-raft` binds loopback, so no peer's dial is ever answered.
+/// @param cfg The configuration.
+/// @return True when the stated consensus address contradicts a loopback bind.
+[[nodiscard]] bool ConsensusPastALoopbackBind(NodeConfig const& cfg);
+
+/// Why a loopback consensus bind with an address off this machine is refused.
+inline constexpr std::string_view ConsensusPastALoopbackBindRefusal =
+    "--listen-raft binds loopback, so only this machine can reach this node's consensus port, and peers are told to "
+    "dial it at a host off this machine (--raft-self, or this machine's name): every one of them would go "
+    "unanswered, and be counted in a quorum it is absent from. Bind --listen-raft to an address they reach, or the "
+    "wildcard, or say --raft-self=127.0.0.1 for a cluster that never leaves this machine";
+
+/// Whether the consensus address this node would announce reaches only the machine that dials it
+/// (`Cluster::AnnouncesOnlyThisMachine`): a loopback bind, a `--raft-self` naming loopback or
+/// `localhost`, or a consensus confined to this machine (`ConsensusConfinedToThisMachine`). A
+/// DEFAULTED discovery stands down on such a node -- the surface row and `StartDiscoveryOrExplain`
+/// both ask this -- and a typed one is refused (`DiscoveryAnnouncesOnlyThisMachine`).
+/// @param cfg The configuration.
+/// @return True when the announced consensus address would send every peer to itself.
+[[nodiscard]] bool ConsensusAddressReachesOnlyThisMachine(NodeConfig const& cfg);
+
+/// Whether a `--discovery` the operator TYPED would announce a consensus address every peer
+/// resolves to itself (`Cluster::AnnouncesOnlyThisMachine`) -- a loopback bind, or a
+/// `--raft-self` naming loopback or `localhost`.
+///
+/// A cluster that never leaves this machine is a legitimate configuration, and a DEFAULTED
+/// discovery stands down on it (`StartDiscoveryOrExplain`); a typed one asks for exactly what
+/// such a node must never do, and is refused here, where an install is judged too.
+/// @param cfg The configuration.
+/// @return True when the typed discovery would beacon an address that reaches only its dialler.
+[[nodiscard]] bool DiscoveryAnnouncesOnlyThisMachine(NodeConfig const& cfg);
+
+/// Why a typed `--discovery` on a node whose consensus address reaches only this machine is
+/// refused. One text, spent by the startup table and by the discovery tier alike.
+inline constexpr std::string_view DiscoveryAnnouncesOnlyThisMachineRefusal =
+    "--discovery would announce this node's consensus address, which reaches only this machine: every peer "
+    "resolves it to itself, so a beacon would send each of them to dial itself. Name an address other machines "
+    "reach -- bind --listen-raft to it or to the wildcard, and correct --raft-self if you typed one -- or drop "
+    "--discovery for a cluster that never leaves this machine";
+
+/// Why a worker whose advertised name would reach only this machine is refused -- only when it
+/// registers with a scheduler on ANOTHER machine. One on this machine reaches it at loopback.
+inline constexpr std::string_view WorkerNameReachesOnlyThisMachineRefusal =
+    "this worker names no --advertise and binds the wildcard, registers with a scheduler on another machine, and this "
+    "machine's name reaches only itself (localhost, a name under .localhost, or a loopback address): a client leased "
+    "to it would dial its OWN machine. Name --advertise with an address or a name other machines resolve, or give "
+    "this machine a real host name";
+
+/// Why a node that asked for consensus, and whose name would reach only this machine, is refused.
+inline constexpr std::string_view ConsensusNameReachesOnlyThisMachineRefusal =
+    "--listen-raft, --discovery or this node's recorded mode (a voter, which the fleet's other members dial) makes "
+    "this node a consensus member other machines reach, which must name the "
+    "address its peers dial, and this "
+    "machine's name reaches only itself (localhost, a name under .localhost, or a loopback address): "
+    "a peer told to dial it would dial ITSELF. Give --raft-self=<a host other machines resolve> (127.0.0.1 when no "
+    "other machine ever will)";
+
+/// The host a node dials ITSELF at: its own worker's scheduler, and the address a worker whose
+/// name is withheld advertises to a scheduler on this machine.
+///
+/// Loopback whatever the node port binds: the wildcard answers on loopback, and a loopback bind
+/// is loopback. A name here would be the one thing that could fail to resolve.
+inline constexpr std::string_view ThisMachineLoopbackHost = "127.0.0.1";
 
 /// What a bare `--admin-listen` binds.
 ///
@@ -1372,7 +1515,18 @@ inline constexpr std::string_view WorkerNodeListenDefaultHost = "127.0.0.1";
 /// operator deliberately exposed does.
 inline constexpr std::string_view AdminListenDefaultHost = "127.0.0.1";
 
-/// Why a node running consensus that names no `--raft-peer` of its own cannot work.
+/// How an operator states the address peers dial a consensus node at: the remedy for a node that
+/// states none, worded ONCE.
+///
+/// Two texts tell an operator this rule -- the startup refusal below and `--print-surfaces`'
+/// `NOT STATED` line -- and they drifted once: the refusal named one way out while the worksheet
+/// named another, which sends an operator to a flag that does not fit. Since the zero-config
+/// defaults there is one way, `--raft-self` (the host another member dials; the port is
+/// `--listen-raft`'s), and both texts carry this phrase, with a `static_assert` beside each
+/// keeping them from drifting apart again.
+inline constexpr std::string_view ConsensusDialRemedy = "give --raft-self";
+
+/// Why a node running consensus that names no address its peers dial it at cannot work.
 ///
 /// A named constant rather than prose written into the policy row it fills, because
 /// `ConsensusTier::Start` answers with **this** string. The invariant is decided by
@@ -1391,72 +1545,86 @@ inline constexpr std::string_view AdminListenDefaultHost = "127.0.0.1";
 /// refusal as `"{}; refusing to start"`, and the tier's other messages are written
 /// as fragments for exactly that. One message serving two callers has to suit the
 /// one that appends.
-inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
-    "--listen-raft turns consensus on and no --raft-peer names this node: it must name the endpoint its peers "
-    "dial, whether it bootstraps a cluster or joins one, and consensus cannot start without one";
+inline constexpr std::string_view ConsensusNamesNoDialAddressRefusal =
+    "this node runs consensus and names no address its peers dial it at: give --raft-self=<host>, the host another "
+    "member would dial (127.0.0.1 when none ever will); the port is --listen-raft's, and consensus cannot start "
+    "without one";
 
-/// Why a node that announces itself to a fleet, and holds no identity to prove, cannot start (#178).
-///
-/// Every verb a machine joins the fleet with -- `Register`, `NodeAnnounce`, `Heartbeat`,
-/// `Withdraw` -- is refused on a connection that proved no identity the cluster admitted, and every
-/// node that names `--scheduler` sends one of them. A node that holds no key would start, dial and
-/// be refused every round; refused here instead, where an operator is watching.
-inline constexpr std::string_view SchedulerNeedsIdentityRefusal =
-    "--scheduler makes this node announce itself to a fleet, and the fleet admits a machine only by the identity "
-    "it proves: this node runs no consensus and names no --cluster-dir, so it has no identity key to prove. Give "
-    "it --cluster-dir=<dir>, where its key and id are kept, and have the cluster admit it -- --enroll-from=<seed>, "
-    "or --cluster-admit-worker=<id>@<key> with the two lines --print-identity prints";
+static_assert(ConsensusNamesNoDialAddressRefusal.contains(ConsensusDialRemedy),
+              "the startup refusal names the way to state the dial address, in the worksheet's words");
 
-/// Why a scheduler that runs no consensus is refused (#178).
+/// Why a node that runs no consensus may not name `--discovery`.
 ///
-/// A scheduler signs every grant with its identity key and hands every worker a roster a
-/// majority of its cluster's voters certify -- so it holds replicated state, which is
-/// consensus, even alone (owner decision 3). Refused rather than run portless: a mode rides
-/// on the PORT (`RunsConsensus`), and a scheduler quietly running a consensus nothing can
-/// join would make the flag's absence carry a mode.
-inline constexpr std::string_view SchedulerNeedsConsensusRefusal =
-    "--serve-scheduler needs --listen-raft: a scheduler signs every lease with its identity key and hands its "
-    "workers a roster its cluster's voters certify, so it is a consensus member -- one machine alone is a cluster "
-    "of one. Add --listen-raft=<port> and --raft-self=<host>, the address another member would dial it at "
-    "(127.0.0.1 when none ever will)";
+/// One sentence for the startup table and for the discovery tier's belt, which spelled it
+/// separately and named `--node-id` as the switch long after #1022 made it `--listen-raft` --
+/// the flag an operator would then go and add without effect.
+inline constexpr std::string_view DiscoveryNeedsConsensusRefusal =
+    "--discovery needs --listen-raft: discovery finds peers for a CLUSTER, and without a consensus port this node "
+    "is not in one. It would broadcast, be answered, prove its identity and have nowhere to put the answer.";
+
+/// Whether this build can terminate TLS: a property of the BUILD, which the startup table asks
+/// beside the configuration so a line naming TLS material on a build without it is refused where
+/// an operator is watching -- `--print-surfaces`, `--install-service` -- and not only at boot.
+#if defined(FC_TLS_ENABLED)
+inline constexpr bool BuildServesTls = true;
+#else
+inline constexpr bool BuildServesTls = false;
+#endif
+
+/// Why TLS material is refused on a build that cannot serve it.
+///
+/// Refused rather than warned about, and the daemon answers the same way: a node that started in
+/// the clear after being told to serve TLS is one an operator believes is encrypted.
+inline constexpr std::string_view TlsUnavailableRefusal =
+    "--tls-self-signed or --tls-cert was given, and this build has no TLS support (rebuild with "
+    "-DFASTCACHED_ENABLE_TLS=ON): the admin surface would be served in the clear while an operator believed it "
+    "was encrypted.";
 
 /// Why a worker that could verify no lease is refused, when other machines can reach it (#178).
 ///
-/// Answered by the startup check of the state directory (`NodeRoster::Build`), the one moment the
-/// answer can be known: a worker names a scheduler, so it keeps a state directory, and only the
-/// directory says whether it holds a roster. The configuration's half -- a worker with nowhere
-/// to keep one -- is `SchedulerNeedsIdentityRefusal`.
+/// Answered by `NodeRoster::Build`: the only roster there is, is the state a node's own consensus
+/// applies, so a node that runs none holds none, and a worker on it that other machines can reach
+/// could verify no grant. The startup table refuses a worker that runs no consensus first
+/// (`WorkerConsensusClosed`), so the build's refusal is the belt behind it.
 inline constexpr std::string_view RosterlessWorkerRefusal =
-    "a node that admits peers on other machines checks the lease a client presents to its worker, against a roster "
-    "its cluster's voters certify -- and this node runs no consensus, names no --voter-key and holds no roster, so "
-    "it could verify nothing: it would compile for anybody who can reach its port, and report nothing wrong while "
-    "doing it. Name the voters' keys with --voter-key (each voter's --print-identity prints its key). A node "
-    "admitting only its own machine needs none, because a process on this host already has this host's compiler";
+    "a node that admits peers on other machines checks the lease a client presents to its worker, against the state "
+    "its fleet's consensus applies -- and this node runs no consensus and holds no roster, so it could verify "
+    "nothing: it would compile for anybody who can reach its port, and report nothing wrong while doing it. Open "
+    "consensus (--listen-raft) so it applies its fleet's state. A node admitting only its own machine needs none, "
+    "because a process on this host already has this host's compiler";
 
-/// Why `--voter-key` on a consensus node is refused (#178).
-inline constexpr std::string_view VoterKeyOnConsensusNodeRefusal =
-    "--voter-key names the voters a worker that runs NO consensus trusts before it holds a roster; this node runs "
-    "consensus (--listen-raft), so it verifies every grant against the state it applies and would never read "
-    "these keys. Drop --voter-key";
+/// Why a node that runs a worker with its consensus port closed is refused (`WorkerConsensusClosed`).
+///
+/// Such a node never forms: it is given no formation runtime (`MakeFormationRuntime`), so it never
+/// joins a fleet, serves no scheduler of its own (`ServesScheduler`), and its worker has nowhere to
+/// register (`SchedulersOf` is empty) -- it would start, and never be sent a job. A cache-only node
+/// with consensus closed is ordinary, and a learner, which dials its leader and listens for nobody,
+/// is not this case.
+inline constexpr std::string_view WorkerWithConsensusClosedRefusal =
+    "this node runs a worker and runs no consensus (its consensus port is closed, --listen-raft=): a node that runs "
+    "no consensus holds no roster to verify a lease against, and never forms or joins a fleet, so its worker would "
+    "have no scheduler to register with and would never be sent a job. Drop --listen-raft= so the node forms its own "
+    "fleet (and joins one, given --fleet-seed), or give --slots=0 for a cache-only node.";
+
+/// Whether this node runs a worker while running no consensus.
+///
+/// Once a formation record is applied -- and asked again after this machine's names resolve --
+/// it is the real predicate, `!RunsConsensus`, never a flag shape: such a worker holds no roster to
+/// verify a grant against, and serves no scheduler of its own to register with. Today only the
+/// flag (`--listen-raft=`) reaches it, since a name that reaches only this machine confines
+/// consensus to loopback rather than closing it (`ConsensusConfinedToThisMachine`); asked this way,
+/// whatever closes consensus next is refused here rather than started fail-open. Before a record
+/// is applied -- an install, a parse -- the configuration is judged as the first start it will
+/// become, a solitary node, whose port only the flag can close.
+/// @param cfg The parsed configuration.
+/// @return True when the worker would check no lease and have nowhere to register.
+[[nodiscard]] bool WorkerConsensusClosed(NodeConfig const& cfg) noexcept;
 
 /// Why a node with no worker, no scheduler, no consensus and no cache tier is refused.
 inline constexpr std::string_view NodeRunsNothingRefusal =
     "--slots=0 runs no worker, and this node runs no scheduler, no consensus and no cache tier either: it would "
-    "start and serve nobody. Add --serve-scheduler or a cache tier, or give --slots a count to run a worker.";
-
-/// The `--raft-peer` entry `--node-id` names, if the list names it at all.
-///
-/// The predicate behind `ConsensusNamesNoSelfPeerRefusal`, shared for the reason that
-/// constant is: the startup table asks it for a verdict and `ConsensusTier::Start`
-/// asks it for the member itself, and a rule asked two ways is one that drifts.
-///
-/// Answers for the list as typed, so a node with no `--node-id` at all names no
-/// member -- which is not a refusal on its own: whether that is a mistake depends on
-/// whether this node runs consensus, which since #1022 is a different flag's
-/// question, and the table's own row is where the two meet.
-/// @param cfg The parsed configuration.
-/// @return A pointer into `cfg.raftPeers`, valid for as long as `cfg` is, or nullptr.
-[[nodiscard]] Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept;
+    "start and serve nobody. Open consensus (--listen-raft) so its mode can serve the scheduler, add a cache tier, "
+    "or give --slots a count to run a worker.";
 
 /// Whether this node runs consensus, and therefore whether anything will ever tell
 /// its scheduler what term it is in.
@@ -1466,8 +1634,7 @@ inline constexpr std::string_view NodeRunsNothingRefusal =
 /// `StartConsensusOrExplain` answers "is there a cluster to start" and
 /// `SchedulerTier` answers "will somebody publish my role"; those are the same
 /// question, and while each spelled `cfg.nodeId.empty()` for itself they were two
-/// authors of one rule -- the shape `ClusterSelfMember` above exists to prevent, one
-/// flag along.
+/// authors of one rule.
 ///
 /// The disagreement is not hypothetical: the scheduler assumed nobody would, published
 /// standalone leadership at term 0, and then consensus published a real term over the
@@ -1476,28 +1643,50 @@ inline constexpr std::string_view NodeRunsNothingRefusal =
 /// scheduler without consensus is refused at startup -- and this predicate is what that
 /// refusal asks.
 ///
-/// **The switch is `--listen-raft`, and it moved off `--node-id` at
-/// [#1022](https://github.com/LASTRADA-Software/fastcached/issues/1022).** While the
-/// id's ABSENCE carried the mode, the id could never be given a default: any default
-/// makes `nodeId.empty()` false forever, and the one-machine deployment -- which
-/// names no `--raft-peer` -- would then be refused at every boot. A node runs
-/// consensus if and only if it opens a consensus port, so the port is the fact.
+/// **A mode is the STATE held in the cluster dir** (`NodeFormation.hpp`). The switch was
+/// `--node-id` until [#1022](https://github.com/LASTRADA-Software/fastcached/issues/1022):
+/// while the id's ABSENCE carried the mode, the id could never be given a default, because
+/// any default makes `nodeId.empty()` false forever and the one-machine deployment would be
+/// refused at every boot. #1022 moved it to the port; zero-config formation moves it again,
+/// to the record, for the same reason one level up -- a port that has a DEFAULT can no longer
+/// say whether this machine runs consensus, and a record written by the node's own
+/// transitions can. Every mode runs consensus, so this answers whether a record shaped this
+/// configuration at all, and then two orthogonal facts folded in this one place:
 ///
-/// **`--listen-raft` rather than a new boolean**, deliberately: a boolean is a second
-/// thing that can disagree with the port, and both disagreements are states nothing
-/// could describe -- a node that opens a consensus port and runs no consensus, and one
-/// that runs consensus and opens none. That also keeps the rule at one flag, which is
-/// what #613 asks for.
+/// - a mode that DIALS IN (a learner) runs consensus with no port of its own, and needs no
+///   name other machines resolve, since nobody dials it;
+/// - a mode that OPENS the port runs consensus exactly when the Raft surface row resolves
+///   it. That row is where an explicitly empty `--listen-raft=` closes it, so this and
+///   `--print-surfaces` cannot disagree about whether the port is served. A name that reaches
+///   only this machine does NOT close it: the row binds loopback instead
+///   (`ConsensusConfinedToThisMachine`), and the node runs as a fleet of its own.
 ///
-/// Asked of the surface row rather than of `raftListen` directly, so this and
-/// `--print-surfaces` cannot disagree about whether the raft port is served -- the row
-/// is where "is this surface on" is decided for every surface. A value that is not an
-/// address resolves to nothing here and is refused by the grammar walk at the top of
-/// `StartupPolicyRejection`, which runs before any rule that consults this and before
-/// any tier is built.
-/// @param cfg The parsed configuration.
+/// Not a column per mode for the confinement: the name is a fact about the MACHINE, and every
+/// mode that opens a port is subject to it, so a column would be the same value written on
+/// every row that listens.
+///
+/// A value that is not an address resolves to nothing and is refused by the grammar walk at
+/// the top of `StartupPolicyRejection`, which runs before any rule that consults this and
+/// before any tier is built.
+/// @param cfg The parsed configuration, with its formation applied.
 /// @return True when a consensus driver will run and report a role.
 [[nodiscard]] bool RunsConsensus(NodeConfig const& cfg) noexcept;
+
+/// What a caller of a fleet predicate knows about the roster this node verifies keys against.
+///
+/// PRIVATE: never transmitted and never persisted. A node's roster is the state its OWN consensus
+/// applies (#178, T25), so only a node running consensus ever holds one -- no state directory keeps
+/// one for a node that does not. Three answers, because callers ask with three different amounts of
+/// knowledge: `Absent` says no key route is to be counted; `Formed` asks the formation record, which
+/// names the members consensus starts with; `Unknown` counts the key route every consensus node
+/// has -- the fleet a solitary node MAY found later, the fail-closed reading a guard wants and a
+/// statement about the present must not make.
+enum class RosterPresence : std::uint8_t
+{
+    Absent,  ///< No key route is counted: no roster, or a caller that asks about the others alone.
+    Unknown, ///< A guard's reading: a node running consensus holds a roster that may admit by key.
+    Formed,  ///< Consensus's own roster: it admits exactly the members the formation record's mode names.
+};
 
 /// Whether this node runs a compile worker: surveys its toolchains, claims a scratch
 /// root, serves the compile verbs and registers with a scheduler.
@@ -1532,10 +1721,65 @@ inline constexpr OptionComponent<NodeConfig> WorkerComponent {
     .remedy = "give --slots a count to run one",
 };
 
+/// Where a one-shot verb is sent when no `--scheduler` names anywhere: this machine's own node,
+/// which answers what it can and follows `NotLeader` to the leader for the rest.
+inline constexpr std::string_view DefaultAdminTarget = "127.0.0.1:6674";
+
+/// A serving node told where its scheduler is: refused, because its formation record decides that.
+inline constexpr std::string_view SchedulerOnAServingNodeRefusal =
+    "--scheduler names where a one-shot verb is sent; a serving node finds its scheduler from the fleet it "
+    "joined. To join a fleet across a VPN, give --fleet-seed=<host> instead.";
+
+/// A family of one-shot verbs a person puts to a running cluster through `--scheduler`: each
+/// dials it, answers and exits.
+///
+/// Not every early verb: `--cordon` dials this machine's own `--listen-node`, and an install
+/// registers a node that will SERVE, so `--scheduler` beside either is the serving node's refusal.
+///
+/// **Private**: never transmitted or persisted.
+enum class OneShotVerb : std::uint8_t
+{
+    Cluster, ///< A `--cluster-*` verb.
+    Enroll,  ///< An `--enroll-*` verb.
+    Last,    ///< The count, for `Enumerators`.
+};
+
+/// Whether @p cfg runs a verb of @p verb's family.
+///
+/// THE one author of that fact: `main` routes each family by it, and `AimsAtScheduler` folds it
+/// over every family -- so a family routed in one place and missed in the other cannot happen, as
+/// it could while each spelled `cfg.cluster.action != None` for itself (review M-1).
+/// @param cfg The parsed configuration.
+/// @param verb The family.
+/// @return True when the configuration asks for a verb of that family.
+[[nodiscard]] bool IsOneShotVerb(NodeConfig const& cfg, OneShotVerb verb) noexcept;
+
+/// Whether @p cfg runs a one-shot verb that `--scheduler` aims: `IsOneShotVerb` of any family.
+/// @param cfg The parsed configuration.
+/// @return True when `--scheduler` is read.
+[[nodiscard]] bool AimsAtScheduler(NodeConfig const& cfg) noexcept;
+
+/// The one-shot verbs, as the component column of `NodeOptions()` names them: `--scheduler`
+/// configures them alone, so a node that serves is refused it, in its own sentence.
+inline constexpr OptionComponent<NodeConfig> OneShotVerbComponent {
+    .name = "one-shot verbs",
+    .runs = &AimsAtScheduler,
+    .absentBecause = "this node serves",
+    .remedy = "give --fleet-seed=<host> to join a fleet across a VPN",
+    .refusal = SchedulerOnAServingNodeRefusal,
+};
+
+/// Where a one-shot verb is sent, in the order tried: `--scheduler`'s values, or
+/// `DefaultAdminTarget` when it names none.
+/// @param cfg The parsed configuration.
+/// @return The endpoints; never empty.
+[[nodiscard]] std::vector<std::string> AdminTargetsOf(NodeConfig const& cfg);
+
 /// What a node is told when it names a setting only a component it does not run reads.
 ///
 /// ONE sentence for every such row, generated from the row and its component, because
-/// the rule is one rule: the setting would be accepted and reach nothing (#206).
+/// the rule is one rule: the setting would be accepted and reach nothing (#206) -- unless
+/// the component states its own (`OptionComponent::refusal`).
 /// @param spec A row of `NodeOptions()` whose `component` is not null.
 /// @return The refusal.
 [[nodiscard]] std::string UnrunComponentRefusal(OptionSpec<NodeConfig> const& spec);
@@ -1551,17 +1795,32 @@ inline constexpr OptionComponent<NodeConfig> WorkerComponent {
 /// @return True when a cache tier will be built unless starting it fails.
 [[nodiscard]] bool ConfiguresCacheTier(NodeConfig const& cfg) noexcept;
 
-/// The member endpoint `--raft-self` and `--listen-raft` name between them.
+/// Where the shared tier's store lives: `<state directory>/shared-cache/objects.cow`.
+///
+/// A directory of its own inside the node's state directory (`NodeStateDirectory`: the
+/// `--cluster-dir` typed, else the default resolved at startup), never `--cache-dir`: the
+/// private tier's store is claimed exclusively by this process already, and the two tiers
+/// answer to different verbs and different callers. `DiskStoreFileName` is the file's
+/// name in both, so a test measuring either store spells it once.
+///
+/// **Never `cfg.clusterDir` alone**: that is only the TYPED directory, so a zero-config
+/// node -- which names none -- would open its shared tier at a path relative to the
+/// working directory.
+/// @param cfg The configuration; its state directory must be resolved.
+/// @return The store file.
+[[nodiscard]] std::filesystem::path SharedCacheStorePath(NodeConfig const& cfg);
+
+/// The member endpoint `--raft-self` -- or, when it is not given, this machine's resolved
+/// fully qualified name -- and `--listen-raft` name between them.
 ///
 /// **One author for a value two places need**, which is the whole reason it is a
-/// function: `ApplyNodeIdentity` builds this node's own `--raft-peer` entry out of
-/// it, and the startup rule that refuses `--raft-self` beside a `--raft-peer` for
-/// this node has to be able to tell that entry from a DIFFERENT one an operator
-/// typed. Written twice, those two would disagree about IPv6 bracketing and the rule
-/// would refuse every reload of a node it had just accepted at startup -- the reload
-/// path judges a candidate the identity has already been applied to.
+/// function: `ConsensusDialAddressOf` answers from it, and `BootstrapMembersOf` builds
+/// this node's own member entry out of that answer. Written twice, those two would
+/// disagree about IPv6 bracketing, and the address a node starts under would not be the
+/// one it reports.
 /// @param cfg The parsed configuration.
-/// @return `host:port`, or empty when either half is missing.
+/// @return `host:port`, or empty when either half is missing -- a node running no consensus,
+///         or one naming no `--raft-self` before its names are resolved.
 [[nodiscard]] std::string RaftSelfEndpoint(NodeConfig const& cfg);
 
 /// Why `ConsensusDialAddressOf` has no address to give.
@@ -1570,9 +1829,11 @@ inline constexpr OptionComponent<NodeConfig> WorkerComponent {
 /// endpoint as an optional, and a gap is simply not sent.
 enum class ConsensusDialGap : std::uint8_t
 {
-    NoConsensus, ///< `--listen-raft` does not resolve, so there is nothing to dial.
-    Unstated,    ///< Consensus runs, and the node names itself neither way.
-    Last,        ///< The count, for `EnumTable`.
+    NoConsensus,      ///< `--listen-raft` does not resolve, so there is nothing to dial.
+    Unstated,         ///< Consensus runs, and the node names itself neither way.
+    AwaitingHostName, ///< Consensus runs, and the host name it falls back to is resolved at startup.
+    DialsIn,          ///< Consensus runs in a mode that binds no Raft port: it dials, and nobody dials it.
+    Last,             ///< The count, for `EnumTable`.
 };
 
 /// The consensus address this node tells the cluster to dial it at (#1328).
@@ -1584,18 +1845,15 @@ enum class ConsensusDialGap : std::uint8_t
 /// bound address compares the wrong string, so this is printed separately and labelled
 /// as the receipt labels it.
 ///
-/// The node's own member entry first, because that is the pair consensus runs under and
-/// `EnrollClaim` sends: an operator's `--raft-peer` for this node, or the one
-/// `ApplyNodeIdentity` built from `--raft-self`. `RaftSelfEndpoint` second, for a
-/// configuration whose identity has not been resolved yet -- `--print-surfaces` runs
-/// before an id is minted. Where both exist and differ, the startup table refuses the
-/// configuration (`RaftSelfContradictsItsOwnPeer`); this reports the entry consensus
-/// would run under and refuses nothing.
+/// `RaftSelfEndpoint`: `--raft-self`'s host, or this machine's name, on the raft port -- the
+/// pair consensus runs under. This reports it and refuses nothing.
 ///
-/// **Three answers, not an empty string**: a node running no consensus has no dial
-/// address (absent is not zero), and a consensus node naming itself neither way has one
-/// nobody stated -- which the startup table refuses, and which `--print-surfaces` still
-/// has to be able to print.
+/// **Absences, not an empty string**: a node running no consensus has no dial address
+/// (absent is not zero), a consensus node naming itself neither way has one nobody stated
+/// -- which the startup table refuses, and which `--print-surfaces` still has to be able
+/// to print -- and a mode whose row closes the Raft port (a learner) needs none, because it
+/// dials the fleet's voters and the leader answers it on that session. That last one is
+/// never refused for lacking an address: nobody would ever dial the one it named.
 ///
 /// The one derivation of this precedence: `ApplyNodeIdentity` builds the member entry
 /// from it, so the address a node runs under and the one it prints cannot disagree.
@@ -1608,25 +1866,15 @@ enum class ConsensusDialGap : std::uint8_t
 /// One spelling for two callers -- the scheduler tier's ready line and the worker's
 /// -- because the policy is the **node's** rather than any one surface's, and a
 /// phrase each of them built separately is one that drifts. Read off the
-/// configuration rather than off the oracle: the count is a property of what the
-/// operator wrote, and the oracle is shared by three surfaces and no longer any one
-/// tier's to inspect.
+/// configuration rather than off the oracle: the oracle is shared by three surfaces
+/// and no longer any one tier's to inspect.
 ///
-/// It says "this machine" out loud, because that admission is unconditional and an
-/// operator reading "2 member host(s)" would otherwise not know their own builds
-/// were covered. And it names the flag that would fix it when there is no policy at
-/// all, which is the whole of #235's second half: such a worker starts, logs a
-/// healthy line and refuses every dispatched compile, so the one line an operator
-/// reads has to say that the port is closed. A scheduler cannot reach that case --
-/// `--serve-scheduler` with no policy is refused at startup -- so it costs its line
-/// nothing.
-///
-/// *What* it says depends on whether `--node-id` turned consensus on, because such a
-/// node is about to admit hosts nobody typed and a line reading as a final answer
-/// would mislead. Both remedies are named either way: the agreed member set ADDS to
-/// what an operator listed rather than replacing it (#251), so `--fleet-member` is a
-/// working answer on a clustered node too -- and it is the only route by which a
-/// client machine, which is no cluster peer, is admitted at all.
+/// It says "this machine" out loud, because that admission is unconditional. It names
+/// the key routes on every node rather than only where a roster is visible in the
+/// configuration, because a state directory can keep a roster no configuration can
+/// see, and a line claiming "this machine only" on such a node would be a confident
+/// wrong answer. `--fleet-open` is the one admission a flag states, so it is the one
+/// tail the sentence grows.
 /// @param cfg The parsed configuration.
 /// @return A phrase naming who this node admits.
 [[nodiscard]] std::string AdmissionSummary(NodeConfig const& cfg);
@@ -1654,9 +1902,17 @@ enum class ConsensusDialGap : std::uint8_t
 /// the startup table of a configuration and by `NodeRoster::Build` of a state directory -- two
 /// moments, one predicate. It reads `--bind`, so under socket activation it describes nothing,
 /// and `MakeWorkerLeaseValidator` keeps the backstop for that case.
+///
+/// **The key routes count**, through `AdmitsRemotePeers`: a roster admits machines by
+/// proof and by ticket, so a network-facing worker holding one reaches other machines
+/// although no flag names any of them. Asked with `Absent` it answers for a node known
+/// to hold no roster; with `Unknown`, for a configuration asked before any roster was
+/// read, and then a key route counts as live; with `Formed`, for a node running consensus,
+/// whose roster admits the members its formation record names.
 /// @param cfg The parsed configuration.
+/// @param roster What the caller knows about the roster this node verifies keys against.
 /// @return True when another machine could present a lease here.
-[[nodiscard]] bool CompileVerbsReachOtherMachines(NodeConfig const& cfg);
+[[nodiscard]] bool CompileVerbsReachOtherMachines(NodeConfig const& cfg, RosterPresence roster);
 
 /// One path-valued worker flag whose file holds a secret.
 ///
@@ -1705,6 +1961,16 @@ using NodePublicPathFlag = PublicPathFlag;
 [[nodiscard]] std::vector<std::filesystem::path> NodeSecretFiles(NodeConfig const& cfg,
                                                                  std::filesystem::path const& configFile,
                                                                  bool secretNamedOnCommandLine);
+
+/// `NodeSecretFiles`, each file with the hint its row names: what a warning renders. The
+/// identity key is told the OWNER-ONLY remedy, since the node minted it and nothing else reads it.
+/// @param cfg The merged configuration.
+/// @param configFile The configuration file that was actually read, or empty.
+/// @param secretNamedOnCommandLine Whether argv supplied `--requirepass`.
+/// @return The subjects, in `NodeSecretFiles`' order.
+[[nodiscard]] std::vector<SecretFileSubject> NodeSecretFileSubjects(NodeConfig const& cfg,
+                                                                    std::filesystem::path const& configFile,
+                                                                    bool secretNamedOnCommandLine);
 
 /// Why this worker's configuration cannot work, if it cannot.
 ///

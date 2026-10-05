@@ -122,6 +122,21 @@ struct JobError
     /// into a log. Detail set at the other refusal sites is this file's own literal
     /// text and needs no such treatment.
     std::string detail;
+    /// The argument a `RejectedArgument` refusal names, alone and already reduced the way
+    /// `detail` reduces it; empty for every refusal that names none.
+    ///
+    /// Beside `detail` rather than parsed back out of it: `detail` is a sentence for a person
+    /// and may be reworded, while the node LISTS refused arguments in a condition, and a list
+    /// built by cutting words out of a sentence breaks the day the sentence changes.
+    std::string subject;
+    /// The driver whose argument rules refused `subject`, so a reader can ask those rules again
+    /// (`IsAcceptableJobArgument`) rather than a copy of them.
+    ///
+    /// Disengaged when no such question can be asked of `subject` and answered for the argument
+    /// that arrived: a refusal naming no argument, a path-mapping value no argument rule judged,
+    /// and a `subject` that `RejectedArgumentNaming` had to cut or reduce -- the reduced text is
+    /// not the argument, and judged in its place it can pass where the argument does not.
+    std::optional<Flavor> judgedFor;
 
     /// A `RejectedArgument` refusal naming the offending argument.
     ///
@@ -132,8 +147,10 @@ struct JobError
     /// construction — which the fleet requires of text a peer sent, and which a
     /// verbatim copy of an arbitrary byte string would not be.
     /// @param argument The argument the allowlist refused, as it arrived.
+    /// @param judgedFor The driver whose argument rules refused it; `std::nullopt` when none
+    ///        did. Required, so a new call site says which rather than inheriting "none".
     /// @return The refusal.
-    [[nodiscard]] static JobError RejectedArgumentNaming(std::string_view argument);
+    [[nodiscard]] static JobError RejectedArgumentNaming(std::string_view argument, std::optional<Flavor> judgedFor);
 
     /// @param error The error.
     /// @param reason The reason to compare against.

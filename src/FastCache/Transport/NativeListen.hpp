@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include <core/net/IListener.hpp>
 #include <core/net/NetError.hpp>
@@ -79,6 +81,45 @@ struct BoundSocket
 /// @return The port @p socket is bound to, or 0 when it cannot be asked.
 [[nodiscard]] std::uint16_t BoundPortOf(core::platform::NativeHandle socket) noexcept;
 
+/// @return The address @p socket is bound to as the KERNEL reports it -- "127.0.0.1", "::1",
+///         "0.0.0.0" -- in `CanonicalAddressLiteral`'s spelling, or empty when it cannot be asked.
+[[nodiscard]] std::string BoundAddressOf(core::platform::NativeHandle socket);
+
+/// The canonical spelling of an IPv4 or IPv6 address literal -- the one `BoundAddressOf` reports,
+/// so `::0001` and `::1` compare equal. Pure: nothing is looked up, so a host NAME is not a
+/// literal and answers nothing.
+/// @param text The text, unbracketed.
+/// @return The canonical literal, or nothing when @p text is not an address literal.
+[[nodiscard]] std::optional<std::string> CanonicalAddressLiteral(std::string_view text);
+
+/// What a socket call here answering @p osError reports -- the one mapping `AcceptRaw` and
+/// `BlockingListener` share, exposed so a test binds the classification an accept loop acts on
+/// rather than scripting around it.
+///
+/// Anything no row names is `SystemError`, which every accept loop reads as unclassified: it backs
+/// off on it, and reports itself degraded if a run of it persists. A per-connection failure is given
+/// a code an accept loop steps past, and running out of descriptors or memory `ResourceExhausted`,
+/// which it backs off on without calling itself degraded.
+/// @param osError The platform's error number: `errno` on POSIX, `WSAGetLastError()` on Windows.
+/// @return The code a caller is told.
+[[nodiscard]] core::net::NetErrorCode SocketErrorCode(int osError) noexcept;
+
+/// Where a listening socket is bound: its address, as the socket reports it, and its port.
+struct BoundEndpoint
+{
+    std::string host;      ///< The bound address: `0.0.0.0` or `::` for the wildcard, else the one address.
+    std::uint16_t port {}; ///< The bound port.
+};
+
+/// Where a listening socket a supervisor handed over is bound. Socket activation names a descriptor
+/// NUMBER, never a handle, and only the socket knows where it listens: the unit chose the address
+/// as well as the port -- `ListenStream=6676` is the wildcard, `ListenStream=10.0.0.5:6676` one
+/// address -- so neither can be read off this process's configuration.
+/// @param descriptor The inherited descriptor. Windows has no socket activation, so there a
+///        number names no socket and the answer is always nothing.
+/// @return The address and port, or nothing when the socket cannot be asked or names no address.
+[[nodiscard]] std::optional<BoundEndpoint> BoundEndpointOfDescriptor(int descriptor);
+
 /// Close a socket this file handed out, ignoring the result.
 void CloseNativeSocket(core::platform::NativeHandle socket) noexcept;
 
@@ -115,12 +156,30 @@ struct AcceptedSocket
 ///
 /// **@p descriptor is this call's on every path.** `core::net::adoptListener` leaves a handle it
 /// refused with its caller; this closes it then, so a caller that hands a descriptor over never
-/// closes it itself and cannot close it twice.
+/// closes it itself and cannot close it twice. A descriptor that is not a LISTENING `SOCK_STREAM`
+/// socket is refused by name before core-cpp sees it, as `BlockingListener::Adopt` refuses one.
 /// @param loop The loop the listener belongs to.
 /// @param descriptor An already-bound, already-listening descriptor; owned from here on.
 /// @return The listener, or why the descriptor could not be served.
 [[nodiscard]] std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptInheritedListener(
     core::net::EventLoop& loop, int descriptor);
+
+/// A listener over a socket this process bound and set listening itself, driven by @p loop.
+///
+/// For a caller that must hold a port from the moment it is chosen until the moment it is
+/// served: binding port 0, reading the port and closing the socket so a loop can bind it again
+/// leaves the port free in between, and on a host running other processes it is an ephemeral
+/// port something else may take. Handing the bound socket over closes that gap.
+///
+/// **@p handle is this call's on every path**, as `AdoptInheritedListener`'s descriptor is: the
+/// listener closes it, and a handle `core::net::adoptListener` refuses is closed here. So is one
+/// that is not a LISTENING stream socket, refused by name before core-cpp takes it, since an accept loop over
+/// it would fail every accept, forever -- the one adoption path both callers share.
+/// @param loop The loop the listener belongs to.
+/// @param handle A bound, listening socket; owned from here on.
+/// @return The listener, or why the socket could not be served.
+[[nodiscard]] std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptBoundListener(
+    core::net::EventLoop& loop, core::platform::NativeHandle handle);
 
 /// A TCP listener a thread BLOCKS on: `accept()` completes before it returns.
 ///
@@ -149,8 +208,12 @@ class BlockingListener final: public core::net::IListener
 
     /// Take over a listening socket this process did not bind -- one inherited through socket
     /// activation.
-    /// @param handle The listening socket; owned by the result.
-    /// @return The listener.
+    ///
+    /// A descriptor that is not a LISTENING `SOCK_STREAM` socket is refused by name, since accept()
+    /// on it would fail forever: `IsBound()` is false and `BindError()` says which it was -- the
+    /// type, or `SO_ACCEPTCONN` for a stream socket nobody called listen() on.
+    /// @param handle The listening socket; owned from the call on, and closed here when refused.
+    /// @return The listener, bound, or refused with the reason in `BindError()`.
     [[nodiscard]] static std::unique_ptr<BlockingListener> Adopt(core::platform::NativeHandle handle);
 
     BlockingListener(BlockingListener const&) = delete;
@@ -163,9 +226,11 @@ class BlockingListener final: public core::net::IListener
     /// `SetTimeouts` runs out (`core::net::NetErrorCode::Timeout`). Completes before it returns.
     [[nodiscard]] core::async::Task<core::net::AcceptResult> accept() override;
 
-    void close() noexcept override;
-
     [[nodiscard]] std::uint16_t boundPort() const noexcept override;
+
+    /// @return The address this listener is bound to, as the kernel reports it; empty when it is
+    ///         not bound. See `BoundAddressOf`.
+    [[nodiscard]] std::string BoundAddress() const;
 
     /// @param acceptPoll How long one accept waits before answering `Timeout`; zero waits for ever.
     /// @param ioTimeout The send and receive timeout every accepted socket gets; zero for none.
@@ -182,6 +247,19 @@ class BlockingListener final: public core::net::IListener
     {
         return _bindError;
     }
+
+    /// Hand the listening socket out and own it no longer -- to `AdoptBoundListener`, so a
+    /// loop serves the port this bound without it ever being released in between.
+    /// @return The socket, or `InvalidHandle` when none is bound; the caller owns it.
+    [[nodiscard]] core::platform::NativeHandle Release() noexcept
+    {
+        return std::exchange(_handle, core::platform::InvalidHandle);
+    }
+
+  protected:
+    /// Closes the listening socket. A blocking accept parked in another thread is NOT woken by it on
+    /// POSIX; see the class comment.
+    void doClose() noexcept override;
 
   private:
     BlockingListener() = default;

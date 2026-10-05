@@ -125,6 +125,11 @@ std::optional<NodeId> const& RaftNode::KnownLeader() const noexcept
     return _knownLeader;
 }
 
+std::optional<core::platform::SteadyTimePoint> RaftNode::LastLeaderContact() const noexcept
+{
+    return _lastLeaderContact;
+}
+
 RaftLog const& RaftNode::Log() const noexcept
 {
     return _log;
@@ -187,6 +192,7 @@ void RaftNode::NoteLeaderContact(core::platform::SteadyTimePoint now)
     // beside it until nothing read one. Why this stayed a function of its own
     // rather than becoming `ArmElectionTimer` at the call sites is in the header.
     ArmElectionTimer(now);
+    _lastLeaderContact = now;
 }
 
 void RaftNode::NoteFollowerContact(NodeId const& follower, core::platform::SteadyTimePoint now)

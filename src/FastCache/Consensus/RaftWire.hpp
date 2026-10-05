@@ -52,7 +52,9 @@ namespace FastCache::Consensus::RaftWire
 /// connection := Challenge(acceptor -> dialler)
 ///               Proof(dialler -> acceptor)
 ///               Verdict(acceptor -> dialler)
-///               (frame [32-byte tag])*   dialler -> acceptor, once Accepted
+///               (frame [32-byte tag])*   dialler -> acceptor, once Accepted, and
+///                                        acceptor -> dialler too when the proof asked
+///                                        for `SessionDirection::TwoWay`
 /// ```
 ///
 /// The first three are the HANDSHAKE and carry no trailer: their own fields hold the
@@ -143,16 +145,24 @@ using WireVersion = WireFrame::Version;
 /// challenge and a proof each carry an X25519 ephemeral key, from which the two ends agree a
 /// session key nobody else holds. A version 3 peer's handshake is refused by its arity before
 /// any field is read -- and should it ever decode, it proves nothing this build can check.
-inline constexpr WireVersion CurrentVersion = 4;
+///
+/// 5 since the office-fleet flag day, and it is the grammar a fourth time: the proof carries a
+/// sixth field, the `SessionDirection` it asks for, and the session keys are derived per direction
+/// under their own label (`fastcache-raft-session-v3`). A version 4 peer's five-field proof is
+/// refused by its VERSION before any field is read, so the mismatch is reported as the unsupported
+/// version it is rather than as a malformed proof -- which is what a version 4 peer built before the
+/// field and one built after it said to each other while both named 4.
+inline constexpr WireVersion CurrentVersion = 5;
 
 /// The oldest version this build still accepts.
 ///
 /// Equal to `CurrentVersion`: a version 1 peer authenticates nothing, and accepting
 /// one would be the per-connection fallback #1308 exists to refuse; a version 2 peer
 /// spells a configuration this build cannot read (#1449); a version 3 peer proves only that
-/// it holds the key every member shares, which is exactly what #178 stopped accepting. So
-/// the consensus members of a fleet upgrade together.
-inline constexpr WireVersion MinSupportedVersion = 4;
+/// it holds the key every member shares, which is exactly what #178 stopped accepting; and a
+/// version 4 peer's proof names no session direction, so the two ends could not agree which keys
+/// seal which way. So the consensus members of a fleet upgrade together.
+inline constexpr WireVersion MinSupportedVersion = 5;
 
 /// Size of the fixed frame header: magic, version, type, payload length.
 inline constexpr std::size_t HeaderSize = WireFrame::HeaderSize;
@@ -333,12 +343,13 @@ inline constexpr std::array MessageTable {
                         .name = "Challenge",
                         .fieldCount = 2,
                         .phase = FramePhase::Handshake(Detail::HandshakeCeiling({ NonceBytes, EphemeralKeySize })) },
-    // The dialler's id, the id it dialled, its nonce, its ephemeral key, and its signature.
+    // The dialler's id, the id it dialled, the session direction it asks for, its nonce, its
+    // ephemeral key, and its signature.
     MessageDescriptor { .type = MessageType::Proof,
                         .name = "Proof",
-                        .fieldCount = 5,
+                        .fieldCount = 6,
                         .phase = FramePhase::Handshake(Detail::HandshakeCeiling(
-                            { MaxHandshakeIdBytes, MaxHandshakeIdBytes, NonceBytes, EphemeralKeySize, SignatureSize })) },
+                            { MaxHandshakeIdBytes, MaxHandshakeIdBytes, 1, NonceBytes, EphemeralKeySize, SignatureSize })) },
     // The verdict, the acceptor's id, and its signature.
     MessageDescriptor { .type = MessageType::Verdict,
                         .name = "Verdict",
@@ -917,6 +928,21 @@ static_assert(static_cast<std::uint8_t>(HandshakeVerdict::OwnId) == 1, "Handshak
 static_assert(static_cast<std::uint8_t>(HandshakeVerdict::Accepted) == 2, "HandshakeVerdict ordinals are a wire contract");
 static_assert(static_cast<std::uint8_t>(HandshakeVerdict::KeyRevoked) == 3, "HandshakeVerdict ordinals are a wire contract");
 
+/// Which way Raft frames flow on one connection.
+///
+/// **TRANSMITTED: the ordinal is the proof's direction byte**, and it is inside the dialler's
+/// signature and the acceptor's -- so a relay cannot turn a connection the dialler only writes
+/// on into one the acceptor writes on as well. Append only; `Last` never travels.
+enum class SessionDirection : std::uint8_t
+{
+    OneWay = 0, ///< Dialler to acceptor only; replies ride the other member's own dial (voter to voter).
+    TwoWay = 1, ///< The acceptor also writes to the dialler here: a member nobody dials, dialling in.
+    Last = 2,   ///< Not a direction, and never travels. See `DecodeWireEnum`.
+};
+
+static_assert(static_cast<std::uint8_t>(SessionDirection::OneWay) == 0, "SessionDirection ordinals are a wire contract");
+static_assert(static_cast<std::uint8_t>(SessionDirection::TwoWay) == 1, "SessionDirection ordinals are a wire contract");
+
 /// The acceptor's opening: its fresh values, before it has read a byte.
 struct ChallengeFrame
 {
@@ -930,8 +956,9 @@ struct ChallengeFrame
 /// The dialler's proof of who it is.
 struct ProofFrame
 {
-    NodeId dialler;                ///< Who is dialling.
-    NodeId target;                 ///< Which member it believes it dialled.
+    NodeId dialler;                                          ///< Who is dialling.
+    NodeId target;                                           ///< Which member it believes it dialled.
+    SessionDirection direction { SessionDirection::OneWay }; ///< Which way frames flow once it is accepted.
     Nonce nonce {};                ///< The dialler's own nonce, so the acceptor's answer is fresh too.
     X25519PublicKey ephemeral {};  ///< The dialler's half of the Diffie-Hellman exchange.
     Ed25519Signature signature {}; ///< The dialler's signature over the whole transcript so far.
@@ -969,8 +996,10 @@ struct VerdictFrame
 /// @return The framed handshake message. It carries no trailer.
 [[nodiscard]] inline std::vector<std::byte> EncodeProof(ProofFrame const& proof, WireVersion version = CurrentVersion)
 {
+    auto const direction = Detail::EnumField(proof.direction);
     std::array const fields { WireFields::AsBytes(proof.dialler),
                               WireFields::AsBytes(proof.target),
+                              std::span<std::byte const> { direction },
                               std::span<std::byte const> { proof.nonce },
                               std::span<std::byte const> { proof.ephemeral },
                               std::span<std::byte const> { proof.signature } };
@@ -1111,16 +1140,20 @@ namespace Detail
         .and_then([](auto const& fields) -> std::expected<ProofFrame, ConsensusError> {
             auto dialler = Detail::HandshakeId(fields[0]);
             auto target = Detail::HandshakeId(fields[1]);
-            auto const nonce = Detail::FixedField<NonceBytes>(fields[2]);
-            auto const ephemeral = Detail::FixedField<EphemeralKeySize>(fields[3]);
-            auto const signature = Detail::FixedField<SignatureSize>(fields[4]);
+            auto const direction = Detail::DecodeEnum<SessionDirection>(fields[2]);
+            auto const nonce = Detail::FixedField<NonceBytes>(fields[3]);
+            auto const ephemeral = Detail::FixedField<EphemeralKeySize>(fields[4]);
+            auto const signature = Detail::FixedField<SignatureSize>(fields[5]);
             if (!dialler.has_value() || !target.has_value())
                 return std::unexpected { MalformedWireFrame("Proof: an id is empty, too long, or not UTF-8") };
+            if (!direction.has_value())
+                return std::unexpected { MalformedWireFrame("Proof: the direction names no known session shape") };
             if (!nonce.has_value() || !ephemeral.has_value() || !signature.has_value())
                 return std::unexpected { MalformedWireFrame(
                     "Proof: the nonce, the ephemeral key or the signature is the wrong width") };
             return ProofFrame { .dialler = *std::move(dialler),
                                 .target = *std::move(target),
+                                .direction = *direction,
                                 .nonce = *nonce,
                                 .ephemeral = *ephemeral,
                                 .signature = *signature };

@@ -114,7 +114,7 @@ namespace
     {
         if (control != CTRL_C_EVENT && control != CTRL_BREAK_EVENT)
             return FALSE;
-        auto const event = stopEvent.load(std::memory_order_acquire);
+        auto* const event = stopEvent.load(std::memory_order_acquire);
         if (!stopClaimed.load(std::memory_order_acquire) || event == nullptr)
             return FALSE;
         (void) ::SetEvent(event);
@@ -128,7 +128,7 @@ namespace
     {
         if (stopEvent.load(std::memory_order_acquire) != nullptr)
             return {};
-        auto const event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        auto* const event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (event == nullptr)
             return std::unexpected(std::format("cannot create an event: {}",
                                                std::system_category().message(static_cast<int>(::GetLastError()))));
@@ -609,7 +609,7 @@ std::expected<std::unique_ptr<IStopSignal>, std::string> InstallStopSignal()
 std::intptr_t StopSignalHandlerEnd() noexcept
 {
 #if defined(_WIN32)
-    auto const event = stopEvent.load(std::memory_order_acquire);
+    auto* const event = stopEvent.load(std::memory_order_acquire);
     return event == nullptr ? -1 : static_cast<std::intptr_t>(reinterpret_cast<std::uintptr_t>(event));
 #else
     return stopPipeWrite.load(std::memory_order_acquire);

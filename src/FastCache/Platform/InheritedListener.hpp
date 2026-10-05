@@ -2,7 +2,9 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -113,5 +115,40 @@ inline constexpr int ActivationFirstDescriptor = 3;
 /// @return The handed-over descriptors, in the supervisor's order, already marked
 ///         close-on-exec; empty when there was no handoff, which is not an error.
 [[nodiscard]] std::vector<int> AdoptInheritedDescriptors();
+
+/// What a process does with a descriptor a supervisor handed it, once it keeps the descriptor for
+/// itself and hands its users COPIES: the seam a test substitutes, since the handoff happens once
+/// per process and a copy is a system call.
+class IInheritedDescriptors
+{
+  public:
+    IInheritedDescriptors() = default;
+    IInheritedDescriptors(IInheritedDescriptors const&) = delete;
+    IInheritedDescriptors(IInheritedDescriptors&&) = delete;
+    IInheritedDescriptors& operator=(IInheritedDescriptors const&) = delete;
+    IInheritedDescriptors& operator=(IInheritedDescriptors&&) = delete;
+    virtual ~IInheritedDescriptors() = default;
+
+    /// A new descriptor for the same open socket, marked close-on-exec as the original is.
+    /// @param descriptor A descriptor this process holds.
+    /// @return The copy, which its taker owns; or why none could be made.
+    [[nodiscard]] virtual std::expected<int, std::string> Duplicate(int descriptor) const = 0;
+
+    /// Close @p descriptor, which the caller owns.
+    /// @param descriptor The descriptor.
+    virtual void Close(int descriptor) const noexcept = 0;
+};
+
+/// The system's: `fcntl(F_DUPFD_CLOEXEC)` and `close`. Windows hands nothing over
+/// (`AdoptInheritedDescriptors`), so there every duplicate is refused and nothing is ever closed.
+class SystemInheritedDescriptors final: public IInheritedDescriptors
+{
+  public:
+    /// @copydoc IInheritedDescriptors::Duplicate
+    [[nodiscard]] std::expected<int, std::string> Duplicate(int descriptor) const override;
+
+    /// @copydoc IInheritedDescriptors::Close
+    void Close(int descriptor) const noexcept override;
+};
 
 } // namespace FastCache

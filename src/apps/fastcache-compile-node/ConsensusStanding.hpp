@@ -3,12 +3,49 @@
 
 #include <FastCache/Consensus/RaftTypes.hpp>
 
+#include <algorithm>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 
 namespace FastCache::Node
 {
+
+/// Whether the state this node's consensus applied has caught up with the log it recovered at start.
+///
+/// PRIVATE: persisted and transmitted nowhere -- what travels is the refusal it selects
+/// (`RosterNotYetApplied`). Three answers, because "no tier to ask" is neither of the others, and a
+/// `bool` would have to call it one of them.
+enum class AppliedStateReading : std::uint8_t
+{
+    /// No tier answers: consensus has not started yet, or this process is stopping.
+    Unknown,
+    /// Applied short of the log it recovered: a key the cluster holds may not be in the roster yet.
+    Behind,
+    /// Applied through what it recovered: a key the roster lacks is one the state it applied lacks.
+    CaughtUp,
+};
+
+/// The reading for a node that has applied through @p applied, holds a log through @p lastLog, and
+/// recovered a log through @p recovered when it started.
+///
+/// **Through the SHORTER of the recovered log and the log it holds now**: a follower's recovered tail
+/// may be entries no leader ever committed, which its leader then truncates and may never write past
+/// again -- measured against the recovered index alone, such a node would answer "not yet" forever.
+/// Against the log it holds it catches up the moment it applies what its leader committed. A node that
+/// recovered no log at all (a first start) has nothing to catch up with.
+/// @param applied The highest index applied, consensus' own entries included.
+/// @param lastLog The last index its log holds now.
+/// @param recovered The last index its log held when it started.
+/// @return `Behind` or `CaughtUp`.
+[[nodiscard]] constexpr AppliedStateReading AppliedStateOf(Consensus::LogIndex applied,
+                                                           Consensus::LogIndex lastLog,
+                                                           Consensus::LogIndex recovered) noexcept
+{
+    return applied.value >= std::min(recovered.value, lastLog.value) ? AppliedStateReading::CaughtUp
+                                                                     : AppliedStateReading::Behind;
+}
 
 /// Where this node sits in its own consensus configuration, asked when somebody asks (#1449).
 ///
@@ -33,6 +70,12 @@ class IConsensusStandingSource
     /// @return The standing, or nullopt when there is nothing to ask -- nothing attached yet,
     ///         or this process is stopping.
     [[nodiscard]] virtual std::optional<Consensus::Standing> CurrentStanding() const = 0;
+
+    /// Whether the state this node applied has caught up with the log it recovered at start
+    /// (`AppliedStateOf`) -- what decides whether a key absent from its roster is absent from its
+    /// cluster or only not applied yet (`NodeProofResponder`).
+    /// @return The reading; never `Unknown` from a tier, which exists only while consensus runs.
+    [[nodiscard]] virtual AppliedStateReading CurrentAppliedState() const = 0;
 };
 
 /// The consensus tier's standing, attached once the tier exists and detached before it goes.
@@ -95,6 +138,13 @@ class ConsensusStandingSlot final: public IConsensusStandingSource
     {
         std::shared_lock const guard { _mutex };
         return _source != nullptr ? _source->CurrentStanding() : std::nullopt;
+    }
+
+    /// @return The attached source's answer, or `Unknown` when none is attached.
+    [[nodiscard]] AppliedStateReading CurrentAppliedState() const override
+    {
+        std::shared_lock const guard { _mutex };
+        return _source != nullptr ? _source->CurrentAppliedState() : AppliedStateReading::Unknown;
     }
 
   private:

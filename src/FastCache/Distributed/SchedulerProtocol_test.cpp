@@ -3,6 +3,7 @@
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -12,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <span>
 #include <string>
@@ -21,6 +23,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -43,8 +46,13 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 /// A machine the fleet has admitted by the identity it proved, which is what every verb a machine
-/// joins the fleet with needs since #178.
-CallerContext const Insider { .membership = Membership::Member, .peerId = "peer-1", .provenNodeId = "node-1" };
+/// joins the fleet with needs since #178 -- and a proof identifies its caller. A VOTER's, so it also
+/// has the operator's standing the control verbs require; a learner's is the W-1 case below.
+CallerContext const Insider { .membership = Membership::Member,
+                              .peerId = "peer-1",
+                              .provenNodeId = "node-1",
+                              .identified = true,
+                              .operatorStanding = true };
 
 /// A caller the fleet admits by its ADDRESS and that proved nothing: a client, which may lease and
 /// may not join.
@@ -191,6 +199,32 @@ TEST_CASE("A version outside the range is told what would have worked", "[distri
     CHECK(text.contains("supported versions"));
 
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion) == 1);
+}
+
+TEST_CASE("A version-14 LEASE in its own three-field grammar is refused by number, never read as malformed",
+          "[distributed][scheduler][protocol][version]")
+{
+    // What a launcher built before the office-fleet flag day sends: LEASE as three fields
+    // (fingerprint, key, codecs) at version byte 0x0E. The version-15 request is five, so a reader
+    // that got past the header would refuse it as malformed -- a version mismatch reported as a broken
+    // client. Refused on the NUMBER instead, naming the range, and counted as a version refusal.
+    Fixture fixture;
+    auto const payload = WireFields::Encode({ WireFields::AsBytes("fp"), WireFields::AsBytes("k"), {} });
+    auto frame = std::vector<std::byte>(Wire::RequestHeaderSize + payload.size());
+    WireFrame::PutHeader(frame,
+                         Wire::Magic,
+                         static_cast<Wire::WireVersion>(14),
+                         static_cast<std::uint8_t>(Wire::Op::Lease),
+                         static_cast<std::uint32_t>(payload.size()));
+    std::ranges::copy(payload, frame.begin() + static_cast<std::ptrdiff_t>(Wire::RequestHeaderSize));
+    REQUIRE(std::to_integer<unsigned>(frame[1]) == 0x0E);
+
+    auto const reply = fixture.protocol.Answer(frame, Insider);
+    REQUIRE(ErrorOf(reply) == Wire::ErrorCode::UnsupportedVersion);
+    auto const text = PayloadOf(reply).subspan(1);
+    CHECK(std::string_view { reinterpret_cast<char const*>(text.data()), text.size() } == "supported versions 15..15");
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion) == 1);
+    CHECK(ErrorOf(reply) != Wire::ErrorCode::MalformedFrame);
 }
 
 TEST_CASE("A frame that is not this protocol is the one condition that closes", "[distributed][scheduler][protocol]")
@@ -1015,4 +1049,223 @@ TEST_CASE("Exactly the verbs a machine joins the fleet with require a proven ide
         INFO(row.name);
         CHECK((row.identity == Wire::IdentityRequirement::ProvenNodeOnly) == joins);
     }
+}
+
+TEST_CASE("An operator's control verb is refused a caller only --fleet-open admitted, by name and counted",
+          "[distributed][scheduler][protocol][admission][security]")
+{
+    // With the scheduler's password gone, what stood between an anonymous caller on a --fleet-open
+    // node and `CLUSTER-ADMIT` was membership -- and --fleet-open makes everybody a member. So the
+    // control verbs ask the verb column (`IdentityRequirement::IdentifiedCaller`) of a context the
+    // production fold built, and the route table says --fleet-open identifies nobody.
+    Fixture fixture;
+    Testing::OpenFleetFold fold;
+    auto const contextOf = [&fold](ConnectionFacts facts) {
+        return CallerContextOf(fold.admitted, std::move(facts));
+    };
+    auto const anonymous = contextOf(Testing::OpenFleetFold::Anonymous());
+    REQUIRE(anonymous.membership == Membership::Member); // admitted: the open policy is working
+    CHECK_FALSE(anonymous.identified);
+
+    constexpr auto ControlVerbs = std::array {
+        Wire::Op::ClusterSet,
+        Wire::Op::ClusterForget,
+        Wire::Op::ClusterAdmit,
+        Wire::Op::ClusterAdmitLearner,
+    };
+    auto refused = std::uint64_t { 0 };
+    for (auto const op: ControlVerbs)
+    {
+        INFO("op " << static_cast<int>(op));
+        auto const refusal = fixture.protocol.RefusePeer(anonymous, static_cast<std::uint8_t>(op));
+        REQUIRE(refusal.has_value());
+        CHECK(ErrorOf(Unwrap(refusal)) == Wire::ErrorCode::IdentifiedCallerRequired);
+        ++refused;
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired) == refused);
+    }
+
+    // The same refusal after the payload is read, for a caller of `Answer` that never asked the door.
+    auto const late =
+        fixture.protocol.Answer(Wire::EncodeClusterSet(Wire::ClusterSetRequest { .name = "k", .value = "v" }), anonymous);
+    CHECK(ErrorOf(late) == Wire::ErrorCode::IdentifiedCallerRequired);
+
+    // What identifies a caller is admitted to every one of them: a ticket, a proof, this machine.
+    for (auto const& [what, facts]: { std::pair { "a ticket", Testing::OpenFleetFold::Ticketed() },
+                                      std::pair { "a proof", Testing::OpenFleetFold::Proven() },
+                                      std::pair { "loopback", Testing::OpenFleetFold::Local() } })
+    {
+        INFO(what);
+        auto const caller = contextOf(facts);
+        CHECK(caller.identified);
+        for (auto const op: ControlVerbs)
+            CHECK_FALSE(fixture.protocol.RefusePeer(caller, static_cast<std::uint8_t>(op)).has_value());
+    }
+
+    // And the verbs a client sends are not control verbs: the anonymous caller still leases.
+    CHECK_FALSE(fixture.protocol.RefusePeer(anonymous, static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
+}
+
+TEST_CASE("The retired worker admission is an unknown opcode to a ticketed and a proven caller alike",
+          "[distributed][scheduler][protocol][admission][retired]")
+{
+    // 0x1D was CLUSTER-ADMIT-WORKER, which admitted a principal by its key. Principal mode is
+    // retired, so the byte is in `RetiredOpcodes` and no row claims it. A caller that identifies
+    // itself -- by a ticket, or by a proven key, either of which passed the identified-caller
+    // door this verb once asked -- is refused it as an unknown opcode by name, counted as one,
+    // and never as a refusal about WHO asked: no identity can make a retired verb run.
+    Fixture fixture;
+    Testing::OpenFleetFold fold;
+    REQUIRE(std::ranges::contains(Wire::RetiredOpcodes, std::uint8_t { 0x1D }));
+    REQUIRE(Wire::FindOp(0x1D) == nullptr);
+
+    // What an earlier build sent: an admission's fields under the retired byte.
+    auto retired = Wire::EncodeClusterAdmit<Wire::Op::ClusterAdmitLearner>(
+        Wire::ClusterAdmitRequest { .memberId = "w9", .raftEndpoint = {}, .publicKey = std::nullopt });
+    REQUIRE(retired[2] == std::byte { static_cast<std::uint8_t>(Wire::Op::ClusterAdmitLearner) });
+    retired[2] = std::byte { 0x1D };
+
+    auto refusedUnknown = std::uint64_t { 0 };
+    for (auto const& [what, facts]: { std::pair { "a ticket", Testing::OpenFleetFold::Ticketed() },
+                                      std::pair { "a proof", Testing::OpenFleetFold::Proven() } })
+    {
+        INFO(what);
+        auto const caller = CallerContextOf(fold.admitted, facts);
+        REQUIRE(caller.identified);
+
+        // The door asks no identity of a byte no row claims; the refusal comes after the header.
+        CHECK_FALSE(fixture.protocol.RefusePeer(caller, 0x1D).has_value());
+        auto const reply = fixture.protocol.Answer(retired, caller);
+        CHECK(StatusOf(reply) == Wire::Status::Error);
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::UnknownOpcode);
+        ++refusedUnknown;
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnknownOpcode) == refusedUnknown);
+    }
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired) == 0);
+
+    // The control: the same bytes under the learner admission's own opcode are a verb this
+    // scheduler knows, so they are NOT refused as unknown.
+    retired[2] = std::byte { static_cast<std::uint8_t>(Wire::Op::ClusterAdmitLearner) };
+    CHECK(ErrorOf(fixture.protocol.Answer(retired, CallerContextOf(fold.admitted, Testing::OpenFleetFold::Proven())))
+          != Wire::ErrorCode::UnknownOpcode);
+}
+
+TEST_CASE("An operator's control verb is refused a learner's ticket and a learner's proven key, by name and counted",
+          "[distributed][scheduler][protocol][admission][security][operator-standing]")
+{
+    // W-1: a machine ticket proves a fleet MACHINE, not an operator -- any process on an admitted laptop
+    // can have its node mint one. So the control verbs ask for an operator's standing: this machine,
+    // or an identity whose machine holds a voter's seat in the applied state. Every control verb
+    // this surface serves, read FROM THE TABLE, so a verb that joins the column is asked here too.
+    Fixture fixture;
+    Testing::OpenFleetFold fold;
+    auto const contextOf = [&fold](ConnectionFacts facts) {
+        return CallerContextOf(fold.admitted, std::move(facts));
+    };
+    std::vector<Wire::OpDescriptor> controlVerbs;
+    std::ranges::copy_if(Wire::OpTable, std::back_inserter(controlVerbs), [](Wire::OpDescriptor const& row) {
+        return row.identity == Wire::IdentityRequirement::OperatorStanding && row.family == Wire::VerbFamily::Scheduler;
+    });
+    REQUIRE(controlVerbs.size() == 4); // admit, admit-learner, forget, set (admit-worker is retired)
+    auto const counted = [&fixture] {
+        return fixture.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedOperatorStandingRequired);
+    };
+
+    auto refused = std::uint64_t { 0 };
+    for (auto const& [what, facts]: { std::pair { "a learner's ticket", Testing::OpenFleetFold::LearnerTicketed() },
+                                      std::pair { "a learner's proven key", Testing::OpenFleetFold::LearnerProven() } })
+    {
+        INFO(what);
+        auto const learner = contextOf(facts);
+        // Admitted and identified: the refusal is about STANDING, not about who the caller is.
+        REQUIRE(learner.membership == Membership::Member);
+        REQUIRE(learner.identified);
+        CHECK_FALSE(learner.operatorStanding);
+        for (auto const& row: controlVerbs)
+        {
+            INFO(row.name);
+            auto const refusal = fixture.protocol.RefusePeer(learner, static_cast<std::uint8_t>(row.code));
+            REQUIRE(refusal.has_value());
+            CHECK(ErrorOf(Unwrap(refusal)) == Wire::ErrorCode::OperatorStandingRequired);
+            CHECK(counted() == ++refused);
+        }
+        // A client verb is still served: a ticket admits a CALLER.
+        CHECK_FALSE(fixture.protocol.RefusePeer(learner, static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
+    }
+    // The anonymous caller's series did not move: these were identified callers.
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired) == 0);
+
+    // After the payload too, and the message names the remedy.
+    auto const late = fixture.protocol.Answer(Wire::EncodeClusterSet(Wire::ClusterSetRequest { .name = "k", .value = "v" }),
+                                              contextOf(Testing::OpenFleetFold::LearnerTicketed()));
+    CHECK(ErrorOf(late) == Wire::ErrorCode::OperatorStandingRequired);
+    auto const message = Wire::DecodeErrorPayload(PayloadOf(late));
+    REQUIRE(message.has_value());
+    CHECK(Unwrap(message).second.contains("run it on a voter, or promote this machine"));
+    CHECK(counted() == ++refused);
+
+    // A voter's ticket and this machine are accepted at every one of them.
+    for (auto const& [what, facts]: { std::pair { "a voter's ticket", Testing::OpenFleetFold::Ticketed() },
+                                      std::pair { "a voter's proven key", Testing::OpenFleetFold::Proven() },
+                                      std::pair { "loopback", Testing::OpenFleetFold::Local() } })
+    {
+        INFO(what);
+        auto const caller = contextOf(facts);
+        CHECK(caller.operatorStanding);
+        for (auto const& row: controlVerbs)
+            CHECK_FALSE(fixture.protocol.RefusePeer(caller, static_cast<std::uint8_t>(row.code)).has_value());
+    }
+    CHECK(counted() == refused);
+}
+
+TEST_CASE("Where a worker was seen and what it answers on cross the wire into a grant's dial hint",
+          "[distributed][scheduler][protocol][dialhint]")
+{
+    // Through the framing, for the reason the whole-exchange case above gives: the service's
+    // own cases hand it the address lists directly, and would not notice an arm that decoded
+    // them and passed nothing on. Each hint below is reachable ONLY through the list its verb
+    // carried -- REGISTER's capacity record, then HEARTBEAT's load record.
+    Fixture fixture;
+    CallerContext const beforeReconnect { .membership = Membership::Member, .peerId = "10.8.0.7", .provenNodeId = "node-1" };
+    CallerContext const afterReconnect { .membership = Membership::Member, .peerId = "10.8.0.42", .provenNodeId = "node-1" };
+
+    Wire::CapacityFields capacity {};
+    capacity.interfaceAddresses = { "10.8.0.7" };
+    auto const registration = Wire::EncodeRegister(Wire::RegisterRequest {
+        .fingerprint = "gcc-14", .endpoint = "laptop.corp:7100", .slots = 1, .acceptedCodecs = {}, .capacity = capacity });
+    auto const admitted = fixture.protocol.Answer(registration, beforeReconnect);
+    REQUIRE(StatusOf(admitted) == Wire::Status::Ok);
+    auto const record = Wire::DecodeRegisterReply(PayloadOf(admitted));
+    REQUIRE(record.has_value());
+
+    auto const hintFor = [&fixture](std::string_view key) {
+        auto const granted = fixture.protocol.Answer(
+            Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = key, .acceptedCodecs = {} }), Insider);
+        REQUIRE(StatusOf(granted) == Wire::Status::Ok);
+        auto const grant = Wire::DecodeLeaseGrant(PayloadOf(granted));
+        REQUIRE(grant.has_value());
+        CHECK(Wire::AsStringView(Unwrap(grant).endpoint) == "laptop.corp:7100");
+        return std::string { Wire::AsStringView(Unwrap(grant).dialHint) };
+    };
+    CHECK(hintFor("k1") == "10.8.0.7:7100");
+
+    Wire::LoadFields load {};
+    load.interfaceAddresses = { "10.8.0.42" };
+    auto const beat = Wire::EncodeHeartbeat(Unwrap(record).workerId, /*inFlight=*/0, load);
+    REQUIRE(StatusOf(fixture.protocol.Answer(beat, afterReconnect)) == Wire::Status::Ok);
+    CHECK(hintFor("k2") == "10.8.0.42:7100");
+}
+
+TEST_CASE("A LEASE's toolchain label reaches the scheduler's unserved list",
+          "[distributed][scheduler][protocol][conditions]")
+{
+    // Through the protocol, not around it: a decoder that dropped the fourth field would leave the
+    // service tests green and every unserved toolchain unlabelled.
+    Fixture fixture;
+    auto const frame = Wire::EncodeLease(
+        Wire::LeaseRequest { .fingerprint = "fp-cl", .key = "k", .acceptedCodecs = {}, .toolchainLabel = "cl 19.44.35207" });
+    CHECK(ErrorOf(fixture.protocol.Answer(frame, Insider)) == Wire::ErrorCode::NoWorker);
+
+    auto const unserved = fixture.service.UnservedToolchainsNow();
+    REQUIRE(unserved.size() == 1);
+    CHECK(unserved.front().label == "cl 19.44.35207");
 }

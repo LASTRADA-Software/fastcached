@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ClusterAdminCli.hpp"
+#include "EndpointDialerTestUtils.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeCredential.hpp"
+#include "NodeFormation.hpp"
+#include "NodePresenceTier.hpp"
+#include "NodeProofClient.hpp"
 #include "RemoteUpstream.hpp"
 
 #include <FastCache/Config/YamlReader.hpp>
@@ -14,9 +18,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -34,10 +40,14 @@
 #include <core/net/IAsyncAddressResolver.hpp>
 #include <core/net/IConnector.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/LocalityFakes.hpp>
+#include <tests/NodeFormationFakes.hpp>
+#include <tests/NodeProofFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
+#include <tests/Unwrap.hpp>
 
-// **All three sites in one file, and that arrangement IS the test** (#404).
+// **Every site in one file, and that arrangement IS the test** (#404).
 //
 // `--requirepass` on this worker is presented and never required, and it was captured
 // by value at three construction sites: the cache tier's upstream client, the cluster
@@ -46,11 +56,13 @@
 // symptom is an authentication failure nobody can reproduce, on a machine nobody is
 // watching.
 //
-// The property is therefore "ONE rotation, THREE sites", and a suite that spreads it
-// across three files beside three implementations is a suite in which the third site
-// is the one nobody adds. Each case below rotates the same shape of source and reads
-// the bytes that went OUT, because a site holding a stale copy still returns a correct
-// object, still logs nothing, and still moves no counter.
+// Since then the heartbeat round presents NOTHING, and the case for it here says so: the
+// secret is the `--upstream` cache's, a scheduler checks no password, and presenting it
+// there handed it to every scheduler this node dialled. So the sites are two that rotate
+// and three rounds that must stay bare, and a suite spreading them across files is one in
+// which the next site is the one nobody adds. Each case reads the bytes that went OUT,
+// because a site holding a stale copy -- or presenting where it should not -- still
+// returns a correct object, still logs nothing, and still moves no counter.
 //
 // What is deliberately NOT asserted anywhere here is `ICredentialSource::Current()`
 // alone. A source that rotates while every site ignores it is precisely the bug, and a
@@ -70,6 +82,10 @@ constexpr std::string_view SecondSecret = "secret-after-rotation";
 constexpr std::chrono::milliseconds RefreshInterval { 30'000 };
 constexpr std::chrono::milliseconds ConnectTimeout { 1'000 };
 constexpr std::chrono::milliseconds IoTimeout { 5'000 };
+// Its own constant rather than reusing `RefreshInterval`: the two answer different
+// questions -- how long a resolved address is trusted, versus how long a failed
+// exchange is -- and neither case here ever fails, so nothing asserts this value.
+constexpr std::chrono::milliseconds UnreachableRetryInterval { 10'000 };
 
 /// A credential source an operator can be simulated rotating.
 ///
@@ -295,8 +311,17 @@ TEST_CASE("Site 1: the shared cache is asked with the secret in force NOW", "[no
     ScriptingConnector connector { AcceptedThen(Wire::EncodeReply(Wire::Status::Miss, {})) };
     core::platform::ManualClock clock;
 
-    RemoteUpstream upstream { "127.0.0.1:6674", credential, [](std::string_view) {}, connector, nullptr,
-                              resolver,         clock,      ConnectTimeout,          IoTimeout, RefreshInterval };
+    RemoteUpstream upstream { "127.0.0.1:6674",
+                              credential,
+                              [](std::string_view) {},
+                              connector,
+                              nullptr,
+                              resolver,
+                              clock,
+                              UpstreamTimings { .connectTimeout = ConnectTimeout,
+                                                .ioTimeout = IoTimeout,
+                                                .addressRefreshInterval = RefreshInterval,
+                                                .unreachableRetryInterval = UnreachableRetryInterval } };
 
     (void) core::async::syncRun(upstream.Fetch("k"));
     REQUIRE(connector.Dials() == 1);
@@ -323,8 +348,17 @@ TEST_CASE("Site 1, the other verb: a STORE presents the rotated secret too", "[n
     ScriptingConnector connector { AcceptedThen(Wire::EncodeReply(Wire::Status::Ok, {})) };
     core::platform::ManualClock clock;
 
-    RemoteUpstream upstream { "127.0.0.1:6674", credential, [](std::string_view) {}, connector, nullptr,
-                              resolver,         clock,      ConnectTimeout,          IoTimeout, RefreshInterval };
+    RemoteUpstream upstream { "127.0.0.1:6674",
+                              credential,
+                              [](std::string_view) {},
+                              connector,
+                              nullptr,
+                              resolver,
+                              clock,
+                              UpstreamTimings { .connectTimeout = ConnectTimeout,
+                                                .ioTimeout = IoTimeout,
+                                                .addressRefreshInterval = RefreshInterval,
+                                                .unreachableRetryInterval = UnreachableRetryInterval } };
 
     auto const value = std::vector<std::byte> { std::byte { 0x01 } };
     (void) core::async::syncRun(upstream.Store("k", value));
@@ -339,6 +373,30 @@ TEST_CASE("Site 1, the other verb: a STORE presents the rotated secret too", "[n
           == authOnly);
 }
 
+namespace
+{
+
+/// A per-endpoint credential that answers from @p source at every ask, for the site whose seam is
+/// `Cc::ICredentialFor`.
+class AskedAtTheExchange final: public Cc::ICredentialFor
+{
+  public:
+    explicit AskedAtTheExchange(ICredentialSource const& source) noexcept:
+        _source { source }
+    {
+    }
+
+    [[nodiscard]] Cc::PresentedCredential Present(std::string_view /*audience*/) override
+    {
+        return Cc::PresentedCredential { .credential = _source.Current() };
+    }
+
+  private:
+    ICredentialSource const& _source;
+};
+
+} // namespace
+
 TEST_CASE("Site 2: a cluster verb presents the secret in force NOW", "[node][credential][rotation]")
 {
     // This verb cannot observe a rotation in production -- it runs once and the
@@ -346,92 +404,170 @@ TEST_CASE("Site 2: a cluster verb presents the secret in force NOW", "[node][cre
     // property that outlives that fact: the site reads the source at the exchange,
     // so it cannot become the stale one when somebody calls it from a running worker.
     RotatingCredential credential { FirstSecret };
+    AskedAtTheExchange credentials { credential };
     auto notice = Cc::CredentialNotice::Silent();
     ClusterRequest const request { .action = ClusterAction::Status, .key = {}, .value = {}, .publicKey = std::nullopt };
 
     Testing::ScriptedSocket first { AcceptedThen(Wire::EncodeReply(Wire::Status::Ok, {})) };
-    (void) PutClusterRequest(first, notice, request, credential, "scheduler.example:6676");
+    (void) PutClusterRequest(first, notice, request, credentials, "scheduler.example:6676");
     CHECK(first.Sent() == AuthThen(FirstSecret, EncodeClusterRequest(request)));
 
     credential.Rotate(SecondSecret);
     Testing::ScriptedSocket second { AcceptedThen(Wire::EncodeReply(Wire::Status::Ok, {})) };
-    (void) PutClusterRequest(second, notice, request, credential, "scheduler.example:6676");
+    (void) PutClusterRequest(second, notice, request, credentials, "scheduler.example:6676");
 
     CHECK(second.Sent() == AuthThen(SecondSecret, EncodeClusterRequest(request)));
     CHECK(second.Sent() != first.Sent());
 }
 
-TEST_CASE("Site 3: a registration presents the secret in force NOW", "[node][credential][rotation]")
+namespace
 {
-    // The site that could not be shown at all before #404, because it lived in
-    // `main.cpp` -- the one translation unit no test reaches. `HeartbeatRound` held a
-    // `Cc::Credential const&` bound to a local `WorkerBody` built once, so this was
-    // the site a rotation was GUARANTEED to miss while the other two moved.
-    //
-    // Asserted on the REGISTER frame's leading AUTH rather than on the whole exchange:
-    // the registration's own payload carries this machine's capacity and a version
-    // string, which are not what this case is about and would make it fail on an
-    // unrelated wire change.
-    NodeConfig cfg;
-    cfg.schedulers = { "scheduler.example:6676" };
 
-    RotatingCredential credential { FirstSecret };
+/// Every framed request in @p sent, in order, by its declared length.
+/// @param sent What a scripted socket was written.
+/// @return One op byte per whole frame.
+[[nodiscard]] std::vector<std::uint8_t> OpsIn(std::span<std::byte const> sent)
+{
+    std::vector<std::uint8_t> ops;
+    while (sent.size() >= Wire::RequestHeaderSize)
+    {
+        auto const header = Wire::DecodeRequestHeader(sent);
+        if (!header.has_value())
+            break;
+        auto const whole = Wire::RequestHeaderSize + std::size_t { header->payloadLength };
+        if (sent.size() < whole)
+            break;
+        ops.push_back(header->opRaw);
+        sent = sent.subspan(whole);
+    }
+    return ops;
+}
+
+/// Whether @p secret appears anywhere in @p sent, framed or not.
+/// @param sent What a scripted socket was written.
+/// @param secret The password.
+/// @return True when its bytes are there.
+[[nodiscard]] bool Carries(std::span<std::byte const> sent, std::string_view secret)
+{
+    return !std::ranges::search(sent, Wire::AsBytes(secret)).empty();
+}
+
+/// Assert @p sent is exactly one @p verb frame: no `AUTH` before it and the secret nowhere.
+///
+/// The verb is the positive control. A parse that found no frame at all would satisfy "no
+/// `AUTH`" and "no secret" alike, so the case names what the round DID send.
+/// @param sent What the scheduler was written.
+/// @param verb The one request the round sends.
+void CheckBare(std::span<std::byte const> sent, Wire::Op verb)
+{
+    auto const ops = OpsIn(sent);
+    INFO("ops sent: " << ops.size());
+    CHECK(std::ranges::find(ops, static_cast<std::uint8_t>(Wire::Op::Auth)) == ops.end());
+    CHECK_FALSE(Carries(sent, FirstSecret));
+    CHECK(ops == std::vector<std::uint8_t> { static_cast<std::uint8_t>(verb) });
+}
+
+/// Every server has the one standing; never consulted where the scheduler serves no proof.
+class AnyServer final: public IServerTrust
+{
+  public:
+    [[nodiscard]] ServerStanding StandingOf(std::string_view /*serverId*/,
+                                            Ed25519PublicKey const& /*serverKey*/) const override
+    {
+        return ServerStanding::Voter;
+    }
+
+    /// @copydoc IServerTrust::Expected
+    [[nodiscard]] std::string_view Expected() const override
+    {
+        return "a voter";
+    }
+};
+
+} // namespace
+
+TEST_CASE("No round a node sends a scheduler presents the password whatever is configured", "[node][credential][scheduler]")
+{
+    // `--requirepass` is the secret of the cache behind `--upstream`. A scheduler checks no
+    // password -- it answers a password AUTH `Ok` and establishes nothing -- so these rounds,
+    // which #404 made present the CURRENT secret, were handing it in the clear, pipelined
+    // ahead of any seal, to every `--scheduler` and to every endpoint a `NotLeader` named. The
+    // node proof is this machine's credential with a scheduler.
+    //
+    // The secret is configured in every section and the round is the production one, so a
+    // round that read `cfg.requirePass` again -- or an exchange that presented anything --
+    // shows up in the bytes.
+    auto cfg = Testing::LearnerRegisteringWith(NodeConfig {}, { "scheduler.example:6676" });
+    cfg.requirePass = FirstSecret;
+
     AtomicMetricsSink metrics;
     NullLogger logger;
     SilentLoadSampler loadSampler;
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
-    std::atomic<bool> fleetMismatch { false };
-
-    Cc::CredentialNotice notice = Cc::CredentialNotice::Silent();
+    Testing::ThisMachineIs const locality {};
+    std::atomic<bool> addressCapNoticed { false };
     std::vector<Cc::WorkerRegistrar> registrars;
-    registrars.emplace_back(notice, "gcc-14", "10.0.0.2:6677", 1U, Wire::CodecList {}, Wire::CapacityFields {});
-
-    // Empty here: this case is about which credential a round PRESENTS, and a
-    // withdrawal presents the same one through the same seam. Covered on its own in
-    // `NodeAnnounce_test.cpp` rather than folded in as a second subject.
+    registrars.emplace_back("gcc-14", "10.0.0.2:6677", 1U, Wire::CodecList {}, Wire::CapacityFields {});
     std::vector<Cc::WorkerRegistrar> withdrawals;
 
-    HeartbeatRound const round { .cfg = cfg,
-                                 .registrars = registrars,
-                                 .withdrawals = withdrawals,
-                                 .capacity = capacity,
-                                 .loadSampler = loadSampler,
-                                 .cacheTier = nullptr,
-                                 .metrics = metrics,
-                                 .credential = credential,
-                                 .notice = notice,
-                                 // Nothing proves: every case in this file is about the announce
-                                 // round itself, against a scripted fleet that serves no handshake
-                                 // (#178). The proof is `FrameEndpoint_test`'s, over a real socket.
-                                 .prover = nullptr,
-                                 .lease = lease,
-                                 .fleetMismatch = fleetMismatch,
-                                 .logger = logger };
+    core::platform::ManualClock reachabilityClock;
+    SchedulerReachability reachability { reachabilityClock };
+    auto const key = Testing::TestKeyPair("worker-a");
+    AnyServer const trust;
+    Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+    NodeProofClient const prover { "worker-a", key, trust, nullptr, nullptr, random };
 
-    auto const authFor = [](std::string_view secret) {
-        return Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = std::string { secret } });
-    };
-    auto const leadingAuth = [](Testing::ScriptedSocket const& socket, std::size_t length) {
-        auto const& sent = socket.Sent();
-        if (sent.size() < length)
-            return std::vector<std::byte> {};
-        return std::vector<std::byte> { sent.begin(), sent.begin() + static_cast<std::ptrdiff_t>(length) };
+    auto const roundProvedBy = [&](NodeProofClient const* proving) {
+        return HeartbeatRound { .cfg = cfg,
+                                .registrars = registrars,
+                                .withdrawals = withdrawals,
+                                .capacity = capacity,
+                                .loadSampler = loadSampler,
+                                .locality = locality,
+                                .addressCapNoticed = addressCapNoticed,
+                                .cacheTier = nullptr,
+                                .metrics = metrics,
+                                .prover = proving,
+                                .lease = lease,
+                                .logger = logger,
+                                .reachability = reachability };
     };
 
-    Testing::ScriptedSocket first { AcceptedThen(Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today")) };
-    (void) AnnounceOnce(round, first, cfg.schedulers.front());
-    CHECK(leadingAuth(first, authFor(FirstSecret).size()) == authFor(FirstSecret));
+    SECTION("a registration")
+    {
+        Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today") };
+        (void) AnnounceOnce(roundProvedBy(nullptr), scheduler, SchedulersOf(cfg, AsConfigured).front());
+        CheckBare(scheduler.Sent(), Wire::Op::Register);
+    }
 
-    credential.Rotate(SecondSecret);
-    Testing::ScriptedSocket second { AcceptedThen(Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today")) };
-    (void) AnnounceOnce(round, second, cfg.schedulers.front());
+    SECTION("the proof that opens every round")
+    {
+        // A node running no consensus serves no proof: the round stops at the challenge, which
+        // is the first thing any connection to a scheduler carries.
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NoCluster, "no consensus here") } };
+        auto link = Testing::Unwrap(SchedulerLink::For(SchedulersOf(cfg, AsConfigured)));
+        CHECK(AnnounceRound(roundProvedBy(&prover), link, dialer) == 0);
+        CheckBare(dialer.SentOn(0), Wire::Op::NodeChallenge);
+    }
 
-    CHECK(leadingAuth(second, authFor(SecondSecret).size()) == authFor(SecondSecret));
-    // The round is `const` and was built once, before the rotation. That is the whole
-    // point: a `Cc::Credential` member here could not have moved, and this assertion
-    // is what says the member is a seam rather than a value.
-    CHECK(leadingAuth(second, authFor(FirstSecret).size()) != authFor(FirstSecret));
+    SECTION("a presence announcement")
+    {
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today") } };
+        auto link = Testing::Unwrap(SchedulerLink::For(SchedulersOf(cfg, AsConfigured)));
+        Wire::CapacityFields const machine {};
+        Wire::LoadFields const load {};
+        CHECK_FALSE(AnnouncePresence(PresenceMessage { .endpoint = "10.0.0.2:6677",
+                                                       .capacity = machine,
+                                                       .load = load,
+                                                       .logger = logger,
+                                                       .prover = nullptr,
+                                                       .reachability = reachability,
+                                                       .joinMemos = {} },
+                                     link,
+                                     dialer));
+        CheckBare(dialer.SentOn(0), Wire::Op::NodeAnnounce);
+    }
 }
 
 TEST_CASE("The production source answers from the LIVE snapshot, not the startup one", "[node][credential][rotation]")
@@ -446,15 +582,12 @@ TEST_CASE("The production source answers from the LIVE snapshot, not the startup
     // fail at the `CHECK` -- and those are two different repairs in two different
     // files, which is why they are separate assertions rather than one.
     Testing::ScratchDirectory const scratch { "node-credential-rotation" };
-    // A state directory in both, because a node naming a scheduler must keep an identity (#178)
+    // A state directory in both, because a node that registers must keep an identity (#178)
     // and `cluster_dir` is not reloadable: a file and a live configuration disagreeing about it
     // would make this reload refuse for a reason that has nothing to do with the credential.
-    auto const path = WriteConfig(
-        scratch.Path(),
-        std::format("scheduler: scheduler.example:6676\ncluster_dir: node-state\nrequirepass: {}\n", SecondSecret));
+    auto const path = WriteConfig(scratch.Path(), std::format("cluster_dir: node-state\nrequirepass: {}\n", SecondSecret));
 
     NodeConfig initial;
-    initial.schedulers = { "scheduler.example:6676" };
     initial.clusterDir = "node-state";
     initial.requirePass = std::string { FirstSecret };
 
@@ -484,19 +617,27 @@ TEST_CASE("A worker with no configuration file presents what it was started with
     CHECK(credential.Current().Configured());
 }
 
-TEST_CASE("Only the seam derives a credential from the configuration", "[node][credential][seam]")
+namespace
 {
-    // **The guard is a scan, because nothing forces a site to reach for the seam.**
-    //
-    // The type system stops a site that HOLDS an `ICredentialSource const&` from going
-    // stale -- there is no field to be stale in. It says nothing about a fourth site
-    // that never asks for one and builds its own `Cc::Credential` from `cfg.token`
-    // instead, which is exactly what the three sites this ticket is about did. That is
-    // the rulebook's split: a guard folded INTO the operation is self-enforcing, a
-    // guard nothing compels needs a scan.
-    //
-    // Test sources are excluded and they must be: this very file constructs
-    // credentials, which is what makes it able to say what a rotation looks like.
+
+/// One non-test source of this binary's directory, with its full-line comments dropped.
+struct NodeSource
+{
+    std::string name; ///< Its file name.
+    std::string code; ///< Its text, every line that is only a `//` comment blanked.
+};
+
+/// Every non-test `.cpp` and `.hpp` of `src/apps/fastcache-compile-node`, read whole.
+///
+/// **The `[node][credential][seam]` cases walk this, and that is why they are scans**: nothing
+/// forces a site to reach for the seam, or a leg to hold no source. A guard folded INTO an
+/// operation is self-enforcing; a guard nothing compels needs a scan.
+///
+/// Test sources are excluded and they must be: the case files construct credentials, which is
+/// what makes them able to say what a rotation looks like.
+/// @return One entry per file.
+[[nodiscard]] std::vector<NodeSource> NodeSourcesWithoutComments()
+{
     std::filesystem::path const nodeDir =
         std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node";
     REQUIRE(std::filesystem::is_directory(nodeDir));
@@ -522,13 +663,10 @@ TEST_CASE("Only the seam derives a credential from the configuration", "[node][c
         return out;
     };
 
-    std::vector<std::string> offenders;
-    std::size_t scanned = 0;
-    bool seamConstructsOne = false;
-
+    auto sources = std::vector<NodeSource> {};
     for (auto const& entry: std::filesystem::directory_iterator { nodeDir })
     {
-        auto const name = entry.path().filename().string();
+        auto name = entry.path().filename().string();
         auto const extension = entry.path().extension().string();
         if (extension != ".cpp" && extension != ".hpp")
             continue;
@@ -553,10 +691,139 @@ TEST_CASE("Only the seam derives a credential from the configuration", "[node][c
         contents << in.rdbuf();
         auto const text = std::move(contents).str();
         REQUIRE_FALSE(text.empty());
-        ++scanned;
+        sources.push_back(NodeSource { .name = std::move(name), .code = withoutComments(text) });
+    }
+    return sources;
+}
 
-        auto const code = withoutComments(text);
-        auto const constructs = code.contains("Cc::Credential {") || code.contains("Cc::Credential{");
+/// Why a file of this directory may name a credential source at all. Private to this file: never
+/// transmitted or persisted.
+enum class HolderKind : std::uint8_t
+{
+    Seam,     ///< Declares the source, or builds the one production instance of it.
+    Upstream, ///< The `--upstream` leg: the cache behind it is what checks `--requirepass`.
+    Fixture,  ///< A test helper that is not a `_test.cpp`.
+};
+
+/// A file allowed to hold a credential -- a source, or a `Cc::Credential` value -- and why.
+struct CredentialHolderRow
+{
+    std::string_view file; ///< Its name in `src/apps/fastcache-compile-node`.
+    HolderKind kind;       ///< Why it may.
+    std::string_view why;  ///< What it presents, and to whom.
+};
+
+/// **The positive list: every non-test file here that holds a credential, source or value, and no other.**
+///
+/// A source is `--requirepass`, and the one service that checks a password is the cache behind
+/// `--upstream`. A leg presenting it anywhere else hands the secret, in the clear and ahead of any
+/// seal, to an endpoint that checks nothing -- the enroll channel did, once a beat, to whatever
+/// machine a beacon named. An operator's one-shot verb asks what to present PER ENDPOINT
+/// (`Cc::ICredentialFor`), which shows each one this machine's node's ticket and keeps the password
+/// for `--upstream` alone; a file holding that seam is a holder too. A file absent from this list
+/// is refused by name, so a new holder is a new ROW with a reason rather than a forgotten argument;
+/// and a row whose file names no source any more is refused as stale, so a row leaves with the leg
+/// it describes. An operator's verb that asks the per-endpoint seam is that seam's caller, and a
+/// `Seam` row: it presents nothing the seam did not choose for the endpoint it reached.
+constexpr auto CredentialHolders = std::array {
+    CredentialHolderRow { .file = "NodeCredential.hpp",
+                          .kind = HolderKind::Seam,
+                          .why = "declares the source and its one production implementation" },
+    CredentialHolderRow { .file = "main.cpp",
+                          .kind = HolderKind::Seam,
+                          .why = "builds the source from the live configuration and hands it to the legs below" },
+    CredentialHolderRow { .file = "CacheTier.hpp",
+                          .kind = HolderKind::Upstream,
+                          .why = "takes the source for the --upstream leg it builds, and for nothing else" },
+    CredentialHolderRow { .file = "RemoteUpstream.hpp",
+                          .kind = HolderKind::Upstream,
+                          .why = "the --upstream leg: presents --requirepass to the cache that checks it" },
+    CredentialHolderRow { .file = "RemoteUpstream.cpp",
+                          .kind = HolderKind::Upstream,
+                          .why = "the --upstream leg: presents --requirepass to the cache that checks it" },
+    CredentialHolderRow { .file = "OperatorCredentials.hpp",
+                          .kind = HolderKind::Seam,
+                          .why = "what an operator's one-shot verb presents to each endpoint (Cc::ICredentialFor): this "
+                                 "machine's node's ticket, and --requirepass to --upstream alone" },
+    CredentialHolderRow { .file = "OperatorCredentials.cpp",
+                          .kind = HolderKind::Seam,
+                          .why = "builds that per-endpoint seam from the configuration the verb was invoked with" },
+    CredentialHolderRow { .file = "ClusterAdminCli.hpp",
+                          .kind = HolderKind::Seam,
+                          .why = "an operator's cluster verb, asking per endpoint what each is shown" },
+    CredentialHolderRow { .file = "ClusterAdminCli.cpp",
+                          .kind = HolderKind::Seam,
+                          .why = "an operator's cluster verb, asking per endpoint what each is shown" },
+    CredentialHolderRow {
+        .file = "EnrollClient.hpp",
+        .kind = HolderKind::Seam,
+        .why = "the operator's enrollment verbs, asking per endpoint -- the one dialled AND each one an unsigned "
+               "NotLeader redirect names -- what each is shown; a joiner's polls present none" },
+    CredentialHolderRow {
+        .file = "EnrollClient.cpp",
+        .kind = HolderKind::Seam,
+        .why = "the operator's enrollment verbs, asking per endpoint -- the one dialled AND each one an unsigned "
+               "NotLeader redirect names -- what each is shown; a joiner's polls present none" },
+};
+
+/// What marks a file as holding a credential: a source, or a credential VALUE.
+///
+/// A value is the shape a source is turned into one call before it is presented, so a leg handed
+/// one by `main` -- `Cc::Credential const& credential` -- presents a secret as surely as a leg
+/// holding the source does, and a list of source names alone is blind to it.
+///
+/// **What no needle finds, and the direction it fails in: OPEN.** A source's `Current()` handed
+/// straight into a callee that takes the value under another spelling -- `auto`, an alias, a
+/// template, or a callee outside this directory -- names neither, so a file presenting a credential
+/// that way is not refused here.
+constexpr auto CredentialNeedles = std::array<std::string_view, 6> {
+    "ICredentialSource",    // the source
+    "ConfiguredCredential", // its production implementation
+    "ICredentialFor",       // the per-endpoint seam an operator's one-shot verb asks
+    "Cc::Credential ",      // a value or a `const&` declared: `Cc::Credential credential`, `Cc::Credential const&`
+    "Cc::Credential&",      // a reference spelled without a space
+    "Cc::Credential>",      // one inside a template: `std::optional<Cc::Credential>`
+};
+
+/// Whether @p code holds a credential.
+/// @param code A file's text with its comments dropped.
+/// @return True when it contains any of `CredentialNeedles`.
+[[nodiscard]] bool NamesCredentialSource(std::string_view code)
+{
+    return std::ranges::any_of(CredentialNeedles, [code](std::string_view needle) { return code.contains(needle); });
+}
+
+/// @param names What to join.
+/// @return @p names, comma-separated.
+[[nodiscard]] std::string Joined(std::vector<std::string> const& names)
+{
+    std::string joined;
+    for (auto const& name: names)
+        joined += (joined.empty() ? "" : ", ") + name;
+    return joined;
+}
+
+} // namespace
+
+TEST_CASE("Only the seam derives a credential from the configuration", "[node][credential][seam]")
+{
+    // **The guard is a scan, because nothing forces a site to reach for the seam.**
+    //
+    // The type system stops a site that HOLDS an `ICredentialSource const&` from going
+    // stale -- there is no field to be stale in. It says nothing about a fourth site
+    // that never asks for one and builds its own `Cc::Credential` from `cfg.token`
+    // instead, which is exactly what the three sites this ticket is about did. That is
+    // the rulebook's split: a guard folded INTO the operation is self-enforcing, a
+    // guard nothing compels needs a scan.
+    std::vector<std::string> offenders;
+    std::size_t scanned = 0;
+    bool seamConstructsOne = false;
+
+    for (auto const& [name, code]: NodeSourcesWithoutComments())
+    {
+        ++scanned;
+        auto const constructs = code.contains("Cc::Credential {") || code.contains("Cc::Credential{")
+                                || code.contains("decltype(NoCredential())");
         if (name == "NodeCredential.hpp")
         {
             seamConstructsOne = constructs;
@@ -574,11 +841,63 @@ TEST_CASE("Only the seam derives a credential from the configuration", "[node][c
     INFO("the seam itself must construct one, or the pattern below means nothing");
     CHECK(seamConstructsOne);
 
-    INFO("deriving a credential outside NodeCredential.hpp: " << [&] {
-        std::string joined;
-        for (auto const& name: offenders)
-            joined += (joined.empty() ? "" : ", ") + name;
-        return joined;
-    }());
+    INFO("deriving a credential outside NodeCredential.hpp: " << Joined(offenders));
     CHECK(offenders.empty());
+}
+
+TEST_CASE("The holder scan finds a credential held by value and says what it cannot find", "[node][credential][seam]")
+{
+    // Each needle against the shape it exists for, planted: a needle that stopped matching reads
+    // exactly like a tree with no such holder.
+    CHECK(NamesCredentialSource("void Prove(std::string const& endpoint, Cc::Credential const& credential);"));
+    CHECK(NamesCredentialSource("    Cc::Credential _held;"));
+    CHECK(NamesCredentialSource("void Present(Cc::Credential& credential);"));
+    CHECK(NamesCredentialSource("std::optional<Cc::Credential> maybe;"));
+    CHECK(NamesCredentialSource("Node::ICredentialSource const& credential"));
+    CHECK(NamesCredentialSource("ConfiguredCredential source { reloader };"));
+    CHECK(NamesCredentialSource("void Run(ClusterRequest const& request, Cc::ICredentialFor& credentials);"));
+
+    // The stated blind spot, pinned: a source's value handed straight through is not found. Fails
+    // OPEN, which is why `CredentialNeedles` says so -- and the day a needle covers it, this line goes.
+    CHECK_FALSE(NamesCredentialSource("client.Prove(endpoint, proof.credential->Current());"));
+
+    // And nothing about a credential at all is not a holder.
+    CHECK_FALSE(NamesCredentialSource("auto const credential = NoCredential();"));
+}
+
+TEST_CASE("Only the files the holder list names hold a credential source", "[node][credential][seam]")
+{
+    // A credential presented where nothing checks it is a secret handed to whoever answers, and a
+    // leg that HOLDS a source is invisible to the scan above, which looks for a credential BUILT
+    // outside the seam. So the holders are a list, judged in both directions.
+    auto const sources = NodeSourcesWithoutComments();
+    REQUIRE(sources.size() > 20);
+
+    auto unlisted = std::vector<std::string> {};
+    for (auto const& [name, code]: sources)
+        if (NamesCredentialSource(code) && !std::ranges::contains(CredentialHolders, name, &CredentialHolderRow::file))
+            unlisted.push_back(name);
+
+    auto stale = std::vector<std::string> {};
+    for (auto const& row: CredentialHolders)
+    {
+        auto const holds = std::ranges::any_of(sources, [&row](NodeSource const& source) {
+            return source.name == row.file && NamesCredentialSource(source.code);
+        });
+        if (!holds)
+            stale.emplace_back(row.file);
+    }
+
+    // The positive control: the pattern still finds the seam, so an empty `unlisted` is a finding
+    // about the tree rather than about a spelling that stopped matching.
+    CHECK(std::ranges::any_of(sources, [](NodeSource const& source) {
+        return source.name == "NodeCredential.hpp" && NamesCredentialSource(source.code);
+    }));
+
+    INFO("holding a credential source with no CredentialHolders row -- a credential is presented where a row "
+         "says why, and nowhere else: "
+         << Joined(unlisted));
+    CHECK(unlisted.empty());
+    INFO("CredentialHolders rows whose file names no credential source any more -- delete them: " << Joined(stale));
+    CHECK(stale.empty());
 }

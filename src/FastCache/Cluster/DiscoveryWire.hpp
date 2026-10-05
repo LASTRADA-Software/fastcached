@@ -2,12 +2,15 @@
 #pragma once
 
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -17,8 +20,8 @@
 #include <string_view>
 #include <vector>
 
-/// The LAN discovery wire: what a node broadcasts about itself, and how a peer proves which
-/// identity key it holds before anything it claims is believed (#178).
+/// The LAN discovery wire: what a node broadcasts about itself and its fleet, and how a peer proves
+/// which identity key it holds before anything it claims is believed (#178).
 namespace FastCache::Cluster::DiscoveryWire
 {
 
@@ -31,20 +34,39 @@ inline constexpr std::byte Magic { 0xFD };
 
 /// Lowest wire version this build still decodes.
 ///
-/// Moved with `CurrentVersion`: a version-1 proof is a MAC under the shared key, which this
-/// build has nothing to verify against, so accepting one would be accepting a claim nobody can
-/// check.
-inline constexpr std::uint8_t MinimumVersion = 2;
+/// Moved with `CurrentVersion` every time. A version-1 proof is a MAC under the shared key, which
+/// this build has nothing to verify against; a version-2 beacon names an id and an endpoint where
+/// this build reads a signed fleet summary, and its proof signs neither the summary nor the nonce it
+/// answers. Accepting either would be accepting a claim nobody here can check.
+inline constexpr std::uint8_t MinimumVersion = 3;
 
 /// Wire version this build emits.
 ///
-/// **2 is a GRAMMAR change, and that is why it moved** (#178) -- the opposite of #402, which
-/// changed only what the MAC covered and rightly did not. A proof now carries the prover's
-/// public key and a 64-byte Ed25519 signature where it carried a 32-byte HMAC, so its arity and
-/// its field widths both changed: a version-1 reader would refuse the proof as malformed and
-/// report a peer that failed to prove a key it holds. The question is always which of the two
-/// changed, never whether a MAC did.
-inline constexpr std::uint8_t CurrentVersion = 2;
+/// **2 was a GRAMMAR change, and that is why it moved** (#178) -- the opposite of #402, which
+/// changed only what the MAC covered and rightly did not. A proof carried the prover's public key
+/// and a 64-byte Ed25519 signature where it carried a 32-byte HMAC, so its arity and its field
+/// widths both changed: a version-1 reader would refuse the proof as malformed and report a peer
+/// that failed to prove a key it holds. The question is always which of the two changed, never
+/// whether a MAC did.
+///
+/// **3 is a grammar change again** (the office-fleet flag day), and every datagram moved:
+/// - the beacon and the proof carry the node's fleet summary as one nested field where they carried
+///   an id and an endpoint, and the proof signs that summary under its own label
+///   (`discovery-proof-v3`);
+/// - the beacon and the challenge are each padded by one trailing field, so a beacon is two fields
+///   and a challenge three (see `EncodeBeacon` and `EncodeChallenge` for why);
+/// - the proof ECHOES the nonce it answers -- four fields -- because a challenger keeps no table of
+///   what it asked: the nonce is a cookie it recomputes from what the proof claims
+///   (`ChallengeCookies`);
+/// - the summary both nest holds eleven fields -- the fleet's member ids, how many it records, the
+///   speaker's own `0xFC` endpoint and its leader's key among them -- with every dialled endpoint in
+///   it held to `ParseDialEndpoint`.
+///
+/// A version-2 datagram is refused by NUMBER (`ClassifyDatagram`), never misread by arity. Both
+/// services drop a datagram they cannot classify as `Ignored`, with no counter and no log line, so a
+/// version-2 node and a version-3 node on one segment fail closed and silently never see each other:
+/// an upgrade finishes on every machine of a segment (`docs/operations/upgrading-a-fleet.md`).
+inline constexpr std::uint8_t CurrentVersion = 3;
 
 /// What a datagram is.
 ///
@@ -59,95 +81,85 @@ enum class Kind : std::uint8_t
     Proof = 0x03,     ///< A signature over the challenge, by the key the proof names.
 };
 
-/// A node announcing itself on the segment.
+/// How many fields each kind's payload is: a beacon's summary and padding; a challenge's cluster,
+/// nonce and padding; a proof's summary, the nonce it answers, its key and its signature.
+inline constexpr std::size_t BeaconFieldCount = 2;
+inline constexpr std::size_t ChallengeFieldCount = 3;
+inline constexpr std::size_t ProofFieldCount = 4;
+
+/// A node announcing itself and its fleet on the segment.
 ///
-/// What it carries is deliberately minimal, and what it does **not** carry is the
-/// point: nothing an eavesdropper could replay into a membership change. A beacon is an
-/// invitation to *ask*, not a credential -- the challenge that follows it is what proves
-/// anything, and only to the node that chose its nonce.
+/// What it does **not** carry is the point: nothing an eavesdropper could replay into a
+/// membership change. A beacon is an invitation to *ask*, not a credential -- every field in it
+/// is a HINT until a proof signs the same summary, and then only to the node that chose that
+/// proof's nonce. Anything decided on a fleet summary, a yield above all, is decided on a proof's.
 struct Beacon
 {
-    /// Which cluster this node believes it is in.
+    /// What the node says: which fleet it is in, whether that fleet is established, when it was
+    /// created, where its leader takes enrollment, and the node's own id and Raft endpoint.
     ///
-    /// Plain text and not a secret: two unrelated fleets on one segment must be
-    /// able to ignore each other, and that is a routing question rather than a
-    /// security one. Treating it as a credential is the mistake -- it is on the
-    /// wire in every datagram.
-    std::string clusterId;
-
-    /// The node's Raft id, which is also how membership names it.
-    std::string nodeId;
-
-    /// Where this node answers Raft peer traffic, as `host:port`.
-    ///
-    /// The whole reason discovery exists: `RaftMembership` names a member by id
-    /// and carries no endpoint, so a node the cluster has agreed to admit is
-    /// unreachable until something supplies one. This is that something.
-    std::string raftEndpoint;
+    /// Plain text and not a secret. The cluster id is how two unrelated fleets on one segment
+    /// tell each other apart, which is a routing question rather than a security one; the id and
+    /// the endpoint are what `RaftMembership` needs and does not carry, since it names a member by
+    /// id alone. The same codec as the `0xFC` port's `FleetSummary` reply, so a seed and a beacon
+    /// cannot describe one node in two grammars.
+    CompileCacheWire::FleetSummary summary;
 };
 
 /// A nonce the joiner must authenticate.
 struct Challenge
 {
-    std::string clusterId; ///< Which cluster is asking.
-    Nonce nonce {};        ///< Fresh from `DrawNonce`; never reused.
+    std::string clusterId; ///< The CHALLENGER's cluster: routing only, and signed so an answer names its asker.
+    Nonce nonce {};        ///< A cookie the challenger can recompute (`ChallengeCookies`); never reused.
 };
 
 /// A peer's answer to a Challenge.
 ///
 /// **The key travels, and the signature is what makes it worth reading** (#178): a proof says
-/// "the holder of THIS key, answering THIS nonce, is this id at this endpoint". Whether the
-/// cluster knows that key is the verifier's question, asked of its roster AFTER the signature
+/// "the holder of THIS key, answering THIS nonce, says THIS about itself and its fleet". Whether
+/// the cluster knows that key is the verifier's question, asked of its roster AFTER the signature
 /// verifies -- so a key nobody admitted is reported by name rather than trusted, and a key the
 /// roster revoked is recognised for what it is.
 struct Proof
 {
-    std::string nodeId;            ///< Who is answering.
-    std::string raftEndpoint;      ///< Where to reach them.
-    Ed25519PublicKey publicKey {}; ///< The key they sign with.
-    Ed25519Signature signature {}; ///< Over `ProofMessage`, under `publicKey`.
+    CompileCacheWire::FleetSummary summary; ///< What the prover says, every field of it signed.
+    Nonce answers {};                       ///< The challenge's nonce, echoed; signed, as the challenge's.
+    Ed25519PublicKey publicKey {};          ///< The key they sign with.
+    Ed25519Signature signature {};          ///< Over `ProofMessage`, under `publicKey`.
 };
 
-/// The label a proof's signature is taken under.
+/// The bytes a proof signs: its label (`IdentityKeyPurpose::DiscoveryProof`), the challenger's
+/// cluster, the nonce, the prover's whole fleet summary as ONE nested field, and the key, in this
+/// project's length-prefixed field grammar.
 ///
-/// A label of its own, so a discovery proof can never verify as a Raft handshake signature or
-/// the reverse: those are labelled `fastcache-raft-*`, over different fields. `v2` because the
-/// `v1` name was the shared key's MAC label (`fastcache-discovery-v1`), retired with it and
-/// never reused -- a new construction under an old label would accept whatever the old one
-/// signed.
-inline constexpr std::string_view ProofSignatureLabel = "fastcache-discovery-proof-v2";
-
-/// The bytes a proof signs: the label and five fields, in this project's length-prefixed
-/// field grammar.
-///
-/// **The prover's identity, its endpoint and its KEY are inside the signature**, not merely
-/// alongside it. Signing the nonce alone would let anyone who observed one valid proof replay it
-/// with a different endpoint -- admitting a known id at an attacker's address, which is object
-/// injection into every build the fleet serves -- and leaving the key out would let a proof be
-/// re-attributed to any key the signature happened to verify under. Length-prefixed for the
-/// reason the object key's fields are: a separator that can occur inside a value is not a
-/// framing, so `{node="a", endpoint="b:1"}` and `{node="a:b", endpoint="1"}` would otherwise
-/// sign identically.
+/// **Every summary field and the KEY are inside the signature**, not merely alongside it. The
+/// summary is what formation decides on -- whether to yield, to whom, where to enroll -- so a
+/// field outside the signature is one a relay can rewrite into a yield. Signing the nonce alone
+/// would let anyone who observed one valid proof replay it with a different endpoint, admitting
+/// a known id at an attacker's address, which is object injection into every build the fleet
+/// serves; leaving the key out would let a proof be re-attributed to any key the signature
+/// happened to verify under. Length-prefixed for the reason the object key's fields are: a
+/// separator that can occur inside a value is not a framing, so `{node="a", endpoint="b:1"}` and
+/// `{node="a:b", endpoint="1"}` would otherwise sign identically. The summary's bytes are
+/// `EncodeFleetSummaryFields`', exactly what the beacon carries.
 ///
 /// One function for both ends, for `LeaseToken::PackClaims`' reason: a signer and a verifier
 /// that each spell this list are a signer and a verifier that will one day spell it
 /// differently, which presents as every node on the segment failing to prove the key it holds.
 /// @param challenge What was asked.
-/// @param nodeId Who is answering.
-/// @param raftEndpoint Where they will answer Raft traffic.
+/// @param summary What the prover says about itself and its fleet.
 /// @param publicKey The key they sign with.
 /// @return The message, owned.
-[[nodiscard]] inline std::vector<std::byte> ProofMessage(Challenge const& challenge,
-                                                         std::string_view nodeId,
-                                                         std::string_view raftEndpoint,
-                                                         Ed25519PublicKey const& publicKey)
+[[nodiscard]] inline LabelledMessage ProofMessage(Challenge const& challenge,
+                                                  CompileCacheWire::FleetSummary const& summary,
+                                                  Ed25519PublicKey const& publicKey)
 {
-    return WireFields::Encode({ WireFields::AsBytes(ProofSignatureLabel),
-                                WireFields::AsBytes(challenge.clusterId),
-                                std::span<std::byte const> { challenge.nonce },
-                                WireFields::AsBytes(nodeId),
-                                WireFields::AsBytes(raftEndpoint),
-                                std::span<std::byte const> { publicKey } });
+    auto const fields = CompileCacheWire::EncodeFleetSummaryFields(summary);
+    return LabelledMessage::Of(IdentityKeyPurpose::DiscoveryProof,
+                               { WireFields::AsBytes(challenge.clusterId),
+                                 std::span<std::byte const> { challenge.nonce },
+                                 std::span<std::byte const> { fields },
+                                 std::span<std::byte const> { publicKey } });
 }
 
 /// Whether @p proof is a signature over @p challenge by the key it names.
@@ -160,8 +172,22 @@ inline constexpr std::string_view ProofSignatureLabel = "fastcache-discovery-pro
 /// @return True only when the signature verifies.
 [[nodiscard]] inline bool VerifyProofSignature(Challenge const& challenge, Proof const& proof)
 {
-    auto const message = ProofMessage(challenge, proof.nodeId, proof.raftEndpoint, proof.publicKey);
-    return Ed25519Verify(proof.publicKey, message, proof.signature);
+    return VerifyLabelled(proof.publicKey, ProofMessage(challenge, proof.summary, proof.publicKey), proof.signature);
+}
+
+/// Whether a reply of @p reply bytes may answer a datagram of @p request bytes: never larger.
+///
+/// Discovery answers whatever address a datagram came FROM, and a source address on a datagram
+/// is whatever its sender typed. So a reply larger than its request is an AMPLIFIER aimed at a
+/// third party for the price of the smaller datagram, and every reply this protocol sends is
+/// bounded by the one that provoked it: a challenge by the beacon, a proof by the challenge. A
+/// reflector at 1:1 is left, which a spoofed source always buys; an amplifier is not.
+/// @param reply The reply's size on the wire.
+/// @param request The size of the datagram it answers.
+/// @return True when the reply is no larger.
+[[nodiscard]] constexpr bool AnswerFits(std::size_t reply, std::size_t request) noexcept
+{
+    return reply <= request;
 }
 
 /// Wrap an already-encoded payload in this protocol's frame header.
@@ -194,46 +220,108 @@ inline constexpr std::string_view ProofSignatureLabel = "fastcache-discovery-pro
     return out;
 }
 
-/// Encode a beacon as a complete datagram.
-/// @param beacon What to announce.
-/// @return The bytes to send.
-[[nodiscard]] inline std::vector<std::byte> EncodeBeacon(Beacon const& beacon)
-{
-    auto const payload = WireFields::Encode({
-        WireFields::AsBytes(beacon.clusterId),
-        WireFields::AsBytes(beacon.nodeId),
-        WireFields::AsBytes(beacon.raftEndpoint),
-    });
-
-    return Frame(Kind::Beacon, payload);
-}
-
-/// Encode a challenge as a complete datagram.
-/// @param challenge What to ask.
-/// @return The bytes to send.
-[[nodiscard]] inline std::vector<std::byte> EncodeChallenge(Challenge const& challenge)
-{
-    auto const payload = WireFields::Encode({
-        WireFields::AsBytes(challenge.clusterId),
-        std::span<std::byte const> { challenge.nonce },
-    });
-
-    return Frame(Kind::Challenge, payload);
-}
-
-/// Encode a proof as a complete datagram.
+/// Encode a proof as a complete datagram: the summary nested as one field, then the nonce it
+/// answers, the key and the signature.
+///
+/// The grammar alone, unbounded: a node answers a challenge only when `AnswerFits` says the proof
+/// is no larger than it, which `DiscoveryService` asks BEFORE signing -- see `ProofDatagramSize`.
 /// @param proof What to answer with.
 /// @return The bytes to send.
 [[nodiscard]] inline std::vector<std::byte> EncodeProof(Proof const& proof)
 {
-    auto const payload = WireFields::Encode({
-        WireFields::AsBytes(proof.nodeId),
-        WireFields::AsBytes(proof.raftEndpoint),
-        std::span<std::byte const> { proof.publicKey },
-        std::span<std::byte const> { proof.signature },
-    });
+    assert(proof.summary.members.size() <= CompileCacheWire::MaxFleetSummaryMembers
+           && "a datagram carries a cut list (`CarriedSummary`); a longer one is refused by every reader");
+    auto const fields = CompileCacheWire::EncodeFleetSummaryFields(proof.summary);
+    return Frame(Kind::Proof,
+                 WireFields::Encode({ std::span<std::byte const> { fields },
+                                      std::span<std::byte const> { proof.answers },
+                                      std::span<std::byte const> { proof.publicKey },
+                                      std::span<std::byte const> { proof.signature } }));
+}
 
-    return Frame(Kind::Proof, payload);
+/// The smallest proof a node of this build can send, and so the smallest honest beacon: a summary
+/// naming a one-byte cluster and nothing else -- no member, a member total of zero -- then the
+/// nonce, the key and the signature.
+/// @return Its datagram's size in bytes.
+[[nodiscard]] consteval std::size_t SmallestProofDatagram() noexcept
+{
+    auto const summary = (CompileCacheWire::FleetSummaryFieldCount * WireFields::FieldPrefixSize) + 1 /* cluster */
+                         + 1 /* state */ + sizeof(std::uint64_t)                                      /* created */
+                         + sizeof(std::uint64_t) /* memberTotal */;
+    return WireFrame::HeaderSize + (ProofFieldCount * WireFields::FieldPrefixSize) + summary + NonceBytes
+           + Ed25519PublicKeyBytes + Ed25519SignatureBytes;
+}
+
+/// The largest challenge a node of this build sends before it is padded: a cluster id at
+/// `CompileCacheWire::MaxIdBytes`, the nonce, and an empty padding field.
+/// @return Its datagram's size in bytes.
+[[nodiscard]] consteval std::size_t LargestUnpaddedChallenge() noexcept
+{
+    return WireFrame::HeaderSize + (ChallengeFieldCount * WireFields::FieldPrefixSize) + CompileCacheWire::MaxIdBytes
+           + NonceBytes;
+}
+
+// An honest beacon is always challenged: no cluster id this build accepts makes a challenge larger
+// than the smallest beacon a node of this build sends. Without the bound, a long enough id was a
+// node that challenged nobody, in silence, since `EncodeChallenge` refuses to amplify.
+static_assert(LargestUnpaddedChallenge() <= SmallestProofDatagram(),
+              "a challenge naming the longest cluster id must fit the smallest honest beacon");
+
+/// How large a proof carrying @p summary is on the wire.
+///
+/// Known before anything is signed, because the nonce, the key and the signature are fixed width: so a node
+/// can refuse to answer a challenge too small for its proof without spending a signature on it.
+/// @param summary What the proof would say.
+/// @return Its datagram's size in bytes.
+[[nodiscard]] inline std::size_t ProofDatagramSize(CompileCacheWire::FleetSummary const& summary)
+{
+    return EncodeProof(Proof { .summary = summary, .answers = {}, .publicKey = {}, .signature = {} }).size();
+}
+
+/// Encode a beacon as a complete datagram: the summary's own fields nested as one field, then
+/// padding.
+///
+/// **Padded to exactly the size of the proof its sender answers with**, because that is what lets
+/// neither reply amplify (`AnswerFits`). A challenger pads its challenge to the beacon it answers,
+/// so the challenge is no larger than the beacon; and the challenged node's proof carries the
+/// summary its beacon did, so it is no larger than the challenge. Unpadded, one of the two would
+/// have to be larger than what provoked it. The padding is zeroes and is never read.
+/// @param beacon What to announce.
+/// @return The bytes to send.
+[[nodiscard]] inline std::vector<std::byte> EncodeBeacon(Beacon const& beacon)
+{
+    assert(beacon.summary.members.size() <= CompileCacheWire::MaxFleetSummaryMembers
+           && "a datagram carries a cut list (`CarriedSummary`); a longer one is refused by every reader");
+    auto const fields = CompileCacheWire::EncodeFleetSummaryFields(beacon.summary);
+    auto const unpadded =
+        WireFrame::HeaderSize
+        + WireFields::Encode({ std::span<std::byte const> { fields }, std::span<std::byte const> {} }).size();
+    auto const padding = std::vector<std::byte>(ProofDatagramSize(beacon.summary) - unpadded);
+    return Frame(Kind::Beacon,
+                 WireFields::Encode({ std::span<std::byte const> { fields }, std::span<std::byte const> { padding } }));
+}
+
+/// Encode a challenge as a complete datagram, padded to EXACTLY the size of the beacon it answers.
+///
+/// Exactly rather than at least, for `AnswerFits`' reason in both directions: no larger, so a
+/// spoofed beacon buys no more than its own size aimed at a third party; and no smaller, so the
+/// proof the beacon's sender answers with -- as large as its beacon, see `EncodeBeacon` -- fits.
+/// The padding is zeroes and is never read.
+/// @param challenge What to ask.
+/// @param answering The size of the beacon datagram this challenge answers.
+/// @return The bytes to send, or nullopt when even an unpadded challenge would be larger than
+///         @p answering, which is not sent.
+[[nodiscard]] inline std::optional<std::vector<std::byte>> EncodeChallenge(Challenge const& challenge, std::size_t answering)
+{
+    auto const fields = [&challenge](std::span<std::byte const> padding) {
+        return WireFields::Encode(
+            { WireFields::AsBytes(challenge.clusterId), std::span<std::byte const> { challenge.nonce }, padding });
+    };
+    auto const unpadded = WireFrame::HeaderSize + fields({}).size();
+    if (!AnswerFits(unpadded, answering))
+        return std::nullopt;
+    auto const padding = std::vector<std::byte>(answering - unpadded);
+    return Frame(Kind::Challenge, fields(padding));
 }
 
 /// What kind a datagram is, when it is one of ours at all.
@@ -275,20 +363,25 @@ inline constexpr std::string_view ProofSignatureLabel = "fastcache-discovery-pro
 }
 
 /// Decode a beacon datagram.
+///
+/// The summary is read by its own codec and nothing else, so a state byte this build has no name
+/// for refuses the beacon rather than reading as whatever a default says.
 /// @param datagram The bytes as they arrived.
-/// @return The beacon, or nullopt when it is not a well-formed one.
+/// @return The beacon, owning every field, or nullopt when it is not a well-formed one.
 [[nodiscard]] inline std::optional<Beacon> DecodeBeacon(std::span<std::byte const> datagram)
 {
     if (ClassifyDatagram(datagram) != Kind::Beacon)
         return std::nullopt;
 
-    auto const fields = WireFields::SplitExactly(datagram.subspan(WireFrame::HeaderSize), 3);
+    // The second field is `EncodeBeacon`'s padding, whatever it holds.
+    auto const fields = WireFields::SplitExactly(datagram.subspan(WireFrame::HeaderSize), BeaconFieldCount);
     if (!fields.has_value())
         return std::nullopt;
 
-    return Beacon { .clusterId = std::string { WireFields::AsStringView((*fields)[0]) },
-                    .nodeId = std::string { WireFields::AsStringView((*fields)[1]) },
-                    .raftEndpoint = std::string { WireFields::AsStringView((*fields)[2]) } };
+    auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0]);
+    if (!summary.has_value())
+        return std::nullopt;
+    return Beacon { .summary = *std::move(summary) };
 }
 
 /// Decode a challenge datagram.
@@ -299,12 +392,15 @@ inline constexpr std::string_view ProofSignatureLabel = "fastcache-discovery-pro
     if (ClassifyDatagram(datagram) != Kind::Challenge)
         return std::nullopt;
 
-    auto const fields = WireFields::SplitExactly(datagram.subspan(WireFrame::HeaderSize), 2);
+    // The third field is `EncodeChallenge`'s padding, whatever it holds.
+    auto const fields = WireFields::SplitExactly(datagram.subspan(WireFrame::HeaderSize), ChallengeFieldCount);
     if (!fields.has_value())
         return std::nullopt;
 
+    // The challenger's cluster within the bound every summary's is held to, so what this node
+    // signs its proof over is never larger than an honest challenge can be.
     auto const& nonce = (*fields)[1];
-    if (nonce.size() != std::tuple_size_v<decltype(Challenge::nonce)>)
+    if ((*fields)[0].size() > CompileCacheWire::MaxIdBytes || nonce.size() != std::tuple_size_v<decltype(Challenge::nonce)>)
         return std::nullopt;
 
     Challenge out { .clusterId = std::string { WireFields::AsStringView((*fields)[0]) }, .nonce = {} };
@@ -320,21 +416,24 @@ inline constexpr std::string_view ProofSignatureLabel = "fastcache-discovery-pro
     if (ClassifyDatagram(datagram) != Kind::Proof)
         return std::nullopt;
 
-    auto const fields = WireFields::SplitExactly(datagram.subspan(WireFrame::HeaderSize), 4);
+    auto const fields = WireFields::SplitExactly(datagram.subspan(WireFrame::HeaderSize), ProofFieldCount);
     if (!fields.has_value())
         return std::nullopt;
 
-    // Exactly one key and exactly one signature wide: a prefix of a key is a different key, and
+    // Exactly one nonce, one key and one signature wide: a prefix of a key is a different key, and
     // a truncated signature verifies as nothing -- refused here so the verifier is never asked.
+    auto const& answers = (*fields)[1];
     auto const& key = (*fields)[2];
     auto const& signature = (*fields)[3];
-    if (key.size() != Ed25519PublicKeyBytes || signature.size() != Ed25519SignatureBytes)
+    if (answers.size() != NonceBytes || key.size() != Ed25519PublicKeyBytes || signature.size() != Ed25519SignatureBytes)
         return std::nullopt;
 
-    Proof out { .nodeId = std::string { WireFields::AsStringView((*fields)[0]) },
-                .raftEndpoint = std::string { WireFields::AsStringView((*fields)[1]) },
-                .publicKey = {},
-                .signature = {} };
+    auto summary = CompileCacheWire::DecodeFleetSummaryFields((*fields)[0]);
+    if (!summary.has_value())
+        return std::nullopt;
+
+    Proof out { .summary = *std::move(summary), .answers = {}, .publicKey = {}, .signature = {} };
+    std::ranges::copy(answers, out.answers.begin());
     std::ranges::copy(key, out.publicKey.begin());
     std::ranges::copy(signature, out.signature.begin());
     return out;

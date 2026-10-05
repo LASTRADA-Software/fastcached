@@ -128,15 +128,19 @@ inline constexpr std::array ExchangeLogTable {
     VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmitLearner,
                  .level = LogLevel::Info,
                  .rationale = "adds, moves or demotes a member; same audit argument as cluster-admit" },
-    VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmitWorker,
-                 .level = LogLevel::Info,
-                 .rationale = "admits a machine's identity key as a worker; same audit argument as cluster-admit" },
-    VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmitClient,
-                 .level = LogLevel::Info,
-                 .rationale = "admits a client host; same audit argument as cluster-admit" },
-    VerbLogRow { .code = CompileCacheWire::Op::ClusterForgetClient,
-                 .level = LogLevel::Info,
-                 .rationale = "decommissions a client host, and an operator asked about it later needs the line" },
+    // The fleet cache verbs at their private twins' level, for their twins' reason: the
+    // shared cache is asked once or more per translation unit by every machine in the fleet.
+    VerbLogRow { .code = CompileCacheWire::Op::SharedStore,
+                 .level = LogLevel::Debug,
+                 .rationale = "store's rate across the whole fleet, on the one machine that serves it; at Info a "
+                              "single office build buries that machine's journal" },
+    VerbLogRow { .code = CompileCacheWire::Op::SharedFetch,
+                 .level = LogLevel::Debug,
+                 .rationale = "fetch's rate across the whole fleet -- every machine's every TU -- on the one machine "
+                              "that serves it; the highest-rate verb that node answers" },
+    VerbLogRow { .code = CompileCacheWire::Op::MintTicket,
+                 .level = LogLevel::Debug,
+                 .rationale = "one per launcher exchange; an Info line each would bury the log" },
     VerbLogRow { .code = CompileCacheWire::Op::Compile,
                  .level = LogLevel::Info,
                  .rationale = "seconds of somebody's CPU, one per distributed TU; the heaviest thing this node "
@@ -185,6 +189,11 @@ inline constexpr std::array ExchangeLogTable {
                               "which is the only place a VPN worker's changing address is reconciled with a "
                               "stable identity; once per connection, and a refusal here is the line an operator "
                               "reads when a node's identity key was never admitted, or was revoked" },
+    VerbLogRow { .code = CompileCacheWire::Op::FleetSummary,
+                 .level = LogLevel::Debug,
+                 .rationale = "a read that changes nothing, which a machine looking for a fleet asks of every seed "
+                              "it knows on every round until it joins one; at Info an office of such machines would "
+                              "look like traffic, and what an operator wants is the enrollment it leads to" },
 };
 
 /// Whether every verb this build serves states a log level.

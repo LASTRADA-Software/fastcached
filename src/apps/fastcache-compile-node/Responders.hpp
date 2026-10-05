@@ -2,9 +2,9 @@
 #pragma once
 
 #include "CacheProxy.hpp"
+#include "EnrollmentAbsence.hpp"
 #include "FrameEndpoint.hpp"
 
-#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
@@ -99,17 +99,6 @@ namespace Detail
         CacheRefusalPolicy policy; ///< What this surface does about it.
     };
 
-    /// Why neither credential arm counts, stated once for the two rows that share it.
-    ///
-    /// The two enumerators are separate because a client is told different things
-    /// about them; the ARGUMENT is one argument about one fact -- which family `AUTH`
-    /// belongs to -- so it is one sentence. Written out twice it is two literals that
-    /// can drift on any edit with nothing to catch it, which is the "second statement
-    /// of one fact" the row type's own documentation is shaped to avoid.
-    inline constexpr std::string_view CredentialIsTheSchedulersRationale =
-        "AUTH is the Session family, which MergedResponder routes to the scheduler; no credential outcome is ever "
-        "decided against this surface";
-
     /// What the CACHE surface does about each endpoint-decided refusal (#491).
     ///
     /// The byte budget is the arm #491 was filed about, and the one this surface
@@ -127,9 +116,9 @@ namespace Detail
         { .refusal = EndpointRefusal::InFlightBudget,
           .policy = { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedEndpointBusy, .rationale = {} } },
         { .refusal = EndpointRefusal::CredentialMalformed,
-          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
+          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSessionsRationale } },
         { .refusal = EndpointRefusal::CredentialRejected,
-          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
+          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSessionsRationale } },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .policy = { .counter = std::nullopt, .rationale = AnswerDeadlineIsTheEndpointsRationale } },
         { .refusal = EndpointRefusal::NodeProofUnchallenged,
@@ -189,9 +178,7 @@ namespace Detail
                                       "with no OpTable row is Unset -- so an unknown one is answered UnservedReply at "
                                       "the door and never reaches this surface" };
             case CompileCacheWire::PrePayloadDecision::Unauthenticated:
-                return { .counter = std::nullopt,
-                         .rationale = "AuthRequired() is false here by decision (#287, #290), and DecidePrePayload "
-                                      "yields this only for a surface that requires a credential" };
+                return { .counter = std::nullopt, .rationale = NodeChecksNoPasswordRationale };
             case CompileCacheWire::PrePayloadDecision::Serve:
                 break;
         }
@@ -231,14 +218,14 @@ namespace Detail
     /// reinstates elsewhere in this change, and a file holding two new security
     /// counters is the last place to ship the other spelling.
     ///
-    /// A `std::optional` per row rather than a switch with a silent arm, because two
-    /// refusals here deliberately count NOTHING: the byte budget says this surface is
-    /// momentarily full, which the peer retries past, and summed into a credential
-    /// series it would make that series unreadable; and the answer deadline is the
-    /// endpoint's own decision, counted in the endpoint's own rows. `nullopt` says so
-    /// where a missing `case` would only imply it. `EnumTable` takes its extent from
-    /// `EndpointRefusal::Last`, so a fifth enumerator leaves an empty row here rather
-    /// than silently borrowing a neighbour's.
+    /// A `std::optional` per row rather than a switch with a silent arm, because every
+    /// refusal here deliberately counts NOTHING, each for the reason its row states: the
+    /// byte budget says this surface is momentarily full, which the peer retries past;
+    /// the credential is the session component's; the answer deadline is the endpoint's
+    /// own decision; a proof is the prover's. `nullopt` says so where a missing `case`
+    /// would only imply it. `EnumTable` takes its extent from `EndpointRefusal::Last`, so
+    /// a new enumerator leaves an empty row here rather than silently borrowing a
+    /// neighbour's.
     struct SchedulerEndpointRefusal
     {
         EndpointRefusal refusal;                  ///< Which endpoint decision this describes.
@@ -260,17 +247,12 @@ namespace Detail
           .answer = std::nullopt,
           .rationale = "the byte budget says this surface is momentarily full, which the peer sees and retries; summed "
                        "into a security series it is what makes that series unreadable" },
-        // `.rationale` empty and SAID so, for the reason the compile surface's table
-        // spells it: clang and GCC refuse the omission under this project's pedantic
-        // flags and MSVC accepts it silently.
         { .refusal = EndpointRefusal::CredentialMalformed,
-          .answer = Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::MalformedFrame,
-                                         .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed },
-          .rationale = {} },
+          .answer = std::nullopt,
+          .rationale = CredentialIsTheSessionsRationale },
         { .refusal = EndpointRefusal::CredentialRejected,
-          .answer = Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::Unauthenticated,
-                                         .counter = IMetricsSink::Counter::SchedulerCredentialsRejected },
-          .rationale = {} },
+          .answer = std::nullopt,
+          .rationale = CredentialIsTheSessionsRationale },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .answer = std::nullopt,
           .rationale = AnswerDeadlineIsTheEndpointsRationale },
@@ -320,19 +302,13 @@ class SchedulerResponder final: public IFrameResponder
   public:
     /// @param protocol Answers each request; must outlive this.
     /// @param membership Decides who may spend the fleet's capacity; must outlive this.
-    /// @param policy The credential this surface requires, or nullptr for none.
-    ///        Shared rather than referenced because "there is no credential" has to
-    ///        be representable, and a null reference is not
-    ///        ([#289](https://github.com/LASTRADA-Software/fastcached/issues/289)).
-    /// @param metrics Where a refused credential is counted; must outlive this.
+    /// @param metrics Where an endpoint refusal would be counted; must outlive this.
     SchedulerResponder(Distributed::SchedulerProtocol& protocol,
                        Distributed::IMembershipOracle const& membership,
-                       IMetricsSink& metrics,
-                       std::shared_ptr<AuthPolicy const> policy = nullptr) noexcept:
+                       IMetricsSink& metrics) noexcept:
         _protocol { protocol },
         _membership { membership },
-        _metrics { metrics },
-        _policy { std::move(policy) }
+        _metrics { metrics }
     {
     }
 
@@ -368,78 +344,39 @@ class SchedulerResponder final: public IFrameResponder
         return _protocol.RefusePeer(Context(peer), opRaw);
     }
 
-    /// @copydoc IFrameResponder::AuthRequired
-    ///
-    /// **Membership is not a credential.** It answers "is this host one an operator
-    /// listed", which a host that is not on the list can satisfy by being on the
-    /// network the list was written for -- so it is an anti-leeching rule, and #289
-    /// is what makes the scheduler verbs safe on a port that faces one.
-    ///
-    /// The verb is ignored: this listener serves the scheduler verbs and nothing else,
-    /// so the surface-wide answer IS the per-verb one. It stops being so the moment
-    /// the surfaces merge (#290), which is why the question now carries the verb.
-    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return _policy != nullptr && _policy->Enabled();
-    }
-
     /// @copydoc IFrameResponder::CheckCredential
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    ///
+    /// `NoPolicy`: AUTH is the Session family's; this surface is never routed one.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
     {
-        return FastCache::CheckCredential(_policy.get(), payload);
+        return NotTheSessionSurface();
     }
 
     /// @copydoc IFrameResponder::RefusalReply
     ///
-    /// The credential refusal is the one this surface counts. It is deliberately the
-    /// only counted arm: a size or opcode refusal says the peer is confused, an
-    /// unauthenticated one says somebody is reaching for verbs they hold no secret
-    /// for, and an operator watching for the second does not want the first summed
-    /// into it.
+    /// Uncounted: a size or opcode refusal says the peer is confused, and an
+    /// unauthenticated one cannot happen on a node that checks no password.
     [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
                                                       std::uint8_t /*opRaw*/,
                                                       std::string_view detail) const override
     {
         // The caller's wording, which is empty for every decision but the frame
         // ceiling -- and that one names both numbers, because "too large" without the
-        // limit tells an operator nothing about a kilobyte cap. Nothing is added here:
-        // what a message could say is which verb the caller failed to reach, and an
-        // unauthenticated peer learns nothing from being told that.
-        if (decision == CompileCacheWire::PrePayloadDecision::Unauthenticated)
-            return Cc::Refuse(_metrics,
-                              { .code = CompileCacheWire::ErrorCodeFor(decision),
-                                .counter = IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated },
-                              detail);
+        // limit tells an operator nothing about a kilobyte cap.
         return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::ErrorCodeFor(decision),
-                                          .rationale =
-                                              "a size or opcode refusal says the peer is confused; an operator watching "
-                                              "for somebody reaching after verbs they hold no secret for does not want "
-                                              "it summed into that series" },
+                                          .rationale = decision == CompileCacheWire::PrePayloadDecision::Unauthenticated
+                                                           ? NodeChecksNoPasswordRationale
+                                                           : "a size or opcode refusal says the peer is confused about "
+                                                             "the framing, not about the fleet" },
                                         detail);
     }
 
     /// @copydoc IFrameResponder::EndpointRefusalReply
     ///
-    /// The credential refusals are this surface's, because the credential is: `AUTH`
-    /// routes here on the merged listener, so a peer presenting a wrong token is
-    /// refused by this component and has to be counted against it.
-    ///
-    /// **They are two counters and not one**, and neither is
-    /// `SchedulerRequestsRefusedUnauthenticated` above. That one counts a peer that
-    /// never authenticated -- a member with no token file, which is a configuration
-    /// mistake; these count a peer that tried and failed, which is a rotated key or a
-    /// probe. A client is told `unauthenticated` for all three and an operator does
-    /// three different things, which is the whole argument for a row being the
-    /// refusal rather than the code.
-    ///
-    /// Two arms are not counted, and each says why in its own row. The byte budget
-    /// says this surface is momentarily full, which the peer sees and retries, and
-    /// summing it into a security series is what makes that series unreadable; the
-    /// answer deadline is the endpoint's decision and the endpoint counts it.
-    /// `Detail::SchedulerEndpointRefusals` is where both are said, and where the two
-    /// that ARE counted carry their rows -- the rationale travels with the row rather
-    /// than sitting here, because a sentence written once at the call site explained
-    /// the budget correctly and would have explained a deadline wrongly.
+    /// Every arm is uncounted, and each says why in its own row of
+    /// `Detail::SchedulerEndpointRefusals` -- the rationale travels with the row rather
+    /// than sitting here, because a sentence written once at the call site explained the
+    /// budget correctly and would have explained a deadline wrongly.
     [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const override
@@ -567,13 +504,12 @@ class SchedulerResponder final: public IFrameResponder
     /// @param peer The caller, whose host is taken over by the returned context.
     [[nodiscard]] Distributed::CallerContext Context(PeerIdentity peer) const
     {
-        return Distributed::CallerContextOf(_membership, std::move(peer.host), peer.proven);
+        return Distributed::CallerContextOf(_membership, std::move(peer));
     }
 
     Distributed::SchedulerProtocol& _protocol;
     Distributed::IMembershipOracle const& _membership;
     IMetricsSink& _metrics;
-    std::shared_ptr<AuthPolicy const> _policy;
 };
 
 /// Serves this node's own cache tier to clients on this machine, and to nobody else.
@@ -590,9 +526,9 @@ class SchedulerResponder final: public IFrameResponder
 /// the **verb** is what survived that merge; "it is only bound to loopback" did not,
 /// and this is the layer that now carries the whole rule rather than half of it.
 ///
-/// Membership is *not* consulted here, and its absence is the fix. A
-/// `--fleet-member` names a machine that may spend this node's CPU and be leased its
-/// slots; it does not name a machine that may read this node's whole build output,
+/// Membership is *not* consulted here, and its absence is the fix. A member is a
+/// machine that may spend this node's CPU and be leased its slots; it is not a
+/// machine that may read this node's whole build output,
 /// which is what a cache tier is. Those were one list answering two questions, and
 /// the second answer was wrong: a peer could `FETCH` every object this machine had
 /// ever compiled. The compile surface still asks membership, because "may you run a
@@ -660,7 +596,7 @@ class CacheResponder final: public IFrameResponder
     /// oversight** (#287, #1428, #178). This tier serves THIS MACHINE, always: locality is a
     /// property of the verb, and a machine the fleet admitted is still not this one. The proof
     /// establishes membership, and membership is the list this surface deliberately does not
-    /// consult -- a `--fleet-member` may spend this node's CPU, and it may not read every object
+    /// consult -- a member may spend this node's CPU, and it may not read every object
     /// this machine has ever compiled. So the identity's `proven` is not read, and a proven peer
     /// is refused exactly as it is today.
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
@@ -674,38 +610,12 @@ class CacheResponder final: public IFrameResponder
                           "this node serves its cache to its own machine only");
     }
 
-    /// @copydoc IFrameResponder::AuthRequired
-    ///
-    /// **No**, and stated rather than inherited. This surface is already closed to
-    /// everyone but this machine (#287), so the peer gate above refuses every caller
-    /// a credential could -- and a credential here would have to be readable by every
-    /// local build, which makes it one an attacker who is already local can read too.
-    ///
-    /// The interface is pure virtual precisely so this answer has to be written down:
-    /// a default would let a surface added later inherit an open door by saying
-    /// nothing, which is the shape this codebase records as reopening a hole by
-    /// omission.
-    ///
-    /// The verb is ignored for the same reason the scheduler's is -- this listener
-    /// carries one verb family. Note where the reason above actually attaches, though:
-    /// "a credential every local build can read is not a credential" is a fact about
-    /// the CACHE VERBS, not about the port they arrive on, so it survives a merge onto
-    /// a shared listener and the answer there has to follow the verb rather than the
-    /// surface (#290).
-    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return false;
-    }
-
     /// @copydoc IFrameResponder::CheckCredential
     ///
-    /// There is no policy, so this answers `NoPolicy` for every payload: `Ok`, and
-    /// nothing verified. That is what keeps a token-configured launcher working
-    /// against a node whose cache requires none -- the same reason the daemon answers
-    /// AUTH `Ok` when auth is off.
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    /// `NoPolicy`: AUTH is the Session family's; this surface is never routed one.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
     {
-        return FastCache::CheckCredential(nullptr, payload);
+        return NotTheSessionSurface();
     }
 
     /// @copydoc IFrameResponder::RefusalReply
@@ -729,8 +639,8 @@ class CacheResponder final: public IFrameResponder
     /// cache tier actually reaches: the endpoint's in-flight ceiling folds to the
     /// largest owner's, which is this cache's, so a `STORE` is what runs into it.
     /// `Detail::CacheEndpointRefusals` carries that and the two credential arms, which
-    /// `MergedResponder` routes to the scheduler and this surface therefore never
-    /// sees.
+    /// `MergedResponder` routes to the session component and this surface therefore
+    /// never sees.
     [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const override
@@ -841,10 +751,9 @@ class CacheResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::NodeProver
     ///
-    /// **None, and that is the whole reason the proof verbs are a family of their own.** The
-    /// credential THIS surface owns is `--scheduler-token-file`, an operator's token; the cluster
-    /// key is a different secret, in a different file, that every member of the fleet holds. A
-    /// scheduler verifying it would also make a pure worker -- an ordinary deployment -- unprovable.
+    /// **None, and that is the whole reason the proof verbs are a family of their own.** A proof
+    /// is judged against the roster, which a scheduler does not own; a scheduler verifying one
+    /// would also make a pure worker -- an ordinary deployment -- unprovable.
     ///
     /// What this surface does with a proof is READ it: `RefusePeer` folds it into the membership
     /// answer, which is where a proven key holder is admitted.
@@ -905,8 +814,7 @@ struct SurfaceComponents
     /// Answers the cache verbs, or nullptr when this node holds no tier.
     IFrameResponder* cache { nullptr };
 
-    /// Answers the scheduler verbs, or nullptr when this node does not schedule. Also
-    /// owns the credential, so `AUTH` goes here.
+    /// Answers the scheduler verbs, or nullptr when this node does not schedule.
     IFrameResponder* scheduler { nullptr };
 
     /// Answers the compile verbs, or nullptr when this node runs no worker.
@@ -927,6 +835,12 @@ struct SurfaceComponents
     /// admit anybody should not be openable, which is why this is a component a node
     /// may not run rather than a surface that is always present and always refuses.
     IFrameResponder* enrollment { nullptr };
+
+    /// Why `enrollment` is null, read only while it is: the reason this node KNOWS, so a joiner
+    /// pointed here is told it (`EnrollmentAbsenceTable`) rather than a guess -- *runs no consensus*
+    /// from a node that runs it is a confident wrong signal. `NoConsensus`, the ordinary reason, for a
+    /// composition that names none; `ComposeSurfaceComponents` always names one.
+    EnrollmentAbsence enrollmentAbsence { EnrollmentAbsence::NoConsensus };
 
     /// Answers `Subscribe`: live stats as a stream rather than a poll (#1399).
     ///
@@ -950,6 +864,27 @@ struct SurfaceComponents
     /// at the door -- `NoCluster` rather than `UnimplementedVerb`, because a caller told the latter
     /// goes off to upgrade a node that is already current.
     IFrameResponder* nodeProof { nullptr };
+
+    /// Answers `FleetSummary`: which fleet this node is in, signed over the asker's nonce.
+    ///
+    /// Like `node`, **never null on a built node**: a joiner probing a seed must be answered
+    /// whatever the seed runs. A node with no fleet to offer says so in the component's own
+    /// refusal (`NoCluster`), not as a family missing at the door.
+    IFrameResponder* formation { nullptr };
+
+    /// Answers the `Session` family: `AUTH`, and what a verified ticket establishes.
+    ///
+    /// Like `node`, **never null on a built node**: the node checks no password, and which
+    /// machine a ticket speaks for is a question every node answers, whatever it runs.
+    IFrameResponder* session { nullptr };
+
+    /// Answers the fleet's shared cache: `SharedFetch` and `SharedStore`.
+    ///
+    /// Like `node`, **never null on a built node**: a node the `shared-cache` setting does not
+    /// name answers an admitted caller `NotSharedCache`, so the family is never unrouted and a node
+    /// named at runtime needs no component it did not already have. Null only in a test that
+    /// routes nothing there.
+    IFrameResponder* sharedCache { nullptr };
 };
 
 /// Whether a verb family's owner is there on a built node. In-process only, never
@@ -984,6 +919,7 @@ struct FamilyRoute
     IFrameResponder* SurfaceComponents::* owner; ///< The member that answers it, or null for none.
     FamilyPresence presence;                     ///< Whether that owner exists on a built node.
     SessionCeilings ceilings;                    ///< Whether the surface reads its ceilings.
+    std::string_view component;                  ///< The owner's member name, for a refusal to say; empty for none.
 };
 
 /// **The merged listener's one routing table** (#206): which component answers each verb
@@ -995,32 +931,39 @@ inline constexpr EnumTable<CompileCacheWire::VerbFamily, FamilyRoute> FamilyRout
     { .family = CompileCacheWire::VerbFamily::Unset,
       .owner = nullptr,
       .presence = FamilyPresence::NoOwner,
-      .ceilings = SessionCeilings::NotRead },
-    // `Session` follows the scheduler, because the credential is the scheduler's: the cache
-    // requires none, so an `AUTH` routed to it would be answered "no policy" and a peer
-    // holding the scheduler's secret could never present it.
+      .ceilings = SessionCeilings::NotRead,
+      .component = "" },
+    // `Session` is its own component's, on every built node: the node checks no password, and
+    // what an `AUTH` can still establish -- which machine a ticket speaks for -- must not
+    // depend on which components a node runs. Its ceilings are NOT read: `AUTH` is bounded
+    // by its own `OpTable` row, and every other owner on the port has larger ones.
     { .family = CompileCacheWire::VerbFamily::Session,
-      .owner = &SurfaceComponents::scheduler,
-      .presence = FamilyPresence::WhenItsComponentRuns,
-      .ceilings = SessionCeilings::Folded },
+      .owner = &SurfaceComponents::session,
+      .presence = FamilyPresence::OnEveryBuiltNode,
+      .ceilings = SessionCeilings::NotRead,
+      .component = "session" },
     { .family = CompileCacheWire::VerbFamily::Cache,
       .owner = &SurfaceComponents::cache,
       .presence = FamilyPresence::WhenItsComponentRuns,
-      .ceilings = SessionCeilings::Folded },
+      .ceilings = SessionCeilings::Folded,
+      .component = "cache" },
     { .family = CompileCacheWire::VerbFamily::Scheduler,
       .owner = &SurfaceComponents::scheduler,
       .presence = FamilyPresence::WhenItsComponentRuns,
-      .ceilings = SessionCeilings::Folded },
+      .ceilings = SessionCeilings::Folded,
+      .component = "scheduler" },
     { .family = CompileCacheWire::VerbFamily::Compile,
       .owner = &SurfaceComponents::compile,
       .presence = FamilyPresence::WhenItsComponentRuns,
-      .ceilings = SessionCeilings::Folded },
+      .ceilings = SessionCeilings::Folded,
+      .component = "compile" },
     // *What do you serve?* must work on whatever a node runs, so this owner is never null
     // on a built node the way the component families' legitimately are.
     { .family = CompileCacheWire::VerbFamily::Node,
       .owner = &SurfaceComponents::node,
       .presence = FamilyPresence::OnEveryBuiltNode,
-      .ceilings = SessionCeilings::Folded },
+      .ceilings = SessionCeilings::Folded,
+      .component = "node" },
     // Legitimately null, and on most deployments it is: a node that runs no consensus has no
     // cluster to let anybody into, so the family is refused at the door with the sentence
     // every unserved family gets. Its ceilings are NOT read, and `EnrollmentResponder` says
@@ -1029,18 +972,21 @@ inline constexpr EnumTable<CompileCacheWire::VerbFamily, FamilyRoute> FamilyRout
     { .family = CompileCacheWire::VerbFamily::Enrollment,
       .owner = &SurfaceComponents::enrollment,
       .presence = FamilyPresence::WhenItsComponentRuns,
-      .ceilings = SessionCeilings::NotRead },
+      .ceilings = SessionCeilings::NotRead,
+      .component = "enrollment" },
     // For `Node`'s reason: a watcher asks what a node is doing whatever it runs.
     { .family = CompileCacheWire::VerbFamily::Live,
       .owner = &SurfaceComponents::live,
       .presence = FamilyPresence::OnEveryBuiltNode,
-      .ceilings = SessionCeilings::Folded },
+      .ceilings = SessionCeilings::Folded,
+      .component = "live" },
     // For `Live`'s reason: a reader pointed at a worker is told where the fleet is served
     // rather than that nothing here speaks the verb.
     { .family = CompileCacheWire::VerbFamily::Fleet,
       .owner = &SurfaceComponents::fleet,
       .presence = FamilyPresence::OnEveryBuiltNode,
-      .ceilings = SessionCeilings::Folded },
+      .ceilings = SessionCeilings::Folded,
+      .component = "fleet" },
     // Legitimately null: a node running no consensus holds no roster to verify a proof
     // against. Its ceilings are NOT read, for `Enrollment`'s reason -- the fold is a MAXIMUM
     // over connections and a SUM over every-node owners, so folding a small number in would
@@ -1049,7 +995,27 @@ inline constexpr EnumTable<CompileCacheWire::VerbFamily, FamilyRoute> FamilyRout
     { .family = CompileCacheWire::VerbFamily::NodeProof,
       .owner = &SurfaceComponents::nodeProof,
       .presence = FamilyPresence::WhenItsComponentRuns,
-      .ceilings = SessionCeilings::NotRead },
+      .ceilings = SessionCeilings::NotRead,
+      .component = "nodeProof" },
+    // For `Node`'s reason: a joiner asks a seed which fleet it is in whatever the seed runs, and a
+    // seed with none to offer says so itself. Its ceilings are NOT read, for `Enrollment`'s
+    // reason: the verb carries one nonce under its own `OpTable` ceiling, and a ceiling folded in
+    // would widen nothing today and every surface on the port after a later raise. Its connection
+    // allowance ADDS to the other every-node owners', since they coexist on every port.
+    { .family = CompileCacheWire::VerbFamily::Formation,
+      .owner = &SurfaceComponents::formation,
+      .presence = FamilyPresence::OnEveryBuiltNode,
+      .ceilings = SessionCeilings::NotRead,
+      .component = "formation" },
+    // The fleet's shared cache, on every built node: a node the setting does not name refuses
+    // an admitted caller `NotSharedCache` itself rather than leaving the family unrouted. Its
+    // ceilings ARE read, because any node may be named at runtime and must then take a STORE of
+    // an object's size -- and being an every-node owner, its connection allowance ADDS.
+    { .family = CompileCacheWire::VerbFamily::SharedCache,
+      .owner = &SurfaceComponents::sharedCache,
+      .presence = FamilyPresence::OnEveryBuiltNode,
+      .ceilings = SessionCeilings::Folded,
+      .component = "sharedCache" },
 } };
 
 static_assert(RowsInEnumeratorOrder(FamilyRoutes, &FamilyRoute::family),
@@ -1080,6 +1046,26 @@ static_assert(RowsInEnumeratorOrder(FamilyRoutes, &FamilyRoute::family),
 
 static_assert(EveryFamilyIsClassified(),
               "every FamilyRoutes row states its presence and its ceilings, and every-node owners are distinct");
+
+static_assert(std::ranges::all_of(FamilyRoutes,
+                                  [](FamilyRoute const& row) { return row.component.empty() == (row.owner == nullptr); }),
+              "a family with an owner names that owner's member, and one with none names nothing");
+
+/// The first family every built node answers whose owner @p components leaves null, or null.
+///
+/// **What makes "never null on a built node" true rather than stated** (`SurfaceComponents`): a
+/// node that forgot to route one of these families answers it `UnimplementedVerb`, which a client
+/// reads as *this node is too old*, and nothing else would notice. Asked of the table's
+/// `OnEveryBuiltNode` column, so the next such family is checked without an edit here.
+/// @param components What the listener would route to.
+/// @return The route whose owner is missing, or nullptr when every one is present.
+[[nodiscard]] constexpr FamilyRoute const* MissingEveryNodeOwner(SurfaceComponents const& components) noexcept
+{
+    for (auto const& row: FamilyRoutes)
+        if (row.presence == FamilyPresence::OnEveryBuiltNode && components.*row.owner == nullptr)
+            return &row;
+    return nullptr;
+}
 
 /// The component of @p components that answers @p family, or nullptr when this node serves
 /// it nowhere. `FamilyRoutes` is the table; this reads it.
@@ -1178,30 +1164,15 @@ class MergedResponder final: public IFrameResponder
         return owner->RefusePeer(peer, opRaw);
     }
 
-    /// @copydoc IFrameResponder::AuthRequired
-    ///
-    /// The whole reason this question had to take the verb. The two owners answer it
-    /// oppositely and both are right: the scheduler requires a credential when one is
-    /// configured, the cache requires none because a credential every local build can
-    /// read is not a credential. An unowned verb answers `false` and is unreachable
-    /// anyway -- `RefusePeer` above has already refused it, and requiring a credential
-    /// for a verb nobody serves would tell a stranger that one exists.
-    [[nodiscard]] bool AuthRequired(std::uint8_t opRaw) const noexcept override
-    {
-        auto const* const owner = OwnerOf(opRaw);
-        return owner != nullptr && owner->AuthRequired(opRaw);
-    }
-
     /// @copydoc IFrameResponder::CheckCredential
     ///
-    /// The scheduler's, because the credential is. A node with no scheduler has no
-    /// policy to check -- and never reaches this, since `AUTH` is then an unowned verb
-    /// refused at the door.
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    /// The session component's, because `AUTH` is a `Session` verb. It is on every built node;
+    /// a composition that names none has nothing to establish, and answers so.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> payload) const override
     {
-        if (_components.scheduler == nullptr)
-            return CredentialOutcome::NoPolicy;
-        return _components.scheduler->CheckCredential(payload);
+        if (_components.session == nullptr)
+            return NotTheSessionSurface();
+        return _components.session->CheckCredential(payload);
     }
 
     /// @copydoc IFrameResponder::RefusalReply
@@ -1232,14 +1203,28 @@ class MergedResponder final: public IFrameResponder
     /// the wording is the same either way, and a cache STORE that overran the byte
     /// budget counted against the scheduler names the wrong subsystem.
     ///
-    /// A verb is always known here -- the endpoint decodes the header before it asks
-    /// any of these -- so unlike `MaxRequestBytes` and its two siblings there is
-    /// nothing to fold and no surface-wide answer to invent.
+    /// **The verb is NOT always verified here.** On a plain connection the endpoint
+    /// decodes the header and routes an unowned verb to `UnservedReply` before any
+    /// budget is asked. A SEALED frame is refused over budget from a header whose tag
+    /// was never read (`SealFault::OverBudget`), so its verb is a byte nobody vouched
+    /// for, and it may name anything.
+    ///
+    /// **So an unowned verb refused over budget is answered by the owner whose
+    /// budget it is**, and counted on that owner's busy row. The refusal is certain and
+    /// the verb is not: the budget that ran out is the one `MaxInFlightBytes` folded to,
+    /// which is `BudgetOwner()`'s, and the busy answer is true whatever the frame
+    /// would have asked. Answered `UnservedReply` instead, it moved no counter -- an
+    /// injector declaring a large length on an unowned verb would have turned a counted
+    /// broken seal into a refusal nothing records. The row that moves was still chosen
+    /// by an unverified byte (owned verb: its owner's; unowned: the budget's), which is
+    /// observability rather than safety: the connection ends either way.
     [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
                                                               std::uint8_t opRaw,
                                                               std::string_view detail) const override
     {
-        auto const* const owner = OwnerOf(opRaw);
+        auto const* owner = OwnerOf(opRaw);
+        if (owner == nullptr && refusal == EndpointRefusal::InFlightBudget)
+            owner = BudgetOwner();
         if (owner == nullptr)
             return UnservedReply(opRaw);
         return owner->EndpointRefusalReply(refusal, opRaw, detail);
@@ -1287,8 +1272,9 @@ class MergedResponder final: public IFrameResponder
     /// connect while every live subscription is held. On a node running only consensus
     /// their largest alone was the live cap, so the port refused new connections exactly
     /// when the subscriptions were full and the live responder's own counted refusal never
-    /// fired. Their sum is below every other owner's ceiling, so no other node's number
-    /// moves.
+    /// fired. The fleet's shared cache is an every-node owner too, sized for one kept session
+    /// per fleet node, so the sum can now pass a component owner's ceiling -- and whichever
+    /// is larger is the listener's.
     [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         std::size_t coexisting = 0;
@@ -1389,7 +1375,9 @@ class MergedResponder final: public IFrameResponder
     {
         CompileCacheWire::VerbFamily family; ///< Whose verbs this row answers.
         Cc::UncountedRefusal refusal;        ///< What the client is told, and why nothing rises.
-        std::string_view detail;             ///< Words for the operator who sent it.
+        /// Words for the operator who sent it, chosen from what this node knows -- which, for the
+        /// enrollment family, is WHY it records nobody (`SurfaceComponents::enrollmentAbsence`).
+        std::string_view (*detail)(SurfaceComponents const& components) noexcept;
     };
 
     /// Every family with an answer of its own; any other unserved family is unimplemented.
@@ -1399,32 +1387,39 @@ class MergedResponder final: public IFrameResponder
                        .rationale = "what a node without consensus answers every enrolment attempt aimed at it, which "
                                     "is an ordinary misdirection rather than an event; counted, it would bury the scan "
                                     "it would be read for, exactly as the unserved-family answer below would" },
-          .detail = "this node runs no consensus, so it belongs to no cluster and there is nothing here to join; ask a "
-                    "node that runs consensus -- --node-status names the components a node serves" },
+          .detail =
+              [](SurfaceComponents const& components) noexcept {
+                  return EnrollmentAbsenceDetail(components.enrollmentAbsence);
+              } },
         { .family = CompileCacheWire::VerbFamily::Compile,
           .refusal = { .code = CompileCacheWire::NoCompileWorker::Code,
                        .rationale = "what a node running no worker answers a compile or a cordon aimed at it: nothing "
                                     "leases this node, so each one is a person or a script at the wrong machine, "
                                     "which is a misdirection rather than an event a series should count" },
-          .detail = "this endpoint runs no compile worker: it was started with --slots=0, so nothing here compiles "
-                    "and there is nothing to cordon; ask a node that runs one -- --node-status names the components "
-                    "a node serves" },
+          .detail = [](SurfaceComponents const&) noexcept -> std::string_view {
+              return "this endpoint runs no compile worker: it was started with --slots=0, so nothing here compiles "
+                     "and there is nothing to cordon; ask a node that runs one -- `fastcache-cli node` names the "
+                     "components a node serves";
+          } },
         { .family = CompileCacheWire::VerbFamily::NodeProof,
           .refusal = { .code = CompileCacheWire::ErrorCode::NoCluster,
                        .rationale = "what a node running no consensus answers every proof aimed at it: it is no "
-                                    "scheduler, so a proof here is a --scheduler naming the wrong machine; counted, "
+                                    "scheduler, so a proof here is a node registering at the wrong machine; counted, "
                                     "one misdirected node would dominate the series that says whether an identity is "
                                     "WRONG somewhere" },
-          .detail = "this node runs no consensus, so it holds no roster to prove an identity against and is no "
-                    "scheduler of any fleet; admission at this endpoint is decided by your address -- --node-status "
-                    "names the components a node serves" },
+          .detail = [](SurfaceComponents const&) noexcept -> std::string_view {
+              return "this node runs no consensus, so it holds no roster to prove an identity against and is no "
+                     "scheduler of any fleet; admission at this endpoint is decided by your address -- "
+                     "`fastcache-cli node` names the components a node serves";
+          } },
     });
 
     // The compile row says `CompileCacheWire::NoCompileWorker`'s fact, which the daemon answers too, so
     // neither endpoint can reword it or move its code without the other (#206).
     static_assert(CompileCacheWire::SaysNoCompileWorker(
         core::findOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->refusal.code,
-        core::findOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->detail));
+        core::findOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)
+            ->detail(SurfaceComponents {})));
 
     /// What a verb this node serves nowhere is answered with.
     ///
@@ -1448,16 +1443,19 @@ class MergedResponder final: public IFrameResponder
     /// at. What DID change is that all four routes here -- `Answer`, `RefusePeer`,
     /// `RefusalReply` and `EndpointRefusalReply` -- give one sentence: a peer asking
     /// for a verb served nowhere is told that, rather than being told its frame was
-    /// too large and sent to shrink one that was never going to be answered.
+    /// too large and sent to shrink one that was never going to be answered. One arm
+    /// is excepted, and `EndpointRefusalReply` says why: an in-flight refusal of a
+    /// SEALED frame, whose verb is an unverified byte, is answered busy by the
+    /// budget's owner and counted there.
     /// **It takes the VERB, because one unserved family must not answer
     /// `UnimplementedVerb`.** The enrollment family is refused `NoCluster` instead, and
     /// the reason is the rule that *unimplemented is not served elsewhere*: a node
     /// without consensus implements these verbs perfectly well and has no cluster to
     /// let anybody into, so `UnimplementedVerb` -- which the client reads as
     /// `UnknownOpcode` -- told a joiner *the seed is running a build older than this
-    /// one*. The documented flow points `--enroll-from` at ANY member and most members
-    /// run no consensus, so the commonest operator mistake produced a confident wrong
-    /// diagnosis that sends somebody to upgrade a node that is already current.
+    /// one*. A joiner pointed at a node that runs no consensus is the commonest operator
+    /// mistake, and it produced a confident wrong diagnosis that sends somebody to upgrade
+    /// a node that is already current.
     ///
     /// `CompileCacheHandler`'s `RefusedVerbs` table already drew exactly this
     /// distinction for the daemon, with the argument written out beside it -- *"a joiner
@@ -1481,11 +1479,11 @@ class MergedResponder final: public IFrameResponder
     /// condition, as the enrollment row does with `NoCluster`.
     /// @param opRaw The third header byte, as received.
     /// @return The encoded refusal.
-    [[nodiscard]] static std::vector<std::byte> UnservedReply(std::uint8_t opRaw)
+    [[nodiscard]] std::vector<std::byte> UnservedReply(std::uint8_t opRaw) const
     {
         auto const family = CompileCacheWire::FamilyOf(opRaw);
         if (auto const* const row = core::findOrNull(UnservedFamilies, family, &UnservedFamily::family))
-            return Cc::RefuseWithoutCounter(row->refusal, row->detail);
+            return Cc::RefuseWithoutCounter(row->refusal, row->detail(_components));
 
         return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::UnimplementedVerb,
                                           .rationale =
@@ -1501,8 +1499,9 @@ class MergedResponder final: public IFrameResponder
     /// only in which member function they read, and copy-pasted branches that differ
     /// by a name are what this codebase treats as a defect.
     ///
-    /// **It folds every owner whose `FamilyRoutes` row says `SessionCeilings::Folded`**:
-    /// today everything but `enrollment`, whose row and whose responder say why. A
+    /// **It folds every owner whose `FamilyRoutes` row says `SessionCeilings::Folded`**, and
+    /// each `NotRead` row says why it is left out -- the table is the list, so none is kept
+    /// here. A
     /// per-component connection or byte ceiling has nowhere to live on one listener, one
     /// accept queue and one byte budget (#1338), so a small number here is never a
     /// narrowing, and a larger one widens every surface on the port.
@@ -1513,8 +1512,14 @@ class MergedResponder final: public IFrameResponder
     /// `MaxRequestBytes`, stated at those three declarations in `FrameEndpoint.hpp`. That was
     /// unreachable while `main.cpp` set `.compile` unconditionally, and #206 reached it: a
     /// `--slots=0` node running only consensus bound this port and closed every connection
-    /// it accepted, `--node-status` included. They are sized as the SMALL owners, so on any
-    /// node running a cache, a scheduler or a worker they change no number.
+    /// it accepted, `--node-status` included. The operator owners are sized as the SMALL ones,
+    /// so on any node running a cache, a scheduler or a worker they change no number. **The
+    /// fleet's shared cache is the exception**: it is an every-node owner sized for an object,
+    /// because any node may be named at runtime, so it moves the request and in-flight ceilings
+    /// of a node running neither a cache tier nor a worker -- a scheduler-only one from 64 KiB,
+    /// a consensus-only one from the operator owners' -- to 256 MiB, and adds its 128
+    /// connections to every node's sum. A sealed frame is charged to that budget before it is
+    /// held (`SealedFrameCharge`), so the larger ceiling is not a larger unaccounted buffer.
     /// @param ceiling Which ceiling to read.
     /// @return The largest of the folded owners present; never 0 on a built node.
     [[nodiscard]] std::size_t Largest(std::size_t (IFrameResponder::*ceiling)() const noexcept) const noexcept
@@ -1524,6 +1529,23 @@ class MergedResponder final: public IFrameResponder
             if (auto const* const owner = row.owner == nullptr ? nullptr : _components.*row.owner;
                 row.ceilings == SessionCeilings::Folded && owner != nullptr)
                 out = std::max(out, (owner->*ceiling)());
+        return out;
+    }
+
+    /// The owner whose in-flight budget the endpoint enforces: the folded owner present with the
+    /// largest `MaxInFlightBytes`, the first in `FamilyRoutes` order on a tie.
+    ///
+    /// The same walk as `Largest`, answering WHO rather than how much, because a refusal of that
+    /// budget for a verb nobody owns still has to move somebody's row (`EndpointRefusalReply`).
+    /// @return That owner; null only when no folded owner is present, which no built node is.
+    [[nodiscard]] IFrameResponder const* BudgetOwner() const noexcept
+    {
+        IFrameResponder const* out = nullptr;
+        for (auto const& row: FamilyRoutes)
+            if (auto const* const owner = row.owner == nullptr ? nullptr : _components.*row.owner;
+                row.ceilings == SessionCeilings::Folded && owner != nullptr
+                && (out == nullptr || owner->MaxInFlightBytes() > out->MaxInFlightBytes()))
+                out = owner;
         return out;
     }
 

@@ -3,6 +3,7 @@
 
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 
 #include <optional>
 #include <span>
@@ -61,10 +62,10 @@ class IRaftPeerKeys
     /// @return The key.
     [[nodiscard]] virtual Ed25519PublicKey OwnPublicKey() const = 0;
 
-    /// Sign @p message with this node's own private key.
+    /// Sign @p message with this node's own private key: a labelled message, and nothing else.
     /// @param message What is signed.
     /// @return The signature.
-    [[nodiscard]] virtual Ed25519Signature SignAsSelf(std::span<std::byte const> message) const = 0;
+    [[nodiscard]] virtual Ed25519Signature SignAsSelf(LabelledMessage const& message) const = 0;
 
     /// What the roster says about @p peer's keys, now.
     /// @param peer A member id, as a handshake claimed it.

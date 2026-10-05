@@ -91,6 +91,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # Which files are third-party, asked of the tree being scanned (#1370).
 # shellcheck source=lib/third-party-roots.sh
 . scripts/lib/third-party-roots.sh
+# shellcheck source=lib/git-scrub.sh
+. scripts/lib/git-scrub.sh
 
 Workflow=".github/workflows/build.yml"
 
@@ -236,16 +238,39 @@ ExtractDocumentedConfigure() {
 # substitution, where an exit would end only the subshell and leave the caller reading a
 # truncated list with a clean status.
 DocumentationSites() {
-    local tracked matches firstParty declined
+    local tracked matches firstParty declined grepStatus errors errorText
+    # Both searches' stderr is KEPT and judged, never discarded: `git grep` exits 0 over a tracked
+    # file it cannot open (`error: failed to stat 'X': Permission denied`) and leaves it out, and
+    # the walk's `grep -r` exits 2 for the same file into a pipeline whose status is `sed`'s. A
+    # document that could not be read is one whose line was never compared, so any stderr is a
+    # refusal, quoted -- the rule `fastcached_tracked_files` follows for the CMake checks.
+    # Refused as a LINE, never an exit: this runs in a process substitution, where an exit ends
+    # only the subshell and leaves the caller reading a truncated list with a clean status.
+    if ! errors="$(mktemp 2>/dev/null)" || [[ -z "$errors" ]]; then
+        echo "refused:no scratch file could be made for the search's stderr (mktemp failed), so a document it could not read would go unseen and which files document the database is unknown"
+        return 0
+    fi
+    grepStatus=0
     if tracked="$(git ls-files 2>/dev/null)" && [[ -n "$tracked" ]]; then
         echo "mode:git ls-files"
-        matches="$(printf '%s\n' "$tracked" | tr '\n' '\0' \
-                   | xargs -0 grep -l -e "-B ${DatabaseDir}" -- 2>/dev/null || true)"
+        # One `git grep` over the tracked files rather than `grep` over a list of them: the
+        # same files and the same pattern, searched in parallel. Over a DrvFs checkout -- where
+        # every local gate tree takes its sources from -- reading them one after another was
+        # this check's whole cost. Status 1 is "nothing matched"; anything above it is a
+        # search that did not run, which is refused rather than read as an empty answer.
+        matches="$(git grep -l -e "-B ${DatabaseDir}" 2>"$errors")" || grepStatus=$?
     else
         echo "mode:directory walk (no git index)"
         matches="$(grep -rl --exclude-dir=.git --exclude-dir=.claude \
                         --exclude-dir=out --exclude-dir=_deps \
-                        -e "-B ${DatabaseDir}" . 2>/dev/null | sed 's|^\./||' || true)"
+                        -e "-B ${DatabaseDir}" . 2>"$errors")" || grepStatus=$?
+        matches="$(printf '%s\n' "$matches" | sed 's|^\./||')"
+    fi
+    errorText="$(tr '\n' ' ' < "$errors")"
+    rm -f "$errors"
+    if (( grepStatus > 1 )) || [[ -n "$errorText" ]]; then
+        echo "refused:the search of $(pwd) did not answer cleanly (status ${grepStatus}: ${errorText% }), so which files document the database is unknown -- a file it could not read is not one that holds no line"
+        return 0
     fi
     matches="$(printf '%s\n' "$matches" | grep -v "^${SelfPath}$" | grep -v '^$' || true)"
     if ! firstParty="$(first_party_paths "$(pwd)" "$matches")"; then
@@ -313,10 +338,11 @@ CompareConfigure() {
     echo "  FAIL: $label does not document what the clang-tidy job configures." >&2
     echo "        A person following it gets a database whose flags and target set differ from CI's," >&2
     echo "        so the sweep reports findings CI suppresses and misses findings CI raises." >&2
-    # `diff` on process substitutions rather than a pipeline into `grep`: under
-    # `pipefail` a short-circuiting reader kills the producer with SIGPIPE and the
-    # pipeline then reports the PRODUCER's status.
-    diff <(printf '%s\n' "$ciNormal") <(printf '%s\n' "$docNormal") \
+    # `diff` through `pipe_pair_into` rather than a pipeline into `grep`: under `pipefail`
+    # a short-circuiting reader kills the producer with SIGPIPE and the pipeline then
+    # reports the PRODUCER's status. Nor `diff <(...) <(...)`, which in this pipeline makes
+    # diff the PARENT of both writers -- the shape a Windows runner killed a grep in (#1630).
+    pipe_pair_into "$ciNormal"$'\n' "$docNormal"$'\n' diff /dev/fd/3 - \
         | sed 's/^/          /' >&2 || true
     return 1
 }
@@ -470,7 +496,7 @@ and again, three hundred lines further down:
         # nothing about what had happened, which is the failure shape this
         # repository's own testing rules refuse.
         if [[ "$useGit" == git ]]; then
-            if ! ( cd "$tree" && git init -q . && git add -A ) >/dev/null 2>&1; then
+            if ! ( cd "$tree" && scratch_git init -q . && scratch_git add -A ) >/dev/null 2>&1; then
                 Report "scan '$name' setup" "git init + git add to succeed" "they failed"
                 return 0
             fi
@@ -495,6 +521,40 @@ and again, three hundred lines further down:
     ExpectScan "no git index, ignored sibling checkout excluded" \
         "directory walk (no git index)" nogit w
 
+    # A document that cannot be READ is refused in both modes, never skipped: `git grep` exits 0
+    # over it, saying so on stderr only, and the walk's `grep -r` exits 2 into a pipeline. The
+    # same tree readable is the control, so the refusal is the unreadable file's and nothing
+    # else in the fixture's. chmod 000 does not bite as root, so the plant is asked by `cat`.
+    ExpectUnreadable() {
+        name="$1"; useGit="$2"
+        tree="$scratch/scan-unreadable-$3"
+        mkdir -p "$tree/scripts/lib"
+        printf 'vendor/upstream\n' > "$tree/scripts/lib/third-party-roots.txt"
+        printf '#   cmake --preset clang-debug -B %s\n' "$DatabaseDir" > "$tree/scripts/tidy-sweep.sh"
+        printf '    cmake --preset clang-debug -B %s -DSTALE=YES\n' "$DatabaseDir" > "$tree/docs.md"
+        if [[ "$useGit" == git ]] && ! ( cd "$tree" && scratch_git init -q . && scratch_git add -A ) >/dev/null 2>&1; then
+            Report "scan '$name' setup" "git init + git add to succeed" "they failed"
+            return 0
+        fi
+        got="$( cd "$tree" && DocumentationSites 2>/dev/null )"
+        Report "scan '$name' control: readable, the sites are listed" "docs.md scripts/tidy-sweep.sh " \
+            "$(printf '%s\n' "$got" | grep -v -E '^(mode|declined|refused):' | grep -v '^$' | tr '\n' ' ')"
+        chmod 000 "$tree/docs.md"
+        if cat "$tree/docs.md" >/dev/null 2>&1; then
+            chmod 644 "$tree/docs.md"
+            echo "ok: self-test scan '$name' skipped -- chmod 000 did not stop this process reading the file (running as root?)"
+            return 0
+        fi
+        got="$( cd "$tree" && DocumentationSites 2>/dev/null )"
+        chmod 644 "$tree/docs.md"
+        Report "scan '$name' refuses an unreadable document" "refused" \
+            "$(printf '%s\n' "$got" | sed -n 's/^\(refused\):.*/\1/p')"
+    }
+    if command -v git >/dev/null 2>&1; then
+        ExpectUnreadable "git index, an unreadable document" git g
+    fi
+    ExpectUnreadable "no git index, an unreadable document" nogit w
+
     # A roots file naming no root is a REFUSAL line, never an empty set (#1370).
     tree="$scratch/scan-noroots"
     mkdir -p "$tree/scripts/lib"
@@ -503,6 +563,15 @@ and again, three hundred lines further down:
     got="$( cd "$tree" && DocumentationSites 2>/dev/null )"
     Report "scan with a roots file naming no root refuses" "refused" \
         "$(printf '%s\n' "$got" | sed -n 's/^\(refused\):.*/\1/p')"
+
+    # No scratch file for the search's stderr is a REFUSAL line too, never an exit from inside
+    # the process substitution. The failure is a function shadowing `mktemp`, never a `TMPDIR`
+    # naming a directory that does not exist: macOS's `mktemp` made its file anyway, and the
+    # case read a missing refusal on a run that never reached the arm it tests.
+    printf 'vendor/upstream\n' > "$tree/scripts/lib/third-party-roots.txt"
+    got="$( cd "$tree" && mktemp() { return 1; } && DocumentationSites 2>/dev/null )"
+    Report "scan with no scratch file for stderr refuses as a line" "refused:no scratch file" \
+        "$(printf '%s\n' "$got" | grep -o '^refused:no scratch file' || true)"
 
     # -----------------------------------------------------------------------
     # The WORKFLOW-side extractor, which decides what everything else is compared

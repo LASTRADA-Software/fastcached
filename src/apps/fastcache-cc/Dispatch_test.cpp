@@ -1,24 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "ArgumentDenials.hpp"
 #include "CompileCorrelation.hpp"
+#include "CompileJob.hpp"
 #include "Dispatch.hpp"
+#include "Stats.hpp"
+#include "TicketCredentials.hpp"
+
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Protocol/CompileReplySeal.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
+#include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <core/async/SyncRun.hpp>
 #include <core/net/KeepAlive.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/CompileReplyFakes.hpp>
+#include <tests/TicketFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -151,6 +166,19 @@ class ScriptedFleet final: public IEndpointExchange
         _costs.insert_or_assign(std::move(endpoint), duration);
     }
 
+    /// Make every exchange with `endpoint` end in `failure`, with no reply: a peer that
+    /// was reached and lost (`PeerLost`), outwaited (`Expired`) or went quiet (`Silent`).
+    ///
+    /// Beside `Serve` rather than instead of it, and asked FIRST, so a case states the
+    /// transport's verdict without also having to leave the endpoint unserved -- which is
+    /// the one spelling of `Unreached` and would say the opposite.
+    /// @param endpoint Which peer.
+    /// @param failure How every exchange with it ends.
+    void FailsWith(std::string endpoint, TransportFailure failure)
+    {
+        _failures.insert_or_assign(std::move(endpoint), failure);
+    }
+
     /// Drive `CostsTime` against this clock, which the case also hands `Dispatch`.
     /// @param clock The case's clock; must outlive this fleet.
     void UseClock(core::platform::ManualClock& clock) noexcept
@@ -166,6 +194,20 @@ class ScriptedFleet final: public IEndpointExchange
         auto const key = std::string { hostPort };
         _dialled.push_back(key);
         _budgets.push_back(budget);
+        // Advanced before the reply is produced, so the time is spent DURING the
+        // exchange rather than after it -- which is where a `LEASE` round trip's
+        // duration actually falls relative to the mint it contains. And before every
+        // way it can fail, because a dial that reached nothing still spent its time:
+        // what is left of a grant after a dead hint is the subject of a case.
+        if (_clock != nullptr)
+            if (auto const cost = _costs.find(key); cost != _costs.end())
+                _clock->advance(cost->second);
+        if (auto const failed = _failures.find(key); failed != _failures.end())
+        {
+            CacheOutcome outcome {};
+            outcome.transportFailure = failed->second;
+            return outcome;
+        }
         auto const it = _scripts.find(key);
         if (it == _scripts.end())
             return CacheOutcome {};
@@ -178,12 +220,6 @@ class ScriptedFleet final: public IEndpointExchange
         if (auto const slow = _durations.find(key); slow != _durations.end())
             if (budget.BoundsTotal() && budget.total < slow->second)
                 return CacheOutcome {};
-        // Advanced before the reply is produced, so the time is spent DURING the
-        // exchange rather than after it -- which is where a `LEASE` round trip's
-        // duration actually falls relative to the mint it contains.
-        if (_clock != nullptr)
-            if (auto const cost = _costs.find(key); cost != _costs.end())
-                _clock->advance(cost->second);
         ScriptedPeer peer { it->second, &_sent[key] };
         return core::async::syncRun(ExchangeFramed(&peer, &Unwatched(), std::move(frame), credential));
     }
@@ -216,6 +252,7 @@ class ScriptedFleet final: public IEndpointExchange
     std::map<std::string, std::size_t> _limits;
     std::map<std::string, std::chrono::milliseconds> _durations;
     std::map<std::string, std::chrono::milliseconds> _costs;
+    std::map<std::string, TransportFailure> _failures;
     core::platform::ManualClock* _clock { nullptr };
 };
 
@@ -230,10 +267,13 @@ constexpr std::string_view Worker = "worker:6676";
 ///        file are about routing and codecs rather than about budgets.
 [[nodiscard]] std::vector<std::byte> GrantReply(Wire::CodecList codecs = {}, std::chrono::milliseconds lifetime = {})
 {
-    return Wire::EncodeReply(
-        Wire::Status::Ok,
-        Wire::EncodeLeaseGrant(Wire::LeaseGrant {
-            .endpoint = Worker, .leaseToken = "l1", .workerCodecs = std::move(codecs), .lifetime = lifetime }));
+    return Wire::EncodeReply(Wire::Status::Ok,
+                             Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = Worker,
+                                                                       .leaseToken = "l1",
+                                                                       .workerCodecs = std::move(codecs),
+                                                                       .lifetime = lifetime,
+                                                                       .dialHint = {},
+                                                                       .workerKey = Testing::TestWorkerPublicKey() }));
 }
 
 /// The source name as the client sends it and the worker digests it: the WHOLE path.
@@ -264,6 +304,9 @@ struct ReplyFields
     std::string_view correlation;           ///< What the worker claims it compiled.
     std::string_view err;                   ///< The remote compiler's stderr.
     std::uint32_t exitCode { 0 };           ///< What the remote compiler thought of the code.
+    /// Whose key signs it (W-4). The worker the grant names, `Testing::TestWorkerKey()`, unless a
+    /// case is about a reply somebody else signed -- or nobody did, which is null.
+    Ed25519KeyPair const* signer { &Testing::TestWorkerKey() };
 };
 
 /// Frame one COMPILE reply.
@@ -271,13 +314,19 @@ struct ReplyFields
 /// @return The framed reply.
 [[nodiscard]] std::vector<std::byte> ReplyFrom(ReplyFields const& fields)
 {
-    return Wire::EncodeReply(
-        Wire::Status::Ok,
-        Wire::EncodeCompileResult(Wire::CompileResult { .exitCode = fields.exitCode,
-                                                        .object = fields.objectField,
-                                                        .stdoutText = {},
-                                                        .stderrText = Wire::AsBytes(fields.err),
-                                                        .correlation = Wire::AsBytes(fields.correlation) }));
+    auto const signature =
+        fields.signer != nullptr
+            ? std::optional { SealCompileReply(*fields.signer, Wire::AsBytes(fields.correlation), fields.objectField) }
+            : std::nullopt;
+    return Wire::EncodeReply(Wire::Status::Ok,
+                             Wire::EncodeCompileResult(Wire::CompileResult {
+                                 .exitCode = fields.exitCode,
+                                 .object = fields.objectField,
+                                 .stdoutText = {},
+                                 .stderrText = Wire::AsBytes(fields.err),
+                                 .correlation = Wire::AsBytes(fields.correlation),
+                                 .signature = signature.has_value() ? std::span<std::byte const> { *signature }
+                                                                    : std::span<std::byte const> {} }));
 }
 
 /// What an honest worker would report having compiled, for `request`.
@@ -365,6 +414,7 @@ struct ReplyFields
                              .fingerprint = "gcc-13-abc",
                              .objectKey = "objkey",
                              .args = args,
+                             .family = DriverFamily::Gnu,
                              .preprocessed = "int main() { return 0; }",
                              .sourceName = "a.cpp",
                              .compileDir = {},
@@ -621,6 +671,70 @@ TEST_CASE("An unreachable worker is unavailable and names the endpoint", "[dispa
     CHECK(result.detail.contains(Worker));
 }
 
+TEST_CASE("A dispatch says how its lease leg ended, and at which scheduler", "[dispatch]")
+{
+    // What the reachability memo reads. Only an `Unreached` at the CONFIGURED scheduler
+    // may be remembered, so every other way the lease leg can end has to say so too --
+    // including a redirect, whose endpoint is not the configured one.
+    constexpr std::string_view Leader = "leader:6675";
+    std::vector<std::string> const args { "-O2" };
+
+    SECTION("nothing answered")
+    {
+        ScriptedFleet fleet;
+        auto const result = Dispatch(fleet, Request(args));
+        CHECK(result.leaseTransport == TransportFailure::Unreached);
+        CHECK(result.leaseEndpoint == Scheduler);
+    }
+    SECTION("the scheduler declined")
+    {
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NoWorker, {}));
+        auto const result = Dispatch(fleet, Request(args));
+        REQUIRE(result.status == DispatchStatus::Declined);
+        CHECK(result.leaseTransport == TransportFailure::None);
+        CHECK(result.leaseEndpoint == Scheduler);
+    }
+    SECTION("the grant was malformed")
+    {
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes("not-a-grant")));
+        auto const result = Dispatch(fleet, Request(args));
+        REQUIRE(result.status == DispatchStatus::Unavailable);
+        CHECK(result.leaseTransport == TransportFailure::None);
+        CHECK(result.leaseEndpoint == Scheduler);
+    }
+    SECTION("the granted worker was unreachable")
+    {
+        // The lease leg COMPLETED; it is the worker that is down, not the scheduler.
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantReply());
+        auto const result = Dispatch(fleet, Request(args));
+        REQUIRE(result.status == DispatchStatus::Unavailable);
+        CHECK(result.leaseTransport == TransportFailure::None);
+        CHECK(result.leaseEndpoint == Scheduler);
+    }
+    SECTION("a redirected lease compiled")
+    {
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Leader));
+        fleet.Serve(std::string { Leader }, GrantReply());
+        fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECTBYTES"));
+        auto const result = Dispatch(fleet, Request(args));
+        REQUIRE(result.Ran());
+        CHECK(result.leaseTransport == TransportFailure::None);
+        CHECK(result.leaseEndpoint == Leader);
+    }
+    SECTION("the leader a redirect named was unreachable")
+    {
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Leader));
+        auto const result = Dispatch(fleet, Request(args));
+        CHECK(result.leaseTransport == TransportFailure::Unreached);
+        CHECK(result.leaseEndpoint == Leader);
+    }
+}
+
 TEST_CASE("A worker refusing the job is a decline, not a compile", "[dispatch]")
 {
     // An unknown lease, a fingerprint it does not have, an argument it will not
@@ -698,6 +812,101 @@ TEST_CASE("A decline says WHICH kind, from either end of the fleet", "[dispatch]
     // reads as a peer from the future rather than this build forgetting one.
     CHECK(DeclineCauseFor(Wire::ErrorCode::WorkerCompilerUnclassified) != DeclineCause::Unrecognised);
     CHECK(refused.decline != noWorker);
+}
+
+TEST_CASE("An argument no worker runs is refused before a lease is asked for", "[dispatch][decline][denied]")
+{
+    // The worker refuses these by a row no `--allow-compile-arg` can lift, so asking cost a
+    // lease, a round trip and the whole translation unit for an answer the client can read off
+    // the same table. The seam's promise is that NOTHING is dialled -- a scripted scheduler
+    // that would grant is served, and must never be reached.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::WorkerRejectedArgument, {}));
+
+    std::vector<std::string> const args { "-O2", "-Xclang", "-load", "-fanalyzer" };
+    auto const result = Dispatch(fleet, Request(args));
+
+    CHECK(result.status == DispatchStatus::DeniedHere);
+    CHECK(fleet.Dialled().empty());
+    CHECK(fleet.SentTo(std::string { Scheduler }).empty());
+    // The FIRST denied argument, named for the log; `-fanalyzer` is merely unlisted, which an
+    // operator may extend, so it is not this refusal's business.
+    CHECK(result.refusal.contains("-Xclang"));
+    CHECK_FALSE(result.refusal.contains("-fanalyzer"));
+    CHECK(RecordingFor(result.status, result.decline).outcome == DispatchOutcome::Refused);
+    CHECK(SpecificsFor(result) == result.refusal);
+
+    // The control: an argument the table does not deny still asks the fleet, so the refusal
+    // above is the table's rather than a dispatch that asks nobody.
+    ScriptedFleet asking;
+    asking.Serve(std::string { Scheduler }, GrantReply());
+    asking.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::WorkerRejectedArgument, {}));
+    std::vector<std::string> const unlisted { "-O2", "-fanalyzer" };
+    auto const asked = Dispatch(asking, Request(unlisted));
+    CHECK(asked.status == DispatchStatus::Declined);
+    CHECK_FALSE(asking.Dialled().empty());
+}
+
+TEST_CASE("The launcher refuses exactly what the worker refuses by row", "[dispatch][denied]")
+{
+    // One table, read by both ends: every row's spelling, under both introducers where its
+    // family has them, is refused by the worker's own predicate -- AND by it with an operator
+    // entry naming the argument, which is what makes a row a row rather than an absence.
+    for (auto const& row: DeniedArguments)
+        for (auto const family: { DriverFamily::Msvc, DriverFamily::Gnu })
+        {
+            if (!Overlaps(row.families, family))
+                continue;
+            for (auto const introducer: IntroducersOf(family))
+            {
+                auto const arg = std::string(1, introducer) + std::string { row.spelling } + "x";
+                INFO("argument " << arg);
+                REQUIRE(FindDeniedArgument(arg, family) != nullptr);
+                auto const& driver = DriverOf(family == DriverFamily::Msvc ? Flavor::Cl : Flavor::Gcc);
+                std::vector<std::string> const operatorAllowed { arg };
+                CHECK_FALSE(IsAcceptableJobArgument(arg, driver, operatorAllowed));
+            }
+        }
+}
+
+TEST_CASE("Two machines of one build cannot be reported as disagreeing about the wire", "[dispatch][decline]")
+{
+    // `ProtocolMismatch` says a staggered upgrade that never finished. Two refusals were graded
+    // that way that two ends of ONE build produce every day: a flag the worker's allowlist does
+    // not carry, and a translation unit larger than the worker's surface takes. An operator told
+    // "disagree about the wire" goes looking for an old binary that is not there.
+    auto declineFor = [](Wire::ErrorCode workerAnswer, std::string_view message) {
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantReply());
+        fleet.Serve(std::string { Worker }, Wire::EncodeErrorReply(workerAnswer, message));
+        std::vector<std::string> const args { "-O2" };
+        return Dispatch(fleet, Request(args));
+    };
+
+    auto const argument = declineFor(Wire::ErrorCode::WorkerRejectedArgument,
+                                     "argument -external:W0 is not on this worker's accepted-flag list");
+    REQUIRE(argument.status == DispatchStatus::Declined);
+    CHECK(argument.decline == DeclineCause::ArgumentRefused);
+    // The peer's words, which name the argument, ride apart from the endpoint-bearing detail.
+    CHECK(argument.refusal == "argument -external:W0 is not on this worker's accepted-flag list");
+
+    auto const tooLarge = declineFor(Wire::ErrorCode::PayloadTooLarge, "frame exceeds this surface's ceiling");
+    REQUIRE(tooLarge.status == DispatchStatus::Declined);
+    CHECK(tooLarge.decline == DeclineCause::TooLarge);
+    // A property of the unit under a ceiling every worker of one build shares, so it is not the
+    // one-machine row either.
+    CHECK(tooLarge.decline != DeclineCause::WorkerRefused);
+    CHECK(tooLarge.refusal == "frame exceeds this surface's ceiling");
+
+    // The discrimination: neither is the protocol row, and they are not each other either.
+    CHECK(argument.decline != DeclineCause::ProtocolMismatch);
+    CHECK(tooLarge.decline != DeclineCause::ProtocolMismatch);
+    CHECK(argument.decline != tooLarge.decline);
+
+    // The control: a frame fault still IS a wire disagreement, so the rows above are a
+    // classification rather than a table that stopped answering `ProtocolMismatch` at all.
+    CHECK(declineFor(Wire::ErrorCode::MalformedFrame, {}).decline == DeclineCause::ProtocolMismatch);
 }
 
 TEST_CASE("An exhausted redirect chain declines as no-leader, not as a refusal", "[dispatch][decline][redirect]")
@@ -1124,6 +1333,199 @@ TEST_CASE("A lease refused with NotLeader is retried against the leader it names
     CHECK(OpOf(toDemoted[0]) == Wire::Op::Lease);
 }
 
+namespace
+{
+
+using Testing::MintsForItsAudience;
+
+/// Answers each exchange with the next of `answers`, whoever it is dialled at.
+///
+/// Scripted per EXCHANGE rather than per endpoint, which `ScriptedFleet` cannot do: on one merged
+/// surface the lease, the compile and the release reach one address and are answered differently.
+/// The subject here is which exchange a refusal is filed under, not the framing.
+class AnswersInTurn final: public IEndpointExchange
+{
+  public:
+    CacheOutcome Exchange(std::string_view hostPort,
+                          std::vector<std::byte> /*frame*/,
+                          Credential const& credential,
+                          ExchangeBudget /*budget*/) override
+    {
+        dialled.emplace_back(hostPort);
+        presented.push_back(credential.Configured());
+        REQUIRE(dialled.size() <= answers.size());
+        return answers[dialled.size() - 1];
+    }
+
+    std::vector<CacheOutcome> answers; ///< One per exchange, in order.
+    std::vector<std::string> dialled;  ///< Where each exchange went.
+    std::vector<bool> presented;       ///< Whether each exchange presented a credential.
+};
+
+/// @param value What the exchange served.
+/// @return A hit serving @p value.
+[[nodiscard]] CacheOutcome ServedWith(std::vector<std::byte> value = {})
+{
+    auto outcome = CacheOutcome {};
+    outcome.kind = CacheOutcomeKind::Hit;
+    outcome.value = std::move(value);
+    return outcome;
+}
+
+/// @param code Why the exchange was refused.
+/// @return A refusal with @p code.
+[[nodiscard]] CacheOutcome RefusedWith(Wire::ErrorCode code)
+{
+    auto outcome = CacheOutcome {};
+    outcome.kind = CacheOutcomeKind::Rejected;
+    outcome.code = code;
+    return outcome;
+}
+
+/// @param reply A command's reply.
+/// @return The replies a connection presenting a credential reads: AUTH's `Ok`, then @p reply.
+[[nodiscard]] std::vector<std::byte> BehindAuth(std::vector<std::byte> const& reply)
+{
+    auto replies = Wire::EncodeReply(Wire::Status::Ok, {});
+    replies.insert(replies.end(), reply.begin(), reply.end());
+    return replies;
+}
+
+} // namespace
+
+TEST_CASE("Every exchange of a redirected dispatch presents a ticket naming the endpoint it dialled",
+          "[dispatch][redirect][ticket]")
+{
+    // The decorator asks per DIAL, so a redirect, the worker a grant names and the release at the
+    // scheduler that issued the lease each get a ticket for exactly where the frame went. By
+    // construction today; pinned against a refactor that follows a redirect below the decorator or
+    // hands `Dispatch` the raw exchange -- and against a dial hint rewriting the address under it.
+    constexpr std::string_view Leader = "leader:6675";
+    std::array<std::string, 1> const args { "-c" };
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, BehindAuth(Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Leader)));
+    fleet.Serve(std::string { Leader }, BehindAuth(GrantReply()));
+    fleet.Serve(std::string { Worker }, BehindAuth(CompileReply(Request(args), "OBJECTBYTES")));
+
+    MintsForItsAudience node;
+    TicketCredentials tickets {
+        node, std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {}, {}
+    };
+    CredentialedExchange credentialed { fleet, tickets };
+
+    auto const result = Dispatch(credentialed, Request(args));
+    REQUIRE(result.status == DispatchStatus::Compiled);
+
+    // The demoted scheduler, the leader it named, the worker that leader granted, and the release
+    // at the leader -- and a ticket minted for each, in the same order.
+    auto const expected = std::vector<std::string> {
+        std::string { Scheduler }, std::string { Leader }, std::string { Worker }, std::string { Leader }
+    };
+    CHECK(fleet.Dialled() == expected);
+    CHECK(node.audiences == expected);
+
+    // What each endpoint was SHOWN: every AUTH it received carries a ticket naming it.
+    for (auto const endpoint: { Scheduler, Leader, Worker })
+    {
+        INFO(endpoint);
+        auto auths = std::size_t { 0 };
+        for (auto const frame: FramesTo(fleet, endpoint))
+        {
+            if (OpOf(frame) != std::optional { Wire::Op::Auth })
+                continue;
+            ++auths;
+            auto const auth = Wire::DecodeAuthPayload(frame.subspan(Wire::RequestHeaderSize));
+            REQUIRE(auth.has_value());
+            CHECK(Unwrap(auth).kind == Wire::AuthKind::MachineTicket);
+            CHECK(Wire::AsStringView(Unwrap(auth).secret) == Testing::TicketFor(endpoint));
+        }
+        CHECK(std::cmp_equal(auths, std::ranges::count(expected, std::string { endpoint })));
+    }
+}
+
+TEST_CASE("A compile refused despite a valid ticket is not explained by the release's failed mint",
+          "[dispatch][ticket][stats]")
+{
+    // A refused compile is always followed by the RELEASE, through the same decorator. When the
+    // compile presented a VALID ticket and was refused anyway, and the release's mint then failed,
+    // the decline is the compile's -- its own words -- and never "no machine ticket". Run with the
+    // worker at an address of its own, and on one merged surface where the scheduler is the worker,
+    // so the endpoint alone cannot tell the compile from the release.
+    struct Row
+    {
+        char const* what;
+        std::string_view worker;
+    };
+    for (auto const& row: std::to_array<Row>(
+             { { .what = "a worker of its own", .worker = Worker }, { .what = "one merged surface", .worker = Scheduler } }))
+    {
+        INFO(row.what);
+        std::array<std::string, 1> const args { "-c" };
+        auto const grant = Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = row.worker,
+                                                                     .leaseToken = "l1",
+                                                                     .workerCodecs = {},
+                                                                     .lifetime = {},
+                                                                     .dialHint = {},
+                                                                     .workerKey = Testing::TestWorkerPublicKey() });
+
+        AnswersInTurn fleet;
+        fleet.answers = { ServedWith(grant),
+                          RefusedWith(Wire::ErrorCode::NotAMember),
+                          RefusedWith(Wire::ErrorCode::NotAMember) };
+
+        // The lease's and the compile's mints succeed; the release's does not.
+        MintsForItsAudience node;
+        node.unreachableAfter = 2;
+        TicketCredentials tickets { node, std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {},
+                                    {} };
+        CredentialedExchange credentialed { fleet, tickets };
+
+        auto const result = Dispatch(credentialed, Request(args));
+        REQUIRE(result.status == DispatchStatus::Declined);
+        REQUIRE(result.decline == DeclineCause::NotPermitted);
+        // Lease, compile, release -- the compile WITH a ticket, the release without one.
+        REQUIRE(fleet.dialled
+                == std::vector<std::string> {
+                    std::string { Scheduler }, std::string { row.worker }, std::string { Scheduler } });
+        CHECK(fleet.presented == std::vector<bool> { true, true, false });
+        CHECK(result.declinedAt
+              == std::optional { ExchangeSite { .endpoint = std::string { row.worker },
+                                                .opcode = std::to_underlying(Wire::Op::Compile) } });
+
+        auto const recorded = RecordedReason(result, credentialed.Refusals());
+        CHECK(recorded.reason == RecordingFor(result.status, result.decline).reason);
+        CHECK(recorded.reason != ReasonFor(MintFailure::Unreachable));
+    }
+}
+
+TEST_CASE("A compile refused because its own mint failed is explained by that mint", "[dispatch][ticket][stats]")
+{
+    // The control for the case above: the same dispatch, with the COMPILE's mint failing and the
+    // release served, is the refusal a missing ticket explains.
+    std::array<std::string, 1> const args { "-c" };
+    auto const grant = Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = Worker,
+                                                                 .leaseToken = "l1",
+                                                                 .workerCodecs = {},
+                                                                 .lifetime = {},
+                                                                 .dialHint = {},
+                                                                 .workerKey = Testing::TestWorkerPublicKey() });
+    AnswersInTurn fleet;
+    fleet.answers = { ServedWith(grant), RefusedWith(Wire::ErrorCode::NotAMember), ServedWith() };
+
+    MintsForItsAudience node;
+    node.unreachableAfter = 1;
+    TicketCredentials tickets {
+        node, std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {}, {}
+    };
+    CredentialedExchange credentialed { fleet, tickets };
+
+    auto const result = Dispatch(credentialed, Request(args));
+    REQUIRE(result.status == DispatchStatus::Declined);
+    CHECK(fleet.presented == std::vector<bool> { true, false, false });
+    CHECK(RecordedReason(result, credentialed.Refusals()).reason == ReasonFor(MintFailure::Unreachable));
+}
+
 TEST_CASE("A NotLeader naming no address is a refusal, not somewhere to dial", "[dispatch][redirect]")
 {
     // An election in progress. `SchedulerService` answers `NotLeader` with nothing
@@ -1520,5 +1922,553 @@ TEST_CASE("The client waits for as long as the GRANT says, not for as long as it
         auto const compileLeg = std::ranges::find(dialled, std::string { Worker });
         REQUIRE(compileLeg != dialled.end());
         CHECK(budgets.at(static_cast<std::size_t>(compileLeg - dialled.begin())).total == DefaultDispatchTotal);
+    }
+}
+
+TEST_CASE("A lease names the workers this client could not reach, and a dead one is reported", "[dispatch][exclusion]")
+{
+    std::vector<std::string> const args { "-O2" };
+    std::vector<std::string> const excluded { "gone.corp:6676" };
+    auto request = Request(args);
+    request.excludedWorkers = excluded;
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    // `Worker` is never served: the compile leg is Unreached.
+    auto const result = Dispatch(fleet, request);
+
+    auto const frames = FramesTo(fleet, Scheduler);
+    REQUIRE_FALSE(frames.empty());
+    auto const lease = Wire::DecodeLeasePayload(frames.front().subspan(Wire::RequestHeaderSize));
+    REQUIRE(lease.has_value());
+    REQUIRE(Unwrap(lease).excluded.size() == 1);
+    CHECK(Wire::AsStringView(Unwrap(lease).excluded[0]) == "gone.corp:6676");
+
+    CHECK(result.status == DispatchStatus::Unavailable);
+    CHECK(result.unreachedWorker == Worker);
+}
+
+TEST_CASE("A worker that was reached and then lost is not reported unreachable", "[dispatch][exclusion]")
+{
+    std::vector<std::string> const args { "-O2" };
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.FailsWith(std::string { Worker }, TransportFailure::PeerLost);
+    CHECK(Dispatch(fleet, Request(args)).unreachedWorker.empty());
+}
+
+TEST_CASE("Only a compile leg that reached nothing reports its worker unreachable", "[dispatch][exclusion]")
+{
+    // One row per way a dispatch can end, each driven through `Dispatch` itself. The
+    // verdict is `TransportFailureTable`'s; what this pins is that the compile leg asks
+    // it, and that every outcome which never reached the compile leg reports nobody.
+    std::vector<std::string> const args { "-O2" };
+    auto const request = Request(args);
+
+    struct Row
+    {
+        std::string_view outcome;                    ///< What the row is, for the failure message.
+        std::function<void(ScriptedFleet&)> arrange; ///< How the fleet produces it.
+        bool reportsWorker;                          ///< Whether `Worker` comes back unreachable.
+    };
+    auto const granted = [](ScriptedFleet& fleet) {
+        fleet.Serve(std::string { Scheduler }, GrantReply());
+    };
+    auto const compileFails = [&](TransportFailure failure) {
+        return [&granted, failure](ScriptedFleet& fleet) {
+            granted(fleet);
+            fleet.FailsWith(std::string { Worker }, failure);
+        };
+    };
+    auto const rows = std::to_array<Row>({
+        { .outcome = "compiled",
+          .arrange =
+              [&](ScriptedFleet& fleet) {
+                  granted(fleet);
+                  fleet.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
+              },
+          .reportsWorker = false },
+        { .outcome = "compiled, and the compiler failed",
+          .arrange =
+              [&](ScriptedFleet& fleet) {
+                  granted(fleet);
+                  fleet.Serve(std::string { Worker }, CompileReply(request, "", 1, "error: no"));
+              },
+          .reportsWorker = false },
+        { .outcome = "the worker refused the job",
+          .arrange =
+              [&](ScriptedFleet& fleet) {
+                  granted(fleet);
+                  fleet.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}));
+              },
+          .reportsWorker = false },
+        { .outcome = "the scheduler refused the lease",
+          .arrange =
+              [](ScriptedFleet& fleet) {
+                  fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NoWorker, {}));
+              },
+          .reportsWorker = false },
+        { .outcome = "the scheduler was unreached", .arrange = [](ScriptedFleet&) {}, .reportsWorker = false },
+        { .outcome = "the worker was unreached", .arrange = granted, .reportsWorker = true },
+        { .outcome = "the worker was lost", .arrange = compileFails(TransportFailure::PeerLost), .reportsWorker = false },
+        { .outcome = "the worker outran the budget",
+          .arrange = compileFails(TransportFailure::Expired),
+          .reportsWorker = false },
+        { .outcome = "the worker went silent", .arrange = compileFails(TransportFailure::Silent), .reportsWorker = false },
+    });
+
+    for (auto const& row: rows)
+    {
+        INFO(row.outcome);
+        ScriptedFleet fleet;
+        row.arrange(fleet);
+        auto const result = Dispatch(fleet, request);
+        CHECK(result.unreachedWorker == (row.reportsWorker ? Worker : std::string_view {}));
+    }
+}
+
+TEST_CASE("A lease names at most as many exclusions as the wire carries, the newest ones", "[dispatch][exclusion]")
+{
+    // The memo keeps exactly `MaxLeaseExclusions`, so this is a caller handing more than
+    // the memo would -- and the ones that travel are the FIRST, which is the newest.
+    std::vector<std::string> excluded;
+    for (auto const n: std::views::iota(std::size_t { 0 }, Wire::MaxLeaseExclusions + 1))
+        excluded.push_back(std::format("gone-{}.corp:6676", n));
+    std::vector<std::string> const args { "-O2" };
+    auto request = Request(args);
+    request.excludedWorkers = excluded;
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NoWorker, {}));
+    (void) Dispatch(fleet, request);
+
+    auto const frames = FramesTo(fleet, Scheduler);
+    REQUIRE(frames.size() == 1);
+    auto const lease = Wire::DecodeLeasePayload(frames.front().subspan(Wire::RequestHeaderSize));
+    REQUIRE(lease.has_value());
+    std::vector<std::string> sent;
+    for (auto const entry: Unwrap(lease).excluded)
+        sent.emplace_back(Wire::AsStringView(entry));
+    auto const newest = std::span { excluded }.first(Wire::MaxLeaseExclusions);
+    CHECK(sent == std::vector<std::string> { newest.begin(), newest.end() });
+}
+
+TEST_CASE("A redirected lease carries the same exclusions to the leader", "[dispatch][exclusion][redirect]")
+{
+    // A redirect changes WHO decides, not which workers this client could not reach: a
+    // leader asked without the list would grant the very machine the first ask excluded.
+    constexpr std::string_view Leader = "leader:6675";
+    std::vector<std::string> const args { "-O2" };
+    std::vector<std::string> const excluded { "gone.corp:6676", "lost.corp:6676" };
+    auto request = Request(args);
+    request.excludedWorkers = excluded;
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Leader));
+    fleet.Serve(std::string { Leader }, Wire::EncodeErrorReply(Wire::ErrorCode::NoWorker, {}));
+    (void) Dispatch(fleet, request);
+
+    for (auto const endpoint: { Scheduler, Leader })
+    {
+        INFO(endpoint);
+        auto const frames = FramesTo(fleet, endpoint);
+        REQUIRE(frames.size() == 1);
+        auto const lease = Wire::DecodeLeasePayload(frames.front().subspan(Wire::RequestHeaderSize));
+        REQUIRE(lease.has_value());
+        std::vector<std::string> sent;
+        for (auto const entry: Unwrap(lease).excluded)
+            sent.emplace_back(Wire::AsStringView(entry));
+        CHECK(sent == excluded);
+    }
+}
+
+namespace
+{
+/// Where a grant says `Worker` was last seen: an address, beside the name the token signs.
+constexpr std::string_view Hint = "10.8.0.7:6676";
+
+/// A lease reply granting `Worker`, hinting @p hint.
+/// @param hint The grant's dial hint, dialled or not as `Dispatch` decides.
+/// @param lifetime How long the scheduler says the lease lives; zero names none.
+/// @return The framed reply.
+[[nodiscard]] std::vector<std::byte> GrantWithHint(std::string_view hint, std::chrono::milliseconds lifetime = {})
+{
+    return Wire::EncodeReply(Wire::Status::Ok,
+                             Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = Worker,
+                                                                       .leaseToken = "l1",
+                                                                       .workerCodecs = {},
+                                                                       .lifetime = lifetime,
+                                                                       .dialHint = hint,
+                                                                       .workerKey = Testing::TestWorkerPublicKey() }));
+}
+
+/// How many RELEASE frames reached the scheduler.
+/// @param fleet The scripted fleet that recorded them.
+/// @return The count; exactly one is the rule, on every path out of the compile.
+[[nodiscard]] std::size_t ReleasesSent(ScriptedFleet& fleet)
+{
+    return static_cast<std::size_t>(std::ranges::count_if(
+        FramesTo(fleet, Scheduler), [](auto const frame) { return OpOf(frame) == Wire::Op::Release; }));
+}
+
+/// The dials `Dispatch` makes: the lease, @p compiles, then the release.
+/// @param compiles The compile dials, in order.
+/// @return The whole expected sequence.
+[[nodiscard]] std::vector<std::string> LeaseThen(std::initializer_list<std::string_view> compiles)
+{
+    std::vector<std::string> dialled { std::string { Scheduler } };
+    for (auto const compile: compiles)
+        dialled.emplace_back(compile);
+    dialled.emplace_back(Scheduler);
+    return dialled;
+}
+} // namespace
+
+TEST_CASE("Exactly two outcomes at a dial hint send the client on to the name", "[dispatch][dialhint]")
+{
+    // The retry decision, over EVERY transport failure and EVERY refusal this build knows:
+    // an allowlist of two, stated literally here rather than derived from the tables it
+    // tests, so a row added to either table fails this case until somebody argues for it.
+    std::size_t retried = 0;
+    for (auto const failure: Enumerators<TransportFailure>())
+    {
+        CacheOutcome outcome {};
+        outcome.transportFailure = failure;
+        INFO(DescribeTransportFailure(failure));
+        CHECK(RetriesAtAdvertisedName(outcome) == (failure == TransportFailure::Unreached));
+        retried += RetriesAtAdvertisedName(outcome) ? 1 : 0;
+    }
+    for (auto const& row: Wire::ErrorTable)
+    {
+        CacheOutcome outcome {};
+        outcome.kind = CacheOutcomeKind::Rejected;
+        outcome.transportFailure = TransportFailure::None;
+        outcome.code = row.code;
+        INFO(row.name);
+        CHECK(RetriesAtAdvertisedName(outcome) == (row.code == Wire::ErrorCode::LeaseEndpointMismatch));
+        retried += RetriesAtAdvertisedName(outcome) ? 1 : 0;
+    }
+    // A worker that answered -- a compile or a miss -- is never redialled.
+    for (auto const kind: { CacheOutcomeKind::Hit, CacheOutcomeKind::Miss })
+    {
+        CacheOutcome outcome {};
+        outcome.kind = kind;
+        outcome.transportFailure = TransportFailure::None;
+        CHECK_FALSE(RetriesAtAdvertisedName(outcome));
+    }
+    CHECK(retried == 2);
+}
+
+TEST_CASE("The hint is dialled first, on a short connect budget, and compiles there", "[dispatch][dialhint]")
+{
+    std::vector<std::string> const args { "-O2" };
+    auto const request = Request(args);
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+    fleet.Serve(std::string { Hint }, CompileReply(request, "OBJ"));
+    // The name answers too, so a client dialling it first would ALSO compile: what
+    // separates the two is which address the compile went to.
+    fleet.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
+
+    auto const result = Dispatch(fleet, request);
+    REQUIRE(result.Ran());
+    CHECK(result.dialledEndpoint == Hint);
+    CHECK(result.workerEndpoint == Worker); // WHICH worker, by its name -- the one the token signs
+    CHECK(fleet.Dialled() == LeaseThen({ Hint }));
+    REQUIRE(fleet.Budgets().size() == 3);
+    CHECK(fleet.Budgets()[1].connect == HintConnectBudget);
+    // Only the connect ceiling is the hint's own: the rest is the compile leg's.
+    CHECK(fleet.Budgets()[1].total == DispatchBudgets {}.compile.total);
+    CHECK(fleet.Budgets()[1].keepAlive == core::net::KeepAlive::Yes);
+    CHECK(ReleasesSent(fleet) == 1);
+}
+
+TEST_CASE("An unreachable hint, or one another worker refuses, falls back to the name", "[dispatch][dialhint]")
+{
+    std::vector<std::string> const args { "-O2" };
+    auto const request = Request(args);
+    for (auto const refusing: { false, true })
+    {
+        INFO("hint " << (refusing ? "refused" : "unreachable"));
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+        if (refusing)
+            // The stale DNS case's dangerous half: the address now belongs to ANOTHER fleet
+            // worker, which checks the token's endpoint against its own name and refuses.
+            fleet.Serve(std::string { Hint }, Wire::EncodeErrorReply(Wire::ErrorCode::LeaseEndpointMismatch, "not me"));
+        fleet.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
+
+        auto const result = Dispatch(fleet, request);
+        REQUIRE(result.Ran());
+        CHECK(result.dialledEndpoint == Worker);
+        CHECK(result.workerEndpoint == Worker);
+        CHECK(fleet.Dialled() == LeaseThen({ Hint, Worker }));
+        REQUIRE(fleet.Budgets().size() == 4);
+        CHECK(fleet.Budgets()[2].connect == ExchangeBudget {}.connect); // the name's own connect budget
+        // A dead hint with a live name is a stale ADDRESS: nobody is reported unreachable.
+        CHECK(result.unreachedWorker.empty());
+        CHECK(ReleasesSent(fleet) == 1);
+    }
+}
+
+TEST_CASE("A hint that was reached and then went wrong is never retried at the name", "[dispatch][dialhint]")
+{
+    std::vector<std::string> const args { "-O2" };
+    for (auto const failure: { TransportFailure::PeerLost, TransportFailure::Expired, TransportFailure::Silent })
+    {
+        INFO(DescribeTransportFailure(failure));
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+        fleet.FailsWith(std::string { Hint }, failure);
+        fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJ"));
+
+        auto const result = Dispatch(fleet, Request(args));
+        CHECK(result.status == DispatchStatus::Unavailable);
+        CHECK(result.dialledEndpoint == Hint);
+        CHECK(fleet.Dialled() == LeaseThen({ Hint }));
+        // A machine was reached: nobody is unreachable, and the name was never asked.
+        CHECK(result.unreachedWorker.empty());
+        CHECK(ReleasesSent(fleet) == 1);
+    }
+}
+
+TEST_CASE("A refusal at the hint other than the endpoint mismatch is the worker's answer", "[dispatch][dialhint]")
+{
+    // Every refusal this build knows but the one row, each from the hint: the worker there
+    // answered, and the name would reach the same machine to hear it again.
+    std::vector<std::string> const args { "-O2" };
+    for (auto const& row: Wire::ErrorTable)
+    {
+        if (row.code == Wire::ErrorCode::LeaseEndpointMismatch)
+            continue;
+        INFO(row.name);
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+        fleet.Serve(std::string { Hint }, Wire::EncodeErrorReply(row.code, "no"));
+        fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJ"));
+
+        auto const result = Dispatch(fleet, Request(args));
+        CHECK(result.status == DispatchStatus::Declined);
+        CHECK(result.decline == DeclineCauseFor(row.code));
+        CHECK(result.dialledEndpoint == Hint);
+        CHECK(fleet.Dialled() == LeaseThen({ Hint }));
+        CHECK(ReleasesSent(fleet) == 1);
+    }
+}
+
+TEST_CASE("A hint that is not a dial endpoint, or is the name, is no hint", "[dispatch][dialhint]")
+{
+    std::vector<std::string> const args { "-O2" };
+    auto const request = Request(args);
+    for (auto const hint: { std::string_view { "no leader: try again" }, std::string_view { ":6676" }, Worker })
+    {
+        INFO(hint);
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantWithHint(hint));
+        fleet.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
+        auto const result = Dispatch(fleet, request);
+        CHECK(result.Ran());
+        CHECK(result.dialledEndpoint == Worker);
+        CHECK(fleet.Dialled() == LeaseThen({ Worker }));
+        // Dialled as the NAME, so under the name's own connect budget.
+        REQUIRE(fleet.Budgets().size() == 3);
+        CHECK(fleet.Budgets()[1].connect == ExchangeBudget {}.connect);
+    }
+}
+
+TEST_CASE("Only a dead NAME is reported unreachable, never a dead hint", "[dispatch][dialhint][exclusion]")
+{
+    std::vector<std::string> const args { "-O2" };
+    auto const request = Request(args);
+
+    // Both the hint and the name unreached: the worker is reported by its NAME, which is
+    // what the scheduler's registry and the next LEASE's exclusion list key on.
+    ScriptedFleet dead;
+    dead.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+    auto const bothDead = Dispatch(dead, request);
+    CHECK(bothDead.status == DispatchStatus::Unavailable);
+    CHECK(bothDead.unreachedWorker == Worker);
+    CHECK(bothDead.dialledEndpoint == Worker);
+    CHECK(dead.Dialled() == LeaseThen({ Hint, Worker }));
+    CHECK(ReleasesSent(dead) == 1);
+
+    // Another worker refused at the hint and the name reached nothing: the NAME's dial
+    // decides, so the worker is reported.
+    ScriptedFleet refusedThenDead;
+    refusedThenDead.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+    refusedThenDead.Serve(std::string { Hint }, Wire::EncodeErrorReply(Wire::ErrorCode::LeaseEndpointMismatch, "not me"));
+    CHECK(Dispatch(refusedThenDead, request).unreachedWorker == Worker);
+    CHECK(ReleasesSent(refusedThenDead) == 1);
+
+    // The hint unreached and the name reached and LOST: the machine is up.
+    ScriptedFleet lostAtName;
+    lostAtName.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+    lostAtName.FailsWith(std::string { Worker }, TransportFailure::PeerLost);
+    CHECK(Dispatch(lostAtName, request).unreachedWorker.empty());
+    CHECK(lostAtName.Dialled() == LeaseThen({ Hint, Worker }));
+}
+
+TEST_CASE("The name is given what is LEFT of the grant after the hint, not a fresh budget", "[dispatch][dialhint][lease]")
+{
+    // #1122's rule, one dial later: the grant runs from the mint, and a dial at the name
+    // starts after the hint's has already spent some of it. Re-using the hint's budget
+    // would wait past the lease by exactly that much.
+    constexpr auto granted = std::chrono::milliseconds { 2'400'000 };
+    constexpr auto roundTrip = std::chrono::milliseconds { 90'000 };
+    // Absurd for a connect capped at a third of a second, and deliberate: the case is
+    // about which INSTANT the name's budget is measured at, and an elapsed time too small
+    // to see would pass under the defect.
+    constexpr auto atHint = std::chrono::milliseconds { 20'000 };
+    static_assert(granted > roundTrip + atHint, "the exhausted-grant floor is another case");
+
+    std::vector<std::string> const args { "-O2" };
+    for (auto const refusing: { false, true })
+    {
+        INFO("hint " << (refusing ? "refused" : "unreachable"));
+        core::platform::ManualClock clock;
+        ScriptedFleet fleet;
+        fleet.UseClock(clock);
+        fleet.CostsTime(std::string { Scheduler }, roundTrip);
+        fleet.CostsTime(std::string { Hint }, atHint);
+        fleet.Serve(std::string { Scheduler }, GrantWithHint(Hint, granted));
+        if (refusing)
+            fleet.Serve(std::string { Hint }, Wire::EncodeErrorReply(Wire::ErrorCode::LeaseEndpointMismatch, "not me"));
+        fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJ"));
+
+        auto const result = Dispatch(fleet, Request(args), {}, {}, {}, &clock);
+        REQUIRE(result.Ran());
+        REQUIRE(fleet.Dialled() == LeaseThen({ Hint, Worker }));
+        CHECK(fleet.Budgets()[1].total == granted - roundTrip);
+        CHECK(fleet.Budgets()[2].total == granted - roundTrip - atHint);
+    }
+}
+
+TEST_CASE("A hint's connect ceiling is a cap, and caps an unbounded connect too", "[dispatch][dialhint]")
+{
+    // A SHORTER configured connect is kept; a non-positive one is `core::net`'s spelling
+    // of the platform default -- minutes -- and a stale hint must not wait that long.
+    std::vector<std::string> const args { "-O2" };
+    struct Row
+    {
+        std::chrono::milliseconds configured; ///< `FASTCACHE_CONNECT_TIMEOUT`.
+        std::chrono::milliseconds atHint;     ///< What the dial at the hint gets.
+    };
+    auto const rows = std::to_array<Row>({
+        { .configured = std::chrono::milliseconds { 100 }, .atHint = std::chrono::milliseconds { 100 } },
+        { .configured = std::chrono::milliseconds { 5'000 }, .atHint = HintConnectBudget },
+        { .configured = std::chrono::milliseconds::zero(), .atHint = HintConnectBudget },
+    });
+    for (auto const& row: rows)
+    {
+        INFO("configured " << row.configured.count() << " ms");
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+        auto const budgets = DispatchBudgetsFor(DispatchBudgetKnobs { .connect = row.configured });
+        (void) Dispatch(fleet, Request(args), budgets);
+        REQUIRE(fleet.Dialled() == LeaseThen({ Hint, Worker }));
+        CHECK(fleet.Budgets()[1].connect == row.atHint);
+        // The name keeps what the operator configured, whatever it is.
+        CHECK(fleet.Budgets()[2].connect == row.configured);
+    }
+}
+
+TEST_CASE("A dispatch names the worker, and the hint address when that is what compiled", "[dispatch][dialhint]")
+{
+    // The launcher's success lines print this, so an operator can tell which address a
+    // compile used: with split-horizon DNS the hint and the name can both work, and a
+    // line naming only the worker would read the same either way.
+    std::vector<std::string> const args { "-O2" };
+    auto const request = Request(args);
+
+    ScriptedFleet atHint;
+    atHint.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+    atHint.Serve(std::string { Hint }, CompileReply(request, "OBJ"));
+    auto const viaHint = Dispatch(atHint, request);
+    REQUIRE(viaHint.Ran());
+    CHECK(DescribeWorkerReached(viaHint) == std::format("{} at {}", Worker, Hint));
+
+    ScriptedFleet atName;
+    atName.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+    atName.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
+    auto const viaName = Dispatch(atName, request);
+    REQUIRE(viaName.Ran());
+    REQUIRE(viaName.dialledEndpoint == Worker);
+    CHECK(DescribeWorkerReached(viaName) == Worker);
+
+    // Refused at the lease: no compile dial was attempted, so there is nothing to name.
+    ScriptedFleet refused;
+    refused.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NoWorker, {}));
+    auto const none = Dispatch(refused, request);
+    REQUIRE(none.dialledEndpoint.empty());
+    CHECK(DescribeWorkerReached(none).empty());
+
+    // A compile that reached the hint and failed there names the address alone, since no
+    // worker compiled -- the failure's own detail carries the name beside it.
+    ScriptedFleet lost;
+    lost.Serve(std::string { Scheduler }, GrantWithHint(Hint));
+    lost.FailsWith(std::string { Hint }, TransportFailure::PeerLost);
+    auto const lostAtHint = Dispatch(lost, request);
+    REQUIRE_FALSE(lostAtHint.Ran());
+    CHECK(DescribeWorkerReached(lostAtHint) == Hint);
+    CHECK(lostAtHint.detail.contains(std::format("{} at {}", Worker, Hint)));
+}
+
+TEST_CASE("A lease names the toolchain the client compiles with, in words", "[dispatch]")
+{
+    // What lets the leader's `unserved-toolchain` say WHICH compiler nobody serves.
+    std::vector<std::string> const args { "-O2" };
+    auto request = Request(args);
+    request.toolchainLabel = "g++ 14.2.0";
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply(request, "OBJECTBYTES"));
+    REQUIRE(Dispatch(fleet, request).Ran());
+
+    auto const frames = FramesTo(fleet, Scheduler);
+    REQUIRE_FALSE(frames.empty());
+    REQUIRE(OpOf(frames.front()) == Wire::Op::Lease);
+    auto const lease = Wire::DecodeLeasePayload(frames.front().subspan(Wire::RequestHeaderSize));
+    REQUIRE(lease.has_value());
+    CHECK(Wire::AsStringView(Unwrap(lease).toolchainLabel) == "g++ 14.2.0");
+}
+
+TEST_CASE("A lease never carries a label a scheduler would refuse it for", "[dispatch]")
+{
+    // The label is display only, and a scheduler refuses the WHOLE lease over one that is not text or
+    // is longer than it records -- so sending it would cost this compile its distribution for a
+    // name. It goes out empty instead, and the lease still asks under the fingerprint.
+    struct Case
+    {
+        std::string_view why;
+        std::string label;
+        std::string sent;
+    };
+    auto const atBound = std::string(Wire::MaxToolchainLabelBytes, 'x');
+    auto const cases = std::array {
+        Case { .why = "not text", .label = "g++ \xff 14.2.0", .sent = "" },
+        Case { .why = "over the bound", .label = atBound + "x", .sent = "" },
+        // The control, which a guard dropping every label would fail.
+        Case { .why = "at the bound", .label = atBound, .sent = atBound },
+    };
+
+    std::vector<std::string> const args { "-O2" };
+    for (auto const& [why, label, sent]: cases)
+    {
+        INFO(why);
+        auto request = Request(args);
+        request.toolchainLabel = label;
+
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantReply());
+        fleet.Serve(std::string { Worker }, CompileReply(request, "OBJECTBYTES"));
+        REQUIRE(Dispatch(fleet, request).Ran());
+
+        auto const frames = FramesTo(fleet, Scheduler);
+        REQUIRE_FALSE(frames.empty());
+        REQUIRE(OpOf(frames.front()) == Wire::Op::Lease);
+        auto const lease = Wire::DecodeLeasePayload(frames.front().subspan(Wire::RequestHeaderSize));
+        REQUIRE(lease.has_value());
+        CHECK(Wire::AsStringView(Unwrap(lease).toolchainLabel) == sent);
     }
 }

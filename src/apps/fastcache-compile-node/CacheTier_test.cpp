@@ -2,11 +2,17 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 #include "LiveStatsSources.hpp"
+#include "MachineStandingTestUtils.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeProofClient.hpp"
 #include "NodeStatusResponder.hpp"
+#include "SharedCacheHost.hpp"
+#include "SharedCacheStatus.hpp"
 #include "StatsSource.hpp"
 
 #include <FastCache/Core/Compression.hpp>
+#include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -44,8 +50,10 @@
 #include <core/net/testing/InMemorySocket.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/HalfClose.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedHostFacts.hpp>
+#include <tests/SharedTierFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -112,10 +120,83 @@ struct Fixture
     /// own "no configuration file, no secret" source rather than a fake.
     NodeConfig unauthenticated;
     ConfiguredCredential credential { unauthenticated, nullptr };
+    /// Where the fleet's setting points: nowhere, and these nodes hold no identity to prove with, so
+    /// the upstream is `--upstream`'s or none -- the cases here are about the TIER.
+    SharedCacheDirectory directory { "pc-7", {} };
 
-    [[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> Start(NodeConfig const& cfg)
+    [[nodiscard]] std::expected<std::unique_ptr<CacheTier>, NodeRefusal> Start(NodeConfig const& cfg)
     {
-        return StartCacheTierOrExplain(io, cfg, credential, locality, clock, metrics, logger);
+        UpstreamParts const parts { .upstream = cfg.upstream,
+                                    .credential = credential,
+                                    .directory = directory,
+                                    .prover = nullptr,
+                                    .io = io,
+                                    .clock = clock,
+                                    .metrics = metrics,
+                                    .conditions = nullptr,
+                                    .logger = logger,
+                                    .host = nullptr };
+        return StartCacheTierOrExplain(cfg, parts, locality, clock, metrics, logger);
+    }
+};
+
+/// A trust that admits no server. The upstream never asks it -- the shared cache's dialer passes a
+/// trust naming the one machine per operation -- so what it answers is never read.
+class RefusingTrust final: public IServerTrust
+{
+  public:
+    [[nodiscard]] ServerStanding StandingOf(std::string_view /*serverId*/,
+                                            Ed25519PublicKey const& /*serverKey*/) const override
+    {
+        return ServerStanding::NotVoter;
+    }
+
+    [[nodiscard]] std::string_view Expected() const override
+    {
+        return "nobody";
+    }
+};
+
+/// Everything `MakeCacheUpstream` chooses between, for a node `pc-7` with an identity and a host.
+struct UpstreamFixture
+{
+    NodeIoLoop io;
+    core::platform::ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    NodeConfig unauthenticated;
+    ConfiguredCredential credential { unauthenticated, nullptr };
+    SharedCacheDirectory directory { "pc-7", {} };
+    Ed25519KeyPair key = Testing::TestKeyPair("pc-7");
+    RefusingTrust trust;
+    SystemSecureRandom random;
+    NodeProofClient prover { "pc-7", key, trust, nullptr, nullptr, random };
+    Testing::MemoryOpener opener;
+    SharedCacheHost host { "pc-7", opener, nullptr, logger, ReconcileOn::Caller };
+
+    /// @param upstream `--upstream`, or empty.
+    /// @return The parts, with this node's identity and host.
+    [[nodiscard]] UpstreamParts Parts(std::string_view upstream)
+    {
+        return UpstreamParts { .upstream = upstream,
+                               .credential = credential,
+                               .directory = directory,
+                               .prover = &prover,
+                               .io = io,
+                               .clock = clock,
+                               .metrics = metrics,
+                               .conditions = nullptr,
+                               .logger = logger,
+                               .host = &host };
+    }
+
+    /// Both the directory and the host apply a state naming THIS node, and the host opens its tier.
+    void NameThisMachine()
+    {
+        auto const state = Testing::NamingSharedCache("pc-7");
+        directory.Applied(state);
+        host.Applied(state);
+        host.Reconcile();
     }
 };
 
@@ -150,17 +231,6 @@ template <typename Table>
 {
     return std::vector<std::byte>(bytes, std::byte { 0x41 });
 }
-
-/// A node identity nothing reads: `NodeMetrics` answers the cache subject, which is the counters and
-/// the snapshot only.
-class NoIdentity final: public INodeStatusSource
-{
-  public:
-    [[nodiscard]] Wire::NodeStatusFields Describe() const override
-    {
-        return {};
-    }
-};
 
 /// Write all of @p bytes.
 /// @param socket Where; must outlive the task.
@@ -218,7 +288,7 @@ class MetricsDoors
                                         .history = nullptr,
                                         .endpoint = {},
                                         .surfaces = _served } },
-        _responder { _identity, _sources, _membership, metrics }
+        _responder { _identity, _sources, _membership, _standing, metrics }
     {
     }
 
@@ -266,7 +336,9 @@ class MetricsDoors
   private:
     Testing::ScriptedHostFacts _host;
     Testing::FixedHostCounters _load;
-    NoIdentity _identity;
+    /// Nothing reads it: `NodeMetrics` answers the cache subject, which is the counters and the
+    /// snapshot only.
+    Testing::SilentNodeStatus _identity;
     Distributed::OpenMembership _membership;
     IMetricsSink& _metrics;
     AdminHttpServer::SnapshotProvider _provider;
@@ -277,6 +349,8 @@ class MetricsDoors
     /// make the case assert absences as well, which is `NodeStatusResponder_test`'s subject.
     ServedSurfaces _served {};
     NodeLiveStatsSources _sources;
+    /// No roster: this fixture asks no machine question.
+    Testing::FixedStanding _standing {};
     NodeStatusResponder _responder;
 };
 
@@ -447,8 +521,11 @@ TEST_CASE("A cache directory that cannot be opened is fatal when it was named", 
     // And it names the flag that failed. Both failures this function can report
     // leave through one string, so a directory it could not create used to reach
     // the operator as "--listen-node ..." and send them to check a port.
-    CHECK(started.error().contains("--cache-dir"));
-    CHECK_FALSE(started.error().contains("--listen-node"));
+    CHECK(started.error().reason.contains("--cache-dir"));
+    CHECK_FALSE(started.error().reason.contains("--listen-node"));
+    // A directory that could not be created may be creatable at the next start -- a volume not yet
+    // mounted -- so the cache tier's refusals are restarted.
+    CHECK(started.error().cause == NodeRefusalCause::CacheStore);
 }
 
 // The provenance rule -- a NAMED address is a promise and a broken promise is fatal,
@@ -588,21 +665,22 @@ TEST_CASE("The disk tier compresses with the codec the node names", "[node][cach
     constexpr std::size_t PayloadBytes = 256 * 1024;
     auto const payload = Compressible(PayloadBytes);
 
-    // Measured on the STORE FILE, not on `bytesUsed`.
+    // Measured on the STORE FILE and on `bytesUsed`, and both must follow the codec.
     //
-    // The two tiers denominate their budgets differently, and it is easy to assert
-    // the wrong one: `InMemoryLruStorage` charges STORED bytes, so compression shows
-    // up there, while `CowTreeStorage` charges `originalLen` -- the pre-compression
-    // size, at `_storeBytes += originalLen` in `StoreEntry` -- so a compressed disk
-    // tier reports exactly the same `bytesUsed` as an uncompressed one. Asserting on
-    // it here would have compared 65536 with 65536 and read as "the codec did
-    // nothing", which is a true observation carrying a false claim.
-    //
-    // It also means `--cache-disk` bounds LOGICAL bytes: a compressed disk tier holds
-    // its cap in pre-compression terms and occupies less than that on the filesystem.
-    auto fileBytes = [&payload](CompressionCodec codec, std::string_view scratchName) {
+    // `bytesUsed` used to be blind to it: `CowTreeStorage` charged `originalLen`, the
+    // pre-compression size, so a compressed disk tier reported exactly what an
+    // uncompressed one did, and `--cache-disk` bounded logical bytes. It now charges
+    // the store's page footprint, so a value costs its compressed size against the
+    // budget -- which is what lets compression make the same budget hold more.
+    struct Measured
+    {
+        std::size_t file;      ///< The store file's length once closed.
+        std::size_t footprint; ///< The disk tier's `bytesUsed` while open.
+    };
+    auto measure = [&payload](CompressionCodec codec, std::string_view scratchName) {
         Testing::ScratchDirectory const scratch { scratchName };
         auto const store = scratch.Path() / DiskStoreFileName;
+        std::size_t footprint = 0;
         {
             Fixture fixture;
             auto cfg = Fixture::BaseConfig();
@@ -634,28 +712,28 @@ TEST_CASE("The disk tier compresses with the codec the node names", "[node][cach
                                      .bytes;
             REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
 
-            // The budget is denominated in logical bytes whatever the codec, which is
-            // the other half of the note above and is worth pinning: if this ever
-            // starts tracking the compressed size, the assertion below is measuring
-            // something else.
             auto const tiers = tier->SnapshotTiers();
             REQUIRE(At(tiers, StorageTier::Disk).has_value());
-            CHECK(Unwrap(At(tiers, StorageTier::Disk)).bytesUsed >= PayloadBytes);
+            footprint = Unwrap(At(tiers, StorageTier::Disk)).bytesUsed;
         }
         // Sized after the tier is closed, so the last commit has certainly landed.
         std::error_code error;
         auto const size = std::filesystem::file_size(store, error);
         REQUIRE_FALSE(error);
-        return static_cast<std::size_t>(size);
+        return Measured { .file = static_cast<std::size_t>(size), .footprint = footprint };
     };
 
-    auto const plain = fileBytes(CompressionCodec::Identity, "node-disk-codec-none");
-    auto const packed = fileBytes(CompressionCodec::Zstd, "node-disk-codec-zstd");
+    auto const plain = measure(CompressionCodec::Identity, "node-disk-codec-none");
+    auto const packed = measure(CompressionCodec::Zstd, "node-disk-codec-zstd");
 
     // A ratio rather than a constant: how well zstd does on this payload is for zstd
     // to decide, and the file carries pages of tree overhead either way.
-    CHECK(plain >= PayloadBytes);
-    CHECK(packed < plain / 2);
+    CHECK(plain.file >= PayloadBytes);
+    CHECK(packed.file < plain.file / 2);
+    // And the budget's figure sees the codec too. Uncompressed, it is at least the
+    // payload; compressed, well under half of that.
+    CHECK(plain.footprint >= PayloadBytes);
+    CHECK(packed.footprint < plain.footprint / 2);
 }
 
 TEST_CASE("The startup line names a present tier's codec and an absent tier's nothing", "[node][cache-tier][compression]")
@@ -920,4 +998,138 @@ TEST_CASE("A dropped key moves the delete figures NodeMetrics reads, with no adm
 
     REQUIRE(ask(Wire::EncodeCacheDrop("dropped")) == Wire::Status::Miss);
     CHECK(deleteFigures() == std::pair { std::uint64_t { 1 }, std::uint64_t { 1 } });
+}
+
+TEST_CASE("A local upstream wins over the fleet's shared cache", "[node][cache-tier][shared-cache]")
+{
+    // A node with an identity AND an `--upstream`: the operator typed that address on this machine,
+    // and it is fixed for the process, so it wins over whatever the fleet's setting names.
+    UpstreamFixture fix;
+    CHECK(UpstreamKindOf(fix.Parts("cache-old.office.example:6674")) == UpstreamKind::Daemon);
+    CHECK(MakeCacheUpstream(fix.Parts("cache-old.office.example:6674"))->Configured());
+}
+
+TEST_CASE("With no local upstream a node with an identity reads through to the fleet setting",
+          "[node][cache-tier][shared-cache]")
+{
+    UpstreamFixture fix;
+    CHECK(UpstreamKindOf(fix.Parts("")) == UpstreamKind::FleetSharedCache);
+    auto const chosen = MakeCacheUpstream(fix.Parts(""));
+    // And an unset setting is honest: not configured.
+    CHECK_FALSE(chosen->Configured());
+}
+
+TEST_CASE("Each upstream kind speaks its own verb pair", "[node][cache-tier][shared-cache]")
+{
+    CHECK(UpstreamKindTable[static_cast<std::size_t>(UpstreamKind::Daemon)].verbs
+          == std::optional { Wire::DaemonCacheVerbs });
+    CHECK(UpstreamKindTable[static_cast<std::size_t>(UpstreamKind::FleetSharedCache)].verbs
+          == std::optional { Wire::FleetSharedCacheVerbs });
+    CHECK_FALSE(UpstreamKindTable[static_cast<std::size_t>(UpstreamKind::InProcessShared)].verbs.has_value());
+    CHECK_FALSE(UpstreamKindTable[static_cast<std::size_t>(UpstreamKind::None)].verbs.has_value());
+}
+
+TEST_CASE("The named machine's private tier reads through in process, dialling nothing", "[node][cache-tier][shared-cache]")
+{
+    // The same upstream every node with an identity builds, on the machine the setting names: the
+    // switch hands the operation to the in-process half. Had it chosen the proven session, the
+    // target -- this machine -- is not one a session is dialled for, so the store would have come
+    // back `NotConfigured` rather than stored; and nothing on the dialling side may have moved.
+    UpstreamFixture fix;
+    fix.NameThisMachine();
+    auto const chosen = MakeCacheUpstream(fix.Parts(""));
+    REQUIRE(chosen->Configured());
+    auto const value = Testing::AStoredObject();
+    CHECK(core::async::syncRun(chosen->Store("k", value)) == UpstreamStore::Stored);
+    auto const fetched = core::async::syncRun(chosen->Fetch("k"));
+    REQUIRE(fetched.has_value());
+    CHECK(Unwrap(fetched) == value);
+    for (auto const counter: { IMetricsSink::Counter::NodeSharedCacheSessionsOpened,
+                               IMetricsSink::Counter::NodeSharedCacheProofsFailed,
+                               IMetricsSink::Counter::NodeSharedCacheProofsRefusedWrongKey,
+                               IMetricsSink::Counter::NodeSharedCacheStaleHints,
+                               IMetricsSink::Counter::NodeSharedCacheUnresolved })
+        CHECK(fix.metrics.Read(counter) == 0);
+    // The shared tier's own series moved: it was read and written in process.
+    CHECK(fix.opener.metrics.Read(IMetricsSink::Counter::NodeSharedCacheHits) == 1);
+}
+
+TEST_CASE("A node with no identity and no upstream reads through to nothing", "[node][cache-tier][shared-cache]")
+{
+    UpstreamFixture fix;
+    auto parts = fix.Parts("");
+    parts.prover = nullptr;
+    CHECK(UpstreamKindOf(parts) == UpstreamKind::None);
+    CHECK_FALSE(MakeCacheUpstream(parts)->Configured());
+}
+
+TEST_CASE("The tier hands out the fleet half's status only where it reads through to the fleet",
+          "[node][cache-tier][shared-cache][status]")
+{
+    // What `--node-status` is handed, reached the way `main` reaches it: through the tier, past the
+    // switch and the proven wrapper `MakeCacheUpstream` builds, to the one half that keeps a verdict.
+    Fixture fixture;
+    UpstreamFixture fix;
+    auto const cfg = Fixture::BaseConfig();
+    SECTION("the fleet's setting: the live verdict of the half that dials it")
+    {
+        auto started =
+            StartCacheTierOrExplain(cfg, fix.Parts(""), fixture.locality, fixture.clock, fixture.metrics, fixture.logger);
+        REQUIRE(started.has_value());
+        REQUIRE(*started != nullptr);
+        auto const* const status = (*started)->SharedCacheStatus();
+        REQUIRE(status != nullptr);
+        // Live, and the fleet half's: it follows the directory it re-judges from.
+        CHECK(status->Report().source == Wire::WireSharedCacheSource::None);
+        fix.directory.Applied(Testing::NamingSharedCache("cache-c"));
+        CHECK(status->Report().source == Wire::WireSharedCacheSource::Setting);
+        CHECK(status->Report().machineId == "cache-c");
+    }
+    SECTION("--upstream: nothing proves anything on that leg")
+    {
+        auto started = StartCacheTierOrExplain(
+            cfg, fix.Parts("127.0.0.1:1"), fixture.locality, fixture.clock, fixture.metrics, fixture.logger);
+        REQUIRE(started.has_value());
+        REQUIRE(*started != nullptr);
+        CHECK((*started)->SharedCacheStatus() == nullptr);
+    }
+    SECTION("no identity: nothing reaches the fleet")
+    {
+        auto parts = fix.Parts("");
+        parts.prover = nullptr;
+        auto started = StartCacheTierOrExplain(cfg, parts, fixture.locality, fixture.clock, fixture.metrics, fixture.logger);
+        REQUIRE(started.has_value());
+        REQUIRE(*started != nullptr);
+        CHECK((*started)->SharedCacheStatus() == nullptr);
+    }
+}
+
+TEST_CASE("The startup line names the upstream by its kind", "[node][cache-tier][shared-cache]")
+{
+    // The line reads the SAME kind the tier was built from, so it cannot name another choice.
+    Fixture fixture;
+    UpstreamFixture fix;
+    auto const cfg = Fixture::BaseConfig();
+    SECTION("the fleet's setting, for a node with an identity")
+    {
+        auto started =
+            StartCacheTierOrExplain(cfg, fix.Parts(""), fixture.locality, fixture.clock, fixture.metrics, fixture.logger);
+        REQUIRE(started.has_value());
+        CHECK(Logged(fixture.logger, "upstream shared-cache (the fleet setting; resolved at every apply))"));
+    }
+    SECTION("--upstream, which wins")
+    {
+        auto started = StartCacheTierOrExplain(
+            cfg, fix.Parts("127.0.0.1:1"), fixture.locality, fixture.clock, fixture.metrics, fixture.logger);
+        REQUIRE(started.has_value());
+        CHECK(Logged(fixture.logger, "upstream 127.0.0.1:1 (override, fastcached verbs))"));
+    }
+    SECTION("nothing, for a node with neither")
+    {
+        auto parts = fix.Parts("");
+        parts.prover = nullptr;
+        auto started = StartCacheTierOrExplain(cfg, parts, fixture.locality, fixture.clock, fixture.metrics, fixture.logger);
+        REQUIRE(started.has_value());
+        CHECK(Logged(fixture.logger, "upstream none)"));
+    }
 }

@@ -229,12 +229,12 @@ namespace
     /// How one `FigureSource` is computed.
     struct FigureSourceSpec
     {
-        FigureSource source; ///< The enumerator this row describes.
+        FigureSource source {}; ///< The enumerator this row describes.
         /// The computation, over the primary and second fields, for the whole cache or one tier.
         Series (*compute)(std::deque<HistoryEntry> const& history,
                           ReadingField field,
                           ReadingField other,
-                          std::optional<StorageTier> tier);
+                          std::optional<StorageTier> tier) = nullptr;
         /// Whether a figure's `addends` add their rates to what `compute` made.
         bool takesAddends { false };
     };
@@ -1317,7 +1317,7 @@ namespace
     /// The frame's word for one of the leader's cell tones.
     struct CellToneDress
     {
-        Distributed::CellTone tone;     ///< The enumerator this row describes.
+        Distributed::CellTone tone {};  ///< The enumerator this row describes.
         std::optional<FrameTone> frame; ///< How the frame dresses it; none for plain.
     };
 
@@ -1461,8 +1461,8 @@ namespace
     /// alert as a refusal is. A severity this build cannot name is plain, since a colour would be a guess.
     struct SeverityTone
     {
-        CompileCacheWire::ConditionSeverity severity; ///< The enumerator this row describes.
-        std::optional<FrameTone> tone;                ///< How an id of that severity is dressed; none for plain.
+        CompileCacheWire::ConditionSeverity severity {}; ///< The enumerator this row describes.
+        std::optional<FrameTone> tone;                   ///< How an id of that severity is dressed; none for plain.
     };
     constexpr EnumTable<CompileCacheWire::ConditionSeverity, SeverityTone> SeverityTones { {
         { .severity = CompileCacheWire::ConditionSeverity::Notice, .tone = std::nullopt },
@@ -2055,7 +2055,7 @@ namespace
         std::string_view key; ///< The keystroke's bytes; empty for a section the strip does not name.
     };
 
-    /// One row per `FleetSection`, in enumerator order: what the strip's `keys  m w l c f ! t` hint lists.
+    /// One row per `FleetSection`, in enumerator order: what the strip's `keys  m w l c r ! t` hint lists.
     ///
     /// A letter per tab, from the section's key -- except `members`, whose `m` `machines` already has, so it
     /// answers to `c`, for cluster, and `conditions`, whose `c` members then has: it answers to `!`, the key a
@@ -2067,7 +2067,7 @@ namespace
         { .section = FleetSection::Workers, .key = "w" },
         { .section = FleetSection::Leases, .key = "l" },
         { .section = FleetSection::Members, .key = "c" },
-        { .section = FleetSection::Forgotten, .key = "f" },
+        { .section = FleetSection::Revoked, .key = "r" },
         { .section = FleetSection::Conditions, .key = "!" },
         { .section = FleetSection::Tiers, .key = "t" },
         // Not a tab: the history is not in the document a live panel is pushed.

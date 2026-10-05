@@ -93,4 +93,20 @@ template <typename T, typename E>
     return value.has_value() ? *value : absent;
 }
 
+/// `Unwrap` for a `std::expected` whose value has no default to stand in for an absent one --
+/// a `Cluster::ProvenFleetSummary`, which only a verification makes -- on the terms of the
+/// `optional` overload above: `REQUIRE` it first, and a case that did not stops here.
+/// @tparam T The contained type.
+/// @tparam E The refusal type.
+/// @param value The result, already `REQUIRE`d to hold a value.
+/// @return A reference to its value.
+template <typename T, typename E>
+    requires(!std::default_initializable<T>)
+[[nodiscard]] T const& Unwrap(std::expected<T, E> const& value)
+{
+    if (!value.has_value())
+        std::abort();
+    return *value;
+}
+
 } // namespace FastCache::Testing

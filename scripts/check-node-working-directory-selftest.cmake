@@ -55,6 +55,10 @@ Type=simple
 ExecStart=/usr/bin/fastcache-compile-node
 RuntimeDirectory=fastcache-node
 WorkingDirectory=/run/fastcache-node
+StateDirectory=fastcache-node
+")
+set(GoodNodeDefaults
+"inline constexpr std::string_view NodeStateDirectoryName = \"fastcache-node\";
 ")
 set(GoodDaemon
 "[Service]
@@ -73,9 +77,11 @@ function(fastcached_make_tree name unit body outVar)
     set(tree "${root}/${name}")
     file(REMOVE_RECURSE "${tree}")
     file(MAKE_DIRECTORY "${tree}/packaging/linux")
+    file(MAKE_DIRECTORY "${tree}/src/apps/fastcache-compile-node")
     file(WRITE "${tree}/packaging/linux/fastcache-compile-node.service" "${GoodWorker}")
     file(WRITE "${tree}/packaging/linux/fastcached.service" "${GoodDaemon}")
     file(WRITE "${tree}/packaging/linux/fastcached-user.service" "${GoodDaemon}")
+    file(WRITE "${tree}/src/apps/fastcache-compile-node/NodeDefaults.hpp" "${GoodNodeDefaults}")
     if(NOT unit STREQUAL "")
         file(WRITE "${tree}/packaging/linux/${unit}" "${body}")
     endif()
@@ -185,6 +191,7 @@ fastcached_case("last-wins" "fastcache-compile-node.service"
 "[Service]
 ExecStart=/usr/bin/fastcache-compile-node
 RuntimeDirectory=fastcache-node
+StateDirectory=fastcache-node
 WorkingDirectory=/
 WorkingDirectory=/run/fastcache-node
 " "PASS" ""
@@ -219,6 +226,7 @@ fastcached_case("resolvable-specifier" "fastcache-compile-node.service"
 "[Service]
 ExecStart=/usr/bin/fastcache-compile-node
 RuntimeDirectory=fastcache-node
+StateDirectory=fastcache-node
 WorkingDirectory=%t/fastcache-node
 " "PASS" ""
     "%t is the runtime root for a system unit, so %t/fastcache-node is the RuntimeDirectory above and must be accepted rather than refused as unresolvable")
@@ -259,6 +267,55 @@ WorkingDirectory=/opt/nowhere
     "a WorkingDirectory nothing creates stops the service starting regardless of whether it spawns a compiler, so the exemption is from NEEDING one, not from being checked")
 
 # --- the failure mode a consistency check must not have ----------------------
+fastcached_case("state-directory-missing" "fastcache-compile-node.service"
+"[Service]
+ExecStart=/usr/bin/fastcache-compile-node
+RuntimeDirectory=fastcache-node
+WorkingDirectory=/run/fastcache-node
+" "REFUSE" "declares no StateDirectory="
+    "a worker unit that hands over no state directory leaves the unprivileged service keeping the machine's identity in its account's home")
+
+fastcached_case("state-directory-other-name" "fastcache-compile-node.service"
+"[Service]
+ExecStart=/usr/bin/fastcache-compile-node
+RuntimeDirectory=fastcache-node
+WorkingDirectory=/run/fastcache-node
+StateDirectory=fastcache-worker
+" "REFUSE" "the node declines it"
+    "systemd hands over a directory the node does not take, since it takes only one named NodeStateDirectoryName")
+
+fastcached_case("state-directory-reset" "fastcache-compile-node.service"
+"[Service]
+ExecStart=/usr/bin/fastcache-compile-node
+RuntimeDirectory=fastcache-node
+WorkingDirectory=/run/fastcache-node
+StateDirectory=fastcache-node
+StateDirectory=
+" "REFUSE" "in force"
+    "a later empty assignment resets the list, so nothing is handed over")
+
+fastcached_case("state-directory-list" "fastcache-compile-node.service"
+"[Service]
+ExecStart=/usr/bin/fastcache-compile-node
+RuntimeDirectory=fastcache-node
+WorkingDirectory=/run/fastcache-node
+StateDirectory=fastcache-cache fastcache-node
+" "PASS" ""
+    "one assignment may name several directories, and the node's is among them")
+
+fastcached_make_tree("state-name-unreadable" "" "" tree)
+file(WRITE "${tree}/src/apps/fastcache-compile-node/NodeDefaults.hpp" "// renamed\n")
+fastcached_run_check("${tree}" objected output)
+math(EXPR caseCount "${caseCount} + 1")
+if(NOT objected)
+    list(APPEND failures "state-name-unreadable: a header spelling no NodeStateDirectoryName was not refused -- the unit would be judged against nothing")
+else()
+    string(FIND "${output}" "spells no NodeStateDirectoryName" said)
+    if(said EQUAL -1)
+        list(APPEND failures "state-name-unreadable: refused, but not for its own reason")
+    endif()
+endif()
+
 fastcached_make_tree("absent" "" "" tree)
 file(REMOVE "${tree}/packaging/linux/fastcache-compile-node.service")
 fastcached_run_check("${tree}" objected output)

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/MachineName.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
@@ -55,6 +56,9 @@ class FakeCluster final: public IClusterAdmin
         return _state;
     }
 
+    /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+    void NoteAnnouncedEndpoint(Consensus::NodeId const& /*member*/, std::string /*endpoint*/) override {}
+
     [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& /*command*/) override
     {
         return {};
@@ -82,7 +86,7 @@ class FakeCluster final: public IClusterAdmin
     FleetSnapshot snapshot;
     snapshot.role = SchedulerRole::Leader;
     snapshot.nodes = { Machine("10.0.0.2:7100", 32) };
-    snapshot.leases = { 100, 7, 5, 3, 2 };
+    snapshot.leases = { 100, 7, 5, 3, 1, 2 };
     snapshot.liveLeases = 4;
     snapshot.registrations = 9;
     return snapshot;
@@ -147,15 +151,12 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
     auto snapshot = LeadingSnapshot();
     snapshot.cluster = Cluster::ClusterState {
         .members = { Cluster::ClusterMember {
-            .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = "10.0.0.2:6676", .publicKey = std::nullopt } },
+            .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = "10.0.0.2:6676", .publicKey = {} } },
         .settings = {},
-        .clients = {},
-        // A tombstone for the tier's reason: this case walks the TABLES, and a
+        // A revocation for the tier's reason: this case walks the TABLES, and a
         // section rendering from an empty vector would be covered by asserting
         // almost nothing about it.
-        .forgotten = { "10.0.0.9" },
-        .principals = {},
-        .revokedKeys = {}
+        .revokedKeys = { Cluster::RevokedKey { .id = "n9", .publicKey = {} } }
     };
     snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
                                                              .fingerprint = "gcc-13-abcdef",
@@ -797,27 +798,30 @@ TEST_CASE("A member that never announced and one a re-admit cleared render diffe
     // literal would assert the representation rather than what the cluster records.
     auto snapshot = LeadingSnapshot();
     Cluster::ClusterState state;
+    // Admitted under keys, as every member is; the re-admit states none and keeps the recorded one.
+    auto const keyOf = [](std::uint8_t fill) {
+        auto key = Ed25519PublicKey {};
+        key.fill(static_cast<std::byte>(fill));
+        return key;
+    };
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "quiet",
                              .value = "10.0.0.1:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = std::nullopt,
-                             .role = std::nullopt });
+                             .publicKey = keyOf(0x51) });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "moved",
                              .value = "10.0.0.2:6675",
                              .schedulerEndpoint = "10.0.0.2:6676",
-                             .publicKey = std::nullopt,
-                             .role = std::nullopt });
+                             .publicKey = keyOf(0x52) });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "moved",
                              .value = "10.0.0.2:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = std::nullopt,
-                             .role = std::nullopt });
+                             .publicKey = std::nullopt });
     snapshot.cluster = state;
 
     // The text section: one row each, and the rows differ in the state column while
@@ -887,13 +891,14 @@ TEST_CASE("Each lease outcome carries its own number", "[distributed][fleetview]
     // rather than passing on equal numbers -- and because summing this split is the
     // mistake the whole table exists to prevent.
     auto snapshot = LeadingSnapshot();
-    snapshot.leases = { 100, 7, 5, 3, 2 };
+    snapshot.leases = { 100, 7, 5, 3, 9, 2 };
 
     auto const json = RenderFleetJson(snapshot, NoHistory());
     CHECK(json.contains(R"("granted":100)"));
     CHECK(json.contains(R"("no-worker":7)"));
     CHECK(json.contains(R"("no-capacity":5)"));
     CHECK(json.contains(R"("withdrawn":3)"));
+    CHECK(json.contains(R"("all-excluded":9)"));
     CHECK(json.contains(R"("duplicate":2)"));
     // And the page says out loud that they must not be added together.
     CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("Do not add these together"));
@@ -917,8 +922,8 @@ TEST_CASE("Collecting a fleet reads the registry per machine and the counters as
     CHECK(scheduler.Register(member, announce).status == CompileCacheWire::Status::Ok);
 
     Cluster::ClusterState state;
-    state.members.push_back(Cluster::ClusterMember {
-        .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = {}, .publicKey = std::nullopt });
+    state.members.push_back(
+        Cluster::ClusterMember { .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = {}, .publicKey = {} });
     FakeCluster cluster { state };
 
     auto const snapshot = CollectFleet(FleetSources { .scheduler = &scheduler, .cluster = &cluster, .metrics = &metrics });
@@ -999,8 +1004,8 @@ TEST_CASE("A fleet nothing was ever dispatched to says so, rather than reading a
     // host CPU, found none of it accounted for by work this fleet had handed out,
     // and told the operator their own build belonged to somebody else.
     auto snapshot = LeadingSnapshot();
-    snapshot.leases = { 0, 0, 0, 0, 0 }; // registered, and never asked
-    snapshot.liveLeases = 0;             // nor is anything outstanding
+    snapshot.leases = { 0, 0, 0, 0, 0, 0 }; // registered, and never asked
+    snapshot.liveLeases = 0;                // nor is anything outstanding
     auto busy = Machine("10.0.0.1:7100", 16);
     busy.registeredSlots = 16;
     busy.fleetJobsInFlight = 0;
@@ -1054,8 +1059,8 @@ TEST_CASE("A scheduler that has just taken over does not call a working fleet un
     // them" on a page whose own bar shows four running, and would displace the
     // withheld reading that is the actually useful one.
     auto snapshot = LeadingSnapshot();
-    snapshot.leases = { 0, 0, 0, 0, 0 }; // this leader has granted nothing yet
-    snapshot.liveLeases = 0;             // and holds no lease of its own
+    snapshot.leases = { 0, 0, 0, 0, 0, 0 }; // this leader has granted nothing yet
+    snapshot.liveLeases = 0;                // and holds no lease of its own
     auto busy = Machine("10.0.0.1:7100", 16);
     busy.registeredSlots = 16;
     busy.fleetJobsInFlight = 4; // but the fleet is demonstrably working
@@ -1077,7 +1082,7 @@ TEST_CASE("A lease outstanding is dispatch, even before the count catches up", "
     // `liveLeases` is the only thing that knows, and without it this page would
     // announce an unused fleet in the gap between a grant and its job.
     auto snapshot = LeadingSnapshot();
-    snapshot.leases = { 0, 0, 0, 0, 0 };
+    snapshot.leases = { 0, 0, 0, 0, 0, 0 };
     snapshot.liveLeases = 2;
     auto idle = Machine("10.0.0.1:7100", 16);
     idle.registeredSlots = 16;
@@ -1704,15 +1709,14 @@ TEST_CASE("A peer that got its bytes past the door cannot make the whole fleet's
     // into it with nobody left to refuse it.
     auto snapshot = LeadingSnapshot();
     snapshot.leaderEndpoint = "10.0.0.2:7100\xFF";
-    snapshot.cluster = Cluster::ClusterState { .members = { Cluster::ClusterMember { .id = "n\x80\x80",
-                                                                                     .raftEndpoint = "10.0.0.2:6675\xC3",
-                                                                                     .schedulerEndpoint = "\xE2\x82",
-                                                                                     .publicKey = std::nullopt } },
-                                               .settings = {},
-                                               .clients = {},
-                                               .forgotten = {},
-                                               .principals = {},
-                                               .revokedKeys = {} };
+    snapshot.cluster = Cluster::ClusterState {
+        .members = { Cluster::ClusterMember {
+            .id = "n\x80\x80", .raftEndpoint = "10.0.0.2:6675\xC3", .schedulerEndpoint = "\xE2\x82", .publicKey = {} } },
+        .settings = {},
+        // And the id a revocation carries, which is the
+        // id the forgotten record held -- the same door.
+        .revokedKeys = { Cluster::RevokedKey { .id = "n\x80gone", .publicKey = {} } }
+    };
     snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
                                                              .fingerprint = "gcc-13-ab\x80\x80",
                                                              .endpoint = "10.0.0.2:7100\xFF",
@@ -2182,97 +2186,83 @@ TEST_CASE("Each refusal tile names the counter it renders, in its own tile", "[d
     CHECK((detail.empty() && seen == LeaseOutcomeTable.size()));
 }
 
-TEST_CASE("The forgotten clients reach every surface, and absent is not the same as none",
-          "[distributed][fleetview][forget]")
+TEST_CASE("The revoked keys reach every surface, and absent is not the same as none", "[distributed][fleetview][forget]")
 {
-    // #1471. The tombstones were the one piece of replicated membership state no surface
-    // showed: `node` reports how MANY a node enforces and never which, so an operator who
-    // has issued three forgets cannot tell which machine a given node is refusing.
+    // A machine is forgotten by its key, so what a forget leaves is a revocation, and this is
+    // the section that shows it: whose key it was and the key, which an operator compares
+    // against what a machine's `--node-status` reports.
     //
     // WHAT DISTINGUISHES: three states that a renderer collapsing any two of them would
-    // pass at least one of -- no cluster, a cluster with no tombstones, and a cluster with
-    // some -- asserted on all three surfaces.
+    // pass at least one of -- no cluster, a cluster that revoked nothing, and a cluster that
+    // revoked keys -- asserted on all three surfaces.
     auto snapshot = LeadingSnapshot();
 
     SECTION("a node running no cluster reports null, never an empty set")
     {
         REQUIRE_FALSE(snapshot.cluster.has_value());
-        CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("forgotten":null)"));
+        CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("revoked":null)"));
         CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("runs no cluster"));
     }
 
-    SECTION("a cluster that has forgotten nobody reports an empty set, and says so in words")
+    SECTION("a cluster that has revoked nothing reports an empty set, and says so in words")
     {
         snapshot.cluster = Cluster::ClusterState {};
-        CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("forgotten":[])"));
+        CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("revoked":[])"));
         // The sentence rather than a bare empty table, which reads as a section that
         // failed to render.
-        CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("forgotten nobody"));
-        // And the column still reaches the page in this state: a section whose columns
+        CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("revoked no key"));
+        // And the columns still reach the page in this state: a section whose columns
         // appear only when it has rows is one no table-walking test can hold to account.
-        CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("Forgotten clients"));
+        CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("Revoked keys"));
     }
 
-    SECTION("every forgotten host is named on all three surfaces")
+    SECTION("every revoked key is named, with whose it was, on all three surfaces")
     {
-        // Built through `Apply`, which is how a leader acquires this state; a literal
-        // would assert the representation rather than what the cluster records.
+        // Built through `Apply`, which is how a leader acquires this state: two machines
+        // admitted by key and forgotten. A literal would assert the representation rather
+        // than what the cluster records.
+        auto keyOf = [](std::uint8_t fill) {
+            auto key = Ed25519PublicKey {};
+            key.fill(static_cast<std::byte>(fill));
+            return key;
+        };
         Cluster::ClusterState state;
-        Apply(state,
-              Cluster::Command { .kind = Cluster::CommandKind::ForgetClient,
-                                 .key = "10.0.0.7",
-                                 .value = {},
-                                 .schedulerEndpoint = {},
-                                 .publicKey = std::nullopt,
-                                 .role = std::nullopt });
-        Apply(state,
-              Cluster::Command { .kind = Cluster::CommandKind::ForgetClient,
-                                 .key = "10.0.0.8",
-                                 .value = {},
-                                 .schedulerEndpoint = {},
-                                 .publicKey = std::nullopt,
-                                 .role = std::nullopt });
+        for (auto const& [id, fill]:
+             { std::pair { "w7", std::uint8_t { 0x77 } }, std::pair { "w8", std::uint8_t { 0x88 } } })
+        {
+            Apply(state,
+                  Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
+                                     .key = id,
+                                     .value = {},
+                                     .schedulerEndpoint = {},
+                                     .publicKey = keyOf(fill) });
+            Apply(state,
+                  Cluster::Command { .kind = Cluster::CommandKind::Forget,
+                                     .key = id,
+                                     .value = {},
+                                     .schedulerEndpoint = {},
+                                     .publicKey = std::nullopt });
+        }
+        REQUIRE(state.revokedKeys.size() == 2);
         snapshot.cluster = state;
+        auto const w7Key = FormatEd25519PublicKey(keyOf(0x77));
+        auto const w8Key = FormatEd25519PublicKey(keyOf(0x88));
 
         auto const json = RenderFleetJson(snapshot, NoHistory());
-        CHECK(json.contains("10.0.0.7"));
-        CHECK(json.contains("10.0.0.8"));
-        CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("10.0.0.8"));
+        CHECK(json.contains(R"("id":"w7")"));
+        CHECK(json.contains(w7Key));
+        CHECK(json.contains(w8Key));
+        auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+        CHECK(html.contains("w8"));
+        CHECK(html.contains(w8Key));
 
-        // The section's own table: a header and one line per host, and nothing else --
+        // The section's own table: a header and one line per key, and nothing else --
         // the form a reader pipes into `cut`.
-        auto const section = RenderFleetText(snapshot, NoHistory(), FleetSection::Forgotten);
+        auto const section = RenderFleetText(snapshot, NoHistory(), FleetSection::Revoked);
         CHECK(LineCount(section) == 3);
-        CHECK(HeaderLine(section) == "host");
-        CHECK(section.contains("10.0.0.7"));
-        CHECK(section.contains("10.0.0.8"));
-    }
-
-    SECTION("a host admitted again is no longer forgotten, on the page as in the fold")
-    {
-        // The direction that fails OPEN elsewhere in this tree, and the one a renderer
-        // reading a stale copy would get wrong: a re-admit removes the tombstone, so a
-        // surface still naming the host would send an operator to undo a forget that is
-        // already undone.
-        Cluster::ClusterState state;
-        Apply(state,
-              Cluster::Command { .kind = Cluster::CommandKind::ForgetClient,
-                                 .key = "10.0.0.7",
-                                 .value = {},
-                                 .schedulerEndpoint = {},
-                                 .publicKey = std::nullopt,
-                                 .role = std::nullopt });
-        Apply(state,
-              Cluster::Command { .kind = Cluster::CommandKind::AdmitClient,
-                                 .key = "10.0.0.7",
-                                 .value = {},
-                                 .schedulerEndpoint = {},
-                                 .publicKey = std::nullopt,
-                                 .role = std::nullopt });
-        snapshot.cluster = state;
-
-        CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("forgotten":[])"));
-        CHECK(LineCount(RenderFleetText(snapshot, NoHistory(), FleetSection::Forgotten)) == 1);
+        CHECK(HeaderLine(section) == "id\tkey");
+        CHECK(section.contains(std::format("w7\t{}", w7Key)));
+        CHECK(section.contains(std::format("w8\t{}", w8Key)));
     }
 }
 

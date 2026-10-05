@@ -9,8 +9,11 @@
 #include <atomic>
 #include <cstdint>
 #include <exception>
+#include <string>
+#include <string_view>
 
 #include <core/async/Task.hpp>
+#include <core/net/AcceptLoopHealth.hpp>
 #include <core/net/IAdmissionControl.hpp>
 #include <core/net/IListener.hpp>
 
@@ -59,6 +62,12 @@ class Server
   public:
     /// Construct over the given collaborators; all references must outlive
     /// the server. Admission/metrics may be null.
+    /// @param acceptLoops Where the loop says so if it degrades, or ends while the server is not
+    ///        shutting down -- the registry the daemon's `/healthz` answers from. Required, never
+    ///        defaulted: a construction site that could leave it out would lose that report in
+    ///        silence.
+    /// @param surface The name this loop reports under, in its log lines and in @p acceptLoops,
+    ///        so an operator can tell which bind stopped, e.g. `cache 0.0.0.0:11211`.
     /// @param session Per-server session context (auth policy etc.) forwarded
     ///        to every connection. Copied by value; defaults to no auth.
     /// @param tls TLS context to wrap accepted sockets with, or nullptr for
@@ -68,6 +77,8 @@ class Server
     Server(core::net::IListener& listener,
            CacheEngine& engine,
            ILogger& logger,
+           core::net::AcceptLoopHealth& acceptLoops,
+           std::string surface,
            core::net::IAdmissionControl* admission = nullptr,
            IMetricsSink* metrics = nullptr,
            SessionContext session = {},
@@ -87,6 +98,13 @@ class Server
     [[nodiscard]] std::uint64_t AcceptedCount() const noexcept
     {
         return _accepted.load(std::memory_order_relaxed);
+    }
+
+    /// @return The name this loop reports under, in its log lines and in the `/healthz`
+    ///         registry -- the `surface` it was constructed with.
+    [[nodiscard]] std::string_view Surface() const noexcept
+    {
+        return _surface;
     }
 
     /// @return True while `Run()` is parked in the listener's `Accept()`.
@@ -109,6 +127,8 @@ class Server
     core::net::IListener& _listener;
     CacheEngine& _engine;
     ILogger& _logger;
+    core::net::AcceptLoopHealth& _acceptLoops; ///< Told if the loop degrades, or ends while not shutting down.
+    std::string _surface;                      ///< The name the loop reports under.
     core::net::IAdmissionControl* _admission;
     IMetricsSink* _metrics;
     SessionContext _session;

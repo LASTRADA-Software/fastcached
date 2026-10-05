@@ -7,8 +7,10 @@
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -26,6 +28,45 @@ enum class SocketActivation : std::uint8_t
 {
     No = 0, ///< This process bound its own port, so `--bind` describes it.
     Yes,    ///< A socket unit owns the port, and `--bind` describes nothing.
+};
+
+/// Which lease check a worker built: none yet, one that verifies a grant's signature, or one that
+/// verifies nothing.
+///
+/// **Private**: never transmitted or persisted.
+enum class BuiltLeaseCheck : std::uint8_t
+{
+    None,      ///< No worker built a lease check in this process yet.
+    Signed,    ///< `Cc::SignedLeaseValidator`: every grant is verified against the roster.
+    Unchecked, ///< `Cc::UncheckedLeaseValidator`: no grant is verified.
+};
+
+/// What the running worker's lease check IS, as the factory that built it recorded it.
+///
+/// A fact about the process rather than about a configuration, and that is the point: whether a
+/// worker checks its leases is decided ONCE, at startup, by `MakeWorkerLeaseValidator`, and a
+/// reload that widens admission afterwards is safe exactly when what was built verifies grants.
+/// Asking flag shapes instead was how a path the shapes did not foresee reached an unchecked
+/// compile port (review I-2): this is read by `ReloadCheckWith`, so no future path can widen past
+/// an unchecked worker unguarded. Written on the body's thread, read on the reload's.
+class LeaseCheckInForce
+{
+  public:
+    /// Record what was built.
+    /// @param built The lease check the factory returned.
+    void Record(BuiltLeaseCheck built) noexcept
+    {
+        _built.store(built, std::memory_order_release);
+    }
+
+    /// @return The lease check the running worker built, or `None` before any did.
+    [[nodiscard]] BuiltLeaseCheck Current() const noexcept
+    {
+        return _built.load(std::memory_order_acquire);
+    }
+
+  private:
+    std::atomic<BuiltLeaseCheck> _built { BuiltLeaseCheck::None };
 };
 
 /// Build the lease check this node's compile port applies, from its configuration.
@@ -77,6 +118,9 @@ enum class SocketActivation : std::uint8_t
 ///        string the scheduler signs into a grant and the string this checks against
 ///        have to be one fact at every moment, not two readers of one file (#1279).
 ///        Borrowed by the validator, so it must outlive it.
+/// @param identityKey This node's identity public key, the one it proves itself with: a grant
+///        whose signed claims name another machine's key is refused (W-4). Copied; empty for a
+///        node that proves nothing.
 /// @param clock Where "now" comes from. A **wall** clock, not a steady one: the
 ///        expiry was stamped on another machine, and a steady instant means nothing
 ///        off the host that read it. Borrowed, so it must outlive the validator.
@@ -88,45 +132,48 @@ enum class SocketActivation : std::uint8_t
 ///        caller to hold a different set of objects.
 /// @param metrics Where an adopted term reset is counted.
 /// @param logger Where the chosen mode is announced.
+/// @param inForce Where the check it built is recorded, before it is returned -- folded into the
+///        operation, so no worker can build one without the reload guard knowing which.
 /// @return The validator, or why this node must not serve.
 [[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(
     NodeConfig const& cfg,
     Distributed::ILeaseRoster const* roster,
     Cc::IAdvertisedEndpointSource const& advertise,
+    std::span<std::byte const> identityKey,
     SocketActivation activation,
     core::platform::WallClockRef clock,
     Distributed::WorkerLeaseState& lease,
     IMetricsSink& metrics,
-    ILogger& logger);
+    ILogger& logger,
+    LeaseCheckInForce& inForce);
 
-/// Whether the fleet a scheduler admitted this node to is the one the operator asked
-/// for.
+/// Why a reload that widens admission on a worker whose lease check verifies nothing is refused.
+inline constexpr std::string_view ReloadWidensUncheckedWorkerRefusal =
+    "a reload may not widen admission with --fleet-open while this worker compiles WITHOUT verifying lease "
+    "signatures: it chose that lease check at startup, when no machine but this one could reach its compile verbs, and "
+    "widening now would open an unauthenticated compile port with every refusal counter reading zero. Restart the "
+    "node with the admission you want, so it chooses its lease check for it, or leave the admission policy as it is.";
+
+/// Whether a reload from @p previous to @p candidate widens admission while the running worker's
+/// lease check verifies nothing.
 ///
-/// `--cluster-id` is an **assertion**, not a source and not an override. Since #401 the
-/// identity comes from the REGISTER reply; the flag, when the operator NAMED one, says
-/// which fleet they expected. Disagreement is a provisioning fault -- this node would be
-/// serving a fleet nobody meant -- so the caller refuses rather than silently preferring
-/// one side. Preferring the config would put configuration back above registration and
-/// reopen the default-`fastcache` cross-fleet accept; preferring the registration
-/// quietly would make the flag a lie.
-///
-/// A free function over the two values rather than a branch inside the heartbeat round,
-/// because that round lives in `main.cpp`'s anonymous namespace where nothing can reach
-/// it, and a rule nothing can test is a rule nothing is held to.
-///
-/// @param asserted Whether the operator NAMED a cluster. Asked as provenance rather
-///        than by comparing the value against the default, which cannot see an operator
-///        who typed the default -- the option table's own rule.
-/// @param configured What `--cluster-id` says.
-/// @param registered What the scheduler's REGISTER reply named, which may legally be
-///        empty for a scheduler that names no fleet.
-/// @return True when the node may serve: either nothing was asserted, or what was
-///         asserted is what was registered.
-[[nodiscard]] constexpr bool FleetAssertionHolds(bool asserted,
-                                                 std::string_view configured,
-                                                 std::string_view registered) noexcept
-{
-    return !asserted || configured == registered;
-}
+/// Asked as a WIDENING, never as a state: a worker already admitting remote peers passed its own
+/// startup rules, and may reload freely, narrowing included -- the one edit that makes it safer.
+/// @param previous The configuration in force.
+/// @param candidate The one the reload would publish.
+/// @param built What the running worker built (`LeaseCheckInForce::Current`).
+/// @return True when the reload must be refused.
+[[nodiscard]] bool ReloadWidensUncheckedWorker(NodeConfig const& previous,
+                                               NodeConfig const& candidate,
+                                               BuiltLeaseCheck built);
+
+/// The check a running node's reloader applies: `ValidateNodeReloadable`, then the one rule about
+/// what the running worker BUILT (`ReloadWidensUncheckedWorker`), asked of @p inForce at the moment
+/// of each reload. LAST, so a save that both widens and moves an unreloadable setting is told about
+/// every setting first.
+/// @param inForce What the running worker recorded. Borrowed, so it must outlive the reloader.
+/// @return The check.
+[[nodiscard]] std::function<std::expected<void, ConfigError>(NodeConfig const&, NodeConfig const&)> ReloadCheckWith(
+    LeaseCheckInForce const& inForce);
 
 } // namespace FastCache::Node

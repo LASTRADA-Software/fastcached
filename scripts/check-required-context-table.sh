@@ -122,9 +122,31 @@ RegionEnd='required-context-scan: data-end'
 # A comment line, a `printf` staging the token and a `grep` pattern containing it are all
 # NOT declarations, because none of them starts with it. A COMMENT is not a call site.
 # ---------------------------------------------------------------------------
-# $1: file to scan, $2: path to report it as
-ScanFile() {
-    awk -v FNAME="$2" -v MARK="$Marker" -v RBEG="$RegionBegin" -v REND="$RegionEnd" '
+# ONE awk over every file named after @p 1, not one per file: a process start per file is what a loaded Windows
+# ctest cannot afford (two spawns per file, 245 files, and this timed out at 60 s). Per-file state is reset at each
+# file's first line, and the markers still pending at a file's end are flushed there and at END, so the records are
+# the ones a per-file run printed, in the same order.
+# $1: tree root the paths are reported relative to; $2...: files to scan
+ScanFiles() {
+    local tree="$1"
+    shift
+    awk -v TREE="$tree" -v MARK="$Marker" -v RBEG="$RegionBegin" -v REND="$RegionEnd" '
+        function flushOrphans(    i, text) {
+            for (i = 1; i <= pendingMarks; i++) {
+                text = markText[i]
+                sub(/^[ \t]*#[ \t]*/, "", text)
+                sub(MARK "[ \t]*", "", text)
+                printf "ORPHAN %s %d %s\n", FNAME, markLine[i], text
+            }
+            pendingMarks = 0
+        }
+        FNR == 1 {
+            if (NR > 1)
+                flushOrphans()
+            FNAME = substr(FILENAME, length(TREE) + 2)
+            inData = 0
+            inTable = 0
+        }
         # A data REGION is fixture text by construction. Its own begin/end lines are
         # reported so the consumer can check the region BALANCES -- an unclosed
         # `data-begin` silently exempts the rest of the file, which is the one way this
@@ -158,15 +180,7 @@ ScanFile() {
         }
         # Anything that is not a comment ends the header block, so the markers collected
         # so far belong to no declaration.
-        !isComment {
-            for (i = 1; i <= pendingMarks; i++) {
-                text = markText[i]
-                sub(/^[ \t]*#[ \t]*/, "", text)
-                sub(MARK "[ \t]*", "", text)
-                printf "ORPHAN %s %d %s\n", FNAME, markLine[i], text
-            }
-            pendingMarks = 0
-        }
+        !isComment { flushOrphans() }
         inTable && /^[ \t]*\)/ { inTable = 0 }
         inTable && /^[ \t]*"/ {
             row = $0
@@ -185,15 +199,8 @@ ScanFile() {
                 printf "READER %s %d %s\n", FNAME, FNR, d
             }
         }
-        END {
-            for (i = 1; i <= pendingMarks; i++) {
-                text = markText[i]
-                sub(/^[ \t]*#[ \t]*/, "", text)
-                sub(MARK "[ \t]*", "", text)
-                printf "ORPHAN %s %d %s\n", FNAME, markLine[i], text
-            }
-        }
-    ' "$1"
+        END { flushOrphans() }
+    ' "$@"
 }
 
 # $1: tree root. Fills the globals below; refuses rather than returning on a broken scan.
@@ -202,7 +209,7 @@ ScannedFiles=0
 Failures=0
 
 Collect() {
-    local tree="$1" dir="$tree/scripts" f rel records=""
+    local tree="$1" dir="$tree/scripts" f
     [ -d "$dir" ] || Refuse "no such directory: $dir -- the scan has nothing to read, which is not a pass"
 
     local listing
@@ -210,27 +217,85 @@ Collect() {
     [ -n "$listing" ] || Refuse "no regular files under $dir -- an empty scan agrees with every rule"
 
     local count=0
+    local files=()
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         case "$f" in
             *' '*) Refuse "$f contains a space; this scan's record format cannot carry one" ;;
         esac
-        rel="${f#"$tree"/}"
         count=$(( count + 1 ))
-        records="${records}$(ScanFile "$f" "$rel")
-"
+        files[${#files[@]}]="$f"
     done <<EOF
 $listing
 EOF
 
     ScannedFiles="$count"
-    Records="$records"
+    Records="$(ScanFiles "$tree" "${files[@]}")" || Refuse "the scan of $dir did not complete, so nothing was judged"
 }
 
 # ---------------------------------------------------------------------------
 # The rules. Seven, and every one of them can fire -- driven both directions by the
 # self-test, because a guard nobody has watched ACCEPT is not known to work either.
 # ---------------------------------------------------------------------------
+# The helpers below answer through a GLOBAL rather than on stdout, because `$(...)` is a fork -- and on Git Bash a
+# fork is a process start like any other. Each is a bash builtin loop over records already in memory.
+
+# How many lines of @p 1 carry something other than whitespace, into `Counted`.
+CountNonBlank() {
+    local l
+    Counted=0
+    while IFS= read -r l; do
+        case "$l" in
+            *[![:space:]]*) Counted=$(( Counted + 1 )) ;;
+        esac
+    done <<EOF
+$1
+EOF
+}
+
+# @p 1 with every run of whitespace made one space and none at either end -- what awk's re-joining of fields
+# produced, which rule 4 compares -- into `Normalized`.
+NormalizeSpaces() {
+    set -f
+    # shellcheck disable=SC2086  # the word splitting IS the normalisation
+    set -- $1
+    set +f
+    Normalized="$*"
+}
+
+# Markers belonging to the declaration at $2:$3, as `<file> <line>  <kind> <reason...>` lines, into `Found`.
+# $1 records (`<file> <markLine> <declLine> <kind> <reason...>`), $2 file, $3 declaration line
+MarksFor() {
+    local f l d rest
+    Found=""
+    while read -r f l d rest; do
+        [ -n "${f:-}" ] || continue
+        [ "$f" = "$2" ] && [ "$d" = "$3" ] || continue
+        Found="${Found}${f} ${l}  ${rest}
+"
+    done <<EOF
+$1
+EOF
+}
+
+# The rows of the declaration at $2:$3, one per line, in order, whitespace normalised, into `Found`.
+# $1 records (`<file> <declLine> <row text...>`), $2 file, $3 declaration line
+RowsFor() {
+    local f d rest
+    Found=""
+    while read -r f d rest; do
+        [ -n "${f:-}" ] || continue
+        [ "$f" = "$2" ] && [ "$d" = "$3" ] || continue
+        NormalizeSpaces "$rest"
+        Found="${Found}${Normalized}
+"
+    done <<EOF
+$1
+EOF
+    Found="${Found%
+}"
+}
+
 # $1: tree root. Returns 0 clean, 1 on a finding; refuses with 2.
 Judge() {
     local tree="$1"
@@ -268,7 +333,8 @@ EOF
     # tree where the array has been renamed out from under it, which is the one state
     # that needs saying loudest.
     local declCount=0
-    declCount="$(printf '%s' "$decls" | grep -c '[^[:space:]]')" || declCount=0
+    CountNonBlank "$decls"
+    declCount="$Counted"
     if [ "$declCount" -eq 0 ]; then
         Refuse "the scan found no \`RequiredContexts=(\` declaration under $tree/scripts
        ($ScannedFiles file(s) read). A scan that selects nothing is not a pass: either
@@ -324,9 +390,10 @@ EOF
         fi
 
         # Rule 3: exactly one marker in the header, carrying a reason.
-        marks="$(MarksFor "$declMarks" "$declFile" "$declLine")"
-        n=0
-        n="$(printf '%s' "$marks" | grep -c '[^[:space:]]')" || n=0
+        MarksFor "$declMarks" "$declFile" "$declLine"
+        marks="$Found"
+        CountNonBlank "$marks"
+        n="$Counted"
         if [ "$n" -eq 0 ]; then
             Fail "$declFile:$declLine declares \`RequiredContexts=(\` with no
      \`# $Marker <live|fixture -- why>\` line in the comment block above it.
@@ -341,8 +408,9 @@ EOF
      Two markers is two claims about one declaration and nothing says which holds."
             continue
         fi
-        read -r markKind markReason <<EOF
-$(printf '%s' "$marks" | sed 's/^[^ ]* [^ ]* //')
+        # `<file> <line>  <kind> <reason...>`: the two leading fields are dropped by `read` itself.
+        read -r _ _ markKind markReason <<EOF
+$marks
 EOF
         case "$markKind" in
             live)
@@ -356,8 +424,24 @@ EOF
                 # Two ways to have none, and they need one answer: `-- ` with nothing
                 # after it (the trim empties it), and a marker carrying no `--` at all
                 # (the trim changes nothing, so `trimmed` still equals the original).
-                local trimmed
-                trimmed="$(printf '%s' "$markReason" | sed 's/^--[[:space:]]*//; s/[[:space:]]*$//')"
+                local trimmed="$markReason"
+                case "$trimmed" in
+                    --*)
+                        trimmed="${trimmed#--}"
+                        while :; do
+                            case "$trimmed" in
+                                [[:space:]]*) trimmed="${trimmed#?}" ;;
+                                *) break ;;
+                            esac
+                        done
+                        ;;
+                esac
+                while :; do
+                    case "$trimmed" in
+                        *[[:space:]]) trimmed="${trimmed%?}" ;;
+                        *) break ;;
+                    esac
+                done
                 if [ -z "$trimmed" ] || [ "$trimmed" = "$markReason" ]; then
                     Fail "$declFile:$declLine is marked \`fixture\` with no reason after \`--\`.
      Spell it \`# $Marker fixture -- <why this is not the live table>\`. A reason nobody
@@ -378,7 +462,8 @@ EOF
 
     # --- Rule 2: exactly one live table -------------------------------------
     local liveCount liveFile
-    liveCount="$(printf '%s' "$liveFiles" | grep -c '[^[:space:]]')" || liveCount=0
+    CountNonBlank "$liveFiles"
+    liveCount="$Counted"
     if [ "$liveCount" -eq 0 ]; then
         Fail "no declaration is marked \`$Marker live\`, so nothing in this tree says
      which copy of the table is authoritative. Every reader defaults to one file; that
@@ -388,9 +473,10 @@ EOF
 $(printf '%s' "$liveFiles" | sed 's/^/       /')
      Two authorities is no authority. Exactly one declaration is the table."
     fi
-    liveFile="$(printf '%s' "$liveFiles" | sed -n '1s/ .*//p')"
     local liveLine
-    liveLine="$(printf '%s' "$liveFiles" | sed -n '1s/^[^ ]* //p')"
+    read -r liveFile liveLine <<EOF
+$liveFiles
+EOF
 
     # --- Rule 6: a marker whose declaration has gone is STALE ---------------
     #
@@ -415,11 +501,13 @@ EOF
     # marker changing, which is this rule's whole subject.
     if [ -n "$liveFile" ]; then
         local liveRows fixFile fixLine fixRows
-        liveRows="$(RowsFor "$rowLines" "$liveFile" "$liveLine")"
+        RowsFor "$rowLines" "$liveFile" "$liveLine"
+        liveRows="$Found"
         while read -r declFile declLine declIndent; do
             [ -n "${declFile:-}" ] || continue
             [ "$declFile" = "$liveFile" ] && [ "$declLine" = "$liveLine" ] && continue
-            fixRows="$(RowsFor "$rowLines" "$declFile" "$declLine")"
+            RowsFor "$rowLines" "$declFile" "$declLine"
+            fixRows="$Found"
             [ -n "$fixRows" ] || continue
             if [ "$fixRows" = "$liveRows" ]; then
                 Fail "$declFile:$declLine holds the SAME rows as the live table at
@@ -469,22 +557,6 @@ EOF
     return 1
 }
 
-# Markers belonging to the declaration at $2:$3, as `<line> <kind> <reason...>`.
-# $1 records, $2 file, $3 declaration line
-MarksFor() {
-    awk -v F="$2" -v L="$3" '$1 == F && $3 == L { $3 = ""; print }' <<EOF
-$1
-EOF
-}
-
-# The rows of the declaration at $2:$3, one per line, in order.
-# $1 records, $2 file, $3 declaration line
-RowsFor() {
-    awk -v F="$2" -v L="$3" '$1 == F && $2 == L { $1 = ""; $2 = ""; sub(/^[ \t]+/, ""); print }' <<EOF
-$1
-EOF
-}
-
 # ---------------------------------------------------------------------------
 # Self-test. Every rule, both directions.
 #
@@ -502,18 +574,27 @@ RunSelfTest() {
     trap 'rm -rf "$SelfTestTmp"' EXIT
     local tmp="$SelfTestTmp"
 
+    # Stdin to the file @p 1, line by line and in bash: a heredoc through `cat` was a process per file staged.
+    Put() {
+        local line
+        : > "$1"
+        while IFS= read -r line; do
+            printf '%s\n' "$line" >> "$1"
+        done
+    }
+
     # A tree with a live table, a fixture, and a reader pointed at the live one.
     # $1 name
     Mk() {
         mkdir -p "$tmp/$1/scripts"
-        cat > "$tmp/$1/scripts/live.sh" <<'LIVE'
+        Put "$tmp/$1/scripts/live.sh" <<'LIVE'
 # required-context-table: live
 RequiredContexts=(
     "Alpha|w.yml"
     "Beta|w.yml"
 )
 LIVE
-        cat > "$tmp/$1/scripts/fixture.sh" <<'FIX'
+        Put "$tmp/$1/scripts/fixture.sh" <<'FIX'
 Stage() {
     cat > "$f" <<'REQ'
 # required-context-table: fixture -- a pinned subset, so a promotion moves no verdict here
@@ -523,7 +604,7 @@ RequiredContexts=(
 REQ
 }
 FIX
-        cat > "$tmp/$1/scripts/reader.sh" <<'RD'
+        Put "$tmp/$1/scripts/reader.sh" <<'RD'
 Table="${FASTCACHED_REQUIRED_CONTEXTS_FILE:-scripts/live.sh}"
 RD
     }
@@ -543,14 +624,14 @@ RD
         # The VERDICT, not the colour. Every refusal below is distinguished by the rule
         # it names: a case asserting only "it failed" passes under any other rule firing,
         # which is how a refusal test comes to assert what both sides produce.
-        # `-e` and not a bare pattern: every `wanted` string below is prose, and a
-        # markdown-shaped one beginning with `-` is parsed as an option bundle. Without
-        # `-e` grep exits 2, which `if ! grep ...` reads as FALSY -- so the assertion
-        # silently inverts. And NOT `-e --`: that makes `--` the pattern and the prose
-        # the FILE, which is what the first draft of this line did.
-        if ! grep -Fqe "$text" <<EOF
-$out
-EOF
+        # A quoted `case` pattern is a FIXED-string search in bash itself: no process per
+        # case, and no option parsing to invert it -- a `wanted` string beginning with `-`
+        # was a grep option bundle unless spelled `-e`, and `-e --` made the prose a FILE.
+        local says=0
+        case "$out" in
+            *"$text"*) says=1 ;;
+        esac
+        if [ "$says" -eq 0 ]
         then
             printf 'FAIL case %d (%s): exit %s as expected but the output does not say why\n' \
                 "$cases" "$what" "$got"
@@ -568,7 +649,7 @@ EOF
 
     # Rule 3, and the live instance of #1360: a NEW file declaring the array unmarked.
     Mk plant
-    cat > "$tmp/plant/scripts/hand-rolled.sh" <<'PLANT'
+    Put "$tmp/plant/scripts/hand-rolled.sh" <<'PLANT'
 RequiredContexts=(
     "Alpha|w.yml"
 )
@@ -577,7 +658,7 @@ PLANT
         "$tmp/plant" 1 "scripts/hand-rolled.sh:1 declares"
 
     Mk noreason
-    cat > "$tmp/noreason/scripts/hand-rolled.sh" <<'NR'
+    Put "$tmp/noreason/scripts/hand-rolled.sh" <<'NR'
 # required-context-table: fixture
 RequiredContexts=(
     "Alpha|w.yml"
@@ -587,7 +668,7 @@ NR
         "$tmp/noreason" 1 "marked \`fixture\` with no reason"
 
     Mk badkind
-    cat > "$tmp/badkind/scripts/hand-rolled.sh" <<'BK'
+    Put "$tmp/badkind/scripts/hand-rolled.sh" <<'BK'
 # required-context-table: probably-fine
 RequiredContexts=(
     "Alpha|w.yml"
@@ -604,7 +685,7 @@ BK
         "$tmp/nolive" 1 "no declaration is marked"
 
     Mk twolive
-    cat > "$tmp/twolive/scripts/other.sh" <<'TL'
+    Put "$tmp/twolive/scripts/other.sh" <<'TL'
 # required-context-table: live
 RequiredContexts=(
     "Gamma|w.yml"
@@ -614,7 +695,7 @@ TL
 
     # Rule 4: a fixture synced into a copy of the live table.
     Mk synced
-    cat > "$tmp/synced/scripts/fixture.sh" <<'SY'
+    Put "$tmp/synced/scripts/fixture.sh" <<'SY'
 Stage() {
     cat > "$f" <<'REQ'
 # required-context-table: fixture -- a pinned subset, so a promotion moves no verdict here
@@ -630,7 +711,7 @@ SY
 
     # Rule 5: a reader pointed at the fixture -- the defect that opened #1360.
     Mk misread
-    cat > "$tmp/misread/scripts/reader.sh" <<'MR'
+    Put "$tmp/misread/scripts/reader.sh" <<'MR'
 Table="${FASTCACHED_REQUIRED_CONTEXTS_FILE:-scripts/fixture.sh}"
 MR
     Case "a reader defaulting to the fixture is refused" \
@@ -638,7 +719,7 @@ MR
 
     # Rule 6: the marker outlived its declaration.
     Mk stale
-    cat > "$tmp/stale/scripts/hand-rolled.sh" <<'ST'
+    Put "$tmp/stale/scripts/hand-rolled.sh" <<'ST'
 # required-context-table: fixture -- a stand-in for the cases below
 echo "the declaration this described is gone"
 ST
@@ -647,7 +728,7 @@ ST
 
     # Rule 7: indented, so `source` sees it and the three awk readers do not.
     Mk indented
-    cat > "$tmp/indented/scripts/hand-rolled.sh" <<'IN'
+    Put "$tmp/indented/scripts/hand-rolled.sh" <<'IN'
 Setup() {
     # required-context-table: fixture -- indented inside a function
     RequiredContexts=(
@@ -672,7 +753,7 @@ IN
     # And the mirror: declarations but no reader, so rule 5 reached nothing. A rule that
     # reached no site reports exactly as green as one every site satisfied.
     mkdir -p "$tmp/noreader/scripts"
-    cat > "$tmp/noreader/scripts/live.sh" <<'NRD'
+    Put "$tmp/noreader/scripts/live.sh" <<'NRD'
 # required-context-table: live
 RequiredContexts=(
     "Alpha|w.yml"
@@ -694,7 +775,7 @@ NRD
     #     passed throughout, because a staged tree has no outer region -- the mode under
     #     test was not the mode in use, and only the live run caught it.
     Mk balanced
-    cat > "$tmp/balanced/scripts/has-region.sh" <<BAL
+    Put "$tmp/balanced/scripts/has-region.sh" <<BAL
 echo "a region that closes"
 # ${RegionBegin}
 RequiredContexts=(
@@ -707,7 +788,7 @@ BAL
         "$tmp/balanced" 0 "live table is scripts/live.sh"
 
     Mk unbalanced
-    cat > "$tmp/unbalanced/scripts/has-region.sh" <<UNBAL
+    Put "$tmp/unbalanced/scripts/has-region.sh" <<UNBAL
 # ${RegionBegin}
 RequiredContexts=(
     "Alpha|w.yml"
@@ -720,13 +801,32 @@ UNBAL
     # `grep` pattern containing it. All three are in the real tree; two checks here have
     # already matched their own explanatory headers.
     Mk quoted
-    cat > "$tmp/quoted/scripts/talks-about-it.sh" <<'QT'
+    Put "$tmp/quoted/scripts/talks-about-it.sh" <<'QT'
 # RequiredContexts=( would be unmarked here, and this line is a comment
 printf 'RequiredContexts=(\n)\n' > "$scratch/table.sh"
 if grep -q '^RequiredContexts=(' "$Table"; then :; fi
 QT
     Case "a comment, a printf and a grep pattern are not declarations" \
         "$tmp/quoted" 0 "live table is scripts/live.sh"
+
+    # Rule 4's ACCEPTING arm for rows, not counts. Every case above that reaches rule 4 stages a fixture with FEWER
+    # rows than the live table, so a comparison that saw only how many rows there are passed all of them: blanking
+    # every row left this suite green (measured, when the row comparison moved from awk into bash). The same number
+    # of rows, different rows, is a stand-in and not a copy.
+    Mk samecount
+    Put "$tmp/samecount/scripts/fixture.sh" <<'SC'
+Stage() {
+    cat > "$f" <<'REQ'
+# required-context-table: fixture -- as many rows as the live table, and not the same ones
+RequiredContexts=(
+    "Alpha|w.yml"
+    "Gamma|w.yml"
+)
+REQ
+}
+SC
+    Case "a fixture with as many rows as the live table, but different ones, passes" \
+        "$tmp/samecount" 0 "live table is scripts/live.sh"
 
     printf 'self-test: %d cases run\n' "$cases"
     if [ "$fails" -eq 0 ]; then

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ReplayGuard.hpp"
+#include "StreamGrammar.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -31,12 +32,13 @@ PathCanon::Layout WindowsLayout()
 
 /// A stored value's regions in their positional order: 0 = stdout, 1 = stderr,
 /// 2 = the GNU depfile. Mirrors what the launcher stores, so a fixture here cannot
-/// drift from the shape the guard actually sees.
+/// drift from the shape the guard actually sees -- which is why the stream grammar is
+/// ASKED of `StreamGrammar` rather than spelled: it was `ShowIncludes` until generation 6.
 std::vector<TextRegion> Value(std::string stdoutText, std::string stderrText, std::string depfile = {})
 {
     std::vector<TextRegion> regions {
-        { .grammar = PathCanon::Grammar::ShowIncludes, .bytes = std::move(stdoutText) },
-        { .grammar = PathCanon::Grammar::ShowIncludes, .bytes = std::move(stderrText) },
+        { .grammar = StreamGrammar(Flavor::Cl), .bytes = std::move(stdoutText) },
+        { .grammar = StreamGrammar(Flavor::Cl), .bytes = std::move(stderrText) },
     };
     if (!depfile.empty())
         regions.push_back({ .grammar = PathCanon::Grammar::GccDepfile, .bytes = std::move(depfile) });
@@ -191,6 +193,17 @@ TEST_CASE("A diagnostics region declares no dependencies", "[replay-guard]")
                    "\r\n" },
     };
     CHECK(ReplayedDependencyPaths(regions, WindowsLayout()).empty());
+}
+
+TEST_CASE("An MSVC stream's notes are dependencies and its diagnostics are not", "[replay-guard]")
+{
+    // The stream grammar rewrites both line languages, and this guard reads one of them. A
+    // warning naming a header that has since gone is a line of text; the note is the record.
+    auto const regions =
+        Value(std::string { R"(Note: including file: D:\Project\src\a.hpp)" } + "\r\n"
+                  + R"(D:\Project\src\gone.hpp(12,3): warning C4100: unreferenced)" + "\r\n",
+              std::string { R"(D:\Project\src\b.cpp(4): error C2065: 'y': undeclared identifier)" } + "\r\n");
+    CHECK(ReplayedDependencyPaths(regions, WindowsLayout()) == std::vector<std::string> { R"(D:\Project\src\a.hpp)" });
 }
 
 TEST_CASE("A span the region walker declined to localize is not probed", "[replay-guard]")

@@ -185,6 +185,47 @@ TEST_CASE("SplitAll still rejects a malformed payload", "[core][wirefields]")
     }
 }
 
+TEST_CASE("SplitAtMost reads a list up to its cap and refuses one past it", "[core][wirefields]")
+{
+    constexpr std::size_t Cap = 3;
+    for (auto const count: std::views::iota(std::size_t { 0 }, Cap + 1))
+    {
+        std::vector<std::string_view> texts(count, "x"sv);
+        auto const split = WireFields::SplitAtMost(WireFields::Encode(Fields(texts)), Cap);
+        REQUIRE(split.has_value());
+        CHECK(Unwrap(split).size() == count);
+    }
+
+    // One past the cap is refused rather than truncated to the cap: a list that
+    // silently lost its tail would read as a shorter list the peer never sent.
+    std::vector<std::string_view> const over(Cap + 1, "x"sv);
+    CHECK_FALSE(WireFields::SplitAtMost(WireFields::Encode(Fields(over)), Cap).has_value());
+
+    // A cap of zero admits exactly the empty list.
+    CHECK(WireFields::SplitAtMost({}, 0).has_value());
+    CHECK_FALSE(WireFields::SplitAtMost(WireFields::Encode(Fields(std::array { "x"sv })), 0).has_value());
+}
+
+TEST_CASE("SplitAtMost still rejects a malformed payload inside its cap", "[core][wirefields]")
+{
+    auto const texts = std::array { "alpha"sv, "beta"sv };
+    auto const encoded = WireFields::Encode(Fields(texts));
+
+    SECTION("a truncated length prefix")
+    {
+        auto truncated = encoded;
+        truncated.resize(encoded.size() - 6);
+        CHECK_FALSE(WireFields::SplitAtMost(truncated, 8).has_value());
+    }
+
+    SECTION("a length running past the end")
+    {
+        auto lying = encoded;
+        lying[3] = std::byte { 0xFF };
+        CHECK_FALSE(WireFields::SplitAtMost(lying, 8).has_value());
+    }
+}
+
 TEST_CASE("EncodeInto leaves room for a caller's frame header", "[core][wirefields]")
 {
     // The property that keeps a protocol from encoding its payload separately

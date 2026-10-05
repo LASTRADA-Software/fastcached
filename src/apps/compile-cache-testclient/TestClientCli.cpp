@@ -138,7 +138,7 @@ std::expected<Args, ConfigError> ParseArgs(std::span<char const* const> argv)
 {
     if (argv.empty())
         return std::unexpected(
-            ArgvError(ConfigErrorCode::MissingRequired, "sub-command", "expected store|fetch (try --help)"));
+            UnrowedArgvError(ConfigErrorCode::MissingRequired, "sub-command", "expected store|fetch (try --help)"));
 
     // A leading `--help` is a query, not a malformed store. Matched against the
     // table rather than re-spelling "--help"/"-h" here, so the accepted
@@ -153,8 +153,8 @@ std::expected<Args, ConfigError> ParseArgs(std::span<char const* const> argv)
 
     auto const command = FindSubCommand(head);
     if (!command.has_value())
-        return std::unexpected(
-            ArgvError(ConfigErrorCode::UnknownKey, std::string { head }, "unknown sub-command (expected store|fetch)"));
+        return std::unexpected(UnrowedArgvError(
+            ConfigErrorCode::UnknownKey, std::string { head }, "unknown sub-command (expected store|fetch)"));
 
     Args parsed { .action = command->action };
     auto const flow = ParseOptionsInto(TestClientOptions(), argv.subspan(1), parsed);
@@ -168,7 +168,7 @@ std::expected<Args, ConfigError> ParseArgs(std::span<char const* const> argv)
     // Checked here rather than at the use site so a missing port is one clear
     // diagnostic instead of a connection to port 0.
     if (parsed.port == 0)
-        return std::unexpected(ArgvError(ConfigErrorCode::MissingRequired, "--port", "required"));
+        return std::unexpected(UnrowedArgvError(ConfigErrorCode::MissingRequired, "--port", "required"));
     return parsed;
 }
 

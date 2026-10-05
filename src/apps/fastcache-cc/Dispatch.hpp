@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "ArgumentDenials.hpp"
 #include "CacheProtocol.hpp"
 #include "CodecEnvelope.hpp"
 
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -303,6 +307,60 @@ struct DispatchBudgetKnobs
 static_assert(DispatchBudgetsFor(DispatchBudgetKnobs {}) == DispatchBudgets {},
               "DispatchBudgetsFor must reproduce DispatchBudgets' own defaults, field for field");
 
+/// How long a grant's dial HINT may take to connect before the advertised name is tried.
+///
+/// A third of the ordinary connect budget. A hint is the address the scheduler last saw
+/// this worker's connections arrive from, seconds ago, so an answer inside 300 ms is the
+/// ordinary case -- and a hint that has gone stale (the VPN moved the machine again, the
+/// address went to somebody else) costs a third of a second before the name is tried,
+/// rather than the full second a dead name costs.
+inline constexpr std::chrono::milliseconds HintConnectBudget { 300 };
+
+/// The compile leg's budget, for a dial at the grant's hint.
+///
+/// Only `connect` differs, and it is capped rather than replaced: an operator who set a
+/// SHORTER connect timeout keeps it. A non-positive connect is `core::net`'s spelling of
+/// *the platform's default* -- which is minutes, not a third of a second -- so it takes
+/// the cap too, or `FASTCACHE_CONNECT_TIMEOUT=0s` would give a stale hint the longest
+/// wait of all.
+/// @param compile The compile leg's budget as it stands for this dial.
+/// @return The same budget, with its connect ceiling at most `HintConnectBudget`.
+[[nodiscard]] constexpr ExchangeBudget AtDialHint(ExchangeBudget compile) noexcept
+{
+    compile.connect = compile.connect > std::chrono::milliseconds::zero() ? std::min(compile.connect, HintConnectBudget)
+                                                                          : HintConnectBudget;
+    return compile;
+}
+
+/// The transport failures at the hint that send the client on to the advertised name.
+///
+/// One row: `Unreached`, which made no connection, so nothing can have run. `PeerLost`,
+/// `Expired` and `Silent` all REACHED a machine that may be compiling the job right now,
+/// and a second dial could compile it twice -- so they are final, and the table errs
+/// narrow: a failure missing here costs one local compile, a failure wrongly present
+/// costs a duplicate one on the fleet.
+inline constexpr std::array HintRetryTransportFailures { TransportFailure::Unreached };
+
+/// The refusals at the hint that send the client on to the advertised name.
+///
+/// One row: `LeaseEndpointMismatch`, which a worker answers when the token names a
+/// different endpoint from its own -- the hint's address now belongs to ANOTHER fleet
+/// worker, which refused before running anything. Every other refusal is the granted
+/// worker's own answer, and the name would reach the same machine to hear it again.
+inline constexpr std::array HintRetryRefusals { CompileCacheWire::ErrorCode::LeaseEndpointMismatch };
+
+/// Whether an outcome at the dial hint is retried at the advertised name.
+/// @param outcome The compile exchange's outcome at the hint.
+/// @return True only for a row of `HintRetryTransportFailures` or `HintRetryRefusals`.
+[[nodiscard]] inline bool RetriesAtAdvertisedName(CacheOutcome const& outcome) noexcept
+{
+    if (outcome.kind == CacheOutcomeKind::Transport)
+        return std::ranges::contains(HintRetryTransportFailures, outcome.transportFailure);
+    if (outcome.kind == CacheOutcomeKind::Rejected)
+        return std::ranges::contains(HintRetryRefusals, outcome.code);
+    return false;
+}
+
 /// How a dispatch attempt ended.
 ///
 /// There is deliberately no "failed" outcome. Every way this can go wrong ends
@@ -335,6 +393,26 @@ enum class DispatchStatus : std::uint8_t
     /// the object, which would be a wrong object under a correct key — the failure
     /// this whole mechanism exists to make impossible.
     Mismatched,
+    /// THIS launcher refused before asking: an argument of the job is one every worker
+    /// refuses by a row of `DeniedArguments`, which no operator setting can lift.
+    ///
+    /// Its own status rather than a `Declined`, because the fleet was never asked --
+    /// no lease was requested, no worker dialled, no translation unit sent -- and
+    /// `Declined` is recorded as the fleet declining. It is recorded as this machine's
+    /// refusal instead, beside the other command lines this launcher will not send.
+    /// `refusal` names the argument.
+    DeniedHere,
+    /// The reply to a COMPILE did not come from the worker the grant named: its signature does
+    /// not verify under the key the grant carried, it carries none, or the grant named no key to
+    /// check it against (W-4).
+    ///
+    /// **Its own status for `Mismatched`'s reason, and the more serious of the two.** A crossed
+    /// reply is a fleet machine confusing two jobs; this is an address -- a dial hint gone stale, a
+    /// VPN address reassigned, a long-TTL name -- answering on a machine that is not the worker at
+    /// all, and returning whatever it liked. Used, that object would be stored here and written
+    /// through to the fleet's shared cache, poisoning every machine that later fetches its key. So
+    /// the object is never used, the build compiles locally, and the sentence is unconditional.
+    Unauthenticated,
     /// The enumerator count, so a table over this enum takes its extent from the
     /// enum itself rather than from a literal. See `Core/EnumTable.hpp`: a length
     /// anchored on an enumerator by name is a guard that fires only when nothing is
@@ -396,6 +474,23 @@ enum class DeclineCause : std::uint8_t
     /// a toolchain it no longer has, a scratch root it cannot write. One machine to
     /// go and look at, rather than a fleet-shaped problem.
     WorkerRefused,
+    /// A worker would not pass one of this compile's arguments to its compiler.
+    ///
+    /// Not `WorkerRefused`, because the remedy is not one machine: every worker running this
+    /// build refuses the same flag, so it is a flag this FLEET does not dispatch. An operator
+    /// adds it with `--allow-compile-arg` on the workers when it runs no program and names no
+    /// path, or leaves those compiles local. And never `ProtocolMismatch`, which is what it read
+    /// as while the worker answered it `malformed-frame`: two ends of one build, reported as a
+    /// version skew. `DispatchResult::refusal` carries the worker's sentence, which names it.
+    ArgumentRefused,
+    /// The job was larger than a worker's surface takes.
+    ///
+    /// A FLEET fact for the same reason `ArgumentRefused` is one: the ceiling is a constant of the
+    /// worker's build (`WorkerMaxRequestBytes`), so every worker of that build refuses the same
+    /// translation unit alike, and "one machine to go and look at" would send an operator to a
+    /// machine for a property of the unit. Nothing to fix on either end; the compile runs here,
+    /// correctly, and the peer's message naming the ceiling rides `DispatchResult::refusal`.
+    TooLarge,
     /// The fleet could not name a leader to ask.
     ///
     /// Its own row rather than a share of `NotPermitted`, because it is transient by
@@ -442,7 +537,14 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnsupportedVersion, .cause = DeclineCause::ProtocolMismatch },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownOpcode, .cause = DeclineCause::ProtocolMismatch },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::MalformedFrame, .cause = DeclineCause::ProtocolMismatch },
-    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::PayloadTooLarge, .cause = DeclineCause::ProtocolMismatch },
+    // A size ceiling, which two machines of one build meet as readily as two of different
+    // builds: a translation unit whose frame, or whose declared expansion, is larger than the
+    // worker's surface will take. Graded `ProtocolMismatch` it read as a staggered upgrade that
+    // never finished; `TooLarge` says why it is neither that nor one machine's fault.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::PayloadTooLarge, .cause = DeclineCause::TooLarge },
+    // A STORE refusal, which no dispatch sends: a launcher meets it on a compile only by talking
+    // to a surface that is not the one it thinks it is -- a disagreement about the wire in the
+    // cluster rows' sense below, and not a claim about either end's version.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::MalformedValue, .cause = DeclineCause::ProtocolMismatch },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::StorageWriteFailed, .cause = DeclineCause::WorkerRefused },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::Unauthenticated, .cause = DeclineCause::NotPermitted },
@@ -488,19 +590,17 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerToolchainSurveyInFlight, .cause = DeclineCause::Withdrawn },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::RequestDeadlineExceeded, .cause = DeclineCause::Withdrawn },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::ForeignValueGeneration, .cause = DeclineCause::ProtocolMismatch },
-    // Enrollment, which no compile reaches either: a LAUNCHER meeting one of these has
-    // reached a surface it did not think it was talking to, exactly as the cluster rows
-    // above have. Rows so that neither arrives `Unrecognised`, which reads as a peer
-    // from the future while really being this build forgetting an entry.
+    // Enrollment, which no compile reaches either: a LAUNCHER meeting it has reached a
+    // surface it did not think it was talking to, exactly as the cluster rows above have.
+    // A row so that it does not arrive `Unrecognised`, which reads as a peer from the
+    // future while really being this build forgetting an entry.
     //
-    // `NotPermitted` rather than `Withdrawn` for both, and the difference is what a
-    // launcher DOES: withdrawn means retry somewhere else in a moment, and neither of
-    // these clears without a person. The joiner that legitimately meets them is
-    // `--enroll-from`, which does not go through this table at all -- it reads the same
-    // codes through `ReadEnrollReply`, where a closed window is a WAIT rather than a
-    // refusal, because that client is the one thing in the tree with a reason to keep
-    // asking.
-    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentClosed, .cause = DeclineCause::NotPermitted },
+    // `NotPermitted` rather than `Withdrawn`, and the difference is what a launcher DOES:
+    // withdrawn means retry somewhere else in a moment, and this does not clear without a
+    // person. The joiner that legitimately meets it is a node's formation controller, which
+    // does not go through this table at all -- it reads the same code through
+    // `ReadEnrollReply`, where a full list is a WAIT rather than a refusal, because that
+    // client is the one thing in the tree with a reason to keep asking.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentFull, .cause = DeclineCause::NotPermitted },
     // A fleet read, which no compile reaches: the same reasoning as the enrollment rows above.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownFleetSelector, .cause = DeclineCause::NotPermitted },
@@ -515,11 +615,35 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeKeyUnknown, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeKeyRevoked, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeIdentityRequired, .cause = DeclineCause::NotPermitted },
+    // A NODE's proof a node could not judge yet: retriable for the node that proves, and
+    // unreachable from a compile, since the launcher proves nothing -- so the rows above' answer.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::RosterNotYetApplied, .cause = DeclineCause::NotPermitted },
+    // Enrollment's, for `EnrollmentFull`'s reason above.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentHostFull, .cause = DeclineCause::NotPermitted },
     // A worker that can verify nobody's grant (#178): ONE machine declining the job it was
     // handed, and the machine is where the cause is -- cut off from the leader whose roster
     // it would need, or only reaching an ex-leader that withholds it. Not `NotPermitted`,
     // which points at this client's configuration, which is fine.
-    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::RosterExpired, .cause = DeclineCause::WorkerRefused },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::GrantUnverifiable, .cause = DeclineCause::WorkerRefused },
+    // A machine ticket refused: this machine is not admitted, its key was revoked, or the ticket
+    // named another node or has lapsed. Usually fixed where this client stands rather than by
+    // adding machines, so `NotPermitted`. The exception is one worker whose roster is stale and
+    // does not yet hold this machine -- a worker behind its fleet's state, which another worker
+    // would not share.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::TicketRefused, .cause = DeclineCause::NotPermitted },
+    // An operator's control verb from a caller only `--fleet-open` admitted. The launcher sends no
+    // control verb, so a compile cannot reach it; were one to, no retry clears it, which is
+    // `NotPermitted`'s answer.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::IdentifiedCallerRequired, .cause = DeclineCause::NotPermitted },
+    // The same verbs from an identified caller whose machine is no voter: no compile reaches it, and
+    // no retry clears it until an operator promotes the machine, which is `NotPermitted` again.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::OperatorStandingRequired, .cause = DeclineCause::NotPermitted },
+    // The fleet's shared cache, which no compile reaches: the launcher speaks FETCH and
+    // STORE to its own machine and never the shared verbs, so meeting this means it reached a
+    // surface it did not think it was talking to -- the enrollment rows' reasoning. A row so it
+    // does not arrive `Unrecognised`, which reads as a peer from the future.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NotSharedCache, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerRejectedArgument, .cause = DeclineCause::ArgumentRefused },
 };
 
 /// Whether every refusal this build's wire header knows carries a classification.
@@ -560,6 +684,20 @@ static_assert(DeclineCausesAreTotal(),
     return DeclineCause::Unrecognised;
 }
 
+/// Which exchange of a dispatch a refusal came from: the endpoint it dialled, and the verb it asked.
+///
+/// Both halves, because one endpoint answers several exchanges of one dispatch: a node serving the
+/// scheduler and a worker on one merged surface is asked for the LEASE, refuses the COMPILE, and is
+/// sent the RELEASE -- three exchanges at one address, and only the second declined the dispatch.
+struct ExchangeSite
+{
+    std::string endpoint;   ///< Where the frame went, as `host:port`.
+    std::uint8_t opcode {}; ///< The request's opcode byte, as the frame carried it.
+
+    /// @return True when both name the same endpoint and verb.
+    [[nodiscard]] bool operator==(ExchangeSite const&) const = default;
+};
+
 /// The result of one dispatch attempt.
 struct DispatchResult
 {
@@ -578,7 +716,41 @@ struct DispatchResult
     std::string stdoutText;        ///< The remote compiler's stdout.
     std::string stderrText;        ///< The remote compiler's stderr.
     std::string detail;            ///< Why it was declined or unavailable; empty on success.
-    std::string workerEndpoint;    ///< Which worker ran it, for diagnostics.
+    /// Which worker ran it, by the endpoint it ADVERTISES -- the name the lease token signs,
+    /// whichever address reached it. Set only when a worker compiled.
+    std::string workerEndpoint;
+    /// Which ADDRESS the compile that produced this result was sent to: the grant's dial
+    /// hint, or the advertised name. `workerEndpoint` says which worker; this says how it
+    /// was reached. Empty when no compile dial was attempted.
+    std::string dialledEndpoint;
+    /// The exchange whose refusal declined the dispatch, when `status` is `Declined`: the LEASE at
+    /// whoever answered it, or the COMPILE at the worker the grant named. Never the RELEASE, which
+    /// runs after a refused compile too and decides nothing about it.
+    std::optional<ExchangeSite> declinedAt {};
+    /// How the LEASE exchange ended at the transport, `None` when it completed. Read by
+    /// the reachability memo, which remembers only `Unreached` -- a scheduler that was
+    /// reached and then misbehaved is not one that is down.
+    TransportFailure leaseTransport { TransportFailure::None };
+    /// Which scheduler the last lease exchange went to: the configured one, or the leader
+    /// a `NotLeader` named. The memo records only against the configured one.
+    std::string leaseEndpoint;
+    /// The ADVERTISED endpoint of a worker that nothing reached, so the next launcher
+    /// excludes it. Empty otherwise.
+    ///
+    /// Set only when a dial at the worker's NAME made no connection at all
+    /// (`MarksUnreachable`). A worker that was reached and then lost, outwaited or went
+    /// quiet is UP, and so is one that refused the job or compiled; none of those is
+    /// named here. Nor is a dial HINT that reached nothing while the name then answered:
+    /// that is a stale address, not a dead machine.
+    std::string unreachedWorker;
+    /// The refusing peer's own message, on a `Declined` result; empty otherwise.
+    ///
+    /// Apart from `detail`, which formats an endpoint and the code's name around it for the
+    /// verbose line: this is the part an operator ACTS on -- which argument a worker would not
+    /// take, which ceiling a translation unit exceeded -- and it is what the invocation log
+    /// records beside the fixed tally reason, so a refusal can be acted on without `-v` and
+    /// without the node's counters.
+    std::string refusal;
 
     /// @return True when a worker actually ran the compiler.
     [[nodiscard]] bool Ran() const noexcept
@@ -587,6 +759,34 @@ struct DispatchResult
     }
 };
 
+/// How to name a worker and the address that reached it, in a line an operator reads.
+///
+/// The name alone when the dial went to the name, and `<name> at <address>` when it went
+/// to a dial hint: the two can both work (split-horizon DNS over a VPN), so a line naming
+/// only the worker cannot say which one the compile used. ONE spelling for the failure
+/// messages `Dispatch` builds and the success lines the launcher prints.
+/// @param worker The worker by the endpoint it advertises; may be empty.
+/// @param dialled The address the compile was sent to; may be empty.
+/// @return The phrase; the non-empty one of the two when only one is set, and empty when
+///         neither is.
+[[nodiscard]] inline std::string WorkerAt(std::string_view worker, std::string_view dialled)
+{
+    if (dialled.empty() || dialled == worker)
+        return std::string { worker };
+    if (worker.empty())
+        return std::string { dialled };
+    return std::format("{} at {}", worker, dialled);
+}
+
+/// `WorkerAt` for a finished dispatch.
+/// @param result What `Dispatch` returned.
+/// @return Which worker the compile went to, and at which address when that was a hint;
+///         empty when no compile dial was attempted.
+[[nodiscard]] inline std::string DescribeWorkerReached(DispatchResult const& result)
+{
+    return WorkerAt(result.workerEndpoint, result.dialledEndpoint);
+}
+
 /// Everything one dispatch needs.
 struct DispatchRequest
 {
@@ -594,7 +794,11 @@ struct DispatchRequest
     std::string_view fingerprint;       ///< This client's toolchain identity.
     std::string_view objectKey;         ///< The cache key, for duplicate suppression.
     std::span<std::string const> args;  ///< Already filtered by `RemoteCompileArgs`.
-    std::string_view preprocessed;      ///< The translation unit, preprocessed.
+    /// The family of the driver `args` are spelled for -- the client's, which the
+    /// fingerprint binds to the worker's. Read against `DeniedArguments` before anything
+    /// is asked of the fleet.
+    DriverFamily family;
+    std::string_view preprocessed; ///< The translation unit, preprocessed.
     /// The translation unit's path, as the build system spelled it, and it travels
     /// WHOLE (#660).
     ///
@@ -626,6 +830,24 @@ struct DispatchRequest
     /// malformed and the worker refuses it, exactly as the compilation-directory pair.
     std::string_view sourceRoot;
     std::string_view sourceRootReplacement;
+
+    /// Workers this client could not reach moments ago, by the endpoint they advertise,
+    /// newest first -- the reachability memo's `Fresh(WorkerUnreached)`. Sent on the LEASE
+    /// so the scheduler grants somebody else; empty is the ordinary case.
+    ///
+    /// Taken BEFORE this dispatch, so it can never name the worker this dispatch is about
+    /// to be granted: a worker this dispatch fails to reach comes back as
+    /// `DispatchResult::unreachedWorker`, for the NEXT launcher. The wire takes at most
+    /// `CompileCacheWire::MaxLeaseExclusions`, the newest ones, which is also as many as
+    /// the memo keeps.
+    std::span<std::string const> excludedWorkers {};
+
+    /// What a person calls this client's toolchain, e.g. `cl 19.44.35207`, from `ToolchainLabel`;
+    /// empty when there is nothing to call it.
+    ///
+    /// Sent with the LEASE so a scheduler with no worker for `fingerprint` can say WHICH compiler
+    /// nobody serves. Display only: nothing matches on it, and the fingerprint decides.
+    std::string_view toolchainLabel {};
 };
 
 /// Ask the scheduler for a worker and have it compile this translation unit.
@@ -637,6 +859,13 @@ struct DispatchRequest
 /// one. The client never waits in a queue — a scheduler with nothing free refuses
 /// immediately, and the caller compiles locally. That is not a fallback bolted on
 /// afterwards; it is why the scheduler is allowed to refuse at all.
+///
+/// **A grant carrying a dial hint is compiled at the hint first**, under
+/// `AtDialHint`'s short connect ceiling, and at the advertised name only when
+/// `RetriesAtAdvertisedName` says nothing ran at the hint. The token signs the NAME
+/// either way, so a hint that lands on another fleet worker is refused there rather than
+/// compiled. The retry gets what is left of the grant at that moment, never a fresh
+/// budget, and it is still the one lease, released once.
 ///
 /// **The release is not optional and not the caller's to remember.** A lease
 /// suppresses every other client's attempt at the same key, so one that is never
@@ -697,6 +926,26 @@ struct DispatchRequest
 /// @param field The encoded argument field.
 /// @return The arguments, or an empty list when the field is malformed.
 [[nodiscard]] std::vector<std::string> DecodeArgs(std::span<std::byte const> field);
+
+/// The toolchain label this project's clients send a scheduler: their own, unless a scheduler would
+/// refuse what carries it.
+///
+/// A scheduler KEEPS the label -- a LEASE's for `unserved-toolchain`, a REGISTER's in the worker's
+/// entry -- so it refuses the whole request whose label is not UTF-8 or is longer than
+/// `CompileCacheWire::MaxToolchainLabelBytes`, rather than keep it. The label is display only --
+/// nothing matches on it -- so sending one of those would trade a compile's distribution, or a
+/// worker's place in the fleet, for a name; sending none loses only the name. The same predicate and
+/// the same bound the scheduler refuses by, so the two ends cannot disagree about which labels travel.
+/// @param label What `ToolchainLabel` called the compiler.
+/// @return @p label, or empty when a scheduler would refuse it.
+[[nodiscard]] std::string_view SendableToolchainLabel(std::string_view label);
+
+/// Why a scheduler would refuse what carries @p label, in words for a log line -- the one
+/// predicate `SendableToolchainLabel` answers by, so the two cannot disagree. Text is asked
+/// first, as the scheduler asks it.
+/// @param label What `ToolchainLabel` called the compiler.
+/// @return The reason, or nullopt when the label travels.
+[[nodiscard]] std::optional<std::string> ToolchainLabelWithheldBecause(std::string_view label);
 
 // The exchange that talks over real TCP connections is `MakeTcpExchange()` in
 // `ReactorExchange.hpp`, deliberately not here. It needs a reactor, and this header

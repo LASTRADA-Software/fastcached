@@ -301,12 +301,13 @@ namespace
                                 "build. A worker that reports a FAILED compile is retried\n"
                                 "locally before its diagnostics are believed." },
         EnvVarSpec { .name = EnvName::Token,
-                     .summary = "Shared secret presented to a daemon started with\n"
-                                "--requirepass. Unset means no credential is sent, which is\n"
-                                "correct against a daemon that requires none. Setting it\n"
-                                "against a daemon that requires none is also fine -- such a\n"
-                                "daemon accepts the credential and ignores it. Costs no\n"
-                                "round trip: it is pipelined ahead of the real command\n"
+                     .summary = "The password for a cache at FASTCACHE_ADDR started with\n"
+                                "--requirepass, presented to that cache alone. A compile\n"
+                                "node needs none: this machine's node mints a machine ticket\n"
+                                "for every exchange with another machine, and a token sent\n"
+                                "there would admit nobody. Unset means no password is sent,\n"
+                                "which is correct against a cache that requires none. Costs\n"
+                                "no round trip: it is pipelined ahead of the real command\n"
                                 "rather than awaited." },
         EnvVarSpec { .name = EnvName::User,
                      .summary = "Username to accompany FASTCACHE_TOKEN. Unset (the usual\n"

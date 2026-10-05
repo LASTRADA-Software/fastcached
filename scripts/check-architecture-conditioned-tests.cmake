@@ -79,7 +79,22 @@ set(directivePattern "^[ \t]*#[ \t]*(if|ifdef|ifndef|elif)[^\n]*(${architectureM
 
 # A GLOB, never a file list: a list is exact about the files it knows and silent
 # about the ones it does not, and silence reads identically to complete coverage.
-file(GLOB_RECURSE testSources LIST_DIRECTORIES false "${SOURCE_DIR}/*_test.cpp")
+# Through `fastcached_tracked_files`, this tree's one answer to HOW a check finds its files,
+# rather than a traversal of its own: on DrvFs -- where every local gate tree takes its
+# sources from -- walking the tree and reading every file it found cost seconds a single
+# `git grep` spends in under half of one, and several lanes gating at once took this check
+# past its budget. CONTAINING names the literal every match must contain, so a file without
+# it is not read at all; the count printed is still over the whole set.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+string(REPLACE "|" ";" architectureMacroNames "${architectureMacros}")
+fastcached_tracked_files("${SOURCE_DIR}"
+    PATHSPECS "*_test.cpp"
+    GLOBS "*_test.cpp"
+    FILTER "_test\\.cpp$"
+    CONTAINING ${architectureMacroNames} CONTAINING_OUT testSourcesHolding
+    FILES_OUT testSources MODE_OUT testSourcesMode)
+list(TRANSFORM testSources PREPEND "${SOURCE_DIR}/")
+list(TRANSFORM testSourcesHolding PREPEND "${SOURCE_DIR}/")
 
 # Quoted, because `if(VAR STREQUAL "")` does not fire when VAR is UNSET and an
 # empty glob unsets it -- CMake then compares the literal string `testSources`
@@ -95,7 +110,7 @@ endif()
 list(LENGTH testSources testFileCount)
 
 set(offenders "")
-foreach(source IN LISTS testSources)
+foreach(source IN LISTS testSourcesHolding)
     # Only MATCHING lines enter the list, so the bracket hazard that breaks other
     # `file(STRINGS)` readers cannot reach this one: a preprocessor directive
     # naming an architecture macro carries no `]` to merge two elements on.

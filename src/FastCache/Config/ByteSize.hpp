@@ -33,9 +33,7 @@ namespace FastCache
 ///         host total); OutOfRange is returned when the value exceeds
 ///         `std::numeric_limits<std::size_t>::max()` or when the percentage
 ///         is outside 0..100.
-[[nodiscard]] std::expected<std::size_t, ConfigError> ParseByteSize(std::string_view sv,
-                                                                    std::string_view field,
-                                                                    std::size_t hostTotalBytes = 0);
+[[nodiscard]] std::expected<std::size_t, ConfigError> ParseByteSize(std::string_view sv, std::size_t hostTotalBytes = 0);
 
 /// Format a byte count as a short human-readable string.
 ///

@@ -22,7 +22,7 @@ Documentation=https://github.com/LASTRADA-Software/fastcached
 
 [Socket]
 # The worker's single 0xFC port: the cache verbs, the compile verbs a scheduler
-# dispatches here, and the scheduler verbs themselves with --serve-scheduler.
+# dispatches here, and the scheduler verbs themselves while the node's mode serves a scheduler.
 # It is deliberately NOT an IANA-registered assignment, and deliberately not
 # 6674 either -- 6674 is where fastcache-cc looks by default and where a
 # fastcached listens, so activating there would collide on a machine running

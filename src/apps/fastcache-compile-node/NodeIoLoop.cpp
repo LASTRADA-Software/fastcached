@@ -70,12 +70,12 @@ void NodeIoLoop::Start()
     _thread = std::jthread { [this] { _reactor.run(); } };
 }
 
-void NodeIoLoop::Retire(std::unique_ptr<core::net::IListener> listener)
+void NodeIoLoop::Retire(std::shared_ptr<void> owned)
 {
-    if (!listener)
+    if (!owned)
         return;
     std::scoped_lock const guard { _retiredMutex };
-    _retired.push_back(std::move(listener));
+    _retired.push_back(std::move(owned));
 }
 
 void NodeIoLoop::NoteLoopStarted() noexcept

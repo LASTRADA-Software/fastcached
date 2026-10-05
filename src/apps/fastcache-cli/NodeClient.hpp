@@ -8,6 +8,7 @@
 
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/TicketChoice.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -51,7 +52,7 @@ namespace FastCache::Cli
 ///     build. Fatal, and it must never be reported as *your node is too old*.
 ///   - **Everything else** -- an ordinary refusal, relayed BY NAME with whatever the
 ///     server said. `NotAMember` is the one an operator meets in practice, and its
-///     remedy (`--fleet-member`) is on the node rather than here.
+///     remedy (admitting this machine's key) is on the node rather than here.
 ///
 /// The distinction is a TABLE column below, not a `switch` at a call site, for the
 /// reason the rulebook gives: three surfaces spelling one refusal separately is exactly
@@ -135,6 +136,20 @@ class INodeExchange
     /// parameter rather than at the accessor.
     /// @return The endpoint text.
     [[nodiscard]] virtual std::string_view Address() const = 0;
+
+    /// Remarks gathered while opening this connection, for stderr: a credential not honoured, a
+    /// ticket that could not be minted.
+    ///
+    /// **On the seam, not only on the socket-backed class**, because a verb that follows
+    /// `NotLeader` dials the leader through `INodeDialer` and holds only this interface: a
+    /// remark the leader's connection made would otherwise be dropped exactly where it explains
+    /// the leader's refusal.
+    /// @return The remarks, in the order they were made.
+    [[nodiscard]] virtual std::span<std::string const> Advisories() const = 0;
+
+    /// Why this connection presented no machine ticket when one was due.
+    /// @return The mint's failure, or nullopt when a ticket was presented or none was due.
+    [[nodiscard]] virtual std::optional<Cc::MintFailure> MissingTicket() const = 0;
 };
 
 /// How a verb reaches a node it did not dial first: the leader a `NotLeader` named (#1391).

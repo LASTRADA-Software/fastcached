@@ -23,8 +23,8 @@ namespace FastCache
 /// ([#623](https://github.com/LASTRADA-Software/fastcached/issues/623) is what a
 /// setting reachable from one table and not another costs).
 ///
-/// **They name no field.** `ApplyOneOption` stamps the row's own spelling onto an
-/// error whose `field` is empty, which is the only attribution that cannot drift
+/// **They name no field.** `ApplyOneOption` stamps the row's own spelling onto every
+/// refusal, which is the only attribution that cannot drift
 /// when a flag is renamed -- and it is what the copies got wrong: the daemon
 /// stamped `compression` on a bad `--memory-compression` value, sending an
 /// operator to the wrong flag. A caller reading a FILE re-stamps `source`, `line`

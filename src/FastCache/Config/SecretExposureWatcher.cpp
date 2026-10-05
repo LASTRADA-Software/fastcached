@@ -16,6 +16,11 @@ std::vector<std::string> SecretExposureWatcher::Observe(std::span<std::filesyste
     return Transitions(SecretFileExposures(files));
 }
 
+std::vector<std::string> SecretExposureWatcher::Observe(std::span<SecretFileSubject const> files)
+{
+    return Transitions(SecretFileExposures(files));
+}
+
 std::vector<std::string> SecretExposureWatcher::Transitions(std::span<SecretFileFinding const> found)
 {
     std::vector<std::string> fresh;
@@ -29,7 +34,7 @@ std::vector<std::string> SecretExposureWatcher::Transitions(std::span<SecretFile
         if (previous != _reported.end() && previous->exposure == finding.exposure)
             continue;
 
-        fresh.push_back(SecretExposureHint(finding.path, finding.exposure));
+        fresh.push_back(finding.hint(finding.path, finding.exposure));
     }
 
     // Replaced whole rather than merged, which is what forgets a path that stopped
@@ -47,7 +52,7 @@ void WatchSecretExposure(ConfigReloader& reloader, bool secretNamedOnCommandLine
     // shape this whole arrangement exists to avoid.
     WatchSecretExposure<Config>(
         reloader,
-        [secretNamedOnCommandLine](Config const& cfg) { return DaemonSecretFiles(cfg, secretNamedOnCommandLine); },
+        [secretNamedOnCommandLine](Config const& cfg) { return DaemonSecretFileSubjects(cfg, secretNamedOnCommandLine); },
         std::move(report));
 }
 

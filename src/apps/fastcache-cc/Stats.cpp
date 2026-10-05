@@ -7,11 +7,13 @@
 // `Markup.hpp` pulls in `Ranges.hpp` and `Utf8.hpp` and there is no `.cpp` between
 // the three, which is what makes the shared escaper reachable from here at all.
 #include <FastCache/Core/Markup.hpp>
+#include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Platform/Environment.hpp>
 
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -19,9 +21,12 @@
 #include <format>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <ranges>
 #include <sstream>
+#include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -89,6 +94,56 @@ namespace
         std::ranges::replace(out, '\t', ' ');
         std::ranges::replace(out, '\r', ' ');
         std::ranges::replace(out, '\n', ' ');
+        return out;
+    }
+
+    /// The dispatch specifics as the log may hold them: printable text, and bounded.
+    ///
+    /// Part of this text is a PEER's -- a worker's refusal message arrives verbatim -- and part is
+    /// the launcher's own, which carries a client's paths and arguments; so it is reduced here, at
+    /// the one writer, rather than trusted. Walked a CODE POINT at a time through the one UTF-8
+    /// decoder this tree shares, because both halves of the reduction are about characters:
+    ///
+    ///   - a control character becomes a space. C0 and DEL (a tab would split the line into
+    ///     columns this build never wrote) and C1 as well: `U+009B` is a whole CSI to a terminal
+    ///     that reads UTF-8, so an escape sequence would otherwise reach whoever reads the log;
+    ///   - a byte that begins no valid sequence becomes `?`, so what the log holds is UTF-8 even
+    ///     when the peer's text was not;
+    ///   - the cap is taken at a sequence boundary. A cut by byte would leave half a character at
+    ///     the end of a non-ASCII path, which is invalid UTF-8 in a log a reader decodes as UTF-8.
+    ///
+    /// The cap is well above any refusal sentence this tree writes. It bounds THIS column only: the
+    /// line's other columns are not bounded here, and the line's atomicity comes from one append
+    /// per line, not from its length.
+    /// @param text The specifics, as the launcher holds them.
+    /// @return What the log records.
+    [[nodiscard]] std::string BoundedSpecifics(std::string_view text)
+    {
+        constexpr std::size_t MaxSpecificsBytes = 320;
+        constexpr char32_t FirstPrintable = 0x20;
+        constexpr char32_t Delete = 0x7F;
+        constexpr char32_t LastC1Control = 0x9F;
+        std::string out;
+        std::size_t at = 0;
+        while (at < text.size())
+        {
+            auto const rest = text.substr(at);
+            auto const decoded = DecodeUtf8(rest);
+            auto const length = decoded.has_value() ? decoded->length : 1;
+            // What is written for this sequence is never longer than the sequence itself, so
+            // asking with its own length keeps the column under the cap and whole characters in it.
+            if (out.size() + length > MaxSpecificsBytes)
+                break;
+            if (!decoded.has_value())
+                out += '?';
+            else if (decoded->value < FirstPrintable || (decoded->value >= Delete && decoded->value <= LastC1Control))
+                out += ' ';
+            else
+                out += rest.substr(0, length);
+            at += length;
+        }
+        if (at < text.size())
+            out += "...";
         return out;
     }
 
@@ -200,6 +255,11 @@ namespace
                       .tone = &StatsPalette::bad,
                       .outcome = DispatchOutcome::Mismatched,
                       .reach = FleetReach::Asked },
+        DispatchRow { .token = "UNAUTHENTICATED",
+                      .label = "unauthenticated reply",
+                      .tone = &StatsPalette::bad,
+                      .outcome = DispatchOutcome::Unauthenticated,
+                      .reach = FleetReach::Asked },
         DispatchRow { .token = "DISCARDED",
                       .label = "result discarded",
                       .tone = &StatsPalette::bad,
@@ -220,6 +280,16 @@ namespace
         return DispatchTable[static_cast<std::size_t>(outcome)];
     }
 
+    /// Whether a recorded dispatch carries the peer's words into the log's specifics column.
+    ///
+    /// Private to this file and never persisted: the log holds the TEXT, not this choice.
+    enum class Specifics : std::uint8_t
+    {
+        None,    ///< Nothing to act on beyond the reason.
+        Refusal, ///< `DispatchResult::refusal`, which names what to act on.
+        ByCause, ///< Whatever the decline's own row in `DeclineReasonTable` says.
+    };
+
     /// How one `DispatchStatus` — what `Dispatch` actually returned — is recorded on
     /// the axis above.
     ///
@@ -236,25 +306,48 @@ namespace
         std::string_view reason;
         DispatchStatus status {};   ///< Which status this row describes.
         DispatchOutcome outcome {}; ///< How the reports bucket it.
+        Specifics specifics {};     ///< What rides the specifics column.
     };
 
     constexpr EnumTable<DispatchStatus, DispatchRecordingRow> DispatchRecordingTable { {
-        DispatchRecordingRow { .reason = {}, .status = DispatchStatus::Compiled, .outcome = DispatchOutcome::Dispatched },
+        DispatchRecordingRow { .reason = {},
+                               .status = DispatchStatus::Compiled,
+                               .outcome = DispatchOutcome::Dispatched,
+                               .specifics = Specifics::None },
         // No reason of its own: a decline's reason comes from `DeclineReasonTable`
         // below, keyed on the CAUSE. This row used to read "the fleet declined this
         // compile" for every way a fleet can say no, so an operator saw one bucket
         // covering "nothing serves your compiler", "the fleet is busy" and "a worker
         // refused the job" -- three remedies that are not adjacent (#618).
-        DispatchRecordingRow { .reason = {}, .status = DispatchStatus::Declined, .outcome = DispatchOutcome::Declined },
+        DispatchRecordingRow { .reason = {},
+                               .status = DispatchStatus::Declined,
+                               .outcome = DispatchOutcome::Declined,
+                               .specifics = Specifics::ByCause },
         DispatchRecordingRow { .reason = "the fleet could not be reached",
                                .status = DispatchStatus::Unavailable,
-                               .outcome = DispatchOutcome::Unreachable },
+                               .outcome = DispatchOutcome::Unreachable,
+                               .specifics = Specifics::None },
         // No reason, and here that is a decision rather than the absence of a
         // failure. The launcher already puts #280's sentence on the CACHE axis, which
         // that rule requires -- a copy here would print the identical sentence under
         // two headings of one report, and two rankings of one event read as two
         // events. The state says it: `crossed reply` is a line no other state emits.
-        DispatchRecordingRow { .reason = {}, .status = DispatchStatus::Mismatched, .outcome = DispatchOutcome::Mismatched },
+        DispatchRecordingRow { .reason = {},
+                               .status = DispatchStatus::Mismatched,
+                               .outcome = DispatchOutcome::Mismatched,
+                               .specifics = Specifics::None },
+        // This machine's refusal, beside the command lines it will not send: the fleet was
+        // never asked, so it says nothing about the fleet. The argument rides the specifics.
+        DispatchRecordingRow { .reason = "the command line carries an argument no worker passes to a compiler",
+                               .status = DispatchStatus::DeniedHere,
+                               .outcome = DispatchOutcome::Refused,
+                               .specifics = Specifics::Refusal },
+        // No reason, for `Mismatched`'s: the launcher puts the sentence on the CACHE axis, and the
+        // state says it -- `unauthenticated reply` is a line no other state emits (W-4).
+        DispatchRecordingRow { .reason = {},
+                               .status = DispatchStatus::Unauthenticated,
+                               .outcome = DispatchOutcome::Unauthenticated,
+                               .specifics = Specifics::None },
     } };
     static_assert(RowsInEnumeratorOrder(DispatchRecordingTable, &DispatchRecordingRow::status),
                   "DispatchRecordingTable must hold exactly one row per DispatchStatus, in enumerator order");
@@ -264,6 +357,10 @@ namespace
     {
         std::string_view reason; ///< The FIXED tally reason.
         DeclineCause cause {};   ///< Which cause this row describes.
+        /// Whether the peer's words are recorded: only where they name what to DO -- the
+        /// argument, the ceiling, the machine's own failure. Where they would name an endpoint or
+        /// a code the reason already stands for, they stay on the verbose line.
+        Specifics specifics {};
     };
 
     /// One row per `DeclineCause`, in enumerator order.
@@ -280,21 +377,46 @@ namespace
     /// this repository's metrics rules already refuse to sum -- a misconfigured
     /// fleet, a fleet that is too small, and a fleet that is unavailable.
     constexpr EnumTable<DeclineCause, DeclineReasonRow> DeclineReasonTable { {
-        DeclineReasonRow { .reason = "no worker serves this toolchain", .cause = DeclineCause::NoToolchain },
-        DeclineReasonRow { .reason = "the fleet was full of its own work", .cause = DeclineCause::NoCapacity },
-        DeclineReasonRow { .reason = "matching workers had withdrawn their slots", .cause = DeclineCause::Withdrawn },
+        DeclineReasonRow {
+            .reason = "no worker serves this toolchain", .cause = DeclineCause::NoToolchain, .specifics = Specifics::None },
+        DeclineReasonRow { .reason = "the fleet was full of its own work",
+                           .cause = DeclineCause::NoCapacity,
+                           .specifics = Specifics::None },
+        DeclineReasonRow { .reason = "matching workers had withdrawn their slots",
+                           .cause = DeclineCause::Withdrawn,
+                           .specifics = Specifics::None },
         DeclineReasonRow { .reason = "another client was already building this key",
-                           .cause = DeclineCause::AlreadyBuilding },
-        DeclineReasonRow { .reason = "the fleet refused this client", .cause = DeclineCause::NotPermitted },
-        DeclineReasonRow { .reason = "the worker refused the job", .cause = DeclineCause::WorkerRefused },
-        DeclineReasonRow { .reason = "the fleet named no leader to ask", .cause = DeclineCause::NoLeader },
+                           .cause = DeclineCause::AlreadyBuilding,
+                           .specifics = Specifics::None },
+        DeclineReasonRow {
+            .reason = "the fleet refused this client", .cause = DeclineCause::NotPermitted, .specifics = Specifics::None },
+        // What the machine could not do -- a lease it would not honour, a scratch root, a spawn.
+        DeclineReasonRow {
+            .reason = "the worker refused the job", .cause = DeclineCause::WorkerRefused, .specifics = Specifics::Refusal },
+        // The argument, which is the whole of what an operator needs and nothing else names.
+        DeclineReasonRow { .reason = "a worker would not take an argument of this compile",
+                           .cause = DeclineCause::ArgumentRefused,
+                           .specifics = Specifics::Refusal },
+        // The ceiling the unit went over.
+        DeclineReasonRow { .reason = "the job is larger than a worker accepts",
+                           .cause = DeclineCause::TooLarge,
+                           .specifics = Specifics::Refusal },
+        // An exhausted redirect chain's message IS the last leader's endpoint: peer text, and
+        // the verbose line's business rather than something to act on from the log.
+        DeclineReasonRow {
+            .reason = "the fleet named no leader to ask", .cause = DeclineCause::NoLeader, .specifics = Specifics::None },
         DeclineReasonRow { .reason = "this launcher and the fleet disagree about the wire",
-                           .cause = DeclineCause::ProtocolMismatch },
+                           .cause = DeclineCause::ProtocolMismatch,
+                           .specifics = Specifics::None },
         DeclineReasonRow { .reason = "the fleet refused with a reason this launcher does not know",
-                           .cause = DeclineCause::Unrecognised },
+                           .cause = DeclineCause::Unrecognised,
+                           .specifics = Specifics::None },
     } };
     static_assert(RowsInEnumeratorOrder(DeclineReasonTable, &DeclineReasonRow::cause),
                   "DeclineReasonTable must hold exactly one row per DeclineCause, in enumerator order");
+    static_assert(std::ranges::none_of(DeclineReasonTable,
+                                       [](DeclineReasonRow const& row) { return row.specifics == Specifics::ByCause; }),
+                  "a decline's row decides its specifics itself; ByCause here would name no answer");
 
     /// Widest label the distribution section can print.
     ///
@@ -337,6 +459,10 @@ namespace
         std::uint64_t misses {};
         std::uint64_t uncacheable {};
         std::uint64_t unavailable {};
+        std::uint64_t exitCodes {};      ///< Records that carry an exit code at all.
+        std::uint64_t compilesFailed {}; ///< Of those, a non-zero one.
+        /// Hits `FASTCACHE_VERIFY` rejected; see `Outcome::VerifyMismatch`.
+        std::uint64_t verifyMismatches {};
 
         // Full sample sets, not running sums: the point of the distribution is the
         // shape (a bimodal miss profile means something an average hides).
@@ -374,7 +500,17 @@ namespace
 
         [[nodiscard]] std::uint64_t Total() const noexcept
         {
-            return hits + misses + uncacheable + unavailable;
+            return hits + misses + uncacheable + unavailable + verifyMismatches;
+        }
+
+        /// The compiles the cache ANSWERED, which is what a hit rate is rated against.
+        ///
+        /// A rejected hit is one of them -- the cache answered, wrongly -- so it counts
+        /// in the denominator and not in the numerator. One definition, because the text
+        /// and the HTML report both rate against it.
+        [[nodiscard]] std::uint64_t Servable() const noexcept
+        {
+            return hits + misses + verifyMismatches;
         }
 
         /// Sum the per-state dispatch counters whose row has @p column set.
@@ -458,7 +594,166 @@ namespace
             return Outcome::Miss;
         if (token == "UNCACHEABLE")
             return Outcome::Uncacheable;
+        if (token == "VERIFY-MISMATCH")
+            return Outcome::VerifyMismatch;
         return Outcome::Unavailable;
+    }
+
+    /// The marker that opens every line written in an explicit format version: `v` and the number.
+    ///
+    /// An outcome token is an uppercase word, so no line from before the marker can begin with one.
+    constexpr std::string_view LogVersionPrefix = "v";
+
+    /// The format this build writes. **Bumped whenever `LogColumnTable` changes in any way** --
+    /// order, meaning, count -- because the version is the only thing a reader can check; the
+    /// arity that stood in for it is a count, and two formats can share a count.
+    constexpr unsigned CurrentLogVersion = 2;
+
+    /// One column of a version-2 line, in the order it is written.
+    ///
+    /// **Persisted: the enumerator values ARE the on-disk column order**, so they are spelled out,
+    /// and a change to them is a change to `CurrentLogVersion`.
+    enum class LogColumn : std::uint8_t
+    {
+        Outcome = 0,
+        PrefetchGroup = 1,
+        ValueBytes = 2,
+        ElapsedMs = 3,
+        Source = 4,
+        Detail = 5,
+        PreprocessMs = 6,
+        CacheMs = 7,
+        DirectMs = 8,
+        DirectHit = 9,
+        TimestampUnixSeconds = 10,
+        Dispatch = 11,
+        DispatchDetail = 12,
+        DispatchSpecifics = 13,
+        ExitCode = 14,
+        Last = 15,
+    };
+
+    /// How one column is written and read.
+    struct LogColumnRow
+    {
+        LogColumn column;                                       ///< Which column.
+        std::string_view name;                                  ///< What a reader of the file calls it.
+        void (*write)(Record const& record, std::string& line); ///< Appends the column's text.
+        void (*read)(std::string_view text, Record& record);    ///< Sets the record from it.
+    };
+
+    /// Parse a signed exit code; nothing for text that is not one.
+    [[nodiscard]] std::optional<std::int32_t> ParseExitCode(std::string_view text)
+    {
+        std::int32_t value = 0;
+        auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (text.empty() || error != std::errc {} || end != text.data() + text.size())
+            return std::nullopt;
+        return value;
+    }
+
+    /// Every column of the current format, in the order it is written: the ONE description of a
+    /// version-2 line, which the writer and the reader both walk.
+    constexpr EnumTable<LogColumn, LogColumnRow> LogColumnTable { {
+        { .column = LogColumn::Outcome,
+          .name = "outcome",
+          .write = [](Record const& r, std::string& l) { l += ToStringView(r.outcome); },
+          .read = [](std::string_view t, Record& r) { r.outcome = ParseOutcome(t); } },
+        { .column = LogColumn::PrefetchGroup,
+          .name = "prefetch-group",
+          .write = [](Record const& r, std::string& l) { l += Sanitize(r.prefetchGroup); },
+          .read = [](std::string_view t, Record& r) { r.prefetchGroup = std::string { t }; } },
+        { .column = LogColumn::ValueBytes,
+          .name = "value-bytes",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.valueBytes); },
+          .read = [](std::string_view t, Record& r) { r.valueBytes = ParseUnsigned(t); } },
+        { .column = LogColumn::ElapsedMs,
+          .name = "elapsed-ms",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.elapsedMs); },
+          .read = [](std::string_view t, Record& r) { r.elapsedMs = ParseUnsigned(t); } },
+        { .column = LogColumn::Source,
+          .name = "source",
+          .write = [](Record const& r, std::string& l) { l += Sanitize(r.source); },
+          .read = [](std::string_view t, Record& r) { r.source = std::string { t }; } },
+        { .column = LogColumn::Detail,
+          .name = "detail",
+          .write = [](Record const& r, std::string& l) { l += Sanitize(r.detail); },
+          .read = [](std::string_view t, Record& r) { r.detail = std::string { t }; } },
+        { .column = LogColumn::PreprocessMs,
+          .name = "preprocess-ms",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.preprocessMs); },
+          .read =
+              [](std::string_view t, Record& r) {
+                  r.preprocessMs = ParseUnsigned(t);
+                  r.hasPhaseColumns = true;
+              } },
+        { .column = LogColumn::CacheMs,
+          .name = "cache-ms",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.cacheMs); },
+          .read = [](std::string_view t, Record& r) { r.cacheMs = ParseUnsigned(t); } },
+        { .column = LogColumn::DirectMs,
+          .name = "direct-ms",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.directMs); },
+          .read = [](std::string_view t, Record& r) { r.directMs = ParseUnsigned(t); } },
+        { .column = LogColumn::DirectHit,
+          .name = "direct-hit",
+          .write = [](Record const& r, std::string& l) { l += r.directHit ? "1" : "0"; },
+          .read = [](std::string_view t, Record& r) { r.directHit = t == "1"; } },
+        { .column = LogColumn::TimestampUnixSeconds,
+          .name = "timestamp",
+          .write = [](Record const& r, std::string& l) { l += std::to_string(r.timestampUnixSeconds); },
+          .read = [](std::string_view t, Record& r) { r.timestampUnixSeconds = ParseUnsigned(t); } },
+        { .column = LogColumn::Dispatch,
+          .name = "dispatch",
+          .write = [](Record const& r, std::string& l) { l += ToStringView(r.dispatch); },
+          .read = [](std::string_view t, Record& r) { r.dispatch = ParseDispatchOutcome(t); } },
+        { .column = LogColumn::DispatchDetail,
+          .name = "dispatch-detail",
+          .write = [](Record const& r, std::string& l) { l += Sanitize(r.dispatchDetail); },
+          .read = [](std::string_view t, Record& r) { r.dispatchDetail = std::string { t }; } },
+        { .column = LogColumn::DispatchSpecifics,
+          .name = "dispatch-specifics",
+          .write = [](Record const& r, std::string& l) { l += BoundedSpecifics(r.dispatchSpecifics); },
+          .read = [](std::string_view t, Record& r) { r.dispatchSpecifics = std::string { t }; } },
+        { .column = LogColumn::ExitCode,
+          .name = "exit-code",
+          .write =
+              [](Record const& r, std::string& l) {
+                  if (r.exitCode.has_value())
+                      l += std::to_string(*r.exitCode);
+              },
+          .read = [](std::string_view t, Record& r) { r.exitCode = ParseExitCode(t); } },
+    } };
+    static_assert(RowsInEnumeratorOrder(LogColumnTable, &LogColumnRow::column),
+                  "LogColumnTable must hold one row per LogColumn, in enumerator order -- which is the column order");
+
+    /// The format version a line's first field names, when it names one.
+    /// @param first The line's first field.
+    /// @return The version; nothing for a line from before versions were written (version 1).
+    [[nodiscard]] std::optional<unsigned> LineVersion(std::string_view first)
+    {
+        if (!first.starts_with(LogVersionPrefix) || first.size() == LogVersionPrefix.size())
+            return std::nullopt;
+        unsigned version = 0;
+        auto const digits = first.substr(LogVersionPrefix.size());
+        auto const [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), version);
+        if (error != std::errc {} || end != digits.data() + digits.size())
+            return std::nullopt;
+        return version;
+    }
+
+    /// Write one record as a current-format line, newline included.
+    /// @param record The record. @return The line.
+    [[nodiscard]] std::string EncodeLine(Record const& record)
+    {
+        auto line = std::format("{}{}", LogVersionPrefix, CurrentLogVersion);
+        for (auto const& row: LogColumnTable)
+        {
+            line += FieldSeparator;
+            row.write(record, line);
+        }
+        line += '\n';
+        return line;
     }
 
     /// Rebuild a `Record` from one log line's already-split fields.
@@ -500,6 +795,38 @@ namespace
             record.dispatch = ParseDispatchOutcome(fields[11]);
         if (fields.size() >= 13)
             record.dispatchDetail = std::string { fields[12] };
+        // Newer still, and read only when present for the same reason: a line from before it
+        // says nothing about which argument was refused, which is not the same as "none".
+        if (fields.size() >= 14)
+            record.dispatchSpecifics = std::string { fields[13] };
+        return record;
+    }
+
+    /// Read one log line's already-split fields, whichever format wrote it.
+    ///
+    /// Three readings and no fourth. A line that opens with a version marker is read by THAT
+    /// version's column table, and only when every column is there; a line without one was written
+    /// before versions were, and is read by arity as it always was (`DecodeFields`); a version this
+    /// build does not know is SKIPPED -- never read by position, which would take a later build's
+    /// columns for this one's and put an exit code where a byte count was.
+    /// @param fields The line's fields.
+    /// @return The record, or nothing for a line this build cannot read.
+    [[nodiscard]] std::optional<Record> DecodeLine(std::vector<std::string_view> const& fields)
+    {
+        if (fields.empty())
+            return std::nullopt;
+        auto const version = LineVersion(fields.front());
+        if (!version.has_value())
+        {
+            if (fields.size() < 4)
+                return std::nullopt;
+            return DecodeFields(fields);
+        }
+        if (*version != CurrentLogVersion || fields.size() != LogColumnTable.size() + 1)
+            return std::nullopt;
+        Record record;
+        for (auto const& row: LogColumnTable)
+            row.read(fields[static_cast<std::size_t>(row.column) + 1], record);
         return record;
     }
 
@@ -687,7 +1014,7 @@ namespace
         // Rate the cache against the compiles it could actually serve. Dividing by
         // every invocation blends "the cache did not have it" with "the cache was
         // unreachable", so an outage reads as a poor hit rate and hides its own cause.
-        auto const servable = tally.hits + tally.misses;
+        auto const servable = tally.Servable();
 
         out << "  compiles     : " << tally.Total() << '\n'
             << "  hits         : " << Colorize(std::to_string(tally.hits), palette.good, palette.reset) << "  ("
@@ -703,6 +1030,10 @@ namespace
             out << "  unavailable  : " << Colorize(std::to_string(tally.unavailable), palette.bad, palette.reset) << "  ("
                 << Percent(tally.unavailable, tally.Total()) << " of all compiles -- "
                 << Colorize("CACHE NOT REACHED", palette.bad, palette.reset) << ")\n";
+        if (tally.verifyMismatches > 0)
+            out << "  wrong object : " << Colorize(std::to_string(tally.verifyMismatches), palette.bad, palette.reset)
+                << "  (hits FASTCACHE_VERIFY rejected -- " << Colorize("WRONG OBJECT SERVED", palette.bad, palette.reset)
+                << "; the fresh compile was used)\n";
 
         if (!tally.reasons.empty())
         {
@@ -710,6 +1041,14 @@ namespace
             for (auto const& [reason, count]: RankedByCount(tally.reasons))
                 out << "    " << Colorize(std::to_string(count) + "x", palette.bad, palette.reset) << "  " << reason << '\n';
         }
+
+        // Only over records that say: a line from before the exit code was recorded is not a success.
+        if (tally.exitCodes > 0)
+            out << "  compile failed: "
+                << Colorize(std::to_string(tally.compilesFailed),
+                            tally.compilesFailed > 0 ? palette.bad : palette.neutral,
+                            palette.reset)
+                << " of " << tally.exitCodes << " that recorded an exit code\n";
 
         AppendDispatchLines(out, tally, palette);
 
@@ -741,10 +1080,27 @@ std::string_view ToStringView(Outcome outcome) noexcept
             return "MISS";
         case Outcome::Uncacheable:
             return "UNCACHEABLE";
+        case Outcome::VerifyMismatch:
+            return "VERIFY-MISMATCH";
         case Outcome::Unavailable:
             break;
     }
     return "UNAVAILABLE";
+}
+
+Outcome OutcomeOfServedHit(HitVerdict verdict) noexcept
+{
+    switch (verdict)
+    {
+        case HitVerdict::Mismatched:
+            return Outcome::VerifyMismatch;
+        case HitVerdict::NotChecked:
+        case HitVerdict::Matched:
+        case HitVerdict::Inconclusive:
+        case HitVerdict::Unsupported:
+            break;
+    }
+    return Outcome::Hit;
 }
 
 DispatchRecording RecordingFor(DispatchStatus status, DeclineCause cause) noexcept
@@ -769,6 +1125,19 @@ DispatchRecording RecordingFor(DispatchStatus status, DeclineCause cause) noexce
                                    .outcome = row.outcome };
     return DispatchRecording { .reason = DeclineReasonTable[static_cast<std::size_t>(cause)].reason,
                                .outcome = row.outcome };
+}
+
+std::string SpecificsFor(DispatchResult const& result)
+{
+    // Out of range on either axis says nothing this build can report on, as `RecordingFor` answers.
+    if (static_cast<std::size_t>(result.status) >= EnumeratorCount<DispatchStatus>)
+        return {};
+    auto specifics = DispatchRecordingTable[static_cast<std::size_t>(result.status)].specifics;
+    if (specifics == Specifics::ByCause)
+        specifics = static_cast<std::size_t>(result.decline) < EnumeratorCount<DeclineCause>
+                        ? DeclineReasonTable[static_cast<std::size_t>(result.decline)].specifics
+                        : Specifics::None;
+    return specifics == Specifics::Refusal ? result.refusal : std::string {};
 }
 
 std::string_view ToStringView(DispatchOutcome outcome) noexcept
@@ -806,33 +1175,8 @@ void AppendRecord(Record const& record)
     if (path.empty())
         return;
 
-    std::string line;
-    line += ToStringView(record.outcome);
-    line += FieldSeparator;
-    line += Sanitize(record.prefetchGroup);
-    line += FieldSeparator;
-    line += std::to_string(record.valueBytes);
-    line += FieldSeparator;
-    line += std::to_string(record.elapsedMs);
-    line += FieldSeparator;
-    line += Sanitize(record.source);
-    line += FieldSeparator;
-    line += Sanitize(record.detail);
-    line += FieldSeparator;
-    line += std::to_string(record.preprocessMs);
-    line += FieldSeparator;
-    line += std::to_string(record.cacheMs);
-    line += FieldSeparator;
-    line += std::to_string(record.directMs);
-    line += FieldSeparator;
-    line += record.directHit ? "1" : "0";
-    line += FieldSeparator;
-    line += std::to_string(record.timestampUnixSeconds);
-    line += FieldSeparator;
-    line += ToStringView(record.dispatch);
-    line += FieldSeparator;
-    line += Sanitize(record.dispatchDetail);
-    line += '\n';
+    // Current format, from the one column table the reader walks too.
+    auto const line = EncodeLine(record);
 
 #if defined(_WIN32)
     // FILE_APPEND_DATA without FILE_WRITE_DATA makes each write atomically land
@@ -865,7 +1209,7 @@ void AppendRecord(Record const& record)
 #endif
 }
 
-std::vector<Record> ParseLog(std::string_view groupFilter)
+LogReading ReadLog(std::string_view groupFilter)
 {
     auto const path = LogPath();
     if (path.empty())
@@ -875,7 +1219,7 @@ std::vector<Record> ParseLog(std::string_view groupFilter)
     if (!input)
         return {};
 
-    std::vector<Record> records;
+    LogReading reading;
     std::string line;
     while (std::getline(input, line))
     {
@@ -884,16 +1228,30 @@ std::vector<Record> ParseLog(std::string_view groupFilter)
         if (line.empty())
             continue;
 
-        auto const fields = SplitFields(line);
-        if (fields.size() < 4)
+        auto record = DecodeLine(SplitFields(line));
+        if (!record.has_value())
+        {
+            ++reading.unreadable;
             continue;
-
-        if (!groupFilter.empty() && fields[1] != groupFilter)
+        }
+        // Filtered on the DECODED group, never on a field position: the group is the second
+        // column of an unversioned line and the third of a versioned one.
+        if (!groupFilter.empty() && record->prefetchGroup != groupFilter)
             continue;
-
-        records.push_back(DecodeFields(fields));
+        reading.records.push_back(std::move(*record));
     }
-    return records;
+    return reading;
+}
+
+std::vector<Record> ParseLog(std::string_view groupFilter)
+{
+    return ReadLog(groupFilter).records;
+}
+
+std::uint64_t RecordTimestamp(core::platform::IWallClock const& clock) noexcept
+{
+    auto const sinceEpoch = clock.now().time_since_epoch();
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(sinceEpoch).count());
 }
 
 namespace
@@ -914,6 +1272,12 @@ namespace
         {
             for (Tally* tally: { &folded.overall, &folded.byGroup[record.prefetchGroup] })
             {
+                if (record.exitCode.has_value())
+                {
+                    ++tally->exitCodes;
+                    if (record.exitCode.value_or(0) != 0)
+                        ++tally->compilesFailed;
+                }
                 switch (record.outcome)
                 {
                     case Outcome::Hit:
@@ -942,6 +1306,9 @@ namespace
                         break;
                     case Outcome::Unavailable:
                         ++tally->unavailable;
+                        break;
+                    case Outcome::VerifyMismatch:
+                        ++tally->verifyMismatches;
                         break;
                 }
                 if (!record.detail.empty())
@@ -984,10 +1351,11 @@ std::string FormatReport(std::string_view groupFilter, UsageColor color)
     if (!probe)
         return "fastcache-cc: no statistics recorded yet (" + path + ").\n";
 
-    auto const records = ParseLog(groupFilter);
+    auto const reading = ReadLog(groupFilter);
+    auto const& records = reading.records;
     auto const [overall, byGroup, neverCached] = FoldRecords(records);
 
-    if (overall.Total() == 0)
+    if (overall.Total() == 0 && reading.unreadable == 0)
     {
         if (groupFilter.empty())
             return "fastcache-cc: no statistics recorded yet (" + path + ").\n";
@@ -1002,6 +1370,9 @@ std::string FormatReport(std::string_view groupFilter, UsageColor color)
     else
         out << "prefetch group " << groupFilter << '\n';
     AppendTallyLines(out, overall, palette);
+    if (reading.unreadable > 0)
+        out << "  skipped      : " << reading.unreadable
+            << " log line(s) in a format this launcher does not read -- a later launcher wrote them\n";
 
     if (groupFilter.empty() && byGroup.size() > 1)
     {
@@ -1164,7 +1535,7 @@ namespace
                 ++bucket.hits;
                 ++bucket.servable;
             }
-            else if (record.outcome == Outcome::Miss)
+            else if (record.outcome == Outcome::Miss || record.outcome == Outcome::VerifyMismatch)
                 ++bucket.servable;
         }
         return { byDay.begin(), byDay.end() };
@@ -1421,7 +1792,7 @@ std::string FormatHtmlReport(std::string_view groupFilter)
         return "fastcache-cc: no records for prefetch group '" + std::string { groupFilter } + "'.\n";
     }
 
-    auto const servable = overall.hits + overall.misses;
+    auto const servable = overall.Servable();
     auto const hitRate = Percent(overall.hits, servable);
 
     std::ostringstream out;
@@ -1461,6 +1832,10 @@ std::string FormatHtmlReport(std::string_view groupFilter)
     AppendTallyCard(out, "misses", overall.misses, "miss");
     AppendTallyCard(out, "uncacheable", overall.uncacheable, "uncache");
     AppendTallyCard(out, "unavailable", overall.unavailable, "bad");
+    // Only when there is one, like the text report's line: a card reading zero on every
+    // dashboard of a machine that never verifies would teach a reader to skip it.
+    if (overall.verifyMismatches > 0)
+        AppendTallyCard(out, "wrong objects", overall.verifyMismatches, "bad");
     out << "</div>";
 
     out << R"(<div class="panel"><div class="panel-title">hit rate over time</div>)" << RenderTrendSvg(records) << "</div>";

@@ -450,21 +450,6 @@ struct PreprocessedInputSpelling
 /// @return The reason, or empty when this language may be cached and dispatched.
 [[nodiscard]] std::string_view UncacheableBecause(SourceLanguage language) noexcept;
 
-/// Whether `arg` makes a compile write something BESIDES its object file.
-///
-/// A cache hit reproduces the object and the dependency record and nothing else, so
-/// a line that also writes a BMI (`/ifcOutput`, `-fmodule-output`) or a precompiled
-/// header (`/Yc`) must not be cached: replaying only the object leaves the second
-/// artefact missing, which fails loudly, or stale, which does not. The module
-/// EXTENSIONS are the other half of the same rule and are handled by
-/// `LanguageOfSource` — this table is for an ordinary source promoted by a flag,
-/// which is how a `.cpp` becomes a module interface unit (`cl /interface`).
-///
-/// @param arg    The argument as it appeared on the command line.
-/// @param family Which family's spellings may match.
-/// @return True when this argument means a second artefact is produced.
-[[nodiscard]] bool ProducesSideArtefact(std::string_view arg, DriverFamily family);
-
 /// How one compiler driver spells the options the launcher needs.
 ///
 /// This is the data behind the parser: adding a driver is adding a row to the
@@ -618,6 +603,30 @@ struct DriverSpec
     std::span<std::string_view const> versionFlags;
 };
 
+/// Whether `arg` makes a compile write something BESIDES its object file.
+///
+/// A cache hit reproduces the object and the dependency record and nothing else, so
+/// a line that also writes a BMI (`/ifcOutput`, `-fmodule-output`), a precompiled
+/// header (`/Yc`) or `cl`'s PDB shared across the target (`/Zi`, `/ZI`) must not be
+/// cached: replaying only the object leaves the second artefact missing, which fails
+/// loudly, or stale, which does not. The module EXTENSIONS are the other half of the
+/// same rule and are handled by `LanguageOfSource` — this table is for an ordinary
+/// source promoted by a flag, which is how a `.cpp` becomes a module interface unit
+/// (`cl /interface`).
+///
+/// One flag is here although it writes nothing: `cl`'s `/Yu`, whose object is tied
+/// to the one pch.obj it was compiled against, by a symbol that differs per checkout
+/// and by a record naming that file's absolute path. The key sees neither, so a
+/// replay fails to link in another checkout, or links without the translation unit's
+/// debug info after the PCH was rebuilt. clang-cl's `/Yu` object carries neither and
+/// stays cacheable.
+///
+/// @param arg    The argument as it appeared on the command line.
+/// @param driver The driver whose spellings and flavor apply.
+/// @return True when this argument means a second artefact is produced, or (`cl /Yu`)
+///         an object tied to an artefact the key cannot see.
+[[nodiscard]] bool ProducesSideArtefact(std::string_view arg, DriverSpec const& driver);
+
 /// The pieces of a compile command line the launcher needs to key, cache, and
 /// reproduce a compilation.
 struct ParsedCommand
@@ -628,10 +637,11 @@ struct ParsedCommand
     std::string objPath;             ///< The requested object output (/Fo or -o).
     std::string depPath;             ///< The requested depfile (-MF), if any.
     bool wantShowIncludes { false }; ///< True if /showIncludes was requested.
-    /// True when the line also writes a BMI or a precompiled header, which makes it
-    /// uncacheable. Recorded rather than folded into `parsedOk` alone so the
-    /// launcher can say WHY it stepped aside: a link step and a module interface
-    /// unit are both passed through, and only one of them looks like a defect.
+    /// True when the line also writes a BMI, a precompiled header or `cl`'s shared
+    /// PDB, or uses a precompiled header under `cl` (`/Yu`), which makes it
+    /// uncacheable. Recorded rather than folded into `parsedOk` alone so the launcher
+    /// can say WHY it stepped aside: a link step and a module interface unit are both
+    /// passed through, and only one of them looks like a defect.
     bool sideArtefact { false };
     /// True when a pass-through dependency flag (`-clang:-MF`) arrived with its value
     /// in a SEPARATE argument, which the launcher cannot read. Uncacheable rather than
@@ -724,8 +734,8 @@ struct ParsedCommand
 /// multi-TU line), names no explicit object output (`g++ -c a.cpp`, which
 /// defaults to `./a.o` — a path the launcher cannot reconstruct), is
 /// preprocess-only, or writes a second artefact besides the object (a BMI or a
-/// precompiled header — see `ProducesSideArtefact`) — the launcher then falls back
-/// to a plain exec.
+/// precompiled header) or uses a precompiled header under `cl` (see
+/// `ProducesSideArtefact`) — the launcher then falls back to a plain exec.
 ///
 /// @param argv The full invocation, argv[0] being the compiler.
 /// @return The parsed command; `parsedOk` gates cacheability.

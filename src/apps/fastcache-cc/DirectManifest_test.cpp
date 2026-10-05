@@ -1687,7 +1687,7 @@ TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
     // to disagree about what was hashed.
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
     auto const manifestKey = ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51");
-    CHECK(manifestKey == "2f8e995262b738bea0d31e062b6d4682");
+    CHECK(manifestKey == "c9ccdb2f69e66935265a024bef7b0c5e");
 
     // And the generations it has retired stay retired. This is the half the vector
     // above cannot cover: a v5 manifest is only safe because no launcher carrying
@@ -1698,6 +1698,9 @@ TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
         { .key = "manifest-v3", .digest = "76b19c2b7caf3e0db4dcc1efcecb76aa" },
         { .key = "manifest-v4", .digest = "8221eaeac6f3f8e52e523507780ed186" },
         { .key = "manifest-v5", .digest = "72ed897f5c3dd9ec9fc2b4607aafdc96" },
+        // Retired by root binding: a v6 manifest is shared between checkouts and points
+        // straight at the producer's object, `__FILE__` and all. Only the tag moved.
+        { .key = "manifest-v6", .digest = "2f8e995262b738bea0d31e062b6d4682" },
     });
     RequireNoRetiredDigest<std::string_view>(manifestKey, Retired);
 

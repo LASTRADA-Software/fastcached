@@ -5,6 +5,8 @@
 #include <FastCache/Platform/NarrowText.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -34,6 +36,23 @@ namespace FastCache::Cc
 
 namespace
 {
+#if defined(_WIN32)
+    /// @param info What `GetNativeSystemInfo` filled in.
+    /// @return Its `wProcessorArchitecture`.
+    ///
+    /// Read by offset rather than as `info.wProcessorArchitecture`: the field sits in the anonymous union
+    /// `SYSTEM_INFO` opens with, and this tree's analyser refuses member access through a union
+    /// (`cppcoreguidelines-pro-type-union-access`) -- `WindowsFirewall.cpp`'s `DispatchOf` is the same shape.
+    [[nodiscard]] WORD ProcessorArchitectureOf(SYSTEM_INFO const& info) noexcept
+    {
+        auto architecture = WORD { PROCESSOR_ARCHITECTURE_UNKNOWN };
+        std::memcpy(&architecture,
+                    reinterpret_cast<std::byte const*>(&info) + offsetof(SYSTEM_INFO, wProcessorArchitecture),
+                    sizeof architecture);
+        return architecture;
+    }
+#endif
+
     /// The separator this host splits a search-path variable on.
     ///
     /// A `#if` rather than a runtime test because it is a property of the host's
@@ -168,7 +187,7 @@ namespace
             // The fallback is still a NATIVE reading rather than the emulated one.
             SYSTEM_INFO info {};
             ::GetNativeSystemInfo(&info);
-            switch (info.wProcessorArchitecture)
+            switch (ProcessorArchitectureOf(info))
             {
                 case PROCESSOR_ARCHITECTURE_ARM64:
                     return HostArchitecture::Arm64;

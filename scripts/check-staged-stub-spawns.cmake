@@ -79,7 +79,7 @@ endmacro()
 #                     that cannot start it. `guard` must appear in the file, and
 #                     `reason` must be about the SUBJECT rather than the platform.
 #
-# TOTAL: 8 rows, which is the derived candidate count on this tree and is asserted
+# TOTAL: 9 rows, which is the derived candidate count on this tree and is asserted
 # against it below rather than restated as a number nobody re-derives.
 #
 # NO SEMICOLONS in a reason. CMake turns `;` into a list separator, so a reason
@@ -95,6 +95,7 @@ set(StagedStubSpawns
     "scripts/check-tracked-files-selftest.cmake|data|-|staged so the tracked-file enumeration has a path to return -- nothing executes it"
     "scripts/check-staged-stub-spawns.cmake|data|-|this scan's OWN pattern literals. It carries every shebang it matches on and names every spawn mechanism, so it is a candidate by construction -- and it stages nothing"
     "scripts/check-staged-stub-spawns-selftest.cmake|data|-|the self-test's staged tree bodies, written as strings into synthetic trees under a scratch directory and never executed"
+    "scripts/check-version-git-unanswered.cmake|adapted|git.cmd|the stub git that execute_process spawns is staged as `git.cmd` on Windows and as `#!/bin/sh` elsewhere, one CMake file behind both, so every case runs on both platforms"
 )
 
 # The vocabulary that makes a reason a portability excuse rather than a subject
@@ -241,8 +242,8 @@ endforeach()
 
 # The table's stated length, asserted rather than written in prose.
 list(LENGTH StagedStubSpawns rowCount)
-if(NOT rowCount EQUAL 8)
-    Refuse("the table has ${rowCount} rows; the comment above says 8. Update both or neither -- a total stated beside a table is derived from it or it is a second claim.")
+if(NOT rowCount EQUAL 9)
+    Refuse("the table has ${rowCount} rows; the comment above says 9. Update both or neither -- a total stated beside a table is derived from it or it is a second claim.")
 endif()
 
 if(failures GREATER 0)

@@ -128,7 +128,21 @@ UseColor: true
 # to every tracked header and reports `<matched>/<total>`, so a new root shows up as
 # `286/287` with the missed file named. The enumeration is safe only because that
 # check exists -- do not weaken one without the other.
-HeaderFilterRegex: '.*/src/(CowTree|FastCache|apps|tests)/.*'
+#
+# Every separator is `[/\\]`, because the path the filter is matched against is the
+# path a header was OPENED by, and on Windows that is not the POSIX one: the MSVC
+# compile database spells its include directories with backslashes, so a header opens
+# as `D:\...\src/tests/X.hpp`. Spelled with `/` alone, this pattern matched no header
+# on a Windows run -- a naming violation planted in one was reported 0 times, and twice
+# once either separator was accepted -- and the run still read clean, since the main
+# file's findings came through. local-gate's coverage check could not see it, matching
+# POSIX paths only. `ctest -R tidy-header-filter` asks every tracked header in the
+# POSIX, all-backslash and MSVC-mixed spellings, and that no spelling of a dependency
+# path is taken; and `scripts/tidy-sweep.sh`'s header canary makes the analyser itself
+# report a finding planted in two headers before any sweep is believed, on whichever
+# host the sweep runs. In a YAML single-quoted scalar a backslash is literal, and inside
+# a POSIX bracket expression -- `llvm::Regex` is one -- so is the regex's.
+HeaderFilterRegex: '.*[/\\]src[/\\](CowTree|FastCache|apps|tests)[/\\].*'
 FormatStyle:     none
 CheckOptions:
   - key:             readability-function-cognitive-complexity.Threshold
@@ -145,6 +159,12 @@ CheckOptions:
     value:           '0'
   - key:             cppcoreguidelines-explicit-virtual-functions.IgnoreDestructors
     value:           '1'
+  # The C functions whose result is an OWNER, so `gsl::owner<std::FILE*> x = f(...)` is accepted
+  # for them. The check's default list plus `::_wfsopen`: the CRT's wide-path, share-mode `fopen`,
+  # which DurableFile.cpp and NodeKey.cpp call on Windows exactly where POSIX calls `std::fopen`.
+  # Setting the key REPLACES the default, so the default's seven stay spelled out.
+  - key:             cppcoreguidelines-owning-memory.LegacyResourceProducers
+    value:           '::malloc;::aligned_alloc;::realloc;::calloc;::fopen;::freopen;::tmpfile;::_wfsopen'
   - key:             cppcoreguidelines-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
     value:           '1'
   - key:             google-readability-braces-around-statements.ShortStatementLines

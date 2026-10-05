@@ -215,11 +215,12 @@ fault.
   while the two happened to be equal. `AttributedCounterCount()` is the derivation that stays
   right.
 
-  **And a scan for `Increment(Counter::X)` attributes barely a quarter of them.** FOUR mechanisms
+  **And a scan for `Increment(Counter::X)` attributes barely a quarter of them.** FIVE mechanisms
   write a counter here -- a `SurfaceRefusal` row spent by `Refuse(row)`, a `LeaseToken` outcome
-  row, a classifier returning the row for its caller to spend, and a direct `Increment` -- so
-  reading only the `SurfaceRefusal` tables, which is the obvious reading of *written through
-  `Refuse(row)`*, leaves a handful looking unwritten.
+  row, a classifier returning the row for its caller to spend, a `CacheTierProfile` member spent
+  by the cache tier built with that profile, and a direct `Increment` -- so reading only the
+  `SurfaceRefusal` tables, which is the obvious reading of *written through `Refuse(row)`*, leaves
+  a good many looking unwritten.
 
   **The figures live in `ctest -R counter-attribution` and are deliberately not copied here.**
   The sentence this replaces said "106 of 144" for a tree that had moved to 148, and then 149;
@@ -294,9 +295,10 @@ fault.
   is the sum (those are different jobs).
 - **The dashboard's credential is separate from `--requirepass`, and the surface
   is refused rather than served without one.** `--requirepass` is what a node
-  *presents* to the scheduler and every member of the fleet holds it, so reusing it
+  *presents* to the shared cache and every member of the fleet holds it, so reusing it
   would let any worker read every other node's fleet map -- wrong direction and
-  wrong grain. It is a file for the reason `--scheduler-token-file` is one, and a
+  wrong grain. It is a file because a secret on a command line is readable by every
+  process on the machine, and a
   non-loopback `--admin-listen` with `--dashboard` and no token file is a **startup
   refusal**: the page lists every member's hostname, endpoint and capacity, and
   HTTPS does not substitute, because TLS authenticates the server to the browser
@@ -845,9 +847,9 @@ looks exactly like a port nobody is talking to.
   values, in BOTH directions, since the one-directional half passes for a router that
   sends nothing to the surface at all.
 - **The other two reasons not to count**, from the same pass: a rise that would be
-  ORDINARY TRAFFIC (the cache's `AUTH` refusal is what a `FASTCACHE_TOKEN` launcher
-  gets once per exchange for a whole build — `UnservedReply`'s argument, one surface
-  over), and an event ALREADY COUNTED somewhere better placed to see it (a failed
+  ORDINARY TRAFFIC (a node with no cache tier answers every local `FETCH`
+  `unimplemented-verb`, once per exchange for a whole build — `UnservedReply`'s argument,
+  one surface over), and an event ALREADY COUNTED somewhere better placed to see it (a failed
   local write moves `NodeCacheStoreFailures` inside `LocalCache::Store`, where every
   caller is visible and not only the ones that arrived over the wire; a second row
   would count one write twice). Neither is "this refusal does not matter".
@@ -868,10 +870,8 @@ looks exactly like a port nobody is talking to.
   operator. The types keep them apart rather than a comment asking somebody to.
 - **Not every refusal is an EVENT, and one that ordinary traffic produces must not be
   counted.** The merged listener answers `UnimplementedVerb` to a verb this node runs
-  no component for — and that is what a *healthy* deployment gets: a worker with no
-  scheduler refuses every `AUTH` a `FASTCACHE_TOKEN` launcher sends, once per exchange
-  for a whole build, and a node with no cache tier refuses every local `FETCH` the same
-  way. Counted, the series is a build's traffic and a port scan is invisible inside it
+  no component for — and that is what a *healthy* deployment gets: a node with no cache
+  tier refuses every local `FETCH`, once per exchange for a whole build. Counted, the series is a build's traffic and a port scan is invisible inside it
   — which is this rule's own failure reached from the opposite side: a signal nothing
   can be read out of is no better than a counter that never moves. The test is not "is
   this a refusal" but "would a rise mean something happened". Splitting such an answer
@@ -952,6 +952,36 @@ outright rather than drawing with a gap.
   applied AFTER it is committed, so a peer built before the refusal existed can
   still replicate a member id past it with nobody left to refuse. Both escapers
   in `FleetText.hpp` walk one shared decoder so they cannot disagree.
+- **A verb that starts KEEPING a string owes it the gate that day, and "it is
+  only matched" is the claim that goes stale.** LEASE's key and fingerprint were
+  compared and dropped, so nothing gated them -- except the key was already kept,
+  by the lease table, and listed among `/fleet.json`'s outstanding leases. When
+  the `no-worker` refusals began to be remembered for `unserved-toolchain`, the
+  fingerprint and the client's toolchain label joined it in the leader's state.
+  **Every kept field owes TWO gates, text and a ceiling of its own**, because the
+  frame's ceiling is 64 KiB and a kept string lives as long as its record: sixteen
+  unserved toolchains at the frame's bound is a megabyte a peer chose. So
+  `SchedulerService::Lease` asks both of every row of `LeaseFields` -- one table,
+  each row carrying its ceiling, so a fourth kept string cannot be checked for one
+  and forgotten for the other. A ceiling is sized from what the field IS and
+  `static_assert`ed where the producer is visible: the key and the fingerprint are
+  `KeyDigest` hex (`MaxLeaseKeyBytes`, `MaxToolchainFingerprintBytes`, held in
+  `fastcache-cc/Dispatch.cpp`), the label a compiler's name and version
+  (`MaxToolchainLabelBytes`, beside its constant). Two refusal rows, not text and
+  too long (`MalformedFrame` on the wire, a counter each), never
+  `MalformedRegistration`, whose counter is the WORKER's. And the launcher sends
+  only a label that passes the same predicate and bound: the label is display
+  only, and a client refused its whole lease over one would lose distribution for
+  a name. REGISTER and NODE-ANNOUNCE are held by the same table shape --
+  `RegistrationFields` (its codec list a length-only row), and `PresenceFields`
+  plus each condition row against its `ConditionFieldTable` ceiling, all gated
+  through the one `RefuseUnkept` -- with `MalformedRegistration` for both
+  questions and a too-long counter per verb, the version, host-name and codec
+  ceilings `static_assert`ed at their producers, `--advertise` and a pinned
+  fingerprint refused by the node's parse, and the registrar withholding a label
+  as the launcher does, at Warn; an overlong condition field is refused first by
+  the decoder as a malformed frame no counter moves for, so the service gate and
+  its counter cover only a caller in the same process.
 - **Markup carries what XML's `Char` production admits, and that is a rule about
   CODE POINTS, not bytes.** JSON spells every control byte with a legal
   `\uXXXX` escape and puts no hole in its character range at all. XML admits
@@ -1004,8 +1034,9 @@ The log lines stay.
   are the same pixels -- so every test of a surface drives one of each and asserts they differ,
   and a neuter that renders every row as latched fails exactly those cases.
 - **Four states, and two of them are claims nobody else can make.** `raised`, `clear` (checked
-  and benign), `not-evaluated` (this node runs nothing that could raise it, with the reason), and
-  `undecided` (nothing evaluated it). The last is *forgot* and must not be spelled like the
+  and benign), `not-evaluated` (this node runs nothing that could raise it, or -- for a
+  fleet-wide row -- is not the leader that decides it, with the reason), and `undecided`
+  (nothing evaluated it). The last is *forgot* and must not be spelled like the
   second, which is *decided*: `NodeConditions::Settle` answers an absent component's rows
   `not-evaluated` and hands back every row still `undecided`, which `main` logs as an error. A
   row whose component is PRESENT is left undecided on purpose -- filling it in would hide the
@@ -1039,6 +1070,57 @@ The log lines stay.
 - **A condition with no detection behind it is not a row.** `--scheduler` naming a literal seed
   address (#1310) was a candidate and is not wired: nothing detects it, and a row nothing can
   raise would read `undecided` forever -- the defect above, shipped on purpose.
+- **A setback that repeats every round is said on its TRANSITION, never once per round.** Both
+  announce loops logged an unreachable scheduler, an unproved identity and a refused registration
+  or presence at Warn on every round -- about 360 lines an hour from one machine running a worker
+  and the presence loop -- which is a log nobody reads for the one line that changed.
+  `SchedulerReachability` (`apps/fastcache-compile-node/`) keys on the round's OUTCOME, one row
+  of `SchedulerOutcomeTable` per kind, and says it through `ReachabilityTable`. Its `cadence`
+  column is the one interval. Each property below is tested with a `ManualClock` by counting
+  lines per level (`[reachability]`):
+  - **A change of outcome at one place is a transition**, and so is a new place. A repeat is not.
+  - **At most one Warn per scheduler per cadence, and the budget counts LOSSES** (`Lost`, then
+    `Further` at Info, then `Relapse` at Debug). Strict transitions alone are 90 Warns an hour on
+    a flapping VPN link -- the same flood through another door.
+  - **A recovery is said at the level of the loudest line said about its setback**: an operator
+    told it went away is told it came back, and one who was not, is not.
+  - **ONE per PROCESS**, owned by `main` and lent to both loops, or one machine says each
+    transition twice.
+  - **"Still" is claimed only about a place still being ASKED.** One nothing touched for a whole
+    cadence -- a remembered leader `SchedulerLink` let go of, a PC that slept -- is forgotten
+    silently, and a failure after that is news again at Warn.
+  - **A refusal naming a LEADER is not a setback**: it is the redirect the round follows at once,
+    and it stays at Debug.
+  - **The constructor pre-answers every row `clear`, before any round has run.** `Evaluate()` runs
+    once over an empty `_setbacks` set from the constructor, so a component wired at construction
+    reads `clear` rather than `undecided` from its first poll -- a window bounded by the time
+    before the first round completes, not a claim that anything was checked in it.
+
+  Its row is `scheduler-unreachable`: LIVE, raised only by the `Unreachable` outcome through the
+  table's `raises` column, from the same state -- no second observation. A refusal does not raise
+  it, because the remedy names the network and a scheduler that refused did answer -- and a
+  connection that stalled or lost its peer after it answered is folded into `Unreachable` for the
+  same reason, at `AnnounceRefusalKind::Transport` (`WorkerProtocol.hpp`): the exchange never
+  completed, so nothing about a toolchain or a fingerprint was actually refused.
+- **A FLEET-wide row is the LEADER's, and every other node says so.** `unserved-toolchain` and
+  `mixed-node-versions` read the leader's registry -- what clients asked it for, what every machine
+  announced to it -- and a follower's copy holds none of that. So a scheduler that is not leading
+  answers them `not-evaluated`, naming the leader when it knows one, and never `clear`: *clear* from
+  a node that cannot see the fleet is a confident wrong signal. Both clear by TIME as well as by
+  event -- nobody asking inside `UnservedToolchains::Window`, a machine's presence expiring -- so
+  `SchedulerTier` re-asks them on `SchedulerConditionInterval` as well as at `Start` and every
+  `SetRole`; answered only when a verb arrived, a leader nobody talks to would go on naming a machine
+  that left. `EveryFleetRowHasAnEvaluator` makes a `Scheduler`-scope row with no evaluator a BUILD
+  failure. The LEASE's toolchain label is display only, like a worker's, and reaches the row through
+  `ListDetail`, which escapes it: a label is never a reason to refuse a lease.
+- **And the leader says `clear` only once it has WATCHED.** What those rows read reaches the leader
+  alone and nothing another leader saw survives a failover, so a leadership younger than a row's
+  span (`FleetConditionRow::observation`: `UnservedToolchains::Window`, the heartbeat timeout)
+  answers `not-evaluated` -- undecided must not read as clear -- while a refusal it does see is
+  raised at once. Leading in a new TERM is a new leadership even with no demotion seen, since another
+  node may have led in between. The role change and every evaluation are ONE ordered decision
+  (`SchedulerTier::_roleMutex`): without it a watch pass that read `Leader` could write its stale
+  raise or clear over a demotion's `not-evaluated`, for up to an interval.
 
 ## Open work
 

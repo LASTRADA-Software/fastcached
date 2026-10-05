@@ -4,27 +4,33 @@
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
 #include "EndpointDialer.hpp"
+#include "HostEventInbox.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
-#include "NodeCredential.hpp"
+#include "NodeRefusal.hpp"
 #include "NodeReload.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeToolchains.hpp"
+#include "RefusedArguments.hpp"
 #include "SchedulerLink.hpp"
+#include "SchedulerReachability.hpp"
 #include "ScratchClaim.hpp"
 #include "WorkerLease.hpp"
 
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/HostEvents.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -32,6 +38,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -69,6 +76,30 @@ struct WorkerMachine
     std::filesystem::path scratchBase;                  ///< Where scratch roots are claimed.
 };
 
+/// The label a REGISTER for @p toolchain carries: its own, or none when a scheduler would
+/// refuse the whole registration over it (`Cc::ToolchainLabelWithheldBecause`).
+///
+/// The label is display only, so the worker registers without it rather than not at all --
+/// and says so once per toolchain at Warn, naming the compiler and why, because a fleet page
+/// showing no name for a compiler this node serves is otherwise a question nobody can answer.
+/// @param toolchain What this worker serves.
+/// @param logger Where the Warn goes.
+/// @return The label to send; empty when it is withheld.
+[[nodiscard]] std::string RegisteredToolchainLabel(ServedToolchain const& toolchain, ILogger& logger);
+
+/// How a worker that served and then gave up ends, when it did.
+///
+/// A survey that found nothing to compile with is `ToolchainSurvey`, a FAILURE: a compiler
+/// installed since is found by the next one.
+/// @param surveyFoundNothing Whether the survey found nothing to serve.
+/// @return The cause, or nullopt when the worker stopped cleanly.
+[[nodiscard]] constexpr std::optional<NodeRefusalCause> WorkerEnding(bool surveyFoundNothing) noexcept
+{
+    if (surveyFoundNothing)
+        return NodeRefusalCause::ToolchainSurvey;
+    return std::nullopt;
+}
+
 /// This machine's own worker seams: the real process runner, toolchain host, discovery
 /// and scratch claimant, claiming under `ScratchBaseDirectory()`.
 ///
@@ -86,7 +117,7 @@ using WorkerMachineFactory = std::function<WorkerMachine()>;
 struct WorkerTierParts
 {
     NodeConfig const& cfg;                     ///< The configuration the node started with.
-    NodeReloader const* reloader;              ///< The live configuration; null with no file.
+    NodeReloader const* reloader {};           ///< The live configuration; null with no file.
     Distributed::NodeCapacity const& capacity; ///< What `NodeCapacityOf` made of this machine.
     /// Where this node tells clients to reach it, right now.
     ///
@@ -102,29 +133,73 @@ struct WorkerTierParts
     /// address is learned by re-surveying, and only a worker re-surveys. The presence loop
     /// reads it and never writes.
     AnnouncedEndpoint& announced;
-    SocketActivation activation;                      ///< Whether a supervisor handed the port over.
+    /// Where a supervisor handed the node surface over; disengaged when the node binds its own. One
+    /// value for both questions it answers -- whether the socket was handed over, which the lease
+    /// check asks, and where this node's own scheduler answers, which the registration asks -- so
+    /// the two cannot disagree.
+    ActivatedNodeEndpoint activatedNodeEndpoint;
+    /// Where the heartbeat registers, re-read at every round (`AppliedSchedulers`): the process's one,
+    /// shared with the presence loop and told every applied state by the consensus tier.
+    ISchedulerEndpointSource const& schedulers;
     Distributed::IMembershipOracle const& membership; ///< Who may send a compile at all.
-    ILocalityOracle const& locality;                  ///< Who may cordon this worker.
-    NodeIoLoop& io;                                   ///< The reactor a compile's reply returns to.
-    IHostFactsSource const& host;                     ///< The hostname a registration labels.
-    CacheTier const* cacheTier;                       ///< Null on a node with no cache.
-    ICredentialSource const& credential;              ///< What the heartbeat presents.
+    /// Who may cordon this worker, and what each heartbeat reports it answers on: ONE set, the
+    /// one the ticket audience checks, so a dial hint never names an address this node refuses.
+    ILocalityOracle const& locality;
+    NodeIoLoop& io;                ///< The reactor a compile's reply returns to.
+    IHostFactsSource const& host;  ///< The hostname a registration labels.
+    CacheTier const* cacheTier {}; ///< Null on a node with no cache.
     /// How this machine proves WHICH machine it is to a scheduler (#178), or null where nothing
     /// proves -- a test whose scripted fleet serves no handshake. One instance per process,
     /// shared with the presence loop.
-    NodeProofClient const* prover;
+    NodeProofClient const* prover {};
     /// What a lease grant is verified against (#178), or null when this node verifies none --
     /// legal only where no other machine can reach it. Owned by `main`'s `NodeRoster`.
-    Distributed::ILeaseRoster const* leaseRoster;
+    Distributed::ILeaseRoster const* leaseRoster {};
+    /// Where the lease check this worker builds is recorded, for the reload guard
+    /// (`ReloadCheckWith`). Owned by `main`, across every body, beside the reloader that reads it.
+    LeaseCheckInForce& leaseCheck;
     IMetricsSink& metrics; ///< Where the worker counts.
     ILogger& logger;       ///< Where it reports.
     /// Where the worker's conditions are answered (#1364): whether its scratch root can be
     /// written into a debug-prefix-map rule. Evaluated where the root is claimed, beside the
     /// warning that says the same thing at startup.
     NodeConditions& conditions;
+    /// Where the host's suspend, resume and network events arrive. The tier listens for as long
+    /// as it exists.
+    IHostEvents& hostEvents;
+    /// Where a suspend's bounded wait for its withdrawal blocks and reads time.
+    IDrainWait& suspendWait;
+    /// How the heartbeat reaches a scheduler -- its rounds and a suspend's one withdrawal. Only
+    /// the heartbeat thread dials through it, never the thread a host event arrives on.
+    IEndpointDialer& schedulerDialer;
 };
 
 class WorkerTier;
+
+/// Wait out one heartbeat interval, handling a suspend on the way.
+///
+/// **A suspend is withdrawn and then waited PAST**: announcing right after withdrawing would
+/// re-register a machine that is about to sleep. So the withdrawal runs, the suspend waiting on it
+/// is let go (`HostEventInbox::Settle`), and the wait goes on -- unless something else is pending
+/// beside it, a resume or a network change, which ends the wait so the round runs. Any other wake
+/// ends it too. Runs on the heartbeat's thread, which is what makes every dial the withdrawal makes
+/// one the delivering thread never makes.
+///
+/// A free function over the two objects rather than a `WorkerTier` member, because the heartbeat
+/// loop is reached by no test and this is the rule a suspend depends on.
+/// @param stop Ends the wait, and the heartbeat.
+/// @param capacity Whose wait is woken by a cordon and by a host event.
+/// @param inbox Where host events wait for this thread.
+/// @param announcedCordon The cordon the round that just ran carried.
+/// @param interval How long to wait when nothing happens.
+/// @param withdrawForSuspend Retires every registration and tells the scheduler.
+/// @return What ended the wait; `Stopped` ends the heartbeat.
+[[nodiscard]] HeartbeatWake AwaitNextRound(std::stop_token const& stop,
+                                           CompileCapacity& capacity,
+                                           HostEventInbox& inbox,
+                                           bool announcedCordon,
+                                           std::chrono::milliseconds interval,
+                                           std::function<void()> const& withdrawForSuspend);
 
 /// The heartbeat thread of a started worker, which stops and joins when destroyed.
 ///
@@ -144,6 +219,22 @@ class WorkerHeartbeat
   private:
     std::jthread _thread;
 };
+
+/// Adopt a reloaded compile-argument allowlist, and say so when it changed.
+///
+/// Out here rather than private to the heartbeat, so the one decision a reload makes about
+/// refused arguments is one a test can reach with the objects the tier holds.
+/// @param jobs The runner the set is applied to.
+/// @param refused What this worker has refused; re-judged against the set now in force when the
+///        set changes, because a changed allowlist is the operator acting on exactly that report.
+/// @param logger Where the change is announced, at Warn.
+/// @param inForce The set applied now; replaced when the candidate differs.
+/// @param candidate The set the live configuration names.
+void AdoptAllowlist(Cc::CompileJobRunner& jobs,
+                    RefusedArgumentsReport& refused,
+                    ILogger& logger,
+                    std::vector<std::string>& inForce,
+                    std::vector<std::string> const& candidate);
 
 /// The node's worker: survey, scratch root, job runner, lease check, slot cap, compile
 /// responder and heartbeat, owned as one thing (#1387).
@@ -166,16 +257,16 @@ class WorkerTier
     /// answered on the node's one `0xFC` listener through `Responder()`.
     ///
     /// **A worker always has a scheduler link, and that is enforced here rather than
-    /// assumed.** The startup table refuses a worker with no `--scheduler`; a
-    /// configuration that reached this anyway is a defect in that table, and it is
-    /// refused by name rather than left to start a worker that never registers.
+    /// assumed.** It is aimed where the formation record says this node registers
+    /// (`SchedulersOf`), never at `--scheduler`; a record that names nowhere is refused by
+    /// name rather than left to start a worker that never registers.
     ///
     /// **Nothing of the machine is built for a node running no worker**, the scratch base
     /// included: @p makeMachine is called only once a worker is decided.
     /// @param parts What the node lends the tier.
     /// @param makeMachine Builds the machine's seams; not called when no worker runs.
     /// @return The tier; null when `RunsWorker` is false; or why the node must not start.
-    [[nodiscard]] static std::expected<std::unique_ptr<WorkerTier>, std::string> Start(
+    [[nodiscard]] static std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> Start(
         WorkerTierParts const& parts, WorkerMachineFactory const& makeMachine);
 
     ~WorkerTier() = default;
@@ -193,8 +284,18 @@ class WorkerTier
     /// NODE-ANNOUNCE from the presence loop, which runs on every node (#1440). This tier
     /// hands over none, so it reads none.
     /// @param statusClock The clock `node-status` differences a registration against.
+    /// @param reachability How loudly a scheduler that does not answer, or refuses, is said: the
+    ///        process's one, shared with the presence loop. Must outlive the returned heartbeat.
     /// @return The running heartbeat.
-    [[nodiscard]] WorkerHeartbeat Launch(core::platform::IClock const& statusClock);
+    [[nodiscard]] WorkerHeartbeat Launch(core::platform::IClock const& statusClock, SchedulerReachability& reachability);
+
+    /// @return Where this worker's next round registers, in the order it tries them, as the
+    ///         heartbeat last read them (`ISchedulerEndpointSource`). Read it before `Launch`: a round
+    ///         re-reads it on the heartbeat's own thread.
+    [[nodiscard]] std::vector<std::string> const& RegistersWith() const noexcept
+    {
+        return _link.Configured();
+    }
 
     /// @return What answers the compile family on this node's `0xFC` listener.
     [[nodiscard]] CompileResponder& Responder() noexcept
@@ -252,15 +353,28 @@ class WorkerTier
         return _jobs.CompilerFor(fingerprint);
     }
 
+    /// One registrar per served toolchain, carrying this machine's capacity record and
+    /// the endpoint in force when it is called.
+    ///
+    /// A pure query -- it reads `_toolchains`' entries and `_announced`'s current value and
+    /// builds a `Cc::WorkerRegistrar` per one, whose own constructor only stores what it is
+    /// given -- so it is public rather than reached through a test-only seam: calling it
+    /// does not register, heartbeat or withdraw anything, and a case can ask it directly
+    /// for what a real round would build without spinning the heartbeat thread that is
+    /// `Serve`'s and `AnnounceAs`'s only production caller.
+    /// @param served What this worker currently serves, fingerprint to toolchain.
+    /// @return One registrar per entry of @p served.
+    [[nodiscard]] std::vector<Cc::WorkerRegistrar> RegistrarsFor(std::map<std::string, ServedToolchain> const& served);
+
     /// Stop admitting compiles, and wait for the ones admitted to finish.
     void StopAndDrain();
 
-    /// Whether the worker ended in a way a supervisor must read as a failure: a survey
-    /// that found nothing to serve, or a fleet that is not the one `--cluster-id` names.
-    /// @return True when the process should exit non-zero.
-    [[nodiscard]] bool EndedInRefusal() const noexcept
+    /// How the worker ended, when a supervisor must not read it as a clean stop
+    /// (`WorkerEnding`).
+    /// @return The cause the process ends with, or nullopt for a clean stop.
+    [[nodiscard]] std::optional<NodeRefusalCause> Ending() const noexcept
     {
-        return _surveyFoundNothing || _fleetAssertionFailed;
+        return WorkerEnding(_surveyFoundNothing);
     }
 
   private:
@@ -274,11 +388,9 @@ class WorkerTier
                std::uint32_t slots);
 
     /// The heartbeat thread's body: the first survey, then a round per interval.
-    void Heartbeat(std::stop_token const& stop, core::platform::IClock const& statusClock);
-
-    /// One registrar per served toolchain, carrying this machine's capacity record and
-    /// the endpoint in force when it is called.
-    [[nodiscard]] std::vector<Cc::WorkerRegistrar> RegistrarsFor(std::map<std::string, ServedToolchain> const& served);
+    void Heartbeat(std::stop_token const& stop,
+                   core::platform::IClock const& statusClock,
+                   SchedulerReachability& reachability);
 
     /// Make @p served what the compile port and the registrations answer, in that order.
     void Serve(std::map<std::string, ServedToolchain> served);
@@ -297,12 +409,17 @@ class WorkerTier
     /// fleet holds another. That is the property a second reader of the configuration
     /// could not have.
     /// @param endpoint The new endpoint; non-empty, per `AdvertisedEndpointChange`.
-    void AnnounceAs(std::string endpoint);
+    /// @param statusClock What `node-status` stamps against, for the registrations this retires.
+    void AnnounceAs(std::string endpoint, core::platform::IClock const& statusClock);
+
+    /// Retire every registration and tell the scheduler, before the machine sleeps.
+    /// @param round What to withdraw and where to log.
+    /// @param statusClock What `node-status` stamps against.
+    void WithdrawForSuspend(HeartbeatRound const& round, core::platform::IClock const& statusClock);
 
     NodeConfig const& _cfg;
     NodeReloader const* _reloader;
     CacheTier const* _cacheTier;
-    ICredentialSource const& _credential;
 
     /// How this machine proves itself, or null where nothing proves. Borrowed, and it outlives
     /// this tier: `main` declares it above the tier and destroys it after.
@@ -313,6 +430,9 @@ class WorkerTier
     /// check both read. Borrowed from `main`, which declares it above this tier and destroys
     /// it after -- `_prover`'s arrangement, for `_prover`'s reason.
     AnnouncedEndpoint& _announced;
+    /// What each heartbeat reports this machine answers on: the locality oracle's own set
+    /// (`HeartbeatRound::locality`). Borrowed from `main`, which declares it above this tier.
+    ILocalityOracle const& _locality;
     WorkerMachine _machine;
     core::platform::SteadyClock _toolchainClock;
     DiscoveredToolchains _discovered;
@@ -321,6 +441,9 @@ class WorkerTier
     Cc::CompileJobRunner _jobs;
     std::vector<std::string> _appliedExtraArgs;
     std::unique_ptr<Distributed::WorkerLeaseState> _leaseState;
+    /// Which arguments this worker refused, said as a condition and once per argument in the
+    /// log. Declared before `_protocol`, which borrows it, so member order keeps it alive.
+    RefusedArgumentsReport _refusedArguments;
     Cc::WorkerProtocol _protocol;
     std::uint32_t _slots;
     core::async::ThreadPoolExecutor _pool;
@@ -328,13 +451,16 @@ class WorkerTier
     CompileResponder _responder;
     NodeRuntimeState _runtime;
     CompileCacheWire::CapacityFields _advertisedWire;
-    Cc::CredentialNotice _registrarNotice;
     std::vector<Cc::WorkerRegistrar> _registrars;
     std::vector<Cc::WorkerRegistrar> _withdrawals;
-    BlockingEndpointDialer _dialer;
+    IEndpointDialer& _dialer;
     SchedulerLink _link;
     std::atomic<bool> _surveyFoundNothing { false };
-    std::atomic<bool> _fleetAssertionFailed { false };
+    std::atomic<bool> _addressCapNoticed { false };
+    /// Host events for the heartbeat thread. After `_capacity`, whose wake it calls.
+    HostEventInbox _hostInbox;
+    /// Listening, from construction to destruction. After `_hostInbox`, so it goes first.
+    HostEventSubscription _hostSubscription;
 };
 
 } // namespace FastCache::Node

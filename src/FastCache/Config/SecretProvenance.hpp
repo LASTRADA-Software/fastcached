@@ -91,6 +91,27 @@ struct SecretProvenanceFacts
 /// @return One sentence per exposed file, in @p files order; empty when none is.
 [[nodiscard]] std::vector<std::string> SecretFileWarnings(std::span<std::filesystem::path const> files);
 
+/// How an exposure of one file is told to an operator, and what to run about it.
+///
+/// A column rather than one function for every file, because the remedy depends on who is
+/// meant to read the file: `SecretExposureHint` restricts it to the administrators and the
+/// machine's services -- right for a configuration a service reads -- and
+/// `OwnerOnlySecretExposureHint` to its owner, which is the only right answer for a secret the
+/// process minted for itself. Handed the wrong one, an operator who follows it exactly can lock
+/// the process out of its own key.
+using SecretExposureHintFor = std::string (*)(std::filesystem::path const& path, SecretExposure exposure);
+
+/// A file a secret lives in, and how its exposure is told.
+struct SecretFileSubject
+{
+    std::filesystem::path path;                         ///< The file, as the caller names it.
+    SecretExposureHintFor hint { &SecretExposureHint }; ///< How an exposure of it is told.
+};
+
+/// @copydoc SecretFileWarnings(std::span<std::filesystem::path const>)
+/// Each file's sentence is its own subject's `hint`.
+[[nodiscard]] std::vector<std::string> SecretFileWarnings(std::span<SecretFileSubject const> files);
+
 /// One file found unfit to hold a secret.
 struct SecretFileFinding
 {
@@ -99,6 +120,9 @@ struct SecretFileFinding
 
     /// Why it is unfit. Never `None` -- a fit file produces no finding at all.
     SecretExposure exposure { SecretExposure::None };
+
+    /// How it is told to an operator: the subject's own `hint`.
+    SecretExposureHintFor hint { &SecretExposureHint };
 };
 
 /// Which of @p files are unfit to hold a secret, and why.
@@ -118,6 +142,10 @@ struct SecretFileFinding
 /// @param files The files this process holds secrets in, in the order to report.
 /// @return One finding per exposed file, in @p files order; empty when none is.
 [[nodiscard]] std::vector<SecretFileFinding> SecretFileExposures(std::span<std::filesystem::path const> files);
+
+/// @copydoc SecretFileExposures(std::span<std::filesystem::path const>)
+/// Each finding carries its subject's `hint`.
+[[nodiscard]] std::vector<SecretFileFinding> SecretFileExposures(std::span<SecretFileSubject const> files);
 
 /// One path-valued flag whose file holds a secret.
 ///
@@ -142,8 +170,9 @@ struct SecretFileFinding
 template <typename ConfigT, typename PathT = std::filesystem::path>
 struct SecretFileRow
 {
-    std::string_view flag;                ///< The `--flag` spelling, and the key the coverage guard joins on.
-    PathT (*path)(ConfigT const& config); ///< The file this configuration's secret lives in, or empty.
+    std::string_view flag;                            ///< The `--flag` spelling, and the key the coverage guard joins on.
+    PathT (*path)(ConfigT const& config);             ///< The file this configuration's secret lives in, or empty.
+    SecretExposureHintFor hint = &SecretExposureHint; ///< How an exposure of that file is told: who reads it.
 };
 
 /// One path-valued flag whose file is deliberately NOT a secret.
@@ -226,5 +255,11 @@ struct PublicPathFlag
 ///         out. The shape is the worker's `NodeSecretFiles`, so a reader meets one
 ///         answer twice.
 [[nodiscard]] std::vector<std::filesystem::path> DaemonSecretFiles(Config const& cfg, bool secretNamedOnCommandLine);
+
+/// `DaemonSecretFiles`, each file with the hint its row names: what a warning renders.
+/// @param cfg The merged configuration in force.
+/// @param secretNamedOnCommandLine Whether argv supplied `--requirepass`.
+/// @return The subjects, in `DaemonSecretFiles`' order.
+[[nodiscard]] std::vector<SecretFileSubject> DaemonSecretFileSubjects(Config const& cfg, bool secretNamedOnCommandLine);
 
 } // namespace FastCache

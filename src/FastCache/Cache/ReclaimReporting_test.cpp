@@ -63,6 +63,29 @@ class AlwaysListening final: public IStorageMutationObserver
     return std::vector<std::byte>(bytes);
 }
 
+/// Page size of a disk tier whose budget holds ONE entry: the smallest the store accepts.
+constexpr std::size_t OneEntryPageSize = 512;
+
+/// A value past the inline limit and inside one overflow page, so an entry costs exactly
+/// one page of footprint and evicting it frees that page.
+constexpr std::size_t OneEntryValueLen = 300;
+
+/// A disk tier at `path` whose budget holds one entry and not two.
+///
+/// The budget is the store's page footprint: two meta slots and the leaf holding the
+/// format marker, plus one entry's overflow page. A second entry's page is over it.
+/// @param path Where the store lives.
+/// @return The options.
+[[nodiscard]] CowTreeStorage::Options OneEntryBudget(std::filesystem::path const& path)
+{
+    CowTreeStorage::Options opts;
+    opts.path = path;
+    opts.pageSize = OneEntryPageSize;
+    opts.maxBytes = 4 * OneEntryPageSize;
+    opts.compression = CompressionCodec::Identity;
+    return opts;
+}
+
 /// A verb that loads a record before it writes, and the name a failure reports.
 struct ReclaimingVerb
 {
@@ -305,9 +328,7 @@ TEST_CASE("The disk tier does not report evicting what a flush already voided", 
 {
     FastCache::Testing::ScratchDirectory const dir { "reclaim-cow-flush-evict" };
 
-    CowTreeStorage::Options opts;
-    opts.path = dir / "tier.cow";
-    opts.maxBytes = 100;
+    auto const opts = OneEntryBudget(dir / "tier.cow");
     auto tier = CowTreeStorage::Open(opts);
     REQUIRE(tier.has_value());
 
@@ -315,9 +336,9 @@ TEST_CASE("The disk tier does not report evicting what a flush already voided", 
     ReclaimLog log { &obs };
     (*tier)->SetReclaimLog(&log);
 
-    REQUIRE((*tier)->Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE((*tier)->Set("a", Value(OneEntryValueLen), 0, core::platform::SteadyTimePoint::max()).has_value());
     (*tier)->FlushWithGeneration(core::platform::SteadyTimePoint {});
-    REQUIRE((*tier)->Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE((*tier)->Set("b", Value(OneEntryValueLen), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     REQUIRE((*tier)->Snapshot().evictions > 0);
     REQUIRE(DrainNames(log).empty());
@@ -331,9 +352,7 @@ TEST_CASE("A LayeredStorage does not report an L2 eviction either", "[cache][rec
     // L2's recency stale enough to evict it.
     FastCache::Testing::ScratchDirectory const dir { "reclaim-layered-l2-evict" };
 
-    CowTreeStorage::Options opts;
-    opts.path = dir / "tier.cow";
-    opts.maxBytes = 100;
+    auto const opts = OneEntryBudget(dir / "tier.cow");
     auto l2 = CowTreeStorage::Open(opts);
     REQUIRE(l2.has_value());
 
@@ -343,8 +362,8 @@ TEST_CASE("A LayeredStorage does not report an L2 eviction either", "[cache][rec
     LayeredStorage layered { std::make_unique<InMemoryLruStorage>(0), std::move(*l2) };
     layered.SetReclaimLog(&log);
 
-    REQUIRE(layered.Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
-    REQUIRE(layered.Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE(layered.Set("a", Value(OneEntryValueLen), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE(layered.Set("b", Value(OneEntryValueLen), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     REQUIRE(layered.L2().Snapshot().evictions > 0);
     REQUIRE(DrainNames(log).empty());
@@ -382,9 +401,7 @@ TEST_CASE("The disk tier reports what it evicted to stay under its budget", "[ca
 {
     FastCache::Testing::ScratchDirectory const dir { "reclaim-cow-evict" };
 
-    CowTreeStorage::Options opts;
-    opts.path = dir / "tier.cow";
-    opts.maxBytes = 100;
+    auto const opts = OneEntryBudget(dir / "tier.cow");
     auto tier = CowTreeStorage::Open(opts);
     REQUIRE(tier.has_value());
 
@@ -392,10 +409,10 @@ TEST_CASE("The disk tier reports what it evicted to stay under its budget", "[ca
     ReclaimLog log { &obs };
     (*tier)->SetReclaimLog(&log);
 
-    REQUIRE((*tier)->Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE((*tier)->Set("a", Value(OneEntryValueLen), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE(DrainNames(log).empty());
 
-    REQUIRE((*tier)->Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE((*tier)->Set("b", Value(OneEntryValueLen), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE(DrainNames(log) == std::vector<std::string> { "evict:a" });
 }
 

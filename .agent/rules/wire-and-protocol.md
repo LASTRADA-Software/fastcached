@@ -31,6 +31,26 @@ Every rule below has already been a bug.
   is deliberately **no handshake**, because the launcher opens a fresh connection
   per *operation* and a HELLO would cost 2–4 round trips per translation unit on
   the exact path this list already records regressions on.
+- **On a SEALED connection, a refusal decided from a header whose tag has not been
+  read is a sealed reply and then a CLOSE, never a resynchronization** -- the one
+  exception to the rule above, and it is not a relaxation of it. That rule's premise
+  is that a declared length leaves both ends agreeing where the next frame starts.
+  On a sealed stream the tag FOLLOWS the payload, so a header refused before its
+  frame is gathered (`SealFault::OverBudget`: the in-flight budget has no room for
+  it) carries a length nobody verified. Stepping over that many bytes would let
+  whoever wrote the header -- an on-path writer holding no session key -- choose
+  the next frame boundary and so the sequence position every later tag is checked
+  at, which is exactly what the seal exists to deny ("a proof is worth nothing
+  unless every frame after it is SEALED"). So `AnswerSealedOverBudget`
+  (`FrameEndpoint.cpp`) writes the verb owner's `EndpointRefusalReply(InFlightBudget)`
+  -- the budget owner's when nothing owns the verb, since the verb is as unverified as
+  the length -- sealed, and the connection ends: an honest peer still reads *busy* as an unsealed
+  one does, for the price of one re-proof. Its case is *"A sealed frame the in-flight
+  budget has no room for is answered busy and never held"*. **Do not "fix" this
+  close into a resync to match the rule above**: that turns a refusal into a
+  frame-boundary oracle for an attacker. Every other seal fault (a bad tag, a
+  replay, an oversized or unframed header) closes UNANSWERED, because there the
+  frame is not known to be the peer's at all.
 - **A reply is one frame per request, and `Status::Progress` is the first of two exceptions --
   bounded to exactly one verb, carrying nothing, and paid for with a version step.** The
   second is `Status::Push`, below, bounded the same way.
@@ -537,6 +557,20 @@ Every rule below has already been a bug.
     pre-auth verb cannot reopen the hole by omission rather than by decision. The
     refusal names the verb whose ceiling it hit, because "exceeds cap 268435456" tells
     an operator nothing about a 4 KiB limit.
+  - **A REPLY is read from a stranger too, so it has the mirror column.** A client that
+    dials a seed a DNS answer named -- or anything answering at that address -- reads from
+    a peer that proved nothing, and a reply header declares its length in a `u32`: sized
+    by it before a byte arrives, five bytes committed 512 MiB in a fleet probe (measured,
+    16 -> 526 MiB peak working set), and 200000 `Progress` pulses on a verb that never
+    pulses were waited through. So every `OpTable` row states `maxReply` (`ReplyCap`, whose
+    default constructor is deleted as `PayloadCap`'s is), `PreAuthRepliesAreBounded()` and
+    `BoundedRepliesHoldARefusal()` are `static_assert`ed, and `Cc`'s ONE reply reader asks
+    the verb it SENT -- read off its own frame -- before it allocates: a status the verb's
+    EXISTING `legalStatuses` column does not admit, and a declared length over `maxReply`,
+    end the exchange as a transport failure. `ReplyCarriesArtefact` is for FETCH and COMPILE
+    alone. And a probe of a stranger is bounded by ONE deadline over connect and exchange on
+    the injected clock (`Transport/TotalDeadlineSocket`, every read re-armed to the time
+    left) -- never by the per-call `SO_RCVTIMEO` a dribbling peer outlasts one byte at a time.
   - **Adding a verb must not break the fleet that does not have it, and that is a
     property of the CLIENT.** `Op::Auth` deliberately did not bump `CurrentVersion` —
     the framing exists so a receiver steps over a verb it does not know — so a daemon
@@ -601,6 +635,9 @@ Every rule below has already been a bug.
     is that the symptom names the wrong subject.
   - **A `RelocatedVerbs` row**, saying which code and which sentence. `DispatchNotPermitted`
     for a verb another binary serves; `NoCluster` only for one asking about replicated state.
+    A refusal DERIVED from data that already names the verb is that row's equivalent, not a
+    special case: `CacheProxy` refuses a verb another cache tier's `CacheTierProfile` serves as
+    `DispatchNotPermitted`, computed from the profiles, because a row per verb would restate them.
     Admission is a property of the PROCESS being asked, so a client told `NoCluster` goes
     looking for consensus it does not need. The generic walk only asserts the refusal is not
     `UnknownOpcode`, so the case that asserts WHICH refusal is a second one.
@@ -667,6 +704,28 @@ Every rule below has already been a bug.
   because both ends name the constant. A reviewer read the raw-enumerator assertion as
   the weak one and it was the only one that could fail; the instinct that a literal is
   a code smell is usually right and was exactly wrong here.
+
+  **Its mirror: a RETIRED value keeps its number, and the number is never given to
+  anything else.** A peer built before the retirement still maps the byte to its old
+  name, so a new meaning under it is reported by that peer as the old one -- the single
+  worst way for a value to be wrong. Each retired set is a table beside its live one,
+  checked against it at compile time (`NoRetiredErrorCodeIsReused` and its siblings),
+  never a comment:
+
+  <!-- table-total: none -->
+  | Space | Retired | Was | Table |
+  |---|---|---|---|
+  | `ErrorCode` | `0x06`, `0x24` | canonicalization-failed (#59, #69); enrollment-already-collected (#178) | `RetiredErrorCodes` |
+  | `Op` | `0x16`, `0x17` | `CLUSTER-ADMIT-CLIENT`, `CLUSTER-FORGET-CLIENT` (#1309) | `RetiredOpcodes` |
+  | `EnrollmentDecision` | `0x03` | `Collected`, the key hand-over #178 retired with the secret | `RetiredEnrollmentDecisions` |
+  | `WireMembershipRoute` | `0x01`, `0x02`, `0x04` | the address routes: a listed host, the cluster's member hosts, a forgotten host | `RetiredWireMembershipRoutes` |
+  | `Cluster::CommandKind` | `3`, `4` | `AdmitClient`, `ForgetClient`, refused by name when replayed (`RetiredVerbRefusal`) | the `Retired*` enumerators |
+  | `MembershipParticipant` | `0` | reserved rather than retired: a zero route bit is no route | `MembershipParticipant::Reserved` |
+
+  A retired OPCODE is an unknown one to every surface -- `FindOp` answers nullptr and it is
+  refused `UnknownOpcode` -- while a retired `CommandKind` in a node's OWN log refuses the
+  start by name (#1542's `CanRead`), because a log is a record this node must be able to
+  replay and a frame is not.
 
   **And the test for it is a behavioural one, not "the code changed".** Asserting the
   enumerator passes the moment somebody edits a constant. What regresses the defect is
@@ -899,6 +958,17 @@ Every rule below has already been a bug.
     from one only it holds, so sharing is asked for per socket
     (`PortSharing`) rather than being every UDP socket's default. See
     `.agent/rules/consensus-and-cluster.md`.
+  - **A port a node binds itself is bound AGAIN by every serving body, never kept and
+    duplicated across bodies -- because on Windows the duplicate cannot be served.** A
+    completion-port association belongs to the SOCKET, not to the handle, and every
+    body has its own reactor: once one body's duplicate was associated with its IOCP,
+    associating a new duplicate with the next body's IOCP is refused
+    (`CreateIoCompletionPort` error 87), measured on Windows 11 build 26200. The rebind
+    it costs is safe there, measured the same day: an exclusive rebind at once succeeds
+    after a server-first close, a client-first close, and with an accepted connection
+    still open. `FrameEndpoint_test`'s reform case holds the last two shapes; the
+    duplicate stays a POSIX socket-activation device (`Node::ActivationHold`), and
+    must never be extended to Windows.
 
 - **A platform socket error is classified in one place.** `Detail::TranslateError`
   in `BlockingSocket.cpp` mapped ten conditions onto `NetErrorCode`;
@@ -1079,29 +1149,62 @@ Every rule below has already been a bug.
     silently wrong on the other. It was open-coded at three sites in two subsystems;
     it is `Net::IsDeadlineExpiry` now, beside the enum, which is a dependency-free
     leaf and so costs nothing at the `net-boundary` line.
-    **`FrameEndpoint`'s accept loop tests `WouldBlock` ALONE and is right to** — that
-    listener arms no poll timeout, so `Timeout` cannot arrive there and the second
-    operand would be dead. A narrower test with a stated reason is not the same
-    finding as a narrower test by omission, and reading the first as the second is
-    the easy mistake here, because the grep looks identical. It was reported as a
-    defect by two reviewers and repeated once before anybody opened the file, so the
-    reason is now recorded AT the site as well as beside the predicate.
-    **The reason is REACHABILITY, and calling it semantic is a defect that was
-    written into this file and then had to be taken out again.** "On an accept,
-    `WouldBlock` is not a deadline expiring" sounds better — it survives a rewiring
-    where a reachability claim does not — and it is FALSE. The predicate's other two
-    callers are accept loops whose listeners *do* arm a poll timeout, and there
-    `WouldBlock` (POSIX) and `Timeout` (Winsock) are one event under two names: *the
-    poll ticked, re-check the stop flag, accept again*. Believe the semantic version
-    and the invited edit is to drop `WouldBlock` from `IsDeadlineExpiry` — which
-    makes `AdminHttpServer::Run` and `RaftPeerServer::Run` treat every POSIX poll
-    tick as a fatal accept error and `co_return`, so both surfaces stop accepting
-    about a quarter of a second after they start, with one `Debug` line as the only
-    symptom. **A reason that generalises further than the fact it was drawn from is
-    worse than the narrow one**, because it reads as licence somewhere it was never
-    measured. The maintenance cost of the true reason is real and is the price: give
-    that listener a poll timeout and the site must move to `IsDeadlineExpiry` in the
-    same change.
+    **No accept loop spells either code any more**: core-cpp's `core::net::AcceptErrorTable`
+    (`<core/net/AcceptPolicy.hpp>`, graduated from this tree at core-cpp 0.6.0) classifies
+    every `core::net::NetErrorCode` for all five loops, and
+    both poll codes are `PollTick` there -- *the poll ticked, re-check the stop flag, accept
+    again*. The history is kept because it is the trap the table closes. `FrameEndpoint`
+    once tested `WouldBlock` ALONE, correctly, for a REACHABILITY reason (that listener arms
+    no poll timeout); calling the reason semantic -- "on an accept, `WouldBlock` is not a
+    deadline expiring" -- was FALSE, and invited dropping `WouldBlock` from
+    `IsDeadlineExpiry`, which would have made `AdminHttpServer::Run` and
+    `RaftPeerServer::Run` treat every POSIX poll tick as fatal and stop accepting a quarter
+    of a second after they started. **A reason that generalises further than the fact it
+    was drawn from is worse than the narrow one.** A row in one table has no such reason to
+    get wrong.
+  - **A failed accept is almost never a failed LISTENER, so only a closed or vanished one
+    ends an accept loop** -- `Cancelled` (`Closed`) and `BadHandle` (`Dead`), the only two
+    dispositions that end one; a `Dead` listener is CLOSED by the loop, so its port refuses
+    rather than queues.
+    Every loop in the tree used to end on any code but the poll tick, at `Debug`, with the
+    listening socket left open: the backlog then fills and the kernel refuses every later
+    connect, for as long as the process runs. On Windows an `AcceptEx` completes with
+    `WSAECONNRESET` when a client resets its QUEUED connection -- a launcher killed
+    mid-exchange, or one whose 1 s budget ran out under load -- and that one event stopped
+    the installed node's 0xFC surface for nine hours while `/healthz` answered `200`.
+    Reproduced on a scratch node by flooding it with client resets: dark after 149
+    connections, `accept loop ended (connection reset (AcceptEx) [errno 10054])`.
+    - A failed CONNECTION is accepted past with a rate-limited `Warn`; an EXHAUSTION
+      (`ResourceExhausted`: `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` and their Winsock twins,
+      rows of `NativeListen`'s `SocketErrors` for the blocking listeners) waits a bounded
+      backoff first, on the loop's own timer (`WaitOutBackoff`: the reactor's, or the
+      injected blocking wait for a loop that owns its thread). A failure NOTHING classifies
+      (`SystemError`) is backed off on too, and a run of `UnclassifiedBeforeDegraded` of them
+      reports the loop DEGRADED -- in the registry until an accept succeeds or the loop
+      stops; and every `FailuresBeforeYield`
+      failed connections in a row the loop YIELDS for `FirstBackoff`, because a listener
+      whose accept fails without suspending would otherwise never yield its reactor. The
+      hang that found this was a FIXTURE answering `Eof` to end a loop.
+    - **A yield, never a backoff that grows, for failed CONNECTIONS**: each one consumed a
+      queued connection, so the loop is DRAINING a backlog, and slowing it is what keeps a
+      port refusing. Measured: the first cut doubled to a second per failure, and after a
+      15 s flood of resets the raft port refused connects until its backlog of dead
+      connections had drained at one a second. Backing off is for EXHAUSTION alone.
+    - A loop that ends while its surface is NOT shutting down says so at `Error` and in the
+      process's `core::net::AcceptLoopHealth`, which `/healthz` (`503` naming the surface) and
+      the node's `surface-not-accepting` condition both read; a DEGRADED loop is reported
+      there too, `503` naming it degraded and the LIVE `surface-accept-degraded` row. Every
+      loop carries the verdicts out through ONE `Transport/AcceptLoopReporter`, so the five
+      agree on the level and the record. **A listening port is not a
+      serving one**, and a liveness probe that asks nothing is the confident wrong signal.
+      The ADMIN loop is the one `/healthz` cannot report, since the thread that would answer
+      `503` is the one that ended -- a probe times out instead, measured -- so on the node its
+      end is carried by that condition row (NODE-STATUS (`fastcache-cli node`) and the fleet page, both over
+      other surfaces), and the daemon has only the `Error` line.
+    - A fixture that ends a loop by answering some error is now a fixture that SPINS: it
+      must answer `Cancelled`, the way a closed listener does. core-cpp's
+      `core::net::testing::FailingListener` is the shared fake for the opposite -- failures a
+      loop must survive.
   - **The reported shape cannot be asserted on, and its deterministic twin can.**
     *Connect, wait, then ask* is a RACE to observe: an unfixed server answers and
     closes at the deadline, the client's late write then draws an RST, and the RST

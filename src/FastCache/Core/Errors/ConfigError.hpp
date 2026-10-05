@@ -13,7 +13,7 @@ namespace FastCache
 enum class ConfigErrorCode : std::uint8_t
 {
     Ok = 0,            ///< Sentinel.
-    FileNotFound,      ///< A named configuration file does not exist or cannot be read.
+    FileNotFound,      ///< A named configuration file does not exist.
     ParseError,        ///< YAML/CLI input is syntactically invalid.
     UnknownKey,        ///< YAML contains a key we do not recognise.
     TypeMismatch,      ///< Field present but wrong type (e.g., string where int expected).
@@ -22,6 +22,7 @@ enum class ConfigErrorCode : std::uint8_t
     ImmutableChanged,  ///< Reload attempted to change a field that is fixed at startup.
     UndefinedVariable, ///< Value references an environment variable that is not set.
     WriteFailed,       ///< Configuration could not be written to its destination.
+    FileUnreadable,    ///< A named configuration file is there, and could not be read.
 };
 
 [[nodiscard]] constexpr std::string_view ToStringView(ConfigErrorCode code) noexcept
@@ -48,6 +49,8 @@ enum class ConfigErrorCode : std::uint8_t
             return "UndefinedVariable";
         case ConfigErrorCode::WriteFailed:
             return "WriteFailed";
+        case ConfigErrorCode::FileUnreadable:
+            return "FileUnreadable";
     }
     return "Unknown";
 }

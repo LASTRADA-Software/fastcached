@@ -170,9 +170,10 @@ function(fastcached_stage_and_run name fakes subject exemptionRow mode outOutput
         if(NOT GIT_EXECUTABLE)
             message(FATAL_ERROR "case `${name}`: git mode needs git, and none was found")
         endif()
-        execute_process(COMMAND "${GIT_EXECUTABLE}" init -q "${tree}"
+        fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
+        execute_process(COMMAND ${scratchGit} init -q "${tree}"
                         RESULT_VARIABLE initStatus OUTPUT_QUIET ERROR_QUIET)
-        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${tree}" add -A
+        execute_process(COMMAND ${scratchGit} -C "${tree}" add -A
                         RESULT_VARIABLE addStatus OUTPUT_QUIET ERROR_QUIET)
         if(NOT initStatus EQUAL 0 OR NOT addStatus EQUAL 0)
             message(FATAL_ERROR

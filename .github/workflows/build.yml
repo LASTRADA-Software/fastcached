@@ -2147,6 +2147,10 @@ jobs:
         if: ${{ needs.changes.outputs.code != 'false' }}
         env:
           FASTCACHED_EXPECT_SHA256_ENGINE: ${{ matrix.sha256Engine }}
+          # This runner is elevated, so the FileTrust ACL cases that set a directory's owner to
+          # Administrators must RUN, not skip. Set, they fail closed: a runner that turns out not
+          # to be elevated turns this red rather than retiring the guard silently.
+          FASTCACHED_EXPECT_ELEVATED: '1'
         run: ctest --preset ${{ matrix.preset }} --output-log out/build/${{ matrix.preset }}/ctest-output.log
 
       # The other half of the bracket, and it only runs on a red.
@@ -2695,20 +2699,18 @@ jobs:
           id fastcache-node >/dev/null \
             || { echo "::error::the fastcache-node service account was not created"; exit 1; }
 
-          # A scheduler that is not there. The worker must still start, warn and
-          # keep retrying -- a fleet where the scheduler restarts must not turn
-          # into a fleet of dead workers.
+          # No scheduler: a node that serves is refused one, and serves the fleet its
+          # formation record names -- its own, on this first start.
           # Written as YAML into the file the unit's ExecStart names, which is the
           # ONLY way to configure this worker since #291 -- an env file of
           # command-line arguments and a config file are two mechanisms that can
           # disagree about one setting, and nobody had written down which won.
           #
-          # `cluster_dir` since #178 PR 6: a worker proves an identity key kept there
-          # on every connection to its scheduler, and naming a scheduler without one is
-          # refused at startup. /var/lib/fastcache-node is the StateDirectory= the unit
+          # `cluster_dir` since #178 PR 6: a node keeps its identity key and its
+          # formation record there. /var/lib/fastcache-node is the StateDirectory= the unit
           # creates for it -- the one writable place under ProtectSystem=strict that
           # survives a restart, so this step also pins that the unit provides it.
-          printf 'scheduler: 127.0.0.1:6675\nadvertise: 127.0.0.1:6676\ncluster_dir: /var/lib/fastcache-node\ntoolchain:\n  - /usr/bin/g++\n' \
+          printf 'advertise: 127.0.0.1:6676\ncluster_dir: /var/lib/fastcache-node\ntoolchain:\n  - /usr/bin/g++\n' \
             | sudo tee /etc/fastcached/fastcache-compile-node.yaml >/dev/null
 
           # Enabling the SOCKET is what enables the worker; the service carries
@@ -3421,40 +3423,310 @@ jobs:
           }
           exit $code
 
-      # Install silently, then assert the MSI really registered an auto-start
-      # service and started it — the behaviour the installer promises.
+      # An operator upgrading from the MSI they run TODAY, 0.3.0, whose uninstall
+      # deletes both services and which leaves FastCached auto-starting on 6674. A
+      # major upgrade runs that uninstall first, so the new package must register
+      # both services again rather than trust them to survive. The upgrade states NO
+      # property, as an operator who has read nothing types it: 0.3.0 remembered
+      # nothing, and the node needs no property, so it must come out registered and
+      # running -- which this case pins.
+      #
+      # Then two builds of THIS package upgrade one another, each direction being
+      # possible because they share a version and CPack's MajorUpgrade allows the
+      # same version: keeping both features (the node's registration must SURVIVE,
+      # so no node property is passed), dropping fastcached, then dropping the node
+      # (each time the new product deletes the dropped feature's leftover
+      # registration). Last, a fresh install told FASTCACHED_START_SERVICE=0. Every
+      # transaction is followed by the service table it must leave
+      # (scripts/lib/MsiServiceTable.psm1).
+      #
+      # 0.3.0 by name, and its asset pinned by digest and ProductCode: every
+      # expectation about the starting point and the 3010 tolerance is a fact about
+      # that one installer. The step after this one covers "the latest release".
+      # The repository is named because the release is the product's, not whichever
+      # fork runs this.
+      #
+      # This and the next step call the GitHub API, and they run BEFORE the MSI is
+      # uploaded: on a tag build a GitHub API outage fails this job, and the release
+      # job then refuses for want of the Windows packages, although the package
+      # itself built.
+      #
+      # A script, because the subject is Windows Installer and the service control
+      # manager across two packages, which no in-process test reaches.
+      - name: "Upgrade from the 0.3.0 MSI, then between two builds of this one"
+        shell: pwsh
+        working-directory: out/build/cl-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
+          # 0.3.0's installer registers its node only with a scheduler; this one takes none, and a
+          # node that serves refuses one. Its advertise property is 0.3.0's; this package has none.
+          $release030NodeProperties = @('FASTCACHE_NODE_SCHEDULER=127.0.0.1:6675', 'FASTCACHE_NODE_ADVERTISE=127.0.0.1:6674')
+          $fastcachedOnly = 'ADDLOCAL=CM_C_Cli,CM_C_Daemon,CM_C_Launcher'
+          $oldSession = 'Adding UPGRADINGPRODUCTCODE property|UPGRADINGPRODUCTCODE=\{'
+
+          # The asset this step's expectations were written against. A release asset
+          # can be replaced under the same tag; a different file is a different
+          # subject, refused by name rather than tested.
+          $release = 'v0.3.0'
+          $releaseSha256 = 'BBF565C835A72D9F537F6869B3B46AC0176967A574F7CF7337AAC3FAE646CEAB'
+          $releaseProductCode = '{FDCDAB73-40AF-4EDA-9340-7C33986C3207}'
+          $old = Join-Path $env:RUNNER_TEMP 'previous-release'
+          New-Item -ItemType Directory -Force -Path $old | Out-Null
+          gh release download $release --repo LASTRADA-Software/fastcached --pattern '*.msi' --dir $old --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not download the $release MSI (gh exited $LASTEXITCODE)" }
+          $previous = (Get-ChildItem -Path $old -Filter *.msi | Select-Object -First 1).FullName
+          if (-not $previous) { throw "release $release carries no .msi, so this step cannot test the upgrade it exists for" }
+          $sha256 = (Get-FileHash -Algorithm SHA256 -Path $previous).Hash
+          if ($sha256 -ne $releaseSha256) { throw "the $release MSI's SHA256 is $sha256, not the pinned ${releaseSha256}: the asset was replaced" }
+          if ((Get-MsiProperty $previous 'ProductCode') -ne $releaseProductCode) {
+            throw "the $release MSI's ProductCode is $(Get-MsiProperty $previous 'ProductCode'), not the pinned $releaseProductCode"
+          }
+
+          # The build the Package step made, which the steps after this one install
+          # and the upload ships, and a second cpack run of the same tree beside it.
+          # CPack mints a ProductCode per run, so each is a major upgrade of the other.
+          $first = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
+          $newerDir = Join-Path $env:RUNNER_TEMP 'second-build'
+          cpack -G WIX -B $newerDir
+          if ($LASTEXITCODE -ne 0) { throw "the second cpack run failed with $LASTEXITCODE" }
+          $newer = (Get-ChildItem -Path $newerDir -Filter *.msi | Select-Object -First 1).FullName
+          if (-not $newer) { throw "the second cpack run left no .msi in $newerDir" }
+
+          # Windows Installer's own rule for where RemoveExistingProducts may sit, asked of the
+          # package BEFORE any install: ICE63. With it after InstallInitialize, an action that
+          # writes to the execution script ahead of it is Error 2613 at run time, which ended
+          # every upgrade in round 7; wix reports ICE63 as a warning, so it is judged here.
+          # msi-custom-action-commands states the same rule over the fragment.
+          $ice63 = @(& wix msi validate -ice ICE63 $first 2>&1)
+          $ice63 | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) { throw "wix msi validate -ice ICE63 exited $LASTEXITCODE" }
+          if ($ice63 | Select-String -SimpleMatch 'ICE63') { throw "ICE63 refuses where RemoveExistingProducts sits (Error 2613 at run time)" }
+
+          # What makes each transaction below an UPGRADE rather than a second
+          # product or a repair, checked against the packages rather than assumed.
+          $family = Get-MsiProperty $first 'UpgradeCode'
+          foreach ($package in $previous, $newer) {
+            if ((Get-MsiProperty $package 'UpgradeCode') -ne $family) { throw "$package is not of this package's family $family" }
+          }
+          $productOf = @{}
+          foreach ($package in $previous, $first, $newer) { $productOf[$package] = Get-MsiProperty $package 'ProductCode' }
+          if (@($productOf.Values | Sort-Object -Unique).Count -ne 3) {
+            throw "two of the three packages share a ProductCode, so one install would be a repair: $($productOf.Values -join ', ')"
+          }
+
+          # The starting point: 0.3.0 with the node registered.
+          Invoke-Msiexec -Operation '/i' -Package $previous -Log 'previous.log' -Properties $release030NodeProperties -What "installing $release"
+          Assert-InstalledProduct $family $productOf[$previous]
+          Assert-ServiceTable -Row Release030WithNode -Log 'previous.log'
+
+          # Exactly 0, as every upgrade here: 0.3.0 stops its services WITHOUT waiting, and this
+          # package waits for their processes to exit before it replaces a file
+          # (FastCacheAwaitServiceExit) -- 3010 was a file one of them still held, replaced at the
+          # next boot, with the node's checked steps then running whichever binary was on the disk.
+          # No property: the node registration exists and runs afterwards all the same.
+          Invoke-Msiexec -Operation '/i' -Package $first -Log 'upgrade.log' -What "the upgrade from $release"
+          Assert-InstalledProduct $family $productOf[$first]
+          # The ORDER is the fix (batch 4 review, B4-2): 0.3.0's own uninstall-service ran FIRST
+          # (RemoveExistingProducts is scheduled afterInstallInitialize); the files waited for 0.3.0's
+          # service processes; FastCached, kept and made manual, was stopped and its PROCESS waited
+          # for -- it held 6674, which the node binds exclusively; and only then was the node
+          # registered and started, both checked, so either failing fails the transaction above. And
+          # what is registered now carries no --scheduler, which the node refuses at every start.
+          Assert-MsiActionOrder -Path 'upgrade.log' -Actions 'FastCacheNodeUninstallService', 'FastCacheAwaitServiceExit', `
+            'FastCachedAwaitExitForNode', 'FastCacheNodeInstallService', 'FastCacheNodeStartService'
+          Assert-NodeRegistrationLacks '--scheduler'
+          Assert-ServiceTable -Row NodeSelected -Log 'upgrade.log'
+
+          # The upgrade re-applied an OLD, exposed 0.3.0 state directory: assert it is now
+          # private, both directions. A 0.3.0 directory owned by the service or SYSTEM is
+          # secured in place; one a foreign account owns or that was junctioned now REFUSES
+          # the ACL by design, which would surface here as this assertion's throw.
+          Assert-NodeStatePrivate
+          # And its firewall opens what the service does: the record the 0.3.0 directory held is
+          # read only after the install secured it, so the rules carry consensus and discovery.
+          Assert-NodeFirewall
+
+          # Keeping both features, with NO node property: the node is registered again
+          # with none, and started. The old
+          # product's ServiceControl rows stop each service, waiting, before a file
+          # is replaced, so nothing is held and the exit is exactly 0. The old
+          # product's half is in this log, which the first pattern proves, so the
+          # absence of its uninstall-service actions is a finding and not a blind spot.
+          #
+          # And over the advertised endpoint an earlier package of this table REMEMBERED (W-10): planted as
+          # that package wrote it, an IP literal a roaming laptop once typed. The property is gone, so the
+          # upgrade must forget the value and register the node with no advertise flag at all.
+          $installerKey = 'HKLM:\SOFTWARE\fastcached\Installer'
+          New-Item -Path $installerKey -Force | Out-Null
+          New-ItemProperty -Path $installerKey -Name 'NodeAdvertise' -Value '10.8.0.7:6674' -PropertyType String -Force | Out-Null
+          Invoke-Msiexec -Operation '/i' -Package $newer -Log 'upgrade-newer.log' -What 'an upgrade between two builds'
+          Assert-InstalledProduct $family $productOf[$newer]
+          Assert-MsiLog -Path 'upgrade-newer.log' -Present $oldSession, (Get-MsiActionRanPattern 'FastCacheForgetNodeAdvertise') `
+            -Absent (Get-MsiActionRanPattern 'FastCacheNodeUninstallService'), (Get-MsiActionRanPattern 'FastCachedUninstallService')
+          Assert-ServiceTable -Row NodeSelected -Log 'upgrade-newer.log'
+          if ($null -ne (Get-ItemProperty -Path $installerKey -Name 'NodeAdvertise' -ErrorAction SilentlyContinue)) {
+            throw "the upgrade left the remembered NodeAdvertise value in $installerKey; nothing reads it, and the property is gone"
+          }
+          Assert-NodeRegistrationLacks '--advertise'
+
+          # Dropping fastcached on an upgrade, the node kept without its properties:
+          # the old product's half keeps fastcached's registration, the new product
+          # has no fastcached.exe to remove it with, so sc.exe deletes the leftover.
+          Invoke-Msiexec -Operation '/i' -Package $first -Log 'upgrade-node-only.log' -Properties 'ADDLOCAL=CM_C_Cli,CM_C_Node' `
+            -What 'an upgrade deselecting fastcached'
+          Assert-InstalledProduct $family $productOf[$first]
+          Assert-MsiLog -Path 'upgrade-node-only.log' -Present $oldSession, (Get-MsiActionRanPattern 'FastCachedDeleteLeftover') `
+            -Absent (Get-MsiActionRanPattern 'FastCachedUninstallService'), (Get-MsiActionRanPattern 'FastCacheNodeUninstallService')
+          Assert-ServiceTable -Row NodeAlone -Log 'upgrade-node-only.log'
+
+          # Dropping the node on an upgrade, the same way round: its leftover is
+          # deleted by sc.exe, and fastcached is registered again, auto and started.
+          # And its FIREWALL GROUP goes with it (W-11): sc.exe removes no rule, so the fragment
+          # removes the group. Populated first, or an empty group afterwards would prove nothing.
+          # (fastcached's group is not asserted the other way round: the daemon binds loopback by
+          # default, opens no rule, and so leaves nothing to orphan here -- an empty group there is
+          # true whether or not its removal works.)
+          Assert-NodeFirewall
+          Invoke-Msiexec -Operation '/i' -Package $newer -Log 'upgrade-deselect.log' -Properties $fastcachedOnly `
+            -What 'an upgrade deselecting the node'
+          Assert-InstalledProduct $family $productOf[$newer]
+          Assert-MsiLog -Path 'upgrade-deselect.log' -Present $oldSession, (Get-MsiActionRanPattern 'FastCacheNodeDeleteLeftover'), `
+            (Get-MsiActionRanPattern 'FastCacheNodeDeleteLeftoverFirewall') `
+            -Absent (Get-MsiActionRanPattern 'FastCacheNodeUninstallService')
+          Assert-ServiceTable -Row DaemonAlone -Log 'upgrade-deselect.log'
+          Assert-FirewallGroupEmpty 'fastcached: FastCacheCompileNode'
+
+          Invoke-Msiexec -Operation '/x' -Package $newer -Log 'uninstall-upgraded.log' -What 'uninstalling after the upgrades'
+          Assert-InstalledProduct $family ''
+          Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-upgraded.log'
+
+          # The opt-out: fastcached registered auto and left stopped.
+          Invoke-Msiexec -Operation '/i' -Package $first -Log 'install-unstarted.log' -Properties $fastcachedOnly, 'FASTCACHED_START_SERVICE=0' `
+            -What 'a fastcached-only install told not to start it'
+          Assert-ServiceTable -Row DaemonAloneUnstarted -Log 'install-unstarted.log'
+          Invoke-Msiexec -Operation '/x' -Package $first -Log 'uninstall-unstarted.log' -What 'uninstalling the unstarted install'
+          Assert-InstalledProduct $family ''
+          Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-unstarted.log'
+
+          # Host C, the shared-cache machine (W-12): installed fastcached-only, then upgraded by a
+          # double-click -- a plain /i of the newer package with NO ADDLOCAL. MigrateFeatureStates
+          # carries the old selection over, so it must stay fastcached-only: the node neither
+          # installed nor registered, and fastcached auto and started as before.
+          Invoke-Msiexec -Operation '/i' -Package $first -Log 'install-daemon-only.log' -Properties $fastcachedOnly `
+            -What 'a fastcached-only install, host C'
+          Assert-ServiceTable -Row DaemonAlone -Log 'install-daemon-only.log'
+          Invoke-Msiexec -Operation '/i' -Package $newer -Log 'upgrade-daemon-only.log' `
+            -What 'a plain upgrade of a fastcached-only install, no ADDLOCAL'
+          Assert-InstalledProduct $family $productOf[$newer]
+          Assert-MsiLog -Path 'upgrade-daemon-only.log' -Present $oldSession `
+            -Absent (Get-MsiActionRanPattern 'FastCacheNodeInstallService'), (Get-MsiActionRanPattern 'FastCacheNodeStartService')
+          Assert-ServiceTable -Row DaemonAlone -Log 'upgrade-daemon-only.log'
+          Invoke-Msiexec -Operation '/x' -Package $newer -Log 'uninstall-daemon-only.log' -What 'uninstalling host C'
+          Assert-InstalledProduct $family ''
+          Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-daemon-only.log'
+
+          # The steps below start from a clean machine: what 0.3.0 seeded, and the
+          # identity key the node minted, are not what they assert about.
+          Remove-FastCacheMachineState
+
+      # The DERIVED leg: whatever release is the latest, upgraded to this build.
+      # While that is 0.3.0 the step above is this leg, and this step says so. Once
+      # a release carrying this package's service table is the latest, it is a
+      # starting point the step above never reaches: installed with the node's two
+      # properties it leaves the node selected, and the upgrade between it and this
+      # build must exit exactly 0 and leave that row. A script for the previous
+      # step's reason, and it calls the GitHub API for the reason given there.
+      #
+      # Two expectations it holds about that release, each failing closed:
+      #   * It carries THIS service table. A hotfix cut from 0.3.x is the old
+      #     installer under a newer tag, and fails the node-selected row after its
+      #     own install -- a finding about that release, not about this build.
+      #   * This build is not OLDER. A build's version comes from the nearest tag,
+      #     so a branch that does not contain the latest release's tag would
+      #     install as a downgrade, which msiexec refuses with 1603. That is
+      #     refused before any install, naming the cause: rebase.
+      - name: "Upgrade from the latest release, when that is not 0.3.0"
+        shell: pwsh
+        working-directory: out/build/cl-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
+          $latest = gh release view --repo LASTRADA-Software/fastcached --json tagName --jq .tagName
+          if ($LASTEXITCODE -ne 0 -or -not $latest) { throw "could not read the latest release's tag (gh exited $LASTEXITCODE)" }
+          if ($latest -eq 'v0.3.0') {
+            Write-Host "::notice::the latest release is $latest, which the previous step upgrades from with its asset pinned; this leg is covered there"
+          } else {
+            $old = Join-Path $env:RUNNER_TEMP 'latest-release'
+            New-Item -ItemType Directory -Force -Path $old | Out-Null
+            gh release download $latest --repo LASTRADA-Software/fastcached --pattern '*.msi' --dir $old --clobber
+            if ($LASTEXITCODE -ne 0) { throw "could not download the $latest MSI (gh exited $LASTEXITCODE)" }
+            $previous = (Get-ChildItem -Path $old -Filter *.msi | Select-Object -First 1).FullName
+            if (-not $previous) { throw "release $latest carries no .msi, so this step cannot test the upgrade it exists for" }
+
+            $first = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
+            $family = Get-MsiProperty $first 'UpgradeCode'
+            if ((Get-MsiProperty $previous 'UpgradeCode') -ne $family) { throw "$previous is not of this package's family $family" }
+            $previousCode = Get-MsiProperty $previous 'ProductCode'
+            $firstCode = Get-MsiProperty $first 'ProductCode'
+            if ($previousCode -eq $firstCode) { throw "$latest and this build share the ProductCode $firstCode, so the upgrade would be a repair" }
+            $downgrade = Get-UpgradeVersionVerdict (Get-MsiProperty $first 'ProductVersion') (Get-MsiProperty $previous 'ProductVersion') $latest
+            if ($downgrade) { throw $downgrade }
+
+            # The latest release's installer registers its node only with a scheduler, and that
+            # registration carries `--scheduler`: the upgrade below, with no property, must
+            # register the node again without it, or the service refuses every start.
+            Invoke-Msiexec -Operation '/i' -Package $previous -Log 'latest.log' `
+              -Properties 'FASTCACHE_NODE_SCHEDULER=127.0.0.1:6675', 'FASTCACHE_NODE_ADVERTISE=127.0.0.1:6674' -What "installing $latest"
+            Assert-InstalledProduct $family $previousCode
+            Assert-ServiceTable -Row NodeSelected -Log 'latest.log'
+
+            Invoke-Msiexec -Operation '/i' -Package $first -Log 'upgrade-latest.log' -What "the upgrade from $latest"
+            Assert-InstalledProduct $family $firstCode
+            Assert-ServiceTable -Row NodeSelected -Log 'upgrade-latest.log'
+
+            Invoke-Msiexec -Operation '/x' -Package $first -Log 'uninstall-latest.log' -What "uninstalling after the upgrade from $latest"
+            Assert-InstalledProduct $family ''
+            Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-latest.log'
+            Remove-FastCacheMachineState
+          }
+
+      # First the DEFAULT install, a plain /i naming no feature and no property, as
+      # an operator who double-clicks the package gets it: every feature is selected
+      # by default, so the node is registered auto and running and fastcached manual
+      # and stopped. The [msi] round trip in DocumentedCommandLines_test proves the
+      # no-property COMMAND parses and installs; only this transaction proves the
+      # package's default feature selection reaches it. Uninstalled again, and the
+      # machine state cleared, so what follows starts clean.
+      #
+      # Then a fresh install naming the fastcached-only features, and the service table
+      # it must leave: fastcached auto and serving, no node registered, and the
+      # install's bin on the machine PATH, which rides the REQUIRED Cli feature.
       - name: "Install the MSI and verify the service"
         shell: pwsh
         working-directory: out/build/cl-release
         run: |
           $ErrorActionPreference = 'Stop'
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
+          function Show-InstallLog { Show-MsiLog 'install.log' }
           $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
-          Write-Host "Installing $msi"
-          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "`"$msi`"", '/qn', '/l*v', 'install.log')
 
-          # A blind tail of a verbose MSI log is useless — the last 80 lines are
-          # just the property dump. Select the lines that name the failure: the
-          # action trace, custom-action returns, and error records.
-          function Show-InstallLog {
-            Write-Host "===== install.log (relevant lines) ====="
-            Select-String -Path install.log -Pattern `
-              'Action (start|ended)','CustomAction','FastCached','returned actual error','Note: 1: 1(4|7)[0-9][0-9]','Installation (success|failed)','error' `
-              | Select-Object -Last 60 | ForEach-Object { $_.Line }
-          }
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'install-default.log' -What 'the default install'
+          Assert-ServiceTable -Row NodeSelected -Log 'install-default.log'
+          Invoke-Msiexec -Operation '/x' -Package $msi -Log 'uninstall-default.log' -What 'uninstalling the default install'
+          Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-default.log'
+          Remove-FastCacheMachineState
 
-          if ($p.ExitCode -ne 0) {
-            Show-InstallLog
-            throw "msiexec failed with $($p.ExitCode)"
-          }
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'install.log' `
+            -Properties 'ADDLOCAL=CM_C_Cli,CM_C_Daemon,CM_C_Launcher' -What 'a fastcached-only install'
 
-          $svc = Get-Service -Name FastCached -ErrorAction SilentlyContinue
-          if (-not $svc) { Show-InstallLog; throw 'FastCached service was not registered' }
-
-          $start = (Get-CimInstance Win32_Service -Filter "Name='FastCached'").StartMode
-          if ($start -ne 'Auto') { throw "expected auto-start, got $start" }
-
-          for ($i = 0; $i -lt 30 -and (Get-Service FastCached).Status -ne 'Running'; $i++) { Start-Sleep 1 }
-          if ((Get-Service FastCached).Status -ne 'Running') { throw 'service did not start' }
+          Assert-ServiceTable -Row DaemonAlone -Log 'install.log'
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($machinePath -notlike '*\fastcached\bin*') { throw "machine PATH lacks the install's bin: $machinePath" }
 
           # The identity it logs on as. Told nothing, CreateService uses LocalSystem
           # -- unrestricted access to every local resource, and a member of the local
@@ -3528,16 +3800,159 @@ jobs:
           }
           Write-Host "daemon honoured its machine-wide config (answered on 6699)"
 
-      # The compile worker registers itself; the MSI never does. What is asserted
+      # The service table under a FEATURE CHANGE, the transaction nothing above
+      # runs: adding the node makes fastcached manual and stops it (both would
+      # answer on 6674), removing the node gives fastcached back its auto start and
+      # removes the node's registration. A script for the previous steps' reason.
+      - name: "Changing features re-applies the service table"
+        shell: pwsh
+        working-directory: out/build/cl-release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
+          $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
+
+          # A node that cannot START on a fastcached machine (batch 4 review, B4-1): the transaction
+          # fails, and the rollback leaves fastcached exactly as it found it -- auto again (the node
+          # had made it manual), RUNNING again (the transaction stopped it for the node), and its
+          # command line and remembered scope unchanged. fastcached serves on 6699 here (the step
+          # above moved it), so a listener this step holds on 6674 is what the node cannot bind: it
+          # refuses inside its body, never reports RUNNING (it reports running once it serves), and
+          # its checked start fails. Empty and absent are one remembered scope (install.md). And its
+          # LIVE firewall rules (R4-3): the transaction re-registered fastcached with a scope of
+          # 10.0.0.0/8, which rewrites them, so the remembered scope coming back says nothing about
+          # what the firewall admits.
+          #
+          # A loopback-only fastcached -- the shipped default -- has NO rules, and an empty group
+          # unchanged proves nothing, so for this case alone it faces the network: `bind: 0.0.0.0`
+          # in the machine-wide file, which the transaction's registration and the rollback's both
+          # derive the rules from (a --bind in the command line would come back with the exact
+          # restore and never be re-derived), registered as FastCachedInstallService registers it,
+          # with the remembered scope. Undone after the case, so later steps see loopback again.
+          $scopeBefore = "$((Get-ItemProperty -Path 'HKLM:\SOFTWARE\fastcached\Installer' -ErrorAction SilentlyContinue).FirewallAllow)"
+          $cfg = "$env:ProgramData\fastcached\fastcached.yaml"
+          $cfgBefore = Get-Content -Raw -LiteralPath $cfg
+          $fastcachedExe = @(Split-RegisteredCommandLine (Get-CimInstance Win32_Service -Filter "Name='FastCached'").PathName)[0]
+          $register = @('--install-service', '--service-start=auto') + @(if ($scopeBefore) { "--firewall-allow=$scopeBefore" })
+          Add-Content -Path $cfg -Value "`nbind: 0.0.0.0"
+          & $fastcachedExe @register
+          if ($LASTEXITCODE -ne 0) { throw "re-registering fastcached to face the network exited $LASTEXITCODE" }
+          $fastcachedBefore = Get-CimInstance Win32_Service -Filter "Name='FastCached'"
+          $fastcachedFirewallBefore = Get-FirewallGroupSnapshot 'fastcached: FastCached'
+          $fastcachedFirewallBefore | ForEach-Object { Write-Host "  before: $_" }
+          $hold = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, 6674)
+          $hold.ExclusiveAddressUse = $true
+          $hold.Start()
+          try {
+            Invoke-Msiexec -Operation '/i' -Package $msi -Log 'add-node-refused.log' -What 'adding the node while 6674 is held' `
+              -Properties 'ADDLOCAL=CM_C_Node', 'FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8' -Accept @(1603)
+          } finally {
+            $hold.Stop()
+          }
+          Assert-MsiLog -Path 'add-node-refused.log' -Present 'CustomAction FastCacheNodeStartService returned actual error code', `
+            (Get-MsiActionRanPattern 'FastCachedStopForNode'), (Get-MsiActionRanPattern 'FastCachedAwaitExitForNode')
+          Assert-ServiceTable -Row DaemonAlone -Log 'add-node-refused.log'
+          $fastcachedAfter = Get-CimInstance Win32_Service -Filter "Name='FastCached'"
+          if ($fastcachedAfter.PathName -cne $fastcachedBefore.PathName) {
+            throw "the failed node install left fastcached registered as '$($fastcachedAfter.PathName)', not '$($fastcachedBefore.PathName)'"
+          }
+          $scopeAfter = "$((Get-ItemProperty -Path 'HKLM:\SOFTWARE\fastcached\Installer' -ErrorAction SilentlyContinue).FirewallAllow)"
+          if ($scopeAfter -cne $scopeBefore) {
+            throw "the failed node install left the remembered firewall scope '$scopeAfter', not '$scopeBefore'"
+          }
+          Assert-FirewallGroupUnchanged -Group 'fastcached: FastCached' -Before $fastcachedFirewallBefore
+          Write-Host "the node that could not start rolled back to fastcached auto, running and registered as before, its firewall rules unchanged"
+          # Loopback again, as every later step expects: the file as it was, and a registration that
+          # removes the rules the case opened.
+          Set-Content -LiteralPath $cfg -Value $cfgBefore -NoNewline
+          & $fastcachedExe @register
+          if ($LASTEXITCODE -ne 0) { throw "re-registering fastcached on loopback exited $LASTEXITCODE" }
+          Assert-FirewallGroupEmpty 'fastcached: FastCached'
+
+          # No property at all: this package has no advertised-endpoint property (W-10), so the node is
+          # registered with no advertise flag and advertises this machine's name.
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'add-node.log' -What 'adding the node feature' `
+            -Properties 'ADDLOCAL=CM_C_Node'
+          Assert-ServiceTable -Row NodeSelected -Log 'add-node.log'
+
+          # The node's state directory, and the identity key in it, answer to nobody but
+          # SYSTEM, Administrators and the service. The assertion is shared with the upgrade
+          # step (MsiServiceTable.psm1), so the two cannot drift.
+          Assert-NodeStatePrivate
+          Assert-NodeFirewall
+
+          # The firewall scope is REMEMBERED: every transaction re-registers the node, so a repair
+          # that states no scope must register the one an earlier transaction stated, never open the
+          # rules to any address. Scoped in a repair, then repaired with no property at all.
+          # The fleet seed and the fleet pin ride the same repair, each the node registration's own
+          # argument -- the pin VERBATIM, since it is security material nothing re-spells.
+          $pin = '0123456789abcdef0123456789abcdef@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo'
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'scope-node.log' -What 'a repair stating a scope, a seed and a pin' `
+            -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus', 'FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8', 'FASTCACHE_FLEET_SEED=seed.example.invalid', "FASTCACHE_FLEET_ID=$pin"
+          Assert-NodeFirewallScope -Scope '10.0.0.0/8'
+          Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed.example.invalid:6674'
+          Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'repair-scope.log' -What 'a repair stating none of them' `
+            -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus'
+          Assert-NodeFirewallScope -Scope '10.0.0.0/8'
+          Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed.example.invalid:6674'
+          Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
+
+          # A pin the node's parser REFUSES fails the transaction (batch 3 review, B3-1): the node's
+          # arguments are checked first, before anything is remembered or registered, so the repair
+          # neither "succeeds" over the old registration nor remembers the refused pin for every later
+          # transaction. All three halves are asserted: the transaction is refused BY THE CHECK, what
+          # the machine had survives it -- the registration's pin and the remembered one -- and the
+          # node is RUNNING again (B4-6): the repair stopped it to replace its files, and only the
+          # rollback's restart brings it back.
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'refused-pin.log' -What 'a repair stating a pin the node refuses' `
+            -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus', 'FASTCACHE_FLEET_ID=0123456789abcdef0123456789abcdef' `
+            -Accept @(1603)
+          Assert-MsiLog -Path 'refused-pin.log' -Present 'CustomAction FastCacheNodeCheckArguments returned actual error code'
+          Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
+          $remembered = Get-ItemPropertyValue -Path 'HKLM:\SOFTWARE\fastcached\Installer' -Name 'FleetId'
+          if ($remembered -cne $pin) {
+            throw "the refused repair changed the remembered fleet pin: '$remembered', expected '$pin'"
+          }
+          Assert-ServiceTable -Row NodeSelected -Log 'refused-pin.log'
+          Write-Host "the refused pin failed the repair; the registration and the remembered pin are unchanged, and the node runs"
+
+          # A transaction that re-registers a RUNNING node without replacing its files restarts it
+          # (B4-5): a new seed on an already-installed node is a feature change that copies nothing,
+          # and the process it left running had the old command line until its next restart. The PID
+          # is the witness, and the log proves no ServiceControl row stopped the node, so a new PID
+          # is the transaction's own restart rather than a file replacement's.
+          $nodeBefore = (Get-CimInstance Win32_Service -Filter "Name='FastCacheCompileNode'").ProcessId
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'reseed-node.log' -What 'a feature change giving the node a new seed' `
+            -Properties 'ADDLOCAL=CM_C_Node', 'FASTCACHE_FLEET_SEED=seed2.example.invalid'
+          Assert-MsiLog -Path 'reseed-node.log' -Present (Get-MsiActionRanPattern 'FastCacheNodeStopForRestart') `
+            -Absent 'ServiceControl\(.*Name=FastCacheCompileNode'
+          Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed2.example.invalid:6674'
+          Assert-ServiceTable -Row NodeSelected -Log 'reseed-node.log'
+          $nodeAfter = (Get-CimInstance Win32_Service -Filter "Name='FastCacheCompileNode'").ProcessId
+          if ($nodeAfter -eq $nodeBefore) {
+            throw "the node was re-registered with a new seed and kept running as PID $nodeBefore, with the old command line"
+          }
+          Write-Host "the re-registered node was restarted (PID $nodeBefore, then $nodeAfter)"
+
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'remove-node.log' -Properties 'REMOVE=CM_C_Node' `
+            -What 'removing the node feature'
+          Assert-ServiceTable -Row DaemonAlone -Log 'remove-node.log'
+
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($machinePath -notlike '*\fastcached\bin*') { throw "machine PATH lost the install's bin: $machinePath" }
+
+      # The compile worker registering ITSELF, from its own command line. What is asserted
       # here is the identity it registers UNDER: told nothing, CreateService logs a
       # service on as LocalSystem -- the whole machine -- and this process compiles
       # input that arrived over the network. The macOS half of the same decision is
       # the fastcache-node account (issue #87); on Windows it is a virtual account,
       # which the SCM derives from the service name and creates itself.
       #
-      # Run against the built binary rather than the MSI payload because the MSI
-      # deliberately registers no worker: it has no scheduler address or toolchain
-      # list to register one with.
+      # Run against the built binary rather than the MSI's node feature because the
+      # flags below (a listen port beside the daemon's, a named toolchain) are the
+      # command line's; the MSI's own node registration is what the steps above
+      # drive, start mode and state after every transaction.
       - name: "Verify the compile worker does not register as LocalSystem"
         shell: pwsh
         working-directory: out/build/cl-release
@@ -3552,7 +3967,7 @@ jobs:
 
           # --listen-node is NAMED, and it has to be since #290 stage 3.
           #
-          # A node opens exactly one 0xFC port, defaulting to 127.0.0.1:6674 -- and
+          # A node opens exactly one 0xFC port, defaulting to 0.0.0.0:6674 -- and
           # the step above leaves a `fastcached` serving on 6674 for the rest of the
           # job, where the Linux packaging job stops its daemon before installing the
           # worker. Left defaulted, the worker's only port is a port it cannot have,
@@ -3562,11 +3977,11 @@ jobs:
           #
           # 6676, matching --advertise, so the two agree -- a loopback bind under a
           # loopback advertise is the coherent single-machine shape and passes the
-          # startup table. Whether this job should co-install a daemon and a worker
-          # on one machine at all is a real question (#229 says it should not), and
-          # not one this step is the place to settle.
+          # startup table. Co-installing a daemon and a worker on one machine is not
+          # a supported shape -- a node answers every verb the daemon does
+          # (docs/tools/fastcache-compile-node.md) -- and this job does it only
+          # because the MSI under test ships both features.
           & $node --install-service `
-              --scheduler=127.0.0.1:6675 `
               --listen-node=127.0.0.1:6676 `
               --advertise=127.0.0.1:6676 `
               --cache-dir="$cacheDir" `
@@ -3652,6 +4067,75 @@ jobs:
           if (Get-Service -Name FastCacheCompileNode -ErrorAction SilentlyContinue) {
             throw 'FastCacheCompileNode survived --uninstall-service'
           }
+
+      # The firewall half of --install-service, on the REAL Windows Firewall: the rule a
+      # registration creates is inbound, allowing, every profile, scoped to the program, the
+      # service and --firewall-allow; a second install replaces rather than duplicates it; an
+      # uninstall removes it. A script, because the Windows Filtering Platform is the subject.
+      #
+      # It names a configuration file of its OWN. Without one the daemon reads the machine-wide
+      # file, and the steps above leave the product installed with `port: 6699` written into it:
+      # beside this step's `--listen` that is a startup refusal ("--port (or its key) cannot be
+      # combined with --listen"), so the registration was refused -- correctly, since the
+      # service would refuse every start (round 8, the first run that reached this step).
+      - name: "Install-service creates the firewall rules and uninstall-service removes them"
+        shell: pwsh
+        working-directory: out/build/cl-release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path 'target/fastcached.exe').Path
+          $name = 'FastCachedFirewallProbe'
+          $group = "fastcached: $name"
+          $config = Join-Path $env:RUNNER_TEMP 'firewall-probe.yaml'
+          Set-Content -LiteralPath $config -Value '# The firewall probe: named so no machine-wide configuration is read.'
+          if (@(Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue).Count -ne 0) {
+            throw "rules for '$group' exist before the install, so this step cannot tell creation from leftovers"
+          }
+
+          & $exe --install-service --service-name=$name --service-start=manual --config=$config --listen=0.0.0.0:6698 --firewall-allow=10.0.0.0/8 --firewall-allow=fd00::/8
+          if ($LASTEXITCODE -ne 0) { throw "install-service failed with $LASTEXITCODE, expected 0" }
+          try {
+            $rules = @(Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue)
+            if ($rules.Count -ne 1) { $rules | Format-List DisplayName, Group; throw "expected one rule in '$group', found $($rules.Count)" }
+            $rule = $rules[0]
+            if ($rule.Direction -ne 'Inbound' -or $rule.Action -ne 'Allow' -or $rule.Enabled -ne 'True') {
+              throw "rule is $($rule.Direction)/$($rule.Action)/enabled=$($rule.Enabled), expected Inbound/Allow/enabled=True"
+            }
+            if ($rule.Profile -ne 'Any') { throw "rule profile is '$($rule.Profile)', expected Any: a VPN adapter is usually Public" }
+            $port = $rule | Get-NetFirewallPortFilter
+            if ($port.Protocol -ne 'TCP' -or $port.LocalPort -ne '6698') { throw "rule filters $($port.Protocol) $($port.LocalPort), expected TCP 6698" }
+            $app = $rule | Get-NetFirewallApplicationFilter
+            if ($app.Program -ne $exe) { throw "rule program is '$($app.Program)', expected '$exe'" }
+            $svc = $rule | Get-NetFirewallServiceFilter
+            if ($svc.Service -ne $name) { throw "rule service is '$($svc.Service)', expected '$name'" }
+
+            # A rule scoped to a service SID matches nothing unless the service itself carries
+            # one: fastcached's virtual-account services register SERVICE_SID_TYPE_UNRESTRICTED
+            # (ServiceControl.cpp), so this is the other half of the service-filter check above
+            # rather than a second subject.
+            $sidType = @(& sc.exe qsidtype $name)
+            if ($LASTEXITCODE -ne 0 -or ($sidType -join ' ') -notmatch 'UNRESTRICTED') {
+              throw "sc.exe qsidtype $name did not report UNRESTRICTED, found: $($sidType -join ' | ')"
+            }
+
+            $addr = $rule | Get-NetFirewallAddressFilter
+            # Both families on one rule: Windows reports an IPv4 subnet as address/mask and an IPv6
+            # one as address/prefix.
+            if ($addr.RemoteAddress -notcontains '10.0.0.0/255.0.0.0' -or $addr.RemoteAddress -notcontains 'fd00::/8') {
+              throw "rule remote scope is '$($addr.RemoteAddress -join ',')', expected 10.0.0.0/255.0.0.0 and fd00::/8"
+            }
+
+            & $exe --install-service --service-name=$name --service-start=manual --config=$config --listen=0.0.0.0:6698 --firewall-allow=10.0.0.0/8 --firewall-allow=fd00::/8
+            if ($LASTEXITCODE -ne 0) { throw "re-running install-service failed with $LASTEXITCODE, expected 0" }
+            $again = @(Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue)
+            if ($again.Count -ne 1) { throw "a second install left $($again.Count) rule(s) in '$group', expected 1: it must replace rather than duplicate" }
+          }
+          finally {
+            & $exe --uninstall-service --service-name=$name
+          }
+          $left = @(Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue)
+          if ($left.Count -ne 0) { throw "uninstall-service left $($left.Count) rule(s) in '$group', expected 0" }
+          if (Get-Service -Name $name -ErrorAction SilentlyContinue) { throw "$name survived uninstall-service" }
 
       # The configuration half of the same promise, which nothing asserted
       # before: the .deb/.rpm conffile and the .pkg postinstall are both checked
@@ -3921,13 +4405,14 @@ jobs:
         working-directory: out/build/cl-release
         run: |
           $ErrorActionPreference = 'Stop'
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
           $cfg = "$env:ProgramData\fastcached\fastcached.yaml"
           $marker = '# local edit that must survive'
           Add-Content -Path $cfg -Value $marker
 
           $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
-          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "`"$msi`"", '/qn', 'REINSTALL=ALL', 'REINSTALLMODE=vomus')
-          if ($p.ExitCode -ne 0) { throw "reinstall failed with $($p.ExitCode)" }
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'reinstall.log' -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus' `
+            -What 'the reinstall'
 
           if (-not (Select-String -Path $cfg -Pattern ([regex]::Escape($marker)) -Quiet)) {
             throw 'the reinstall overwrote the operator edit'
@@ -3935,11 +4420,10 @@ jobs:
 
           # The upgrade path for the service identity. A reinstall re-registers the
           # daemon, so this is where a change to what it logs on as would strand an
-          # existing installation -- registered, and unable to start.
-          for ($i = 0; $i -lt 30 -and (Get-Service FastCached).Status -ne 'Running'; $i++) { Start-Sleep 1 }
-          if ((Get-Service FastCached).Status -ne 'Running') {
-            throw 'the daemon did not come back up after a reinstall'
-          }
+          # existing installation -- registered, and unable to start. A repair is
+          # also a transaction the service table is applied on, so it must leave
+          # the table the install left.
+          Assert-ServiceTable -Row DaemonAlone -Log 'reinstall.log'
           $svc = Get-CimInstance Win32_Service -Filter "Name='FastCached'"
           if ($svc.StartName -ne 'NT SERVICE\FastCached') {
             throw "after reinstall the daemon runs as '$($svc.StartName)'"
@@ -3950,12 +4434,10 @@ jobs:
         working-directory: out/build/cl-release
         run: |
           $ErrorActionPreference = 'Stop'
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
           $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
-          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/x', "`"$msi`"", '/qn')
-          if ($p.ExitCode -ne 0) { throw "uninstall failed with $($p.ExitCode)" }
-          if (Get-Service -Name FastCached -ErrorAction SilentlyContinue) {
-            throw 'FastCached service survived uninstall'
-          }
+          Invoke-Msiexec -Operation '/x' -Package $msi -Log 'uninstall.log' -What 'the uninstall'
+          Assert-ServiceTable -Row NothingInstalled -Log 'uninstall.log'
 
           # Documented behaviour on every platform: the configuration is the
           # operator's, not the package's, so it outlives the package.

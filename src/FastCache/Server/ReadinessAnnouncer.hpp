@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -80,7 +81,10 @@ class ReadinessAnnouncer
     ///        after the logger and before the threads that arm it.
     /// @param endpointSummary What the readiness line says it is ready on, e.g.
     ///        `2 bind(s) x 4 reactors`. Copied.
-    ReadinessAnnouncer(ILogger& logger, std::string endpointSummary) noexcept;
+    /// @param onAnnounced Run once, right after the readiness line, on the thread that emitted it --
+    ///        how a service host learns the daemon serves (`DaemonControls::MarkServing`) and
+    ///        reports RUNNING on the same fact the line states. Empty for none.
+    ReadinessAnnouncer(ILogger& logger, std::string endpointSummary, std::function<void()> onAnnounced = {}) noexcept;
 
     ReadinessAnnouncer(ReadinessAnnouncer const&) = delete;
     ReadinessAnnouncer(ReadinessAnnouncer&&) = delete;
@@ -116,7 +120,7 @@ class ReadinessAnnouncer
     ///
     /// Safe from any thread: exactly one caller observes the transition, so the
     /// readiness line is emitted once however many threads arm concurrently.
-    /// @param what Names the participant for the Debug line, e.g. `reactor 0 bind 1`.
+    /// @param what Names the participant for the Debug line, e.g. `cache 0.0.0.0:11211 on reactor 1`.
     void AcceptorArmed(std::string_view what);
 
     /// @return True once the readiness line has been emitted.
@@ -135,6 +139,7 @@ class ReadinessAnnouncer
 
     ILogger& _logger;
     std::string _endpointSummary;
+    std::function<void()> _onAnnounced;
     std::atomic<std::size_t> _expected { 0 };
     std::atomic<std::size_t> _armed { 0 };
     std::atomic<bool> _sealed { false };

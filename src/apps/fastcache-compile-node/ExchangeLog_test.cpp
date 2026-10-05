@@ -69,14 +69,14 @@ TEST_CASE("ExchangeLog: an operator at the default level sees scheduling and no 
     // as a list of rows -- a new high-rate verb added at Info would pass every
     // per-row check above and still destroy the journal.
     //
-    // Asserted as a PARTITION: every Cache-family verb is Debug and every
-    // Compile-family verb is Info. Scheduler is deliberately mixed (heartbeat is
+    // Asserted as a PARTITION: every Cache- and SharedCache-family verb is Debug and
+    // every Compile-family verb is Info. Scheduler is deliberately mixed (heartbeat is
     // periodic, a lease is an event), so it is not asserted wholesale -- a claim
     // that would be false is worse than no claim.
     for (auto const& row: Wire::OpTable)
     {
         auto const level = LogLevelForOp(static_cast<std::uint8_t>(row.code));
-        if (row.family == Wire::VerbFamily::Cache)
+        if (row.family == Wire::VerbFamily::Cache || row.family == Wire::VerbFamily::SharedCache)
             CHECK(level == LogLevel::Debug);
         if (row.family == Wire::VerbFamily::Compile)
             CHECK(level == LogLevel::Info);

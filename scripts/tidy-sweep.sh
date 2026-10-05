@@ -15,6 +15,14 @@
 # grep for "error:" reads exactly like success. That mistake has already sent a
 # branch to CI twice with findings a local sweep had reported clean.
 #
+# **And that its HEADER findings reach the report.** A finding in a header is kept
+# only when `.clang-tidy`'s HeaderFilterRegex takes the header's path as clang spells
+# it on this host; the rest is discarded as non-user code in the same silence. A
+# `/`-only pattern did exactly that on Windows, where the path carries backslashes,
+# and the `clang-tidy-windows` leg reported clean without keeping a single header
+# finding. So a second canary plants a finding in two headers and refuses to go on
+# unless the analyser reports both.
+#
 # **What it sweeps is the diff plus everything the diff can break.** A changed
 # header is not a translation unit, so tidying only the changed `.cpp` files would
 # let an edit to `Logger.hpp` land a finding in fifty files nobody checked. The
@@ -88,8 +96,8 @@
 #                `MERGE_GROUP_BASE_SHA`). This is how the workflow invokes it, so
 #                that the event -> (scope, base) mapping lives in one place a
 #                reader can see whole rather than in three CI expressions.
-#   --self-test  check the scope computation against a synthetic tree, and the
-#                canary's verdict against staged probe records, then exit. Needs
+#   --self-test  check the scope computation against a synthetic tree, and both
+#                canaries' verdicts against staged probe records, then exit. Needs
 #                no compile database and no clang-tidy -- which is the whole
 #                point of the second one: until #257 the canary's decision could
 #                only be exercised by a machine already running a full sweep with
@@ -384,6 +392,9 @@ NotOurPattern=""
 # shellcheck source=lib/third-party-roots.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/third-party-roots.sh" \
     || { echo "TIDY SWEEP FATAL: cannot read scripts/lib/third-party-roots.sh" >&2; exit 2; }
+# shellcheck source=lib/git-scrub.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/git-scrub.sh" \
+    || { echo "TIDY SWEEP FATAL: cannot read scripts/lib/git-scrub.sh" >&2; exit 2; }
 
 # Read the third-party roots of the repository at @p 1 into `NotOurRoots` and `NotOurPattern`.
 # @param 1 The repository root.
@@ -403,21 +414,26 @@ LoadNotOurRoots() {
 # source created but not added yet is exactly the code nothing has ever checked, and
 # dropping it here would drop it silently.
 #
-# PURE -- it filters and returns, and refuses nothing. One call site reads it through
-# a process substitution, where an `exit` ends only the subshell: the outer script
-# would carry on with a truncated list and a clean status, which is this script's own
-# nightmare wearing the costume of the guard against it. The assertion that the
-# exclusion still works lives at top level, once, in `AssertNotOurRootsExcluded`.
+# It never EXITS, and every caller reads it into a FILE at the top level and checks the
+# status there: inside a process substitution an `exit` ends only the subshell, and the
+# outer script would carry on with a truncated list and a clean status, which is this
+# script's own nightmare wearing the costume of the guard against it. The assertion
+# that the exclusion still works lives at top level, once, in `AssertNotOurRootsExcluded`.
 #
 # @param @ Optional `git ls-files` pathspec globs.
+# @return 0 with the files on stdout -- none is an answer: the filter's 1 -- or 2 when
+#         `git ls-files` or the filter FAILED (above 1, a kill included: #1630). Read
+#         behind `|| true`, a failure was an empty list, and an `--only` sweep then
+#         planned nothing and exited 0 over nothing analysed (round 10 review, I1).
 FirstPartyFiles() {
-    local listed
-    listed="$(git ls-files --cached --others --exclude-standard "$@")"
+    local listed status=0
+    listed="$(git ls-files --cached --others --exclude-standard "$@")" || return 2
     # Not a herestring: this is the whole `git ls-files` listing, which is past the
-    # 64 KiB pipe buffer where Git Bash's `<<<` deadlocks. See the measurement in
+    # 64 KiB pipe buffer where Git Bash's `<<<` deadlocks. Nor `grep < <(...)`, which
+    # makes grep the writer's parent (#1630). See `pipe_lines_into` in
     # `scripts/lib/third-party-roots.sh`.
-    grep -vE "$NotOurPattern" < <(printf '%s
-' "$listed") || true
+    pipe_lines_into "$listed"$'\n' grep -vE "$NotOurPattern" || status=$?
+    [[ "$status" -le 1 ]] || return 2
 }
 
 # Every tracked-or-new file UNDER the roots: exactly what `FirstPartyFiles` declines.
@@ -425,12 +441,13 @@ FirstPartyFiles() {
 # reader having to trust that it did.
 #
 # @param @ Optional `git ls-files` pathspec globs.
+# @return As `FirstPartyFiles`.
 DeclinedThirdPartyFiles() {
-    local listed
-    listed="$(git ls-files --cached --others --exclude-standard "$@")"
+    local listed status=0
+    listed="$(git ls-files --cached --others --exclude-standard "$@")" || return 2
     # Same listing, same boundary.
-    grep -E "$NotOurPattern" < <(printf '%s
-' "$listed") || true
+    pipe_lines_into "$listed"$'\n' grep -E "$NotOurPattern" || status=$?
+    [[ "$status" -le 1 ]] || return 2
 }
 
 # That the exclusion above still bites. Called once, from the top level, where a
@@ -442,16 +459,24 @@ DeclinedThirdPartyFiles() {
 # nobody here wrote. So for every root that exists AND carries tracked files,
 # dropping it must actually reduce the set.
 AssertNotOurRootsExcluded() {
-    local root all kept
+    local root all kept status
     for root in "${NotOurRoots[@]}"; do
         [[ -d "$root" ]] || continue
         [[ -n "$(git ls-files "$root")" ]] || continue
-        all="$(git ls-files --cached --others --exclude-standard)"
-        # Same listing, same boundary, twice.
-        grep -q "^${root}/" < <(printf '%s
-' "$all") || continue
-        kept="$(grep -v "^${root}/" < <(printf '%s
-' "$all") || true)"
+        all="$(git ls-files --cached --others --exclude-standard)" \
+            || fatal "git ls-files failed, so whether the '${root}/' exclusion still bites cannot be asked"
+        # Same listing, same boundary, twice -- and each grep's status READ: a grep that
+        # failed took `|| continue` and skipped the assertion, or left `kept` empty, which
+        # differs from `all` and passed it (round 10 review, I1).
+        status=0
+        pipe_lines_into "$all"$'\n' grep -q "^${root}/" || status=$?
+        [[ "$status" -le 1 ]] \
+            || fatal "grep exited ${status} looking for '${root}/' in the listing, so whether its exclusion still bites is not known -- the CHECK failing"
+        [[ "$status" -eq 0 ]] || continue
+        status=0
+        kept="$(pipe_lines_into "$all"$'\n' grep -v "^${root}/")" || status=$?
+        [[ "$status" -le 1 ]] \
+            || fatal "grep exited ${status} dropping '${root}/' from the listing, so whether its exclusion still bites is not known -- the CHECK failing"
         [[ "$kept" != "$all" ]] \
             || fatal "the '${root}/' exclusion matched nothing while ${root}/ holds tracked files, so this sweep would analyse code this repository does not own"
     done
@@ -993,6 +1018,34 @@ OnlyCoverageVerdict() {
     echo ok
 }
 
+# `nothing` or `refuse`: may a run of `$1` mode whose plan came back EMPTY exit 0 saying
+# there is nothing to sweep? Only a mode that derived its set from a diff may: `--all`
+# sweeps the whole database, and `--only` NAMES its files -- the units a leg exists to
+# reach -- so an empty plan there is a sweep of nothing, which would report clean (round
+# 10 review, I1). Pure, for the reason `OnlyCoverageVerdict` is.
+#
+# @param 1 Sweep mode (`all`, `ci` or `only`).
+EmptyPlanVerdict() {
+    case "$1" in
+        all|only) echo refuse ;;
+        *) echo nothing ;;
+    esac
+}
+
+# `ok` or `refuse`: may a run of `$1` mode go on when `$2` of the files it was told to sweep
+# planned no translation unit? The per-file form of `EmptyPlanVerdict` (round 11 review, M5):
+# `--only` naming five files of which three plan would sweep two and report clean, the other
+# three left as a stderr note. A diff-derived run chose its set itself, and a header or a file
+# the platform does not compile is an ordinary member of it. Pure, for `OnlyCoverageVerdict`'s
+# reason.
+#
+# @param 1 Sweep mode (`all`, `ci` or `only`).
+# @param 2 How many named files planned no translation unit.
+NamedUnplannedVerdict() {
+    [[ "$1" == only && "$2" -gt 0 ]] && { echo refuse; return; }
+    echo ok
+}
+
 # ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
@@ -1048,8 +1101,150 @@ CanaryVerdict() {
     echo ok
 }
 
+# The FINDING lines in one unit's output: every diagnostic line except the ones the
+# compiler emits for a warning option it does not know (the GCC-only flags a clang
+# build has no use for).
+#
+# Judged by the TAG, anchored at the end of the line -- never by the words anywhere
+# on it. A substring filter swallowed real findings: a message that merely mentions
+# `unknown-warning-option`, and every finding in a file whose PATH contains it, both
+# read as nothing to report. The tag has two spellings in clang-tidy's output:
+# `[clang-diagnostic-unknown-warning-option]`, and the same with `,-warnings-as-errors`
+# appended under `WarningsAsErrors: "*"`. The compiler's own `[-Wunknown-warning-option]`
+# is deliberately NOT dropped: clang-tidy does not print it (measured: 22.1.8, through a
+# database naming GCC-only flags, printed no unknown-warning line at all), and a filter
+# wider than the tool's output can only swallow something else. Colour escapes and a
+# Windows `\r` are stripped first: this tree's `.clang-tidy` colours output even into a
+# file (measured), and `$` would otherwise sit after them.
+# @param 1 Everything the unit printed, stdout and stderr together.
+# @return Prints the finding lines, possibly none; always succeeds.
+FindingLines() {
+    printf '%s\n' "$1" \
+        | sed -e $'s/\x1b\\[[0-9;]*m//g' -e $'s/\r$//' \
+        | grep -E '(error|warning):' \
+        | grep -vE '\[clang-diagnostic-unknown-warning-option(,-warnings-as-errors)?\]$' \
+        || true
+}
+
+# What one unit's run of clang-tidy says about that unit.
+#
+# A non-zero exit is how clang-tidy reports FINDINGS, and is also how it reports
+# having analysed NOTHING: a unit it could not process can exit 1 and print no
+# diagnostic at all. The finding filter below then finds no line, and the unit used to
+# be summed into `TIDY SWEEP CLEAN` -- a file that was never read, reported clean. So
+# the exit status is read together with the output: non-zero with no diagnostic line
+# of ANY kind is `unanalysed`, a failure of the sweep and never a pass.
+#
+# `clean` needs a reason, and there are two: a zero exit, or a non-zero one whose only
+# DIAGNOSTIC lines are unknown-warning-option ones (`FindingLines` drops them: GCC-only
+# flags a clang build ignores). Non-diagnostic lines are TOLERATED in that second case
+# -- an `Error while processing`, even a `Stack dump:` -- and that leniency is bounded
+# on purpose rather than by accident: a crash exits at or above 126, which is `fatal`
+# before this row is reached (128 plus the signal on POSIX; measured under Git Bash on
+# Windows, for a RELEASE-CRT program: an access violation 139, a stack overflow,
+# `__fastfail` and `abort()` each 127). A DEBUG-CRT `abort()` exits 3 (measured), below
+# that line -- and the release case is the one that applies, measured from the pinned
+# 22.1.8 `clang-tidy.exe`'s import table: `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll`,
+# `MSVCP140.dll` and the `api-ms-win-crt-*` set, with no `ucrtbased`, `vcruntime140d` or
+# `msvcp140d`. A Debug-CRT crash that printed no diagnostic line would reach `unanalysed`
+# rather than `fatal`: still a failure, never `clean`. And a run that analysed nothing because no check was
+# enabled is the canary's question, asked once before any unit. Anything else falls to
+# `unanalysed` -- the table fails CLOSED, so a combination nobody thought of reads as a
+# unit not covered.
+# @param 1 The unit's exit status.
+# @param 2 `yes` when `FindingLines` found a line in the output, `no` otherwise.
+# @param 3 `yes` when the output held a diagnostic line of any kind, `no` otherwise.
+# @return Prints `fatal`, `findings`, `clean` or `unanalysed`.
+TidyUnitVerdict() {
+    local rc="$1" findings="$2" anyDiagnostic="$3"
+    if [[ "$rc" -ge 126 ]]; then
+        echo fatal
+    elif [[ "$findings" == yes ]]; then
+        echo findings
+    elif [[ "$rc" -eq 0 ]]; then
+        echo clean
+    elif [[ "$anyDiagnostic" == yes ]]; then
+        echo clean
+    else
+        echo unanalysed
+    fi
+}
+
+# How many `Expect` cases `SelfTest` runs. Printed AND asserted, because a self-test
+# that stopped early -- a helper that `return`ed, a block skipped by a failed
+# precondition, a row deleted by mistake -- would otherwise print PASSED over fewer
+# judgements than it claims. Change it in the same edit that adds or removes a row.
+SelfTestCases=116
+
+# The HEADER canary's decision: was a finding planted in each named header REPORTED?
+#
+# `Canary` proves the analyser parses a unit, which says nothing about headers: a
+# finding in a header is reported only when `.clang-tidy`'s HeaderFilterRegex takes the
+# header's path AS CLANG SPELLS IT, and everything else is discarded as non-user code
+# with nothing to show for it but a `Suppressed N warnings` line. On Windows that path
+# carries a backslash wherever clang joined an include directory to a header name, and
+# a `/`-only pattern discarded every first-party header finding there while the
+# `clang-tidy-windows` leg reported clean. `local-gate.sh` asks the same question of a
+# MODEL of the regex engine on every host; this asks the analyser itself, on the host
+# the sweep runs on, before any verdict is believed.
+#
+# The failing arms are four because the remedies are: `filtered` is the header filter
+# refusing a path (clang-tidy SAID it suppressed something), `unreported` is a finding
+# that never happened at all -- no line, no suppression, so the check that should fire
+# is off or the header was never read -- `config-unread` is clang-tidy refusing the
+# `--config-file` it was handed, and the unit-level arms are `CanaryVerdict`'s, asked
+# first, since a probe that did not parse says nothing about any of them.
+#
+# `config-unread` has its own arm because it is how a path that did not survive the
+# trip to the analyser looks -- on the Windows leg, an MSYS conversion that went wrong
+# -- and it exits 1 with no finding and no suppression, which `unreported` would send
+# looking for a disabled check.
+#
+# A header is matched by its BASENAME at the end of a path spelled with EITHER
+# separator, since the line naming it on Windows is `C:\...\src\tests\X.hpp:3:12:`, AND
+# by the PLANTED check's tag. Any finding at the header is not enough: a compile error
+# in a header is reported whatever HeaderFilterRegex says -- measured, the `/`-only
+# pattern reports `[clang-diagnostic-error]` from a header it filters -- so counting it
+# would pass the canary over the very filter it exists to test.
+#
+# @param 1 The probe's exit status.
+# @param 2 Everything the probe printed, stdout and stderr together.
+# @param 3.. The basename of each header a finding was planted in.
+# @return Prints `ok`, `filtered <header>`, `unreported <header>`, `config-unread
+#         <output>`, or a `CanaryVerdict` failure word.
+HeaderCanaryVerdict() {
+    local rc="$1" output="$2" unit header
+    shift 2
+    unit="$(CanaryVerdict "$rc" "$output")"
+    if [[ "$unit" != ok ]]; then
+        echo "$unit"
+        return
+    fi
+    case "$output" in
+        *"can't read config-file"*)
+            echo "config-unread ${output}"
+            return ;;
+    esac
+    for header in "$@"; do
+        # A herestring rather than a pipe: `producer | grep -q` is a false negative
+        # under pipefail, and on the success path.
+        # The name's `.` stays a wildcard, which costs nothing for names this fixed.
+        # The tag is `[readability-identifier-naming]`, or with `,-warnings-as-errors`
+        # appended where `.clang-tidy` makes it an error, so it ends at `]` or `,`.
+        if grep -Eq "(^|[/\\\\])${header}:[0-9]+:[0-9]+: (warning|error): .*\\[readability-identifier-naming[],]" <<< "$output"; then
+            continue
+        fi
+        case "$output" in
+            *"in non-user code"*) echo "filtered ${header}" ;;
+            *)                    echo "unreported ${header}" ;;
+        esac
+        return
+    done
+    echo ok
+}
+
 SelfTest() {
-    local status=0
+    local status=0 cases=0
     # A literal apostrophe, so the canary expectations below can carry the ones
     # clang-tidy's own messages do without a line of nested quoting each.
     local SQ="'"
@@ -1074,6 +1269,7 @@ SelfTest() {
 
     Expect() {
         local what="$1" want="$2" got="$3"
+        cases=$((cases + 1))
         if [[ "$want" == "$got" ]]; then
             echo "  ok   ${what}"
         else
@@ -1418,6 +1614,16 @@ STUB
     # And the modes that CHOSE their own set are unaffected: an empty unit there is
     # a platform-gated file on the other platform, which is the guard working.
     Expect "--all tolerates an empty unit"   "ok" "$(OnlyCoverageVerdict all 3 0)"
+    # An EMPTY PLAN is "nothing to sweep" only where the set came from a diff: `--only` named
+    # its files, and a plan holding none of them is a sweep of nothing (round 10 review, I1).
+    Expect "--only refuses an empty plan"    "refuse"  "$(EmptyPlanVerdict only)"
+    Expect "--all refuses an empty plan"     "refuse"  "$(EmptyPlanVerdict all)"
+    Expect "--ci may find nothing to sweep"  "nothing" "$(EmptyPlanVerdict ci)"
+    # And per FILE: `--only` refuses a named file that planned no unit; a diff-derived run's
+    # header or other-platform file is an ordinary member of its set (round 11 review, M5).
+    Expect "--only refuses a named file that planned no unit" "refuse" "$(NamedUnplannedVerdict only 1)"
+    Expect "--only goes on when every named file planned"     "ok"     "$(NamedUnplannedVerdict only 0)"
+    Expect "--ci tolerates a changed file with no unit"       "ok"     "$(NamedUnplannedVerdict ci 3)"
     Expect "--ci tolerates an unknown unit"  "ok" "$(OnlyCoverageVerdict ci 0 3)"
     # NOT asserted here, deliberately: that the preprocessed dump is created inside
     # $scratch rather than $TMPDIR. Both paths delete it on the way out, so the
@@ -1532,6 +1738,93 @@ STUB
            "not-parsing fatal error: ${SQ}stddef.h${SQ} file not found" \
            "$(CanaryVerdict 0 "fatal error: ${SQ}stddef.h${SQ} file not found")"
 
+    # One unit's verdict, every arm. The accepting direction first, for the canary's
+    # reason: a `TidyUnitVerdict` answering `unanalysed` unconditionally would satisfy
+    # the refusing case while failing every branch in the tree.
+    Expect "a zero exit with no finding is a clean unit" "clean" "$(TidyUnitVerdict 0 no no)"
+    Expect "a non-zero exit explained only by unknown warning options is a clean unit" \
+           "clean" "$(TidyUnitVerdict 1 no yes)"
+    Expect "findings are findings, whatever the exit" "findings" "$(TidyUnitVerdict 1 yes yes)"
+    Expect "a warning under a zero exit is still a finding" "findings" "$(TidyUnitVerdict 0 yes yes)"
+    Expect "a binary that never started is fatal" "fatal" "$(TidyUnitVerdict 127 no no)"
+    # The case this function exists for: exit 1 and not one diagnostic line. It used to
+    # read as CLEAN, which is a file nobody analysed reported as covered.
+    Expect "a non-zero exit with NO diagnostic is a unit nobody analysed" \
+           "unanalysed" "$(TidyUnitVerdict 1 no no)"
+
+    # Which lines are findings: the unknown-warning-option TAG is dropped, in both of
+    # clang-tidy's spellings and through colour escapes -- and nothing that merely MENTIONS it.
+    local uwo="warning: unknown warning option '-Wno-foo'"
+    Expect "clang-tidy's unknown-warning-option tag is not a finding" \
+           "" "$(FindingLines "${uwo} [clang-diagnostic-unknown-warning-option]")"
+    Expect "nor is it under warnings-as-errors" \
+           "" "$(FindingLines "error: unknown warning option '-Wno-foo' [clang-diagnostic-unknown-warning-option,-warnings-as-errors]")"
+    Expect "nor when Windows colours it and ends it with a carriage return" \
+           "" "$(FindingLines $'\x1b[0;1;35m'"${uwo}"$' [clang-diagnostic-unknown-warning-option]\x1b[0m\r')"
+    Expect "a finding whose MESSAGE mentions unknown-warning-option is still a finding" \
+           "src/x.cpp:1:1: warning: comment says unknown-warning-option here [readability-foo]" \
+           "$(FindingLines "src/x.cpp:1:1: warning: comment says unknown-warning-option here [readability-foo]")"
+    Expect "a finding in a file whose PATH holds unknown-warning-option is still a finding" \
+           "src/unknown-warning-option/x.cpp:1:1: warning: bad [readability-foo]" \
+           "$(FindingLines "src/unknown-warning-option/x.cpp:1:1: warning: bad [readability-foo]")"
+
+    # The HEADER canary's verdict, accepting first. The lines are the ones the pinned
+    # clang-tidy printed natively over a Windows database: the sibling header spelled
+    # with backslashes throughout, the `-I` one joined to a `/` include -- so a verdict
+    # that only recognised `/` would refuse the very run that proves the filter works.
+    local hdrSib="TidyHeaderCanarySibling.hpp" hdrInc="TidyHeaderCanaryIncluded.hpp"
+    local winSib="C:\\Temp\\tmp.x\\header-canary\\src\\tests\\${hdrSib}:4:12: error: invalid case style for global variable ${SQ}g_siblingCanary${SQ} [readability-identifier-naming,-warnings-as-errors]"
+    local winInc="C:/Temp/tmp.x/header-canary/src\\FastCache/${hdrInc}:4:12: error: invalid case style for global variable ${SQ}g_includedCanary${SQ} [readability-identifier-naming,-warnings-as-errors]"
+    local posixSib="/tmp/tmp.x/header-canary/src/tests/${hdrSib}:4:12: warning: invalid case style for global variable ${SQ}g_siblingCanary${SQ} [readability-identifier-naming]"
+    local posixInc="/tmp/tmp.x/header-canary/src/FastCache/${hdrInc}:4:12: warning: invalid case style for global variable ${SQ}g_includedCanary${SQ} [readability-identifier-naming]"
+    local suppressed="Suppressed 2 warnings (2 in non-user code)."
+    Expect "both header findings reported with Windows spellings pass the header canary" \
+           "ok" "$(HeaderCanaryVerdict 1 "2 warnings generated.
+${winInc}
+${winSib}
+2 warnings treated as errors" "$hdrSib" "$hdrInc")"
+    Expect "both header findings reported with POSIX spellings pass the header canary" \
+           "ok" "$(HeaderCanaryVerdict 1 "${posixSib}
+${posixInc}" "$hdrSib" "$hdrInc")"
+    # The blind filter, verbatim from the `/`-only pattern's run: exit 0, a suppression
+    # line, no finding. This is the state the Windows leg sat in, reporting clean.
+    Expect "findings the header filter suppressed are refused as filtered" \
+           "filtered ${hdrSib}" "$(HeaderCanaryVerdict 0 "2 warnings generated.
+${suppressed}" "$hdrSib" "$hdrInc")"
+    # Half a fix -- `\\` after the root only -- takes the sibling and refuses the mixed
+    # spelling, and the verdict names WHICH header, so the remedy points at the shape.
+    Expect "a filter taking only one spelling is refused, naming the other header" \
+           "filtered ${hdrInc}" "$(HeaderCanaryVerdict 1 "${winSib}
+Suppressed 1 warnings (1 in non-user code)." "$hdrSib" "$hdrInc")"
+    Expect "no finding and no suppression is unreported, never filtered" \
+           "unreported ${hdrSib}" "$(HeaderCanaryVerdict 0 "" "$hdrSib" "$hdrInc")"
+    # A finding in the UNIT is not a finding in the header: the anchor is the basename
+    # at the end of a path, so `TidyHeaderCanary.cpp` cannot stand in for either.
+    Expect "a finding in the unit alone does not pass the header canary" \
+           "unreported ${hdrSib}" \
+           "$(HeaderCanaryVerdict 1 "C:\\Temp\\src\\tests\\TidyHeaderCanary.cpp:1:1: error: x [y]" "$hdrSib" "$hdrInc")"
+    # A compile error in a header is reported whatever the header filter says, so it
+    # must not stand in for the planted finding -- measured, the `/`-only pattern reports
+    # this line from a header it filters. Neither is another check's finding.
+    Expect "a header COMPILE ERROR alone does not count as the planted finding" \
+           "unreported ${hdrSib}" \
+           "$(HeaderCanaryVerdict 1 "C:\\Temp\\src\\tests\\${hdrSib}:2:1: error: unknown type name ${SQ}not_a_type${SQ} [clang-diagnostic-error]
+${winInc}" "$hdrSib" "$hdrInc")"
+    Expect "another check's finding at the header does not count either" \
+           "unreported ${hdrInc}" \
+           "$(HeaderCanaryVerdict 1 "${winSib}
+C:/Temp/src\\FastCache/${hdrInc}:4:1: error: variable is non-const [cppcoreguidelines-avoid-non-const-global-variables,-warnings-as-errors]" "$hdrSib" "$hdrInc")"
+    # The configuration never read is its own outcome, not `unreported`: it is what a
+    # path the analyser could not open looks like, and it exits 1 with nothing else said.
+    Expect "an unreadable --config-file is config-unread, never unreported" \
+           "config-unread Error: can${SQ}t read config-file ${SQ}D:/no/such/.clang-tidy${SQ}: no such file or directory" \
+           "$(HeaderCanaryVerdict 1 "Error: can${SQ}t read config-file ${SQ}D:/no/such/.clang-tidy${SQ}: no such file or directory" "$hdrSib" "$hdrInc")"
+    Expect "a header canary probe that could not execute says so first" \
+           "not-executed exit 127" "$(HeaderCanaryVerdict 127 "" "$hdrSib" "$hdrInc")"
+    Expect "a header canary probe that could not parse says so first" \
+           "not-parsing fatal error: ${SQ}stddef.h${SQ} file not found" \
+           "$(HeaderCanaryVerdict 0 "fatal error: ${SQ}stddef.h${SQ} file not found" "$hdrSib" "$hdrInc")"
+
     # The third-party roots (#1370), planted: a scratch repository whose roots file names
     # `vendor`, holding one first-party source and one vendored one. The sweep's file set
     # must keep the first and decline the second BY NAME -- a roots reader that silently
@@ -1541,11 +1834,33 @@ STUB
     printf 'int a;\n' > "$tp/src/a.cpp"
     printf 'int b;\n' > "$tp/vendor/upstream/b.cpp"
     printf '# roots\nvendor\n' > "$tp/scripts/lib/third-party-roots.txt"
-    if env -u GIT_DIR -u GIT_WORK_TREE git -C "$tp" init -q >/dev/null 2>&1 \
-        && env -u GIT_DIR -u GIT_WORK_TREE git -C "$tp" add -A >/dev/null 2>&1; then
+    if scratch_git -C "$tp" init -q >/dev/null 2>&1 \
+        && scratch_git -C "$tp" add -A >/dev/null 2>&1; then
         Expect "a planted third-party source is declined, and the first-party one kept" \
                "src/a.cpp"$'\t'"vendor/upstream/b.cpp" \
                "$(cd "$tp" && LoadNotOurRoots "$tp" && printf '%s\t%s' "$(FirstPartyFiles '*.cpp')" "$(DeclinedThirdPartyFiles '*.cpp')")"
+        # And a listing that FAILED is refused, never an empty set (round 10 review, I1): a
+        # filter grep killed (148, #1630's status), and `git ls-files` failing, each answer 2
+        # from both enumerators -- while a filter that selects nothing (1) is an answer, 0.
+        Expect "a killed filter grep is refused by both enumerators (2), never read as no files" "2 2" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && grep() { return 148; } \
+                  && { FirstPartyFiles '*.cpp' > /dev/null; a=$?; DeclinedThirdPartyFiles '*.cpp' > /dev/null; echo "$a $?"; })"
+        Expect "a failing git ls-files is refused by both enumerators (2), never read as no files" "2 2" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && git() { return 128; } \
+                  && { FirstPartyFiles '*.cpp' > /dev/null; a=$?; DeclinedThirdPartyFiles '*.cpp' > /dev/null; echo "$a $?"; })"
+        Expect "a filter selecting nothing is an answer (0), not a refusal" "0" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && grep() { return 1; } && { FirstPartyFiles '*.cpp' > /dev/null; echo "$?"; })"
+        # And the assertion that the exclusion bites: each of its two greps killed is a FATAL
+        # (2), never a skipped root or an empty `kept` that differs from the listing and passes.
+        # The control first, so a 2 below is the grep's and not the tree's.
+        Expect "the exclusion assertion passes on the planted tree" "0" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && { (AssertNotOurRootsExcluded) > /dev/null 2>&1; echo "$?"; })"
+        Expect "the exclusion assertion is fatal when its root-finding grep is killed" "2" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && grep() { [ "$1" = -q ] && return 148; command grep "$@"; } \
+                  && { (AssertNotOurRootsExcluded) > /dev/null 2>&1; echo "$?"; })"
+        Expect "the exclusion assertion is fatal when its root-dropping grep is killed" "2" \
+               "$(cd "$tp" && LoadNotOurRoots "$tp" && grep() { [ "$1" = -v ] && return 148; command grep "$@"; } \
+                  && { (AssertNotOurRootsExcluded) > /dev/null 2>&1; echo "$?"; })"
     else
         echo "  FAIL third-party roots: git could not stage the scratch repository, so the planted case did not run"
         status=1
@@ -1567,6 +1882,11 @@ STUB
     Expect "a listing with no object-order phony selects nothing, which the step refuses" \
            "" "$(ObjectOrderTargets "$(printf 'all: phony\nclean: CLEAN\n')")"
 
+    echo "TIDY SWEEP SELF-TEST: ${cases} case(s) ran, ${SelfTestCases} expected"
+    if [[ "$cases" -ne "$SelfTestCases" ]]; then
+        echo "  FAIL the self-test ran ${cases} case(s) where it declares ${SelfTestCases}: it stopped early, skipped a block or lost a row -- or SelfTestCases was not updated with one"
+        status=1
+    fi
     [[ "$status" -eq 0 ]] && echo "TIDY SWEEP SELF-TEST PASSED"
     return "$status"
 }
@@ -1802,6 +2122,55 @@ Canary() {
     esac
 }
 
+# A canary for HEADERS, against the analyser itself. Two first-party-shaped headers,
+# each holding a naming violation, reached the two ways clang builds a header path:
+# `TidyHeaderCanarySibling.hpp` by a quote include beside the unit (on Windows,
+# `...\src\tests\TidyHeaderCanarySibling.hpp`) and `TidyHeaderCanaryIncluded.hpp` through
+# `-I<root>/src` and `<FastCache/...>` (on Windows, `...\src\FastCache/...`, the mixed
+# spelling). Both must be REPORTED under this tree's own `.clang-tidy`, or the sweep
+# stops: a clean verdict from a run that discards every header finding is a claim about
+# no header at all. Measured with the pinned clang-tidy, natively on Windows from Git
+# Bash, which is how the `clang-tidy-windows` job calls it, and with no compile database,
+# since this unit brings its own flags: under the `/`-only pattern both findings are
+# suppressed and this refuses; under `[/\\]` both are reported. On Linux it passes under
+# either pattern, because clang spells the paths with `/` there; the backslash half is
+# checked on the Windows leg alone, and on Linux by `local-gate.sh`'s model of the regex.
+#
+# In the scratch tree rather than in `src/`: nothing is written into the checkout, and
+# `--config-file` names the configuration so the one under test is this tree's whether
+# or not the scratch directory sits under it. No compile database either -- the unit
+# includes nothing else, and the header filter is a question about PATHS.
+HeaderCanary() {
+    local canary="${scratch}/header-canary" probe probe_rc verdict
+    mkdir -p "${canary}/src/tests" "${canary}/src/FastCache" \
+        || fatal "cannot create the header canary's scratch tree"
+    printf '#pragma once\nnamespace FastCache::TidyHeaderCanary\n{\ninline int g_siblingCanary = 0;\n}\n' \
+        > "${canary}/src/tests/TidyHeaderCanarySibling.hpp"
+    printf '#pragma once\nnamespace FastCache::TidyHeaderCanary\n{\ninline int g_includedCanary = 0;\n}\n' \
+        > "${canary}/src/FastCache/TidyHeaderCanaryIncluded.hpp"
+    printf '#include "TidyHeaderCanarySibling.hpp"\n#include <FastCache/TidyHeaderCanaryIncluded.hpp>\n' \
+        > "${canary}/src/tests/TidyHeaderCanary.cpp"
+    # Colour off: `.clang-tidy` turns it on, and an escape sequence between a path and
+    # `error:` is a finding the verdict cannot see -- measured, it refused a run that
+    # had reported both headers.
+    probe="$("$TIDY" "--config-file=${repo_root}/.clang-tidy" --use-color=false \
+        "${canary}/src/tests/TidyHeaderCanary.cpp" -- -std=c++23 "-I${canary}/src" 2>&1)"
+    probe_rc=$?
+    verdict="$(HeaderCanaryVerdict "$probe_rc" "$probe" TidyHeaderCanarySibling.hpp TidyHeaderCanaryIncluded.hpp)"
+    case "$verdict" in
+        ok) ;;
+        filtered*) fatal "the header filter in ${repo_root}/.clang-tidy (HeaderFilterRegex) discarded a finding planted in ${verdict#filtered } as non-user code, so every first-party header finding in this sweep would be discarded the same way and a clean verdict would describe no header. clang spells a header's path with THIS host's separator wherever it joined an include directory to a header name, so a pattern that writes a separator as / is blind on Windows: write every separator as [/\\\\]. What $TIDY printed:
+${probe}" ;;
+        unreported*) fatal "$TIDY reported nothing about a naming violation planted in ${verdict#unreported } -- no finding and no suppressed warning -- so it is not reading headers the way this sweep assumes: the check that should fire (readability-identifier-naming's GlobalVariableCase) may be off in ${repo_root}/.clang-tidy, or the header was never included, or the configuration file was not read (check the path clang-tidy received). This is not the header filter, which would have said it suppressed something. What $TIDY printed:
+${probe}" ;;
+        config-unread*) fatal "$TIDY could not read the configuration it was handed as --config-file=${repo_root}/.clang-tidy, so the header canary tested no header filter at all. Check the path clang-tidy received: on the Windows leg this is what an MSYS path conversion that went wrong looks like, and the path in the message below is the one the analyser actually tried. What $TIDY printed:
+${verdict#config-unread }" ;;
+        not-executed*) fatal "$TIDY could not be executed for the header canary (${verdict#not-executed })" ;;
+        not-parsing*) fatal "$TIDY is not parsing the header canary: ${verdict#not-parsing }" ;;
+        *) fatal "HeaderCanaryVerdict returned an unrecognised verdict [${verdict}]; that is a bug in this script, not a problem with $TIDY" ;;
+    esac
+}
+
 # A compile database is not a tree that PARSES. clang-tidy reads each unit the way the
 # compiler would, so a header the build generates has to exist -- and the clang-tidy job
 # configures without building. libunicode, which core-cpp's terminal UI links, writes its
@@ -1900,7 +2269,8 @@ fi
 # Before either enumeration below reaches `FirstPartyFiles`, and at the top level so
 # a refusal can stop the run.
 AssertNotOurRootsExcluded
-declinedFiles="$(DeclinedThirdPartyFiles)"
+declinedFiles="$(DeclinedThirdPartyFiles)" \
+    || fatal "which files are third-party could not be listed (git ls-files or its filter failed)"
 [[ -z "$declinedFiles" ]] || echo "TIDY SWEEP: $(third_party_declined_summary 'file(s)' "$declinedFiles")"
 
 if [[ "$mode" != all && "$mode" != only ]]; then
@@ -1927,11 +2297,13 @@ if [[ "$mode" != all && "$mode" != only ]]; then
     #
     # Filtered to what is actually on disk, because `--cached` also lists a tracked
     # file deleted from the worktree and not yet staged, and the include scan now
-    # treats a file it cannot read as fatal rather than as an empty graph.
-    mapfile -t sources < <(FirstPartyFiles "${globs[@]}" \
-                           | while IFS= read -r candidate; do
-                                 [[ -f "$candidate" ]] && printf '%s\n' "$candidate"
-                             done)
+    # treats a file it cannot read as fatal rather than as an empty graph. Into a FILE
+    # first, at the top level, where its refusal can stop the run.
+    FirstPartyFiles "${globs[@]}" > "${scratch}/sources-listed" \
+        || fatal "the first-party sources could not be listed (git ls-files or its filter failed)"
+    while IFS= read -r candidate; do
+        [[ -f "$candidate" ]] && sources+=("$candidate")
+    done < "${scratch}/sources-listed"
     for path in "${changed[@]}"; do
         for extension in "${SourceExtensions[@]}"; do
             [[ "$path" == *".${extension}" ]] && { touched+=("$path"); break; }
@@ -1947,7 +2319,8 @@ if [[ "$mode" != all && "$mode" != only ]]; then
     echo "TIDY SWEEP: ${#touched[@]} changed source(s) reach $(wc -l < "$selection" | tr -d ' ') candidate file(s)"
 fi
 
-FirstPartyFiles > "${scratch}/first-party"
+FirstPartyFiles > "${scratch}/first-party" \
+    || fatal "the first-party files could not be listed (git ls-files or its filter failed), so no plan could be read as complete"
 
 # Through a file, so the plan's exit status is OBSERVED. `mapfile < <(PlanUnits …)`
 # discards it, and every way the plan can fail -- a compile database this build
@@ -1960,16 +2333,34 @@ if ! PlanUnits "$selection" "${scratch}/first-party" > "${scratch}/plan"; then
 fi
 mapfile -t plan < "${scratch}/plan"
 if [[ "${#plan[@]}" -eq 0 ]]; then
-    if [[ "$mode" == all ]]; then
+    if [[ "$(EmptyPlanVerdict "$mode")" != nothing ]]; then
+        [[ "$mode" != only ]] \
+            || fatal "--only=${onlyList} names ${#onlyPaths[@]} file(s) and none is a first-party translation unit in ${DB}/compile_commands.json; a sweep of nothing would report clean"
         fatal "no first-party translation units in ${DB}/compile_commands.json"
     fi
     echo "TIDY SWEEP: nothing changed here reaches a translation unit this platform"
     echo "            compiles; nothing to sweep"
     exit 0
 fi
+# Every file `--only` named has to have planned: one that did not would be swept by nobody
+# while the run reports clean over the rest. The plan's second field is the repo path.
+unplanned=()
+if [[ "$mode" == only ]]; then
+    declare -A plannedPaths=()
+    for row in "${plan[@]}"; do
+        rest="${row#*$'\t'}"
+        plannedPaths["${rest%%$'\t'*}"]=1
+    done
+    for path in "${onlyPaths[@]}"; do
+        [[ -n "${plannedPaths[$path]+x}" ]] || unplanned+=("$path")
+    done
+fi
+[[ "$(NamedUnplannedVerdict "$mode" "${#unplanned[@]}")" == ok ]] \
+    || fatal "--only=${onlyList} names ${#unplanned[@]} file(s) that plan no translation unit in ${DB}/compile_commands.json, first '${unplanned[0]}'; sweeping the rest would report clean over a set smaller than the one named"
 echo "TIDY SWEEP: ${#plan[@]} translation unit(s), ${TIDY}, ${JOBS} at a time"
 EnsureGeneratedSources
 Canary
+HeaderCanary
 
 # One translation unit, into numbered files so the report below is in a stable
 # order however the pool interleaves. A refusal to EXECUTE is recorded apart from
@@ -2002,16 +2393,21 @@ TidyOne() {
     esac
     out="$("$TIDY" -p "$database" --quiet "$file" 2>&1)"
     rc=$?
-    if [[ "$rc" -ge 126 ]]; then
-        printf '%s (exit %s)\n' "$file" "$rc" > "${slot}.fatal"
-        return
-    fi
-    # Unknown *warning options* are the GCC-only flags a clang build has no use
-    # for; everything else is a finding.
-    hits="$(printf '%s\n' "$out" | grep -E 'error:|warning:' | grep -v 'unknown-warning-option')"
-    if [[ -n "$hits" ]]; then
-        printf '=== %s\n%s\n' "$file" "$hits" > "${slot}.out"
-    fi
+    hits="$(FindingLines "$out")"
+    local findings=no anyDiagnostic=no
+    [[ -n "$hits" ]] && findings=yes
+    # A bash match rather than `grep -q <<<`: the output can pass 64 KiB, where a Git Bash
+    # herestring deadlocks.
+    [[ "$out" =~ (error|warning): ]] && anyDiagnostic=yes
+    case "$(TidyUnitVerdict "$rc" "$findings" "$anyDiagnostic")" in
+        fatal)      printf '%s (exit %s)\n' "$file" "$rc" > "${slot}.fatal" ;;
+        findings)   printf '=== %s\n%s\n' "$file" "$hits" > "${slot}.out" ;;
+        clean)      : ;;
+        # Named, with what it did print, so the next person starts from the evidence.
+        unanalysed) { printf '%s (exit %s, and not one diagnostic line)\n' "$file" "$rc"
+                      [[ -z "$out" ]] || printf '%s\n' "$out" | head -3 | sed 's/^/    /'; } > "${slot}.unanalysed" ;;
+        *)          printf '%s (unrecognised unit verdict)\n' "$file" > "${slot}.unanalysed" ;;
+    esac
 }
 
 
@@ -2071,6 +2467,16 @@ for report in "$scratch"/*.out; do
     cat "$report"
     status=1
 done
+
+# A unit clang-tidy exited non-zero on without printing a diagnostic was not ANALYSED,
+# and must not be counted into the clean verdict below (`TidyUnitVerdict`).
+unanalysed=("$scratch"/*.unanalysed)
+if [[ "${#unanalysed[@]}" -gt 0 ]]; then
+    echo "TIDY SWEEP: ${#unanalysed[@]} unit(s) exited non-zero with no diagnostic, so they were NOT analysed" >&2
+    echo "            and this run says nothing about them; it is a failure, not a pass:" >&2
+    cat "${unanalysed[@]}" >&2
+    status=1
+fi
 
 # The count that means something, and the two that qualify it (#466).
 #

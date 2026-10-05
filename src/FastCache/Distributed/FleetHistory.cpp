@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Core/ByteAppender.hpp>
 #include <FastCache/Core/Crc32c.hpp>
 #include <FastCache/Core/Endian.hpp>
@@ -46,13 +47,20 @@ namespace
     };
 
     /// A node's own series: three rings in one file.
-    constexpr FileEnvelope RingFile { .magic = { 'F', 'C', 'F', 'H' }, .newest = 2 };
+    constexpr FileEnvelope RingFile { .magic = { 'F', 'C', 'F', 'H' }, .newest = 3 };
 
     /// The received-histories store: one nested `FleetHistory` body per machine.
     ///
     /// Its own magic, so a path typed into the wrong flag is refused by name rather
     /// than read as a truncated history.
-    constexpr FileEnvelope NodeStoreFile { .magic = { 'F', 'C', 'N', 'H' }, .newest = 1 };
+    ///
+    /// Its version moves with the nested body's shape, not with `RingFile`'s: a
+    /// nested body carries no envelope of its own, so THIS is the only place a
+    /// reader can learn whether it was written at `ReadVersion2`'s width or
+    /// `ReadVersion3`'s. Version 1 wrote the former, version 2 the latter -- moved
+    /// here because `DispatchAllExcluded` widened `FleetMetric`, the same reason
+    /// `RingFile` moved to 3.
+    constexpr FileEnvelope NodeStoreFile { .magic = { 'F', 'C', 'N', 'H' }, .newest = 2 };
 
     /// Magic, version byte, body length, body checksum.
     constexpr std::size_t EnvelopeSize = 4 + 1 + (sizeof(std::uint64_t) * 2);
@@ -269,8 +277,12 @@ namespace
     /// @param path Where the file belongs.
     /// @param envelope What to stamp.
     /// @param file The whole file: header space, then the body.
-    /// @return True when the rename succeeded.
-    [[nodiscard]] bool WriteFramed(std::filesystem::path const& path, FileEnvelope const& envelope, std::string& file)
+    /// @param which Which state file it is, and so who may read it.
+    /// @return True when the file was replaced.
+    [[nodiscard]] bool WriteFramed(std::filesystem::path const& path,
+                                   FileEnvelope const& envelope,
+                                   std::string& file,
+                                   StateFile which)
     {
         std::string_view const body { file.data() + EnvelopeSize, file.size() - EnvelopeSize };
 
@@ -282,26 +294,9 @@ namespace
         AppendU64(header, Crc32c::Compute(std::span { reinterpret_cast<std::byte const*>(body.data()), body.size() }));
         std::ranges::copy(header, file.begin());
 
-        // Temp then rename: a crash between the two leaves the previous file whole
-        // rather than half of this one.
-        auto const temp = std::filesystem::path { path }.concat(".tmp");
-        {
-            std::ofstream out { temp, std::ios::binary | std::ios::trunc };
-            if (!out)
-                return false;
-            out.write(file.data(), static_cast<std::streamsize>(file.size()));
-            if (!out)
-                return false;
-        }
-
-        std::error_code ec;
-        std::filesystem::rename(temp, path, ec);
-        if (ec)
-        {
-            std::filesystem::remove(temp, ec);
-            return false;
-        }
-        return true;
+        // Through the node's one durable writer: a crash leaves the previous file whole rather than
+        // half of this one, and what lands is synced and its close checked, as every state file is.
+        return Consensus::ReplaceFileAtomically(path, std::as_bytes(std::span { file }), which).has_value();
     }
 
     /// What reading a framed file produced.
@@ -505,12 +500,26 @@ namespace
     /// read without this constant being edited -- and a build whose ring set differs
     /// from the file's is a different version by definition, which is why neither the
     /// writer nor the reader stores a count.
+    ///
+    /// Version 3 carries the same rings; only the value width moved between the two, so
+    /// this is shared rather than duplicated under a second name.
     constexpr auto Version2Rings = []() consteval {
         std::array<FleetRing, EnumeratorCount<FleetRing>> rings {};
         for (auto const& row: FleetRingTable)
             rings[static_cast<std::size_t>(row.ring)] = row.ring;
         return rings;
     }();
+
+    /// The value and fold width versions 1 and 2 wrote: nine, for as long as
+    /// `FleetMetric` had nine enumerators.
+    ///
+    /// Frozen here rather than derived from `EnumeratorCount<FleetMetric>`, which is
+    /// THIS build's width and not what a v1 or v2 file actually holds. `FleetMetric`'s
+    /// own doc comment states the ordinals are a persisted, append-only contract for
+    /// exactly this reason: a metric added after this constant was fixed lands past
+    /// index 8, and a v1 or v2 bucket simply never wrote it -- reading one back with
+    /// that slot at zero is correct, not a gap.
+    constexpr std::size_t LegacyValueWidth = 9;
 
     /// Version 1: a generation, then two rings -- minute and hour -- of
     /// `[start][present][9 values]`, with no fold and no coverage.
@@ -539,8 +548,10 @@ namespace
             // recoverable from it. v2 stores the instant because its buckets fold.
             bucket.sampleMillis = bucket.startMillis;
             bucket.present = present != 0;
-            for (auto& value: bucket.values)
-                if (!from.Take(value))
+            // Exactly the width v1 wrote, never `bucket.values`' own extent: a metric
+            // appended since lands past index 8 and this format never carried it.
+            for (auto const index: std::views::iota(std::size_t { 0 }, LegacyValueWidth))
+                if (!from.Take(bucket.values[index]))
                     return false;
             bucket.coverage = bucket.present ? 1 : 0;
             for (auto const& row: FleetMetricTable)
@@ -562,10 +573,52 @@ namespace
     /// sixty readings into a bucket has no way to recover when the last of them
     /// landed -- and a rate divided by a nominal width instead of the span actually
     /// observed understates by however much of the window was never sampled.
+    ///
+    /// Reads exactly `LegacyValueWidth` values and folds, never `bucket.values`' own
+    /// extent: this format is frozen at the width it was written with, the same reason
+    /// `ReadVersion1` is. A metric appended since -- `DispatchAllExcluded` -- lands past
+    /// index 8 of `bucket.values` and stays at its default zero for every v2 bucket,
+    /// which is correct: no v2 file ever counted an exclusion, because the wire carried
+    /// none yet.
     /// @param reader The cursor.
     /// @param out Where the rings land.
     /// @return False on a truncated or implausible body.
     bool ReadVersion2(BodyReader& reader, LoadedHistory& out)
+    {
+        return ReadBody(reader, out, Version2Rings, [](BodyReader& from, FleetBucket& bucket) {
+            std::uint64_t start = 0;
+            std::uint64_t sample = 0;
+            std::uint64_t present = 0;
+            if (!from.Take(start) || !from.Take(sample) || !from.Take(present) || !from.Take(bucket.coverage))
+                return false;
+            bucket.startMillis = static_cast<std::int64_t>(start);
+            bucket.sampleMillis = static_cast<std::int64_t>(sample);
+            bucket.present = present != 0;
+            for (auto const index: std::views::iota(std::size_t { 0 }, LegacyValueWidth))
+                if (!from.Take(bucket.values[index]))
+                    return false;
+            for (auto const index: std::views::iota(std::size_t { 0 }, LegacyValueWidth))
+                if (!from.Take(bucket.fold[index].low) || !from.Take(bucket.fold[index].high)
+                    || !from.Take(bucket.fold[index].total))
+                    return false;
+            return true;
+        });
+    }
+
+    /// Version 3: the same shape version 2 wrote, over THIS build's full value and fold
+    /// width -- `[start][sample][present][coverage][N values][N x low,high,total]`,
+    /// where `N` is `EnumeratorCount<FleetMetric>`.
+    ///
+    /// Minted because `DispatchAllExcluded` widened that count past what versions 1 and
+    /// 2 ever wrote (#308's ordinals are a persisted contract, so it landed at the END
+    /// rather than reordering either), and reading a v2 body against a wider layout
+    /// would misalign every field after the first missing one. `ReadVersion2` stays
+    /// pinned at nine for that reason; this reader is what moves forward with the live
+    /// table, until it grows again and earns a version 4 of its own.
+    /// @param reader The cursor.
+    /// @param out Where the rings land.
+    /// @return False on a truncated or implausible body.
+    bool ReadVersion3(BodyReader& reader, LoadedHistory& out)
     {
         return ReadBody(reader, out, Version2Rings, [](BodyReader& from, FleetBucket& bucket) {
             std::uint64_t start = 0;
@@ -601,9 +654,10 @@ namespace
     /// the upgrade. Bumping `FileVersion` without adding a row here remains the
     /// decision to discard every history -- and is then a visible one, made by
     /// deleting a row rather than by not noticing a constant.
-    constexpr std::array<HistoryFormat, 2> HistoryFormats {
+    constexpr std::array<HistoryFormat, 3> HistoryFormats {
         HistoryFormat { .version = 1, .read = &ReadVersion1 },
         HistoryFormat { .version = 2, .read = &ReadVersion2 },
+        HistoryFormat { .version = 3, .read = &ReadVersion3 },
     };
 
     /// The reader for a version, if this build has one.
@@ -612,6 +666,31 @@ namespace
     [[nodiscard]] HistoryFormat const* FormatFor(std::uint8_t version) noexcept
     {
         for (auto const& row: HistoryFormats)
+            if (row.version == version)
+                return &row;
+        return nullptr;
+    }
+
+    /// Which shape `NodeStoreFile` wrote its nested bodies in, per its OWN version.
+    ///
+    /// A nested body carries no envelope of its own -- `AppendBody` stamps nothing
+    /// inside it -- so the outer `NodeStoreFile` version is the only place this fact
+    /// travels, and it is a DIFFERENT axis from `RingFile`'s `HistoryFormats`: a
+    /// standalone ring file and a nested body can move on different schedules even
+    /// though today they happen to share readers. Version 1 wrote a nested body in
+    /// `ReadVersion2`'s shape (frozen at nine values); version 2 moved to
+    /// `ReadVersion3`'s, the same day `FleetMetric` grew `DispatchAllExcluded`.
+    constexpr std::array<HistoryFormat, 2> NestedBodyFormats {
+        HistoryFormat { .version = 1, .read = &ReadVersion2 },
+        HistoryFormat { .version = 2, .read = &ReadVersion3 },
+    };
+
+    /// The nested-body reader for one `NodeStoreFile` version, if this build has one.
+    /// @param version What `NodeStoreFile`'s envelope said.
+    /// @return The row, or nullptr.
+    [[nodiscard]] HistoryFormat const* NestedFormatFor(std::uint8_t version) noexcept
+    {
+        for (auto const& row: NestedBodyFormats)
             if (row.version == version)
                 return &row;
         return nullptr;
@@ -845,11 +924,18 @@ void FleetHistory::AppendBody(std::string& out) const
     }
 }
 
-bool FleetHistory::ReadBody(std::string_view body)
+bool FleetHistory::ReadBody(std::string_view body, std::uint8_t version)
 {
+    // There is no envelope on a nested body itself -- `version` is the OUTER
+    // `NodeStoreFile`'s, and `NestedFormatFor` is what turns that into the shape
+    // this body was actually written in.
+    auto const* const format = NestedFormatFor(version);
+    if (format == nullptr)
+        return false;
+
     LoadedHistory loaded;
     BodyReader reader { body };
-    if (!ReadVersion2(reader, loaded))
+    if (!format->read(reader, loaded))
         return false;
 
     auto const guard = std::scoped_lock { _mutex };
@@ -858,7 +944,7 @@ bool FleetHistory::ReadBody(std::string_view body)
     return true;
 }
 
-bool FleetHistory::Save(std::filesystem::path const& path) const
+bool FleetHistory::Save(std::filesystem::path const& path, StateFile which) const
 {
     // Refused BEFORE a byte is composed, and the file is left exactly as it was. A
     // node rolled back to an older build read a history it could not understand;
@@ -870,7 +956,7 @@ bool FleetHistory::Save(std::filesystem::path const& path) const
 
     auto file = FramedBuffer();
     AppendBody(file);
-    return WriteFramed(path, RingFile, file);
+    return WriteFramed(path, RingFile, file, which);
 }
 
 bool FleetHistory::Load(std::filesystem::path const& path)
@@ -1015,7 +1101,7 @@ void FleetNodeHistories::BackfillInto(std::vector<FleetBucket>& into, FleetRange
     }
 }
 
-bool FleetNodeHistories::Save(std::filesystem::path const& path) const
+bool FleetNodeHistories::Save(std::filesystem::path const& path, StateFile which) const
 {
     // The same refusal `FleetHistory::Save` makes, and for the same reason: a build
     // that cannot read this file must not replace it with one it can.
@@ -1053,7 +1139,7 @@ bool FleetNodeHistories::Save(std::filesystem::path const& path) const
         entry->history->AppendBody(file);
         WriteU64(file, lengthAt, file.size() - bodyAt);
     }
-    return WriteFramed(path, NodeStoreFile, file);
+    return WriteFramed(path, NodeStoreFile, file, which);
 }
 
 bool FleetNodeHistories::Load(std::filesystem::path const& path)
@@ -1090,7 +1176,7 @@ bool FleetNodeHistories::Load(std::filesystem::path const& path)
             return false;
 
         auto history = std::make_unique<FleetHistory>(_wall);
-        if (!history->ReadBody(nested))
+        if (!history->ReadBody(nested, opened.version))
             return false;
         restored.emplace(std::string { endpoint },
                          Entry { .history = std::move(history), .highWater = static_cast<std::int64_t>(highWater) });

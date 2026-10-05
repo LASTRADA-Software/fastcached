@@ -6,10 +6,13 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 #include <FastCache/Transport/LingeringClose.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <format>
@@ -19,14 +22,20 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
+#include <core/net/AcceptLoopHealth.hpp>
+#include <core/net/BlockingConnector.hpp>
+#include <core/net/testing/FailingListener.hpp>
 #include <core/net/testing/InMemorySocket.hpp>
 #include <core/net/testing/ParkingReadableSocket.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/BoundedWait.hpp>
 #include <tests/HalfClose.hpp>
+#include <tests/ScopedSignalHandler.hpp>
 #include <tests/SocketDoubles.hpp>
 
 namespace
@@ -707,7 +716,14 @@ TEST_CASE("AdminHttp: a served connection's refusal over a head it did not finis
     FastCache::AtomicMetricsSink metrics;
     FastCache::NullLogger logger;
     core::platform::SteadyClock clock;
-    FastCache::AdminHttpServer server { listener, metrics, [] { return FastCache::MetricsSnapshot {}; }, logger, clock };
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::AdminHttpServer server { listener,
+                                        metrics,
+                                        [] { return FastCache::MetricsSnapshot {}; },
+                                        logger,
+                                        clock,
+                                        acceptLoops,
+                                        FastCache::DefaultDrainWait() };
 
     auto client = listener.connectClient();
     std::string request = "GET /healthz HTTP/1.1\r\nHost: x\r\n";
@@ -780,4 +796,200 @@ TEST_CASE("The tolerated admin verdict is not the verdict for a bind that stops 
     // defect one layer up.
     CHECK_FALSE(tolerated.message.contains("refusing to start"));
     CHECK_FALSE(tolerated.message.contains("exiting"));
+}
+
+namespace
+{
+
+/// One `GET /healthz` through a whole `AdminHttpServer::Run`, over @p listener, answered from
+/// @p acceptLoops.
+/// @param inner Where the client connects; @p listener wraps it or is it.
+/// @param listener What the server accepts from.
+/// @param acceptLoops The registry `/healthz` answers from.
+/// @param logger Where the server logs.
+/// @return The raw response.
+[[nodiscard]] std::string HealthzThroughRun(core::net::testing::InMemoryListener& inner,
+                                            core::net::IListener& listener,
+                                            core::net::AcceptLoopHealth& acceptLoops,
+                                            FastCache::ILogger& logger)
+{
+    FastCache::AtomicMetricsSink metrics;
+    core::platform::SteadyClock clock;
+    FastCache::AdminHttpServer server { listener,
+                                        metrics,
+                                        [] { return FastCache::MetricsSnapshot {}; },
+                                        logger,
+                                        clock,
+                                        acceptLoops,
+                                        FastCache::DefaultDrainWait() };
+    auto client = inner.connectClient();
+    REQUIRE(core::async::syncRun(WriteString(client.get(), "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
+    // Queued connections are accepted before the closed listener ends the loop.
+    inner.close();
+    core::async::syncRun(server.Run());
+    server.Shutdown();
+    return core::async::syncRun(ReadAvailable(client.get()));
+}
+
+} // namespace
+
+TEST_CASE("AdminHttp: /healthz answers 503 naming a surface that stopped accepting", "[metrics][http][admin][accept-loop]")
+{
+    // It answered `200` for nine hours over a node whose 0xFC surface listened and refused every
+    // connect. A liveness probe that asks nothing is the confident wrong signal; this one asks the
+    // accept-loop registry, and the control beside it keeps "always 503" from passing too.
+    FastCache::NullLogger logger;
+    SECTION("while every surface accepts, 200")
+    {
+        core::net::testing::InMemoryListener listener;
+        core::net::AcceptLoopHealth acceptLoops;
+        CHECK(HealthzThroughRun(listener, listener, acceptLoops, logger).starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+    SECTION("once one has stopped, 503 and which")
+    {
+        core::net::testing::InMemoryListener listener;
+        core::net::AcceptLoopHealth acceptLoops;
+        acceptLoops.record(core::net::AcceptLoopEvent { .surface = "node",
+                                                        .line = "connection reset (AcceptEx) [errno 10054]",
+                                                        .error = {},
+                                                        .kind = core::net::AcceptLoopEventKind::GaveUp });
+        auto const response = HealthzThroughRun(listener, listener, acceptLoops, logger);
+        INFO("response was: " << response);
+        CHECK(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        CHECK(response.contains("surface node is not accepting connections: connection reset (AcceptEx)"));
+    }
+    SECTION("while one is degraded, 503 naming it as degraded rather than stopped")
+    {
+        // A loop backing off on failures nothing classifies accepts little or nothing: a probe
+        // that answered 200 over it would be the confident wrong signal again, one step removed.
+        core::net::testing::InMemoryListener listener;
+        core::net::AcceptLoopHealth acceptLoops;
+        acceptLoops.record(core::net::AcceptLoopEvent { .surface = "node",
+                                                        .line = "32 accepts in a row failed",
+                                                        .error = {},
+                                                        .kind = core::net::AcceptLoopEventKind::Degraded });
+        auto const response = HealthzThroughRun(listener, listener, acceptLoops, logger);
+        INFO("response was: " << response);
+        CHECK(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        CHECK(response.contains("surface node is degraded, backing off on failed accepts: 32 accepts in a row failed"));
+        CHECK_FALSE(response.contains("is not accepting connections"));
+    }
+    SECTION("once a degraded one recovers, 200 again")
+    {
+        core::net::testing::InMemoryListener listener;
+        core::net::AcceptLoopHealth acceptLoops;
+        for (auto const kind: { core::net::AcceptLoopEventKind::Degraded, core::net::AcceptLoopEventKind::Recovered })
+            acceptLoops.record(core::net::AcceptLoopEvent { .surface = "node", .line = "x", .error = {}, .kind = kind });
+        CHECK(HealthzThroughRun(listener, listener, acceptLoops, logger).starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+}
+
+TEST_CASE("AdminHttp: a connection a peer reset before it was accepted does not stop /healthz",
+          "[metrics][http][admin][accept-loop]")
+{
+    // The admin loop used to end on anything but a poll tick, taking `/healthz` and `/metrics` with
+    // it. The request queued behind the failure is the whole assertion.
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Debug };
+    core::net::testing::InMemoryListener inner;
+    core::net::testing::FailingListener listener {
+        inner, core::net::testing::repeatedFailures(core::net::NetErrorCode::ConnReset, 1)
+    };
+    core::net::AcceptLoopHealth acceptLoops;
+
+    auto const response = HealthzThroughRun(inner, listener, acceptLoops, logger);
+    INFO("response was: " << response.substr(0, 64));
+    CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(listener.failuresAnswered() == 1);
+    CHECK(std::ranges::count_if(logger.Snapshot(),
+                                [](FastCache::CapturingLogger::Record const& record) {
+                                    return record.level == FastCache::LogLevel::Warn
+                                           && record.message.contains("admin: an accept failed");
+                                })
+          == 1);
+}
+
+TEST_CASE("AdminHttp: signals landing on the accept thread do not stop /healthz",
+          "[metrics][http][admin][accept-loop][signal]")
+{
+    // Measured on both binaries in WSL: one SIGHUP delivered to the admin thread logged "admin:
+    // accept loop ended (cancelled (poll) [errno 4])" and `/healthz` went dead while the process
+    // lived, because the listener read the interrupted poll as a closed socket. This drives the
+    // loop production runs -- `Run()` over a real `BlockingListener` armed the way both binaries
+    // arm it -- on a thread of the case's own, signals that thread, and then asks `/healthz`.
+#if defined(_WIN32)
+    SKIP("no POSIX signal reaches a Windows thread");
+#else
+    using namespace std::chrono_literals;
+    FastCache::Testing::ScopedSignalHandler const handler { SIGUSR2 };
+    REQUIRE(handler.Installed());
+    auto listener = FastCache::BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(listener != nullptr);
+    if (!listener->IsBound())
+        SKIP("this platform would not bind a loopback listener");
+    listener->SetTimeouts(FastCache::AdminHttpServer::AcceptPoll, FastCache::AdminHttpServer::RequestTimeout);
+    auto const port = listener->boundPort();
+
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Debug };
+    FastCache::AtomicMetricsSink metrics;
+    core::platform::SteadyClock clock;
+    core::net::AcceptLoopHealth acceptLoops;
+    FastCache::AdminHttpServer server { *listener,
+                                        metrics,
+                                        [] { return FastCache::MetricsSnapshot {}; },
+                                        logger,
+                                        clock,
+                                        acceptLoops,
+                                        FastCache::DefaultDrainWait() };
+    std::atomic<bool> ended { false };
+    std::jthread acceptThread { [&server, &ended] {
+        core::async::syncRun(server.Run());
+        ended.store(true, std::memory_order_release);
+    } };
+    // Declared after the thread, so it runs first: the loop is asked to stop before the thread is
+    // joined, and a failed assertion below cannot leave the join waiting on a loop nobody stopped.
+    auto const requestStop = [](FastCache::AdminHttpServer* admin) {
+        admin->RequestStop();
+    };
+    std::unique_ptr<FastCache::AdminHttpServer, decltype(requestStop)> const stopFirst { &server, requestStop };
+
+    auto const native = acceptThread.native_handle();
+    std::size_t signalled = 0;
+    // Two hundred signals across several of the loop's 500 ms polls: far more than one lands inside
+    // a parked poll, which is all the old row needed to end the loop.
+    static constexpr std::size_t signalCount = 200;
+    auto const sent = FastCache::Testing::WaitUntil(
+        "every signal to be sent to the admin accept thread",
+        [&signalled] { return signalled >= signalCount; },
+        [&signalled] { return std::format("{} of {} signal(s) sent", signalled, signalCount); },
+        FastCache::Testing::WaitOptions { .step =
+                                              [&handler, native, &signalled] {
+                                                  handler.Interrupt(native);
+                                                  ++signalled;
+                                              },
+                                          .context = {},
+                                          .bound = FastCache::Testing::WaitHangGuard,
+                                          .rest = 5ms });
+    REQUIRE(sent);
+
+    // The loop reported nothing -- the registry `/healthz` answers from is empty -- and is still
+    // running. **At most THREE assertions can fail in this case, and that is load-bearing**: ctest
+    // scores a Catch2 exit of exactly 4 as Skipped (#1152), and the regression this case exists for
+    // failed four when "still running" was asserted twice, reading as a skip under ctest.
+    CHECK(acceptLoops.snapshot().empty());
+    CHECK(std::ranges::none_of(logger.Snapshot(), [](FastCache::CapturingLogger::Record const& record) {
+        return record.level == FastCache::LogLevel::Error;
+    }));
+    // Asked only of a loop still accepting: a connection to a loop that ended would sit in the
+    // backlog and its read would wait for an answer nobody is left to write.
+    REQUIRE_FALSE(ended.load(std::memory_order_acquire));
+    core::net::BlockingConnector connector;
+    auto client =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
+    REQUIRE(client.has_value());
+    REQUIRE(core::async::syncRun(WriteString(client->get(), "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")));
+    auto const response = core::async::syncRun(ReadAvailable(client->get()));
+    INFO("response was: " << response.substr(0, 64));
+    CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+#endif
 }

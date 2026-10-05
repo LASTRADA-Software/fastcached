@@ -182,6 +182,11 @@ struct OptionComponent
     bool (*runs)(Config const&) noexcept; ///< Whether a configuration runs it.
     std::string_view absentBecause;       ///< The setting that turned it off, said as a clause.
     std::string_view remedy;              ///< How to run it instead, said as a clause.
+
+    /// The whole refusal, in place of the sentence a binary generates from the three fields
+    /// above, or empty for that sentence. For a component whose absence has a better remedy
+    /// than running it: a node that serves is not told to stop serving to use `--scheduler`.
+    std::string_view refusal {};
 };
 
 /// One accepted command-line option.
@@ -324,7 +329,7 @@ template <typename Result>
     // Arity is deliberately NOT checked. An `Arity::None` row is a flag whose
     // meaning is its presence, and a file spells presence as a boolean: the key
     // takes `true` or `false`, and `apply` runs on `true` alone. That reading is
-    // exact for both polarities -- `raft_join: true` passes `--raft-join`, and
+    // exact for both polarities -- `dashboard: true` passes `--dashboard`, and
     // `no_toolchain_discovery: false` passes nothing, which is discovery left on.
     // The alternative, a positively-named key with an applier no flag has, is a
     // setting reachable from a file and not from argv -- two mechanisms for one
@@ -378,15 +383,37 @@ template <typename Result>
     return spec.present != nullptr && spec.present(cfg);
 }
 
-/// Build a ConfigError attributed to the command line.
+/// Build the ConfigError a value parser or an option applier refuses with, attributed to the
+/// command line.
+///
+/// **It takes no field, and that is the point.** A value parser cannot know which row reached it
+/// -- one parser serves several flags, and a configuration file reaches the same appliers -- so a
+/// field it wrote was one that named the wrong flag (`bind` for a bad `--listen` host) or the right
+/// one in a spelling no other row used (`raft-peer`, `max-memory`). `ApplyOneOption` stamps the
+/// row's own spelling onto every refusal, and a configuration file stamps its key; so the field is
+/// not a parameter here, and a literal one cannot be written again.
 /// @param code The error category.
-/// @param field The flag or setting at fault.
+/// @param context Human-readable detail.
+/// @return The populated error, with `source` stamped "argv" and no field.
+[[nodiscard]] inline ConfigError ArgvError(ConfigErrorCode code, std::string context)
+{
+    return ConfigError { .code = code, .source = "argv", .line = 0, .field = {}, .context = std::move(context) };
+}
+
+/// Build a command-line ConfigError about something that is NOT a row's value, naming it by hand.
+///
+/// For the few refusals no row reaches: an argument that matches no row (`ApplyOneOption`), and a
+/// sub-command a tool dispatches on before its rows are consulted. Never from a value parser or an
+/// applier, whose field is the row's and is stamped for it; `Options_test`'s census holds every
+/// call to a row saying why it is about no row.
+/// @param code The error category.
+/// @param subject What the refusal is about: the argument, or the missing sub-command.
 /// @param context Human-readable detail.
 /// @return The populated error, with `source` stamped "argv".
-[[nodiscard]] inline ConfigError ArgvError(ConfigErrorCode code, std::string field, std::string context)
+[[nodiscard]] inline ConfigError UnrowedArgvError(ConfigErrorCode code, std::string subject, std::string context)
 {
     return ConfigError {
-        .code = code, .source = "argv", .line = 0, .field = std::move(field), .context = std::move(context)
+        .code = code, .source = "argv", .line = 0, .field = std::move(subject), .context = std::move(context)
     };
 }
 
@@ -448,17 +475,16 @@ template <typename Result>
 /// shape, advancing `i` past the value when it is a separate argv element.
 /// @param args The full argument span.
 /// @param i Index of the argument under inspection; advanced on the two-token form.
-/// @param flag The flag spelling, for the error message.
-/// @return The value text, or a ConfigError when the value is missing.
+/// @return The value text, or a ConfigError when the value is missing -- naming no field, which
+///         `ApplyOneOption` stamps with the row's spelling as it stamps every other refusal.
 [[nodiscard]] inline std::expected<std::string_view, ConfigError> TakeValue(std::span<char const* const> args,
-                                                                            std::size_t& i,
-                                                                            std::string_view flag)
+                                                                            std::size_t& i)
 {
     auto const arg = std::string_view { args[i] };
     if (auto const eq = arg.find('='); eq != std::string_view::npos)
         return arg.substr(eq + 1);
     if (i + 1 >= args.size())
-        return std::unexpected(ArgvError(ConfigErrorCode::ParseError, std::string { flag }, "missing value"));
+        return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "missing value"));
     ++i;
     return std::string_view { args[i] };
 }
@@ -634,7 +660,6 @@ template <auto Field>
         if (length == 0)
             return std::unexpected(ArgvError(
                 ConfigErrorCode::ParseError,
-                {},
                 std::format("value is not valid UTF-8: byte 0x{:02X} at offset {} starts no valid sequence, so this "
                             "value cannot travel to the rest of the fleet",
                             static_cast<unsigned>(static_cast<unsigned char>(sv[offset])),
@@ -642,6 +667,25 @@ template <auto Field>
         offset += length;
     }
     return std::string { sv };
+}
+
+/// As ParseUtf8Text, for a value that NAMES something other machines read, so that empty is
+/// no name at all.
+///
+/// An empty cluster id is not "no cluster": peers refuse a fleet summary that carries one as
+/// malformed, so a node configured with it would have its every beacon and proof ignored with
+/// nothing logged or counted on either side. Refused here instead, in front of whoever typed it.
+///
+/// @param sv The value text.
+/// @return `sv` as an owned string, or why it is empty or not text. The error names no field;
+///         `ApplyOneOption` stamps the flag, and a configuration file its key.
+[[nodiscard]] inline std::expected<std::string, ConfigError> ParseNonEmptyUtf8Text(std::string_view sv)
+{
+    if (sv.empty())
+        return std::unexpected(ArgvError(ConfigErrorCode::ParseError,
+                                         "value is empty: it names something the rest of the fleet reads, and an "
+                                         "empty name is refused by every peer that reads it"));
+    return ParseUtf8Text(sv);
 }
 
 /// Apply the one option named by `args[i]`.
@@ -661,35 +705,34 @@ template <typename Result>
     std::string_view const arg { args[i] };
     auto const match = std::ranges::find_if(table, [arg](OptionSpec<Result> const& spec) { return Matches(arg, spec); });
     if (match == std::ranges::end(table))
-        return std::unexpected(ArgvError(ConfigErrorCode::UnknownKey, std::string { arg }, "unrecognised argument"));
+        return std::unexpected(UnrowedArgvError(ConfigErrorCode::UnknownKey, std::string { arg }, "unrecognised argument"));
 
     if (match->apply != nullptr)
     {
+        // The flag stamped here rather than by the value parser, which cannot know it:
+        // a parser is a free function reached through a member pointer in the table,
+        // shared by every row that uses it. A row's own spelling is the only one that
+        // could ever be right, and a hand-written field is one that drifts when a flag
+        // is renamed -- or never matched it: `bind` for a bad `--listen` host,
+        // `raft-peer` and `max-memory` without the dashes every row carries.
+        //
+        // UNCONDITIONALLY, not only onto an empty field: `ArgvError` takes no field, so
+        // no parser can write one through it, and a field a parser built by hand is
+        // overwritten rather than trusted. The guard is folded into the operation.
+        auto const stamped = [match](ConfigError error) {
+            error.field = std::string { match->primary };
+            return std::unexpected(std::move(error));
+        };
         std::string_view value;
         if (match->arity == Arity::Value)
         {
-            auto const taken = TakeValue(args, i, match->primary);
+            auto const taken = TakeValue(args, i);
             if (!taken.has_value())
-                return std::unexpected(taken.error());
+                return stamped(taken.error());
             value = *taken;
         }
         if (auto const applied = (*match->apply)(result, value); !applied.has_value())
-        {
-            // The flag stamped here rather than by the value parser, which cannot
-            // know it: a parser is a free function reached through a member pointer
-            // in the table, shared by every row that uses it. A row's own spelling
-            // is the only one that could ever be right, and a hand-written field is
-            // one that drifts when a flag is renamed.
-            //
-            // Only when the parser left it empty, so a parser with something more
-            // specific to say -- the node's log-level parser names `log-level`, and
-            // its cluster appliers name the action they were reached through --
-            // keeps saying it.
-            auto error = applied.error();
-            if (error.field.empty())
-                error.field = std::string { match->primary };
-            return std::unexpected(std::move(error));
-        }
+            return stamped(applied.error());
     }
     if (match->select != nullptr)
     {
@@ -734,6 +777,38 @@ template <typename Result>
         ++i;
     }
     return ParseFlow::Continue;
+}
+
+/// Apply every option of a whole argument vector that the table can apply, stepping over each
+/// token it cannot.
+///
+/// For a command line that did NOT parse, where what it still NAMED decides something: which
+/// verb an operator typed decides what the refusal exits with, and `ParseOptionsInto` stops at
+/// the first bad token, so a verb typed after one went unseen -- `--no-such-flag --install-service`
+/// answered a start's code. The rows are the one spelling of every flag, so asking them again is
+/// how the verb is found anywhere in the vector without a second list of spellings. Never a
+/// substitute for the real parse: what this assembles is evidence about a command line that was
+/// refused, not a configuration to run with.
+/// @param table The rows to match against.
+/// @param args The arguments, with the program name already removed.
+/// @param result The result to populate with whatever did apply.
+template <typename Result>
+void ApplyRecognisedOptions(std::span<OptionSpec<Result> const> table, std::span<char const* const> args, Result& result)
+{
+    // The same walk as `ParseOptionsInto`, and a `while` for its reason. On a token that does not
+    // apply, the walk resumes just past THAT token -- whatever value `ApplyOneOption` consumed for
+    // it is read again as a token of its own, and refused or applied on its own merits.
+    auto i = std::size_t { 0 };
+    while (i < args.size())
+    {
+        auto const token = i;
+        auto const flow = ApplyOneOption(table, args, i, result);
+        if (flow.has_value() && *flow == ParseFlow::Stop)
+            return;
+        if (!flow.has_value())
+            i = token;
+        ++i;
+    }
 }
 
 /// Parse a whole argument vector against an option table.

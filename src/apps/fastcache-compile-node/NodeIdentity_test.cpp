@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeFormation.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 
@@ -20,8 +22,11 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/HostNamingFakes.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SecureRandomFakes.hpp>
+#include <tests/UnreadablePath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -38,8 +43,7 @@ namespace
 /// @return The configuration.
 [[nodiscard]] NodeConfig ClusteredNode(std::filesystem::path const& dir)
 {
-    NodeConfig cfg;
-    cfg.schedulers = { "127.0.0.1:6674" };
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.raftListen = "6680";
     cfg.raftSelf = "10.0.0.7";
     cfg.clusterDir = dir;
@@ -226,7 +230,9 @@ TEST_CASE("A recorded identity that cannot be read is refused, never replaced", 
         std::ofstream { path, std::ios::binary | std::ios::trunc } << "\n";
         auto const refused = ResolveNodeIdentity(scratch.Path(), {}, random);
         REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().contains("is empty"));
+        CHECK(refused.error().message.contains("is empty"));
+        CHECK(refused.error().fault == NodeIdentityFault::Empty);
+        CHECK(StageOf(refused.error().fault) == StartStage::NodeIdentity);
     }
 
     SECTION("a record that is not text")
@@ -234,7 +240,24 @@ TEST_CASE("A recorded identity that cannot be read is refused, never replaced", 
         std::ofstream { path, std::ios::binary | std::ios::trunc } << "n1\x80\x80\n";
         auto const refused = ResolveNodeIdentity(scratch.Path(), {}, random);
         REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().contains("does not hold text"));
+        CHECK(refused.error().message.contains("does not hold text"));
+        CHECK(refused.error().fault == NodeIdentityFault::NotText);
+    }
+
+    SECTION("a record that is there and cannot be read")
+    {
+        // Neither absent nor a verdict: nothing was read. It used to answer "absent", and the
+        // resolver then MINTED -- replacing, the moment it could write, an identity the cluster
+        // may have admitted. Refused instead, as the I/O failure it is, and left as it was.
+        Testing::UnreadablePath const held { path, "n1\n" };
+        if (!held.Held())
+            SKIP("this process reads the file anyway (root), so the read arm cannot be reached here");
+        auto const refused = ResolveNodeIdentity(scratch.Path(), {}, random);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().fault == NodeIdentityFault::Unreadable);
+        CHECK(StageOf(refused.error().fault) == StartStage::NodeIdentityIo);
+        CHECK(held.Held());
+        CHECK_FALSE(std::filesystem::exists(std::filesystem::path { path }.concat(Consensus::ReplacementSuffix)));
     }
 
     // The control, and it is not decoration: without it "refuses a damaged record" and
@@ -244,6 +267,61 @@ TEST_CASE("A recorded identity that cannot be read is refused, never replaced", 
         std::ofstream { path, std::ios::binary | std::ios::trunc } << "  n1\r\n";
         CHECK(Resolved(scratch.Path(), {}, random).id == "n1");
     }
+}
+
+TEST_CASE("An identity fault ends a one-shot command by its stage: an I/O arm transient, a verdict a decision",
+          "[node][identity][exit]")
+{
+    // The OTHER reader of the same faults: `--print-identity` and `--install-service` are read by an
+    // operator, and a retry may get past an I/O arm (1) while a verdict on the bytes read is a
+    // decision (2).
+    struct FaultEnding
+    {
+        NodeIdentityFault fault;
+        CommandEnding ending;
+    };
+    constexpr auto verdicts = std::to_array<FaultEnding>({
+        { .fault = NodeIdentityFault::Unreadable, .ending = CommandEnding::Failed },
+        { .fault = NodeIdentityFault::Empty, .ending = CommandEnding::Declined },
+        { .fault = NodeIdentityFault::NotText, .ending = CommandEnding::Declined },
+        { .fault = NodeIdentityFault::DrawFailed, .ending = CommandEnding::Failed },
+        { .fault = NodeIdentityFault::CreateFailed, .ending = CommandEnding::Failed },
+        { .fault = NodeIdentityFault::WriteFailed, .ending = CommandEnding::Failed },
+    });
+    for (auto const fault: Enumerators<NodeIdentityFault>())
+        CHECK(std::ranges::count(verdicts, fault, &FaultEnding::fault) == 1);
+    for (auto const& verdict: verdicts)
+    {
+        INFO(static_cast<int>(verdict.fault));
+        CHECK(EndingOf(verdict.fault) == verdict.ending);
+    }
+}
+
+TEST_CASE("An identity fault ends a start as a refusal only when it is a verdict on bytes that were read",
+          "[node][identity][exit]")
+{
+    struct FaultVerdict
+    {
+        NodeIdentityFault fault;
+        StartStage stage;
+    };
+    constexpr auto verdicts = std::to_array<FaultVerdict>({
+        { .fault = NodeIdentityFault::Unreadable, .stage = StartStage::NodeIdentityIo },
+        { .fault = NodeIdentityFault::Empty, .stage = StartStage::NodeIdentity },
+        { .fault = NodeIdentityFault::NotText, .stage = StartStage::NodeIdentity },
+        { .fault = NodeIdentityFault::DrawFailed, .stage = StartStage::NodeIdentityIo },
+        { .fault = NodeIdentityFault::CreateFailed, .stage = StartStage::NodeIdentityIo },
+        { .fault = NodeIdentityFault::WriteFailed, .stage = StartStage::NodeIdentityIo },
+    });
+    for (auto const fault: Enumerators<NodeIdentityFault>())
+        CHECK(std::ranges::count(verdicts, fault, &FaultVerdict::fault) == 1);
+    for (auto const& verdict: verdicts)
+    {
+        INFO(static_cast<int>(verdict.fault));
+        CHECK(StageOf(verdict.fault) == verdict.stage);
+    }
+    CHECK(ExitOf(StartStage::NodeIdentity) == ProcessExit::Refused);
+    CHECK(ExitOf(StartStage::NodeIdentityIo) == ProcessExit::Failed);
 }
 
 TEST_CASE("A minted identity is 128 bits of the source it was given", "[node][identity]")
@@ -278,8 +356,11 @@ TEST_CASE("An identity the generator cannot draw is refused by name, and nothing
 
     auto const refused = ResolveNodeIdentity(state, {}, denied);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("cannot mint an identity"));
-    CHECK(refused.error().contains(ScriptedSecureRandom::DeniedFailure().primitive));
+    CHECK(refused.error().message.contains("cannot mint an identity"));
+    CHECK(refused.error().message.contains(ScriptedSecureRandom::DeniedFailure().primitive));
+    // A draw that failed is an I/O arm: the next start may draw.
+    CHECK(refused.error().fault == NodeIdentityFault::DrawFailed);
+    CHECK(StageOf(refused.error().fault) == StartStage::NodeIdentityIo);
     CHECK_FALSE(std::filesystem::exists(state));
     CHECK(denied.FillCount() == 2);
 
@@ -295,40 +376,45 @@ TEST_CASE("The state directory has one author, and the default names no identity
     // `ConsensusTier::Start` was the second author of this default until #1024, and it
     // had to change with the identity: the old one was `fastcache-cluster/<node-id>`,
     // and an identity READ OUT of the state directory cannot name the directory it is
-    // read from.
-    NodeConfig bare;
-    CHECK(NodeStateDirectory(bare) == std::filesystem::path { "fastcache-cluster" });
+    // read from. The default is the platform's now, resolved at startup -- into scratch
+    // here, through the scripted probe -- and it names no identity either.
+    ScratchDirectory const scratch { "node-identity-default" };
+    auto bare = Testing::FirstStart(NodeConfig {});
+    ApplyNodeStateDirectory(bare,
+                            Testing::ScriptedConfigPathProbe { { { "LOCALAPPDATA", scratch.Path().string() },
+                                                                 { "XDG_STATE_HOME", scratch.Path().string() } },
+                                                               Testing::ScriptedConfigPathProbe::Privilege::Unprivileged });
+    CHECK(NodeStateDirectory(bare) == scratch.Path() / NodeStateDirectoryName);
 
     // Which is what makes the flag the discriminator, and the discriminator was never
     // lost: two nodes on one machine need two Raft logs and so two directories.
-    NodeConfig named;
+    auto named = Testing::FirstStart(NodeConfig {});
     named.clusterDir = std::filesystem::path { "/var/lib/fastcache-node/left" };
     CHECK(NodeStateDirectory(named) == named.clusterDir);
 }
 
-TEST_CASE("A --raft-self host becomes this node's own member entry", "[node][identity][consensus]")
+TEST_CASE("A --raft-self host becomes this node's own bootstrap member", "[node][identity][consensus]")
 {
-    // **Not separable ergonomics.** A minted identity cannot be typed into
-    // `--raft-peer=<id>=<host>:<port>`, and a node that names no member of its own
-    // configuration is refused -- so without this a derived identity is unusable.
+    // **Not separable ergonomics.** A minted identity is typed nowhere, and a node that
+    // names no member it can be dialled at is refused -- so without this a derived identity
+    // is unusable.
     ScratchDirectory const scratch { "node-identity-self" };
     SystemSecureRandom random;
 
     auto cfg = ClusteredNode(scratch.Path());
-    REQUIRE(ClusterSelfMember(cfg) == nullptr);
-
     auto const identity = Resolved(NodeStateDirectory(cfg), cfg.nodeId, random);
     ApplyNodeIdentity(cfg, identity);
 
     CHECK(cfg.nodeId == identity.id);
-    auto const* const self = ClusterSelfMember(cfg);
-    REQUIRE(self != nullptr);
+    auto const members = BootstrapMembersOf(cfg);
+    REQUIRE(members.size() == 1);
+    CHECK(members.front().id == identity.id);
 
     // The HOST from `--raft-self` and the PORT from `--listen-raft`, which is the whole
     // reason the flag takes only a host: a bare `--listen-raft` binds the WILDCARD, so
     // the address this node binds is not one any peer could dial. A member entry naming
     // `0.0.0.0` is a member nobody can reach.
-    CHECK(self->raftEndpoint == "10.0.0.7:6680");
+    CHECK(members.front().raftEndpoint == "10.0.0.7:6680");
     CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).front().host == "0.0.0.0");
 
     // And the startup table accepts what this produces, which is the half that would
@@ -338,17 +424,23 @@ TEST_CASE("A --raft-self host becomes this node's own member entry", "[node][ide
 
 TEST_CASE("A consensus node that names itself neither way is refused", "[node][identity][consensus]")
 {
-    // The rule reads the config as PARSED, before `ApplyNodeIdentity` turns the flag
-    // into a member -- which is what keeps it a pure function of the command line and
-    // lets `--install-service` reach it.
+    // The rule reads the config as PARSED, before `ApplyNodeIdentity` gives it an id --
+    // which is what keeps it a pure function of the command line and lets
+    // `--install-service` reach it.
     //
-    // Both directions: `--raft-self` satisfies it, and its absence does not.
-    NodeConfig neither;
-    neither.schedulers = { "127.0.0.1:6674" };
+    // Both directions: `--raft-self` satisfies it, and its absence does not -- once the host
+    // name it would otherwise fall back to has resolved to nothing. Before it resolves the
+    // address is awaited, not missing.
+    auto neither = Testing::FirstStart(NodeConfig {});
+    // Where CLIENTS dial it is stated, so the only address left unnamed is the one this rule is
+    // about: a consensus node admits other machines by key, and with no host name resolved an
+    // unnamed advertise would be the wildcard, which its own row refuses first.
+    neither.advertise = "10.0.0.7:6674";
     neither.raftListen = "6680";
+    ApplyHostNames(neither, NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = {} });
     auto const refusal = StartupPolicyRejection(neither);
     REQUIRE(refusal.has_value());
-    CHECK(Unwrap(refusal) == ConsensusNamesNoSelfPeerRefusal);
+    CHECK(Unwrap(refusal) == ConsensusNamesNoDialAddressRefusal);
 
     auto named = neither;
     named.raftSelf = "10.0.0.7";
@@ -372,10 +464,17 @@ TEST_CASE("The startup row refuses exactly the consensus nodes whose dial addres
         bool unstated;         ///< Whether nobody stated where peers dial it.
     };
 
-    NodeConfig worker;
-    worker.schedulers = { "127.0.0.1:6674" };
+    auto worker = Testing::FirstStart(NodeConfig {});
+    // Stated for `A consensus node that names itself neither way`'s reason: the client address is
+    // not what this row asks about, and a consensus shape leaving it to a withheld name is refused
+    // by the wildcard row first.
+    worker.advertise = "10.0.0.7:6674";
+    worker.raftListen.clear();
     auto consensus = worker;
     consensus.raftListen = "6680";
+    // A host name resolved to nothing, so "nobody stated where peers dial it" is reachable:
+    // with none resolved yet the address is awaited instead, which is not this row's answer.
+    ApplyHostNames(consensus, NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = {} });
 
     std::vector<Shape> shapes;
     shapes.push_back({ .what = "no consensus port, whatever else is named",
@@ -395,25 +494,6 @@ TEST_CASE("The startup row refuses exactly the consensus nodes whose dial addres
                                return cfg;
                            }(),
                        .unstated = false });
-    shapes.push_back({ .what = "a typed --raft-peer for its own id",
-                       .cfg =
-                           [&consensus] {
-                               auto cfg = consensus;
-                               cfg.nodeId = "n1";
-                               cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.7:6680")) };
-                               return cfg;
-                           }(),
-                       .unstated = false });
-    shapes.push_back({ .what = "a --raft-peer for another id only",
-                       .cfg =
-                           [&consensus] {
-                               auto cfg = consensus;
-                               cfg.nodeId = "n4";
-                               cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.1:6680")) };
-                               return cfg;
-                           }(),
-                       .unstated = true });
-
     std::size_t refusedByTheRow = 0;
     for (auto const& [what, cfg, unstated]: shapes)
     {
@@ -424,48 +504,12 @@ TEST_CASE("The startup row refuses exactly the consensus nodes whose dial addres
 
         // WHICH refusal, by the row's own constant: a shape refused by some other row first
         // is not this row agreeing.
-        auto const refused = StartupPolicyRejection(cfg).value_or(std::string {}) == ConsensusNamesNoSelfPeerRefusal;
+        auto const refused = StartupPolicyRejection(cfg).value_or(std::string {}) == ConsensusNamesNoDialAddressRefusal;
         CHECK(refused == dialUnstated);
         refusedByTheRow += refused ? 1 : 0;
     }
     // Both answers were reached, so neither half of the agreement held vacuously.
-    CHECK(refusedByTheRow == 2);
-}
-
-TEST_CASE("A --raft-self that CONTRADICTS a --raft-peer for this node is refused", "[node][identity][consensus]")
-{
-    // Two answers to "where do this node's peers dial it", and nothing to rank them by.
-    // `--raft-self` exists for the node whose identity was derived; an operator who
-    // typed the id has already said where this node answers.
-    NodeConfig both;
-    both.schedulers = { "127.0.0.1:6674" };
-    both.raftListen = "6680";
-    both.nodeId = "n1";
-    both.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.4:6680")) };
-    both.raftSelf = "10.0.0.7";
-
-    auto const refusal = StartupPolicyRejection(both);
-    REQUIRE(refusal.has_value());
-    CHECK(Unwrap(refusal).starts_with("--raft-self and a --raft-peer"));
-
-    // **AGREEING is not contradicting**, and this half is not politeness: the reload
-    // path judges a candidate `ApplyNodeIdentity` has already completed, so a rule that
-    // refused any self peer beside `--raft-self` would accept a node at startup and
-    // refuse every reload of it by name. The synthesised entry IS this shape.
-    auto agreeing = both;
-    agreeing.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.7:6680")) };
-    CHECK_FALSE(StartupPolicyRejection(agreeing).has_value());
-
-    // Each alone is fine, which is what stops this refusing the two shapes it exists to
-    // allow.
-    auto typed = both;
-    typed.raftSelf.clear();
-    CHECK_FALSE(StartupPolicyRejection(typed).has_value());
-
-    auto derived = both;
-    derived.raftPeers.clear();
-    derived.nodeId.clear();
-    CHECK_FALSE(StartupPolicyRejection(derived).has_value());
+    CHECK(refusedByTheRow == 1);
 }
 
 TEST_CASE("A configuration survives having its identity applied twice", "[node][identity][consensus]")
@@ -486,9 +530,9 @@ TEST_CASE("A configuration survives having its identity applied twice", "[node][
 
     // Idempotent, because a second application is exactly what a reload performs on a
     // candidate rebuilt from the same file and the same argv.
-    auto const peersAfterOne = cfg.raftPeers.size();
+    auto const membersAfterOne = BootstrapMembersOf(cfg);
     ApplyNodeIdentity(cfg, identity);
-    CHECK(cfg.raftPeers.size() == peersAfterOne);
+    CHECK(BootstrapMembersOf(cfg) == membersAfterOne);
     CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
 }
 
@@ -497,9 +541,9 @@ TEST_CASE("A --raft-self without a consensus port is refused", "[node][identity]
     // The port is the half this flag deliberately does not carry, so without
     // `--listen-raft` there is nothing to pair the host with -- and no consensus for
     // the pair to name a member of.
-    NodeConfig cfg;
-    cfg.schedulers = { "127.0.0.1:6674" };
+    auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.raftSelf = "10.0.0.7";
+    cfg.raftListen.clear();
 
     auto const refusal = StartupPolicyRejection(cfg);
     REQUIRE(refusal.has_value());
@@ -514,8 +558,7 @@ TEST_CASE("An invocation that only asks a question mints nothing", "[node][ident
     // recovery an operator reaches for when the configuration is already wrong. None of
     // them is entitled to leave state behind.
     auto const clustered = [] {
-        NodeConfig cfg;
-        cfg.schedulers = { "127.0.0.1:6674" };
+        auto cfg = Testing::FirstStart(NodeConfig {});
         cfg.raftListen = "6680";
         cfg.raftSelf = "10.0.0.7";
         return cfg;
@@ -543,10 +586,11 @@ TEST_CASE("An invocation that only asks a question mints nothing", "[node][ident
     install.installService = true;
     CHECK(NodeIdentityNeed(install) == IdentityNeed::Mint);
 
-    // And a node running no consensus has no identity to keep.
-    NodeConfig lone;
-    lone.schedulers = { "127.0.0.1:6674" };
-    CHECK(NodeIdentityNeed(lone) == IdentityNeed::None);
+    // And a node running no consensus keeps one too: every node holds an identity key now,
+    // and the id travels with it -- a worker proves it on every connection to a scheduler.
+    auto lone = Testing::FirstStart(NodeConfig {});
+    lone.raftListen.clear();
+    CHECK(NodeIdentityNeed(lone) == IdentityNeed::Mint);
 }
 
 TEST_CASE("A service registration bakes in the resolved identity", "[node][identity][service]")
@@ -563,11 +607,16 @@ TEST_CASE("A service registration bakes in the resolved identity", "[node][ident
     cfg.advertiseExplicit = true;
     cfg.raftListenExplicit = true;
     cfg.raftSelfExplicit = true;
+    // A bind the advertised address answers on: a consensus node admits machines by key, so a
+    // routable advertise over a loopback bind is refused at every boot the registration replays.
+    cfg.nodeListen = "0.0.0.0:6674";
+    cfg.nodeListenExplicit = true;
 
     auto const identity = Resolved(NodeStateDirectory(cfg), cfg.nodeId, random);
     ApplyNodeIdentity(cfg, identity);
 
-    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+    auto const spec =
+        MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg, Testing::InstallerPathProbe());
 
     // Read back by PARSING the registration, never by grepping it: what matters is that
     // the value survives this project's own parser and arrives in the field the node
@@ -577,7 +626,7 @@ TEST_CASE("A service registration bakes in the resolved identity", "[node][ident
     for (auto const& argument: spec.arguments)
         argv.push_back(argument.c_str());
 
-    NodeConfig replayed;
+    auto replayed = Testing::FirstStart(NodeConfig {});
     auto const flow = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, replayed);
     REQUIRE(flow.has_value());
     CHECK(replayed.nodeId == identity.id);
@@ -602,23 +651,13 @@ namespace
     return key;
 }
 
-/// This node's own `--raft-peer` entry, as an operator would type it.
-/// @param id The node's id.
-/// @param suffix What follows the endpoint: empty, or `@<key>`.
-/// @return The parsed member.
-[[nodiscard]] Cluster::ClusterMember TypedSelf(std::string_view id, std::string_view suffix = {})
-{
-    auto member = Cluster::ParseMemberSpec(std::format("{}=10.0.0.7:6680{}", id, suffix));
-    REQUIRE(member.has_value());
-    return *std::move(member);
-}
 } // namespace
 
 TEST_CASE("The key a node holds reaches its own member entry and the configuration", "[node][identity][key]")
 {
     // #178. The record a leader announces is this node's own entry, so the key has to be ON
     // it -- and applied through the one function a reload runs too, or a candidate would hold
-    // a self member whose key has changed and every reload would be refused by name.
+    // a self member whose key has changed.
     ScratchDirectory const scratch { "node-identity-key" };
     SystemSecureRandom random;
 
@@ -626,162 +665,68 @@ TEST_CASE("The key a node holds reaches its own member entry and the configurati
     auto identity = Resolved(NodeStateDirectory(cfg), cfg.nodeId, random);
     identity.publicKey = KeyOf(0x5A);
 
-    SECTION("the entry --raft-self synthesises carries it")
-    {
-        ApplyNodeIdentity(cfg, identity);
-        CHECK(cfg.identityPublicKey == std::optional { KeyOf(0x5A) });
-        auto const* const self = ClusterSelfMember(cfg);
-        REQUIRE(self != nullptr);
-        CHECK(self->publicKey == std::optional { KeyOf(0x5A) });
+    ApplyNodeIdentity(cfg, identity);
+    CHECK(cfg.identityPublicKey == std::optional { KeyOf(0x5A) });
+    auto const members = BootstrapMembersOf(cfg);
+    REQUIRE(members.size() == 1);
+    CHECK(members.front().publicKey == std::optional { KeyOf(0x5A) });
 
-        // And applying twice -- what a reload does to a candidate -- changes nothing.
-        auto const once = cfg.raftPeers;
-        ApplyNodeIdentity(cfg, identity);
-        CHECK(cfg.raftPeers == once);
-    }
-
-    SECTION("a typed entry naming no key is given the one the node holds")
-    {
-        cfg.raftSelf.clear();
-        cfg.raftPeers.push_back(TypedSelf(identity.id));
-        ApplyNodeIdentity(cfg, identity);
-        auto const* const self = ClusterSelfMember(cfg);
-        REQUIRE(self != nullptr);
-        CHECK(self->publicKey == std::optional { KeyOf(0x5A) });
-        CHECK_FALSE(SelfKeyContradiction(cfg, KeyOf(0x5A)).has_value());
-    }
-
-    SECTION("a typed entry naming ANOTHER key is left as typed, and refused")
-    {
-        // Overwriting it would hide the mistake: either the token was copied from another
-        // node, or this is not the state directory it was written for. Both are the
-        // operator's to resolve, so the refusal names both keys, whole.
-        cfg.raftSelf.clear();
-        cfg.raftPeers.push_back(TypedSelf(identity.id, std::format("@{}", FormatEd25519PublicKey(KeyOf(0x11)))));
-        ApplyNodeIdentity(cfg, identity);
-        auto const* const self = ClusterSelfMember(cfg);
-        REQUIRE(self != nullptr);
-        CHECK(self->publicKey == std::optional { KeyOf(0x11) });
-
-        auto const refusal = SelfKeyContradiction(cfg, KeyOf(0x5A));
-        REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).contains(FormatEd25519PublicKey(KeyOf(0x11))));
-        CHECK(Unwrap(refusal).contains(FormatEd25519PublicKey(KeyOf(0x5A))));
-
-        // The control: the same entry naming the key the node DOES hold is no contradiction.
-        CHECK_FALSE(SelfKeyContradiction(cfg, KeyOf(0x11)).has_value());
-    }
+    // And applying twice -- what a reload does to a candidate -- changes nothing.
+    ApplyNodeIdentity(cfg, identity);
+    CHECK(BootstrapMembersOf(cfg) == members);
 }
 
 TEST_CASE("A node that runs no consensus still carries the key it holds", "[node][identity][key]")
 {
     // A worker naming --cluster-dir holds a key and has no id. The key-only identity is what
     // reaches it -- and every reload candidate -- without inventing an id or a member entry.
-    NodeConfig worker;
+    auto worker = Testing::FirstStart(NodeConfig {});
     worker.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
 
     auto const keyOnly = NodeIdentity { .id = {}, .origin = NodeIdentityOrigin::Recorded, .publicKey = KeyOf(0x77) };
     ApplyNodeIdentity(worker, keyOnly);
     CHECK(worker.identityPublicKey == std::optional { KeyOf(0x77) });
     CHECK(worker.nodeId.empty());
-    CHECK(worker.raftPeers.empty());
 }
 
-TEST_CASE("A service registration keeps the key its --raft-peer entries name", "[node][identity][service][key]")
+TEST_CASE("What --print-identity prints is the line --cluster-admit reads back into this member", "[node][identity][key]")
 {
-    // A registration RE-RENDERS every `--raft-peer` from its parsed form, so a rendering that
-    // dropped `@<key>` would install a node whose next start no longer knows what its own
-    // operator typed. Read back by PARSING the registration, never by grepping it.
-    ScratchDirectory const scratch { "node-identity-install-key" };
-    SystemSecureRandom random;
-
-    auto cfg = ClusteredNode(scratch.Path());
-    cfg.advertise = "10.0.0.7:6674";
-    cfg.advertiseExplicit = true;
-    cfg.raftListenExplicit = true;
-    cfg.raftSelfExplicit = true;
-    auto peer = Cluster::ParseMemberSpec(std::format("n2=10.0.0.8:6680@{}", FormatEd25519PublicKey(KeyOf(0x42))));
-    REQUIRE(peer.has_value());
-    cfg.raftPeers.push_back(*peer);
-
-    auto const identity = Resolved(NodeStateDirectory(cfg), cfg.nodeId, random);
-    ApplyNodeIdentity(cfg, identity);
-
-    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
-    std::vector<char const*> argv;
-    argv.reserve(spec.arguments.size());
-    for (auto const& argument: spec.arguments)
-        argv.push_back(argument.c_str());
-
-    NodeConfig replayed;
-    auto const flow = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, replayed);
-    REQUIRE(flow.has_value());
-    auto const replayedPeer = std::ranges::find(replayed.raftPeers, std::string { "n2" }, &Cluster::ClusterMember::id);
-    REQUIRE(replayedPeer != replayed.raftPeers.end());
-    CHECK(replayedPeer->publicKey == std::optional { KeyOf(0x42) });
-}
-
-TEST_CASE("What --print-identity prints is the token --raft-peer reads back into this member", "[node][identity][key]")
-{
-    // #178: every member's --raft-peer has to name every other member's key before any of them
-    // starts, and this is where an operator copies it from. So the token is asserted by
-    // PARSING it, the way the other members will, rather than by its spelling.
+    // #178: an operator who admits a member without an enrollment window types its key, and
+    // this is where it is copied from. So the line is asserted by PARSING it through the flag,
+    // the way the operator's command will be, rather than by its spelling.
     auto const key = Ed25519KeyPair::FromSeed(ScriptedSecureRandom::Ascending(Ed25519SeedBytes)).value().PublicKey();
 
-    SECTION("a consensus member prints its id, its key and its token")
+    SECTION("a consensus member prints its id, its key and its admission line")
     {
-        auto const text = DescribeIdentity("n1", key, std::optional<std::string> { "10.0.0.7:6680" }, IdentityRole::Member);
+        auto const text = DescribeIdentity("n1", key, std::optional<std::string> { "10.0.0.7:6680" });
         CHECK(text.contains(std::format("node-id n1\n")));
         CHECK(text.contains(std::format("public-key {}\n", FormatEd25519PublicKey(key))));
 
-        auto const tokenAt = text.find("raft-peer ");
-        REQUIRE(tokenAt != std::string::npos);
-        auto const token = std::string_view { text }.substr(tokenAt + std::string_view { "raft-peer " }.size());
-        auto const member = Cluster::ParseMemberSpec(token.substr(0, token.find('\n')));
-        REQUIRE(member.has_value());
-        CHECK(Unwrap(member).id == "n1");
-        CHECK(Unwrap(member).raftEndpoint == "10.0.0.7:6680");
-        CHECK(Unwrap(member).publicKey == key);
+        auto const lineAt = text.find("cluster-admit ");
+        REQUIRE(lineAt != std::string::npos);
+        auto const value = std::string_view { text }.substr(lineAt + std::string_view { "cluster-admit " }.size());
+        auto const argument = std::format("--cluster-admit={}", value.substr(0, value.find('\n')));
+
+        auto parsed = Testing::FirstStart(NodeConfig {});
+        auto const argv = std::array { argument.c_str() };
+        REQUIRE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, parsed).has_value());
+        CHECK(parsed.cluster.action == ClusterAction::Admit);
+        CHECK(parsed.cluster.key == "n1");
+        CHECK(parsed.cluster.value == "10.0.0.7:6680");
+        CHECK(parsed.cluster.publicKey == std::optional { key });
     }
 
-    SECTION("a node its peers could not dial yet prints no token rather than a guessed one")
+    SECTION("a node its peers do not dial prints no admission line rather than a guessed one")
     {
-        auto const text = DescribeIdentity("n1", key, std::nullopt, IdentityRole::Member);
-        CHECK(text.contains("public-key "));
-        CHECK_FALSE(text.contains("raft-peer"));
+        // A learner, which dials in: it is admitted through enrollment, where its key is compared
+        // with the one `--enroll-list` shows -- so it prints the key and nothing to type.
+        auto const text = DescribeIdentity("n1", key, std::nullopt);
+        CHECK(text == std::format("node-id n1\npublic-key {}\n", FormatEd25519PublicKey(key)));
     }
 
     SECTION("a node with no id yet has a key and nothing else to print")
     {
-        auto const text = DescribeIdentity("", key, std::nullopt, IdentityRole::Worker);
+        auto const text = DescribeIdentity("", key, std::nullopt);
         CHECK(text == std::format("public-key {}\n", FormatEd25519PublicKey(key)));
     }
-}
-
-TEST_CASE("What --print-identity prints for a worker is what --cluster-admit-worker reads back", "[node][identity][key]")
-{
-    // #178 PR 6: a worker that runs no consensus is admitted by the identity it proves, and an
-    // operator who does not open an enrollment window admits it by typing what it printed. So the
-    // line is asserted by PARSING it through the flag, the way the operator's command will be.
-    auto const key = Ed25519KeyPair::FromSeed(ScriptedSecureRandom::Ascending(Ed25519SeedBytes)).value().PublicKey();
-    auto const text = DescribeIdentity("w-7", key, std::nullopt, IdentityRole::Worker);
-    CHECK(text.contains("node-id w-7\n"));
-    // A worker is no consensus member, so it prints no token a `--raft-peer` would read.
-    CHECK_FALSE(text.contains("raft-peer"));
-
-    auto const lineAt = text.find("cluster-admit-worker ");
-    REQUIRE(lineAt != std::string::npos);
-    auto const value = std::string_view { text }.substr(lineAt + std::string_view { "cluster-admit-worker " }.size());
-    auto const argument = std::format("--cluster-admit-worker={}", value.substr(0, value.find('\n')));
-
-    NodeConfig parsed;
-    auto const argv = std::array { "--scheduler=10.0.0.1:6675", argument.c_str() };
-    REQUIRE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, parsed).has_value());
-    CHECK(parsed.cluster.action == ClusterAction::AdmitWorker);
-    CHECK(parsed.cluster.key == "w-7");
-    CHECK(parsed.cluster.publicKey == std::optional { key });
-
-    // A member prints the other line, never this one: the two routes admit different things.
-    CHECK_FALSE(DescribeIdentity("n1", key, std::optional<std::string> { "10.0.0.7:6680" }, IdentityRole::Member)
-                    .contains("cluster-admit-worker"));
 }

@@ -4,6 +4,7 @@
 #include <FastCache/Core/Base64.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -134,9 +135,10 @@ struct LeaseClaims
     /// signed by a voter's own identity key now, and the same outcome survives one layer
     /// down: a state directory copied to a second site copies the node, key included.
     ///
-    /// Empty is legal and means a node with no `--cluster-id`, which is the
-    /// one-machine deployment. A verifier that has none expects none: two nodes that
-    /// have both declined to name a cluster are not thereby in different ones.
+    /// Never empty from a node: its formation record mints a cluster id at the first start,
+    /// so a one-machine deployment carries one like any other. The codec
+    /// still carries an empty one, and the check is equality, so an empty id matches an
+    /// empty expectation and nothing else.
     std::string clusterId;
 
     /// The scheduler term this grant was issued under.
@@ -161,6 +163,16 @@ struct LeaseClaims
     /// rest of the grant.
     std::string signer;
 
+    /// The identity public key of the worker this grant is for, as the scheduler learned it
+    /// from that worker's proof at registration, or empty when it holds none (W-4).
+    ///
+    /// Inside the signature for `endpoint`'s reason, one layer tighter: an endpoint is a name,
+    /// and a name can come to answer on another machine -- a VPN address reassigned, a long-TTL
+    /// DNS record -- while a key cannot. The worker refuses a grant naming a key that is not its
+    /// own, and the client authenticates the reply against the same key, carried beside the
+    /// token in the grant (`CompileCacheWire::LeaseGrant::workerKey`). Raw bytes, not text.
+    std::string workerKey {};
+
     // Declared in wire order, matching `PackClaims`, so the struct reads in the order the
     // bytes do and a designated initializer lists them in the order it declares them.
 };
@@ -176,22 +188,22 @@ enum class LeaseRefusalReason : std::uint8_t
 {
     /// Not a lease token at all -- not base64, not this format, not this version.
     Malformed,
-    /// This worker holds no roster it can verify a grant against: it has not yet been
-    /// handed one it could certify, and holds none from an earlier run (#178).
+    /// This worker holds no roster it can verify a grant against: the state it applied records
+    /// no voter's key yet (#178).
     ///
     /// A fact about THIS WORKER, like `Unregistered`, so answering it before the signature
-    /// is no oracle. Its own reason rather than a share of `RosterExpired`, because the
-    /// operator actions are opposite: this one never reached a leader whose roster its
-    /// anchors certify, while an expired one did and has since been cut off.
+    /// is no oracle. Its own reason rather than a share of `Unauthorized`, because it says
+    /// nothing about the grant: no grant from anybody could verify here yet.
     NoRoster,
-    /// This worker's roster has not been re-certified by a majority of its voters for longer
-    /// than its lifetime and the skew slack (#178).
+    /// This worker has heard from no leader its applied configuration counts for longer than
+    /// `LeaderSilenceBound` (`Distributed::StateLeaseRoster`), so the state it would verify a grant
+    /// against may be one its fleet has moved past -- a voter forgotten meanwhile still in it.
     ///
-    /// The bound on how long a worker cut off from the cluster -- or kept talking to an
-    /// ex-leader that withholds every newer roster -- goes on trusting the voters it last
-    /// heard of. Past it, a grant signed by a machine the cluster has since revoked would
-    /// verify, so none is honoured.
-    RosterExpired,
+    /// `NoRoster`'s class: a fact about THIS WORKER, answered before the signature and so no
+    /// oracle, and nothing about the grant. Its own reason because the operator action differs: a
+    /// worker that never applied a voter is starting, and one that has stopped hearing a leader is
+    /// cut off from its fleet.
+    Isolated,
     /// A grant no key this worker's roster holds for the named signer verifies: an unknown
     /// signer, a signer that is not a voter, or a forgery.
     Unauthorized,
@@ -264,11 +276,10 @@ struct LeaseRefusalDescriptor
 /// one: a client already answers it correctly, and a second spelling of one fact
 /// is how two peers come to disagree about what happened.
 ///
-/// `NoRoster` and `RosterExpired` share a code of their own, `RosterExpired` (#178):
-/// neither is a statement about the grant, both say this WORKER cannot verify anybody's
-/// grant right now, and a client that read either as "your lease is bad" would stop asking
-/// the right scheduler for a fresh one. `SignerRevoked` shares `LeaseUnauthorized` and keeps
-/// a counter of its own, for `ClusterMismatch`'s reason below.
+/// `NoRoster` and `Isolated` share a code of their own, `GrantUnverifiable` (#178): neither is a
+/// statement about the grant, both say this WORKER cannot verify anybody's grant right now, and a
+/// client that read it as "your lease is bad" would stop asking the right scheduler for a fresh one. `SignerRevoked` shares
+/// `LeaseUnauthorized` and keeps a counter of its own, for `ClusterMismatch`'s reason below.
 ///
 /// `ClusterMismatch` and `Replayed` share `LeaseUnauthorized` too, and each keeps a
 /// counter of its own. The wire code is the same because the client's answer is the
@@ -291,11 +302,11 @@ inline constexpr EnumTable<LeaseRefusalReason, LeaseRefusalDescriptor> LeaseRefu
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized },
     { .reason = LeaseRefusalReason::NoRoster,
-      .code = CompileCacheWire::ErrorCode::RosterExpired,
+      .code = CompileCacheWire::ErrorCode::GrantUnverifiable,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster },
-    { .reason = LeaseRefusalReason::RosterExpired,
-      .code = CompileCacheWire::ErrorCode::RosterExpired,
-      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired },
+    { .reason = LeaseRefusalReason::Isolated,
+      .code = CompileCacheWire::ErrorCode::GrantUnverifiable,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseIsolated },
     { .reason = LeaseRefusalReason::Unauthorized,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized },
@@ -363,17 +374,11 @@ struct LeaseRefusal
 /// voter's identity key where it carried an HMAC under the cluster key. The envelope's
 /// second field changed width and meaning, so a version-2 grant is refused as malformed
 /// rather than read.
-inline constexpr std::uint8_t LeaseTokenVersion = 3;
-
-/// The label a grant's signature is made under (#178).
 ///
-/// Its own label, beside the grant it signs, as every construction signed by a member's own key
-/// carries one: a label distinct from every other is what keeps a signature made for one from
-/// verifying as another. Versioned
-/// with the token, so a signature over a version-2 claim list could never verify as a
-/// version-3 one even under the same key. `fastcache-lease-v1`, the HMAC label, is retired
-/// and never reused.
-inline constexpr std::string_view LeaseSignatureLabel = "fastcache-lease-v3";
+/// **4 since W-4**: the claims name the granted worker's identity key, so a grant answered by
+/// whatever machine has come to hold its endpoint is refused there, and the reply is checked
+/// against that key by the client. A ninth-field version-3 grant is refused as malformed.
+inline constexpr std::uint8_t LeaseTokenVersion = 4;
 
 /// Who signs a grant: the issuing scheduler's identity (#178).
 ///
@@ -397,17 +402,17 @@ class ILeaseSigner
     ///         this scheduler is verified under.
     [[nodiscard]] virtual Ed25519PublicKey PublicKey() const = 0;
 
-    /// Sign @p message with this node's identity key.
+    /// Sign @p message with this node's identity key: a labelled message, and nothing else.
     /// @param message What is signed.
     /// @return The signature.
-    [[nodiscard]] virtual Ed25519Signature Sign(std::span<std::byte const> message) const = 0;
+    [[nodiscard]] virtual Ed25519Signature Sign(LabelledMessage const& message) const = 0;
 };
 
 /// What a verifier's roster says about the keys one signer id may sign a grant with.
 struct LeaseSignerKeys
 {
     /// The key the id signs with NOW -- present only for a VOTER the roster records a key
-    /// for. A learner, a principal and a stranger have none: a grant is a scheduler's, and
+    /// for. A learner and a stranger have none: a grant is a scheduler's, and
     /// only a voter can lead.
     std::optional<Ed25519PublicKey> live;
 
@@ -433,41 +438,66 @@ class ILeaseSignerKeys
     [[nodiscard]] virtual LeaseSignerKeys KeysOf(std::string_view signer) const = 0;
 };
 
-/// Whether a worker's roster may be trusted at an instant (#178).
+/// Whether a worker's roster can verify a grant at an instant (#178).
 ///
-/// **PRIVATE: persisted and transmitted nowhere.** Three answers rather than a `bool`,
-/// because the two ways of being unusable are opposite operator actions: a worker with no
-/// roster never reached a leader its anchors certify, while an expired one did and has since
-/// been cut off.
+/// **PRIVATE: persisted and transmitted nowhere.** An enum rather than a `bool`, so the reading
+/// says WHICH absence it is rather than leaving a `false` to be read as "not trusted".
 enum class RosterStanding : std::uint8_t
 {
-    Current, ///< Trusted: certified, and not past its certification and the slack.
-    Expired, ///< Held, and past its certification and the slack.
-    Absent,  ///< Nothing a grant could be verified against.
+    Current,  ///< Some voter's key is known: a grant is checked against it.
+    Absent,   ///< Nothing a grant could be verified against.
+    Isolated, ///< Voters are known, but no leader they count has spoken for `LeaderSilenceBound`.
+    Last,     ///< Not a standing, and has no row: the length of a table keyed by one.
 };
+
+/// What a validator does with a roster's standing: verify against it, or refuse before the
+/// signature with a reason about THIS worker.
+struct RosterStandingRow
+{
+    RosterStanding standing;                   ///< The standing this row describes.
+    std::optional<LeaseRefusalReason> refusal; ///< What every grant is refused with; nullopt verifies.
+    std::string_view detail;                   ///< What the refusal says; empty where nothing is refused.
+};
+
+/// One row per `RosterStanding`, in enumerator order: the ONE place a standing becomes a refusal.
+inline constexpr EnumTable<RosterStanding, RosterStandingRow> RosterStandingTable { {
+    { .standing = RosterStanding::Current, .refusal = std::nullopt, .detail = {} },
+    { .standing = RosterStanding::Absent,
+      .refusal = LeaseRefusalReason::NoRoster,
+      .detail = "the state this worker applied records no voter's key yet, so it can verify no grant" },
+    { .standing = RosterStanding::Isolated,
+      .refusal = LeaseRefusalReason::Isolated,
+      .detail = "this worker has heard from no leader its fleet counts for longer than it may trust the state it "
+                "applied, so it verifies no grant until one speaks again" },
+} };
+
+static_assert(RowsInEnumeratorOrder(RosterStandingTable, &RosterStandingRow::standing),
+              "RosterStandingTable must hold one row per RosterStanding, in enumerator order");
 
 /// What a worker's roster says about itself at an instant.
 struct RosterReading
 {
-    RosterStanding standing { RosterStanding::Absent }; ///< Whether it may be trusted.
-
-    /// When its certification lapses -- or lapsed. Absent for no roster at all, and for a
-    /// roster that needs no certificate: a consensus member's own applied state.
-    std::optional<std::chrono::system_clock::time_point> certifiedUntil;
+    RosterStanding standing { RosterStanding::Absent }; ///< Whether a grant can be verified.
 };
 
-/// A worker's roster: who may sign its grants, and whether it may be trusted now (#178).
+/// A worker's roster: who may sign its grants, and whether it can verify one now (#178).
 ///
-/// Implemented twice, because a node answers the question two ways: a consensus member from
-/// the state it applied, which needs no certificate, and a worker with no consensus from the
-/// certified roster it adopted (`Distributed::RosterTrust`). Both are read per request, so an
-/// applied revocation or an adopted roster reaches the next grant rather than the next restart.
+/// The state the node's own consensus applied (`Distributed::StateLeaseRoster`): every serving
+/// node runs consensus, so there is no other kind. Read per request, so an applied revocation
+/// reaches the next grant rather than the next restart.
 class ILeaseRoster: public ILeaseSignerKeys
 {
   public:
     /// @param now This machine's wall clock.
-    /// @return Whether the roster may be trusted at @p now, and until when.
+    /// @return Whether the roster can verify a grant at @p now.
     [[nodiscard]] virtual RosterReading Read(std::chrono::system_clock::time_point now) const = 0;
+
+    /// Who the roster admits as a MACHINE, which is a wider question than who may sign a grant:
+    /// `KeysOf` answers for a voter alone, this for every member of either seat with a live key.
+    /// @param machine The machine id a ticket names.
+    /// @return The key the roster holds LIVE for it -- a member of either seat -- and every revoked
+    ///         key, whatever id each was revoked under.
+    [[nodiscard]] virtual LeaseSignerKeys MachineKeysOf(std::string_view machine) const = 0;
 };
 
 /// How far a verifier's wall clock may trail the minting scheduler's.
@@ -560,24 +590,25 @@ namespace Detail
             WireFields::AsBytes(claims.clusterId),
             std::span<std::byte const> { epoch },
             WireFields::AsBytes(claims.signer),
+            WireFields::AsBytes(claims.workerKey),
         });
     }
 
-    /// What a grant's signature is over: its label, then the claims AS PACKED -- one field,
-    /// so a verifier signs over the bytes a peer sent rather than a re-encoding of them.
-    /// One function for the minter and the verifier, for `PackClaims`' reason.
+    /// What a grant's signature is over: its label (`IdentityKeyPurpose::Lease`), then the claims
+    /// AS PACKED -- one field, so a verifier signs over the bytes a peer sent rather than a
+    /// re-encoding of them. One function for the minter and the verifier, for `PackClaims`' reason.
     /// @param packed The packed claims.
     /// @return The signed message.
-    [[nodiscard]] inline std::vector<std::byte> SignedLeaseMessage(std::span<std::byte const> packed)
+    [[nodiscard]] inline LabelledMessage SignedLeaseMessage(std::span<std::byte const> packed)
     {
-        return WireFields::Encode({ WireFields::AsBytes(LeaseSignatureLabel), packed });
+        return LabelledMessage::Of(IdentityKeyPurpose::Lease, { packed });
     }
 
     /// How many fields a token's outer envelope holds: the claims, and the signature.
     inline constexpr std::size_t EnvelopeFieldCount = 2;
 
     /// How many fields the packed claims hold.
-    inline constexpr std::size_t ClaimFieldCount = 9;
+    inline constexpr std::size_t ClaimFieldCount = 10;
 
     /// The largest expiry this host's wall clock can represent, in milliseconds.
     ///
@@ -671,12 +702,12 @@ namespace Detail
     std::ranges::copy(signatureField, presented.begin());
     auto const message = Detail::SignedLeaseMessage(packed);
     auto const keys = signers.KeysOf(WireFields::AsStringView((*fields)[8]));
-    if (!keys.live.has_value() || !Ed25519Verify(*keys.live, message, presented))
+    if (!keys.live.has_value() || !VerifyLabelled(*keys.live, message, presented))
     {
         // Only a signature that VERIFIES under a revoked key is reported as one, so
         // `SignerRevoked` is a statement about who signed rather than about the claim.
         auto const byRevoked = std::ranges::any_of(
-            keys.revoked, [&](Ed25519PublicKey const& revoked) { return Ed25519Verify(revoked, message, presented); });
+            keys.revoked, [&](Ed25519PublicKey const& revoked) { return VerifyLabelled(revoked, message, presented); });
         return std::unexpected { byRevoked ? LeaseRefusalReason::SignerRevoked : LeaseRefusalReason::Unauthorized };
     }
 
@@ -688,7 +719,8 @@ namespace Detail
                              static_cast<std::int64_t>(*expiryMillis) } },
                          .clusterId = std::string { WireFields::AsStringView((*fields)[6]) },
                          .epoch = *epoch,
-                         .signer = std::string { WireFields::AsStringView((*fields)[8]) } };
+                         .signer = std::string { WireFields::AsStringView((*fields)[8]) },
+                         .workerKey = std::string { WireFields::AsStringView((*fields)[9]) } };
 }
 
 /// What learning a scheduler term did to a worker's picture of the fleet.
@@ -1025,13 +1057,13 @@ class SchedulerTermRegressionNotice
 
 /// The fleet a worker was told it serves, learned once at registration.
 ///
-/// **An `optional`, and that is the entire point of the type.** Three states have to
-/// stay apart here and a bare string can only hold two: *never registered*, *registered
-/// into a fleet that names itself*, and *registered into one that names none*. The last
-/// is the one-machine deployment and is legal -- `SchedulerService`'s constructor says
-/// so -- while the first must honour no grant at all. A bare string spells the first and
-/// the third identically, which is how "harden the fleet check" becomes "every
-/// single-machine install stops compiling" (#303's shape, #401's window).
+/// **An `optional`, and that is the entire point of the type.** *Never registered* must
+/// honour no grant at all, and a bare string would spell it as the empty string -- a value
+/// the REGISTER reply's codec still carries, even though no node sends it now that
+/// every node's formation record mints a cluster id. Reading "not registered" out of a string is how
+/// "harden the fleet check" became "every single-machine install stops compiling" (#303's
+/// shape, #401's window); an engaged empty pin is a registration like any other, and the
+/// equality check lets it honour only a grant that names no cluster either.
 ///
 /// Mutex-guarded rather than atomic for the reason `KnownSchedulerTerm` is: the value is
 /// a string, it is written by the heartbeat thread on registration and read by every
@@ -1044,7 +1076,7 @@ class PinnedFleet
     /// Idempotent and last-writer-wins: a worker that re-registers -- which it does
     /// after any refused heartbeat, not only after a restart -- adopts whatever the
     /// scheduler that accepted it says now.
-    /// @param clusterId The fleet named, which may legally be empty.
+    /// @param clusterId The fleet named; empty only if the reply carried an empty one.
     void Pin(std::string clusterId)
     {
         std::scoped_lock const guard { _mutex };
@@ -1052,7 +1084,8 @@ class PinnedFleet
     }
 
     /// @return The fleet this worker registered with, or nullopt when it has not
-    ///         registered. An engaged but EMPTY string is a fleet that names none.
+    ///         registered. An engaged but EMPTY string is a registration whose reply
+    ///         named an empty fleet, which no node sends.
     [[nodiscard]] std::optional<std::string> Pinned() const
     {
         std::scoped_lock const guard { _mutex };
@@ -1102,13 +1135,21 @@ struct LeaseExpectation
     std::string_view endpoint;    ///< The endpoint this worker registered under.
     std::string_view fingerprint; ///< The toolchain this worker is about to run.
 
-    /// The cluster this verifier belongs to; empty when it names none.
+    /// The cluster this verifier belongs to, as its registration named it.
     ///
-    /// Compared for EQUALITY rather than for presence, so two nodes that have both
-    /// declined to name a cluster still agree -- that is the one-machine deployment
-    /// and it must keep working -- while a node that names one refuses a grant from a
-    /// fleet that names another, or none.
+    /// Compared for EQUALITY rather than for presence, so a grant from a fleet that names
+    /// another cluster, or none, is refused. A one-machine deployment names its own minted
+    /// cluster id on both sides, which is why it agrees; an empty id matches only an
+    /// empty one, and no node has that.
     std::string_view clusterId;
+
+    /// This worker's own identity public key, or empty when it holds none (W-4).
+    ///
+    /// A grant naming a key is good only at the machine holding it: an endpoint that has come
+    /// to answer on another machine is refused there as `EndpointMismatch` -- the grant was
+    /// issued for a different worker -- before a compiler runs. A grant naming no key is judged
+    /// by its endpoint alone, as before; the client refuses to send it anywhere.
+    std::string_view identityKey {};
 };
 
 /// Authenticate a grant and check it names this worker, this toolchain, and now.
@@ -1165,6 +1206,15 @@ struct LeaseExpectation
             .reason = LeaseRefusalReason::EndpointMismatch,
             .detail = std::format(
                 "this lease was issued for {}; this worker answers on {}", authentic->endpoint, expected.endpoint) } };
+
+    // The same question as the endpoint's, asked of what cannot move: a grant for the machine
+    // holding one key is not good at a machine holding another, whatever name both answer to.
+    if (!authentic->workerKey.empty() && authentic->workerKey != expected.identityKey)
+        return std::unexpected { LeaseRefusal {
+            .reason = LeaseRefusalReason::EndpointMismatch,
+            .detail = std::format("this lease was issued for {} on a machine holding another identity key; this "
+                                  "worker answers there now",
+                                  authentic->endpoint) } };
 
     if (authentic->fingerprint != expected.fingerprint)
         return std::unexpected { LeaseRefusal { .reason = LeaseRefusalReason::FingerprintMismatch, .detail = {} } };

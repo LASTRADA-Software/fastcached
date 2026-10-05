@@ -19,6 +19,12 @@
 # get either wrong. It compiles to nothing on POSIX, so it costs that build a
 # translation unit and no dependency.
 #
+# Platform/ReplacingRename.cpp is the one rename a written file is moved over the one it replaces with:
+# POSIX semantics on Windows, so a reader sharing delete does not refuse it, and the classic rename only
+# where a filesystem has none -- said, never decided in silence. The node's durable writer is built on
+# it too, and two copies of it were two places for a fix to land in one and miss the other. Standard
+# library and the Win32 API only.
+#
 # Cli/Duration.cpp is the one duration grammar every time-valued setting is written in (#1402). The launcher's
 # timeout environment variables are such settings, and a second parser here would be a second answer to what `2s`
 # means. A unit table and two functions over <charconv> and <chrono>: no dependency either.
@@ -44,6 +50,7 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/NarrowText.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Registry.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/ReplacingRename.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
 
 # The launcher's TCP client -- the blocking pair it dials with, and the event loop and
@@ -147,6 +154,7 @@ endif()
 # distinctly from a miss" be a test rather than a hope.
 set(_fc_cc_sources
     CmdLine.cpp
+    AtomicFile.cpp
     CodecEnvelope.cpp
     CompileJob.cpp
     LauncherCli.cpp
@@ -162,12 +170,16 @@ set(_fc_cc_sources
     MarkerDiscovery.cpp
     NotePathCollapse.cpp
     ObjectEquivalence.cpp
+    ObjectSections.cpp
     ParallelFor.cpp
     PathResolve.cpp
     RefusalNotice.cpp
     ReplayGuard.cpp
+    ReachabilityMemo.cpp
+    RootBinding.cpp
     RootReconciler.cpp
     Stats.cpp
+    TicketCredentials.cpp
     ToolchainFingerprint.cpp
     ToolchainHost.cpp
     ToolchainProbe.cpp
@@ -267,7 +279,7 @@ endif()
 
 install(TARGETS fastcache-cc
     RUNTIME DESTINATION "${FASTCACHED_INSTALL_BINDIR}"
-    COMPONENT Runtime
+    COMPONENT "${FASTCACHED_APP_COMPONENT}"
 )
 
 # Unit tests for the reusable launcher pieces (parsing, keying, statistics, and
@@ -277,6 +289,7 @@ if(FASTCACHED_BUILD_TESTS)
     add_executable(fastcache-cc-tests
         test_main.cpp
         ${_fc_cc_sources}
+        AtomicFile_test.cpp
         CacheDecision_test.cpp
         CmdLine_test.cpp
         CompileJob_test.cpp
@@ -288,6 +301,7 @@ if(FASTCACHED_BUILD_TESTS)
         CacheProtocol_test.cpp
         HitVerification_test.cpp
         ObjectEquivalence_test.cpp
+        ObjectSections_test.cpp
         CompileCorrelation_test.cpp
         ReactorExchange_test.cpp
         Dispatch_test.cpp
@@ -298,9 +312,13 @@ if(FASTCACHED_BUILD_TESTS)
         PathResolve_test.cpp
         RefusalNotice_test.cpp
         ReplayGuard_test.cpp
+        ReachabilityMemo_test.cpp
+        RootBinding_test.cpp
+        StreamGrammar_test.cpp
         RootReconciler_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
+        TicketCredentials_test.cpp
         # Discovery is the compile NODE's, not the launcher's -- `fastcache-cc`
         # never surveys a machine, it is handed a compiler. The source is listed
         # here for its tests and in `_fc_node_shared` for its one real consumer,

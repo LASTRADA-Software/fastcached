@@ -121,6 +121,8 @@ set -uo pipefail
 # Which files are this project's own is ONE answer, and an enumerator that does not ask takes vendored source
 # as first-party (#1370). `CompositeActions` lists what git tracks, so it asks.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/third-party-roots.sh"
+# shellcheck source=lib/git-scrub.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/git-scrub.sh"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -1696,8 +1698,8 @@ WF
     Stage() {
         local path="$tmp/$1/$2"
         if ! { { [ -d "${path%/*}" ] || mkdir -p "${path%/*}"; } && WriteStdinTo "$path" \
-            && { [ -d "$tmp/$1/.git" ] || git -C "$tmp/$1" init -q >/dev/null 2>&1; } \
-            && { [ "${3:-}" = untracked ] || git -C "$tmp/$1" add -- "$2" >/dev/null 2>&1; }; }; then
+            && { [ -d "$tmp/$1/.git" ] || scratch_git -C "$tmp/$1" init -q >/dev/null 2>&1; } \
+            && { [ "${3:-}" = untracked ] || scratch_git -C "$tmp/$1" add -- "$2" >/dev/null 2>&1; }; }; then
             failures=$((failures + 1))
             echo "  $1: could not stage $2 in a scratch repository"
         fi

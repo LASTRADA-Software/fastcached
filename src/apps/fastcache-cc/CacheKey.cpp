@@ -288,7 +288,17 @@ std::string ComputeKey(KeyInputs const& inputs)
     // poisoned region from a sound one would have to call a path with no
     // `<SRCROOT>` sentinel suspect, and 92 of the 93 paths a trivial translation
     // unit reports are toolchain headers that correctly have none.
-    KeyDigest digest { "objkey-v6" };
+    //
+    // v7 retires every value stored before root binding (RootBinding.hpp). An object
+    // naming its producer's checkout -- a `__FILE__` under direct mode, any
+    // `std::source_location` on any path -- was stored under a key every checkout
+    // computes, so those entries serve another checkout's paths and nothing in a value
+    // says which of them do. This construction is unchanged and the golden vector below
+    // moved for the tag alone; what changed is where a STORE puts a root-bound object and
+    // what a FETCH does on meeting its marker, and an older entry was written by neither
+    // rule. `manifest-v7` moves with it, in the lock-step ComputeManifestKey describes --
+    // and for a second reason of its own, since direct mode is where the defect lived.
+    KeyDigest digest { "objkey-v7" };
     digest.Field(inputs.compilerId);
     digest.Field(inputs.preprocessed);
     for (auto const& arg: inputs.relativizedArgs)

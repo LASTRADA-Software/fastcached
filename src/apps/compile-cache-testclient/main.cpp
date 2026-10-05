@@ -106,14 +106,15 @@ struct DriverSpec
     /// Suppress the driver's banner, or empty when it has none.
     ///
     /// Not cosmetic on an MSVC driver: its dependency record IS its output, so a
-    /// banner printed there is stored inside the `ShowIncludes` region and
+    /// banner printed there is stored inside the `MsvcStream` region and
     /// travels with the value. A GNU driver writes the record to a file and has
     /// nothing to suppress, which is why this is a column and not a constant.
     std::string_view quietFlag;
     PathCanon::Grammar grammar; ///< The grammar the record is written in.
     /// The grammar the launcher tags a captured STREAM region with for this family --
-    /// `ShowIncludes` for an MSVC driver, whose notes are its output, and
-    /// `GccDiagnostics` for a GNU one, whose record is a separate file.
+    /// `MsvcStream` for an MSVC driver, whose notes and diagnostics are both its output,
+    /// and `GccDiagnostics` for a GNU one, whose record is a separate file. The launcher's
+    /// `Cc::StreamGrammar` is the answer this column mirrors.
     PathCanon::Grammar streamGrammar;
 };
 
@@ -126,7 +127,7 @@ constexpr auto MsvcDriver = DriverSpec { .objectFlag = "/Fo",
                                          .dependencyValue = {},
                                          .quietFlag = "/nologo",
                                          .grammar = PathCanon::Grammar::ShowIncludes,
-                                         .streamGrammar = PathCanon::Grammar::ShowIncludes };
+                                         .streamGrammar = PathCanon::Grammar::MsvcStream };
 
 constexpr auto GnuDriver = DriverSpec { .objectFlag = "-o",
                                         .compileOnly = "-c",

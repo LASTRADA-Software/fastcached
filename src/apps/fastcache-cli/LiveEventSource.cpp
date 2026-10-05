@@ -273,7 +273,8 @@ namespace
     [[nodiscard]] std::string_view CallerRemedy(Wire::ErrorCode code, Wire::SubscribeRequest const& request) noexcept
     {
         if (code == Wire::ErrorCode::NotAMember)
-            return "; add this machine to that node's --fleet-member list";
+            return "; have that node's fleet admit this machine (its node asks to enroll -- --fleet-seed names a fleet "
+                   "no beacon reaches -- and --enroll-approve admits it there)";
         if (code != Wire::ErrorCode::Unauthenticated)
             return {};
         if (request.subject != Wire::LiveSubject::Fleet)

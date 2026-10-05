@@ -432,7 +432,7 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
     // to disagree about what was hashed, and the retirement check would go vacuous
     // in the one edit it exists to catch.
     auto const key = ComputeKey(inputs);
-    CHECK(key == "e7d074ee4bda35d76e6bf65eba71e7b1");
+    CHECK(key == "7323057f60d9ffaca969b16ef293ceaa");
 
     // What the vector alone cannot say: that the tag has not been put BACK. See
     // Generation -- reverting the tag and re-pasting the vector is one edit
@@ -442,6 +442,8 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
         { .key = "objkey-v3", .digest = "65a330c5e6541bf33b2682d642717669" },
         { .key = "objkey-v4", .digest = "a38a64d1e6e4c72f555c7e97ba26bd16" },
         { .key = "objkey-v5", .digest = "b89cce126e819bbb6868c7a6065e01cb" },
+        // The v6 -> v7 bump changed nothing but the tag, so this is the outgoing vector.
+        { .key = "objkey-v6", .digest = "e7d074ee4bda35d76e6bf65eba71e7b1" },
     });
     RequireNoRetiredDigest<std::string_view>(key, Retired);
 }
@@ -755,10 +757,11 @@ TEST_CASE("A prefix-map flag's root is relativized, so two checkouts still share
         return ComputeKey(KeyInputs { .compilerId = "g++ (GCC) 15.2.0",
                                       // Identical across both checkouts: line markers are suppressed, and
                                       // this TU expands no `__FILE__`. A TU that DOES expand it carries the
-                                      // difference in this very field and keys apart on its own -- the
-                                      // preprocessor is what expands `__FILE__` and this is the raw
-                                      // preprocessed text, so there is no arrangement in which two
-                                      // checkouts share a key while their `__FILE__` strings differ.
+                                      // difference in this very field, so THIS key tells the two checkouts
+                                      // apart -- and only this one. The direct-mode manifest key never sees
+                                      // the expansion, and `std::source_location` is filled in by the
+                                      // compiler after preprocessing, so it reaches no key at all. Those are
+                                      // caught from the OBJECT instead: see RootBinding.hpp.
                                       .preprocessed = "namespace demo{int Add(int a,int b)noexcept{return a+b;}}",
                                       .relativizedArgs = Relativize(args, root),
                                       .dependencyPaths = {} });

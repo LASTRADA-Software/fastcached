@@ -175,9 +175,11 @@
 #   none     OS page cache only; fastest, loses data on power failure
 #storage_durability: batched
 
-# Cap the on-disk tier. 0 means unbounded — the cache grows to whatever it
-# needs. Set this to keep a build cache inside a fixed disk allotment; the
-# budget is split evenly across shards and each evicts its own LRU tail.
+# Cap the on-disk tier at what it occupies on disk — compressed values at their
+# compressed size, so compression makes it hold more. 0 means unbounded — the
+# cache grows to whatever it needs. Set this to keep a build cache inside a
+# fixed disk allotment; the budget is split evenly across shards and each
+# evicts its own LRU tail.
 #storage_max_disk: 0
 
 # Largest single value accepted, in bytes. The default is sized for compile

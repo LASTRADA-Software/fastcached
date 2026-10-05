@@ -24,7 +24,7 @@ declares:
 | Offset | Size | Field | Meaning |
 |--------|------|-------|---------|
 | 0 | 1 | magic | Always `0xFC`. |
-| 1 | 1 | version | Protocol version. Current: **14**, and the oldest accepted is also **14** — see [Versioning](#versioning). |
+| 1 | 1 | version | Protocol version. Current: **15**, and the oldest accepted is also **15** — see [Versioning](#versioning). |
 | 2 | 1 | op | `0x01` STORE, `0x02` FETCH, `0x03` AUTH; the rest are [distributed execution](#distributed-execution) and [node identity](#node-identity-and-sealed-frames). |
 | 3 | 4 | payloadLength | Bytes of payload following the header. |
 
@@ -108,16 +108,24 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x1f` | cluster-change-in-flight | One membership change is already uncommitted, so this one must wait. The one **retriable** code in the cluster-administration range: the cluster could accept the change and will, shortly. Not `invalid-cluster-change`, which would send an operator to correct a record that is already correct. |
 | `0x20` | cluster-change-not-needed | The change asked for is already in force, so nothing was recorded — `--cluster-admit` naming a member the cluster already has. Idempotence rather than a mistake, and a code rather than a success because no entry was appended and there is no index to name. |
 | `0x21` | worker-compiler-unclassified | The worker ran the program its own `--toolchain` names and cannot tell what it is, so it cannot build a command line for it. Split from `worker-spawn-failed`, which says the program could not be run at all. |
-| `0x22` | enrollment-closed | This node runs no enrollment window right now. The **default** answer to an enrollment request — the window is closed unless an operator has just opened it — and counted, since a rise with nobody at a terminal is somebody trying the door. |
-| `0x23` | enrollment-full | The window is open and its pending list is full, so the request was not recorded. A refusal rather than an eviction, so a flood cannot push the real joiner off the list the operator is reading. |
+| `0x22` | *(reserved)* | Never sent. Was `enrollment-closed`, the answer a closed enrollment window gave; since zero-config formation a joiner's request is always recorded and the approval is the gate. The number is burnt. |
+| `0x23` | enrollment-full | The pending list is full, so the request was not recorded. A refusal rather than an eviction, so a flood cannot push the real joiner off the list the operator is reading. |
 | `0x24` | *(reserved)* | Never sent. Was `enrollment-already-collected`, which made a key hand-over spendable once; an approved enrollment no longer carries a secret ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). The number is burnt. |
 | `0x25` | unknown-fleet-selector | A fleet read named a section or a range this build does not serve. The message lists the ones it does. |
 | `0x26` | node-proof-unchallenged | A node proof arrived with no challenge outstanding on this connection — never asked for one, or already spent it. The exchange was got wrong, so ask for a challenge; not a statement about the key. |
 | `0x27` | node-proof-rejected | A node proof's signature did not verify under the identity key it presented. One answer for every way that happens, since naming the field would be an oracle, and asked **before** the roster is consulted. |
-| `0x28` | roster-expired | The worker can check nobody's lease right now: it holds no roster of the cluster's voters, or the one it holds has not been re-certified within its lifetime and the clock-skew slack. A statement about the worker, never about the lease — a fresh grant would get the same answer. |
+| `0x28` | *(reserved)* | Never sent. Was `roster-expired`, named for the certified roster's lapse ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)); what it still meant is `grant-unverifiable`. The number is burnt. |
 | `0x29` | node-key-unknown | A node proof verified, under a key this cluster does not hold for the id it named: a machine nobody admitted, or one presenting a key other than the one admitted under its id. The remedy is an admission, not a new key. |
-| `0x2a` | node-key-revoked | A node proof verified under a key the cluster has **revoked** — the forgotten machine itself. The connection is kept and marked, and every later verb on it is refused as the forgotten machine's, even from a host `--fleet-member` still names. |
-| `0x2b` | node-identity-required | A verb only a machine that **proved** its identity may send — REGISTER, NODE-ANNOUNCE, HEARTBEAT, WITHDRAW — arrived on a connection that has not. An address admits a client; it no longer admits a machine into the fleet, loopback included. |
+| `0x2a` | node-key-revoked | A node proof verified under a key the cluster has **revoked** — the forgotten machine itself. The connection is kept and marked, and every later verb on it is refused as the forgotten machine's, from any address, this machine's included. |
+| `0x2b` | node-identity-required | A verb only a machine that **proved** its identity may send — REGISTER, NODE-ANNOUNCE, HEARTBEAT, WITHDRAW — arrived on a connection that has not, loopback included. A machine ticket admits a client and never satisfies these: a ticketed connection is not sealed. |
+| `0x2c` | enrollment-host-full | The request came from an address that already has as many enrollment requests waiting as one host may hold, counted by the address each request first came from, so it was not recorded. Its own code rather than enrollment-full, because one address asking a lot and many machines waiting are different problems; a joiner treats both as a wait. |
+| `0x2d` | ticket-refused | An AUTH presenting a machine ticket this node did not accept: a signature that does not verify, a machine the roster does not hold, a revoked key, an audience that is not this node, or an expiry passed. One code for all of them. The message names the reason when the caller could have checked it itself -- malformed bytes, a wrong audience, an expiry -- or when it is the node's own state; a forgery, a machine the roster does not hold and a revoked key all read `not admitted by this node`, because AUTH answers any address and those three would tell a stranger which ids the roster holds. The node still counts each of them apart. Not `unauthenticated`, which says a credential is still owed; this one says a credential was presented and judged. |
+| `0x2e` | identified-caller-required | An operator's **control** verb -- `CLUSTER-ADMIT` in every form, `CLUSTER-FORGET`, `CLUSTER-SET`, `ENROLL-CONTROL` -- from a caller admitted by `--fleet-open` alone. `--fleet-open` admits a caller to what the fleet serves and never to what decides the fleet; a caller on this machine, one that proved a node key, or one presenting a verified machine ticket is past this refusal, and is then asked for an operator's standing (`operator-standing-required`). Not `not-a-member`: the caller is admitted, and the remedy is to identify itself. |
+| `0x2f` | not-shared-cache | A `SHARED-FETCH` or `SHARED-STORE` at a node that is not the fleet's shared cache right now: the `shared-cache` setting names another machine or none, or names this one and its tier could not be opened. Not `unknown-opcode`, since every node implements the verbs and a client told otherwise would conclude the build is too old; not `not-a-member`, which would tell a proven member it is not one. A `fastcached` answers it too, so a client has one refusal to read as a miss whichever wrong machine it reached. |
+| `0x30` | worker-rejected-argument | The worker will not pass one of the job's arguments to its compiler — it is not on the worker's per-driver-family allowlist, or a path-mapping value cannot be spelled into a rule — and the message names it. The frame was well formed: until this code existed the refusal was answered `malformed-frame`, and a launcher reported a flag this fleet does not dispatch as a version skew. Either add the argument on the workers with `--allow-compile-arg`, if it runs no program and names no path, or leave those compiles to run locally. |
+| `0x31` | grant-unverifiable | The worker can check nobody's lease right now: the state its own consensus applied names no voter yet, or no leader that state counts has spoken to it for longer than the silence bound. A statement about the worker, never about the lease — a fresh grant would get the same answer. |
+| `0x32` | roster-not-yet-applied | A node proof the answering node cannot judge **yet**: its consensus has not applied the log it recovered when it started -- a lone voter before its election commits, a follower before its leader first speaks -- so the key roster it judges by may lack a key its cluster holds. Answered instead of `node-key-unknown`, which would tell an operator to admit a machine the cluster already holds. A statement about the answering node: the proving node asks again on a short backoff, and nobody needs to act. A launcher never meets it -- it proves no identity. |
+| `0x33` | operator-standing-required | An operator's **control** verb -- `CLUSTER-ADMIT` in every form, `CLUSTER-FORGET`, `CLUSTER-SET`, `ENROLL-CONTROL` -- from a caller that IS identified, by a proven node key or a verified machine ticket, whose machine holds no **voter's** seat in the state the asked node applied. A ticket proves a fleet machine, never an operator: any process on an admitted laptop can have its node mint one. These verbs are answered to the asked node's own machine and to a voter's identity alone; run the verb on a voter, or promote this machine. A caller `--fleet-open` alone admitted is still told `identified-caller-required`. |
 
 Every one of these is a **refusal the client answers by compiling locally**,
 never by failing. They are distinct codes rather than one "no" because they mean
@@ -152,19 +160,147 @@ client localizes it to its own layout.
 ### AUTH
 
 ```
-[0xFC][ver][0x03][u32 len]  payload: [username][secret]
+[0xFC][ver][0x03][u32 len]  payload: [kind][username][secret]
 ```
+
+`kind` is one byte naming the credential: `0x01` a password, `0x02` a machine
+ticket, whose bytes are the `secret` and whose `username` must be empty. Any
+other byte, or a ticket with a username, is a malformed frame.
 
 An empty `username` asks to be verified against the secret alone — the redis
 `requirepass` form, and the usual one. The field is always present so the frame
 arity does not depend on which credential style a client uses.
 
+`fastcached` holds no roster and so can verify no machine: against
+`--requirepass` a ticket is refused as a wrong credential would be, and with no
+credential configured it is answered `Ok` and verifies nothing, like any other.
+
+A compile node checks no password — the one it may hold, `--requirepass`, it only
+presents to the `fastcached` behind its `--upstream` — so it verifies a **ticket** and
+nothing else: a password `AUTH` is answered `Ok` and establishes nothing, and the declared `kind`
+decides what is verified — a genuine ticket's bytes under the password kind establish
+nothing either. A ticket it accepts says which machine the connection speaks for; one it
+refuses is `ticket-refused` and **clears** whatever an earlier `AUTH` on the connection
+established, so the command pipelined behind it is judged as a stranger's — or, for a
+revoked key, as the forgotten machine's, which no later `AUTH` lifts.
+
+A ticket is its claims, then an Ed25519 signature over them by the machine's own
+identity key, as two length-prefixed fields. The claims are a label, the machine id, the
+**audience** — the one endpoint it may be presented to, as the presenter dialled it — a
+big-endian `u64` expiry in Unix seconds, and a nonce, each length-prefixed. A node accepts
+one only for an audience that is itself, within a minute of its minting and the clock-skew
+slack, and once: it remembers every ticket it has spent until it could no longer be
+accepted anyway.
+
+### MINT-TICKET
+
+```
+[0xFC][ver][0x1e][u32 len]  payload: [audience]
+```
+
+Asks a compile node to mint a ticket, signed with its identity key, for `audience`. The
+reply payload is the ticket, ready to be the `secret` of an `AUTH` of kind `0x02`.
+
+Served **over loopback only**, judged from the connection's peer address: a ticket is this
+machine vouching for its caller, so a caller on another machine is refused `not-a-member`
+before anything is signed. An audience naming no one machine — loopback, a wildcard, no
+host — is refused `malformed-frame`, since such a ticket would be spendable at any node
+that heard it. A node that holds no identity key refuses it `no-cluster`.
+
+### EXPLAIN-ADMISSION
+
+```
+[0xFC][ver][0x1b][u32 len]  payload: [subject]
+reply:                               [verdict][u32 decidedBy][standing][subject]
+```
+
+Asks a node to fold its admission decision and report it. A non-empty `subject` is a
+**machine**, named by its id or by its identity key: the answer is where it stands in the
+roster this node holds and which routes a connection proving its key, or presenting its
+ticket, would take. That question is about a third party, so it is gated like any member's
+verb. An empty `subject` asks about **the connection asking**, and is answered even to a
+caller the node refuses — it says only what that connection established.
+
+`verdict` is one byte: `0x01` refused by no route, `0x02` admitted, `0x03` forgotten — a
+revoked key, which outranks every route. `decidedBy` is every route that produced it,
+OR-ed: `0x08` `--fleet-open`, `0x10` a proven key, `0x20` a revoked key, `0x40` loopback,
+`0x80` a machine ticket; `0x01`, `0x02` and `0x04` are retired and never reused.
+`standing` is one byte for a machine question — `0x01` voter, `0x02` learner, `0x03`
+pending in the enrollment window, `0x04` revoked, `0x05` unknown — and an **empty** field
+for the question about the connection. A reader refuses a verdict or a standing it cannot
+name and keeps a route bit it cannot name, so a newer node's answer is never misreported as
+a healthy one.
+
+### FLEET-SUMMARY
+
+```
+[0xFC][ver][0x1f][u32 len]  payload: [nonce]
+reply:                               [summary][publicKey][signature]
+```
+
+Asks a node which fleet it is in. A machine deciding whether to join a fleet asks a seed
+before it is anybody's member, so the verb is **pre-auth**: nobody is refused at the door and
+no credential is asked for. The request is one 32-byte `nonce` the asker chose, and its
+ceiling is 64 bytes (`MaxFleetSummaryPayload`), the tightest on the table, since anybody who
+can route to the port may send it.
+
+The reply's `summary` is one nested field holding exactly the fields a discovery beacon
+carries, byte for byte: the cluster id, the fleet's state (`0x01` solitary, only its founder
+ever admitted; `0x02` established; `0x03` pending, on its way to another fleet), its creation
+time as a big-endian `u64` of Unix seconds, the leader's id and `0xFC` endpoint, the speaker's
+id and Raft endpoint, the member ids (at most `MaxFleetSummaryMembers`, ten, the cap a beacon
+holds: since version 15 every carrier holds one cap), the member total, the speaker's own `0xFC` endpoint and the
+leader's identity key. Under `0x03` the leader fields name the fleet the speaker **asked**,
+never its own. An empty field states that the speaker knows none.
+
+`publicKey` is the answering node's identity key and `signature` is its Ed25519 signature over
+the label `fastcache-fleet-summary-v1`, the asker's nonce, the summary and the key, as
+length-prefixed fields. A recorded answer replayed to a later asker names a nonce that asker
+never chose, so it verifies for nobody else. The signature proves who **spoke**, not that the
+fleet holds whom it names: a reader acts on the member list only beside a key it already holds.
+
+A node that runs no consensus belongs to no fleet and answers `no-cluster`, and so does one
+whose consensus address reaches only itself, since a peer told to dial it would dial itself. A
+`fastcached` answers `no-cluster` too: it is a cache and belongs to no fleet. A nonce that is
+not one 32-byte field is `malformed-frame`. None of these refusals is counted, because anybody
+can provoke them.
+
+### SHARED-FETCH
+
+```
+[0xFC][ver][0x20][u32 len]  payload: [key]
+```
+
+`FETCH`'s payload and replies -- `Ok` carrying the stored value in its canonical form, `Miss`,
+or an error -- and a reply as large as the artefact it carries, as `FETCH`'s is. A different
+verb because a different policy: `FETCH` reads this machine's private tier and answers this
+machine alone, while this reads the **fleet's** shared cache and answers any caller whose
+connection proved a key the fleet holds or presented a ticket the node verifies. This
+machine's own address and `--fleet-open` admit nobody here, and a revoked key is refused from
+any address.
+
+Served only on the machine the cluster's `shared-cache` setting names, and only while its
+tier is open; every other node answers `not-shared-cache` (`0x2f`), and so does a `fastcached`,
+which is never the fleet's shared cache -- one refusal, read as a miss, whichever wrong machine
+a client reached.
+
+### SHARED-STORE
+
+```
+[0xFC][ver][0x21][u32 len]  payload: [key][prefetchGroup][srcRoot][buildTree][value]
+```
+
+`STORE`'s payload, canonicalized the same way, under `SHARED-FETCH`'s policy. The reply is `Ok`
+or an error, bounded to 64 MiB (`MaxReportReply`) as `STORE`'s is. Both verbs are read under the
+session's payload ceiling, like their twins, and are reachable only after the connection's
+admission.
+
 ## Distributed execution
 
 Five more verbs turn the same wire into a scheduler and a worker protocol. None
-of them is served by `fastcached`: the scheduler is `fastcache-compile-node
---serve-scheduler` and the worker is the same binary serving compiles, both
-answering on its one `--listen-node`.
+of them is served by `fastcached`: the scheduler is a `fastcache-compile-node` whose
+mode serves it, and the worker is the same binary serving compiles, both answering on
+its one `--listen-node`.
 
 A scheduling verb arriving at a cache listener is answered `dispatch-not-permitted`
 with a message naming where the scheduler went. It is a **reply**, not a dropped
@@ -183,7 +319,7 @@ and the pool behaves as one rather than advertising N times the machine.
 four cluster-administration verbs (`CLUSTER-STATUS` `0x08`, `CLUSTER-SET` `0x09`,
 `CLUSTER-FORGET` `0x0a`, `CLUSTER-ADMIT` `0x0b`), which the **leader** answers and
 only to a member. `COMPILE` goes to a worker on the **same** `--listen-node` port
-that carries its cache verbs and, with `--serve-scheduler`, the scheduler's:
+that carries its cache verbs and, where the node's mode serves them, the scheduler's:
 [#290](https://github.com/LASTRADA-Software/fastcached/issues/290) merged what were
 three ports into one `0xFC` surface, so the listener is no longer the policy. Which
 caller is admitted to which verb is a property of the **verb**, asked of the
@@ -210,8 +346,9 @@ over anything.
 REGISTER   [fingerprint][endpoint][slots][codecs][capacity] -> [workerId]
 HEARTBEAT  [workerId][inFlight][load]                       -> Ok
 LEASE      [fingerprint][objectKey][codecs]                 -> [endpoint][leaseToken][workerCodecs][leaseLifetime]
+                                                               [dialHint][workerKey]
 COMPILE    [leaseToken][fingerprint][args][source][codecs][sourceName]
-                                              -> [exitCode][object][stdout][stderr][correlation]
+                                              -> [exitCode][object][stdout][stderr][correlation][signature]
 RELEASE    [leaseToken][objectKey]                          -> Ok
 ```
 
@@ -269,6 +406,31 @@ unkeyed, so a worker that can return a wrong object can return a wrong digest ju
 as easily. It also cannot see a runner that fed the right bytes and read back the
 wrong object file — there the metadata is honest and only the object is foreign, and
 the worker's exclusive scratch claim is what closes that.
+
+**Against a machine that is not the worker, the reply is SIGNED.** An endpoint is a
+name, and a name can come to answer on another machine — a VPN address reassigned
+between a heartbeat and a compile, a DNS record with a long TTL. Such a machine can
+accept the job and return a well-formed, correctly correlated object, and before the
+signature that object was stored here and written through to the fleet's shared tier.
+So the grant names the granted worker's identity public key — `workerKey`, the key the
+worker's `REGISTER` connection **proved**, 32 bytes — and the worker signs
+`(correlation, SHA-256 of the object as sent)` under that key, as the label
+`fastcache-compile-reply-v1` followed by the two fields length-prefixed: `signature`,
+64 bytes. The launcher checks it against the key the grant named **before** it opens
+the object envelope or stores anything; a missing or wrong signature is refused as
+`UNAUTHENTICATED` on `--show-stats`, the translation unit is compiled locally, and the
+lease is released like every other way out of a grant. A grant that names no key is
+refused the same way **before** anything is dialled, because it names nobody whose
+reply could be accepted.
+
+The key travels twice and the two copies answer different questions. In the clear on
+the grant it is what the **client** verifies against — a client verifies no lease
+claims. Inside the lease token's signed claims (token layout 4, label
+`fastcache-lease-v4`) it is what the **worker** checks against its own key, so a fleet
+worker that has come to hold another worker's endpoint refuses the job
+`lease-endpoint-mismatch`, naming *another identity key*, before a compiler runs.
+Neither field moved the wire version: the field counts of the grant and the reply are
+exact, and a peer of the other count is one this build does not read.
 
 Two rules carry the weight and neither is configurable. A job goes only to a
 worker whose fingerprint is **byte-identical**: an over-strict match costs a
@@ -367,8 +529,9 @@ since it carries a whole translation unit.
 A machine that **joins the fleet** — registers a worker, announces itself, heartbeats,
 withdraws — proves which machine it is before it sends any of those verbs, and every frame
 after that proof is sealed ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
-A client asking for a lease or a cache entry proves nothing: it is admitted by its address
-or its credential exactly as before, and pays no round trip for any of this.
+A client asking for a lease or a cache entry runs no handshake and pays no round trip for
+any of this. A remote one proves its machine with a machine ticket instead (`AUTH`, below);
+only a loopback caller is admitted by its address, and `--fleet-open` admits everyone.
 
 ```
 NODE-CHALLENGE 0x18  [nonceC(32)][ephC(32)]
@@ -396,6 +559,13 @@ the frame's header and its payload. A frame whose tag does not verify, one that 
 one sent under the other direction's key, or one longer than a frame may be closes the
 connection, unanswered.
 
+A sealed frame is held whole until its tag can be checked, and that holding is charged to the
+node's in-flight byte budget. A frame the budget has no room for is refused as soon as its
+header arrives: the peer is answered `endpoint-busy`, sealed, and the connection then closes.
+It closes rather than skipping the frame because the frame's length is not verified until its
+tag is, and skipping a length nobody verified would let whoever wrote it choose where the next
+frame starts. A caller that reads `endpoint-busy` here proves again on a fresh connection.
+
 **The seal is what makes the proof worth having.** Without it, a machine on the path could
 relay a genuine worker's handshake to the scheduler, watch it succeed, and then write a
 REGISTER of its own into the connection the worker's proof admitted — naming an endpoint of
@@ -409,8 +579,7 @@ again in place. Bytes a caller pipelined behind PROVE-NODE close the connection 
 arrived in the clear, before the seal existed, so nothing can say whose they are.
 
 A worker holds its identity key in `--cluster-dir`, which it mints on first start; the
-cluster admits the key through an enrollment window or `--cluster-admit-worker=<id>@<key>`
-(`0x1d`), and forgets it — refusing it from every address — with `--cluster-forget`. What
+cluster admits the key through an enrollment window, as a learner, and forgets it — refusing it from every address — with `--cluster-forget`. What
 an operator sees of all of this is on the
 [node's page](../tools/fastcache-compile-node.md#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
 
@@ -522,7 +691,7 @@ through the daemon's connection logger, so a rejection is visible to the
 operator as well as to the client.
 
 An `unsupported-version` message names the offered version *and* the supported
-range (`unsupported wire version 13; this server speaks 14..14`). A rejection that
+range (`unsupported wire version 14; this server speaks 15..15`). A rejection that
 does not say what would have worked cannot be acted on, and this is the only
 message an operator with a mismatched install will ever see.
 
@@ -550,7 +719,7 @@ The wire version describes the *framing*; `CompileValueVersion`, the first byte
 of a stored blob, describes the *value format*. They are separate because a
 stored blob outlives any connection: the wire version is agreed per request,
 while the blob's version is discovered when it is decoded, however long after it
-was written. The launcher's cache key additionally carries an `objkey-v6` schema
+was written. The launcher's cache key additionally carries an `objkey-v7` schema
 tag; bumping it re-keys the cache, so stale entries miss and are rewritten rather
 than being served under rules they were not written by.
 
@@ -602,9 +771,15 @@ CompileValue {
 
 The object blob is opaque and never rewritten. Text regions are the compiler's
 captured stdout and stderr, and their grammar tells the server where the paths
-are — `/showIncludes` notes for MSVC drivers, Makefile depfile syntax for GNU
-ones. Only recognised path spans are rewritten; every other byte, including
-diagnostics the grammar does not match, is preserved verbatim.
+are. An MSVC driver's streams carry `/showIncludes` notes AND diagnostics -- the
+notes move between the two streams with the flag -- so both are tagged with one
+grammar that reads every line language such a stream holds: the note, the
+`<path>(<line>[,<col>]): ` diagnostic head, and the `In file included from`
+chain clang-cl writes on it. A GNU driver's streams carry diagnostics, and its
+dependency record is a third region in Makefile depfile syntax. Only recognised
+path spans are rewritten, a span's `..` segments collapsed first where the
+result lies under a root; every other byte, a caret's echoed source line
+included, is preserved verbatim.
 
 This asymmetry is the whole design: canonicalize on STORE, serve canonical on
 FETCH, localize on the client. The server stores exactly one representation of

@@ -2,15 +2,19 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Distributed/NodeLoadTestUtils.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
+#include <format>
 #include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <core/platform/Clock.hpp>
@@ -1033,4 +1037,177 @@ TEST_CASE("A registration age counts from the registration, not from the last he
     REQUIRE(reports.size() == 1);
     CHECK(reports[0].heartbeatAge == std::chrono::milliseconds { 900 });
     CHECK(reports[0].registeredAge == std::chrono::milliseconds { 5'900 });
+}
+
+TEST_CASE("An excluded worker is skipped, and a fleet of nothing but excluded ones says so",
+          "[distributed][registry][exclusion]")
+{
+    Fixture fix;
+    (void) fix.registry.Register(Announce(Gcc13, "laptop.corp:6676", 8)); // more headroom: preferred when allowed
+    auto const other = fix.registry.Register(Announce(Gcc13, "desk.corp:6676", 2));
+
+    std::array<std::string_view, 1> const laptop { "laptop.corp:6676" };
+    auto const picked = fix.registry.Pick(Gcc13, laptop);
+    REQUIRE(picked.has_value());
+    CHECK(picked->id == other);
+
+    std::array<std::string_view, 2> const both { "laptop.corp:6676", "desk.corp:6676" };
+    auto const none = fix.registry.Pick(Gcc13, both);
+    REQUIRE_FALSE(none.has_value());
+    CHECK(none.error() == PickError::Excluded);
+
+    // An exclusion narrows only a MATCHING fleet: a toolchain nobody serves is still
+    // NoWorker, whatever the client listed -- the misconfiguration must not hide behind it.
+    CHECK(fix.registry.Pick(Gcc14, both).error() == PickError::NoWorker);
+}
+
+TEST_CASE("A busy fleet with one worker excluded is busy, not excluded", "[distributed][registry][exclusion]")
+{
+    Fixture fix;
+    auto const laptop = fix.registry.Register(Announce(Gcc13, "laptop.corp:6676", 1));
+    auto const desk = fix.registry.Register(Announce(Gcc13, "desk.corp:6676", 1));
+    (void) laptop;
+    fix.registry.JobStarted(desk); // desk full of this fleet's own work
+    std::array<std::string_view, 1> const excluded { "laptop.corp:6676" };
+    CHECK(fix.registry.Pick(Gcc13, excluded).error() == PickError::NoCapacity);
+}
+
+TEST_CASE("An exclusion list at the wire's own cap still finds the one worker left out",
+          "[distributed][registry][exclusion]")
+{
+    // `MaxLeaseExclusions` bounds what a DECODED request can carry (`CompileCacheWire.hpp`);
+    // `Pick` itself takes a `span` and enforces no limit of its own. This proves the
+    // widest list the wire actually delivers works end to end, rather than only the
+    // one- and two-entry lists the other exclusion cases use.
+    Fixture fix;
+    std::vector<std::string> endpoints;
+    endpoints.reserve(CompileCacheWire::MaxLeaseExclusions);
+    for (auto const index: std::views::iota(std::size_t { 0 }, CompileCacheWire::MaxLeaseExclusions))
+    {
+        endpoints.push_back(std::format("worker{}.corp:6676", index));
+        (void) fix.registry.Register(Announce(Gcc13, endpoints.back(), 1));
+    }
+    std::vector<std::string_view> excluded;
+    excluded.reserve(endpoints.size());
+    for (auto const& endpoint: endpoints)
+        excluded.push_back(endpoint);
+    REQUIRE(excluded.size() == CompileCacheWire::MaxLeaseExclusions);
+
+    // Every worker registered so far is excluded, so the whole fleet is off limits.
+    CHECK(fix.registry.Pick(Gcc13, excluded).error() == PickError::Excluded);
+
+    // One more worker, not on the list: still found, so a full-width exclusion list
+    // does not overrun, truncate or otherwise mis-scan.
+    auto const survivor = fix.registry.Register(Announce(Gcc13, "survivor.corp:6676", 1));
+    auto const picked = fix.registry.Pick(Gcc13, excluded);
+    REQUIRE(picked.has_value());
+    CHECK(picked->id == survivor);
+}
+
+TEST_CASE("A heartbeat records where the worker was seen and what it answers on", "[distributed][registry][dialhint]")
+{
+    Fixture fix;
+    auto const id = fix.registry.Register(Announce(Gcc13, "laptop.corp:6676", 1));
+    std::vector<std::string> const interfaces { "10.8.0.7", "fe80::1" };
+    REQUIRE(fix.registry
+                .Heartbeat(id, NodeLoad {}, WorkerAddresses { .observedHost = "10.8.0.7", .interfaceAddresses = interfaces })
+                .has_value());
+
+    auto const picked = fix.registry.Pick(Gcc13);
+    REQUIRE(picked.has_value());
+    CHECK(picked->observedHost == "10.8.0.7");
+    CHECK(picked->interfaceAddresses == interfaces);
+
+    // The laptop's VPN address moved: the next heartbeat REPLACES both facts.
+    std::vector<std::string> const moved { "10.8.0.42" };
+    REQUIRE(
+        fix.registry.Heartbeat(id, NodeLoad {}, WorkerAddresses { .observedHost = "10.8.0.42", .interfaceAddresses = moved })
+            .has_value());
+    auto const after = fix.registry.Pick(Gcc13);
+    REQUIRE(after.has_value());
+    CHECK(after->observedHost == "10.8.0.42");
+    CHECK(after->interfaceAddresses == moved);
+}
+
+TEST_CASE("A heartbeat that reports no addresses clears the list an earlier exchange left",
+          "[distributed][registry][dialhint]")
+{
+    // The decision this pins: an empty list REPLACES, it does not keep. The wire cannot tell
+    // "reported none" from "said nothing" -- an absent field decodes as empty -- and every
+    // worker that sends a list at REGISTER sends one on every heartbeat from the same sample,
+    // so an empty list is the worker's current statement. Keeping the earlier one would pair
+    // this beat's observed host with another exchange's list in the NAT check, and the cost
+    // of clearing is only a lease without a hint, which dials the name as before.
+    Fixture fix;
+    std::vector<std::string> const atRegistration { "10.8.0.7" };
+    auto registration = Announce(Gcc13, "laptop.corp:6676", 1);
+    registration.observedHost = "10.8.0.7";
+    registration.interfaceAddresses = atRegistration;
+    auto const id = fix.registry.Register(registration);
+
+    auto const registered = fix.registry.Pick(Gcc13);
+    REQUIRE(registered.has_value());
+    CHECK(registered->observedHost == "10.8.0.7");
+    CHECK(registered->interfaceAddresses == atRegistration);
+
+    REQUIRE(fix.registry.Heartbeat(id, NodeLoad {}, WorkerAddresses { .observedHost = "10.8.0.7", .interfaceAddresses = {} })
+                .has_value());
+    auto const beat = fix.registry.Pick(Gcc13);
+    REQUIRE(beat.has_value());
+    CHECK(beat->observedHost == "10.8.0.7");
+    CHECK(beat->interfaceAddresses.empty());
+}
+
+TEST_CASE("A re-registration refreshes where the worker was seen and what it answers on",
+          "[distributed][registry][dialhint]")
+{
+    Fixture fix;
+    std::vector<std::string> const before { "10.8.0.7" };
+    auto first = Announce(Gcc13, "laptop.corp:6676", 1);
+    first.observedHost = "10.8.0.7";
+    first.interfaceAddresses = before;
+    auto const id = fix.registry.Register(first);
+
+    // Same (fingerprint, endpoint), so the same entry -- reached again after a reconnect.
+    std::vector<std::string> const after { "10.8.0.42", "192.168.1.20" };
+    auto second = Announce(Gcc13, "laptop.corp:6676", 1);
+    second.observedHost = "10.8.0.42";
+    second.interfaceAddresses = after;
+    CHECK(fix.registry.Register(second) == id);
+
+    auto const picked = fix.registry.Pick(Gcc13);
+    REQUIRE(picked.has_value());
+    CHECK(picked->observedHost == "10.8.0.42");
+    CHECK(picked->interfaceAddresses == after);
+}
+
+TEST_CASE("What a heartbeat reported outlives the request that carried it", "[distributed][registry][dialhint]")
+{
+    // `WorkerAddresses` borrows; the entry must own. Arranged so a view would dangle: the
+    // strings are longer than any small-string buffer, so their characters live in freed
+    // HEAP storage once the scope ends, and that storage is churned before the read.
+    constexpr std::string_view Unique = "fd00:1234:5678:9abc:def0:1234:5678:9abc";
+    static_assert(Unique.size() > 23, "must exceed every standard library's small-string buffer");
+
+    Fixture fix;
+    auto const id = fix.registry.Register(Announce(Gcc13, "laptop.corp:6676", 1));
+    {
+        std::string const observed { Unique };
+        std::vector<std::string> const interfaces { std::string { Unique } };
+        REQUIRE(
+            fix.registry
+                .Heartbeat(id, NodeLoad {}, WorkerAddresses { .observedHost = observed, .interfaceAddresses = interfaces })
+                .has_value());
+    }
+    constexpr int ChurnCount = 64;
+    std::vector<std::string> churn;
+    churn.reserve(ChurnCount);
+    for (auto const index: std::views::iota(0, ChurnCount))
+        churn.emplace_back(Unique.size(), static_cast<char>('a' + (index % 26)));
+
+    auto const picked = fix.registry.Pick(Gcc13);
+    REQUIRE(picked.has_value());
+    CHECK(picked->observedHost == Unique);
+    REQUIRE(picked->interfaceAddresses.size() == 1);
+    CHECK(picked->interfaceAddresses.front() == Unique);
 }

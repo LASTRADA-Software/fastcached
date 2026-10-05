@@ -101,7 +101,7 @@ std::expected<void, ConsensusError> ClusterStateMachine::RestoreSnapshot(std::sp
         // after which this node would refuse every peer it had been serving a moment
         // earlier. At install that is the whole answer; at recovery there is nothing
         // held yet, and the refusal is what stops the node starting on a state that
-        // lost its members and its tombstones (#1542).
+        // lost its members and its revoked keys (#1542).
         //
         // The reason is named, because the two causes send an operator to different
         // places: another build's encoding (both versions stated) is an upgrade still

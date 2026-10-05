@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
 #include "NodeConditions.hpp"
+#include "NodeIdentity.hpp"
 
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
@@ -40,6 +41,7 @@
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedHostFacts.hpp>
+#include <tests/UnreadablePath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -60,9 +62,11 @@ namespace
 [[nodiscard]] NodeConfig Installable()
 {
     NodeConfig cfg;
-    cfg.schedulers = { "cache.internal:6675" };
-    // Where its identity is kept (#178): a node naming a scheduler proves which machine it is.
+    // Where its identity is kept (#178): a node that registers proves which machine it is.
     cfg.clusterDir = "cluster";
+    // A bind other machines reach, beside the address they are told to dial: that state
+    // directory is a key route, so a routable advertise over a loopback bind is refused.
+    cfg.nodeListen = "0.0.0.0:6676";
     cfg.advertise = "worker-01.internal:6676";
     cfg.toolchains = { "/usr/bin/g++" };
     return cfg;
@@ -190,7 +194,8 @@ TEST_CASE("An unparseable --admin-listen is refused, not guessed at", "[node][ad
     // And what the factory itself still refuses: a surface it was asked to serve
     // that resolves to no address. Naming the flag, because an operator has to know
     // which surface went unserved.
-    auto const started = AdminEndpoint::Start(NodeSurface::Admin, off, metrics, WorkerShapedSnapshot(), logger);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto const started = AdminEndpoint::Start(NodeSurface::Admin, off, metrics, WorkerShapedSnapshot(), logger, acceptLoops);
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains("--admin-listen"));
 }
@@ -221,7 +226,8 @@ TEST_CASE("A bare port binds loopback rather than the wildcard", "[node][admin]"
     auto cfg = Installable();
     cfg.adminListen = std::to_string(port);
 
-    auto const bare = AdminEndpoint::Start(NodeSurface::Admin, cfg, metrics, WorkerShapedSnapshot(), logger);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto const bare = AdminEndpoint::Start(NodeSurface::Admin, cfg, metrics, WorkerShapedSnapshot(), logger, acceptLoops);
     REQUIRE(bare.has_value());
     CHECK((*bare)->BoundEndpoint() == std::format("127.0.0.1:{}", port));
 }
@@ -242,8 +248,9 @@ TEST_CASE("An endpoint that cannot bind reports why", "[node][admin]")
     NullLogger logger;
 
     auto const unreachable = std::string { "192.0.2.1:6674" };
+    core::net::AcceptLoopHealth acceptLoops;
     auto const started =
-        AdminEndpoint::Start(NodeSurface::Admin, AdminOn(unreachable), metrics, WorkerShapedSnapshot(), logger);
+        AdminEndpoint::Start(NodeSurface::Admin, AdminOn(unreachable), metrics, WorkerShapedSnapshot(), logger, acceptLoops);
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains(unreachable));
 }
@@ -273,12 +280,14 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     // naming nothing, which this repository has already paid for once. It fails in
     // seconds instead, saying what it waited for.
     auto stopped = std::async(std::launch::async, [&] {
-        auto started = AdminEndpoint::Start(NodeSurface::Admin, cfg, metrics, WorkerShapedSnapshot(), logger);
+        core::net::AcceptLoopHealth acceptLoops;
+        auto started = AdminEndpoint::Start(NodeSurface::Admin, cfg, metrics, WorkerShapedSnapshot(), logger, acceptLoops);
         return started.has_value();
     });
 
     REQUIRE(stopped.wait_for(15s) == std::future_status::ready);
-    REQUIRE(stopped.get());
+    auto const startedOk = stopped.get();
+    REQUIRE(startedOk);
 
     // And the port is free again, which is only true if the listener was really
     // closed rather than leaked with its thread still parked on it.
@@ -590,7 +599,10 @@ TEST_CASE("A credential file that cannot be used is refused rather than ignored"
 
     auto const missing = Node::ReadDashboardToken(scratch.Path() / "absent");
     REQUIRE_FALSE(missing.has_value());
-    CHECK(missing.error().contains("absent"));
+    CHECK(missing.error().reason.contains("absent"));
+    // An open that failed is the I/O arm, whatever its errno: nothing was read, and the next start
+    // may open it -- a provisioner that had not written it yet, a mount back.
+    CHECK(missing.error().cause == Node::NodeRefusalCause::CredentialIo);
 
     auto const emptyPath = scratch.Path() / "empty";
     {
@@ -599,7 +611,17 @@ TEST_CASE("A credential file that cannot be used is refused rather than ignored"
     }
     auto const empty = Node::ReadDashboardToken(emptyPath);
     REQUIRE_FALSE(empty.has_value());
-    CHECK(empty.error().contains("empty"));
+    CHECK(empty.error().reason.contains("empty"));
+    // A verdict on bytes that WERE read: the next start reads the same nothing.
+    CHECK(empty.error().cause == Node::NodeRefusalCause::CredentialFile);
+
+    Testing::UnreadablePath const held { scratch.Path() / "unreadable", "secret" };
+    if (held.Held())
+    {
+        auto const unreadable = Node::ReadDashboardToken(scratch.Path() / "unreadable");
+        REQUIRE_FALSE(unreadable.has_value());
+        CHECK(unreadable.error().cause == Node::NodeRefusalCause::CredentialIo);
+    }
 }
 
 TEST_CASE("The fleet routes answer on their own paths and gate on the credential", "[node][admin][dashboard]")
@@ -744,8 +766,17 @@ TEST_CASE("An admin surface nobody asked for starts nothing at all", "[node][adm
     Node::NodeConditions conditions;
     NodeConfig cfg;
 
-    auto surface = Node::StartAdminSurfaceOrExplain(
-        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto surface = Node::StartAdminSurfaceOrExplain(cfg,
+                                                    scrapeHost,
+                                                    metrics,
+                                                    WorkerShapedSnapshot(),
+                                                    std::nullopt,
+                                                    nullptr,
+                                                    AdminCredential {},
+                                                    logger,
+                                                    conditions,
+                                                    acceptLoops);
     REQUIRE(surface.has_value());
     CHECK(surface->endpoint == nullptr);
     // A surface that never started answers nothing about its certificate: the row is left for
@@ -769,10 +800,20 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
         NodeConfig cfg;
         cfg.adminListen = "not-a-port";
 
-        auto const surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+        core::net::AcceptLoopHealth acceptLoops;
+        auto const surface = Node::StartAdminSurfaceOrExplain(cfg,
+                                                              scrapeHost,
+                                                              metrics,
+                                                              WorkerShapedSnapshot(),
+                                                              std::nullopt,
+                                                              nullptr,
+                                                              AdminCredential {},
+                                                              logger,
+                                                              conditions,
+                                                              acceptLoops);
         REQUIRE_FALSE(surface.has_value());
-        CHECK(surface.error().contains("--admin-listen"));
+        CHECK(surface.error().reason.contains("--admin-listen"));
+        CHECK(surface.error().cause == Node::NodeRefusalCause::Listener);
 
         // The VALUE is no longer echoed here, and that is the relocation rather than
         // a loss: since #288 the surface table owns the grammar, so a spelling that
@@ -800,7 +841,11 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
 
         auto const credential = Node::LoadDashboardCredentialOrExplain(cfg);
         REQUIRE_FALSE(credential.has_value());
-        CHECK(credential.error().contains("--dashboard-token-file"));
+        CHECK(credential.error().reason.contains("--dashboard-token-file"));
+        // Refused to start -- never read as "no credential" -- and a FAILURE a supervisor
+        // restarts, since an open that failed may succeed at the next start.
+        CHECK(credential.error().cause == Node::NodeRefusalCause::CredentialIo);
+        CHECK(Node::ExitCodeFor(credential.error().cause) == ExitCodeOf(ProcessExit::Failed));
 
         // And the control: naming no file is no credential, not a refusal.
         auto const none = Node::LoadDashboardCredentialOrExplain(NodeConfig {});
@@ -838,8 +883,17 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
 
     SECTION("with no scheduler, /fleet is not a route")
     {
-        auto surface = Node::StartAdminSurfaceOrExplain(
-            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+        core::net::AcceptLoopHealth acceptLoops;
+        auto surface = Node::StartAdminSurfaceOrExplain(cfg,
+                                                        scrapeHost,
+                                                        metrics,
+                                                        WorkerShapedSnapshot(),
+                                                        std::nullopt,
+                                                        nullptr,
+                                                        AdminCredential {},
+                                                        logger,
+                                                        conditions,
+                                                        acceptLoops);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
         CHECK(surface->endpoint->BoundEndpoint() == std::format("127.0.0.1:{}", port));
@@ -847,6 +901,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
 
     SECTION("with a scheduler, the surface starts and serves it")
     {
+        core::net::AcceptLoopHealth acceptLoops;
         auto surface = Node::StartAdminSurfaceOrExplain(
             cfg,
             scrapeHost,
@@ -856,7 +911,8 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
             nullptr,
             AdminCredential {},
             logger,
-            conditions);
+            conditions,
+            acceptLoops);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
     }
@@ -883,8 +939,17 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     cfg.adminListen = std::format("127.0.0.1:{}", port);
     cfg.tlsSelfSigned = true;
 
-    auto surface = Node::StartAdminSurfaceOrExplain(
-        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto surface = Node::StartAdminSurfaceOrExplain(cfg,
+                                                    scrapeHost,
+                                                    metrics,
+                                                    WorkerShapedSnapshot(),
+                                                    std::nullopt,
+                                                    nullptr,
+                                                    AdminCredential {},
+                                                    logger,
+                                                    conditions,
+                                                    acceptLoops);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
     REQUIRE(surface->tls != nullptr);
@@ -923,8 +988,17 @@ TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][adm
     NodeConfig cfg;
     cfg.adminListen = std::format("127.0.0.1:{}", port);
 
-    auto surface = Node::StartAdminSurfaceOrExplain(
-        cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
+    core::net::AcceptLoopHealth acceptLoops;
+    auto surface = Node::StartAdminSurfaceOrExplain(cfg,
+                                                    scrapeHost,
+                                                    metrics,
+                                                    WorkerShapedSnapshot(),
+                                                    std::nullopt,
+                                                    nullptr,
+                                                    AdminCredential {},
+                                                    logger,
+                                                    conditions,
+                                                    acceptLoops);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
 #if defined(FC_TLS_ENABLED)
@@ -939,7 +1013,11 @@ TEST_CASE("A sample records what the fleet is, in the slots the table names", "[
 {
     Distributed::FleetSnapshot snapshot;
     snapshot.role = Distributed::SchedulerRole::Leader;
-    snapshot.leases = { 11, 2, 3, 4, 5 };
+    // Six now: `LeaseOutcomeTable` grew `all-excluded` in between `withdrawn` and
+    // `duplicate`, which is why the sample below is matched by counter identity
+    // rather than by position -- a positional read would keep landing `duplicate`'s
+    // OLD slot, this fleet's `all-excluded` reading, into `DispatchDuplicate` forever.
+    snapshot.leases = { 11, 2, 3, 4, 9, 5 };
     // Two machines, each of which registered against two toolchains. The cache
     // figures come off NodeReports() and so are counted once per machine.
     snapshot.nodes.resize(2);
@@ -959,10 +1037,11 @@ TEST_CASE("A sample records what the fleet is, in the slots the table names", "[
 
     CHECK(slot(Distributed::FleetMetric::DispatchGranted) == 11);
     CHECK(slot(Distributed::FleetMetric::DispatchNoWorker) == 2);
+    CHECK(slot(Distributed::FleetMetric::DispatchAllExcluded) == 9);
     CHECK(slot(Distributed::FleetMetric::DispatchDuplicate) == 5);
 
     // EVERY slot, including the four a machine can also answer for itself. This is
-    // the fleet series, a leader can answer for all nine, and these are fleet-wide
+    // the fleet series, a leader can answer for all ten, and these are fleet-wide
     // sums -- a different number from any one machine's, and the one this page draws.
     // Filling only the fleet-scoped half here would have flattened the capacity and
     // hit-rate charts to zero, with an existing install's restored history plotting a
@@ -1217,6 +1296,28 @@ TEST_CASE("The history path follows the directories a node already has", "[node]
     // a cluster member.
     cfg.clusterDir = "/var/lib/fastcache-cluster";
     CHECK(FleetHistoryPath(cfg) == std::filesystem::path { "/var/lib/fastcache-cluster" } / "fleet-history.bin");
+}
+
+TEST_CASE("A node started with no configuration keeps its history in the state directory its start resolved",
+          "[node][admin][fleethistory]")
+{
+    // No `--cluster-dir` and no `--cache-dir`: the default the start resolved is the only directory
+    // this node has, and every other state file lives there. Asked of the typed flag alone, the
+    // history went nowhere -- memory-only, on exactly the install that names nothing.
+    NodeConfig cfg;
+    cfg.stateDirectory = NodeStateDirectoryChoice { .path = "/home/user/.local/state/fastcache-node",
+                                                    .origin = StateDirectoryOrigin::PerUser };
+    auto const paths = HistoryPaths::For(cfg);
+    for (auto const& path: { paths.fleet, paths.node, paths.received })
+    {
+        INFO(path.string());
+        CHECK(path.parent_path() == NodeStateDirectory(cfg));
+    }
+    CHECK(paths.fleet.filename() == "fleet-history.bin");
+
+    // Beside a cache directory too: the state directory is where the node's own files are.
+    cfg.cacheDir = "/var/lib/fastcache";
+    CHECK(FleetHistoryPath(cfg).parent_path() == NodeStateDirectory(cfg));
 }
 
 namespace

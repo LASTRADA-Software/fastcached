@@ -4,7 +4,9 @@
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Protocol/LeaderRedirect.hpp>
 
+#include <cstdint>
 #include <format>
+#include <span>
 #include <utility>
 
 #include <core/async/Task.hpp>
@@ -73,6 +75,17 @@ namespace
             liveness->MovedForward();
     }
 
+    /// The verb a request frame asks.
+    /// @param frame A framed request this side encoded.
+    /// @return Its row, or null when the frame names no verb this build knows.
+    [[nodiscard]] Wire::OpDescriptor const* AskedVerb(std::span<std::byte const> frame)
+    {
+        if (frame.size() < Wire::RequestHeaderSize)
+            return nullptr;
+        auto const header = Wire::DecodeRequestHeader(frame.first(Wire::RequestHeaderSize));
+        return header.has_value() ? Wire::FindOp(header->opRaw) : nullptr;
+    }
+
     /// Read exactly one reply frame, header first and then precisely the number
     /// of bytes the header declared.
     ///
@@ -99,10 +112,22 @@ namespace
     /// the reason every frame on this wire is: the declared length is what keeps the
     /// link synchronised, and a reader that refuses a payload it does not understand
     /// closes a connection the framing was built to keep.
+    ///
+    /// **But only for a verb that pulses, and only up to the verb's reply ceiling**, both read off
+    /// `OpTable` for the verb that was ASKED -- because the other end may be a stranger. A status
+    /// the verb's `legalStatuses` does not admit is a transport failure, so a `Progress` on a verb
+    /// that never pulses cannot hold a reader forever one five-byte frame at a time; and a declared
+    /// length above the verb's `maxReply` is refused BEFORE `receiveExactly` sizes a buffer by it,
+    /// so a five-byte header cannot commit four GiB. Both are the reply's shape rather than its
+    /// meaning, so they end the exchange rather than resynchronise it.
     /// @param client Connected transport.
     /// @param liveness Told about each progress frame; may be null.
+    /// @param asked The verb the reply answers, or null for a frame this build cannot name --
+    ///        which is then read unbounded, as every reply was before the ceilings existed.
     /// @return The outcome, with the payload attached.
-    [[nodiscard]] core::async::Task<CacheOutcome> RecvReply(core::net::ISocket* client, IExchangeLiveness* liveness)
+    [[nodiscard]] core::async::Task<CacheOutcome> RecvReply(core::net::ISocket* client,
+                                                            IExchangeLiveness* liveness,
+                                                            Wire::OpDescriptor const* asked)
     {
         while (true)
         {
@@ -112,6 +137,9 @@ namespace
 
             auto const header = Wire::DecodeReplyHeader(*headerBytes);
             if (!header.has_value())
+                co_return Plain(CacheOutcomeKind::Transport);
+            if (asked != nullptr
+                && (!Wire::StatusLegalFor(*asked, header->status) || !Wire::ReplyFits(*asked, header->payloadLength)))
                 co_return Plain(CacheOutcomeKind::Transport);
 
             std::vector<std::byte> payload;
@@ -202,16 +230,19 @@ namespace
                                                            Credential credential,
                                                            IExchangeLiveness* liveness)
     {
+        // The verb the reply answers, read off the frame this side built: every caller of this
+        // path reaches the ceilings without naming them.
+        auto const* const asked = AskedVerb(frame);
         if (!credential.Configured())
         {
             if (!co_await core::net::sendAll(client, frame))
                 co_return Plain(CacheOutcomeKind::Transport);
             NoteRequestSent(liveness);
-            co_return co_await RecvReply(client, liveness);
+            co_return co_await RecvReply(client, liveness, asked);
         }
 
-        auto const authFrame =
-            Wire::EncodeAuth(Wire::AuthRequest { .username = credential.username, .secret = credential.secret });
+        auto const authFrame = Wire::EncodeAuth(Wire::AuthRequest {
+            .kind = credential.kind, .username = credential.username, .secret = credential.secret.View() });
         if (!co_await core::net::sendAll(client, authFrame) || !co_await core::net::sendAll(client, frame))
             co_return Plain(CacheOutcomeKind::Transport);
         NoteRequestSent(liveness);
@@ -219,7 +250,7 @@ namespace
         // Non-const so the returns below can move rather than copy: an outcome
         // can carry a whole cached object, and `performance-no-automatic-move`
         // rejects the const spelling outright.
-        auto authOutcome = co_await RecvReply(client, liveness);
+        auto authOutcome = co_await RecvReply(client, liveness, Wire::FindOp(static_cast<std::uint8_t>(Wire::Op::Auth)));
         if (authOutcome.kind == CacheOutcomeKind::Transport)
             co_return authOutcome;
 
@@ -227,7 +258,7 @@ namespace
         // answers every request it read, so leaving it in the socket would strand
         // a frame and the next command on this connection would read this one's
         // answer.
-        auto commandOutcome = co_await RecvReply(client, liveness);
+        auto commandOutcome = co_await RecvReply(client, liveness, asked);
 
         // A daemon that predates the AUTH verb answers it `unknown-opcode` and —
         // because the framing was built to let a receiver step over a verb it does
@@ -313,17 +344,19 @@ std::string DescribeOutcome(CacheOutcome const& outcome)
 core::async::Task<CacheOutcome> CacheFetch(core::net::ISocket* client,
                                            CredentialNotice* notice,
                                            std::string_view key,
-                                           Credential credential)
+                                           Credential credential,
+                                           Wire::CacheVerbs verbs)
 {
-    co_return co_await Exchange(client, notice, Wire::EncodeFetch(key), std::move(credential), nullptr);
+    co_return co_await Exchange(client, notice, Wire::EncodeFetchAs(verbs, key), std::move(credential), nullptr);
 }
 
 core::async::Task<CacheOutcome> CacheStore(core::net::ISocket* client,
                                            CredentialNotice* notice,
                                            Wire::StoreRequest request,
-                                           Credential credential)
+                                           Credential credential,
+                                           Wire::CacheVerbs verbs)
 {
-    co_return co_await Exchange(client, notice, Wire::EncodeStore(request), std::move(credential), nullptr);
+    co_return co_await Exchange(client, notice, Wire::EncodeStoreAs(verbs, request), std::move(credential), nullptr);
 }
 
 } // namespace FastCache::Cc

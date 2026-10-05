@@ -70,7 +70,8 @@ src/FastCache/
                 by the daemon, fastcache-cc and fastcache-compile-node)
   Server/       Connection (per-client coroutine), Server (accept loop),
                 ReactorServerLoop (the server driver), AdminHttpServer
-  Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
+  Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / ServiceHost over
+                IServiceControlManager, the SCM on Windows),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
                 CpuAffinity, HostMemory, ServiceControl, Terminal,
                 InheritedListener (systemd socket activation)

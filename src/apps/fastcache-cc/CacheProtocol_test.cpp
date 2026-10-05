@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include <core/async/SyncRun.hpp>
@@ -70,6 +73,15 @@ class CountingLiveness final: public IExchangeLiveness
     int _moves { 0 };
 };
 
+/// A COMPILE request as the reader sees it: only its verb matters here, since what a reply may be
+/// -- which statuses, how long -- is read off the verb that was asked, and COMPILE is the one verb
+/// that pulses.
+/// @return A framed COMPILE request with no fields.
+[[nodiscard]] std::vector<std::byte> AskCompile()
+{
+    return Wire::Detail::EncodeRequest(Wire::CurrentVersion, Wire::Op::Compile, {});
+}
+
 /// Concatenate framed replies into one scripted stream.
 /// @param frames The replies, in the order the peer sends them.
 /// @return The bytes.
@@ -97,7 +109,7 @@ TEST_CASE("A progress frame is stepped over, and the answer behind it is the out
                                               Wire::EncodeReply(Wire::Status::Ok, object) }) };
     CountingLiveness liveness;
 
-    auto const outcome = core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
+    auto const outcome = core::async::syncRun(ExchangeFramed(&client, &Unwatched(), AskCompile(), {}, &liveness));
 
     CHECK(outcome.kind == CacheOutcomeKind::Hit);
     CHECK(outcome.value == object);
@@ -160,7 +172,7 @@ TEST_CASE("A refusal behind a progress frame is still the refusal")
         { Wire::EncodeProgressReply(), Wire::EncodeErrorReply(Wire::ErrorCode::WorkerSpawnFailed, "no compiler") }) };
     CountingLiveness liveness;
 
-    auto const outcome = core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
+    auto const outcome = core::async::syncRun(ExchangeFramed(&client, &Unwatched(), AskCompile(), {}, &liveness));
 
     CHECK(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(outcome.code == Wire::ErrorCode::WorkerSpawnFailed);
@@ -176,7 +188,7 @@ TEST_CASE("A peer that pulses and then breaks is a transport failure, not a hit"
     Testing::ScriptedSocket client { Stream({ Wire::EncodeProgressReply(), Wire::EncodeProgressReply() }) };
     CountingLiveness liveness;
 
-    auto const outcome = core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
+    auto const outcome = core::async::syncRun(ExchangeFramed(&client, &Unwatched(), AskCompile(), {}, &liveness));
 
     CHECK(outcome.kind == CacheOutcomeKind::Transport);
     CHECK(outcome.value.empty());
@@ -212,13 +224,70 @@ TEST_CASE("A pulse ahead of a credentialled command does not strand the AUTH rep
                                               Wire::EncodeReply(Wire::Status::Ok, object) }) };
     CountingLiveness liveness;
 
-    auto const outcome = core::async::syncRun(ExchangeFramed(
-        &client, &Unwatched(), Wire::EncodeFetch("k"), Credential { .username = "", .secret = "s3cret" }, &liveness));
+    auto const outcome = core::async::syncRun(
+        ExchangeFramed(&client, &Unwatched(), AskCompile(), Credential { .username = "", .secret = "s3cret" }, &liveness));
 
     CHECK(outcome.kind == CacheOutcomeKind::Hit);
     CHECK(outcome.value == object);
     CHECK_FALSE(outcome.credentialIgnored);
     CHECK(liveness.Moves() == 2);
+}
+
+TEST_CASE("A pulse on a verb that never pulses ends the exchange, and nothing behind it is read")
+{
+    // FETCH is answered from a table; its `legalStatuses` admits no `Progress`. A peer that pulses
+    // on it anyway is not a slow worker but a reader held one five-byte frame at a time, so the first
+    // pulse is a transport failure -- and the hit scripted behind it is never reached.
+    auto const object = std::vector<std::byte> { std::byte { 0x2A } };
+    Testing::ScriptedSocket client { Stream({ Wire::EncodeProgressReply(), Wire::EncodeReply(Wire::Status::Ok, object) }) };
+
+    auto const outcome = core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
+
+    CHECK(outcome.kind == CacheOutcomeKind::Transport);
+    CHECK(client.Cursor() == Wire::ReplyHeaderSize);
+}
+
+TEST_CASE("A status a verb cannot be answered with is a transport failure")
+{
+    // STORE cannot miss. The column says so, and the reader asks it rather than a list of its own.
+    Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Miss, {}) };
+
+    auto const outcome = core::async::syncRun(
+        ExchangeFramed(&client,
+                       &Unwatched(),
+                       Wire::EncodeStore({ .key = "k", .prefetchGroup = "", .srcRoot = "", .buildTree = "", .value = {} }),
+                       {},
+                       nullptr));
+
+    CHECK(outcome.kind == CacheOutcomeKind::Transport);
+}
+
+TEST_CASE("A reply longer than its verb's ceiling is refused before its payload is read")
+{
+    // The ceiling is read off the verb that was ASKED, before the declared length sizes a buffer:
+    // one byte past FLEET-SUMMARY's is refused with only the header consumed, and exactly the
+    // ceiling is read in full -- the boundary, from both sides.
+    auto const nonce = std::array<std::byte, Wire::NodeChallengeBytes> {};
+    auto const replyOf = [](std::size_t length) {
+        return Wire::EncodeReply(Wire::Status::Error, std::vector<std::byte>(length, std::byte { 0 }));
+    };
+
+    Testing::ScriptedSocket over { replyOf(Wire::MaxFleetSummaryReply + 1) };
+    auto const refused =
+        core::async::syncRun(ExchangeFramed(&over, &Unwatched(), Wire::EncodeFleetSummaryRequest(nonce), {}, nullptr));
+    CHECK(refused.kind == CacheOutcomeKind::Transport);
+    CHECK(over.Cursor() == Wire::ReplyHeaderSize);
+
+    Testing::ScriptedSocket at { replyOf(Wire::MaxFleetSummaryReply) };
+    std::ignore =
+        core::async::syncRun(ExchangeFramed(&at, &Unwatched(), Wire::EncodeFleetSummaryRequest(nonce), {}, nullptr));
+    CHECK(at.Cursor() == Wire::ReplyHeaderSize + Wire::MaxFleetSummaryReply);
+
+    // A verb whose reply carries an artefact states no ceiling of its own: the same length is read.
+    Testing::ScriptedSocket artefact { Wire::EncodeReply(Wire::Status::Ok,
+                                                         std::vector<std::byte>(Wire::MaxFleetSummaryReply + 1)) };
+    auto const hit = core::async::syncRun(ExchangeFramed(&artefact, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
+    CHECK(hit.kind == CacheOutcomeKind::Hit);
 }
 
 TEST_CASE("CacheFetch sends exactly what the wire module specifies")
@@ -413,7 +482,7 @@ namespace
 /// A credential with a secret, i.e. one that will actually be presented.
 [[nodiscard]] Credential Token(std::string_view secret, std::string_view username = {})
 {
-    return Credential { .username = std::string { username }, .secret = std::string { secret } };
+    return Credential { .kind = Wire::AuthKind::Password, .username = std::string { username }, .secret = secret };
 }
 
 } // namespace
@@ -455,7 +524,8 @@ TEST_CASE("A credential is pipelined ahead of the command, with no round trip be
     auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Token("s3cret")));
     CHECK(outcome.kind == CacheOutcomeKind::Miss);
 
-    auto expected = Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = "s3cret" });
+    auto expected =
+        Wire::EncodeAuth(Wire::AuthRequest { .kind = Wire::AuthKind::Password, .username = "", .secret = "s3cret" });
     auto const fetch = Wire::EncodeFetch("k");
     expected.insert(expected.end(), fetch.begin(), fetch.end());
     CHECK(client.Sent() == expected);
@@ -463,6 +533,26 @@ TEST_CASE("A credential is pipelined ahead of the command, with no round trip be
     // deliberately not asserted here: two back-to-back writes are just as
     // pipelined as one, and requiring a single write would mean copying the
     // command frame for nothing.
+    CHECK(client.Trace() == "SSR");
+}
+
+TEST_CASE("A machine ticket is pipelined ahead of the command, and its kind travels")
+{
+    // The same one-write-sequence property, for the credential the launcher presents to every
+    // other machine -- and the KIND byte, without which a node reads the ticket's bytes as a
+    // password and refuses it.
+    Testing::ScriptedSocket client { Replies(
+        { Wire::EncodeReply(Wire::Status::Ok, {}), Wire::EncodeReply(Wire::Status::Miss, {}) }) };
+
+    auto const ticket = Credential { .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = "t" };
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", ticket));
+    CHECK(outcome.kind == CacheOutcomeKind::Miss);
+
+    auto expected =
+        Wire::EncodeAuth(Wire::AuthRequest { .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = "t" });
+    auto const fetch = Wire::EncodeFetch("k");
+    expected.insert(expected.end(), fetch.begin(), fetch.end());
+    CHECK(client.Sent() == expected);
     CHECK(client.Trace() == "SSR");
 }
 
@@ -516,7 +606,8 @@ TEST_CASE("CacheStore presents the credential the same way CacheFetch does")
     auto const outcome = core::async::syncRun(CacheStore(&client, &Unwatched(), request, Token("s3cret", "bob")));
     CHECK(outcome.IsHit());
 
-    auto expected = Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s3cret" });
+    auto expected =
+        Wire::EncodeAuth(Wire::AuthRequest { .kind = Wire::AuthKind::Password, .username = "bob", .secret = "s3cret" });
     auto const store = Wire::EncodeStore(request);
     expected.insert(expected.end(), store.begin(), store.end());
     CHECK(client.Sent() == expected);
@@ -675,4 +766,27 @@ TEST_CASE("A served object is not a redirect")
 
     REQUIRE(outcome.kind == CacheOutcomeKind::Hit);
     CHECK(RedirectTarget(outcome) == std::nullopt);
+}
+
+TEST_CASE("Only a dial that made no connection marks its peer unreachable", "[exclusion]")
+{
+    // Walked over every enumerator rather than a list of the ones that exist today, so
+    // a sixth failure arrives with a verdict somebody chose: `RowsInEnumeratorOrder`
+    // refuses a missing row, and this refuses a row that quietly says "unreachable".
+    std::vector<TransportFailure> marked;
+    for (auto const failure: Enumerators<TransportFailure>())
+        if (MarksUnreachable(failure))
+            marked.push_back(failure);
+    CHECK(marked == std::vector { TransportFailure::Unreached });
+
+    // Each row by name, so a failure says WHICH verdict moved.
+    CHECK_FALSE(MarksUnreachable(TransportFailure::None));
+    CHECK(MarksUnreachable(TransportFailure::Unreached));
+    CHECK_FALSE(MarksUnreachable(TransportFailure::PeerLost));
+    CHECK_FALSE(MarksUnreachable(TransportFailure::Expired));
+    CHECK_FALSE(MarksUnreachable(TransportFailure::Silent));
+
+    // A value past the table keeps a phrase and marks nobody: no row classified it.
+    CHECK_FALSE(MarksUnreachable(TransportFailure::Last));
+    CHECK_FALSE(DescribeTransportFailure(TransportFailure::Last).empty());
 }

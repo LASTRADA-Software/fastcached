@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "AtomicFile.hpp"
 #include "ObjectEquivalence.hpp"
 
 #include <cstddef>
@@ -154,5 +155,21 @@ struct HitComparison
 /// @param key The object key, so the entry can be looked at rather than only counted.
 /// @return The line, or empty for `NotChecked` and `Matched`.
 [[nodiscard]] std::string DescribeVerdict(HitComparison const& comparison, std::string_view key);
+
+/// Put the object a hit served back where the build expects it, after the verifier's fresh
+/// compile FAILED -- which says nothing about the cached object and may have left no output.
+///
+/// Through `WriteFileAtomically`, the launcher's one writer: the build's object is the served
+/// one whole, or left as the failed compile left it. The aside -- the ONLY good copy once the
+/// compile has run -- is removed only after the put-back is confirmed. A put-back that failed
+/// keeps it, and the verdict's detail says where it is, so the bytes are never lost to a
+/// failed or interrupted copy.
+/// @param aside Where the served object was copied before the fresh compile.
+/// @param served The build's object path.
+/// @param files The filesystem.
+/// @return `Inconclusive`, with a detail naming the kept aside when the put-back failed.
+[[nodiscard]] HitComparison RestoreServedObject(std::filesystem::path const& aside,
+                                                std::filesystem::path const& served,
+                                                IAtomicWriteFiles& files);
 
 } // namespace FastCache::Cc

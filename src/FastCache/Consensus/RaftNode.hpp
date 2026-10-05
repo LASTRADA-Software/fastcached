@@ -6,6 +6,7 @@
 #include <FastCache/Consensus/RaftLog.hpp>
 #include <FastCache/Consensus/RaftOutput.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
+#include <FastCache/Consensus/Standing.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 
@@ -25,16 +26,6 @@
 
 namespace FastCache::Consensus
 {
-
-/// Which timer governs a node.
-///
-/// **Private: never transmitted or persisted**, so the enumerators carry no values.
-enum class TimerKind : std::uint8_t
-{
-    Election,  ///< Time until this node stands for election.
-    Heartbeat, ///< Time until this node next sends heartbeats.
-    None,      ///< Nothing falls due: this node never stands (#1449).
-};
 
 /// The per-role facts the state machine reads rather than branches on.
 struct RoleTraits
@@ -78,61 +69,6 @@ static_assert(RowsInEnumeratorOrder(RoleTable, &RoleTraits::role),
 [[nodiscard]] constexpr RoleTraits const& TraitsOf(Role role) noexcept
 {
     return RoleTable[static_cast<std::size_t>(role)];
-}
-
-/// The per-standing facts the state machine reads rather than branches on.
-struct StandingTraits
-{
-    Standing standing {};  ///< The standing this row describes.
-    std::string_view name; ///< For log lines, test failure messages and a status report.
-
-    /// What a follower or candidate in this standing waits on.
-    ///
-    /// `Election` for a node that stands, `None` for one that never does. It governs
-    /// only the roles whose own timer is `Election`: a LEADER that has been demoted or
-    /// removed is still owed its heartbeats until the change that did it commits, and
-    /// only it can commit that change.
-    TimerKind timer {};
-
-    /// Whether it grants a vote or a pre-vote when asked.
-    ///
-    /// A refusal decided HERE is `VoteRefusal::CastsNoVote`, which is what "a learner
-    /// refuses by row" means: the node answers, and the row is the reason.
-    bool votes {};
-};
-
-/// Behaviour that varies by standing, as data.
-///
-/// The learner row is the point (#1449), and `NoCluster` is its oldest instance: a node
-/// waiting to be admitted was already a node that neither stands nor votes, spelled as
-/// a special case in `NextDeadline` and as an accident of `IsMember` finding nobody. It
-/// is the same two columns, so it is the same kind of row.
-///
-/// `Outsider` keeps what such a node always did -- it stands and it votes -- because
-/// nothing here asked for that to change. It cannot win for itself (a node counts its
-/// own vote only while it is a VOTER), and a voter it asks refuses it by the candidate's
-/// own row, so its campaigning costs a message per timeout and decides nothing.
-inline constexpr EnumTable<Standing, StandingTraits> StandingTable { {
-    { .standing = Standing::NoCluster, .name = "no cluster", .timer = TimerKind::None, .votes = false },
-    { .standing = Standing::Voter, .name = "voter", .timer = TimerKind::Election, .votes = true },
-    { .standing = Standing::Learner, .name = "learner", .timer = TimerKind::None, .votes = false },
-    { .standing = Standing::Outsider, .name = "outsider", .timer = TimerKind::Election, .votes = true },
-} };
-
-static_assert(RowsInEnumeratorOrder(StandingTable, &StandingTraits::standing),
-              "StandingTable must hold one row per Standing, in enumerator order");
-
-static_assert(std::ranges::none_of(StandingTable,
-                                   [](StandingTraits const& row) { return row.timer == TimerKind::Heartbeat; }),
-              "a standing decides whether a node STANDS; heartbeats are a role's, and a standing that asked for "
-              "them would have a follower broadcasting as though it led");
-
-/// The row describing `standing`.
-/// @param standing The standing to look up.
-/// @return Its traits.
-[[nodiscard]] constexpr StandingTraits const& TraitsOf(Standing standing) noexcept
-{
-    return StandingTable[static_cast<std::size_t>(standing)];
 }
 
 /// Whether this node's application can take on the state a leader's snapshot carries.
@@ -223,6 +159,16 @@ class RaftNode
     /// is that "there is no leader right now" is answerable immediately.
     /// @return The known leader, or nullopt.
     [[nodiscard]] std::optional<NodeId> const& KnownLeader() const noexcept;
+
+    /// When a leader last spoke to this node: the last `AppendEntries` or `InstallSnapshot` it
+    /// accepted from the leader of its current term.
+    ///
+    /// A RECORD, never a decision here: this node answers a pre-vote from its election deadline, not
+    /// from this (issue #117). What reads it is a worker bounding how long it honours grants against
+    /// a state no leader has refreshed (`Distributed::StateLeaseRoster`), and a learner -- which runs
+    /// no election and so never forgets `KnownLeader` -- has no other evidence that one still speaks.
+    /// @return The instant, or nullopt before any leader has spoken.
+    [[nodiscard]] std::optional<core::platform::SteadyTimePoint> LastLeaderContact() const noexcept;
 
     /// @return The node's log.
     [[nodiscard]] RaftLog const& Log() const noexcept;
@@ -720,12 +666,14 @@ class RaftNode
     /// When this node would stand for election, and — since issue #117 — also
     /// what it answers a challenger's pre-vote from, together with `_knownLeader`.
     ///
-    /// It replaced a separate `_lastLeaderContact` timestamp, which after that
-    /// change nothing read. Keeping a written-but-unread record of "when did a
-    /// leader last speak" would be worse than not having one: the next person to
-    /// need that question answered would reach for it without noticing it no
-    /// longer decides anything.
+    /// It replaced a separate `_lastLeaderContact` timestamp for THIS question, which
+    /// it no longer answers; `_lastLeaderContact` below is back for another reader
+    /// and decides nothing about an election.
     core::platform::SteadyTimePoint _electionDeadline {};
+
+    /// When a leader last spoke to this node; see `LastLeaderContact`. Read by the
+    /// lease roster's isolation bound, never by an election.
+    std::optional<core::platform::SteadyTimePoint> _lastLeaderContact;
     core::platform::SteadyTimePoint _heartbeatDeadline {};
 
     LogIndex _commitIndex {}; ///< Highest index known committed.

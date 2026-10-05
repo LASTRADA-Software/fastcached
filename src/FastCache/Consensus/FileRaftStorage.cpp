@@ -6,6 +6,7 @@
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Owner.hpp>
 #include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Platform/FileTrust.hpp>
 
 #include <algorithm>
 #include <array>
@@ -70,9 +71,9 @@ namespace
     /// The format a log whose records carry no version was written in.
     constexpr std::uint16_t UnversionedLogFormat = 1;
 
-    constexpr std::string_view StateFileName = "raft-state";
-    constexpr std::string_view LogFileName = "raft-log";
-    constexpr std::string_view SnapshotFileName = "raft-snapshot";
+    /// Every file the store keeps, for `StoreFileNames`.
+    constexpr auto StoreFiles =
+        std::to_array<std::string_view>({ RaftStateFileName, RaftLogFileName, RaftSnapshotFileName });
 
     /// Append a big-endian integer to `out`.
     template <typename T>
@@ -356,18 +357,22 @@ namespace
 
 } // namespace
 
+std::span<std::string_view const> FileRaftStorage::StoreFileNames() noexcept
+{
+    return StoreFiles;
+}
+
 std::expected<FileRaftStorage, ConsensusError> FileRaftStorage::Open(std::filesystem::path const& directory)
 {
-    auto error = std::error_code {};
-    std::filesystem::create_directories(directory, error);
-    if (error)
+    // Its owner's alone when this creates it, as the state directory always is.
+    if (auto const created = CreateOwnerOnlyDirectory(directory); !created.has_value())
         return std::unexpected { FastCache::StorageFailure(
-            std::format("cannot create {}: {}", directory.string(), error.message())) };
+            std::format("cannot create {}: {}", directory.string(), created.error().message())) };
 
     auto store = FileRaftStorage {};
-    store._statePath = directory / StateFileName;
-    store._logPath = directory / LogFileName;
-    store._snapshotPath = directory / SnapshotFileName;
+    store._statePath = directory / RaftStateFileName;
+    store._logPath = directory / RaftLogFileName;
+    store._snapshotPath = directory / RaftSnapshotFileName;
 
     // Opened for update rather than append: a truncation has to seek backwards,
     // and "a" would silently move every write to the end regardless.
@@ -383,11 +388,21 @@ std::expected<FileRaftStorage, ConsensusError> FileRaftStorage::Open(std::filesy
             return std::unexpected { FastCache::StorageFailure(
                 std::format("cannot open the existing {}", store._logPath.string())) };
 
-        store._log = OpenBinary(store._logPath, "w+b");
+        // Created exclusively and unshared, then opened for update, with the access its row
+        // gives it (`CreateStateFile`): no other account may hold a handle to it from
+        // the moment it exists, and the service account the directory grants must be able to
+        // read a log an elevated operator created. A failed create says WHY.
+        auto created = CreateStateFile(store._logPath, StateFile::RaftLog);
+        if (!created.has_value())
+            return std::unexpected { FastCache::StorageFailure(
+                std::format("cannot create {}: {}", store._logPath.string(), created.error().message())) };
+        created->reset();
+        store._log = OpenBinary(store._logPath, "r+b");
     }
 
     if (store._log == nullptr)
-        return std::unexpected { FastCache::StorageFailure(std::format("cannot open {}", store._logPath.string())) };
+        return std::unexpected { FastCache::StorageFailure(
+            std::format("cannot open {}: {}", store._logPath.string(), std::generic_category().message(errno))) };
 
     // Scanned here rather than in Load, so the offset table is valid from the
     // moment the store exists. Deriving it in Load left an ordering requirement
@@ -577,7 +592,7 @@ std::expected<void, ConsensusError> FileRaftStorage::TrimLogThrough(LogIndex thr
     // stream's position and buffer agree with the file it now refers to.
     CloseLog();
 
-    if (auto replaced = ReplaceFileAtomically(_logPath, kept); !replaced.has_value())
+    if (auto replaced = ReplaceFileAtomically(_logPath, kept, StateFile::RaftLog); !replaced.has_value())
     {
         _log = OpenBinary(_logPath, "r+b");
         return std::unexpected { replaced.error() };
@@ -619,13 +634,13 @@ std::expected<void, ConsensusError> FileRaftStorage::SaveState(PersistentState c
 
     // A half-written vote reads as no vote at all, so this file is replaced rather
     // than rewritten in place.
-    return ReplaceFileAtomically(_statePath, body);
+    return ReplaceFileAtomically(_statePath, body, StateFile::RaftState);
 }
 
 std::expected<void, ConsensusError> FileRaftStorage::SaveSnapshot(RaftSnapshot const& snapshot)
 {
     auto const body = EncodeSnapshot(snapshot);
-    if (auto written = ReplaceFileAtomically(_snapshotPath, body); !written.has_value())
+    if (auto written = ReplaceFileAtomically(_snapshotPath, body, StateFile::RaftSnapshot); !written.has_value())
         return std::unexpected { written.error() };
 
     // Only now. A crash between these two leaves a durable snapshot beside a log

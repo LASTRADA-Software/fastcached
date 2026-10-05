@@ -30,9 +30,9 @@ NODE_ACCOUNT="@FASTCACHED_MACOS_NODE_ACCOUNT@"
 #   * The account is inert until something registers a job as it: shell
 #     /usr/bin/false, no home, IsHidden.
 #
-# The installer does NOT register the worker itself -- it has no scheduler address
-# or toolchain list to register one WITH, and NodeServiceRejection refuses a
-# registration missing either. This makes the operator's own
+# The installer does NOT register the worker itself: whether this machine serves
+# compiles at all is the operator's decision, and a registration is a command line
+# replayed at every boot. This makes the operator's own
 # `fastcache-compile-node --install-service --service-scope=system` work; without
 # the account that command is refused, and without the refusal it would register a
 # launchd job running as ROOT that compiles input from the network (issue #87).

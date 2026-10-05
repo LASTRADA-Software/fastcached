@@ -65,6 +65,10 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# `fastcached_scratch_git`: the fixture's own git runs with the inherited `GIT_DIR` and its
+# kin removed, or under an exported `GIT_DIR` its `git init` writes THAT repository.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -330,19 +334,20 @@ else()
         # and the check falls back to the directory walk, which reads as two unrelated
         # verdicts being wrong. A broken fixture must say it is broken.
         set(gitSetup "")
-        execute_process(COMMAND "${FASTCACHED_GIT}" init -q "${tree}"
+        fastcached_scratch_git("${FASTCACHED_GIT}" scratchGit)
+        execute_process(COMMAND ${scratchGit} init -q "${tree}"
                         OUTPUT_QUIET ERROR_VARIABLE gitError RESULT_VARIABLE gitStatus)
         if(NOT gitStatus EQUAL 0)
             set(gitSetup "git init: ${gitError}")
         endif()
-        execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add
+        execute_process(COMMAND ${scratchGit} -C "${tree}" add
                                 "src/thing/Thing_test.cpp" "src/thing/Gone_test.cpp"
                         OUTPUT_QUIET ERROR_VARIABLE gitError RESULT_VARIABLE gitStatus)
         if(NOT gitStatus EQUAL 0 AND gitSetup STREQUAL "")
             set(gitSetup "git add: ${gitError}")
         endif()
         if(case STREQUAL "tracked-bad")
-            execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add
+            execute_process(COMMAND ${scratchGit} -C "${tree}" add
                             "src/thing/Bad_test.cpp"
                             OUTPUT_QUIET ERROR_VARIABLE gitError RESULT_VARIABLE gitStatus)
             if(NOT gitStatus EQUAL 0 AND gitSetup STREQUAL "")
@@ -350,7 +355,7 @@ else()
             endif()
         endif()
         if(case STREQUAL "tracked-vendored")
-            execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add
+            execute_process(COMMAND ${scratchGit} -C "${tree}" add
                             "vendor/endo/tui/Upstream_test.cpp"
                             OUTPUT_QUIET ERROR_VARIABLE gitError RESULT_VARIABLE gitStatus)
             if(NOT gitStatus EQUAL 0 AND gitSetup STREQUAL "")

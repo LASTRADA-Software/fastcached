@@ -33,6 +33,29 @@ namespace FastCache::Node
 /// surfaces, not because one is derived from the other.
 constexpr int MaxAnnounceRedirects = 2;
 
+/// Where a node registers NOW: the scheduler endpoints a round walks, re-read at the start of every
+/// round (`SchedulerLink::BeginRound`).
+///
+/// A seam rather than a list, because the answer moves while the node runs: a node that serves no
+/// scheduler registers at its fleet's voters, and a voter that moves its `0xFC` endpoint announces
+/// the new one, proven, and the leader records it -- so the APPLIED state names the new endpoint while
+/// the formation record still remembers the old one until a reform. `Node::AppliedSchedulers` is the
+/// production answer.
+class ISchedulerEndpointSource
+{
+  public:
+    ISchedulerEndpointSource() = default;
+    ISchedulerEndpointSource(ISchedulerEndpointSource const&) = delete;
+    ISchedulerEndpointSource(ISchedulerEndpointSource&&) = delete;
+    ISchedulerEndpointSource& operator=(ISchedulerEndpointSource const&) = delete;
+    ISchedulerEndpointSource& operator=(ISchedulerEndpointSource&&) = delete;
+    virtual ~ISchedulerEndpointSource() = default;
+
+    /// @return The endpoints to register with, in the order a round tries them; empty when none is
+    ///         known. Called from a round's own thread while another thread may move the answer.
+    [[nodiscard]] virtual std::vector<std::string> Current() const = 0;
+};
+
 /// Where this node believes the scheduler's leader is, across heartbeat rounds.
 ///
 /// **Pure**: no socket, no clock, no logger. The heartbeat thread dials whatever
@@ -65,14 +88,14 @@ constexpr int MaxAnnounceRedirects = 2;
 /// stick.
 ///
 /// A remembered leader that stops answering is forgotten and the configured
-/// `--scheduler` is tried again **in the same round**, rather than a heartbeat
+/// scheduler endpoint is tried again **in the same round**, rather than a heartbeat
 /// interval later: the configured endpoint is the one an operator can actually
 /// fix, and skipping a round to reach it doubles the window in which this machine
 /// is missing from the fleet.
 ///
 /// ## Several configured endpoints (#1310)
 ///
-/// `--scheduler` is a list, and the fallback walks it: a round that cannot get
+/// `SchedulersOf` is a list, and the fallback walks it: a round that cannot get
 /// through at one configured endpoint tries the next, still in the same round, until
 /// each has been tried once. The walk starts at the configured endpoint that last
 /// ACCEPTED a round, so a fleet whose first entry was retired pays that entry's
@@ -101,12 +124,41 @@ class SchedulerLink
     ///
     /// On a configuration the startup table accepts, the answer is present exactly when
     /// `RunsWorker` is true, which `NodeConfig_test` asserts.
-    /// @param configured The `--scheduler` endpoints, in the operator's order. Never
-    ///        forgotten, and what this falls back through.
+    /// @param configured The endpoints to register with, in order -- a node's formation record's
+    ///        answer (`SchedulersOf`). Never forgotten, and what this falls back through.
     /// @return The link, or nothing when @p configured is empty.
     [[nodiscard]] static std::optional<SchedulerLink> For(std::vector<std::string> configured);
 
-    /// Start a heartbeat round, resetting the per-round redirect budget.
+    /// A link over what @p source answers now, re-read at the start of every round, or nothing when
+    /// it answers none. A name of its own rather than an overload of `For`, which a braced empty list
+    /// would make ambiguous.
+    ///
+    /// **Re-read in `BeginRound`, the one call every round makes**, never by each loop beside it: a
+    /// voter that moved its `0xFC` endpoint is reached at the next round of BOTH loops that dial
+    /// through a link, and neither can forget to ask.
+    /// @param source Where this node registers now; must outlive the link.
+    /// @return The link, or nothing when @p source answers an empty list.
+    [[nodiscard]] static std::optional<SchedulerLink> Over(ISchedulerEndpointSource const& source);
+
+    /// @return The endpoints the current round walks, in order. Moved only by `BeginRound`, so read
+    ///         it on the round's own thread, or before the first round.
+    [[nodiscard]] std::vector<std::string> const& Configured() const noexcept
+    {
+        return _configured;
+    }
+
+    /// Walk @p configured from the next round on.
+    ///
+    /// The walk keeps its place by ENDPOINT rather than by position: the endpoint that last accepted
+    /// a round stays where the next round starts when it is still listed, and the list's first entry
+    /// is where a round starts when it is not. A remembered leader is kept -- it is not a configured
+    /// endpoint, and a moved list says nothing about who leads. An empty list changes nothing: a
+    /// source that knows no endpoint for a moment is no reason to forget every one this link knew.
+    /// @param configured The endpoints, in order.
+    void Retarget(std::vector<std::string> configured);
+
+    /// Start a heartbeat round, resetting the per-round redirect budget, and re-read where this node
+    /// registers when the link was built over a source (`Retarget`).
     ///
     /// The budget is per round rather than per process: a fleet that re-elects
     /// once an hour should spend one redirect an hour, not exhaust a lifetime
@@ -148,6 +200,8 @@ class SchedulerLink
     [[nodiscard]] std::string const& ConfiguredAt(std::size_t offset) const noexcept;
 
     std::vector<std::string> _configured;
+    /// Where `BeginRound` re-reads the list; null for a link built over a fixed one.
+    ISchedulerEndpointSource const* _source { nullptr };
     /// The leader a round has been accepted at, when that is not a configured
     /// endpoint; empty until one has been.
     std::optional<std::string> _learned;
@@ -195,12 +249,8 @@ struct RoundReport
 /// @param beats         Registrars that heartbeated successfully.
 /// @param registrations Registrars that registered this round.
 /// @param total         Registrars attempted.
-/// @param leaderKnown   Whether a `NotLeader` named somewhere to go next.
 /// @return The level and the sentence.
-[[nodiscard]] inline RoundReport DescribeAnnounceRound(std::size_t beats,
-                                                       std::size_t registrations,
-                                                       std::size_t total,
-                                                       bool leaderKnown)
+[[nodiscard]] inline RoundReport DescribeAnnounceRound(std::size_t beats, std::size_t registrations, std::size_t total)
 {
     auto const accepted = beats + registrations;
 
@@ -212,9 +262,13 @@ struct RoundReport
     // Rewording either form breaks that distinction in a fixture rather than in a
     // build, which is a timeout with no failed assertion. #999 is about the STEADY
     // round, which no fixture waits on, so only that gains a new sentence.
+    //
+    // Debug, whoever caused it. A shortfall is registrars a scheduler refused or redirected, and each
+    // of those is said on its own: a refusal by `SchedulerReachability`, at Warn on its transition and
+    // quietly while it lasts; a redirect at Info, as the round follows it. This line only counts them,
+    // on every round, so anything louder than Debug would say each refusal again every interval.
     if (accepted < total)
-        return { .level = leaderKnown ? LogLevel::Debug : LogLevel::Warn,
-                 .message = std::format("{} of {} toolchain(s) registered", accepted, total) };
+        return { .level = LogLevel::Debug, .message = std::format("{} of {} toolchain(s) registered", accepted, total) };
 
     // A heartbeat that fell through to a registration: the scheduler had forgotten this
     // worker and it re-announced itself. Named rather than folded into either pure case,

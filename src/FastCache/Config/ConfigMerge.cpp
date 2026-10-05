@@ -3,11 +3,13 @@
 #include <FastCache/Config/FileOptions.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 
+#include <algorithm>
 #include <array>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <iterator>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -124,6 +126,51 @@ std::expected<void, ConfigError> ValidateBinds(std::span<BindConfig const> binds
         }
     }
     return {};
+}
+
+std::vector<BindConfig> EffectiveBinds(Config const& config)
+{
+    if (!config.binds.empty())
+        return config.binds;
+    return { BindConfig { .address = config.bindAddress, .port = config.port, .tls = config.tlsEnabled } };
+}
+
+std::optional<std::string> DaemonStartupRejection(Config const& config)
+{
+#if defined(FC_TLS_ENABLED)
+    constexpr bool buildServesTls = true;
+#else
+    constexpr bool buildServesTls = false;
+#endif
+
+    auto const binds = EffectiveBinds(config);
+    auto const wantsTls = config.tlsEnabled || std::ranges::any_of(binds, &BindConfig::tls);
+
+    /// One rule: whether it refuses, and what it says.
+    struct Rule
+    {
+        bool refuses;             ///< Whether this configuration breaks it.
+        std::string_view message; ///< Why.
+    };
+
+    // Duplicate endpoints first, because its message names the endpoint and a TLS rule answering
+    // in its place would describe a different mistake.
+    if (auto const unique = ValidateBinds(binds); !unique.has_value())
+        return unique.error().context;
+
+    auto const rules = std::to_array<Rule>({
+        { .refuses = wantsTls && !buildServesTls, .message = DaemonTlsUnavailableRefusal },
+        { .refuses = wantsTls && buildServesTls && (config.tlsCertPath.empty() || config.tlsKeyPath.empty()),
+          .message = DaemonTlsMaterialRefusal },
+        // A disk budget only exists with a store to bound, and the durability only matters there.
+        { .refuses = !config.storagePath.empty() && config.storageMaxDiskBytes != 0
+                     && config.storageDurability != StorageDurability::Batched,
+          .message = DaemonStorageBudgetDurabilityRefusal },
+    });
+    for (auto const& rule: rules)
+        if (rule.refuses)
+            return std::string { rule.message };
+    return std::nullopt;
 }
 
 std::string FormatBindSummary(std::span<BindConfig const> binds)

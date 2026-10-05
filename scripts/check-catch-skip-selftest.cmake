@@ -48,6 +48,10 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# `fastcached_scratch_git`: the fixture's own git runs with the inherited `GIT_DIR` and its
+# kin removed, or under an exported `GIT_DIR` its `git init` writes THAT repository.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -216,12 +220,13 @@ else()
 ")
         fastcached_plant_roots("${tree}")
 
-        execute_process(COMMAND "${FASTCACHED_GIT}" init -q "${tree}" RESULT_VARIABLE ignored)
-        execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add "src/thing/CMakeLists.txt"
+        fastcached_scratch_git("${FASTCACHED_GIT}" scratchGit)
+        execute_process(COMMAND ${scratchGit} init -q "${tree}" RESULT_VARIABLE ignored)
+        execute_process(COMMAND ${scratchGit} -C "${tree}" add "src/thing/CMakeLists.txt"
                         RESULT_VARIABLE ignored)
         if(case STREQUAL "tracked-bare")
             # Force it in, since a real checkout would have it ignored.
-            execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add -f
+            execute_process(COMMAND ${scratchGit} -C "${tree}" add -f
                             ".cache/CPM/catch2/deadbeef/tests/CMakeLists.txt"
                             RESULT_VARIABLE ignored)
         endif()
@@ -310,8 +315,9 @@ if(FASTCACHED_GIT)
     fastcached_make_tree("vendored-git" "src/thing/CMakeLists.txt"
         "catch_discover_tests(thing-tests PROPERTIES SKIP_RETURN_CODE 4)\n" tree)
     file(WRITE "${tree}/vendor/upstream/tests/CMakeLists.txt" "${vendoredBody}")
-    execute_process(COMMAND "${FASTCACHED_GIT}" init -q "${tree}" RESULT_VARIABLE ignored)
-    execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add -A RESULT_VARIABLE ignored)
+    fastcached_scratch_git("${FASTCACHED_GIT}" scratchGit)
+    execute_process(COMMAND ${scratchGit} init -q "${tree}" RESULT_VARIABLE ignored)
+    execute_process(COMMAND ${scratchGit} -C "${tree}" add -A RESULT_VARIABLE ignored)
     list(APPEND vendoredTrees "${tree}")
 endif()
 foreach(tree IN LISTS vendoredTrees)

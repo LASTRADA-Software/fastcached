@@ -26,6 +26,11 @@
 #   1. Equivalent object -- a worker's object matches a locally compiled one.
 #   2. Still a cache     -- a dispatched result is served from the cache next time.
 #   3. C, not C++        -- a dispatched C translation unit comes back compiled as C.
+#  3b. Root-bound        -- a dispatched object naming its checkout (the builtin
+#                           `source_location` is made of) is not served into a second
+#                           checkout, and is served back to the first.
+#  3c. One spelling      -- a header one dispatched compile reaches through two include
+#                           chains is ONE /showIncludes note, with no `..` in any note.
 #   4. Fingerprint       -- a worker for another toolchain is never chosen.
 #
 # "MATCHES" IS NOT BYTE-IDENTICAL HERE, and every part of that is measured rather
@@ -62,6 +67,10 @@ param(
     [string]$Fastcached = "$PSScriptRoot/../out/build/clangcl-debug/target/fastcached.exe",
     [string]$Node       = "$PSScriptRoot/../out/build/clangcl-debug/target/fastcache-compile-node.exe",
     [string]$Launcher   = "$PSScriptRoot/../out/build/clangcl-debug/target/fastcache-cc.exe",
+    # Asked for the scheduler's own record of a worker when a dispatch comes back
+    # withdrawn; see `Assert-NotWithdrawn`. Without it a withdrawal still fails, and
+    # cannot say which limit took the slots.
+    [string]$Cli        = "",
     # Zero allocates a free block per run, which is the default; a non-zero value
     # pins one, which is what somebody reproducing a failure wants. See
     # `Get-FreePortBlock` for why the fixed default had to go.
@@ -82,6 +91,13 @@ $SKIP = 77
 $exit = 0
 $ranAnyCompiler = $false
 
+# Before the skips and the self-test modes, so a machine that skips this fixture still
+# judges it: every launcher it runs must sit inside `Use-E2ELauncherState`, or it would
+# read or delete the caller's statistics. The why is written in the module, once.
+Import-Module (Join-Path $PSScriptRoot "lib/E2EEnvironment.psm1") -Force
+try { Assert-E2ELauncherFixture -Fixture $PSCommandPath }
+catch { Write-Host "dist-compile E2E FAILED: $($_.Exception.Message)"; exit 1 }
+
 # Skipped entirely under -SelfTest, which drives no process at all: requiring the
 # three binaries there would make the one check that needs no build the one check
 # that cannot run without one.
@@ -96,8 +112,16 @@ if (-not $SelfTest) {
     $Fastcached = (Resolve-Path $Fastcached).Path
     $Node       = (Resolve-Path $Node).Path
 
+# Every node started below is SOLITARY: a fleet of its own, serving the scheduler its own
+# worker registers with, so one process leases, verifies and compiles. A second node cannot
+# join a first over loopback, which is how these nodes bind -- a fleet is never offered at an
+# address only this machine reaches -- so what needs two machines is asserted in process;
+# `dist-compile-e2e.sh` names where. Each runs consensus on a loopback port of its own (`$schedRaftPort`, `$isoRaftPort`)
+# and no discovery (`--discovery=`), which is on by default and whose beacon would reach every
+# other fixture on this machine.
+#
 # Every node started below turns its own cache tier OFF. `--listen-node` defaults
-# to 127.0.0.1:6674 -- where `fastcache-cc` looks -- which is right for the one node
+# to 0.0.0.0:6674 -- 6674 being where `fastcache-cc` looks -- which is right for the one node
 # per machine a real deployment runs and wrong here, where several share a host and
 # would race for it. Said explicitly rather than left to the default's
 # warn-and-continue, so a node that failed to bind for some OTHER reason still shows
@@ -112,7 +136,29 @@ $NoLocalCache = "--cache-memory=0"
 # launcher is a string prefix comparison. The reconciliation added for issue #66
 # handles that now, but a fixture whose roots are ambiguous is testing the
 # reconciliation as well as its own property.
-$scratch = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "dist-e2e"
+#
+# The BASE of every run. Each run claims a root of its own under it
+# (`New-E2ERunRoot`, never reused), and each driver gets a directory of its own under
+# that and a port block of its own (see the driver loop), because a process is not
+# known to be gone when whatever follows it starts: `Stop-Spawned` bounds its wait
+# and a killed process can outlive the bound. Between RUNS the same thing happened:
+# with one root cleared at each start, an immediate rerun died in 0 s on
+# "raft-log ... being used by another process" while the holders' PIDs sat in the
+# previous run's log. So old roots are swept best-effort, and one that will not go
+# is reported with the processes whose command line names it. With one directory shared between the
+# drivers, the second one's `Remove-Item` met the first one's isolation worker
+# still holding `iso-worker.log` and failed the run with "being used by another
+# process" -- a teardown overlap reported as a fault of the case that ran next.
+# Not a LOG name problem: with every kill made late, the same removal met the
+# isolation scheduler's `raft-log` first, and a state directory has no per-driver
+# name to give it. Waiting longer only moves that line; sharing nothing removes it.
+#
+# Nor is it only this run's processes: Defender opens a file to scan it when its last
+# writer closes it, and a delete meeting that handle fails with a sharing violation.
+# Measured: `iso-scheduler.log` refused its delete with the Restart Manager naming
+# `WinDefend` as the only holder, and the run failed as "The process cannot access the
+# file" with every case green.
+$scratchBase = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "dist-e2e"
 
 # How many consecutive ports the run needs, counted from `$BasePort`.
 #
@@ -169,23 +215,23 @@ function Get-FreePortBlock([int]$count) {
     throw "could not find $count consecutive free ports"
 }
 
-# Not under `-SelfTest`, which drives no process and opens no socket -- which is
-# precisely why CMake keeps it in the DEFAULT ctest set rather than labelling it
-# `smoke`. Probing here would give that case eight connect attempts it has no use
-# for, and a way to fail ("could not find 8 consecutive free ports") on a machine
-# whose ports are none of its business.
-if (-not $SelfTest -and $BasePort -eq 0) { $BasePort = Get-FreePortBlock $PortsNeeded }
-
-$cachePort    = $BasePort
-$dispatchPort = $BasePort + 1
-$workerPort   = $BasePort + 2
-# Each scheduler's consensus port (#178): a scheduler is a cluster of one, bound to
-# loopback where nothing dials it. +6 and +7 were free since the dedicated compile port
-# went.
-$schedRaftPort = $BasePort + 6
-$isoRaftPort   = $BasePort + 7
+# What the caller pinned, if anything. The block itself is drawn per DRIVER, inside
+# the driver loop, for the reason `$scratchBase` gives: a process of the previous
+# driver that outlived its teardown bound still holds its ports, and a fresh draw
+# steps around it where a shared block would fail the next bind. A pinned block is
+# shared by every driver, because pinning one is asking for exactly that.
+#
+# Not probed under `-SelfTest`, which never reaches the driver loop and opens no
+# port of its own -- which is precisely why CMake keeps it in the DEFAULT ctest set
+# rather than labelling it `smoke`. Probing there would give that case connect
+# attempts it has no use for, and a way to fail ("could not find 9 consecutive free
+# ports") on a machine whose ports are none of its business.
+$PinnedBasePort = $BasePort
 
 $procs = @()
+# What each spawned process was started AS, keyed by PID, so a teardown that finds
+# one still running can say which one it is rather than only that one is.
+$spawnedCommandLines = @{}
 
 # Quote the arguments Start-Process will not quote for you.
 #
@@ -227,24 +273,40 @@ function Start-Background([string]$path, [string[]]$arguments, [string]$errorLog
         PassThru              = $true
         RedirectStandardError = $errorLog
     }
-    if ($IsWindows) { return Start-Process @common -WindowStyle Hidden }
-    return Start-Process @common
+    $proc = if ($IsWindows) { Start-Process @common -WindowStyle Hidden } else { Start-Process @common }
+    $script:spawnedCommandLines[$proc.Id] = (@($path) + @($common.ArgumentList)) -join ' '
+    return $proc
 }
+
+# The teardown DECISION -- kill, confirm each process EXITED within one shared
+# bound, name what did not -- is shared with node-scratch-isolation-e2e.ps1, and
+# its cases run from `-SelfTest` below.
+Import-Module (Join-Path $PSScriptRoot "lib/E2EProcesses.psm1") -Force
+
+# How long the killed processes are given, together, to be gone.
+#
+# A stall bound rather than an estimate: a kill is not instant, and on a
+# saturated host it was measured taking 2.2 s with one busy thread per core and
+# over 5 s with three -- where the 5 s this used to allow ran out, silently, and
+# the run carried on beside a process still holding its port and its log. One
+# that is not gone in a minute is wedged, and is reported as such.
+$KillWaitMilliseconds = 60000
 
 function Stop-Spawned {
     # Every spawned process, on every exit path. One left holding a port makes the
-    # NEXT run fail at startup for a reason unrelated to what actually broke.
-    foreach ($p in $script:procs) {
-        if ($null -eq $p) { continue }
-        # Both swallow deliberately: a process that exited between the check and
-        # the Kill throws, and so does WaitForExit on a handle that is already
-        # gone. Cleanup runs on every exit path INCLUDING the failing ones, so
-        # anything thrown here would replace the real diagnostic with a secondary
-        # one about tearing down.
-        try { if (-not $p.HasExited) { $p.Kill() } } catch { $null = $_ }
-        try { $p.WaitForExit(5000) | Out-Null } catch { $null = $_ }
-    }
+    # NEXT run fail at startup for a reason unrelated to what actually broke -- so
+    # one that outlives the bound is NAMED, rather than returned from in silence.
+    #
+    # Returns one line per process NOT gone within `$KillWaitMilliseconds`, and the
+    # caller prints them at once and decides what they mean. Between drivers they are
+    # FATAL when `-BasePort` is pinned, since every driver then shares one port block and
+    # the next pass would start beside them; with the default, each driver has a port
+    # block and a directory of its own, so they are counted and fail the exit status in
+    # the `finally`. In the `finally` they are lines, since an exception there would
+    # replace the real diagnostic with one about tearing down.
+    $survivors = @(Stop-E2EProcesses $script:procs $script:spawnedCommandLines -BoundMilliseconds $KillWaitMilliseconds)
     $script:procs = @()
+    return $survivors
 }
 
 # Read a file another process is still writing to.
@@ -273,6 +335,18 @@ function Read-LiveText([string]$path) {
     }
 }
 
+# Every grant this worker runs is CHECKED: the worker's own startup line says which lease check it
+# built (`MakeWorkerLeaseValidator`), and a worker that fell back to the one verifying nothing would
+# pass every case below -- its compiles still run. So the line is WAITED for -- the worker tier is
+# built after the scheduler that logs `scheduling for the fleet` -- and its opposite asserted absent.
+function Assert-ChecksLeases([string]$path, [string]$what) {
+    $text = Wait-ForLine $path ([regex]::Escape("verifying lease signatures against the state this node's consensus applies")) 60 $what
+    if ($text -match [regex]::Escape("compiling WITHOUT verifying")) {
+        Write-Host $text
+        throw "$what compiles WITHOUT verifying lease signatures"
+    }
+}
+
 function Wait-ForLine([string]$path, [string]$pattern, [int]$seconds, [string]$what) {
     foreach ($attempt in 1..($seconds * 5)) {
         $text = Read-LiveText $path
@@ -281,59 +355,6 @@ function Wait-ForLine([string]$path, [string]$pattern, [int]$seconds, [string]$w
     }
     Write-Host (Read-LiveText $path)
     throw "$what never reported /$pattern/"
-}
-
-# The public key a scheduler will sign its leases with, minted into its state directory
-# before it starts (#178): `--print-identity` over the same consensus flags, whose
-# `public-key` line is what a worker's --voter-key takes. The start that follows reads
-# the same files back rather than minting a second identity.
-function Get-SchedulerKey([string]$stateDir, [int]$raftPort) {
-    $identity = & $Node --print-identity "--listen-raft=127.0.0.1:$raftPort" `
-                        "--raft-self=127.0.0.1" "--cluster-dir=$stateDir"
-    if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint a scheduler identity in $stateDir (exit $LASTEXITCODE)" }
-    $line = @($identity) | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
-    if (-not $line) { throw "--print-identity printed no public-key line: $identity" }
-    return $line.Substring('public-key '.Length)
-}
-
-# Admit a worker to the cluster its scheduler leads, under the identity it will prove there
-# (#178 PR 6), and wait until the leader has APPLIED the admission. The shell twin is
-# `dist-compile-e2e.sh`'s `admit_worker`, and the reasoning is the same: a worker that dials
-# in before the entry is applied is refused `node-key-unknown` and registers a heartbeat
-# interval late, and a scheduler that has just started answers `not-leader` until it leads
-# its cluster of one. What an operator runs, in the order an operator runs it: the worker's
-# `--print-identity` mints the identity into its state directory and prints the
-# `--cluster-admit-worker` line, and the start then reads the same files back.
-#
-# Bounded by a Stopwatch, which is monotonic, rather than by counting the sleeps it asked for.
-function Admit-Worker([string]$stateDir, [string]$scheduler, [string]$what) {
-    $identity = @(& $Node --print-identity "--cluster-dir=$stateDir")
-    if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint an identity for the $what in $stateDir (exit $LASTEXITCODE)" }
-    $tokenLine = $identity | Where-Object { $_ -like 'cluster-admit-worker *' } | Select-Object -First 1
-    $keyLine = $identity | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
-    if (-not $tokenLine -or -not $keyLine) {
-        throw "--print-identity printed no cluster-admit-worker line and key for the ${what}: $($identity -join ' | ')"
-    }
-    $token = $tokenLine.Substring('cluster-admit-worker '.Length)
-    $key = $keyLine.Substring('public-key '.Length)
-
-    $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    $recorded = $false
-    $last = ""
-    while ($clock.Elapsed.TotalSeconds -lt 30) {
-        if (-not $recorded) {
-            $last = (@(& $Node "--scheduler=$scheduler" "--cluster-admit-worker=$token") -join ' | ')
-            $recorded = ($LASTEXITCODE -eq 0)
-        }
-        if ($recorded) {
-            $status = (@(& $Node "--scheduler=$scheduler" --cluster-status) -join "`n")
-            if ($LASTEXITCODE -eq 0 -and $status.Contains("key=$key")) { return }
-            $last = $status
-        }
-        Start-Sleep -Milliseconds 200
-    }
-    throw ("the scheduler at $scheduler did not admit the $what within " +
-           "$([int]$clock.Elapsed.TotalSeconds) s (recorded: $recorded): $last")
 }
 
 # The readiness markers, as a TABLE (#1213).
@@ -744,7 +765,8 @@ int Probe() { return static_cast<int>(std::string("x").size()); }
 }
 
 function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
-                            [string]$scheduler, [int]$cache, [string]$sourceName = "u.cpp") {
+                            [string]$scheduler, [int]$cache, [string]$sourceName = "u.cpp",
+                            [string[]]$extra = @()) {
     $env:FASTCACHE_ADDR       = "127.0.0.1:$cache"
     $env:FASTCACHE_SOURCE_DIR = $root
     $env:FASTCACHE_BINARY_DIR = (Join-Path $root "build")
@@ -753,13 +775,17 @@ function Invoke-Dispatching([string]$compiler, [string]$root, [string]$obj,
     else            { Remove-Item -Path "env:FASTCACHE_SCHEDULER" -ErrorAction SilentlyContinue }
 
     $source  = Join-Path $root $sourceName
+    $outFile = New-TemporaryFile
     $errFile = New-TemporaryFile
-    $p = Start-Process -FilePath $Launcher `
-        -ArgumentList (ConvertTo-QuotedArgs @($compiler, "/nologo", "/c", "/Fo$obj", $source)) `
-        -NoNewWindow -Wait -PassThru -RedirectStandardError $errFile
+    $p = Use-E2ELauncherState $launcherState {
+        Start-Process -FilePath $Launcher `
+            -ArgumentList (ConvertTo-QuotedArgs (@($compiler, "/nologo", "/c", "/Fo$obj") + $extra + @($source))) `
+            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    }
+    $out = Get-Content -Raw $outFile -ErrorAction SilentlyContinue
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
-    Remove-Item $errFile -ErrorAction SilentlyContinue
-    return @{ code = $p.ExitCode; stderr = $err }
+    Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
+    return @{ code = $p.ExitCode; stdout = [string]$out; stderr = $err }
 }
 # --- the object comparison, tested against input it can be given on purpose ----
 #
@@ -804,6 +830,75 @@ function New-SyntheticCoff([string]$path, [object[]]$sections, [uint32]$stamp = 
     $all = [System.Collections.Generic.List[byte]]::new()
     $all.AddRange($header); $all.AddRange($headers); $all.AddRange($blob); $all.AddRange($tail)
     [System.IO.File]::WriteAllBytes($path, $all.ToArray())
+}
+
+# ---- a worker that withdrew its slots --------------------------------------
+#
+# The worker every dispatching case uses is offered one slot above this host's
+# core count (see `$workerSlots`), so CPU used outside this fleet cannot withdraw
+# it: a `rejected (withdrawn)` is a FAILURE, never a skip, and the useful thing to
+# say is WHICH limit took the slots -- memory and scratch still can, and should, on
+# a starved host. Load-driven withdrawal itself is the product's behaviour and is
+# covered where it lives: `NodePolicy_test.cpp`'s `SlotCeilingsFor` cases, and the
+# `Withdrawn` refusal in `SchedulerProtocol_test.cpp` and `WorkerRegistry_test.cpp`.
+
+# Whether a launcher's output is the scheduler refusing a lease because every
+# matching worker withdrew. Pure, so the self-test drives it without a process.
+# @param stderr The launcher's stderr for a compile that was not dispatched.
+# @return True for a withdrawal.
+function Test-WithdrawnRefusal([string]$stderr) {
+    return $stderr -match "not dispatched \(rejected \(withdrawn\)"
+}
+
+# The scheduler's `limited-by` for one worker, out of `fleet workers` as JSON.
+# @param json        What `fastcache-cli --format=json fleet workers` printed.
+# @param endpoint    The worker's advertised endpoint.
+# @param fingerprint The toolchain the lease asked for.
+# @return The `limited-by` text, or $null when no such worker is in the record.
+function Get-WorkerLimit([string]$json, [string]$endpoint, [string]$fingerprint) {
+    try { $rows = @($json | ConvertFrom-Json) } catch { return $null }
+    foreach ($row in $rows) {
+        if ($row.endpoint -eq $endpoint -and $row.toolchain -eq $fingerprint) { return $row.'limited-by' }
+    }
+    return $null
+}
+
+# Read the scheduler's record of one worker, or $null when it cannot be read.
+#
+# Bounded, because it is asked on a path that is already failing and an unbounded
+# ask there turns a named refusal into a hang: the client's own ceilings are 5 s to
+# connect and 10 s per read and write, so `$CliReadSeconds` is their sum. An expiry
+# is SAID, naming what was waited for, and reads as an absent record.
+$CliReadSeconds = 15
+function Read-WorkerLimit([string]$scheduler, [string]$endpoint, [string]$fingerprint) {
+    if (-not $Cli -or -not (Test-Path $Cli)) { return $null }
+    $out = Join-Path ([IO.Path]::GetTempPath()) ("dist-e2e-fleet-" + [Guid]::NewGuid().ToString("N") + ".json")
+    $asked = Start-Process -FilePath $Cli -PassThru -NoNewWindow `
+        -ArgumentList (ConvertTo-QuotedArgs @("--addr=$scheduler", "--format=json", "fleet", "workers")) `
+        -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+    try {
+        if (-not $asked.WaitForExit($CliReadSeconds * 1000)) {
+            try { $asked.Kill() } catch { $null = $_ }
+            Write-Host "the scheduler's record was not read: fastcache-cli fleet workers against $scheduler did not answer within $CliReadSeconds s"
+            return $null
+        }
+        if ($asked.ExitCode -ne 0) { return $null }
+        return Get-WorkerLimit (Get-Content -Raw -LiteralPath $out) $endpoint $fingerprint
+    } finally {
+        Remove-Item -LiteralPath $out, "$out.err" -ErrorAction SilentlyContinue
+    }
+}
+
+# Called where a dispatch the case needed did not happen. A withdrawal THROWS,
+# naming the limit the scheduler's record gives -- the worker is sized so CPU used
+# outside this fleet cannot cause one (`$workerSlots`), so whatever did is the
+# finding. Anything else returns, and the caller's own failure stands.
+function Assert-NotWithdrawn($result, [string]$scheduler, [string]$workerEndpoint, [string]$fingerprint) {
+    if (-not (Test-WithdrawnRefusal $result.stderr)) { return }
+    $limit = Read-WorkerLimit $scheduler $workerEndpoint $fingerprint
+    $limitText = if ($null -eq $limit) { "unreadable" } else { $limit }
+    Write-Host $result.stderr
+    throw "the worker withdrew its slots (the scheduler's record says it is limited by '$limitText'), which it is sized never to do for CPU used outside this fleet -- see `$workerSlots"
 }
 
 function Invoke-SelfTest {
@@ -899,6 +994,24 @@ function Invoke-SelfTest {
         Assert-That ($sections[0].Name -eq ".text`$mn" -and $sections[1].Name -eq ".debug`$S") "in file order, by name"
         Assert-That ($sections[0].Size -eq $code.Length) "with their sizes"
 
+        # ---- Test-WithdrawnRefusal ---------------------------------------
+        $withdrawn = "fastcache-cc: not dispatched (rejected (withdrawn): every matching worker has withdrawn its capacity); compiling locally"
+        $noWorker  = "fastcache-cc: not dispatched (rejected (no-worker): no worker serves this toolchain); compiling locally"
+        Assert-That (Test-WithdrawnRefusal $withdrawn) "a withdrawn refusal is recognised"
+        Assert-That (-not (Test-WithdrawnRefusal $noWorker)) "a different refusal is not a withdrawal"
+        Assert-That (-not (Test-WithdrawnRefusal "")) "nor is a compile that said nothing"
+
+        # The scheduler's record as `fastcache-cli --format=json fleet workers`
+        # prints it -- captured from a real run, with a second row added -- so
+        # the reader is asked which worker it is looking at, not just whether a
+        # `limited-by` exists.
+        $fleet = '[{"id":"w1","toolchain":"3f5d2a3eca09d20f79b8bf9217019b87","compiler":"cl 19.51.36252","endpoint":"127.0.0.1:25271","slots":"32","in-flight":"0","available":"0","limited-by":"external-cpu","heartbeat-age":"2078","registered-age":"2078","last-picked-age":null},' +
+                 '{"id":"w2","toolchain":"3f5d2a3eca09d20f79b8bf9217019b87","compiler":"cl 19.51.36252","endpoint":"127.0.0.1:25999","slots":"4","in-flight":"0","available":"4","limited-by":"registered","heartbeat-age":"10","registered-age":"10","last-picked-age":null}]'
+        Assert-That ((Get-WorkerLimit $fleet "127.0.0.1:25271" "3f5d2a3eca09d20f79b8bf9217019b87") -eq "external-cpu") "the worker's own row is read"
+        Assert-That ((Get-WorkerLimit $fleet "127.0.0.1:25999" "3f5d2a3eca09d20f79b8bf9217019b87") -eq "registered") "and not its neighbour's"
+        Assert-That ($null -eq (Get-WorkerLimit $fleet "127.0.0.1:25271" "9e5d3aaa03c5f0c2564bda4c6c68f021")) "another toolchain at that endpoint is not this worker"
+        Assert-That ($null -eq (Get-WorkerLimit "not json" "127.0.0.1:25271" "3f5d2a3eca09d20f79b8bf9217019b87")) "an unreadable record is absent, not a limit"
+
         # ---- the readiness waits (#1213) --------------------------------
         #
         # Driven here rather than through the fixture, for the reason
@@ -959,6 +1072,14 @@ function Invoke-SelfTest {
         } finally {
             $listener.Stop()
         }
+
+        # ---- the teardown's report --------------------------------------
+        #
+        # The cases live beside the decision, in `lib/E2EProcesses.psm1`; running
+        # them here also proves this fixture's import of it works.
+        $teardown = Invoke-E2EProcessesSelfTest
+        $script:selfTestCases += $teardown.Cases
+        $script:selfTestFailures += $teardown.Failures
     } finally {
         Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
     }
@@ -968,14 +1089,21 @@ function Invoke-SelfTest {
     # down in a comment anywhere: it moves whenever a case is added, and a
     # restated total is a second thing to be wrong.
     if ($script:selfTestFailures -ne 0) {
-        Write-Host "dist-compile-e2e self-test FAILED ($script:selfTestFailures of $script:selfTestCases case(s): object comparison and the readiness waits)"
+        Write-Host "dist-compile-e2e self-test FAILED ($script:selfTestFailures of $script:selfTestCases case(s): object comparison, the withdrawal refusal, the readiness waits, the teardown report and scratch roots)"
         return 1
     }
-    Write-Host "dist-compile-e2e self-test PASSED ($script:selfTestCases case(s): object comparison and the readiness waits)"
+    Write-Host "dist-compile-e2e self-test PASSED ($script:selfTestCases case(s): object comparison, the withdrawal refusal, the readiness waits, the teardown report and scratch roots)"
     return 0
 }
 
 if ($SelfTest) { exit (Invoke-SelfTest) }
+
+# The launcher reads its whole configuration from FASTCACHE_* variables, and the calls
+# below set only the ones they mean -- so an inherited FASTCACHE_VERIFY, FASTCACHE_TOKEN
+# or FASTCACHE_NO_DIRECT would decide what a case measures. Importing the shared module
+# clears every one of them; this fixture draws no port through `E2EPorts.psm1`, which
+# would otherwise have imported it.
+Import-Module (Join-Path $PSScriptRoot "lib/E2EEnvironment.psm1") -Force
 
 
 # What "the same object" means, per driver, and why it is not one answer.
@@ -1002,7 +1130,24 @@ $Drivers = @(
     @{ Name = "clang-cl"; Rules = @{ Sections = @();                       TailMayDiffer = $false } }
 )
 
+$runRoot = $null
+# Every process a teardown between drivers could not end, for the verdict in `finally`.
+$script:killSurvivors = @()
+# Every launcher this fixture runs records into a state directory of the run's own,
+# through `Use-E2ELauncherState` in `scripts/lib/E2EEnvironment.psm1`, which also
+# refuses this file if any launcher runs outside it. This replaces a LOCALAPPDATA the
+# driver loop set process-wide and never put back. Inside the `try` whose `finally`
+# removes the state root and reports what the run did to the caller's logs.
+$launcherState = $null
 try {
+    # Old roots first, reported and never fatal; then this run's own: see `$scratchBase`.
+    foreach ($line in @(Clear-E2EStaleRoots -Base $scratchBase)) { Write-Host "stale scratch: $line" }
+    $runRoot = New-E2ERunRoot -Base $scratchBase
+    $scratchRoot = $runRoot.Path
+    Write-Host "== scratch root for this run: $scratchRoot"
+    $launcherState = Enter-E2ELauncherState -Launcher $Launcher -Fixture $PSCommandPath -RunTrees @($scratchRoot)
+    Write-Host "launcher statistics isolated to $($launcherState.Log)"
+
     foreach ($driver in $Drivers) {
         $cc = $driver.Name
         $rules = $driver.Rules
@@ -1011,24 +1156,29 @@ try {
             continue
         }
 
-        if (Test-Path $scratch) { Remove-Item -Recurse -Force $scratch }
+        # This driver's own directory and its own port block -- nothing the previous
+        # driver's processes could still be holding (see `$scratchBase`).
+        $scratch = Join-Path $scratchRoot $cc
         New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+        $BasePort = if ($PinnedBasePort -ne 0) { $PinnedBasePort } else { Get-FreePortBlock $PortsNeeded }
+        $cachePort    = $BasePort
+        $dispatchPort = $BasePort + 1
+        # Each node's consensus port (#178): a node is a cluster of one, bound to loopback
+        # where nothing dials it. +6 and +7 were free since the dedicated compile port went;
+        # +2 and +5, which were the separate workers' ports, are drawn and left unused.
+        $schedRaftPort = $BasePort + 6
+        $isoRaftPort   = $BasePort + 7
 
-        # No key file (#178 PR 6): every scheduler signs with its own identity key, a
-        # worker CHECKS the signature when it is given that key with --voter-key, as each
-        # worker below is, and a worker JOINS only under an identity key of its own that
-        # the scheduler's cluster admitted (`Admit-Worker`). The shell twin does the same.
+        # No key file (#178 PR 6): every node's scheduler signs with the node's own identity
+        # key, and its worker CHECKS the signature against the state the node's own consensus
+        # applies. No key is typed and nothing is admitted by hand. The shell twin does the same.
 
         if (-not (Test-CompilerWorks $cc $scratch)) {
             Write-Host "skip $cc (on PATH but cannot compile here)"
             continue
         }
         $ranAnyCompiler = $true
-        Write-Host "== driver: $cc"
-
-        # Statistics are per-user state; keep this run out of the developer's log.
-        $env:LOCALAPPDATA = Join-Path $scratch "state"
-        New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
+        Write-Host "== driver: $cc (ports $BasePort..$($BasePort + $PortsNeeded - 1), scratch $scratch)"
 
         # One listener now, and only the cache. `fastcached` used to carry the
         # scheduler too, on a second `--listen-dispatch` endpoint; that flag is gone.
@@ -1042,83 +1192,69 @@ try {
         $procs += $daemon
         Wait-ForReady Daemon $cachePort $daemon "daemon" $daemonLog
 
-        # A compile node running the fleet's scheduler. --fleet-open because every
-        # peer here is loopback -- and because the policy has to be STATED: a node
-        # with no member list refuses everybody, which is the right default and not a
-        # working configuration, so it is refused at startup.
-        #
-        # It runs no worker, deliberately (`--slots=0`, #206). A scheduler is a worker
-        # too unless told otherwise, and a second MATCHING worker would make "which
-        # worker ran this job" a race that the cases below assert against by reading
-        # one worker's counters. Running none, it registers with nobody, so it names no
-        # --scheduler of its own either.
-        # One port: since #290 stage 3 the compile verbs arrive on --listen-node
-        # beside the cache and scheduler verbs, so this node's worker half answers on
-        # $dispatchPort too and --advertise names that. The dedicated compile port it
-        # used to open, and the $BasePort + 6 it used to take, are both gone -- that
-        # offset is the scheduler's consensus port now.
-        #
-        # And it runs consensus, a cluster of one (#178): a scheduler signs every lease with
-        # an identity key kept in its state directory, and holds the roster its workers
-        # check those signatures against. Each worker is given its key with --voter-key,
-        # which is what puts this fixture's dispatches on the CHECKED path: a loopback
-        # worker told no voter checks no lease at all.
-        $schedLog = Join-Path $scratch "scheduler.log"
-        $schedState = Join-Path $scratch "scheduler.state"
-        $schedKey = Get-SchedulerKey $schedState $schedRaftPort
-        $scheduler = Start-Background $Node @(
-            $NoLocalCache,
-            "--serve-scheduler", "--listen-node=127.0.0.1:$dispatchPort", "--fleet-open",
-            "--listen-raft=127.0.0.1:$schedRaftPort", "--raft-self=127.0.0.1",
-            "--cluster-dir=$schedState",
-            "--advertise=127.0.0.1:$dispatchPort",
-            "--slots=0",
-            "--log-level=debug") $schedLog
-        $procs += $scheduler
-        Wait-ForReady Node $dispatchPort $scheduler "scheduler" $schedLog
-
         # Asked of the launcher rather than derived here. The fingerprint is a
         # digest over the compiler's whole include tree; a fixture that recomputed
         # it would assert its own reimplementation, and if the two disagreed every
         # case would degrade to a local compile and still exit 0 -- passing while
         # testing nothing.
         $ccPath = (Get-Command $cc).Source
-        $fingerprint = (& $Launcher --print-toolchain-fingerprint $ccPath) | Select-Object -First 1
+        $fingerprint = Use-E2ELauncherState $launcherState { (& $Launcher --print-toolchain-fingerprint $ccPath) | Select-Object -First 1 }
         if (-not $fingerprint) { throw "the launcher reported no toolchain fingerprint for $cc" }
 
-        # Slots enough that background CPU cannot withdraw all of them.
+        # ONE slot above the node's own core count, so no amount of CPU used outside
+        # this fleet can withdraw the worker these cases dispatch to.
         #
-        # `AvailableSlots` reduces a worker's ceiling by the cores its machine is
-        # busy with OUTSIDE this fleet -- `cpuBusyPermille * logicalCores / 1000`,
-        # less this fleet's own in-flight jobs -- so a worker offering two slots on
-        # a many-core machine withdraws both as soon as a few percent of that
-        # machine is doing something else. This fixture IS that something else: it
-        # runs local reference compiles on the same box, and on CI the rest of the
-        # suite runs beside it. The dispatch then comes back `rejected (withdrawn)`
-        # and the case fails as "the compile was not dispatched to a worker", which
-        # reads as a fault in dispatch and is a fault in the fixture's sizing.
+        # `SlotCeilingsFor` charges other work only past the headroom the slots leave,
+        # and with the slots above the cores there is no headroom: every external core
+        # is charged. There are at most `logicalCores` of them, so the ceiling never
+        # falls below `slots - logicalCores`, which is one. With the slots AT the core
+        # count it fell to zero on any host with no idle core, and a host running other
+        # builds beside this suite is exactly that: the worker withdrew `external-cpu`,
+        # and case 5 -- whose subject is an unreachable CACHE -- ended as a skip or a
+        # failure about a withdrawal it was never about.
         #
-        # Offering the whole machine puts the ceiling at cores-minus-external,
-        # which reaches zero only when the host really is saturated -- and is what
-        # a node dedicating this machine to the fleet would advertise anyway. The
-        # `--slots=1` workers elsewhere in this file are deliberate and stay: their
-        # cases are ABOUT a worker having exactly one.
-        $workerSlots = [Environment]::ProcessorCount
+        # Oversubscribing is a supported configuration rather than a trick:
+        # `OfferableSlots` takes an operator's `--slots` untouched, precisely so a
+        # machine can be offered more jobs than it has cores. The other two ceilings
+        # are not covered and should not be: a host with under 1 GiB of memory or
+        # 128 MiB of scratch left is starved, not busy, and still withdraws.
+        #
+        # Counted so it cannot fall SHORT of the node's count, which is
+        # `GetSystemInfo`'s processor count. `[Environment]::ProcessorCount` honours
+        # this process's affinity mask and so can only be lower; the CIM figure is the
+        # whole machine and can only be higher, which is the safe direction. The larger
+        # of the two is used.
+        #
+        # The `--slots=1` workers elsewhere in this file are deliberate and stay:
+        # their cases are ABOUT a worker having exactly one.
+        $hostCores = [Environment]::ProcessorCount
+        $machine = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+        if ($machine -and $machine.NumberOfLogicalProcessors -gt $hostCores) {
+            $hostCores = [int]$machine.NumberOfLogicalProcessors
+        }
+        $workerSlots = $hostCores + 1
 
+        # One compile node: it serves the fleet's scheduler -- a first start is a cluster of
+        # one, and its mode serves one -- and its own worker registers with it, so the
+        # scheduler that leases this worker is the one in the same process. A serving node
+        # is refused `--scheduler`, so there is no second process to point at it.
+        # --fleet-open because the policy has to be STATED; the clients here are this
+        # machine and admitted either way. The node is the ONLY worker its scheduler has,
+        # so "which worker ran this job" is never a race. One port: the scheduler and the
+        # compile verbs answer on --listen-node, and --advertise names it.
         $workerLog = Join-Path $scratch "worker.log"
         $workerState = Join-Path $scratch "worker.state"
-        Admit-Worker $workerState "127.0.0.1:$dispatchPort" "worker"
         $worker = Start-Background $Node @(
-            $NoLocalCache, "--voter-key=$schedKey", "--cluster-dir=$workerState",
-            "--scheduler=127.0.0.1:$dispatchPort", "--listen-node=127.0.0.1:$workerPort",
-            "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=$workerSlots",
+            $NoLocalCache, "--fleet-open",
+            "--listen-node=127.0.0.1:$dispatchPort", "--advertise=127.0.0.1:$dispatchPort",
+            "--listen-raft=127.0.0.1:$schedRaftPort", "--raft-self=127.0.0.1",
+            "--cluster-dir=$workerState", "--discovery=",
+            "--toolchain=$ccPath", "--slots=$workerSlots",
             "--log-level=debug") $workerLog
         $procs += $worker
-        Wait-ForReady Node $workerPort $worker "worker" $workerLog
-        # A lease reaching a worker before it holds a roster is refused `roster-expired`
-        # and compiled locally, which every case below would report as a dispatch that
-        # never happened -- so nothing is dispatched until it holds one.
-        Wait-ForLine $workerLog "roster: adopted roster version" 60 "worker" | Out-Null
+        Wait-ForReady Node $dispatchPort $worker "worker" $workerLog
+        Wait-ForLine $workerLog "scheduling for the fleet" 60 "worker" | Out-Null
+        Assert-ChecksLeases $workerLog "worker"
         $workerText = Wait-ForLine $workerLog "toolchain\(s\) registered" 120 "worker"
 
         # The worker computed its own fingerprint from a bare --toolchain. If it
@@ -1149,6 +1285,7 @@ try {
         $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort" $cachePort
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched compile failed" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
+            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$dispatchPort" $fingerprint
             Write-Host $r.stderr
             # The WORKER's log too, not just the client's. A refusal reaches the
             # client as one line naming a wire error code, and the reason it
@@ -1281,6 +1418,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $r = Invoke-Dispatching $cc $croot $cobj "127.0.0.1:$dispatchPort" $cachePort "u.c"
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched C compile failed" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
+            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$dispatchPort" $fingerprint
             Write-Host $r.stderr
             Write-Host "--- worker log ---"
             Write-Host (Read-LiveText $workerLog)
@@ -1294,13 +1432,86 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         }
         Write-Host "   a C translation unit was compiled as C on the worker"
 
+        # --- 3b: a dispatched object naming its checkout stays with it -------
+        #
+        # A worker compiles `/E` text whose line markers name the CLIENT's paths, so
+        # the builtin `std::source_location` is made of resolves to the client's
+        # checkout on the worker -- and no key sees it, because it is filled in after
+        # preprocessing. The dispatched object is stored by the same code as a local
+        # one, scanned against the client's roots (apps/fastcache-cc/RootBinding.hpp),
+        # so a second checkout must MISS through the first one's marker and dispatch
+        # its own, and the first must still HIT its own copy without dispatching.
+        # Before root binding the second checkout was served the first one's object.
+        $boundRoots = @{}
+        foreach ($co in 'checkout-a', 'checkout-b') {
+            $broot = Join-Path $scratch "bound\$co"
+            New-Item -ItemType Directory -Force -Path (Join-Path $broot "build") | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $broot "inc") | Out-Null
+            "#pragma once`ninline int One() { return 1; }" | Set-Content -Encoding utf8 (Join-Path $broot "inc\h1.h")
+            ("#include `"inc/h1.h`"`nchar const* Tag() { return `"$cc-dist-case-bound`"; }`n" +
+             "char const* Where() { return __builtin_FILE(); }`nint G() { return One(); }") |
+                Set-Content -Encoding utf8 (Join-Path $broot "u.cpp")
+            $boundRoots[$co] = $broot
+        }
+        $objA = Join-Path $boundRoots['checkout-a'] "build\u.obj"
+        $objB = Join-Path $boundRoots['checkout-b'] "build\u.obj"
+        $rA = Invoke-Dispatching $cc $boundRoots['checkout-a'] $objA "127.0.0.1:$dispatchPort" $cachePort
+        $rB = Invoke-Dispatching $cc $boundRoots['checkout-b'] $objB "127.0.0.1:$dispatchPort" $cachePort
+        Remove-Item -LiteralPath $objA -Force -ErrorAction SilentlyContinue
+        $rA2 = Invoke-Dispatching $cc $boundRoots['checkout-a'] $objA "127.0.0.1:$dispatchPort" $cachePort
+        $bNamesA = (Test-Path $objB) -and [System.Text.Encoding]::Latin1.GetString(
+            [System.IO.File]::ReadAllBytes($objB)).Contains($boundRoots['checkout-a'])
+        $okA = $rA.code -eq 0 -and $rA.stderr -match "DISPATCHED to " -and $rA.stderr -match "root-bound object"
+        $okB = $rB.code -eq 0 -and $rB.stderr -match "fastcache-cc: MISS key=\S+ \(root-bound:" `
+               -and $rB.stderr -match "DISPATCHED to " -and (Test-Path $objB) -and -not $bNamesA
+        $okA2 = $rA2.code -eq 0 -and $rA2.stderr -match "fastcache-cc: HIT key=\S+ \(root-bound:" `
+                -and $rA2.stderr -notmatch "DISPATCHED to "
+        if (-not ($okA -and $okB -and $okA2)) {
+            foreach ($leg in @(@{n="a"; r=$rA}, @{n="b"; r=$rB}, @{n="a again"; r=$rA2})) {
+                Write-Host "--- $($leg.n) ---"
+                Write-Host $leg.r.stderr
+            }
+            throw "a dispatched root-bound object was not kept with its checkout (a=$okA b=$okB b-names-a=$bNamesA a-again=$okA2)"
+        }
+        Write-Host "   a dispatched object naming its checkout was kept with it, and served back to it"
+
+        # --- 3c: one header, two include chains, one note (#1593) ------------
+        #
+        # A worker sees no `#include`, so the client writes a dispatched compile's
+        # /showIncludes notes from its probe's dependency list. `cl` reports a header it
+        # reaches twice in two spellings -- `<root>\a/x.h` directly, `<root>\b\../a/x.h`
+        # through `b/y.h` (measured, VS 18) -- and the renderer's dedup is byte-exact, so
+        # before the list was collapsed and spelled one way at the probe boundary this
+        # wrote two notes for one file. The header is UNGUARDED on purpose: both drivers
+        # skip the note for a guarded header's second inclusion entirely.
+        $chainRoot = Join-Path $scratch "chains"
+        New-Item -ItemType Directory -Force -Path (Join-Path $chainRoot "build"), (Join-Path $chainRoot "a"),
+            (Join-Path $chainRoot "b") | Out-Null
+        "extern int xv;" | Set-Content -Encoding utf8 (Join-Path $chainRoot "a\x.h")
+        "#include `"../a/x.h`"`ninline int Y() { return 2; }" | Set-Content -Encoding utf8 (Join-Path $chainRoot "b\y.h")
+        ("#include `"a/x.h`"`n#include `"b/y.h`"`nchar const* Tag() { return `"$cc-dist-case-chains`"; }`n" +
+         "int U() { return Y() + xv; }") | Set-Content -Encoding utf8 (Join-Path $chainRoot "u.cpp")
+        $chainObj = Join-Path $chainRoot "build\u.obj"
+        $rC = Invoke-Dispatching $cc $chainRoot $chainObj "127.0.0.1:$dispatchPort" $cachePort "u.cpp" @("/showIncludes")
+        $notes = @(($rC.stdout -split "`r?`n") | Where-Object { $_ -match '^Note: including file:' })
+        $xNotes = @($notes | Where-Object { $_ -match '[\\/]a[\\/]x\.h$' })
+        $yNotes = @($notes | Where-Object { $_ -match '[\\/]b[\\/]y\.h$' })
+        $dotted = @($notes | Where-Object { $_ -match '(^|[\\/ ])\.\.([\\/]|$)' })
+        if (-not ($rC.code -eq 0 -and $rC.stderr -match "DISPATCHED to " -and $xNotes.Count -eq 1 -and $yNotes.Count -eq 1 `
+                  -and $dotted.Count -eq 0)) {
+            Write-Host "--- stdout ---"; Write-Host $rC.stdout
+            Write-Host "--- stderr ---"; Write-Host $rC.stderr
+            throw ("a header reached through two include chains was not ONE note (x.h notes=$($xNotes.Count), " +
+                   "y.h notes=$($yNotes.Count), notes with '..'=$($dotted.Count))")
+        }
+        Write-Host "   a header reached through two include chains was one note, with no '..' in any"
+
         # --- 4: a worker for another toolchain is never chosen ---------------
-        # Its own daemon and its own worker, so the mismatched worker is the ONLY
-        # one registered. Reusing the fleet above would leave a matching worker
-        # available and the case would pass without testing anything.
+        # Its own daemon and its own node, so the mismatched worker is the ONLY one its
+        # scheduler has. Reusing the node above would leave a matching worker available
+        # and the case would pass without testing anything.
         $isoCache    = $BasePort + 3
         $isoDispatch = $BasePort + 4
-        $isoWorker   = $BasePort + 5
 
         $isoDaemonLog = Join-Path $scratch "iso-daemon.log"
         $isoDaemon = Start-Background $Fastcached @(
@@ -1309,34 +1520,21 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $procs += $isoDaemon
         Wait-ForReady Daemon $isoCache $isoDaemon "isolation daemon" $isoDaemonLog
 
-        # A second SCHEDULER as well, so the mismatched worker is the only one
-        # registered with it -- and it runs no worker (`--slots=0`, #206), or it would
-        # BE a matching worker and the case would pass without testing anything.
-        $isoSchedLog = Join-Path $scratch "iso-scheduler.log"
-        $isoSchedState = Join-Path $scratch "iso-scheduler.state"
-        $isoSchedKey = Get-SchedulerKey $isoSchedState $isoRaftPort
-        $isoScheduler = Start-Background $Node @(
-            $NoLocalCache,
-            "--serve-scheduler", "--listen-node=127.0.0.1:$isoDispatch", "--fleet-open",
-            "--listen-raft=127.0.0.1:$isoRaftPort", "--raft-self=127.0.0.1",
-            "--cluster-dir=$isoSchedState",
-            "--advertise=127.0.0.1:$isoDispatch",
-            "--slots=0", "--log-level=debug") $isoSchedLog
-        $procs += $isoScheduler
-        Wait-ForReady Node $isoDispatch $isoScheduler "isolation scheduler" $isoSchedLog
-
+        # One node, serving a toolchain this client does not use: its own worker is the
+        # only one its scheduler has.
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
         $isoWorkerState = Join-Path $scratch "iso-worker.state"
-        Admit-Worker $isoWorkerState "127.0.0.1:$isoDispatch" "isolation worker"
         $isoNode = Start-Background $Node @(
-            $NoLocalCache, "--voter-key=$isoSchedKey", "--cluster-dir=$isoWorkerState",
-            "--scheduler=127.0.0.1:$isoDispatch", "--listen-node=127.0.0.1:$isoWorker",
-            "--advertise=127.0.0.1:$isoWorker",
+            $NoLocalCache, "--fleet-open",
+            "--listen-node=127.0.0.1:$isoDispatch", "--advertise=127.0.0.1:$isoDispatch",
+            "--listen-raft=127.0.0.1:$isoRaftPort", "--raft-self=127.0.0.1",
+            "--cluster-dir=$isoWorkerState", "--discovery=",
             "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",
             "--log-level=debug") $isoWorkerLog
         $procs += $isoNode
-        Wait-ForReady Node $isoWorker $isoNode "isolation worker" $isoWorkerLog
-        Wait-ForLine $isoWorkerLog "roster: adopted roster version" 60 "isolation worker" | Out-Null
+        Wait-ForReady Node $isoDispatch $isoNode "isolation worker" $isoWorkerLog
+        Wait-ForLine $isoWorkerLog "scheduling for the fleet" 60 "isolation worker" | Out-Null
+        Assert-ChecksLeases $isoWorkerLog "isolation worker"
         Wait-ForLine $isoWorkerLog "toolchain\(s\) registered" 120 "isolation worker" | Out-Null
 
         $isoRoot = Join-Path $scratch "iso-proj"
@@ -1393,6 +1591,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $r = Invoke-Dispatching $cc $deadRoot $deadObj "127.0.0.1:$dispatchPort" $deadCachePort
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the build did not survive an unreachable cache" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
+            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$dispatchPort" $fingerprint
             Write-Host $r.stderr
             Write-Host "--- worker log ---"
             Write-Host (Read-LiveText $workerLog)
@@ -1441,20 +1640,52 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         # accepted cost of cross-checkout sharing on this platform.
         Write-Host "== no case 13 here: neither COFF driver has a path-map switch (see #203, #506)"
 
-        Stop-Spawned
+        # Named WHEN FOUND, so the line precedes whatever the next driver reports. Fatal
+        # here only with `-BasePort` pinned: every driver then shares one port block, and
+        # the next pass would start beside a process still holding it. With the default
+        # the next pass has a directory and a port block of its own (see `$scratchBase`),
+        # so a survivor holds nothing it will reach for; it is still not a clean run, so
+        # it is counted and the `finally` fails the exit status.
+        $found = @(Stop-Spawned)
+        foreach ($line in $found) { Write-Host "teardown after ${cc}: $line" }
+        $script:killSurvivors += $found
+        if ($found.Count -gt 0 -and $PinnedBasePort -ne 0) {
+            throw "$($found.Count) process(es) outlived the teardown after $cc, and -BasePort pins every driver to one port block"
+        }
     }
 
     if (-not $ranAnyCompiler) {
         Write-Host "no usable MSVC-family compiler here; skipping"
         exit $SKIP
     }
+
+    # The positive control: this run's compiles recorded in its own log.
+    $recorded = Get-E2ELauncherStateRecordCount $launcherState
+    if ($recorded -lt 1) { throw "the launcher recorded nothing in this run's state log ($($launcherState.Log))" }
+    Write-Host "this run's compiles were recorded in its own state log: $recorded record(s)"
+
     Write-Host ""
     Write-Host "dist-compile E2E PASSED"
 } catch {
     Write-Host "dist-compile E2E FAILED: $_"
     $exit = 1
 } finally {
-    Stop-Spawned
+    # Those found between drivers were printed when found; only this teardown's are new.
+    $final = @(Stop-Spawned)
+    foreach ($line in $final) { Write-Host "teardown: $line" }
+    # What the run did to the caller's logs, reported on EVERY way out -- a failure path is
+    # where a leak shows -- and a failure whatever else happened.
+    $callerDamage = @(Exit-E2ELauncherState $launcherState)
+    foreach ($line in $callerDamage) { Write-Host "dist-compile E2E FAILED: $line" }
+    $survivors = @($script:killSurvivors) + $final
+    # Released LAST, once nothing this run started should still be writing under it.
+    if ($null -ne $runRoot) { $runRoot.Claim.Dispose() }
+    if ($callerDamage.Count -gt 0) { exit 1 }
+    # And not a clean exit. A run that is already failing keeps its failure, which is
+    # the diagnostic that matters; a pass -- or a SKIP, whose `exit` is unwinding
+    # through here -- leaving a process it could not kill is not one, so the `exit`
+    # here overrides it.
+    if ($survivors.Count -gt 0 -and $exit -ne 1) { exit 1 }
 }
 
 exit $exit

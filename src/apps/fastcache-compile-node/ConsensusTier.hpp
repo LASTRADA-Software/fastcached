@@ -2,18 +2,25 @@
 #pragma once
 
 #include "ConsensusStanding.hpp"
+#include "LocalCache.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeFormation.hpp"
 #include "NodeMembership.hpp"
+#include "NodeRefusal.hpp"
 #include "NodeRoster.hpp"
+#include "NodeSurfaces.hpp"
 #include "SchedulerTier.hpp"
+#include "SharedCacheDirectory.hpp"
+#include "SharedCacheHost.hpp"
 
+#include <FastCache/Cluster/AnnouncedEndpoints.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/ClusterStateMachine.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
-#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Cluster/RosterKeys.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
+#include <FastCache/Consensus/ForwardingSink.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
@@ -24,7 +31,9 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
+#include <core/net/AcceptLoopHealth.hpp>
 #include <core/net/PlatformLoop.hpp>
 #include <core/platform/Clock.hpp>
 // For `ConsensusStatus`, which is the shape a scrape reports this node's own quorum
@@ -49,43 +58,80 @@
 #include <unordered_map>
 #include <vector>
 
+#include <WorkerProtocol.hpp>
 #include <core/net/Sockets.hpp>
 #include <core/net/ThreadedAddressResolver.hpp>
 
 namespace FastCache::Node
 {
 
+/// Why a consensus tier cannot start without this node's id.
+///
+/// Every Raft message is addressed by member id, so a node with none could never be voted for.
+/// **No configuration reaches it**: the start mints the id into the state directory before this
+/// tier exists, so it names the caller that skipped that, rather than a flag to change. It ends
+/// without a full stop for `ConsensusNamesNoDialAddressRefusal`'s reason.
+inline constexpr std::string_view ConsensusNeedsNodeIdRefusal =
+    "consensus needs this node's id and was started without one: every Raft message is addressed by member id, so a "
+    "node without one could never be voted for. The start mints it into the state directory before consensus "
+    "exists, so this is a caller that skipped that";
+
 /// Why a consensus tier cannot start without this node's identity key (#178).
 ///
 /// Every Raft peer connection proves each end's OWN key, so a node without one could neither
 /// be heard nor hear anybody -- and running consensus unauthenticated instead is the
 /// per-connection fallback #1308 refused, one key later. **No configuration reaches it**: a
-/// node running consensus always has a state directory (`HoldsNodeKey`), and the start resolves
+/// node always has a state directory (`NodeStateDirectory`), and the start resolves
 /// the key there -- or refuses, naming the file -- before this tier exists. So it names the
 /// caller that skipped that, rather than a flag to change. It ends without a full stop for
-/// `ConsensusNamesNoSelfPeerRefusal`'s reason.
+/// `ConsensusNamesNoDialAddressRefusal`'s reason.
 inline constexpr std::string_view ConsensusNeedsIdentityKeyRefusal =
     "consensus needs this node's identity key and was started without one: every Raft peer connection proves each "
     "end's own key, so a node without one could neither be heard nor hear anybody. The start resolves it out of the "
     "state directory before consensus exists, so this is a caller that skipped that";
 
-/// Where clients should be told to reach this node's scheduler.
+/// This node's own member record, which consensus runs as and announces.
 ///
-/// The HOST comes from this node's own consensus endpoint and the PORT from what
-/// the scheduler surface actually bound, and neither half can supply the other. A
-/// scheduler that bound `0.0.0.0:7000` -- which is its default, because peers are
-/// on other machines by definition -- names no address a client can dial. The
-/// consensus endpoint is dialable by construction, since every peer opens a socket
-/// to it, and names the wrong port.
+/// Its entry among the members the formation starts with, or -- where they name it with no
+/// endpoint yet -- one built from the address consensus runs under (`ConsensusDialAddressOf`).
+/// A mode that dials in (a learner, whose row closes the Raft port) is its entry as recorded,
+/// endpoint or none, and is built with NO endpoint where it is absent: nobody dials it, so it is
+/// never refused for lacking an address. Any other mode that names no address is refused: a
+/// member nobody can reach could never win a vote and could never be voted for.
 ///
-/// Exposed rather than hidden in the `.cpp` for the reason `ParsePeerSpec` is: the
-/// rule is worth checking, and the alternative home is `main.cpp`, which is in no
-/// test target.
-/// @param raftEndpoint This node's consensus endpoint, as its peers dial it.
-/// @param schedulerBound What the scheduler surface bound, empty when it serves
-///        none.
-/// @return The endpoint to advertise, empty when there is nothing to advertise.
-[[nodiscard]] std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::string_view schedulerBound);
+/// Exposed rather than hidden in `Start` because the rule is worth checking and `main.cpp` is in no
+/// test target: which mode may start without an address is a rule, and `Start` needs a whole tier
+/// to reach it.
+/// @param cfg The resolved configuration, with its identity and formation applied.
+/// @param members The members the formation starts consensus with (`BootstrapMembersOf`).
+/// @param publicKey The identity key this node proves itself with, which a record always holds.
+/// @return The record, or `ConsensusNeedsNodeIdRefusal` / `ConsensusNamesNoDialAddressRefusal`.
+[[nodiscard]] std::expected<Cluster::ClusterMember, std::string> ConsensusSelfMemberOf(
+    NodeConfig const& cfg, std::span<Cluster::MemberSpec const> members, Ed25519PublicKey const& publicKey);
+
+/// Where a member's consensus port answers, as a log line says it.
+///
+/// A learner dials in, so the cluster may record it with no consensus endpoint, and a line
+/// interpolating the empty string reads `recorded laptop at , scheduler ...` -- a blank where
+/// the renderers say absent. Exposed so a case can read the wording without a running tier.
+/// @param raftEndpoint The recorded endpoint, possibly empty.
+/// @return `at <endpoint>`, or `with no consensus endpoint` when it is empty.
+[[nodiscard]] std::string DescribeConsensusEndpoint(std::string_view raftEndpoint);
+
+/// Every peer that reaches this node by dialling in, which the transport places as such.
+///
+/// Read through the one column two ways, and both are needed. The RECORD's seats
+/// (`Cluster::LinkOfSeat`) name every learner the cluster agreed on; the CONFIGURATION's
+/// standings (`Consensus::Membership::StandingOf`, then `TraitsOf(...).link`) name the ones
+/// consensus counts right now -- which after a restart includes a learner whose admission sits in
+/// the log tail, applied only once this node has led and committed again, while the leader sends
+/// to it from the moment it leads. Placing from the record alone counted every such drop as a
+/// peer nothing can reach.
+/// @param state The applied state.
+/// @param configuration The configuration consensus holds.
+/// @return The ids, sorted, each once.
+[[nodiscard]] std::vector<Consensus::NodeId> DialInPeers(Cluster::ClusterState const& state,
+                                                         Consensus::Configuration const& configuration);
 
 /// What one read of the driver says about this node's own cluster.
 ///
@@ -111,9 +157,8 @@ inline constexpr std::string_view ConsensusNeedsIdentityKeyRefusal =
 /// which is what issue #117 was, and why nobody could tell whether the algorithm
 /// or the fixture was wrong.
 ///
-/// A free function for the reason `AdvertisedSchedulerEndpoint` is: the wording
-/// is the diagnostic, and a rendering reachable only from a running tier is one
-/// no case can read.
+/// A free function so a case can read it: the wording is the diagnostic, and a
+/// rendering reachable only from a running tier is one no case can read.
 /// @param role What this node is, in the scheduler's vocabulary.
 /// @param term The consensus term it is playing it in.
 /// @param leaderEndpoint Where its leader answers; empty when there is none or
@@ -137,7 +182,7 @@ inline constexpr std::string_view ConsensusNeedsIdentityKeyRefusal =
 ///
 /// `RaftDriver::Create` refused because the application cannot read what the node
 /// recovered -- its own snapshot, or a command its own log holds -- and running on the
-/// rest would mean running without the members, the settings and the forget tombstones
+/// rest would mean running without the members, the settings and the revoked keys
 /// that state carried. What an operator needs is WHERE (the directory), WHAT (which
 /// part, the version found and the version this build reads, all of it in the
 /// refusal's context) and what to DO, which is the store's own remedy: the three files
@@ -215,7 +260,67 @@ void ReportInstallRefusal(std::optional<Consensus::RaftDriver::InstallRefusal> c
     return proposedAt > commitIndex;
 }
 
+/// The shape a node's consensus tier takes: its mode row's columns, read in one place.
+struct ConsensusTierShape
+{
+    bool listens { true }; ///< Whether the Raft port is bound and a peer server accepts on it (`raftListener`).
+    /// Which way the sessions this node dials flow (`dials`): `TwoWay` for a learner.
+    Consensus::RaftWire::SessionDirection direction { Consensus::RaftWire::SessionDirection::OneWay };
+};
+
+/// The shape @p cfg's mode gives its consensus tier.
+///
+/// A configuration no record shaped listens one-way, as every node did before a mode decided: its
+/// Raft surface resolves nothing, so the start refuses it by the surface's own sentence.
+/// @param cfg The configuration, its formation applied.
+/// @return The shape.
+[[nodiscard]] ConsensusTierShape ConsensusTierShapeOf(NodeConfig const& cfg) noexcept;
+
+/// What a node's formation is told by its consensus. Either may be empty, which a case that is not
+/// about formation leaves it.
+///
+/// Both are PUSHED, for `ConsensusTier::RoleObserver`'s reason: the applied state and a signed
+/// revocation arrive on consensus's threads, and the formation acts on the applied state alone
+/// (`FormationController::OnClusterState`) -- never on a proposal or a leader's word.
+struct FormationHooks
+{
+    /// Told every applied state and every move of who leads: the state, the cluster whose consensus
+    /// applied it (the tier knows which; a state names none), who leads, and where the leader answers
+    /// the `0xFC` port -- empty when nobody is known to lead or the state records no endpoint for it.
+    /// Called on consensus's threads: it records and returns, and never calls back into the tier.
+    std::function<void(Cluster::ClusterState const& state,
+                       std::string_view clusterId,
+                       std::optional<Consensus::NodeId> const& leader,
+                       std::string_view leaderNodeEndpoint)>
+        onState;
+
+    /// Told that an acceptor that proved its id answered, SIGNED, that this node's own key is
+    /// revoked -- how a learner offline through its own forget learns of it (#1555).
+    Consensus::OwnKeyRevokedObserver onOwnKeyRevoked;
+};
+
+/// Who leads and when it last spoke to this node, as a reconcile pass reads the driver
+/// (`ConsensusTier::LeaderContactObserver`).
+///
+/// RAW: it does not decide whether the leader counts. The driver's configuration is its ACTIVE one,
+/// which an uncommitted entry can move, while the rule is a leader the APPLIED configuration counts
+/// -- so that is asked by the roster, of the voters it applied. Pure, so the reading is pinned by a
+/// test: while this node leads, an age of zero; otherwise the leader it names and how long ago the
+/// driver last accepted contact from it -- an AGE, so the roster measures silence on its own clock.
+/// @param progress The driver's progress, read together.
+/// @param now The pass's instant, on the driver's steady clock.
+/// @return The reading.
+[[nodiscard]] Distributed::LeaderReading LeaderReadingOf(Consensus::RaftDriver::Progress const& progress,
+                                                         core::platform::SteadyTimePoint now);
+
 /// Consensus, running.
+///
+/// **A mode's ROW decides the tier's shape, and nothing here switches on the mode.** Its
+/// `raftListener` column decides whether the Raft port is bound and a peer server accepts on it --
+/// a learner listens for nobody -- and its `dials` column decides which way every session this node
+/// dials flows: `TwoWay` for a learner, which nobody dials, so the voter it dials answers on the
+/// same connection. Who is dialled is the seat's link column (`Cluster::LinkOfSeat`): a member
+/// whose seat dials IN -- a learner -- is never dialled, by a voter or by another learner.
 ///
 /// **What this replaces is the reason it exists.** Until now every node called
 /// `SchedulerService::SetRole(Leader, {})` at startup — a placeholder that was said
@@ -324,46 +429,52 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// forget. One commit, one call, both facts.
     using MembersObserver = std::function<void(Cluster::ClusterState const& state)>;
 
-    /// Told every endorsement this node signs of the roster it applied (#178).
-    ///
-    /// Pushed, as the member set is, because it has two readers that must not wait for each
-    /// other: this node's own scheduler takes it directly -- which is how a lone scheduler
-    /// certifies its roster without dialling itself -- and the presence loop carries the latest
-    /// one to whoever leads. Called on the reconciler thread, only when an endorsement is
-    /// signed: when the roster changes, and every `Cluster::RosterEndorsementRefresh` while it
-    /// does not.
-    using EndorsementObserver = std::function<void(Cluster::RosterEndorsement const& endorsement)>;
+    /// Told, at every reconcile pass, who leads and how long ago it last spoke (`LeaderReadingOf`)
+    /// -- raw, for the roster to judge against the configuration it APPLIED, and an age, for the
+    /// roster to measure on its own clock. Called on the reconciler thread: it records and returns.
+    using LeaderContactObserver = std::function<void(Distributed::LeaderReading const& reading)>;
 
     /// Start consensus, or explain why the node must not start.
     /// @param cfg The parsed configuration.
-    /// @param schedulerBound What this node's scheduler surface bound, empty when
-    ///        it serves none. Only the PORT is taken from it; see
-    ///        `AdvertisedSchedulerEndpoint` for why the host cannot be.
+    /// @param advertised Where this node's `0xFC` port answers, read at every reconcile pass: the
+    ///        endpoint its own record asserts (`ClusterMember::schedulerEndpoint`), so a reload of
+    ///        `--advertise` reaches the record at the next pass this node leads. The one object the
+    ///        worker registers under and NODE-ANNOUNCE names (`AnnouncedEndpoint`). Must outlive the
+    ///        tier.
     /// @param identityKey This node's identity key, as the start resolved it out of the state
     ///        directory (#178). Taken rather than read again, so the key every peer connection
     ///        proves and the one the node announced are one reading of one file. Disengaged is
     ///        refused (`ConsensusNeedsIdentityKeyRefusal`).
     /// @param onRole Told this node's role; must outlive the tier.
     /// @param onMembers Told the member set; must outlive the tier.
-    /// @param wallClock What an endorsement's `notAfter` is read from: a WALL clock, since a
-    ///        worker on another machine compares it with its own. Must outlive the tier.
-    /// @param onEndorsement Told every endorsement this node signs; may be empty.
+    /// @param onLeaderContact Told each pass's reading of when a counted leader last spoke -- what
+    ///        bounds how long a worker trusts the state it applied; must outlive the tier.
     /// @param metrics Where a refused peer connection is counted; must outlive the tier.
     /// @param logger Where progress and refusals are reported.
     /// @param conditions Where this tier answers its node conditions; null when nobody
     ///        reads them. Must outlive the tier.
+    /// @param hooks What this node's formation is told; empty for a node whose formation does not
+    ///        listen. Stated by every caller, never defaulted: a defaulted collaborator is how a new
+    ///        production caller would drop the formation without a word.
+    /// @param boundListener A socket already bound to the peer port the configuration names and
+    ///        listening, served as it is instead of binding that port again; null binds it, which
+    ///        is what a node does. For a caller that chose the port by binding it: releasing the
+    ///        socket so the tier can bind the same number leaves an ephemeral port free for
+    ///        anything else on the host to take in between. Owned from here on, on every path --
+    ///        a start refused before the listener is served closes it.
     /// @return The running tier, or the fatal reason.
-    [[nodiscard]] static std::expected<std::unique_ptr<ConsensusTier>, std::string> Start(
+    [[nodiscard]] static std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> Start(
         NodeConfig const& cfg,
-        std::string_view schedulerBound,
+        Cc::IAdvertisedEndpointSource const& advertised,
         std::optional<Ed25519KeyPair> const& identityKey,
         RoleObserver onRole,
         MembersObserver onMembers,
-        core::platform::WallClockRef wallClock,
-        EndorsementObserver onEndorsement,
+        LeaderContactObserver onLeaderContact,
         IMetricsSink& metrics,
         ILogger& logger,
-        NodeConditions* conditions = nullptr);
+        NodeConditions* conditions,
+        FormationHooks hooks,
+        std::unique_ptr<BlockingListener> boundListener = nullptr);
 
     ConsensusTier(ConsensusTier const&) = delete;
     ConsensusTier& operator=(ConsensusTier const&) = delete;
@@ -414,6 +525,11 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// @return The standing; always engaged, since a tier that exists runs consensus.
     [[nodiscard]] std::optional<Consensus::Standing> CurrentStanding() const override;
 
+    /// Whether this node has applied the log it recovered when the tier started (`AppliedStateOf`),
+    /// from ONE read of the driver, so the applied and last indices describe one moment.
+    /// @return `Behind` or `CaughtUp`.
+    [[nodiscard]] AppliedStateReading CurrentAppliedState() const override;
+
     /// Offer a change to the cluster, discarding where it landed.
     ///
     /// The `IClusterAdmin` spelling of `Propose`. The index is dropped because the
@@ -422,6 +538,12 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// @param command The change.
     /// @return Nothing, or why it was refused.
     [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) override;
+
+    /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+    ///
+    /// Kept, latest per member, until the next pass this node leads, which re-proposes the member's
+    /// record when it differs (`Cluster::AnnouncedEndpointDesires`). Any thread.
+    void NoteAnnouncedEndpoint(Consensus::NodeId const& member, std::string endpoint) override;
 
     /// Add to what this node believes the membership should include.
     ///
@@ -456,26 +578,56 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
         return _roster;
     }
 
-    /// The address this node's peer port bound.
+    /// The address this node's peer port bound; EMPTY for a mode whose row binds none -- a learner,
+    /// which dials every voter and is answered on that session.
     [[nodiscard]] std::string const& BoundEndpoint() const noexcept
     {
         return _boundEndpoint;
     }
 
+    /// Whether the peer port's accept loop is degraded, or has stopped while this tier was not
+    /// shutting down.
+    ///
+    /// The tier's own, because it runs its own reactor; `main` forwards it into the node's one
+    /// registry (`core::net::AcceptLoopHealth::forward`), which the liveness probe and the condition read.
+    /// @return The registry the peer server reports to.
+    [[nodiscard]] core::net::AcceptLoopHealth& AcceptLoops() noexcept
+    {
+        return _acceptLoops;
+    }
+
+    /// Which way the sessions this node dials flow: its mode row's `dials` column.
+    /// @return `TwoWay` for a learner, `OneWay` otherwise.
+    [[nodiscard]] Consensus::RaftWire::SessionDirection Direction() const noexcept;
+
+    /// Every member this node dials now, self excluded, sorted. Read off the transport, so it is
+    /// the dial list itself rather than a second account of it.
+    /// @return The ids.
+    [[nodiscard]] std::vector<Consensus::NodeId> DialTargets() const;
+
   private:
     ConsensusTier(Cluster::ClusterMember self,
+                  Cc::IAdvertisedEndpointSource const& advertised,
                   Consensus::FileRaftStorage storage,
                   Ed25519KeyPair identityKey,
-                  std::span<Cluster::ClusterMember const> knownMembers,
+                  std::span<Cluster::MemberSpec const> knownMembers,
                   std::string boundEndpoint,
                   RoleObserver onRole,
                   MembersObserver onMembers,
-                  core::platform::WallClockRef wallClock,
+                  LeaderContactObserver onLeaderContact,
                   std::string clusterId,
-                  EndorsementObserver onEndorsement,
                   IMetricsSink& metrics,
                   ILogger& logger,
-                  NodeConditions* conditions);
+                  NodeConditions* conditions,
+                  FormationHooks hooks);
+
+    /// Bind the Raft port on this node's reactor, or serve the one a caller handed over already
+    /// bound, or explain why neither can be.
+    /// @param bind Where to bind, and where a handed listener must be bound.
+    /// @param boundListener The peer port already bound, or null to bind it; see `Start`.
+    /// @return Nothing on success, or the fatal reason.
+    [[nodiscard]] std::expected<void, NodeRefusal> Listen(SurfaceEndpoint const& bind,
+                                                          std::unique_ptr<BlockingListener> boundListener);
 
     /// Build the driver and start both loops.
     ///
@@ -491,14 +643,17 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     ///        nothing else can supply it.
     /// @param bootstrap The member set consensus starts under; empty for a node
     ///        waiting to be admitted.
-    /// @param bindAddress Where the peer port binds.
-    /// @param bindPort The peer port.
+    /// @param bind Where the peer port binds; DISENGAGED for a mode whose row binds none, which
+    ///        then runs no peer server either.
+    /// @param direction Which way the sessions this node dials flow.
+    /// @param boundListener The peer port already bound, or null to bind it; see `Start`.
     /// @return Nothing on success, or the fatal reason.
-    [[nodiscard]] std::expected<void, std::string> Launch(NodeConfig const& cfg,
-                                                          std::vector<Cluster::ClusterMember> const& dialable,
-                                                          std::vector<Cluster::ClusterMember> const& bootstrap,
-                                                          std::string_view bindAddress,
-                                                          std::uint16_t bindPort);
+    [[nodiscard]] std::expected<void, NodeRefusal> Launch(NodeConfig const& cfg,
+                                                          std::vector<Cluster::MemberSpec> const& dialable,
+                                                          std::vector<Cluster::MemberSpec> const& bootstrap,
+                                                          std::optional<SurfaceEndpoint> const& bind,
+                                                          Consensus::RaftWire::SessionDirection direction,
+                                                          std::unique_ptr<BlockingListener> boundListener);
 
     /// Translate a consensus role into the scheduler's, and pass it on.
     ///
@@ -524,6 +679,10 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// locally. Every time.
     void Republish();
 
+    /// Tell the formation the applied state, who leads, and where the leader answers.
+    /// @param state The state this node's consensus applied last.
+    void TellFormation(Cluster::ClusterState const& state);
+
     /// Act on a change to the replicated state.
     /// @param state What the cluster now holds.
     void OnStateChanged(Cluster::ClusterState const& state);
@@ -537,18 +696,6 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// block, being on the path that still has to send the next heartbeat.
     void Reconcile();
 
-    /// Endorse the roster @p state holds, when this node is a voter and one is due (#178).
-    ///
-    /// On EVERY node rather than only the leader, for `LearnMembers`' reason: a roster is
-    /// certified by a majority of the voters, and a leader cannot endorse on anybody's behalf.
-    /// Signed when the roster moved since the last endorsement and every
-    /// `Cluster::RosterEndorsementRefresh` while it has not, each lasting
-    /// `Cluster::RosterEndorsementLifetime` -- and never by a learner, or by a voter the state
-    /// records under a key other than the one this node holds, whose endorsement would verify
-    /// nowhere.
-    /// @param state What this node applied.
-    void Endorse(Cluster::ClusterState const& state);
-
     /// Teach the transport where every member of the cluster answers.
     ///
     /// Runs on **every** node rather than only the leader, and that is the whole
@@ -557,20 +704,23 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// replicates to it, and every other member sends it votes. A follower that
     /// waited to become leader before learning an address would be a follower whose
     /// votes go nowhere.
+    ///
+    /// It also tells the transport which members dial in rather than being dialled, read from
+    /// each member's seat through the link column (`Cluster::LinkOfSeat`), so a message for a
+    /// learner with no session is counted as that and never as a peer nothing can reach.
     /// @param state The cluster's state as this node last applied it.
     /// @param desired What this node believes should be present, snapshotted once
     ///        by the caller: taking it twice in one pass would let discovery land
     ///        between, so a leader would dial one set and propose from another.
     void LearnMembers(Cluster::ClusterState const& state, std::span<Cluster::DesiredMember const> desired);
 
-    /// Say, once per member, that a desire was refused because the cluster forgot its
-    /// host or its id.
+    /// Say, once per member, that a desire was refused because the cluster forgot its id
+    /// and revoked its key.
     ///
     /// The refusal itself is `Cluster::MembershipProposals`'s (#1528, #1555); this is only
     /// what makes it visible, since a refused desire and one the state already matches
-    /// both propose nothing. Which forget is named, because a host tombstone refuses
-    /// ANOTHER id at that host too, and an operator reading the line has to know which
-    /// machine's forget is being honoured. Reconciler thread only.
+    /// both propose nothing. The revoked key is named, because it is what the machine is
+    /// forgotten by, wherever it now dials from. Reconciler thread only.
     /// @param state The state the plan was made against.
     /// @param refused The desires this pass's plan refused.
     void ReportForgottenDesires(Cluster::ClusterState const& state, std::span<Cluster::DesiredMember const> refused);
@@ -664,11 +814,21 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// carries the election timers. Declared after `_reactor` and `_resolver`
     /// because it references both.
     std::unique_ptr<core::net::IConnector> _connector;
+
+    /// Where the transport delivers what an acceptor writes back on a two-way session. The
+    /// transport is built before the driver it delivers into, so this is bound to `_sink` once
+    /// that exists, before the transport starts. Declared before `_transport`, which holds it.
+    Consensus::ForwardingSink _inbound;
+
     std::unique_ptr<Consensus::RaftPeerTransport> _transport;
     Cluster::ClusterStateMachine _application;
     std::unique_ptr<Consensus::RaftDriver> _driver;
+    /// The last index the log held when the driver was built: what this node recovered, and what its
+    /// applied state must reach before an absent key means an absent member (`CurrentAppliedState`).
+    Consensus::LogIndex _recoveredLastIndex {};
     std::unique_ptr<core::net::IListener> _listener;
     std::unique_ptr<Consensus::IRaftMessageSink> _sink;
+    core::net::AcceptLoopHealth _acceptLoops; ///< Declared before the server that reports to it.
     std::unique_ptr<Consensus::RaftPeerServer> _peerServer;
 
     RoleObserver _onRole;
@@ -676,30 +836,29 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
 
     /// This node's own record, which nothing else can supply.
     ///
-    /// Its scheduler endpoint is the half nobody else knows: peers learn a node's
-    /// consensus address by dialing it, and there is no equivalent for a port they
-    /// never connect to. So a node announces itself, and only while it leads --
-    /// which is exactly when its scheduler endpoint is the one clients need.
+    /// Its `0xFC` endpoint is the half nobody else knows: peers learn a node's consensus
+    /// address by dialing it, and there is no equivalent for a port they never connect to.
+    /// So a node asserts its own -- read from `_advertised` at every pass, never kept here --
+    /// and every other member's arrives by a PROVEN announcement (`NoteAnnouncedEndpoint`).
     Cluster::ClusterMember _self;
+
+    /// Where this node's `0xFC` port answers now: what its own record asserts.
+    Cc::IAdvertisedEndpointSource const& _advertised;
 
     /// Told the member set whenever it changes; may be empty.
     MembersObserver _onMembers;
 
+    /// Told each reconcile pass's leader-contact reading; may be empty.
+    LeaderContactObserver _onLeaderContact;
+
     /// Where this tier answers `unreadable-leader-snapshot`; null when nobody reads it.
     NodeConditions* _conditions;
 
-    /// What an endorsement's lapse is read from.
-    core::platform::WallClockRef _wallClock;
-
-    /// The fleet every endorsement names: `--cluster-id`.
+    /// The fleet this node runs in: the formation record's cluster id, as the formation is told it.
     std::string _clusterId;
 
-    /// Told every endorsement this node signs; may be empty.
-    EndorsementObserver _onEndorsement;
-
-    /// The last endorsement this node signed, so an unchanged roster is re-signed only when a
-    /// refresh is due. Reconciler thread only.
-    std::optional<Cluster::RosterEndorsement> _endorsement;
+    /// What this node's formation is told; either half may be empty.
+    FormationHooks _hooks;
 
     /// What consensus last said, so a state change can be re-read against it.
     ///
@@ -747,6 +906,30 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     mutable std::mutex _desiredMutex;
     std::vector<Cluster::DesiredMember> _desired;
 
+    /// The latest `0xFC` endpoint each member PROVED and announced to this node's scheduler;
+    /// guarded by `_desiredMutex`. Dropped at every change of leadership (`PublishRole`): a follower
+    /// is told nothing, and a stale map must not outlive the leadership it was announced to.
+    Cluster::AnnouncedEndpointMap _announced;
+
+    /// Where a member's endpoint re-proposal landed, and in which term.
+    struct EndpointProposal
+    {
+        Consensus::LogIndex at; ///< The proposal's index.
+        Consensus::Term in;     ///< The term it was made in.
+    };
+
+    /// Each member whose endpoint re-proposal has not committed, so at most one is in flight per
+    /// member (`QuorumProposalPending` decides). Reconciler thread only; dropped at every change of
+    /// leadership, seen through `_leadershipChanges`.
+    std::map<Consensus::NodeId, EndpointProposal, std::less<>> _endpointsInFlight;
+
+    /// How many times this node gained or lost leadership: bumped at the transition (`PublishRole`),
+    /// read by the reconciler, which drops `_endpointsInFlight` when it moved since its last pass.
+    std::atomic<std::uint64_t> _leadershipChanges { 0 };
+
+    /// The `_leadershipChanges` the in-flight map was last kept under. Reconciler thread only.
+    std::uint64_t _inFlightLeadership { 0 };
+
     /// The member ids this node was started with, which it never proposes removing.
     ///
     /// What tells "the operator forgot this member" apart from "nobody ever wrote it
@@ -756,7 +939,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// rebuilt from live members only, so a fleet restarted after a removal would
     /// count a forgotten member forever.
     ///
-    /// Empty for a node started with `--raft-join`, which asserts nothing about who
+    /// Empty for a node that joined a fleet, which asserts nothing about who
     /// is a member -- so every member of the cluster it joins is one it may later be
     /// told to forget.
     std::vector<Consensus::NodeId> _bootstrapIds;
@@ -814,11 +997,12 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// pass repeats.
     std::atomic<bool> _leads { false };
 
-    /// How many of the two reactor loops are still running.
+    /// How many of the reactor loops `Start` submitted are still running: set from the list it
+    /// submits, never restated -- a mode that binds no Raft port runs one, every other two.
     ///
     /// Whichever finishes last stops the reactor, so `Run()` never returns while a
     /// coroutine is still parked on it -- which would leak that frame outright.
-    std::atomic<int> _loopsRunning { 2 };
+    std::atomic<int> _loopsRunning { 0 };
 
     // Started last and joined first, which the member order gives for free.
     std::jthread _ioThread;
@@ -841,13 +1025,33 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
 /// @return A reader of that tier's status, or an empty function when there is none.
 [[nodiscard]] std::function<ConsensusStatus()> ConsensusScrapeSource(ConsensusTier const* tier);
 
+/// What the consensus tier tells about the fleet's shared cache, at every applied state, in this
+/// order: where the shared cache is, whether this machine serves it, and then the private tier's
+/// upstream, which re-judges what it reports from the directory it was just told.
+///
+/// One record, so the three cannot be transposed at the call site; the order they are told in lives
+/// in `ApplySharedCacheState`, which a harness with no host calls too.
+struct SharedCacheListeners
+{
+    SharedCacheDirectory& directory; ///< Where the shared cache is.
+    SharedCacheHost& host;           ///< Whether this machine serves it.
+    ICacheUpstream* upstream;        ///< The private tier's upstream; null on a node that keeps no objects.
+
+    /// Tell each of them @p state, in order.
+    /// @param state The state the cluster just applied.
+    void Applied(Cluster::ClusterState const& state) const
+    {
+        ApplySharedCacheState(state, directory, &host, upstream);
+    }
+};
+
 /// Start consensus when the operator configured a cluster, wiring it to the node.
 ///
 /// A function rather than four lines in `WorkerBody`, for the reason
 /// `StartCacheTierOrExplain` is one: it is a coherent decision with one answer, it
 /// pushed `WorkerBody` past clang-tidy's cognitive-complexity limit inline, and
 /// `main.cpp` is in no test target. What it encodes is which of this node's parts
-/// consensus drives -- the scheduler's role and its endorsements, the fleet's membership,
+/// consensus drives -- the scheduler's role, the fleet's membership,
 /// and the roster every grant is verified against -- and that list is the thing worth
 /// reading in one place.
 ///
@@ -855,32 +1059,36 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
 /// and therefore no scheduler, since #178 makes every scheduler a consensus member. That is the
 /// ordinary shape of a pure worker, not a degraded one.
 /// @param cfg The parsed configuration.
-/// @param schedulerTier Told this node's role and every endorsement it signs; may be null when
-///        it serves none.
-/// @param schedulerBound What the node's `0xFC` listener bound, or empty when there
-///        is none. Passed in rather than read off the scheduler tier, which stopped
-///        owning a listener when the surfaces merged (#290) -- and it is what a leader
-///        advertises, so it must be what was BOUND: `--listen-node=0` means "pick a
-///        port", and an endpoint echoing `:0` back names nothing a client could dial.
+/// @param schedulerTier Told this node's role; may be null when it serves none.
+/// @param advertised Where this node's `0xFC` port answers now; see `ConsensusTier::Start`.
+///        Must outlive the tier.
 /// @param identityKey This node's identity key, as the start resolved it; see
 ///        `ConsensusTier::Start`.
 /// @param membership Told the replicated member set; must outlive the tier.
-/// @param roster Told every applied state and every endorsement this node signs (#178); must
-///        outlive the tier.
-/// @param wallClock What an endorsement's lapse is read from; must outlive the tier.
+/// @param roster Told every applied state (#178); must outlive the tier.
+/// @param schedulers Told every applied state: where this node's worker and presence loop register
+///        next, so a voter that moved its `0xFC` endpoint is reached without a reform. Must outlive
+///        the tier.
+/// @param sharedCache Told every applied state: the directory and the host by reference, since every
+///        node builds both and a consensus node that told them nothing would neither find nor serve
+///        the tier the cluster named; the upstream where there is one. Each must outlive the tier.
 /// @param metrics Where a refused peer connection is counted; must outlive the tier.
 /// @param logger Where progress and refusals are reported.
+/// @param conditions Where the tier answers its node conditions; null when nobody reads them.
+/// @param hooks What this node's formation is told; see `ConsensusTier::Start`.
 /// @return The tier, a null tier meaning "no cluster configured", or the fatal reason.
-[[nodiscard]] std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExplain(
+[[nodiscard]] std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExplain(
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,
-    std::string_view schedulerBound,
+    Cc::IAdvertisedEndpointSource const& advertised,
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     NodeRoster& roster,
-    core::platform::WallClockRef wallClock,
+    AppliedSchedulers& schedulers,
+    SharedCacheListeners sharedCache,
     IMetricsSink& metrics,
     ILogger& logger,
-    NodeConditions* conditions = nullptr);
+    NodeConditions* conditions,
+    FormationHooks hooks);
 
 } // namespace FastCache::Node

@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -136,7 +137,7 @@ struct ConsensusStatus
     /// learners, each in whatever order consensus holds them (#1449).
     ///
     /// Both sets empty means this node holds no configuration — the legitimate
-    /// waiting state of a `--raft-join` node, and a fatal one for any other. That is
+    /// waiting state of a node that joined a fleet, and a fatal one for any other. That is
     /// `HasCluster()`, which is why no separate boolean is carried: a second field
     /// saying the same thing is a second thing to be wrong. Where THIS node sits in
     /// it is `Consensus::Membership::StandingOf`, asked with the node's own id, which
@@ -260,13 +261,6 @@ struct MetricsSnapshot
     /// consensus and has not yet been admitted to anything, because that is a
     /// *reading* and the one #435 exists to make observable. See `ConsensusStatus`.
     std::optional<ConsensusStatus> consensus {};
-
-    /// Whole seconds until the roster this node verifies lease grants against stops being
-    /// certified, 0 once it has (#178) -- ABSENT on a node whose roster has no certificate to
-    /// lapse: a consensus member, whose roster is the state it applied, and a node that holds
-    /// none. A worker past zero, and the clock-skew slack, refuses every grant `roster-expired`,
-    /// so this is the reading an alert on a withholding or unreachable leader watches.
-    std::optional<std::uint64_t> rosterExpiresInSeconds {};
 
     Uptime uptime {};
 
@@ -421,7 +415,7 @@ enum class MetricsSurface : std::uint8_t
     ConsensusPeerWire,
 
     /// The fleet scheduler: `Distributed/SchedulerService.cpp`, `SchedulerProtocol.cpp` and
-    /// `FleetView.hpp`. Only a node started with `--serve-scheduler` builds one.
+    /// `FleetView.hpp`. Only a node whose mode serves the scheduler builds one.
     CompileScheduler,
 
     /// The compile worker, on both sides of the dispatch: `fastcache-cc`'s `WorkerProtocol.cpp`
@@ -449,6 +443,16 @@ enum class MetricsSurface : std::uint8_t
     /// these, and reporting them as zeroes there would be a plausible wrong answer.
     NodeDiscovery,
 
+    /// Zero-config formation, the node's `FormationController.cpp`: the decisions that move a node
+    /// between modes. Served where `main` constructs a controller -- which it does not yet -- so
+    /// until then no process moves these.
+    NodeFormation,
+
+    /// The fleet cache verbs on the node's merged listener: `SharedCacheResponder`,
+    /// `SharedCacheHost` and `LocalCache` under `SharedTierProfile`. Built on every node,
+    /// dormant or serving.
+    NodeSharedCache,
+
     /// Enumerator count. Not a surface.
     Last
 };
@@ -464,7 +468,8 @@ inline constexpr std::array EverySurface {
     MetricsSurface::CacheAcceptPath,   MetricsSurface::CacheStorage,      MetricsSurface::CacheCompileSurface,
     MetricsSurface::LiveStats,         MetricsSurface::ConsensusPeerWire, MetricsSurface::CompileScheduler,
     MetricsSurface::CompileWorker,     MetricsSurface::NodeEnrollment,    MetricsSurface::NodeCacheTier,
-    MetricsSurface::NodeFrameEndpoint, MetricsSurface::NodeDiscovery,
+    MetricsSurface::NodeFrameEndpoint, MetricsSurface::NodeDiscovery,     MetricsSurface::NodeFormation,
+    MetricsSurface::NodeSharedCache,
 };
 
 static_assert(EverySurface.size() == static_cast<std::size_t>(MetricsSurface::Last),
@@ -482,7 +487,7 @@ struct CounterSoleWriter
 /// row ABSENT rather than as a plausible zero.
 ///
 /// **One row per (counter, surface) PAIR, and a counter may have several.** A set-valued field
-/// would be a fixed-size array carrying exactly one element for 170 of 171 counters, to serve
+/// would be a fixed-size array carrying exactly one element for 222 of 223 counters, to serve
 /// the single row -- `LiveSubscriptionsRevoked` -- written from two components. Two rows say
 /// the same thing with no arithmetic, and `CounterHasAWriterIn` folds them.
 ///
@@ -505,23 +510,29 @@ struct CounterSoleWriter
 /// a row silently absent from the attribution and indistinguishable from one nobody had
 /// considered, cannot recur by omission ([#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)).
 ///
-/// **How the 171 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 46
-/// of them and would have rendered the other 125 absent -- the same defect as the bug, three
-/// times larger. The rows are written by four mechanisms, and reading only `SurfaceRefusal`
-/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 114 of the 125 and
-/// leaves eleven looking unwritten:
+/// **How the 230 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 58
+/// of them and would have rendered the other 172 absent -- the same defect as the bug, three
+/// times larger. The rows are written by five mechanisms, and reading only `SurfaceRefusal`
+/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 145 of the 172 and
+/// leaves 27 looking unwritten:
 ///
 /// | mechanism | rows |
 /// |---|---|
-/// | a `SurfaceRefusal` row, spent by `Refuse(row)` | 115 |
+/// | a `.counter` table row, spent by `Refuse(row)`, `RefuseAs` or an outcome table's reader | 146 |
 /// | a `LeaseToken.hpp` outcome row's `workerCounter` | 10 |
 /// | returned by a classifier for its caller to spend | 4 |
-/// | `Increment(Counter::X)` directly | 46 |
+/// | a `CacheTierProfile` member, spent by the tier built with it | 16 |
+/// | `Increment(Counter::X)` directly | 58 |
 ///
-/// The column sums past 171 because four rows are written two ways -- and the 114 above is not
-/// the 115 here: 115 rows HAVE a refusal row, and 114 of those have no increment site, which is
+/// The column sums past 230 because four rows are written two ways -- and the 145 above is not
+/// the 146 here: 146 rows HAVE a refusal row, and 145 of those have no increment site, which is
 /// what a `SurfaceRefusal`-only reading would reach. Two figures one apart, measuring different
 /// things, is exactly how a census comes to be quoted wrong, so both are asserted.
+///
+/// **Every row has a writer.** The fleet's shared cache catalogued fifteen counters ahead of the
+/// tasks that write them, each named meanwhile by `DeclaredAheadOfItsWriterTable` in
+/// `CounterAttribution_test.cpp`; that table is empty now, and its own check refuses a row the
+/// moment its counter gets a real writer -- so an exclusion cannot outlive the reason for it.
 ///
 /// **The figures are pinned rather than pointed at**, which the rulebook asks for a
 /// measurement's conditions: they describe this tree at one instant and must not silently
@@ -544,6 +555,8 @@ inline constexpr std::array CounterSoleWriterTable {
     CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesNoCapacity,
                         .surface = MetricsSurface::CompileScheduler },
     CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesWithdrawn,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesAllExcluded,
                         .surface = MetricsSurface::CompileScheduler },
     CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesDuplicate,
                         .surface = MetricsSurface::CompileScheduler },
@@ -615,12 +628,6 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::CompileWorker },
     CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge,
                         .surface = MetricsSurface::CompileWorker },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerFramesRefusedMalformedCredential,
-                        .surface = MetricsSurface::CompileWorker },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerFramesRefusedRejectedCredential,
-                        .surface = MetricsSurface::CompileWorker },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerFramesRefusedUnauthenticated,
-                        .surface = MetricsSurface::CompileWorker },
     CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed,
                         .surface = MetricsSurface::CompileWorker },
     CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeUnsupportedCodec,
@@ -660,8 +667,6 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::NodeFrameEndpoint },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember,
                         .surface = MetricsSurface::NodeFrameEndpoint },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeRequestsRefusedHostForgotten,
-                        .surface = MetricsSurface::NodeFrameEndpoint },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedPayloadTooLarge,
                         .surface = MetricsSurface::NodeFrameEndpoint },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedEndpointBusy,
@@ -678,12 +683,6 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::NodeCacheTier },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedForeignGeneration,
                         .surface = MetricsSurface::NodeCacheTier },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated,
-                        .surface = MetricsSurface::NodeFrameEndpoint },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::SchedulerCredentialsRejected,
-                        .surface = MetricsSurface::NodeFrameEndpoint },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed,
-                        .surface = MetricsSurface::NodeFrameEndpoint },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeFrameConnectionsRefusedAtCapacity,
                         .surface = MetricsSurface::NodeFrameEndpoint },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeProofsAccepted, .surface = MetricsSurface::NodeFrameEndpoint },
@@ -729,19 +728,15 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::NodeFrameEndpoint },
     CounterSoleWriter { .counter = IMetricsSink::Counter::FramePeerWatchDeparturesAbortive,
                         .surface = MetricsSurface::NodeFrameEndpoint },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedClosed,
-                        .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedFull,
                         .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed,
                         .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey,
                         .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedForged,
+                        .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentControlRefusedNotAMember,
-                        .surface = MetricsSurface::NodeEnrollment },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentControlRefusedUnauthenticated,
-                        .surface = MetricsSurface::NodeEnrollment },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentWindowsOpened,
                         .surface = MetricsSurface::NodeEnrollment },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRostersServed,
                         .surface = MetricsSurface::NodeEnrollment },
@@ -750,6 +745,12 @@ inline constexpr std::array CounterSoleWriterTable {
     CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedRevokedKey,
                         .surface = MetricsSurface::NodeDiscovery },
     CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryProofsRefusedForged,
+                        .surface = MetricsSurface::NodeDiscovery },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryBeaconsOverBound,
+                        .surface = MetricsSurface::NodeDiscovery },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryRepliesWithheld,
+                        .surface = MetricsSurface::NodeDiscovery },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DiscoveryProofChecksWithheld,
                         .surface = MetricsSurface::NodeDiscovery },
     CounterSoleWriter { .counter = IMetricsSink::Counter::LiveSubscriptionsOpened, .surface = MetricsSurface::LiveStats },
     CounterSoleWriter { .counter = IMetricsSink::Counter::LiveSnapshotsRendered, .surface = MetricsSurface::LiveStats },
@@ -800,6 +801,12 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerFramesRefusedSender,
                         .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerFramesRefusedUnreadable,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerFramesRefusedOverCap,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerFramesRefusedBadMagic,
+                        .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedFull,
                         .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedTimeout,
@@ -830,20 +837,30 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedKeyWithdrawn,
                         .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameTag,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameSender,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameUnreadable,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameOverCap,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameBadMagic,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedSilent,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftSendsDroppedNoSession,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftSendsDroppedUnknownPeer,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftInboundSessionsSuperseded,
+                        .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster,
                         .surface = MetricsSurface::CompileWorker },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired,
+    CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseIsolated,
                         .surface = MetricsSurface::CompileWorker },
     CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseSignerRevoked,
                         .surface = MetricsSurface::CompileWorker },
-    // The roster trust exists only on a node that runs a worker and no consensus, and nothing
-    // else offers it a roster -- so the worker's surface, which `--slots=0` removes.
-    CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerRostersRefusedUncertified,
-                        .surface = MetricsSurface::CompileWorker },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::WorkerRostersRefusedExpired,
-                        .surface = MetricsSurface::CompileWorker },
-    CounterSoleWriter { .counter = IMetricsSink::Counter::SchedulerRosterEndorsementsRefused,
-                        .surface = MetricsSurface::CompileScheduler },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeProofsRefusedUnknownKey,
                         .surface = MetricsSurface::NodeFrameEndpoint },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeProofsRefusedRevokedKey,
@@ -854,6 +871,113 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::NodeFrameEndpoint },
     CounterSoleWriter { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedNodeIdentityRequired,
                         .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsExpired,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentApprovalsManual,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentApprovalsAuto,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedHostCap,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsCleared,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentApprovalsRefusedKeyMismatch,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedIdTooLong,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::FormationYields, .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::FormationJoinsAbandoned,
+                        .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::FormationAdmissionsRefused,
+                        .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsAccepted,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsRefusedMalformed,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsRefusedNotUtf8,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsRefusedNoRoster,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsRefusedUnknownMachine,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsRefusedForged,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsRefusedRevoked,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsRefusedWrongAudience,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsRefusedExpired,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsRefusedReplayed,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsRefusedSpentSetFull,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketsMinted, .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketMintsRefusedNotLocal,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketMintsRefusedMalformed,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketMintsRefusedNoKey,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeTicketMintsRefusedNoRandom,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedOperatorStandingRequired,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentControlRefusedOperatorStandingRequired,
+                        .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheHits, .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheMisses,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheStoreFailures,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedNotAMember,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedNotServing,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedPayloadTooLarge,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedEndpointBusy,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedUnsupportedVersion,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedMalformedPayload,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedForeignGeneration,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheProofsRefusedWrongKey,
+                        .surface = MetricsSurface::NodeCacheTier },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheProofsFailed,
+                        .surface = MetricsSurface::NodeCacheTier },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheUnresolved,
+                        .surface = MetricsSurface::NodeCacheTier },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheStaleHints,
+                        .surface = MetricsSurface::NodeCacheTier },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheSessionsOpened,
+                        .surface = MetricsSurface::NodeCacheTier },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesMalformed,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchLeasesFieldTooLong,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchWorkerRegistrationsFieldTooLong,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::DispatchNodeAnnouncementsFieldTooLong,
+                        .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::FormationAdmissionsUnverified,
+                        .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::FormationYieldsRefusedPin,
+                        .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::FormationAdmissionsRefusedPin,
+                        .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::StateFileReplacesFellBack,
+                        .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::StateDirectorySyncsUnsupported,
+                        .surface = MetricsSurface::NodeFormation },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
 };
 
 /// Whether every catalogue row has at least one surface attributed to it.
@@ -863,22 +987,31 @@ inline constexpr std::array CounterSoleWriterTable {
 /// held then were in that state, so the silence read as coverage exactly the way the rulebook
 /// says it does. A measurement of that moment, so it does not move with the catalogue.
 ///
+/// Which counters `CounterSoleWriterTable` names at least once, indexed by enumerator.
+///
+/// ONE pass over the table. The walk it replaces asked the whole table once per counter, which is
+/// counters x rows steps inside a constant expression: at 223 x 224, over MSVC's checked array
+/// iterators, clang's default `-fconstexpr-steps` ran out, and every clang-cl or clang-tidy parse
+/// of a translation unit including this header failed the `static_assert` below. `cl` does not
+/// count steps the same way, so the Windows build stayed green while the analyser could not parse.
+/// @return One flag per `IMetricsSink::Counter`, true when some row names it.
+[[nodiscard]] constexpr std::array<bool, EnumeratorCount<IMetricsSink::Counter>> AttributedCounters() noexcept
+{
+    auto named = std::array<bool, EnumeratorCount<IMetricsSink::Counter>> {};
+    for (auto const& row: CounterSoleWriterTable)
+        if (auto const index = CounterIndex(row.counter); index.has_value())
+            named[*index] = true;
+    return named;
+}
+
 /// A `consteval` fold rather than a size comparison, because `CounterSoleWriterTable.size()`
-/// counts (counter, surface) PAIRS: it is 172 for 171 counters today, and a row duplicated
+/// counts (counter, surface) PAIRS: it is 231 for 230 counters today, and a row duplicated
 /// while another went missing would leave any arithmetic on the size perfectly consistent.
 ///
 /// @return True when no enumerator is missing from the table.
 [[nodiscard]] consteval bool EveryCounterIsAttributed() noexcept
 {
-    for (auto const counter: Enumerators<IMetricsSink::Counter>())
-    {
-        auto found = false;
-        for (auto const& row: CounterSoleWriterTable)
-            found = found || row.counter == counter;
-        if (!found)
-            return false;
-    }
-    return true;
+    return std::ranges::all_of(AttributedCounters(), std::identity {});
 }
 
 static_assert(EveryCounterIsAttributed(),
@@ -897,15 +1030,7 @@ static_assert(EveryCounterIsAttributed(),
 /// @return The number of counters with at least one attributed surface.
 [[nodiscard]] constexpr std::size_t AttributedCounterCount() noexcept
 {
-    auto count = std::size_t { 0 };
-    for (auto const counter: Enumerators<IMetricsSink::Counter>())
-        for (auto const& row: CounterSoleWriterTable)
-            if (row.counter == counter)
-            {
-                ++count;
-                break;
-            }
-    return count;
+    return static_cast<std::size_t>(std::ranges::count(AttributedCounters(), true));
 }
 
 /// Whether a process serving @p surfaces could ever write @p counter.

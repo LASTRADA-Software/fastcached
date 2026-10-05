@@ -3,6 +3,7 @@
 #include <FastCache/Cluster/RosterKeys.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include <tests/RaftPeerKeyFakes.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cluster;
@@ -22,7 +24,13 @@ namespace
 {
 
 /// A member as a command line names it, with the key typed for it -- or none.
-[[nodiscard]] ClusterMember Typed(std::string const& id, std::optional<Ed25519PublicKey> key)
+[[nodiscard]] MemberSpec Typed(std::string const& id, std::optional<Ed25519PublicKey> key)
+{
+    return MemberSpec { .id = id, .raftEndpoint = "10.0.0.1:6680", .publicKey = key };
+}
+
+/// A member as the state records it, under @p key.
+[[nodiscard]] ClusterMember Recorded(std::string const& id, Ed25519PublicKey const& key)
 {
     return ClusterMember { .id = id,
                            .raftEndpoint = "10.0.0.1:6680",
@@ -32,6 +40,18 @@ namespace
                            .publicKey = key };
 }
 
+/// The members a command line typed, each recorded under the key it typed.
+[[nodiscard]] std::vector<ClusterMember> RecordedAsTyped(std::vector<MemberSpec> const& typed)
+{
+    auto recorded = std::vector<ClusterMember> {};
+    for (auto const& member: typed)
+    {
+        REQUIRE(member.publicKey.has_value());
+        recorded.push_back(Recorded(member.id, Testing::Unwrap(member.publicKey)));
+    }
+    return recorded;
+}
+
 /// The key a test gives @p machine.
 [[nodiscard]] Ed25519PublicKey KeyOf(std::string const& machine)
 {
@@ -39,7 +59,7 @@ namespace
 }
 
 /// n1's roster, over a command line naming n1, n2 with its key, and n3 with none.
-[[nodiscard]] std::vector<ClusterMember> Bootstrap()
+[[nodiscard]] std::vector<MemberSpec> Bootstrap()
 {
     return { Typed("n1", KeyOf("n1")), Typed("n2", KeyOf("n2")), Typed("n3", std::nullopt) };
 }
@@ -67,18 +87,11 @@ TEST_CASE("The replicated state wins wherever it states a key", "[cluster][roste
     // n2 re-admitted under a new key a year after its command line was written, and n3's key
     // arriving from the cluster where the command line had none.
     ClusterState state;
-    state.members = { Typed("n2", KeyOf("n2-reinstalled")), Typed("n3", KeyOf("n3")) };
+    state.members = { Recorded("n2", KeyOf("n2-reinstalled")), Recorded("n3", KeyOf("n3")) };
     roster.Adopt(state);
 
     CHECK(roster.KeysOf("n2").live == KeyOf("n2-reinstalled"));
     CHECK(roster.KeysOf("n3").live == KeyOf("n3"));
-
-    // A member the state records with NO key falls back to the typed one: admitted before it
-    // stated one, which is not a statement that it has none.
-    ClusterState unstated;
-    unstated.members = { Typed("n2", std::nullopt) };
-    roster.Adopt(unstated);
-    CHECK(roster.KeysOf("n2").live == KeyOf("n2"));
 }
 
 TEST_CASE("A typed key the cluster revoked is revoked, whatever the command line says", "[cluster][roster]")
@@ -89,14 +102,10 @@ TEST_CASE("A typed key the cluster revoked is revoked, whatever the command line
     RosterKeys roster { TestKeyPair("n1"), bootstrap };
 
     ClusterState state;
-    state.members = { Typed("n2", KeyOf("n2")) };
+    state.members = { Recorded("n2", KeyOf("n2")) };
     Apply(state,
-          Command { .kind = CommandKind::Forget,
-                    .key = "n2",
-                    .value = {},
-                    .schedulerEndpoint = {},
-                    .publicKey = std::nullopt,
-                    .role = std::nullopt });
+          Command {
+              .kind = CommandKind::Forget, .key = "n2", .value = {}, .schedulerEndpoint = {}, .publicKey = std::nullopt });
     REQUIRE(state.IsRevoked(KeyOf("n2")));
     roster.Adopt(state);
 
@@ -121,14 +130,10 @@ TEST_CASE("A forgotten machine is reported as itself whatever id it claims", "[c
     Consensus::RaftPeerIdentity const identity { "n1", roster };
 
     ClusterState state;
-    state.members = bootstrap;
+    state.members = RecordedAsTyped(bootstrap);
     Apply(state,
-          Command { .kind = CommandKind::Forget,
-                    .key = "n3",
-                    .value = {},
-                    .schedulerEndpoint = {},
-                    .publicKey = std::nullopt,
-                    .role = std::nullopt });
+          Command {
+              .kind = CommandKind::Forget, .key = "n3", .value = {}, .schedulerEndpoint = {}, .publicKey = std::nullopt });
     REQUIRE(state.IsRevoked(KeyOf("n3")));
     roster.Adopt(state);
 
@@ -174,14 +179,10 @@ TEST_CASE("A forgotten member keeps its own key here until the configuration dro
     Consensus::RaftPeerIdentity const identity { "n1", roster };
 
     ClusterState state;
-    state.members = bootstrap;
+    state.members = RecordedAsTyped(bootstrap);
     Apply(state,
-          Command { .kind = CommandKind::Forget,
-                    .key = "n3",
-                    .value = {},
-                    .schedulerEndpoint = {},
-                    .publicKey = std::nullopt,
-                    .role = std::nullopt });
+          Command {
+              .kind = CommandKind::Forget, .key = "n3", .value = {}, .schedulerEndpoint = {}, .publicKey = std::nullopt });
     REQUIRE(state.IsRevoked(KeyOf("n3")));
     roster.Adopt(state);
     roster.AdoptConfiguration(Consensus::Configuration { .voters = { "n1", "n2", "n3" }, .learners = {} });
@@ -205,38 +206,25 @@ TEST_CASE("A forgotten member keeps its own key here until the configuration dro
     CHECK(std::ranges::contains(roster.KeysOf("n3").revoked, KeyOf("n3")));
 }
 
-TEST_CASE("A principal is a stranger on the Raft peer wire", "[cluster][roster]")
-{
-    // A principal never joins consensus, so its admitted key proves nothing here.
-    auto const bootstrap = Bootstrap();
-    RosterKeys roster { TestKeyPair("n1"), bootstrap };
-
-    ClusterState state;
-    state.principals = { ClusterPrincipal { .id = "w1", .publicKey = KeyOf("w1"), .role = PrincipalRole::Worker } };
-    roster.Adopt(state);
-
-    CHECK_FALSE(roster.KeysOf("w1").live.has_value());
-}
-
 TEST_CASE("A roster signs as its own key and nothing else", "[cluster][roster]")
 {
     auto const bootstrap = Bootstrap();
     RosterKeys const roster { TestKeyPair("n1"), bootstrap };
 
     CHECK(roster.OwnPublicKey() == KeyOf("n1"));
-    auto const message = WireFields::AsBytes("a transcript");
+    auto const message = LabelledMessage::Of(IdentityKeyPurpose::RaftDiallerProof, { WireFields::AsBytes("a transcript") });
     auto const signature = roster.SignAsSelf(message);
-    CHECK(Ed25519Verify(KeyOf("n1"), message, signature));
-    CHECK_FALSE(Ed25519Verify(KeyOf("n2"), message, signature));
+    CHECK(VerifyLabelled(KeyOf("n1"), message, signature));
+    CHECK_FALSE(VerifyLabelled(KeyOf("n2"), message, signature));
 }
 
-TEST_CASE("An applied forget withdraws the key from every session it proved, though --raft-peer still types it",
+TEST_CASE("An applied forget withdraws the key from every session it proved, though the bootstrap roster still names it",
           "[cluster][roster][revocation][forget]")
 {
     // The whole chain a session re-asks before each frame: the replicated command, the roster
     // adopting the state it produced, and the identity answering from the roster.
     //
-    // #1555: n3 is TYPED into this node's `--raft-peer` with its key, which is what makes the
+    // #1555: n3 is in this node's bootstrap roster with its key, which is what makes the
     // revocation load-bearing. Removing the record alone leaves the typed key standing -- the
     // state states no key for n3 any more, so the roster falls back to the command line -- and
     // the forgotten machine goes on proving itself here for as long as it runs.
@@ -245,17 +233,13 @@ TEST_CASE("An applied forget withdraws the key from every session it proved, tho
     Consensus::RaftPeerIdentity const identity { "n1", roster };
 
     ClusterState state;
-    state.members = bootstrap;
+    state.members = RecordedAsTyped(bootstrap);
     roster.Adopt(state);
     REQUIRE(identity.StillProves("n3", KeyOf("n3")));
 
     Apply(state,
-          Command { .kind = CommandKind::Forget,
-                    .key = "n3",
-                    .value = {},
-                    .schedulerEndpoint = {},
-                    .publicKey = std::nullopt,
-                    .role = std::nullopt });
+          Command {
+              .kind = CommandKind::Forget, .key = "n3", .value = {}, .schedulerEndpoint = {}, .publicKey = std::nullopt });
     REQUIRE(std::ranges::none_of(state.members, [](ClusterMember const& m) { return m.id == "n3"; }));
     roster.Adopt(state);
     // And the configuration no longer counts n3 -- the removal the forget leads to, which the

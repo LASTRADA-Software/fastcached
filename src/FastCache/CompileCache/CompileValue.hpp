@@ -127,7 +127,52 @@ namespace FastCache
 ///   `ForeignGeneration` refuses it and the launcher takes the miss. Checked rather than
 ///   assumed: were direct mode able to reach an old object without passing the generation
 ///   gate, this would be a three-version change.
-inline constexpr std::uint8_t CompileValueVersion = 5;
+///
+/// **Generation 6 retires generation 5 for two changes to what a server does with one
+/// region, paid for with one cold cache.**
+///
+/// - **The MSVC family's streams carry `Grammar::MsvcStream`**, notes AND diagnostics.
+///   Tagged `ShowIncludes`, which rewrites note lines only, every `cl` and `clang-cl`
+///   warning, error and `note:` was stored and replayed carrying the producing checkout's
+///   absolute path -- measured as C4100 in a header, served across two checkouts with
+///   direct mode off, under a key those checkouts share by design. The diagnostic head
+///   is anchored at column zero and tightened to `(<digits>[,<digits>]): `, which also
+///   narrows `MsvcDiagnostics`. An older server meets tag 4, refuses the frame, and the
+///   refusal costs a miss; a generation-5 value holds foreign paths nothing marks, and
+///   this byte is what retires it.
+/// - **`CanonicalizeRegion` collapses `..` out of a span before matching the roots**
+///   ([#1593](https://github.com/LASTRADA-Software/fastcached/issues/1593)). A driver
+///   reports `D:\proj\build\..\inc\a.hpp` for a header reached through a relative
+///   include chain, and generation 5 stored it as `<BUILDTREE>/../inc/a.hpp` -- a token
+///   naming a file the path does not name, which localizes into a consumer whose build
+///   tree sits elsewhere as a path to nothing. A span whose collapsed form lies under no
+///   root is canonicalized exactly as before, from its own spelling. #1593 was held open
+///   to ride the next bump rather than buy one; this is that bump.
+///
+/// The key construction does not move with either, and needs no second bump here: this
+/// branch's `objkey-v7` / `manifest-v7` already retire every entry and manifest an
+/// earlier launcher wrote, and the `ForeignGeneration` gate is what refuses a generation-5
+/// value that reaches a generation-6 build any other way.
+///
+/// **Generation 7 retires generation 6 for four changes the Job 2 review measured**, each
+/// a region a generation-6 server stores differently:
+///
+/// - **A span whose collapsed form lies under NO root is stored as that collapsed
+///   absolute spelling.** Generation 6 matched it as written, and `<SRCROOT>/../third/x.h`
+///   resolves against the CONSUMER's root depth, so it named a different file there --
+///   #1593's hazard, in the one place #1593's first fix did not reach.
+/// - **The MSVC diagnostic head accepts `(<digits>) : `**, the `#pragma message(__FILE__
+///   ...)` idiom MSVC documents: direct mode shares its manifest across checkouts and the
+///   stream grammar is all that keeps the replayed message local.
+/// - **`Grammar::MsvcStream` reads `clang-cl -fdiagnostics-format=clang`'s GCC-format
+///   head**, `<path>:<line>:<col>: `.
+/// - **The `..` collapse holds a UNC share aside as its anchor**, so `\\host\share\..\x.h`
+///   is `\\host\share\x.h`, where Windows resolves it, and never `\\host\x.h`.
+///
+/// Generation 6 never left the branch that introduced it, and it is retired rather than
+/// amended anyway: a frozen generation is a claim about behaviour, and a server built
+/// from that branch still stamps 6 on text it rewrites the old way. No key moves.
+inline constexpr std::uint8_t CompileValueVersion = 7;
 
 /// Where the generation sits in an encoded value: its leading byte.
 ///

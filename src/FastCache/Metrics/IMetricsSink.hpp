@@ -117,6 +117,11 @@ class IMetricsSink
         /// disks would go and buy machines rather than free 200 MB. Rising here with
         /// a flat `NoCapacity` is a fleet that is big enough and unavailable.
         DispatchLeasesWithdrawn,
+        /// Lease requests refused because every matching worker was on the client's own
+        /// exclusion list -- workers it could not reach a moment ago. Answered `no-worker`
+        /// on the wire and NEVER counted there: this is the network between clients and
+        /// machines, that one is a toolchain nobody serves.
+        DispatchLeasesAllExcluded,
         /// Lease requests refused because another client already held a lease for
         /// this key. Not a failure: it is duplicate-work suppression doing its
         /// job, and the clients it refuses compile locally.
@@ -453,47 +458,6 @@ class IMetricsSink
         /// (#326).
         WorkerFramesRefusedPayloadTooLarge,
 
-        /// `AUTH` payloads on a compile surface that would not decode at all.
-        ///
-        /// Its own row rather than `WorkerFramesRefusedMalformedPayload`, although
-        /// both answer `MalformedFrame`: that one is a request body that did not
-        /// decode into the fields its verb requires, this one is a credential. An
-        /// operator told only "a malformed frame arrived" cannot tell a client version
-        /// skew from somebody malforming AUTH at the door, which is the #327 confusion
-        /// re-created one refusal further along.
-        ///
-        /// Zero on every configuration this build ships, exactly as the counter below
-        /// is and for the same reason: `MergedResponder` routes the `Session` family
-        /// to the scheduler, so a compile surface is never asked about a credential.
-        /// A tally's zero is the truth about events that did not happen; a rise means
-        /// what may compile here has changed.
-        WorkerFramesRefusedMalformedCredential,
-
-        /// `AUTH` payloads on a compile surface that decoded and did not verify.
-        ///
-        /// Its own row rather than `WorkerFramesRefusedUnauthenticated` below, although
-        /// both answer `unauthenticated`: that one is a peer that reached a verb having
-        /// never presented a credential, this one is a peer that presented one and got
-        /// it wrong. The same split the scheduler surface carries, and for the same
-        /// reason -- an operator acts on a misconfigured member and on somebody trying
-        /// secrets differently.
-        ///
-        /// Zero on every configuration this build ships, exactly as its two neighbours
-        /// are: the `Session` verb family is routed to the scheduler, so a compile
-        /// surface is never asked for a credential at all.
-        WorkerFramesRefusedRejectedCredential,
-
-        /// Frames refused for reaching a compile verb before a credential.
-        ///
-        /// Zero on every configuration this build ships, and that is the point rather
-        /// than a reason to leave it out: a compile carries its own per-job credential
-        /// -- the lease the scheduler signed -- so `CompileResponder::AuthRequired`
-        /// answers false and the pre-payload gate never reaches this. A rise means
-        /// that answer changed, which is a change to who may compile here, and a
-        /// counter is how an operator would find out. A tally's zero is the truth
-        /// about events that did not happen.
-        WorkerFramesRefusedUnauthenticated,
-
         /// Jobs refused while opening the request's codec envelope, one counter per
         /// reason — the same split, and for the same argument, that `EnvelopeError`
         /// makes one layer down.
@@ -660,6 +624,30 @@ class IMetricsSink
         NodeCacheUpstreamStores,
         NodeCacheUpstreamStoreFailures,
 
+        /// The fleet cache verbs on this node's merged listener, served while the `shared-cache`
+        /// setting names this machine; every refusal is its own row because each sends
+        /// an operator somewhere different.
+        NodeSharedCacheHits,
+        NodeSharedCacheMisses,
+        NodeSharedCacheStoreFailures,
+        NodeSharedCacheRequestsRefusedNotAMember,
+        NodeSharedCacheRequestsRefusedNotServing,
+        NodeSharedCacheRequestsRefusedPayloadTooLarge,
+        NodeSharedCacheRequestsRefusedEndpointBusy,
+        NodeSharedCacheRequestsRefusedUnsupportedVersion,
+        NodeSharedCacheRequestsRefusedMalformedPayload,
+        NodeSharedCacheRequestsRefusedForeignGeneration,
+
+        /// This node reading through to the named machine: a peer that proved ANOTHER key is
+        /// counted apart from one that proved nothing, because the first is an impostor or a
+        /// re-addressed host and the second is a network; and every handshake is counted, because
+        /// a kept-open session is supposed to make them rare.
+        NodeSharedCacheProofsRefusedWrongKey,
+        NodeSharedCacheProofsFailed,
+        NodeSharedCacheUnresolved,
+        NodeSharedCacheStaleHints,
+        NodeSharedCacheSessionsOpened,
+
         /// Cache requests refused because the caller is not on this machine (#287).
         ///
         /// The node's tier is this machine's entire build output, so it is served to
@@ -672,50 +660,31 @@ class IMetricsSink
         /// to "is this happening to me".
         ///
         /// That last sentence stopped being the whole story when the cache and
-        /// scheduler surfaces merged (#290). A node running `--serve-scheduler` binds
-        /// the wildcard, so peers reach the same port the cache verbs arrive on and a
-        /// rise there is ORDINARY rather than a signal -- it is the tightening working.
-        /// A **worker** still defaults to loopback and a rise there still means what it
-        /// always did. The counter is the same fact either way; which reading applies
-        /// is a property of the node, and the help text says so rather than promising
-        /// a zero the merge made false.
+        /// scheduler surfaces merged (#290), and stopped being true at all when the
+        /// zero-config defaults bound EVERY node's port to the wildcard. On a node
+        /// clients are pointed at for the scheduler, peers reach the same port the
+        /// cache verbs arrive on and a rise is ORDINARY rather than a signal -- it is
+        /// the tightening working; anywhere else a rise means something off-box is
+        /// asking. The counter is the same fact either way; which reading applies is a
+        /// property of the node, and the help text says so rather than promising a
+        /// zero the defaults made false.
         NodeCacheRequestsRefusedNotLocal,
-        NodeStatusRequestsRefusedNotAMember,
 
-        /// Requests refused because the cluster has FORGOTTEN the calling host
-        /// (#1309).
-        ///
-        /// **One counter for every surface, which is the one deviation from the
-        /// per-surface convention above, and it is deliberate.** Each
-        /// `...RefusedNotAMember` row answers a question about a DOOR -- how much
-        /// stranger traffic is arriving at the compile port, at live stats, at
-        /// `node-status` -- because a stranger at each is a different operational
-        /// story. A forgotten host is not a story about the door: it is one machine
-        /// somebody decommissioned that still has this fleet in its configuration,
-        /// and the remedy is the same wherever it knocked. Split six ways it would
-        /// have to be summed by hand to answer the only question anybody asks of it,
-        /// and five of the six would sit at zero looking like coverage.
-        ///
-        /// **Never sum it with a `...RefusedNotAMember` row either**, and it does not
-        /// double-count into one: a forgotten host is refused through THIS row
-        /// instead, so those keep meaning exactly what they always did -- a host
-        /// nobody ever listed. The two causes are opposite diagnoses. A stranger is
-        /// something to investigate; a forgotten host is something an operator
-        /// already decided, and a rise means the other end has not been told.
-        ///
-        /// Zero is the ordinary reading on a fleet nobody has shrunk, and it is an
-        /// honest zero rather than an absence: the row exists on every node, and a
-        /// node with no cluster simply never classifies anybody `Forgotten`.
-        NodeRequestsRefusedHostForgotten,
+        /// An operator verb refused because the caller is not a fleet member: `node-status`,
+        /// `node-metrics`, and `explain-admission` asked about a MACHINE. Asked about the
+        /// caller's own connection, `explain-admission` is answered to anyone and moves nothing.
+        NodeStatusRequestsRefusedNotAMember,
 
         /// An operator verb whose header declared more payload than it may carry.
         ///
-        /// **Every one of these verbs is fieldless** -- `node-status` and
-        /// `node-metrics` have nothing to ask with -- and their `OpTable` rows bound
-        /// them to `MaxControlPayload` rather than to the session cap. So a header
-        /// declaring megabytes against one of them did not come from a client of this
-        /// tree at any version: it is a probe, or a caller that has confused the verb
-        /// with a cache one.
+        /// **`node-status` and `node-metrics` are fieldless** -- they have nothing to ask
+        /// with -- and their `OpTable` rows bound them to `MaxControlPayload` rather than
+        /// to the session cap, so a header declaring more against either did not come from
+        /// a client of this tree at any version: it is a probe, or a caller that has
+        /// confused the verb with a cache one. **`explain-admission` carries one subject**,
+        /// an id or a 43-character key, under its own `MaxExplainAdmissionPayload`, and is
+        /// reachable before admission: a rise from it is an operand no roster could name, or
+        /// a stranger probing the port.
         ///
         /// **Never summed with `NodeCacheRequestsRefusedPayloadTooLarge`.** They share
         /// a wire code, a port and nothing else -- that one is what a misconfigured
@@ -736,8 +705,9 @@ class IMetricsSink
         /// says the diagnosis failed, that one says why.
         NodeStatusRequestsRefusedEndpointBusy,
 
-        /// An `explain-admission` whose payload is not exactly one field naming a host
-        /// ([#1471](https://github.com/LASTRADA-Software/fastcached/issues/1471)).
+        /// An `explain-admission` whose payload is not exactly one field naming its subject
+        /// ([#1471](https://github.com/LASTRADA-Software/fastcached/issues/1471)). The verb is
+        /// reachable before admission, so a caller the node refuses can move this too.
         ///
         /// Counted rather than uncounted, because a rise means something an operator acts on and
         /// it is not what a healthy caller produces: the CLI encodes this verb through
@@ -829,44 +799,6 @@ class IMetricsSink
         /// launcher, which reports a miss and compiles locally.
         NodeCacheRequestsRefusedForeignGeneration,
 
-        /// Scheduler requests refused because the connection presented no accepted
-        /// credential.
-        ///
-        /// Counted at the pre-payload gate, so it rises for a frame whose body was
-        /// never read. Only a surface with `--scheduler-token-file` configured can
-        /// move it: with no credential set there is nothing to fail, and the counter
-        /// stays at zero -- which is the honest answer to "is my scheduler port
-        /// guarded", because zero here plus a non-loopback bind means it is not.
-        ///
-        /// Never sum with `WorkerJobsRefusedNotAMember`: that one says a host was not
-        /// on the operator's list, this one says a caller held no secret. A fleet peer
-        /// with a stale token moves this and not that.
-        SchedulerRequestsRefusedUnauthenticated,
-
-        /// `AUTH` attempts on the scheduler surface that decoded and did not verify.
-        ///
-        /// **The credential-guessing signal**, and the one
-        /// `SchedulerRequestsRefusedUnauthenticated` above cannot carry: that one
-        /// counts a peer reaching a verb WITHOUT having authenticated, which is a
-        /// misconfigured fleet member. This counts a peer that presented a token and
-        /// got it wrong -- a rotated key, or somebody trying. An operator does
-        /// opposite things about the two, so they are two rows although a client is
-        /// told `unauthenticated` either way.
-        ///
-        /// Until #447 this rose nowhere at all: the endpoint answered the wire code
-        /// itself, so a fleet being probed for its scheduler token read a flat zero on
-        /// the exact series an operator would go looking at.
-        SchedulerCredentialsRejected,
-
-        /// `AUTH` payloads on the scheduler surface that would not decode at all.
-        ///
-        /// Separate from the rejection above because it says something different: a
-        /// peer that cannot form the frame is a version or client-library mismatch,
-        /// while one forming it correctly with the wrong secret is the security
-        /// question. Summed, the second hides inside the first whenever an old client
-        /// is in the fleet.
-        SchedulerCredentialsMalformed,
-
         /// Connections turned away because the `0xFC` listener already holds every
         /// connection it will.
         ///
@@ -904,10 +836,6 @@ class IMetricsSink
         /// caller who cannot sign learns nothing about which ids and keys the cluster holds -- and
         /// a machine the cluster simply never admitted lands in `NodeProofsRefusedUnknownKey`
         /// instead, because its signature is sound (#178).
-        ///
-        /// `SchedulerCredentialsRejected`'s sibling and never summed with it: that one is a
-        /// wrong `--requirepass` against this node's `--scheduler-token-file`, an operator's
-        /// token. Two facts, two remedies.
         NodeProofsRejected,
 
         /// `ProveNode` frames that arrived with no challenge outstanding on their connection.
@@ -915,15 +843,13 @@ class IMetricsSink
         /// Never asked for one, or already spent one. Not a security signal and it says so:
         /// what moves it is a client that has the exchange wrong, which is a version or
         /// client-library fault. Summed with the rejection above it would hide a forgery
-        /// inside an old client's traffic, which is the shape `SchedulerCredentialsMalformed`
-        /// was split out for.
+        /// inside an old client's traffic.
         NodeProofsUnchallenged,
 
         /// `NodeChallenge` and `ProveNode` payloads that would not decode into their fixed-width fields.
         ///
-        /// `SchedulerCredentialsMalformed`'s counterpart, for its reason: a peer that cannot
-        /// form the frame is a mismatch, and one forming it correctly and failing to verify is the
-        /// security question.
+        /// Apart from the rejection above: a peer that cannot form the frame is a mismatch, and one
+        /// forming it correctly and failing to verify is the security question.
         NodeProofsMalformed,
 
         /// Reclaim reports the buffer between the storage tiers and the keyspace
@@ -1187,22 +1113,6 @@ class IMetricsSink
         /// `WatchPeer` keeps those two arms apart for exactly this reason.
         FramePeerWatchDeparturesAbortive,
 
-        /// ENROLL requests refused because this node runs no window right now.
-        ///
-        /// **The only pre-auth refusal series this protocol has, and the reason
-        /// `Op::Enroll` is counted at all.** Every other verb requires a credential, so a
-        /// stranger reaching for one is already visible as an authentication refusal.
-        /// This verb is deliberately reachable by anybody who can route to the port, and
-        /// the window is closed except for the minutes an operator spends admitting
-        /// machines -- so a rise here with nobody at a terminal is somebody trying the
-        /// door, and it is the only place that shows.
-        ///
-        /// Zero on a node that nobody has probed, which is the common case and is not
-        /// evidence the refusal works. What says the mechanism is live is
-        /// `EnrollmentWindowsOpened` beside it: a fleet that has enrolled machines has
-        /// moved that one.
-        EnrollmentRequestsRefusedClosed,
-
         /// ENROLL requests refused because the pending list was full, so nothing was
         /// recorded.
         ///
@@ -1238,6 +1148,16 @@ class IMetricsSink
         /// as `fastcache_raft_peer_connections_refused_revoked_key_total` on the peer wire.
         EnrollmentRequestsRefusedRevokedKey,
 
+        /// ENROLL requests refused because their signature does not verify under the key they ask
+        /// with -- a request the key's holder did not make.
+        ///
+        /// The id and the key are public, so anybody can poll under a joiner's pair; what they
+        /// cannot do is sign, and an unsigned poll is what once let a stranger set the endpoint a
+        /// joiner's member record kept. Not ordinary on any deployment: a joiner of this tree signs
+        /// every request with the key it states. A rise is somebody polling under another machine's
+        /// identity -- or a joiner whose key file and stated key disagree.
+        EnrollmentRequestsRefusedForged,
+
         /// ENROLL-CONTROL requests refused because the caller is not a fleet member.
         ///
         /// **Somebody trying to approve themselves.** The window admits strangers by
@@ -1251,34 +1171,6 @@ class IMetricsSink
         /// code and describes somebody asking a node what it is.
         EnrollmentControlRefusedNotAMember,
 
-        /// ENROLL-CONTROL requests refused because the connection presented no accepted
-        /// credential.
-        ///
-        /// The third of three outcomes a caller can reach on this verb, and separate from
-        /// the two above for the reason the scheduler's three are separate: a peer that
-        /// never authenticated is a misconfigured operator, one whose token was rejected
-        /// is on the scheduler's own credential series, and a non-member that
-        /// authenticated correctly is the row above. Folded, the one that means somebody
-        /// is probing sits under the one that means somebody typo'd a path.
-        ///
-        /// Zero while no `--scheduler-token-file` is set, because there is then nothing to
-        /// fail -- so zero here does not mean the verb is protected, it means membership
-        /// is the only gate on it.
-        EnrollmentControlRefusedUnauthenticated,
-
-        /// Enrollment windows opened on this node.
-        ///
-        /// **An audit trail, and the only durable one.** The window lives in memory and a
-        /// restart closes it, the warning it emits reaches only whoever reads this node's
-        /// log, and the open STATE is a snapshot field that says nothing about how often
-        /// it has been open. This is what a scrape can alert on: any rise is a minute in
-        /// which anybody who could reach this machine could ask to be admitted to the fleet.
-        ///
-        /// A tally rather than a gauge, which is what keeps it and the snapshot from
-        /// being two spellings of one fact: this counts events and zero is the truth
-        /// about a node whose window has never been opened.
-        EnrollmentWindowsOpened,
-
         /// Rosters handed to an admitted joiner (#178).
         ///
         /// **The event the feature exists to perform**: a machine an operator approved by
@@ -1290,9 +1182,6 @@ class IMetricsSink
         /// No secret crosses with it, which is why it replaced a counter of cluster keys handed
         /// over rather than keeping that name: the roster is every member's PUBLIC key.
         ///
-        /// Read beside `EnrollmentWindowsOpened`: rosters served without an open is impossible
-        /// and would be a bug report, and opens without any is the ordinary shape of a window
-        /// somebody opened and closed again.
         EnrollmentRostersServed,
 
         /// Discovery proofs that verified under a key this node's roster does not record for
@@ -1320,6 +1209,39 @@ class IMetricsSink
         /// it presented. A healthy segment produces none, so a rise is somebody forging, or a
         /// build that signs a different message -- which the version byte should have refused.
         DiscoveryProofsRefusedForged,
+
+        /// Discovery beacons that reached a bound (`Cluster::DiscoveryBounds`): an entry nothing
+        /// vouches for displaced -- the least recently heard unrostered peer, the oldest fleet that
+        /// proved nothing -- or a new fleet dropped because every remembered fleet has proven
+        /// itself. A challenge is held by no table (`Cluster::ChallengeCookies`), so none is here.
+        ///
+        /// A beacon is unauthenticated, so every table it grows is one anything on the segment can
+        /// try to fill by inventing ids; each overflow is counted here rather than logged, since
+        /// logging would hand the same datagram a disk to fill. One series for every bound: the
+        /// count says a flood is under way, not which table it reached. A healthy segment produces
+        /// none; a rise is somebody flooding the beacon port, or a segment far larger than one
+        /// broadcast domain should carry.
+        DiscoveryBeaconsOverBound,
+
+        /// Discovery replies not sent: a challenge or a proof that would have been larger than
+        /// the datagram that provoked it, or a proof past the answer budget (`Cluster::WorkBudgets`,
+        /// the source host's share and then everybody's).
+        ///
+        /// A reply goes to whatever address its request came FROM, which the sender typed, so a
+        /// reply larger than its request would be an amplifier and an unlimited one a signing
+        /// oracle. Counted rather than logged, since anything on the segment can provoke it. Two
+        /// builds of this project never produce the size case against each other; a rise is
+        /// somebody sending challenges by hand, a flood of them, or -- once per change, and gone by
+        /// the next beacon round -- a node whose summary grew between its beacon and its answer.
+        DiscoveryRepliesWithheld,
+
+        /// Discovery proofs whose signature was not checked: each answered a challenge this node
+        /// issued and had not spent, but the check budget (`Cluster::WorkBudgets`, the source
+        /// host's share and then everybody's) was spent, or the challenge had already failed
+        /// `Cluster::MaxForgeriesPerChallenge` checks. A forgery spends no challenge, so without
+        /// these one live challenge bought a signature check per datagram. The next beacon round
+        /// asks again.
+        DiscoveryProofChecksWithheld,
 
         /// A live-stats stream this node granted and began pushing to. (#1399)
         LiveSubscriptionsOpened,
@@ -1375,6 +1297,12 @@ class IMetricsSink
         RaftPeerFramesRefusedTag,
         /// A verified Raft message naming a sender other than the connection's proven dialler. (#1308)
         RaftPeerFramesRefusedSender,
+        /// A verified Raft frame this build cannot read, which ends the connection.
+        RaftPeerFramesRefusedUnreadable,
+        /// A Raft frame declaring more payload than this node buffers, which ends the connection.
+        RaftPeerFramesRefusedOverCap,
+        /// A Raft frame whose header did not decode, which ends the connection.
+        RaftPeerFramesRefusedBadMagic,
         /// A Raft peer connection closed because the listener already serves its maximum. (#1308)
         RaftPeerConnectionsRefusedFull,
         /// A Raft dial whose acceptor did not challenge or answer within the handshake bound. (#1308)
@@ -1410,19 +1338,37 @@ class IMetricsSink
         RaftPeerDialsRefusedOwnKeyRevoked,
         /// A proven Raft dial this node ended because the cluster no longer holds the acceptor's key. (#178)
         RaftPeerDialsEndedKeyWithdrawn,
+        /// A two-way Raft session this node dialled, ended because a frame the acceptor wrote failed its tag.
+        RaftPeerDialsEndedFrameTag,
+        /// A two-way Raft session this node dialled, ended because a verified message named another sender.
+        RaftPeerDialsEndedFrameSender,
+        /// A two-way Raft session this node dialled, ended on a verified frame this build cannot read.
+        RaftPeerDialsEndedFrameUnreadable,
+        /// A two-way Raft session this node dialled, ended on a frame declaring more than this node buffers.
+        RaftPeerDialsEndedFrameOverCap,
+        /// A two-way Raft session this node dialled, ended on a frame whose header did not decode.
+        RaftPeerDialsEndedFrameBadMagic,
+        /// A two-way Raft session this node dialled that carried nothing for its idle bound, so
+        /// this node closed it and redials (`SessionIdleTable`): a session to a voter that is not
+        /// leading, or a half-open one whose other end went away while this machine slept.
+        RaftPeerDialsEndedSilent,
+        /// A Raft message dropped for a peer that dials in (a learner, by its seat's link) and has
+        /// no session attached: offline, or not yet dialled.
+        RaftSendsDroppedNoSession,
+        /// A Raft message dropped for a peer this node can place nowhere: it neither dials it nor
+        /// was told it dials in.
+        RaftSendsDroppedUnknownPeer,
+        /// A two-way Raft session closed because the same id proved a newer one: a learner that
+        /// reconnected, or -- at a steady rate -- two machines sharing one identity key.
+        RaftInboundSessionsSuperseded,
 
-        /// A grant refused because this worker holds no roster its trust anchors certify. (#178)
+        /// A grant refused because the state this worker applied records no voter's key yet. (#178)
         WorkerJobsRefusedLeaseNoRoster,
-        /// A grant refused because this worker's roster has not been re-certified in time. (#178)
-        WorkerJobsRefusedLeaseRosterExpired,
+        /// A grant refused because this worker has heard from no leader its applied configuration
+        /// counts for longer than `Distributed::LeaderSilenceBound`. (#178)
+        WorkerJobsRefusedLeaseIsolated,
         /// A grant whose signature verifies under a key the cluster revoked. (#178)
         WorkerJobsRefusedLeaseSignerRevoked,
-        /// A roster offered to this worker that a majority of its voters did not endorse. (#178)
-        WorkerRostersRefusedUncertified,
-        /// A roster offered to this worker whose majority of endorsements had already lapsed. (#178)
-        WorkerRostersRefusedExpired,
-        /// A roster endorsement the leader refused: not a voter's, or not signed by one. (#178)
-        SchedulerRosterEndorsementsRefused,
 
         /// A node proof whose signature verified under a key this cluster does not hold for the id
         /// it named: a machine nobody admitted, or one presenting a key other than its own. (#178)
@@ -1432,8 +1378,11 @@ class IMetricsSink
         /// verb on it is refused as that machine's. (#178)
         NodeProofsRefusedRevokedKey,
         /// A verb refused, at any door, because the connection proved an identity key the cluster
-        /// revoked -- whatever its address, `--fleet-member` included. `node_requests_refused_host_forgotten`
-        /// is a forgotten ADDRESS; this is the removed MACHINE. (#178)
+        /// revoked, or presented a ticket signed by one -- whatever its address: the removed
+        /// MACHINE. A machine is forgotten by its key, so this is the one forgotten-machine
+        /// refusal. Only a proof is TOLD it; a ticket's holder, who may have captured it, gets the
+        /// stranger's words, and off `--fleet-open` this counter is the one place the two are told
+        /// apart; under the flag the refusal itself tells them, since a stranger is served. (#178, #1555)
         NodeRequestsRefusedKeyRevoked,
         /// A proven connection closed because a frame's seal did not verify: something between the
         /// two ends injected, altered, replayed or reordered a frame. Never answered -- an injected
@@ -1442,6 +1391,168 @@ class IMetricsSink
         /// A verb only a machine that proved its identity may send -- REGISTER, NODE-ANNOUNCE,
         /// HEARTBEAT, WITHDRAW -- refused on a connection that proved none that is live. (#178)
         SchedulerRequestsRefusedNodeIdentityRequired,
+        /// Enrollment requests the leader forgot because the machine stopped asking for
+        /// `PendingRowLifetime` before anybody decided about it. A machine switched off or given up
+        /// while waiting; one that asks again is recorded afresh.
+        EnrollmentRequestsExpired,
+        /// Joiners an operator admitted by name with `--enroll-approve`, counted once the cluster
+        /// agreed to record them.
+        EnrollmentApprovalsManual,
+        /// Joiners an armed `--enroll-auto-approve` deadline admitted, counted apart from the
+        /// manual ones because the audit question after a window is *who got in while nobody was
+        /// looking*.
+        EnrollmentApprovalsAuto,
+        /// ENROLL requests refused because their source host already held
+        /// `MaxPendingEnrollmentsPerHost` undecided rows. Apart from the full-list row because the
+        /// cause is one address asking a lot rather than many machines waiting, which is what a
+        /// flood looks like.
+        EnrollmentRequestsRefusedHostCap,
+        /// Rows `--enroll-clear` dropped: requests nobody had decided about, forgotten on an
+        /// operator's word.
+        EnrollmentRequestsCleared,
+        /// Approvals refused because the key they named is not the key the row holds: the
+        /// machine asking under that id now is not the one the operator compared -- most often
+        /// because the compared one stopped asking and another took its id.
+        EnrollmentApprovalsRefusedKeyMismatch,
+        /// ENROLL requests refused because the id they named is longer than `MaxIdBytes`, the bound
+        /// every id this fleet carries is held to. Refused where the id ENTERS: a row holding one is
+        /// a row `--enroll-reject` cannot name, removable only by clearing every honest row with it.
+        EnrollmentRequestsRefusedIdTooLong,
+        /// Times this node decided to ask another fleet to admit it: a solitary node that proved an
+        /// older or established fleet it yields to, and recorded the join before asking.
+        FormationYields,
+        /// Joins this node gave up because the fleet it asked stopped answering for
+        /// `PendingGiveUpAfter`. It stays in its own cluster and may ask again.
+        FormationJoinsAbandoned,
+        /// Admissions a pending node did not believe: the roster it was handed does not record it
+        /// under its own key, or records no member under the key that proved the fleet it asked. No
+        /// dissolve follows; the node stays in its own cluster. Only admissions whose signature
+        /// held reach this check: an unsigned or forged one is `FormationAdmissionsUnverified`.
+        FormationAdmissionsRefused,
+
+        /// A machine ticket this node verified and spent: AUTH on that connection speaks for the
+        /// machine it names.
+        NodeTicketsAccepted,
+        /// A machine ticket whose bytes are not one: a client of another version, or none of ours.
+        NodeTicketsRefusedMalformed,
+        /// A genuine machine ticket whose machine id or audience is not UTF-8, refused before it is
+        /// compared, logged or rendered.
+        NodeTicketsRefusedNotUtf8,
+        /// A machine ticket refused because this node holds no current roster to check it against.
+        NodeTicketsRefusedNoRoster,
+        /// A machine ticket naming a machine the roster holds no live key for, signed by no revoked
+        /// key: a machine not admitted.
+        NodeTicketsRefusedUnknownMachine,
+        /// A machine ticket naming an admitted machine and not signed by that machine's key.
+        NodeTicketsRefusedForged,
+        /// A machine ticket signed by a key the cluster revoked: the forgotten machine itself.
+        NodeTicketsRefusedRevoked,
+        /// A genuine machine ticket minted for an endpoint other than this node.
+        NodeTicketsRefusedWrongAudience,
+        /// A genuine machine ticket outside the acceptance window, past it or too far ahead of it, or
+        /// expiring no later than a spend this node has already let go of.
+        NodeTicketsRefusedExpired,
+        /// A genuine machine ticket this node had already spent.
+        NodeTicketsRefusedReplayed,
+        /// A genuine machine ticket refused because this node's spent set is full of live entries.
+        NodeTicketsRefusedSpentSetFull,
+
+        /// Machine tickets this node signed for a process on this machine (MINT-TICKET).
+        ///
+        /// The positive half of the four mint refusals below, and the figure a fleet's ticket traffic
+        /// starts from: every ticket some node accepts was minted by one of these.
+        NodeTicketsMinted,
+        /// MINT-TICKET asked from anywhere but loopback: a ticket is minted for this machine's own
+        /// processes only, judged from the connection's peer address, so the request is refused
+        /// before anything is signed.
+        NodeTicketMintsRefusedNotLocal,
+        /// MINT-TICKET whose audience will not decode, is not UTF-8 text (which every verifier
+        /// refuses), or names no one machine -- loopback, a wildcard, or no host at all -- so the
+        /// ticket would be spendable at any node.
+        NodeTicketMintsRefusedMalformed,
+        /// MINT-TICKET on a node that holds no identity key, so it has nothing to sign with.
+        NodeTicketMintsRefusedNoKey,
+        /// MINT-TICKET this node could not draw a nonce for (#1527): a fact about this machine's
+        /// random source, answered as a refusal rather than a weaker ticket.
+        NodeTicketMintsRefusedNoRandom,
+
+        /// An operator's control verb -- a cluster admission, forget or setting -- from a caller
+        /// `--fleet-open` alone admitted, refused `IdentifiedCallerRequired`. The caller is a member
+        /// and asked to change the fleet anyway, so on an open node this is somebody trying the
+        /// decision half of the policy.
+        SchedulerRequestsRefusedIdentifiedCallerRequired,
+        /// An `ENROLL-CONTROL` -- approve, reject, auto-approve, clear, list -- from a caller
+        /// `--fleet-open` alone admitted: an anonymous caller trying to decide who joins. Kept apart
+        /// from `EnrollmentControlRefusedNotAMember`, which is a caller nothing admitted at all.
+        EnrollmentControlRefusedIdentifiedCallerRequired,
+        /// An operator's control verb -- a cluster admission, forget or setting -- from an IDENTIFIED
+        /// caller whose machine holds no voter's seat, refused `OperatorStandingRequired`: a learner's
+        /// machine ticket or proven key. A ticket proves a fleet machine, never an operator, so a rise
+        /// is a process on a fleet machine trying to decide the fleet.
+        SchedulerRequestsRefusedOperatorStandingRequired,
+        /// An `ENROLL-CONTROL` -- approve, reject, auto-approve, clear, list -- from an identified
+        /// caller whose machine holds no voter's seat: a learner deciding who joins. Kept apart from
+        /// `EnrollmentControlRefusedIdentifiedCallerRequired`, an anonymous caller.
+        EnrollmentControlRefusedOperatorStandingRequired,
+
+        /// Lease requests refused because a string they carried -- the key, the toolchain
+        /// fingerprint, or the label a person reads that toolchain by -- is not UTF-8. The lease-side
+        /// twin of `DispatchWorkerRegistrationsMalformed`: a lease refused `no-worker` is recorded for
+        /// the leader's `unserved-toolchain` condition and a granted one is listed with its key, so
+        /// what a lease names enters the fleet's state and is gated where it enters. This project's
+        /// launcher sends only a label it checked, so a rise names a client that does not.
+        DispatchLeasesMalformed,
+        /// Lease requests refused because a string they carried is longer than a scheduler records:
+        /// the key (`CompileCacheWire::MaxLeaseKeyBytes`), the toolchain fingerprint
+        /// (`MaxToolchainFingerprintBytes`) or its label (`MaxToolchainLabelBytes`). Each is kept, so
+        /// each has a ceiling far below the frame's. Apart from `DispatchLeasesMalformed` because the
+        /// two have different causes: that one is bytes that are not text, this one text longer than
+        /// anything a real client writes -- and this project's launcher sends neither.
+        DispatchLeasesFieldTooLong,
+
+        /// Registrations refused because a field they carried is longer than a scheduler records:
+        /// the fingerprint, endpoint, version, toolchain label, display name or codec list, each
+        /// against its `CompileCacheWire` ceiling. Every one is kept in the worker's entry. Apart from
+        /// `DispatchWorkerRegistrationsMalformed`, which counts bytes that are not text: this one is
+        /// a field longer than anything this project's nodes send.
+        DispatchWorkerRegistrationsFieldTooLong,
+        /// Machine announcements (NODE-ANNOUNCE) refused because their endpoint or version is longer
+        /// than a scheduler records. Both are kept in the machine's row on the fleet page. A condition
+        /// row's fields have ceilings too, but over the wire the decoder refuses an overlong one first,
+        /// as a malformed frame that no counter moves for -- so this counts those only for a caller
+        /// of the service in the same process. This project's nodes send none that long, so a rise
+        /// names a peer that does.
+        DispatchNodeAnnouncementsFieldTooLong,
+        /// Answers -- an admission, a refusal or a not-yet -- a pending node refused because their
+        /// signature did not bind them to the fleet it asked: none, one that does not verify over its
+        /// own request and the outcome stated, or a genuine one by a key it never proved for that
+        /// fleet. Each counts as no answer. A roster is public, so this -- not the roster's content --
+        /// is what stops an answer the fleet did not give.
+        FormationAdmissionsUnverified,
+        /// Proven fleets a solitary node would have asked to admit it and did not, because
+        /// `--fleet-id` pins it to another cluster. Once per proof, so a fleet that keeps beaconing
+        /// keeps counting: the attack the pin stops looks like exactly this.
+        FormationYieldsRefusedPin,
+        /// Moves into another cluster a pinned node refused: an approval from a fleet its pin does
+        /// not admit, or its fleet's order to dissolve into one. No state changes; once per answer
+        /// or per order.
+        FormationAdmissionsRefusedPin,
+        /// Serving bodies that found, at their start, that a state file in this node's directory is
+        /// replaced by the classic rename: the POSIX-semantics one was refused (`ProbeReplaceRoute`).
+        /// On Windows a reader holding a state file open then makes its replace fail.
+        StateFileReplacesFellBack,
+
+        /// Serving bodies that found, as they started, that the filesystem holding this node's state
+        /// directory cannot sync a directory at all, so a replaced state file is not known to survive a
+        /// power loss there (`Consensus::MeansDirectorySyncUnsupported`). Every replace still lands --
+        /// such a volume used to refuse them all -- and the warning names the directory and the answer.
+        StateDirectorySyncsUnsupported,
+
+        /// A node proof this node could not judge YET, answered `RosterNotYetApplied` rather than
+        /// `NodeProofsRefusedUnknownKey`: its consensus had not applied the log it recovered at start,
+        /// so its key roster could lack a key its cluster holds. A few at every start are the boot
+        /// order; a count that keeps rising is a node that cannot elect, or cannot hear its leader.
+        NodeProofsRefusedRosterNotYetApplied,
 
         Last,
     };

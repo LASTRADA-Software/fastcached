@@ -45,11 +45,22 @@ set -uo pipefail
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 library="${source_dir}/scripts/lib/e2e-common.sh"
 
+# How many lanes each table of cases runs in (`start_case_lanes` says why), and the tables
+# that run in lanes AT ONCE -- every one of them, since each lane gets a slice of the port
+# range of its own and two tables' lanes run side by side. Up here because the `port-*`
+# cases read them too, and a case body runs long before the driver's code does.
+CaseLanes=8
+CaseLaneTables=(cases socket_cases)
+CaseLaneSlices=$(( CaseLanes * ${#CaseLaneTables[@]} ))
+
 # Which files are third-party (#1370), for the one census here that lists the whole
 # repository rather than walking `scripts/`.
 # shellcheck source=lib/third-party-roots.sh
 . "${source_dir}/scripts/lib/third-party-roots.sh" \
     || { echo "FAIL: cannot read scripts/lib/third-party-roots.sh" >&2; exit 1; }
+# shellcheck source=lib/git-scrub.sh
+. "${source_dir}/scripts/lib/git-scrub.sh" \
+    || { echo "FAIL: cannot read scripts/lib/git-scrub.sh" >&2; exit 1; }
 
 # How many immediate commands `fast_path_ms` puts through `run_bounded`.
 #
@@ -585,10 +596,14 @@ run_case() {
     ports)
         drawn=""
         n=0
+        # The range this case draws from: its lane's slice, else the whole range.
+        range="$(e2e_port_range)"
+        floor="${range% *}"
+        ceiling="${range#* }"
         while [ "$n" -lt 40 ]; do
             p="$(free_port)"
-            [ "$p" -ge 20000 ] || fail "drew ${p}, below the floor of 20000"
-            [ "$p" -lt 32000 ] || fail "drew ${p}, at or above the ceiling of 32000"
+            [ "$p" -ge "$floor" ] || fail "drew ${p}, below the floor of ${floor}"
+            [ "$p" -lt "$ceiling" ] || fail "drew ${p}, at or above the ceiling of ${ceiling}"
             case " ${drawn} " in
                 *" ${p} "*) fail "drew ${p} twice; the issued-port ledger is not working" ;;
             esac
@@ -616,18 +631,25 @@ run_case() {
     # substitution, so two draws from one seed are two different streams.
     #
     # So the ledger is PRE-LOADED instead, with every port in the range but the
-    # top thousand. A draw that consults it can only come back from that
-    # thousand; a draw that does not has eleven chances in twelve of coming back
-    # from below it, and five draws make that 4 in 10^6. Nothing is listening on
-    # any of them -- which is the whole point, and exactly the situation the
-    # ledger exists for: a port issued a moment ago, whose server has not bound
+    # top TWELFTH. A draw that consults it can only come back from that band; a draw
+    # that does not comes back from below it eleven times in twelve, and five draws
+    # make that 4 in 10^6 -- whatever the range, a lane's slice or all of it. The band
+    # is a FRACTION, not a count: a fixed hundred was 0.8% of the whole range, so run
+    # alone (`--case`, no slice) a draw that DID consult the ledger missed it often
+    # enough to exhaust `free_port`'s tries most of the time (round 6, I2). Nothing is
+    # listening on any of them -- which is the whole point, and exactly the situation
+    # the ledger exists for: a port issued a moment ago, whose server has not bound
     # yet, probes free.
     ports-ledger)
-        seq 20000 30999 > "${scratch}/.issued-ports"
+        range="$(e2e_port_range)"
+        floor="${range% *}"
+        ceiling="${range#* }"
+        keep=$(( (ceiling - floor) / 12 ))
+        seq "$floor" $(( ceiling - keep - 1 )) > "${scratch}/.issued-ports"
         n=0
         while [ "$n" -lt 5 ]; do
             p="$(free_port)"
-            [ "$p" -ge 31000 ] \
+            [ "$p" -ge $(( ceiling - keep )) ] \
                 || fail "drew ${p}, which the ledger already held; the ledger is not consulted"
             n=$(( n + 1 ))
         done
@@ -644,6 +666,250 @@ run_case() {
             fail "port_answers said something is listening on the unbound port ${p}"
         fi
         echo "port_answers is false for an unbound port"
+        ;;
+
+    # --- the lanes' slices of the port range ----------------------------------
+    #
+    # Disjoint and inside the range, for the lane count the driver uses: adjacent
+    # slices share a boundary and no port, the first starts at the floor and none
+    # passes the ceiling. Two slices that overlapped would put two lanes back on one
+    # number, which is the collision the slices exist to remove.
+    port-slices)
+        expected_floor="$E2ePortFloor"
+        n=0
+        while [ "$n" -lt "$CaseLaneSlices" ]; do
+            slice="$(e2e_port_slice "$n" "$CaseLaneSlices")"
+            [ "${slice%-*}" = "$expected_floor" ] \
+                || fail "slice ${n} of ${CaseLaneSlices} is ${slice}; it should start at ${expected_floor}"
+            [ "${slice#*-}" -gt "${slice%-*}" ] || fail "slice ${n} of ${CaseLaneSlices} is empty: ${slice}"
+            [ "${slice#*-}" -le "$E2ePortCeiling" ] || fail "slice ${n} of ${CaseLaneSlices} passes the ceiling: ${slice}"
+            expected_floor="${slice#*-}"
+            n=$(( n + 1 ))
+        done
+        echo "${CaseLaneSlices} slices of ${E2ePortFloor}-${E2ePortCeiling}, disjoint and inside it"
+        ;;
+
+    # A draw stays inside the slice it was handed. A ten-port slice and five draws:
+    # one that ignored it would come back from the other 11990 numbers almost surely.
+    # The ten are the first of the range this case already draws from, its lane's, so
+    # its probes never connect to a listener another lane staged.
+    port-range-honoured)
+        range="$(e2e_port_range)"
+        floor="${range% *}"
+        E2E_PORT_RANGE="${floor}-$(( floor + 10 ))"
+        export E2E_PORT_RANGE
+        n=0
+        while [ "$n" -lt 5 ]; do
+            p="$(free_port)"
+            { [ "$p" -ge "$floor" ] && [ "$p" -lt $(( floor + 10 )) ]; } || fail "drew ${p}, outside the slice ${E2E_PORT_RANGE}"
+            n=$(( n + 1 ))
+        done
+        echo "five draws stayed inside the slice they were handed"
+        ;;
+
+    # And a slice that is not one ends the run by name, rather than drawing from
+    # somewhere a neighbouring lane may be drawing too.
+    port-range-refused)
+        E2E_PORT_RANGE=1000-2000
+        export E2E_PORT_RANGE
+        p="$(free_port)"
+        echo "BUG: drew ${p} from a slice outside the range"
+        ;;
+
+    # The WIRING: the driver handed THIS lane a slice, and it is one of the lanes'.
+    # Run through the lanes only; run alone it has no lane, and says so.
+    port-range-of-this-lane)
+        [ -n "${E2E_PORT_RANGE:-}" ] \
+            || fail "E2E_PORT_RANGE is unset: this case runs under the self-test's lanes, which hand each its own slice"
+        n=0
+        found=""
+        while [ "$n" -lt "$CaseLaneSlices" ]; do
+            [ "$(e2e_port_slice "$n" "$CaseLaneSlices")" != "$E2E_PORT_RANGE" ] || found="$n"
+            n=$(( n + 1 ))
+        done
+        if [ -n "$found" ]; then
+            echo "this lane draws from slice ${found} of ${CaseLaneSlices}"
+        else
+            echo "BUG: E2E_PORT_RANGE='${E2E_PORT_RANGE}' is none of the lanes' slices"
+        fi
+        ;;
+
+    # --- a stop that must END CLEANLY ------------------------------------------
+    #
+    # `stop_and_require_clean_exit`, both directions and both of its refusals. Each
+    # staged child answers TERM the way a node can: by exiting 0 from a handler, by
+    # dying of the default disposition (143), by crashing on the way out (134 is
+    # `abort`), or by exiting 0 after printing the shared-cache host's refusal. The
+    # child says when its trap is INSTALLED, and the case waits for that, so a TERM
+    # can never land before the handler exists and read as 143. And each child drops
+    # the case's own traps first: a forked subshell inherits them, and one exiting
+    # from its handler would otherwise run this case's cleanup -- deleting the very
+    # log the helper is about to read.
+    clean-stop-handled | clean-stop-unhandled | clean-stop-unhandled-opted-in | clean-stop-bad-opt-in | clean-stop-crashed | clean-stop-refusal-line)
+        log="${scratch}/child.log"
+        childArmed="${scratch}/armed"
+        : > "$log"
+        case "$name" in
+            clean-stop-handled)
+                ( trap - EXIT INT HUP; trap 'kill "$s" 2>/dev/null; exit 0' TERM
+                  : > "$childArmed"; sleep 30 & s=$!; wait "$s" ) >/dev/null 2>&1 3>&- &
+                ;;
+            clean-stop-unhandled | clean-stop-unhandled-opted-in | clean-stop-bad-opt-in)
+                ( trap - EXIT TERM INT HUP; : > "$childArmed"; exec sleep 30 ) >/dev/null 2>&1 3>&- &
+                ;;
+            clean-stop-crashed)
+                ( trap - EXIT INT HUP; trap 'kill "$s" 2>/dev/null; exit 134' TERM
+                  : > "$childArmed"; sleep 30 & s=$!; wait "$s" ) >/dev/null 2>&1 3>&- &
+                ;;
+            clean-stop-refusal-line)
+                ( trap - EXIT INT HUP
+                  trap 'kill "$s" 2>/dev/null; echo "the shared-cache host is being destroyed while 1 reader(s) still borrow it" >> "$log"; exit 0' TERM
+                  : > "$childArmed"; sleep 30 & s=$!; wait "$s" ) >/dev/null 2>&1 3>&- &
+                ;;
+        esac
+        child=$!
+        armedYet() { [ -e "$childArmed" ]; }
+        wait_until armedYet "the staged child to install its TERM handling" "$child" "-" 5
+        # The opt-in is passed only where the case is named for it: every other row,
+        # the unhandled TERM included, is judged by the DEFAULT contract.
+        optIn=()
+        case "$name" in
+            clean-stop-unhandled-opted-in) optIn=(term-ends-it) ;;
+            clean-stop-bad-opt-in) optIn=(term-is-fine) ;;
+        esac
+        stop_and_require_clean_exit "$child" "the staged child" 5 "$log" ${optIn[@]+"${optIn[@]}"}
+        echo "stop_and_require_clean_exit accepted status ${E2eStopStatus}"
+        ;;
+
+    # --- a fixture inherits no FASTCACHE_* ------------------------------------
+    #
+    # Sourcing the library clears every FASTCACHE_* the shell inherited, so an
+    # operator's FASTCACHE_SCHEDULER cannot send a fixture's "local" compile to
+    # their fleet. Driven the way a fixture meets it: the variable EXPORTED before
+    # the `source`, the fixture's own setting exported after, and a stand-in
+    # compile that reports the environment it was started with.
+    #
+    # The control runs first and is not decoration: a stand-in that saw no
+    # exported variable at all would satisfy the "did not reach" line while testing
+    # nothing. And the harness knob row is the other direction -- a scrub that
+    # cleared everything would pass the first two lines and switch `tsan-gate.sh`'s
+    # bound off in silence.
+    fastcache-env-scrubbed)
+        stub="${scratch}/stub-compile"
+        printf '#!/bin/sh\nenv\n' > "$stub"
+        chmod +x "$stub"
+        control="$(FASTCACHE_SCHEDULER=staged.invalid:6674 "$stub")"
+        case "$control" in
+            *FASTCACHE_SCHEDULER=staged.invalid:6674*) ;;
+            *) echo "BUG: the stand-in compile never saw an exported variable, so nothing below is tested" ;;
+        esac
+        seen="$(FASTCACHE_SCHEDULER=staged.invalid:6674 FASTCACHE_TSAN_TIMEOUT=77 \
+            bash -c '. "$1"; export FASTCACHE_VERBOSE=1; "$2"' _ "$library" "$stub")"
+        case "$seen" in
+            *FASTCACHE_SCHEDULER=*) echo "BUG: an inherited FASTCACHE_SCHEDULER reached the fixture's compile" ;;
+            *) echo "an inherited FASTCACHE_SCHEDULER did not reach the compile" ;;
+        esac
+        case "$seen" in
+            *FASTCACHE_VERBOSE=1*) echo "the fixture's own FASTCACHE_VERBOSE did" ;;
+            *) echo "BUG: the fixture's own export, made after sourcing, did not reach the compile" ;;
+        esac
+        case "$seen" in
+            *FASTCACHE_TSAN_TIMEOUT=77*) echo "the harness knob FASTCACHE_TSAN_TIMEOUT was kept" ;;
+            *) echo "BUG: the harness knob FASTCACHE_TSAN_TIMEOUT was cleared" ;;
+        esac
+        ;;
+
+    # --- the invocation log, read by column NAME ---------------------------------
+    #
+    # The layout comes from Stats.cpp, so a line in the version this build writes, a line
+    # from before versions and a line in a version it does not write are three answers: the
+    # column, the column read one place earlier, and nothing with status 3. The current
+    # line comes FIRST, from the layout itself: a reader that took the first field as the
+    # outcome passes the old line and reads `v2` here.
+    launcher-log-field)
+        e2e_launcher_log_line MISS /tree/v.cpp > "${scratch}/log"
+        printf 'HIT\tdefault\t1\t2\t/tree/old.cpp\n' >> "${scratch}/log"
+        echo "outcomes: $(e2e_launcher_log_field outcome < "${scratch}/log" | tr '\n' ' ')"
+        echo "sources: $(e2e_launcher_log_field source < "${scratch}/log" | tr '\n' ' ')"
+        printf 'v999\tMISS\tdefault\t0\t1\t/tree/new.cpp\n' > "${scratch}/foreign"
+        status=0
+        foreign="$(e2e_launcher_log_field source < "${scratch}/foreign" 2>/dev/null)" || status=$?
+        echo "a foreign version: status ${status}, [${foreign}]"
+        status=0
+        e2e_launcher_log_field no-such-column < "${scratch}/log" >/dev/null 2>&1 || status=$?
+        echo "an unknown column: status ${status}"
+        # A line in this build's version that is short of its columns: Stats.cpp refuses it, so
+        # this reader must too, rather than read what is there by position.
+        printf '%s\tMISS\tdefault\t0\t1\t/tree/short.cpp\n' "$(e2e_launcher_log_version)" > "${scratch}/short"
+        status=0
+        short="$(e2e_launcher_log_field source < "${scratch}/short" 2>/dev/null)" || status=$?
+        echo "a short line: status ${status}, [${short}]"
+        # A column name this reader cannot read is a refused LAYOUT, never a column skipped in
+        # silence -- which would shift every later column by one.
+        sed 's/\.name = "elapsed-ms"/.name = "elapsed_ms"/' "${source_dir}/src/apps/fastcache-cc/Stats.cpp" > "${scratch}/Stats.cpp"
+        grep -q 'elapsed_ms' "${scratch}/Stats.cpp" || echo "BUG: the odd column name was not planted"
+        status=0
+        e2e_launcher_log_layout "${scratch}/Stats.cpp" >/dev/null 2>&1 || status=$?
+        echo "an odd column name: status ${status}"
+        ;;
+
+    # --- the caller-damage check, when its own count cannot be taken -------------
+    #
+    # The check counts this run's records in the caller's log with one awk. An awk that FAILS
+    # is the instrument failing, which must read as damage nobody can rule out -- never as a
+    # clean log. The control runs first through the same function: a record of this run is
+    # found. Then an `awk` that fails only for the count (the layout read still works) is put
+    # first on PATH.
+    launcher-damage-unread)
+        caller="${scratch}/caller.log"
+        e2e_launcher_log_line MISS "${scratch}/run/a.cpp" > "$caller"
+        _e2e_workdir="${scratch}/run"
+        _e2e_launcher_state_trees=""
+        _e2e_launcher_state_caller="${caller}|absent||"
+        control="$(_e2e_launcher_state_caller_damage)"
+        case "$control" in
+            *"1 of this run's compiles were recorded"*) echo "the control found this run's record" ;;
+            *) echo "BUG: the control did not find this run's record: [${control}]" ;;
+        esac
+        # The stub reaches the real awk by dropping itself, PATH's first entry -- never through
+        # `command -v awk`, which unguarded-prerequisites reads as a guard making awk optional.
+        mkdir -p "${scratch}/bin"
+        printf '#!/bin/sh\nif [ -n "${E2E_STATE_TREES+x}" ]; then exit 2; fi\nPATH="${PATH#*:}" exec awk "$@"\n' > "${scratch}/bin/awk"
+        chmod +x "${scratch}/bin/awk"
+        failed="$(PATH="${scratch}/bin:${PATH}" _e2e_launcher_state_caller_damage)"
+        case "$failed" in
+            *"could not be read past its start"*) echo "a failed count is reported, not clean" ;;
+            "") echo "BUG: a failed count read as a clean log" ;;
+            *) echo "BUG: a failed count read as: [${failed}]" ;;
+        esac
+        ;;
+
+    # The same count, failed one stage EARLIER: the `tail` that feeds awk. Under `set +o
+    # pipefail` the pipeline's status is awk's alone, and an awk handed nothing prints zero
+    # records -- a clean log -- so the count asks both stages' statuses (`PIPESTATUS`). The stub
+    # fails on the `-c +N` form the count uses; it cannot key on `E2E_STATE_TREES` as the awk
+    # stub does, since only awk's environment carries it.
+    launcher-damage-unread-tail)
+        caller="${scratch}/caller.log"
+        e2e_launcher_log_line MISS "${scratch}/run/a.cpp" > "$caller"
+        _e2e_workdir="${scratch}/run"
+        _e2e_launcher_state_trees=""
+        _e2e_launcher_state_caller="${caller}|absent||"
+        control="$(_e2e_launcher_state_caller_damage)"
+        case "$control" in
+            *"1 of this run's compiles were recorded"*) echo "the control found this run's record" ;;
+            *) echo "BUG: the control did not find this run's record: [${control}]" ;;
+        esac
+        # The real `tail` is reached by dropping the stub's own PATH entry, as the awk stub does.
+        mkdir -p "${scratch}/bin"
+        printf '#!/bin/sh\nif [ "${1-}" = "-c" ]; then exit 1; fi\nPATH="${PATH#*:}" exec tail "$@"\n' > "${scratch}/bin/tail"
+        chmod +x "${scratch}/bin/tail"
+        failed="$(PATH="${scratch}/bin:${PATH}" _e2e_launcher_state_caller_damage)"
+        case "$failed" in
+            *"could not be read past its start"*) echo "a failed count is reported, not clean" ;;
+            "") echo "BUG: a failed count read as a clean log" ;;
+            *) echo "BUG: a failed count read as: [${failed}]" ;;
+        esac
         ;;
 
     # --- the wait loop -------------------------------------------------------
@@ -1108,51 +1374,6 @@ run_case() {
         [ "$distinct" = "3" ] \
             || fail "the three records produced ${distinct} distinct findings, not 3"
         echo "the counter finding named all three terminal states"
-        ;;
-
-    # --- `wait_for_node_counter`, against a stub client -----------------------
-    #
-    # The `0xFC` door (#1308). Its acquisition is a CLIENT, not a listener, so the
-    # stand-in is a script that prints what `fastcache-cli node-metrics --format=kv`
-    # prints -- no perl, no port -- and each terminal state is one stub. The wait is
-    # the one `wait_for_counter` uses, so what these add is that the reader and the
-    # door name reach it: `node-metrics` in the finding, never `/metrics`.
-    node-counter-rises|node-counter-flat|node-counter-absent|node-counter-never-answered)
-        log="${scratch}/node-counter.log"
-        : > "$log"
-        stub="${scratch}/fastcache-cli-stub"
-        case "$name" in
-            node-counter-rises) printf '#!/bin/sh\nprintf "other_total=9\\nstaged_counter_total=1\\n"\n' > "$stub" ;;
-            node-counter-flat) printf '#!/bin/sh\nprintf "staged_counter_total=0\\n"\n' > "$stub" ;;
-            node-counter-absent) printf '#!/bin/sh\nprintf "other_total=3\\n"\n' > "$stub" ;;
-            node-counter-never-answered) printf '#!/bin/sh\nexit 3\n' > "$stub" ;;
-        esac
-        chmod +x "$stub"
-        sleep 30 >/dev/null 2>&1 &
-        staged=$!
-        wait_for_node_counter "$stub" 127.0.0.1:1 staged_counter_total 1 "$staged" "a stub node" "$log"
-        [ "$E2eCounterReading" = "1" ] \
-            || fail "E2eCounterReading is '${E2eCounterReading}', not the reading 1"
-        echo "wait_for_node_counter returned and handed back the reading 1"
-        ;;
-
-    # The `name=value` grammar under it: `metric_value`'s rules over the other
-    # separator, each one a way a reading goes wrong quietly.
-    node-metric-value-grammar)
-        body=$'fastcache_a_total=7\nfastcache_a_refused_total=0\n'
-        [ "$(node_metric_value "$body" fastcache_a_total)" = "7" ] \
-            || fail "a counter was not read by its exact name"
-        [ -z "$(node_metric_value "$body" fastcache_b_total)" ] \
-            || fail "an absent counter did not read empty"
-        [ "$(node_metric_value "$body" fastcache_a_refused_total)" = "0" ] \
-            || fail "a real zero did not read zero"
-        [ -z "$(node_metric_value "$body" fastcache_a)" ] \
-            || fail "a prefix of a counter name matched something"
-        [ -z "$(node_metric_value $'fastcache_a_total 7\n' fastcache_a_total)" ] \
-            || fail "a Prometheus line was read as a node-metrics one"
-        [ "$(node_metric_value $'c=1\nc=4\n' c)" = "4" ] \
-            || fail "the last reading of a repeated counter did not win"
-        echo "the node-metrics grammar refused a prefix, a Prometheus line and an absent counter"
         ;;
 
     # --- the Prometheus grammar, against staged bodies ------------------------
@@ -1750,6 +1971,75 @@ run_case() {
             || echo "BUG: expected exactly one SIGKILL escalation, got ${killed} -- a dead KILL arm and a lucky grace read alike"
         ;;
 
+    # A job SIGKILL does not end is NAMED and never waited on. No real process can
+    # outlive SIGKILL on demand -- the case that needs this is a kernel stuck in
+    # uninterruptible I/O -- so `kill` is shadowed to lie about ONE pid: TERM and
+    # KILL "succeed" and `kill -0` keeps saying it is alive. `wait` is shadowed to
+    # RECORD what it was asked about, because a reaper that waited on the survivor
+    # is the hang itself, and a real `wait` on a live `sleep 30` would only show
+    # that as a slow pass. The real job is ended by hand once the shadows are gone.
+    reap-names-a-survivor-of-sigkill)
+        sleep 30 &
+        stuck=$!
+        sleep 0.2
+        waited=""
+        kill() {
+            case "$*" in
+                "$stuck"|"-0 $stuck"|"-9 $stuck") return 0 ;;
+            esac
+            command kill "$@"
+        }
+        wait() { waited="${waited} $*"; builtin wait "$@"; }
+        _e2e_kill_grace_seconds=1
+        reap_background_jobs 1 2> "${scratch}/reap.err"
+        unset -f kill wait
+        echo "reap outcome: escalated=${E2eReapKilled}, survivors=${E2eReapSurvivors}"
+        case "$waited" in *"$stuck"*) echo "BUG: the survivor was waited on (${waited})" ;; esac
+        if grep -q "pid ${stuck} was still running 1s after SIGKILL and was NOT waited on: sleep 30" "${scratch}/reap.err"; then
+            echo "the survivor was named with its pid and command"
+        else
+            cat "${scratch}/reap.err"
+            echo "BUG: the survivor was not named with its pid and command"
+        fi
+        command kill -9 "$stuck" 2>/dev/null || true
+        builtin wait "$stuck" 2>/dev/null || true
+        ;;
+
+    # The one decision `reap_background_jobs` leaves to a fixture's trap: a survivor
+    # must end the run non-zero, and none must leave it alone. Both directions, since
+    # a helper that always exited would pass the first half by itself.
+    exit-if-reap-left-survivors)
+        E2eReapSurvivors=0
+        ( e2e_exit_if_reap_left_survivors; echo "with no survivor the trap carried on" )
+        E2eReapSurvivors=1
+        ( e2e_exit_if_reap_left_survivors; echo "BUG: a survivor did not end the shell" )             || echo "a survivor ended the shell with status $?"
+        ;;
+
+    # `stop_and_require_exit`'s escalation, bounded the same way, and its refusal
+    # naming the pid. A pid nothing owns, with `kill` lying that it is alive and
+    # that every signal landed, so there is no real process for the case to leave
+    # behind and `ps` has no command to report.
+    stop-names-a-survivor-of-sigkill)
+        ghost=2147483000
+        kill() {
+            case "$*" in
+                "$ghost"|"-0 $ghost"|"-9 $ghost") return 0 ;;
+            esac
+            command kill "$@"
+        }
+        # The survivor alone: the deadline's own helper process is waited on
+        # legitimately when it is disarmed.
+        wait() {
+            case " $* " in
+                *" $ghost "*) echo "BUG: the survivor was waited on" ;;
+                *) builtin wait "$@" ;;
+            esac
+        }
+        _e2e_kill_grace_seconds=1
+        stop_and_require_exit "$ghost" "the staged survivor" 1
+        echo "BUG: stop_and_require_exit returned for a process that never went"
+        ;;
+
     # --- the real-socket cases ----------------------------------------------
     #
     # `wait_for_port` and `http_get` against a listener that really binds, really
@@ -2060,89 +2350,6 @@ run_case() {
         echo "http_get reported the response CUT SHORT and said so"
         ;;
 
-    # --- `ask_leader` asks whoever leads NOW ---------------------------------
-    #
-    # `$leader_endpoint` is pinned when a section derives it, and leadership can
-    # legitimately move before that section finishes. A command put to the node
-    # that led a moment ago then gets "ask somebody else", and the fixture
-    # reported that as the cluster refusing a legitimate command (#117, #172).
-    #
-    # Driven with a stubbed `cluster` because the real failure cannot be summoned:
-    # it needs an election to land inside one call. Stubbing the answer places the
-    # interleaving instead of waiting for it, which is the only way this fix can be
-    # shown to bite at all.
-    #
-    # `ask_leader` binds `cluster`, `find_leader` and `$leader_endpoint` late,
-    # which is exactly why it lives in the library and not in the fixture.
-    ask-leader-*)
-        leader_endpoint="127.0.0.1:1111"
-        calls="${scratch}/calls"
-        rederived="${scratch}/rederived"
-        : > "$calls"
-
-        find_leader() {
-            printf '%s\n' "re-derived: $1" >> "$rederived"
-            leader_endpoint="127.0.0.1:2222"
-        }
-
-        # Answers come from a queue, one per call, so a case states the sequence
-        # it is exercising rather than a predicate over the argument.
-        answers=()
-        cluster() {
-            local n
-            n="$(wc -l < "$calls" | tr -d ' ')"
-            printf 'x\n' >> "$calls"
-            printf '%s\n' "${answers[$n]}"
-        }
-
-        case "$name" in
-        ask-leader-first-answer)
-            answers=("accepted: done")
-            ask_leader "--cluster-set=k=v" "accepted" "should not be reported"
-            echo "took the first answer, asked $(wc -l < "$calls" | tr -d ' ') time(s)"
-            # An `if`, not `[ ... ] && ...`: the good path is the file being ABSENT,
-            # and a bare test returning 1 under the `set -e` this harness deliberately
-            # keeps would fail the case for passing.
-            if [ -e "$rederived" ]; then echo "BUG: re-derived the leader when the first answer was fine"; fi
-            ;;
-
-        # THE CASE THIS TICKET EXISTS FOR. Without the retry this fails.
-        ask-leader-retries)
-            answers=("rejected (not-leader): this node does not lead the cluster" "accepted: done")
-            ask_leader "--cluster-admit=n4=127.0.0.1:9" "accepted" "the leader refused to admit a member"
-            echo "recovered after a moved leadership, asked $(wc -l < "$calls" | tr -d ' ') time(s)"
-            cat "$rederived"
-            ;;
-
-        # The SECOND spelling of the same refusal. A fixture that retried on a
-        # recognised "not the leader" wording would have to know both, and would
-        # stop retrying the day either is reworded. This one matches neither --
-        # it retries because the answer is not what the caller asserts.
-        ask-leader-election)
-            answers=("the cluster has no leader right now; try again shortly" "accepted: done")
-            ask_leader "--cluster-forget=n3" "accepted" "the leader refused to forget a member"
-            echo "recovered from an election in progress, asked $(wc -l < "$calls" | tr -d ' ') time(s)"
-            ;;
-
-        # A refusal can BE the assertion: the typo case asserts that an unknown
-        # setting is refused BY NAME, so the substring is the typo. Proof that the
-        # contract is "the answer carries this", never "the command succeeded".
-        ask-leader-refusal-is-the-assertion)
-            answers=("rejected: unknown setting 'upsteam'")
-            ask_leader "--cluster-set=upsteam=typo" "upsteam" "a typo'd setting was not refused by name"
-            echo "a refusal naming the typo satisfied the assertion"
-            if [ -e "$rederived" ]; then echo "BUG: retried an answer that was already what the caller asserted"; fi
-            ;;
-
-        # Two chances and no more: it reports the caller's sentence and the answer.
-        ask-leader-never)
-            answers=("rejected (not-leader): nope" "rejected (not-leader): still nope")
-            ask_leader "--cluster-admit=n4=127.0.0.1:9" "accepted" "the leader refused to admit a member"
-            echo "BUG: reached the line after a failing ask_leader"
-            ;;
-        esac
-        ;;
-
     # --- the two canaries for `--case`'s own verdict ------------------------
     #
     # In no table, and driven only by the `--case verdict` block far below. They
@@ -2173,100 +2380,6 @@ run_case() {
     esac
 }
 
-# ---------------------------------------------------------------------------
-# The one door every perl stand-in goes through
-# ---------------------------------------------------------------------------
-#
-# Run a perl program as THIS process, under a lifetime bound it cannot omit.
-#
-# ## What it owns, and why it is one function rather than a convention
-#
-# Every stand-in below needs the same PAIR, and neither half is optional:
-#
-#   `exec`  -- `$!` for a backgrounded shell FUNCTION is the subshell bash forks,
-#              not the program that subshell goes on to run. Without it every
-#              `kill "$listener"` in this file reaps a wrapper and leaves perl
-#              alive, reparented, still holding its LISTEN socket (#839).
-#   `alarm` -- no trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled
-#              CI job, and those are the paths a leak actually accumulates on.
-#              #839 measured what that costs: **1368 orphan listeners holding
-#              loopback ports, the oldest 30.5 hours old**, on a fixture in the
-#              DEFAULT ctest set on every platform CI builds. The expensive half
-#              was the PORTS -- these fixtures draw from below the ephemeral
-#              range, so the next run meets a port held by a process nobody knows
-#              about and fails somewhere else entirely.
-#
-# They are INDEPENDENT and a survivor count cannot tell you whether either works:
-# each alone drives the count to zero for a different reason, so a count reads as
-# "both arms fine" while one is dead. #839's arm-independence table is what shows
-# the third arm is doing real work rather than belt-and-braces, and it is quoted
-# in #843 rather than restated here.
-#
-# Three stand-ins each spelled that pair by hand, so a fix to one reached none of
-# the others (#1214) -- and the arm that can be reopened by omission is `alarm`,
-# because a stand-in written without `exec` fails LOUDLY the moment the existing
-# `kill` stops working. #843 is the ticket, and it happened rather than being
-# hypothetical: PR #834 added `_selftest_unprompted_listener` with no bound at
-# all, while the ticket about bounds was open and its diagnosis was written down.
-#
-# So the pair rides on the thing every stand-in must do anyway -- launching its
-# perl -- and there is no argument to pass an unbounded program to. This is the
-# same idiom as `Refuse` taking a row. `check-e2e-perl-bounds` (further down) is
-# what stops a new stand-in
-# spelling `perl` for itself and bypassing the door.
-#
-# ## How the bound is injected without touching the program
-#
-# `perl` accepts several `-e` chunks and joins them, in order, into ONE program.
-# So the bound is its own chunk and the caller's body is passed through verbatim:
-# the three bodies stay textually distinct, which is #1214's own constraint --
-# they model three different things and concatenating perl program text as
-# strings is the hazard the ticket exists to avoid, not the fix.
-#
-# Measured (perl 5.38.2, Linux): the two chunks compose in order, `@ARGV` after
-# `--` is exactly the caller's arguments, `alarm(0)` read from the SECOND chunk
-# reports 30 still pending, and a program that would run 60 s dies at 3 s with
-# status 142 when armed for 3. Control: the same program with no bound chunk
-# survives.
-#
-# ## Why the bodies wait with `select` and not `sleep`
-#
-# perldoc warns that `sleep` may be implemented with `alarm` on some systems, and
-# the two must not then overlap -- which is why `_selftest_listener` used to arm
-# its own alarm AFTER its delay rather than before. Arming here means arming
-# first, so that ordering is no longer available and the question has to be
-# closed rather than sequenced around.
-#
-# Measured on this platform it is a non-issue: `alarm 3; sleep 1; sleep 30` dies
-# at exactly 3.00 s over three runs, with both controls (alarm alone dies at
-# 3.00, no alarm survives). But macOS ships its own perl and cannot be measured
-# from here, so the bodies use `select(undef, undef, undef, N)` -- perldoc's own
-# alarm-safe spelling of a pause -- and the question does not arise on any
-# platform. Stated as MEASURED on Linux and INFERRED nowhere else, deliberately.
-#
-# @param 1 the lifetime bound in whole seconds; refused unless positive
-# @param 2 the perl program, single-quoted at the call site so the shell expands
-#          nothing in it
-# @param 3.. arguments, which the program reads from @ARGV
-_selftest_bounded_perl() {
-    local seconds="$1" program="$2"
-    shift 2
-    # A bound is REQUIRED and must be a positive whole number. `alarm 0` is
-    # perl's spelling of *cancel the alarm*, so a `0` here would read at the call
-    # site as a bound and be the absence of one -- an escape hatch wearing the
-    # shape of the guard, which is the failure this whole door exists to close.
-    case "$seconds" in
-        ''|*[!0-9]*) fail "_selftest_bounded_perl: '${seconds}' is not a whole number of seconds" ;;
-        0) fail "_selftest_bounded_perl: a bound of 0 cancels the alarm; there is no unbounded spelling" ;;
-    esac
-    [ -n "$program" ] || fail "_selftest_bounded_perl: no program given"
-    # The trailing marker is what `perl-bounds-scan` further down reads. This is
-    # the one `perl` command position in the tree allowed to name a program of
-    # its own, because it is the line that ARMS the bound every other one
-    # inherits -- so the scan cannot simply refuse every `perl`, and the claim
-    # has to be stated where it can be read back.
-    exec perl -e "alarm ${seconds};" -e "$program" -- "$@" # perl-lifetime: this line IS the injector
-}
 
 # The bound every stand-in below runs under, in seconds. One number, because
 # nothing here has measured a reason to differ and a per-stand-in constant is a
@@ -2293,7 +2406,7 @@ _selftest_perl_lifetime=30
 #          headers and PART of a body, promises more, and then holds the socket
 #          open -- which is a response our own read bound must end
 _selftest_listener() {
-    # `exec` and the `alarm` bound both come from `_selftest_bounded_perl`, which
+    # `exec` and the `alarm` bound both come from `e2e_bounded_perl`, which
     # is where the whole argument for them lives. What stays here is the one part
     # that is about THIS stand-in.
     #
@@ -2309,7 +2422,7 @@ _selftest_listener() {
     # that cannot fire everywhere is worse than a comment, because it reads as
     # enforcement. A rule nothing can express is a rule nothing can be held to,
     # so this one is written down instead of pretended at.
-    _selftest_bounded_perl "$_selftest_perl_lifetime" '
+    e2e_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $delay, $logfile, $mode) = @ARGV;
         $mode = "complete" unless defined $mode and length $mode;
@@ -2319,7 +2432,7 @@ _selftest_listener() {
         # `select` rather than `sleep`: the bound is already armed by the time
         # this program starts, and perldoc warns that `sleep` may be implemented
         # with `alarm` on some systems. The reasoning, and what was measured, is
-        # at `_selftest_bounded_perl`.
+        # at `e2e_bounded_perl`.
         select(undef, undef, undef, $delay) if $delay;
         # The bound is a TIME and deliberately not a connection count.
         # `port_answers` is `/dev/tcp`, so every `free_port` draw and every
@@ -2399,12 +2512,12 @@ _selftest_listener() {
 #
 # Its lifetime pair -- `exec` and the `alarm` bound, why neither closes the other's
 # hole, and why a survivor COUNT cannot tell you whether either works -- is
-# `_selftest_bounded_perl`'s, which every stand-in here goes through since #1214.
+# `e2e_bounded_perl`'s, which every stand-in here goes through since #1214.
 # This one is the reason that ticket was filed: #834 added it with no bound at all
 # while #843 was open, and its `hold` mode is the worst of the three to leak, since
 # it accumulates accepted CLIENT sockets as well as the listening port.
 _selftest_unprompted_listener() {
-    _selftest_bounded_perl "$_selftest_perl_lifetime" '
+    e2e_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $mode, $logfile) = @ARGV;
         my $srv = IO::Socket::INET->new(
@@ -2455,7 +2568,7 @@ _selftest_unprompted_listener() {
 # saying the process was making progress beside a COUNTER finding saying what
 # actually went wrong. A stand-in that logged nothing would collapse the two.
 #
-# `exec` and the lifetime bound come from `_selftest_bounded_perl`. This is the
+# `exec` and the lifetime bound come from `e2e_bounded_perl`. This is the
 # FOURTH stand-in and the one that made #1214 a ticket rather than a tidy-up: it
 # was added by a branch in flight while the door was being written on another, so
 # it spelled the pair by hand and nothing but a scan could have said so. That the
@@ -2470,7 +2583,7 @@ _selftest_unprompted_listener() {
 # @param 2 mode: rise | flat | absent
 # @param 3 the log to append one line per request to
 _selftest_metrics() {
-    _selftest_bounded_perl "$_selftest_perl_lifetime" '
+    e2e_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $mode, $logfile) = @ARGV;
         my $srv = IO::Socket::INET->new(
@@ -2535,11 +2648,11 @@ _selftest_metrics() {
 # @param 3 the log to write it to
 # @param 4 the marker text to log, e.g. `$E2eNodeReadyMarker`
 _selftest_node() {
-    # `exec` and the `alarm` bound come from `_selftest_bounded_perl`. Only ever
+    # `exec` and the `alarm` bound come from `e2e_bounded_perl`. Only ever
     # called with `&`, since the door `exec`s: `$!` must be this perl and not the
     # subshell bash forks for a backgrounded function, or the `kill "$staged"` at
     # the call site signals a wrapper and leaves this process holding its port.
-    _selftest_bounded_perl "$_selftest_perl_lifetime" '
+    e2e_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $delay, $logfile, $marker) = @ARGV;
         my $srv = IO::Socket::INET->new(
@@ -2664,6 +2777,103 @@ note_failure() {
         *" $1 "*) ;;
         *) failed_cases="${failed_cases}${failed_cases:+ }$1" ;;
     esac
+}
+
+# Run the case of every record, several at once, and judge each in RECORD ORDER.
+#
+# The cases were run one after another, and they are mostly WAITS -- a staged
+# timeout, a budget of one or two seconds, a listener that answers late -- so the
+# serial loop spent most of this test's time asleep: the cases summed to about two
+# minutes alone on a WSL host, against a 120 s ctest TIMEOUT the whole test has to
+# fit in (the conditions are in the filemacro lane's Job 3 report). Every case is
+# its own `bash --case` process with its own scratch directory, port ledger and job
+# table, so running them side by side changes nothing a case can see -- except the
+# PORTS, which a per-run ledger cannot keep apart: two lanes drew one number, one bound
+# it, and the other's `node-ready-refuses-unbound` found a listener nobody had staged
+# (Linux arm64, round 6). So each lane draws from its OWN slice of the range
+# (`E2E_PORT_RANGE`, `e2e_port_slice`), numbered across EVERY table in `CaseLaneTables`:
+# the shell and the socket tables run at once, and numbering each from zero gave lane k
+# of both one slice. `lane-slices-disjoint` asserts that across the lanes actually
+# started, and `port-range-of-this-lane` that a case sees its lane's.
+#
+# `start_case_lanes` deals the records round-robin into `CaseLanes` lanes; each lane
+# runs its cases one after another in the background, while the scans below go on
+# in the foreground. `judge_case_lanes` waits for exactly those lanes and only then
+# judges: `expect` and `note_failure` run here, in the parent, in the order of the
+# table -- so the counters, the failure names and the order of the `FAIL` lines are
+# what the serial loop produced. A case whose lane recorded no status never reached
+# a verdict, and is a failure by name rather than a silent gap.
+#
+# Lanes rather than a job pool because bash 3.2 has no `wait -n`. Each lane clears
+# the traps it inherited before it does anything else. `CaseLanes` is set at the top.
+
+# Start the lanes for a table of case records.
+# Sets `started_lanes` to the lanes' directory, which `judge_case_lanes` takes; a
+# directory that could not be created, or a table `CaseLaneTables` does not name, is
+# the empty string, and judging it fails every case by name.
+# @param 1 the table's name, a row of `CaseLaneTables`
+# @param ... the case records
+start_case_lanes() {
+    local table="$1" record lane index=0 ordinal=-1 n=0
+    shift
+    for record in "${CaseLaneTables[@]}"; do
+        [ "$record" != "$table" ] || ordinal="$n"
+        n=$(( n + 1 ))
+    done
+    if [ "$ordinal" -lt 0 ]; then
+        echo "start_case_lanes: '${table}' is not a row of CaseLaneTables, so it has no slices of the port range" >&2
+        started_lanes=""
+        return 0
+    fi
+    started_lanes="$(mktemp -d)" || { started_lanes=""; return 0; }
+    for record in "$@"; do
+        printf '%s\n' "${record%%|*}" >> "${started_lanes}/lane-$(( index % CaseLanes ))"
+        index=$(( index + 1 ))
+    done
+    for lane in "${started_lanes}"/lane-*; do
+        # The slice is the lane's number across EVERY table -- the lane's file suffix, so it
+        # is the lane's and not the order the glob listed them in -- written down here, in
+        # the driver, so `lane-slices-disjoint` reads what each lane was handed.
+        ( . "$library" && e2e_port_slice $(( ordinal * CaseLanes + ${lane##*/lane-} )) "$CaseLaneSlices" ) \
+            > "${started_lanes}/slice.${lane##*/lane-}" 2>/dev/null \
+            || rm -f "${started_lanes}/slice.${lane##*/lane-}"
+        (
+            trap - EXIT TERM INT HUP
+            E2E_PORT_RANGE="$(cat "${started_lanes}/slice.${lane##*/lane-}" 2>/dev/null)"
+            [ -n "$E2E_PORT_RANGE" ] || { echo "lane ${lane##*/}: no slice of the port range" >&2; exit 1; }
+            export E2E_PORT_RANGE
+            while IFS= read -r name; do
+                bash "${BASH_SOURCE[0]}" --case "$name" > "${started_lanes}/out.${name}" 2>&1
+                echo "$?" > "${started_lanes}/status.${name}"
+            done < "$lane"
+        ) &
+        echo "$!" >> "${started_lanes}/pids"
+    done
+}
+
+# Wait for one table's lanes, then judge every record in table order.
+# @param 1 the directory `start_case_lanes` set
+# @param ... the case records it was started with
+judge_case_lanes() {
+    local lanes="$1" record name pid
+    shift
+    if [ -n "$lanes" ] && [ -r "${lanes}/pids" ]; then
+        while IFS= read -r pid; do
+            wait "$pid" 2>/dev/null || true
+        done < "${lanes}/pids"
+    fi
+    for record in "$@"; do
+        name="${record%%|*}"
+        ran=$(( ran + 1 ))
+        if [ -z "$lanes" ] || [ ! -s "${lanes}/status.${name}" ]; then
+            echo "FAIL ${name}: its lane recorded no exit status, so the case never reached a verdict" >&2
+            note_failure "$name"
+            continue
+        fi
+        expect "$record" "$(cat "${lanes}/out.${name}")" "$(cat "${lanes}/status.${name}")" \
+            || note_failure "$name"
+    done
+    [ -z "$lanes" ] || rm -rf "$lanes"
 }
 
 # What each case must exit with and what its combined output must and must not
@@ -3109,6 +3319,23 @@ cases=(
     "ports|0|40 distinct ports, all in range, all recorded"
     "ports-ledger|0|the ledger confined five draws to the ports it had not issued"
     "port-answers-closed|0|port_answers is false for an unbound port"
+    "port-slices|0|${CaseLaneSlices} slices of 20000-32000, disjoint and inside it"
+    "port-range-honoured|0|five draws stayed inside the slice they were handed|!BUG:"
+    "port-range-refused|1|E2E_PORT_RANGE='1000-2000' is not a slice of 20000-32000|!BUG:"
+    "port-range-of-this-lane|0|this lane draws from slice|!BUG:"
+    "launcher-log-field|0|outcomes: MISS HIT |sources: /tree/v.cpp /tree/old.cpp |a foreign version: status 3, []|an unknown column: status 2|a short line: status 4, []|an odd column name: status 2|!BUG:"
+    "launcher-damage-unread|0|the control found this run's record|a failed count is reported, not clean|!BUG:"
+    "launcher-damage-unread-tail|0|the control found this run's record|a failed count is reported, not clean|!BUG:"
+    # Both accepting rows first: a helper refusing everything would satisfy every
+    # refusing row while failing each clean stop. 143 is refused by DEFAULT -- a TERM
+    # that killed a process skipped its teardown -- and accepted only when opted into.
+    "clean-stop-handled|0|stop_and_require_clean_exit accepted status 0|!BUG:"
+    "clean-stop-unhandled-opted-in|0|stop_and_require_clean_exit accepted status 143|!BUG:"
+    "clean-stop-unhandled|1|exited with status 143: the TERM killed it before its handler ran|!accepted status|!BUG:"
+    "clean-stop-bad-opt-in|1|unknown fifth argument 'term-is-fine'|!accepted status|!BUG:"
+    "clean-stop-crashed|1|exited with status 134 when asked to stop|!accepted status|!BUG:"
+    "clean-stop-refusal-line|1|refused to destroy its shared-cache host|exit status 0|!accepted status|!BUG:"
+    "fastcache-env-scrubbed|0|an inherited FASTCACHE_SCHEDULER did not reach the compile|the fixture's own FASTCACHE_VERBOSE did|the harness knob FASTCACHE_TSAN_TIMEOUT was kept|!BUG:"
     "wait-success|0|the wait returned when the predicate became true|polls) for the staged marker"
     "wait-death-is-prompt|1|the process DIED|exit=3|of a 10s budget|!BUG:|!waited 9s|!waited 10s"
     "wait-timeout-silent|1|logged NOTHING for the whole 2s|!BUG:"
@@ -3135,13 +3362,6 @@ cases=(
     # `metric_value` into the library and left its decisions asserted on no tree
     # (#597, which found the same gap on the fixture side before the move).
     "metric-value-grammar|0|the Prometheus grammar refused a prefix, a label and an absent series|!BUG:"
-    # The `0xFC` door (#1308): one stub client per terminal state, and the finding names
-    # the door that was asked, so `!/metrics` is the half that distinguishes.
-    "node-counter-rises|0|wait_for_node_counter returned and handed back the reading 1|!BUG:"
-    "node-counter-flat|1|of a 1s budget|never reached 1; the last reading was 0|!BUG:"
-    "node-counter-absent|1|of a 1s budget|node-metrics answered and exports no staged_counter_total series at all|!/metrics|!BUG:"
-    "node-counter-never-answered|1|of a 1s budget|nothing ever answered a node-metrics request|!/metrics|!BUG:"
-    "node-metric-value-grammar|0|the node-metrics grammar refused a prefix, a Prometheus line and an absent counter|!BUG:"
     "bounded-returns-status|0|run_bounded said 'carried' with status 3"
     "bounded-missing-command|0|a missing command: outcome=unstartable|!BUG:"
     "bounded-outcome-survives-capture|0|two subshells down, the outcome reads unstartable"
@@ -3155,12 +3375,10 @@ cases=(
     "bounded-fast-path-bites|0|the staged flat-pause defect asked for|!BUG:"
     "bounded-outlasts-a-trapped-term|0|a TERM-ignoring child exited 124"
     "reap-takes-what-nothing-recorded|0|escalated=1, still alive: none|!BUG:"
+    "reap-names-a-survivor-of-sigkill|0|reap outcome: escalated=1, survivors=1|the survivor was named with its pid and command|!BUG:"
+    "exit-if-reap-left-survivors|0|with no survivor the trap carried on|a survivor ended the shell with status 1|!BUG:"
+    "stop-names-a-survivor-of-sigkill|1|the staged survivor (pid 2147483000: (command unknown)) was still running|was still there 1s after SIGKILL -- not waited on|!BUG:"
     "ancestry-bound-fires|0|at the default bound a real child is a descendant|the ancestry bound gave up rather than walking on|!BUG:"
-    "ask-leader-first-answer|0|asked 1 time(s)|!BUG:"
-    "ask-leader-retries|0|recovered after a moved leadership|asked 2 time(s)|re-derived: whoever leads now|!BUG:"
-    "ask-leader-election|0|recovered from an election in progress|asked 2 time(s)|!BUG:"
-    "ask-leader-refusal-is-the-assertion|0|a refusal naming the typo satisfied the assertion|!BUG:"
-    "ask-leader-never|1|the leader refused to admit a member|still nope|!BUG:"
 )
 
 # Perl is what stages a real listener. Where it is absent those cases are
@@ -3199,15 +3417,6 @@ socket_cases=(
     "counter-flat|1|of a 1s budget|never reached 1; the last reading was 0|!BUG:"
     "counter-absent|1|of a 1s budget|exports no staged_counter_total series at all|!BUG:"
 )
-
-echo "== the helpers, in real shells"
-for record in "${cases[@]}"; do
-    name="${record%%|*}"
-    out="$( bash "${BASH_SOURCE[0]}" --case "$name" 2>&1 )"
-    status=$?
-    ran=$(( ran + 1 ))
-    expect "$record" "$out" "$status" || note_failure "${record%%|*}"
-done
 
 # --- `--case` is a verdict, in BOTH directions -----------------------------
 #
@@ -3625,6 +3834,46 @@ expect "bounded-fast-path|0| immediate commands asked for |!BUG:" "$out" "$statu
 # the paragraph above happening to the line below it.
 sed -n -e 's/^[0-9][0-9]* immediate/   &/p' -e 's/^SLOW:/   &/p' <<< "$out"
 
+# Both case tables' lanes start HERE and are judged at the end of the run, so the
+# scans below overlap the cases' waits. Here and not earlier: the sections above
+# time the helpers against the clock (`run_bounded`'s ceiling, its fast path, a
+# bound read as a duration), and sixteen lanes of case processes beside them made
+# `bounded-clock` read a 1 s bound as more than 10 s under Git Bash, where a fork
+# is expensive -- measured, and it passed there with the lanes started after them.
+# The scans read files and time nothing. The listener cases need perl to stage a
+# listener, asked once, here, for both places that act on it.
+start_case_lanes cases "${cases[@]}"
+shell_case_lanes="$started_lanes"
+socket_case_lanes=""
+socket_cases_runnable=no
+if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then # perl-lifetime: a foreground availability probe; it exits at once and is never backgrounded
+    socket_cases_runnable=yes
+    start_case_lanes socket_cases "${socket_cases[@]}"
+    socket_case_lanes="$started_lanes"
+fi
+
+# --- the lanes' slices are disjoint ACROSS the tables ----------------------
+#
+# The wiring the per-case `port-range-of-this-lane` cannot see: that no two lanes
+# running now were handed one slice. Read from what `start_case_lanes` wrote down,
+# over every table that started, so a second table numbering its lanes from zero
+# again -- round 6's defect -- is a duplicate here.
+ran=$(( ran + 1 ))
+lane_slices="$(cat "${shell_case_lanes:-/nonexistent}"/slice.* ${socket_case_lanes:+"$socket_case_lanes"/slice.*} 2>/dev/null)"
+lane_count="$(printf '%s\n' "$lane_slices" | grep -c .)"
+lane_unique="$(printf '%s\n' "$lane_slices" | grep . | sort -u | grep -c .)"
+# As many as there are lanes, counted from the lane files themselves: a table with fewer
+# records than `CaseLanes` starts fewer lanes, and a product of the two would overstate it.
+lane_expected="$(ls "${shell_case_lanes:-/nonexistent}" ${socket_case_lanes:+"$socket_case_lanes"} 2>/dev/null | grep -c '^lane-')"
+if [ "$lane_expected" -eq 0 ] || [ "$lane_count" -ne "$lane_expected" ] || [ "$lane_unique" -ne "$lane_count" ]; then
+    echo "FAIL lane-slices-disjoint: ${lane_count} lane(s) were handed ${lane_unique} distinct slice(s), expected ${lane_expected} distinct:" >&2
+    printf '%s\n' "$lane_slices" | sed 's/^/     | /' >&2
+    note_failure "lane-slices-disjoint"
+else
+    echo "lane-slices-disjoint: ${lane_count} lanes, ${lane_unique} distinct slices of ${CaseLaneSlices}"
+fi
+echo "== the helpers: ${#cases[@]} case(s), and the listener cases, started in lanes; judged at the end"
+
 # --- no fixture spells `timeout` again -------------------------------------
 #
 # `run_bounded` above is not only a helper, it is this check's subject. macOS has
@@ -3766,8 +4015,25 @@ rm -rf "$canary_dir"
 # `find` and not a glob, because a glob cannot recurse portably and this has to
 # work in an exported tarball where there is no git. Scoped to `scripts/`, which
 # is a choice and is therefore checked further down rather than assumed.
+#
+# It walks a SNAPSHOT of `scripts/`, taken once below, rather than the tree. Seven
+# scans each read every file several times, one process per read, and where the
+# checkout sits on a slow filesystem the OPEN is the cost: the early-exit scan
+# alone, over the same 78 files, took 9.8 s on WSL's `/mnt/d` and 0.9 s over an
+# ext4 copy (Job 3, measured). The copy is the same bytes, taken before any scan
+# runs, and every scan reports by basename, so nothing a scan says changes. The
+# walk-scope check further down still asks the TREE (`git ls-files`), because its
+# question is about the tree.
+#
+# @param 1 the tree whose `scripts/` is walked; the snapshot when omitted. The door-home
+#          canary passes its staged trees, so the one walk is the one it tests.
 _shell_scripts() {
-    find "${source_dir}/scripts" -type f -name '*.sh' 2>/dev/null | LC_ALL=C sort
+    find "${1:-$scan_root}/scripts" -type f -name '*.sh' 2>/dev/null | LC_ALL=C sort
+}
+
+scan_root="$(mktemp -d)" && cp -R "${source_dir}/scripts" "${scan_root}/" || {
+    echo "FAIL shell-walk: could not snapshot ${source_dir}/scripts for the scans" >&2
+    exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -4079,9 +4345,11 @@ while IFS= read -r script; do
         echo "     But NOT for an operand of 64 KiB or more: Git Bash writes a herestring into a" >&2
         echo "     pipe IN FULL before it starts the reader, so it deadlocks at the buffer -- 65535" >&2
         echo "     bytes completes and 65536 hangs, measured. A repository-wide listing is already" >&2
-        echo "     past it, so feed one through process substitution, whose reader drains" >&2
-        echo "     concurrently and which still reports the MATCHER's status:" >&2
-        echo "       grep -q PATTERN < <(printf '%s\\n' \"\$text\")        (#1591)" >&2
+        echo "     past it, so feed one through pipe_lines_into (scripts/lib/third-party-roots.sh)," >&2
+        echo "     a pipe whose reader drains concurrently and which reports the MATCHER's status:" >&2
+        echo "       pipe_lines_into \"\$text\"\$'\\n' grep -q PATTERN        (#1591)" >&2
+        echo "     Never grep < <(printf ...): that makes grep the writer's PARENT, and on a" >&2
+        echo "     Windows runner such a grep came back killed, exit 148 (#1630)." >&2
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
         note_failure "early-exit-scan"
     fi
@@ -4096,6 +4364,167 @@ if [ "$earlyexit_scanned" -lt 1 ]; then
     echo "     either way every script 'passed' without being read." >&2
     note_failure "early-exit-scan"
 fi
+
+# --- no external filter reads a process substitution ------------------------
+#
+# `grep PATTERN < <(printf ...)` can make the FILTER the parent of the substitution's writer, and
+# on a GitHub Windows runner a grep fed that way came back with exit 148, 128 + 20, and 20 is
+# SIGCHLD in the MSYS2 runtime (#1630, round 10). Round 8 was a status-2 refusal from the same
+# kind of grep whose status was never printed, read as a kill but not measured as one. That the
+# writer's exit is what killed it is INFERRED (it did not reproduce locally). The parentage is
+# MEASURED, each writer reading its own PPID out of /proc on Git Bash 5.2.37 and bash 3.2.57: the
+# filter is the writer's parent for `cmd < <(w)` and `$(cmd < <(w))`, and for an ARGUMENT
+# `cmd <(w)` inside `$( )` or a pipeline -- the `diff <(a) <(b) | sed` and `$(comm -23 <(a) <(b))`
+# this tree had. A top-level `cmd <(w)` measured a sibling, and `done < <(cmd <(w))` a parent on
+# 5.2 and a sibling on 3.2: whether a line is safe depends on a construct around it and on the
+# bash version, neither of which a line shows. So the rule is the one a line CAN show -- no
+# external filter reads a process substitution, in either position -- and the remedy is a pipe,
+# whose writer is the shell's child in every context measured: `pipe_lines_into` for one input,
+# `pipe_pair_into` for two (scripts/lib/third-party-roots.sh). A `while read ...; done < <(...)`,
+# `mapfile` or a shell function is the SHELL reading, and is not matched; nor is a filter named
+# inside a string, since the command must be in COMMAND position.
+#
+# The arguments between the filter and its `<(` are read QUOTE-AWARE: a `|`, `;` or `&` inside a
+# quoted argument -- `grep -E 'a|b'`, an awk program's `;` -- does not end the command, and `2>&1`
+# is a redirection rather than a separator. And the prefixes a command may carry are allowed in
+# front of the filter: `VAR=value`, `timeout N`, `nice [-n N]`, `stdbuf -oL`, `time [-p]`,
+# `command`, `env`, and a backtick substitution (the wrappers after round 11's review, M3).
+# The first version stopped at the first `|`, `;` or `&` anywhere, quotes included, and missed
+# nine everyday shapes no blind spot named (round 10 review, I3); each is a canary row below.
+#
+# BLIND SPOTS, all failing OPEN -- the line passes:
+#   - a filter not in the list below, and a filter behind a WRAPPER command not in the prefix
+#     list (`ionice`, `chrt`, `sudo`, ...);
+#   - one invoked through a variable (`"$python3_bin" x.py < <(...)`);
+#   - one whose `<(` sits on a continuation line after a `\`;
+#   - a quoted argument holding an escaped quote of its own kind (`"a\"|b"`), which ends the
+#     quoted run early, and any other quoting this class does not model ($'...', nested $( ));
+#   - every `run:` block of `.github/workflows`, which `_shell_scripts` does not walk;
+#   - a file the scan's own grep failed on, whose empty answer the `|| true` keeps -- the house
+#     idiom of every extractor here, open as #1631.
+# None is in the tree today; the census that said so was every `<(` in `scripts/` and in
+# `.github/workflows`, classified by hand (and by the round 10 review), not this regex.
+#
+# READ THROUGH ITS REGIONS: this file states the scan's own canary lines, so the two canary
+# heredocs sit in a `procsub-scan` data region and the file is scanned like any other -- never
+# exempted whole, which would blind the scan to its 5700 lines (#492's shape; round 10 review,
+# I4). The region holds the heredocs ALONE: the code around them is code the scan must read, and
+# the pattern's own text cannot match it, since its filter list is never followed by `<(` (round
+# 11 review, M2).
+_procsub_pattern() {
+    local sq="'" dq='"'
+    local position='(^|[$][(]|[;&|!{(`]|(^|[[:space:]])(then|do|if|else|elif|while|until|command|exec))[[:space:]]*'
+    local prefixes='(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|timeout[[:space:]]+[^[:space:]]+|nice([[:space:]]+-n[[:space:]]*[^[:space:]]+)?|stdbuf([[:space:]]+-[ioe][^[:space:]]*)+|time([[:space:]]+-p)?|command|env)[[:space:]]+)*'
+    local filters='(grep|egrep|fgrep|sort|sed|awk|cut|wc|tr|uniq|head|tail|cat|comm|diff|cmp|paste|join|tee|nl|od|base64|sha256sum|md5sum|iconv|jq|xargs|git|perl|python3?|sh|bash)'
+    local arguments="([[:space:]]([^|;&${sq}${dq}]|${sq}[^${sq}]*${sq}|${dq}[^${dq}]*${dq}|[0-9]?>&[0-9-])*)?"
+    printf '%s' "${position}${prefixes}${filters}${arguments}[[:space:]]<\\("
+}
+ProcsubPattern="$(_procsub_pattern)"
+_external_reads_procsub() {
+    _readable_dropping_regions "procsub-scan" "$1" | grep -nE "$ProcsubPattern" 2>/dev/null || true
+}
+
+procsub_canary_dir="$(mktemp -d)"
+# procsub-scan: data-begin
+cat > "${procsub_canary_dir}/must-catch.sh" <<'CANARY'
+selected="$(grep -E -- "$pattern" < <(printf '%s\n' "$3"))" || status=$?
+grep -q "^${root}/" < <(printf '%s\n' "$all") || continue
+names="$(sort -u < <(printf '%s' "$named"))"
+if grep -qx -- "$leg" < <(printf '%s\n' "$legs"); then :; fi
+count=$(wc -l < <(producer))
+awk '{print $1}' < <(git ls-files)
+diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed 's/^/     | /' >&2
+Miss "it WROTE the configuration" "$(diff <(printf '%s\n' "$before") <(printf '%s\n' "$now"))"
+done < <(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
+gap="$(comm -23 <(printf '%s\n' "$literals") <(printf '%s\n' "$reached" | sort -u))"
+grep -E 'alpha|beta' < <(printf '%s\n' "$x")
+awk '{ n++; print }' < <(printf '%s\n' "$x")
+x="$(sed -e 's/a/b/;s/c/d/' < <(printf '%s\n' "$y"))"
+grep -E "a|b" <(printf '%s\n' "$x") | cat
+grep -c x 2>&1 < <(printf '%s\n' "$x")
+LC_ALL=C sort -u < <(printf '%s\n' "$x")
+command grep -q x < <(printf '%s\n' "$x")
+timeout 5 grep -q x < <(printf '%s\n' "$x")
+v=`grep -c x < <(printf '%s\n' "$x")`
+nice -n 5 grep x < <(printf '%s\n' "$x")
+stdbuf -oL grep x < <(printf '%s\n' "$x")
+time sort -u < <(printf '%s\n' "$x")
+CANARY
+cat > "${procsub_canary_dir}/must-not-catch.sh" <<'CANARY'
+done < <(printf '%s\n' "$paths")
+while IFS= read -r line; do :; done < <(grep -n x "$f")
+selected="$(pipe_lines_into "$3"$'\n' grep -E -- "$pattern")" || status=$?
+unanalysed="$(pipe_pair_into "$expected"$'\n' "$actual"$'\n' comm -13 /dev/fd/3 -)" || comm_status=$?
+echo "     Never grep < <(printf ...): that makes grep the writer's PARENT" >&2
+echo "  diff <(a) <(b) is the same shape as an argument" >&2
+# grep -q x < <(printf '%s\n' "$y")
+header_filter_read_paths paths total < <(printf '%s\n' "$x")
+done < <(grep -v '^[[:space:]]*#' "$onlyList" | grep . | sort -u)
+grep -c . "$file"
+diff "$want" "$got"
+collect_lines < <(printf '%s\n' "$x")
+echo 'grep -E "a|b" < <(printf x) is the shape' >&2
+LC_ALL=C pipe_lines_into "$x"$'\n' sort -u
+CANARY
+# procsub-scan: data-end
+_scan_canary "procsub-reader-scan-canary" _external_reads_procsub \
+    "${procsub_canary_dir}/must-catch.sh" "${procsub_canary_dir}/must-not-catch.sh" \
+    22 "external filters reading a process substitution" "a shell read, a remedy or a string"
+rm -rf "$procsub_canary_dir"
+
+# And the region is a REGION: a canary line staged in this file OUTSIDE it is read, and caught.
+procsub_region_canary="$(mktemp -d)"
+{
+    printf '%s\n' '# procsub-scan: data-begin' 'grep -q x < <(printf y)' '# procsub-scan: data-end'
+    printf '%s\n' 'sort -u < <(printf y)'
+} > "${procsub_region_canary}/regioned.sh"
+ran=$(( ran + 1 ))
+procsub_region_hits="$(_external_reads_procsub "${procsub_region_canary}/regioned.sh")"
+if [ "$procsub_region_hits" != "4:sort -u < <(printf y)" ]; then
+    echo "FAIL procsub-region-canary: the region must hide exactly the line inside it and no line after" >&2
+    echo "     it, so the scan should report line 4 alone; it reported [${procsub_region_hits}]" >&2
+    note_failure "procsub-region-canary"
+fi
+rm -rf "$procsub_region_canary"
+
+procsub_scanned=0
+procsub_regions=""
+while IFS= read -r script; do
+    [ -n "$script" ] || continue
+    base="${script##*/}"
+    ran=$(( ran + 1 ))
+    _region_ok "procsub-reader-scan" "procsub-scan" "$script" "$base" || continue
+    case "$(grep -c '^[[:space:]]*# procsub-scan: data-begin[[:space:]]*$' "$script")" in
+        0) ;;
+        *) procsub_regions="${procsub_regions:+${procsub_regions}, }${base}" ;;
+    esac
+    procsub_scanned=$(( procsub_scanned + 1 ))
+    ran=$(( ran + 1 ))
+    hits="$(_external_reads_procsub "$script")"
+    if [ -n "$hits" ]; then
+        echo "FAIL procsub-reader-scan: ${base} feeds an external filter through a process substitution." >&2
+        echo "     That can make the filter the PARENT of the writer -- measured for < <(...) and for" >&2
+        echo "     an argument <(...) inside \$( ) or a pipeline -- and on a Windows runner a grep fed" >&2
+        echo "     that way came back with exit 148, 128 + SIGCHLD in the MSYS2 runtime (#1630; the" >&2
+        echo "     cause INFERRED). Feed it through a PIPE from scripts/lib/third-party-roots.sh" >&2
+        echo "     (source it if the script does not), which answers with the FILTER's status:" >&2
+        echo "       one input:   pipe_lines_into \"\$text\"\$'\\n' grep -E PATTERN" >&2
+        echo "       two inputs:  pipe_pair_into \"\$a\"\$'\\n' \"\$b\"\$'\\n' comm -23 /dev/fd/3 -" >&2
+        echo "     and CHECK that status where the output decides anything: a filter that failed" >&2
+        echo "     printed nothing, and nothing reads as 'none found'. A while-read loop or a shell" >&2
+        echo "     function over < <(...) is the shell reading and is fine as it is. A line that is" >&2
+        echo "     DATA for this scan -- a canary -- goes in a '# procsub-scan: data-begin/end' region." >&2
+        printf '%s\n' "$hits" | sed 's/^/     | /' >&2
+        note_failure "procsub-reader-scan"
+    fi
+done < <( _shell_scripts )
+ran=$(( ran + 1 ))
+if [ "$procsub_scanned" -lt 1 ]; then
+    echo "FAIL procsub-reader-scan: no script was read, so every script 'passed' without being read." >&2
+    note_failure "procsub-reader-scan"
+fi
+echo "   procsub: scanned ${procsub_scanned} script(s) under scripts/ (walked, not listed)"
+[ -z "$procsub_regions" ] || echo "   procsub: declared data region(s) in: ${procsub_regions}"
 
 # --- no script captures a `wc` count without normalising it -----------------
 #
@@ -4233,8 +4662,8 @@ _library_helper_names() {
 }
 
 # Definitions of those names in one script, at ANY indentation. A fixture's
-# helpers are not all at column zero -- `dist-compile-e2e.sh` defines two inside
-# its `--case membership` block -- so anchoring at column zero would read a
+# helpers are not all at column zero -- `check-banner-probe-identity.sh` defines
+# two inside its `--self-test` block -- so anchoring at column zero would read a
 # nested copy as absent, which is the direction that fails silently.
 #
 # WHOLE-FILE FIRST, because this test is in the DEFAULT set and runs on every
@@ -4338,7 +4767,7 @@ fi
 
 # --- every perl invocation is bounded, or SAYS why it is not ----------------
 #
-# `_selftest_bounded_perl` makes the `exec` + `alarm` pair impossible to omit for
+# `e2e_bounded_perl` makes the `exec` + `alarm` pair impossible to omit for
 # anything that goes through it. Nothing makes a new stand-in go through it, and
 # that is exactly the gap #843 is about: **a rule stated in the files that obey it
 # reaches no file that does not** (#970). The three stand-ins here now carry the
@@ -4356,7 +4785,7 @@ fi
 # TWO spellings, each a claim, which is `Refuse` / `RefuseWithoutCounter` in a
 # shell script:
 #
-#   * route through `_selftest_bounded_perl` -- bounded, nothing to say;
+#   * route through `e2e_bounded_perl` -- bounded, nothing to say;
 #   * carry `# perl-lifetime: <reason>` on the invocation line -- deliberately
 #     unbounded, and WHY.
 #
@@ -4367,13 +4796,18 @@ fi
 #
 # ## The census, and why it is a check rather than a sentence
 #
-# Measured on this tree, two constructions with a positive control: `perl` in a
-# COMMAND position appears in exactly one tracked shell script -- this one -- and
-# `git grep -c -i perl` over every tracked file agrees that no other script
-# mentions it at all. A scan whose subject has left the tree reports every file
-# clean, and that reads identically to complete coverage, so the tally below
-# REFUSES at zero rather than passing. Finding one instance by other means before
-# believing a zero is what that clause is.
+# The injector -- the one line that arms the bound -- lives in `lib/e2e-common.sh`,
+# where every fixture can reach it; it was written in this file and moved, because
+# a door in one private file reaches no other script and `compile-cache-e2e.sh` had
+# already grown a second one, marker and all. A scan whose subject has left the
+# tree reports every file clean, and that reads identically to complete coverage,
+# so the tally below REFUSES at zero rather than passing.
+#
+# And the scan knows WHERE the door is, because a marker is a claim anyone can
+# write: exactly one line in the tree may carry the injector's marker, and it must
+# be in `lib/e2e-common.sh`; a marked invocation anywhere else that arms its OWN
+# `alarm` is a private door, refused even though it states a reason -- that was
+# `compile-cache-e2e.sh`'s shape before it routed through the library.
 #
 # ## Why this reads through a declared region and the other scans' canaries do not
 #
@@ -4447,7 +4881,7 @@ CANARY
 # could have been written too wide: a routed stand-in, a marked invocation, `perl`
 # as an ARGUMENT rather than a command, the word inside a string, and a comment.
 cat > "${canary_dir}/must-not-catch.sh" <<'CANARY'
-_selftest_bounded_perl 30 "print 1" "$@"
+e2e_bounded_perl 30 "print 1" "$@"
 perl -e "exit 0" # perl-lifetime: a probe, and here is the reason
 command -v perl >/dev/null 2>&1 || skip "no perl"
 echo "SKIPPED: perl with IO::Socket::INET is not available"
@@ -4458,6 +4892,91 @@ _scan_canary "perl-bounds-canary" _perl_unmarked_invocations \
     "${canary_dir}/must-catch.sh" "${canary_dir}/must-not-catch.sh" \
     6 "invocations" "a routed, marked, argument-position, quoted or commented mention of perl"
 rm -rf "$canary_dir"
+
+perl_door_home="scripts/lib/e2e-common.sh"
+
+# The door's two rules over one tree, as FINDINGS rather than verdicts, so the staged trees
+# below and the real one are judged by the same code: `injector <path>:<line>` for every
+# marked invocation carrying the injector's marker, and `private <path>:<line>` for a marked
+# invocation OUTSIDE the library that arms an `alarm` of its own -- a second door, whatever
+# reason its marker states.
+# @param 1 the tree root; its `scripts/` is walked
+_perl_door_findings() {
+    local root="$1" script relative row
+    while IFS= read -r script; do
+        [ -n "$script" ] || continue
+        relative="${script#"${root}"/}"
+        while IFS= read -r row; do
+            [ -n "$row" ] || continue
+            case "$row" in
+                *"# perl-lifetime: this line IS the injector"*)
+                    echo "injector ${relative}:${row%%:*}" ;;
+                *alarm*)
+                    [ "$relative" = "$perl_door_home" ] || echo "private ${relative}:${row%%:*}" ;;
+            esac
+        done <<EOF
+$(_perl_marked_invocations "$script")
+EOF
+    done < <(_shell_scripts "$root")
+}
+
+# Where the door is, from `_perl_door_findings`: `home` (exactly one injector, in the
+# library), `more than one`, `none`, or `elsewhere`. Four answers, because each is a
+# different fault: a second door, a door whose marker changed, and a door that moved.
+# @param 1 the findings
+_perl_door_verdict() {
+    local injectors
+    injectors="$(printf '%s\n' "$1" | sed -n 's/^injector //p' | tr '\n' ' ')"
+    injectors="${injectors% }"
+    case "$injectors" in
+        *" "*)                      echo "more than one" ;;
+        "${perl_door_home}:"[0-9]*) echo "home" ;;
+        "")                         echo "none" ;;
+        *)                          echo "elsewhere" ;;
+    esac
+}
+
+# The canary for both rules, over COMMITTED staged trees -- the same two halves as the
+# perl-bounds canary above. Must-not-catch: the door at home, a routed stand-in and a marked
+# foreground probe. Must-catch, one tree each: a second door (a marked invocation arming its own
+# alarm), more than one injector marker, the marker only elsewhere, and no marker at all. A rule
+# nobody has watched fire on a planted violation is not known to work, and a rule nobody has
+# watched ACCEPT is not either.
+# perl-scan: data-begin
+door_canary="$(mktemp -d)"
+_stage_door() { # tree, the library's text, the fixture's text
+    mkdir -p "$1/scripts/lib"
+    printf '%s\n' "$2" > "$1/scripts/lib/e2e-common.sh"
+    printf '%s\n' "$3" > "$1/scripts/fixture.sh"
+}
+door_injector='    exec perl -e "alarm ${seconds};" -e "$program" -- "$@" # perl-lifetime: this line IS the injector'
+_stage_door "${door_canary}/home" "$door_injector" 'e2e_bounded_perl 30 "print 1" "$@"
+perl -MTime::HiRes -e1 # perl-lifetime: a foreground probe that exits at once'
+_stage_door "${door_canary}/second-door" "$door_injector" 'exec perl -e "alarm $3;" -e "$program" -- "$1" # perl-lifetime: bounded by the alarm chunk before its program'
+_stage_door "${door_canary}/more-than-one" "$door_injector" "$door_injector"
+_stage_door "${door_canary}/elsewhere" 'e2e_bounded_perl() { :; }' "$door_injector"
+_stage_door "${door_canary}/none" '    exec perl -e "alarm ${seconds};" -e "$program" -- "$@" # perl-lifetime: the injector' 'e2e_bounded_perl 30 "print 1"'
+# perl-scan: data-end
+_door_canary_case() { # tree, the verdict wanted, whether a private door is wanted (yes|no)
+    local findings verdict private
+    ran=$(( ran + 1 ))
+    findings="$(_perl_door_findings "${door_canary}/$1")"
+    verdict="$(_perl_door_verdict "$findings")"
+    case "$findings" in *"private "*) private=yes ;; *) private=no ;; esac
+    if [ "$verdict" != "$2" ] || [ "$private" != "$3" ]; then
+        echo "FAIL perl-bounds-door-home-canary: the staged '$1' tree gave door '${verdict}' and a" >&2
+        echo "     private door '${private}', want '$2' and '$3' -- so the rule cannot be trusted" >&2
+        echo "     on the real tree in that direction." >&2
+        printf '%s\n' "$findings" | sed 's/^/     | /' >&2
+        note_failure "perl-bounds-door-home-canary"
+    fi
+}
+_door_canary_case home          "home"          no
+_door_canary_case second-door   "home"          yes
+_door_canary_case more-than-one "more than one" no
+_door_canary_case elsewhere     "elsewhere"     no
+_door_canary_case none          "none"          no
+rm -rf "$door_canary"
 
 perl_scanned=0
 perl_marked_total=0
@@ -4479,7 +4998,7 @@ while IFS= read -r script; do
         echo "     A stand-in needs 'exec' (or the kill at its call site reaps a wrapper)" >&2
         echo "     and a lifetime bound (or nothing reaps it under SIGKILL, ctest --timeout" >&2
         echo "     or a cancelled job) -- #839 measured 1368 orphan listeners holding ports." >&2
-        echo "     Use _selftest_bounded_perl <seconds> '<program>' <args...>, or state a" >&2
+        echo "     Use e2e_bounded_perl <seconds> '<program>' <args...> from scripts/lib/e2e-common.sh, or state a" >&2
         echo "     reason on the line as '# perl-lifetime: why this one needs no bound'." >&2
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
         note_failure "perl-bounds-scan"
@@ -4507,15 +5026,40 @@ fi
 ran=$(( ran + 1 ))
 if [ "$perl_marked_total" -lt 1 ]; then
     echo "FAIL perl-bounds-scan: not one perl invocation was found anywhere under scripts/." >&2
-    echo "     The injector in _selftest_bounded_perl carries a '# perl-lifetime:' marker," >&2
+    echo "     The injector in e2e_bounded_perl carries a '# perl-lifetime:' marker," >&2
     echo "     so zero means the pattern has stopped matching rather than that the tree is" >&2
     echo "     clean -- which is the reading that passes over everything." >&2
     note_failure "perl-bounds-scan"
+fi
+# The door's HOME: one injector, in the library. Zero means the door moved or its
+# marker changed, and the scan above would still pass every routed stand-in; two
+# means a fixture grew a private door and marked it like the real one.
+perl_door_findings="$(_perl_door_findings "$scan_root")"
+perl_injectors="$(printf '%s\n' "$perl_door_findings" | sed -n 's/^injector //p' | tr '\n' ' ')"
+perl_injectors="${perl_injectors% }"
+while IFS= read -r perl_private; do
+    [ -n "$perl_private" ] || continue
+    ran=$(( ran + 1 ))
+    echo "FAIL perl-bounds-door-home: ${perl_private} arms an alarm of its own -- a" >&2
+    echo "     second door. Its marker states a reason, but the bound is the door's to" >&2
+    echo "     inject, in ${perl_door_home}, where one fix reaches every fixture." >&2
+    echo "     Call e2e_bounded_perl <seconds> '<program>' <args...> instead." >&2
+    note_failure "perl-bounds-door-home"
+done <<EOF
+$(printf '%s\n' "$perl_door_findings" | sed -n 's/^private //p')
+EOF
+ran=$(( ran + 1 ))
+perl_door_verdict="$(_perl_door_verdict "$perl_door_findings")"
+if [ "$perl_door_verdict" != "home" ]; then
+    echo "FAIL perl-bounds-door-home: the injector marker must be on exactly one line, in" >&2
+    echo "     ${perl_door_home} (e2e_bounded_perl); found ${perl_door_verdict}: ${perl_injectors:-<nowhere>}." >&2
+    note_failure "perl-bounds-door-home"
 fi
 # Reported, not merely tolerated: a region nobody can see added is this mechanism's
 # own way of becoming an exemption, which is the bash-3.2 scan's argument for the
 # same line.
 echo "   perl bounds: scanned ${perl_scanned} script(s) under scripts/ (walked, not listed)"
+echo "   perl bounds: the door is at ${perl_injectors:-<nowhere>}"
 echo "   perl bounds: declared data region(s) in: ${perl_regions:-none}"
 echo "   perl bounds: a tracked *.sh outside scripts/ is refused by shell-walk-scope, below"
 
@@ -4530,18 +5074,18 @@ echo "   perl bounds: a tracked *.sh outside scripts/ is refused by shell-walk-s
 # killed everything would pass the refusing half alone.
 if command -v perl >/dev/null 2>&1; then
     ran=$(( ran + 1 ))
-    bounded_out="$( ( _selftest_bounded_perl 2 'select(undef, undef, undef, 60); print "SURVIVED\n";' ) 2>/dev/null )"
+    bounded_out="$( ( . "$library"; e2e_bounded_perl 2 'select(undef, undef, undef, 60); print "SURVIVED\n";' ) 2>/dev/null )"
     bounded_status=$?
     if [ "$bounded_status" -ne 142 ] || [ -n "$bounded_out" ]; then
         echo "FAIL perl-bounds-door: a program that would run 60s under a 2s bound exited" >&2
         echo "     ${bounded_status} (want 142 = 128 + SIGALRM) and printed '${bounded_out}'." >&2
-        echo "     _selftest_bounded_perl is not arming the alarm, so every stand-in that" >&2
+        echo "     e2e_bounded_perl is not arming the alarm, so every stand-in that" >&2
         echo "     goes through it is unbounded while the scan above reports clean." >&2
         note_failure "perl-bounds-door"
     fi
 
     ran=$(( ran + 1 ))
-    alive_out="$( ( _selftest_bounded_perl 30 'print "ALIVE:", join(",", @ARGV), "\n";' one two ) 2>/dev/null )"
+    alive_out="$( ( . "$library"; e2e_bounded_perl 30 'print "ALIVE:", join(",", @ARGV), "\n";' one two ) 2>/dev/null )"
     alive_status=$?
     if [ "$alive_status" -ne 0 ] || [ "$alive_out" != "ALIVE:one,two" ]; then
         echo "FAIL perl-bounds-door: the ACCEPTING direction. A short program under a 30s" >&2
@@ -4550,26 +5094,30 @@ if command -v perl >/dev/null 2>&1; then
         echo "     and the arguments after -- are what every stand-in reads from @ARGV." >&2
         note_failure "perl-bounds-door"
     fi
+
+    # The REFUSING direction of the door's own argument check: `alarm 0` is perl's
+    # spelling of cancel, so a 0 must be refused before anything runs. In a process
+    # of its OWN, because the refusal is `fail`, which signals `_e2e_top_pid` -- the
+    # `$$` of whoever sourced the library, which inside a subshell is this driver.
+    ran=$(( ran + 1 ))
+    zero_out="$(bash -c '. "$1"; e2e_bounded_perl 0 "print qq(RAN\n);"' _ "$library" 2>&1)" && zero_status=0 || zero_status=$?
+    case "$zero_out" in
+        *RAN*) zero_verdict="ran the program" ;;
+        *"a bound of 0 cancels the alarm"*) zero_verdict="refused" ;;
+        *) zero_verdict="neither ran nor said why" ;;
+    esac
+    if [ "$zero_status" -eq 0 ] || [ "$zero_verdict" != "refused" ]; then
+        echo "FAIL perl-bounds-door: a bound of 0 -- perl's spelling of NO alarm -- exited" >&2
+        echo "     ${zero_status} and ${zero_verdict}, want a non-zero refusal naming it: '${zero_out}'." >&2
+        echo "     A 0 that reads as a bound at the call site and is the absence of one is the" >&2
+        echo "     escape hatch e2e_bounded_perl exists to close." >&2
+        note_failure "perl-bounds-door"
+    fi
 else
     echo "   perl-bounds-door: NOT CHECKED -- no perl on this host" >&2
     skipped=$(( skipped + 1 ))
 fi
 
-if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then # perl-lifetime: a foreground availability probe; it exits at once and is never backgrounded
-    echo "== the helpers, against a real listener"
-    for record in "${socket_cases[@]}"; do
-        name="${record%%|*}"
-        out="$( bash "${BASH_SOURCE[0]}" --case "$name" 2>&1 )"
-        status=$?
-        ran=$(( ran + 1 ))
-        expect "$record" "$out" "$status" || note_failure "${record%%|*}"
-    done
-else
-    for record in "${socket_cases[@]}"; do
-        echo "SKIPPED ${record%%|*}: perl with IO::Socket::INET is not available to stage a listener" >&2
-        skipped=$(( skipped + 1 ))
-    done
-fi
 
 # --- bash 3.2 --------------------------------------------------------------
 #
@@ -4965,8 +5513,8 @@ if git -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
     : > "${stray_canary}/tree/vendor/upstream/upstream.sh"
     : > "${stray_canary}/tree/tools/stray.sh"
     stray_canary_found=""
-    if git -C "${stray_canary}/tree" init -q >/dev/null 2>&1 \
-        && git -C "${stray_canary}/tree" add -A >/dev/null 2>&1; then
+    if scratch_git -C "${stray_canary}/tree" init -q >/dev/null 2>&1 \
+        && scratch_git -C "${stray_canary}/tree" add -A >/dev/null 2>&1; then
         stray_canary_found="$(_shell_walk_strays "${stray_canary}/tree" 2>"${stray_canary}/declined")"
     fi
     stray_canary_declined="$(cat "${stray_canary}/declined" 2>/dev/null || true)"
@@ -5135,17 +5683,12 @@ seconds_exempt="tsan-canary-rate.sh:computes a delta and echoes it. It reports t
 #     monotonic co-timers, so what is left of them here is the realtime figure they
 #     PRINT beside it -- the first kind, arrived at from the second.
 #
-# `cluster-e2e.sh` has no file-level exemption any more: its eight waits are armed
-# co-timers, so the only reads left in it are the two below, which feed prose.
-#
 seconds_reported=(
     'local started="$SECONDS" grewAt="$SECONDS"|wait_until: the two origins for the durations it REPORTS'
     'grewAt="$SECONDS"|wait_until: when the log last grew, for the stall reading'
     'elapsed=$(( SECONDS - started ))|the elapsed a verdict PRINTS, so it is measured rather than assumed'
     'stall=$(( SECONDS - grewAt ))|how long since the log grew, a reported reading'
     'local started="$SECONDS" elapsed=0 armed dpid dmark|stop_and_require_exit: the origin for the duration it reports'
-    'local started="$SECONDS"|cluster-e2e.sh: the origin for firstNamedAt, which feeds diagnostic prose only'
-    'firstNamedAt=$(( SECONDS - started ))|cluster-e2e.sh: how long until a leader was first named, printed in the formation diagnosis'
     'before=$SECONDS|_http_drain_fd3: the observation #1048 left with no reader'
     '_http_drain_elapsed=$(( SECONDS - before ))|_http_drain_fd3: that same observation, marked not to be read'
     'clock_started="$SECONDS"|check-e2e-helpers.sh: the realtime origin wait-clock-bound PRINTS; its verdict is the monotonic co-timer'
@@ -5395,6 +5938,21 @@ case "$first_line" in
         note_failure "shebang"
         ;;
 esac
+
+rm -rf "$scan_root"
+
+# --- the cases, judged ------------------------------------------------------
+echo "== the helpers, in real shells"
+judge_case_lanes "$shell_case_lanes" "${cases[@]}"
+if [ "$socket_cases_runnable" = yes ]; then
+    echo "== the helpers, against a real listener"
+    judge_case_lanes "$socket_case_lanes" "${socket_cases[@]}"
+else
+    for record in "${socket_cases[@]}"; do
+        echo "SKIPPED ${record%%|*}: perl with IO::Socket::INET is not available to stage a listener" >&2
+        skipped=$(( skipped + 1 ))
+    done
+fi
 
 # ---------------------------------------------------------------------------
 

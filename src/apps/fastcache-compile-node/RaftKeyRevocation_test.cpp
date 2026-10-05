@@ -37,6 +37,7 @@
 #include <core/net/testing/InMemorySocket.hpp>
 #include <core/net/testing/TestLoop.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/CountingConnector.hpp>
 #include <tests/ListenerConnector.hpp>
 #include <tests/ScratchPath.hpp>
 
@@ -81,7 +82,8 @@ class RecordingSink final: public Consensus::IRaftMessageSink
 [[nodiscard]] Ed25519KeyPair MintKey(std::filesystem::path const& stateDirectory)
 {
     SystemSecureRandom random;
-    auto resolved = ResolveNodeKey(stateDirectory, random);
+    FileTrustNodeKeyGuard guard;
+    auto resolved = ResolveNodeKey(stateDirectory, random, guard);
     REQUIRE(resolved.has_value());
     REQUIRE(resolved->origin == NodeKeyOrigin::Minted);
     return std::move(resolved->pair);
@@ -122,13 +124,19 @@ struct Machine
                                     .publicKey = machine.PublicKey() };
 }
 
+/// @p machine as a command line types it, with its key.
+[[nodiscard]] Cluster::MemberSpec TypedAs(Machine const& machine)
+{
+    return Cluster::MemberSpec { .id = machine.id, .raftEndpoint = "in-memory:1", .publicKey = machine.PublicKey() };
+}
+
 /// One node's view of the cluster: its roster over its own key, and its identity over that --
 /// what `ConsensusTier` holds.
 struct NodeView
 {
     /// @param self The machine this view is.
     /// @param members Every member, as each node's command line names them.
-    NodeView(Machine const& self, std::vector<Cluster::ClusterMember> const& members):
+    NodeView(Machine const& self, std::vector<Cluster::MemberSpec> const& members):
         roster { self.key, members },
         identity { self.id, roster }
     {
@@ -147,8 +155,8 @@ struct Network
 {
     /// @param acceptor Who n1 is.
     explicit Network(Consensus::IRaftPeerIdentity const& acceptor):
-        server { listener, reactor,  sink,   logger,
-                 metrics,  acceptor, random, Consensus::PeerServerOptions { .handshakeBound = 0ms } }
+        server { listener, reactor,  sink,   inbound,     logger,
+                 metrics,  acceptor, random, acceptLoops, Consensus::PeerServerOptions { .handshakeBound = 0ms } }
     {
         [](Consensus::RaftPeerServer* accepting) -> core::async::DetachedTask {
             co_await accepting->Run();
@@ -181,6 +189,8 @@ struct Network
     NullLogger logger;
     AtomicMetricsSink metrics;
     SystemSecureRandom random;
+    Testing::NoInboundLinks inbound; ///< Every dialler here is one-way, so nothing is attached.
+    core::net::AcceptLoopHealth acceptLoops;
     Consensus::RaftPeerServer server;
 };
 
@@ -195,6 +205,7 @@ struct Dialler
         transport { std::vector { Consensus::PeerEndpoint { .id = "n1", .host = "in-memory", .port = 1 } },
                     network.reactor,
                     network.connector,
+                    inbound,
                     logger,
                     metrics,
                     view.identity,
@@ -241,6 +252,7 @@ struct Dialler
     }
 
     Network& net;                           ///< Where it dials.
+    RecordingSink inbound;                  ///< What a two-way session would deliver; this one is one-way.
     NullLogger logger;                      ///< Where it reports.
     AtomicMetricsSink metrics;              ///< What it counted.
     SystemSecureRandom random;              ///< Its handshakes' randomness.
@@ -266,12 +278,12 @@ TEST_CASE("After --cluster-forget=n3, n3's session closes and its redial is refu
 
     // Every node's command line names every member with its key, and the cluster's state
     // records the same -- the formed cluster this case starts from.
-    auto const members = std::vector { MemberOf(n1), MemberOf(n2), MemberOf(n3) };
+    auto const typed = std::vector { TypedAs(n1), TypedAs(n2), TypedAs(n3) };
     Cluster::ClusterState state;
-    state.members = members;
-    NodeView v1 { n1, members };
-    NodeView v2 { n2, members };
-    NodeView v3 { n3, members };
+    state.members = { MemberOf(n1), MemberOf(n2), MemberOf(n3) };
+    NodeView v1 { n1, typed };
+    NodeView v2 { n2, typed };
+    NodeView v3 { n3, typed };
     for (auto* const view: { &v1, &v2, &v3 })
         view->roster.Adopt(state);
 
@@ -290,8 +302,7 @@ TEST_CASE("After --cluster-forget=n3, n3's session closes and its redial is refu
                                       .key = "n3",
                                       .value = {},
                                       .schedulerEndpoint = {},
-                                      .publicKey = std::nullopt,
-                                      .role = std::nullopt });
+                                      .publicKey = std::nullopt });
     REQUIRE(state.IsRevoked(n3.PublicKey()));
     // And the configuration drops n3, which is when the revocation takes effect on this wire:
     // a member still counted keeps its key for itself until then (`RosterKeys`, #1555).
@@ -332,7 +343,8 @@ TEST_CASE("After --cluster-forget=n3, n3's session closes and its redial is refu
     {
         CAPTURE(machine->id);
         SystemSecureRandom random;
-        auto const restarted = ResolveNodeKey(machine->stateDirectory, random);
+        FileTrustNodeKeyGuard guard;
+        auto const restarted = ResolveNodeKey(machine->stateDirectory, random, guard);
         REQUIRE(restarted.has_value());
         CHECK(restarted->origin == NodeKeyOrigin::Recorded);
         CHECK(restarted->pair.PublicKey() == machine->PublicKey());

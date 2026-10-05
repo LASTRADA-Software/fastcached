@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Consensus/RaftTypes.hpp>
+#include <FastCache/Consensus/Standing.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/ConsensusError.hpp>
@@ -28,11 +29,11 @@ namespace FastCache::Cluster
 /// travels.
 ///
 /// It exists because an empty `schedulerEndpoint` is two states (#1340). A member
-/// that has never led has not said, which is ordinary. A member whose endpoint a
-/// re-admit cleared HAD said, and `AddMember` wiped it wholesale -- right for a move,
-/// and reachable without one, because enrollment recovery re-approves through the same
-/// verb. The causes differ and so do the remedies, and the endpoint alone cannot tell
-/// them apart.
+/// that has announced none has not said -- a bootstrap peer typed on a command line,
+/// before its first announcement. A member whose endpoint was cleared HAD said, and a
+/// record re-proposed with none wiped it, since `AddMember` and `AddLearner` apply
+/// wholesale. The causes differ and so do the remedies, and the endpoint alone cannot
+/// tell them apart.
 ///
 /// **A history rather than a three-state status**, because *announced* is already what
 /// a non-empty endpoint says: storing it a second time would be a second source of
@@ -63,6 +64,22 @@ enum class MemberSeat : std::uint8_t
     Last = 2,    ///< Not a seat, and never travels. See `DecodeWireEnum`.
 };
 
+/// A member as an operator TYPES it: `<id>=<host>:<port>[@<key>]`, the token `--cluster-admit`
+/// takes -- and the shape of the bootstrap set consensus starts from.
+///
+/// Not a `ClusterMember`, because the two differ in the one thing that decides admission: a
+/// token may state no key -- a `--cluster-admit` moving a member that keeps the key recorded for
+/// it, or a founder whose start has not resolved its own key yet -- while a member the state
+/// records always holds one. Parsed by `ParseMemberSpec`, rendered by `FormatMemberSpec`.
+struct MemberSpec
+{
+    Consensus::NodeId id;                      ///< The member's identity.
+    std::string raftEndpoint;                  ///< Where its consensus port answers.
+    std::optional<Ed25519PublicKey> publicKey; ///< The key the token states, when it states one.
+
+    [[nodiscard]] friend bool operator==(MemberSpec const&, MemberSpec const&) = default;
+};
+
 /// One member of the cluster, as the replicated state records it.
 ///
 /// **The endpoint is the point.** `Consensus::RaftMembership` carries ids and
@@ -77,14 +94,17 @@ struct ClusterMember
 {
     Consensus::NodeId id; ///< Stable identity; what consensus counts.
 
-    /// host:port this member's consensus port answers on.
+    /// host:port this member's consensus port answers on, or empty for a learner.
     ///
-    /// Always present -- a member with no address is the thing this struct exists to
-    /// make impossible -- and always dialable, because it is what every other member
-    /// opens a socket to.
+    /// Present and dialable wherever the seat is DIALLED (`SeatNeedsEndpoint`) -- a voter
+    /// with no address is the thing this struct exists to make impossible, because it is
+    /// what every other member opens a socket to. A learner is reached over the session it
+    /// dials in on (`Consensus::PeerLink::DialsIn`), so nobody opens a socket to it and its
+    /// endpoint may be empty; `Validate` is where the one is required and the other is not.
     std::string raftEndpoint;
 
-    /// host:port clients reach the fleet on while this member LEADS; may be empty.
+    /// host:port this member's `0xFC` port answers on, for EVERY member, learners included; empty
+    /// until it is announced.
     ///
     /// **A second endpoint rather than one**, and the reason is a defect this pairing
     /// closes rather than a generality. `NotLeader` carries a redirect, and the one
@@ -94,14 +114,27 @@ struct ClusterMember
     /// ports, two facts, and collapsing them made every redirect in a real cluster
     /// point somewhere nothing could be done with.
     ///
-    /// Empty is legitimate and means "this member has not said". Only a *leader's*
-    /// matters, and a leader announces its own record on election -- so the value is
-    /// absent exactly for the members whose value nobody needs, and a bootstrap peer
-    /// that has never led carries none rather than carrying a guess.
+    /// **What anything resolving a machine reads** -- the redirect reads the leader's, and a
+    /// resolver reads any member's. It is the member's own word: set at join from the endpoint its
+    /// `Enroll` stated -- SIGNED by the key it asked with, and verified before the leader records or
+    /// refreshes anything (`Cluster::VerifyEnrollRequest`) -- asserted by a leader for itself on
+    /// every reconcile pass, and moved for any other member only by a PROVEN NODE-ANNOUNCE, which has
+    /// the leader re-propose that member's record with its seat and key kept
+    /// (`Cluster::AnnouncedEndpointDesires`). Never from an unproven claim, never for an id the state
+    /// does not record, one change in flight per member.
     ///
-    /// Empty has a second cause, which `schedulerEndpointHistory` tells apart: a
-    /// re-admit clears it. A reader reporting WHY it is empty asks
-    /// `SchedulerEndpointStateOf`, never this field and a second guess.
+    /// Empty is legitimate and means "this member has not said" -- a bootstrap peer that has
+    /// announced nothing yet carries none rather than a guess. **Otherwise one ANOTHER machine can
+    /// dial** (`IsPeerDialableEndpoint`): `Validate` refuses a loopback, `localhost` or wildcard one
+    /// on every route above, and each producer states none in its place, because a resolver sent
+    /// there reaches itself.
+    ///
+    /// Empty has a second cause, which `schedulerEndpointHistory` tells apart: a record
+    /// re-proposed with none clears it -- a leader whose own advertised endpoint became empty, or an
+    /// operator's re-admit under ANOTHER key, which records a replaced machine whose predecessor's
+    /// endpoint is the wrong one to dial. A re-admit under the same key, or none, states none and
+    /// KEEPS what is recorded. A reader reporting WHY it is empty asks `SchedulerEndpointStateOf`,
+    /// never this field and a second guess.
     std::string schedulerEndpoint;
 
     /// Whether `schedulerEndpoint` has ever held a value since this id was admitted.
@@ -114,70 +147,19 @@ struct ClusterMember
     /// is promoted or demoted, and nothing else writes it.
     MemberSeat seat { MemberSeat::Voter };
 
-    /// This member's identity key, or absent when nothing has stated one (#178).
+    /// This member's identity key (#178) -- never ABSENT, since the type has no such value,
+    /// and never the all-zero key a construction that omits it value-initializes to.
     ///
-    /// **Absent is not a key of zeroes, and it is not "revoked".** A member admitted before
-    /// keys existed, or admitted by a verb that named none, simply has not said; what asserts
-    /// one is the member itself, announcing its own record, or an operator's `@<key>`. A
-    /// re-admit that names no key KEEPS what is recorded -- unlike the scheduler endpoint, a
-    /// machine that moves keeps its identity -- and only a forget takes it away, revoking it
-    /// with the record (`CommandKind::Forget`).
-    std::optional<Ed25519PublicKey> publicKey;
+    /// What holds: a member `Apply` recorded or `DecodeState` decoded never holds an absent or
+    /// all-zero key. A machine is admitted and forgotten by its key, so `Apply` records only
+    /// what `KeyToRecord` returns, which is never the all-zero key, and `DecodeState` refuses
+    /// a member whose key field is empty or all zero, by name. A re-admit that names no key
+    /// KEEPS what is recorded -- unlike the scheduler endpoint, a machine that moves keeps its
+    /// identity -- and only a forget takes it away, revoking it with the record
+    /// (`CommandKind::Forget`).
+    Ed25519PublicKey publicKey {};
 
     [[nodiscard]] friend bool operator==(ClusterMember const&, ClusterMember const&) = default;
-};
-
-/// What a principal is admitted to do (#178).
-///
-/// **Persisted and transmitted**: one byte per principal in a snapshot and in every
-/// `ClusterStatus` reply, and one byte in an `AdmitPrincipal` command. The ordinals are
-/// explicit and append only, and `Last` never travels.
-enum class PrincipalRole : std::uint8_t
-{
-    Worker = 0, ///< Registers with the scheduler and runs compiles; never joins consensus.
-    Last = 1,   ///< Not a role, and never travels. See `DecodeWireEnum`.
-};
-
-/// How one `PrincipalRole` is spelled.
-struct PrincipalRoleRow
-{
-    PrincipalRole role;    ///< The role this row describes.
-    std::string_view name; ///< Its one spelling: a table cell, a JSON value and a report word alike.
-};
-
-/// One row per `PrincipalRole`, in enumerator order.
-inline constexpr EnumTable<PrincipalRole, PrincipalRoleRow> PrincipalRoleTable { {
-    { .role = PrincipalRole::Worker, .name = "worker" },
-} };
-
-static_assert(RowsInEnumeratorOrder(PrincipalRoleTable, &PrincipalRoleRow::role),
-              "PrincipalRoleTable must hold one row per PrincipalRole, in enumerator order");
-
-/// The spelling of `role`, from `PrincipalRoleTable`.
-/// @param role A role.
-/// @return Its row's name.
-[[nodiscard]] constexpr std::string_view PrincipalRoleName(PrincipalRole role) noexcept
-{
-    return PrincipalRoleTable[static_cast<std::size_t>(role)].name;
-}
-
-/// A machine the cluster admits by its KEY without counting it (#178).
-///
-/// **Not a member**, and the difference is the whole reason this is a second list rather
-/// than a third `MemberSeat`. A member is somewhere consensus replicates to -- it has a Raft
-/// endpoint every other member dials -- while a principal is a machine that never joins
-/// consensus at all: a roaming worker whose address the VPN reassigns. What the cluster
-/// records about it is the one thing that does not move, its key, and what it may do.
-///
-/// An id is a member or a principal, never both; `Apply` holds that, and `DecodeState`
-/// refuses a state that breaks it.
-struct ClusterPrincipal
-{
-    Consensus::NodeId id;                         ///< Its identity, as it names itself.
-    Ed25519PublicKey publicKey {};                ///< The key it proves that identity with.
-    PrincipalRole role { PrincipalRole::Worker }; ///< What it is admitted to do.
-
-    [[nodiscard]] friend bool operator==(ClusterPrincipal const&, ClusterPrincipal const&) = default;
 };
 
 /// A key the cluster will never admit again, and whose it was (#178).
@@ -209,9 +191,10 @@ struct RevokedKey
 /// `--cluster-status` and `fastcache-cli cluster-members` cannot answer it three ways.
 enum class SchedulerEndpointState : std::uint8_t
 {
-    Announced,      ///< Recorded: where clients reach the fleet while this member leads.
-    NeverAnnounced, ///< Never recorded. A member that has not led; the ordinary case.
-    Cleared,        ///< Recorded once and wiped by a re-admit; it returns when the member next leads.
+    Announced,      ///< Recorded: where this member's `0xFC` port answers.
+    NeverAnnounced, ///< Never recorded. A member that has announced none yet.
+    Cleared,        ///< Wiped by a record re-proposed with none -- a leader advertising none, or a machine
+                    ///< replaced under another key; back when the member next announces.
     Last,           ///< Not a state, and has no row: the length of a table keyed by one.
 };
 
@@ -245,8 +228,8 @@ static_assert(RowsInEnumeratorOrder(SchedulerEndpointStateTable, &SchedulerEndpo
 /// Parse one `<id>=<host>:<port>[@<key>]` member specification.
 ///
 /// The grammar an operator types, in the one place the type it produces lives. It
-/// has two callers that must not disagree — `--raft-peer` names a member at
-/// startup and `--cluster-admit` names one at runtime, and the documentation tells
+/// has two callers that must not disagree — `--print-identity` prints a member's
+/// `cluster-admit` line and `--cluster-admit` reads it, and the documentation tells
 /// an operator to copy the same token between them — so a second implementation
 /// would be two flags accepting different token sets for one concept, with only one
 /// of them being what the transport actually dials.
@@ -267,18 +250,17 @@ static_assert(RowsInEnumeratorOrder(SchedulerEndpointStateTable, &SchedulerEndpo
 /// that says what a key looks like, never read as part of the endpoint.
 /// @param spec The token as an operator wrote it.
 /// @return The member, or why the token is not one -- a sentence naming the token.
-[[nodiscard]] std::expected<ClusterMember, std::string> ParseMemberSpec(std::string_view spec);
+[[nodiscard]] std::expected<MemberSpec, std::string> ParseMemberSpec(std::string_view spec);
 
 /// Render @p member the way `ParseMemberSpec` reads it: `<id>=<host>:<port>`, and `@<key>`
-/// when a key is recorded.
+/// when the token states a key.
 ///
 /// The inverse, beside the parser, for the reason the key's own two functions are a pair:
-/// a service registration re-renders every `--raft-peer` from its parsed form, and a
-/// rendering that dropped the key would install a node whose next start no longer knows
-/// what its own operator typed.
+/// `--print-identity` renders the `cluster-admit` line an operator copies, and a
+/// rendering that dropped the key would admit a member nobody could verify.
 /// @param member The member.
 /// @return The token.
-[[nodiscard]] std::string FormatMemberSpec(ClusterMember const& member);
+[[nodiscard]] std::string FormatMemberSpec(MemberSpec const& member);
 
 /// A setting every member of the cluster must agree on.
 ///
@@ -393,6 +375,26 @@ inline constexpr std::string_view LeaseLifetimeSetting = "lease-lifetime";
 /// The reliable question is who passes this constant to `SettingOf`.
 inline constexpr std::string_view FleetOpenSetting = "fleet-open";
 
+/// The key naming the machine every node reads through to as the fleet's shared cache.
+///
+/// **An ID, never an address**, and that is what lets it be replicated where `upstream` could not
+/// be: a node dials the `0xFC` endpoint the cluster records for that member
+/// (`ClusterMember::schedulerEndpoint`) and sends nothing until the peer proves the key the roster
+/// holds for this id -- and it presents no credential on that leg, because the proven session
+/// identifies both ends. So one committed entry cannot send any node's secret anywhere. Empty is
+/// how it is unset.
+inline constexpr std::string_view SharedCacheSetting = "shared-cache";
+
+/// Refuse a `shared-cache` value this cluster may not agree on: anything that is not empty and not
+/// shaped like an id -- an address above all, since the setting exists to name a machine by id.
+///
+/// The value's SHAPE only, so it can be a `SettingSpec::refuse` column. Whether the id names a
+/// machine the cluster holds a live key for is a question about the state, and
+/// `ValidateAgainst` asks it.
+/// @param value What the operator typed.
+/// @return Why it may not be set, or nullopt when it may.
+[[nodiscard]] std::optional<std::string> RefuseSharedCache(std::string_view value);
+
 /// Read a `lease-lifetime` value, or say why it is not one.
 ///
 /// **The one predicate both the validator and every reader ask**, rather than one
@@ -424,7 +426,7 @@ inline constexpr std::string_view FleetOpenSetting = "fleet-open";
 /// can differ per machine because the machines differ. `--slots` is the counter-
 /// example worth naming: it describes one host and replicating it would impose one
 /// machine's size on all of them.
-inline constexpr std::array<SettingSpec, 2> SettingTable {
+inline constexpr std::array<SettingSpec, 3> SettingTable {
     SettingSpec { .name = FleetOpenSetting,
                   .summary = R"('1' to admit every caller to the fleet, '0' for members only)",
                   .readBy = "NodeMembership::AgreedOpenness" },
@@ -433,6 +435,13 @@ inline constexpr std::array<SettingSpec, 2> SettingTable {
                              "for a slot, compile, and the object coming back -- not how long a compiler may run",
                   .refuse = &RefuseLeaseLifetime,
                   .readBy = "SchedulerService::AgreedLeaseLifetime" },
+    SettingSpec { .name = SharedCacheSetting,
+                  .summary = "the id of the machine every node reads through to and stores to as the fleet's shared "
+                             "cache; empty for none. An ID, never an address: each node dials what that machine "
+                             "announced and sends nothing until that machine proves the key this cluster holds "
+                             "for the id",
+                  .refuse = &RefuseSharedCache,
+                  .readBy = "SharedCacheDirectory::Applied" },
 };
 
 static_assert(RowsCarryAConsumer(SettingTable),
@@ -495,10 +504,16 @@ struct RefusedSettingSpec
 ///
 /// Nothing read the row, so removing it takes no behaviour with it: the per-node
 /// `--upstream` flag has always been what decides this, and the refusal names it.
+///
+/// `shared-cache` complies with this rule rather than escaping it: it names an ID, the peer
+/// must prove that ID's roster key before anything is sent, and nothing a node holds as a
+/// secret is presented on that leg.
 inline constexpr std::array<RefusedSettingSpec, 1> RefusedSettingTable { {
     RefusedSettingSpec { .name = "upstream",
-                         .reason = "it decides where a node presents its --requirepass credential, so it is "
-                                   "per-machine configuration -- set --upstream on the node that reads through" },
+                         .reason = "it would decide where a node presents its --requirepass credential, so it is "
+                                   "per-machine configuration -- set --upstream on the node that reads through, or "
+                                   "name a machine with shared-cache=<id>, which every node reaches only once that "
+                                   "machine proves its own roster key, and to which no credential is presented" },
 } };
 
 /// Whether `name` is a key this cluster refuses to replicate.
@@ -526,6 +541,29 @@ struct Setting
     [[nodiscard]] friend bool operator==(Setting const&, Setting const&) = default;
 };
 
+/// A fleet's decision to dissolve into another: one fleet split in two heals by its losing half
+/// leaving for the survivor, every member at once.
+///
+/// Replicated rather than decided by each member, so every member of the losing fleet follows the
+/// SAME decision and none needs evidence of its own: the leader that decided proved the survivor, and
+/// what it proved travels here. Recorded in the state as well as the log, so a member that restarts,
+/// or catches up from a snapshot taken after the entry, still reads it.
+struct DissolveOrder
+{
+    std::string clusterId;                    ///< The fleet that survives.
+    Ed25519PublicKey provenKey {};            ///< The key that proved its summary to the leader that decided.
+    std::string leaderNodeEndpoint;           ///< Where its leader answers the `0xFC` port, as proven.
+    std::uint64_t createdAtUnixSeconds { 0 }; ///< Its age, as proven.
+
+    /// Its leader's identity key, as the proven summary reached it from `provenKey`: the speaker's
+    /// own when it spoke as the leader, else the leader key its signed summary stated. What a leaving
+    /// member holds the survivor's leader to, rather than to whichever key answers at
+    /// `leaderNodeEndpoint`.
+    Ed25519PublicKey leaderKey {};
+
+    [[nodiscard]] friend bool operator==(DissolveOrder const&, DissolveOrder const&) = default;
+};
+
 /// Everything the cluster agrees on.
 ///
 /// Deliberately small, and deliberately **not** the cache. The log that carries this
@@ -544,57 +582,32 @@ struct ClusterState
     /// Settings, sorted by name for the same reason.
     std::vector<Setting> settings;
 
-    /// Hosts the cluster admits as CLIENTS, sorted and unique (#1309).
-    ///
-    /// A client -- a developer's laptop, a CI runner, anything running `fastcache-cc`
-    /// against the fleet -- never joins consensus, so it had no replicated route at all:
-    /// it was admitted only by each node's `--fleet-member` list, and removing one meant
-    /// a reload on every machine. Host only, because that is all admission compares: a
-    /// caller dials from an ephemeral port.
-    std::vector<std::string> clients;
-
-    /// Hosts the cluster has FORGOTTEN, sorted and unique (#1309): a tombstone per host.
-    ///
-    /// **Recorded, because absence cannot say it.** A host missing from `members` and
-    /// `clients` is the ordinary state of every machine a node's own list names, so a
-    /// forget that only erased would leave nothing a node could narrow its local list
-    /// by -- and a local list is exactly where a decommissioned machine lingers. Written
-    /// by `ForgetClient` and by `Forget` (the removed member's consensus host),
-    /// cleared by `AdmitClient` and `AddMember` for that host.
-    ///
-    /// **Bounded by the distinct hosts ever forgotten and not re-admitted**, never by
-    /// traffic: nothing but a committed command adds one, and a re-admit removes one.
-    std::vector<std::string> forgotten;
-
-    /// Machines admitted by key rather than as members, sorted by id (#178).
-    ///
-    /// Written by `AdmitPrincipal`, which enrollment proposes for a worker (#178 PR 4), and
-    /// removed by `Forget`, which revokes the key with it (#1555).
-    std::vector<ClusterPrincipal> principals;
-
     /// Keys the cluster will never admit again, sorted by id and then key, one entry per
     /// key (#178).
     ///
-    /// **Bounded by the keys ever revoked**, never by traffic, for `forgotten`'s reason:
-    /// nothing but a committed `Forget` of an id holding a key adds one. Nothing ever
+    /// **Bounded by the keys ever revoked**, never by traffic: nothing but a committed
+    /// `Forget` of an id holding a key adds one. Nothing ever
     /// shortens it -- a revocation that could be undone would be a key that could come
     /// back, and the property is that it cannot.
     std::vector<RevokedKey> revokedKeys;
 
-    /// How many times the ROSTER has changed: the members' ids, endpoints, seats and keys,
-    /// the principals and the revoked keys (#178).
+    /// How many times the ROSTER has changed: the members' ids, endpoints, seats and keys, and
+    /// the revoked keys (#178).
     ///
     /// **Derived by `Apply`, never carried by a command**, and bumped only when the roster's
-    /// projection actually differs afterwards -- so every voter applying the same log reaches
-    /// the same number for the same roster, which is what lets their endorsements of it add
-    /// up to a majority. The applied log INDEX is the rejected alternative: two voters a
-    /// moment apart would endorse one roster under two versions, and neither would ever
-    /// reach a majority.
+    /// projection actually differs afterwards -- so every node applying the same log reports
+    /// the same number for the same roster, and an operator comparing two nodes'
+    /// `roster-version` compares rosters rather than log positions. The applied log INDEX is
+    /// the rejected alternative: two nodes a moment apart would report one roster under two
+    /// numbers.
     ///
-    /// A worker adopts only a version at least as new as the one it holds, so this is also
-    /// what stops a replayed old roster -- endorsed when it was current -- from winding a
-    /// worker back.
+    /// It once also let voters' endorsements of a certified roster add up to a majority. That
+    /// roster is retired: every node reads the roster its own consensus applied.
     std::uint64_t rosterVersion {};
+
+    /// The last dissolve this fleet decided, if any (`CommandKind::DissolveInto`): every member that
+    /// applies it leaves for the survivor it names.
+    std::optional<DissolveOrder> dissolveOrder {};
 
     [[nodiscard]] friend bool operator==(ClusterState const&, ClusterState const&) = default;
 
@@ -603,10 +616,10 @@ struct ClusterState
     /// @return Its Raft endpoint, or nullopt when it is not a member.
     [[nodiscard]] std::optional<std::string> RaftEndpointOf(std::string_view id) const;
 
-    /// Where clients reach the fleet while `id` leads, if it has said.
+    /// Where `id`'s `0xFC` port answers, if it has said.
     ///
     /// Absent for a member that is not known, for one that has never announced
-    /// itself **and** for one a re-admit cleared, which are deliberately the same
+    /// itself **and** for one whose endpoint was cleared, which are deliberately the same
     /// answer here: all three mean there is nowhere to send a client, and a caller
     /// routing one would have nothing different to do about any of them. Telling the
     /// last two apart is a question for a person reading a report, and
@@ -620,38 +633,27 @@ struct ClusterState
     /// @return Its value, or nullopt when nobody set it.
     [[nodiscard]] std::optional<std::string> SettingOf(std::string_view name) const;
 
-    /// Every member's consensus endpoint, in id order.
-    ///
-    /// The Raft one rather than the scheduler one, because this feeds
-    /// `Distributed::ClusterMembership`, which matches on the HOST part and admits a
-    /// peer whatever port it dialed from. Both endpoints name the same host, and only
-    /// this one is guaranteed to be there at all.
-    /// @return The endpoints, which is what `Distributed::ClusterMembership` takes.
-    [[nodiscard]] std::vector<std::string> Endpoints() const;
-
-    /// Whether the cluster admits `host` as a client.
-    ///
-    /// Through `SameHost`, the one comparison admission makes, so a client recorded as
-    /// `10.0.0.1` is the one a dual-stack listener reports as `::ffff:10.0.0.1`.
-    /// @param host A caller's host, without a port.
-    /// @return True when a `clients` entry names the same machine.
-    [[nodiscard]] bool AdmitsClient(std::string_view host) const;
-
-    /// Whether the cluster has forgotten `host` and not admitted it again.
-    /// @param host A caller's host, without a port.
-    /// @return True when a `forgotten` entry names the same machine.
-    [[nodiscard]] bool HasForgotten(std::string_view host) const;
-
     /// Whether `key` has been revoked.
     /// @param key A public key.
     /// @return True when a `revokedKeys` entry holds it.
     [[nodiscard]] bool IsRevoked(Ed25519PublicKey const& key) const;
 
-    /// Who holds `key` LIVE, as a member or as a principal.
+    /// Which member holds `key` LIVE.
     /// @param key A public key.
-    /// @return The holder's id, or nullopt when no member and no principal holds it.
+    /// @return The holder's id, or nullopt when no member holds it.
     [[nodiscard]] std::optional<std::string> HolderOf(Ed25519PublicKey const& key) const;
 };
+
+/// The key `id` holds LIVE as a member.
+///
+/// Members only: every fleet machine is admitted as a member, voter or learner, so a machine
+/// recorded any other way is not one a node could be asked to trust by id. A revoked key is never
+/// a live one here, since a forget removes the record together with the key it held. Matched
+/// whole, never by prefix.
+/// @param state The state.
+/// @param id The machine.
+/// @return Its recorded key, or nullopt when it is not a member.
+[[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(ClusterState const& state, std::string_view id);
 
 /// What a command does to the state.
 ///
@@ -678,11 +680,8 @@ struct ClusterState
 /// and that has a consequence a fleet mid-upgrade lives with: a member running a build
 /// that predates a verb meets its committed entries and SKIPS them by name
 /// (`ClusterStateMachine::Apply`), applying the rest of the log around them. So it holds
-/// the state as if that command had never been proposed -- which for #1309's two verbs
-/// means such a member admits no replicated client (closed, and healed by the upgrade)
-/// and ignores a client forget (OPEN for that host, until it is upgraded). #178's two
-/// verbs DID move it, because they brought two fields the layout had no room for. #1555
-/// moved it again with the layout untouched, because it changed what a verb MEANS --
+/// the state as if that command had never been proposed. #178's two verbs DID move it, because they brought two fields the
+/// layout had no room for. #1555 moved it again with the layout untouched, because it changed what a verb MEANS --
 /// `RemoveMember`'s ordinal became `Forget` -- which an older entry's byte cannot say.
 enum class CommandKind : std::uint8_t
 {
@@ -693,24 +692,25 @@ enum class CommandKind : std::uint8_t
     /// would leave a window in which the cluster has agreed it does not exist.
     AddMember = 0,
 
-    /// Forget an id: remove it wherever the cluster records it, as a member or as a
-    /// principal, and REVOKE the key that record held (#1555). `--cluster-forget`.
+    /// Forget an id: remove its member record, and REVOKE the key that record held (#1555).
+    /// `--cluster-forget`.
     ///
     /// **One act, because an operator removing a machine has one intention.** The two
     /// halves apart are a state nobody asked for: a record gone and its key live is a
-    /// machine every node whose `--raft-peer` still types that key goes on accepting --
+    /// machine every node whose bootstrap roster still names that key goes on accepting --
     /// removal failing OPEN -- and a key revoked under a record that stays is a member the
     /// configuration goes on counting, so on the consensus wire the revocation never takes
     /// effect. So there is no verb for either half alone.
     ///
-    /// What it takes is DERIVED from the record being removed, as a member's host tombstone
-    /// is (#1309), so it cannot disagree with what the state holds when it commits -- a key
-    /// replaced between the proposal and the commit is the one revoked. A member leaves a
-    /// tombstone for its host too; a principal has no host. Beside that, the command may
+    /// What it takes is DERIVED from the record being removed, so it cannot disagree with
+    /// what the state holds when it commits -- a key replaced between the proposal and the
+    /// commit is the one revoked. **It records no host**: a machine is admitted and
+    /// forgotten by its key alone, and an address is not an identity. Beside that, the
+    /// command may
     /// carry the key the proposing LEADER holds live for the id (`PrepareForget`): the one
-    /// thing the state cannot derive, because a member a `--raft-peer` line typed with its
-    /// key is recorded without one, or not at all, and its key lives only on the command
-    /// lines that type it. Never another id's key -- refused at the proposal, skipped at
+    /// thing the state cannot derive, because a bootstrap member named with its key may be
+    /// recorded nowhere, or under another key, and that key then lives only in the rosters that
+    /// name it. Never another id's key -- refused at the proposal, skipped at
     /// commit.
     ///
     /// The ordinal is `RemoveMember`'s, and the verb is that one widened rather than a new
@@ -724,37 +724,37 @@ enum class CommandKind : std::uint8_t
     Forget,
     SetSetting,
 
-    /// Admit a client host to the fleet, clearing any tombstone for it (#1309).
-    ///
-    /// The replicated counterpart of a `--fleet-member` entry, for a machine that never
-    /// joins consensus. Also the route BACK for a member that was forgotten and now
-    /// serves as a plain worker or client: its forget tombstoned its host.
-    AdmitClient,
+    /// RETIRED (was AdmitClient, #1309): reserved, never reused. Proposed by nothing; `Validate`
+    /// refuses it by name, `DecodeCommand` refuses its byte by name, and so a log holding one
+    /// refuses to start (`CanRead`, #1542) while a peer's entry is skipped.
+    RetiredAdmitClient,
 
-    /// Forget a client host: stop admitting it and record that it was forgotten (#1309).
-    ///
-    /// A POSITIVE act, and recorded as one, because a node's own `--fleet-member` list
-    /// may still name the host -- a tombstone is what lets every node refuse it with one
-    /// committed entry rather than a reload on each machine.
-    ForgetClient,
+    /// RETIRED (was ForgetClient, #1309): as above.
+    RetiredForgetClient,
 
     /// `AddMember`, recording the member as a LEARNER (#1449).
     ///
-    /// A verb rather than a field on `AddMember`, for the reason `AdmitClient` is one:
-    /// the layout stays as it is and `CommandVersion` does not move. Everything else is
+    /// A verb rather than a field on `AddMember`, so the layout stays as it is and
+    /// `CommandVersion` does not move. Everything else is
     /// `AddMember`'s -- the same fields, the same wholesale record, the same move -- so
     /// admitting a voter through this verb DEMOTES it, and admitting a learner through
     /// `AddMember` promotes it. `MemberSeatTable` says which verb writes which seat.
     AddLearner,
 
-    /// Admit a machine by its key, as a principal rather than a member (#178).
+    /// RETIRED (was AdmitPrincipal, #178): admitted a machine by its key as a principal rather
+    /// than a member. Principal mode is retired -- every machine that joins is a learner member
+    /// holding a key -- so the byte stays reserved, `Validate` refuses it by name, and a node
+    /// whose own log holds one refuses to start rather than replay it.
+    RetiredAdmitPrincipal,
+
+    /// Dissolve this fleet into another: record the `DissolveOrder` every member leaves on.
     ///
-    /// Refused for a key that is revoked, for a key another id holds, and for an id that
-    /// is a member. Re-admitting a principal's id replaces its record, which is how a
-    /// principal's key is rotated -- the old key is then simply nobody's, refused on every
-    /// wire as a key nobody holds. A key an operator wants refused FOR GOOD is revoked by
-    /// forgetting the id before it is admitted again under its new one (`Forget`).
-    AdmitPrincipal,
+    /// Proposed by the LEADER of the fleet that loses a healing split, and only on evidence that heals
+    /// by itself -- a VOTER's key (`Cluster::SplitHealing`). Carries the survivor's id (`key`), its leader's
+    /// `0xFC` endpoint (`value`), the key that proved it (`publicKey`) and its age
+    /// (`createdAtUnixSeconds`) -- the one field no earlier verb had, which is why `CommandVersion`
+    /// moved with it.
+    DissolveInto,
 
     Last, ///< Not a verb, and has no row: the length of a table keyed by one.
 };
@@ -775,6 +775,12 @@ struct MemberSeatRow
     /// can dial it: a member counted before its votes can arrive is a quorum that has
     /// grown and cannot be satisfied.
     bool counted;
+
+    /// The consensus standing a member in this seat holds once consensus has caught up.
+    ///
+    /// What `LinkOfSeat` reads the seat's `PeerLink` from, so how a member is reached is
+    /// `Consensus::StandingTable`'s column and is stated nowhere here a second time.
+    Consensus::Standing standing;
 };
 
 /// One row per `MemberSeat`, in enumerator order.
@@ -787,16 +793,45 @@ inline constexpr EnumTable<MemberSeat, MemberSeatRow> MemberSeatTable { {
       .name = "voter",
       .admittedBy = CommandKind::AddMember,
       .set = &Consensus::Configuration::voters,
-      .counted = true },
+      .counted = true,
+      .standing = Consensus::Standing::Voter },
     { .seat = MemberSeat::Learner,
       .name = "learner",
       .admittedBy = CommandKind::AddLearner,
       .set = &Consensus::Configuration::learners,
-      .counted = false },
+      .counted = false,
+      .standing = Consensus::Standing::Learner },
 } };
 
 static_assert(RowsInEnumeratorOrder(MemberSeatTable, &MemberSeatRow::seat),
               "MemberSeatTable must hold one row per MemberSeat, in enumerator order");
+
+static_assert(std::ranges::all_of(MemberSeatTable,
+                                  [](MemberSeatRow const& row) {
+                                      return Consensus::TraitsOf(row.standing).votes == row.counted;
+                                  }),
+              "a seat a quorum counts must be a standing that votes, and the reverse: the two tables say who is "
+              "counted, and a seat and its standing that disagreed would count a member that cannot vote");
+
+/// How a member recorded in `seat` is reached by the others.
+///
+/// `Consensus::StandingTable`'s `link` column, read through the seat's standing, so every
+/// site that asks -- `Validate`, the reconciler's additions, the transport's view of who
+/// dials in -- reads the one column rather than branching on the seat.
+/// @param seat A seat.
+/// @return Its standing's link.
+[[nodiscard]] constexpr Consensus::PeerLink LinkOfSeat(MemberSeat seat) noexcept
+{
+    return Consensus::TraitsOf(MemberSeatTable[static_cast<std::size_t>(seat)].standing).link;
+}
+
+/// Whether a member recorded in `seat` must have a consensus endpoint every member can dial.
+/// @param seat A seat.
+/// @return True exactly where the seat is `Consensus::PeerLink::Dialled`.
+[[nodiscard]] constexpr bool SeatNeedsEndpoint(MemberSeat seat) noexcept
+{
+    return LinkOfSeat(seat) == Consensus::PeerLink::Dialled;
+}
 
 /// The seat `kind` admits a member into, if it admits one at all.
 /// @param kind A verb.
@@ -836,36 +871,38 @@ struct Command
 {
     CommandKind kind { CommandKind::AddMember };
     /// The member id for `AddMember`/`AddLearner`, the setting name for `SetSetting`, the
-    /// client's host (a port, if given, is ignored) for `AdmitClient`/`ForgetClient`, the
-    /// principal's id for `AdmitPrincipal`, and the id -- a member's or a principal's -- for
-    /// `Forget`.
+    /// member's id for `Forget`, and the survivor's id for `DissolveInto`.
     std::string key;
     /// The consensus endpoint for `AddMember`/`AddLearner`, the value for `SetSetting`,
     /// empty otherwise.
     std::string value;
 
-    /// `AddMember`/`AddLearner` only: where clients reach the fleet while this member leads.
+    /// `AddMember`/`AddLearner` only: where this member's `0xFC` port answers.
     ///
     /// Applied **wholesale**, so an empty one clears whatever was recorded rather
-    /// than leaving it. That is the right way round: a member is re-admitted when its
-    /// record has changed, and a node that moved has moved both ports -- keeping the
-    /// old scheduler endpoint would redirect clients to an address that member no
-    /// longer answers, which is worse than redirecting them nowhere. The member keeps
+    /// than leaving it. That is the right way round: whoever proposes the command states
+    /// the whole record -- `SchedulerService::ClusterAdmit` carries the recorded endpoint
+    /// when its caller states none, and a member that moved has its record re-proposed with
+    /// the new one -- so an empty one here is an assertion and never an omission. The member keeps
     /// the fact that it had one (`SchedulerEndpointHistory`), which `Apply` derives
     /// rather than this command carrying it. Refused for the other two verbs, because a
     /// field a verb ignores is a field somebody misunderstood.
     std::string schedulerEndpoint;
 
     /// The key the verb acts on (#178): the member's for `AddMember`/`AddLearner`, where
-    /// absent is NO OPINION and keeps what is recorded; the principal's for
-    /// `AdmitPrincipal`, where it is required; and for `Forget`, the key the proposing leader
+    /// absent is NO OPINION and keeps what is recorded; the survivor's proven key for
+    /// `DissolveInto`, where it is required; and for `Forget`, the key the proposing leader
     /// holds live for the id, revoked beside whatever the record holds (`PrepareForget`).
     /// Refused for every other verb.
     std::optional<Ed25519PublicKey> publicKey;
 
-    /// `AdmitPrincipal` only, and required there: what the principal may do. Refused for
+    /// `DissolveInto` only, and required there: when the survivor was created, as proven. Refused for
     /// every other verb.
-    std::optional<PrincipalRole> role;
+    std::optional<std::uint64_t> createdAtUnixSeconds {};
+
+    /// `DissolveInto` only, and required there: the survivor's leader's key, reached from
+    /// `publicKey` (`DissolveOrder::leaderKey`). Refused for every other verb.
+    std::optional<Ed25519PublicKey> leaderKey {};
 
     [[nodiscard]] friend bool operator==(Command const&, Command const&) = default;
 };
@@ -878,8 +915,9 @@ struct Command
 /// Read a command back.
 ///
 /// Refused **by name**, in the three ways a peer-wire frame is: another build's encoding is
-/// `UnsupportedVersion` with both versions stated, a verb this build does not know is
-/// `UnknownMessageType`, and only bytes that are not a command are `MalformedFrame`. A
+/// `UnsupportedVersion` with both versions stated, a verb this build does not know -- or one it
+/// RETIRED, named as such -- is `UnknownMessageType`, and only bytes that are not a command are
+/// `MalformedFrame`. A
 /// committed entry that will not decode is skipped, so the reason is what the log line
 /// says -- *upgrade that node* and *these bytes are damaged* are different remedies.
 /// @param payload The entry's payload.
@@ -934,10 +972,10 @@ void Apply(ClusterState& state, Command const& command);
 /// type, and that member would count towards quorum forever -- which is the trap
 /// #159 records.
 ///
-/// `AdmitClient` and `ForgetClient` constrain their host, which both record: it must
-/// name a machine, and it must not be this one's loopback -- a caller on the node's own
-/// machine is always admitted to it, so a record about loopback would be accepted,
-/// replicated and snapshotted while deciding nothing.
+/// The RETIRED verbs (`RetiredAdmitClient`, `RetiredForgetClient`, `RetiredAdmitPrincipal`) are
+/// refused by name,
+/// whatever they carry: their bytes stay reserved so an old entry is never read as a
+/// different verb.
 ///
 /// **A function of the command alone**, so it cannot know what the state holds: a key
 /// that is revoked, or held by somebody else, is `ValidateAgainst`'s question.
@@ -949,8 +987,10 @@ void Apply(ClusterState& state, Command const& command);
 ///
 /// `Validate`, and then the rules only the state can answer, which are all about KEYS: a
 /// revoked key is never admitted again (`KeyRevoked`, a refusal of the command -- nothing
-/// the state can later do un-revokes it); a key is held by one id at a time; and an id is a
-/// member or a principal, never both. Every proposer asks this -- the leader before it
+/// the state can later do un-revokes it); a key is held by one id at a time; and a member is
+/// never admitted with NO key, stated
+/// or recorded -- a machine is forgotten by revoking its key, so one admitted without one
+/// could never be forgotten for good. Every proposer asks this -- the leader before it
 /// appends, and the scheduler surface an operator types at -- so the refusal reaches whoever
 /// asked, with its reason.
 ///

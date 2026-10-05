@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/StateFiles.hpp>
 #include <FastCache/Distributed/FleetSample.hpp>
 
 #include <algorithm>
@@ -249,7 +250,7 @@ class FleetHistory
     ///
     /// Idempotent within a bucket: sampling twice inside the same minute overwrites
     /// rather than appends, so a jittery timer cannot double-count.
-    /// @param values The nine readings, counters cumulative.
+    /// @param values The ten readings, counters cumulative.
     void Record(EnumTable<FleetMetric, std::uint64_t> const& values);
 
     /// Replay a bucket another machine recorded, at ITS instant rather than now.
@@ -330,8 +331,9 @@ class FleetHistory
     /// Refuses, leaving the file untouched, when `Load` found one a later build
     /// wrote -- see `ReadOnly`.
     /// @param path Where to write.
+    /// @param which Which state file it is, and so who may read it (`CreateStateFile`).
     /// @return True on success.
-    bool Save(std::filesystem::path const& path) const;
+    bool Save(std::filesystem::path const& path, StateFile which) const;
 
     /// Whether this history refuses to write, because the file on disk is newer.
     ///
@@ -361,9 +363,14 @@ class FleetHistory
     void AppendBody(std::string& out) const;
 
     /// Read rings back from a nested body.
+    ///
+    /// A nested body carries no envelope of its own -- `version` is the OUTER
+    /// `NodeStoreFile`'s, the only place which shape this body was written in
+    /// travels, since `AppendBody` stamps nothing of its own inside it.
     /// @param body The bytes `AppendBody` wrote.
+    /// @param version What NodeStoreFile's envelope said.
     /// @return True when they were understood.
-    bool ReadBody(std::string_view body);
+    bool ReadBody(std::string_view body, std::uint8_t version);
 
     /// One reading at a stated instant; `Record` and `Adopt` differ only in that.
     /// @param now When the reading was taken.
@@ -482,8 +489,9 @@ class FleetNodeHistories final: public IFleetHistorySink
     /// would leave those windows a gap for as long as the rings hold them -- which is
     /// the failure this whole phase removes, reintroduced by a restart.
     /// @param path Where to write.
+    /// @param which Which state file it is, and so who may read it (`CreateStateFile`).
     /// @return True on success.
-    [[nodiscard]] bool Save(std::filesystem::path const& path) const;
+    [[nodiscard]] bool Save(std::filesystem::path const& path, StateFile which) const;
 
   private:
     core::platform::WallClockRef _wall;

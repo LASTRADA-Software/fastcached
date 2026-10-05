@@ -76,6 +76,9 @@ namespace
     /// They carry absolute paths, which is exactly why the KEY's probe suppresses
     /// them and why this text must never reach `ComputeKey`. The two runs answer two
     /// questions and only one of them has to be portable.
+    /// The argument after which a driver reads everything as an input file.
+    constexpr std::string_view EndOfOptions = "--";
+
     constexpr std::array<std::string_view, 1> MsvcDispatchPreprocess { "/E" };
     constexpr std::array<std::string_view, 1> GnuDispatchPreprocess { "-E" };
 
@@ -406,7 +409,7 @@ namespace
     // the producing machine's object path into every Windows key and two checkouts
     // at different roots could never share an entry.
 
-    constexpr std::array<PathValueFlag, 19> PathValues { {
+    constexpr std::array<PathValueFlag, 21> PathValues { {
         // The prefix-map row first, being the longest spelling. GNU-only: `cl` has
         // no path-map switch at all, and clang-cl accepts `-ffile-prefix-map`
         // while ignoring it for the records that matter -- measured, an object
@@ -431,6 +434,16 @@ namespace
           .valueTailSeparator = '=' },
         { .spelling = "/external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         { .spelling = "-external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
+        // clang-cl's spelling of the same thing, and the one CMake writes for a `SYSTEM`
+        // include directory under clang-cl (`-imsvc<dir>`, measured with CMake 4.3.1 and
+        // clang-cl 22.1.3). Unrecognised, `CouldNameAFile` refused every such unit as not
+        // dispatchable. It needs no worker-side counterpart, which is why it is dropped
+        // like `/external:I`: clang-cl's `/E` marks each header found under it as a
+        // system header in the line markers (`# 1 "..." 3`), and the worker suppresses
+        // warnings on those lines by that flag -- measured, `/W4 /WX`, local exit 0 and
+        // the worker's `.i` exit 0 with the flag gone.
+        { .spelling = "-imsvc", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
+        { .spelling = "/imsvc", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         // clang-cl's pass-through spellings of the GNU dependency flags, which is how
         // CMake's Ninja generator asks clang-cl for a depfile (#1531). Unrecognised,
         // the launcher never learned the depfile's path: a miss wrote one as a side
@@ -512,15 +525,20 @@ namespace
         { .spelling = "/U", .families = DriverFamily::Msvc },
     } };
 
-    /// One flag that makes a compile write a second artefact, and which families
-    /// spell it that way.
+    /// One flag that makes a compile write a second artefact (or, for `cl /Yu`, tie its
+    /// object to one), and which drivers spell it that way.
     struct SideArtefactFlag
     {
         std::string_view spelling;
         DriverFamily families;
+        /// The one driver the row is about, when another driver of `families` accepts
+        /// the same spelling and means something a hit CAN reproduce by it. Disengaged:
+        /// every driver of `families`.
+        std::optional<Flavor> onlyFlavor {};
     };
 
-    /// Flags that make a compile write something BESIDES its object file.
+    /// Flags that make a compile write something BESIDES its object file, and one flag,
+    /// `cl`'s `/Yu`, that makes the object depend on a build artefact the key cannot see.
     ///
     /// One row per spelling, exactly as PathValues does it and for the same reason:
     /// an MSVC driver accepts `-` for every option, and a row matched on introducer
@@ -532,7 +550,7 @@ namespace
     /// and matches nothing here. It is left out rather than half-matched, because a
     /// row that fires on `-Xclang` alone would un-cache every build that passes any
     /// `-Xclang` flag at all.
-    constexpr std::array<SideArtefactFlag, 13> SideArtefacts { {
+    constexpr std::array<SideArtefactFlag, 19> SideArtefacts { {
         { .spelling = "/interface", .families = DriverFamily::Msvc },
         { .spelling = "-interface", .families = DriverFamily::Msvc },
         { .spelling = "/internalPartition", .families = DriverFamily::Msvc },
@@ -546,7 +564,32 @@ namespace
         { .spelling = "-fmodule-output", .families = DriverFamily::Gnu },
         { .spelling = "-fmodule-mapper", .families = DriverFamily::Gnu },
         { .spelling = "--precompile", .families = DriverFamily::Gnu },
+        // `cl`'s shared-PDB debug formats. The object only REFERS to the PDB, which holds
+        // every translation unit's types, so a hit restores an object whose types were
+        // never written anywhere. clang-cl reads these spellings as `/Z7` -- its own option
+        // table says "Like /Z7" -- so they are `cl`'s rows alone.
+        { .spelling = "/Zi", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
+        { .spelling = "-Zi", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
+        { .spelling = "/ZI", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
+        { .spelling = "-ZI", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
+        // `cl`'s `/Yu` READS a precompiled header rather than writing one, and is here on
+        // measured evidence (cl 19.51): the object forces a `__@@_PchSym_` symbol whose
+        // name differs per checkout, and its types begin with an `LF_PRECOMP` record
+        // naming the absolute path of the pch.obj it was compiled against. The key hashes
+        // the header's text and neither of those, so a hit replayed into another checkout
+        // failed to link (LNK2011), and one replayed after a PCH rebuild linked without
+        // the translation unit's debug info (LNK4206). clang-cl 22's `/Yu` object carries
+        // neither and replayed clean, so these are `cl`'s rows alone.
+        { .spelling = "/Yu", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
+        { .spelling = "-Yu", .families = DriverFamily::Msvc, .onlyFlavor = Flavor::Cl },
     } };
+
+    // The stated extent must equal the row count. A larger one pads the array with
+    // value-initialized rows, and an empty spelling would reach `.front()` in
+    // `ProducesSideArtefact` -- undefined behaviour rather than a row that matches
+    // nothing. An empty spelling is exactly what such a row has.
+    static_assert(std::ranges::none_of(SideArtefacts, [](SideArtefactFlag const& row) { return row.spelling.empty(); }),
+                  "SideArtefacts' stated extent must equal its row count -- an empty row is a padded one");
 
     /// Which introducer characters each family's options start with.
     constexpr std::array<std::pair<DriverFamily, std::string_view>, 4> FamilyIntroducers { {
@@ -1044,9 +1087,9 @@ std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg, std::stri
     return std::nullopt;
 }
 
-bool ProducesSideArtefact(std::string_view arg, DriverFamily family)
+bool ProducesSideArtefact(std::string_view arg, DriverSpec const& driver)
 {
-    auto const introducers = IntroducersOf(family);
+    auto const introducers = IntroducersOf(driver.family);
     if (arg.empty() || introducers.empty() || !introducers.contains(arg.front()))
         return false;
 
@@ -1057,7 +1100,8 @@ bool ProducesSideArtefact(std::string_view arg, DriverFamily family)
     // bare form would have caught the shape nobody writes and missed the one
     // everybody does.
     return std::ranges::any_of(SideArtefacts, [&](SideArtefactFlag const& row) {
-        return introducers.contains(row.spelling.front()) && Overlaps(row.families, family) && arg.starts_with(row.spelling);
+        return introducers.contains(row.spelling.front()) && Overlaps(row.families, driver.family)
+               && (!row.onlyFlavor.has_value() || *row.onlyFlavor == driver.flavor) && arg.starts_with(row.spelling);
     });
 }
 
@@ -1254,9 +1298,10 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
         }
 
         // Asked of every argument, and of the SOURCE too by way of its extension
-        // below: a compile that also writes a BMI or a precompiled header is not
-        // one a cache hit can reproduce.
-        if (ProducesSideArtefact(a, driver.family))
+        // below: a compile that also writes a BMI, a precompiled header or `cl`'s
+        // shared `/Zi` PDB, or that reads a precompiled header under `cl` (`/Yu`),
+        // is not one a cache hit can reproduce.
+        if (ProducesSideArtefact(a, driver))
         {
             out.sideArtefact = true;
             continue;
@@ -1412,6 +1457,14 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
         if (a == cmd.source)
             continue;
 
+        // The end-of-options marker, which CMake's clang-cl rule writes before every
+        // source (`-c -- $in`). It belongs to the SOURCE, which never travels, and
+        // forwarded it did harm twice over: the worker's allowlist has no row for it, so
+        // every CMake + clang-cl unit came back refused; and a worker that took it would
+        // read the language flags appended below as input files.
+        if (a == EndOfOptions)
+            continue;
+
         // The compile-only marker and the dependency switches, off the driver's own
         // list. Same rule PreprocessCommand applies, and the same reason for reading
         // it here rather than restating it: a spelling added to that table has to be
@@ -1447,7 +1500,14 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
         {
             // The separated `-x c++` form owns the next argument too, and leaving
             // its value behind would hand the worker a bare `c++` to open as a file.
-            if (a == row->spelling && i + 1 < argv.size())
+            //
+            // ONLY a row whose language arrives as a VALUE. `/TP` carries its language
+            // in its own spelling, and this skip used to take the argument after it as
+            // well: `/TP /W4 /WX` reached a worker as `/WX` alone, compiled at the
+            // default warning level what the client compiled at `/W4`, and served the
+            // object of a compile that fails locally. CMake writes a `-D` after `/TP`,
+            // which is dropped here anyway, and that is how it hid.
+            if (!row->language.has_value() && a == row->spelling && i + 1 < argv.size())
                 skipUntil = i + 2;
             continue;
         }

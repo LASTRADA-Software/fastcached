@@ -12,6 +12,8 @@
 #include <string_view>
 #include <vector>
 
+#include <core/net/AcceptLoopHealth.hpp>
+
 /// @file NodeConditions.hpp
 /// What this node has detected that an operator must act on, as ONE table (#1364).
 ///
@@ -37,13 +39,31 @@ namespace FastCache::Node
 /// lists the rows in.
 enum class NodeCondition : std::uint8_t
 {
-    CounterTableSkew = 0,     ///< The metrics catalogue names counters this build's sink has no slot for (#1362).
-    ScratchRootUnmappable,    ///< The worker's scratch root cannot be written into a debug-prefix-map rule (#810).
-    GeneratedTlsCertificate,  ///< The admin surface serves a certificate generated at startup.
-    EnrollmentWindowOpen,     ///< A stranger that asks can be admitted to the cluster (#1298).
-    ForgottenFleetMember,     ///< `--fleet-member` names a host the cluster has forgotten (#1309).
-    UnreadableLeaderSnapshot, ///< This build cannot read the snapshot its leader sends, so it stays behind (#1552).
-    Last,                     ///< Not a condition.
+    CounterTableSkew = 0,           ///< The metrics catalogue names counters this build's sink has no slot for (#1362).
+    ScratchRootUnmappable,          ///< The worker's scratch root cannot be written into a debug-prefix-map rule (#810).
+    GeneratedTlsCertificate,        ///< The admin surface serves a certificate generated at startup.
+    EnrollmentWindowOpen,           ///< An armed auto-approve window admits whoever asks, unexamined (#1298).
+    UnreadableLeaderSnapshot,       ///< This build cannot read the snapshot its leader sends, so it stays behind (#1552).
+    UnqualifiedHostName,            ///< Peers are told to dial a host name with no domain.
+    HostNameReachesOnlyThisMachine, ///< This machine's name reaches only itself, so nothing offers it.
+    EnrollmentRequestsWaiting,      ///< Machines have asked to join and nobody has decided about them.
+    ForeignFleetVisible,     ///< Another fleet proves itself on this segment that this node will not merge with or join.
+    SharedCacheUnavailable,  ///< The fleet names this machine its shared cache, and its shared tier will not open.
+    SharedCacheUnproven,     ///< The fleet names another machine its shared cache, and this node is not reaching it.
+    SchedulerUnreachable,    ///< A scheduler this node registers with does not answer a dial.
+    UnservedToolchain,       ///< Clients asked the leader for a toolchain no live worker serves.
+    MixedNodeVersions,       ///< The leader sees one wire served by more than one build.
+    OwnRecordAwaited,        ///< Its own cluster has not recorded this node's key, so it announces to nobody.
+    RefusedCompileArguments, ///< The worker refused compiles over arguments it will not pass to its compiler.
+    SurfaceNotAccepting,     ///< A serving surface's accept loop has ended: its port listens and refuses.
+    SurfaceAcceptDegraded,   ///< A serving surface's accept loop is backing off on failures nothing classifies.
+    FleetSplitHealing, ///< This fleet and another are one fleet split in two: healing by itself, or waiting on an operator.
+    FormationMoveRefused,   ///< A move of this node's formation was refused: the startup rules refuse the shape it moves to.
+    ConsensusLeaderSilent,  ///< No leader this node's applied configuration counts has spoken for too long to trust its
+                            ///< grants.
+    StateDirectoryUnsynced, ///< The state directory's filesystem cannot sync a directory, so its replaces may not survive
+                            ///< a power loss.
+    Last,                   ///< Not a condition.
 };
 
 /// Which of this node's components evaluates a row.
@@ -55,10 +75,11 @@ enum class ConditionScope : std::uint8_t
 {
     Process = 0,  ///< Every process: evaluated at startup, before any component is built.
     Worker,       ///< The worker tier; absent with `--slots=0`.
-    Scheduler,    ///< The scheduler tier; absent without `--serve-scheduler`.
+    Scheduler,    ///< The scheduler tier; absent unless the node's mode serves one (`ServesScheduler`).
     AdminSurface, ///< The admin HTTP surface; absent without `--admin-listen`.
     Enrollment,   ///< The enrollment window; served only by a consensus node that also schedules.
     Consensus,    ///< Consensus and the cluster state it replicates; absent without `--listen-raft`.
+    Announce,     ///< The announce loops; absent when this node registers with no scheduler (`AnnouncesToAScheduler`).
     Last,         ///< Not a scope.
 };
 
@@ -71,6 +92,7 @@ struct PresentComponents
     bool adminSurface; ///< An admin endpoint is serving.
     bool enrollment;   ///< An enrollment window is reachable.
     bool consensus;    ///< Consensus runs.
+    bool announces;    ///< The announce loops run: this node registers somewhere (`AnnouncesToAScheduler`).
 };
 
 /// One scope: which `PresentComponents` member says it runs, and what a row of it answers when it
@@ -92,17 +114,20 @@ inline constexpr EnumTable<ConditionScope, ConditionScopeRow> ConditionScopeTabl
       .notEvaluated = "this node runs no worker (--slots=0)" },
     { .scope = ConditionScope::Scheduler,
       .present = &PresentComponents::scheduler,
-      .notEvaluated = "this node runs no scheduler (no --serve-scheduler)" },
+      .notEvaluated = "this node runs no scheduler (its mode serves none, or its consensus is closed)" },
     { .scope = ConditionScope::AdminSurface,
       .present = &PresentComponents::adminSurface,
       .notEvaluated = "this node serves no admin surface (no --admin-listen)" },
     { .scope = ConditionScope::Enrollment,
       .present = &PresentComponents::enrollment,
       .notEvaluated = "this node serves no enrollment window: that takes consensus (--listen-raft) and a scheduler "
-                      "(--serve-scheduler)" },
+                      "(its mode)" },
     { .scope = ConditionScope::Consensus,
       .present = &PresentComponents::consensus,
       .notEvaluated = "this node runs no consensus (no --listen-raft), so no cluster state reaches it" },
+    { .scope = ConditionScope::Announce,
+      .present = &PresentComponents::announces,
+      .notEvaluated = "this node registers with no scheduler, so it dials none that could be unreachable" },
 } };
 static_assert(RowsInEnumeratorOrder(ConditionScopeTable, &ConditionScopeRow::scope),
               "ConditionScopeTable must hold one row per ConditionScope, in enumerator order");
@@ -158,17 +183,9 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .persistence = CompileCacheWire::ConditionPersistence::Live,
       .severity = CompileCacheWire::ConditionSeverity::Alert,
       .scope = ConditionScope::Enrollment,
-      .remedy = "Close it with --enroll-close once the machines you meant to admit have joined; check who is waiting "
-                "with --enroll-list before approving anyone, because approving hands that machine this cluster's key. "
-                "A restart closes it too." },
-    { .condition = NodeCondition::ForgottenFleetMember,
-      .id = "forgotten-fleet-member",
-      .persistence = CompileCacheWire::ConditionPersistence::Live,
-      .severity = CompileCacheWire::ConditionSeverity::Warning,
-      .scope = ConditionScope::Consensus,
-      .remedy = "Remove these hosts from this node's --fleet-member list (fleet_member in its configuration file) and "
-                "reload it. They are refused either way, because the cluster's forget outranks the listing; if the "
-                "forget was a mistake, --cluster-admit-client undoes it for every node instead." },
+      .remedy = "Check who got in with --enroll-list, which marks each auto-approved row with when the window was "
+                "armed, and compare each key with the one its machine printed. --enroll-auto-approve=off ends the "
+                "window; so does a restart or a change of leader, since it is held in the leader's memory alone." },
     { .condition = NodeCondition::UnreadableLeaderSnapshot,
       .id = "unreadable-leader-snapshot",
       .persistence = CompileCacheWire::ConditionPersistence::Live,
@@ -179,16 +196,187 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "members, settings, forgets -- until it can. It catches up by itself once it reads the leader's "
                 "snapshot; nothing needs moving aside. A fleet upgrades as one: see "
                 "docs/operations/upgrading-a-fleet.md." },
+    { .condition = NodeCondition::UnqualifiedHostName,
+      .id = "unqualified-host-name",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Process,
+      .remedy = "Set --advertise (advertise in the configuration file; a reload applies it) and --raft-self (raft_self; "
+                "a restart applies it) to a name every peer resolves, or to an address; or give this machine a DNS "
+                "domain and restart the node, since the name is read once at startup. Until then a peer whose DNS "
+                "search list does not complete the name cannot reach this node, which registers and answers nobody "
+                "there." },
+    { .condition = NodeCondition::HostNameReachesOnlyThisMachine,
+      .id = "host-name-reaches-only-this-machine",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Process,
+      .remedy = "Fix this machine's DNS so its name resolves for other machines, and restart (the name is read once "
+                "at startup); or set --raft-self (raft_self; a restart applies it) and --advertise (advertise; a "
+                "reload applies it) to an address or name they resolve. Until then this node is a fleet of its own on "
+                "loopback -- its own scheduler and worker, no discovery -- that can neither form nor join a fleet." },
+    { .condition = NodeCondition::EnrollmentRequestsWaiting,
+      .id = "enrollment-requests-waiting",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Notice,
+      .scope = ConditionScope::Enrollment,
+      .remedy = "Run --enroll-list and compare each machine's key with the one that machine printed; admit one with "
+                "--enroll-approve=<id>@<key>, which admits exactly the key named, or refuse it with --enroll-reject=<id>. "
+                "A machine that stops asking for ten minutes is forgotten." },
+    { .condition = NodeCondition::ForeignFleetVisible,
+      .id = "foreign-fleet-visible",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Consensus,
+      .remedy = "Decide which fleet each machine named here belongs to, and --cluster-forget it from the other: "
+                "established fleets merge only when a key this fleet holds proves them one fleet split in two, and "
+                "one that merely CLAIMS a machine of this one never merges. For a fleet --fleet-id keeps this node "
+                "out of, change the pin if it names the wrong fleet. It clears a few minutes after the other fleet "
+                "stops being heard." },
+    { .condition = NodeCondition::SharedCacheUnavailable,
+      .id = "shared-cache-unavailable",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Alert,
+      .scope = ConditionScope::Consensus,
+      .remedy = "The fleet's shared-cache setting names this machine and its shared tier will not open; every other "
+                "node's builds miss meanwhile and compile locally. Fix what the detail names -- usually another process "
+                "holding <state-dir>/shared-cache, or a full disk -- and it opens at the next change the cluster "
+                "applies or within 30 seconds; or name another machine with --cluster-set shared-cache=<id>." },
+    { .condition = NodeCondition::SharedCacheUnproven,
+      .id = "shared-cache-unproven",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Consensus,
+      .remedy = "This node's builds are not reaching the fleet's shared cache and compile locally instead. The detail "
+                "names why: a machine at the announced address that proved another key (an address reassigned, or an "
+                "impostor -- nothing was sent to it), the named machine refusing this node's key (its roster does not "
+                "hold it, or holds it revoked), one that did not answer, or a setting naming a machine this cluster "
+                "cannot reach by key. Check --cluster-status, and run fastcache-cli node on the named machine." },
+    { .condition = NodeCondition::SchedulerUnreachable,
+      .id = "scheduler-unreachable",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Announce,
+      .remedy = "Check the VPN or network between this machine and the schedulers named here; the node keeps "
+                "serving this machine meanwhile. It rejoins the fleet by itself on the first round that gets "
+                "through, so nothing needs restarting once the network is back." },
+    { .condition = NodeCondition::UnservedToolchain,
+      .id = "unserved-toolchain",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Scheduler,
+      .remedy = "Put the named compiler, at the named version, on at least one worker, or move the clients to a "
+                "compiler the fleet already serves (the fleet page's compiler column lists them): every lease counted "
+                "here was refused and compiled on the client's own machine instead. It clears once a worker serving "
+                "it registers, or once no client has asked for it for fifteen minutes." },
+    { .condition = NodeCondition::MixedNodeVersions,
+      .id = "mixed-node-versions",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Scheduler,
+      .remedy = "Upgrade every node to one build: these still speak one wire, so nothing refuses them and nothing "
+                "else reports it, but a fleet upgrades as one and two builds can disagree about anything the wire "
+                "does not carry. The detail and the fleet page's version column name each build and its machines. It "
+                "clears once the last odd machine runs the fleet's build or has been gone for ninety seconds; see "
+                "docs/operations/upgrading-a-fleet.md." },
+    { .condition = NodeCondition::OwnRecordAwaited,
+      .id = "own-record-awaited",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Consensus,
+      .remedy = "This node announces itself to no scheduler until its own cluster records its key. If that cluster "
+                "cannot elect, bring back a majority of its voters. If this machine joined a running cluster, admit "
+                "it: it asks to enroll and --enroll-approve admits it, or --cluster-admit=<id>=<host>:<port>@<key> "
+                "on a member, with what --print-identity prints. If the detail says its id is recorded under another key, "
+                "restore that "
+                "node-key, or --cluster-forget=<id> and admit this key." },
+    // Live: an operator's reload of the allowlist is the fix landing, and it re-judges the row --
+    // each argument the new list admits leaves, and the row clears once none is left.
+    // A warning and not an alert, because nothing is WRONG with what a build produces -- each
+    // refused compile runs on its own client -- only distribution is lost, which is what the
+    // counter alone could say and never say which flag.
+    { .condition = NodeCondition::RefusedCompileArguments,
+      .id = "refused-compile-arguments",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Worker,
+      .remedy = "Builds stay correct: each refused compile ran on its own client, losing only distribution. Admit a "
+                "named argument that runs no program and names no path with --allow-compile-arg=<argument> on every "
+                "worker, then reload. The reload re-judges the row: each argument the list now admits leaves, and the "
+                "row clears once none is named. One still named was not admitted: check its spelling; the list never "
+                "overrides the built-in rules. Report a flag every build carries: it belongs in the built-in table." },
+    { .condition = NodeCondition::SurfaceNotAccepting,
+      .id = "surface-not-accepting",
+      .persistence = CompileCacheWire::ConditionPersistence::Latched,
+      .severity = CompileCacheWire::ConditionSeverity::Alert,
+      .scope = ConditionScope::Process,
+      .remedy = "Restart this node: the surfaces named here have stopped accepting connections and do not start "
+                "again by themselves, so their ports still listen and refuse every client -- builds compile cold, "
+                "and a scheduler named here hands out nothing. /healthz answers 503 while this is raised. The "
+                "reason is what the last accept answered; report it with this node's version, because only a "
+                "closed or vanished listener is meant to end a loop." },
+    // Live: the loop goes on accepting through its backoff, and the first accept that succeeds
+    // clears the row -- as does the surface being shut down, which leaves nothing degraded.
+    // An alert, as /healthz's 503 is: a surface that accepts little or nothing compiles cold.
+    { .condition = NodeCondition::SurfaceAcceptDegraded,
+      .id = "surface-accept-degraded",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Alert,
+      .scope = ConditionScope::Process,
+      .remedy = "The surfaces named here have failed to accept connections for longer than any transient explains, "
+                "on a failure this build does not classify; each backs off and accepts little or nothing, so builds "
+                "compile cold. /healthz answers 503 while this is raised, and the row clears by itself once an "
+                "accept succeeds. Check this host for exhausted file descriptors or memory, and report the reason "
+                "with this node's version so the failure can be classified." },
+    { .condition = NodeCondition::FleetSplitHealing,
+      .id = "fleet-split-healing",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Consensus,
+      .remedy = "Where the detail says which side yields, nothing: that side rejoins the other by itself, and a "
+                "machine the survivor did not record waits on its --enroll-list. Where it says an operator decides, "
+                "nothing moves until you do: ask the machine it names which fleet it is in, and check the other with "
+                "--cluster-status. Not yours: leave it. Yours: --cluster-forget=<id> each machine of the fleet that "
+                "does not stay, then --enroll-approve=<id>@<key> it on the survivor. Clears once the other is no "
+                "longer heard." },
+    { .condition = NodeCondition::FormationMoveRefused,
+      .id = "formation-move-refused",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Alert,
+      .scope = ConditionScope::Consensus,
+      .remedy = "Fix the rule the detail names and restart this node; until then it keeps the mode it is in rather "
+                "than serve a shape its next restart would refuse." },
+    { .condition = NodeCondition::ConsensusLeaderSilent,
+      .id = "consensus-leader-silent",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Consensus,
+      .remedy = "Restore this node's Raft sessions to its fleet -- check the network path to its voters and "
+                "--cluster-status on one of them. Until a leader the fleet counts speaks to it again, every grant it is "
+                "handed is refused and the compiles fall back to their own machines; a voter its fleet forgot meanwhile is "
+                "what this protects against. It clears at the first leader contact." },
+    { .condition = NodeCondition::StateDirectoryUnsynced,
+      .id = "state-directory-unsynced",
+      .persistence = CompileCacheWire::ConditionPersistence::Latched,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Process,
+      .remedy = "Stop the node, move its state directory whole to a local volume -- it holds the node's identity, so a "
+                "new empty directory would be a new machine -- point --cluster-dir at the new place and start it. "
+                "The filesystem the detail names cannot sync a directory, so a state file replaced there (the "
+                "Raft term and vote, the formation record) is not known to survive a power loss: one a power cut "
+                "takes back is read as the file before it. The node serves meanwhile; a restart on the same "
+                "volume will not clear this." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");
 
-/// Whether every row of the table can travel: at most `MaxNodeConditions` of them, each with an id
-/// and a remedy inside their ceilings, no id empty or spelled twice, every remedy non-empty.
+/// Whether every row of the table can travel: FEWER than `MaxNodeConditions` of them -- one row to
+/// spare, so the next condition costs a row of the table rather than a re-derived share -- each with
+/// an id and a remedy inside their ceilings, no id empty or spelled twice, every remedy non-empty.
 /// @return True when the table fits the wire.
 [[nodiscard]] consteval bool NodeConditionTableFitsTheWire() noexcept
 {
-    if (NodeConditionTable.empty() || NodeConditionTable.size() > CompileCacheWire::MaxNodeConditions)
+    if (NodeConditionTable.empty() || NodeConditionTable.size() >= CompileCacheWire::MaxNodeConditions)
         return false;
     for (auto const& row: NodeConditionTable)
     {
@@ -201,8 +389,8 @@ static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condi
     return true;
 }
 static_assert(NodeConditionTableFitsTheWire(),
-              "every condition must fit the wire: at most MaxNodeConditions rows, each with a unique id and a remedy "
-              "inside their ceilings");
+              "every condition must fit the wire with a row to spare: fewer than MaxNodeConditions rows, each with a "
+              "unique id and a remedy inside their ceilings");
 
 /// The row describing @p condition.
 /// @param condition The condition.
@@ -312,5 +500,19 @@ void EvaluateProcessConditions(NodeConditions& conditions, IMetricsSink const& m
 /// @param items The items, in the order to name them.
 /// @return The detail.
 [[nodiscard]] std::string ListDetail(std::string_view lead, std::vector<std::string> const& items);
+
+/// Keep `surface-not-accepting` and `surface-accept-degraded` true to @p health for as long as this
+/// process runs.
+///
+/// Clears both rows now -- checked and benign, since nothing has stopped or degraded yet. Each
+/// change the registry records re-reads it: `surface-not-accepting` is raised, naming every surface
+/// that gave up and why, and stays raised, since a loop that gave up does not start again;
+/// `surface-accept-degraded` names every degraded surface, and clears once none is left. The ONE
+/// place that reads the node's accept-loop registry into a condition, so the rows and `/healthz`
+/// answer from the same registry. Safe from any number of loop threads at once: the read and the
+/// write it answers with are one step, so the last answer is from the newest record.
+/// @param health The node's registry; must outlive @p conditions' use of it.
+/// @param conditions Where the row is answered; must outlive @p health.
+void WatchAcceptLoops(core::net::AcceptLoopHealth& health, NodeConditions& conditions);
 
 } // namespace FastCache::Node

@@ -1,12 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeDefaults.hpp"
+#include "NodeFormation.hpp"
 #include "NodeReload.hpp"
 
+#include <FastCache/Config/YamlReader.hpp>
+
 #include <utility>
+#include <vector>
 
 namespace FastCache::Node
 {
 
-void ApplyReloadRequest(NodeReloader* reloader, NodeMembership& membership, ILogger& logger)
+NodeReloader::Reparse ReloadCandidateReader(std::span<char const* const> args, ReloadBasis basis)
+{
+    return [args, basis = std::move(basis)](std::filesystem::path const& path) -> std::expected<NodeConfig, ConfigError> {
+        // A FRESH configuration, never the live one. A file that fails halfway is then discarded
+        // whole rather than leaving the running worker holding part of a document nobody wrote.
+        NodeConfig candidate;
+        auto const loaded =
+            ReadYamlSettings(path).and_then([&candidate, &path, args](std::vector<YamlSetting> const& settings) {
+                return ApplyNodeConfiguration(settings, path, args, candidate);
+            });
+        if (!loaded.has_value())
+            return std::unexpected(loaded.error());
+
+        // The state directory and the names first, carried rather than resolved again: the
+        // identity dials the names.
+        candidate.stateDirectory = basis.stateDirectory;
+        ApplyHostNames(candidate, basis.hostNames);
+
+        // The formation as it is kept NOW: a candidate shaped by no record would run no consensus the
+        // running node does, and one shaped by the record the start kept would put a reformed node
+        // back in a mode it has left. A record that cannot be read, or is gone, declines the reload.
+        auto const formationRefusal = [](std::string context) {
+            return std::unexpected(ConfigError { .code = ConfigErrorCode::ParseError,
+                                                 .source = "formation",
+                                                 .line = 0,
+                                                 .field = {},
+                                                 .context = std::move(context) });
+        };
+        auto const kept = basis.formation ? basis.formation()
+                                          : std::expected<KeptFormation, std::string> { std::unexpected {
+                                                std::string { "this node keeps no formation record" } } };
+        if (!kept.has_value())
+            return formationRefusal(kept.error());
+        if (!kept->record.has_value())
+            return formationRefusal(std::string { FormationRecordGone });
+        if (auto applied = ApplyFormation(candidate, *kept->record, kept->remembered); !applied.has_value())
+            return formationRefusal(applied.error());
+
+        // The identity again, through the function the start used. A candidate rebuilt without it
+        // holds an empty `--node-id`, an unreloadable field that has CHANGED -- so every reload
+        // would be refused by name, on a worker whose configuration was perfectly valid.
+        ApplyNodeIdentity(candidate, basis.identity);
+        return candidate;
+    };
+}
+
+void ApplyReloadRequest(NodeReloader* reloader, NodeMembership& membership, NodeConditions& conditions, ILogger& logger)
 {
     if (reloader == nullptr)
     {
@@ -42,6 +93,10 @@ void ApplyReloadRequest(NodeReloader* reloader, NodeMembership& membership, ILog
     // `AdmissionAnnouncement`, which is pure and tested; what decides whether anything
     // takes effect is nothing at all.
     membership.Adopt(*current);
+
+    // `--advertise` is reloadable, so whether a bare host name is still what peers are told to
+    // dial is asked of the configuration now in force; unconditional for `Adopt`'s reason.
+    EvaluateHostNameCondition(conditions, *current);
 
     // At WARN, which is the level a credential change is logged at, and for the same
     // reason: this is the setting that decides which machines this worker will spend

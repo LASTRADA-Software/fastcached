@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ToolchainFingerprint.hpp"
 
+#include <FastCache/Protocol/CompileCacheWire.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
@@ -210,4 +212,9 @@ TEST_CASE("A fingerprint is a fixed-width hex string", "[toolchain][fingerprint]
     auto const fingerprint = ComputeToolchainFingerprint("gcc 13.2.0", Gnu, SampleTree());
     CHECK(fingerprint.size() == 32);
     CHECK(fingerprint.find_first_not_of("0123456789abcdef") == std::string::npos);
+
+    // And a scheduler keeps what a lease names, so it refuses a fingerprint longer than it records:
+    // the width asserted above is what `MaxToolchainFingerprintBytes` was sized from, with room to
+    // spare, and a real fingerprint the scheduler refused would never be distributed at all.
+    CHECK(fingerprint.size() * 2 <= FastCache::CompileCacheWire::MaxToolchainFingerprintBytes);
 }

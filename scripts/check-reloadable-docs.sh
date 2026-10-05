@@ -74,8 +74,18 @@ set -uo pipefail
 # Which files are third-party, asked of the tree being checked (#1370). An upstream file
 # cannot declare a subject of THIS project's, whatever text it happens to carry.
 # shellcheck source=lib/third-party-roots.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/third-party-roots.sh" \
+#
+# Found with parameter expansion rather than `$(cd "$(dirname ...)" && pwd)`: that is two
+# processes on every run, and the self-test runs this script once per case.
+case "${BASH_SOURCE[0]}" in
+    */*) SelfDir="${BASH_SOURCE[0]%/*}" ;;
+    *) SelfDir=. ;;
+esac
+. "${SelfDir}/lib/third-party-roots.sh" \
     || { echo "FAIL reloadable-docs: cannot read scripts/lib/third-party-roots.sh" >&2; exit 1; }
+# shellcheck source=lib/git-scrub.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/git-scrub.sh" \
+    || { echo "FAIL reloadable-docs: cannot read scripts/lib/git-scrub.sh" >&2; exit 1; }
 
 # The markers that DEFINE the artefact set. Spelled once each: they are what the scan
 # searches for, what the refusal names, and what a new artefact would have to adopt.
@@ -118,15 +128,17 @@ fastcache-compile-node|src/apps/fastcache-compile-node/NodeConfig.cpp
 fastcached|src/FastCache/Config/CliParser.cpp
 '
 
-# The option table a subject is checked against.
+# The option table a subject is checked against, into `TableFor` -- a global rather than
+# stdout, because it is asked once per artefact and `$(...)` is a process each time.
 # @param 1 The subject.
-# @return The path, relative to the tree root, or nothing when this check knows no such subject.
+# Sets `TableFor` to the path, relative to the tree root, or to nothing when this check knows no such subject.
 table_for_subject() {
     local name path
+    TableFor=""
     while IFS='|' read -r name path; do
         [[ -n "$name" ]] || continue
         if [[ "$name" == "$1" ]]; then
-            printf '%s' "$path"
+            TableFor="$path"
             return 0
         fi
     done <<< "$SubjectTable"
@@ -196,53 +208,65 @@ refuse() {
 # `});`), and comment lines are not rows. `check_subject` requires that marker before
 # walking, so a table that stops matching is a named refusal rather than an empty set.
 #
-# @param 1 The option table source.
-# @return The keys, one per line, unsorted.
-reloadable_keys_from_table() {
-    awk -v opener="$TableArrayMarker" '
-        function emit() {
-            if (primary != "" && rel == "Yes" && yaml != "") print yaml
-            primary = ""
+# A fragment of `analyse`: `tableLine` is called for every line of an option table, and it
+# emits `TRUTH <key>` per reloadable row and `OPENER yes` when the table carries the opener
+# anywhere -- comments included, which is what the `grep -q` it replaces answered.
+readonly TableWalk='
+    function tableStart() { inTable = 0; primary = ""; hasOpener = 0 }
+    function tableRow() {
+        if (primary != "" && rel == "Yes" && yaml != "") out("TRUTH", yaml)
+        primary = ""
+    }
+    function tableEnd() {
+        tableRow()
+        if (hasOpener) out("OPENER", "yes")
+    }
+    function tableLine(    seg) {
+        if (index($0, opener)) hasOpener = 1
+        if ($0 ~ /^[[:space:]]*(\/\/|\/\*|\*)/) return
+        if (inTable == 0) {
+            if (index($0, opener)) inTable = 1
+            return
         }
-        /^[[:space:]]*(\/\/|\/\*|\*)/     { next }
-        inTable == 0 && index($0, opener) { inTable = 1; next }
-        inTable == 0                      { next }
-        /^[[:space:]]*\}\);/              { emit(); inTable = 0; next }
-        /\.primary = "/                   { emit(); primary = $0; yaml = ""; rel = "No" }
-        /\.yamlKey = "/                   { if (match($0, /\.yamlKey = "[^"]*"/)) {
-                                              seg = substr($0, RSTART, RLENGTH)
-                                              yaml = substr(seg, index(seg, "\"") + 1)
-                                              sub(/"$/, "", yaml)
-                                          } }
-        /\.reloadable = Reloadable::Yes/  { if (primary != "") rel = "Yes" }
-        END                                   { emit() }
-    ' "$1"
-}
+        if ($0 ~ /^[[:space:]]*\}\);/) { tableRow(); inTable = 0; return }
+        if ($0 ~ /\.primary = "/) { tableRow(); primary = $0; yaml = ""; rel = "No" }
+        if ($0 ~ /\.yamlKey = "/) {
+            if (match($0, /\.yamlKey = "[^"]*"/)) {
+                seg = substr($0, RSTART, RLENGTH)
+                yaml = substr(seg, index(seg, "\"") + 1)
+                sub(/"$/, "", yaml)
+            }
+        }
+        if ($0 ~ /\.reloadable = Reloadable::Yes/) { if (primary != "") rel = "Yes" }
+    }
+'
 
 # The keys a docs Reloadable/restart table claims reload.
 #
 # The cell is the first row under the separator, first column. Keys are the backticked
 # tokens in it, so prose in the same cell is not read as a setting.
 #
-# @param 1 The markdown file.
-# @return The keys, one per line, unsorted.
-reloadable_keys_from_docs() {
-    awk -v marker="$DocsTableMarker" '
-        index($0, marker) { seen = 1; next }
-        seen == 1 && /^\|[ :-]*\|/ { seen = 2; next }
-        seen == 2 {
-            # First column only: everything before the second bar.
-            line = $0
-            sub(/^\|/, "", line)
-            sub(/\|.*$/, "", line)
-            while (match(line, /`[a-z_]+`/)) {
-                print substr(line, RSTART + 1, RLENGTH - 2)
-                line = substr(line, RSTART + RLENGTH)
-            }
-            exit
+# A fragment of `analyse`, called for every line of an artefact: `DOCS yes` when the file
+# carries the marker anywhere, and `DOCSKEY <key>` per key in the first table's cell.
+readonly DocsTableRead='
+    function docsStart() { docsState = 0; hasDocs = 0 }
+    function docsLine(    line) {
+        if (!hasDocs && index($0, docsMarker)) { hasDocs = 1; out("DOCS", "yes") }
+        if (docsState == 3) return
+        if (index($0, docsMarker)) { docsState = 1; return }
+        if (docsState == 1 && $0 ~ /^\|[ :-]*\|/) { docsState = 2; return }
+        if (docsState != 2) return
+        # First column only: everything before the second bar.
+        line = $0
+        sub(/^\|/, "", line)
+        sub(/\|.*$/, "", line)
+        while (match(line, /`[a-z_]+`/)) {
+            out("DOCSKEY", substr(line, RSTART + 1, RLENGTH - 2))
+            line = substr(line, RSTART + RLENGTH)
         }
-    ' "$1"
-}
+        docsState = 3
+    }
+'
 
 # The number a file states, as a numeral, from a count written in words or digits.
 #
@@ -251,49 +275,48 @@ reloadable_keys_from_docs() {
 # only understood digits would stop matching the day somebody wrote one, matching
 # nothing, which reads as agreement. The daemon's spells `FIVE` (#1070).
 #
-# @param 1 The word or numeral.
-# @return The numeral, or nothing when it is not a number this understands.
+# @param 1 The word or numeral, lower-cased -- `analyse` lowers it, so this spends no `tr`.
+# Sets `Numeral` to the numeral, or to nothing when it is not a number this understands.
 numeral_of() {
-    local word
-    word="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-    case "$word" in
-        0|1|2|3|4|5|6|7|8|9|1[0-9]|20) echo "$word" ;;
-        zero) echo 0 ;;      one) echo 1 ;;       two) echo 2 ;;
-        three) echo 3 ;;     four) echo 4 ;;      five) echo 5 ;;
-        six) echo 6 ;;       seven) echo 7 ;;     eight) echo 8 ;;
-        nine) echo 9 ;;      ten) echo 10 ;;      eleven) echo 11 ;;
-        twelve) echo 12 ;;   thirteen) echo 13 ;; fourteen) echo 14 ;;
-        fifteen) echo 15 ;;  sixteen) echo 16 ;;  seventeen) echo 17 ;;
-        eighteen) echo 18 ;; nineteen) echo 19 ;; twenty) echo 20 ;;
+    Numeral=""
+    case "$1" in
+        0|1|2|3|4|5|6|7|8|9|1[0-9]|20) Numeral="$1" ;;
+        zero) Numeral=0 ;;      one) Numeral=1 ;;       two) Numeral=2 ;;
+        three) Numeral=3 ;;     four) Numeral=4 ;;      five) Numeral=5 ;;
+        six) Numeral=6 ;;       seven) Numeral=7 ;;     eight) Numeral=8 ;;
+        nine) Numeral=9 ;;      ten) Numeral=10 ;;      eleven) Numeral=11 ;;
+        twelve) Numeral=12 ;;   thirteen) Numeral=13 ;; fourteen) Numeral=14 ;;
+        fifteen) Numeral=15 ;;  sixteen) Numeral=16 ;;  seventeen) Numeral=17 ;;
+        eighteen) Numeral=18 ;; nineteen) Numeral=19 ;; twenty) Numeral=20 ;;
         *) ;;
     esac
 }
 
-# The count a file states, as a numeral.
-# @param 1 The file.
-# @return The numeral, or nothing when the sentence is there and the number is not.
-stated_count_of() {
-    local word
-    word="$(awk -v marker="$CountMarker" '
-        {
-            where = index($0, marker)
-            if (where > 0) {
-                before = substr($0, 1, where - 1)
-                n = split(before, parts, /[ \t]+/)
-                # The LAST NON-EMPTY field. A trailing separator makes `parts[n]`
-                # empty, so the check refused a correct file for stating no number.
-                # Found by running it against the shipped reference, whose line reads
-                # `# SEVEN settings are reloadable ...` -- one space before the marker.
-                for (i = n; i >= 1; i--) {
-                    if (parts[i] != "") { print parts[i]; break }
-                }
-                exit
-            }
+# The count a file states, as the word before the count marker on the first line carrying it.
+#
+# A fragment of `analyse`: `COUNT yes` when the file carries the marker anywhere, `COUNTWORD
+# <word>` lower-cased, and `NAMED yes` when a line carries the marker with a colon after it
+# -- what `grep -q "${CountMarker}.*:"` answered.
+readonly CountRead='
+    function countStart() { hasCount = 0; countDone = 0; named = 0 }
+    function countLine(    where, before, n, parts, i) {
+        where = index($0, countMarker)
+        if (where == 0) return
+        if (!hasCount) { hasCount = 1; out("COUNT", "yes") }
+        if (!named && index(substr($0, where + length(countMarker)), ":") > 0) { named = 1; out("NAMED", "yes") }
+        if (countDone) return
+        countDone = 1
+        before = substr($0, 1, where - 1)
+        n = split(before, parts, /[ \t]+/)
+        # The LAST NON-EMPTY field. A trailing separator makes `parts[n]`
+        # empty, so the check refused a correct file for stating no number.
+        # Found by running it against the shipped reference, whose line reads
+        # `# SEVEN settings are reloadable ...` -- one space before the marker.
+        for (i = n; i >= 1; i--) {
+            if (parts[i] != "") { out("COUNTWORD", tolower(parts[i])); break }
         }
-    ' "$1")"
-    [[ -n "$word" ]] || return 0
-    numeral_of "$word"
-}
+    }
+'
 
 # The setting NAMES a reference configuration states beside its count, if it states any.
 #
@@ -309,57 +332,155 @@ stated_count_of() {
 # that parses to nothing: that is the parser having stopped matching, and it is refused by
 # the caller rather than read as a file claiming nothing.
 #
-# @param 1 The file.
-# @return The names, one per line, unsorted; nothing when the file states no name list.
-stated_keys_of() {
-    awk -v marker="$CountMarker" '
-        found == 0 {
-            where = index($0, marker)
-            if (where == 0) next
-            rest = substr($0, where + length(marker))
+# A fragment of `analyse`: `COUNTKEY <name>` per name, emitted once the list ends -- at a bare
+# `#` or at the end of the file.
+readonly StatedNamesRead='
+    function keysStart() { keysState = 0; keysText = "" }
+    function keysFlush(    n, parts, i) {
+        gsub(/[.;]/, "", keysText)
+        n = split(keysText, parts, /[,[:space:]]+/)
+        for (i = 1; i <= n; i++)
+            if (parts[i] != "" && parts[i] != "and")
+                out("COUNTKEY", parts[i])
+        keysState = 2
+    }
+    function keysEnd() { if (keysState == 1) keysFlush() }
+    function keysLine(    where, rest, colon, line) {
+        if (keysState == 0) {
+            where = index($0, countMarker)
+            if (where == 0) return
+            rest = substr($0, where + length(countMarker))
             colon = index(rest, ":")
-            if (colon == 0) exit          # a count with no names: the node shape
-            found = 1
-            text = substr(rest, colon + 1)
-            next
+            if (colon == 0) { keysState = 2; return }   # a count with no names: the node shape
+            keysState = 1
+            keysText = substr(rest, colon + 1)
+            return
         }
-        found == 1 {
-            line = $0
-            sub(/^[ \t]*#[ \t]?/, "", line)
-            if (line ~ /^[ \t]*$/) exit
-            text = text " " line
-        }
-        END {
-            if (found == 0) exit
-            gsub(/[.;]/, "", text)
-            n = split(text, parts, /[,[:space:]]+/)
-            for (i = 1; i <= n; i++)
-                if (parts[i] != "" && parts[i] != "and")
-                    print parts[i]
-        }
-    ' "$1"
-}
+        if (keysState != 1) return
+        line = $0
+        sub(/^[ \t]*#[ \t]?/, "", line)
+        if (line ~ /^[ \t]*$/) { keysFlush(); return }
+        keysText = keysText " " line
+    }
+'
 
-# Which binary a file says it is describing.
-# @param 1 The file.
-# @return The subject, or nothing when the file declares none.
-subject_of() {
-    awk -v marker="$SubjectMarker" '
-        {
-            where = index($0, marker)
-            if (where > 0) {
-                rest = substr($0, where + length(marker))
-                n = split(rest, parts, /[ \t]+/)
-                for (i = 1; i <= n; i++) {
-                    if (parts[i] != "") {
-                        gsub(/[^A-Za-z0-9._-]/, "", parts[i])
-                        if (parts[i] != "") { print parts[i]; exit }
-                    }
-                }
-                exit
+# Which binary a file says it is describing: the first name after the first subject marker.
+#
+# A fragment of `analyse`: `SUBJECT <name>`, or nothing when the file declares none.
+readonly SubjectRead='
+    function subjectStart() { subjectDone = 0 }
+    function subjectLine(    where, rest, n, parts, i) {
+        if (subjectDone) return
+        where = index($0, subjectMarker)
+        if (where == 0) return
+        subjectDone = 1
+        rest = substr($0, where + length(subjectMarker))
+        n = split(rest, parts, /[ \t]+/)
+        for (i = 1; i <= n; i++) {
+            if (parts[i] != "") {
+                gsub(/[^A-Za-z0-9._-]/, "", parts[i])
+                if (parts[i] != "") { out("SUBJECT", parts[i]); return }
             }
         }
-    ' "$1"
+    }
+'
+
+# Every option table and every declaring artefact, read in ONE awk pass, as records
+# `<kind> TAB <file> TAB <value>` -- the fragments above, each answering what one reader
+# used to answer about one file. Then ONE `sort`: `-k3,3` within a kind and a file orders a
+# key set exactly as the `sort -u` each set used to get, whatever the locale, so the
+# messages below list keys in the order they always did.
+#
+# **One process for the tree rather than a grep, an awk, a sort and two `comm` per file.**
+# A run spent about ninety processes on a fixture of six files, two seconds idle, and the
+# self-test runs twenty-two of them: under a loaded ctest it timed out at 180 s. Answering
+# through records rather than through a process per question is what took it out of that.
+#
+# @param 1 The source directory. @param 2 The option tables, relative, newline-separated.
+# @param 3.. The files to read, each `<source directory>/<relative path>`.
+# @return The records, sorted.
+analyse() {
+    local root="$1" tables="$2"
+    shift 2
+    # The table list through the ENVIRONMENT, never `-v`: macOS's awk (the one true awk) refuses a
+    # `-v` value holding a newline ("newline in string"), and the list is newline-separated.
+    FASTCACHED_RELOADABLE_TABLES="$tables" awk -v prefix="${root}/" -v opener="$TableArrayMarker" \
+        -v subjectMarker="$SubjectMarker" -v docsMarker="$DocsTableMarker" -v countMarker="$CountMarker" "
+        ${TableWalk}${DocsTableRead}${CountRead}${StatedNamesRead}${SubjectRead}"'
+        function out(kind, value) { printf "%s\t%s\t%s\n", kind, file, value }
+        function finish() {
+            if (file == "") return
+            if (isTable) tableEnd()
+            else keysEnd()
+        }
+        BEGIN {
+            n = split(ENVIRON["FASTCACHED_RELOADABLE_TABLES"], listed, "\n")
+            for (i = 1; i <= n; i++) if (listed[i] != "") tableAt[listed[i]] = 1
+        }
+        FNR == 1 {
+            finish()
+            file = FILENAME
+            if (substr(file, 1, length(prefix)) == prefix) file = substr(file, length(prefix) + 1)
+            isTable = (file in tableAt)
+            tableStart(); docsStart(); countStart(); keysStart(); subjectStart()
+        }
+        isTable { tableLine(); next }
+        { subjectLine(); docsLine(); countLine(); keysLine() }
+        END { finish() }
+    ' "$@" | sort -t "$Tab" -k1,1 -k2,2 -k3,3 -u
+}
+
+Tab=$'\t'
+Nl=$'\n'
+Records=""
+
+# The values of every record of kind @p 1 about file @p 2, in `analyse`'s order, one per line,
+# into `Found`. Parameter expansion only: no process and no pipe, so no size limit either.
+records_of() {
+    local rest="$Records" line kind file
+    Found=""
+    while [[ -n "$rest" ]]; do
+        line="${rest%%"$Nl"*}"
+        rest="${rest#*"$Nl"}"
+        kind="${line%%"$Tab"*}"
+        line="${line#*"$Tab"}"
+        file="${line%%"$Tab"*}"
+        if [[ "$kind" == "$1" && "$file" == "$2" ]]; then
+            Found="${Found}${line#*"$Tab"}${Nl}"
+        fi
+    done
+    Found="${Found%"$Nl"}"
+}
+
+# The lines of @p 1 that are not lines of @p 2, in @p 1's order, each followed by a space --
+# `comm -23` of two sorted sets, joined as `tr '\n' ' '` joined it -- into `Missing`.
+set_minus() {
+    local rest="$1" x
+    Missing=""
+    [[ -n "$rest" ]] || return 0
+    rest="${rest}${Nl}"
+    while [[ -n "$rest" ]]; do
+        x="${rest%%"$Nl"*}"
+        rest="${rest#*"$Nl"}"
+        case "${Nl}${2}${Nl}" in
+            *"${Nl}${x}${Nl}"*) ;;
+            *) Missing="${Missing}${x} " ;;
+        esac
+    done
+}
+
+# How many lines the STRING @p 1 has, into `Counted`, without a subprocess. Not
+# `scripts/lib/e2e-common.sh`'s `count_lines`, which counts a FILE through `wc`: a
+# different contract, so a different name -- the shared-helper scan matches by name.
+count_text_lines() {
+    local rest="$1"
+    Counted=0
+    [[ -n "$rest" ]] || return 0
+    rest="${rest}${Nl}"
+    while [[ -n "$rest" ]]; do
+        rest="${rest#*"$Nl"}"
+        Counted=$((Counted + 1))
+    done
 }
 
 # Every tracked file carrying a marker.
@@ -431,23 +552,42 @@ check_tree() {
         || echo "reloadable-docs: $(third_party_declined_summary "file(s) carrying '${SubjectMarker}'" "$declined")"
     [[ -n "$declaring" ]] || refuse "no tracked file carries '${SubjectMarker}'; the artefacts that state a reloadable set declare which binary they describe, and a scan that finds none is describing nothing"
 
+    # Every option table that exists and every declaring artefact, read once. A table that
+    # does not exist is left out and refused by name when its subject is reached, as before.
+    local tables="" rest
+    local -a analysed
+    analysed=()
+    while IFS='|' read -r name path; do
+        [[ -n "$name" ]] || continue
+        tables="${tables}${path}${Nl}"
+        [[ -f "${root}/${path}" ]] && analysed+=("${root}/${path}")
+    done <<< "$SubjectTable"
+    rest="${declaring}${Nl}"
+    while [[ -n "$rest" ]]; do
+        f="${rest%%"$Nl"*}"
+        rest="${rest#*"$Nl"}"
+        [[ -n "$f" ]] && analysed+=("${root}/${f}")
+    done
+    Records="$(analyse "$root" "$tables" "${analysed[@]}")" \
+        || refuse "the option tables and artefacts under ${root} could not be read, so nothing about them has been established"
+    [[ -z "$Records" ]] || Records="${Records}${Nl}"
+
     # Every declared subject must be one this check reads. Refused rather than skipped: a
     # subject nobody handles is a claim nothing verifies, and skipping it silently is how
     # it stays that way -- which was the daemon matrix's position for as long as #1070 was
     # open, honestly out of scope by carrying no marker at all.
     #
-    # Each artefact is asked its subject ONCE and the answer KEPT. `subject_of` is an awk
-    # fork, and the per-subject pass below would otherwise re-ask every file once per
-    # SubjectTable row -- rows times artefacts, growing with both. This file already
-    # records what a process per file costs: `files_carrying` is one `grep -l` across the
-    # whole tracked set precisely because the per-file form put a sibling scan over a CI
-    # budget, so re-deriving here would be this script contradicting its own note.
+    # Each artefact is asked its subject ONCE and the answer KEPT, so the per-subject pass
+    # below does not re-ask every file once per SubjectTable row -- rows times artefacts,
+    # growing with both. It is a lookup in the records now rather than an awk per file.
     local declared=""
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
-        subject="$(subject_of "${root}/${f}")"
+        records_of SUBJECT "$f"
+        subject="$Found"
         [[ -n "$subject" ]] || refuse "${f} carries '${SubjectMarker}' and names no binary after it"
-        path="$(table_for_subject "$subject")"
+        table_for_subject "$subject"
+        path="$TableFor"
         [[ -n "$path" ]] \
             || refuse "${f} declares subject '${subject}', which this check does not read -- it knows $(known_subjects). Add a SubjectTable row naming that binary's option table, or drop the marker; do not leave a declared claim unchecked"
         declared="${declared}${subject}|${f}
@@ -485,24 +625,29 @@ check_subject() {
     local truth truthCount docsFiles countFiles f found missing extra stated carries statedKeys
 
     [[ -f "$table" ]] || refuse "${subject}: no option table at ${table}"
-    grep -q "$TableArrayMarker" "$table" \
+    records_of OPENER "$3"
+    [[ -n "$Found" ]] \
         || refuse "${subject}: ${table} carries no '${TableArrayMarker}' -- the row walk is bounded by that opener, so without it the walk reads nothing and a clean result would describe a table this check never entered"
 
-    truth="$(reloadable_keys_from_table "$table" | sort -u)"
+    records_of TRUTH "$3"
+    truth="$Found"
     [[ -n "$truth" ]] || refuse "${subject}: the option table yielded no Reloadable::Yes row with a yamlKey; the scan has stopped matching, so a clean result would describe a table it never read"
-    truthCount="$(printf '%s\n' "$truth" | wc -l | tr -d ' ')"
+    count_text_lines "$truth"
+    truthCount="$Counted"
 
     docsFiles=""
     countFiles=""
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
         carries=0
-        if grep -F -- "$DocsTableMarker" "${root}/${f}" >/dev/null 2>&1; then
+        records_of DOCS "$f"
+        if [[ -n "$Found" ]]; then
             docsFiles="${docsFiles}${f}
 "
             carries=1
         fi
-        if grep -F -- "$CountMarker" "${root}/${f}" >/dev/null 2>&1; then
+        records_of COUNT "$f"
+        if [[ -n "$Found" ]]; then
             countFiles="${countFiles}${f}
 "
             carries=1
@@ -535,11 +680,14 @@ check_subject() {
 
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
-        found="$(reloadable_keys_from_docs "${root}/${f}" | sort -u)"
+        records_of DOCSKEY "$f"
+        found="$Found"
         [[ -n "$found" ]] || refuse "${f} carries the table marker and its Reloadable cell parsed to nothing"
 
-        missing="$(comm -23 <(printf '%s\n' "$truth") <(printf '%s\n' "$found") | tr '\n' ' ')"
-        extra="$(comm -13 <(printf '%s\n' "$truth") <(printf '%s\n' "$found") | tr '\n' ' ')"
+        set_minus "$truth" "$found"
+        missing="$Missing"
+        set_minus "$found" "$truth"
+        extra="$Missing"
 
         # The direction a reader loses: a setting reloads and the table does not say so.
         [[ -z "${missing// /}" ]] \
@@ -556,7 +704,12 @@ check_subject() {
 
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
-        stated="$(stated_count_of "${root}/${f}")"
+        records_of COUNTWORD "$f"
+        stated=""
+        if [[ -n "$Found" ]]; then
+            numeral_of "$Found"
+            stated="$Numeral"
+        fi
         [[ -n "$stated" ]] \
             || refuse "${f} says '${CountMarker}' and the word before it is not a number this understands"
         [[ "$stated" -eq "$truthCount" ]] \
@@ -565,12 +718,16 @@ check_subject() {
 
         # And the NAMES, when the file lists them. A file may state a count alone; what it
         # may not do is list names nothing reads.
-        if grep -q "${CountMarker}.*:" "${root}/${f}"; then
-            statedKeys="$(stated_keys_of "${root}/${f}" | sort -u)"
+        records_of NAMED "$f"
+        if [[ -n "$Found" ]]; then
+            records_of COUNTKEY "$f"
+            statedKeys="$Found"
             [[ -n "$statedKeys" ]] \
                 || refuse "${f} lists setting names after '${CountMarker}' and the parser read none of them; a name list nothing can read is the claim this check exists to hold"
-            missing="$(comm -23 <(printf '%s\n' "$truth") <(printf '%s\n' "$statedKeys") | tr '\n' ' ')"
-            extra="$(comm -13 <(printf '%s\n' "$truth") <(printf '%s\n' "$statedKeys") | tr '\n' ' ')"
+            set_minus "$truth" "$statedKeys"
+            missing="$Missing"
+            set_minus "$statedKeys" "$truth"
+            extra="$Missing"
             [[ -z "${missing// /}" ]] \
                 || refuse "${f} names the reloadable settings and does not list ${missing% }; the ${subject} option table marks them reloadable"
             [[ -z "${extra// /}" ]] \
@@ -634,7 +791,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     _artefacts() {
         local at="$1" subject="$2" tablePath="$3" docsPath="$4" yamlPath="$5"
         local tableKeys="$6" docsKeys="$7" count="$8" style="$9" k cell=""
-        mkdir -p "${at}/$(dirname "$tablePath")" "${at}/$(dirname "$docsPath")" "${at}/$(dirname "$yamlPath")"
+        # The directories are `_tree`'s to make, in one `mkdir` for the whole tree.
         {
             echo 'std::span<OptionSpec const> TheOptions()'
             echo '{'
@@ -732,9 +889,20 @@ if [[ "${1:-}" == "--self-test" ]]; then
         ' "$file" > "${file}.named" && mv "${file}.named" "$file"
     }
 
+    # Make the tree tracked: `git ls-files` reads the INDEX, so `git add` is what tracking
+    # is and a commit adds a process per tree and says nothing more to this check.
+    #
+    # @param 1 The tree.
+    _track() {
+        scratch_git -C "$1" add -A >/dev/null 2>&1
+    }
+
     _tree() {
         local at="$1" nodeTable="$2" nodeDocs="$3" nodeCount="$4"
         local dTable="${5-$2}" dDocs="${6-$3}" dCount="${7-$4}"
+
+        mkdir -p "${at}/src/apps/fastcache-compile-node" "${at}/docs/tools" "${at}/packaging/config" \
+            "${at}/src/FastCache/Config" "${at}/docs/snippets" "${at}/scripts/lib"
 
         _artefacts "$at" fastcache-compile-node \
             src/apps/fastcache-compile-node/NodeConfig.cpp docs/tools/node.md packaging/config/node.yaml \
@@ -746,11 +914,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
 
         # The tree states its third-party roots (#1370), or every case is refused for
         # the roots file -- including the ones expecting a refusal for something else.
-        mkdir -p "${at}/scripts/lib"
         printf '# planted\nvendor/upstream\n' > "${at}/scripts/lib/third-party-roots.txt"
 
-        ( cd "$at" && git init -q . && git add -A \
-            && git -c user.email=t@t -c user.name=t commit -qm t ) >/dev/null 2>&1
+        scratch_git -C "$at" init -q >/dev/null 2>&1
+        _track "$at"
     }
 
     # 1. The control. A check that refuses everything refuses a correct tree too, and
@@ -781,7 +948,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     _tree "${work}/nomarker" "log_level" "log_level" "one"
     sed -i.bak 's/| Reloadable | Requires a restart |/| Reloads | Needs a restart |/' \
         "${work}/nomarker/docs/tools/node.md" && rm -f "${work}/nomarker/docs/tools/node.md.bak"
-    ( cd "${work}/nomarker" && git add -A && git -c user.email=t@t -c user.name=t commit -qm r ) >/dev/null 2>&1
+    _track "${work}/nomarker"
     # The refusal is the per-FILE one rather than the scope one, and that is the better
     # of the two: it names the file that declared a subject and then said nothing about
     # it, where "no tracked file carries the marker" would only say something is absent.
@@ -808,8 +975,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
         echo '|---|---|'
         echo '| `log_level` | `bind` |'
     } > "${work}/otherbinary/docs/tools/cli.md"
-    ( cd "${work}/otherbinary" && git add -A \
-        && git -c user.email=t@t -c user.name=t commit -qm o ) >/dev/null 2>&1
+    _track "${work}/otherbinary"
     _case "an-artefact-for-another-binary-is-refused-by-name" 1 "declares subject 'fastcache-cli'" "${work}/otherbinary"
 
     # 9. A subject declared and nothing stated: the marker is decoration, and decoration
@@ -820,8 +986,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
         echo ''
         echo 'This page says nothing about which settings reload.'
     } > "${work}/emptyclaim/docs/tools/silent.md"
-    ( cd "${work}/emptyclaim" && git add -A \
-        && git -c user.email=t@t -c user.name=t commit -qm e ) >/dev/null 2>&1
+    _track "${work}/emptyclaim"
     _case "a-declared-subject-that-states-nothing" 1 "states no reloadable set and no count" "${work}/emptyclaim"
 
     # 10. A subject with a TABLE ROW and no artefact. Two empty lists agree perfectly, so
@@ -836,8 +1001,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     sed -i.bak 's/reloadable-for: fastcache-compile-node/describes: something-else-entirely/' \
         "${work}/nosubject/docs/tools/node.md" "${work}/nosubject/packaging/config/node.yaml"
     rm -f "${work}/nosubject/docs/tools/node.md.bak" "${work}/nosubject/packaging/config/node.yaml.bak"
-    ( cd "${work}/nosubject" && git add -A \
-        && git -c user.email=t@t -c user.name=t commit -qm n ) >/dev/null 2>&1
+    _track "${work}/nosubject"
     _case "no-artefact-declares-a-subject-with-a-row" 1 "which this check has a table row for" "${work}/nosubject"
 
     # 11. The scope arm the case above no longer reaches: files declaring the subject
@@ -845,8 +1009,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     #     an arm no case reaches is an arm nobody has watched refuse.
     _tree "${work}/nodocstable" "log_level" "log_level" "one"
     rm -f "${work}/nodocstable/docs/tools/node.md"
-    ( cd "${work}/nodocstable" && git add -A \
-        && git -c user.email=t@t -c user.name=t commit -qm d ) >/dev/null 2>&1
+    _track "${work}/nodocstable"
     _case "nothing-declaring-the-subject-has-the-table" 1 "carries the docs marker" "${work}/nodocstable"
 
     # 12. A THIRD-PARTY file declaring a subject this check does not read is declined, by
@@ -858,8 +1021,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
         echo '<!-- reloadable-for: fastcache-cli -->'
         echo '| Reloadable | Requires a restart |'
     } > "${work}/vendored/vendor/upstream/docs/daemon.md"
-    ( cd "${work}/vendored" && git add -A \
-        && git -c user.email=t@t -c user.name=t commit -qm v ) >/dev/null 2>&1
+    _track "${work}/vendored"
     _case "a-third-party-artefact-is-declined-by-name" 0 \
         "declined 1 third-party file(s) carrying 'reloadable-for:' under the roots in scripts/lib/third-party-roots.txt, first vendor/upstream/docs/daemon.md" \
         "${work}/vendored"
@@ -877,8 +1039,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
         "${work}/nomarkers/docs/tools/node.md" "${work}/nomarkers/packaging/config/node.yaml" \
         "${work}/nomarkers/docs/snippets/reload-matrix.md" "${work}/nomarkers/packaging/config/fastcached.yaml"
     find "${work}/nomarkers" -name "*.bak" -delete
-    ( cd "${work}/nomarkers" && git add -A \
-        && git -c user.email=t@t -c user.name=t commit -qm m ) >/dev/null 2>&1
+    _track "${work}/nomarkers"
     # The MARKER is part of the expected phrase, not decoration: "no tracked file carries"
     # is also what this prints when `git ls-files` fails for an unrelated reason and the
     # scan comes back empty, so the shorter phrase would let a broken-worktree run pass

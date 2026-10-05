@@ -109,6 +109,29 @@ struct NarrowTextPolicy
 /// @return The UTF-8 text, or `std::nullopt` when neither candidate applies.
 [[nodiscard]] std::optional<std::string> Utf8FromNarrowText(std::string_view text, std::optional<std::uint32_t> codePage);
 
+#if defined(_WIN32)
+/// The UTF-8 form of UTF-16 text a Windows API wrote.
+///
+/// Declared on Windows alone, because only there is a `wchar_t` string UTF-16: a
+/// function other platforms could only answer "no" to is one nobody should be able
+/// to call. Strict in both directions `Utf8FromNarrowText` is -- a lone surrogate is
+/// refused rather than turned into U+FFFD, since a host name or a DNS target spelled
+/// with a substitute character names nothing.
+/// @param text The UTF-16 text.
+/// @return The UTF-8 text (empty for empty input), or `std::nullopt` when @p text is
+///         not valid UTF-16.
+[[nodiscard]] std::optional<std::string> Utf8FromWideText(std::wstring_view text);
+
+/// The UTF-16 form of UTF-8 text, for a Windows API that takes only wide strings.
+///
+/// The mirror of `Utf8FromWideText`, and refused on the same terms: bytes that are
+/// not UTF-8 are not a name to hand the platform.
+/// @param text The UTF-8 text.
+/// @return The UTF-16 text (empty for empty input), or `std::nullopt` when @p text is
+///         not valid UTF-8.
+[[nodiscard]] std::optional<std::wstring> WideTextFromUtf8(std::string_view text);
+#endif
+
 /// A `std::filesystem::path` from narrow bytes, without throwing.
 ///
 /// The one place this project turns the platform's refusal into an answer, and it

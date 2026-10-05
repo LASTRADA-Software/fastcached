@@ -3,6 +3,16 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <string_view>
+
+#if !defined(_WIN32)
+    #include <fcntl.h>
+    #include <unistd.h>
+#endif
+
 using namespace FastCache;
 
 namespace
@@ -83,4 +93,41 @@ TEST_CASE("A single descriptor is the ordinary case", "[socket-activation]")
     REQUIRE(handoff.Any());
     CHECK(handoff.count == 1);
     CHECK(handoff.firstDescriptor == 3);
+}
+
+TEST_CASE("A copy of an inherited descriptor is the same open file that closes apart and that no child inherits",
+          "[socket-activation]")
+{
+    // What a process keeping the supervisor's socket hands each user: a second descriptor for the same
+    // open file, which its taker may close without closing the original, and which a spawned compiler
+    // does not inherit -- the original's close-on-exec, kept.
+    SystemInheritedDescriptors const descriptors;
+#if defined(_WIN32)
+    // Nothing is ever handed over here, so there is nothing to copy -- and asking says so.
+    CHECK_FALSE(descriptors.Duplicate(3).has_value());
+#else
+    auto ends = std::array<int, 2> {};
+    REQUIRE(::pipe(ends.data()) == 0);
+    auto const [readEnd, writeEnd] = ends;
+
+    auto const copy = descriptors.Duplicate(readEnd);
+    REQUIRE(copy.has_value());
+    CHECK(*copy != readEnd);
+    CHECK((::fcntl(*copy, F_GETFD) & FD_CLOEXEC) != 0);
+
+    // The same open file: what is written to the pipe is read through the copy.
+    auto const byte = std::array<char, 1> { 'x' };
+    REQUIRE(::write(writeEnd, byte.data(), byte.size()) == 1);
+    auto read = std::array<char, 1> {};
+    CHECK(::read(*copy, read.data(), read.size()) == 1);
+    CHECK(read[0] == 'x');
+
+    // Closed apart: the original still reads once the copy is gone.
+    descriptors.Close(*copy);
+    REQUIRE(::write(writeEnd, byte.data(), byte.size()) == 1);
+    CHECK(::read(readEnd, read.data(), read.size()) == 1);
+
+    descriptors.Close(readEnd);
+    descriptors.Close(writeEnd);
+#endif
 }

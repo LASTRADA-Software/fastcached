@@ -256,12 +256,13 @@ struct Rig
     // below edits THIS object after the stream began, and a fixture that handed the
     // responder a fresh oracle would pass under the very defect re-gating exists for.
     ListedMembership membership { { std::string { Watcher }, "127.0.0.1", "10.0.0.8" },
-                                  Distributed::MembershipParticipant::FleetMemberList };
+                                  Distributed::MembershipParticipant::OpenPolicy };
     // The identity keys the cluster holds, MUTABLE for the same reason: the revocation case
     // below revokes one after the stream began.
     Distributed::KeyRosterMembership keys;
-    // Composed as `NodeMembership` composes the node's oracle: the listed hosts and the key
-    // roster under one fold, bound once.
+    // Composed as `NodeMembership` composes the node's oracle: the route that admits a remote host
+    // by address (a mutable fake standing for `--fleet-open`, so a removal is the policy narrowing on
+    // a reload) and the key roster under one fold, bound once.
     Distributed::AnyOfMembership oracle { { &membership, &keys } };
     LiveStatsResponder responder { sources, oracle, AdminCredential {}, reactor, metrics };
     std::deque<std::unique_ptr<LiveStatsResponder>> responders;
@@ -468,17 +469,16 @@ TEST_CASE("A key holder streams from an address on no list, and keeps streaming 
     }
 }
 
-TEST_CASE("A proven watcher dropped from the member list keeps its stream, because the key still admits it",
-          "[node][livestats]")
+TEST_CASE("A proven watcher keeps its stream from any address, because the key admits it", "[node][livestats]")
 {
     // The exact inverse of *A watcher removed from the membership loses its stream on the next
-    // tick* above, and both are correct: `--fleet-member` is ONE route to admission and what the
-    // cluster agrees is ADDED rather than substituted, so a host that holds the key is admitted
-    // by the key after the list stops naming it (#1471's union, folded by `ExplainConnection`).
+    // tick* above, and both are correct: the open policy is ONE route to admission and the key is
+    // ADDED rather than substituted, so a watcher that proved the key is admitted by the key after
+    // the policy stops admitting its address (#1471's union, folded by `ExplainConnection`).
     //
-    // It is here because it is the operator-visible consequence, and the direction an operator
-    // gets wrong: editing the list is not how a proven machine is removed. Revoking its key is,
-    // and that ends the stream on the next tick -- the case after this one.
+    // It is here because it is the operator-visible consequence: an address is not how a proven
+    // machine is removed. Revoking its key is, and that ends the stream on the next tick -- the
+    // case after this one.
     Rig rig;
     auto& stream = rig.OpenProven(SubscribeFrame(Wire::LiveSubject::Node, 500), std::string { Watcher });
     REQUIRE_FALSE(stream.finished);
@@ -498,7 +498,7 @@ TEST_CASE("A proven watcher whose key is revoked loses its stream on the next ti
     // #178: removing one machine is revoking its key, and a revocation has to reach a stream that
     // is ALREADY RUNNING -- a gate asked once at subscribe time would leave a forgotten machine
     // watching the fleet for as long as it keeps the connection open. The watcher dials from an
-    // address `--fleet-member` still lists, so the key's tombstone is what ends it.
+    // address the open policy still admits, so the key's tombstone is what ends it.
     Rig rig;
     auto& stream = rig.OpenProven(SubscribeFrame(Wire::LiveSubject::Node, 500), std::string { Watcher });
     REQUIRE_FALSE(stream.finished);
@@ -511,11 +511,11 @@ TEST_CASE("A proven watcher whose key is revoked loses its stream on the next ti
     CHECK(Testing::ErrorOf(stream.reply) == Wire::ErrorCode::NotAMember);
     // Counted as the forgotten MACHINE, the gate's own row, rather than as the generic removal
     // of a host: the two are opposite diagnoses, and an operator watching a subscriber drop has
-    // to be able to tell a revoked key from an edited list.
+    // to be able to tell a revoked key from a narrowed policy.
     CHECK(rig.Read(IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked) == 1);
     CHECK(rig.Read(IMetricsSink::Counter::LiveSubscriptionsRevoked) == 0);
 
-    // The control: a watcher at the same listed address that proved nothing is untouched by a
+    // The control: a watcher at the same admitted address that proved nothing is untouched by a
     // revocation of a key it never presented.
     auto& unproved = rig.Open(SubscribeFrame(Wire::LiveSubject::Node, 500), std::string { Watcher });
     REQUIRE_FALSE(unproved.finished);
@@ -708,7 +708,7 @@ TEST_CASE("Detaching the sources ends every stream in order at its next tick", "
     AtomicMetricsSink metrics;
     ScriptedSources sources;
     LiveStatsSourceSlot slot;
-    ListedMembership membership { { std::string { Watcher } }, Distributed::MembershipParticipant::FleetMemberList };
+    ListedMembership membership { { std::string { Watcher } }, Distributed::MembershipParticipant::OpenPolicy };
     LiveStatsResponder responder { slot, membership, AdminCredential {}, reactor, metrics };
 
     Stream stream { reactor };

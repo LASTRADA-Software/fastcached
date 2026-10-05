@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
+#include "NodeIdentity.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/StateFiles.hpp>
 #include <FastCache/Core/StopAwareWait.hpp>
 
+#include <core/Ranges.hpp>
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
 #if defined(FC_TLS_ENABLED)
@@ -74,20 +77,17 @@ AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sou
             // empty member set, because a node that RUNS consensus and holds no
             // configuration is the #388 state and has to be visible, not silent.
             .consensus = sources.consensus ? std::optional { sources.consensus() } : std::nullopt,
-            // Sampled per scrape, for the consensus reading's reason: a countdown captured once
-            // is a number that stops counting.
-            .rosterExpiresInSeconds = sources.roster != nullptr ? sources.roster->ExpiresInSeconds() : std::nullopt,
             .uptime =
                 Uptime { std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startedAt) },
         };
     };
 }
 
-std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesystem::path const& path)
+std::expected<FastCache::SecureString, NodeRefusal> ReadSecretFile(std::filesystem::path const& path)
 {
     std::ifstream file { path, std::ios::binary };
     if (!file)
-        return std::unexpected { std::format("cannot read '{}'", path.string()) };
+        return std::unexpected { Refusal(NodeRefusalCause::CredentialIo, std::format("cannot read '{}'", path.string())) };
 
     // **Read into SECURE character storage rather than through `std::ostringstream`.**
     // That is what this used to do, and `buffer.str()` is an ordinary `std::string` while
@@ -123,7 +123,8 @@ std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesyst
     // The `std::ostringstream` form this replaced had the same hole, so it is a carried
     // gap rather than a regression, and the loop is where it became cheap to close.
     if (file.bad())
-        return std::unexpected { std::format("could not read all of '{}'", path.string()) };
+        return std::unexpected { Refusal(NodeRefusalCause::CredentialIo,
+                                         std::format("could not read all of '{}'", path.string())) };
 
     // Trailing whitespace is trimmed because every editor adds a newline, and an
     // operator should not have to know that a secret which looks right is one byte
@@ -134,18 +135,20 @@ std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesyst
         secret.pop_back();
 
     if (secret.empty())
-        return std::unexpected { std::format("'{}' is empty; a credential file nobody can fail to match is "
-                                             "worse than none, because the surface looks guarded",
-                                             path.string()) };
+        return std::unexpected { Refusal(NodeRefusalCause::CredentialFile,
+                                         std::format("'{}' is empty; a credential file nobody can fail to match "
+                                                     "is worse than none, because the surface looks guarded",
+                                                     path.string())) };
 
     return FastCache::SecureString { std::string_view { secret.data(), secret.size() } };
 }
 
-std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path)
+std::expected<AdminCredential, NodeRefusal> ReadDashboardToken(std::filesystem::path const& path)
 {
-    // The reading is shared with `--scheduler-token-file` (#289); what differs is
-    // only what the secret becomes. Written once, so the trailing-newline rule and
-    // the empty-file refusal cannot hold for one credential and not the other.
+    // The reading is `ReadSecretFile`'s, shared with every secret this node reads by
+    // path; what differs is only what the secret becomes. Written once, so the
+    // trailing-newline rule and the empty-file refusal cannot hold for one credential
+    // and not another.
     return ReadSecretFile(path).transform(
         [](FastCache::SecureString secret) { return AdminCredential { std::move(secret) }; });
 }
@@ -666,25 +669,76 @@ EnumTable<Distributed::FleetMetric, std::uint64_t> SampleFrom(Distributed::Fleet
         values[static_cast<std::size_t>(metric)] = value;
     };
 
-    // The five dispatch counters keep `LeaseOutcomeTable`'s order rather than being
-    // named one by one, so a sixth outcome lands here by being added to that table.
-    static constexpr std::array<Distributed::FleetMetric, 5> dispatchSlots {
-        Distributed::FleetMetric::DispatchGranted,    Distributed::FleetMetric::DispatchNoWorker,
-        Distributed::FleetMetric::DispatchNoCapacity, Distributed::FleetMetric::DispatchWithdrawn,
-        Distributed::FleetMetric::DispatchDuplicate,
+    // Matched by COUNTER rather than by position, and that is load-bearing now that
+    // `LeaseOutcomeTable` can grow somewhere other than its own end:
+    // `DispatchLeasesAllExcluded` landed beside `Withdrawn`, which shifted `duplicate`
+    // from index 4 to index 5. A position-keyed loop would have kept reading
+    // `duplicate`'s old slot -- `all-excluded`'s value -- into `FleetMetric::DispatchDuplicate`
+    // forever, silently, which is exactly what a neuter of this loop back to positional
+    // indexing demonstrated before this was written.
+    struct DispatchSlot
+    {
+        Distributed::FleetMetric metric;
+        IMetricsSink::Counter counter;
     };
+    static constexpr std::array<DispatchSlot, 6> dispatchSlots {
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchGranted,
+                       .counter = IMetricsSink::Counter::DispatchLeasesGranted },
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchNoWorker,
+                       .counter = IMetricsSink::Counter::DispatchLeasesNoWorker },
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchNoCapacity,
+                       .counter = IMetricsSink::Counter::DispatchLeasesNoCapacity },
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchWithdrawn,
+                       .counter = IMetricsSink::Counter::DispatchLeasesWithdrawn },
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchAllExcluded,
+                       .counter = IMetricsSink::Counter::DispatchLeasesAllExcluded },
+        DispatchSlot { .metric = Distributed::FleetMetric::DispatchDuplicate,
+                       .counter = IMetricsSink::Counter::DispatchLeasesDuplicate },
+    };
+    // Two checks, not one: the lambda below proves every `LeaseOutcomeTable` ROW
+    // matches exactly one `dispatchSlots` entry, which says nothing about a SLOT
+    // matching no row -- a 7th slot naming a counter no row has would still pass it,
+    // and the loop's `findOrNull` would then come back null for that slot, making
+    // the pointer arithmetic below undefined behaviour. The size check closes that:
+    // with both facts holding, no slot can be left over one row short of a match,
+    // so together they prove a true bijection rather than only the direction the
+    // lambda checks on its own.
     static_assert(dispatchSlots.size() == Distributed::LeaseOutcomeTable.size(),
                   "every lease outcome needs a slot, or a refusal reason silently stops being recorded");
-    for (auto const index: std::views::iota(std::size_t { 0 }, dispatchSlots.size()))
+    static_assert(
+        []() consteval {
+            for (auto const& row: Distributed::LeaseOutcomeTable)
+            {
+                auto matches = 0;
+                for (auto const& slot: dispatchSlots)
+                    if (slot.counter == row.counter)
+                        ++matches;
+                if (matches != 1)
+                    return false;
+            }
+            return true;
+        }(),
+        "every LeaseOutcomeTable counter must appear in dispatchSlots exactly once, or a lease outcome silently "
+        "stops reaching its FleetMetric slot");
+    for (auto const& slot: dispatchSlots)
+    {
+        // `findOrNull` rather than `std::ranges::find` because `LeaseOutcomeTable` is a
+        // `std::array`, whose iterator type is not portably nameable; see `core/Ranges.hpp`.
+        // Never null: the two static_asserts above together prove every slot's counter
+        // matches exactly one row, so there is nothing left to guard against here.
+        auto const* const row =
+            core::findOrNull(Distributed::LeaseOutcomeTable, slot.counter, &Distributed::LeaseOutcomeRow::counter);
+        auto const index = static_cast<std::size_t>(row - Distributed::LeaseOutcomeTable.data());
         if (index < snapshot.leases.size())
-            put(dispatchSlots[index], snapshot.leases[index]);
+            put(slot.metric, snapshot.leases[index]);
+    }
 
     // Summed over `NodeReports()`, never over `LiveWorkers()`: a node started with
     // two --toolchain flags is two registry entries carrying one machine's cache,
     // and summing there counts that cache once per toolchain.
     //
     // Every slot, including the ones a machine can also answer for itself. This is
-    // the FLEET series and a leader can answer for all nine -- these are fleet-wide
+    // the FLEET series and a leader can answer for all ten -- these are fleet-wide
     // sums, which is a different number from any one machine's and the one this page
     // draws. `FleetMetricScope` is about what a NODE may claim about itself, not
     // about what belongs here.
@@ -744,7 +798,7 @@ EnumTable<Distributed::FleetMetric, std::uint64_t> NodeSampleFrom(IMetricsSink c
     return values;
 }
 
-std::filesystem::path HistoryPathFor(NodeConfig const& cfg, HistoryFile which)
+std::string_view HistoryFileNameOf(HistoryFile which) noexcept
 {
     // One row per file, in enumerator order, so a fourth file is a row rather than a
     // path spelled somewhere nobody looks. The fleet file keeps the name it always
@@ -761,14 +815,22 @@ std::filesystem::path HistoryPathFor(NodeConfig const& cfg, HistoryFile which)
     // share a format, since each would then load the other's readings without
     // complaint.
     static constexpr EnumTable<HistoryFile, FileNameRow> fileNames {
-        FileNameRow { .which = HistoryFile::Node, .name = "node-history.bin" },
-        FileNameRow { .which = HistoryFile::Fleet, .name = "fleet-history.bin" },
-        FileNameRow { .which = HistoryFile::Received, .name = "received-history.bin" },
+        FileNameRow { .which = HistoryFile::Node, .name = StateFileName(StateFile::NodeHistory) },
+        FileNameRow { .which = HistoryFile::Fleet, .name = StateFileName(StateFile::FleetHistory) },
+        FileNameRow { .which = HistoryFile::Received, .name = StateFileName(StateFile::ReceivedHistory) },
     };
     static_assert(RowsInEnumeratorOrder(fileNames, &FileNameRow::which));
-    auto const name = fileNames[static_cast<std::size_t>(which)].name;
-    if (!cfg.clusterDir.empty())
-        return cfg.clusterDir / name;
+    return fileNames[static_cast<std::size_t>(which)].name;
+}
+
+std::filesystem::path HistoryPathFor(NodeConfig const& cfg, HistoryFile which)
+{
+    auto const name = HistoryFileNameOf(which);
+    // The state directory the node keeps, typed or the default its start resolved -- never the
+    // typed flag alone, which a node started with no configuration leaves empty while it keeps
+    // every other state file in the default. Its history went nowhere at all.
+    if (auto const chosen = ChosenStateDirectory(cfg); chosen.has_value())
+        return chosen->path / name;
     if (!cfg.cacheDir.empty())
         return cfg.cacheDir / name;
     return {};
@@ -806,19 +868,19 @@ FleetSampler::FleetSampler(std::optional<Distributed::FleetSources> sources,
     _stores { Store { .path = std::move(paths.fleet),
                       .what = "fleet",
                       .load = [this](auto const& at) { return _fleet.Load(at); },
-                      .save = [this](auto const& at) { return _fleet.Save(at); },
+                      .save = [this](auto const& at) { return _fleet.Save(at, StateFile::FleetHistory); },
                       .readOnly = [this] { return _fleet.ReadOnly(); },
                       .worthWriting = [this] { return !_fleet.Empty(); } },
               Store { .path = std::move(paths.node),
                       .what = "node",
                       .load = [this](auto const& at) { return _node.Load(at); },
-                      .save = [this](auto const& at) { return _node.Save(at); },
+                      .save = [this](auto const& at) { return _node.Save(at, StateFile::NodeHistory); },
                       .readOnly = [this] { return _node.ReadOnly(); },
                       .worthWriting = [this] { return !_node.Empty(); } },
               Store { .path = std::move(paths.received),
                       .what = "received",
                       .load = [this](auto const& at) { return _received.Load(at); },
-                      .save = [this](auto const& at) { return _received.Save(at); },
+                      .save = [this](auto const& at) { return _received.Save(at, StateFile::ReceivedHistory); },
                       .readOnly = [this] { return _received.ReadOnly(); },
                       .worthWriting = [this] { return _received.Count() > 0; } } },
     _logger { logger }
@@ -952,7 +1014,7 @@ void FleetSampler::Persist()
     }
 }
 
-std::expected<AdminCredential, std::string> LoadDashboardCredentialOrExplain(NodeConfig const& cfg)
+std::expected<AdminCredential, NodeRefusal> LoadDashboardCredentialOrExplain(NodeConfig const& cfg)
 {
     // A file that cannot be read must not become "no credential": that is the single failure
     // that turns a guarded fleet map into an open one.
@@ -960,11 +1022,12 @@ std::expected<AdminCredential, std::string> LoadDashboardCredentialOrExplain(Nod
         return AdminCredential {};
     auto read = ReadDashboardToken(cfg.dashboardTokenFile);
     if (!read.has_value())
-        return std::unexpected { std::format("--dashboard-token-file {}", read.error()) };
+        return std::unexpected { Refusal(read.error().cause,
+                                         std::format("--dashboard-token-file {}", read.error().reason)) };
     return std::move(*read);
 }
 
-std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig const& cfg,
+std::expected<AdminSurface, NodeRefusal> StartAdminSurfaceOrExplain(NodeConfig const& cfg,
                                                                     [[maybe_unused]] IHostFactsSource const& host,
                                                                     IMetricsSink& metrics,
                                                                     AdminHttpServer::SnapshotProvider snapshot,
@@ -972,7 +1035,8 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
                                                                     FleetSampler const* sampler,
                                                                     AdminCredential const& credential,
                                                                     ILogger& logger,
-                                                                    NodeConditions& conditions)
+                                                                    NodeConditions& conditions,
+                                                                    core::net::AcceptLoopHealth& acceptLoops)
 {
     AdminSurface surface;
 
@@ -996,16 +1060,15 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
                                  .commonName = "fastcache-node", .subjectNames = SelfSignedSubjectNames(cfg, host) })
                            : core::net::makeTlsServerContextFromFiles(cfg.tlsCertFile, cfg.tlsKeyFile);
         if (!created.has_value())
-            return std::unexpected { std::format(
-                "{}: {}", cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert/--tls-key", created.error()) };
+            return std::unexpected { Refusal(
+                NodeRefusalCause::TlsMaterial,
+                std::format("{}: {}", cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert/--tls-key", created.error())) };
         surface.tls = std::move(*created);
 #else
-        // Refused rather than warned about, and the daemon answers the same way: a
-        // node that started in the clear after being told to serve TLS is one an
-        // operator believes is encrypted.
-        return std::unexpected { std::format("{} requested but this build has no TLS support "
-                                             "(rebuild with -DFASTCACHED_ENABLE_TLS=ON)",
-                                             cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert") };
+        // The startup table refuses this first (`BuildServesTls`), so `--print-surfaces` and
+        // `--install-service` do too; this is the belt for a configuration no argv produced,
+        // in the table's words.
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, std::string { TlsUnavailableRefusal }) };
 #endif
     }
 
@@ -1025,6 +1088,7 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
                                         metrics,
                                         std::move(snapshot),
                                         logger,
+                                        acceptLoops,
                                         std::move(routes),
 #if defined(FC_TLS_ENABLED)
                                         surface.tls.get());
@@ -1032,7 +1096,9 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
                                         nullptr);
 #endif
     if (!started.has_value())
-        return std::unexpected { std::format("--admin-listen {}", started.error()) };
+        // `Listener` for the whole of `AdminEndpoint::Start`: it binds, and it also judges the
+        // address -- which the startup table has refused first -- so a refusal from it is mixed.
+        return std::unexpected { Refusal(NodeRefusalCause::Listener, std::format("--admin-listen {}", started.error())) };
 
     surface.endpoint = std::move(*started);
 
@@ -1082,6 +1148,7 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
                              AdminHttpServer::SnapshotProvider snapshot,
                              std::string boundEndpoint,
                              ILogger& logger,
+                             core::net::AcceptLoopHealth& acceptLoops,
                              std::vector<AdminRoute> routes,
                              core::net::ITlsContext* tls,
                              ServedSurfaces surfaces):
@@ -1098,6 +1165,9 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
         std::move(snapshot),
         logger,
         _clock,
+        acceptLoops,
+        // The loop owns its thread and its listener blocks, so a backoff blocks too.
+        DefaultDrainWait(),
         std::move(routes),
         tls,
         _surfaces.Span()) },
@@ -1133,6 +1203,7 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
                                                                                 IMetricsSink& metrics,
                                                                                 AdminHttpServer::SnapshotProvider snapshot,
                                                                                 ILogger& logger,
+                                                                                core::net::AcceptLoopHealth& acceptLoops,
                                                                                 std::vector<AdminRoute> routes,
                                                                                 core::net::ITlsContext* tls)
 {
@@ -1177,6 +1248,7 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
                                                                 std::move(snapshot),
                                                                 std::format("{}:{}", endpoint.host, endpoint.port),
                                                                 logger,
+                                                                acceptLoops,
                                                                 std::move(routes),
                                                                 tls,
                                                                 NodeServedSurfacesFor(cfg) } };

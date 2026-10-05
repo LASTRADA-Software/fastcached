@@ -17,6 +17,7 @@ add_executable(fastcache-bench
     BuildBanner.cpp
     BuildBannerListener.cpp
     BuildBanner_test.cpp
+    DiscoverySignatureBench.cpp
     LiveStatsBench.cpp
     RaftPeerFrameBench.cpp
     Sha256Bench.cpp

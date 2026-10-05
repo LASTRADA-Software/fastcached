@@ -1,16 +1,103 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
+#include <FastCache/Protocol/ProvenIdentity.hpp>
 
 #include <algorithm>
+#include <cstdint>
+#include <format>
+#include <functional>
+#include <map>
+#include <optional>
+#include <set>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include <tests/RaftPeerKeyFakes.hpp>
+
 namespace FastCache::Testing
 {
+
+/// Which hosts a route can honestly answer for when it answers by HOST -- the only question a
+/// host-answering fake (`ListedMembership`, `FixedMembership`) can be asked.
+///
+/// Private to these fakes: never transmitted or persisted.
+enum class HostReach : std::uint8_t
+{
+    None,        ///< Production never derives this route from a host: it needs a KEY the connection showed.
+    ThisMachine, ///< Admits this machine and nobody else.
+    AnyHost,     ///< Admits a host without a key.
+};
+
+/// One row of `HostLabels`.
+struct HostLabelRow
+{
+    Distributed::MembershipParticipant route; ///< The admission route.
+    std::string_view name;                    ///< How a refusal names it.
+    HostReach reach;                          ///< Which hosts a fake may label with it.
+};
+
+/// The routes a host-answering fake may stand for, and over which hosts.
+///
+/// **Only `Loopback` and `OpenPolicy` answer by host in production.** A proven key and a verified
+/// ticket are facts a CONNECTION established (`ConnectionFacts::proven`,
+/// `ConnectionFacts::authenticatedMachine`), asked of a key roster through `ExplainKey`; a revoked
+/// key is the same, refused. A host list labelled with one of those describes a route that does not
+/// exist -- an operator "admitted by ticket" from an address with no ticket at all -- and its cases
+/// pass over the gap. A case about one composes `RosterFold` and presents the key.
+inline constexpr EnumTable<Distributed::MembershipParticipant, HostLabelRow> HostLabels { {
+    { .route = Distributed::MembershipParticipant::Reserved, .name = "the reserved participant", .reach = HostReach::None },
+    { .route = Distributed::MembershipParticipant::Loopback, .name = "Loopback", .reach = HostReach::ThisMachine },
+    { .route = Distributed::MembershipParticipant::OpenPolicy, .name = "OpenPolicy", .reach = HostReach::AnyHost },
+    { .route = Distributed::MembershipParticipant::ProvenIdentity, .name = "ProvenIdentity", .reach = HostReach::None },
+    { .route = Distributed::MembershipParticipant::MachineTicket, .name = "MachineTicket", .reach = HostReach::None },
+    { .route = Distributed::MembershipParticipant::KeyTombstone, .name = "KeyTombstone", .reach = HostReach::None },
+} };
+
+static_assert(RowsInEnumeratorOrder(HostLabels, &HostLabelRow::route),
+              "HostLabels must hold one row per MembershipParticipant, in enumerator order");
+
+/// Refuse a route label a host-answering fake could not honestly carry.
+///
+/// **A fake more permissive than the real thing makes its cases pass while describing a route that
+/// does not exist**, and nothing ever fails to find it. `HostLabels` says which labels are such a
+/// fake by construction: every route production derives from a key rather than a host, `Reserved`,
+/// which no decision can name, and `Loopback` on any host that is not this machine -- loopback
+/// admits this machine and nobody else. A remote host a case must admit by address is
+/// `OpenPolicy`'s, the one route that admits a remote host without a key.
+/// @param participant The route the fake stands for.
+/// @param admitted The hosts it answers `Member` for.
+/// @throws std::invalid_argument naming the label and, for `Loopback`, the host.
+inline void RequireHonestLabel(Distributed::MembershipParticipant participant, std::span<std::string const> admitted)
+{
+    auto const& row = HostLabels[std::to_underlying(participant)];
+    switch (row.reach)
+    {
+        case HostReach::None:
+            throw std::invalid_argument(
+                std::format("a membership fake that answers by host may not stand for {}: production never derives "
+                            "that route from a host. Compose Testing::RosterFold and present the key on the connection",
+                            row.name));
+        case HostReach::ThisMachine:
+            for (auto const& host: admitted)
+                if (!IsLoopbackHost(host))
+                    throw std::invalid_argument(
+                        std::format("a membership fake labels {} Loopback, which admits only this machine; a remote "
+                                    "host admitted by address is OpenPolicy's",
+                                    host));
+            return;
+        case HostReach::AnyHost:
+            return;
+    }
+}
 
 /// An oracle that admits whatever is in a host list.
 ///
@@ -34,11 +121,30 @@ class ListedMembership final: public Distributed::IMembershipOracle
     ///        *which participant decided* can compare an inherited answer against an
     ///        inherited answer and pass while attributing nothing. Consolidating these fakes
     ///        must not consolidate the fact each case states, which is why this is a
-    ///        parameter rather than the `FleetMemberList` the four copies hardcoded.
-    ListedMembership(std::vector<std::string> members, Distributed::MembershipParticipant participant) noexcept:
+    ///        parameter rather than the route the four copies hardcoded.
+    ///        Checked by `RequireHonestLabel`: `Loopback` lists this machine's spellings only.
+    /// @param votedBy For a KEY route (`ProvenIdentity`, `MachineTicket`): the evidence whose machine
+    ///        the fake says holds a voter's seat -- what an operator's control verbs ask
+    ///        (`MembershipDecision::votedBy`). Empty by default, the direction that fails CLOSED: a
+    ///        listed caller is a machine and no operator unless the call site says it votes.
+    /// @throws std::invalid_argument for a label no production route could carry, or a voter's seat
+    ///         stated for a route that names no machine.
+    ListedMembership(std::vector<std::string> members,
+                     Distributed::MembershipParticipant participant,
+                     Distributed::KeyEvidenceSet votedBy = {}):
         _members { std::move(members) },
-        _participant { participant }
+        _participant { participant },
+        _votedBy { votedBy }
     {
+        RequireHonestLabel(_participant, _members);
+        // Asked of the evidence table, never of `MembershipRoutes`' standing column: that column is
+        // what a case using this fake tests, and a guard reading it would refuse to build the fixture
+        // under a neuter of it rather than let the case go red.
+        if (_votedBy != Distributed::KeyEvidenceSet {}
+            && std::ranges::none_of(Distributed::KeyEvidenceRoutes, [this](Distributed::KeyEvidenceRow const& row) {
+                   return row.participant == _participant;
+               }))
+            throw std::invalid_argument("a membership fake states a voter's seat only for a route that names a machine");
     }
 
     /// @copydoc Distributed::IMembershipOracle::Explain
@@ -47,10 +153,27 @@ class ListedMembership final: public Distributed::IMembershipOracle
     /// refused a host it never mentioned (#1471).
     [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view peerAddress) const override
     {
-        return Distributed::DecidedBy(std::ranges::find(_members, peerAddress) != _members.end()
-                                          ? Distributed::Membership::Member
-                                          : Distributed::Membership::Outsider,
-                                      _participant);
+        auto decision = Distributed::DecidedBy(std::ranges::find(_members, peerAddress) != _members.end()
+                                                   ? Distributed::Membership::Member
+                                                   : Distributed::Membership::Outsider,
+                                               _participant);
+        if (decision.verdict == Distributed::Membership::Member)
+            decision.votedBy = _votedBy;
+        return decision;
+    }
+
+    /// No opinion: a host list knows no keys. A case about a key a connection established
+    /// composes this with a `Distributed::KeyRosterMembership`.
+    [[nodiscard]] Distributed::MembershipDecision ExplainKey(ProvenIdentity const& /*identity*/,
+                                                             Distributed::KeyEvidence /*evidence*/) const override
+    {
+        return {};
+    }
+
+    /// No key, for `ExplainKey`'s reason.
+    [[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view /*id*/) const override
+    {
+        return std::nullopt;
     }
 
     /// Stop admitting @p peer.
@@ -59,13 +182,6 @@ class ListedMembership final: public Distributed::IMembershipOracle
     /// stop being one mid-case, because its subject is that a subscription is re-gated on
     /// EVERY tick rather than once at subscribe time.
     /// @param peer Who to remove.
-    /// No opinion: a host list knows no keys, exactly as `Distributed::HostSetMembership` answers.
-    /// A case about a PROVED identity composes this with a `Distributed::KeyRosterMembership`.
-    [[nodiscard]] Distributed::MembershipDecision ExplainKey(ProvenIdentity const& /*proven*/) const override
-    {
-        return {};
-    }
-
     void Remove(std::string_view peer)
     {
         std::erase(_members, peer);
@@ -74,6 +190,7 @@ class ListedMembership final: public Distributed::IMembershipOracle
   private:
     std::vector<std::string> _members;
     Distributed::MembershipParticipant _participant;
+    Distributed::KeyEvidenceSet _votedBy;
 };
 
 /// An oracle that answers one fixed verdict, whatever it is asked about.
@@ -93,10 +210,18 @@ class FixedMembership final: public Distributed::IMembershipOracle
     ///        rather than by the assertion, which is where reading does not find it. Ask for a
     ///        route explicitly even where the case does not care which; that is a statement,
     ///        not a default.
-    FixedMembership(Distributed::Membership verdict, Distributed::MembershipParticipant participant) noexcept:
+    ///        Checked by `RequireHonestLabel`: a fixed verdict answers EVERY host, so `Loopback` may
+    ///        carry only `Outsider` -- loopback's honest opinion of a host that is not this machine.
+    /// @throws std::invalid_argument for a label no production route could carry.
+    FixedMembership(Distributed::Membership verdict, Distributed::MembershipParticipant participant):
         _verdict { verdict },
         _participant { participant }
     {
+        // Every host, so any host that is not this machine stands for the lot.
+        if (_verdict != Distributed::Membership::Outsider)
+            RequireHonestLabel(_participant, std::vector<std::string> { "10.0.0.1" });
+        else if (_participant == Distributed::MembershipParticipant::Reserved)
+            RequireHonestLabel(_participant, {});
     }
 
     /// @param peerAddress Ignored.
@@ -108,16 +233,159 @@ class FixedMembership final: public Distributed::IMembershipOracle
         return Distributed::DecidedBy(_verdict, _participant);
     }
 
-    /// No opinion: this answers about ADDRESSES, one verdict for all of them. A case about a PROVED
-    /// identity composes a `Distributed::KeyRosterMembership` beside it.
-    [[nodiscard]] Distributed::MembershipDecision ExplainKey(ProvenIdentity const& /*proven*/) const override
+    /// No opinion: this answers about ADDRESSES, one verdict for all of them. A case about a key a
+    /// connection established composes a `Distributed::KeyRosterMembership` beside it.
+    [[nodiscard]] Distributed::MembershipDecision ExplainKey(ProvenIdentity const& /*identity*/,
+                                                             Distributed::KeyEvidence /*evidence*/) const override
     {
         return {};
+    }
+
+    /// No key, for `ExplainKey`'s reason.
+    [[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view /*id*/) const override
+    {
+        return std::nullopt;
     }
 
   private:
     Distributed::Membership _verdict;
     Distributed::MembershipParticipant _participant;
+};
+
+/// The identity @p id establishes -- by proof or by ticket -- under its shared test key.
+/// @param id The machine.
+/// @return Its id and key.
+[[nodiscard]] inline ProvenIdentity IdentityOf(std::string const& id)
+{
+    return ProvenIdentity { .id = id, .key = TestKeyPair(id).PublicKey() };
+}
+
+/// The fold a node composes when it is not open -- this machine, and a key roster -- over REAL
+/// oracles, holding the test keys of `live` and revoking those of `revoked`.
+///
+/// Not a fake: a case about which MACHINE is admitted by a key it proved or presented needs the
+/// production participants, since a fake that answered `Member` for a key would prove only that
+/// the fake does. Shared because several surfaces ask the same question -- a ticketed machine
+/// admitted to compile, refused this machine's cache -- and each copy is a place to compose the
+/// fold differently from `Node::NodeMembership`.
+struct RosterFold
+{
+    Distributed::LoopbackMembership loopback;
+    Distributed::KeyRosterMembership keys;
+    /// Declared after the participants it borrows.
+    Distributed::AnyOfMembership admitted { { &loopback, &keys } };
+
+    /// @param live The ids whose test keys are live.
+    /// @param revoked The ids whose test keys are revoked.
+    /// @param voters The ids among @p live that hold a voter's seat -- what an operator's control verb
+    ///        asks of a key route (`MembershipDecision::votedBy`). None by default: a key proves a
+    ///        machine, and a case about operators says which machines are voters.
+    explicit RosterFold(std::vector<std::string> const& live,
+                        std::vector<std::string> const& revoked = {},
+                        std::vector<std::string> const& voters = {})
+    {
+        std::map<std::string, Ed25519PublicKey, std::less<>> liveKeys;
+        for (auto const& id: live)
+            liveKeys.emplace(id, TestKeyPair(id).PublicKey());
+        std::vector<Ed25519PublicKey> revokedKeys;
+        revokedKeys.reserve(revoked.size());
+        for (auto const& id: revoked)
+            revokedKeys.push_back(TestKeyPair(id).PublicKey());
+        keys.Publish(std::move(liveKeys),
+                     std::move(revokedKeys),
+                     std::set<std::string, std::less<>> { voters.begin(), voters.end() });
+    }
+
+    // The composite points into this object, so it is neither copied nor moved.
+    RosterFold(RosterFold const&) = delete;
+    RosterFold& operator=(RosterFold const&) = delete;
+    RosterFold(RosterFold&&) = delete;
+    RosterFold& operator=(RosterFold&&) = delete;
+    ~RosterFold() = default;
+};
+
+/// A `--fleet-open` node's admission, composed as `Node::NodeMembership` composes it under the flag:
+/// loopback, the open policy, and a key roster in which pc-07's test key is live in a VOTER's seat
+/// and lt-12's in a LEARNER's.
+///
+/// Not a fake, for `RosterFold`'s reason: which ROUTE admitted a caller, and whether the machine it
+/// names votes, is exactly what an operator's control verb asks (`IdentityRequirement::
+/// OperatorStanding`), and only the production participants name their routes as production does.
+/// The callers such a case needs are spelled once here, so each file asks about the same connections.
+struct OpenFleetFold
+{
+    Distributed::LoopbackMembership loopback;
+    Distributed::OpenMembership open;
+    Distributed::KeyRosterMembership keys;
+    /// Declared after the participants it borrows.
+    Distributed::AnyOfMembership admitted { { &loopback, &open, &keys } };
+
+    /// The machine the roster holds in a voter's seat.
+    static constexpr std::string_view Machine = "pc-07";
+
+    /// The machine the roster holds in a learner's seat: identified by its key or ticket, and no operator.
+    static constexpr std::string_view Learner = "lt-12";
+
+    OpenFleetFold()
+    {
+        keys.Publish({ { std::string { Machine }, TestKeyPair(std::string { Machine }).PublicKey() },
+                       { std::string { Learner }, TestKeyPair(std::string { Learner }).PublicKey() } },
+                     {},
+                     { std::string { Machine } });
+    }
+
+    /// @return A caller on another machine that showed nothing: admitted by `--fleet-open` alone.
+    [[nodiscard]] static ConnectionFacts Anonymous()
+    {
+        return ConnectionFacts { .host = "203.0.113.9" };
+    }
+
+    /// @return The same address, presenting a verified ticket for the machine the roster holds.
+    [[nodiscard]] static ConnectionFacts Ticketed()
+    {
+        return ConnectionFacts { .host = "203.0.113.9",
+                                 .authenticatedMachine =
+                                     ProvenIdentity { .id = std::string { Machine },
+                                                      .key = TestKeyPair(std::string { Machine }).PublicKey() } };
+    }
+
+    /// @return The same address, having proved the key the roster holds.
+    [[nodiscard]] static ConnectionFacts Proven()
+    {
+        return ConnectionFacts { .host = "203.0.113.9",
+                                 .proven = ProvenIdentity { .id = std::string { Machine },
+                                                            .key = TestKeyPair(std::string { Machine }).PublicKey() } };
+    }
+
+    /// @return Another address, presenting a verified ticket for the learner the roster holds.
+    [[nodiscard]] static ConnectionFacts LearnerTicketed()
+    {
+        return ConnectionFacts { .host = "198.51.100.12",
+                                 .authenticatedMachine =
+                                     ProvenIdentity { .id = std::string { Learner },
+                                                      .key = TestKeyPair(std::string { Learner }).PublicKey() } };
+    }
+
+    /// @return That address, having proved the learner's key.
+    [[nodiscard]] static ConnectionFacts LearnerProven()
+    {
+        return ConnectionFacts { .host = "198.51.100.12",
+                                 .proven = ProvenIdentity { .id = std::string { Learner },
+                                                            .key = TestKeyPair(std::string { Learner }).PublicKey() } };
+    }
+
+    /// @return A caller on this machine that showed nothing.
+    [[nodiscard]] static ConnectionFacts Local()
+    {
+        return ConnectionFacts { .host = "127.0.0.1" };
+    }
+
+    // The composite points into this object, so it is neither copied nor moved.
+    OpenFleetFold(OpenFleetFold const&) = delete;
+    OpenFleetFold& operator=(OpenFleetFold const&) = delete;
+    OpenFleetFold(OpenFleetFold&&) = delete;
+    OpenFleetFold& operator=(OpenFleetFold&&) = delete;
+    ~OpenFleetFold() = default;
 };
 
 } // namespace FastCache::Testing

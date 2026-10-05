@@ -19,6 +19,105 @@
 namespace FastCache::Node
 {
 
+/// The four bounds a `RemoteUpstream` works to, named where it is built.
+///
+/// A struct rather than four positional `std::chrono::milliseconds`: they share one type, so a
+/// transposition compiles and runs -- and the newest, `unreachableRetryInterval`, sits beside
+/// `addressRefreshInterval`, the pair most likely to be swapped and the least likely to be
+/// noticed, since both are intervals of seconds.
+struct UpstreamTimings
+{
+    std::chrono::milliseconds connectTimeout;         ///< Ceiling on the dial, resolution included.
+    std::chrono::milliseconds ioTimeout;              ///< Ceiling on one whole exchange.
+    std::chrono::milliseconds addressRefreshInterval; ///< How long a resolved address is reused.
+    /// How long a failed EXCHANGE is believed: a dial that did not connect, or a connection that
+    /// reached the I/O ceiling or lost its peer before it was answered.
+    std::chrono::milliseconds unreachableRetryInterval;
+};
+
+/// Whether the shared cache answered the last time this node asked it -- a failed EXCHANGE
+/// remembered for an INTERVAL, so an unreachable or stalling upstream costs one exchange per
+/// interval rather than one per miss.
+///
+/// ## Safety was decided first, and it is what licenses remembering at all
+///
+/// `AGENT.md`'s *Caching an expensive repeated answer*: the question is what a STALE answer does,
+/// not what the probe costs.
+///
+/// - **Stale UNREACHABLE** -- the cache came back inside the interval. A local miss it could have
+///   answered is answered as a miss and compiled locally, and a store is not offered upstream.
+///   That fails CLOSED (it is the answer an unreachable upstream already produced) and self-heals
+///   at the next probe, at most one interval later.
+/// - **Stale REACHABLE** -- the cache went away since the last exchange that was answered. Every
+///   operation that passed `ShouldDial` before the first failure LANDS is already dialling, and
+///   each of them pays its own ceiling -- the connect ceiling where the dial fails, the connect
+///   and I/O ceilings where the peer accepts and stalls. On a reactor that is every miss in flight
+///   at that moment, not one. Only operations arriving after the first failure lands are spared.
+///   Each operation still pays at most what EVERY operation paid before this existed, so this
+///   direction is no worse than no memo at all.
+///
+/// Neither direction produces a wrong answer that looks right: every outcome this changes was
+/// already a miss or a declined store.
+///
+/// ## An exchange that never completed counts, exactly like a dial that failed
+///
+/// A connection that opened and then timed out or lost its peer -- `CacheOutcomeKind::Transport` --
+/// is remembered as a failed dial is. It is the COSTLIER failure: it spends up to the per-operation
+/// I/O ceiling, not a connect ceiling. Both staleness directions stay safe:
+/// - a peer that recovered costs a MISS for at most one interval;
+/// - a peer that stalls again costs one wasted exchange per interval rather than one per miss.
+///
+/// ## Refreshed on an INTERVAL, never on a miss
+///
+/// Only whether the EXCHANGE completed is evidence. A `Miss` or a `Rejected` from a cache that
+/// answered says the cache is up, and no answer moves this toward unreachable -- so no request
+/// pattern can make it probe more than once per interval, which is the amplifier
+/// `RemoteUpstream::DialTarget`'s own comment rules out.
+///
+/// ## The probe is stamped BEFORE it runs
+///
+/// `ShouldDial` moves the next-probe instant the moment it grants a probe, not when the probe
+/// fails. A dial suspends on the reactor for up to the connect ceiling, and every miss arriving
+/// meanwhile would otherwise find the window expired and dial too -- a burst of exactly the dials
+/// this exists to remove, at exactly the moment the cache is least likely to answer.
+///
+/// That keeps probes from overlapping only while a probe finishes inside one interval, which is
+/// why `CacheTier.cpp` asserts the interval above the connect and I/O ceilings together. It is a
+/// floor rather than a guarantee: `RemoteUpstream::DialTarget`'s address lookup is bounded by
+/// neither ceiling, so a probe whose lookup hangs can still outlast an interval.
+///
+/// ## One thread
+///
+/// Read and written only on the node's I/O reactor, which is one thread (`NodeIoLoop`), as
+/// `RemoteUpstream::_lastLookupAt` is -- so it takes no lock.
+class UpstreamReachability
+{
+  public:
+    /// @param clock What ages a failed exchange. Injected: a memo with a hidden clock is untestable.
+    /// @param retryInterval How long a failed exchange is believed before the next probe.
+    UpstreamReachability(core::platform::IClock const& clock, std::chrono::milliseconds retryInterval) noexcept;
+
+    /// Whether an operation should dial now.
+    ///
+    /// True while nothing has failed, or once a failure's interval has run out -- and in that
+    /// second case the next probe is stamped before returning, so only one operation probes.
+    /// @return True to dial; false to answer as a miss (or a declined store) without dialling.
+    [[nodiscard]] bool ShouldDial();
+
+    /// An exchange completed (any answer, a `Miss` included): the upstream is reachable, and every
+    /// operation dials again.
+    void Answered() noexcept;
+
+    /// A dial failed, or a connected exchange never completed: believe it for one retry interval.
+    void Unanswered();
+
+  private:
+    core::platform::IClock const& _clock;
+    std::chrono::milliseconds _retryInterval;
+    /// When the next probe may dial; disengaged while the upstream is believed reachable.
+    std::optional<core::platform::SteadyTimePoint> _nextProbeAt;
+};
+
 /// The shared `fastcached`, reached over the `0xFC` wire.
 ///
 /// Built on the launcher's own `CacheFetch`/`CacheStore` rather than a second
@@ -56,10 +155,6 @@ class RemoteUpstream final: public ICacheUpstream
     ///        this runs inside the node's cache endpoint, so a blocking dial here
     ///        would stall every other connection sharing that loop -- which is
     ///        precisely the defect this class used to cause.
-    /// @param connectTimeout Ceiling on the dial, resolution included. Separate
-    ///        from `ioTimeout` because they bound different things and neither
-    ///        implies the other; collapsing them gave this a five-second
-    ///        resolve-plus-connect budget nobody chose.
     /// @param reactor Where the per-operation deadline is armed, or **nullptr**
     ///        when the connector is a blocking one -- the same nullable-reactor
     ///        convention `SleepUntil` and `core::net::IAsyncAddressResolver` use. With a
@@ -67,25 +162,37 @@ class RemoteUpstream final: public ICacheUpstream
     ///        arming a timer would be a second mechanism for one job; with a
     ///        reactor connector that option is inert and the timer is the only
     ///        thing that bounds anything.
-    /// @param ioTimeout Per-operation ceiling. Bounded rather than generous: a node
-    ///        waiting on an unreachable cache is a node not compiling, and the
-    ///        fallback costs one local build.
-    ///
-    ///        Armed as a `core::net::DeadlineTimer` that CLOSES the socket, rather than as
-    ///        `SO_RCVTIMEO` which is what it used to be. That is strictly more
-    ///        than the socket option gave: the option bounds a single call, so a
-    ///        peer dribbling one byte at a time could still take forever, while
-    ///        this bounds the whole exchange. It is also the only thing that
-    ///        works at all on a reactor socket, whose reads suspend rather than
-    ///        block.
     /// @param resolver How the endpoint's host is turned into an address, at most
-    ///        once per @p addressRefreshInterval. Injected like every other ambient
+    ///        once per `addressRefreshInterval`. Injected like every other ambient
     ///        dependency: a cache with a hidden resolver or a hidden clock is
     ///        untestable by construction.
-    /// @param clock What ages the held address. Injected for the same reason.
-    /// @param addressRefreshInterval How long a resolved address is reused before it
-    ///        is looked up again. See `DefaultAddressRefreshInterval` for both
-    ///        directions this trades off.
+    /// @param clock What ages the held address and a failed exchange. Injected for
+    ///        the same reason.
+    /// @param timings The bounds this works to; see UpstreamTimings.
+    ///
+    ///        connectTimeout: ceiling on the dial, resolution included. Separate
+    ///        from `ioTimeout` because they bound different things and neither
+    ///        implies the other; collapsing them gave this a five-second
+    ///        resolve-plus-connect budget nobody chose.
+    ///
+    ///        ioTimeout: per-operation ceiling. Bounded rather than generous: a node
+    ///        waiting on an unreachable cache is a node not compiling, and the
+    ///        fallback costs one local build. Armed as a `core::net::DeadlineTimer`
+    ///        that CLOSES the socket, rather than as `SO_RCVTIMEO` which is what it
+    ///        used to be. That is strictly more than the socket option gave: the
+    ///        option bounds a single call, so a peer dribbling one byte at a time
+    ///        could still take forever, while this bounds the whole exchange. It is
+    ///        also the only thing that works at all on a reactor socket, whose reads
+    ///        suspend rather than block.
+    ///
+    ///        addressRefreshInterval: how long a resolved address is reused before it
+    ///        is looked up again. See `UpstreamAddressRefreshInterval` in
+    ///        `CacheTier.cpp` for both directions this trades off.
+    ///
+    ///        unreachableRetryInterval: how long a failed exchange is believed -- a
+    ///        dial that did not connect, or a connection that reached `ioTimeout` or
+    ///        lost its peer before it was answered; see UpstreamReachability for
+    ///        both staleness directions.
     RemoteUpstream(std::string endpoint,
                    ICredentialSource const& credential,
                    Cc::CredentialNotice::Sink noticeSink,
@@ -93,9 +200,7 @@ class RemoteUpstream final: public ICacheUpstream
                    core::net::EventLoop* reactor,
                    core::net::IAsyncAddressResolver& resolver,
                    core::platform::IClock& clock,
-                   std::chrono::milliseconds connectTimeout,
-                   std::chrono::milliseconds ioTimeout,
-                   std::chrono::milliseconds addressRefreshInterval);
+                   UpstreamTimings timings);
 
     [[nodiscard]] core::async::Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) override;
     [[nodiscard]] core::async::Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) override;
@@ -119,6 +224,13 @@ class RemoteUpstream final: public ICacheUpstream
     /// simply by asking for keys this cache does not have.
     /// @return Endpoint text for `DialEndpoint`.
     [[nodiscard]] core::async::Task<std::string> DialTarget();
+
+    /// Tell the memo how an exchange that CONNECTED ended.
+    ///
+    /// `Transport` -- a stall the deadline closed, or a peer that went away -- is remembered as a
+    /// failed dial is; any answer at all, a `Miss` and a `Rejected` included, says the cache is up.
+    /// @param kind How the exchange ended.
+    void RecordExchange(Cc::CacheOutcomeKind kind);
 
     std::string _endpoint;
 
@@ -162,6 +274,12 @@ class RemoteUpstream final: public ICacheUpstream
     std::chrono::milliseconds _connectTimeout;
     std::chrono::milliseconds _ioTimeout;
     std::chrono::milliseconds _addressRefreshInterval;
+
+    /// Whether the last exchange was answered, a failed one -- a dial that did not connect, or a
+    /// connection that reached the I/O ceiling or lost its peer -- believed for
+    /// `unreachableRetryInterval`; consulted before any lookup or dial. A member rather than a collaborator anybody wires:
+    /// every `RemoteUpstream` has one, so there is no construction that could leave it out.
+    UpstreamReachability _reachability;
 };
 
 } // namespace FastCache::Node

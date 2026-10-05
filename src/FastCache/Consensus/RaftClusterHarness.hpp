@@ -4,9 +4,11 @@
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/InMemoryRaftStorage.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
+#include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftOutput.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
+#include <FastCache/Consensus/Standing.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
@@ -28,10 +30,13 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <core/platform/Clock.hpp>
 
 namespace FastCache::Consensus
@@ -79,6 +84,34 @@ namespace FastCache::Consensus
 /// for every honest member: messages are routed by name, and the node inside runs as the id
 /// its identity proves. That is what lets `Intrude` put a machine on the network that CLAIMS
 /// an existing member's id, which a network keyed by one of them could not express.
+///
+/// ## Separate clusters on one network
+///
+/// Formation starts with machines that are each a cluster of their own (`Solitary`), and a
+/// machine that yields to another dissolves its own and joins the other's (`Dissolve`). So
+/// every member carries the TAG of the cluster it is in, and the safety properties are checked
+/// per tag: two solitary machines each elect themselves in term 1, which Election Safety over
+/// every node would call a violation and which is two elections with one winner each. The
+/// constructor's members share one tag; a machine with no tag -- a joiner, or a dissolved one --
+/// contributes nothing until it accepts an `AppendEntries` or `InstallSnapshot` from a leader,
+/// and then takes that leader's tag. A member that already HAS a tag and accepts a leader of
+/// another is a violation of its own ("Cluster isolation"): Log Matching compares only members
+/// of one cluster, so a machine that joined another without dissolving would mix two logs with
+/// nothing comparing them, and this is what reports it.
+///
+/// ## Who dials whom is the link column
+///
+/// Each message rides a session one of its two ends dialled, and which end is decided by
+/// `StandingTable`'s `link` column, asked of the SENDER's active configuration: a receiver the
+/// sender sees as `DialsIn` -- a learner -- dialled the session itself, two-way, and the frame
+/// travels acceptor to dialler; a sender that sees ITSELF as `DialsIn` dials two-way and writes;
+/// everything else is the sender dialling one-way, as a voter's link is -- including a node
+/// counted nowhere yet (`NoCluster`, whose link is `NotReached`), such as a dissolved node's first
+/// reply before it holds any configuration. A TWO-WAY session exists only while its dialler is
+/// online (`SetDialsIn`); a one-way dial is not gated, which reaches nobody that matters here,
+/// since nothing a leader sends reaches a node counted nowhere over a learner's session. Every
+/// established session is counted by its dialling end and its direction (`DialsFrom`) -- so "the
+/// leader never dials a learner" is a count of zero rather than a claim.
 class RaftClusterHarness
 {
   public:
@@ -206,6 +239,63 @@ class RaftClusterHarness
     /// @param identity What it proves itself as.
     void Intrude(NodeId const& who, std::unique_ptr<IRaftPeerIdentity const> identity);
 
+    /// A machine alone: its own one-voter cluster, on the same network, in a cluster of its own.
+    ///
+    /// What every machine is before formation: it leads itself, commits alone, and its tag is its
+    /// own id, so its term-1 election is judged against nobody else's.
+    /// @param who The machine; must not already exist.
+    void Solitary(NodeId const& who);
+
+    /// Set `who`'s store aside and restart it with an empty configuration under the same identity.
+    ///
+    /// What a node does between approval and adopting the fleet's roster: the store it ran its
+    /// own cluster in is archived rather than deleted (`Member::archived`), its application is
+    /// emptied, it holds no tag, and it waits -- as a joiner does -- for a leader to speak to it.
+    /// Rebuilt through `BuildDriver`, the one way this harness makes a driver.
+    /// @param who The machine.
+    void Dissolve(NodeId const& who);
+
+    /// Whether a member that dials in -- a learner, by its standing in the SENDER's configuration --
+    /// is online. Offline, no TWO-WAY session it dials exists: nothing the leader sends reaches it,
+    /// and nothing it would answer on that session leaves. A one-way dial is not gated; see the
+    /// class note for why that reaches nobody that matters.
+    /// @param who The member.
+    /// @param online Whether it is.
+    void SetDialsIn(NodeId const& who, bool online);
+
+    /// Sessions established with @p dialler as the dialling end, towards @p acceptor, either way.
+    /// @param dialler The end that dialled.
+    /// @param acceptor The end that accepted.
+    /// @return The count over both directions, zero when it never dialled.
+    [[nodiscard]] std::uint64_t DialsFrom(NodeId const& dialler, NodeId const& acceptor) const;
+
+    /// Sessions established with @p dialler as the dialling end, towards @p acceptor, in one
+    /// direction -- which is what tells a learner's own two-way dial from a voter's one-way one.
+    /// @param dialler The end that dialled.
+    /// @param acceptor The end that accepted.
+    /// @param direction The direction its proof signed.
+    /// @return The count, zero when it never dialled that way.
+    [[nodiscard]] std::uint64_t DialsFrom(NodeId const& dialler,
+                                          NodeId const& acceptor,
+                                          RaftWire::SessionDirection direction) const;
+
+    /// The leader of the cluster @p member is in, by that cluster's own tag.
+    /// @param member Any member of the cluster.
+    /// @return The highest-term leader sharing its tag, or nullopt when it has no tag or no leader.
+    [[nodiscard]] std::optional<NodeId> LeaderOf(NodeId const& member) const;
+
+    /// `ProposeOnLeader`, through the leader of @p member's cluster.
+    /// @param member Any member of the cluster.
+    /// @param payload The bytes.
+    /// @return Where it landed, or nullopt when that cluster has no leader.
+    [[nodiscard]] std::optional<LogIndex> ProposeOnLeaderOf(NodeId const& member, std::vector<std::byte> payload);
+
+    /// `ProposeMembershipOnLeader`, through the leader of @p member's cluster.
+    /// @param member Any member of the cluster.
+    /// @param configuration The proposed voters and learners.
+    /// @return Where it landed, or nullopt when that cluster has no leader or it was refused.
+    [[nodiscard]] std::optional<LogIndex> ProposeMembershipOnLeaderOf(NodeId const& member, Configuration configuration);
+
     /// How many messages addressed to a node were refused before reaching it.
     /// @param who The receiver.
     /// @return The count, zero for a node that has refused nothing.
@@ -228,7 +318,7 @@ class RaftClusterHarness
     /// @return Its term, or nullopt when nobody leads.
     [[nodiscard]] std::optional<Term> TermOfLeader() const;
 
-    /// Offer an entry through whichever node leads.
+    /// Offer an entry through whichever node leads -- the harness's only cluster.
     /// @param payload The bytes.
     /// @return Where it landed, or nullopt when nobody leads.
     [[nodiscard]] std::optional<LogIndex> ProposeOnLeader(std::vector<std::byte> payload);
@@ -266,6 +356,10 @@ class RaftClusterHarness
         std::unique_ptr<IRaftPeerIdentity const> identity;
 
         std::unique_ptr<InMemoryRaftStorage> storage;
+
+        /// Every store `Dissolve` set aside, oldest first: kept, never read again by the node.
+        std::vector<std::unique_ptr<InMemoryRaftStorage>> archived;
+
         std::unique_ptr<IRaftTransport> transport;
         std::unique_ptr<IRaftStateMachine> machine;
 
@@ -292,6 +386,12 @@ class RaftClusterHarness
         /// `SetSnapshotsUnreadable`.
         bool snapshotsUnreadable = false;
 
+        /// Whether a session this member dials in on can exist; see `SetDialsIn`.
+        bool dialsIn { true };
+
+        /// The cluster this member is in, by tag; empty until it has one. See the class note.
+        std::string cluster;
+
         /// What this node's application HOLDS: every entry it has applied or been
         /// restored with, in index order (#1542).
         ///
@@ -304,12 +404,26 @@ class RaftClusterHarness
     };
 
   private:
+    /// Which end of a message dials the session it rides, and which way that session flows.
+    struct Carriage
+    {
+        NodeId dialler;                          ///< `from` or `to`: the end that dialled.
+        RaftWire::SessionDirection direction {}; ///< Signed into the dialler's proof.
+    };
+
     struct InFlight
     {
         NodeId from;
         NodeId to;
         RaftMessage message;
         core::platform::SteadyTimePoint deliverAt;
+        Carriage carriage; ///< Decided when it was sent, from the sender's configuration then.
+
+        /// The cluster the sender was in when it SENT this, which is the cluster the message speaks
+        /// for. Read at delivery instead, a message a leader sent just before it dissolved would be
+        /// credited to the cluster it joined since, and a follower still in the old one would be
+        /// reported as joining that cluster without dissolving.
+        std::string senderCluster;
     };
 
     /// Collects sends into the harness's own queue.
@@ -451,26 +565,81 @@ class RaftClusterHarness
     /// @param who The node's name on the network.
     /// @param bootstrap Its bootstrap configuration; empty for a joiner.
     /// @param identity Who it proves itself as.
-    void AddNode(NodeId const& who, Configuration bootstrap, std::unique_ptr<IRaftPeerIdentity const> identity);
+    /// @param cluster Its cluster's tag; empty for a joiner, which takes one from its first leader.
+    void AddNode(NodeId const& who,
+                 Configuration bootstrap,
+                 std::unique_ptr<IRaftPeerIdentity const> identity,
+                 std::string cluster);
 
     /// Refuse a second node under an id already on the network.
     /// @param who The id about to be added.
     void RequireNew(NodeId const& who) const;
 
-    /// Run the peer wire's exchange for one message, sender dialling receiver.
+    /// Run the peer wire's exchange for one message, over a session @p diallerName dialled.
     ///
     /// Every step the production ends take, in their order, with their objects: a
     /// failure at any of them is a refusal, and only a message that decoded from a
     /// frame the receiver opened -- naming the sender that proved its id -- is
-    /// delivered.
+    /// delivered. When the RECEIVER dialled, the sender is the acceptor and the frame is
+    /// sealed under the acceptor-to-dialler key, which only a two-way session has.
     /// @param message The message, with its sender and receiver.
+    /// @param diallerName Which of the two dialled: its sender or its receiver.
+    /// @param direction Which way the session flows, as the dialler's proof says.
     /// @return What the receiver decoded, or nullopt when the exchange refused it.
-    [[nodiscard]] std::optional<RaftMessage> Authenticate(InFlight const& message);
+    [[nodiscard]] std::optional<RaftMessage> Authenticate(InFlight const& message,
+                                                          NodeId const& diallerName,
+                                                          RaftWire::SessionDirection direction);
+
+    /// How a message from @p from to @p to is carried, by the link column of the sender's
+    /// active configuration. See the class note.
+    /// @param from The sender.
+    /// @param to The receiver.
+    /// @return Which end dials, and which way.
+    [[nodiscard]] Carriage CarriageFor(NodeId const& from, NodeId const& to) const;
+
+    /// The member named @p who, or null when nothing on the network is: the one lookup `Find`,
+    /// `At` and `RequireNew` react to, each in its own way.
+    /// @param who A name on the network.
+    /// @return The owning element, or null.
+    [[nodiscard]] std::unique_ptr<Member> const* FindOrNull(NodeId const& who) const;
+
+    /// Hand @p message to @p receiver's driver, keeping its cluster tag and checking isolation.
+    /// @param receiver The running receiver.
+    /// @param from The sender's name on the network.
+    /// @param senderCluster The cluster the sender was in when it sent @p message.
+    /// @param message What the receiver authenticated.
+    /// @param now The current instant.
+    void Hear(Member& receiver,
+              NodeId const& from,
+              std::string const& senderCluster,
+              RaftMessage const& message,
+              core::platform::SteadyTimePoint now);
+
+    /// The highest-term leader among the running members @p inCluster admits.
+    /// @param inCluster Which members count.
+    /// @return Its id, or nullopt.
+    [[nodiscard]] std::optional<NodeId> HighestLeader(std::function<bool(Member const&)> const& inCluster) const;
+
+    /// Offer an entry through @p leader.
+    /// @param leader The node to propose on, or nullopt for none.
+    /// @param payload The bytes.
+    /// @return Where it landed, or nullopt.
+    [[nodiscard]] std::optional<LogIndex> ProposeOn(std::optional<NodeId> const& leader, std::vector<std::byte> payload);
+
+    /// Offer a configuration through @p leader.
+    /// @param leader The node to propose on, or nullopt for none.
+    /// @param configuration The proposed voters and learners.
+    /// @return Where it landed, or nullopt.
+    [[nodiscard]] std::optional<LogIndex> ProposeMembershipOn(std::optional<NodeId> const& leader,
+                                                              Configuration configuration);
 
     void Enqueue(NodeId const& from, NodeId const& to, RaftMessage message);
     void RecordApplied(NodeId const& who, AppliedEntry const& entry);
     [[nodiscard]] bool Reaches(NodeId const& from, NodeId const& to) const;
     void CheckInvariants();
+
+    /// Log Matching, over every pair of running members in one cluster; part of `CheckInvariants`.
+    void CheckLogMatching();
 
     [[nodiscard]] Member& Find(NodeId const& who);
 
@@ -512,6 +681,9 @@ class RaftClusterHarness
     /// Completed deliveries, by sender.
     std::map<NodeId, std::uint64_t> _deliveredFrom;
 
+    /// Established sessions, by (dialler, acceptor, direction).
+    std::map<std::tuple<NodeId, NodeId, RaftWire::SessionDirection>, std::uint64_t> _dialsFrom;
+
     /// The constructor's seed stagger, kept so `Join` can continue the same
     /// series rather than start a second one that could collide with it.
     std::uint64_t _seedOffset { 1 };
@@ -529,8 +701,14 @@ class RaftClusterHarness
     std::optional<std::set<NodeId>> _partition;
     std::uint64_t _lossPercent { 0 };
 
-    /// Which node was seen leading each term, for Election Safety.
-    std::map<std::uint64_t, NodeId> _leaderOfTerm;
+    /// A cluster's tag and a number in it: a term or an index. The properties are per cluster.
+    using Tagged = std::pair<std::string, std::uint64_t>;
+
+    /// The tag every member the constructor starts shares, and every intruder claims.
+    static constexpr std::string_view BootstrapCluster = "bootstrap";
+
+    /// Which node was seen leading each term of each cluster, for Election Safety.
+    std::map<Tagged, NodeId> _leaderOfTerm;
 
     /// What was committed at each index, and in which term.
     ///
@@ -547,7 +725,7 @@ class RaftClusterHarness
         std::uint64_t term {};
     };
 
-    std::map<std::uint64_t, Committed> _appliedAt;
+    std::map<Tagged, Committed> _appliedAt;
 
     std::vector<std::string> _violations;
 };
@@ -581,15 +759,17 @@ inline RaftClusterHarness::RaftClusterHarness(Configuration configuration,
     // existed, so no existing case's schedule moved.
     for (auto const* const set: { &_members.voters, &_members.learners })
         for (auto const& id: *set)
-            AddNode(id, _members, _identities(id));
+            AddNode(id, _members, _identities(id), std::string { BootstrapCluster });
 }
 
 inline void RaftClusterHarness::AddNode(NodeId const& who,
                                         Configuration bootstrap,
-                                        std::unique_ptr<IRaftPeerIdentity const> identity)
+                                        std::unique_ptr<IRaftPeerIdentity const> identity,
+                                        std::string cluster)
 {
     auto member = std::make_unique<Member>();
     member->id = who;
+    member->cluster = std::move(cluster);
     member->identity = std::move(identity);
     member->storage = std::make_unique<InMemoryRaftStorage>();
     member->transport = std::make_unique<QueueingTransport>(*this, member->id);
@@ -713,11 +893,15 @@ inline RaftConfig RaftClusterHarness::ConfigFor(NodeId const& who, Configuration
                         .heartbeatInterval = std::chrono::milliseconds { 50 } };
 }
 
+inline std::unique_ptr<RaftClusterHarness::Member> const* RaftClusterHarness::FindOrNull(NodeId const& who) const
+{
+    return core::findOrNull(_nodes, who, [](std::unique_ptr<Member> const& node) -> NodeId const& { return node->id; });
+}
+
 inline RaftClusterHarness::Member& RaftClusterHarness::Find(NodeId const& who)
 {
-    for (auto& node: _nodes)
-        if (node->id == who)
-            return *node;
+    if (auto const* const found = FindOrNull(who); found != nullptr)
+        return **found;
 
     // Loudly, rather than falling back to the first node. A silent fallback makes
     // `Restart("n4")` on a three-node cluster restart n1 and the case pass while
@@ -729,9 +913,8 @@ inline RaftClusterHarness::Member& RaftClusterHarness::Find(NodeId const& who)
 
 inline RaftClusterHarness::Member const& RaftClusterHarness::At(NodeId const& who) const
 {
-    for (auto const& node: _nodes)
-        if (node->id == who)
-            return *node;
+    if (auto const* const found = FindOrNull(who); found != nullptr)
+        return **found;
 
     throw std::out_of_range { "no such cluster member: " + who };
 }
@@ -781,16 +964,22 @@ inline std::uint64_t RaftClusterHarness::DeliveredFrom(NodeId const& who) const
     return found == _deliveredFrom.end() ? 0 : found->second;
 }
 
-inline std::optional<RaftMessage> RaftClusterHarness::Authenticate(InFlight const& message)
+inline std::optional<RaftMessage> RaftClusterHarness::Authenticate(InFlight const& message,
+                                                                   NodeId const& diallerName,
+                                                                   RaftWire::SessionDirection direction)
 {
-    auto const& sender = Find(message.from);
-    auto const& receiver = Find(message.to);
+    // Which end is which is the carriage's: the SENDER writes either way, and it writes as the
+    // dialler or, on a session its receiver dialled in on, as the acceptor.
+    auto const senderDials = diallerName == message.from;
+    auto const& diallingEnd = Find(senderDials ? message.from : message.to);
+    auto const& acceptingEnd = Find(senderDials ? message.to : message.from);
 
-    // The receiver is the acceptor: it challenges before it has read anything. A nonce
-    // that cannot be drawn is a delivery refused, as it is a connection closed on the wire.
-    // The sender dials the id it ADDRESSED, which is the member it believes it is talking to.
-    auto acceptorBegun = AcceptorHandshake::Create(*receiver.identity, _nonces);
-    auto diallerBegun = DiallerHandshake::Create(*sender.identity, message.to, _nonces);
+    // The acceptor challenges before it has read anything. A nonce that cannot be drawn is a
+    // delivery refused, as it is a connection closed on the wire. The dialler dials the id it
+    // believes it is talking to: the member it ADDRESSED, or the one whose session it opened.
+    auto acceptorBegun = AcceptorHandshake::Create(*acceptingEnd.identity, _nonces);
+    auto diallerBegun =
+        DiallerHandshake::Create(*diallingEnd.identity, senderDials ? message.to : message.from, direction, _nonces);
     if (!acceptorBegun.has_value() || !diallerBegun.has_value())
         return std::nullopt;
     auto& acceptor = *acceptorBegun;
@@ -808,24 +997,51 @@ inline std::optional<RaftMessage> RaftClusterHarness::Authenticate(InFlight cons
     if (conclusion.outcome != VerdictOutcome::Accepted || !conclusion.session.has_value())
         return std::nullopt;
 
-    // Each end seals and opens under the key IT agreed, so a disagreement about the
-    // session is a refused frame here exactly as it is on a connection.
+    // Each end seals and opens under the key IT agreed for the direction the frame travels, so
+    // a disagreement about the session is a refused frame here exactly as it is on a connection.
+    // Written by the sender: dialler to acceptor when it dialled, acceptor to dialler when its
+    // receiver did -- and the frame names the id the WRITING end proved.
     auto const frame = RaftWire::Encode(message.message);
     auto const bytes = std::span<std::byte const> { frame };
     auto const header = bytes.first(RaftWire::HeaderSize);
     auto const payload = bytes.subspan(RaftWire::HeaderSize);
-    auto const tag = FrameSealer { *std::move(conclusion.session) }.Seal(header, payload);
-    if (!FrameOpener { *std::move(judgement.session) }.Open(header, payload, tag))
+    auto& sealing = senderDials ? conclusion.session->diallerToAcceptor : judgement.session->acceptorToDialler;
+    auto& opening = senderDials ? judgement.session->diallerToAcceptor : conclusion.session->acceptorToDialler;
+    auto const tag = FrameSealer { std::move(sealing) }.Seal(header, payload);
+    if (!FrameOpener { std::move(opening) }.Open(header, payload, tag))
         return std::nullopt;
 
     auto const decodedHeader = RaftWire::DecodeHeader(header);
     if (!decodedHeader.has_value())
         return std::nullopt;
     auto decoded = RaftWire::DecodeMessage(*decodedHeader, payload);
-    if (!decoded.has_value() || SenderOf(*decoded) != judgement.dialler)
+    auto const& writer = senderDials ? judgement.dialler : conclusion.acceptor;
+    if (!decoded.has_value() || SenderOf(*decoded) != writer)
         return std::nullopt;
 
+    ++_dialsFrom[{ diallingEnd.id, acceptingEnd.id, direction }];
     return std::move(decoded).value();
+}
+
+inline RaftClusterHarness::Carriage RaftClusterHarness::CarriageFor(NodeId const& from, NodeId const& to) const
+{
+    // Asked of the SENDER's configuration, at the moment it sends -- what its transport knows.
+    // A sender with no running driver (one being built) has no configuration to ask, and
+    // dials as a voter would.
+    auto const* const found = FindOrNull(from);
+    if (found == nullptr || (*found)->driver == nullptr)
+        return Carriage { .dialler = from, .direction = RaftWire::SessionDirection::OneWay };
+
+    auto const& sender = **found;
+    auto const& configuration = sender.driver->Node().ActiveConfiguration();
+    auto const linkOf = [&configuration](NodeId const& who) {
+        return TraitsOf(Membership::StandingOf(configuration, who)).link;
+    };
+    if (linkOf(to) == PeerLink::DialsIn)
+        return Carriage { .dialler = to, .direction = RaftWire::SessionDirection::TwoWay };
+    if (linkOf(sender.identity->Self()) == PeerLink::DialsIn)
+        return Carriage { .dialler = from, .direction = RaftWire::SessionDirection::TwoWay };
+    return Carriage { .dialler = from, .direction = RaftWire::SessionDirection::OneWay };
 }
 
 inline void RaftClusterHarness::Enqueue(NodeId const& from, NodeId const& to, RaftMessage message)
@@ -837,10 +1053,13 @@ inline void RaftClusterHarness::Enqueue(NodeId const& from, NodeId const& to, Ra
     // sent in one step can arrive in either order, and Raft has to be indifferent
     // to that rather than merely usually survive it.
     auto const delay = _network.UniformInRange(1, 3);
+    auto carriage = CarriageFor(from, to);
     _wire.push_back(InFlight { .from = from,
                                .to = to,
                                .message = std::move(message),
-                               .deliverAt = _clock.now() + std::chrono::milliseconds { delay * 5 } });
+                               .deliverAt = _clock.now() + std::chrono::milliseconds { delay * 5 },
+                               .carriage = std::move(carriage),
+                               .senderCluster = Find(from).cluster });
 }
 
 inline void RaftClusterHarness::RecordApplied(NodeId const& who, AppliedEntry const& entry)
@@ -852,12 +1071,18 @@ inline void RaftClusterHarness::RecordApplied(NodeId const& who, AppliedEntry co
     // different commands at the same index. This is the property everything else
     // in the algorithm exists to produce, so it is asserted against the actual
     // application rather than inferred from logs.
+    //
+    // Per cluster: two solitary machines each apply their own first command at index 1. A
+    // member with no tag yet contributes nothing, as the class note says.
+    auto const& cluster = Find(who).cluster;
+    if (cluster.empty())
+        return;
     auto const term = Find(who).driver->Node().CurrentTerm().value;
 
-    auto const seen = _appliedAt.find(entry.index.value);
+    auto const seen = _appliedAt.find(Tagged { cluster, entry.index.value });
     if (seen == _appliedAt.end())
     {
-        _appliedAt.emplace(entry.index.value, Committed { .payload = entry.payload, .term = term });
+        _appliedAt.emplace(Tagged { cluster, entry.index.value }, Committed { .payload = entry.payload, .term = term });
         return;
     }
 
@@ -877,16 +1102,17 @@ inline void RaftClusterHarness::CheckInvariants()
     {
         auto const& raft = node->driver->Node();
 
-        if (raft.CurrentRole() == Role::Leader)
+        // A member with no cluster yet contributes nothing; see the class note.
+        if (raft.CurrentRole() == Role::Leader && !node->cluster.empty())
         {
-            // Election Safety: at most one leader per term.
+            // Election Safety: at most one leader per term, per cluster.
             auto const term = raft.CurrentTerm().value;
-            auto const claimed = _leaderOfTerm.find(term);
+            auto const claimed = _leaderOfTerm.find(Tagged { node->cluster, term });
             if (claimed == _leaderOfTerm.end())
-                _leaderOfTerm.emplace(term, node->id);
+                _leaderOfTerm.emplace(Tagged { node->cluster, term }, node->id);
             else if (claimed->second != node->id)
                 _violations.push_back("Election Safety: both " + claimed->second + " and " + node->id + " led term "
-                                      + std::to_string(term));
+                                      + std::to_string(term) + " of cluster " + node->cluster);
 
             // Leader Completeness: an entry committed in term T is present, with
             // the same bytes, in the log of every leader of a term above T.
@@ -906,9 +1132,10 @@ inline void RaftClusterHarness::CheckInvariants()
                 _violations.push_back("Snapshot: leader " + node->id
                                       + " holds a snapshot its own encoder cannot have written");
 
-            for (auto const& [index, committed]: _appliedAt)
+            for (auto const& [tagged, committed]: _appliedAt)
             {
-                if (term <= committed.term)
+                auto const& [cluster, index] = tagged;
+                if (cluster != node->cluster || term <= committed.term)
                     continue;
 
                 if (index <= boundary)
@@ -940,16 +1167,29 @@ inline void RaftClusterHarness::CheckInvariants()
         }
     }
 
+    CheckLogMatching();
+}
+
+inline void RaftClusterHarness::CheckLogMatching()
+{
     // Log Matching: two logs sharing an (index, term) must agree on every entry
     // up through that index.
     auto up = std::vector<Member const*> {};
     for (auto const& node: _nodes | std::views::filter(IsUp))
         up.push_back(node.get());
 
+    // Per cluster: two logs in different clusters share indices and terms by coincidence.
+    auto const sameCluster = [](Member const& left, Member const& right) {
+        return !left.cluster.empty() && left.cluster == right.cluster;
+    };
+
     for (auto const outer: std::views::iota(std::size_t { 0 }, up.size()))
     {
         for (auto const inner: std::views::iota(outer + 1, up.size()))
         {
+            if (!sameCluster(*up[outer], *up[inner]))
+                continue;
+
             auto const& left = up[outer]->driver->Node().Log();
             auto const& right = up[inner]->driver->Node().Log();
             auto const shared = std::min(left.LastIndex().value, right.LastIndex().value);
@@ -1006,7 +1246,12 @@ inline void RaftClusterHarness::Step(std::chrono::milliseconds by)
         if (!Reaches(message.from, message.to))
             continue;
 
-        auto authenticated = Authenticate(message);
+        // A session a learner dials exists only while it is online: offline, nothing rides it,
+        // in either direction -- and nothing dialled the learner instead.
+        if (message.carriage.direction == RaftWire::SessionDirection::TwoWay && !Find(message.carriage.dialler).dialsIn)
+            continue;
+
+        auto authenticated = Authenticate(message, message.carriage.dialler, message.carriage.direction);
         if (!authenticated.has_value())
         {
             ++_refusedAt[message.to];
@@ -1019,13 +1264,44 @@ inline void RaftClusterHarness::Step(std::chrono::milliseconds by)
             continue; // Down: see `IsUp`.
 
         ++_deliveredFrom[message.from];
-        (void) receiver.driver->Receive(*std::move(authenticated), now);
+        Hear(receiver, message.from, message.senderCluster, *authenticated, now);
     }
 
     for (auto& node: _nodes | std::views::filter(IsUp))
         (void) node->driver->Tick(now);
 
     CheckInvariants();
+}
+
+inline void RaftClusterHarness::Hear(Member& receiver,
+                                     NodeId const& from,
+                                     std::string const& senderCluster,
+                                     RaftMessage const& message,
+                                     core::platform::SteadyTimePoint now)
+{
+    auto const fromLeader =
+        std::holds_alternative<AppendEntriesRequest>(message) || std::holds_alternative<InstallSnapshotRequest>(message);
+    auto const leader = SenderOf(message);
+
+    // A member with no cluster takes the tag of the first leader it accepts: tentatively, BEFORE
+    // it hears the message, since hearing it may apply entries, and undone when the node did not
+    // take the sender as its leader.
+    auto const adopting = receiver.cluster.empty() && fromLeader && !senderCluster.empty();
+    if (adopting)
+        receiver.cluster = senderCluster;
+
+    (void) receiver.driver->Receive(message, now);
+    auto const followsSender = receiver.driver->Node().KnownLeader() == std::optional<NodeId> { leader };
+
+    if (adopting && !followsSender)
+        receiver.cluster.clear();
+
+    // Cluster isolation: a member already IN a cluster that takes another cluster's leader has
+    // joined it without dissolving. Log Matching compares only members of one cluster, so without
+    // this nothing would compare the two logs it now mixes.
+    if (!adopting && fromLeader && followsSender && !senderCluster.empty() && senderCluster != receiver.cluster)
+        _violations.push_back("Cluster isolation: " + receiver.id + " of cluster " + receiver.cluster + " accepted leader "
+                              + from + " of cluster " + senderCluster + " without dissolving");
 }
 
 inline void RaftClusterHarness::Run(std::size_t steps, std::chrono::milliseconds by)
@@ -1061,13 +1337,18 @@ inline std::optional<NodeId> RaftClusterHarness::Leader() const
     //
     // This is not a loophole in Election Safety, which is per *term*: the stale
     // leader holds an older term than the one the majority elected.
+    return HighestLeader([](Member const&) { return true; });
+}
+
+inline std::optional<NodeId> RaftClusterHarness::HighestLeader(std::function<bool(Member const&)> const& inCluster) const
+{
     auto best = std::optional<NodeId> {};
     auto bestTerm = Term::None();
 
     for (auto const& node: _nodes | std::views::filter(IsUp))
     {
         auto const& raft = node->driver->Node();
-        if (raft.CurrentRole() != Role::Leader)
+        if (raft.CurrentRole() != Role::Leader || !inCluster(*node))
             continue;
 
         if (!best.has_value() || raft.CurrentTerm() > bestTerm)
@@ -1078,6 +1359,14 @@ inline std::optional<NodeId> RaftClusterHarness::Leader() const
     }
 
     return best;
+}
+
+inline std::optional<NodeId> RaftClusterHarness::LeaderOf(NodeId const& member) const
+{
+    auto const& cluster = At(member).cluster;
+    if (cluster.empty())
+        return std::nullopt;
+    return HighestLeader([&cluster](Member const& node) { return node.cluster == cluster; });
 }
 
 inline std::optional<Term> RaftClusterHarness::TermOfLeader() const
@@ -1091,7 +1380,28 @@ inline std::optional<Term> RaftClusterHarness::TermOfLeader() const
 
 inline std::optional<LogIndex> RaftClusterHarness::ProposeOnLeader(std::vector<std::byte> payload)
 {
-    auto const leader = Leader();
+    return ProposeOn(Leader(), std::move(payload));
+}
+
+inline std::optional<LogIndex> RaftClusterHarness::ProposeMembershipOnLeader(Configuration configuration)
+{
+    return ProposeMembershipOn(Leader(), std::move(configuration));
+}
+
+inline std::optional<LogIndex> RaftClusterHarness::ProposeOnLeaderOf(NodeId const& member, std::vector<std::byte> payload)
+{
+    return ProposeOn(LeaderOf(member), std::move(payload));
+}
+
+inline std::optional<LogIndex> RaftClusterHarness::ProposeMembershipOnLeaderOf(NodeId const& member,
+                                                                               Configuration configuration)
+{
+    return ProposeMembershipOn(LeaderOf(member), std::move(configuration));
+}
+
+inline std::optional<LogIndex> RaftClusterHarness::ProposeOn(std::optional<NodeId> const& leader,
+                                                             std::vector<std::byte> payload)
+{
     if (!leader.has_value())
         return std::nullopt;
 
@@ -1102,9 +1412,9 @@ inline std::optional<LogIndex> RaftClusterHarness::ProposeOnLeader(std::vector<s
     return *proposed;
 }
 
-inline std::optional<LogIndex> RaftClusterHarness::ProposeMembershipOnLeader(Configuration configuration)
+inline std::optional<LogIndex> RaftClusterHarness::ProposeMembershipOn(std::optional<NodeId> const& leader,
+                                                                       Configuration configuration)
 {
-    auto const leader = Leader();
     if (!leader.has_value())
         return std::nullopt;
 
@@ -1142,9 +1452,8 @@ inline std::expected<void, ConsensusError> RaftClusterHarness::Restart(NodeId co
 
 inline void RaftClusterHarness::RequireNew(NodeId const& who) const
 {
-    for (auto const& node: _nodes)
-        if (node->id == who)
-            throw std::invalid_argument { "cluster member already exists: " + who };
+    if (FindOrNull(who) != nullptr)
+        throw std::invalid_argument { "cluster member already exists: " + who };
 }
 
 inline void RaftClusterHarness::Join(NodeId const& who)
@@ -1159,7 +1468,7 @@ inline void RaftClusterHarness::Join(NodeId const& who, std::unique_ptr<IRaftPee
     // The same construction every bootstrap node gets, differing in exactly one
     // thing: no bootstrap set. Anything else that differed would be a difference in
     // the very dimension this harness exists to compare.
-    AddNode(who, {}, std::move(identity));
+    AddNode(who, {}, std::move(identity), {});
 }
 
 inline void RaftClusterHarness::Intrude(NodeId const& who, std::unique_ptr<IRaftPeerIdentity const> identity)
@@ -1171,7 +1480,55 @@ inline void RaftClusterHarness::Intrude(NodeId const& who, std::unique_ptr<IRaft
     auto bootstrap = _members;
     if (std::ranges::find(bootstrap.voters, identity->Self()) == bootstrap.voters.end())
         bootstrap.voters.push_back(identity->Self());
-    AddNode(who, std::move(bootstrap), std::move(identity));
+    AddNode(who, std::move(bootstrap), std::move(identity), std::string { BootstrapCluster });
+}
+
+inline void RaftClusterHarness::Solitary(NodeId const& who)
+{
+    RequireNew(who);
+
+    // The same construction every node gets; its bootstrap is itself alone, and its tag is its
+    // own id, which no other machine's is.
+    AddNode(who, Configuration { .voters = { who }, .learners = {} }, _identities(who), who);
+}
+
+inline void RaftClusterHarness::Dissolve(NodeId const& who)
+{
+    auto& member = Find(who);
+
+    // The old process is gone before the store is set aside: the driver holds it.
+    member.driver.reset();
+    member.archived.push_back(std::move(member.storage));
+    member.storage = std::make_unique<InMemoryRaftStorage>();
+    member.application.clear();
+    member.cluster.clear();
+
+    // No bootstrap, as a joiner has none: its configuration comes from the leader that admits it,
+    // and a restart must reconstruct it from its own log rather than from a list it was not given.
+    member.bootstrap = Configuration {};
+
+    auto node = RaftNode::Create(ConfigFor(member.identity->Self(), member.bootstrap), *member.random, _clock.now());
+    if (auto built = BuildDriver(member, std::move(node).value()); !built.has_value())
+        throw std::logic_error { "a dissolved node's driver was refused: " + built.error().context };
+}
+
+inline void RaftClusterHarness::SetDialsIn(NodeId const& who, bool online)
+{
+    Find(who).dialsIn = online;
+}
+
+inline std::uint64_t RaftClusterHarness::DialsFrom(NodeId const& dialler, NodeId const& acceptor) const
+{
+    return DialsFrom(dialler, acceptor, RaftWire::SessionDirection::OneWay)
+           + DialsFrom(dialler, acceptor, RaftWire::SessionDirection::TwoWay);
+}
+
+inline std::uint64_t RaftClusterHarness::DialsFrom(NodeId const& dialler,
+                                                   NodeId const& acceptor,
+                                                   RaftWire::SessionDirection direction) const
+{
+    auto const found = _dialsFrom.find({ dialler, acceptor, direction });
+    return found == _dialsFrom.end() ? 0 : found->second;
 }
 
 } // namespace FastCache::Consensus

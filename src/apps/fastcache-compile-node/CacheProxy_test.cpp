@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProxy.hpp"
+#include "PrivateTierProfile.hpp"
 #include "Responders.hpp"
+#include "SharedTierProfile.hpp"
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
@@ -20,11 +22,13 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <core/async/SyncRun.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/ForeignGenerationValue.hpp>
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -48,16 +52,39 @@ namespace
     return out;
 }
 
+/// The words a refusal carries.
+///
+/// Two refusals on this surface share `DispatchNotPermitted` -- a twin tier's verb and another
+/// port's verb -- so a case asserting WHICH refusal it got reads the sentence as well as the code.
+/// @param reply The reply bytes.
+/// @return The refusal's message.
+[[nodiscard]] std::string RefusalWordsOf(std::span<std::byte const> reply)
+{
+    auto const decoded = Wire::DecodeErrorPayload(PayloadOf(reply));
+    REQUIRE(decoded.has_value());
+    return std::string { Unwrap(decoded).second };
+}
+
 /// A node cache with nothing behind it, which is the single-machine shape.
+///
+/// The private tier unless a case names another: `Fixture fix;` builds what every node has, and
+/// `Fixture fix { .profile = SharedTierProfile };` the fleet's shared tier over the same code.
 struct Fixture
 {
     // Field order is the analyzer's rather than the reading order; see
-    // `LocalCache_test` for why a test fixture's padding is worth caring about.
+    // `LocalCache_test` for why a test fixture's padding is worth caring about. `profile` sits
+    // after `local` for that reason, which a designated initializer is free to name.
+    //
+    // Every member without a constructor argument is braced, because naming `profile` is
+    // aggregate initialization: each member it does not name is copy-list-initialized from its
+    // default member initializer, or from `{}` when it has none -- which `ManualClock`'s explicit
+    // default constructor refuses, and which the missing-field warning reports for the rest.
     InMemoryLruStorage local { 64 * 1024 };
-    NoUpstream upstream;
-    core::platform::ManualClock clock;
-    AtomicMetricsSink metrics;
-    LocalCache cache { local, upstream, clock, metrics };
+    CacheTierProfile const& profile { PrivateTierProfile };
+    NoUpstream upstream {};
+    core::platform::ManualClock clock {};
+    AtomicMetricsSink metrics {};
+    LocalCache cache { local, upstream, clock, metrics, profile };
     CacheProxy proxy { cache, metrics };
 };
 
@@ -344,7 +371,7 @@ TEST_CASE("The node's cache answers this machine and refuses every other one", "
     }
 }
 
-TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or not",
+TEST_CASE("(#287) a ticketed machine is refused this machine's cache tier, member or not",
           "[node][cache][membership][cache-locality]")
 {
     // THE HOLE THIS CLOSED. `CacheResponder` used to gate on `Membership::Member`,
@@ -353,12 +380,12 @@ TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or n
     // ("its own machine and its cluster"), which is why #287 is a deliberate
     // tightening rather than a bug fix, and why it shipped as a breaking change.
     //
-    // The peer here is ADMITTED by the member list, and that is the whole point of
-    // the fixture: a case whose caller was refused for some OTHER reason would pass
-    // under the bug and prove nothing about locality.
+    // The peer here is ADMITTED -- by a verified ticket for a key the roster holds -- and that is
+    // the whole point of the fixture: a case whose caller was refused for some OTHER reason would
+    // pass under the bug and prove nothing about locality.
     Fixture fixture;
-    Distributed::ClusterMembership const membership { Distributed::MembershipParticipant::FleetMemberList,
-                                                      { "10.0.0.1:7000" } };
+    Testing::RosterFold const membership { { "pc-01" } };
+    auto const peer = ConnectionFacts { .host = "10.0.0.1", .authenticatedMachine = Testing::IdentityOf("pc-01") };
     Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
     CachedLocalityOracle const locality { machine, fixture.clock };
     CacheResponder responder { fixture.proxy, locality, fixture.metrics };
@@ -366,15 +393,14 @@ TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or n
     // Stated first, so a later change to the membership vocabulary cannot turn this
     // case green by quietly reclassifying the peer: it IS a member, and it is
     // refused anyway.
-    REQUIRE(membership.Classify("10.0.0.1") == Distributed::Membership::Member);
+    REQUIRE(Distributed::ExplainConnection(membership.admitted, peer).verdict == Distributed::Membership::Member);
 
     // And it is not this machine, by either of the two properties that could make
     // it one.
     REQUIRE_FALSE(IsLoopbackHost("10.0.0.1"));
     REQUIRE_FALSE(locality.IsThisMachine("10.0.0.1"));
 
-    auto const refused =
-        core::async::syncRun(responder.Answer(Wire::EncodeFetch("some-key"), PeerIdentity { .host = "10.0.0.1" })).bytes;
+    auto const refused = core::async::syncRun(responder.Answer(Wire::EncodeFetch("some-key"), peer)).bytes;
     auto const header = Wire::DecodeReplyHeader(refused);
     REQUIRE(header.has_value());
     CHECK(Unwrap(header).status == Wire::Status::Error);
@@ -642,21 +668,19 @@ TEST_CASE("(#491) the cache surface's uncounted arms are unreachable, swept rath
         CHECK(served >= 2);
     }
 
-    SECTION("no opcode reaches the cache's Unauthenticated arm, because it requires no credential")
+    SECTION("no opcode reaches the cache's Unauthenticated arm, because the node checks no password")
     {
-        // `AuthRequired()` is false here by decision (#287, #290): a credential every
-        // local build can read is not a credential. `DecidePrePayload` yields
-        // `Unauthenticated` only for a surface that requires one, so this arm is
+        // The endpoint asks `DecidePrePayload` with `authRequired` false for every verb, and it
+        // yields `Unauthenticated` only for a surface that requires a credential -- so this arm is
         // closed by that answer rather than by the routing above.
         for (auto const value: std::views::iota(0, 256))
         {
             auto const opRaw = static_cast<std::uint8_t>(value);
             INFO("opcode " << value);
-            CHECK_FALSE(cache.AuthRequired(opRaw));
             CHECK(Wire::DecidePrePayload({ .opRaw = opRaw,
                                            .declaredLength = 0,
                                            .sessionCap = cache.MaxRequestBytes(),
-                                           .authRequired = cache.AuthRequired(opRaw),
+                                           .authRequired = false,
                                            .credentialAccepted = false })
                   != Wire::PrePayloadDecision::Unauthenticated);
         }
@@ -665,9 +689,9 @@ TEST_CASE("(#491) the cache surface's uncounted arms are unreachable, swept rath
     SECTION("AUTH is the Session family, so no credential outcome is ever decided against the cache")
     {
         // The two `EndpointRefusal` credential arms are answered by whichever surface
-        // owns `Op::Auth`. With no scheduler configured that is NOBODY -- and the
-        // point of asserting the null is that a router which fell back to the cache
-        // would answer `&cache` here and reopen both arms in silence.
+        // owns `Op::Auth` -- the session component, which this composition does not name,
+        // so that is NOBODY here. The point of asserting the null is that a router which
+        // fell back to the cache would answer `&cache` and reopen both arms in silence.
         auto const auth = static_cast<std::uint8_t>(Wire::Op::Auth);
         CHECK(Wire::FamilyOf(auth) == Wire::VerbFamily::Session);
         CHECK(merged.OwnerOf(auth) == nullptr);
@@ -720,4 +744,150 @@ TEST_CASE("(#1276) a drop from another machine is refused before it removes anyt
         StatusOf(core::async::syncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.0.0.7" }))
                      .bytes)
         == Wire::Status::Miss);
+}
+
+TEST_CASE("A tier answers its own verb pair and refuses its twin's", "[node][cache][shared-cache]")
+{
+    Fixture fix { .profile = SharedTierProfile };
+    CompileValue value;
+    value.objectBlob = Bytes("OBJECT");
+    // Named: `StoreRequest::value` is a span, so a temporary encoding would die with this
+    // declaration and the store below would read freed bytes.
+    auto const encoded = EncodeCompileValue(value);
+    auto const request =
+        Wire::StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = encoded };
+    CHECK(StatusOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeStoreAs(Wire::FleetSharedCacheVerbs, request))))
+          == Wire::Status::Ok);
+    CHECK(StatusOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetchAs(Wire::FleetSharedCacheVerbs, "k"))))
+          == Wire::Status::Ok);
+    // The private verbs reaching the shared tier are refused, never served: the router never sends
+    // them here, and a tier that answered them would be a second door to the fleet's objects. The
+    // code says *served elsewhere*, and the words say WHERE -- the other tier, not another port.
+    for (auto const& frame: { Wire::EncodeFetch("k"), Wire::EncodeCacheDrop("k") })
+    {
+        auto const reply = core::async::syncRun(fix.proxy.Answer(frame));
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::DispatchNotPermitted);
+        CHECK(RefusalWordsOf(reply).contains("other cache tier"));
+    }
+}
+
+TEST_CASE("The shared tier canonicalizes a stored value against the producer's roots", "[node][cache][shared-cache]")
+{
+    // The reason the shared tier reuses this class: the fleet's cache is where one machine's
+    // object is replayed by another, so a region still naming the PRODUCER's checkout would hand
+    // every consumer dependencies on files it will never edit (#319). Driven through the fleet
+    // verbs with non-empty roots, both of them, so a shared path that skipped the rewrite -- or
+    // rewrote only the source root -- is seen here rather than in somebody's build graph.
+    Fixture fix { .profile = SharedTierProfile };
+
+    CompileValue value;
+    value.objectBlob = Bytes("OBJECT");
+    value.textRegions.push_back({ .grammar = PathCanon::Grammar::ShowIncludes,
+                                  .bytes = "Note: including file: /producer/src/dep.hpp\n"
+                                           "Note: including file: /producer/build/gen/cfg.hpp\n" });
+
+    auto const stored = core::async::syncRun(
+        fix.proxy.Answer(Wire::EncodeStoreAs(Wire::FleetSharedCacheVerbs,
+                                             Wire::StoreRequest { .key = "k-shared-canon",
+                                                                  .prefetchGroup = {},
+                                                                  .srcRoot = "/producer/src",
+                                                                  .buildTree = "/producer/build",
+                                                                  .value = EncodeCompileValue(value) })));
+    REQUIRE(StatusOf(stored) == Wire::Status::Ok);
+
+    auto const fetched =
+        core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetchAs(Wire::FleetSharedCacheVerbs, "k-shared-canon")));
+    REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
+    auto const decoded = DecodeCompileValue(PayloadOf(fetched));
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->textRegions.size() == 1);
+
+    CHECK(decoded->textRegions.front().bytes
+          == "Note: including file: <SRCROOT>/dep.hpp\n"
+             "Note: including file: <BUILDTREE>/gen/cfg.hpp\n");
+    CHECK_FALSE(decoded->textRegions.front().bytes.contains("/producer/"));
+    CHECK(decoded->objectBlob == Bytes("OBJECT"));
+}
+
+TEST_CASE("A tier's refusals move its own series and never its twin's", "[node][cache][shared-cache][metrics]")
+{
+    // The refusal rows are functions of the tier, so the shared tier's version skew, bad body and
+    // foreign generation rise on the `NodeSharedCache*` series. Asserted over the whole counter
+    // vector, for `AllCounters`'s reason: a check on the one row passes with the neighbouring
+    // private-tier row moving beside it.
+    auto const store = [](std::vector<std::byte> value) {
+        return Wire::EncodeStoreAs(
+            Wire::FleetSharedCacheVerbs,
+            Wire::StoreRequest {
+                .key = "k", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = std::move(value) });
+    };
+
+    SECTION("a version this build cannot decode")
+    {
+        Fixture fix { .profile = SharedTierProfile };
+        auto const before = AllCounters(fix.metrics);
+        auto const reply = core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetchAs(
+            Wire::FleetSharedCacheVerbs, "k", static_cast<Wire::WireVersion>(Wire::CurrentVersion + 1))));
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::UnsupportedVersion);
+        CHECK(Moved(before, AllCounters(fix.metrics))
+              == Only(IMetricsSink::Counter::NodeSharedCacheRequestsRefusedUnsupportedVersion));
+    }
+
+    SECTION("a body that will not decode")
+    {
+        // The declared length matches the bytes sent, so this is a malformed BODY rather than a
+        // truncated frame, which answers the same code and moves nothing.
+        Fixture fix { .profile = SharedTierProfile };
+        std::vector<std::byte> frame(Wire::RequestHeaderSize + 2);
+        WireFrame::PutHeader(
+            frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::FleetSharedCacheVerbs.fetch), 2);
+        frame[Wire::RequestHeaderSize] = std::byte { 0xFF };
+        frame[Wire::RequestHeaderSize + 1] = std::byte { 0xFF };
+
+        auto const before = AllCounters(fix.metrics);
+        CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::MalformedFrame);
+        CHECK(Moved(before, AllCounters(fix.metrics))
+              == Only(IMetricsSink::Counter::NodeSharedCacheRequestsRefusedMalformedPayload));
+    }
+
+    SECTION("a stored value of another generation")
+    {
+        Fixture fix { .profile = SharedTierProfile };
+        auto const before = AllCounters(fix.metrics);
+        auto const reply = core::async::syncRun(fix.proxy.Answer(store(Testing::ForeignGenerationValue())));
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::ForeignValueGeneration);
+        CHECK(Moved(before, AllCounters(fix.metrics))
+              == Only(IMetricsSink::Counter::NodeSharedCacheRequestsRefusedForeignGeneration));
+    }
+
+    SECTION("and the twin's verbs move nothing, like every other arm a peer cannot reach")
+    {
+        Fixture fix { .profile = SharedTierProfile };
+        auto const before = AllCounters(fix.metrics);
+        CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
+                  .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = Bytes("OBJECT") }))))
+              == Wire::ErrorCode::DispatchNotPermitted);
+        CHECK(Moved(before, AllCounters(fix.metrics)).empty());
+    }
+}
+
+TEST_CASE("The private tier refuses the shared tier's verbs as its twin's", "[node][cache][shared-cache]")
+{
+    // The other direction of the pair: the private tier answers exactly FETCH, STORE and
+    // CACHE-DROP, and a fleet verb reaching it is refused as served elsewhere, naming the other
+    // tier -- never `UnimplementedVerb`, which a client reads as a build too old to know the verb.
+    Fixture fix;
+    // Named for the shared-tier case's reason: `StoreRequest::value` is a span.
+    auto const object = Bytes("OBJECT");
+    auto const request =
+        Wire::StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = object };
+    for (auto const& frame: { Wire::EncodeStoreAs(Wire::FleetSharedCacheVerbs, request),
+                              Wire::EncodeFetchAs(Wire::FleetSharedCacheVerbs, "k") })
+    {
+        auto const reply = core::async::syncRun(fix.proxy.Answer(frame));
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::DispatchNotPermitted);
+        CHECK(RefusalWordsOf(reply).contains("other cache tier"));
+    }
+    // Nothing was stored through the refused verb.
+    CHECK(StatusOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetch("k")))) == Wire::Status::Miss);
 }

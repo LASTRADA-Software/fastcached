@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeFormation.hpp"
 #include "NodePresenceTier.hpp"
+
+// Its own header FIRST and in a group of its own, for `WorkerLease.cpp`'s reason.
+#include "HostEventInbox.hpp"
 
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 
 #include <chrono>
 #include <cstddef>
+#include <format>
 #include <span>
 #include <utility>
 #include <vector>
@@ -15,8 +20,6 @@ namespace FastCache::Node
 namespace
 {
     namespace Wire = FastCache::CompileCacheWire;
-
-    constexpr std::chrono::milliseconds PresenceIoTimeout { 10'000 };
 
     /// What this machine says about itself: the endpoint, the capacity, the load and the
     /// history buckets nobody has taken yet.
@@ -29,41 +32,56 @@ namespace
         PresenceAnnouncement(std::string_view endpoint,
                              Wire::CapacityFields const& capacity,
                              Wire::LoadFields const& load,
-                             std::span<std::byte const> endorsement,
-                             ICredentialSource const& credential,
-                             Cc::CredentialNotice& notice,
-                             ILogger& logger) noexcept:
+                             std::span<Wire::JoinMemoFields const> joinMemos,
+                             ILogger& logger,
+                             SchedulerReachability& reachability) noexcept:
             _endpoint { endpoint },
             _capacity { capacity },
             _load { load },
-            _endorsement { endorsement },
-            _credential { credential },
-            _notice { notice },
-            _logger { logger }
+            _joinMemos { joinMemos },
+            _logger { logger },
+            _reachability { reachability }
         {
         }
 
         [[nodiscard]] AnnounceOutcome Attempt(core::net::ISocket& client, std::string_view endpoint) override
         {
-            auto sent =
-                Cc::AnnounceNodePresence(client, _notice, _endpoint, _capacity, _load, _endorsement, _credential.Current());
+            auto sent = Cc::AnnounceNodePresence(client, _endpoint, _capacity, _load, _joinMemos);
             if (sent.has_value())
             {
                 _accepted = true;
-                _reply = *std::move(sent);
+                if (auto const back = _reachability.Succeeded(AnnounceStage::Announcement, endpoint); back.has_value())
+                    _logger.Log(back->level, back->message);
                 return AnnounceOutcome { .accepted = 1, .leader = std::nullopt };
             }
 
-            // At Warn rather than Error, for the reason a registration refusal is: a scheduler
-            // mid-election and a peer too old to know the verb are both what a healthy fleet
-            // looks like for a few seconds, and the round carries on either way. It names BOTH
-            // addresses because they are different facts -- the scheduler that refused, and the
-            // machine it refused -- and a message carrying one of them reads as the other.
-            _logger.Logf(LogLevel::Warn,
-                         "scheduler {} did not record this machine at {}: {}",
-                         endpoint,
-                         _endpoint,
-                         sent.error().reason);
+            // Both addresses, because they are different facts -- the scheduler that refused, and the
+            // machine it refused -- and a message carrying one of them reads as the other. A refusal
+            // naming a LEADER is the redirect the round follows at once: Debug, never the tracker, or
+            // every election spends a scheduler's Warn. Formatted from the table's own sentence
+            // rather than restated here, so the words cannot drift from what `SchedulerReachability`
+            // says for the same outcome.
+            auto const reason = std::format("at {}: {}", _endpoint, sent.error().reason);
+            if (sent.error().leader.has_value())
+            {
+                auto const subject = std::string_view {}; // No toolchain: presence names the machine, not one.
+                _logger.Log(LogLevel::Debug,
+                            std::vformat(SchedulerOutcomeRowOf(SchedulerOutcome::PresenceRefused).failure,
+                                         std::make_format_args(endpoint, subject, reason)));
+            }
+            else
+            {
+                // A stall or a lost peer after the socket connected never told this node
+                // anything to act on, so it is this scheduler being unreachable -- not a
+                // refusal to record this machine. Without this split, a hung connection
+                // logged and counted as `PresenceRefused` and never raised
+                // `scheduler-unreachable`.
+                auto const outcome = sent.error().kind == Cc::AnnounceRefusalKind::Transport
+                                         ? SchedulerOutcome::Unreachable
+                                         : SchedulerOutcome::PresenceRefused;
+                auto const said = _reachability.Failed(outcome, SchedulerFailure { .endpoint = endpoint, .reason = reason });
+                _logger.Log(said.level, said.message);
+            }
             return AnnounceOutcome { .accepted = 0, .leader = sent.error().leader };
         }
 
@@ -74,23 +92,14 @@ namespace
             return _accepted;
         }
 
-        /// @return What the scheduler that recorded this machine answered with: an encoded
-        ///         certified roster, or empty.
-        [[nodiscard]] std::span<std::byte const> Reply() const noexcept
-        {
-            return _reply;
-        }
-
       private:
         std::string_view _endpoint;
         Wire::CapacityFields const& _capacity;
         Wire::LoadFields const& _load;
-        std::span<std::byte const> _endorsement;
-        ICredentialSource const& _credential;
-        Cc::CredentialNotice& _notice;
+        std::span<Wire::JoinMemoFields const> _joinMemos;
         ILogger& _logger;
+        SchedulerReachability& _reachability;
         bool _accepted = false;
-        std::vector<std::byte> _reply;
     };
 } // namespace
 
@@ -116,17 +125,23 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
     // live row that cleared is clear at the leader one interval later.
     load.conditions = round.conditions.Snapshot();
 
+    // Every fleet this machine once asked, read per round: the leader files them under the id this
+    // machine PROVED, as the evidence a split of the fleet is told on (`Cluster::SplitEvidenceFor`).
+    auto memos = std::vector<Wire::JoinMemoFields> {};
+    if (round.askedJoins != nullptr)
+        for (auto const& asked: round.askedJoins->AskedJoins())
+            memos.push_back(Wire::JoinMemoFields { .clusterId = asked.clusterId, .provenKey = asked.provenKey });
+
     auto const accepted = AnnouncePresence(
         PresenceMessage {
             .endpoint = round.endpoint,
             .capacity = round.capacity,
             .load = load,
-            .credential = round.credential,
-            .notice = round.notice,
             .logger = round.logger,
             .prover = round.prover,
+            .reachability = round.reachability,
+            .joinMemos = memos,
         },
-        round.roster,
         link,
         dialer);
 
@@ -135,29 +150,28 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
     return accepted;
 }
 
-bool AnnouncePresence(PresenceMessage const& message, IPresenceRoster* roster, SchedulerLink& link, IEndpointDialer& dialer)
+bool AnnouncePresence(PresenceMessage const& message, SchedulerLink& link, IEndpointDialer& dialer)
 {
-    // The roster rides the same verb (#178): a voter's endorsement out, and back whatever roster
-    // the leader can certify -- which a node that holds none adopts in this same round, from
-    // whichever scheduler the round's redirects and fallbacks reached.
-    auto const endorsement = roster != nullptr ? roster->Endorsement() : std::vector<std::byte> {};
-    PresenceAnnouncement announcement { message.endpoint,   message.capacity, message.load,  endorsement,
-                                        message.credential, message.notice,   message.logger };
+    PresenceAnnouncement announcement { message.endpoint,  message.capacity, message.load,
+                                        message.joinMemos, message.logger,   message.reachability };
     (void) DialAndAnnounce(
-        link,
-        dialer,
-        message.logger,
-        announcement,
-        AnnounceProof { .prover = message.prover, .credential = &message.credential, .notice = &message.notice });
-
-    if (announcement.Accepted() && roster != nullptr)
-        roster->Offered(announcement.Reply());
+        link, message.reachability, dialer, message.logger, announcement, AnnounceProof { .prover = message.prover });
     return announcement.Accepted();
+}
+
+bool AnnouncesToAScheduler(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated)
+{
+    return SchedulerLink::For(SchedulersOf(cfg, activated)).has_value();
+}
+
+bool AwaitsItsOwnRecord(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated)
+{
+    return RunsConsensus(cfg) && AnnouncesToAScheduler(cfg, activated);
 }
 
 std::unique_ptr<NodePresence> NodePresence::Start(NodePresenceParts const& parts)
 {
-    auto link = SchedulerLink::For(parts.cfg.schedulers);
+    auto link = SchedulerLink::Over(parts.schedulers);
     if (!link.has_value())
         return nullptr;
 
@@ -171,18 +185,19 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _cacheTier { parts.cacheTier },
     _metrics { parts.metrics },
     _sampler { parts.sampler },
-    _credential { parts.credential },
     _logger { parts.logger },
     _conditions { parts.conditions },
-    _roster { parts.roster },
     _prover { parts.prover },
-    // Reported at Warn and once, exactly as the registrars' notice is: a credential the
-    // scheduler did not want is a configuration fact, not a per-round event.
-    _notice { [&logger = parts.logger](std::string_view text) { logger.Logf(LogLevel::Warn, "scheduler: {}", text); } },
-    _capacityWire { Distributed::CapacityToWire(parts.capacity) },
+    _reachability { parts.reachability },
+    _askedJoins { parts.askedJoins },
+    // `AnnouncedCapacity` rather than `Distributed::CapacityToWire` alone: the latter knows
+    // nothing of the version, so a node with no worker sent NODE-ANNOUNCE with none, and the
+    // leader recorded it exactly as absent as a build too old to know the field.
+    _capacityWire { AnnouncedCapacity(parts.capacity) },
     _loadSampler { MakeHostLoadSampler(MakeSystemCounterSource()) },
-    _dialer { PresenceIoTimeout },
-    _link { std::move(link) }
+    _dialer { parts.dialer },
+    _link { std::move(link) },
+    _hostSubscription { parts.hostEvents, _presenceWake }
 {
 }
 
@@ -209,14 +224,13 @@ void NodePresence::Loop(std::stop_token const& stop)
                                                        .cacheTier = _cacheTier,
                                                        .metrics = _metrics,
                                                        .sampler = _sampler,
-                                                       .credential = _credential,
-                                                       .notice = _notice,
                                                        .capacity = _capacityWire,
                                                        .endpoint = endpoint,
                                                        .logger = _logger,
                                                        .conditions = _conditions,
-                                                       .roster = _roster,
-                                                       .prover = _prover },
+                                                       .prover = _prover,
+                                                       .reachability = _reachability,
+                                                       .askedJoins = _askedJoins },
                                        _link,
                                        _dialer);
 
@@ -227,14 +241,39 @@ void NodePresence::Loop(std::stop_token const& stop)
 
 bool NodePresence::WaitOutInterval(std::stop_token const& stop)
 {
+    auto const interval = std::chrono::duration_cast<std::chrono::milliseconds>(NextAnnounceWait(_prover));
+    return _presenceWake.WaitOut(stop, interval) == PresenceWakeReason::Stopped;
+}
+
+void PresenceWake::OnHostEvent(HostEvent event)
+{
+    auto const& row = HostEventActionFor(event);
+    {
+        std::scoped_lock const lock { _mutex };
+        // A wake still pending is older than a suspend, and superseded by it; one posted after is
+        // owed as ever. See `HostEventActionRow::supersedesOlderWakes`.
+        if (row.supersedesOlderWakes)
+            _announceNow = false;
+        if (!row.wakesPresence)
+            return;
+        _announceNow = true;
+    }
+    _wake.notify_all();
+}
+
+PresenceWakeReason PresenceWake::WaitOut(std::stop_token const& stop, std::chrono::milliseconds interval)
+{
     // A named lock, because the stop-token `wait_for` takes it by non-const reference -- a
     // temporary does not bind, which is the compiler catching the lifetime question rather
     // than a style preference.
-    auto const interval = _roster != nullptr && _roster->Wanting()
-                              ? std::chrono::duration_cast<std::chrono::seconds>(RosterWantingInterval)
-                              : NodeAnnounceInterval;
-    std::unique_lock lock { _wakeMutex };
-    return _wake.wait_for(lock, stop, interval, [&stop] { return stop.stop_requested(); });
+    std::unique_lock lock { _mutex };
+    auto const woken = _wake.wait_for(lock, stop, interval, [this] { return _announceNow; });
+    if (stop.stop_requested())
+        return PresenceWakeReason::Stopped;
+    if (!woken)
+        return PresenceWakeReason::Elapsed;
+    _announceNow = false;
+    return PresenceWakeReason::HostEvent;
 }
 
 } // namespace FastCache::Node

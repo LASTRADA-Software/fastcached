@@ -186,7 +186,7 @@ class RaftDriver
     /// comes back with its applied index AT the snapshot's boundary, so nothing the
     /// snapshot covers will ever be applied again: the snapshot's state reaches the
     /// application here or never, and a node that ran without it would lose every
-    /// fact it held -- for a membership state the forget tombstones too, so removal
+    /// fact it held -- for a membership state the revoked keys too, so removal
     /// fails OPEN. Folded into building rather than left to the caller, because the
     /// defect was precisely a caller that did not know to do it.
     ///
@@ -311,6 +311,11 @@ class RaftDriver
         /// node.
         std::optional<NodeId> knownLeader;
 
+        /// When a leader last spoke to this node (`RaftNode::LastLeaderContact`); nullopt before
+        /// any did. A follower's or learner's evidence, on the driver's steady clock -- a leader
+        /// never hears from one, and answers for itself through its quorum.
+        std::optional<core::platform::SteadyTimePoint> lastLeaderContact;
+
         /// How far each member's log is known to match this node's, when it leads (#1537).
         ///
         /// Under the same lock as `commitIndex`, and for the reason `term` is: the two are
@@ -325,6 +330,14 @@ class RaftDriver
         /// a node that has NOT reached an index, and read apart from the commit index the
         /// two could describe different moments.
         std::optional<InstallRefusal> installRefusal;
+
+        /// The highest index this node has applied (`RaftNode::LastApplied`), consensus' own entries
+        /// included. Read under the lock the application is handed entries under, so an index read
+        /// here has REACHED the application -- what a reader comparing it against the log needs.
+        LogIndex appliedIndex {};
+
+        /// The last index this node's log holds (`RaftLog::LastIndex`), under the same lock.
+        LogIndex lastLogIndex {};
     };
 
     /// @return What this node believes about its own cluster, read together.

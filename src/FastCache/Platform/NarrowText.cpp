@@ -69,6 +69,40 @@ namespace
         return std::nullopt;
 #endif
     }
+
+#if defined(_WIN32)
+    /// The UTF-16 form of @p text read through @p codePage, refusing what that page
+    /// cannot express.
+    ///
+    /// The Win32 conversions are `int`-sized. A depfile past 2 GiB is not a thing
+    /// that happens, but a silent truncation to a negative length is a wrong answer
+    /// rather than a refused one, so it is refused.
+    /// @param text     The narrow text.
+    /// @param codePage The page it is written in.
+    /// @return The wide text (empty for empty input), or `std::nullopt`.
+    [[nodiscard]] std::optional<std::wstring> WideFromCodePage(std::string_view text, std::uint32_t codePage)
+    {
+        if (text.empty())
+            return std::wstring {};
+        if (text.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            return std::nullopt;
+
+        // The length is spelled from `text.size()` inside each call rather than hoisted, so a
+        // call that reads `text.data()` visibly carries its bound.
+        auto const wideLength =
+            ::MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0);
+        if (wideLength <= 0)
+            return std::nullopt;
+
+        std::wstring wide;
+        wide.resize(static_cast<std::size_t>(wideLength));
+        if (::MultiByteToWideChar(
+                codePage, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), wide.data(), wideLength)
+            <= 0)
+            return std::nullopt;
+        return wide;
+    }
+#endif
 } // namespace
 
 std::optional<std::uint32_t> ActiveCodePage() noexcept
@@ -104,42 +138,16 @@ std::optional<std::string> Utf8FromNarrowText(std::string_view text, std::option
         return std::nullopt;
 
 #if defined(_WIN32)
-    // The Win32 conversions are `int`-sized. A depfile past 2 GiB is not a thing
-    // that happens, but a silent truncation to a negative length is a wrong answer
-    // rather than a refused one, so it is refused.
-    if (text.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
-        return std::nullopt;
-
-    auto const narrowLength = static_cast<int>(text.size());
-
     // MB_ERR_INVALID_CHARS and WC_ERR_INVALID_CHARS on both legs, so what the named
     // page cannot express is a refusal rather than a U+FFFD quietly substituted
     // into a filename. It catches less than it sounds like -- a single-byte page
     // decodes nearly everything, and Windows even maps CP-1252's five unassigned
     // bytes to the matching C1 controls -- which is precisely why there is one
     // candidate page and never a ladder of them.
-    auto const wideLength = ::MultiByteToWideChar(*codePage, MB_ERR_INVALID_CHARS, text.data(), narrowLength, nullptr, 0);
-    if (wideLength <= 0)
+    auto const wide = WideFromCodePage(text, *codePage);
+    if (!wide.has_value())
         return std::nullopt;
-
-    std::wstring wide;
-    wide.resize(static_cast<std::size_t>(wideLength));
-    if (::MultiByteToWideChar(*codePage, MB_ERR_INVALID_CHARS, text.data(), narrowLength, wide.data(), wideLength) <= 0)
-        return std::nullopt;
-
-    auto const utf8Length =
-        ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), wideLength, nullptr, 0, nullptr, nullptr);
-    if (utf8Length <= 0)
-        return std::nullopt;
-
-    std::string utf8;
-    utf8.resize(static_cast<std::size_t>(utf8Length));
-    if (::WideCharToMultiByte(
-            CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), wideLength, utf8.data(), utf8Length, nullptr, nullptr)
-        <= 0)
-        return std::nullopt;
-
-    return utf8;
+    return Utf8FromWideText(*wide);
 #else
     // Unreachable through `HostNarrowTextPolicy()`, which names no code page here,
     // and spelled out rather than left to fall off the end: there is no transcoder
@@ -148,6 +156,40 @@ std::optional<std::string> Utf8FromNarrowText(std::string_view text, std::option
     return std::nullopt;
 #endif
 }
+
+#if defined(_WIN32)
+std::optional<std::string> Utf8FromWideText(std::wstring_view text)
+{
+    if (text.empty())
+        return std::string {};
+    if (text.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        return std::nullopt;
+
+    auto const utf8Length = ::WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (utf8Length <= 0)
+        return std::nullopt;
+
+    std::string utf8;
+    utf8.resize(static_cast<std::size_t>(utf8Length));
+    if (::WideCharToMultiByte(CP_UTF8,
+                              WC_ERR_INVALID_CHARS,
+                              text.data(),
+                              static_cast<int>(text.size()),
+                              utf8.data(),
+                              utf8Length,
+                              nullptr,
+                              nullptr)
+        <= 0)
+        return std::nullopt;
+    return utf8;
+}
+
+std::optional<std::wstring> WideTextFromUtf8(std::string_view text)
+{
+    return WideFromCodePage(text, CP_UTF8);
+}
+#endif
 
 std::optional<std::filesystem::path> PathFromNarrowText(std::string_view text) noexcept
 {

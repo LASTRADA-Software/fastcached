@@ -196,7 +196,7 @@ namespace
 #if defined(_WIN32)
     [[nodiscard]] std::expected<HANDLE, ClaimFailure> TakeClaim(std::filesystem::path const& claimFile)
     {
-        auto const path = claimFile.native();
+        auto const& path = claimFile.native();
         // `dwShareMode = 0` IS the claim: no other handle to this path can be opened
         // at all while this one lives, so there is no separate lock call and no
         // window in which the file is open but unclaimed. A null security attribute

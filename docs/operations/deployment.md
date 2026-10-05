@@ -39,6 +39,59 @@ flag:
 Leave `log_timestamps` off — journald timestamps every line already, and off
 is the default on Linux.
 
+A start the daemon **refuses** — a flag it does not know, a configuration file
+it read that does not load, a combination of settings a rule forbids, and for
+`fastcache-compile-node` also a credential file it read and found empty, or an
+identity key in its state directory it read and cannot use — exits **78**
+(`EX_CONFIG`; `systemctl status` shows `status=78/CONFIG`) and is **not**
+restarted: the unit says `RestartPreventExitStatus=78`, because the next start
+would refuse the same configuration the same way. A start that finds a defect in
+the binary's own build — a component it was built without — exits 78 as well,
+for the same reason: no configuration causes it, and every start meets it. The unit stays `failed` with
+the reason in the journal until you fix it and start it. Every other failure —
+a port still held by a process that was exiting, a store another process holds,
+and **any named file that could not be read**, whatever the reason: a
+configuration file, a credential or a key that is not there, or
+that the service account may not read, or that lives on a share or a mount
+that is not back yet — exits 1 and is restarted after a second
+(`Restart=on-failure`), within systemd's default start limit of five starts in
+ten seconds. A file that could not be read says nothing about its contents, and
+the next start may read it; if it cannot — a path that is simply wrong — the
+limit stops the retries.
+
+Measured on systemd 259:
+
+| What happened | What systemd did |
+|---|---|
+| a refusal, at once or after three seconds | ran it once; `failed`, status 78 |
+| a failure, at once | five runs, then `failed` by the start limit |
+| a failure after three seconds | restarted every time: nine restarts in forty seconds, still going |
+| `systemctl restart` by hand, eight times three seconds apart | every one honoured |
+| `systemctl restart` by hand, eight times 0.2 seconds apart | the fifth refused, "start of the service was attempted too often", and the unit left **stopped** |
+
+The last row is the default start limit, which counts your starts as well as
+systemd's: five starts inside ten seconds are honoured, and a sixth — the fifth
+`systemctl restart` right after a start — is refused and leaves the service
+down until `systemctl reset-failed fastcached && systemctl start fastcached`.
+
+Only a start answers 1 or 78. A command that answers and exits —
+`--install-service`, `--uninstall-service`, `--migrate-storage` and
+`--seed-config` on either binary, and `fastcache-compile-node`'s
+`--print-surfaces`, `--print-identity`, `--migrate-cache`, cluster,
+enrollment and cordon commands — is not supervised, and answers what a
+script calling it should do next:
+
+| Exit | Meaning | When |
+|---|---|---|
+| 0 | done | it did what it was asked |
+| **2** | **a decision — do not retry** | a command line that did not parse (wherever the command was typed on it), a configuration file that did not parse or names a setting that does not exist, an install the startup rules refuse, a service name the registration will not use, access denied, a service that already exists or is not installed, a store in a format it cannot convert or that another process holds, a refusal the scheduler or seed **replied** with — except the ones listed under 1 |
+| 1 | **transient — a retry may help** | a scheduler, seed or node that **could not be reached** or broke off the exchange, a reply that decided nothing: another cluster change still committing, an endpoint or fleet at its capacity, a fleet with no worker registered for the toolchain yet (one that is still starting), a cluster with no leader right now, leaders that went on redirecting to each other, a machine that gave up waiting to be approved (run it again once an operator approves it), a file that is not there or could not be read or written (a named configuration file included, as at a start), a service-manager call that failed on its own, a conversion that stopped part-way (run it again to finish it) |
+
+`fastcached --healthcheck` is read by a container runtime, and Docker documents
+0 and 1 and reserves 2, so it answers 0 for healthy and **1 for everything
+else** — unhealthy, a refused command line, or a configuration file that did
+not load.
+
 ### Reloading
 
 `systemctl reload fastcached` sends `SIGHUP`, which re-reads the config file in
@@ -150,17 +203,31 @@ agent under `/var/root` that your own login never starts and your own
 | Runs as | the invoking user | `_fastcached` |
 | Starts at | login | boot |
 | Privileges | none | root to install |
-| `KeepAlive` | on crash only | always |
+| `KeepAlive` | on crash only | on crash only |
 
 The generated plist deliberately does **not** pass `--daemon`. launchd, like
 systemd, supervises the process it started; a job that double-forks is
 reaped immediately as `exited` and the service silently never runs.
 
 The two scopes are alternatives — both bind the same address, and there is
-no unix-socket endpoint to separate them. A per-user agent uses
-`KeepAlive={Crashed:true}` rather than `true` for that reason: an agent that
-loses the race for the port exits cleanly, and restart-always would turn
-that into a permanent ten-second crash loop instead of one log line.
+no unix-socket endpoint to separate them.
+
+Both use `KeepAlive={Crashed:true}`: a process that crashed is restarted, no
+more often than every thirty seconds (`ThrottleInterval`), and one that
+**exited** — whatever its code — stays stopped. launchd cannot tell a refusal
+(exit 78) from any other exit: `launchd.plist(5)`'s `KeepAlive` conditions ask
+whether an exit was successful or a crash, never which code it had, and nothing
+in it stops after N. So every shape that restarts a clean non-zero exit restarts
+a refused start forever, once per `ThrottleInterval`, writing the same refusal
+each time; the system daemon's `KeepAlive=true` did exactly that. Crash-only is
+the least bad choice, and it costs two things the other supervisors do not:
+
+- a **failure** is not retried either — a port still held by a process that was
+  exiting, or a per-user agent that lost the race for the port to another
+  user's, is one line in the log and a stopped job, where systemd and the
+  Windows service manager would start it again;
+- a process that **crashes** at every start is restarted forever, every thirty
+  seconds.
 
 Status, restart, logs:
 
@@ -205,7 +272,9 @@ To remove it: `fastcached --uninstall-service --service-scope=<scope>`, or
 
 ## Windows service
 
-The MSI registers `fastcached` as an auto-start service and seeds
+The MSI registers `fastcached` as an auto-start service — a manual one, left
+stopped, when the fastcache-compile-node feature is installed too, since both answer
+on 6674 ([the MSI's service table](../getting-started/install.md#windows)) — and seeds
 `C:\ProgramData\fastcached\fastcached.yaml` from the template it ships, unless
 a config is already there. The registration passes **no** `--config`: the
 service resolves that path itself at every start, so editing the file is all it
@@ -222,6 +291,50 @@ fastcached.exe --uninstall-service
 
 Pass `--config=C:\path\to\fastcached.yaml` only to point the service at a file
 *other* than the default location.
+
+### When a start is refused
+
+A configuration the service refuses at startup — a flag it does not know, a file
+that does not parse, a flag combination a startup rule rejects — is reported to
+the SCM as a **stop with
+a service-specific code**, and the reason is written to the Application event log
+under the service's name:
+
+```
+> sc.exe query FastCached
+        STATE              : 1  STOPPED
+        WIN32_EXIT_CODE    : 1066  (0x42a)
+        SERVICE_EXIT_CODE  : 78  (0x4e)
+```
+
+`1066` is `ERROR_SERVICE_SPECIFIC_ERROR`: the reason is the process's own exit
+code, `78` for a start either binary refused on its configuration (or on a defect in
+its own build) and `1` for
+one that failed for a reason the next start may not meet. It is **not** error 1053, *did not respond to the start or
+control request in a timely fashion* — that is what a refusal used to produce,
+because the process exited before connecting to the SCM.
+
+`--install-service` is held to the same rules as a start, so a line every start
+would refuse is refused while you are watching rather than registered.
+`--uninstall-service` and `--healthcheck` are not: removing a service must not be
+blocked by the mistake it was reached to undo, and a probe of a daemon that is
+serving must not call it unhealthy over a rule that decides only whether one may
+start.
+
+The restart policy the registration sets is **finite**: after a failure the SCM
+restarts the service after one second, again after one second, once more after
+thirty seconds, and then leaves it stopped (`sc qfailure` lists the four
+actions). Ten minutes without a failure starts the count over. It counts
+failures rather than starts, so the SCM never refuses a start you make yourself.
+
+A refused start is restarted here too, unlike under systemd, because the SCM
+cannot be told apart from a failure without losing what `sc query` shows: it runs
+its recovery actions for every stop whose `WIN32_EXIT_CODE` is not zero, and the
+only refusal that would escape them is one reported as zero — with the `1066` and
+the `78` above gone. So a configuration that stays wrong is refused four times,
+each writing its reason to the event log, and then the service stays stopped
+until you fix it and start it. systemd does not restart a refusal at all, and
+launchd restarts a crash only (see [launchd](#launchd)).
 
 ### What it runs as
 
@@ -258,10 +371,11 @@ If you add or move `storage_path` afterwards, grant it from an elevated prompt:
 icacls "D:\fastcached\cache" /grant "NT SERVICE\FastCached":(OI)(CI)F
 ```
 
-Note that re-running `--install-service` does **not** repair it: registering a
-service that already exists is refused before the handover happens, so the grant
-never runs. Either use `icacls`, or `--uninstall-service` first — which stops the
-service, so `icacls` is the less disruptive of the two.
+Re-running `--install-service` from an elevated prompt repairs it too: registering
+a service that already exists re-applies the registration — start type, command
+line, account, restart policy — and runs the handover again for the
+`storage_path` that install resolves. It does not restart a running service, so a
+changed command line takes effect at the next start.
 
 A daemon that cannot open its storage says so at startup and prints this command
 with your own paths and service name filled in; without `storage_path` it is
@@ -298,7 +412,29 @@ and makes path arguments absolute — a service starts with its
 working directory set to `C:\Windows\System32`, so a relative path captured
 at install time would resolve elsewhere at boot. It creates the service
 already set to auto-start but leaves it stopped, so the first start is
-explicit.
+explicit; `--service-start=manual` registers it to wait for somebody to start
+it instead. The start mode belongs to the registration, not to the command line
+the service runs with.
+
+### What it opens in the firewall
+
+Registering also opens the Windows Firewall for every cache listener that binds
+beyond loopback and, with `--metrics`, for a metrics endpoint that does — nothing
+at all for the default `127.0.0.1:6674`. Each gets one inbound rule, admitting
+`fastcached.exe` running as this service, on every network profile, in the group
+`fastcached: FastCached`; the install line lists them. `--firewall-allow=<address[/prefix]>`
+(IPv4 or IPv6, repeatable) limits which remote addresses they admit, and `/0` is
+refused: leave the flag out to allow any address.
+
+Running `--install-service` again replaces the group rather than adding to it, and
+`--uninstall-service` removes it once Windows accepts the delete — at once, even for
+a service that had not stopped within a minute and is only marked for deletion until
+it exits. A firewall that refuses
+never fails either command: it is reported as a warning, and an uninstall whose
+delete was refused leaves the rules in place, since the service may still be
+running. A listener bound to the name `localhost` is given a rule too, and the
+install says why — a name is whatever the resolver answers; bind `127.0.0.1` or
+`::1` to need none.
 
 ## Container
 
@@ -323,6 +459,12 @@ The image's `HEALTHCHECK` runs `fastcached --healthcheck`, which probes
 `http://127.0.0.1:<metrics-port>/healthz` and exits 0 (healthy) or 1. It is
 self-contained — no `curl`/`wget` in the image — but requires the daemon to run
 with `--metrics`.
+
+`/healthz` answers `503` once any bind's accept loop has ended while the daemon was not
+stopping, naming the bind and what its last accept answered: such a port still listens and
+refuses every client, so a probe that only saw the process alive would call it healthy.
+Only a closed listener ends a loop; a client that reset its queued connection is logged at
+`Warn` and accepted past.
 
 ## Authentication
 
@@ -360,7 +502,7 @@ certificate (mutual TLS) auth is not yet implemented.
 ```sh
 fastcached --metrics --metrics-bind=0.0.0.0 --metrics-port=9259
 curl http://host:9259/metrics    # Prometheus text exposition
-curl http://host:9259/healthz    # 200 OK
+curl http://host:9259/healthz    # 200 OK; 503 naming any bind that stopped accepting
 ```
 
 If the endpoint cannot be bound the daemon **carries on serving the cache without
@@ -386,7 +528,7 @@ omitted from the exposition instead of reported as `0`.
 
 The same reading applies inside the daemon's own namespace: the
 `fastcached_dispatch_*` block below is the fleet scheduler's, and the scheduler is
-`fastcache-compile-node --serve-scheduler`. The `fastcached_` prefix on it is
+`fastcache-compile-node`. The `fastcached_` prefix on it is
 historical.
 
 #### Command traffic
@@ -441,8 +583,9 @@ published per tier and stays on the unlabelled series above.
 | Series | Says |
 |---|---|
 | `fastcached_tier_items` | Live entries this tier holds. |
-| `fastcached_tier_bytes_used` | Bytes this tier holds. |
+| `fastcached_tier_bytes_used` | What this tier's budget counts: stored (compressed) value bytes for `memory`, the on-disk footprint (pages in use × page size) for `disk`. |
 | `fastcached_tier_bytes_limit` | This tier's own byte budget; `0` means unbounded. |
+| `fastcached_tier_file_bytes` | Length of the file backing a disk tier, free pages included; runs ahead of `bytes_used` by its free pages until a commit cuts them off the end or later writes reuse them. Absent for a tier with no file. |
 | `fastcached_tier_evictions_total` | Entries this tier dropped to stay within its budget. |
 | `fastcached_tier_index_bytes` | Resident memory this tier spends on its key index — always RAM, even for a disk tier. |
 
@@ -487,7 +630,7 @@ node's reads a fleet mid-upgrade as one that has converged.
 #### Fleet dispatch
 
 The fleet scheduler's series. `fastcached` runs no scheduler, so **on a daemon these
-are flat at zero**; they move on `fastcache-compile-node --serve-scheduler`, and
+are flat at zero**; they move on a `fastcache-compile-node` that serves the scheduler, and
 [Distributed compilation](../getting-started/distributed-compilation.md#confirming-it-works)
 is where they are explained one by one.
 
@@ -498,12 +641,17 @@ is where they are explained one by one.
 | `fastcached_dispatch_leases_no_worker_total` | The fleet is misconfigured — workers are up but nobody matches. |
 | `fastcached_dispatch_leases_no_capacity_total` | The fleet is too small. |
 | `fastcached_dispatch_leases_withdrawn_total` | The fleet is unavailable — slots free on paper, machines busy elsewhere. |
+| `fastcached_dispatch_leases_all_excluded_total` | The fleet is **unreachable from its clients** — every matching worker was on the asking client's exclusion list. A network problem, not a missing toolchain. |
 | `fastcached_dispatch_leases_duplicate_total` | Duplicate-work suppression is doing its job. |
 | `fastcached_dispatch_leases_reclaimed_total` | A machine went away mid-job and the keys it was building were freed. |
 | `fastcached_dispatch_leases_unauthorized_total` | A lease token this cluster never signed was handed back. |
 | `fastcached_dispatch_leases_released_late_total` | A compile outran the lease timeout and reported back too late. Read as a fraction of `released_total`; a steady fraction means the lease bound is too short for this site's slowest translation unit. |
+| `fastcached_dispatch_leases_malformed_total` | A client asked for a lease naming its key, toolchain or toolchain label in bytes that are not UTF-8, and was refused. |
+| `fastcached_dispatch_leases_field_too_long_total` | A client asked for a lease with a key, toolchain fingerprint or toolchain label longer than a scheduler records, and was refused. |
 | `fastcached_dispatch_worker_registrations_total` | Workers registering. A steady rise means heartbeats are not arriving. |
 | `fastcached_dispatch_worker_registrations_malformed_total` | A peer named its toolchain, endpoint or version in bytes that are not UTF-8 and was refused. |
+| `fastcached_dispatch_worker_registrations_field_too_long_total` | A peer registered with a fingerprint, endpoint, version, toolchain label, display name or codec list longer than a scheduler records, and was refused. |
+| `fastcached_dispatch_node_announcements_field_too_long_total` | A machine announced itself with an endpoint or version longer than a scheduler records, and was refused. An overlong condition field is refused earlier, when the frame is decoded, and is not counted here. |
 | `fastcached_dispatch_worker_endpoint_mismatch_total` | A worker was admitted while advertising an endpoint whose host is not the address it connected from. |
 | `fastcached_dispatch_workers_expired_total` | A machine stopped heartbeating and was dropped. |
 | `fastcached_dispatch_workers_withdrawn_total` | A machine re-surveyed, found it no longer serves a toolchain, and retired that registration itself. |

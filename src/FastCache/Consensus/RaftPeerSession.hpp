@@ -30,18 +30,20 @@
 /// ```
 /// acceptor                                        dialler
 ///   Challenge{nonceA, ephA}                ---->
-///                                          <----  Proof{d, a, nonceD, ephD, sig_d}
+///                                          <----  Proof{d, a, dir, nonceD, ephD, sig_d}
 ///   verify sig_d under d's key, then OwnId, then WrongTarget
 ///   Verdict{verdict, self, sig_a}          ---->
 ///                                                 verify sig_a under a's key, then read it
 ///                                          <----  frame[tag] frame[tag] ...
+///   frame[tag] frame[tag] ...              ---->  (only when dir is TwoWay)
 /// ```
 ///
-/// `sig_d`: the dialler's Ed25519 signature over `[nonceA, ephA, d, a, nonceD, ephD]`.
+/// `sig_d`: the dialler's Ed25519 signature over `[nonceA, ephA, d, a, dir, nonceD, ephD]`.
 /// `sig_a`: the acceptor's, over all of that, `sig_d`, the verdict and its own id.
-/// The frame key: HKDF-SHA256 over X25519(ephA, ephD), salted with both nonces, bound to
-///               both ephemeral keys and both ids. Each frame's tag is an HMAC under it, over
-///               its implicit position and its bytes (`Core/SessionSeal.hpp`).
+/// The frame keys: two, one per direction, each HKDF-SHA256 over X25519(ephA, ephD), salted
+///               with both nonces, bound to the direction it seals, `dir`, both ephemeral keys
+///               and both ids. Each frame's tag is an HMAC under its direction's key, over its
+///               implicit position and its bytes (`Core/SessionSeal.hpp`).
 ///
 /// ## Why each part is what it is
 ///
@@ -73,6 +75,14 @@
 ///   of a session it was not an end of.
 /// - **The position is implicit.** Both ends count, so a frame dropped, replayed or reordered
 ///   inside a connection fails its tag, and there is no field an attacker could set.
+/// - **The direction is SIGNED, by both ends.** Whether the acceptor writes on the connection
+///   is decided by the proof, so a relay that could flip that byte could make an acceptor
+///   write to a peer that never asked, or starve one that did. Inside both transcripts, a
+///   flipped byte is a forged proof.
+/// - **One key per direction.** Both ends count their positions from zero, so under ONE key the
+///   acceptor's first frame and the dialler's first frame are sealed at the same position under
+///   the same key -- and a frame reflected back at its own sender opens. Each direction's key is
+///   its own HKDF output, labelled with the direction, so a reflected frame fails its tag.
 namespace FastCache::Consensus
 {
 
@@ -89,6 +99,16 @@ enum class ProofOutcome : std::uint8_t
     RevokedKey,  ///< The signature verified under a key the roster has revoked.
     WrongTarget, ///< Proved its id, but dialled another member.
     OwnId,       ///< Proved this node's own id: it holds this node's private key.
+};
+
+/// The two keys a handshake agrees; a one-way connection uses the first only.
+///
+/// Each is derived on its own, labelled with the direction it seals, so neither is a function of
+/// the other that anybody without the handshake's secrets can compute.
+struct SessionKeys
+{
+    SessionKey diallerToAcceptor; ///< Seals what the dialler writes; the acceptor opens with it.
+    SessionKey acceptorToDialler; ///< Seals what the acceptor writes, on a two-way connection only.
 };
 
 /// The acceptor's half of one connection's handshake.
@@ -117,8 +137,12 @@ class AcceptorHandshake
         /// operator matches against the revocation they made. Meaningless otherwise.
         Ed25519PublicKey provenKey {};
 
-        /// The frame key, when `Accepted`.
-        std::optional<SessionKey> session;
+        /// The frame keys, when `Accepted`.
+        std::optional<SessionKeys> session;
+
+        /// Which way the dialler asked for frames to flow, as its signed proof says. Meaningful
+        /// only when `Accepted`: until the signature verifies it is a claim.
+        RaftWire::SessionDirection direction { RaftWire::SessionDirection::OneWay };
     };
 
     /// Begin a handshake by drawing its challenge: a nonce and an ephemeral key.
@@ -188,8 +212,8 @@ class DiallerHandshake
         /// before every frame. Meaningless unless `Accepted`.
         Ed25519PublicKey provenKey {};
 
-        /// The frame key, when `Accepted`.
-        std::optional<SessionKey> session;
+        /// The frame keys, when `Accepted`.
+        std::optional<SessionKeys> session;
     };
 
     /// Begin a handshake by drawing this end's nonce and ephemeral key.
@@ -199,10 +223,12 @@ class DiallerHandshake
     /// @param identity Who this node is, and how it tells who answered; must outlive the
     ///        handshake.
     /// @param target The member this node believes it dialled.
+    /// @param direction Which way frames are to flow on this connection; signed into the proof.
     /// @param random Where the nonce and the ephemeral secret come from.
     /// @return The handshake, or why nothing could be drawn.
     [[nodiscard]] static std::expected<DiallerHandshake, SecureRandomError> Create(IRaftPeerIdentity const& identity,
                                                                                    NodeId target,
+                                                                                   RaftWire::SessionDirection direction,
                                                                                    ISecureRandom& random);
 
     /// Answer the acceptor's challenge.
@@ -219,17 +245,20 @@ class DiallerHandshake
   private:
     /// @param identity Who this node is.
     /// @param target The member this node believes it dialled.
+    /// @param direction Which way frames are to flow on this connection.
     /// @param nonce This end's nonce, freshly drawn by `Create`.
     /// @param ephemeralSecret The secret half of this end's ephemeral key.
     /// @param ephemeral Its public half.
     DiallerHandshake(IRaftPeerIdentity const& identity,
                      NodeId target,
+                     RaftWire::SessionDirection direction,
                      Nonce const& nonce,
                      SecureByteBuffer ephemeralSecret,
                      X25519PublicKey const& ephemeral);
 
     IRaftPeerIdentity const& _identity;
     NodeId _target;
+    RaftWire::SessionDirection _direction;
     Nonce _nonce;
     SecureByteBuffer _ephemeralSecret;
     X25519PublicKey _ephemeral;

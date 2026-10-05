@@ -1,37 +1,22 @@
-!!! warning "A node checks no inbound credential"
+!!! note "A node verifies machines, and holds no shared secret"
 
-    None of a node's three framed surfaces — scheduler, compile port, cache tier
-    — serves the `AUTH` verb, so there is nothing for a credential to
-    authenticate against. `--requirepass` on a node is only the secret it
-    **presents** when it dials somebody else, and it works in exactly one
-    direction: against a `fastcached` named by `--upstream`, which does serve
-    `AUTH`.
+    A compile node's framed surfaces — scheduler, compile port, cache tier — take one
+    inbound credential, and it identifies a **machine**, not a person: a machine ticket,
+    signed by a machine's own identity key and verified against the roster the node holds.
+    There is no password and no key shared across the fleet, so nothing a node could leak
+    lets another machine speak for it. `--requirepass` on a node is only the secret it
+    **presents** when it dials a `fastcached` named by `--upstream`, which is the one
+    surface that takes one.
 
-    **Setting a credential no longer breaks anything.** All three surfaces refuse
-    `AUTH` with `unknown-opcode`, which is the one refusal `fastcache-cc` steps
-    over before carrying on unauthenticated — the right outcome against a surface
-    with no credential to check. So a client with `FASTCACHE_TOKEN` set leases,
-    compiles, registers, reads and writes normally. On its **cache** exchanges it
-    also reports `credential ignored`, so the fact is not silent there; on a lease,
-    a compile, a release or a registration it is — those callers receive the same
-    flag and discard it.
+    A launcher sends `FASTCACHE_TOKEN` to the cache at `FASTCACHE_ADDR` and to nothing
+    else; every exchange with another machine presents a ticket its own node minted for
+    that exchange. A password `AUTH` that does reach a node is answered `Ok` and
+    establishes nothing, so a client configured with a token is never broken by a node —
+    the node's scheduler once answered it `dispatch-not-permitted` instead, which the
+    launcher treats as fatal
+    ([#340](https://github.com/LASTRADA-Software/fastcached/issues/340)).
 
-    That code is a wire contract between binaries that do not link each other, and
-    the three surfaces once answered it three different ways. Two of them said
-    `dispatch-not-permitted`, which the launcher treats as fatal and returns in
-    place of the answer to the request actually sent —
-    [#283](https://github.com/LASTRADA-Software/fastcached/issues/283) corrected
-    the cache tier and [#340](https://github.com/LASTRADA-Software/fastcached/issues/340)
-    the other two. Until then, a `FASTCACHE_TOKEN` client had every `LEASE`
-    declined behind a green build, and a `--requirepass` worker never joined the
-    fleet at all.
-
-    **What is still open is the credential itself**, and it is a gap rather than a
-    design: what an inbound credential should be spelled, and what `AUTH` should
-    mean against a node that has none configured, are the questions
-    [#976](https://github.com/LASTRADA-Software/fastcached/issues/976) is open on.
-    (#198 and #289 asked the worker's and the scheduler's halves separately and are
-    both closed; #976 is the live ticket, and the questions did not change.)
-    Until it closes, a fleet's boundary is **network
-    reachability plus membership**, not a secret — so keep these surfaces on a
-    network you would run a compiler for.
+    A ticket travels in the clear, so it is bound to ONE endpoint, lives a minute and is
+    spent once at the node that accepts it; a node proof is sealed from its first frame. A
+    network where a ticket can be captured costs a replay at no other node and no later
+    moment. The cache tier admits this machine only, whatever the caller presents.

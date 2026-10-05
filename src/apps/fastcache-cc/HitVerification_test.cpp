@@ -11,6 +11,7 @@
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -274,4 +275,67 @@ TEST_CASE("A toolchain that cannot be compared is not reported as a wrong object
     CHECK(line.contains("objkey-v3:abcdef"));
     CHECK(line.contains("cannot verify"));
     CHECK_FALSE(line.contains("WRONG OBJECT"));
+}
+
+namespace
+{
+
+/// The launcher's own filesystem, except that every rename is refused: an atomic write then fails
+/// at its last step, after its temp file was written -- a put-back that did not happen.
+class RefusingReplace final: public IAtomicWriteFiles
+{
+  public:
+    std::unique_ptr<IFileSink> Create(std::filesystem::path const& path) override
+    {
+        return _disk->Create(path);
+    }
+
+    bool Replace(std::filesystem::path const& /*from*/, std::filesystem::path const& /*to*/) override
+    {
+        return false;
+    }
+
+    void Remove(std::filesystem::path const& path) noexcept override
+    {
+        _disk->Remove(path);
+    }
+
+  private:
+    std::unique_ptr<IAtomicWriteFiles> _disk { MakeDiskFiles() };
+};
+
+} // namespace
+
+TEST_CASE("A verification put-back keeps the served object aside until it is confirmed back", "[launcher][verify]")
+{
+    // After a FAILED fresh compile the aside is the only good copy of what the hit served. It goes
+    // only once the build's object is confirmed to be that copy again; a put-back that failed keeps
+    // it, and the verdict line says where.
+    Testing::ScratchDirectory const scratch { "fc-cc-verify-putback" };
+    scratch.Write("u.obj.fastcache-verify", "SERVED OBJECT");
+    auto const aside = scratch / "u.obj.fastcache-verify";
+    auto const served = scratch / "u.obj";
+
+    SECTION("confirmed: the build's object is the served one, and the aside is gone")
+    {
+        auto const disk = MakeDiskFiles();
+        auto const result = RestoreServedObject(aside, served, *disk);
+        CHECK(result.verdict == HitVerdict::Inconclusive);
+        CHECK(result.detail.empty());
+        CHECK(ReadFileShared(served) == std::optional<std::string> { "SERVED OBJECT" });
+        CHECK_FALSE(std::filesystem::exists(aside));
+    }
+
+    SECTION("refused: the aside survives, and the verdict line names it")
+    {
+        RefusingReplace refusing;
+        auto const result = RestoreServedObject(aside, served, refusing);
+        CHECK(result.verdict == HitVerdict::Inconclusive);
+        CHECK(ReadFileShared(aside) == std::optional<std::string> { "SERVED OBJECT" });
+        CHECK_FALSE(std::filesystem::exists(served));
+        auto const line = DescribeVerdict(result, "objkey-v3:abcdef");
+        CHECK(line.contains("could not verify"));
+        CHECK(line.contains(aside.string()));
+        CHECK(line.contains("replace"));
+    }
 }

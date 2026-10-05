@@ -12,6 +12,7 @@
 #include <FastCache/Distributed/NodeProof.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheAuth.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
@@ -162,10 +163,60 @@ inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
     "the answer deadline is the endpoint's decision and the endpoint counts it, in the sweep row and the "
     "refusal-sent row; a per-surface copy would be a third tally of one event";
 
+/// What an `AUTH` frame established on one connection.
+///
+/// A verdict rather than a `CredentialOutcome`, because an accepted `AUTH` on a node says WHO:
+/// a verified ticket speaks for a machine, and that machine is what admission folds as
+/// `ConnectionFacts::authenticatedMachine`. The endpoint clears it on every `AUTH` it reads a
+/// header for and ASSIGNS it on every one it answers, so a refused one -- at the header or by
+/// its verdict -- clears whatever an earlier one established.
+///
+/// **A refused ticket grants no admission, and one refused for a REVOKED key says so**: its
+/// `revokedMachine` is recorded on the connection and never cleared, because the connection is the
+/// forgotten machine's and every later verb on it is refused as that machine's
+/// (`ConnectionFacts::revokedMachine`) -- on a `--fleet-open` node too, where its address alone
+/// would admit it.
+struct CredentialVerdict
+{
+    CredentialOutcome outcome { CredentialOutcome::Malformed }; ///< Only Accepted admits anything.
+    /// The machine a VERIFIED ticket speaks for; engaged only when `outcome == Accepted`.
+    std::optional<ProvenIdentity> machine {};
+    /// The revoked key a refused ticket verified under; engaged only when it was refused for that.
+    std::optional<RevokedKeyEvidence> revokedMachine {};
+    /// The refusal the surface already encoded AND counted; empty unless it refused.
+    std::vector<std::byte> refusalReply {};
+};
+
+/// Why no surface but the session component counts a credential refusal, stated once for
+/// every surface that has to say it.
+///
+/// Here rather than beside one responder for `EndpointRefusalCodes`' reason: this is a
+/// property of the ROUTING -- `AUTH` is `VerbFamily::Session`, which `MergedResponder` sends
+/// to the session component -- so no other surface is ever asked to check a credential.
+inline constexpr std::string_view CredentialIsTheSessionsRationale =
+    "AUTH is the Session family, which MergedResponder routes to the session component; no credential outcome is "
+    "ever decided against this surface";
+
+/// Why no node surface counts `PrePayloadDecision::Unauthenticated`, stated once.
+///
+/// The node checks no password, so the endpoint asks `DecidePrePayload` with `authRequired`
+/// false for every verb -- and that is the only road to this decision. A surface counting it
+/// would own a row no event can move.
+inline constexpr std::string_view NodeChecksNoPasswordRationale =
+    "the node checks no password: the endpoint asks DecidePrePayload with authRequired false for every verb, which "
+    "is the only road to this decision";
+
+/// The answer every surface but the session component gives an `AUTH` it is never routed.
+/// @return `NoPolicy`, establishing nothing.
+[[nodiscard]] inline CredentialVerdict NotTheSessionSurface() noexcept
+{
+    return CredentialVerdict { .outcome = CredentialOutcome::NoPolicy };
+}
+
 /// Why no surface but the identity prover's counts a node-proof refusal, stated once for
 /// every surface that has to say it.
 ///
-/// `CredentialIsTheSchedulersRationale`'s exact counterpart, and it is here rather than beside
+/// `CredentialIsTheSessionsRationale`'s exact counterpart, and it is here rather than beside
 /// one responder for `EndpointRefusalCodes`' reason: this is a property of the ROUTING -- the
 /// two proof verbs are `VerbFamily::NodeProof`, which `MergedResponder` sends to the one
 /// component that verifies identities -- so no other surface can ever be asked about them. Six
@@ -266,6 +317,15 @@ struct FrameReply
 
     /// What stays held until the reply has been written or abandoned; null for nothing.
     std::unique_ptr<IReplyHold> hold;
+
+    /// Whether this answer is the connection's LAST: the endpoint writes it, then closes.
+    ///
+    /// For a verb answered once per connection by design -- FLEET-SUMMARY, whose every answer is a
+    /// signature a stranger asked for -- so that pipelining questions on one connection cannot keep
+    /// a reactor signing: each signature then costs a handshake and a slot of the port's pool. The
+    /// close LINGERS, so a request pipelined behind this one is drained rather than answered by a
+    /// reset that could destroy this reply in the peer's receive queue.
+    bool endsConnection { false };
 };
 
 /// Serves one subscription for as long as it lasts.
@@ -510,44 +570,24 @@ class IFrameResponder
     [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                            std::uint8_t opRaw) const = 0;
 
-    /// Does this surface require a credential before this verb?
-    ///
-    /// Asked once per frame rather than cached, because a surface may be
-    /// reconfigured and a connection already open must not keep an answer from
-    /// before. It is a field read behind a virtual call, not a probe.
-    ///
-    /// **Takes the verb, since #290.** Every implementation today ignores it, because
-    /// each surface serves one verb family -- but a merged 0xFC listener has no
-    /// surface-wide answer available. The two production responders answer this
-    /// oppositely and both are right: the scheduler requires a credential when one is
-    /// configured, and the cache requires none because *a credential readable by every
-    /// local build is not a credential*. A merged surface answering `true` refuses
-    /// every local `fastcache-cc` FETCH; answering `false` undoes #289. The cache's
-    /// reason is a property of its VERBS rather than of the port they arrive on, so it
-    /// survives the merge and the answer follows the verb.
-    ///
-    /// Still not folded into `RefusePeer`, which now also takes the verb: that one
-    /// answers before the payload is read and returns an encoded refusal, this one
-    /// feeds `DecidePrePayload` alongside the declared length and the connection's
-    /// credential state. Two questions at one point in the loop, not one wider one
-    /// ([#289](https://github.com/LASTRADA-Software/fastcached/issues/289)).
-    ///
-    /// @param opRaw The third header byte, as received; not necessarily a known verb.
-    /// @return True when unauthenticated peers must be refused this verb.
-    [[nodiscard]] virtual bool AuthRequired(std::uint8_t opRaw) const noexcept = 0;
-
-    /// Check an `AUTH` payload against this surface's credential.
+    /// Check an `AUTH` payload.
     ///
     /// The endpoint terminates `AUTH` rather than passing it to `Answer`, because
     /// what the verb changes is **connection state**, and the responder is shared by
     /// every connection on this surface -- exactly as the daemon's handler keeps
     /// `credentialAccepted` in its own loop rather than in the policy.
     ///
+    /// **The node checks no password.** There is no credential to require before a verb, so
+    /// nothing here gates a frame: admission is `RefusePeer`'s. What an `AUTH` can still
+    /// establish is which MACHINE a verified ticket speaks for, and only the session
+    /// component -- the `Session` family's owner -- can answer that; every other surface is
+    /// never routed an `AUTH` and says so.
+    ///
     /// @param payload The `AUTH` request payload, already bounded by `MaxAuthPayload`
     ///        through the pre-payload gate.
-    /// @return What was established. Only `Accepted` may mark the connection
-    ///         authenticated -- `NoPolicy` is answered `Ok` and verifies nothing.
-    [[nodiscard]] virtual CredentialOutcome CheckCredential(std::span<std::byte const> payload) const = 0;
+    /// @return What was established. Only `Accepted` carries a machine -- `NoPolicy` is
+    ///         answered `Ok` and establishes nothing.
+    [[nodiscard]] virtual CredentialVerdict CheckCredential(std::span<std::byte const> payload) const = 0;
 
     /// Encode -- and count -- a pre-payload refusal `DecidePrePayload` decided.
     ///
@@ -922,6 +962,72 @@ class IFrameResponder
     [[nodiscard]] virtual INodeProver* NodeProver() noexcept = 0;
 };
 
+/// How a refused request gets back to a frame boundary, so the connection stays
+/// usable.
+///
+/// **A PRIVATE enum -- nothing transmits it and nothing stores it -- so it states no
+/// ordinals.** An explicit `= N` here would assert a contract that does not exist.
+enum class Resynchronize : std::uint8_t
+{
+    StepOver, ///< Read and discard exactly what the header declared.
+    Oversize, ///< The declaration is past the cap, so the step-over is bounded too.
+};
+
+/// A refusal decided from a request HEADER, before a payload byte is read.
+///
+/// Returned by value and owning: the reply is bytes this endpoint will hand to a
+/// write, not a view into anything the decision borrowed. `.agent/rules/wire-and-protocol.md`
+/// is explicit that a struct a decoder returns by value must not borrow from what it
+/// decoded, and the same reasoning governs a decision returned to a caller that then
+/// suspends.
+struct HeaderRefusal
+{
+    std::vector<std::byte> reply; ///< What to send. Encoded and counted by the surface.
+    Resynchronize resynchronize;  ///< How to reach the next frame boundary afterwards.
+};
+
+/// What `DecideHeaderRefusal` reads of a surface.
+struct HeaderGate
+{
+    IFrameResponder& responder; ///< What answers -- and encodes and counts -- every refusal.
+    std::string_view what;      ///< The surface's name, for the messages that name it.
+    std::size_t inFlightBytes;  ///< What the surface holds in flight now, read ONCE: the figure decided on.
+};
+
+/// Whether this header is refused, and with what.
+///
+/// **Four refusals, one question, and it writes nothing** -- which is what makes
+/// lifting it out of `ServeConnection` legal at all (#675). That loop holds the
+/// endpoint's exactly-one-writer property, so an extraction that takes a write with
+/// it turns the property into an agreement between two functions; this takes the
+/// DECISION and leaves every byte to the loop, which is why the four `WriteAll`
+/// calls that used to sit in these branches are now one.
+///
+/// **The ORDER is the load-bearing part and it is now stated in one place.** Each
+/// step's reasoning is on the step:
+///
+///  1. The surface-wide cap, on the DECLARED length, so nothing is allocated.
+///  2. Admission, ahead of any resource decision -- a peer this surface will not
+///     serve must not be able to reach one, or a flood of refusable frames exhausts
+///     the budget and makes the surface answer `EndpointBusy` to the peers it does
+///     serve, which is the denial reconstructed one step out (#285, #377).
+///  3. The credential and the per-verb ceiling, through the same `DecidePrePayload`
+///     the daemon's loop calls, so the two surfaces cannot disagree about which
+///     verbs are open before authentication.
+///  4. The in-flight byte budget, last, for the reason step 2 gives.
+///
+/// @param gate What the surface answers with, its name, and the bytes it holds in flight now.
+/// @param peer Who is at the other end: the kernel's host, and what this connection has
+///        proved. A source port is ephemeral and is not an identity, so the address is all an
+///        admission policy had before #1428 -- and a proof is the second thing it now has.
+/// @param decoded The request header, as it decoded.
+/// @param cap The surface-wide request ceiling, read once by the caller.
+/// @return The refusal, or nullopt when the request is to be served.
+[[nodiscard]] std::optional<HeaderRefusal> DecideHeaderRefusal(HeaderGate const& gate,
+                                                               PeerIdentity const& peer,
+                                                               CompileCacheWire::RequestHeader const& decoded,
+                                                               std::size_t cap);
+
 /// Accepts connections and answers framed requests on each until the peer stops.
 ///
 /// Shaped after `WorkerServer` rather than `Server`, and for the reason that governs
@@ -1294,6 +1400,10 @@ class FrameEndpoint
     /// `IFrameResponder::HoldsOwnByteBudget` is an ORDERING that nothing else can
     /// observe (#448).
     [[nodiscard]] std::size_t InFlightBytes() const noexcept;
+
+    /// @return How many connections are being served right now. For tests: forwarded for the same
+    ///         reason as `InFlightBytes`, so a case can see a peer LEAVE rather than infer it.
+    [[nodiscard]] std::size_t OpenConnections() const noexcept;
 
   private:
     FrameEndpoint(NodeIoLoop& io,

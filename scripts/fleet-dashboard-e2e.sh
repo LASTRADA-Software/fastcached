@@ -79,10 +79,12 @@ node_pid=""
 # a loopback-only policy closes the port on its own, and this fixture has the first and
 # deliberately not the second.
 
+# Bounded, where the `kill; wait` it replaced was not: `reap_background_jobs`
+# escalates to SIGKILL and names a node that outlives even that.
 cleanup() {
-    [[ -n "$node_pid" ]] && kill "$node_pid" 2>/dev/null
-    [[ -n "$node_pid" ]] && wait "$node_pid" 2>/dev/null
+    reap_background_jobs
     rm -rf "$workdir"
+    e2e_exit_if_reap_left_survivors
 }
 trap cleanup EXIT
 
@@ -191,7 +193,7 @@ dash_get() {
 
 admin_port="$(free_port)"
 # One port, because since #290 stage 3 a node has one 0xFC surface: the cache verbs,
-# the compile verbs and -- with --serve-scheduler -- the scheduler verbs all arrive
+# the compile verbs and -- where the node's mode serves them -- the scheduler verbs all arrive
 # on --listen-node, and --advertise names that same surface. There used to be a
 # second `worker_port` here for the dedicated compile listener, which no longer
 # exists.
@@ -220,13 +222,14 @@ tls_args=()
 [[ -n "$tls_cert" ]] && tls_args=(--tls-cert "$tls_cert" --tls-key "$tls_key")
 [[ -n "$tls_self_signed" ]] && tls_args=(--tls-self-signed)
 
+# No --scheduler: a node that serves is refused one, and its worker registers with the
+# scheduler its own mode serves, on --listen-node.
 "$node" \
-    --scheduler "127.0.0.1:${sched_port}" \
     --toolchain "$toolchain" \
     --advertise "127.0.0.1:${sched_port}" \
-    --serve-scheduler \
     --listen-node "127.0.0.1:${sched_port}" \
     --listen-raft "127.0.0.1:${raft_port}" \
+    --discovery= \
     --raft-self 127.0.0.1 \
     --cluster-dir "${workdir}/state" \
     --fleet-open \

@@ -4,9 +4,9 @@
 #include "FrameEndpoint.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeRefusal.hpp"
 #include "Responders.hpp"
 
-#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseSigner.hpp>
@@ -15,6 +15,7 @@
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -24,6 +25,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 
 #include <core/platform/Clock.hpp>
@@ -32,6 +34,46 @@ namespace FastCache::Node
 {
 
 class NodeIoLoop;
+
+/// How often a scheduler re-asks its fleet-wide conditions, beside the moments that move them.
+///
+/// **An interval as well as the events, because both rows clear by TIME**: a toolchain nobody has
+/// asked for inside `UnservedToolchains::Window`, a machine whose presence has expired. Answered only
+/// when a verb arrived, a leader nobody talks to would go on reporting a fleet that has changed. Five
+/// seconds against a window of minutes and a presence timeout of ninety seconds: a row lags its cause
+/// by at most this, and a pass costs one registry walk.
+inline constexpr std::chrono::milliseconds SchedulerConditionInterval { 5000 };
+
+/// What the fleet-wide conditions are read from.
+struct SchedulerConditionInputs
+{
+    Distributed::SchedulerService const& service; ///< The fleet as this scheduler sees it.
+    std::string_view ownVersion;                  ///< This build, as `VersionString` spells it.
+    std::string_view ownEndpoint;                 ///< Where this node answers; its name in the version spread.
+    /// How long this scheduler has led without a break -- one term, never interrupted; none when it
+    /// does not lead.
+    std::optional<core::platform::SteadyDuration> leadingFor;
+};
+
+/// Answer every `ConditionScope::Scheduler` row.
+///
+/// **A fleet-wide row is the LEADER's.** On the leader each is raised or cleared; on any other
+/// scheduler each is `not-evaluated`, naming the leader when one is known -- never `clear`, which from
+/// a node that cannot see the fleet would be a confident wrong signal.
+///
+/// **And a leader may say `clear` only once it has WATCHED what the row is about.** What each row
+/// reads -- the leases refused no-worker, the machines that announced -- reaches the leader alone, and
+/// nothing another leader saw carries over a failover. So a leader that has led for less than the
+/// row's observation span reports `not-evaluated` rather than `clear` (`undecided` must not read as
+/// `clear`), with a detail saying WHEN the row decides ("decides in 14 min 30 s"), while anything it
+/// does see is raised at once: a refusal observed is a fact whatever came before it.
+/// @param conditions Where the answers go.
+/// @param inputs What they are read from.
+void EvaluateSchedulerConditions(NodeConditions& conditions, SchedulerConditionInputs const& inputs);
+
+/// The longest span a leader must have led before every fleet-wide row may read `clear`.
+/// @return The longest row's observation span.
+[[nodiscard]] core::platform::SteadyDuration LongestFleetObservation() noexcept;
 
 /// The node's scheduler surface: service, protocol, membership, responder and
 /// listener, owned as one thing.
@@ -66,15 +108,21 @@ class SchedulerTier
     /// @param logger Where the tier reports what it is doing.
     /// @param identityKey This node's identity key pair, as its start resolved it; copied,
     ///        so the tier signs with its own copy for as long as it lives.
+    /// @param conditions The node's condition registry; this tier answers its fleet-wide rows into it
+    ///        before `Start` returns, so `Settle` finds none undecided. Must outlive the tier.
+    /// @param conditionInterval How often the watch re-asks them: `SchedulerConditionInterval` in
+    ///        production, a long interval in a case that drives every evaluation itself.
     /// @return The tier, or why it could not be built.
-    [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, std::string> Start(
+    [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, NodeRefusal> Start(
         NodeConfig const& cfg,
         Distributed::IMembershipOracle const& membership,
         core::platform::IClock& clock,
         core::platform::WallClockRef wallClock,
         IMetricsSink& metrics,
         ILogger& logger,
-        std::optional<Ed25519KeyPair> const& identityKey);
+        std::optional<Ed25519KeyPair> const& identityKey,
+        NodeConditions& conditions,
+        std::chrono::milliseconds conditionInterval);
 
     ~SchedulerTier() = default;
 
@@ -86,26 +134,11 @@ class SchedulerTier
     /// Tell the scheduler what this node is, and who leads if it does not.
     ///
     /// The seam consensus drives, and the only one: every scheduler runs consensus.
+    /// Re-asks the fleet-wide conditions at once: a new leader starts vouching for them, a demoted
+    /// one stops.
     /// @param role What this node is now.
     /// @param leaderEndpoint Where the leader answers, empty when nobody leads.
-    void SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch)
-    {
-        _service.SetRole(role, leaderEndpoint, epoch);
-    }
-
-    /// Take this node's own endorsement of the roster it applied (#178).
-    ///
-    /// The door a node's OWN endorsement reaches its own scheduler through, so a lone
-    /// scheduler certifies its roster without dialling itself; every other voter's arrives on
-    /// NODE-ANNOUNCE, through the same `AcceptEndorsement`.
-    ///
-    /// Kept as well as offered, because it can arrive BEFORE `Administer`: the consensus tier's
-    /// reconciler starts inside its own start, and the tier is handed to this one only after.
-    /// An endorsement offered to a scheduler with no cluster is refused `NoState`, and dropping
-    /// it would leave a lone scheduler with no certified roster until the next refresh -- a
-    /// quarter of an hour of every grant refused. `Administer` offers it again.
-    /// @param endorsement The endorsement.
-    void Endorse(Cluster::RosterEndorsement const& endorsement);
+    void SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch);
 
     /// Give this surface a cluster to administer.
     ///
@@ -113,8 +146,6 @@ class SchedulerTier
     /// `SetRole` is: consensus is constructed after this surface, because it needs
     /// the port this one bound. Left uncalled, the cluster verbs answer
     /// `NoCluster`, which is what a node running no cluster should say.
-    /// And the node's own endorsement, when one arrived before the cluster did, is offered again
-    /// now: see `Endorse`.
     /// @param admin The cluster; must outlive this tier.
     void Administer(Distributed::IClusterAdmin& admin);
 
@@ -172,17 +203,10 @@ class SchedulerTier
         return _service;
     }
 
-    /// The credential this node's surfaces require, or null when none is configured.
-    ///
-    /// Handed out so a second surface requires the SAME one. `AUTH` is a `Session` verb
-    /// and the merged listener routes it here, so a surface holding a policy of its own
-    /// would gate against a credential nothing on this node ever accepts -- which is a
-    /// port that looks guarded and refuses everybody.
-    /// @return The policy, shared; null means membership is the only gate.
-    [[nodiscard]] std::shared_ptr<AuthPolicy const> Policy() const noexcept
-    {
-        return _policy;
-    }
+    /// Answer this scheduler's fleet-wide condition rows now. Thread-safe: the consensus thread (via
+    /// `SetRole`), the watch and a case may all call it, and every evaluation is ordered against every
+    /// role change (`_roleMutex`).
+    void EvaluateConditions();
 
   private:
     SchedulerTier(Distributed::IMembershipOracle const& membership,
@@ -193,7 +217,15 @@ class SchedulerTier
                   std::string signerId,
                   Ed25519KeyPair identityKey,
                   std::string_view clusterId,
-                  std::shared_ptr<AuthPolicy const> policy);
+                  NodeConditions& conditions,
+                  std::string ownEndpoint);
+
+    /// Start the thread that re-asks the fleet-wide rows every @p interval. Called by `Start` once the
+    /// tier is fully built, never from the constructor.
+    void WatchConditions(std::chrono::milliseconds interval);
+
+    /// `EvaluateConditions` with `_roleMutex` already held.
+    void EvaluateConditionsLocked();
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it.
@@ -205,18 +237,36 @@ class SchedulerTier
     Distributed::SchedulerService _service;
     Distributed::SchedulerProtocol _protocol;
 
-    /// The credential every surface on this node requires, or null. Declared before
-    /// `_responder`, which is handed the same object.
-    std::shared_ptr<AuthPolicy const> _policy;
-
     SchedulerResponder _responder;
 
-    /// This node's latest own endorsement, and the lock that serialises it against
-    /// `Administer`: the reconciler thread offers endorsements while `main` hands the service
-    /// its cluster, and the service's cluster pointer is not otherwise guarded until the
-    /// surfaces start serving.
-    std::mutex _ownEndorsementMutex;
-    std::optional<Cluster::RosterEndorsement> _ownEndorsement; ///< Guarded by `_ownEndorsementMutex`.
+    /// Where the fleet-wide rows are answered. Borrowed; outlives this tier.
+    NodeConditions& _conditions;
+
+    /// What `_leadingSince` is read from: the clock the service expires its registry by. Borrowed.
+    core::platform::IClock& _clock;
+
+    /// **A role change and every evaluation are ONE ordered decision.** Without it the watch could
+    /// read `Leader`, the consensus thread demote this node and answer `not-evaluated`, and the watch
+    /// then write its stale raise or clear over that for up to an interval. Held across the role
+    /// change AND the evaluation that follows it, and across every other evaluation, so a pass either
+    /// finishes before a role change (which then answers again) or starts after it.
+    std::mutex _roleMutex;
+    /// When this scheduler's current, unbroken leadership began; none while it does not lead.
+    /// Guarded by `_roleMutex`.
+    std::optional<core::platform::SteadyTimePoint> _leadingSince;
+    /// The term `_leadingSince` belongs to: leading again in another term is a new leadership, since
+    /// another node may have led in between. Guarded by `_roleMutex`.
+    std::uint64_t _leadingEpoch { 0 };
+
+    /// Where this node answers, as its start resolved it -- its name in the version spread. A snapshot:
+    /// after an `--advertise` reload the leader may be listed once more under its own build, which
+    /// changes a count and never which builds serve the fleet.
+    std::string _ownEndpoint;
+
+    /// Re-asks the fleet-wide rows on an interval. **Declared LAST, and the order is load-bearing**:
+    /// its body touches `_service` and `_conditions`, so every member is built before it can start and
+    /// destroyed only after `~jthread` has requested a stop and joined.
+    std::jthread _conditionWatch;
 };
 
 } // namespace FastCache::Node

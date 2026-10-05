@@ -10,6 +10,15 @@
 namespace FastCache
 {
 
+/// The longest host name `QueryHostFacts` reports, in bytes.
+///
+/// DNS's own ceiling on a name, and more than either platform's call returns for a host: a name
+/// that does not fit is reported as empty rather than cut short, since half a hostname matches
+/// nothing while looking like it should. Named because a scheduler records a node's host name as
+/// its display name, and `CompileCacheWire::MaxDisplayNameBytes` is held to this where the name is
+/// put on the wire.
+inline constexpr std::size_t MaxHostNameBytes = 255;
+
 /// What a machine is, as a scheduler needs to know it.
 ///
 /// The facts issue #81 enumerates for a compile node, minus the ones this tree

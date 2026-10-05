@@ -2,10 +2,13 @@
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/InheritedListener.hpp>
 
+#include <cerrno>
 #include <charconv>
 #include <cstdlib>
+#include <format>
 #include <ranges>
 #include <string>
+#include <system_error>
 
 #if !defined(_WIN32)
     #include <fcntl.h>
@@ -43,6 +46,7 @@ namespace
         return value;
     }
 
+#if !defined(_WIN32)
     /// Stop a descriptor from surviving an exec.
     ///
     /// systemd hands its descriptors over WITHOUT close-on-exec, deliberately, so
@@ -51,14 +55,16 @@ namespace
     /// a compiler holding the listening socket keeps the port alive after the
     /// worker exits, so the restart cannot bind and blames an address in use that
     /// nothing visible is using.
-    void MarkCloseOnExec([[maybe_unused]] int descriptor) noexcept
+    ///
+    /// POSIX only, like its one caller: Windows has no socket activation to adopt from, and
+    /// defining it there anyway left an unreferenced function (clang-cl's -Wunused-function).
+    void MarkCloseOnExec(int descriptor) noexcept
     {
-#if !defined(_WIN32)
         auto const flags = ::fcntl(descriptor, F_GETFD);
         if (flags >= 0)
             static_cast<void>(::fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC));
-#endif
     }
+#endif
 
     /// Remove the activation variables from this process's environment.
     void ClearActivationEnvironment() noexcept
@@ -135,6 +141,28 @@ std::vector<int> AdoptInheritedDescriptors()
     ClearActivationEnvironment();
 
     return descriptors;
+}
+
+std::expected<int, std::string> SystemInheritedDescriptors::Duplicate([[maybe_unused]] int descriptor) const
+{
+#if defined(_WIN32)
+    return std::unexpected { std::string { "a supervisor hands no socket over on Windows, so there is none to copy" } };
+#else
+    auto const copy = ::fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0)
+        return std::unexpected { std::format("cannot copy the listening socket a supervisor handed over (descriptor "
+                                             "{}): {}",
+                                             descriptor,
+                                             std::system_category().message(errno)) };
+    return copy;
+#endif
+}
+
+void SystemInheritedDescriptors::Close([[maybe_unused]] int descriptor) const noexcept
+{
+#if !defined(_WIN32)
+    static_cast<void>(::close(descriptor));
+#endif
 }
 
 } // namespace FastCache

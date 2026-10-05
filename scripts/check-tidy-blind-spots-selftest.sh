@@ -141,6 +141,26 @@ run_case accounted pass "1 translation unit(s) contribute nothing in this config
 stage "$(printf '# empty\n')" "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
 run_case unlisted refuse "is analysed by nothing and is not in scripts/tidy-blind-spots.txt"
 
+# The comparison's own `comm` failing is the CHECK failing, and is said: a comm that failed
+# printed nothing, which read as "nothing unanalysed" or "no stale row" -- the pass (#1630).
+# Driven over the trees whose findings it would otherwise report, with a `comm` failing only
+# for its own direction -- exported, so the check's own bash runs it -- so the refusal can only
+# come from the status check and never from the finding.
+commFailingFor() { # case name, the comm flag that fails, wanted refusal, the finding it must not report
+    cases=$((cases + 1))
+    out="$(failingFlag="$2"; comm() { [[ "$1" != "$failingFlag" ]] || return 2; command comm "$@"; }
+           export -f comm; export failingFlag
+           NM="$work/nm" FASTCACHED_SOURCE_DIR="$work" bash "$check" "$work/build" 2>&1)"
+    rc=$?
+    judge "$1" refuse "$3" "$4" "$rc" "$out"
+}
+commFailingFor unanalysed_comm_fails -13 "comm exited 2 listing the measured units the table does not name" \
+    "is analysed by nothing and is not in"
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\tguarded\n')" \
+    "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 40
+commFailingFor stale_comm_fails -23 "comm exited 2 listing the table rows the measurement does not name" \
+    "but it is analysed now"
+
 # A row that is no longer true. A stale exemption hides the next real one.
 stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\tguarded\n')" \
     "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 40

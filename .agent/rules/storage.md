@@ -78,15 +78,15 @@ belongs here is the part that constrains the code.
 **One code, two events, and WHERE decides which.** `Open` is not a scan: it reads
 the two meta slots, walks the free list and looks up two reserved keys — the
 in-flight-conversion marker and the format marker — and `Replay()` is deliberately
-a no-op. **The free-list walk is itself a no-op on any store this project writes**,
-and that has to be said wherever the reach is described (#637): `CommitTxn` pins
-`freeRoot` to `None` on every commit, so the chain is empty by construction and the
-two `Corrupt` refusals inside the walk are unreachable — pinned by a test that seeds
-the chain through `FilePageStore`'s own API, which is a guard on an invariant and
-must not be read as evidence the failure mode is live. So the reach that can
-actually refuse is the meta slots and the two reserved keys. The walk stays because
-the layout is reserved for a future format; what is forbidden is describing it as
-though a store in the field could trip it. So damage inside that reach refuses the process to start, and damage
+a no-op. **The free-list walk is LIVE on every batched store**, and this paragraph
+said the opposite until the file-growth fix: since #990 `FilePageStore` writes the list
+at every group-commit flush and overrides the `freeRoot` that `CommitTxn` still pins to
+`None`, so the walk reads real pages and its `Corrupt` refusals are reachable by damage.
+A free-list LINK past the end of the file is one of them; an ENTRY past the end is NOT,
+because the store now truncates its free tail after a durable flush and both surviving
+metas may still name the cut ids. No list page a surviving meta names is ever cut, which
+is what keeps the link check a damage check. So the reach that can refuse is the meta
+slots, the free-list chain and the two reserved keys. Damage inside that reach refuses the process to start, and damage
 anywhere else is found per key while the process serves. Both `fastcached` and
 `fastcache-compile-node` treat a store that will not open as **fatal**, on purpose
 — the operator named a path, and coming up without it delivers less than was
@@ -240,29 +240,41 @@ damage says which binary it is about.
 
 ## What a tier's byte figures are denominated in
 
-<!-- agent-tripwire: A tier's `bytesUsed` is denominated differently per tier -->
+<!-- agent-tripwire: Both tiers' `bytesUsed` count STORED bytes -->
 
-**The two tiers count different bytes, and neither is wrong.**
-`InMemoryLruStorage` charges its budget the STORED size — `_bytesUsed += storedSize`
-in `InsertNew`, where `storedSize` is whatever `EncodeForStorage` returned, so a
-compressed value is charged what it actually occupies in RAM. `CowTreeStorage`
-charges `originalLen` — `_storeBytes += originalLen` in `CowTreeStorage::StoreEntry`,
-the size before the codec ran. Cited by SYMBOL rather than by offset on purpose: a
-line number in a 1400-line file that is still being edited goes stale silently, and a
-reader who follows a stale one concludes the rule describes whatever now sits there.
+**Both tiers count STORED bytes; the disk tier counts its page footprint.** It was
+otherwise until the file-growth fix (owner decision, 2026-10-03): `CowTreeStorage`
+charged `originalLen`, the size before the codec ran, so a 64 GiB disk budget held
+68.7 GB of logical values in about 11 GB of pages and compression bought the budget
+nothing. Now `InMemoryLruStorage` charges the stored size it always did
+(`_bytesUsed += storedSize` in `InsertNew`), and `CowTreeStorage::FootprintBytes` is
+`IPageStore::PagesInUse()` times the page size -- tree pages, out-of-line value pages,
+the free list's own pages and the two meta slots, compressed values at their compressed
+size. Cited by SYMBOL rather than by offset on purpose: a line number in a file still
+being edited goes stale silently.
 
-So the same object under the same codec moves `bytesUsed` by different amounts in
-the two halves, and the operator-facing consequence is that `--cache-memory` bounds
-**resident** bytes while `--cache-disk` bounds **logical** ones: a compressed disk
-tier reaches its cap holding that much pre-compression data and occupying less than
-that on the filesystem.
+**The budget is the FOOTPRINT, never the file's length.** A free page in the middle of
+the file cannot be cut, so a bound on the length would evict entries without shrinking
+anything and could empty the cache. What holds the length to the footprint is the page
+store: the free list is written into free pages, `Allocate` takes the lowest free id,
+and each durable flush cuts the free tail (`FilePageStore::PagesInUse` states the
+relation). **Both directions:** the file is never shorter than the footprint, and longer
+by the free pages until a flush or later churn removes them --
+`fastcached_tier_file_bytes` reports the length beside `bytesUsed` so the gap is visible.
 
-**A test that asserts compression through the disk tier's `bytesUsed` therefore
-cannot fail.** That is how it was found: the case compared 65536 with 65536 and read
-as *the codec did nothing*, which is a true observation carrying a false claim — the
-tier was compressing correctly the whole time. Measure the STORE FILE for the disk
-half, and `bytesUsed` for the memory half; `ctest -R fastcache-compile-node-tests`
-covers both under `[compression]`.
+**An entry's cost is the pages its eviction frees, which for an inline value is nothing
+until its leaf empties.** The tree frees an empty leaf and never merges underfull ones,
+so a store of small inline values may evict several entries to free one page; values
+large enough to spill to an overflow chain free their pages one eviction at a time.
+`_storeBytes` still totals `originalLen` because the meta records it, and decides
+nothing.
+
+**A test of compression through the disk tier asserts ENTRIES, not bytes.** At one
+budget the codec on must hold strictly more entries than the codec off, with the
+footprint at or under the limit -- "A compressed disk tier holds more under the same
+budget" in `CowTreeStorage_test`. The old trap ran the other way: the case compared
+65536 with 65536 and read as *the codec did nothing* while the tier compressed
+correctly the whole time, because the figure it read did not see the codec.
 
 Neither figure is the RAM a tier costs. `indexBytes` is the key index and is resident
 for both halves, which is why it is reported separately and must not be added to
@@ -355,6 +367,43 @@ describes stops at the first commit that reclaims a page.
 
 Staging into an *uncommitted* write transaction from inside a walk is fine, and
 is what the conversion does.
+
+## Where a flush writes the free list
+
+<!-- agent-tripwire: A flush never extends a file whose free list can hold its own list -->
+
+**A flush never extends a file whose free list can hold its own list, never writes the list
+into a pending free or the previous list's pages, and truncates only `_freeList` ids, before
+the pending frees graduate.** `FilePageStore::WriteFreeListLocked` and
+`TruncateFreeTailLocked`; every clause has already been a bug or is the whole argument for
+why the next one is not.
+
+- **Extending for the list's pages is how a 64 GiB disk tier became a 103 GB file, 89 % free
+  pages.** Each flush grew the file by `ceil(F / idsPerPage)` pages and handed the previous
+  list's pages back to `F`, so a store at its bound grew geometrically. The list's pages come
+  out of `_freeList`; the file is extended only for the shortfall when `_freeList` cannot
+  hold its own list.
+- **The superseded meta is the one a crash or a damaged slot falls back to**, and it still
+  needs two kinds of page that are not in `_freeList`: a PENDING free is in its tree, and the
+  previous list's pages are its `freeRoot`. Writing the list into either damages exactly the
+  fallback -- and a clean reopen never reads the fallback, so no ordinary case can see it.
+  "A flush writes its free list into no page the meta it supersedes still needs"
+  (`FilePageStore_test`) reopens on the superseded meta, and goes red under either theft.
+- **The list NAMES everything free in the new meta's world**, pending frees and the previous
+  list's pages included. Naming is not taking; leaving them out marked them live after every
+  restart.
+- **A truncation cuts only pages free in BOTH surviving metas**, which is why it runs before
+  the pending frees graduate. Both metas may still name a cut id as an ENTRY, so recovery
+  skips an entry past the end of the file; a LINK past the end stays `Corrupt`, because no
+  list page a surviving meta names is ever cut.
+
+**Since the disk budget became the page footprint, a leaked page is lost CAPACITY, not only
+file length** -- it counts against the budget and evicts a live entry, for good. That is why
+only `batched` may carry a budget: the other durabilities persist no free list, so every
+restart would leak every free page, and `fastcached` refuses the combination at startup
+(`DaemonStorageBudgetDurabilityRefusal`). Nothing reclaims a page leaked any other way yet --
+a crash's unflushed extensions, a store written before the fix -- so do not describe the
+footprint as exact on a store with a history.
 
 ## What a refused `Open` can say
 

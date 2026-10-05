@@ -370,7 +370,7 @@ TEST_CASE("A lease expires, with slack for a fleet whose clocks disagree", "[dis
         // legs. Ordered by a comparison first, it cannot happen, and the answer is
         // the correct one -- a clock this far behind has not reached any expiry.
         auto const farFuture =
-            std::chrono::system_clock::time_point { std::chrono::milliseconds { Detail::MaxExpiryMillis } };
+            std::chrono::system_clock::time_point { std::chrono::milliseconds { Distributed::Detail::MaxExpiryMillis } };
         auto const distant = MintLeaseToken(signer,
                                             LeaseClaims { .serial = "17",
                                                           .endpoint = "10.0.0.7:6675",
@@ -666,7 +666,7 @@ TEST_CASE("The cluster and the epoch are inside the signature, not beside it", "
     CHECK(otherCluster != otherEpoch);
 }
 
-TEST_CASE("A version-2 token no longer authenticates", "[distributed][lease][token]")
+TEST_CASE("A version-2 token no longer authenticates, and the layout is version 4", "[distributed][lease][token]")
 {
     // The cost of moving the signature from the cluster key to the issuing voter's own key
     // (#178), stated rather than discovered: every outstanding grant minted by an older build
@@ -676,14 +676,15 @@ TEST_CASE("A version-2 token no longer authenticates", "[distributed][lease][tok
     // Refused as `Malformed` rather than `Unauthorized`, which is the version field doing its
     // job -- and asked BEFORE the signature, so a version-2 token carrying a genuine version-3
     // signature over its own bytes is refused for its version and nothing else.
-    CHECK(LeaseTokenVersion == 3);
+    // 4 since W-4, which put the granted worker's identity key into the claims.
+    CHECK(LeaseTokenVersion == 4);
 
     auto const signer = Testing::TestLeaseSigner();
     Testing::FixedLeaseRoster const roster;
     auto claims = Grant();
     claims.signer = std::string { signer.SignerId() };
-    auto const packedV2 = Detail::PackClaims(2, claims);
-    auto const signature = signer.Sign(Detail::SignedLeaseMessage(packedV2));
+    auto const packedV2 = Distributed::Detail::PackClaims(2, claims);
+    auto const signature = signer.Sign(Distributed::Detail::SignedLeaseMessage(packedV2));
     auto const envelope =
         WireFields::Encode({ std::span<std::byte const> { packedV2 }, std::span<std::byte const> { signature } });
 
@@ -791,8 +792,8 @@ TEST_CASE("The claim fields are framed, not joined", "[distributed][lease][token
 
 TEST_CASE("A signature over the claims without the lease's label is not a lease", "[distributed][lease][token]")
 {
-    // A node's identity key signs more than grants: every Raft handshake transcript and every
-    // roster endorsement too (#178). One key serving several constructions is how a signature
+    // A node's identity key signs more than grants: every Raft handshake transcript, node proof
+    // and fleet summary too (#178). One key serving several constructions is how a signature
     // produced for one comes to be accepted for another, so a grant's message starts with its
     // own label. A signature over the bare packed claims -- what a construction with no label,
     // or another's, would produce -- verifies under the right key and is still no grant.
@@ -800,7 +801,7 @@ TEST_CASE("A signature over the claims without the lease's label is not a lease"
     Testing::FixedLeaseRoster const roster;
     auto claims = Grant();
     claims.signer = std::string { signer.SignerId() };
-    auto const packed = Detail::PackClaims(LeaseTokenVersion, claims);
+    auto const packed = Distributed::Detail::PackClaims(LeaseTokenVersion, claims);
 
     auto const envelopeOver = [&packed](std::span<std::byte const> message, Ed25519KeyPair const& key) {
         auto const signature = key.Sign(message);
@@ -814,8 +815,10 @@ TEST_CASE("A signature over the claims without the lease's label is not a lease"
 
     // The control, built the same way with the label: accepted, so the refusal above is the
     // label's and not the helper's.
-    CHECK(AuthenticateLeaseToken(roster, envelopeOver(Detail::SignedLeaseMessage(packed), Testing::TestKeyPair("scheduler")))
-              .has_value());
+    CHECK(
+        AuthenticateLeaseToken(
+            roster, envelopeOver(Distributed::Detail::SignedLeaseMessage(packed).Bytes(), Testing::TestKeyPair("scheduler")))
+            .has_value());
 }
 
 TEST_CASE("A grant's signature is Ed25519 over the lease label and the claims as packed", "[distributed][lease][token]")
@@ -835,8 +838,51 @@ TEST_CASE("A grant's signature is Ed25519 over the lease label and the claims as
     REQUIRE(presented.size() == Ed25519SignatureBytes);
     Ed25519Signature signature {};
     std::ranges::copy(presented, signature.begin());
-    auto const message = WireFields::Encode({ AsBytes(std::string_view { "fastcache-lease-v3" }), packed });
+    auto const message = WireFields::Encode({ AsBytes(std::string_view { "fastcache-lease-v4" }), packed });
     CHECK(Ed25519Verify(signer.PublicKey(), message, signature));
+}
+
+TEST_CASE("A grant naming another machine's identity key is refused at a worker answering on its endpoint",
+          "[distributed][lease][token][reply-seal]")
+{
+    // W-4: an endpoint is a name, and a name can come to answer on another machine -- a VPN address
+    // reassigned, a long-TTL DNS record. The claims name the granted worker's KEY too, inside the
+    // signature, so a fleet worker that has come to hold the endpoint refuses the job before a
+    // compiler runs, as a grant for a different worker -- and says which, in the operator's words.
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const laptopKey = Testing::TestKeyPair("laptop").PublicKey();
+    auto const otherKey = Testing::TestKeyPair("desk").PublicKey();
+    auto claims = Grant();
+    claims.workerKey = std::string { AsStringView(std::span<std::byte const> { laptopKey }) };
+    auto const token = MintLeaseToken(signer, claims);
+
+    // The claim round-trips through the signature, byte for byte.
+    auto const authentic = AuthenticateLeaseToken(roster, token);
+    REQUIRE(authentic.has_value());
+    CHECK(Unwrap(authentic).workerKey == claims.workerKey);
+
+    auto expectation = Worker();
+    auto const keyText = [](Ed25519PublicKey const& key) {
+        return std::string { AsStringView(std::span<std::byte const> { key }) };
+    };
+
+    // At the machine holding the named key: honoured.
+    auto const ownKey = keyText(laptopKey);
+    expectation.identityKey = ownKey;
+    CHECK(VerifyLeaseToken(roster, token, expectation, Noon()).has_value());
+
+    // At another machine answering on the same endpoint: refused as a grant for another worker.
+    auto const deskKey = keyText(otherKey);
+    expectation.identityKey = deskKey;
+    auto const refused = VerifyLeaseToken(roster, token, expectation, Noon());
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().reason == LeaseRefusalReason::EndpointMismatch);
+    CHECK(refused.error().detail.contains("another identity key"));
+
+    // A grant naming no key is judged by its endpoint alone, as every grant was before.
+    expectation.identityKey = deskKey;
+    CHECK(VerifyLeaseToken(roster, MintLeaseToken(signer, Grant()), expectation, Noon()).has_value());
 }
 
 TEST_CASE("A malformed token is refused rather than partly believed", "[distributed][lease][token]")

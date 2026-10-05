@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConditions.hpp"
 
-#include <FastCache/Core/Utf8.hpp>
+#include <FastCache/Core/PeerText.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 
 #include <cassert>
 #include <format>
+#include <memory>
+#include <mutex>
 #include <ranges>
 #include <utility>
 
@@ -16,55 +18,12 @@ namespace
 {
     namespace Wire = CompileCacheWire;
 
-    /// What a clamped detail ends with, so a reader can tell it was cut.
-    constexpr std::string_view Clamped = "...";
-
-    /// @p raw as TEXT: every byte that belongs to no UTF-8 sequence written `\xNN`.
-    /// @param raw What a component observed; a path may be in any encoding its host chose.
-    /// @return Well-formed UTF-8.
-    [[nodiscard]] std::string AsText(std::string_view raw)
-    {
-        std::string text;
-        text.reserve(raw.size());
-        while (!raw.empty())
-        {
-            auto const length = Utf8SequenceLength(raw);
-            if (length == 0)
-            {
-                text += std::format("\\x{:02X}", static_cast<unsigned>(static_cast<unsigned char>(raw.front())));
-                raw.remove_prefix(1);
-                continue;
-            }
-            text.append(raw.substr(0, length));
-            raw.remove_prefix(length);
-        }
-        return text;
-    }
-
-    /// @p text cut to @p ceiling bytes on a code-point boundary, marked when it was cut.
-    /// @param text Well-formed UTF-8.
-    /// @param ceiling The most bytes it may take.
-    /// @return The text, or a prefix of it ending in `Clamped`.
-    [[nodiscard]] std::string ClampedTo(std::string text, std::size_t ceiling)
-    {
-        if (text.size() <= ceiling)
-            return text;
-        auto cut = ceiling - Clamped.size();
-        // Back off a continuation byte at a time, so the cut never splits a sequence -- a split
-        // one would be the very non-text this clamp runs after `AsText` to avoid.
-        while (cut > 0 && (static_cast<unsigned char>(text[cut]) & Utf8ContinuationMask) == Utf8ContinuationMark)
-            --cut;
-        text.resize(cut);
-        text += Clamped;
-        return text;
-    }
-
     /// A detail as a row carries it: text, and inside the ceiling.
     /// @param raw What was observed.
     /// @return The detail.
     [[nodiscard]] std::string DetailOf(std::string_view raw)
     {
-        return ClampedTo(AsText(raw), Wire::MaxConditionDetailBytes);
+        return BoundedPeerText(raw, Wire::MaxConditionDetailBytes);
     }
 } // namespace
 
@@ -179,12 +138,45 @@ std::string ListDetail(std::string_view lead, std::vector<std::string> const& it
         // Room for this item AND for the count of whatever follows it, so the list is never cut
         // with no room left to say how much was left out.
         auto const tail = rest == 0 ? std::string {} : std::format(" and {} more", rest);
-        auto const candidate = std::format("{}{}", separator, AsText(items[index]));
+        auto const candidate = std::format("{}{}", separator, EscapeNonUtf8(items[index]));
         if (detail.size() + candidate.size() + tail.size() > Wire::MaxConditionDetailBytes)
             return detail + std::format(" and {} more", items.size() - index);
         detail += candidate;
     }
     return detail;
+}
+
+void WatchAcceptLoops(core::net::AcceptLoopHealth& health, NodeConditions& conditions)
+{
+    conditions.Clear(NodeCondition::SurfaceNotAccepting);
+    conditions.Clear(NodeCondition::SurfaceAcceptDegraded);
+    // The registry calls a listener OUTSIDE its own lock, from whichever loop recorded the event, so
+    // two loops' listeners can run at once. Without this, one that snapshotted before the other's
+    // record can write after it -- a Recovered seen as "none degraded" landing last clears the row
+    // while another surface is degraded, and nothing re-raises it, since Degraded is said once per
+    // episode. Held across the snapshot AND the write: a body that runs after a record then reads
+    // the registry after it, so whichever body writes last wrote from the newest snapshot.
+    auto const serialised = std::make_shared<std::mutex>();
+    health.subscribe([&health, &conditions, serialised](core::net::AcceptLoopEvent const&) {
+        std::scoped_lock const lock { *serialised };
+        // Every surface, re-read rather than accumulated here: the registry is the one record, and
+        // a second list beside it would be a second answer to the same question.
+        std::vector<std::string> stopped;
+        std::vector<std::string> degraded;
+        for (auto const& surface: health.snapshot())
+            (surface.kind == core::net::AcceptLoopEventKind::Degraded ? degraded : stopped)
+                .push_back(std::format("{} ({})", surface.surface, surface.reason));
+        // Latched: a surface that gave up stays in the registry for good, so an empty list here
+        // only ever means none has yet.
+        if (!stopped.empty())
+            conditions.Raise(NodeCondition::SurfaceNotAccepting,
+                             ListDetail("surfaces that stopped accepting connections:", stopped));
+        if (degraded.empty())
+            conditions.Clear(NodeCondition::SurfaceAcceptDegraded);
+        else
+            conditions.Raise(NodeCondition::SurfaceAcceptDegraded,
+                             ListDetail("surfaces backing off on failed accepts:", degraded));
+    });
 }
 
 } // namespace FastCache::Node

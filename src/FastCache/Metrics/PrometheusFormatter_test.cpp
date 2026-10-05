@@ -323,7 +323,7 @@ TEST_CASE("A tiered cache renders one labelled sample per tier", "[metrics][prom
     tiers[static_cast<std::size_t>(StorageTier::Memory)] =
         StorageStats { .itemCount = 11, .bytesUsed = 2048, .bytesLimit = 4096, .evictions = 7 };
     tiers[static_cast<std::size_t>(StorageTier::Disk)] =
-        StorageStats { .itemCount = 900, .bytesUsed = 1'000'000, .bytesLimit = 0, .evictions = 1 };
+        StorageStats { .itemCount = 900, .bytesUsed = 1'000'000, .bytesLimit = 0, .fileBytes = 1'310'720, .evictions = 1 };
 
     auto const body = RenderPrometheus(
         metrics,
@@ -342,6 +342,14 @@ TEST_CASE("A tiered cache renders one labelled sample per tier", "[metrics][prom
         CHECK(body.contains("fastcached_tier_evictions_total{tier=\"memory\"} 7\n"));
         CHECK(body.contains("fastcached_tier_evictions_total{tier=\"disk\"} 1\n"));
     }
+    SECTION("the file's length renders for the tier with a file, and only for it")
+    {
+        // Beside the footprint `bytes_used` carries, so an operator sees both what the
+        // budget bounds and what the filesystem is charged. The memory tier has no file,
+        // and a zero there would read as an empty one.
+        CHECK(body.contains("fastcached_tier_file_bytes{tier=\"disk\"} 1310720\n"));
+        CHECK_FALSE(body.contains("fastcached_tier_file_bytes{tier=\"memory\"}"));
+    }
     SECTION("HELP and TYPE appear once per series, not once per label")
     {
         // Repeating them per label value is what a scraper rejects, and it takes
@@ -349,6 +357,7 @@ TEST_CASE("A tiered cache renders one labelled sample per tier", "[metrics][prom
         for (auto const& name: { "fastcached_tier_items",
                                  "fastcached_tier_bytes_used",
                                  "fastcached_tier_bytes_limit",
+                                 "fastcached_tier_file_bytes",
                                  "fastcached_tier_evictions_total" })
         {
             INFO("series " << name);

@@ -430,6 +430,18 @@ gate_known_defects_unusable_status=77
 # shellcheck source=lib/third-party-roots.sh
 . "${repo_root}/scripts/lib/third-party-roots.sh" \
     || { echo "${gate_failed_marker} cannot read scripts/lib/third-party-roots.sh, so no enumerator in this gate can tell third-party files from this repository's own" >&2; exit 1; }
+# The header filter's predicate and its table of SPELLINGS, shared with
+# `ctest -R tidy-header-filter` so the two cannot disagree about what clang-tidy takes.
+# shellcheck source=lib/header-filter.sh
+. "${repo_root}/scripts/lib/header-filter.sh" \
+    || { echo "${gate_failed_marker} cannot read scripts/lib/header-filter.sh, so the header filter cannot be judged" >&2; exit 1; }
+# The one `/proc/<pid>/stat` reader, shared with reap-my-gate.sh's ancestry walk.
+# shellcheck source=lib/proc-stat.sh
+. "${repo_root}/scripts/lib/proc-stat.sh" \
+    || { echo "${gate_failed_marker} cannot read scripts/lib/proc-stat.sh, so the gate lock's holder cannot be walked" >&2; exit 1; }
+# shellcheck source=lib/git-scrub.sh
+. "${repo_root}/scripts/lib/git-scrub.sh" \
+    || { echo "${gate_failed_marker} cannot read scripts/lib/git-scrub.sh, so the gate's own scratch repositories could not be made safely" >&2; exit 1; }
 
 # ctest's own totals line, which three readers here hinge on: it is what
 # `skip_report` requires before it will conclude anything from a missing block,
@@ -845,22 +857,17 @@ gate_lock_holder() {
 
 # One process's parent pid, or nothing when it cannot be read. `/proc/<pid>/stat` first,
 # so a Linux host needs no `ps`: a container carrying util-linux and not procps otherwise
-# walks no ancestry at all, and its gate queues behind its own re-exec. The command name
-# in that file is parenthesised and may itself contain `) `, so the fields are read after
-# the LAST one. @param 1 pid
+# walks no ancestry at all, and its gate queues behind its own re-exec. The file is read by
+# `proc_stat_ppid` (scripts/lib/proc-stat.sh), the one parser reap-my-gate.sh shares -- the
+# command name in it may itself contain `) `, which the `x) y` row below pins. @param 1 pid
 gate_lock_ppid() {
-    local stat=""
-    if [[ -r "/proc/$1/stat" ]]; then
-        IFS= read -r stat < "/proc/$1/stat" 2>/dev/null || true
-    fi
-    if [[ -n "$stat" ]]; then
-        stat="${stat##*) }"
-        stat="${stat#* }"
-        printf '%s\n' "${stat%% *}"
+    local out=""
+    if proc_stat_ppid "$1"; then
+        printf '%s\n' "$proc_stat_reply"
         return 0
     fi
-    stat="$(ps -o ppid= -p "$1" 2>/dev/null)" || return 0
-    printf '%s\n' "${stat// /}"
+    out="$(ps -o ppid= -p "$1" 2>/dev/null)" || return 0
+    printf '%s\n' "${out// /}"
 }
 
 # This process's ancestors as `gate_lock_holder` records, nearest first. Bounded like
@@ -1685,9 +1692,19 @@ compiler_shim_verdict() {
 # `grep -E` is POSIX ERE and clang-tidy is `llvm::Regex`, which is a MODEL of the
 # tool rather than the tool -- stated because a model more permissive than what
 # it stands for produces confident wrong agreement. It is sound for the patterns
-# this file has carried (character classes, alternation, `.*`) and it is checked
-# against the real analyser by `scripts/check-header-filter.sh`, which plants a
-# violation and asks clang-tidy itself.
+# this file has carried (character classes, alternation, `.*`, and a backslash
+# inside a bracket, which is literal to both). This gate never checks that against the
+# real analyser: it does not run `scripts/tidy-sweep.sh`. That sweep's `HeaderCanary`
+# plants a finding in two headers and stops unless clang-tidy itself reports both, but
+# clang spells those paths with `/` on Linux, so there it passes under a `/`-only
+# pattern too -- the BACKSLASH half is asked of the real analyser only on the
+# `clang-tidy-windows` leg. Everywhere else the spellings are `ctest -R
+# tidy-header-filter`'s question, asked of this model. This comment used to cite
+# `scripts/check-header-filter.sh` for that, and no such script has ever existed in this
+# repository. Before the canary the agreement was checked by hand, with clang-tidy
+# 22.1.8 on Windows, 2026-09-29: a violation planted in a header under `src/` reported 0
+# times under a `/`-only filter and twice under `[/\\]` -- which is also why this
+# coverage count, matching POSIX paths only, could not see that defect.
 #
 # @param 1 Path to the `.clang-tidy` to read.
 # @param 2 Repository root, since the filter is matched against absolute paths.
@@ -1695,12 +1712,10 @@ header_filter_coverage() {
     local config="$1" root="$2"
     [[ -r "$config" ]] || { echo "no-config"; return 0; }
 
-    local include exclude includeAll excludeAll
-    includeAll="$(sed -n "s/^HeaderFilterRegex:[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" "$config")"
-    include="${includeAll%%$'\n'*}"
+    local include exclude
+    include="$(header_filter_config "$config" HeaderFilterRegex)"
     [[ -n "$include" ]] || { echo "no-regex"; return 0; }
-    excludeAll="$(sed -n "s/^ExcludeHeaderFilterRegex:[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" "$config")"
-    exclude="${excludeAll%%$'\n'*}"
+    exclude="$(header_filter_config "$config" ExcludeHeaderFilterRegex)"
 
     # The tracked set, not a directory walk: a header the repository does not
     # carry is not one this gate owes an opinion about, and a build directory is
@@ -1723,18 +1738,30 @@ header_filter_coverage() {
     # machine could see it. A local guard that models one layout reproduces the
     # defect it exists to catch.
     #
-    # Asked as PATHS rather than as files that must exist: a build directory may
-    # legitimately not be there yet, and a check that only bites after a build does
-    # not bite when it is first needed.
-    local dep
-    for dep in "${root}/out/build/gate-clang-debug/_deps/catch2-src/src/catch2/catch_test_macros.hpp" \
-               "${root}/.cache/CPM/catch2/0123456789abcdef/src/catch2/catch_test_macros.hpp"; do
-        if grep -qE "$include" <<< "$dep" \
-            && { [[ -z "$exclude" ]] || ! grep -qE "$exclude" <<< "$dep"; }; then
-            echo "deps-leak"
-            return 0
-        fi
-    done
+    # DERIVED from the packages this tree declares (`header_filter_dependency_paths`: every
+    # `CPMAddPackage(NAME ...)`, in both layouts and both header shapes), so a dependency
+    # added tomorrow is asked about without editing this; asked as PATHS rather than files
+    # that must exist; and REACHED in any spelling -- a filter that takes catch2 only when
+    # its path is spelled with backslashes drowns a Windows sweep and no other. A tree that
+    # declares no package is its own word: a parser that found nothing is not a tree
+    # without dependencies.
+    # The roots are asked FIRST because the derivation reads them (only first-party CMake
+    # files declare this tree's packages): an unreadable roots file would otherwise surface
+    # as `no-dependencies`, naming the wrong cause.
+    local dependencies depHit
+    third_party_path_pattern "$root" > /dev/null || { echo "no-roots"; return 0; }
+    dependencies="$(header_filter_dependency_paths "$root")" || { echo "no-dependencies"; return 0; }
+    # Each classifier's status CHECKED, here and below: one that refused printed nothing, and an
+    # empty count is not `0/...`, so it read as `deps-leak` -- the filter blamed for the check
+    # failing, round 10's collapse in `check-tidy-header-filter.sh` (#1630). The refusal is
+    # named through `header_filter_refusal`, which keeps a filter that does not compile the
+    # FILTER's fault.
+    depHit="$(header_filter_reach "$include" "$exclude" "$root" < <(printf '%s\n' "$dependencies"))" \
+        || { header_filter_refusal "$?" "dependency reach"; return 0; }
+    if [[ "${depHit%%/*}" != 0 ]]; then
+        echo "deps-leak"
+        return 0
+    fi
 
     # TRACKED used to be the same set as FIRST-PARTY, and everything above rests on
     # that: "dependency trees are untracked" is why coverage cannot see `deps-leak`,
@@ -1759,8 +1786,12 @@ header_filter_coverage() {
     # the wrong cause, whose remedy is to widen the filter over vendored code.
     local pattern vendored firstParty thirdPartyRoot
     pattern="$(third_party_path_pattern "$root")" || { echo "no-roots"; return 0; }
-    vendored="$(grep -E "$pattern" <<< "$headers" || true)"
-    firstParty="$(grep -vE "$pattern" <<< "$headers" || true)"
+    # Through the library's own selection, never a `grep ... || true` here: that turned a
+    # grep that failed into an empty set, so no vendored header was asked about.
+    vendored="$(third_party_paths "$root" "$headers")" \
+        || { echo "check-failed third-party selection"; return 0; }
+    firstParty="$(first_party_paths "$root" "$headers")" \
+        || { echo "check-failed first-party selection"; return 0; }
 
     # A convention that has stopped describing anything reads exactly like one that
     # is being honoured: if a root's directory is there, it must carry tracked files,
@@ -1793,7 +1824,8 @@ header_filter_coverage() {
     # three sites to correct instead of one. An empty vendored set answers `0/0`, so
     # a tree with no vendored headers takes no special case.
     local vendorHit
-    vendorHit="$(header_filter_match "$include" "$exclude" "$root" <<< "$vendored")"
+    vendorHit="$(header_filter_reach "$include" "$exclude" "$root" <<< "$vendored")" \
+        || { header_filter_refusal "$?" "third-party reach"; return 0; }
     if [[ "${vendorHit%%/*}" != 0 ]]; then
         echo "third-party-leak ${vendorHit%% *}"
         return 0
@@ -1804,35 +1836,17 @@ header_filter_coverage() {
     # is not a tree this gate can report on.
     [[ -n "$firstParty" ]] || { echo "no-headers"; return 0; }
 
-    header_filter_match "$include" "$exclude" "$root" <<< "$firstParty"
+    header_filter_match "$include" "$exclude" "$root" <<< "$firstParty" \
+        || header_filter_refusal "$?" coverage
 }
 
-# The matching itself, over repo-relative header paths on stdin, as
-# `<matched>/<total>` plus the first unmatched path when there is one.
-#
-# Split from the enumeration so `--self-test` can drive it at a SYNTHETIC root:
-# the outcome under test is a property of where a checkout lives, and a case that
-# used the real root would assert the opposite thing depending on which machine
-# ran it -- passing on CI's `.../fastcached/` for the very layout that fails in a
-# lane worktree, which is #1040's own blind spot rebuilt inside its guard.
-#
-# @param 1 The include regex. @param 2 The exclude regex, possibly empty.
-# @param 3 The root the filter is matched against, since clang-tidy sees absolute paths.
-header_filter_match() {
-    local include="$1" exclude="$2" root="$3"
-    local total=0 matched=0 first_missed="" path
-    while IFS= read -r path; do
-        [[ -n "$path" ]] || continue
-        total=$((total + 1))
-        if grep -qE "$include" <<< "$root/$path" \
-            && { [[ -z "$exclude" ]] || ! grep -qE "$exclude" <<< "$root/$path"; }; then
-            matched=$((matched + 1))
-        elif [[ -z "$first_missed" ]]; then
-            first_missed="$path"
-        fi
-    done
-    echo "${matched}/${total}${first_missed:+ $first_missed}"
-}
+# The matching itself is `header_filter_match` (coverage, every spelling) and
+# `header_filter_reach` (a leak, any spelling) in `scripts/lib/header-filter.sh`,
+# split from the enumeration so `--self-test` can drive them at a SYNTHETIC root:
+# where a checkout lives is part of the outcome, and a case that used the real root
+# would assert the opposite thing depending on which machine ran it -- passing on
+# CI's `.../fastcached/` for the very layout that fails in a lane worktree, which is
+# #1040's own blind spot rebuilt inside its guard.
 
 # What the gate says about that coverage.
 #
@@ -1848,6 +1862,9 @@ header_filter_report() {
     local counts="${verdict%% *}" missed=""
     [[ "$verdict" == *" "* ]] && missed="${verdict#* }"
     local matched="${counts%%/*}" total="${counts##*/}"
+    # `src/x.hpp (windows spelling)` names the spelling a path was missed in.
+    local spelling="${missed##*(}"
+    spelling="${spelling%)}"
 
     case "$verdict" in
         '')
@@ -1870,6 +1887,10 @@ header_filter_report() {
             echo "clang-tidy's header filter in $config would report findings inside a DEPENDENCY tree, which carries no .clang-tidy of its own and would bury every first-party finding under someone else's code -- measured at 228 reported catch2 lines from a single test translation unit. Coverage cannot see this, because dependency trees are untracked and so are absent from the set the count is taken over: a filter that takes catch2 still reports perfect coverage. Both layouts are checked, because they disagree -- FetchContent unpacks into out/build/*/_deps/ locally while build.yml sets CPM_SOURCE_CACHE to .cache/CPM, and a pattern excluding only the first passed every developer machine and failed CI inside catch2. Fix it by narrowing what the filter INCLUDES to this repository's own roots under src/, not by adding another dependency location to exclude -- an exclusion bets on where the world puts things, and that bet has now lost once"
             return 1
             ;;
+        no-dependencies)
+            echo "which dependency layouts the filter must keep out cannot be derived from the tracked CMake files of the tree being measured: they declare no CPMAddPackage(NAME ...) at all, or a CPMAddPackage call the derivation cannot name -- one with no NAME, or one whose NAME is spelled through a variable -- or the reader over them failed (it says which, and where, on stderr above). Read as none -- or as fewer than the tree declares -- a filter that takes a dependency's headers would pass. This is the CHECK refusing to report, not a verdict about the filter"
+            return 1
+            ;;
         third-party-leak*)
             echo "clang-tidy's header filter in $config reaches inside a third-party root named in scripts/lib/third-party-roots.txt -- it would report on ${verdict#* } of the tracked headers under those roots -- and they hold third-party source copied VERBATIM from upstream. Those files are not ours to fix, and with WarningsAsErrors: \"*\" the build would fail on naming rules they have no reason to satisfy -- while every first-party finding drowns underneath them, which is the same drowning measured at 228 catch2 lines from one translation unit. Coverage cannot see this: a filter that takes a third-party root counts every tracked header as covered and reports a perfect score. Fix it by narrowing what the filter INCLUDES to this repository's own roots under src/, never by adding the root to an exclusion -- an exclusion bets on where third-party code will be put next, and that bet has already lost once here"
             return 1
@@ -1882,17 +1903,42 @@ header_filter_report() {
             echo "scripts/lib/third-party-roots.txt could not be read under the tree being measured, or names no root (the reader says which on stderr above), so which tracked headers are third-party cannot be answered. Read as none, every vendored header would count as first-party and the filter declining them would present as a PARTIAL match, whose remedy is to widen the filter over vendored code. This is the CHECK refusing to report, not a verdict about the filter"
             return 1
             ;;
+        check-failed*)
+            echo "the header-filter coverage check could not answer for $config: the ${verdict#* } failed, and the step that failed says why on stderr above -- a grep that exited above 1 or was killed, or a roots file that could not be read. This is the CHECK failing, not a verdict about the filter: read as one, an empty answer named a dependency leak or a miss nothing measured (#1630). A filter that does not compile is not this outcome; it is named as the filter's own fault"
+            return 1
+            ;;
+        does-not-compile)
+            echo "clang-tidy's header filter in $config does not compile as an extended regular expression -- the line above says which of HeaderFilterRegex and ExcludeHeaderFilterRegex, and grep's own complaint is above that. That is a verdict about the FILTER: clang-tidy would refuse it too, so fix the pattern"
+            return 1
+            ;;
+        0/*' spelling)')
+            echo "clang-tidy's HeaderFilterRegex in $config matches NONE of this tree's $total tracked first-party headers in the ${spelling} -- it takes them in another spelling, so a build that opens them by this one discards every header finding as non-user code while reading clean. Measured on Windows, where the MSVC database's include directories are backslashed: a planted header violation reported 0 times under a /-only filter. Accept either separator ([/\\\\]) in the pattern rather than adding a second copy of it for one platform; ctest -R tidy-header-filter asks the same question on every platform"
+            return 1
+            ;;
         0/*)
             echo "clang-tidy's HeaderFilterRegex in $config matches NONE of this tree's $total tracked first-party headers, so every header finding would be discarded as non-user code and the analyser would report clean by analysing nothing (#1040). This is a property of where this checkout LIVES: three patterns anchored on the directory name have now missed a real layout, most recently every lane worktree at .../fastcached-worktrees/<lane>/src/. Fix the pattern, do not delete this check"
             return 1
             ;;
     esac
 
+    # What is left must be a COUNT. A word no arm above names -- a verdict added to the reader
+    # and not here -- splits into `matched` and `total` as the same word, compares equal, and
+    # read as "covers all <word> tracked first-party headers": a pass.
+    if [[ -z "$matched" || -z "$total" || "$matched$total" == *[!0-9]* ]]; then
+        echo "the header-filter coverage check answered '$verdict' for $config, which is neither a count nor a word this reporter knows. That is a bug in the GATE, not a verdict about this tree: header_filter_coverage gained an answer header_filter_report has no arm for"
+        return 1
+    fi
+
     if [[ "$matched" == "$total" ]]; then
         echo "== clang-tidy header filter covers all $total tracked first-party headers"
         return 0
     fi
-    echo "clang-tidy's HeaderFilterRegex in $config matches only $matched of this tree's $total tracked first-party headers, so findings in the other $((total - matched)) would be discarded silently -- for example $missed. A partial match is worse than none, because the analyser still reports findings and so looks like it is working (#1040)"
+    # A miss named in one spelling is a SEPARATOR cause -- the header is taken in another
+    # spelling -- so it is not pointed at #1040, which is where a checkout LIVES.
+    local cause="(#1040)"
+    [[ "$missed" == *" spelling)" ]] \
+        && cause="-- and the miss is in the ${spelling}: those headers are taken in another spelling, so the cause is the pattern's SEPARATORS, not where this checkout lives. Accept either separator ([/\\\\]) rather than adding a second copy of the pattern for one platform"
+    echo "clang-tidy's HeaderFilterRegex in $config matches only $matched of this tree's $total tracked first-party headers, so findings in the other $((total - matched)) would be discarded silently -- for example $missed. A partial match is worse than none, because the analyser still reports findings and so looks like it is working ${cause}"
     return 1
 }
 
@@ -2476,6 +2522,22 @@ gate_reached_tests() {
         | awk '/^[ \t]*Test[ \t]+#[0-9]+:/ { sub(/^[^:]*:[ \t]*/, ""); if (length($0)) print }'
 }
 
+# How many non-EMPTY lines @p 1 holds -- a line of spaces counts, as it did for the `grep -c .`
+# this replaced -- counted in THIS shell. Not `grep -c . || true`: a grep
+# that failed or was killed printed nothing, the `|| true` kept the empty answer, and an empty
+# count is `-eq 0` -- "every one reachable" over a gap that named tests (#1630). No subprocess
+# here, so nothing can be killed into answering "none". Not `e2e-common.sh`'s `count_lines`,
+# which counts a FILE with `wc`. The lines arrive through a process substitution the SHELL
+# reads, never a herestring, which deadlocks at 64 KiB on Git Bash (#1591).
+# @param 1 The text. @return The count, on stdout.
+nonempty_line_count() {
+    local line n=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] && n=$((n + 1))
+    done < <(printf '%s\n' "$1")
+    echo "$n"
+}
+
 # The report: which declared tests no gate configuration registers.
 #
 # PURE. It reads no clock, opens no file and runs no ctest -- everything it says
@@ -2507,9 +2569,22 @@ coverage_gap() {
     local declared="$1" reached="$2" contributed="$3" asked="$4"
     local literals unresolved names count gap gapCount
 
-    literals="$(printf '%s\n' "$declared" | awk '$1 == "literal" { print $2 }' | sort -u)"
-    unresolved="$(printf '%s\n' "$declared" | awk '$1 == "unresolved" { print $2 }' | sort -u)"
-    count="$(printf '%s\n' "$literals" | grep -c . || true)"
+    # Each derivation's status CHECKED (#1630): an awk or sort that failed printed nothing, or
+    # part of its answer. An empty `literals` read as "no registrations", blaming the work
+    # tree; a SHORT one dropped names the gap would have named, and an empty `unresolved`
+    # dropped the disclosure below -- both a pass. `pipefail` makes the status the pipeline's.
+    local derived=0
+    literals="$(printf '%s\n' "$declared" | awk '$1 == "literal" { print $2 }' | sort -u)" || derived=$?
+    if [[ "$derived" -eq 0 ]]; then
+        unresolved="$(printf '%s\n' "$declared" | awk '$1 == "unresolved" { print $2 }' | sort -u)" || derived=$?
+    fi
+    if [[ "$derived" -ne 0 ]]; then
+        echo "== coverage: REFUSED -- deriving the declared tests exited ${derived}, so which tests the"
+        echo "==   CMake sources register is not known. This is the CHECK failing, not a tree that"
+        echo "==   registers nothing and not 'everything is reachable'."
+        return 1
+    fi
+    count="$(nonempty_line_count "$literals")"
 
     if [[ "$count" -eq 0 ]]; then
         echo "== coverage: REFUSED -- no test registrations were found in the CMake sources."
@@ -2526,8 +2601,22 @@ coverage_gap() {
         return 1
     fi
 
-    gap="$(comm -23 <(printf '%s\n' "$literals") <(printf '%s\n' "$reached" | sort -u))"
-    gapCount="$(printf '%s\n' "$gap" | grep -c . || true)"
+    # `comm` through `pipe_pair_into`, never `comm <(...) <(...)` inside `$( )`, which makes
+    # comm the PARENT of both writers -- the shape a Windows runner killed a grep in (#1630) --
+    # and CHECKED: a sort or comm that failed printed nothing, which reads below as "every
+    # one reachable".
+    local reachedSorted compared=0
+    reachedSorted="$(pipe_lines_into "$reached"$'\n' sort -u)" || compared=$?
+    if [[ "$compared" -eq 0 ]]; then
+        gap="$(pipe_pair_into "$literals"$'\n' "$reachedSorted"$'\n' comm -23 /dev/fd/3 -)" || compared=$?
+    fi
+    if [[ "$compared" -ne 0 ]]; then
+        echo "== coverage: REFUSED -- sorting or comparing the reached tests exited ${compared}, so which"
+        echo "==   declared tests no configuration reaches is not known. This is the CHECK failing,"
+        echo "==   not 'everything is reachable'."
+        return 1
+    fi
+    gapCount="$(nonempty_line_count "$gap")"
 
     if [[ "$gapCount" -eq 0 ]]; then
         echo "== coverage: ${count} declared test(s), every one reachable in at least one of the"
@@ -2556,7 +2645,7 @@ coverage_gap() {
 
     if [[ -n "$unresolved" ]]; then
         local ucount
-        ucount="$(printf '%s\n' "$unresolved" | grep -c . || true)"
+        ucount="$(nonempty_line_count "$unresolved")"
         echo "==   plus ${ucount} registration(s) whose name is built from a variable, which this"
         echo "==   derivation cannot resolve and does not claim to have checked:"
         local u
@@ -3116,28 +3205,60 @@ CONTINUED" \
     # and the opposite on CI, which is the blind spot being closed.
     _hdrs="src/FastCache/Core/Base64.hpp
 src/apps/fastcached/Main.hpp"
+    # The LAYOUT cases ask the `posix` spelling alone: they are about where a
+    # checkout lives, and the historical patterns are /-only, so every spelling
+    # would make each of them a separator case as well and assert two things at once.
     _old='.*/(fastcached[^/]*|worktrees/[^/]+)/src/.*'
-    _new='.*/src/(CowTree|FastCache|apps|tests)/.*'
+    _slash='.*/src/(CowTree|FastCache|apps|tests)/.*'
+    _new='.*[/\\]src[/\\](CowTree|FastCache|apps|tests)[/\\].*'
     _exc=''
 
     # The three layouts the old pattern covered, which must not regress...
     expect "the old pattern covered the primary checkout" \
-        "2/2" "$(header_filter_match "$_old" "" /w/fastcached <<< "$_hdrs")"
+        "2/2" "$(header_filter_match "$_old" "" /w/fastcached posix <<< "$_hdrs")"
     expect "the old pattern covered a .claude worktree" \
-        "2/2" "$(header_filter_match "$_old" "" /w/fastcached/.claude/worktrees/w1 <<< "$_hdrs")"
+        "2/2" "$(header_filter_match "$_old" "" /w/fastcached/.claude/worktrees/w1 posix <<< "$_hdrs")"
     expect "the old pattern covered a wt-NNN checkout" \
-        "2/2" "$(header_filter_match "$_old" "" /w/fastcached-wt-139 <<< "$_hdrs")"
+        "2/2" "$(header_filter_match "$_old" "" /w/fastcached-wt-139 posix <<< "$_hdrs")"
 
     # ... and the one it did NOT, which is the ticket. Zero of two, and the
     # verdict names the first header that would have gone unanalysed.
     expect "the old pattern covered NO header in a lane worktree" \
         "0/2 src/FastCache/Core/Base64.hpp" \
-        "$(header_filter_match "$_old" "" /w/fastcached-worktrees/lane-a <<< "$_hdrs")"
+        "$(header_filter_match "$_old" "" /w/fastcached-worktrees/lane-a posix <<< "$_hdrs")"
 
-    # The replacement covers all four, which is the point of not naming a layout.
+    # The /-only replacement covered all four as POSIX paths -- which is why this
+    # guard read 363/363 over a filter that matched nothing on Windows.
     for _root in /w/fastcached /w/fastcached/.claude/worktrees/w1 \
                  /w/fastcached-wt-139 /w/fastcached-worktrees/lane-a; do
-        expect "the new pattern covers $_root" \
+        expect "the /-only pattern covers $_root as POSIX paths" \
+            "2/2" "$(header_filter_match "$_slash" "$_exc" "$_root" posix <<< "$_hdrs")"
+    done
+
+    # SPELLINGS. Asked in every spelling -- the default -- the same pattern covers
+    # nothing, and the verdict names the spelling rather than a layout: a path taken
+    # in one spelling and not another is a separator defect, not a location one.
+    expect "the /-only pattern covers NO header in the all-backslash spelling" \
+        "0/2 src/FastCache/Core/Base64.hpp (windows spelling)" \
+        "$(header_filter_match "$_slash" "" /w/fastcached-worktrees/lane-a <<< "$_hdrs")"
+    # A pattern written for both separators as two separate copies -- the edit the
+    # remedy text warns against -- still misses MSVC's mix: a backslashed include
+    # directory, then a slashed `#include` name.
+    _twocopies='(.*/src/(CowTree|FastCache|apps|tests)/.*|.*\\src\\(CowTree|FastCache|apps|tests)\\.*)'
+    expect "two copies of the pattern miss the MSVC mix of separators" \
+        "0/2 src/FastCache/Core/Base64.hpp (msvc spelling)" \
+        "$(header_filter_match "$_twocopies" "" /w/fastcached <<< "$_hdrs")"
+    expect "... which is what the MSVC spelling IS" \
+        '\w\fastcached\src/FastCache/Core/Base64.hpp' \
+        "$(header_filter_spell msvc /w/fastcached/src/FastCache/Core/Base64.hpp)"
+    expect "a spelling nobody defined is refused, never skipped" \
+        "2" "$(header_filter_spell dos /w/x >/dev/null 2>&1; echo $?)"
+
+    # The separator-agnostic pattern covers all four layouts in every spelling,
+    # which is the point of naming neither a layout nor a separator.
+    for _root in /w/fastcached /w/fastcached/.claude/worktrees/w1 \
+                 /w/fastcached-wt-139 /w/fastcached-worktrees/lane-a; do
+        expect "the new pattern covers $_root in every spelling" \
             "2/2" "$(header_filter_match "$_new" "$_exc" "$_root" <<< "$_hdrs")"
     done
 
@@ -3148,10 +3269,20 @@ src/apps/fastcached/Main.hpp"
     _dep_deps="out/build/x/_deps/catch2-src/src/catch2/catch_test_macros.hpp"
     _dep_cpm=".cache/CPM/catch2/0123456789abcdef/src/catch2/catch_test_macros.hpp"
     for _dep in "$_dep_deps" "$_dep_cpm"; do
-        expect "a dependency header is not matched: $_dep" \
-            "0/1 $_dep" \
-            "$(header_filter_match "$_new" "" /w/fastcached-worktrees/lane-a <<< "$_dep")"
+        expect "a dependency header is reached in no spelling: $_dep" \
+            "0/1" \
+            "$(header_filter_reach "$_new" "" /w/fastcached-worktrees/lane-a <<< "$_dep")"
     done
+    # A leak is a question of ANY spelling, and coverage's every-spelling count
+    # cannot ask it: a filter taking catch2 only when it is spelled with
+    # backslashes counts 0 there and drowns a Windows sweep.
+    _depwin="${_new}|"'.*\\_deps\\.*'
+    expect "a dependency taken in the backslash spelling alone is REACHED" \
+        "1/1 $_dep_deps (windows spelling)" \
+        "$(header_filter_reach "$_depwin" "" /w/fastcached-worktrees/lane-a <<< "$_dep_deps")"
+    expect "... where the every-spelling count would have read it as untaken" \
+        "0/1 $_dep_deps (posix spelling)" \
+        "$(header_filter_match "$_depwin" "" /w/fastcached-worktrees/lane-a <<< "$_dep_deps")"
 
     # Pinned as the inequality it is. The first #1040 fix -- broad
     # `.*/src/.*` with `_deps` excluded -- is correct for one layout and takes the
@@ -3159,16 +3290,16 @@ src/apps/fastcached/Main.hpp"
     # clean. A case driven only against `_deps` passes under that bug.
     expect "the old broad+exclude pattern kept _deps out" \
         "0/1 $_dep_deps" \
-        "$(header_filter_match '.*/src/.*' '.*/_deps/.*' /w/fastcached-worktrees/lane-a <<< "$_dep_deps")"
+        "$(header_filter_match '.*/src/.*' '.*/_deps/.*' /w/fastcached-worktrees/lane-a posix <<< "$_dep_deps")"
     expect "... and TOOK the CPM layout, which is the defect CI caught" \
         "1/1" \
-        "$(header_filter_match '.*/src/.*' '.*/_deps/.*' /w/fastcached-worktrees/lane-a <<< "$_dep_cpm")"
+        "$(header_filter_match '.*/src/.*' '.*/_deps/.*' /w/fastcached-worktrees/lane-a posix <<< "$_dep_cpm")"
 
     # A partial match is its own outcome: an analyser blind to 1 of 2 headers
     # still reports findings, so it looks like it is working.
     expect "a partial match names how many and which" \
         "1/2 src/apps/fastcached/Main.hpp" \
-        "$(header_filter_match '.*/src/FastCache/.*' "" /w/fastcached <<< "$_hdrs")"
+        "$(header_filter_match '.*/src/FastCache/.*' "" /w/fastcached posix <<< "$_hdrs")"
 
     # The reporter. `all` is the only arm that carries on -- asserted as the
     # STATUS beside the text, since a reporter that says the right words and
@@ -3177,9 +3308,60 @@ src/apps/fastcached/Main.hpp"
         "== clang-tidy header filter covers all 285 tracked first-party headers|0" \
         "$(text="$(header_filter_report /w/.clang-tidy 285/285)"; printf '%s|%s' "$text" "$?")"
     expect "zero coverage refuses, naming #1040 and the lane layout" \
-        "said|1" "$(report_says 'matches NONE of this tree' header_filter_report /w/.clang-tidy 0/285)"
+        "said|1" "$(report_says 'This is a property of where this checkout LIVES' header_filter_report /w/.clang-tidy 0/285)"
+    expect "zero coverage in one SPELLING refuses naming the separator" \
+        "said|1" "$(report_says 'in the windows spelling -- it takes them in another spelling' header_filter_report /w/.clang-tidy '0/285 src/x.hpp (windows spelling)')"
+    # P3: a BACKSLASH-only filter misses the posix spelling. The sentence must not say the
+    # headers were taken "as POSIX paths" -- that is the one spelling that did NOT take them, a
+    # confident wrong signal. Driven through the real match, so the verdict is the one a gate
+    # would produce, not one typed here.
+    _p3="$(header_filter_match '.*\\src\\(CowTree|FastCache|apps|tests)\\.*' "" /w/fastcached <<< "$_hdrs")"
+    expect "P3: a backslash-only filter's miss is named in the posix spelling" \
+        "0/2 src/FastCache/Core/Base64.hpp (posix spelling)" "$_p3"
+    # `if`, never `case`, inside `$( )`: bash 3.2 reads a case pattern's `)` as the
+    # substitution's end (#1224) -- at RUN time, which `check-bash32-parse.sh` cannot see.
+    _p3_report="$(header_filter_report /w/.clang-tidy "$_p3" 2>&1)"
+    expect "P3: ... and the report never claims the headers were taken as POSIX paths" \
+        "absent" \
+        "$(if [[ "$_p3_report" == *"as POSIX paths"* ]]; then
+               echo "said as POSIX paths"
+           elif [[ "$_p3_report" == *"in the posix spelling -- it takes them in another spelling"* ]]; then
+               echo absent
+           else
+               echo "said neither"
+           fi)"
+    expect "the separator remedy prints the class as .clang-tidy spells it" \
+        "said|1" "$(report_says 'Accept either separator ([/\\])' header_filter_report /w/.clang-tidy '0/285 src/x.hpp (windows spelling)')"
+    expect "... and never as where the checkout lives, which would send the reader to the wrong cause" \
+        "absent" \
+        "$(if [[ "$(header_filter_report /w/.clang-tidy '0/285 src/x.hpp (windows spelling)' 2>&1)" == *LIVES* ]]; then
+               echo "said LIVES"
+           else
+               echo absent
+           fi)"
     expect "partial coverage refuses, naming the count and an example" \
         "said|1" "$(report_says 'matches only 200 of this tree' header_filter_report /w/.clang-tidy '200/285 src/apps/x.hpp')"
+    expect "a partial miss naming no spelling points at #1040, the location cause" \
+        "said|1" "$(report_says 'looks like it is working (#1040)' header_filter_report /w/.clang-tidy '200/285 src/apps/x.hpp')"
+    # P1: a filter taking one root in every spelling and another as POSIX paths only -- a
+    # PARTIAL miss in one spelling. Driven through the real match. Its cause is the separators,
+    # and #1040 (where a checkout lives) must not be named for it.
+    _p1="$(header_filter_match '(.*/src/(CowTree|FastCache|apps|tests)/.*|.*[/\\]src[/\\]FastCache[/\\].*)' "" /w/fastcached <<< "$_hdrs")"
+    expect "P1: a partial miss in one spelling is named in that spelling" \
+        "1/2 src/apps/fastcached/Main.hpp (windows spelling)" "$_p1"
+    expect "P1: ... and its cause is the separators" \
+        "said|1" "$(report_says 'the cause is the pattern'"'"'s SEPARATORS, not where this checkout lives' header_filter_report /w/.clang-tidy "$_p1")"
+    expect "P1: ... and its remedy prints the class as .clang-tidy spells it" \
+        "said|1" "$(report_says 'Accept either separator ([/\\]) rather than adding' header_filter_report /w/.clang-tidy "$_p1")"
+    # `if`, never `case`, inside `$( )`: bash 3.2 reads a case pattern's `)` as the
+    # substitution's end (#1224).
+    expect "P1: ... and never #1040, which is the location cause" \
+        "absent" \
+        "$(if [[ "$(header_filter_report /w/.clang-tidy "$_p1" 2>&1)" == *"#1040"* ]]; then
+               echo "said #1040"
+           else
+               echo absent
+           fi)"
     expect "a config with no HeaderFilterRegex refuses" \
         "said|1" "$(report_says 'names no HeaderFilterRegex' header_filter_report /w/.clang-tidy no-regex)"
     expect "a config that cannot be read refuses" \
@@ -3188,6 +3370,8 @@ src/apps/fastcached/Main.hpp"
         "said|1" "$(report_says 'That is the CHECK failing' header_filter_report /w/.clang-tidy no-headers)"
     expect "an empty coverage verdict is refused BY NAME, never as coverage" \
         "said|1" "$(report_says 'produced NO verdict' header_filter_report /w/.clang-tidy '')"
+    expect "a tree declaring no package refuses as the CHECK, never as no dependencies" \
+        "said|1" "$(report_says 'which dependency layouts the filter must keep out cannot be derived' header_filter_report /w/.clang-tidy no-dependencies)"
     expect "a filter that would take _deps refuses, and says why coverage cannot see it" \
         "said|1" "$(report_says 'dependency trees are untracked' header_filter_report /w/.clang-tidy deps-leak)"
     expect "a filter that would take a third-party root refuses, and says not to exclude it" \
@@ -3196,6 +3380,12 @@ src/apps/fastcached/Main.hpp"
         "said|1" "$(report_says 'the third-party root thirdparty/ named in' header_filter_report /w/.clang-tidy 'third-party-untracked thirdparty')"
     expect "an unreadable roots file refuses as the CHECK, never as a partial match" \
         "said|1" "$(report_says 'which tracked headers are third-party cannot be answered' header_filter_report /w/.clang-tidy no-roots)"
+    expect "a classifier that could not answer refuses as the CHECK, naming which, never as a leak" \
+        "said|1" "$(report_says 'the dependency reach failed' header_filter_report /w/.clang-tidy 'check-failed dependency reach')"
+    expect "a filter that does not compile refuses as the FILTER's fault, never as the check failing" \
+        "said|1" "$(report_says 'That is a verdict about the FILTER' header_filter_report /w/.clang-tidy does-not-compile)"
+    expect "a verdict no arm names is refused as the GATE's bug, never read as full coverage" \
+        "said|1" "$(report_says 'neither a count nor a word this reporter knows' header_filter_report /w/.clang-tidy 'some-new-word detail')"
 
     # -----------------------------------------------------------------------
     # The vendored/first-party SPLIT, driven through `header_filter_coverage` at a
@@ -3211,7 +3401,7 @@ src/apps/fastcached/Main.hpp"
     # spells uniqueness the one way this repository has been bitten by (`$$` is
     # shared inside a subshell on bash 3.2).
     _hf_tree="$scratch/header-filter"
-    _hf_clean='.*/src/(CowTree|FastCache|apps|tests)/.*'
+    _hf_clean='.*[/\\]src[/\\](CowTree|FastCache|apps|tests)[/\\].*'
     _hf_config() { printf "HeaderFilterRegex: '%s'\n" "$1" > "$_hf_tree/.clang-tidy"; }
     # The roots come from the TREE (#1370), so the tree plants its own file -- and a
     # second root, `thirdparty`, which no line of this script names: a split still
@@ -3222,12 +3412,14 @@ src/apps/fastcached/Main.hpp"
     : > "$_hf_tree/src/FastCache/Core/Base64.hpp"
     : > "$_hf_tree/vendor/endo/tui/Sixel.hpp"
     : > "$_hf_tree/thirdparty/lib/Upstream.hpp"
-    : > "$_hf_tree/CMakeLists.txt"
+    # A declared package, so the dependency layouts are DERIVED from something: the
+    # case below that empties it is the refusal when nothing is declared.
+    printf 'CPMAddPackage(\n    NAME Catch2\n    VERSION 3.6.0\n)\n' > "$_hf_tree/CMakeLists.txt"
     : > "$_hf_tree/vendor/endo/CMakeLists.txt"
     : > "$_hf_tree/thirdparty/lib/CMakeLists.txt"
     _hf_roots vendor thirdparty
-    if git -C "$_hf_tree" init -q . 2>/dev/null \
-        && git -C "$_hf_tree" add -A 2>/dev/null; then
+    if scratch_git -C "$_hf_tree" init -q . 2>/dev/null \
+        && scratch_git -C "$_hf_tree" add -A 2>/dev/null; then
         _hf_config "$_hf_clean"
         expect "a vendored header is excluded from coverage, and the first-party one still counts" \
             "1/1" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
@@ -3264,6 +3456,45 @@ src/apps/fastcached/Main.hpp"
         expect "widening the filter over vendor/ is caught, not scored as full coverage" \
             "third-party-leak 1/2" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
 
+        # PLANTED: the widening a separator fix tempts, `[/\\]src[/\\].*` -- which takes
+        # the DECLARED package's headers (`catch2`, derived from the planted CMakeLists).
+        _hf_config '.*[/\\]src[/\\].*'
+        expect "a filter reaching a declared package's headers is caught" \
+            "deps-leak" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
+        # PLANTED: under the clean filter, the reach's grep KILLED (148, #1630's status) over
+        # the dependency paths alone. Its status unread, the empty answer was `deps-leak` --
+        # the filter blamed for the check failing.
+        _hf_config "$_hf_clean"
+        expect "a dependency-reach grep killed is the CHECK failing, never a leak" \
+            "check-failed dependency reach" \
+            "$(grep() { local input; input="$(cat)"; [[ "$input" != *_deps* ]] || return 148; printf '%s' "$input" | command grep "$@"; }
+               header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null < /dev/null)"
+        # And the other direction: a filter that does not compile is the FILTER's fault.
+        _hf_config 'src/(a'
+        expect "a filter that does not compile is named as the filter's fault, never the check's" \
+            "does-not-compile" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
+        # PLANTED: nothing declared. Refused as its own word, never read as "no dependencies".
+        _hf_config "$_hf_clean"
+        cp "$_hf_tree/CMakeLists.txt" "$_hf_tree/CMakeLists.txt.kept"
+        printf '# no packages\n' > "$_hf_tree/CMakeLists.txt"
+        scratch_git -C "$_hf_tree" add CMakeLists.txt 2>/dev/null
+        expect "a tree declaring no package is refused, never read as having no dependencies" \
+            "no-dependencies" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
+        # PLANTED: a call with no NAME beside a named one. Dropped, it would leave the named
+        # package standing for the whole set; refused instead, as the CHECK.
+        cp "$_hf_tree/CMakeLists.txt.kept" "$_hf_tree/CMakeLists.txt"
+        printf 'CPMAddPackage("gh:someone/src@1.0")\n' >> "$_hf_tree/CMakeLists.txt"
+        expect "a CPMAddPackage call with no NAME is refused, never dropped" \
+            "no-dependencies" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
+        # PLANTED: a NAME spelled through a variable, whose literal prefix alone would be a
+        # wrong package rather than a missing one. Refused as the CHECK too.
+        cp "$_hf_tree/CMakeLists.txt.kept" "$_hf_tree/CMakeLists.txt"
+        printf 'CPMAddPackage(NAME foo_${suffix} VERSION 1.0)\n' >> "$_hf_tree/CMakeLists.txt"
+        expect "a CPMAddPackage NAME spelled through a variable is refused, never read as its prefix" \
+            "no-dependencies" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
+        mv "$_hf_tree/CMakeLists.txt.kept" "$_hf_tree/CMakeLists.txt"
+        scratch_git -C "$_hf_tree" add CMakeLists.txt 2>/dev/null
+
         # PLANTED: a roots file naming no root. Refused as its own word, never read
         # as "nothing is third-party" -- which would score this tree 1/3.
         _hf_config "$_hf_clean"
@@ -3276,7 +3507,7 @@ src/apps/fastcached/Main.hpp"
 
         # PLANTED: a root's directory git knows nothing about -- the FIRST root, with
         # the second still tracked, so a check asking only one root cannot pass it.
-        git -C "$_hf_tree" rm -r -q --cached vendor 2>/dev/null
+        scratch_git -C "$_hf_tree" rm -r -q --cached vendor 2>/dev/null
         expect "a third-party root tracking nothing is refused by name" \
             "third-party-untracked vendor" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
     else
@@ -3682,6 +3913,11 @@ $_started"
         done
         if [[ "$(cat "/proc/$_odd/comm" 2>/dev/null)" == "x) y" ]]; then
             expect "a command name containing ') ' does not move the parent pid" "$$" "$(gate_lock_ppid "$_odd")"
+            # And asked of the shared PARSER itself: `gate_lock_ppid` falls back to `ps` when the
+            # parse refuses, so on a host with `ps` a parser that read after the FIRST `) ` would
+            # still pass the row above.
+            proc_stat_ppid "$_odd" || true
+            expect "... and the shared /proc/<pid>/stat parser reads it past the ') '" "$$" "$proc_stat_reply"
         else
             self_test_skipped="${self_test_skipped:+$self_test_skipped, }the ') ' command-name case (the copy never ran as 'x) y')"
         fi
@@ -3691,12 +3927,50 @@ $_started"
     fi
     holder_case "a relative path is read against the holder's directory" "wrapper|77|$scratch/lock/gate.lock" "" \
         "77${_t}$scratch/lock${_t}flock${_u}gate.lock${_u}bash"
-    if ln -s "$_lk" "$scratch/lock/alias.lock" 2>/dev/null; then
-        holder_case "a symlink to the lock is the lock" "wrapper|77|$scratch/lock/alias.lock" "" \
-            "77${_t}/w${_t}flock${_u}$scratch/lock/alias.lock${_u}bash"
+    # What `ln -s` MADE, not whether it succeeded: Git Bash's `ln -s` succeeds by making a COPY
+    # (MSYS's default `winsymlinks` mode), so a probe on its status ran this case over a regular
+    # file and FAILED it -- on master too, 241 checks and this among the reds. Asked for a NATIVE
+    # link (`winsymlinks:nativestrict`, which only MSYS reads), a host that allows them gets one
+    # and runs the case; one that does not is NOT RUN by name, never a FAIL and never a pass.
+    # Three answers, each driven below.
+    symlink_kind() {
+        if [[ -L "$1" ]]; then
+            echo link
+        elif [[ -e "$1" ]]; then
+            echo copy
+        else
+            echo absent
+        fi
+    }
+    mkdir -p "$scratch/symlink-kind"
+    : > "$scratch/symlink-kind/regular"
+    expect "the symlink probe calls a regular file a COPY, never a link" \
+        "copy" "$(symlink_kind "$scratch/symlink-kind/regular")"
+    expect "the symlink probe calls nothing ABSENT" \
+        "absent" "$(symlink_kind "$scratch/symlink-kind/nothing")"
+    if MSYS=winsymlinks:nativestrict ln -s regular "$scratch/symlink-kind/linked" 2>/dev/null \
+        && [[ -L "$scratch/symlink-kind/linked" ]]; then
+        expect "the symlink probe calls a link a LINK" "link" "$(symlink_kind "$scratch/symlink-kind/linked")"
     else
-        self_test_skipped="${self_test_skipped:+$self_test_skipped, }the gate lock's symlink case (ln -s failed here)"
+        self_test_skipped="${self_test_skipped:+$self_test_skipped, }the symlink probe's LINK answer (no real link can be made here)"
     fi
+    MSYS=winsymlinks:nativestrict ln -s "$_lk" "$scratch/lock/alias.lock" 2>/dev/null
+    case "$(symlink_kind "$scratch/lock/alias.lock")" in
+        link)
+            holder_case "a symlink to the lock is the lock" "wrapper|77|$scratch/lock/alias.lock" "" \
+                "77${_t}/w${_t}flock${_u}$scratch/lock/alias.lock${_u}bash"
+            ;;
+        copy)
+            self_test_skipped="${self_test_skipped:+$self_test_skipped, }the gate lock's symlink case (ln -s made a COPY, not a link, on this host)"
+            ;;
+        absent)
+            self_test_skipped="${self_test_skipped:+$self_test_skipped, }the gate lock's symlink case (ln -s failed here)"
+            ;;
+        *)
+            # The classifier answers three words; anything else is the probe broken, said as a failure.
+            expect "the symlink probe answers link, copy or absent" "one of the three" "$(symlink_kind "$scratch/lock/alias.lock")"
+            ;;
+    esac
 
     # The lock by CONTENTION, not by acquisition: a lock nobody contends always acquires,
     # which reads exactly like a free host and is the whole of #1379. Both directions --
@@ -4164,6 +4438,35 @@ beta' 2 2)" == *"every one reachable in at least one"* ]] && echo yes || echo no
         "$([[ "$(coverage_gap 'literal alpha' '' 0 2)" == *"it is 'nothing is known'"* ]] && echo yes || echo no)"
     expect "a gate that built nothing refuses the run" \
         "1" "$(coverage_gap 'literal alpha' '' 0 2 >/dev/null; echo $?)"
+    # The comparison's own `comm` failing is a THIRD refusal (#1630): it printed nothing,
+    # which read as "every one reachable". Over a tree with a real gap, so the pass can only
+    # come from the unchecked status.
+    expect "a comm that fails is REFUSED as the check failing, never 'every one reachable'" \
+        "yes" \
+        "$([[ "$(comm() { return 2; }; coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2)" == *"REFUSED -- sorting or comparing the reached tests exited 2"* ]] && echo yes || echo no)"
+    expect "and it refuses the run" \
+        "1" "$(comm() { return 2; }; coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2 >/dev/null; echo $?)"
+    # The COUNT is taken in this shell: a grep killed (148, #1630's status) once counted the
+    # gap as empty, `-eq 0`, and the gap's names were reported as "every one reachable".
+    expect "a gap is counted with no subprocess, so a killed grep cannot make it 'every one reachable'" \
+        "yes" \
+        "$([[ "$(grep() { return 148; }; coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2)" == *"1 of 2 declared test(s) are registered by NEITHER"* ]] && echo yes || echo no)"
+    # The DERIVATION's status: an awk that failed printed nothing, which read as "no test
+    # registrations" -- a refusal blaming the work tree -- and, over the unresolved names
+    # alone, silently dropped the disclosure that some registrations were never checked.
+    expect "a declared-test derivation that fails is REFUSED as the check, never as a tree with none" \
+        "yes" \
+        "$([[ "$(awk() { [[ "$1" != *'"literal"'* ]] || return 2; command awk "$@"; }
+                 coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2)" == *"REFUSED -- deriving the declared tests exited 2"* ]] && echo yes || echo no)"
+    expect "an unresolved-name derivation that fails is REFUSED, never a dropped disclosure" \
+        "yes" \
+        "$([[ "$(awk() { [[ "$1" != *unresolved* ]] || return 2; command awk "$@"; }
+                 coverage_gap 'literal alpha
+unresolved ${name}' 'alpha' 2 2)" == *"REFUSED -- deriving the declared tests exited 2"* ]] && echo yes || echo no)"
     # The two refusals are two sentences. Sharing one would satisfy every row
     # above while collapsing the states they exist to keep apart.
     #
@@ -4262,6 +4565,9 @@ unresolved src/tests/CMakeLists.txt:288' 'alpha' 2 2)" == *"does not claim to ha
     # already prints -- but `0 failed` is.
     reap_out="$(bash "$(dirname "${BASH_SOURCE[0]}")/reap-my-gate.sh" --self-test 2>&1)"
     reap_status=$?
+    # 77 is a SKIP, and only when the helper also SAYS so: it is recorded below as
+    # NOT RUN, never as a pass and never as a failure. Any other non-zero is a failure.
+    [[ "$reap_status" == 77 && "$reap_out" == *SKIPPED* ]] && reap_status=0
     expect "the gate reaper's own self-test passes" "0" "$reap_status"
     expect "and it reports a count, so a run that judged nothing is visible" \
         "yes" "$([[ "$reap_out" == *"checks ran, 0 failed"* ]] && echo yes || echo no)"
@@ -4273,6 +4579,7 @@ unresolved src/tests/CMakeLists.txt:288' 'alpha' 2 2)" == *"does not claim to ha
     # gate and the gate's own registration already runs everywhere.
     repair_out="$(bash "$(dirname "${BASH_SOURCE[0]}")/repair-worktree-pointers.sh" --self-test 2>&1)"
     repair_status=$?
+    [[ "$repair_status" == 77 && "$repair_out" == *SKIPPED* ]] && repair_status=0
     expect "the worktree-pointer repairer's own self-test passes" "0" "$repair_status"
     expect "and it reports a count, so a run that judged nothing is visible" \
         "yes" "$([[ "$repair_out" == *"checks ran, 0 failed"* ]] && echo yes || echo no)"
@@ -4315,7 +4622,13 @@ unresolved src/tests/CMakeLists.txt:288' 'alpha' 2 2)" == *"does not claim to ha
     fi
 
     echo "local-gate --self-test: ${self_test_ran} checks ran, ${self_test_failures} failed"
-    [[ "$self_test_failures" -eq 0 ]] || exit 1
+    if [[ "$self_test_failures" -ne 0 ]]; then
+        # A RED run names what it did not run as well: the list was printed only on the PASSED
+        # line, so a run that failed one row hid every row it skipped -- NOT RUN silent exactly
+        # when somebody is reading the output.
+        [[ -z "$self_test_skipped" ]] || echo "local-gate --self-test: NOT RUN beside those failures: $self_test_skipped"
+        exit 1
+    fi
 
     # The interpreter is named for the same reason the gate names its analyser: this
     # script is written to bash 3.2 because macOS ships one, and "it passed on some

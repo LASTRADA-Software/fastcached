@@ -76,9 +76,77 @@ $USER` if you want it running while you are not logged in.
 
 ### Windows
 
-Run the MSI. It installs both executables and registers `fastcached` as an
-auto-start Windows service, then starts it — clear the checkbox in the
-installer to register the service without starting it for now.
+Setting up several PCs as one fleet? [Running a Windows office fleet](../operations/windows-office-fleet.md)
+is the runbook: which machine to install first, how the others join, and how to approve them.
+
+Run the MSI and choose what this machine runs: **fastcached** (the cache daemon),
+**fastcache-cc** (the compiler launcher), **fastcache-compile-node** (the compile
+worker), and the command-line client, which is always installed. The installer
+registers the services that follow from the choice:
+
+| Installed | `FastCacheCompileNode` | `FastCached` |
+|---|---|---|
+| the node (with or without fastcached) | starts with Windows, started now | manual, stopped |
+| fastcached without the node | — | starts with Windows, started now (pass `FASTCACHED_START_SERVICE=0` to leave it stopped) |
+
+The node needs no property to be registered: it finds its scheduler from the fleet it forms or
+joins (the [fastcache-compile-node page](../tools/fastcache-compile-node.md#macos-and-windows)
+has the details). There is no property for the address clients reach the node at: the node
+advertises this machine's fully qualified name, resolved at every start, so a renamed machine or a
+new VPN address needs no reinstall; an address that must be typed goes under `advertise:` in the
+node's configuration file. `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8` is optional, and limits the
+firewall rules both registrations create to that remote range; left out, they admit any address. So is
+`FASTCACHE_FLEET_SEED=office-a.vpn.example`, one machine of the fleet for the node to ask when no
+discovery beacon reaches it, as across a VPN; it is registered as the node's `--fleet-seed`, and a
+node that needs more than one names them under `fleet_seed:` in its configuration file. So is
+`FASTCACHE_FLEET_ID`, the one fleet the node may join, pasted as `fastcache-cli node` prints it on a
+machine of that fleet (`<cluster-id>@<key>[,<key>...]`); it is registered VERBATIM as the node's
+`--fleet-id`. A value the node cannot read **fails the whole transaction** (msiexec exits 1603, and
+the log names the action `FastCacheNodeCheckArguments`; `fastcache-compile-node --check-arguments
+--fleet-id=<value>` names what is wrong with the value): the node's own parser checks
+the node's arguments before anything is remembered or registered, so a refused pin is never
+remembered, and a repair or upgrade leaves the existing registration and its remembered pin as they
+were rather than starting a node that trusts whichever fleet proves itself first. A malformed
+`FASTCACHE_FLEET_SEED` fails it the same way. So does a node registration
+that cannot be made, or a node that does not come up serving: the service reports running only once
+the node serves (its `compile node ready` line), so a node that cannot bind its port fails the start
+rather than passing it. The node is checked, registered, remembered and started in that order, each
+step failing the transaction, and every transaction that keeps the node stops and restarts it, so a
+new pin or seed is what the running node has. A transaction that fails leaves each service as it
+found it: its registration put back exactly (command line and start type), started again if the
+transaction had stopped it while it ran, and the remembered values written back. The package also
+pins the node's discovery reply port, `FASTCACHE_DISCOVERY_REPLY_PORT=6682` unless you pass another
+(or pass it empty), so its firewall opens UDP 6682 rather than every local UDP port. A node run by
+hand leaves that port to the kernel, because two nodes on one machine each need one of their own;
+the package installs one node per machine.
+
+A silent install names its features: `msiexec /i fastcached.msi /qn ADDLOCAL=CM_C_Cli,CM_C_Daemon,CM_C_Launcher`.
+Changing the selection later (Settings > Apps > Modify, or `msiexec /i fastcached.msi ADDLOCAL=CM_C_Node`
+and `REMOVE=CM_C_Node`) re-applies the table. An upgrade applies it too: it keeps the registration
+of every feature that stays installed, and removes the registration of a feature it no longer
+installs.
+
+**Upgrading from 0.3.0 or earlier is the exception.** Those installers delete both services when
+they are removed, and a major upgrade removes the old version first. The new installer registers
+`FastCached` and the node again from the table, the node with no property needed. It waits for
+0.3.0's service processes to exit before it replaces a file (0.3.0 stops them without waiting), so
+the upgrade needs no restart. **A failed upgrade from 0.3.0 does not restore 0.3.0's services**:
+the rollback puts 0.3.0's files back, but 0.3.0's own uninstall deleted its registrations before
+this installer ran, so they come back as this installer registers them, which 0.3.0's binaries may
+refuse. Run the upgrade again once its cause is fixed, or reinstall 0.3.0.
+
+Every transaction that keeps a service registers it again, and the optional properties are
+remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_FLEET_SEED` and `FASTCACHE_FLEET_ID` are written to
+`HKLM\SOFTWARE\fastcached\Installer` and read back by the next repair or upgrade, so one that
+leaves them out registers what was installed. The node's two are written only by a transaction
+that keeps the node, once its parser has accepted them. (An advertised endpoint an earlier package of this
+installer remembered there is forgotten by the next transaction, and that registration carries none.) A transaction that states a new value replaces the
+remembered one. An empty value counts as leaving the property out, so a remembered scope is kept;
+to drop it, uninstall (which forgets the values) and install again. An installer older than this
+remembering has nothing to read back, so the first upgrade from one registers what it states: with
+no property the node is still registered and started, advertising this machine's name with its
+firewall rules admitting any address, so pass `FASTCACHE_FIREWALL_ALLOW` (and any other property
+you installed with) on that upgrade to keep it.
 
 ```powershell
 sc.exe query FastCached
@@ -96,7 +164,15 @@ sc.exe stop FastCached
 sc.exe start FastCached
 ```
 
-Uninstalling removes the service and leaves your configuration in place.
+Uninstalling removes the services and leaves your configuration in place.
+
+Registering a service also opens the Windows Firewall for whatever it listens on beyond
+loopback — nothing, for fastcached's default `127.0.0.1:6674` — and uninstalling, or
+deselecting a feature, removes its rules. An upgrade that drops a feature deletes its
+registration and its rule group (`fastcached: <service>`) as well; only its event source
+stays, inert, since it names a program that is no longer installed. What each binary opens is on its own page:
+[fastcached](../operations/deployment.md#windows-service) and
+[fastcache-compile-node](../tools/fastcache-compile-node.md#macos-and-windows).
 
 ### macOS
 
@@ -352,7 +428,7 @@ One further port, **off unless you ask for it**:
 
 | Port | What | Default |
 |------|------|---------|
-| **6675** | The fleet scheduler | off; enable with `fastcache-compile-node --serve-scheduler`, which answers on that node's `--listen-node` rather than on a port of its own. Not served by `fastcached` |
+| **6675** | The fleet scheduler | a convention, not a default: every `fastcache-compile-node` serves the scheduler on its own `--listen-node` rather than on a port of its own, so a scheduling node given `--listen-node=6675` answers there. Not served by `fastcached` |
 
 A worker needs no port of its own. Dispatched compiles arrive on the **same
 `--listen-node` surface** that carries the node's cache verbs, so a worker opens one
@@ -360,10 +436,11 @@ A worker needs no port of its own. Dispatched compiles arrive on the **same
 
 A compile node also serves a **cache tier of its own**, on the same `--listen-node`
 port, which defaults to `6674` on loopback — the same address as the daemon's,
-deliberately, because that is where `fastcache-cc` already looks. On a machine running both, the
-node loses the bind, warns, and carries on with no local tier — the launcher
-reaches the daemon on that port instead. Give one of them a port of its own if you
-want the node's tier as well.
+deliberately, because that is where `fastcache-cc` already looks. A node that cannot
+bind that port **refuses to start** and names the address, whether you typed it or
+not: it opens exactly one `0xFC` port, and without it would register an address
+nothing answers. So do not run a node and `fastcached` on one machine — the node
+answers every verb the daemon does — or give one of them a port of its own.
 A node running consensus additionally binds `--listen-raft` — every connection on that
 port proves the member's own identity key before a message is read — and,
 with discovery on, a UDP `--discovery` port plus a per-node answering port; none has

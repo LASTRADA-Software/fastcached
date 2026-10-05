@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeIdentity.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
@@ -32,6 +33,22 @@ namespace
     /// operator is least likely to get right unaided, because it is also the only UDP
     /// surface.
     constexpr std::string_view DiscoveryBindHost = "0.0.0.0";
+
+    constexpr auto PortKindRows = EnumTable<SurfacePortKind, SurfacePortKindRow> { {
+        { .kind = SurfacePortKind::Fixed,
+          .portText = [](std::uint16_t port) { return std::format("{}", port); },
+          .trailer = {} },
+        // `*` rather than the 0 the endpoint carries: a worksheet line reading `:0` is a port an
+        // operator would copy into a rule, and a rule on port 0 admits nothing.
+        { .kind = SurfacePortKind::KernelChosen,
+          .portText = [](std::uint16_t /*port*/) { return std::string { "*" }; },
+          .trailer = ", port chosen by the kernel at bind" },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(PortKindRows, [](SurfacePortKindRow const& row) { return row.kind; }),
+                  "every SurfacePortKind needs a row, at its own index");
+    static_assert(std::ranges::all_of(PortKindRows, [](SurfacePortKindRow const& row) { return row.portText != nullptr; }),
+                  "every SurfacePortKind row spells its port");
 
     /// Whether text names an address a beacon can be sent to.
     ///
@@ -121,58 +138,31 @@ namespace
                 "the configuration rather than from the listener. It would announce an address nothing "
                 "answers, be leased out, and every client would meet a failed connection and fall back to "
                 "compiling locally, which is silent by design. Green everywhere, working nowhere",
-            // Empty, and the one row where that is not "this surface has no default".
-            // Its default host depends on the CONFIGURATION -- loopback on a worker,
-            // the wildcard on a node that schedules -- so it cannot be one constant,
-            // and `NodeListenDefaultHost` is where it is decided. A value here would be
-            // a second author of the rule, which is exactly what this table exists to
-            // prevent (#290).
-            .defaultHost = {},
+            // The wildcard on every node. It was the one row whose default host depended on
+            // the configuration -- loopback on a worker, the wildcard on a scheduler -- until
+            // the zero-config defaults made every node a fleet participant (#290 merged the two
+            // surfaces that pulled it apart).
+            .defaultHost = NodeSurfaceDefaultHost,
             .spec = &NodeConfig::nodeListen,
             .grammar = ListenEndpointGrammar,
-            .resolve = [](SurfaceRow const& row, NodeConfig const& cfg) -> SurfaceEndpoints {
-                // A port with nothing behind it is not a served surface -- but "nothing
-                // behind it" now has two halves, because two components answer here.
-                // A node with no cache tier still serves the scheduler, and one that
-                // neither caches nor schedules binds nothing at all. The same shape as
-                // raft's `--node-id` gate: a surface can be configured and still not
-                // served.
-                //
-                // **The worker is now the third half, and it makes this surface
-                // unconditional.** It was deliberately excluded while it had a port of
-                // its own that every client dialled; #290 stage 3 retires that port, so
-                // a dispatched compile arrives HERE and a node whose only component is
-                // its worker has nowhere else to answer.
-                //
-                // That leaves no configuration in which this port is not served. Every
-                // node answers `--node-status` and live stats here, whatever else it runs
-                // -- a node started with `--slots=0` and running only consensus included
-                // (#206) -- and `StartNodeSurfaceOrExplain` counts those families too
-                // (`AnswersAnyFamily`), so the listener binds what this row names. A
-                // predicate whose every branch returns the same answer is one that will
-                // drift away from the truth without anything noticing.
-                //
-                // What that test used to protect is still true and now belongs to the
-                // components rather than to the port: `--cache-memory 0` with no
-                // `--cache-dir` still leaves `StartCacheTierOrExplain` returning without
-                // a tier, and a node that does not schedule still answers no scheduler
-                // verb. Neither of those closes the socket any more.
-
-                // Its own `defaultHost` is empty by design, so the row is resolved
-                // against the one this configuration picks.
-                auto resolved = row;
-                resolved.defaultHost = NodeListenDefaultHost(cfg);
-                return ResolveFromSpec(resolved, cfg);
-            },
+            // A port with nothing behind it is not a served surface -- but there is no
+            // configuration in which this one has nothing behind it. Every node answers
+            // `--node-status` and live stats here, whatever else it runs, and a dispatched
+            // compile arrives here since #290 stage 3 retired the worker's own port. So the
+            // row resolves from its spec alone; `StartNodeSurfaceOrExplain` counts every family
+            // it answers (`AnswersAnyFamily`), so the listener binds what this row names.
+            .resolve = ResolveFromSpec,
+            .closedBecause = nullptr,
             .note = "a systemd .socket unit is served on this surface: the unit owns the address, so this "
                     "flag configures nothing there and --advertise is what names where clients go -- it is "
                     "required under activation and refused at startup when absent. one 0xFC port for the cache "
-                    "verbs, this node's own compile verbs, and -- with "
-                    "--serve-scheduler -- the scheduler verbs. A bare "
-                    "port binds loopback on a worker and the wildcard on a scheduler, because peers are "
-                    "elsewhere by definition -- and the cache verbs answer this machine alone whichever it is, "
-                    "so widening it admits nobody new to them. Bound by every node that starts, whatever "
-                    "components it runs: --node-status and live stats are answered here. Scheduling is answered "
+                    "verbs, this node's own compile verbs, and -- where "
+                    "its mode serves them -- the scheduler verbs. A bare "
+                    "port binds the wildcard on every node, because every node is a fleet participant -- and "
+                    "the cache verbs answer this machine alone whatever the bind, while every other verb refuses a "
+                    "caller that is not a member. Bound by every node that starts, whatever "
+                    "components it runs: node status (`fastcache-cli node`) and live stats are answered here. "
+                    "Scheduling is answered "
                     "only while this node LEADS; a follower redirects and an election in progress refuses, so "
                     "the port is open on every member whether or not it is answering today",
         },
@@ -192,6 +182,7 @@ namespace
             .spec = &NodeConfig::adminListen,
             .grammar = ListenEndpointGrammar,
             .resolve = ResolveFromSpec,
+            .closedBecause = nullptr,
             // The one row whose default host is not a firewall detail.
             .note = "the loopback default is what the dashboard's credential rule turns on: reaching loopback "
                     "already means being on the machine, so a bare port needs no token while an address you "
@@ -212,17 +203,33 @@ namespace
             .defaultHost = RaftListenDefaultHost,
             .spec = &NodeConfig::raftListen,
             .grammar = ListenEndpointGrammar,
-            // Plain `ResolveFromSpec` since #1022, and the gate it lost is the point of
-            // that ticket. It used to return nothing unless `--node-id` was given,
-            // because the id was what turned consensus on -- which is what made the id
-            // undefaultable, since any default makes `nodeId.empty()` false forever and
-            // the one-machine deployment would be refused at every boot. The switch is
-            // this flag now: a node runs consensus if and only if it opens this port,
-            // and `RunsConsensus` reads that off this row rather than off `raftListen`,
-            // so there is no second author of "is the raft surface served".
-            .resolve = ResolveFromSpec,
-            .note = "the wildcard for a bare port: peers are on other machines by definition, so a loopback "
-                    "default would be one that silently cannot work. Giving it is what turns consensus ON",
+            // The MODE opens this port (zero-config formation): the formation record decides, a
+            // learner dials the leader and listens for nobody, and a configuration no record
+            // shaped opens nothing. `RunsConsensus` reads the port off this row for every mode
+            // that listens, so there is no second author of "is the raft surface served".
+            .resolve = [](SurfaceRow const& row, NodeConfig const& cfg) -> SurfaceEndpoints {
+                if (!cfg.formation.has_value() || !ModeOpensRaftPort(cfg.formation->mode))
+                    return {};
+                // Confined to LOOPBACK, when the port was never asked for and this machine's name
+                // reaches only itself (`ConsensusConfinedToThisMachine`): a consensus member must
+                // name the address its peers dial, and that name would send every one of them to
+                // itself -- so it binds where only this machine dials, and the node runs as a fleet
+                // of its own, its own scheduler and worker included. Asked HERE so `RunsConsensus`,
+                // `--print-surfaces` and the tier cannot disagree. A TYPED `--listen-raft`, or a
+                // mode other machines dial, is refused by name instead.
+                auto endpoints = ResolveFromSpec(row, cfg);
+                if (ConsensusConfinedToThisMachine(cfg))
+                    for (auto& endpoint: endpoints)
+                        endpoint.host = std::string { ThisMachineLoopbackHost };
+                return endpoints;
+            },
+            .closedBecause = RaftClosedByFormation,
+            .note = "the formation record's mode opens the port, and every mode but a learner's does; it is on by "
+                    "default, an empty --listen-raft= closes it (a node running no consensus), and a node whose name "
+                    "reaches only itself (localhost) binds it to loopback, a fleet of its own, unless --raft-self names "
+                    "it. The wildcard for a bare "
+                    "port: peers are on other machines by definition, so a loopback default would be one that silently "
+                    "cannot work",
         },
         SurfaceRow {
             .surface = NodeSurface::Discovery,
@@ -238,6 +245,18 @@ namespace
             .spec = &NodeConfig::discoveryAddress,
             .grammar = BeaconAddressGrammar,
             .resolve = [](SurfaceRow const& row, NodeConfig const& cfg) -> SurfaceEndpoints {
+                // Beside consensus only, which is `StartDiscoveryOrExplain`'s own rule: a
+                // node that runs none -- an empty `--listen-raft=` -- opens no discovery
+                // socket whatever this address says, and since discovery is on by default
+                // that is the ordinary worker. Asked here so `--print-surfaces`,
+                // `--node-status` and the tier cannot disagree about whether it is served.
+                //
+                // And, defaulted, not beside a consensus address that reaches only this machine --
+                // a loopback bind, or a consensus confined to it -- which the tier stands down on
+                // too: a beacon would send every peer to itself. A typed one is refused instead.
+                if (!RunsConsensus(cfg) || (!cfg.discoveryAddressExplicit && ConsensusAddressReachesOnlyThisMachine(cfg)))
+                    return {};
+
                 // NOT `ResolveFromSpec`: the host half of `--discovery` is where
                 // beacons are SENT, and both sockets bind the wildcard whatever it
                 // says. This is where that protection lives -- reading the announce
@@ -252,17 +271,32 @@ namespace
                 // a port only it holds. An operator who opened the first and not the
                 // second gets a fleet that hears every beacon and completes no
                 // handshake.
-                SurfaceEndpoints out;
-                out.push_back(
-                    SurfaceEndpoint { .host = std::string { row.defaultHost }, .port = beacon->second, .role = "beacon" });
-                if (cfg.discoveryReplyPort != 0)
-                    out.push_back(SurfaceEndpoint {
-                        .host = std::string { row.defaultHost }, .port = cfg.discoveryReplyPort, .role = "reply" });
-                return out;
+                //
+                // The reply socket is ALWAYS here, pinned or not. It used to appear only
+                // when `--discovery-reply-port` named it, which left the default -- a port
+                // the kernel chooses -- out of the worksheet and out of the firewall
+                // rules, and every challenge and proof then arrived at a port no rule
+                // covered. Unpinned, it is an endpoint whose port nobody can name, and
+                // saying so is the port kind's job rather than a missing line's.
+                auto const pinned = cfg.discoveryReplyPort != 0;
+                return SurfaceEndpoints {
+                    SurfaceEndpoint { .host = std::string { row.defaultHost }, .port = beacon->second, .role = "beacon" },
+                    SurfaceEndpoint { .host = std::string { row.defaultHost },
+                                      .port = cfg.discoveryReplyPort,
+                                      .portKind = pinned ? SurfacePortKind::Fixed : SurfacePortKind::KernelChosen,
+                                      .role = "reply" },
+                };
             },
+            .closedBecause = nullptr,
             .note = "UDP, and the only surface that is. The address you write is where beacons are SENT; the "
-                    "sockets always bind the wildcard. Without --discovery-reply-port the reply socket takes "
-                    "an ephemeral port, which a restrictive firewall has to allow as outbound",
+                    "sockets always bind the wildcard. Unless you write one, beacons go to every up interface's "
+                    "directed broadcast on this port, re-read on an interval, never to the limited broadcast. "
+                    "Without --discovery-reply-port the reply socket takes a kernel-chosen port, new at every start, "
+                    "and peers send their challenges and proofs TO it: a restrictive firewall has to let it in, "
+                    "INBOUND, by program, since no port rule can name it. --discovery-reply-port pins one where a "
+                    "site must name it. On by default, and beside consensus only: a node with an empty "
+                    "--listen-raft opens neither socket, and one whose consensus address reaches only this machine "
+                    "opens neither unless you typed --discovery, which is refused",
         },
     };
 
@@ -375,6 +409,11 @@ namespace
     /// @return What to print in that line's trailing column.
     [[nodiscard]] std::string WhyNotServed(SurfaceRow const& row, NodeConfig const& cfg)
     {
+        // The row's own reason first: "set the flag" is wrong for a port the mode keeps closed.
+        if (row.closedBecause != nullptr)
+            if (auto because = row.closedBecause(cfg); because.has_value())
+                return *std::move(because);
+
         if (row.spec == nullptr || (cfg.*row.spec).empty())
             return std::format("not served; set {}", PrimaryFlag(row));
 
@@ -384,9 +423,9 @@ namespace
             // actually starting, rather than a second author of it.
             return std::format("not served; {}={} is not {}", PrimaryFlag(row), cfg.*row.spec, row.grammar.shape);
 
-        // Configured, well-formed, and still nothing bound. No row reaches this since
-        // #1022; see above for why it stays. Why is not uniform enough to be a column,
-        // so the row's own note carries it and this points at it rather than guessing.
+        // Configured, well-formed, and still nothing bound: discovery on a node running no
+        // consensus, which it runs beside. Why is not uniform enough to be a column, so the
+        // row's own note carries it and this points at it rather than guessing.
         return row.note.empty() ? std::string { "not served" } : std::format("not served; see the {} note below", row.name);
     }
 } // namespace
@@ -450,6 +489,11 @@ std::string_view PrimaryFlag(SurfaceRow const& row) noexcept
     return row.flags[0];
 }
 
+SurfacePortKindRow const& SurfacePortKindRowOf(SurfacePortKind kind) noexcept
+{
+    return PortKindRows[static_cast<std::size_t>(kind)];
+}
+
 SurfaceRow const& RowFor(NodeSurface surface) noexcept
 {
     return Surfaces[static_cast<std::size_t>(surface)];
@@ -487,10 +531,18 @@ namespace
           .trailer = "(absent: this node runs no consensus, --listen-raft does not resolve)" },
         { .gap = ConsensusDialGap::Unstated,
           .address = "NOT STATED",
-          .trailer = "-- this node runs consensus and names no address peers dial it at; give --raft-self, or a "
-                     "--raft-peer for its own id" },
+          .trailer = "-- this node runs consensus and names no address peers dial it at; give --raft-self" },
+        { .gap = ConsensusDialGap::AwaitingHostName,
+          .address = "AT STARTUP",
+          .trailer = "-- this machine's fully qualified name on the raft port, resolved when the node starts; give "
+                     "--raft-self to state it now" },
+        { .gap = ConsensusDialGap::DialsIn,
+          .address = "-",
+          .trailer = "(absent: this node dials its fleet's voters, and nobody dials it)" },
     } };
     static_assert(RowsInEnumeratorOrder(DialGapCells, &DialGapCell::gap));
+    static_assert(DialGapCells[static_cast<std::size_t>(ConsensusDialGap::Unstated)].trailer.contains(ConsensusDialRemedy),
+                  "the worksheet names every way to state the dial address, in the startup refusal's words");
 
     /// The address column and the trailer of the worksheet's dial line.
     /// @param dial What `ConsensusDialAddressOf` answered; must outlive the result.
@@ -534,14 +586,17 @@ std::string RenderSurfaces(NodeConfig const& cfg)
         }
 
         for (auto const& endpoint: endpoints)
-            lines.push_back(Line { .label = endpoint.role.empty() ? std::string { row.name }
-                                                                  : std::format("{} {}", row.name, endpoint.role),
-                                   // `FormatHostPort`, not a hand-rolled join: it brackets a v6
-                                   // host, so `--listen-node [2001:db8::1]:6674` comes back as an
-                                   // address that reads back rather than as `2001:db8::1:6674`.
-                                   // This is the surface whose whole purpose is being transcribed.
-                                   .address = FormatHostPort(endpoint.host, endpoint.port),
-                                   .trailer = row.protocol == SurfaceProtocol::Udp ? "UDP" : "TCP" });
+        {
+            auto const& portKind = SurfacePortKindRowOf(endpoint.portKind);
+            lines.push_back(Line {
+                .label = endpoint.role.empty() ? std::string { row.name } : std::format("{} {}", row.name, endpoint.role),
+                // `FormatHostPort`, not a hand-rolled join: it brackets a v6
+                // host, so `--listen-node [2001:db8::1]:6674` comes back as an
+                // address that reads back rather than as `2001:db8::1:6674`.
+                // This is the surface whose whole purpose is being transcribed.
+                .address = FormatHostPort(endpoint.host, portKind.portText(endpoint.port)),
+                .trailer = std::format("{}{}", row.protocol == SurfaceProtocol::Udp ? "UDP" : "TCP", portKind.trailer) });
+        }
     }
 
     // Widths over what is actually PRINTED -- every line, not only the served ones.
@@ -556,7 +611,10 @@ std::string RenderSurfaces(NodeConfig const& cfg)
         addressWidth = std::max(addressWidth, line.address.size());
     }
 
-    std::string out;
+    // The MODE first, on a line of its own: it is what decided which of the rows below are
+    // served, and it is not a port -- `mode:` has no column-one `label  address` shape, so a
+    // transcript reader cannot take it for a surface.
+    auto out = std::format("{}\n\n", DescribeFormationMode(cfg));
     for (auto const& line: lines)
         out += std::format("{:<{}}  {:<{}}  {}\n", line.label, labelWidth, line.address, addressWidth, line.trailer);
 
@@ -579,6 +637,21 @@ std::string RenderSurfaces(NodeConfig const& cfg)
                        CompileCacheWire::ConsensusEndpointLabel,
                        address,
                        trailer);
+
+    // Where this node keeps its identity, and why there -- indented under a heading like the
+    // block above, because it is not a port. A machine can hold two identities (the service's
+    // and a hand-started node's), and the reason is what tells an operator which one this is.
+    out += std::format("\nstate directory:\n  {}\n", DescribeNodeStateDirectory(cfg));
+
+    // Which cluster this node is in and which one `--fleet-id` lets it be in, indented for the same
+    // reason. The id is what another machine's pin names; `none` under the pin is the answer an
+    // operator asks for -- discovery is trust-on-first-use -- and is said, never left blank.
+    out +=
+        std::format("\nfleet:\n  cluster    {}\n  pinned to  {}\n",
+                    cfg.formation.has_value() && !cfg.formation->clusterId.empty() ? cfg.formation->clusterId
+                                                                                   : std::string { "none minted yet" },
+                    cfg.fleetPin.has_value() ? Cluster::FormatPinnedFleet(*cfg.fleetPin)
+                                             : std::string { "none (--fleet-id unset: discovery is trust-on-first-use)" });
 
     // The notes last and separately, because they are prose while the table above is
     // something an operator transcribes into firewall rules. Mixing them would rag the
@@ -623,11 +696,10 @@ ServedSurfaces NodeServedSurfacesFor(NodeConfig const& cfg)
         bool served;
     };
 
-    // `--serve-scheduler` is read directly because `main` has no predicate for it: it builds
-    // the tier under `if (cfg.serveScheduler)`. Enrollment repeats `ServesEnrollment`'s two
-    // clauses for the same reason -- that helper takes a started tier, which does not exist
-    // when a scrape asks this question.
-    auto const servesScheduler = cfg.serveScheduler;
+    // `ServesScheduler`, the one predicate `main` builds the tier under. Enrollment asks
+    // `ServesEnrollment` itself, stating the scheduler by that same predicate: a started tier does not
+    // exist when a scrape asks this question, and a copy of its clauses here missed the pin's.
+    auto const servesScheduler = ServesScheduler(cfg);
     std::array const rows {
         // Never: this binary constructs no `Server`/`ReactorServerLoop`, so
         // `fastcached_connections_*` read absent rather than as a node nobody has connected to.
@@ -644,10 +716,19 @@ ServedSurfaces NodeServedSurfacesFor(NodeConfig const& cfg)
         Row { .surface = MetricsSurface::CompileScheduler, .served = servesScheduler },
         Row { .surface = MetricsSurface::CompileWorker, .served = RunsWorker(cfg) },
         Row { .surface = MetricsSurface::NodeCacheTier, .served = ConfiguresCacheTier(cfg) },
-        Row { .surface = MetricsSurface::NodeEnrollment, .served = RunsConsensus(cfg) && servesScheduler },
-        // `StartDiscoveryOrExplain`'s two conditions: an announce address, and a consensus tier
-        // to desire peers onto.
-        Row { .surface = MetricsSurface::NodeDiscovery, .served = RunsConsensus(cfg) && !cfg.discoveryAddress.empty() },
+        Row { .surface = MetricsSurface::NodeEnrollment, .served = ServesEnrollment(cfg, servesScheduler) },
+        // The discovery row, which asks `StartDiscoveryOrExplain`'s conditions: an announce address,
+        // a consensus tier to desire peers onto, and a consensus address that leaves this machine.
+        Row { .surface = MetricsSurface::NodeDiscovery, .served = !RowFor(NodeSurface::Discovery).Resolve(cfg).empty() },
+        // Never, yet: no `FormationController` is constructed until `main` wires one, so its
+        // counters read absent rather than as a node that never yielded. The wiring makes this the
+        // condition it constructs the controller under.
+        Row { .surface = MetricsSurface::NodeFormation, .served = false },
+        // Always: the fleet cache verbs sit on the same merged listener as `NodeFrameEndpoint`
+        // above, so every node that starts builds the component that answers them -- serving,
+        // when the `shared-cache` setting names this machine, or refusing `not-shared-cache`
+        // otherwise. A dormant node still moves the refusal counters, so it can move these too.
+        Row { .surface = MetricsSurface::NodeSharedCache, .served = true },
     };
     static_assert(rows.size() == EnumeratorCount<MetricsSurface>,
                   "every MetricsSurface needs a row here: a surface omitted is answered 'not "

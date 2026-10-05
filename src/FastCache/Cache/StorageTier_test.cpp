@@ -248,6 +248,13 @@ TEST_CASE("A sharded layered cache reports both tiers", "[storage-tier][sharded]
     CHECK(Unwrap(At(tiers, StorageTier::Disk)).itemCount == 1);
 }
 
+TEST_CASE("The shared tier is disk-backed by default and has no memory half", "[storage][shared-cache]")
+{
+    CHECK_FALSE(FastCache::TraitsFor(StorageTier::Memory).sharedTierDefaultBytes.has_value());
+    REQUIRE(FastCache::TraitsFor(StorageTier::Disk).sharedTierDefaultBytes.has_value());
+    CHECK(Unwrap(FastCache::TraitsFor(StorageTier::Disk).sharedTierDefaultBytes) == 64ULL * 1024 * 1024 * 1024);
+}
+
 TEST_CASE("A decorator forwards the tiers of what it wraps", "[storage-tier]")
 {
     // The failure this prevents: a decorator that inherits the interface default

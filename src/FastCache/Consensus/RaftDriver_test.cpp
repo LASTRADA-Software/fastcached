@@ -5,12 +5,14 @@
 #include <FastCache/Consensus/InMemoryRaftStorage.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 #include <FastCache/Core/Bytes.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <memory>
@@ -1087,14 +1089,28 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
 {
     // #1542 at the production seam: the store `ConsensusTier` opens, the state machine
     // it applies to, and a driver built the way it builds one. A node compacted past a
-    // member, a setting and a forget tombstone, then restarted. Before the fix the
-    // recovered node's applied index sat at the snapshot's boundary and nothing handed
-    // the snapshot to the application, so all three were gone -- and a forgotten client
-    // was admitted again, with nothing reporting it: removal failing OPEN.
+    // member, a learner, a setting and a forget's revoked key, then restarted. Before the
+    // fix the recovered node's applied index sat at the snapshot's boundary and nothing
+    // handed the snapshot to the application, so all of them were gone -- and a forgotten
+    // machine's key was admitted again, with nothing reporting it: removal failing OPEN.
     ScratchDirectory scratch { "fc-raft-restore" };
     NullLogger logger;
     NoPeers transport;
     ScriptedRandomSource random { { 0 } };
+
+    // A key per learner, distinct by fill so one read from the wrong place cannot match.
+    auto const keyOf = [](std::uint8_t fill) {
+        auto key = Ed25519PublicKey {};
+        key.fill(static_cast<std::byte>(fill));
+        return key;
+    };
+    auto const admitLearner = [&keyOf](std::string id, std::uint8_t fill) {
+        return Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
+                                  .key = std::move(id),
+                                  .value = {},
+                                  .schedulerEndpoint = {},
+                                  .publicKey = keyOf(fill) };
+    };
 
     auto forgottenAt = LogIndex {};
     auto aboveAt = LogIndex {};
@@ -1113,27 +1129,26 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
                                                  .key = "n2",
                                                  .value = "10.0.0.2:6675",
                                                  .schedulerEndpoint = {},
-                                                 .publicKey = std::nullopt,
-                                                 .role = std::nullopt },
+                                                 .publicKey = keyOf(0x22) },
                               at);
+        (void) ProposeCommand(*driver, admitLearner("w1", 0x31), at);
+        (void) ProposeCommand(*driver, admitLearner("w9", 0x39), at);
         forgottenAt = ProposeCommand(*driver,
-                                     Cluster::Command { .kind = Cluster::CommandKind::ForgetClient,
-                                                        .key = "10.0.0.7",
+                                     Cluster::Command { .kind = Cluster::CommandKind::Forget,
+                                                        .key = "w9",
                                                         .value = {},
                                                         .schedulerEndpoint = {},
-                                                        .publicKey = std::nullopt,
-                                                        .role = std::nullopt },
+                                                        .publicKey = std::nullopt },
                                      at);
         (void) ProposeCommand(*driver,
                               Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
                                                  .key = std::string { Cluster::LeaseLifetimeSetting },
                                                  .value = "40min",
                                                  .schedulerEndpoint = {},
-                                                 .publicKey = std::nullopt,
-                                                 .role = std::nullopt },
+                                                 .publicKey = std::nullopt },
                               at);
 
-        // Padded until the snapshot covers the tombstone -- counted by the boundary
+        // Padded until the snapshot covers the revocation -- counted by the boundary
         // rather than by a hand-computed number of entries, for the compaction case's
         // reason: a new leader's own no-op is an entry too. Bounded, so a driver that
         // never compacts fails here rather than looping.
@@ -1146,27 +1161,19 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
                                                      .key = std::string { Cluster::FleetOpenSetting },
                                                      .value = step % 2 == 0 ? "1" : "0",
                                                      .schedulerEndpoint = {},
-                                                     .publicKey = std::nullopt,
-                                                     .role = std::nullopt },
+                                                     .publicKey = std::nullopt },
                                   at);
         }
         REQUIRE(driver->Node().SnapshotIndex() >= forgottenAt);
 
         // And one fact ABOVE the snapshot, which a restart re-applies rather than
         // restores -- so the case sees both halves of recovery, in their order.
-        aboveAt = ProposeCommand(*driver,
-                                 Cluster::Command { .kind = Cluster::CommandKind::AdmitClient,
-                                                    .key = "10.0.0.9",
-                                                    .value = {},
-                                                    .schedulerEndpoint = {},
-                                                    .publicKey = std::nullopt,
-                                                    .role = std::nullopt },
-                                 at);
+        aboveAt = ProposeCommand(*driver, admitLearner("w2", 0x32), at);
         REQUIRE(driver->Node().SnapshotIndex() < aboveAt);
 
         before = machine.State();
-        REQUIRE(before.HasForgotten("10.0.0.7"));
-        REQUIRE(before.AdmitsClient("10.0.0.9"));
+        REQUIRE(before.IsRevoked(keyOf(0x39)));
+        REQUIRE(before.HolderOf(keyOf(0x32)) == std::optional<std::string> { "w2" });
     }
 
     // The restart: the same directory, a fresh state machine -- a process remembers
@@ -1179,19 +1186,20 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
 
     // Before a single step: everything the snapshot covered is back.
     //
-    // The tombstone is a REQUIRE, and not for tidiness. A missed restore fails every
+    // The revocation is a REQUIRE, and not for tidiness. A missed restore fails every
     // check below together, and exactly four of them used to: a Catch2 binary's exit
     // status is its failed-assertion count, and four collides with `SKIP_RETURN_CODE 4`,
     // so the neutered fix was scored SKIPPED rather than failed (#1152) -- measured, on
     // this case, before this line was a REQUIRE. Stopping at the headline property
     // makes that defect one failure, whatever is appended below it.
     auto const restored = machine.State();
-    REQUIRE(restored.HasForgotten("10.0.0.7"));
+    REQUIRE(restored.IsRevoked(keyOf(0x39)));
     CHECK(restored.RaftEndpointOf("n2") == std::optional<std::string> { "10.0.0.2:6675" });
+    CHECK(restored.HolderOf(keyOf(0x31)) == std::optional<std::string> { "w1" });
     CHECK(restored.SettingOf(Cluster::LeaseLifetimeSetting) == std::optional<std::string> { "40min" });
     // And nothing above it yet: that is re-applied once it is committed again, never
     // restored -- a snapshot is state as of its index and no further.
-    CHECK_FALSE(restored.AdmitsClient("10.0.0.9"));
+    CHECK_FALSE(restored.HolderOf(keyOf(0x32)).has_value());
 
     // Leading again, it commits what it holds, and the entry above the snapshot lands ON
     // TOP of the restored state rather than in place of it: the whole state is what it

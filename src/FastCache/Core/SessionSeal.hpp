@@ -30,7 +30,8 @@ namespace FastCache
 // **One direction per key.** A sealer and an opener over one key agree on ONE count, so a
 // wire that sends both ways derives a key per direction; one that shares a key between two
 // senders has two counts claiming the same positions, and each end refuses the other's frames.
-// The Raft peer wire sends one way per connection, which is why it derives one.
+// The Raft peer wire derives one per direction on every connection, and seals with the
+// acceptor's only on one whose proof asked for `RaftWire::SessionDirection::TwoWay`.
 //
 // Pure: no socket, no clock, no randomness. The key arrives from a caller that drew it.
 

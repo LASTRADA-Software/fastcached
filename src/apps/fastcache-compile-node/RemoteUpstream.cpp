@@ -14,10 +14,36 @@
 namespace FastCache::Node
 {
 
-namespace
+UpstreamReachability::UpstreamReachability(core::platform::IClock const& clock,
+                                           std::chrono::milliseconds retryInterval) noexcept:
+    _clock { clock },
+    _retryInterval { retryInterval }
 {
+}
 
-} // namespace
+bool UpstreamReachability::ShouldDial()
+{
+    if (!_nextProbeAt.has_value())
+        return true;
+
+    auto const now = _clock.now();
+    if (now < *_nextProbeAt)
+        return false;
+
+    // Stamped as the probe is GRANTED, not when it fails: see the class comment.
+    _nextProbeAt = now + _retryInterval;
+    return true;
+}
+
+void UpstreamReachability::Answered() noexcept
+{
+    _nextProbeAt.reset();
+}
+
+void UpstreamReachability::Unanswered()
+{
+    _nextProbeAt = _clock.now() + _retryInterval;
+}
 
 RemoteUpstream::RemoteUpstream(std::string endpoint,
                                ICredentialSource const& credential,
@@ -26,9 +52,7 @@ RemoteUpstream::RemoteUpstream(std::string endpoint,
                                core::net::EventLoop* reactor,
                                core::net::IAsyncAddressResolver& resolver,
                                core::platform::IClock& clock,
-                               std::chrono::milliseconds connectTimeout,
-                               std::chrono::milliseconds ioTimeout,
-                               std::chrono::milliseconds addressRefreshInterval):
+                               UpstreamTimings timings):
     _endpoint { std::move(endpoint) },
     _credential { credential },
     _notice { std::move(noticeSink) },
@@ -36,9 +60,10 @@ RemoteUpstream::RemoteUpstream(std::string endpoint,
     _reactor { reactor },
     _resolver { resolver },
     _clock { clock },
-    _connectTimeout { connectTimeout },
-    _ioTimeout { ioTimeout },
-    _addressRefreshInterval { addressRefreshInterval }
+    _connectTimeout { timings.connectTimeout },
+    _ioTimeout { timings.ioTimeout },
+    _addressRefreshInterval { timings.addressRefreshInterval },
+    _reachability { clock, timings.unreachableRetryInterval }
 {
     // Split ONCE. `_endpoint` is fixed for this object's life, so re-parsing it per
     // operation would be the same shape of waste the resolution itself was.
@@ -112,16 +137,33 @@ core::async::Task<std::string> RemoteUpstream::DialTarget()
     co_return *_resolved;
 }
 
+void RemoteUpstream::RecordExchange(Cc::CacheOutcomeKind kind)
+{
+    if (kind == Cc::CacheOutcomeKind::Transport)
+        _reachability.Unanswered();
+    else
+        _reachability.Answered();
+}
+
 core::async::Task<std::optional<std::vector<std::byte>>> RemoteUpstream::Fetch(std::string_view key)
 {
+    // Believed unreachable: a miss, without a lookup or a dial. See `UpstreamReachability` for why
+    // a stale answer here is safe in both directions.
+    if (!_reachability.ShouldDial())
+        co_return std::nullopt;
+
     auto const dialTarget = co_await DialTarget();
     auto client =
         co_await Cc::DialEndpoint(&_connector, dialTarget, core::net::DialOptions { .connectTimeout = _connectTimeout });
     if (client == nullptr)
+    {
         // Unreachable is a miss. `LocalCache` documents why: the caller compiles
         // either way, and a build that could FAIL because a cache was down is the
-        // one outcome this subsystem must never produce.
+        // one outcome this subsystem must never produce. Remembered, so the next
+        // miss does not pay this dial again.
+        _reachability.Unanswered();
         co_return std::nullopt;
+    }
 
     // Bounds the WHOLE exchange by closing the socket. Closing completes whatever
     // the exchange is parked on, so it reports a transport failure and this
@@ -134,6 +176,9 @@ core::async::Task<std::optional<std::vector<std::byte>>> RemoteUpstream::Fetch(s
     auto const bound = core::net::armSocketDeadline(_reactor, _ioTimeout, &target);
 
     auto outcome = co_await Cc::CacheFetch(client.get(), &_notice, key, _credential.Current());
+    // Only now is reachability known: a connection whose exchange never completed -- the deadline
+    // closed a stalled peer, or the peer went away -- is remembered exactly as a failed dial is.
+    RecordExchange(outcome.kind);
     if (!outcome.IsHit())
         co_return std::nullopt;
     co_return std::move(outcome.value);
@@ -141,14 +186,22 @@ core::async::Task<std::optional<std::vector<std::byte>>> RemoteUpstream::Fetch(s
 
 core::async::Task<UpstreamStore> RemoteUpstream::Store(std::string_view key, std::span<std::byte const> value)
 {
+    // Believed unreachable: declined without a dial, and counted as a declined store is -- the
+    // fleet did not get this object either way.
+    if (!_reachability.ShouldDial())
+        co_return UpstreamStore::Declined;
+
     auto const dialTarget = co_await DialTarget();
     auto client =
         co_await Cc::DialEndpoint(&_connector, dialTarget, core::net::DialOptions { .connectTimeout = _connectTimeout });
     if (client == nullptr)
+    {
         // `Declined`, not `NotConfigured`: there IS a shared cache and this node
         // could not reach it, which is exactly the condition an operator wants the
         // failure counter to be counting.
+        _reachability.Unanswered();
         co_return UpstreamStore::Declined;
+    }
 
     core::net::SocketDeadlineTarget target { .socket = client.get() };
     auto const bound = core::net::armSocketDeadline(_reactor, _ioTimeout, &target);
@@ -175,6 +228,7 @@ core::async::Task<UpstreamStore> RemoteUpstream::Store(std::string_view key, std
         .key = key, .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = value
     };
     auto const outcome = co_await Cc::CacheStore(client.get(), &_notice, request, _credential.Current());
+    RecordExchange(outcome.kind);
 
     // A STORE that succeeded comes back as `Hit`: the wire answers `Ok`, and
     // `CacheOutcomeKind` names the STATUS rather than the verb. Anything else --

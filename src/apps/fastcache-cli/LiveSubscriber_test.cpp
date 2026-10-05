@@ -300,7 +300,7 @@ TEST_CASE("A subscription reads its stream, and leaving it while a read blocks i
     listener->SetTimeouts(5s, 5s);
 
     auto record = ServerRecord {};
-    auto subscription = NodeSubscription { DialTimeouts { .connect = 5s, .io = 5s }, Credential {} };
+    auto subscription = NodeSubscription { DialTimeouts { .connect = 5s, .io = 5s }, NodeCredentials {} };
     {
         // Declared after what it writes to, so an unwinding case joins it before those go.
         auto const server = std::jthread { [&listener, &record] { ServeOneStream(listener.get(), &record); } };
@@ -356,12 +356,12 @@ TEST_CASE("A leave that arrives while the subscription dials is still the node's
 
     auto record = ServerRecord {};
     NodeSubscription* self = nullptr;
-    auto leavesWhileDialling = [&self](Endpoint const& endpoint, DialTimeouts timeouts, Credential const& credential) {
+    auto leavesWhileDialling = [&self](Endpoint const& endpoint, DialTimeouts timeouts, NodeCredentials const& credentials) {
         self->Leave();
-        return NodeExchange::Open(endpoint, timeouts, credential);
+        return NodeExchange::Open(endpoint, timeouts, credentials);
     };
     auto subscription =
-        NodeSubscription { DialTimeouts { .connect = 5s, .io = 5s }, Credential {}, std::move(leavesWhileDialling) };
+        NodeSubscription { DialTimeouts { .connect = 5s, .io = 5s }, NodeCredentials {}, std::move(leavesWhileDialling) };
     self = &subscription;
     {
         auto const server = std::jthread { [&listener, &record] { ServeOneStream(listener.get(), &record); } };

@@ -133,25 +133,24 @@ namespace
     {
       public:
         /// @param handles The complete set the child may inherit.
-        explicit InheritList(std::span<HANDLE const> handles)
+        ///
+        /// UpdateProcThreadAttribute does not copy: the array must outlive the spawn, which is why it is a
+        /// member rather than the caller's temporary.
+        explicit InheritList(std::span<HANDLE const> handles):
+            _storage(ListBytes()),
+            _handles(handles.begin(), handles.end()),
+            _list(reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(_storage.data()))
         {
-            SIZE_T bytes = 0;
-            // The first call always "fails"; it is how the size is asked for.
-            InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
-            _storage.resize(bytes);
-            _list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(_storage.data());
+            SIZE_T bytes = _storage.size();
             if (!InitializeProcThreadAttributeList(_list, 1, 0, &bytes))
             {
                 _list = nullptr;
                 return;
             }
-            // UpdateProcThreadAttribute does not copy: the array must outlive the
-            // spawn, which is why it is a member rather than the caller's temporary.
-            _handles.assign(handles.begin(), handles.end());
             if (!UpdateProcThreadAttribute(_list,
                                            0,
                                            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                           _handles.data(),
+                                           static_cast<void*>(_handles.data()),
                                            _handles.size() * sizeof(HANDLE),
                                            nullptr,
                                            nullptr))
@@ -185,6 +184,14 @@ namespace
         }
 
       private:
+        /// @return The bytes a one-attribute list needs. The call always "fails"; it is how the size is asked for.
+        [[nodiscard]] static SIZE_T ListBytes() noexcept
+        {
+            SIZE_T bytes = 0;
+            InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
+            return bytes;
+        }
+
         std::vector<std::byte> _storage;
         std::vector<HANDLE> _handles;
         LPPROC_THREAD_ATTRIBUTE_LIST _list { nullptr };

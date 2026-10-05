@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 namespace FastCache::Distributed
 {
@@ -29,20 +30,11 @@ namespace
     /// A table rather than three `case` labels so the membership test below is
     /// derived from it: a verb that reaches this class without a row is refused
     /// rather than served, which is the direction a mistake has to fail in.
-    constexpr std::array SchedulerOps { Wire::Op::Register,
-                                        Wire::Op::NodeAnnounce,
-                                        Wire::Op::Heartbeat,
-                                        Wire::Op::Withdraw,
-                                        Wire::Op::Lease,
-                                        Wire::Op::Release,
-                                        Wire::Op::ClusterStatus,
-                                        Wire::Op::ClusterSet,
-                                        Wire::Op::ClusterForget,
-                                        Wire::Op::ClusterAdmit,
-                                        Wire::Op::ClusterAdmitLearner,
-                                        Wire::Op::ClusterAdmitWorker,
-                                        Wire::Op::ClusterAdmitClient,
-                                        Wire::Op::ClusterForgetClient };
+    constexpr std::array SchedulerOps {
+        Wire::Op::Register,      Wire::Op::NodeAnnounce, Wire::Op::Heartbeat,          Wire::Op::Withdraw,
+        Wire::Op::Lease,         Wire::Op::Release,      Wire::Op::ClusterStatus,      Wire::Op::ClusterSet,
+        Wire::Op::ClusterForget, Wire::Op::ClusterAdmit, Wire::Op::ClusterAdmitLearner
+    };
 
     /// Whether this scheduler serves @p op at all.
     /// @param op The verb, already resolved against `OpTable`.
@@ -57,9 +49,10 @@ namespace
     ///
     /// **Empty since #289**, and the removal is the point. The row that was here said
     /// `Auth` was `UnimplementedVerb` -- "this endpoint schedules and checks no
-    /// credential" -- which was true and is not any more: the scheduler surface
-    /// terminates `AUTH` in `FrameServer`'s loop, because what that verb changes is
-    /// per-connection state and this class is deliberately stateless.
+    /// credential" -- which was true and is not any more: the node's endpoint terminates
+    /// `AUTH` in `FrameServer`'s loop and asks the session component, because what that
+    /// verb changes is per-connection state and this class is deliberately stateless. So
+    /// the verb is served ELSEWHERE, which is `DispatchNotPermitted`, never unknown.
     ///
     /// Leaving the row would have been the exact failure the rulebook records twice
     /// (#283, #340): `UnimplementedVerb` tells `Cc::CacheProtocol::Exchange` to step
@@ -348,12 +341,15 @@ Wire::LoadFields LoadToWire(NodeLoad const& load)
     // handed its series over. Named rather than defaulted because clang-tidy fails
     // the build on a designated initializer that skips a field -- which is how a
     // field added to this record would otherwise be silently dropped here.
+    // `interfaceAddresses` is stated and left empty for the same reason: `NodeLoad`
+    // does not carry them, and the worker attaches its own.
     return Wire::LoadFields { .cpuBusyPermille = load.cpuBusyPermille,
                               .availableMemoryBytes = load.availableMemoryBytes,
                               .freeScratchBytes = load.freeScratchBytes,
                               .cache = CacheLoadToWire(load.cache),
                               .history = {},
-                              .cordoned = load.cordoned };
+                              .cordoned = load.cordoned,
+                              .interfaceAddresses = {} };
 }
 
 NodeLoad LoadFromWire(Wire::LoadFields const& fields, std::uint32_t inFlight)
@@ -392,7 +388,13 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                                           .displayName = fields->capacity.displayName,
                                                           .slots = fields->slots,
                                                           .codecs = fields->acceptedCodecs,
-                                                          .capacity = *capacity });
+                                                          .capacity = *capacity,
+                                                          // Set by the service from the
+                                                          // connection, never from the payload.
+                                                          .observedHost = {},
+                                                          // Borrows `fields`, which outlives the
+                                                          // call; the registry copies it.
+                                                          .interfaceAddresses = fields->capacity.interfaceAddresses });
         }
         case Wire::Op::NodeAnnounce: {
             auto const fields = Wire::DecodeNodeAnnouncePayload(payload);
@@ -423,9 +425,9 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                                         // (#1364). Off the load record, the one
                                                         // variable-arity carrier this verb has.
                                                         .conditions = fields->load.conditions,
-                                                        // A voter's roster endorsement (#178),
-                                                        // opaque until the service verifies it.
-                                                        .endorsement = fields->endorsement },
+                                                        // Borrowed from the decoded frame, which
+                                                        // outlives the call.
+                                                        .joinMemos = fields->joinMemos },
                                          HistoryFromWire(fields->load.history));
         }
         case Wire::Op::Heartbeat: {
@@ -435,7 +437,8 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             return _service.Heartbeat(caller,
                                       Wire::AsStringView(fields->workerId),
                                       LoadFromWire(fields->load, fields->inFlight),
-                                      HistoryFromWire(fields->load.history));
+                                      HistoryFromWire(fields->load.history),
+                                      fields->load.interfaceAddresses);
         }
         case Wire::Op::Withdraw: {
             auto const fields = Wire::DecodeWithdrawPayload(payload);
@@ -447,10 +450,16 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             auto const fields = Wire::DecodeLeasePayload(payload);
             if (!fields.has_value())
                 return SchedulerReply::Malformed();
+            std::vector<std::string_view> excluded;
+            excluded.reserve(fields->excluded.size());
+            for (auto const entry: fields->excluded)
+                excluded.push_back(Wire::AsStringView(entry));
             return _service.Lease(caller,
                                   Wire::LeaseRequest { .fingerprint = Wire::AsStringView(fields->fingerprint),
                                                        .key = Wire::AsStringView(fields->key),
-                                                       .acceptedCodecs = fields->acceptedCodecs });
+                                                       .acceptedCodecs = fields->acceptedCodecs,
+                                                       .excluded = excluded,
+                                                       .toolchainLabel = Wire::AsStringView(fields->toolchainLabel) });
         }
         case Wire::Op::Release: {
             auto const fields = Wire::DecodeReleasePayload(payload);
@@ -481,20 +490,6 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             return _service.ClusterForget(caller, Wire::AsStringView(*memberId));
         }
 
-        case Wire::Op::ClusterAdmitClient: {
-            auto const host = Wire::DecodeClusterClientVerbPayload<Wire::Op::ClusterAdmitClient>(payload);
-            if (!host.has_value())
-                return SchedulerReply::Malformed();
-            return _service.ClusterAdmitClient(caller, Wire::AsStringView(*host));
-        }
-
-        case Wire::Op::ClusterForgetClient: {
-            auto const host = Wire::DecodeClusterClientVerbPayload<Wire::Op::ClusterForgetClient>(payload);
-            if (!host.has_value())
-                return SchedulerReply::Malformed();
-            return _service.ClusterForgetClient(caller, Wire::AsStringView(*host));
-        }
-
         case Wire::Op::ClusterAdmit: {
             auto const fields = Wire::DecodeClusterAdmitPayload<Wire::Op::ClusterAdmit>(payload);
             if (!fields.has_value())
@@ -502,6 +497,7 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             return _service.ClusterAdmit(caller,
                                          Wire::AsStringView(fields->memberId),
                                          Wire::AsStringView(fields->raftEndpoint),
+                                         std::nullopt,
                                          fields->publicKey.transform(Wire::AsStringView),
                                          Cluster::MemberSeat::Voter);
         }
@@ -513,17 +509,11 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             return _service.ClusterAdmit(caller,
                                          Wire::AsStringView(fields->memberId),
                                          Wire::AsStringView(fields->raftEndpoint),
+                                         std::nullopt,
                                          fields->publicKey.transform(Wire::AsStringView),
                                          Cluster::MemberSeat::Learner);
         }
 
-        case Wire::Op::ClusterAdmitWorker: {
-            auto const fields = Wire::DecodeClusterAdmitWorkerPayload(payload);
-            if (!fields.has_value())
-                return SchedulerReply::Malformed();
-            return _service.ClusterAdmitWorker(
-                caller, Wire::AsStringView(fields->workerId), Wire::AsStringView(fields->publicKey));
-        }
         default:
             // Unreachable: `IsSchedulerVerb` has already refused everything else.
             // Kept as a refusal rather than an assertion because a verb added to

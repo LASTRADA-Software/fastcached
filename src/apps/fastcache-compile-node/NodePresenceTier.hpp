@@ -6,19 +6,24 @@
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
-#include "NodeCredential.hpp"
-#include "NodeRoster.hpp"
+#include "NodeProofClient.hpp"
 #include "SchedulerLink.hpp"
+#include "SchedulerReachability.hpp"
 
+#include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/HostEvents.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stop_token>
 #include <thread>
 
@@ -30,24 +35,36 @@ namespace FastCache::Node
 /// What the presence loop borrows from the node. All of it outlives the loop.
 struct NodePresenceParts
 {
-    NodeConfig const& cfg;                          ///< Where the schedulers are.
+    NodeConfig const& cfg; ///< The configuration the node started with.
+    /// Where the loop registers, re-read at every round (`AppliedSchedulers`): the process's one,
+    /// shared with the worker's heartbeat and told every applied state by the consensus tier.
+    ISchedulerEndpointSource const& schedulers;
     Distributed::NodeCapacity const& capacity;      ///< What this machine is.
     Cc::IAdvertisedEndpointSource const& announced; ///< Where it answers; the key its row is filed under.
-    CacheTier const* cacheTier;                     ///< Null on a node with no cache.
+    CacheTier const* cacheTier {};                  ///< Null on a node with no cache.
     IMetricsSink const& metrics;                    ///< Where the cache figures are read.
     FleetSampler& sampler;                          ///< This machine's own series, and its history.
-    ICredentialSource const& credential;            ///< What the announcement presents.
     ILogger& logger;                                ///< Where a refusal is named.
     /// What is wrong with this machine (#1364), read per round and handed to the leader's fleet
     /// page. The one verb every node sends is the one that carries it.
     NodeConditions const& conditions;
-    /// The roster half of the verb (#178): this node's endorsement out, the certified roster
-    /// back. Null on a node that neither endorses nor verifies anything.
-    IPresenceRoster* roster;
-
     /// How this machine proves itself on each connection (#178); null where nothing proves.
-    NodeProofClient const* prover;
+    NodeProofClient const* prover {};
+    /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
+    SchedulerReachability& reachability;
+    /// How the loop's rounds reach a scheduler. Only the loop's own thread dials through it --
+    /// never the thread a host event arrives on.
+    IEndpointDialer& dialer;
+    /// Where the host's resume and network events arrive; either runs the next round at once.
+    IHostEvents& hostEvents;
+    /// The fleets this machine once asked, read per round and handed to the leader; null where no
+    /// formation record is kept.
+    Cluster::IAskedJoinsSource const* askedJoins {};
 };
+
+/// Per-call send/recv ceiling on the presence loop's connection to a scheduler: the ceiling of
+/// the dialer `main` lends the loop.
+inline constexpr std::chrono::milliseconds PresenceIoTimeout { 10'000 };
 
 /// What one presence announcement is made of.
 ///
@@ -62,14 +79,14 @@ struct PresenceRound
     CacheTier const* cacheTier;                       ///< Null on a node with no cache.
     IMetricsSink const& metrics;                      ///< Where the cache figures are read.
     FleetSampler& sampler;                            ///< This machine's series, and its history.
-    ICredentialSource const& credential;              ///< What the announcement presents.
-    Cc::CredentialNotice& notice;                     ///< Where an unwanted credential is reported.
     CompileCacheWire::CapacityFields const& capacity; ///< What this machine is.
     std::string_view endpoint;                        ///< Where it answers; the key its row is filed under.
     ILogger& logger;                                  ///< Where a refusal is named.
     NodeConditions const& conditions;                 ///< What is wrong with this machine, as of this round.
-    IPresenceRoster* roster;                          ///< The roster half of the verb; may be null.
     NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
+    /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
+    SchedulerReachability& reachability;
+    Cluster::IAskedJoinsSource const* askedJoins; ///< The fleets it once asked; null where none are kept.
 };
 
 /// Announce this machine once, and hand over the history it owes.
@@ -90,28 +107,75 @@ struct PresenceMessage
     std::string_view endpoint;                        ///< Where this machine answers; its row's key.
     CompileCacheWire::CapacityFields const& capacity; ///< What this machine is.
     CompileCacheWire::LoadFields const& load;         ///< What it is doing, and the history it hands over.
-    ICredentialSource const& credential;              ///< What the announcement presents.
-    Cc::CredentialNotice& notice;                     ///< Where an unwanted credential is reported.
     ILogger& logger;                                  ///< Where a refusal is named.
     NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
+    /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
+    SchedulerReachability& reachability;
+    std::span<CompileCacheWire::JoinMemoFields const> joinMemos; ///< The fleets it once asked, as the wire carries them.
 };
 
-/// Make one presence announcement: dial, follow a redirect, fall back, and carry the roster both
-/// ways (#178).
+/// Make one presence announcement: dial, follow a redirect, and fall back.
 ///
 /// The part of a round below the sampling, so a fleet harness exercises exactly what a node
-/// runs: `DialAndAnnounce`'s rules for WHICH scheduler, this node's endorsement out, and the
-/// reply handed to @p roster -- from whichever scheduler the round reached, which is what lets a
-/// worker whose remembered leader was deposed adopt the new leader's roster in the same round.
+/// runs: `DialAndAnnounce`'s rules for WHICH scheduler, and whether one recorded this machine.
 /// @param message What to say.
-/// @param roster The roster half, or null on a node that neither endorses nor verifies.
 /// @param link Which scheduler to try, and what an answer teaches it.
 /// @param dialer How a connection is made.
 /// @return Whether a scheduler recorded this machine.
-[[nodiscard]] bool AnnouncePresence(PresenceMessage const& message,
-                                    IPresenceRoster* roster,
-                                    SchedulerLink& link,
-                                    IEndpointDialer& dialer);
+[[nodiscard]] bool AnnouncePresence(PresenceMessage const& message, SchedulerLink& link, IEndpointDialer& dialer);
+
+/// Why the wait between two presence rounds ended.
+///
+/// **Private**: never transmitted or persisted.
+enum class PresenceWakeReason : std::uint8_t
+{
+    Elapsed,   ///< The interval ran out.
+    HostEvent, ///< A resume or a network change asked for a round now.
+    Stopped,   ///< The node is stopping.
+};
+
+/// The wait between presence rounds, which a host event can end early.
+///
+/// Which events end it is `HostEventActionFor(event).wakesPresence`, and which cancel a wake still
+/// pending is `supersedesOlderWakes` -- the same table the worker heartbeat reads, so the two loops
+/// cannot disagree about what a resume or a suspend means.
+///
+/// **A sink that only records and wakes**: the round a wake asks for runs on the loop's thread,
+/// never on the one that delivered the event (`IHostEventSink`'s contract).
+class PresenceWake final: public IHostEventSink
+{
+  public:
+    /// @copydoc IHostEventSink::OnHostEvent
+    void OnHostEvent(HostEvent event) override;
+
+    /// Wait out @p interval, or less.
+    /// @param stop Ends the wait at once.
+    /// @param interval The longest wait.
+    /// @return What ended it; a host event is consumed by the wait it ends.
+    [[nodiscard]] PresenceWakeReason WaitOut(std::stop_token const& stop, std::chrono::milliseconds interval);
+
+  private:
+    std::mutex _mutex;                 ///< Guards `_announceNow`.
+    std::condition_variable_any _wake; ///< Notified when a wake is posted; `_any` because the wait takes a stop token.
+    bool _announceNow { false };       ///< A round is owed now. Under `_mutex`.
+};
+
+/// Whether this node's announce loops run: its formation record names somewhere it registers
+/// (`SchedulersOf`, at the port it actually serves). `NodePresence::Start` builds its link from
+/// that same list, and `scheduler-unreachable` is answered exactly where this says a loop runs
+/// (`PresentComponents::announces`) -- never from `--scheduler`, which a serving node is refused
+/// and which would read "names no scheduler" on every node there is.
+/// @param cfg The configuration the body runs.
+/// @param activated Where a supervisor handed the node surface over, or `AsConfigured`.
+/// @return True when there is somewhere to announce to.
+[[nodiscard]] bool AnnouncesToAScheduler(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated);
+
+/// Whether this node's prover can observe `own-record-awaited`: a consensus node that announces.
+/// One that announces to nobody holds nothing back, so the row is not evaluated there.
+/// @param cfg The configuration the body runs.
+/// @param activated Where a supervisor handed the node surface over, or `AsConfigured`.
+/// @return True when a held-back announcement is something this node can be in.
+[[nodiscard]] bool AwaitsItsOwnRecord(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated);
 
 /// The loop that tells a scheduler this MACHINE exists, running on EVERY node.
 ///
@@ -136,9 +200,10 @@ class NodePresence
   public:
     /// Start announcing.
     ///
-    /// **Null when this node has no `--scheduler`**, which is the honest off-switch rather than
-    /// a flag of its own: `SchedulerLink::For` answers nothing for an empty list, and a node
-    /// with nowhere to announce to has no loop to run. A node with `--slots=0` still gets one.
+    /// **Null when this node registers nowhere** -- its formation record's answer, `SchedulersOf`,
+    /// is empty -- which is the honest off-switch rather than a flag of its own:
+    /// `SchedulerLink::For` answers nothing for an empty list, and a node with nowhere to
+    /// announce to has no loop to run. A node with `--slots=0` still gets one.
     /// @param parts What the node lends the loop.
     /// @return The running loop, or null when there is no scheduler to announce to.
     [[nodiscard]] static std::unique_ptr<NodePresence> Start(NodePresenceParts const& parts);
@@ -167,9 +232,8 @@ class NodePresence
     /// nothing can cancel is a thread a `SIGTERM` has to sit through. One helper rather than
     /// the lock dance at each of the two exits, which is where the two come to differ.
     ///
-    /// `RosterWantingInterval` rather than `NodeAnnounceInterval` while this node holds no
-    /// roster it could verify a grant against (#178): until one arrives it refuses every
-    /// compile, and twenty seconds of that after every start is a worker nobody can use.
+    /// The interval is `NextAnnounceWait`'s, shared with the worker's heartbeat: shorter while this
+    /// node's own cluster has not recorded it yet.
     /// @param stop Requested when the node is shutting down.
     /// @return True when the loop should end.
     [[nodiscard]] bool WaitOutInterval(std::stop_token const& stop);
@@ -181,14 +245,11 @@ class NodePresence
     CacheTier const* _cacheTier;
     IMetricsSink const& _metrics;
     FleetSampler& _sampler;
-    ICredentialSource const& _credential;
     ILogger& _logger;
     NodeConditions const& _conditions;
-    IPresenceRoster* _roster;
     NodeProofClient const* _prover;
-
-    /// Where a credential the scheduler did not want is reported, once for this loop.
-    Cc::CredentialNotice _notice;
+    SchedulerReachability& _reachability;
+    Cluster::IAskedJoinsSource const* _askedJoins;
 
     /// This machine's capacity record, converted once: it is compiled-in and configured
     /// state, and nothing about it changes between rounds.
@@ -202,12 +263,13 @@ class NodePresence
     /// renders as its dash rather than as a full disk.
     std::unique_ptr<IHostLoadSampler> _loadSampler;
 
-    BlockingEndpointDialer _dialer;
+    IEndpointDialer& _dialer;
     SchedulerLink _link;
 
-    /// The bounded, cancellable wait between rounds.
-    std::mutex _wakeMutex;
-    std::condition_variable_any _wake;
+    /// The bounded, cancellable wait between rounds, which a resume or a network change ends.
+    PresenceWake _presenceWake;
+    /// Listening from construction; destroyed before `_presenceWake` and after `_thread`.
+    HostEventSubscription _hostSubscription;
 
     /// **Declared LAST, and the order is load-bearing.** The thread's body touches every
     /// member above it, so they are all constructed before it can start and destroyed only

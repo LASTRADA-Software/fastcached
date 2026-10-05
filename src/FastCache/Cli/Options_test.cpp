@@ -3,16 +3,24 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 using namespace FastCache;
 
@@ -49,6 +57,10 @@ struct TestResult
 };
 
 /// Parse a decimal port, rejecting anything else.
+///
+/// Its refusal writes a field BY HAND -- `ArgvError` takes none, so this builds the error itself
+/// -- because that is the one way left for a parser to try, and the cases below assert that the
+/// row's own spelling overwrites it.
 /// @param sv The value text.
 /// @return The port, or a ConfigError.
 [[nodiscard]] std::expected<std::uint16_t, ConfigError> ParseTestPort(std::string_view sv)
@@ -56,7 +68,11 @@ struct TestResult
     std::uint16_t value = 0;
     auto const [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value);
     if (ec != std::errc {} || ptr != sv.data() + sv.size())
-        return std::unexpected(ArgvError(ConfigErrorCode::TypeMismatch, "port", std::format("not a number: {}", sv)));
+        return std::unexpected(ConfigError { .code = ConfigErrorCode::TypeMismatch,
+                                             .source = "argv",
+                                             .line = 0,
+                                             .field = "port",
+                                             .context = std::format("not a number: {}", sv) });
     return value;
 }
 
@@ -215,17 +231,17 @@ TEST_CASE("a flag at the end of argv with no value is rejected", "[cli][options]
     auto const parsed = Parse({ "--port" });
     REQUIRE_FALSE(parsed.has_value());
     CHECK(parsed.error().code == ConfigErrorCode::ParseError);
-    // The dashed spelling is deliberate: value-parser errors name the setting
-    // ("port"), a missing value names the flag as typed.
+    // The row's own spelling, stamped by `ApplyOneOption` like every other refusal.
     CHECK(parsed.error().field == "--port");
 }
 
-TEST_CASE("a bad value surfaces the parser's own error verbatim", "[cli][options]")
+TEST_CASE("a bad value surfaces the parser's own error, attributed to the row", "[cli][options]")
 {
     auto const parsed = Parse({ "--port=abc" });
     REQUIRE_FALSE(parsed.has_value());
     CHECK(parsed.error().code == ConfigErrorCode::TypeMismatch);
-    CHECK(parsed.error().field == "port");
+    CHECK(parsed.error().context == "not a number: abc");
+    CHECK(parsed.error().field == "--port");
 }
 
 TEST_CASE("flag forms are derived from the row", "[cli][options]")
@@ -300,13 +316,120 @@ TEST_CASE("a value other machines will read is refused when it is not text", "[c
     CHECK_FALSE(Parse({ "--advertise=\xC0\x80" }).has_value());     // overlong NUL
 }
 
-TEST_CASE("a value parser with its own field to name keeps it", "[cli][options]")
+TEST_CASE("a name other machines will read is refused when empty and otherwise judged as text", "[cli][options]")
 {
-    // The stamp fills an EMPTY field only. `ParseTestPort` names `port` deliberately
-    // -- a parser with something more specific to say must go on saying it.
+    // The empty refusal is its OWN refusal, told apart from the encoding one by what it says.
+    auto const empty = ParseNonEmptyUtf8Text("");
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error().code == ConfigErrorCode::ParseError);
+    CHECK(empty.error().context.contains("value is empty"));
+    // It names no field: the parser cannot know which row reached it, so the caller stamps it.
+    CHECK(empty.error().field.empty());
+
+    // A non-empty value that is not text still meets the encoding refusal, not the empty one.
+    auto const legacy = ParseNonEmptyUtf8Text("gr\xFC"
+                                              "n");
+    REQUIRE_FALSE(legacy.has_value());
+    CHECK(legacy.error().context.contains("not valid UTF-8"));
+    CHECK_FALSE(legacy.error().context.contains("value is empty"));
+
+    // And a name that is text is taken as it stands, however short.
+    auto const oneByte = ParseNonEmptyUtf8Text("f");
+    REQUIRE(oneByte.has_value());
+    CHECK(*oneByte == "f");
+}
+
+TEST_CASE("a field a value parser wrote by hand is overwritten by the row's own spelling", "[cli][options]")
+{
+    // `ParseTestPort` names `port` by hand, the way a dozen parsers did before `ArgvError` lost
+    // its field parameter -- each in a spelling no row used, or naming another row outright. The
+    // stamp is UNCONDITIONAL, so what an operator reads is the row they typed, whatever the
+    // parser tried to say.
     auto const bad = Parse({ "--port=nope" });
     REQUIRE_FALSE(bad.has_value());
-    CHECK(bad.error().field == "port");
+    CHECK(bad.error().field == "--port");
+}
+
+namespace
+{
+/// One file's calls of `UnrowedArgvError`, and why each is about no row.
+struct UnrowedCallRow
+{
+    std::string_view file; ///< Relative to the repository root, forward slashes.
+    std::size_t calls;     ///< How many times `UnrowedArgvError(` appears in it.
+    std::string_view why;  ///< What the refusals are about, since it is no row's value.
+};
+
+/// Every first-party, non-test spelling of `UnrowedArgvError(`: the ONE constructor that still names
+/// a field by hand, so the one a literal field could come back through.
+///
+/// Its stated blind spot, and its direction: a value parser that builds a `ConfigError` itself, with a
+/// field, is not counted -- and needs not be, because `ApplyOneOption` overwrites that field (the case
+/// above). What this cannot miss is `UnrowedArgvError` in a file listed or not.
+constexpr std::array UnrowedCalls {
+    UnrowedCallRow { .file = "src/FastCache/Cli/Options.hpp",
+                     .calls = 2,
+                     .why = "its definition, and ApplyOneOption's argument that matched no row" },
+    UnrowedCallRow { .file = "src/apps/compile-cache-testclient/TestClientCli.cpp",
+                     .calls = 3,
+                     .why = "a missing or unknown sub-command, dispatched before any row; and --port required after "
+                            "the rows ran" },
+};
+
+/// @param text A whole source file.
+/// @return How many times `UnrowedArgvError(` appears in it.
+[[nodiscard]] std::size_t UnrowedCallsIn(std::string const& text)
+{
+    auto count = std::size_t { 0 };
+    auto at = text.find("UnrowedArgvError(");
+    while (at != std::string::npos)
+    {
+        ++count;
+        at = text.find("UnrowedArgvError(", at + 1);
+    }
+    return count;
+}
+} // namespace
+
+TEST_CASE("Every call that names a command-line field by hand is a row saying why it is about no row", "[cli][options]")
+{
+    auto const root = std::filesystem::path { FASTCACHED_SOURCE_DIR };
+    auto filesRead = std::size_t { 0 };
+    auto hits = std::vector<std::pair<std::string, std::size_t>> {};
+    for (auto const& entry: std::filesystem::recursive_directory_iterator { root / "src" })
+    {
+        auto const& path = entry.path();
+        auto const isSource = path.extension() == ".cpp" || path.extension() == ".hpp";
+        if (!entry.is_regular_file() || !isSource || path.filename().string().ends_with("_test.cpp")
+            || path.generic_string().contains("/src/tests/"))
+            continue;
+        ++filesRead;
+        std::ifstream input { path, std::ios::binary };
+        std::ostringstream read;
+        read << input.rdbuf();
+        auto const text = std::move(read).str();
+        if (auto const calls = UnrowedCallsIn(text); calls != 0)
+            hits.emplace_back(std::filesystem::relative(path, root).generic_string(), calls);
+    }
+
+    // The walk read the tree: a census that looked at nothing finds nothing.
+    CHECK(filesRead > 200);
+
+    for (auto const& [file, calls]: hits)
+    {
+        INFO(file << " calls UnrowedArgvError " << calls
+                  << " time(s). A value parser or an applier refuses with ArgvError, which names no field: "
+                     "ApplyOneOption stamps the row's own spelling. If this refusal really is about no row, add an "
+                     "UnrowedCalls row saying what it is about.");
+        auto const* const row = core::findOrNull(UnrowedCalls, std::string_view { file }, &UnrowedCallRow::file);
+        REQUIRE(row != nullptr);
+        CHECK(row->calls == calls);
+    }
+    for (auto const& row: UnrowedCalls)
+    {
+        INFO(row.file << ": " << row.why);
+        CHECK(std::ranges::contains(hits, row.file, [](auto const& hit) { return std::string_view { hit.first }; }));
+    }
 }
 
 TEST_CASE("a longer flag is not claimed by a shorter one", "[cli][options]")

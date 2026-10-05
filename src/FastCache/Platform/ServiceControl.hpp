@@ -3,9 +3,14 @@
 
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
+#include <FastCache/Platform/Firewall.hpp>
+#include <FastCache/Platform/ProcessExit.hpp>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +21,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 namespace FastCache
@@ -175,6 +182,38 @@ struct ScopeDefaultRow
 /// @return Its flag prefix, e.g. `--storage=`.
 [[nodiscard]] std::string_view ScopeDefaultFlag(ScopeDefault which) noexcept;
 
+/// Who besides the service may read a path it owns.
+///
+/// **Private**: never transmitted or persisted.
+enum class PathPrivacy : std::uint8_t
+{
+    /// The account is ADDED to what the path already grants: a cache whose objects the fleet
+    /// shares anyway. A failure to hand it over is a warning -- the service cannot write there,
+    /// which is loud and repairable.
+    Shared,
+
+    /// The path gets a protected list of its own -- SYSTEM, Administrators and the service --
+    /// and nothing inherited, because it holds a credential the SERVICE mints. A failure to
+    /// hand it over REFUSES the install: the credential would be readable by other accounts.
+    Private,
+};
+
+/// A path the service must own before its first write, and who else may read it.
+struct OwnedPath
+{
+    std::filesystem::path path;                  ///< What the operator named.
+    PathPrivacy privacy { PathPrivacy::Shared }; ///< Whether it keeps what it inherits.
+
+    /// Leaf names, inside a `Private` directory, of files that hold a credential this node
+    /// mints (the identity key). Empty for a `Shared` path. An exposed one is refused with a
+    /// DELETE remedy rather than told to reset its list, because a disclosed key stays
+    /// disclosed until it is re-minted.
+    std::vector<std::filesystem::path> credentialFiles;
+
+    /// Member-wise.
+    friend bool operator==(OwnedPath const&, OwnedPath const&) = default;
+};
+
 /// **That obstacle is a missing column, not an impossibility**, and the honest
 /// version of this paragraph says so: `OptionSpec::same` already carries a
 /// member-pointer column that reads a field back out (`FieldEq<&Config::x>()`),
@@ -247,7 +286,23 @@ struct ServiceSpec
     /// daemon wants a file. Hence `ownedPaths` rather than `ownedDirectories`:
     /// `chown` and a DACL apply to a file just as well, so only the *create* has
     /// to care, and it is refused in the handover rather than in each producer.
-    std::vector<std::filesystem::path> ownedPaths;
+    ///
+    /// Each carries its `PathPrivacy`. `Private` is for a path holding a credential -- the
+    /// node's state directory, where its identity key lives -- and `HandOverOwnedPaths` is
+    /// where the two are treated differently, once for every supervisor.
+    std::vector<OwnedPath> ownedPaths;
+
+    /// Environment the job is started with when it runs as `serviceAccount`, as name/value pairs.
+    ///
+    /// Tied to the account rather than to the job, because what it exists for is a property of
+    /// running unprivileged: `fastcache-compile-node` keeps its identity in a per-user directory
+    /// when it is not privileged, and its launchd daemon runs as an unprivileged account whose
+    /// home is not where the machine's identity belongs -- so the registration hands it the
+    /// machine-wide directory the way systemd's `StateDirectory=` hands one over
+    /// (`STATE_DIRECTORY`). Emitted wherever `UserName` is, and nowhere else: a per-user agent
+    /// runs as its user and keeps that user's state, and the Windows SCM logs a service on
+    /// with a token that is privileged already.
+    std::vector<std::pair<std::string, std::string>> serviceAccountEnvironment;
 
     /// Whether a secret was typed on the installing command line.
     InlineCredential inlineCredential { InlineCredential::Absent };
@@ -267,6 +322,13 @@ struct ServiceSpec
     /// after it, so the field costs nothing where it is and eight bytes where it
     /// reads best. The two are cross-referenced instead.
     ScopeDefaultSet acceptedScopeDefaults {};
+
+    /// How the supervisor starts this service. A field for `windowsLogon`'s reason: the SCM and
+    /// launchd each read it, and it is decided by the INSTALL, never replayed to the process --
+    /// so no binary's argv carries `--service-start`.
+    ///
+    /// Byte-wide, so it sits in the run `acceptedScopeDefaults` above describes.
+    ServiceStart startMode { ServiceStart::Auto };
 
     /// The `--config` path the operator named, or empty.
     ///
@@ -509,6 +571,31 @@ enum class SupervisorKind : std::uint8_t
 /// @param scope Scope to name.
 /// @return `"user"` or `"system"`.
 [[nodiscard]] std::string_view ServiceScopeName(ServiceScope scope) noexcept;
+
+/// One start mode, described once for every supervisor that reads it.
+///
+/// `ServiceStart` itself is declared in `Config/Config.hpp`, beside `ServiceScope`.
+struct ServiceStartRow
+{
+    ServiceStart start {};         ///< Which mode; its own index in the table.
+    std::string_view name;         ///< The `--service-start` spelling.
+    std::uint32_t scmStartType {}; ///< `SERVICE_AUTO_START` (2) or `SERVICE_DEMAND_START` (3).
+    bool runAtLoad {};             ///< launchd `RunAtLoad`.
+    bool startsAtInstall {};       ///< Whether a launchd install `kickstart`s the job at once.
+    std::string_view described;    ///< How an install message names the mode.
+};
+
+/// @return Every start mode, in enumerator order.
+[[nodiscard]] std::span<ServiceStartRow const> ServiceStartTable() noexcept;
+
+/// @param start A start mode.
+/// @return Its row.
+[[nodiscard]] ServiceStartRow const& ServiceStartRowOf(ServiceStart start) noexcept;
+
+/// Parse a `--service-start` value.
+/// @param text `auto` or `manual`.
+/// @return The mode, or a `ConfigError` naming the field and the accepted spellings.
+[[nodiscard]] std::expected<ServiceStart, ConfigError> ParseServiceStart(std::string_view text);
 
 /// The reverse-DNS launchd job label for @p cfg.
 ///
@@ -822,18 +909,769 @@ enum class LaunchctlFinding : std::uint8_t
 /// @return A phrase that reads correctly after "kickstart timed out (".
 [[nodiscard]] std::string LaunchctlStatusText(LaunchctlReadings const& readings);
 
+/// What a service-control operation left the registration as.
+///
+/// An enum and not an exit code, because two outcomes that end alike are not the same fact to
+/// what follows them: an uninstall that found nothing to remove leaves no service, one that was
+/// refused leaves the service installed -- and the firewall step follows a registration only
+/// where it is gone, or it closes the ports of a service that is still running. And an install
+/// that CREATED the registration is not one that RE-APPLIED it: a refusal after the registration
+/// deletes the one it created and must not delete an upgrade's (`InstallWithServiceFirewall`).
+/// How the command ENDS, and what each later step may assume, are columns of its row
+/// (`ServiceControlOutcomes`), so they cannot disagree with it.
+///
+/// **Private**: never transmitted and never persisted; the process exit code is
+/// `ServiceControlResult::ExitCode()`.
+enum class ServiceControlOutcome : std::uint8_t
+{
+    Created,      ///< An install registered a service that was not registered before.
+    Reapplied,    ///< An install re-applied its registration to a service that was registered.
+    Removed,      ///< An uninstall removed the registration.
+    NotInstalled, ///< An uninstall found no registration of that name, so none remains.
+    Declined,     ///< A decision a retry meets again, made before anything changed: the registration is as it was.
+    Failed,       ///< A failure a retry may get past: the registration is as it was, or unknown.
+    Last,         ///< Not an outcome, and has no row: the length of a table keyed by one.
+};
+
+/// One outcome, how the command that left it ends, and what it left registered.
+struct ServiceControlOutcomeRow
+{
+    ServiceControlOutcome outcome { ServiceControlOutcome::Failed }; ///< The outcome.
+    CommandEnding ending { CommandEnding::Failed };                  ///< How a command leaving it ends.
+    bool registered { false };  ///< An install's registration is in place as asked: its firewall rules follow.
+    bool noneRemains { false }; ///< No registration of the name remains: its firewall rules go.
+};
+
+/// Every outcome's ending, and what it left registered. An uninstall that found nothing DECLINED:
+/// running it again meets the same answer, though nothing of that name remains either. A
+/// declined or failed one leaves the registration as it was, or unknown -- never gone.
+inline constexpr auto ServiceControlOutcomes = EnumTable<ServiceControlOutcome, ServiceControlOutcomeRow> { {
+    { .outcome = ServiceControlOutcome::Created,
+      .ending = CommandEnding::Completed,
+      .registered = true,
+      .noneRemains = false },
+    { .outcome = ServiceControlOutcome::Reapplied,
+      .ending = CommandEnding::Completed,
+      .registered = true,
+      .noneRemains = false },
+    { .outcome = ServiceControlOutcome::Removed,
+      .ending = CommandEnding::Completed,
+      .registered = false,
+      .noneRemains = true },
+    { .outcome = ServiceControlOutcome::NotInstalled,
+      .ending = CommandEnding::Declined,
+      .registered = false,
+      .noneRemains = true },
+    { .outcome = ServiceControlOutcome::Declined,
+      .ending = CommandEnding::Declined,
+      .registered = false,
+      .noneRemains = false },
+    { .outcome = ServiceControlOutcome::Failed, .ending = CommandEnding::Failed, .registered = false, .noneRemains = false },
+} };
+static_assert(RowsInEnumeratorOrder(ServiceControlOutcomes, [](ServiceControlOutcomeRow const& row) { return row.outcome; }),
+              "every ServiceControlOutcome needs a row, at its own index");
+
+/// How a command that left @p outcome ends.
+/// @param outcome What the registration was left as.
+/// @return Its row's ending.
+[[nodiscard]] constexpr CommandEnding EndingOf(ServiceControlOutcome outcome) noexcept
+{
+    return ServiceControlOutcomes[static_cast<std::size_t>(outcome)].ending;
+}
+
+/// Whether an install that left @p outcome has its registration in place, as asked.
+/// @param outcome What the registration was left as.
+/// @return Its row's `registered`.
+[[nodiscard]] constexpr bool Registered(ServiceControlOutcome outcome) noexcept
+{
+    return ServiceControlOutcomes[static_cast<std::size_t>(outcome)].registered;
+}
+
+/// Whether no registration of the name remains after @p outcome.
+/// @param outcome What the registration was left as.
+/// @return Its row's `noneRemains`.
+[[nodiscard]] constexpr bool NoneRemains(ServiceControlOutcome outcome) noexcept
+{
+    return ServiceControlOutcomes[static_cast<std::size_t>(outcome)].noneRemains;
+}
+
+/// How many times the Windows service manager restarts a service that failed -- a refused start
+/// included -- before it leaves it stopped.
+///
+/// **The policy is `ProcessExit`'s, and each supervisor spells as much of it as it can**:
+/// restart a failure, never a refusal, which leaves the process as its own code
+/// (`ProcessExit::Refused`, 78). Each systemd unit under `packaging/linux/` spells all of it,
+/// as `RestartPreventExitStatus=`. launchd can tell an exit only from a crash, so it restarts
+/// neither exit (`BuildLaunchdPlist` says what that costs). And the SCM cannot be told either:
+/// with `fFailureActionsOnNonCrashFailures` set, it runs the recovery actions for EVERY stop
+/// whose `dwWin32ExitCode` is not zero, and a refusal reported as `ERROR_SERVICE_SPECIFIC_ERROR`
+/// (1066) with its code is one. The only stop that runs none reports zero, which is also what
+/// `sc query` would then show -- the refusal's 1066 and 78 hidden from the operator who reads
+/// it -- and clearing the flag would stop the restart of every clean failure with it. So here a
+/// refusal is BOUNDED instead: three restarts, each writing its reason to the event log, then
+/// stopped. `ServiceControl_test` reads all three spellings back.
+inline constexpr std::size_t ServiceRestartAttempts = 3;
+
+/// The window `ServiceRestartAttempts` is counted in: a service that runs this long without
+/// failing starts the count over.
+inline constexpr std::chrono::seconds ServiceRestartWindow { 600 };
+
+/// What a supervisor does after one failure of a registered service.
+///
+/// Private: never transmitted or persisted. The Windows install spells it in the SCM's own
+/// constants (`ScmRecoveryActions`).
+enum class RecoveryAction : std::uint8_t
+{
+    Restart, ///< Start the service again, after the step's delay.
+    None,    ///< Leave it stopped.
+};
+
+/// One failure's answer: the Nth failure since the count last reset takes the Nth step.
+struct RecoveryStep
+{
+    RecoveryAction action { RecoveryAction::None }; ///< What happens.
+    std::chrono::milliseconds delay { 0 };          ///< How long after the failure; zero for `None`.
+};
+
+/// `ServiceRestartAttempts` as the Windows registration spells it, and it ends in no action.
+///
+/// The SCM applies the LAST step to every failure past the end of the list, so a list ending in
+/// a restart restarts forever. Two quick restarts for a crash, one after thirty seconds for a
+/// dependency that was not up yet, then stopped.
+inline constexpr std::array ServiceRecoverySteps {
+    RecoveryStep { .action = RecoveryAction::Restart, .delay = std::chrono::seconds { 1 } },
+    RecoveryStep { .action = RecoveryAction::Restart, .delay = std::chrono::seconds { 1 } },
+    RecoveryStep { .action = RecoveryAction::Restart, .delay = std::chrono::seconds { 30 } },
+    RecoveryStep { .action = RecoveryAction::None, .delay = std::chrono::milliseconds { 0 } },
+};
+static_assert(ServiceRecoverySteps.back().action == RecoveryAction::None,
+              "the SCM repeats the last step forever, so the list must end in no action");
+static_assert(std::ranges::count(ServiceRecoverySteps, RecoveryAction::Restart, &RecoveryStep::action)
+                  == ServiceRestartAttempts,
+              "the Windows steps restart exactly ServiceRestartAttempts times");
+
+/// How long a service must run without failing for the SCM's count to start over.
+inline constexpr std::chrono::seconds ServiceRecoveryResetPeriod = ServiceRestartWindow;
+
+/// One step as the SCM's `SC_ACTION` carries it.
+struct ScmRecoveryAction
+{
+    std::uint32_t type { 0 };    ///< `SC_ACTION_TYPE`: `SC_ACTION_NONE` or `SC_ACTION_RESTART`.
+    std::uint32_t delayMs { 0 }; ///< `Delay`.
+
+    [[nodiscard]] friend bool operator==(ScmRecoveryAction const&, ScmRecoveryAction const&) = default;
+};
+
+/// `SC_ACTION_NONE`, spelled without `<windows.h>`; the Windows build asserts it against the SDK.
+inline constexpr std::uint32_t ScActionNone = 0;
+/// `SC_ACTION_RESTART`, spelled without `<windows.h>`; the Windows build asserts it against the SDK.
+inline constexpr std::uint32_t ScActionRestart = 1;
+
+/// `ServiceRecoverySteps` as the Windows install registers them: the list `sc qfailure` shows.
+/// @return One entry per step, in order.
+[[nodiscard]] std::vector<ScmRecoveryAction> ScmRecoveryActions();
+
 /// Outcome of a service-control operation.
+///
+/// Its ENDING rather than an exit code (`CommandEnding`): a DECISION a retry would meet again --
+/// a rejected name, access denied, a service that already exists or is not there, an account that
+/// does not exist -- or a TRANSIENT failure a retry may get past: a service-manager call that
+/// failed on its own, a path the environment could not answer, a change stopped part-way, such as
+/// a service stopped before its delete failed or a job file written before it would not load.
+/// `CommandExitCode` is the one mapping to a code.
 struct ServiceControlResult
 {
-    int exitCode { 0 };     ///< Process exit code (0 = success).
+    /// What the registration was left as, and so how the command ended (`EndingOf`). `Failed` by
+    /// default: a result that says nothing must not read as a service that is gone, nor as one
+    /// nothing was done to.
+    ServiceControlOutcome outcome { ServiceControlOutcome::Failed };
     std::string message {}; ///< Human-readable status / error message.
+
+    /// @return How the operation ended, as the outcome's row says.
+    [[nodiscard]] constexpr CommandEnding Ending() const noexcept
+    {
+        return EndingOf(outcome);
+    }
+
+    /// @return The process exit code, through the one mapping (`CommandExitCode`).
+    [[nodiscard]] constexpr int ExitCode() const noexcept
+    {
+        return CommandExitCode(Ending());
+    }
 };
+
+/// What `InstallService` does when the SCM refuses to CREATE a service.
+///
+/// **Private**: never transmitted and never persisted.
+enum class CreateRefusalStep : std::uint8_t
+{
+    Reconfigure,   ///< The service exists: re-apply this registration to it.
+    AwaitDeletion, ///< A previous registration is still being deleted: wait, bounded, then create.
+    Refuse,        ///< Anything else: report it.
+    Last
+};
+
+/// One `CreateService` error and what an install does about it.
+struct CreateRefusalRow
+{
+    std::uint32_t win32Error {}; ///< The `GetLastError()` value.
+    CreateRefusalStep step {};   ///< What the install does next.
+    std::string_view why;        ///< The reason, for the reader of the table.
+};
+
+/// @return Every error an install answers other than by refusing.
+[[nodiscard]] std::span<CreateRefusalRow const> CreateRefusalTable() noexcept;
+
+/// @param win32Error What `CreateService` failed with.
+/// @return The table's answer; `Refuse` for an error it does not name.
+[[nodiscard]] CreateRefusalStep CreateRefusalStepFor(std::uint32_t win32Error) noexcept;
+
+/// How long an install waits for a registration the SCM is still deleting.
+inline constexpr std::chrono::seconds MarkedForDeletionCeiling { 30 };
+
+/// How long an uninstall waits for the service to report STOPPED before deleting it.
+inline constexpr std::chrono::seconds UninstallStopCeiling { 60 };
+
+/// The install's wait for a deletion to finish: `MarkedForDeletionCeiling`, asked every quarter second.
+inline constexpr DrainBound MarkedForDeletionBound { .ceiling = MarkedForDeletionCeiling,
+                                                     .poll = std::chrono::milliseconds { 250 } };
+
+/// The uninstall's wait for STOPPED: `UninstallStopCeiling`, asked every quarter second.
+inline constexpr DrainBound UninstallStopBound { .ceiling = UninstallStopCeiling,
+                                                 .poll = std::chrono::milliseconds { 250 } };
+
+/// The two SCM calls an install chooses between, so the choice -- create, wait out a
+/// deletion, or re-apply -- is decided by code a test can drive without a Service
+/// Control Manager. Production is the Win32 implementation in ServiceControl.cpp.
+class IScmRegistrar
+{
+  public:
+    IScmRegistrar() = default;
+    IScmRegistrar(IScmRegistrar const&) = delete;
+    IScmRegistrar(IScmRegistrar&&) = delete;
+    IScmRegistrar& operator=(IScmRegistrar const&) = delete;
+    IScmRegistrar& operator=(IScmRegistrar&&) = delete;
+    virtual ~IScmRegistrar() = default;
+
+    /// Create the service from the registration.
+    /// @return 0 on success, else the `GetLastError()` value.
+    [[nodiscard]] virtual std::uint32_t Create() = 0;
+
+    /// Open the existing service and re-apply the registration to it.
+    /// @return 0 on success, else the `GetLastError()` value.
+    [[nodiscard]] virtual std::uint32_t Reapply() = 0;
+};
+
+/// What an install's SCM half did.
+///
+/// **Private**: never transmitted and never persisted.
+enum class ScmRegistrationOutcome : std::uint8_t
+{
+    Created,   ///< A new service was created.
+    Reapplied, ///< An existing service was reconfigured.
+    Failed,    ///< Neither; `ScmRegistration::win32Error` says why.
+};
+
+/// The outcome of `RegisterWithScm`, with the evidence its messages are drawn from.
+struct ScmRegistration
+{
+    ScmRegistrationOutcome outcome {}; ///< What happened.
+    std::uint32_t win32Error {};       ///< The failing call's error; 0 unless `Failed`.
+
+    /// How long the wait for a deletion took, MEASURED by the drain seam's clock --
+    /// disengaged when no wait ran, which is a different fact from a wait of zero.
+    std::optional<std::chrono::milliseconds> deletionWaited;
+};
+
+/// Create the service, or wait out a deletion and then create it, or re-apply an
+/// existing registration -- whichever `CreateRefusalTable` says the SCM's answer calls for.
+/// @param registrar The two SCM calls.
+/// @param wait Where the deletion wait blocks and reads time.
+/// @return The outcome, the failing error and the measured wait.
+[[nodiscard]] ScmRegistration RegisterWithScm(IScmRegistrar& registrar, IDrainWait& wait);
+
+/// The message an install reports when `RegisterWithScm` failed.
+///
+/// A deletion is described by what was observed: "was still being deleted after" the
+/// MEASURED wait when one ran, "is being deleted" when the SCM said so without one --
+/// which a reconfigure can, when the service is deleted between its create and its change.
+/// @param registration A `Failed` outcome.
+/// @param serviceName The service, for the message.
+/// @return One line for the operator.
+[[nodiscard]] std::string ScmRegistrationFailureMessage(ScmRegistration const& registration, std::string_view serviceName);
+
+/// The message a successful install reports.
+///
+/// A created service is started with `sc start`. A re-applied one may already be running
+/// the OLD registration, which the SCM only reads at a start, so its message says the
+/// change waits for a restart and gives the restart command.
+/// @param outcome `Created` or `Reapplied`.
+/// @param serviceName The service.
+/// @param startDescribed The start mode, as `ServiceStartRow::described` names it.
+/// @param warnings Warning lines to append, each beginning with a newline; may be empty.
+/// @return The message.
+[[nodiscard]] std::string ScmInstallSuccessMessage(ScmRegistrationOutcome outcome,
+                                                   std::string_view serviceName,
+                                                   std::string_view startDescribed,
+                                                   std::string_view warnings);
+
+/// The two ways an install hands a path to its service, one call per `PathPrivacy`.
+///
+/// A seam so the rule telling them apart -- a `Shared` failure warns, a `Private` one refuses
+/// -- is decided once, in `HandOverOwnedPaths`, and tested without a supervisor or an access
+/// list. Each supervisor implements it: the SCM with access lists, launchd with `chown` and
+/// mode bits.
+class IOwnedPathHandover
+{
+  public:
+    IOwnedPathHandover() = default;
+    IOwnedPathHandover(IOwnedPathHandover const&) = delete;
+    IOwnedPathHandover(IOwnedPathHandover&&) = delete;
+    IOwnedPathHandover& operator=(IOwnedPathHandover const&) = delete;
+    IOwnedPathHandover& operator=(IOwnedPathHandover&&) = delete;
+    virtual ~IOwnedPathHandover() = default;
+
+    /// Give the service's account access to @p path, keeping whatever else it grants;
+    /// created as a directory when absent and not named as a file.
+    /// @param path A `Shared` owned path.
+    /// @return Why it could not, or nullopt.
+    [[nodiscard]] virtual std::optional<std::string> Share(std::filesystem::path const& path) = 0;
+
+    /// Give @p path a list of its own -- the service's account and the administrative ones,
+    /// nothing inherited -- creating it likewise, and refusing a redirected or planted one.
+    /// @param path A `Private` owned path.
+    /// @param credentialLeaves Leaf names in @p path whose exposure is refused with a delete
+    ///        remedy rather than a reset one.
+    /// @return Why nothing else is not established to be unable to read it, or nullopt.
+    [[nodiscard]] virtual std::optional<std::string> Seclude(std::filesystem::path const& path,
+                                                             std::span<std::filesystem::path const> credentialLeaves) = 0;
+};
+
+/// What `HandOverOwnedPaths` did.
+struct OwnedPathsHandedOver
+{
+    /// One line per `Shared` path that could not be handed over, each beginning with a
+    /// newline, for the install's message.
+    std::string warnings;
+
+    /// Why the install is refused: a `Private` path that could not be secluded. Disengaged
+    /// when there is none.
+    std::optional<std::string> refusal;
+};
+
+/// Hand every owned path to the service, in order, each the way its `PathPrivacy` says.
+///
+/// A `Shared` path that cannot be handed over is a warning and the walk goes on: the service
+/// fails loudly at its first write, and an operator can repair one directory. A `Private`
+/// one is a refusal and the walk STOPS: that path holds a credential the service mints, and
+/// a service let loose on it would write the credential where other accounts can read it.
+/// @param paths The spec's `ownedPaths`.
+/// @param handover The supervisor's two calls.
+/// @return The warnings, and the refusal when there is one.
+[[nodiscard]] OwnedPathsHandedOver HandOverOwnedPaths(std::span<OwnedPath const> paths, IOwnedPathHandover& handover);
+
+/// What a refused install did about the registration, for its message.
+///
+/// **Private**: never transmitted or persisted.
+enum class RefusedRegistration : std::uint8_t
+{
+    NotMade,    ///< The refusal came before anything was registered.
+    Removed,    ///< This install created the registration and deleted it again.
+    NotRemoved, ///< This install created the registration and could not delete it.
+    Kept,       ///< The service was registered before; its re-applied registration is left.
+};
+
+/// The message an install reports when `HandOverOwnedPaths` refused it.
+/// @param refusal `OwnedPathsHandedOver::refusal`.
+/// @param serviceName The service.
+/// @param registration What became of the registration.
+/// @return One line for the operator, naming what to do next.
+[[nodiscard]] std::string RefusedInstallMessage(std::string_view refusal,
+                                                std::string_view serviceName,
+                                                RefusedRegistration registration);
+
+/// The firewall rules fastcached's registration needs: every non-loopback cache listener and,
+/// with `--metrics`, a non-loopback admin endpoint.
+/// @param cfg The configuration the service will run with (the merged one).
+/// @param program The executable the rules admit.
+/// @param allow `--firewall-allow` scopes; empty admits any address.
+/// @return The rules; empty when nothing faces the network.
+[[nodiscard]] std::vector<FirewallRule> DaemonFirewallRules(Config const& cfg,
+                                                            std::filesystem::path const& program,
+                                                            std::vector<std::string> const& allow);
+
+/// An install's result with the firewall step that follows a registration folded in.
+///
+/// Only a registration whose outcome is `Done` opens anything. Whatever the firewall then
+/// answers, the outcome stays the registration's: a refusal is appended as a warning, never turned into a
+/// failed install of a service that is registered.
+/// @param registered What `InstallService` answered.
+/// @param firewall The machine's firewall, or null where none is managed.
+/// @param serviceName The service registered.
+/// @param rules What it needs (`DaemonFirewallRules`, or the node's own); empty clears the group.
+/// @return @p registered, its message extended by `RegistrationFirewallNote` when it succeeded.
+[[nodiscard]] ServiceControlResult WithRegistrationFirewall(ServiceControlResult registered,
+                                                            IFirewall* firewall,
+                                                            std::string_view serviceName,
+                                                            std::span<FirewallRule const> rules);
+
+/// An uninstall's result with the service's firewall rules removed.
+///
+/// Removed only once no registration remains: the outcome is `Done` (deleted) or
+/// `NotInstalled` (never there). A `Failed` deletion leaves the rules alone and says so, since
+/// that service may still be installed and running, and removing its rules would close its
+/// ports. The outcome stays the deletion's whatever the firewall answers -- an MSI uninstall
+/// must not fail over a firewall rule -- and a removal the firewall refuses names every rule it
+/// left in place and how to remove it. Take @p removed from `UninstallService` as the argument,
+/// so the deletion has already happened before the firewall is asked anything.
+/// @param removed What `UninstallService` answered.
+/// @param firewall The machine's firewall, or null where none is managed.
+/// @param serviceName The service removed.
+/// @return @p removed, its message extended by `RemovalFirewallNote`, or by a line saying the
+///         rules were left where the deletion failed and a firewall is managed.
+[[nodiscard]] ServiceControlResult WithRemovalFirewall(ServiceControlResult removed,
+                                                       IFirewall* firewall,
+                                                       std::string_view serviceName);
+
+// ---------------------------------------------------------------------------
+// The registration seam.
+//
+// Every call a registration makes to the operating system goes through one of the two interfaces
+// below, one per supervisor: the SCM's calls and launchd's share no primitive, so a single
+// interface would make each platform implement the other's calls as unreachable stubs. The
+// registration itself -- which call is made when, and how each answer ENDS it -- is written once
+// over the interface and compiled on every platform (`ScmInstall`, `ScmUninstall`, `LaunchdInstall`,
+// `LaunchdUninstall`), so a scripted fake drives every ending on every host. What an install
+// decides over those calls -- create, wait out a deletion or re-apply (`RegisterWithScm`), and
+// hand each owned path over the way its privacy says (`HandOverOwnedPaths`) -- is decided there
+// too, so the seam carries the calls each of those needs and no decision of its own. The real
+// implementations hold the Win32 and launchd calls as they were, one per platform, and
+// `InstallService`/`UninstallService` hand the platform's to the registration. There is no systemd
+// half: a Linux service is a unit file the packages ship, and nothing here registers one.
+// ---------------------------------------------------------------------------
+
+/// `ERROR_ACCESS_DENIED`, spelled without `<windows.h>`; the Windows build asserts it against the SDK.
+inline constexpr std::uint32_t ScmErrorAccessDenied = 5;
+/// `ERROR_SERVICE_DOES_NOT_EXIST`, spelled without `<windows.h>`; the Windows build asserts it.
+inline constexpr std::uint32_t ScmErrorServiceDoesNotExist = 1060;
+/// `ERROR_SERVICE_EXISTS`, spelled without `<windows.h>`; the Windows build asserts it.
+inline constexpr std::uint32_t ScmErrorServiceExists = 1073;
+
+/// An SCM handle as a registration holds it: opaque, and closed through the calls that opened it.
+struct ScmHandle
+{
+    std::uintptr_t value { 0 }; ///< The `SC_HANDLE`, as an integer.
+
+    [[nodiscard]] friend bool operator==(ScmHandle const&, ScmHandle const&) = default;
+};
+
+/// What the service manager is opened to do.
+///
+/// Private: never transmitted or persisted.
+enum class ScmManagerAccess : std::uint8_t
+{
+    Create,  ///< `SC_MANAGER_CREATE_SERVICE`, to register a service -- and connect, to re-apply one.
+    Connect, ///< `SC_MANAGER_CONNECT`, to open one that is registered.
+    Last,
+};
+
+/// `SC_MANAGER_CONNECT`, spelled without `<windows.h>`; the Windows build asserts it against the SDK.
+inline constexpr std::uint32_t ScManagerConnect = 0x0001;
+/// `SC_MANAGER_CREATE_SERVICE`, spelled without `<windows.h>`; the Windows build asserts it.
+inline constexpr std::uint32_t ScManagerCreateService = 0x0002;
+
+/// One way of opening the service manager, and the access mask it asks for.
+struct ScmManagerAccessRow
+{
+    ScmManagerAccess access { ScmManagerAccess::Last }; ///< Which.
+    std::uint32_t mask { 0 };                           ///< The `dwDesiredAccess` it opens with.
+};
+
+/// Every way a registration opens the service manager: the least each needs, and nothing a
+/// registration does not use. An install asks one bit per call it makes on the manager:
+/// `SC_MANAGER_CREATE_SERVICE` is `CreateService`'s, and `SC_MANAGER_CONNECT` is the `OpenService` a
+/// re-apply makes (`RegisterWithScm`) -- which `OpenSCManager` happens to grant every caller, and is
+/// asked for here so the handle's rights are read, never inferred.
+inline constexpr auto ScmManagerAccessRows = EnumTable<ScmManagerAccess, ScmManagerAccessRow> { {
+    { .access = ScmManagerAccess::Create, .mask = ScManagerConnect | ScManagerCreateService },
+    { .access = ScmManagerAccess::Connect, .mask = ScManagerConnect },
+} };
+static_assert(RowsInEnumeratorOrder(ScmManagerAccessRows, [](ScmManagerAccessRow const& row) { return row.access; }),
+              "every ScmManagerAccess needs a row, at its own index");
+
+/// The access mask @p access opens the service manager with.
+/// @param access What it is opened to do.
+/// @return Its `dwDesiredAccess`.
+[[nodiscard]] constexpr std::uint32_t ScmManagerAccessMask(ScmManagerAccess access) noexcept
+{
+    return ScmManagerAccessRows[static_cast<std::size_t>(access)].mask;
+}
+
+/// The service a registration asks the SCM to create.
+struct ScmServiceRequest
+{
+    std::string name;                        ///< The service name, also its display name.
+    std::string commandLine;                 ///< What the SCM launches (`BuildServiceCommandLine`).
+    std::optional<std::string> logonName {}; ///< Who it runs as; disengaged: LocalSystem.
+    std::uint32_t startType { 2 };           ///< `ServiceStartRow::scmStartType`: auto (2) or demand (3).
+};
+
+/// The Windows service manager's calls, as a registration makes them.
+///
+/// Named apart from the Win32 functions they wrap (`Create`, not `CreateService`): `<windows.h>`
+/// defines those names as macros, which would rename a member in one translation unit and not in
+/// another.
+///
+/// An error is the call's own `GetLastError()` code, never a reading of it: which code a
+/// registration declines on and which it fails on is the registration's decision, so it is made
+/// where a test reaches it.
+class IScmCalls
+{
+  public:
+    IScmCalls() = default;
+    IScmCalls(IScmCalls const&) = delete;
+    IScmCalls(IScmCalls&&) = delete;
+    IScmCalls& operator=(IScmCalls const&) = delete;
+    IScmCalls& operator=(IScmCalls&&) = delete;
+    virtual ~IScmCalls() = default;
+
+    /// @return The running executable's path; empty when it cannot be determined.
+    [[nodiscard]] virtual std::filesystem::path ExecutablePath() = 0;
+
+    /// `OpenSCManager`.
+    /// @param access What it is opened to do.
+    /// @return The manager, or the call's error code.
+    [[nodiscard]] virtual std::expected<ScmHandle, std::uint32_t> OpenManager(ScmManagerAccess access) = 0;
+
+    /// `CreateService`, own process, at the request's start type.
+    /// @param manager An open manager.
+    /// @param request The service to create.
+    /// @return The service, or the call's error code.
+    [[nodiscard]] virtual std::expected<ScmHandle, std::uint32_t> Create(ScmHandle manager,
+                                                                         ScmServiceRequest const& request) = 0;
+
+    /// Open the registered service and re-apply @p request to it (`ChangeServiceConfig`): the
+    /// command line, the start type and the account a fresh install would get.
+    /// @param manager An open manager.
+    /// @param request The registration to re-apply.
+    /// @return The service, or the call's error code.
+    [[nodiscard]] virtual std::expected<ScmHandle, std::uint32_t> Reapply(ScmHandle manager,
+                                                                          ScmServiceRequest const& request) = 0;
+
+    /// `OpenService`, to stop and delete it.
+    /// @param manager An open manager.
+    /// @param name The service.
+    /// @return The service, or the call's error code.
+    [[nodiscard]] virtual std::expected<ScmHandle, std::uint32_t> Open(ScmHandle manager, std::string const& name) = 0;
+
+    /// Register @p description, best-effort: nothing reads whether it took.
+    /// @param service An open service.
+    /// @param description The one-line description.
+    virtual void Describe(ScmHandle service, std::string const& description) = 0;
+
+    /// Set the restart policy (`SERVICE_CONFIG_FAILURE_ACTIONS`), reset after `ServiceRecoveryResetPeriod`.
+    /// @param service An open service.
+    /// @param actions The steps, in order (`ScmRecoveryActions`).
+    /// @return The call's error code when it was refused, else nullopt.
+    [[nodiscard]] virtual std::optional<std::uint32_t> SetRecovery(ScmHandle service,
+                                                                   std::span<ScmRecoveryAction const> actions) = 0;
+
+    /// Apply the restart policy to an ordinary non-zero exit (`SERVICE_CONFIG_FAILURE_ACTIONS_FLAG`).
+    /// @param service An open service.
+    /// @return The call's error code when it was refused, else nullopt.
+    [[nodiscard]] virtual std::optional<std::uint32_t> RecoverOnNonCrashFailures(ScmHandle service) = 0;
+
+    /// Give @p service a service SID (`SERVICE_SID_TYPE_UNRESTRICTED`), which a firewall rule
+    /// scoped to the service matches against.
+    /// @param service An open service.
+    /// @return The call's error code when it was refused, else nullopt.
+    [[nodiscard]] virtual std::optional<std::uint32_t> SetSidType(ScmHandle service) = 0;
+
+    /// Ask @p service to stop, best-effort: one already stopped is no failure.
+    /// @param service An open service.
+    virtual void Stop(ScmHandle service) = 0;
+
+    /// @param service An open service.
+    /// @return Whether it is still running: its status was read and is not STOPPED.
+    [[nodiscard]] virtual bool StillRunning(ScmHandle service) = 0;
+
+    /// `DeleteService`.
+    /// @param service An open service.
+    /// @return The call's error code when it failed, else nullopt.
+    [[nodiscard]] virtual std::optional<std::uint32_t> Delete(ScmHandle service) = 0;
+
+    /// `CloseServiceHandle`.
+    /// @param handle A manager or a service this opened.
+    virtual void Close(ScmHandle handle) = 0;
+
+    /// Register @p serviceName as an Application event source, so its records render as text.
+    /// @param serviceName The service, which is also its event source.
+    /// @return Why it could not, else nullopt.
+    [[nodiscard]] virtual std::optional<std::string> AddEventSource(std::string const& serviceName) = 0;
+
+    /// Remove @p serviceName's event source, best-effort.
+    /// @param serviceName The service, which is also its event source.
+    virtual void RemoveEventSource(std::string const& serviceName) = 0;
+
+    /// Give @p account full control of @p target, creating it as a directory when absent and not a file.
+    /// `IOwnedPathHandover::Share`'s call.
+    /// @param target A path the service must own.
+    /// @param account The trustee, which resolves only once the service exists.
+    /// @return Why it could not, else nullopt.
+    [[nodiscard]] virtual std::optional<std::string> GrantPathAccess(std::filesystem::path const& target,
+                                                                     std::string const& account) = 0;
+
+    /// Give @p target a list of its own: @p account and the administrative ones, nothing
+    /// inherited, creating it likewise. `IOwnedPathHandover::Seclude`'s call.
+    /// @param target A `Private` path the service must own.
+    /// @param account The trustee; empty for LocalSystem, which the administrative entries cover.
+    /// @param credentialLeaves Leaf names whose exposure is refused with a delete remedy.
+    /// @return Why it could not, else nullopt.
+    [[nodiscard]] virtual std::optional<std::string> SecludePath(
+        std::filesystem::path const& target,
+        std::string const& account,
+        std::span<std::filesystem::path const> credentialLeaves) = 0;
+};
+
+/// Whether a launchctl invocation's own diagnostics reach the terminal.
+///
+/// Private: never transmitted or persisted.
+enum class LaunchctlOutput : std::uint8_t
+{
+    Show,    ///< Let launchctl print; its message is the useful diagnostic.
+    Silence, ///< Discard: this call is expected to fail in normal operation.
+};
+
+/// launchd's calls, and the POSIX ones a registration makes around them.
+class ILaunchdCalls
+{
+  public:
+    ILaunchdCalls() = default;
+    ILaunchdCalls(ILaunchdCalls const&) = delete;
+    ILaunchdCalls(ILaunchdCalls&&) = delete;
+    ILaunchdCalls& operator=(ILaunchdCalls const&) = delete;
+    ILaunchdCalls& operator=(ILaunchdCalls&&) = delete;
+    virtual ~ILaunchdCalls() = default;
+
+    /// @return Whether the effective user is root (`geteuid() == 0`).
+    [[nodiscard]] virtual bool RunsAsRoot() = 0;
+
+    /// @return The real user id (`getuid()`), which names the per-user launchd domains.
+    [[nodiscard]] virtual std::uint32_t UserId() = 0;
+
+    /// The invoking user's home directory, from the password database rather than `$HOME`: this
+    /// runs under `sudo` and from pkg postinstall scripts, where `$HOME` is root's or unset.
+    /// @return The directory; empty when it cannot be determined.
+    [[nodiscard]] virtual std::filesystem::path HomeDirectory() = 0;
+
+    /// @param account An account name.
+    /// @return Whether the password database knows it (`getpwnam`).
+    [[nodiscard]] virtual bool AccountExists(std::string const& account) = 0;
+
+    /// The packaged machine-wide configuration an application's registration may point at: only
+    /// one that is readable AND in a trusted system location, so a registration cannot hand
+    /// launchd a file the daemon would refuse to obey at every start.
+    /// @param applicationName The application its files are looked up under; never empty.
+    /// @return The file, or empty when there is none that counts.
+    [[nodiscard]] virtual std::filesystem::path PackagedConfig(std::string_view applicationName) = 0;
+
+    /// Why @p account could not read @p path, if it could not.
+    /// @param account The unprivileged account a system job runs as.
+    /// @param path The configuration file the job will be pointed at.
+    /// @return A diagnostic naming the fix, or nullopt when it is readable or not this check's business.
+    [[nodiscard]] virtual std::optional<std::string> AccountReadDenial(std::string const& account,
+                                                                       std::filesystem::path const& path) = 0;
+
+    /// `create_directories`.
+    /// @param path The directory.
+    /// @return Its error; empty on success.
+    [[nodiscard]] virtual std::error_code CreateDirectories(std::filesystem::path const& path) = 0;
+
+    /// Hand @p logDirectory and @p effective's owned paths to its service account (`chown`), each
+    /// the way its privacy says (`HandOverOwnedPaths`).
+    /// @param effective The registration, its service account named.
+    /// @param logDirectory The job's log directory.
+    /// @return The warnings, and the refusal when a `Private` path could not be secluded.
+    [[nodiscard]] virtual OwnedPathsHandedOver HandOver(ServiceSpec const& effective,
+                                                        std::filesystem::path const& logDirectory) = 0;
+
+    /// @param path Where the job description is written.
+    /// @return Whether one is there already: an install over it re-applies a registration rather
+    ///         than creating one.
+    [[nodiscard]] virtual bool JobFileExists(std::filesystem::path const& path) = 0;
+
+    /// Write the job description.
+    /// @param path Where.
+    /// @param text The plist.
+    /// @return Whether it was written whole.
+    [[nodiscard]] virtual bool WriteJobFile(std::filesystem::path const& path, std::string const& text) = 0;
+
+    /// Run `launchctl` with @p args, bounded.
+    /// @param args Arguments after `argv[0]`.
+    /// @param output Whether its diagnostics reach the terminal.
+    /// @return What the call cost.
+    [[nodiscard]] virtual LaunchctlReadings Launchctl(std::vector<std::string> const& args, LaunchctlOutput output) = 0;
+
+    /// Wait between two probes of a job being torn down.
+    /// @param interval How long.
+    virtual void Pause(std::chrono::milliseconds interval) = 0;
+
+    /// Remove the job description.
+    /// @param path Where.
+    /// @return Whether a file was there to remove, or why it could not be.
+    [[nodiscard]] virtual std::expected<bool, std::error_code> RemoveJobFile(std::filesystem::path const& path) = 0;
+};
+
+/// Register a service with the Windows service manager through @p calls.
+///
+/// `InstallService` on Windows, with the SCM's own calls; every host, with a scripted fake.
+/// Creates the service, waits out a deletion or re-applies an existing registration
+/// (`RegisterWithScm`); and a registration THIS call created is deleted again when an owned path
+/// refuses the install afterwards, while a re-applied one is left as it was found.
+/// @param spec Service to register.
+/// @param calls The service manager.
+/// @param wait Where a wait for a deletion blocks and reads time.
+/// @return What the registration was left as, and what to tell the operator.
+[[nodiscard]] ServiceControlResult ScmInstall(ServiceSpec const& spec,
+                                              IScmCalls& calls,
+                                              IDrainWait& wait = DefaultDrainWait());
+
+/// Remove a service from the Windows service manager through @p calls: stopped first, waited for
+/// (bounded, `UninstallStopBound`), then deleted.
+/// @param spec Service to remove; only `serviceName` is used.
+/// @param calls The service manager.
+/// @param wait Where the wait for STOPPED blocks and reads time.
+/// @return What the registration was left as, and what to tell the operator.
+[[nodiscard]] ServiceControlResult ScmUninstall(ServiceSpec const& spec,
+                                                IScmCalls& calls,
+                                                IDrainWait& wait = DefaultDrainWait());
+
+/// Register a launchd job through @p calls.
+///
+/// `InstallService` on macOS, with launchd's own calls; every host, with a scripted fake.
+/// @param spec Service to register.
+/// @param scope Which launchd domain.
+/// @param calls launchd, and the system around it.
+/// @return What the registration was left as, and what to tell the operator.
+[[nodiscard]] ServiceControlResult LaunchdInstall(ServiceSpec const& spec, ServiceScope scope, ILaunchdCalls& calls);
+
+/// Remove a launchd job through @p calls.
+/// @param spec Service to remove.
+/// @param scope Which launchd domain.
+/// @param calls launchd, and the system around it.
+/// @return What the registration was left as, and what to tell the operator.
+[[nodiscard]] ServiceControlResult LaunchdUninstall(ServiceSpec const& spec, ServiceScope scope, ILaunchdCalls& calls);
 
 /// Register fastcached with the platform's service supervisor.
 ///
-/// Windows: creates an SCM service with start type `SERVICE_AUTO_START` (it runs
-/// on every boot) but leaves it **stopped** — the caller starts it explicitly
-/// (`sc start <name>`) for this session.
+/// Windows: creates an SCM service with the start type `spec.startMode` names but
+/// leaves it **stopped** — the caller starts it explicitly (`sc start <name>`) for
+/// this session. A service that already exists is re-applied rather than refused:
+/// its start type, command line and account are reconfigured, and its description,
+/// restart policy, service SID type, event source and grants are set again, which is
+/// what an upgrade or a repair needs. The SID type is `SERVICE_SID_TYPE_UNRESTRICTED`,
+/// so a firewall rule scoped to the service matches it. One the SCM is still deleting
+/// is waited out for at most `MarkedForDeletionCeiling` (see `CreateRefusalTable`).
 ///
 /// macOS: writes a launchd job description (see BuildLaunchdPlist) to the
 /// directory @p scope names and bootstraps it, so it is running when this
@@ -849,20 +1687,23 @@ struct ServiceControlResult
 ///             which name.
 /// @param scope Which supervisor domain to register in. Ignored on Windows,
 ///              which has only one.
-/// @return ServiceControlResult with exit code 0 and a success message, or a
-///         non-zero code and a diagnostic (e.g. needs elevation, already exists).
+/// @return ServiceControlResult: `Done` and a success message, or what it left and a
+///         diagnostic (e.g. needs elevation, already exists).
 [[nodiscard]] ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope = ServiceScope::System);
 
 /// Remove a previously-registered fastcached service.
 ///
 /// Best-effort stops (Windows) or boots out (macOS) the service first, then
-/// deletes its registration. On platforms with no supervisor this is a no-op
-/// that reports an error.
+/// deletes its registration. On Windows the stop is waited for, at most
+/// `UninstallStopCeiling`, because deleting a running service only marks it and
+/// the next install would then meet a registration still being deleted.
+///
+/// On platforms with no supervisor this is a no-op that reports an error.
 ///
 /// @param spec Service to remove; only `serviceName` is used.
 /// @param scope Which supervisor domain to remove from. Ignored on Windows.
-/// @return ServiceControlResult with exit code 0 and a success message, or a
-///         non-zero code and a diagnostic (e.g. needs elevation, no such service).
+/// @return ServiceControlResult: `Completed` and a success message, or how it ended and a
+///         diagnostic (e.g. needs elevation, no such service).
 [[nodiscard]] ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope scope = ServiceScope::System);
 
 } // namespace FastCache

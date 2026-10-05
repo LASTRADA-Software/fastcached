@@ -159,4 +159,26 @@ std::string DescribeVerdict(HitComparison const& comparison, std::string_view ke
     return {};
 }
 
+HitComparison RestoreServedObject(std::filesystem::path const& aside,
+                                  std::filesystem::path const& served,
+                                  IAtomicWriteFiles& files)
+{
+    auto const inconclusive = [](std::string detail) {
+        return HitComparison { .verdict = HitVerdict::Inconclusive,
+                               .comparison = std::nullopt,
+                               .detail = std::move(detail) };
+    };
+    auto const bytes = ReadFileBytes(aside);
+    if (!bytes.has_value())
+        return inconclusive(std::format("the served object could not be read back, so it was not put back; it is kept at {}",
+                                        aside.string()));
+    if (auto const written = WriteFileAtomically(served, *bytes, CurrentProcessId(), files); !written.has_value())
+        return inconclusive(std::format("the served object could not be put back at {} (the {} failed); it is kept at {}",
+                                        served.string(),
+                                        AtomicWriteStepName(written.error()),
+                                        aside.string()));
+    files.Remove(aside);
+    return inconclusive({});
+}
+
 } // namespace FastCache::Cc

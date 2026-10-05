@@ -65,7 +65,7 @@ struct LeaseOutcomeRow
 /// can hold. A counter added without a catalogue row fails at `CounterTable`'s own
 /// assertion first, so the second one was the shape AGENT.md names: a guard that
 /// fires only when nothing is wrong. One guard, cited, rather than two.
-inline constexpr std::array<LeaseOutcomeRow, 5> LeaseOutcomeTable {
+inline constexpr std::array<LeaseOutcomeRow, 6> LeaseOutcomeTable {
     LeaseOutcomeRow { .counter = IMetricsSink::Counter::DispatchLeasesGranted,
                       .key = "granted",
                       .label = "granted",
@@ -82,6 +82,10 @@ inline constexpr std::array<LeaseOutcomeRow, 5> LeaseOutcomeTable {
                       .key = "withdrawn",
                       .label = "withdrawn",
                       .meaning = "the machines are busy with something else, or out of scratch space." },
+    LeaseOutcomeRow { .counter = IMetricsSink::Counter::DispatchLeasesAllExcluded,
+                      .key = "all-excluded",
+                      .label = "all excluded",
+                      .meaning = "every matching worker was unreachable from the client that asked: a network problem." },
     LeaseOutcomeRow { .counter = IMetricsSink::Counter::DispatchLeasesDuplicate,
                       .key = "duplicate",
                       .label = "duplicate",
@@ -158,7 +162,7 @@ struct FleetSnapshot
 /// What a fleet report is collected from.
 ///
 /// Pointers rather than references because two of them are legitimately absent: a
-/// node with no `--serve-scheduler` runs no scheduler, and one with no `--node-id`
+/// node whose mode serves none runs no scheduler, and one with no `--node-id`
 /// runs no cluster. The bundle then has an obvious "nothing configured" spelling
 /// for a test -- the same device `NodeScrapeSources` uses for a node with no cache.
 struct FleetSources
@@ -301,7 +305,7 @@ enum class FleetSection : std::uint8_t
     Workers,    ///< One row per `(toolchain, endpoint)` registry entry.
     Leases,     ///< The oldest outstanding leases, bounded as the page bounds them.
     Members,    ///< What the cluster has agreed, when this node runs one.
-    Forgotten,  ///< The client hosts the cluster has agreed to stop admitting.
+    Revoked,    ///< The keys the cluster will never admit again, and whose they were.
     Conditions, ///< What each machine says is wrong with it (#1364).
     Tiers,      ///< Per-tier cache figures, for the tiers some member runs.
     Series,     ///< The fleet's history over a range: one row per bucket, one column per series.
@@ -387,12 +391,12 @@ inline constexpr EnumTable<FleetSection, FleetSectionRow> FleetSectionTable {
                       .summary = "what the cluster has agreed; absent when this node runs none",
                       .tabular = true,
                       .inWhole = true },
-    FleetSectionRow { .section = FleetSection::Forgotten,
-                      .key = "forgotten",
-                      .one = "forgotten client",
-                      .many = "forgotten clients",
-                      .summary = "client hosts the cluster has agreed to stop admitting; absent when this node "
-                                 "runs no cluster",
+    FleetSectionRow { .section = FleetSection::Revoked,
+                      .key = "revoked",
+                      .one = "revoked key",
+                      .many = "revoked keys",
+                      .summary = "keys the cluster will never admit again, and whose they were; absent when this "
+                                 "node runs no cluster",
                       .tabular = true,
                       .inWhole = true },
     FleetSectionRow { .section = FleetSection::Conditions,

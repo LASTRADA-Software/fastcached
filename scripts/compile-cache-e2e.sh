@@ -36,6 +36,12 @@
 #                           every one of them, and an empty manifest validates
 #                           against anything: an edited header served the previous
 #                           object under a zero exit code, permanently.
+#  10. Root-bound object — a translation unit whose object names its checkout
+#                           (`__FILE__`, `source_location`) is not served into a
+#                           second checkout in either direct mode, one naming no
+#                           path still is, the first checkout still hits its own
+#                           copy, and a hit FASTCACHE_VERIFY rejects is logged
+#                           VERIFY-MISMATCH rather than HIT.
 #   2c. Dropped object    — the operator's repair after 2b names a wrong object: the
 #                           key is dropped over CACHE-DROP while its direct-mode
 #                           manifest stands. The next compile must MISS, recompile
@@ -80,32 +86,24 @@ done
 readonly SKIP=77
 
 [[ -n "$fastcached" && -x "$fastcached" ]] || { echo "fastcached not found: '$fastcached'; skipping"; exit "$SKIP"; }
-[[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
 command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler'; skipping"; exit "$SKIP"; }
 
 workdir="$(mktemp -d)"
 server_pid=""
-# The authentication section starts a second daemon on its own port. It is reaped
-# there on the happy path, but the trap has to know about it too: a `fail` in
-# between exits the script, and a daemon left holding a port makes the NEXT run
-# of this test fail at startup for a reason that has nothing to do with the run
-# that actually broke.
 auth_pid=""
+# Every background job this shell started -- both daemons, and the launcher the
+# large-object case backgrounds -- is reaped on every path out, BOUNDED:
+# `reap_background_jobs` escalates to SIGKILL and names a job that outlives even
+# that rather than waiting on it. The `kill; wait` pair this replaced waited
+# unboundedly, and a local gate hung in it for 80 minutes on a daemon the kernel
+# could not finish killing. A daemon left holding a port also makes the NEXT run
+# fail at startup for a reason that has nothing to do with the run that broke.
 cleanup() {
-    for pid in "$server_pid" "$auth_pid"; do
-        if [[ -n "$pid" ]]; then
-            kill "$pid" >/dev/null 2>&1 || true
-            wait "$pid" 2>/dev/null || true
-        fi
-    done
+    reap_background_jobs
     rm -rf "$workdir"
+    e2e_exit_if_reap_left_survivors
 }
 trap cleanup EXIT
-
-# Statistics are per-user state; keep this run out of the developer's real log.
-export XDG_STATE_HOME="${workdir}/state"
-export FASTCACHE_VERBOSE=1
-export FASTCACHE_PREFETCH_GROUP="e2e"
 
 # The shared helpers: `fail`, `free_port`, `wait_for_port` -- one copy for every
 # POSIX fixture (#449). This file's own `free_port` was a near-copy of
@@ -123,8 +121,23 @@ export FASTCACHE_PREFETCH_GROUP="e2e"
 # stranger's, and both halves of that mistake show up as a claim about caching --
 # a first compile reported as a HIT, or a second one that was not served -- with
 # nothing anywhere naming the port.
+#
+# Sourcing it also clears every FASTCACHE_* this shell inherited (an operator's
+# FASTCACHE_SCHEDULER would dispatch each "local" compile to their fleet), which is
+# why this fixture's own exports come AFTER it.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
 e2e_begin "compile-cache E2E" "$workdir"
+
+# After `e2e_begin`, whose snapshot of the caller's statistics must precede every use of
+# the launcher variable -- `launcher-state-isolation` refuses one above it.
+[[ -n "$launcher"   && -x "$launcher"   ]] || { echo "fastcache-cc not found: '$launcher'; skipping"; exit "$SKIP"; }
+
+# Every launcher this fixture runs records into a state directory of the run's own,
+# through the shim `e2e_launcher_state_enter` (scripts/lib/e2e-common.sh) puts in
+# front of it. Before any launcher runs, and after `e2e_begin`, whose workdir holds it.
+e2e_launcher_state_enter launcher
+export FASTCACHE_VERBOSE=1
+export FASTCACHE_PREFETCH_GROUP="e2e"
 
 [[ -n "$port" ]] || port="$(free_port)"
 
@@ -257,8 +270,10 @@ EOF
     # nothing.
     grep '^fastcache-cc:' "${workdir}/verify.log" || true
 
-    grep -q "fastcache-cc: HIT" "${workdir}/verify.log" \
-        || fail "the planted object was not served, so nothing was verified"
+    # A hit the verifier REJECTS is traced `VERIFY-MISMATCH`, never `HIT` -- the outcome the
+    # build actually used -- so that word, on this key, is the proof the plant was served.
+    grep -q "fastcache-cc: VERIFY-MISMATCH key=${planted_key}" "${workdir}/verify.log" \
+        || fail "the planted object was not served and rejected, so nothing was verified (a hit FASTCACHE_VERIFY rejects is VERIFY-MISMATCH)"
     grep -q "WRONG OBJECT" "${workdir}/verify.log" \
         || fail "a wrong object was served and nothing said so"
     grep -q "$planted_key" "${workdir}/verify.log" \
@@ -855,6 +870,252 @@ FASTCACHE_ADDR="127.0.0.1:1" "$launcher" "$compiler" -std=c++23 -c "${proj}/a.cp
 cat "${workdir}/fallback.log"
 [[ -f "${proj}/build/fb.o" ]] || fail "fallback compile produced no object"
 
+# --- 8b: every way a dead cache can be silent, inside a bound -----------------
+# The leg above is one shape of a dead cache: a port that refuses. A peer that is LISTENING
+# but never accepts, and one that accepts and then resets, are the other two, and a
+# regression specific to one of them -- a launcher that waits forever on the silent one --
+# would pass the leg above. So each shape compiles here against a peer of its own, must exit
+# 0 with the object a working cache would have left, and must do it inside a BOUND: a hang is
+# then a named failure rather than the test's own timeout.
+#
+# The bound is DERIVED, never picked, and it is per SHAPE. The baseline is the same compile
+# against the live daemon, on the same monotonic clock: what a compile costs when the cache
+# works. One compile makes at most `dead_exchanges` exchanges before it gives up on the cache --
+# direct mode's manifest round trip, then the object fetch; never the STORE, which a fetch the
+# cache did not serve skips (`fastcache-cc --help` says the same under FASTCACHE_TIMEOUT). No
+# scheduler is configured, so there is no dispatch budget to add.
+#
+# What ONE exchange can cost is the deadline that ends it, which differs by shape -- the
+# `dead_shapes` table below:
+#   never-accepting    the connect completes into the backlog, so the exchange runs out TOTAL
+#   refused            the dial fails: at once here, after SYN retries on Windows, never past CONNECT
+#   accept-then-reset  the RST arrives at once; at most CONNECT
+# Those costs compose the leg's HANG bound -- baseline + N x cost + cost / 2 + `dead_wall_slack_ms`
+# -- and nothing else. HOW MANY exchanges a leg spent is COUNTED, never inferred from time: every
+# cache exchange the launcher makes goes through one door that says so on its verbose trace
+# (`cache exchange (...)`), and each leg asks for exactly `dead_exchanges` such lines; the reset
+# peer counts its accepts too, and the two must agree. Time judged the count twice and both times
+# measured the HOST: a wall-clock bound with half an exchange of slack failed on loaded Windows
+# runners (round 8), and so did the launcher's own exchange time on a starved one (round 9, 3616
+# ms for two 1000 ms dials). A launcher that is not scheduled cannot fire its deadline on time;
+# its count is the same however slow the machine is. run-launcher-e2e.ps1 holds the same legs,
+# with the never-accepting peer counting too and a floor on that leg's reported time.
+#
+# Time still judges what a slow host cannot fake. never-accepting, whose exchanges can end only at
+# TOTAL, holds the launcher's OWN reported time (`direct-ms` + `cache-ms`) to a FLOOR of N x TOTAL
+# less a timer's resolution -- a timer reading 0 fails it -- and a CEILING of (2N - 1/2) x TOTAL,
+# 7000 ms at N = 2 and TOTAL = 2000. An exchange that DOUBLED its deadline reports 2N x TOTAL =
+# 8000 (measured 8006-8017 by run-launcher-e2e.ps1) and fails it by TOTAL / 2 = 1000 ms; one that
+# IGNORED FASTCACHE_TIMEOUT falls back to the default total of 10000 ms per exchange and reports
+# about 20000. A stall of up to (N - 1/2) x TOTAL = 3000 ms past the floor still passes: a stall
+# belongs to the HOST, and the host's worst measured overrun is +1616 ms (round 9, on the refused
+# leg). The former (N + 1) x TOTAL, 6000 ms, tolerated a stall of 2000, only 384 above that
+# overrun, and at N = 1 it would equal a doubled TOTAL and catch nothing. The `dead_shapes`
+# table's third column names the deadline a shape is held to that way, or `-`.
+#
+# BLIND SPOTS, failing OPEN. A retry INSIDE one exchange -- in the dial, below the door -- is one
+# trace line, seen only as an extra accept on the reset leg. A WAIT anywhere is judged only by the
+# hang bound. And whether CONNECT is honoured end to end is judged by no leg: a stall moves a
+# refused dial past any ceiling tight enough to see a doubled CONNECT (round 9, +1616 ms on
+# Windows); the deadline MECHANICS are ReactorExchange_test's, and only the environment-to-budget
+# wiring of CONNECT is left to the hang bound.
+#
+# The peers and the clock are perl, because bash can neither listen nor read a monotonic
+# clock (`SECONDS` is the wall clock, which this host steps). A missing perl, or a missing core
+# module, fails the run -- see below.
+dead_connect_ms=1000
+dead_total_ms=2000
+dead_exchanges=2
+# What the wall clock may run past the most N exchanges may take before a leg is a hang: the
+# compile, two process starts and whatever a starved runner adds to them.
+dead_wall_slack_ms=10000
+# A timer firing early by its resolution, for the floor.
+dead_timer_tolerance_ms=50
+# shape, then the NAME of the deadline one exchange against it can spend. The silent shape
+# LAST: this fixture stops at its first failure, and a hang there is the regression the bound
+# exists for, so the other two have reported by the time it can fire.
+dead_shapes="refused dead_connect_ms -
+accept-then-reset dead_connect_ms -
+never-accepting dead_total_ms dead_total_ms"
+dead_peer_pid=""
+dead_launch_pid=""
+dead_ended_ms=0
+dead_accepts=""
+
+# Milliseconds on a monotonic clock.
+dead_now_ms() {
+    perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%d\n", clock_gettime(CLOCK_MONOTONIC) * 1000' # perl-lifetime: a foreground clock read; it exits at once and is never backgrounded
+}
+
+# A loopback peer that writes its port to @2 and then, for @1 `silent`, never accepts --
+# the kernel still completes every handshake into its backlog, so a client connects, writes
+# its request and waits for a reply nobody sends -- or, for `reset`, accepts each connection
+# and closes it with a zero linger, which is an RST, appending one line per accept to
+# `@2.accepts` BEFORE the reset, so the line exists by the time the launcher sees it. It lives
+# at most @3 seconds.
+dead_peer() {
+    # Run as `dead_peer ... &`, a SUBSHELL, which inherits this fixture's EXIT trap -- the run's
+    # cleanup. Cleared first thing, which closes the window from here until the `exec` into perl
+    # below replaces the shell (#1084). It cannot close the window BEFORE this line runs; the
+    # `kill -KILL` that ends the peer is what covers that one.
+    trap - EXIT TERM INT HUP
+    local program='
+        use IO::Socket::INET; use Socket qw(SOL_SOCKET SO_LINGER);
+        my ($mode, $portfile) = @ARGV;
+        my $listener = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 0, Listen => 16)
+            or die "listen: $!";
+        open(my $out, ">", "$portfile.tmp") or die "$portfile: $!";
+        print $out $listener->sockport, "\n";
+        close $out;
+        rename("$portfile.tmp", $portfile) or die "$portfile: $!";
+        if ($mode eq "silent") { select(undef, undef, undef, 3600) while 1; }
+        while (my $client = $listener->accept) {
+            open(my $log, ">>", "$portfile.accepts") or die "$portfile.accepts: $!";
+            print $log "accept\n";
+            close $log;
+            setsockopt($client, SOL_SOCKET, SO_LINGER, pack("ii", 1, 0));
+            close $client;
+        }'
+    e2e_bounded_perl "$3" "$program" "$1" "$2"
+}
+
+dead_peer_ready() { [[ -s "${workdir}/dead-peer.port" ]]; }
+
+# Readiness of the launcher run below: it has exited. Records when it was noticed.
+dead_launch_done() {
+    kill -0 "$dead_launch_pid" 2>/dev/null && return 1
+    dead_ended_ms="$(dead_now_ms)"
+}
+
+# One compile against @1, in the background, bounded by @2 ms. Leaves the exit status in
+# `dead_status` and the elapsed monotonic time in `dead_elapsed_ms`.
+dead_compile() {
+    local addr="$1" bound_ms="$2" what="$3" started
+    rm -f "${dead}/build/d.o"
+    started="$(dead_now_ms)"
+    FASTCACHE_ADDR="$addr" FASTCACHE_CONNECT_TIMEOUT="${dead_connect_ms}ms" FASTCACHE_TIMEOUT="${dead_total_ms}ms" \
+        "$launcher" "$compiler" -std=c++23 -c "${dead}/d.cpp" -o "${dead}/build/d.o" 2> "${workdir}/dead.log" &
+    dead_launch_pid=$!
+    # Whole seconds for the wait, rounded UP; the millisecond bound is judged below.
+    wait_until dead_launch_done "$what, within the ${bound_ms} ms bound" "-" "${workdir}/dead.log" \
+        $(( (bound_ms + 999) / 1000 ))
+    dead_status=0
+    wait "$dead_launch_pid" || dead_status=$?
+    dead_launch_pid=""
+    dead_elapsed_ms=$(( dead_ended_ms - started ))
+}
+
+# perl and its two modules are REQUIRED, not optional: a missing one FAILS the run, naming what
+# is missing. `IO::Socket::INET` and `Time::HiRes` ship with perl itself, so their absence is a
+# broken environment rather than a platform without them, and a skip here printed a line nobody
+# reads while the run still ended in `compile-cache E2E OK` -- a skip that read as a pass, over
+# the three shapes this section exists for (review M-2). Every host this fixture runs on ships
+# perl.
+command -v perl >/dev/null 2>&1 \
+    || fail "dead peers: no perl on PATH, so the never-accepting and reset peers and the elapsed bounds cannot run -- every host this fixture runs on ships perl"
+for dead_module in IO::Socket::INET Time::HiRes; do
+    perl -M"$dead_module" -e1 >/dev/null 2>&1 || fail "dead peers: perl cannot load ${dead_module}, which ships with perl itself -- a broken perl installation, not a platform without it" # perl-lifetime: a foreground availability probe; it exits at once and is never backgrounded
+done
+echo "== dead peers: a cache that cannot answer leaves the compile to go on =="
+dead="${workdir}/deadproj"
+mkdir -p "${dead}/build"
+echo 'char const* tag() { return "dead-peer"; } int main() { return 0; }' > "${dead}/d.cpp"
+export FASTCACHE_SOURCE_DIR="$dead" FASTCACHE_BINARY_DIR="${dead}/build"
+
+dead_compile "127.0.0.1:${port}" $(( 300 * 1000 )) "the baseline compile against the live daemon"
+[[ "$dead_status" -eq 0 && -f "${dead}/build/d.o" ]] \
+    || { cat "${workdir}/dead.log" >&2; fail "dead peers: the live baseline did not compile (exit ${dead_status})"; }
+cp "${dead}/build/d.o" "${workdir}/dead-expected.o"
+dead_baseline_ms="$dead_elapsed_ms"
+echo "   baseline ${dead_baseline_ms} ms against the live daemon"
+
+# fd 3, so nothing the body runs can read the table as its stdin.
+while read -r shape dead_cost_name dead_held_name <&3; do
+    dead_cost_ms="${!dead_cost_name}"
+    dead_bound_ms=$(( dead_baseline_ms + dead_exchanges * dead_cost_ms + dead_cost_ms / 2 + dead_wall_slack_ms ))
+    echo "   ${shape}: exactly ${dead_exchanges} exchange(s); hang bound ${dead_bound_ms} ms = baseline + ${dead_exchanges} x ${dead_cost_ms} + ${dead_cost_ms} / 2 + ${dead_wall_slack_ms} ms"
+    rm -f "${workdir}/dead-peer.port" "${workdir}/dead-peer.port.accepts"
+    case "$shape" in
+        refused)
+            addr="127.0.0.1:$(free_port)" ;;
+        accept-then-reset|never-accepting)
+            mode=reset; [[ "$shape" = never-accepting ]] && mode=silent
+            dead_peer "$mode" "${workdir}/dead-peer.port" $(( 2 * ((dead_bound_ms + 999) / 1000) )) &
+            dead_peer_pid=$!
+            wait_until dead_peer_ready "the ${shape} peer to listen" "$dead_peer_pid" - 10
+            addr="127.0.0.1:$(cat "${workdir}/dead-peer.port")" ;;
+        *)
+            fail "dead peers: no peer for the shape '${shape}'" ;;
+    esac
+    # How many records the run's log holds BEFORE this compile, so the one read below is proven to
+    # be this compile's own (round 10 review, M5).
+    dead_log="$(e2e_launcher_state_log)"
+    dead_records_before=0
+    [[ -f "$dead_log" ]] && dead_records_before="$(count_lines "$dead_log")"
+    dead_compile "$addr" "$dead_bound_ms" "the launcher against the ${shape} peer to finish"
+    if [[ -n "$dead_peer_pid" ]]; then
+        # KILL, never TERM: it covers the window the `trap -` inside `dead_peer` cannot -- a
+        # subshell signalled between its fork and its first command still holds the fixture's
+        # EXIT trap, and a catchable signal would run the run's cleanup from inside it (#1084).
+        # KILL runs no trap, whichever side of that line the peer is on.
+        kill -KILL "$dead_peer_pid" 2>/dev/null || true
+        wait "$dead_peer_pid" 2>/dev/null || true
+        dead_peer_pid=""
+    fi
+    [[ "$dead_status" -eq 0 ]] \
+        || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the compile exited ${dead_status}"; }
+    [[ "$dead_elapsed_ms" -le "$dead_bound_ms" ]] \
+        || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: ${dead_elapsed_ms} ms, over the ${dead_bound_ms} ms hang bound"; }
+    # The COUNT, from the launcher's own trace. grep -c prints 0 and answers 1 for no line; an
+    # answer above 1 prints nothing, and the empty count then fails the comparison -- CLOSED.
+    dead_traced="$(grep -c -- '^fastcache-cc: cache exchange (' "${workdir}/dead.log" || true)"
+    [[ "$dead_traced" == "$dead_exchanges" ]] \
+        || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the launcher traced '${dead_traced}' cache exchange(s), want exactly ${dead_exchanges}"; }
+    # What tells this leg from one that never reached the peer: the launcher says it fell back.
+    grep -qF "(fetch exchange failed)" "${workdir}/dead.log" \
+        || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: no 'fetch exchange failed' fall-back, so the peer was never asked"; }
+    # The launcher's OWN time, between a floor and a ceiling, on the shape whose exchanges cannot
+    # end before their deadline. Read from the record this compile appended to the run's log.
+    if [[ "$dead_held_name" != - ]]; then
+        dead_held_ms="${!dead_held_name}"
+        # Exactly ONE record more than before: the last line is then this compile's, never the
+        # accept-then-reset leg's judged under a cause that is not its own.
+        dead_records_after="$(count_lines "$dead_log")"
+        [[ "$dead_records_after" -eq $(( dead_records_before + 1 )) ]] \
+            || fail "dead peers: ${shape}: the launcher's log went from ${dead_records_before} to ${dead_records_after} record(s), want exactly one more -- the times read below would not be this compile's"
+        dead_record="$(tail -n 1 "$dead_log")"
+        dead_direct_ms="$(e2e_launcher_log_field direct-ms <<< "$dead_record")" \
+            || fail "dead peers: ${shape}: the launcher's record could not be read for direct-ms: ${dead_record}"
+        dead_cache_ms="$(e2e_launcher_log_field cache-ms <<< "$dead_record")" \
+            || fail "dead peers: ${shape}: the launcher's record could not be read for cache-ms: ${dead_record}"
+        [[ "$dead_direct_ms" =~ ^[0-9]+$ && "$dead_cache_ms" =~ ^[0-9]+$ ]] \
+            || fail "dead peers: ${shape}: the launcher's record carries no times (direct-ms '${dead_direct_ms}', cache-ms '${dead_cache_ms}')"
+        dead_spent_ms=$(( dead_direct_ms + dead_cache_ms ))
+        dead_floor_ms=$(( dead_exchanges * dead_held_ms - dead_timer_tolerance_ms ))
+        dead_ceiling_ms=$(( (4 * dead_exchanges - 1) * dead_held_ms / 2 ))
+        [[ "$dead_spent_ms" -ge "$dead_floor_ms" ]] \
+            || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the launcher reported ${dead_spent_ms} ms on the cache, under the ${dead_floor_ms} ms that ${dead_exchanges} exchange(s) with a silent peer cannot end before -- its own timer is not measuring the exchanges"; }
+        [[ "$dead_spent_ms" -le "$dead_ceiling_ms" ]] \
+            || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the launcher reported ${dead_spent_ms} ms on the cache, past the ${dead_ceiling_ms} ms ceiling, (2N - 1/2) x its deadline for ${dead_exchanges} exchange(s) -- an exchange overran its configured deadline by as much as a doubled one does"; }
+        echo "   ${shape}: ${dead_spent_ms} ms reported on the cache (floor ${dead_floor_ms}, ceiling ${dead_ceiling_ms})"
+    fi
+    # And on the reset leg, where every exchange is a connection the peer accepts, the PEER's
+    # count, which must agree with the trace: what makes the launcher's own count trustworthy on
+    # the shapes whose peer cannot count.
+    if [[ "$shape" = accept-then-reset ]]; then
+        # No file is no accept at all -- a count of 0, not a fixture fault.
+        dead_accepts=0
+        [[ ! -e "${workdir}/dead-peer.port.accepts" ]] \
+            || dead_accepts="$(count_lines "${workdir}/dead-peer.port.accepts")"
+        [[ "$dead_accepts" -eq "$dead_traced" ]] \
+            || { cat "${workdir}/dead.log" >&2; fail "dead peers: ${shape}: the peer accepted ${dead_accepts} connection(s) while the launcher traced ${dead_traced} exchange(s) -- its own count is not to be trusted"; }
+    fi
+    cmp -s "${workdir}/dead-expected.o" "${dead}/build/d.o" \
+        || fail "dead peers: ${shape}: no object, or not the one the live baseline compiled"
+    echo "   ${shape}: compiled locally in ${dead_elapsed_ms} ms after ${dead_traced} exchange(s), object matches the baseline${dead_accepts:+, ${dead_accepts} accepted by the peer}"
+    dead_accepts=""
+done 3<<< "$dead_shapes"
+
 # --- 9: forms the launcher must decline to cache ----------------------------
 # A compile with no -o defaults its output to ./a.o, a path the launcher cannot
 # reconstruct. It must pass straight through rather than claim the compile and
@@ -1169,6 +1430,158 @@ else
     echo "   direct mode records and serves a manifest on an aliased root: OK"
 fi
 
+# --- 10: an object naming its checkout is not served into another -----------
+# A translation unit that bakes its own path into program data -- `__FILE__`, or the
+# builtin `std::source_location` is made of -- must not be served into a second
+# checkout, in either direct mode, while one that bakes none still is; the checkout
+# that stored a root-bound copy must still hit it; and a hit FASTCACHE_VERIFY rejects
+# is logged VERIFY-MISMATCH, never HIT. No key can see those paths: the direct-mode
+# key never sees the `__FILE__` expansion and `source_location` reaches no key at
+# all, so the launcher reads the OBJECT (apps/fastcache-cc/RootBinding.hpp). Before
+# that, `__FILE__` with direct mode on and `source_location` in both modes printed
+# the first checkout's path from the second.
+#
+# The outcome of the second checkout is per kind, and that is the discrimination:
+# `srcloc` shares a portable key with the first (the builtin reaches no key), so it
+# meets the first checkout's marker and is a BOUND-MISS; `file` does not share one on
+# the preprocessed path, so once direct mode declines it is an ordinary MISS; `none`
+# is a HIT of the first checkout's very bytes.
+# The tree includes a PROJECT header, and that is load-bearing: a translation unit
+# reporting no dependency records no direct-mode manifest, so a "direct on" leg would
+# never reach direct mode -- where `__FILE__` was mis-served -- and would pass with the
+# fix removed. check_root_bound asserts the manifest was stored.
+write_bound_tree() {
+    local root="$1" kind="$2" tag="$3" body
+    mkdir -p "${root}/src/inc" "${root}/build"
+    printf '#pragma once\ninline int one() { return 1; }\n' > "${root}/src/inc/h1.hpp"
+    case "$kind" in
+        file)   body='char const* Where() { return __FILE__; }' ;;
+        srcloc) body='char const* Where() { return __builtin_FILE(); }' ;;
+        none)   body='char const* Where() { return "nowhere"; }' ;;
+        *)      fail "unknown root-bound kind: ${kind}" ;;
+    esac
+    printf '#include "inc/h1.hpp"\nchar const* Tag() { return "%s"; }\n%s\nint G() { return one(); }\n' \
+        "$tag" "$body" > "${root}/src/u.cpp"
+}
+
+# Compile one tree through the launcher. The environment assignments come first and
+# there is always at least one, so `"$@"` is never empty under `set -u`.
+bound_compile() {
+    local root="$1" log="$2" flag="$3"
+    shift 3
+    env "$@" FASTCACHE_SOURCE_DIR="$root" FASTCACHE_BINARY_DIR="${root}/build" \
+        "$launcher" "$compiler" -std=c++20 ${flag:+"$flag"} -MD -MF "${root}/build/u.d" \
+        -c "${root}/src/u.cpp" -o "${root}/build/u.o" 2> "$log"
+}
+
+# The trace line's word, with the root-binding qualifier the launcher adds.
+bound_outcome() {
+    if grep -q "fastcache-cc: VERIFY-MISMATCH key=" "$1"; then echo VERIFY-MISMATCH
+    elif grep -qE "fastcache-cc: HIT key=[^ ]+ \(root-bound:" "$1"; then echo BOUND-HIT
+    elif grep -qE "fastcache-cc: MISS key=[^ ]+ \(root-bound:" "$1"; then echo BOUND-MISS
+    elif grep -q "fastcache-cc: HIT" "$1"; then echo HIT
+    elif grep -q "fastcache-cc: MISS" "$1"; then echo MISS
+    else echo UNKNOWN
+    fi
+}
+
+check_root_bound() {
+    local kind="$1" direct="$2" want_b="$3" dir a b no_direct oa ob oa2 want_a2
+    dir="${workdir}/bound/${kind}-${direct}"
+    a="${dir}/checkout-a"
+    b="${dir}/checkout-b"
+    write_bound_tree "$a" "$kind" "rootbound-${kind}-${direct}"
+    write_bound_tree "$b" "$kind" "rootbound-${kind}-${direct}"
+    no_direct="FASTCACHE_E2E_CASE=rootbound"
+    [[ "$direct" == off ]] && no_direct="FASTCACHE_NO_DIRECT=1"
+
+    bound_compile "$a" "${dir}/a.log" "" "$no_direct" || fail "root-bound ${kind}/${direct}: checkout a failed to compile"
+    bound_compile "$b" "${dir}/b.log" "" "$no_direct" || fail "root-bound ${kind}/${direct}: checkout b failed to compile"
+    cp "${a}/build/u.o" "${dir}/a.o"
+    # And a again, from a deleted object: the checkout that stored a root-bound copy
+    # must still be served it, or the fix bought correctness by giving up the cache
+    # for these translation units altogether.
+    rm -f "${a}/build/u.o"
+    bound_compile "$a" "${dir}/a2.log" "" "$no_direct" || fail "root-bound ${kind}/${direct}: checkout a failed again"
+
+    if [[ "$direct" == on ]] && ! grep -q "fastcache-cc: MANIFEST stored" "${dir}/a.log"; then
+        cat "${dir}/a.log"
+        fail "root-bound ${kind}/direct on: checkout a recorded no manifest, so the leg never reaches direct mode"
+    fi
+    oa="$(bound_outcome "${dir}/a.log")"
+    ob="$(bound_outcome "${dir}/b.log")"
+    oa2="$(bound_outcome "${dir}/a2.log")"
+    want_a2=BOUND-HIT
+    [[ "$kind" == none ]] && want_a2=HIT
+    if [[ "$oa" != MISS || "$ob" != "$want_b" || "$oa2" != "$want_a2" ]]; then
+        cat "${dir}/a.log" "${dir}/b.log" "${dir}/a2.log"
+        fail "root-bound ${kind}/direct ${direct}: a=${oa} b=${ob} (want ${want_b}) a-again=${oa2} (want ${want_a2})"
+    fi
+    # And b must have READ that manifest: one a stored and b never validated would turn this
+    # leg back into a direct-off one without a single outcome moving. For a bound object, b's
+    # direct mode follows the manifest to a's marker and says so -- and with direct mode off
+    # it never can.
+    if [[ "$kind" != none ]]; then
+        followed=no
+        grep -q "the direct-mode object is root-bound and this checkout has no copy" "${dir}/b.log" && followed=yes
+        want_followed=no
+        [[ "$direct" == on ]] && want_followed=yes
+        if [[ "$followed" != "$want_followed" ]]; then
+            cat "${dir}/b.log"
+            fail "root-bound ${kind}/direct ${direct}: checkout b followed a's manifest=${followed} (want ${want_followed})"
+        fi
+    fi
+    if [[ "$kind" == none ]]; then
+        cmp "${dir}/a.o" "${b}/build/u.o" \
+            || fail "root-bound ${kind}/direct ${direct}: a path-free object was not served into the other checkout"
+    elif LC_ALL=C grep -qaF "$a" "${b}/build/u.o"; then
+        # `if` rather than `grep && fail`: under `set -e` a non-matching grep would
+        # end the script on the SUCCESS path. `LC_ALL=C`, or macOS's grep matches nothing
+        # on an object's non-UTF-8 bytes and this negative search passes forever.
+        fail "root-bound ${kind}/direct ${direct}: checkout b's object names checkout a"
+    fi
+    echo "   ${kind}, direct ${direct}: a=${oa} b=${ob} a-again=${oa2}"
+}
+
+echo "== root-bound objects =="
+for direct in on off; do
+    check_root_bound file "$direct" MISS
+    check_root_bound srcloc "$direct" BOUND-MISS
+    check_root_bound none "$direct" HIT
+done
+
+# A verified hit is logged as what the build USED. An ELF object keeps a strict byte
+# comparison, so a path-free object served across checkouts verifies clean without
+# debug info and is rejected with it (its DWARF names the source) -- both directions,
+# which is what keeps this from passing under a launcher that logged every verified
+# hit one way.
+echo "== a verified cross-checkout hit is logged as what the build used =="
+for debug in off on; do
+    dir="${workdir}/bound/verify-${debug}"
+    write_bound_tree "${dir}/checkout-a" none "rootbound-verify-${debug}"
+    write_bound_tree "${dir}/checkout-b" none "rootbound-verify-${debug}"
+    flag=""
+    want=HIT
+    if [[ "$debug" == on ]]; then
+        flag="-g"
+        want=VERIFY-MISMATCH
+    fi
+    bound_compile "${dir}/checkout-a" "${dir}/a.log" "$flag" FASTCACHE_NO_DIRECT=1 || fail "verify ${debug}: a failed"
+    bound_compile "${dir}/checkout-b" "${dir}/b.log" "$flag" FASTCACHE_NO_DIRECT=1 FASTCACHE_VERIFY=1 \
+        || fail "verify ${debug}: b failed"
+    ob="$(bound_outcome "${dir}/b.log")"
+    logged="$(tail -n 1 "$(e2e_launcher_state_log)" | e2e_launcher_log_field outcome)"
+    wrong=no
+    if grep -q "WRONG OBJECT served" "${dir}/b.log"; then wrong=yes; fi
+    want_wrong=no
+    [[ "$want" == VERIFY-MISMATCH ]] && want_wrong=yes
+    if [[ "$ob" != "$want" || "$logged" != "$want" || "$wrong" != "$want_wrong" ]]; then
+        cat "${dir}/b.log"
+        fail "verify with debug info ${debug}: trace=${ob} logged=${logged} (want ${want}), WRONG OBJECT line=${wrong}"
+    fi
+    echo "   debug info ${debug}: logged ${logged}, WRONG OBJECT line=${wrong}"
+done
+
 # --- authentication ---------------------------------------------------------
 # The compile-cache protocol was the only one in the tree that never checked
 # SessionContext::CurrentAuth(), so a daemon started with --requirepass gated
@@ -1242,8 +1655,11 @@ kill -0 "$auth_pid" 2>/dev/null || {
     [[ -f "${authdir}/build/ok.o" ]] || fail "no object reproduced on the authenticated hit"
 ) || exit 1
 
-kill "$auth_pid" >/dev/null 2>&1 || true
-wait "$auth_pid" 2>/dev/null || true
+# Stopped and REQUIRED to go, within `dist-compile-e2e.sh`'s `daemon_stop_seconds`
+# and for its reason: `fastcached` has nothing to drain, so it stops as soon as its
+# loop is woken. A bare `kill; wait` here was unbounded.
+stop_and_require_exit "$auth_pid" "the authenticating daemon" 5
+auth_pid=""
 echo "   a credential is required, refusals never break the build, and the right one still HITs"
 
 # --- statistics -------------------------------------------------------------
@@ -1272,10 +1688,15 @@ fi
 [ "${rc:-0}" -eq 2 ] || fail "retired flag should exit 2, got ${rc:-0}"
 echo "   retired flags exit 2 with a diagnostic"
 
+# The positive control, BEFORE `-z` clears it; and after it, the caller's logs intact --
+# `-z` being the call that deleted a developer's statistics on the Windows twin.
+e2e_launcher_state_assert_used
 "$launcher" -z >/dev/null || fail "-z returned non-zero"
 "$launcher" --zero-stats >/dev/null || fail "--zero-stats returned non-zero"
+[ ! -f "$(e2e_launcher_state_log)" ] || fail "-z left this run's state log in place ($(e2e_launcher_state_log)), so it cleared some other one"
+e2e_launcher_state_assert_caller_untouched
 
 echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, store ceiling, cross-depth, nested roots," \
-     "moved-header convergence (both layouts keyed apart), an edit re-keying," \
+     "moved-header convergence (both layouts keyed apart), an edit re-keying, root-bound objects keyed apart," \
      "authentication (refused without a credential, cached with one), and safe fallback"
 exit 0

@@ -46,7 +46,7 @@
 #
 # ## The configuration is the packaged one
 #
-# `scheduler:` and `advertise:` and no `listen_node:` -- byte-for-byte the shape
+# `advertise:` and no `listen_node:` -- byte-for-byte the shape
 # `.github/workflows/build.yml` writes into the file the unit's ExecStart names. Taken
 # from the workflow rather than from a shape that seemed representative, because #770
 # is precisely a configuration nobody thought to write down.
@@ -87,10 +87,12 @@ activator="$(command -v systemd-socket-activate 2>/dev/null || true)"
 workdir="$(mktemp -d)"
 activator_pid=""
 
+# Bounded, where the `kill; wait` it replaced was not: `reap_background_jobs`
+# escalates to SIGKILL and names a process that outlives even that.
 cleanup() {
-    [[ -n "$activator_pid" ]] && kill "$activator_pid" 2>/dev/null
-    [[ -n "$activator_pid" ]] && wait "$activator_pid" 2>/dev/null
+    reap_background_jobs
     rm -rf "$workdir"
+    e2e_exit_if_reap_left_survivors
 }
 trap cleanup EXIT
 
@@ -110,6 +112,9 @@ e2e_on_fail dump_node_log
 
 # The port the SUPERVISOR opens. The node never asks for it, which is the whole point.
 port="$(free_port)"
+# This node's consensus port: a node given no scheduler serves its own fleet, and a fixed
+# 6680 would collide with any other node on the machine.
+raft_port="$(free_port)"
 
 # Sampled BEFORE anything starts, so the adoption check below can be about a CHANGE
 # rather than about a state this fixture did not create. See that check for what a bare
@@ -150,14 +155,16 @@ readonly DEFAULT_NODE_PORT=6674
 # independent sources agreeing when it is one dead fact quoted twice.
 readonly READY_SECONDS=240
 
-# The packaged configuration: a scheduler that is not there (the worker must still come
-# up and keep retrying), an advertise naming the ACTIVATED port, the state directory the
-# packaged unit provides for its identity key (#178 PR 6), and deliberately no
-# --listen-node.
+# The packaged configuration: an advertise naming the ACTIVATED port, the state directory
+# the packaged unit provides for its identity key (#178 PR 6), and deliberately no
+# --listen-node. No scheduler: a node that serves is refused one, and finds the fleet it
+# serves from its formation record -- its own, on a first start. Consensus on a port of
+# this run's own, and no discovery beacon on the port every node on the segment shares.
 "$activator" --listen="127.0.0.1:${port}" -- \
     "$node" \
-        --scheduler=127.0.0.1:6675 \
         --cluster-dir="${workdir}/state" \
+        --listen-raft="127.0.0.1:${raft_port}" \
+        --discovery= \
         --advertise="127.0.0.1:${port}" \
         --toolchain=/usr/bin/g++ \
         --cache-memory=0 \

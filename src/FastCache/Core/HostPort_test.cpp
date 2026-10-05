@@ -164,9 +164,127 @@ TEST_CASE("Loopback still answers for every spelling a kernel produces", "[core]
     CHECK_FALSE(IsLoopbackHost("128.0.0.1"));
     CHECK_FALSE(IsLoopbackHost(""));
 
+    // And the NAME stays out of it: a resolver's answer is not a security decision.
+    CHECK_FALSE(IsLoopbackHost("localhost"));
+}
+
+TEST_CASE("A name every machine resolves to itself is told apart from one a peer can dial", "[core][hostport]")
+{
+    // RFC 6761: `localhost` and every name under it resolve to loopback everywhere, so a peer told
+    // to dial one reaches ITSELF. The loopback literals are the same fact spelled as an address.
+    for (auto const* const host: { "localhost",
+                                   "LOCALHOST",
+                                   "localhost.",
+                                   "build.localhost",
+                                   "a.b.LocalHost.",
+                                   "127.0.0.1",
+                                   "127.0.1.1",
+                                   "::1",
+                                   "::ffff:127.0.0.1" })
+    {
+        INFO(host);
+        CHECK(NamesOnlyThisMachine(host));
+    }
+
+    // A name that merely CONTAINS the word is a name, and so is RHEL's `localhost.localdomain`
+    // -- which the placeholder-domain rule reduces to `localhost` first, where it is caught.
+    for (auto const* const host: { "notlocalhost",
+                                   "localhost.example",
+                                   "localhost.localdomain",
+                                   ".localhost-x",
+                                   "worker-01.corp.example",
+                                   "10.0.0.1",
+                                   "" })
+    {
+        INFO(host);
+        CHECK_FALSE(NamesOnlyThisMachine(host));
+    }
+
     // Whatever a resolver says it is, which is not something a security decision may
     // depend on.
     CHECK_FALSE(IsLoopbackHost("localhost"));
+}
+
+TEST_CASE("Loopback is an IP literal inside 127.0.0.0/8 or ::1, and a name never is", "[core][hostport]")
+{
+    // The whole /8, as literals.
+    for (auto const* literal: { "127.0.0.1", "127.5.5.5", "127.255.255.255", "127.0.0.0", "::1", "::ffff:127.5.5.5" })
+    {
+        INFO(literal);
+        CHECK(IsLoopbackHost(literal));
+    }
+
+    // A NAME beginning `127.` was loopback while this matched a prefix, and that direction
+    // is fail-OPEN wherever the answer decides whether a port faces other machines. So is
+    // every text that is not four decimal octets.
+    for (auto const* notLiteral: { "127.cache.example.com",
+                                   "127.0.0.1.example.com",
+                                   "127.",
+                                   "127.1",
+                                   "127.0.1",
+                                   "127.0.0.1.",
+                                   "127.0.0.256",
+                                   "127.0.0.-1",
+                                   "127.0.0.0001",
+                                   "127..0.1",
+                                   "::ffff:127.cache.example.com",
+                                   "0:0:0:0:0:0:0:1x" })
+    {
+        INFO(notLiteral);
+        CHECK_FALSE(IsLoopbackHost(notLiteral));
+    }
+}
+
+TEST_CASE("A host names no one machine when every machine answers to it", "[core][hostport]")
+{
+    for (auto const* everybody: { "127.0.0.1",
+                                  "127.5.5.5",
+                                  "::1",
+                                  "::ffff:127.0.0.1",
+                                  "localhost",
+                                  "LOCALHOST",
+                                  "LocalHost",
+                                  "build.localhost",
+                                  "localhost.",
+                                  "0.0.0.0",
+                                  "::" })
+    {
+        INFO(everybody);
+        CHECK(NamesNoOneMachine(everybody));
+    }
+    for (auto const* one: { "office.corp", "10.0.0.7", "2001:db8::5", "127.cache.example.com", "localhost.corp" })
+    {
+        INFO(one);
+        CHECK_FALSE(NamesNoOneMachine(one));
+    }
+}
+
+TEST_CASE("An endpoint a peer may be told to dial names a host that is neither this machine nor every interface",
+          "[core][hostport]")
+{
+    for (auto const* const endpoint: { "office:6674", "10.0.0.7:6674", "[fd00::7]:6674", "build.example.:6676" })
+    {
+        INFO(endpoint);
+        CHECK(IsPeerDialableEndpoint(endpoint));
+        CHECK(PeerDialableOrNone(endpoint) == endpoint);
+    }
+
+    // Each one sends whoever dials it back to itself, or names nobody at all.
+    for (auto const* const endpoint: { "127.0.0.1:6674",
+                                       "[::1]:6674",
+                                       "localhost:6674",
+                                       "build.localhost:6674",
+                                       "0.0.0.0:6674",
+                                       "[::]:6674",
+                                       ":6674",
+                                       "6674",
+                                       "office",
+                                       "" })
+    {
+        INFO(endpoint);
+        CHECK_FALSE(IsPeerDialableEndpoint(endpoint));
+        CHECK(PeerDialableOrNone(endpoint).empty());
+    }
 }
 
 TEST_CASE("An endpoint gives up its host without dropping a bare one", "[core][hostport]")
@@ -217,4 +335,42 @@ TEST_CASE("Two hosts name one machine across the spellings a listener imposes", 
     // nothing, so a guard on the argument would let it match the empty host and hand
     // an unnameable peer the answer the rule above exists to deny it.
     CHECK_FALSE(SameHost("::ffff:", ""));
+}
+
+TEST_CASE("A link-local address is told apart from every other range, in both families", "[core][hostport]")
+{
+    for (auto const* linkLocal: { "169.254.1.1",
+                                  "169.254.0.0",
+                                  "169.254.255.255",
+                                  "::ffff:169.254.1.1",
+                                  "fe80::1",
+                                  "fe80::",
+                                  "fe80::1%eth0",
+                                  "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff" })
+    {
+        INFO(linkLocal);
+        CHECK(IsLinkLocalHost(linkLocal));
+    }
+    for (auto const* other:
+         { "127.0.0.1", "10.8.0.7", "169.253.1.1", "169.255.1.1", "fe7f::1", "fec0::1", "::1", "::", "laptop.corp", "" })
+    {
+        INFO(other);
+        CHECK_FALSE(IsLinkLocalHost(other));
+    }
+}
+
+TEST_CASE("An IP literal is told apart from a name, in both families", "[core][hostport]")
+{
+    for (auto const* literal:
+         { "10.8.0.7", "0.0.0.0", "255.255.255.255", "::1", "fe80::1%eth0", "2001:db8::7", "::ffff:10.0.0.1" })
+    {
+        INFO(literal);
+        CHECK(IsIpLiteralHost(literal));
+    }
+    for (auto const* name:
+         { "laptop.corp", "localhost", "10.8.0", "10.8.0.7.9", "256.1.1.1", "1.2.3.x", "01234.1.1.1", "", "a" })
+    {
+        INFO(name);
+        CHECK_FALSE(IsIpLiteralHost(name));
+    }
 }

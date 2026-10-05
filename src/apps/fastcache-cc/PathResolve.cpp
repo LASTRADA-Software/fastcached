@@ -137,6 +137,15 @@ namespace
         return CallPathApi([&wide](wchar_t* buffer, DWORD size) { return ::GetLongPathNameW(wide.c_str(), buffer, size); });
     }
 
+    /// The 8.3 short form of an existing path.
+    /// @param path The path to shorten.
+    /// @return The short form, or empty on failure.
+    [[nodiscard]] std::string ShortName(std::filesystem::path const& path)
+    {
+        auto const wide = path.wstring();
+        return CallPathApi([&wide](wchar_t* buffer, DWORD size) { return ::GetShortPathNameW(wide.c_str(), buffer, size); });
+    }
+
 #else
 
     /// Resolve through the filesystem: follows symlinks and removes `.`/`..`.
@@ -229,6 +238,27 @@ namespace
             catch (std::exception const&)
             {
                 return std::string { path };
+            }
+        }
+
+        std::string ShortForm(std::string_view directory) override
+        {
+            try
+            {
+                std::filesystem::path const input { directory };
+                if (!IsResolvable(input))
+                    return std::string { directory };
+#if defined(_WIN32)
+                ++_filesystemCalls;
+                auto shortened = ShortName(input);
+                return shortened.empty() ? std::string { directory } : std::move(shortened);
+#else
+                return std::string { directory };
+#endif
+            }
+            catch (std::exception const&)
+            {
+                return std::string { directory };
             }
         }
 

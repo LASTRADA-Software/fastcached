@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <cstdint>
@@ -26,6 +27,9 @@ enum class AcceptorRefusal : std::uint8_t
     OwnId,            ///< Proved this node's own id: it holds this node's private key.
     FrameTag,         ///< A session frame's tag did not verify.
     FrameSender,      ///< A verified message named a sender other than the proven dialler.
+    FrameUnreadable,  ///< A verified frame this build cannot read.
+    FrameOverCap,     ///< A frame declared more payload than this end buffers.
+    FrameBadMagic,    ///< A frame's header did not decode.
     KeyWithdrawn,     ///< The roster stopped naming the key the session was proved with.
     Full,             ///< The listener already served as many connections as it holds.
     Last,             ///< Not a refusal, and has no row.
@@ -46,6 +50,12 @@ enum class DiallerRefusal : std::uint8_t
     OwnKeyRevoked,      ///< A verified verdict: the acceptor's roster has revoked this node's key.
     EndedByAcceptor,    ///< The acceptor closed after the proof, with no signed verdict.
     KeyWithdrawn,       ///< The roster stopped naming the key the acceptor proved the session with.
+    FrameTag,           ///< On a two-way session: a frame the acceptor wrote failed its tag.
+    FrameSender,        ///< On a two-way session: a verified message named a sender other than the acceptor.
+    FrameUnreadable,    ///< On a two-way session: a verified frame this build cannot read.
+    FrameOverCap,       ///< On a two-way session: a frame declared more payload than this end buffers.
+    FrameBadMagic,      ///< On a two-way session: a frame's header did not decode.
+    SessionSilent,      ///< On a two-way session: nothing was read for the idle bound (`SessionIdleTable`).
     Last,               ///< Not a refusal, and has no row.
 };
 
@@ -63,6 +73,11 @@ struct DiallerRefusalRow
     DiallerRefusal refusal;        ///< The refusal this row describes.
     IMetricsSink::Counter counter; ///< The series it moves.
     std::string_view says;         ///< The log line's reason, completing "gave up ... because ".
+
+    /// The level that line is said at, once a minute per peer at most. `Warn` unless the row says
+    /// otherwise: every refusal but one is a fault somewhere, and the one that is not -- a silent
+    /// session, the ordinary life of a learner's session to a voter that is not leading -- says Debug.
+    LogLevel level { LogLevel::Warn };
 };
 
 /// One row per `AcceptorRefusal`, in enumerator order.
@@ -79,8 +94,8 @@ inline constexpr EnumTable<AcceptorRefusal, AcceptorRefusalRow> AcceptorRefusals
               "claiming that id" },
     { .refusal = AcceptorRefusal::UnknownKey,
       .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedUnknownKey,
-      .says = "this node holds no key for the id it claims: give that member's key with @<key> on --raft-peer, or admit "
-              "it with --cluster-admit=<id>=<host>:<port>@<key>" },
+      .says = "this node holds no key for the id it claims: admit that member with its key, "
+              "--cluster-admit=<id>=<host>:<port>@<key>" },
     { .refusal = AcceptorRefusal::RevokedKey,
       .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedRevokedKey,
       .says = "it proved itself with a key the cluster has revoked: a machine that was removed" },
@@ -96,6 +111,15 @@ inline constexpr EnumTable<AcceptorRefusal, AcceptorRefusalRow> AcceptorRefusals
     { .refusal = AcceptorRefusal::FrameSender,
       .counter = IMetricsSink::Counter::RaftPeerFramesRefusedSender,
       .says = "a verified message named a sender other than the member the connection proved" },
+    { .refusal = AcceptorRefusal::FrameUnreadable,
+      .counter = IMetricsSink::Counter::RaftPeerFramesRefusedUnreadable,
+      .says = "a verified frame is one this build cannot read: another wire version, or a message out of place" },
+    { .refusal = AcceptorRefusal::FrameOverCap,
+      .counter = IMetricsSink::Counter::RaftPeerFramesRefusedOverCap,
+      .says = "a frame declared more payload than this node buffers" },
+    { .refusal = AcceptorRefusal::FrameBadMagic,
+      .counter = IMetricsSink::Counter::RaftPeerFramesRefusedBadMagic,
+      .says = "a frame did not begin with this wire's magic, so nothing after it can be framed" },
     { .refusal = AcceptorRefusal::KeyWithdrawn,
       .counter = IMetricsSink::Counter::RaftPeerConnectionsEndedKeyWithdrawn,
       .says = "the cluster no longer holds the key this connection was proved with: it was revoked or replaced" },
@@ -122,7 +146,8 @@ inline constexpr EnumTable<DiallerRefusal, DiallerRefusalRow> DiallerRefusals { 
               "another machine answering under that id" },
     { .refusal = DiallerRefusal::AcceptorKeyUnknown,
       .counter = IMetricsSink::Counter::RaftPeerDialsRefusedAcceptorKeyUnknown,
-      .says = "this node holds no key for the member that answered: give its key with @<key> on --raft-peer" },
+      .says = "this node holds no key for the member that answered: admit it again with its key, "
+              "--cluster-admit=<id>=<host>:<port>@<key>" },
     { .refusal = DiallerRefusal::AcceptorKeyRevoked,
       .counter = IMetricsSink::Counter::RaftPeerDialsRefusedAcceptorKeyRevoked,
       .says = "the member that answered signed with a key the cluster has revoked: a machine that was removed" },
@@ -143,6 +168,31 @@ inline constexpr EnumTable<DiallerRefusal, DiallerRefusalRow> DiallerRefusals { 
     { .refusal = DiallerRefusal::KeyWithdrawn,
       .counter = IMetricsSink::Counter::RaftPeerDialsEndedKeyWithdrawn,
       .says = "the cluster no longer holds the key the peer proved this connection with: it was revoked or replaced" },
+    { .refusal = DiallerRefusal::FrameTag,
+      .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameTag,
+      .says = "a frame it wrote on the session this node dialled failed its tag: changed, injected, replayed, "
+              "reordered or from another connection" },
+    { .refusal = DiallerRefusal::FrameSender,
+      .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameSender,
+      .says = "a verified message it wrote on the session this node dialled named a sender other than the member "
+              "it proved" },
+    { .refusal = DiallerRefusal::FrameUnreadable,
+      .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameUnreadable,
+      .says = "a verified frame it wrote on the session this node dialled is one this build cannot read: another "
+              "wire version, or a message out of place" },
+    { .refusal = DiallerRefusal::FrameOverCap,
+      .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameOverCap,
+      .says = "a frame on the session this node dialled declared more payload than this node buffers" },
+    { .refusal = DiallerRefusal::FrameBadMagic,
+      .counter = IMetricsSink::Counter::RaftPeerDialsEndedFrameBadMagic,
+      .says = "a frame on the session this node dialled did not begin with this wire's magic, so nothing after "
+              "it can be framed" },
+    { .refusal = DiallerRefusal::SessionSilent,
+      .counter = IMetricsSink::Counter::RaftPeerDialsEndedSilent,
+      .says = "the two-way session this node dialled carried nothing for its idle bound, so this node closed it and "
+              "will redial: the ordinary life of a session to a voter that is not leading, or one whose other end "
+              "went away while this machine slept",
+      .level = LogLevel::Debug },
 } };
 
 static_assert(RowsInEnumeratorOrder(DiallerRefusals, &DiallerRefusalRow::refusal),

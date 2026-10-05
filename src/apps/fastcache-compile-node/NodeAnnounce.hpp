@@ -6,14 +6,19 @@
 #include "CompileCapacity.hpp"
 #include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
-#include "NodeCredential.hpp"
 #include "NodeProofClient.hpp"
 #include "SchedulerLink.hpp"
+#include "SchedulerReachability.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
+#include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
@@ -21,6 +26,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -114,6 +120,35 @@ class AnnouncedEndpoint final: public Cc::IAdvertisedEndpointSource
     std::string _endpoint;
 };
 
+/// This machine's build, as every capacity record it sends carries it -- REGISTER's
+/// through the worker registrar and NODE-ANNOUNCE's through the presence loop alike.
+///
+/// One spelling asked from both call sites rather than each stamping `VersionString` into
+/// its own `CapacityFields` in its own words, which is how a node running no worker came
+/// to advertise none (#1440's second half): `NodePresenceTier` built one straight from
+/// `Distributed::CapacityToWire`, which knows nothing of the version because it is derived
+/// from `NodeCapacity`, a record with no version field of its own to read. See
+/// `AnnouncedCapacity`, which is `NodePresenceTier`'s answer to that.
+/// @return This build's version, compiled in and never configurable.
+[[nodiscard]] constexpr std::string_view AdvertisedVersion() noexcept
+{
+    static_assert(VersionString.size() * 2 <= CompileCacheWire::MaxNodeVersionBytes,
+                  "a scheduler must record twice the version this node sends");
+    return VersionString;
+}
+
+/// This machine's capacity record, as NODE-ANNOUNCE carries it: `capacity`, converted, with
+/// this build's version set on it.
+///
+/// `Distributed::CapacityToWire` alone answers for cores, memory, class and cache -- it is
+/// derived from `NodeCapacity`, which has no version field -- so a caller that stopped at
+/// its answer would carry an absent version, exactly the shape #1440's second half found. A
+/// free function rather than a line repeated at each of `NodePresenceTier`'s call sites,
+/// answering both questions together so neither can be asked without the other.
+/// @param capacity What this machine is.
+/// @return The wire record NODE-ANNOUNCE sends, version included.
+[[nodiscard]] CompileCacheWire::CapacityFields AnnouncedCapacity(Distributed::NodeCapacity const& capacity);
+
 /// A move of the endpoint this worker advertises: the new value, and what to say.
 ///
 /// Two strings, named, rather than a pair: both halves are text and a `.first` deciding
@@ -153,15 +188,15 @@ struct EndpointChange
 [[nodiscard]] std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
                                                                      std::shared_ptr<NodeConfig const> const& live);
 
-// Out of `main.cpp` since #404, and the credential is what forced it.
+// Out of `main.cpp` since #404, so a test can drive the round against a scripted socket and
+// read the bytes that went out.
 //
-// The round used to hold a `Cc::Credential` copied once in `WorkerBody`, so a rotated
-// `--requirepass` reached the shared cache and the cluster verbs and never the
-// scheduler -- and the one translation unit no test can reach is where that could not
-// be shown. It now holds the SEAM, which cannot go stale, and the round lives where a
-// test can drive it against a scripted socket and read the bytes that went out. Both
-// halves matter: the type makes the defect unwritable, the move makes the fix
-// demonstrable.
+// It holds NO credential, and that is the fix rather than an omission. #404 gave it the
+// `--requirepass` seam so a rotation reached registrations too; but a scheduler checks no
+// password, and presenting one handed the upstream cache's secret, in the clear, to every
+// scheduler this node dialled and every endpoint a `NotLeader` named. This machine's
+// credential with a scheduler is its PROOF (`prover`), and `Cc::ExchangeWithScheduler` takes
+// no credential at all.
 
 /// Everything one heartbeat round reads, so the round itself is a function rather
 /// than a hundred lines nested three deep inside `WorkerBody`.
@@ -187,37 +222,44 @@ struct HeartbeatRound
     std::vector<Cc::WorkerRegistrar>& withdrawals;
     CompileCapacity const& capacity; ///< For the in-flight count and the cordon.
     IHostLoadSampler& loadSampler;   ///< CPU, memory and scratch.
-    CacheTier const* cacheTier;      ///< Null on a node with no cache.
-    IMetricsSink const& metrics;     ///< Where the cache figures are read.
-    /// What this worker PRESENTS to the scheduler, asked at each exchange.
+    /// What this machine answers on, asked every round: the locality oracle's own set
+    /// (`ILocalityOracle::Addresses`), the one this node's ticket audience and cache surface
+    /// answer from.
     ///
-    /// The seam and never a value, which is the whole of #404 in one member
-    /// declaration: a `Cc::Credential` here is a copy taken when `WorkerBody` built
-    /// the round, so an operator who rotated `--requirepass` and reloaded got a
-    /// worker whose cache tier presented the new secret and whose registrations went
-    /// on presenting the old one -- until it was restarted, which is the thing the
-    /// reload exists to avoid. There is no field here for a stale secret to sit in.
-    ICredentialSource const& credential;
-
-    /// Where a credential the scheduler did not want is reported once, as every other exchange
-    /// on this wire reports it. The tier's own, shared with the registrars, so a node says it
-    /// once rather than once per verb.
-    Cc::CredentialNotice& notice;
+    /// **One value with the audience, never a second acquisition.** A grant's dial hint is
+    /// derived from this report, and the ticket the client mints for the hint is spent here only
+    /// if the audience accepts the hint's host; reported from a probe of its own, a VPN reconnect
+    /// is hinted before the audience knows it, and every hinted compile in that window is
+    /// refused. Stale in either direction it fails safe -- see `CachedLocalityOracle::Addresses`.
+    ///
+    /// The seam and never a list, for #404's reason: a list here would be a copy taken when the
+    /// round was built, and a worker whose VPN reconnected would never report the new address.
+    ILocalityOracle const& locality;
+    /// Set once this process has said that it answers on more addresses than a report
+    /// carries. Never lowered: the machine's interface count is a property of the machine,
+    /// and repeating the line every heartbeat would bury it rather than say it.
+    std::atomic<bool>& addressCapNoticed;
+    CacheTier const* cacheTier;  ///< Null on a node with no cache.
+    IMetricsSink const& metrics; ///< Where the cache figures are read.
 
     /// How this machine proves WHICH machine it is on every connection the round dials (#178),
     /// or null where nothing proves -- a test whose scripted fleet serves no handshake.
     ///
-    /// Never null on a node that announces itself for real: a node naming `--scheduler` with no
-    /// identity is a startup refusal (`SchedulerNeedsIdentityRefusal`), because every verb a
-    /// joining machine sends is refused without one.
+    /// Never null on a node that announces itself for real: every node holds an identity key
+    /// in its state directory (`NodeStateDirectory`), and every verb a joining machine sends
+    /// is refused without one.
     NodeProofClient const* prover;
     /// Where the fleet this node was admitted to is recorded, so the lease check can
     /// read it. Registration is the only place that fact arrives (#401).
     Distributed::WorkerLeaseState& lease;
-    /// Raised when a scheduler registers this node into a fleet other than the one
-    /// `--cluster-id` asserts. Never lowered: the answer will not change by itself.
-    std::atomic<bool>& fleetMismatch;
     ILogger& logger; ///< Where a refusal is named.
+    /// How loudly a scheduler that does not answer, or refuses, is said across rounds. SHARED with
+    /// the presence loop -- `main` owns one per process -- so a machine says each transition once.
+    ///
+    /// A registration or heartbeat is filed under its toolchain's FINGERPRINT, never under the
+    /// empty subject: that place is where the presence loop's refusal lives, and a worker's success
+    /// filed there would announce "recorded this machine again" about a machine still refused.
+    SchedulerReachability& reachability;
 };
 
 /// What one announcement learned, beyond how many entries landed.
@@ -285,6 +327,24 @@ inline void AdoptRegistrars(std::vector<Cc::WorkerRegistrar> rebuilt,
     current = std::move(rebuilt);
 }
 
+/// Retire EVERY registration this worker holds and start over with @p rebuilt.
+///
+/// The suspend's counterpart of `AdoptRegistrars`: that one keeps a registration the new set
+/// re-registers exactly, this one keeps none -- a sleeping machine is filed nowhere, and the
+/// first round after it wakes registers afresh (the rebuilt registrars carry no id).
+/// @param rebuilt Fresh registrars for the served set.
+/// @param current Registrars in force; replaced by @p rebuilt.
+/// @param withdrawals Where every accepted registrar is appended.
+inline void RetireAllRegistrations(std::vector<Cc::WorkerRegistrar> rebuilt,
+                                   std::vector<Cc::WorkerRegistrar>& current,
+                                   std::vector<Cc::WorkerRegistrar>& withdrawals)
+{
+    for (auto& registrar: current)
+        if (!registrar.WorkerId().empty())
+            withdrawals.push_back(std::move(registrar));
+    current = std::move(rebuilt);
+}
+
 /// Announce this machine to every scheduler entry it serves, once.
 ///
 /// Registration and heartbeating are one concern: a worker is registered exactly as
@@ -306,12 +366,19 @@ inline void AdoptRegistrars(std::vector<Cc::WorkerRegistrar> rebuilt,
 ///
 /// Short, and separate from the exchange's I/O bound: ten seconds is a reasonable
 /// ceiling on an exchange and a very long time to wait for a TCP handshake. It is
-/// also what a retired first `--scheduler` costs every round that starts there, which
+/// also what a retired first scheduler endpoint costs every round that starts there, which
 /// is why a round's walk starts at the endpoint that last accepted (`SchedulerLink`).
 inline constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
 
+/// Per-call send/recv ceiling on the heartbeat's own connection to the scheduler.
+///
+/// Was ten seconds passed as BOTH the dial bound and the I/O bound, which is the
+/// collapse `Cc::DialEndpoint` used to make: ten seconds is a reasonable ceiling
+/// on an exchange and a very long time to wait for a TCP handshake.
+inline constexpr std::chrono::milliseconds HeartbeatIoTimeout { 10'000 };
+
 /// Announce this machine once, following `NotLeader` to wherever it points and falling
-/// back through the configured `--scheduler` list when an endpoint cannot be reached.
+/// back through the scheduler endpoints (`SchedulersOf`) when one cannot be reached.
 ///
 /// Out of `main.cpp` for #1310, whose acceptance is a FALLBACK: a first scheduler that
 /// does not answer and a second that does, asserted by which one took the request.
@@ -343,6 +410,45 @@ inline constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
 /// two loops run in the same process against the same timeout (#1440).
 constexpr std::chrono::seconds NodeAnnounceInterval { 20 };
 
+// Strictly below the cadence a setback lasts silently at, or a machine that only ever
+// announces once a cadence would see every round as due for a reminder -- "still" would
+// stop meaning "still being asked" and start meaning "asked once, a while ago".
+static_assert(NodeAnnounceInterval < SchedulerUnreachableCadence);
+
+/// How often a node whose own cluster has not recorded it yet announces, instead of waiting a whole
+/// `NodeAnnounceInterval`.
+///
+/// Short, because until the record lands the machine is one the fleet cannot use -- a node that has
+/// just started is a node compiling nothing -- and bounded below by what a scheduler can bear: one
+/// announcement per such node every few seconds.
+inline constexpr std::chrono::seconds RecordAwaitedInterval { 2 };
+
+// This interval feeds `SchedulerReachability` exactly as `NodeAnnounceInterval` does -- the loops
+// substitute it for the ordinary one, never run both -- so it owes the tracker the same bound:
+// strictly below the cadence, or a held node's rounds would each read as due for a reminder.
+static_assert(RecordAwaitedInterval < SchedulerUnreachableCadence);
+
+/// How long a loop waits after @p deferrals proofs in a row a scheduler answered `Deferred`
+/// (`RosterNotYetApplied`): `RecordAwaitedInterval`, doubling with each further deferral, and never
+/// past `NodeAnnounceInterval`.
+///
+/// **Short**, because a deferral is a scheduler that has just started -- an election or its leader's
+/// first word away from judging this machine -- and a whole interval of waiting is a machine the fleet
+/// cannot use for no reason. **Bounded**, by the ordinary interval, so a scheduler that never catches
+/// up is asked no more often than every other one, and doubling so that it gets there in a few rounds.
+/// @param deferrals Consecutive deferrals; at least one.
+/// @return The wait.
+[[nodiscard]] constexpr std::chrono::seconds DeferredProofWait(std::size_t deferrals) noexcept
+{
+    // Doublings past the ceiling change nothing, so the shift is capped where the ceiling is
+    // reached -- which also keeps it far from overflowing however long the deferrals run.
+    constexpr std::size_t CeilingDoublings = 4;
+    static_assert(RecordAwaitedInterval * (1 << CeilingDoublings) >= NodeAnnounceInterval,
+                  "the capped doubling must reach the ordinary interval");
+    auto const doublings = std::min(deferrals > 0 ? deferrals - 1 : 0, CeilingDoublings);
+    return std::min(RecordAwaitedInterval * (std::int64_t { 1 } << doublings), NodeAnnounceInterval);
+}
+
 /// The load record describing this MACHINE, sampled once.
 ///
 /// Extracted rather than copied because both announcements describe ONE host: sampling twice in
@@ -369,10 +475,70 @@ constexpr std::chrono::seconds NodeAnnounceInterval { 20 };
                                                              std::uint32_t inFlight,
                                                              bool cordoned);
 
+/// Why an interface address is left out of what a worker reports. PRIVATE: never
+/// transmitted, never persisted.
+enum class UnreportedAddress : std::uint8_t
+{
+    Uncarried,
+    Loopback,
+    LinkLocal,
+    Last,
+};
+
+/// One reason to leave an address out, and the predicate that raises it.
+struct UnreportedAddressRow
+{
+    UnreportedAddress reason;
+    /// @param address One entry as `IHostAddressSource` spells it. @return True to leave it out.
+    bool (*applies)(std::string_view address);
+};
+
+/// What a report leaves out, every row asked of every entry.
+///
+/// Each row is an address the scheduler could never hand a client as a dial hint, so
+/// carrying it would only spend the `MaxInterfaceAddresses` budget that a routable address
+/// needs on a machine with many virtual adapters:
+///   - **Uncarried** is the wire's own per-entry rule, `IsCarriedInterfaceAddress`, asked
+///     rather than restated: an entry the decoder refuses loses the WHOLE record it rides in.
+///   - **Loopback** is never hinted: a peer observed there is on the scheduler's machine.
+///   - **LinkLocal** is vetoed by the scheduler (`HintVeto::LinkLocalObserved`), because a
+///     zone-less `fe80::` names a different machine on every link.
+inline constexpr EnumTable<UnreportedAddress, UnreportedAddressRow> UnreportedAddresses { {
+    { .reason = UnreportedAddress::Uncarried,
+      .applies = [](std::string_view address) { return !CompileCacheWire::IsCarriedInterfaceAddress(address.size()); } },
+    { .reason = UnreportedAddress::Loopback, .applies = [](std::string_view address) { return IsLoopbackHost(address); } },
+    { .reason = UnreportedAddress::LinkLocal, .applies = [](std::string_view address) { return IsLinkLocalHost(address); } },
+} };
+
+static_assert(RowsInEnumeratorOrder(UnreportedAddresses, &UnreportedAddressRow::reason),
+              "UnreportedAddresses must hold one row per UnreportedAddress, in order");
+
+/// The addresses one report carries, and how many the cap left out.
+struct ReportableAddresses
+{
+    /// What survives `UnreportedAddresses`, sorted, unique, at most `MaxInterfaceAddresses`.
+    std::vector<std::string> addresses;
+    /// Entries that survived every row and were dropped by the cap; zero on almost every
+    /// machine, and the number a person needs to read when it is not.
+    std::size_t overCap = 0;
+};
+
+/// The addresses a worker reports on REGISTER and HEARTBEAT, out of what the machine has.
+///
+/// Filtered before the cap, so a host with thirty loopback aliases still reports its one
+/// routable address. **Sorted**, so equal sets encode to equal bytes whatever order the
+/// platform enumerated them in, and so that which entries a cap drops is decided by the
+/// set rather than by the adapter order of the moment. An empty input -- the platform would
+/// not say -- is an empty report, which the scheduler reads as no hint and never as a
+/// refusal.
+/// @param addresses What `IHostAddressSource` answered, unordered and possibly repeated.
+/// @return The report, and how many the cap left out.
+[[nodiscard]] ReportableAddresses ReportableInterfaceAddresses(std::vector<std::string> addresses);
+
 /// One announcement, on a connection somebody else dialled.
 ///
 /// **The seam that lets a node with NO WORKER reach the fleet.** Everything about *which*
-/// scheduler to talk to -- the `--scheduler` list walked at most once per round, a `NotLeader`
+/// scheduler to talk to -- the `SchedulersOf` list walked at most once per round, a `NotLeader`
 /// followed to the endpoint it names, a remembered leader that stops answering falling back in
 /// the SAME round, the bound that stops two nodes naming each other forever -- lives in
 /// `DialAndAnnounce` below and must live in exactly one place. A second loop with its own copy
@@ -400,13 +566,12 @@ class IAnnouncement
 
 /// How a round proves this machine on each connection it dials (#178).
 ///
-/// Pointers, because the proof is absent only where nothing proves -- a test's scripted fleet --
-/// and a null reference is not a thing.
+/// A pointer, because the proof is absent only where nothing proves -- a test's scripted fleet --
+/// and a null reference is not a thing. No password rides beside it: the proof IS this machine's
+/// credential with a scheduler.
 struct AnnounceProof
 {
-    NodeProofClient const* prover;       ///< Who this machine is; null where nothing proves.
-    ICredentialSource const* credential; ///< What the handshake presents where a credential gate asks.
-    Cc::CredentialNotice* notice;        ///< Where an unwanted credential is reported.
+    NodeProofClient const* prover; ///< Who this machine is; null where nothing proves.
 };
 
 /// Dial a scheduler, prove this machine to it, and make @p announcement, following a redirect
@@ -417,16 +582,59 @@ struct AnnounceProof
 /// **The proof is part of reaching a scheduler, not of what is said**, so both announcements
 /// prove through the same lines (#178): a connection the proof did not seal is one on which no
 /// joining verb can be heard, and it is treated exactly as an endpoint that did not answer --
-/// the next `--scheduler` is tried in the same round.
+/// the next scheduler endpoint is tried in the same round.
 /// @param link Which endpoint to try, and what an answer teaches it.
+/// @param reachability How loudly an endpoint that does not answer, or refuses the proof, is said:
+///        on the transition, then on a cadence, never per round. One per process, shared by every loop.
 /// @param dialer How a connection is made.
 /// @param logger Where an unreachable endpoint, a refused proof and a redirect are named.
 /// @param announcement What to say.
 /// @param proof How this machine proves itself on each connection.
 /// @return How many entries the endpoint that answered accepted.
-[[nodiscard]] std::size_t DialAndAnnounce(
-    SchedulerLink& link, IEndpointDialer& dialer, ILogger& logger, IAnnouncement& announcement, AnnounceProof const& proof);
+[[nodiscard]] std::size_t DialAndAnnounce(SchedulerLink& link,
+                                          SchedulerReachability& reachability,
+                                          IEndpointDialer& dialer,
+                                          ILogger& logger,
+                                          IAnnouncement& announcement,
+                                          AnnounceProof const& proof);
+
+/// How long an announcing loop waits before its next round.
+///
+/// One answer for both loops, for `DialAndAnnounce`'s reason: the worker's heartbeat and the
+/// presence loop wait on different primitives, and the rule deciding HOW LONG must not be two.
+/// `DeferredProofWait` while a scheduler answers that it cannot judge this machine yet, and
+/// `RecordAwaitedInterval` while this node's own cluster has not recorded it yet -- which leaves the
+/// machine unusable to the fleet until it clears, and a whole `NodeAnnounceInterval` of that after
+/// every start is a node nobody can use -- and `NodeAnnounceInterval` otherwise.
+/// @param prover Who this machine is; null where nothing proves.
+/// @return The wait.
+[[nodiscard]] std::chrono::seconds NextAnnounceWait(NodeProofClient const* prover);
 
 [[nodiscard]] std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer);
+
+/// The connect bound of the one dial a suspend makes; inside `SuspendWithdrawBudget`.
+inline constexpr std::chrono::milliseconds SuspendDialTimeout { 1'000 };
+
+/// Withdraw what @p round queued, at the endpoint @p link names, in ONE dial. Never registers,
+/// heartbeats, follows a redirect or falls back: the machine is about to sleep. A failure is logged
+/// and the queue dropped -- expiry closes the rest. With nothing queued nothing is dialled.
+///
+/// **Only the CONNECT is bounded by `SuspendDialTimeout`.** The exchange after it -- the proof and
+/// the withdrawals -- is bounded by @p dialer's own I/O ceiling (`HeartbeatIoTimeout` on the
+/// heartbeat's), not by `SuspendWithdrawBudget`. That is safe rather than merely tolerated: the
+/// suspend handler stops waiting at its budget whatever this is doing, a withdrawal the sleep
+/// freezes leaves the entry to the scheduler's expiry exactly as before, and one that finishes
+/// after the machine wakes only un-files it until the next round, which registers afresh because
+/// the rebuilt registrars carry no id. `core::net::DialOptions` has no per-dial I/O bound, so a
+/// tighter one would need a second dialer.
+///
+/// **Deliberately NOT through `round.reachability`**: a machine going to sleep is not a
+/// scheduler outage. Counted there, a failed pre-sleep dial would spend that scheduler's Warn
+/// and then announce a false *reachable again* at wake, so both failures are said here at Info.
+/// @param round What to withdraw and where to log.
+/// @param link Names the endpoint; read, never advanced.
+/// @param dialer How the connection is made.
+/// @return How many registrations the scheduler retired.
+[[nodiscard]] std::size_t WithdrawOnce(HeartbeatRound const& round, SchedulerLink const& link, IEndpointDialer& dialer);
 
 } // namespace FastCache::Node

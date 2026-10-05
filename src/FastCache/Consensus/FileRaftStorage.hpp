@@ -3,11 +3,13 @@
 
 #include <FastCache/Consensus/IRaftStorage.hpp>
 #include <FastCache/Core/Owner.hpp>
+#include <FastCache/Core/StateFiles.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -30,19 +32,20 @@ namespace FastCache::Consensus
 /// while it went on counting the old id towards quorum. And it says how the node gets
 /// back in, since "move it aside" alone reads as harmless: restarted under a bootstrap
 /// set that names only itself, an empty node elects itself and becomes a second cluster,
-/// which `--raft-join` is the flag against.
+/// which a joiner's empty bootstrap set is the rule against.
 ///
 /// Text, not a path to open: every flag it names is a row of `fastcache-compile-node`'s
 /// option table.
 inline constexpr std::string_view UnreadableStateRemedy =
     "stop the node and move raft-state, raft-log and raft-snapshot out of its state directory together, leaving "
-    "node-id and node-key where they are: they are this node's identity, and without them it starts as a different "
-    "node. If its cluster is already running on this build, start it again with --raft-join added and its "
-    "--raft-peer list unchanged, so it waits to be admitted rather than bootstrapping a cluster of itself: a cluster "
-    "that still counts it catches it up from the leader, and one that has forgotten it admits it again with "
-    "--cluster-admit (or --cluster-admit-learner). It keeps its identity, so it needs no --enroll-from. If "
-    "every member was moved aside together, start them under their --raft-peer bootstrap set instead and make again "
-    "every --cluster-* change made since the cluster formed; see docs/operations/upgrading-a-fleet.md";
+    "node-id, node-key and formation where they are: they are this node's identity and the record of how it formed, "
+    "and without them it starts as a different node. A node that JOINED its fleet then waits to be admitted rather "
+    "than bootstrapping a cluster of itself: a fleet that still counts it catches it up from the leader, and one that "
+    "has forgotten it admits it again with --cluster-admit (or --cluster-admit-learner). It keeps its identity, so it "
+    "is admitted under the key it already holds. The node that FOUNDED its fleet bootstraps it again, alone, so move its "
+    "state aside only "
+    "when every member's was moved aside together; then admit the others again from it and make again every "
+    "--cluster-* change made since the fleet formed; see docs/operations/upgrading-a-fleet.md";
 
 /// `IRaftStorage` backed by three files in a directory.
 ///
@@ -103,6 +106,15 @@ inline constexpr std::string_view UnreadableStateRemedy =
 /// means opening and syncing the parent directory, which has no Windows
 /// equivalent and would be one more platform branch; the exposure is a single
 /// election's vote, which the surrounding term rules already tolerate losing.
+/// The file the store keeps its term and vote in.
+inline constexpr std::string_view RaftStateFileName = StateFileName(StateFile::RaftState);
+
+/// The file the store keeps its log in.
+inline constexpr std::string_view RaftLogFileName = StateFileName(StateFile::RaftLog);
+
+/// The file the store keeps its snapshot in.
+inline constexpr std::string_view RaftSnapshotFileName = StateFileName(StateFile::RaftSnapshot);
+
 class FileRaftStorage final: public IRaftStorage
 {
   public:
@@ -113,6 +125,13 @@ class FileRaftStorage final: public IRaftStorage
     /// @param directory Where the two files live; created if absent.
     /// @return The store, or why it could not be opened.
     [[nodiscard]] static std::expected<FileRaftStorage, ConsensusError> Open(std::filesystem::path const& directory);
+
+    /// The files the store keeps in its directory, by name.
+    ///
+    /// What an operator removes to start a node's consensus afresh, so a sentence telling them
+    /// to names the files the store actually writes rather than a copy of their names.
+    /// @return The names, stable for the life of the process.
+    [[nodiscard]] static std::span<std::string_view const> StoreFileNames() noexcept;
 
     FileRaftStorage(FileRaftStorage const&) = delete;
     FileRaftStorage& operator=(FileRaftStorage const&) = delete;

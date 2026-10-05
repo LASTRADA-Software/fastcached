@@ -4,12 +4,19 @@
 // keys both ends derive from it. Where it runs on a connection is `NodeProofResponder_test` and
 // `FrameEndpoint_test`; where the keys seal frames is `SealedFrameSocket_test`.
 #include <FastCache/Cluster/DiscoveryWire.hpp>
-#include <FastCache/Cluster/RosterCertificate.hpp>
+#include <FastCache/Cluster/EnrollAdmissionSignature.hpp>
+#include <FastCache/Cluster/EnrollRequestSignature.hpp>
+#include <FastCache/Cluster/FleetSummarySignature.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
+#include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
+#include <FastCache/Distributed/MachineTicket.hpp>
 #include <FastCache/Distributed/NodeProof.hpp>
+#include <FastCache/Protocol/CompileReplySeal.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -197,41 +204,142 @@ TEST_CASE("A handshake whose ephemeral key is low-order agrees no session", "[di
     CHECK_FALSE(DeriveNodeSessionKeys(handshake.server.secret, lowOrder, handshake.reply, ProvingNode, false).has_value());
 }
 
-TEST_CASE("The handshake's two signatures are signed under distinct labels, and neither is a retired one",
-          "[distributed][nodeproof]")
+namespace
 {
-    // A label is what keeps a signature made for one purpose from verifying as another, so two
-    // rows sharing one would make a server's signature a caller's proof. A retired label is the
-    // pre-shared key's MAC input, and reusing it would let a MAC and a signed message be the same
-    // bytes.
-    for (auto const& row: NodeProofSignatureLabels)
-    {
-        CHECK(std::ranges::count(NodeProofSignatureLabels, row.label, &NodeProofSignatureLabel::label) == 1);
-        CHECK_FALSE(std::ranges::contains(RetiredNodeProofLabels, row.label));
-    }
+/// One sample of every input any identity-key construction's builder takes.
+struct ConstructionSamples
+{
+    Ed25519PublicKey key {};           ///< The signer's public key.
+    Nonce nonce {};                    ///< A challenge's nonce.
+    Wire::FleetSummary summary;        ///< A fleet summary.
+    std::array<std::byte, 3> field {}; ///< A field, standing in for packed claims or a transcript.
+};
+
+/// @param samples The samples.
+/// @return A one-field transcript over the sample field; a view into @p samples.
+[[nodiscard]] std::array<std::span<std::byte const>, 1> TranscriptOf(ConstructionSamples const& samples)
+{
+    return { std::span<std::byte const> { samples.field } };
 }
 
-TEST_CASE("Every construction one identity key signs under names a label no other construction uses",
+/// One construction, and the production builder that makes its message.
+struct ConstructionBuilder
+{
+    IdentityKeyPurpose purpose;                           ///< The construction.
+    LabelledMessage (*build)(ConstructionSamples const&); ///< Its production builder, over the samples.
+};
+
+/// Every construction one identity key signs, each through its production message builder: one row
+/// per `IdentityKeyPurpose`, in enumerator order.
+///
+/// Keyed on the enum `IdentityKeyLabels` is keyed on, so a construction added there without a row
+/// here fails the BUILD, and every question below is asked of it. The Raft and node-proof rows go
+/// through their protocols' OWN enums, so a mapping row pointing at the wrong construction is red.
+constexpr EnumTable<IdentityKeyPurpose, ConstructionBuilder> ConstructionBuilders { {
+    { .purpose = IdentityKeyPurpose::DiscoveryProof,
+      .build =
+          [](ConstructionSamples const& samples) {
+              return Cluster::DiscoveryWire::ProofMessage(
+                  { .clusterId = "c-asker", .nonce = samples.nonce }, samples.summary, samples.key);
+          } },
+    { .purpose = IdentityKeyPurpose::FleetSummary,
+      .build =
+          [](ConstructionSamples const& samples) {
+              return Cluster::FleetSummaryMessage(samples.nonce, samples.summary, samples.key);
+          } },
+    { .purpose = IdentityKeyPurpose::Lease,
+      .build = [](ConstructionSamples const& samples) { return Distributed::Detail::SignedLeaseMessage(samples.field); } },
+    { .purpose = IdentityKeyPurpose::RaftDiallerProof,
+      .build =
+          [](ConstructionSamples const& samples) {
+              auto const transcript = TranscriptOf(samples);
+              return Consensus::RaftPeerSignedMessage(Consensus::RaftPeerSignature::DiallerProof,
+                                                      WireFields::FieldList { transcript });
+          } },
+    { .purpose = IdentityKeyPurpose::RaftAcceptorVerdict,
+      .build =
+          [](ConstructionSamples const& samples) {
+              auto const transcript = TranscriptOf(samples);
+              return Consensus::RaftPeerSignedMessage(Consensus::RaftPeerSignature::AcceptorVerdict,
+                                                      WireFields::FieldList { transcript });
+          } },
+    { .purpose = IdentityKeyPurpose::NodeServerChallenge,
+      .build =
+          [](ConstructionSamples const& samples) {
+              auto const transcript = TranscriptOf(samples);
+              return NodeProofSignedMessage(NodeProofSignature::ServerChallenge, transcript);
+          } },
+    { .purpose = IdentityKeyPurpose::NodeProof,
+      .build =
+          [](ConstructionSamples const& samples) {
+              auto const transcript = TranscriptOf(samples);
+              return NodeProofSignedMessage(NodeProofSignature::NodeProof, transcript);
+          } },
+    { .purpose = IdentityKeyPurpose::MachineTicket,
+      .build =
+          [](ConstructionSamples const& samples) {
+              return MachineTicketMessage(MachineTicketClaims { .machineId = samples.summary.nodeId,
+                                                                .audience = "office.corp:6674",
+                                                                .expiresAtUnixSeconds = 1,
+                                                                .nonce = {} });
+          } },
+    { .purpose = IdentityKeyPurpose::EnrollAdmission,
+      .build =
+          [](ConstructionSamples const& samples) {
+              return Cluster::EnrollAdmissionMessage(
+                  Cluster::AdmissionClaim { .nonce = samples.nonce,
+                                            .joinerId = "n-joiner",
+                                            .joinerKey = samples.key,
+                                            .clusterId = "c-sample",
+                                            .outcome = CompileCacheWire::EnrollOutcome::Approved,
+                                            .roster = samples.field,
+                                            .challenge = {} });
+          } },
+    { .purpose = IdentityKeyPurpose::EnrollRequest,
+      .build =
+          [](ConstructionSamples const& samples) {
+              return Cluster::EnrollRequestMessage(
+                  Cluster::EnrollRequestClaim { .nodeId = "n-joiner",
+                                                .nodeEndpoint = "joiner:6674",
+                                                .role = CompileCacheWire::EnrollRole::Learner,
+                                                .publicKey = samples.key,
+                                                .nonce = samples.nonce,
+                                                .challenge = {} });
+          } },
+    { .purpose = IdentityKeyPurpose::CompileReply,
+      .build = [](ConstructionSamples const& samples) { return CompileReplyMessage(samples.field, samples.field); } },
+} };
+
+static_assert(RowsInEnumeratorOrder(ConstructionBuilders, &ConstructionBuilder::purpose),
+              "ConstructionBuilders must hold one row per IdentityKeyPurpose, in enumerator order");
+} // namespace
+
+TEST_CASE("Every identity-key construction's builder signs as its OWN construction, its label the FIRST field",
           "[distributed][nodeproof]")
 {
-    // A scheduler signs all of these with ONE key -- its node identity key -- so a label is the only
-    // thing keeping its lease from verifying as its Raft verdict or its challenge reply as its
-    // roster endorsement. Each construction checks its OWN labels apart; nothing else asked the
-    // question across them once #178 deleted the pre-shared key's `SigningDomainTable`, whose
-    // `static_assert` asked it of every MAC under that key.
-    std::vector<std::string_view> labels { Cluster::DiscoveryWire::ProofSignatureLabel,
-                                           Cluster::RosterEndorsementLabel,
-                                           Distributed::LeaseSignatureLabel };
-    for (auto const& row: Consensus::RaftPeerSignatureLabels)
-        labels.push_back(row.label);
-    for (auto const& row: NodeProofSignatureLabels)
-        labels.push_back(row.label);
+    // A label is only a separation if it is IN the message, and first: FLEET-SUMMARY signs over a
+    // nonce a STRANGER chose, so without its label leading, what separates that signature from every
+    // other construction under the same key is that nobody happened to shape a 32-byte field there.
+    // `LabelledMessage` makes "first" true by construction, so what each builder can still get wrong
+    // is WHICH construction it names -- asked of each builder's own output, decoded.
+    //
+    // That no two constructions share a label, and none is retired, is a build failure over the one
+    // table (`IdentityKeyLabelsSeparate`); restated here so a reader of this case sees it.
+    STATIC_REQUIRE(IdentityKeyLabelsSeparate());
 
-    for (auto const label: labels)
+    auto const samples =
+        ConstructionSamples { .key = TestKeyPair("signer").PublicKey(),
+                              .nonce = {},
+                              .summary = Wire::FleetSummary { .clusterId = "c-sample", .nodeId = "n-sample" },
+                              .field = { std::byte { 1 }, std::byte { 2 }, std::byte { 3 } } };
+    for (auto const& row: ConstructionBuilders)
     {
-        INFO(label);
-        CHECK_FALSE(label.empty());
-        CHECK(std::ranges::count(labels, label) == 1);
-        CHECK_FALSE(std::ranges::contains(RetiredNodeProofLabels, label));
+        INFO(LabelOf(row.purpose));
+        auto const message = row.build(samples);
+        CHECK(message.Purpose() == row.purpose);
+        auto const fields = WireFields::SplitAll(message.Bytes());
+        REQUIRE(fields.has_value());
+        REQUIRE_FALSE(Unwrap(fields).empty());
+        CHECK(std::ranges::equal(Unwrap(fields).front(), WireFields::AsBytes(LabelOf(row.purpose))));
     }
 }

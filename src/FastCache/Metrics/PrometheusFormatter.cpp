@@ -61,6 +61,9 @@ namespace
         std::string_view help;                                  ///< `# HELP` text.
         MetricType type;                                        ///< Counter or gauge.
         std::uint64_t (*project)(StorageStats const&) noexcept; ///< What to read off one tier.
+        /// Whether the series exists only for a tier backed by a file. A tier with no file
+        /// renders NO line rather than a zero, which would read as an empty file.
+        bool fileTiersOnly { false };
     };
 
     /// The per-tier series, and only the ones that mean something per tier.
@@ -83,13 +86,25 @@ namespace
                      .type = MetricType::Gauge,
                      .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.itemCount); } },
         TierMetric { .name = "fastcached_tier_bytes_used",
-                     .help = "Bytes this tier holds.",
+                     .help = "What this tier's budget counts: stored (post-compression) value bytes for the memory "
+                             "tier, the on-disk footprint (pages in use x page size) for the disk tier.",
                      .type = MetricType::Gauge,
                      .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.bytesUsed); } },
         TierMetric { .name = "fastcached_tier_bytes_limit",
                      .help = "This tier's configured byte budget (0 = unbounded).",
                      .type = MetricType::Gauge,
                      .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.bytesLimit); } },
+        // The disk tier's FILE, beside the footprint `bytes_used` reports. The budget bounds
+        // the footprint; the file exceeds it by its free pages -- the end of the file is cut
+        // at a commit, a page inside it only leaves once later writes reuse it -- so an
+        // operator asking "what is this costing my disk" reads this one.
+        TierMetric { .name = "fastcached_tier_file_bytes",
+                     .help = "Length of the file backing this tier, free pages included. Exceeds "
+                             "fastcached_tier_bytes_used by those free pages until a commit cuts them off the end "
+                             "or later writes reuse them; never below it.",
+                     .type = MetricType::Gauge,
+                     .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.fileBytes); },
+                     .fileTiersOnly = true },
         TierMetric { .name = "fastcached_tier_evictions_total",
                      .help = "Entries this tier dropped to stay within its budget.",
                      .type = MetricType::Counter,
@@ -335,7 +350,7 @@ static void AppendTierMetrics(std::string& out, TieredStorageStats const& tiers)
         for (auto const& tierRow: StorageTierTable)
         {
             auto const& stats = tiers[static_cast<std::size_t>(tierRow.tier)];
-            if (!stats.has_value())
+            if (!stats.has_value() || (row.fileTiersOnly && !tierRow.storedInFile))
                 continue;
             if (!wroteHeader)
             {
@@ -374,8 +389,9 @@ static void AppendConsensusMetrics(std::string& out, ConsensusStatus const& stat
            Metric { .name = "fastcache_node_consensus_members",
                     .help = "Members in the configuration this node's consensus operates under, voters and learners "
                             "alike. 0 is a reading, not an absence: the node holds no configuration, so it campaigns "
-                            "in no election and grants no vote. That is the ordinary waiting state of a --raft-join "
-                            "node and a fault for any other. A process running no consensus renders none of these "
+                            "in no election and grants no vote. That is the ordinary waiting state of a node that "
+                            "joined a fleet and is not admitted yet, and a fault for any other. A process running no "
+                            "consensus renders none of these "
                             "series at all.",
                     .type = Gauge,
                     .value = static_cast<std::uint64_t>(configuration.voters.size() + configuration.learners.size()) });
@@ -538,21 +554,6 @@ std::string RenderPrometheus(StatsReading const& reading)
     // member set INSIDE it is a reading and renders, which is the whole of #435.
     if (snapshot.consensus.has_value())
         AppendConsensusMetrics(out, *snapshot.consensus);
-
-    // And how long the roster this node verifies grants against stays certified, where it has
-    // a certificate to lapse (#178). Absent on a consensus member and on a node holding none:
-    // a `0` there would read as a roster that has lapsed, which is the alert this exists for.
-    if (snapshot.rosterExpiresInSeconds.has_value())
-        Append(out,
-               Metric { .name = "fastcache_node_roster_expires_in_seconds",
-                        .help = "Seconds until the roster this node verifies lease grants against stops being certified "
-                                "by a majority of the cluster's voters; 0 once it has, after which (and the clock-skew "
-                                "slack) every grant is refused roster-expired. A healthy fleet re-endorses every 15 "
-                                "minutes, so this stays above 45 minutes; falling towards 0 means this node has not "
-                                "heard a certified roster from the leader. Absent on a consensus member, whose roster "
-                                "is the state it applies, and on a node that verifies no grant.",
-                        .type = MetricType::Gauge,
-                        .value = *snapshot.rosterExpiresInSeconds });
 
     // Every counter the sink knows, without exception. Exporting the *table*
     // rather than a hand-picked subset is the whole point: seven of the nine

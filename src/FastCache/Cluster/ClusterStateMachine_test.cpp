@@ -3,10 +3,13 @@
 #include <FastCache/Core/Logger.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -14,6 +17,7 @@
 #include <vector>
 
 #include <tests/PreviousClusterState.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -32,16 +36,19 @@ namespace
 /// @param kind What it does.
 /// @param key The member id or setting name.
 /// @param value The consensus endpoint or setting value.
-/// @param scheduler Where clients reach this member while it leads.
+/// @param scheduler Where this member's `0xFC` port answers.
 /// @return The command.
 [[nodiscard]] Command Cmd(CommandKind kind, std::string key, std::string value = {}, std::string scheduler = {})
 {
+    // A member admission states the member's own key, as every admission from absence must:
+    // `Apply` drops one that would leave the member holding none.
+    auto publicKey =
+        SeatAdmittedBy(kind).has_value() ? std::optional { Testing::TestKeyPair(key).PublicKey() } : std::nullopt;
     return Command { .kind = kind,
                      .key = std::move(key),
                      .value = std::move(value),
                      .schedulerEndpoint = std::move(scheduler),
-                     .publicKey = std::nullopt,
-                     .role = std::nullopt };
+                     .publicKey = publicKey };
 }
 
 /// One applied entry carrying a command.
@@ -76,7 +83,9 @@ TEST_CASE("Committed entries become the cluster's state", "[cluster][statemachin
     // between "the cluster agreed" and "this node acts on it" is a window in which
     // this node refuses a peer it has already admitted.
     REQUIRE(watched.published.size() == 2);
-    CHECK(watched.published.back().Endpoints() == std::vector<std::string> { "10.0.0.1:6675", "10.0.0.2:6675" });
+    REQUIRE(watched.published.back().members.size() == 2);
+    CHECK(Unwrap(watched.published.back().RaftEndpointOf("n1")) == "10.0.0.1:6675");
+    CHECK(Unwrap(watched.published.back().RaftEndpointOf("n2")) == "10.0.0.2:6675");
 }
 
 TEST_CASE("Re-applying a prefix reaches the same state", "[cluster][statemachine]")
@@ -134,14 +143,14 @@ TEST_CASE("An entry this build cannot decode is skipped, not fatal", "[cluster][
 TEST_CASE("A committed verb this build does not know is skipped by name, and the log goes on applying",
           "[cluster][statemachine][forget]")
 {
-    // #1309 added two verbs without moving `CommandVersion`, so a member running an older
-    // build DECODES the layout and meets a verb byte it lacks. That is this case: the
-    // first byte past `Last` is exactly what `AdmitClient` is to a build that predates it,
-    // and the byte pins in `ClusterState_test.cpp` hold the two in step.
+    // A verb is added without moving `CommandVersion`, so a member running an older build
+    // DECODES the layout and meets a verb byte it lacks. That is this case: the first byte
+    // past `Last` is exactly what the next verb will be to this build, and the byte pins in
+    // `ClusterState_test.cpp` hold the two in step.
     //
     // What it must not do is crash, wedge, or apply the byte as whichever verb it aliases.
-    // Skipping leaves such a member without the change -- no replicated client admitted,
-    // and a client forget ignored -- and the rest of the log still applies around it.
+    // Skipping leaves such a member without the change, and the rest of the log still applies
+    // around it.
     CapturingLogger logger;
     std::vector<ClusterState> published;
     ClusterStateMachine machine { logger, [&published](ClusterState const& state) { published.push_back(state); } };
@@ -170,6 +179,57 @@ TEST_CASE("A committed verb this build does not know is skipped by name, and the
     CHECK(machine.State().members.size() == 1);
     CHECK(machine.State().settings.size() == 1);
     CHECK(published.size() == 2);
+}
+
+TEST_CASE("A retired verb a peer committed is skipped by name, and one this node holds refuses the start",
+          "[cluster][statemachine][retired]")
+{
+    // Byte 3 is a retired client verb and byte 6 the retired principal admission: known
+    // enumerators, reserved so they are never read as another verb. An earlier build committed
+    // entries carrying them, and this build applies none of them -- a PEER's is skipped by name,
+    // as a verb this build lacks is, and one this node's OWN log holds is refused before the
+    // node starts (#1542), in the storage rule's code for intact bytes another build wrote.
+    auto const [kind, byte] = GENERATE(table<CommandKind, unsigned>({
+        { CommandKind::RetiredAdmitClient, 3U },
+        { CommandKind::RetiredAdmitPrincipal, 6U },
+    }));
+    INFO("verb " << byte);
+    REQUIRE(static_cast<unsigned>(kind) == byte);
+    auto const retired = Encode(Cmd(kind, "10.0.0.7"));
+    REQUIRE(retired.size() > 5);
+    REQUIRE(retired[5] == static_cast<std::byte>(byte));
+    auto const named = std::format("verb {} is retired", byte);
+
+    SECTION("a peer's entry is skipped by name, and the log goes on applying")
+    {
+        CapturingLogger logger;
+        std::vector<ClusterState> published;
+        ClusterStateMachine machine { logger, [&published](ClusterState const& state) { published.push_back(state); } };
+
+        machine.Apply(Consensus::AppliedEntry { .index = Consensus::LogIndex { .value = 1 }, .payload = retired });
+        CHECK(machine.State() == ClusterState {});
+        CHECK(published.empty());
+        auto const records = logger.Snapshot();
+        CHECK(std::ranges::any_of(records, [&named](auto const& record) {
+            return record.message.contains("entry 1") && record.message.contains(named);
+        }));
+
+        machine.Apply(Entry(2, Cmd(CommandKind::SetSetting, "fleet-open", "1")));
+        CHECK(machine.State().settings.size() == 1);
+        CHECK(published.size() == 1);
+    }
+
+    SECTION("one this node holds is another build's format, which refuses the start")
+    {
+        Watched watched;
+        auto const refused = watched.machine.CanRead(retired);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
+        CHECK(refused.error().code != ConsensusErrorCode::StorageFailure);
+        CHECK(refused.error().context.contains(named));
+        CHECK(watched.machine.State() == ClusterState {});
+        CHECK(watched.published.empty());
+    }
 }
 
 TEST_CASE("A snapshot round-trips through the machine", "[cluster][statemachine]")
@@ -282,7 +342,7 @@ TEST_CASE("A snapshot the previous build wrote, in its own layout, is refused by
     CHECK(std::ranges::any_of(records, [](auto const& record) {
         return record.message.contains("cannot decode")
                && record.message.contains(std::format("version {}", Testing::PreviousClusterStateVersion))
-               && record.message.contains("reads 7");
+               && record.message.contains("reads 10");
     }));
 }
 
@@ -350,7 +410,7 @@ TEST_CASE("Whether a command can be applied is asked without applying it, in the
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
         CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterCommandVersion)));
-        CHECK(refused.error().context.contains("reads 4"));
+        CHECK(refused.error().context.contains("reads 6"));
     }
 
     SECTION("bytes that are no command at all are damage")
@@ -379,13 +439,19 @@ TEST_CASE("Whether a snapshot can be restored is asked without restoring it, in 
         CHECK(watched.machine.CanRestore(Encode(other)).has_value());
     }
 
-    SECTION("the previous build's state is another build's format, both versions named")
+    SECTION("an older build's state is another build's format, both versions named")
     {
-        auto const refused = watched.machine.CanRestore(Testing::EncodePreviousClusterState());
+        // The principal era's layout (what the one installation holds) and the one before it.
+        auto const [older, version] = GENERATE(table<std::vector<std::byte>, std::uint8_t>({
+            { Testing::EncodePrincipalEraClusterState(), Testing::PrincipalEraClusterStateVersion },
+            { Testing::EncodePreviousClusterState(), Testing::PreviousClusterStateVersion },
+        }));
+        INFO("state version " << static_cast<unsigned>(version));
+        auto const refused = watched.machine.CanRestore(older);
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
-        CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
-        CHECK(refused.error().context.contains("reads 7"));
+        CHECK(refused.error().context.contains(std::format("version {}", version)));
+        CHECK(refused.error().context.contains("reads 10"));
     }
 
     SECTION("bytes that are no state at all are damage")

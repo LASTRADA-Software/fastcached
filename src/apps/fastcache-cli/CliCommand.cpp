@@ -52,17 +52,16 @@ namespace
 
     /// Parse a `--format` value.
     ///
-    /// Names no field: `ApplyOneOption` stamps the row's own spelling into an error
-    /// whose field the parser left empty, which is what stops a shared parser from
-    /// claiming to be a flag it was merely reached through.
+    /// Names no field -- `ArgvError` takes none: `ApplyOneOption` stamps the row's own
+    /// spelling onto every refusal, which is what stops a shared parser from claiming
+    /// to be a flag it was merely reached through.
     /// @param value The value text.
     /// @return The format, or why it is not one.
     [[nodiscard]] std::expected<OutputFormat, ConfigError> ParseFormatName(std::string_view value)
     {
         if (auto const format = FormatFromName(value); format.has_value())
             return *format;
-        return std::unexpected(
-            ArgvError(ConfigErrorCode::ParseError, {}, std::format("expected one of: {}", FormatNames())));
+        return std::unexpected(ArgvError(ConfigErrorCode::ParseError, std::format("expected one of: {}", FormatNames())));
     }
 
     /// Parse a `--color` value.
@@ -74,7 +73,7 @@ namespace
             if (row.name == value)
                 return row.choice;
         return std::unexpected(
-            ArgvError(ConfigErrorCode::ParseError, {}, std::format("expected one of: {}", ColorChoiceNames())));
+            ArgvError(ConfigErrorCode::ParseError, std::format("expected one of: {}", ColorChoiceNames())));
     }
 
     /// Parse a non-negative count of something.
@@ -83,13 +82,13 @@ namespace
     [[nodiscard]] std::expected<std::int64_t, ConfigError> ParseCount(std::string_view value)
     {
         if (value.empty() || !std::ranges::all_of(value, [](char ch) { return ch >= '0' && ch <= '9'; }))
-            return std::unexpected(ArgvError(ConfigErrorCode::ParseError, {}, "expected a non-negative whole number"));
+            return std::unexpected(ArgvError(ConfigErrorCode::ParseError, "expected a non-negative whole number"));
         std::int64_t parsed = 0;
         auto const* const first = value.data();
         auto const* const last = first + value.size();
         auto const [ptr, ec] = std::from_chars(first, last, parsed);
         if (ec != std::errc {} || ptr != last)
-            return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, {}, "the number is too large"));
+            return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "the number is too large"));
         return parsed;
     }
 
@@ -107,7 +106,7 @@ namespace
             auto const parsed = ParseDialEndpoint(value);
             if (!parsed.has_value())
                 return std::unexpected(
-                    ArgvError(ConfigErrorCode::ParseError, {}, "expected host:port (a bare port names no machine)"));
+                    ArgvError(ConfigErrorCode::ParseError, "expected host:port (a bare port names no machine)"));
             (command.*Field) = Endpoint { .host = parsed->first, .port = parsed->second };
             return {};
         };
@@ -142,7 +141,6 @@ namespace
                 return std::unexpected(std::move(parsed).error());
             if (*parsed == std::chrono::seconds::zero())
                 return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange,
-                                                 {},
                                                  std::format("`{}` is no expiry at all: memcached reads zero as never "
                                                              "expiring and RESP refuses it; leave the flag off instead",
                                                              value)));
@@ -179,7 +177,7 @@ namespace
                 return std::unexpected(parsed.error());
             if (*parsed == 0)
                 return std::unexpected(
-                    ArgvError(ConfigErrorCode::OutOfRange, {}, "expected at least one sample; omit the flag for no bound"));
+                    ArgvError(ConfigErrorCode::OutOfRange, "expected at least one sample; omit the flag for no bound"));
             command.verbOptions.samples = static_cast<std::size_t>(*parsed);
             return {};
         };
@@ -194,8 +192,8 @@ namespace
     {
         return [](Command& command, std::string_view value) -> std::expected<void, ConfigError> {
             if (value.empty())
-                return std::unexpected(ArgvError(
-                    ConfigErrorCode::ParseError, {}, "expected a range key such as 24h or 7d; omit the flag for the day"));
+                return std::unexpected(ArgvError(ConfigErrorCode::ParseError,
+                                                 "expected a range key such as 24h or 7d; omit the flag for the day"));
             command.verbOptions.range = std::string { value };
             return {};
         };
@@ -269,6 +267,13 @@ namespace
           .description = "read the dashboard credential `fleet` and `live-stats fleet`\n"
                          "present from this file; a leader that names one refuses\n"
                          "the fleet to anybody without it" },
+        { .primary = "--mint-from",
+          .arity = Arity::Value,
+          .operand = "=<host:port>",
+          .apply = AssignEndpoint<&Command::mintFrom>(),
+          .description = "where this machine's node mints the ticket a node on\n"
+                         "another machine is shown; the port counts and the host\n"
+                         "is always loopback (default: the dialled node's port)" },
         { .primary = "--user",
           .arity = Arity::Value,
           .operand = "=<name>",
@@ -376,11 +381,11 @@ namespace
         // `fastcache-compile-node --help` by `ctest -R cli-node-flags`, so a flag renamed
         // there reddens here instead of leaving this paragraph pointing at nothing.
         "Some operator actions are fastcache-compile-node flags, not commands here.\n"
-        "Enrollment: --enroll-open, --enroll-list, --enroll-approve, --enroll-reject\n"
-        "and --enroll-close ask the cluster at --scheduler; --enroll-from runs on the\n"
-        "machine that is joining, since it writes that machine's identity and the key\n"
-        "it is handed. --print-surfaces lists the ports a node's configuration would\n"
-        "open, and dials nothing. The cluster-* commands above send the requests its\n"
+        "Enrollment: --enroll-list, --enroll-approve and --enroll-reject ask the\n"
+        "cluster at --scheduler, or this machine's own node without one; a machine\n"
+        "that is joining asks by itself, given --fleet-seed where no beacon reaches.\n"
+        "--print-surfaces lists the ports a node's configuration would open, and\n"
+        "dials nothing. The cluster-* commands above send the requests its\n"
         "--cluster-status, --cluster-set, --cluster-admit, --cluster-admit-learner and\n"
         "--cluster-forget send.",
     });
@@ -547,7 +552,7 @@ void ApplyEnvironment(Command& command, std::optional<std::string> (*lookup)(std
     endpoint("FASTCACHE_ADMIN_ADDR", command.admin);
 
     if (auto const token = value("FASTCACHE_TOKEN"); token.has_value())
-        command.credential.secret = *token;
+        command.credential.secret = SecureString { *token };
     if (auto const user = value("FASTCACHE_USER"); user.has_value())
         command.credential.username = *user;
 }

@@ -110,6 +110,7 @@ fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
     PATHSPECS "src"
     GLOBS "src/*.cpp" "src/**/*.cpp" "src/*.hpp" "src/**/*.hpp"
     FILTER "\\.(cpp|hpp)$"
+    CONTAINING "std::random_device" CONTAINING_OUT sourcesHolding
     FILES_OUT sourceFiles
     MODE_OUT scanMode)
 
@@ -145,9 +146,17 @@ foreach(relative IN LISTS sourceFiles)
         continue()
     endif()
 
+    # Counted whether or not it is read here: every file in scope was examined, by the
+    # file set's search for the literal when it holds none. Stripping comments only
+    # removes text, so a file without `std::random_device` cannot hold a use -- and the
+    # comment stripper walks a file line by line, which on every file under src/ was
+    # most of this check's cost.
+    math(EXPR readCount "${readCount} + 1")
+    if(NOT "${relative}" IN_LIST sourcesHolding)
+        continue()
+    endif()
     file(READ "${FASTCACHED_SOURCE_DIR}/${relative}" wholeFile)
     fastcached_strip_comments("${wholeFile}" code)
-    math(EXPR readCount "${readCount} + 1")
 
     string(REGEX MATCHALL "std::random_device" hits "${code}")
     list(LENGTH hits hitCount)

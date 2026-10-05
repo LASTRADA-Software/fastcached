@@ -134,6 +134,28 @@ enum class ServiceScope : std::uint8_t
     System = 1,
 };
 
+/// How a registered service starts.
+///
+/// A vocabulary type living beside `ServiceScope` for that type's reason: it
+/// configures the installation, not the running daemon, and `CliResult` carries it
+/// -- which `Platform/ServiceControl.hpp` cannot be included to declare, since it
+/// includes the parser. Its rows (`ServiceStartTable`) live there.
+///
+/// **Private**: never transmitted and never persisted by this project -- the SCM start type
+/// and the launchd keys are written from the ROW, never from the enumerator's value, so the
+/// enumerators carry none.
+///
+/// There is no systemd column: this binary registers no systemd unit (`InstallService` answers
+/// "only on Windows and macOS" there), and the packaged units carry their own enable policy.
+enum class ServiceStart : std::uint8_t
+{
+    Auto, ///< Starts with the machine: SCM auto-start, launchd `RunAtLoad`.
+    /// Registered, and started only when somebody asks: SCM demand-start, no `RunAtLoad`.
+    /// On macOS it is restarted on a crash alone, as an auto-start job is (see its row).
+    Manual,
+    Last
+};
+
 /// CPU-affinity policy for the reactor worker threads.
 enum class CpuAffinity : std::uint8_t
 {
@@ -187,8 +209,9 @@ struct Config
     /// 0 (the default) means unbounded — the disk file grows to whatever the
     /// cached content needs. When non-zero, the budget is split evenly across
     /// the physical shards and each shard's CoW tree evicts its LRU tail to
-    /// stay within its share, so the total on-disk footprint is capped. Set
-    /// this to keep a build cache within a fixed disk allotment.
+    /// stay within its share, so the total on-disk footprint is capped: pages
+    /// in use, compressed values at their compressed size. Set this to keep a
+    /// build cache within a fixed disk allotment.
     std::size_t storageMaxDiskBytes { 0 };
 
     /// Number of independent pinned reactors to run (the `--threads`

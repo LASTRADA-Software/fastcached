@@ -49,6 +49,9 @@ list.
   [How it works](how-it-works.md) — the pieces, one compile followed end to end,
   and what decides whether two machines can share anything.
 - New to the project? Read [Quickstart](getting-started/quickstart.md).
+- Setting up Windows PCs to share compiles and a cache? Follow
+  [Running a Windows office fleet](operations/windows-office-fleet.md), the runbook from the
+  first install to the first upgrade.
 - Wondering whether your client will work? Check the
   [Coverage matrix](protocols/coverage-matrix.md).
 - Looking up a command? Browse the [commands index](commands/index.md).

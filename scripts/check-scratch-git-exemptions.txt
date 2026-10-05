@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Files `scripts/check-scratch-git.sh` lets run a git WRITE that inherits the caller's
+# environment: `<path><TAB><reason>`, one per line. A file belongs here only when it writes
+# the repository it was ASKED to -- a release script tagging the tree it runs in -- never one
+# it created. A row matching nothing is refused as stale.

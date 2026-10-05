@@ -41,8 +41,8 @@
 #
 # ## What it does NOT cover, said here so nobody over-applies it
 #
-#   * **Production oracles.** `OpenMembership`, `AnyOfMembership`, `HostSetMembership` and
-#     `NodeMembership` are the real implementations and are not test files. Only `*_test.cpp`
+#   * **Production oracles.** `OpenMembership`, `AnyOfMembership`, `LoopbackMembership`,
+#     `KeyRosterMembership` and `NodeMembership` are the real implementations and are not test files. Only `*_test.cpp`
 #     is scanned.
 #   * **Using the interface.** A test that takes an `IMembershipOracle const&` parameter or
 #     holds a pointer to one is the ORDINARY case and is untouched -- `NodeReload_test.cpp`

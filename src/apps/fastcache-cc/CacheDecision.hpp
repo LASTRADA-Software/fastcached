@@ -71,9 +71,12 @@ enum class FetchObservation : std::uint8_t
     /// Decoded, materialized, and served. The only state in which nothing is
     /// compiled.
     HitServed,
-    /// Decoded, but the object or depfile could not be written here. The cache is
-    /// not usable on this machine right now.
-    HitUnusable,
+    /// Decoded, but the object could not be written here. The cache is not usable on
+    /// this machine right now.
+    HitObjectUnwritable,
+    /// Decoded, but the DEPFILE this build names could not be written. Nothing about the
+    /// cache: the entry is fine and the object was not touched, since it is written last.
+    HitDepFileUnwritable,
     /// Decoded, but a dependency it replays is missing here, so what it asserts is
     /// not true of this machine.
     HitStale,
@@ -126,10 +129,14 @@ inline constexpr EnumTable<FetchObservation, CacheDecisionRow> CacheDecisionTabl
     { .observation = FetchObservation::HitServed,
       .action = CacheAction::ServeFromCache,
       .why = "the hit held up and was written; nothing else runs" },
-    { .observation = FetchObservation::HitUnusable,
+    { .observation = FetchObservation::HitObjectUnwritable,
       .action = CacheAction::CompileWithoutStoring,
       .why = "the object could not be written here, so the cache is not usable on this machine and a store would "
              "fail the same way" },
+    { .observation = FetchObservation::HitDepFileUnwritable,
+      .action = CacheAction::CompileAndStore,
+      .why = "the depfile this build names could not be written here; the cached entry is fine and the object was "
+             "left as it was, so this compiles as a miss would -- the compiler writes both files itself" },
     { .observation = FetchObservation::HitStale,
       .action = CacheAction::CompileAndStore,
       .why = "the object is fine but its dependency record is not true here; the store overwrites this key with "
@@ -214,9 +221,10 @@ inline constexpr std::size_t DepFileRegionIndex = 2;
 /// with everything that read it.
 enum class HitDisposition : std::uint8_t
 {
-    Served,   ///< Object and depfile written, streams replayed.
-    Stale,    ///< A replayed dependency is missing here; recompile and re-store.
-    Unusable, ///< The object or depfile could not be written; abandon the cache.
+    Served,            ///< Object and depfile written, streams replayed.
+    Stale,             ///< A replayed dependency is missing here; recompile and re-store.
+    ObjectUnwritable,  ///< The object could not be written; abandon the cache.
+    DepFileUnwritable, ///< The depfile could not be written; the object was not touched.
 };
 
 /// Fold what the fetch actually produced into one observation.
@@ -251,13 +259,15 @@ enum class HitDisposition : std::uint8_t
             return FetchObservation::HitServed;
         case HitDisposition::Stale:
             return FetchObservation::HitStale;
-        case HitDisposition::Unusable:
-            return FetchObservation::HitUnusable;
+        case HitDisposition::ObjectUnwritable:
+            return FetchObservation::HitObjectUnwritable;
+        case HitDisposition::DepFileUnwritable:
+            return FetchObservation::HitDepFileUnwritable;
     }
     // Unreachable for any value of the enum, and NOT a default arm: a default here
     // would silently absorb a fourth disposition into whatever it returned, which is
     // the failure this whole file exists to make impossible.
-    return FetchObservation::HitUnusable;
+    return FetchObservation::HitObjectUnwritable;
 }
 
 } // namespace FastCache::Cc

@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <optional>
 #include <ranges>
@@ -142,6 +143,34 @@ TEST_CASE("ReadinessAnnouncer announces exactly once however many threads arm", 
     auto const records = logger.Snapshot();
     CHECK(IndicesContaining(records, ReadyMarker).size() == 1);
     CHECK(IndicesContaining(records, "acceptor armed").size() == Acceptors);
+}
+
+TEST_CASE("ReadinessAnnouncer tells its callback once after the line and never before the last arm", "[server][readiness]")
+{
+    // The callback is how a service host learns the daemon serves (B4-6): told early, it reports
+    // RUNNING over a daemon with an acceptor still unarmed; told twice, nothing breaks, but a second
+    // call is a second readiness. So: not before the last arm, exactly once across racing threads,
+    // and with the line already in the log when it runs.
+    constexpr std::size_t Acceptors = 8;
+    CapturingLogger logger;
+    std::atomic<int> told { 0 };
+    std::atomic<bool> lineWasWritten { false };
+    ReadinessAnnouncer announcer { logger, "8 bind(s) x 1 reactors", [&] {
+                                      lineWasWritten.store(!IndicesContaining(logger.Snapshot(), ReadyMarker).empty());
+                                      told.fetch_add(1);
+                                  } };
+    ExpectAndSeal(announcer, Acceptors);
+    announcer.AcceptorArmed("first");
+    CHECK(told.load() == 0);
+
+    std::vector<std::jthread> arms;
+    arms.reserve(Acceptors - 1);
+    for (auto const index: std::views::iota(std::size_t { 1 }, Acceptors))
+        arms.emplace_back([&announcer, index] { announcer.AcceptorArmed(std::to_string(index)); });
+    arms.clear();
+
+    CHECK(told.load() == 1);
+    CHECK(lineWasWritten.load());
 }
 
 TEST_CASE("ReadinessAnnouncer reports an acceptor registered after the set was closed", "[server][readiness]")

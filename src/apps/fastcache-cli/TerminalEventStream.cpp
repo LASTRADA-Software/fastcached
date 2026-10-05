@@ -465,8 +465,8 @@ namespace
     /// How a frame's dressed runs are written.
     struct Dressing
     {
-        std::span<FrameSpan const> spans;   ///< Every span of the frame, in any order.
-        TerminalCapabilities const* record; ///< Whose palette answer applies; null writes every run plain.
+        std::span<FrameSpan const> spans;             ///< Every span of the frame, in any order.
+        TerminalCapabilities const* record = nullptr; ///< Whose palette answer applies; null writes every run plain.
     };
 
     /// Write one row: its dressed runs through core-cpp's styled text, the rest as it stands.
@@ -762,7 +762,7 @@ std::expected<std::unique_ptr<ITerminalInputWait>, std::string> MakeTerminalInpu
         return std::unexpected("the terminal's input: " + watched.error());
     // A source with no resize channel -- a Windows console reports a resize as an input record --
     // answers an invalid handle, and there is nothing to attach.
-    if (auto const resize = input.resizeHandle(); resize != core::platform::InvalidHandle)
+    if (core::platform::NativeHandle const resize = input.resizeHandle(); resize != core::platform::InvalidHandle)
         if (auto watched = wait->Watch(Channel::Resize, resize); !watched)
             return std::unexpected("the terminal's resize notification: " + watched.error());
     return wait;

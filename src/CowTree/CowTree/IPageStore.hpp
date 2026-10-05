@@ -125,14 +125,28 @@ class IPageStore
 
     /// Total data pages this store currently holds, live and free alike.
     ///
-    /// Grows as pages are allocated and never shrinks, so it is an upper bound
-    /// on how many DISTINCT pages any structure inside the store can span. That
-    /// is what it exists for: a tree walk reaches each of its pages once, so a
-    /// walk that has read more pages than this is following a cycle — and a
-    /// cycle is precisely what a per-page CRC cannot catch, since every page
-    /// around the loop is individually valid.
+    /// Never below the pages any structure inside the store spans, so it is an
+    /// upper bound on how many DISTINCT pages a walk can reach. That is what it
+    /// exists for: a tree walk reaches each of its pages once, so a walk that has
+    /// read more pages than this is following a cycle — and a cycle is precisely
+    /// what a per-page CRC cannot catch, since every page around the loop is
+    /// individually valid. It can SHRINK -- `FilePageStore` cuts a free tail after
+    /// a durable flush -- but only by pages nothing references, so the bound holds.
     /// @return The page count; zero for a store nothing has allocated in yet.
     [[nodiscard]] virtual auto PageCount() const noexcept -> std::size_t = 0;
+
+    /// Pages this store occupies that are not free for reuse: every allocated
+    /// data page -- the tree, out-of-line values, a transaction's pages in
+    /// flight, the free list's own pages -- plus the two meta slots.
+    ///
+    /// A FREE page counts here in neither state: not once it is reusable, and
+    /// not while its freeing waits on a flush, since nothing the current tree
+    /// can reach is on it. That is what makes this the figure a byte budget can
+    /// be enforced against -- freeing a page lowers it at once, where a budget
+    /// on the backing file's length would not move until the file was cut, and
+    /// a free page in the middle of a file cannot be cut at all.
+    /// @return The page count, meta slots included.
+    [[nodiscard]] virtual auto PagesInUse() const noexcept -> std::size_t = 0;
 };
 
 } // namespace CowTree

@@ -116,16 +116,83 @@ cmake -S . -B build -G Ninja \
 The fastcached build does this for itself: `cmake/portable/CompileCache.cmake` picks
 `fastcache-cc` up automatically whenever the binary is on `PATH` and a daemon
 answers at `127.0.0.1:6674` — at any other daemon, local or remote, when
-`FASTCACHE_ADDR` is exported, at `-DFASTCACHE_ADDR=host:port` ahead of even that,
-nowhere if it is set empty — and injects `FASTCACHE_SOURCE_DIR` /
+`FASTCACHE_ADDR` is exported when the build tree is created, at
+`-DFASTCACHE_ADDR=host:port` ahead of even that, nowhere if it is set empty — and injects `FASTCACHE_SOURCE_DIR` /
 `FASTCACHE_BINARY_DIR` from the source and binary directories, so those two need
 not be exported.
 
-Exporting `FASTCACHE_ADDR` retargets an existing build tree on its next
-configure, rather than being frozen at whatever the first configure saw, which is
-what ordinary cache semantics would do to it. A `-DFASTCACHE_ADDR=` passed on the
-current run still wins over the environment — including the empty value that opts
-out — since it is the more deliberate of the two.
+**The configure environment seeds a build tree; it does not steer one.**
+`FASTCACHE_ADDR` and `FASTCACHE_SCHEDULER` (below) are taken from the environment
+by the configure that creates the tree's cache entry, and from then on they are
+held in the build tree's cache. Only these move a held value:
+
+- `-DFASTCACHE_ADDR=<host:port>` / `-DFASTCACHE_SCHEDULER=<host:port>`, and the
+  empty `-DFASTCACHE_ADDR=` / `-DFASTCACHE_SCHEDULER=`, which turn the cache and
+  dispatch **off** respectively. A `-D` always outranks the environment, including
+  one that repeats the value the tree already holds;
+- `cmake -U FASTCACHE_ADDR` / `-U FASTCACHE_SCHEDULER`, which removes the entry,
+  so the configure it is part of seeds it again from its own environment;
+- `cmake --fresh`, which seeds everything again.
+
+A configure whose environment presents a different value does **not** apply it.
+It says so, naming the `-D` that would:
+
+```
+-- [cache] FASTCACHE_ADDR is '10.0.0.5:6674' in the environment and NOT applied: this build tree holds '127.0.0.1:6674', and the environment only seeds a tree with no FASTCACHE_ADDR entry -- -DFASTCACHE_ADDR=10.0.0.5:6674 applies it
+```
+
+This used to be the other way round: a *change* in the environment retargeted
+the entry unless it had been "changed by hand", and "by hand" was judged by
+comparing the entry with the value last applied. That comparison cannot see a
+`-D` that typed the value already held -- measured: a tree configured with
+dispatch off from one shell, reconfigured from a terminal holding
+`FASTCACHE_SCHEDULER` with `-DFASTCACHE_SCHEDULER=` to say off explicitly, came up
+**on**. A held value and a reported difference have no such blind spot.
+
+**Dispatch is decided at configure, and configure says which way.** Beside the
+line naming the launcher, it prints one of:
+
+```
+-- [cache] dispatch: 10.0.0.9:6674 (configured, seeded from the configure environment and held in this build tree's cache; baked into the launcher, so the build's own environment does not change it; not probed -- each compile records DISPATCHED or DECLINED in invocations.log; -DFASTCACHE_SCHEDULER= turns it off)
+-- [cache] dispatch: off (no FASTCACHE_SCHEDULER in the configure environment, and this build tree now holds that; every miss compiles on this machine -- -DFASTCACHE_SCHEDULER=<host:port> turns it on)
+-- [cache] dispatch: off (FASTCACHE_SCHEDULER is empty in this build tree's cache, which outranks the 10.0.0.9:6674 in the environment; every miss compiles on this machine -- -DFASTCACHE_SCHEDULER=10.0.0.9:6674 turns it on)
+```
+
+Both open with `[cache] dispatch: ` and then the endpoint or `off`, so one search
+finds the line whichever way configure decided. A value held from an earlier
+configure reads `held in this build tree's cache,
+where a -DFASTCACHE_SCHEDULER or the configure that created the tree put it`,
+and an environment presenting another scheduler adds `the <host:port> in the
+environment is NOT applied -- -DFASTCACHE_SCHEDULER=<host:port> retargets it`.
+The line is **configuration, not reachability**: nothing at configure asks the
+scheduler anything, and each compile records whether it was `DISPATCHED` or
+`DECLINED` in `invocations.log`.
+
+The generated launcher carries exactly what the line says:
+`FASTCACHE_SCHEDULER=<host:port>` when dispatch is on, and `FASTCACHE_SCHEDULER=`
+(which the launcher reads as unset) when it is off. Set-but-empty and unset are
+the same thing in the environment here, unlike `FASTCACHE_ADDR`, because the
+launcher reads them the same way: neither dispatches.
+
+**So a `FASTCACHE_SCHEDULER` in the build's own environment no longer changes
+anything**, in either direction. That is on purpose. The launcher used to read it
+only from the environment of whatever ran the build, so a value set in one shell
+and a build started from another compiled every miss locally -- measured on a
+workstation, 341 misses with `NOT_CONFIGURED` on each, noticed only because a
+fleet dashboard read 0 compiling -- while configure had said nothing about
+dispatch at all. And it is held rather than re-read because the first version of
+this re-read the environment at every configure, and ninja's own re-run from a
+build shell without the variable turned dispatch off in a log nobody reads
+(measured the same day). The configure probe never dispatches, whatever the
+setting: it asks whether the cache answers, and a slow or vanished scheduler must
+not make that question time out. Changing the value changes every compile command,
+so the next build recompiles everything -- served from the cache, since the key does
+not include the scheduler. `ctest -R compile-cache-dispatch` pins the printed line
+against the generated launcher, in both states, across reconfigures with and
+without a `-D`, and across ninja's own regeneration; it holds `FASTCACHE_ADDR` to
+the same rule. This applies only where the module chooses the launcher; a build
+that sets `CMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc` itself still reads the
+environment at build time.
 
 "Answers" is checked, not assumed: configure compiles one tiny translation unit
 through the launcher with `FASTCACHE_VERBOSE=1` and accepts only a reported
@@ -232,8 +299,8 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_DISPATCH_TIMEOUT` | Deadline for one whole **`COMPILE`** exchange with a worker. `0s` removes the bound. Far larger than `FASTCACHE_TIMEOUT` because it bounds a different shape of conversation: a worker writes nothing until the compiler has finished, so the client waits out the entire remote compile in one read. Ten minutes because that is the scheduler's own lease timeout — waiting longer means waiting on a lease it has already reclaimed. See [Distributed compilation](../getting-started/distributed-compilation.md). | `10min` |
 | `FASTCACHE_DISPATCH_IDLE` | Deadline on **silence** during a `COMPILE` exchange. `0s` removes the bound. A worker writes a five-byte progress frame every few seconds while it is compiling, so this bounds how long it may say *nothing* rather than how long the compile may take — which is what lets it be seconds while `FASTCACHE_DISPATCH_TIMEOUT` stays minutes. It is the only thing that sees a worker whose machine answers every keepalive probe while the process makes no progress. On expiry the launcher compiles locally and hands the lease back, and its fall-back line (with `FASTCACHE_VERBOSE`) reads *stopped reporting progress* rather than *ran out of budget*. See [Distributed compilation](../getting-started/distributed-compilation.md). | `30s` |
 | `FASTCACHE_MAX_STORE_BYTES` | Largest compiled result the launcher will offer to the daemon; `0` means no limit. A bigger result is simply left uncached. Matches the daemon's `--storage-max-value` default by construction rather than by negotiation — there is no handshake, so raise **both** or the other keeps refusing. | `268435456` (256 MiB) |
-| `FASTCACHE_SCHEDULER` | `host:port` of a fleet scheduler — the `--listen-node` port of some `fastcache-compile-node` running `--serve-scheduler`. On a miss the launcher asks it for a worker and sends that worker the preprocessed translation unit. Every refusal falls back to a local compile, with one exception: `not-leader` is an instruction rather than an answer about the fleet, so the launcher retries against the endpoint the refusal names (up to two hops, then it compiles locally). This value therefore only has to be **a** member of the cluster, not the current leader — no launcher needs re-pointing after an election. The workers do the same with their own `--scheduler`: a node follows `not-leader` when it registers and heartbeats, and remembers where the leader answered, so an election re-points the whole fleet rather than just the clients. Both halves are needed — a launcher that followed the redirect while the workers did not would reach a leader whose registry they had all expired out of, and every lease would answer `no-worker`. A cache that is unreachable or refuses counts as a miss for this purpose — it does not disable dispatch. See [Distributed compilation](../getting-started/distributed-compilation.md). | unset — **every miss compiles locally** |
-| `FASTCACHE_TOKEN` | Shared secret presented to a **daemon** started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a daemon that requires none: such a daemon accepts it and ignores it. **Not safe with `FASTCACHE_SCHEDULER`** — a compile node serves no `AUTH` verb, so the credential is refused and dispatch stops working entirely ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). | unset — **no credential sent** |
+| `FASTCACHE_SCHEDULER` | `host:port` of a fleet scheduler — the `--listen-node` port of some `fastcache-compile-node` that serves it. On a miss the launcher asks it for a worker and sends that worker the preprocessed translation unit. Every refusal falls back to a local compile, with one exception: `not-leader` is an instruction rather than an answer about the fleet, so the launcher retries against the endpoint the refusal names (up to two hops, then it compiles locally). This value therefore only has to be **a** voter of the cluster, not the current leader — no launcher needs re-pointing after an election. A learner schedules nothing and refuses a lease as a verb it does not serve, so a learner's own node is not a scheduler to name. The workers do the same with their own `--scheduler`: a node follows `not-leader` when it registers and heartbeats, and remembers where the leader answered, so an election re-points the whole fleet rather than just the clients. Both halves are needed — a launcher that followed the redirect while the workers did not would reach a leader whose registry they had all expired out of, and every lease would answer `no-worker`. A cache that is unreachable or refuses counts as a miss for this purpose — it does not disable dispatch. See [Distributed compilation](../getting-started/distributed-compilation.md). A build configured through `cmake/portable/CompileCache.cmake` has this decided at **configure** and baked into its launcher, so the build's own environment does not change it (see Usage). | unset — **every miss compiles locally** |
+| `FASTCACHE_TOKEN` | The password for a cache at `FASTCACHE_ADDR` started with `--requirepass`, presented **to that cache alone**. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a cache that requires none: such a cache accepts it and ignores it. A compile node needs none: every exchange with another machine — the scheduler, a worker, a remote cache — presents a **machine ticket** this machine's node mints for that exchange alone, over loopback at `FASTCACHE_ADDR`'s port, and a token sent there would admit nobody. | unset — **no password sent** |
 | `FASTCACHE_USER` | Username to accompany `FASTCACHE_TOKEN`. Unset (the usual case) authenticates against the secret alone, which is what `--requirepass` configures. Ignored without a token — a username on its own is a misconfiguration, not a request to authenticate, and sending an empty secret would be refused by every server that wants one. | unset |
 | `FASTCACHE_VERIFY` | Verify one hit in every N by compiling the translation unit again and comparing the objects — see [Verifying that a hit is the right object](#verifying-that-a-hit-is-the-right-object). Costs a whole compile per verified hit, so it is for CI, a nightly, or reproducing a report. `1` checks every hit. Which hits are sampled is decided by hashing the key rather than by chance, so the rate holds over a build and a translation unit that verified verifies again. A value that is not a whole number reads as **off** rather than as an error: this is a diagnostic set by hand, and refusing to compile over a typo in it would break the build it was brought in to investigate. | unset (off) |
 | `FASTCACHE_MSVC_DEPS_PREFIX` | The prefix a **dispatched** compile's synthesised `/showIncludes` notes carry — that is, this build's `msvc_deps_prefix`. Only dispatch needs it: a worker compiles preprocessed text and reports no dependencies, so the launcher writes the record itself, while a local compile emits the compiler's own notes and needs nothing here. Ninja matches the prefix **literally** and knows nothing about languages, so an English note against a localized `msvc_deps_prefix` records **no dependencies at all** for that translation unit and the next header edit does not rebuild it — see [A localized MSVC toolchain](#a-localized-msvc-toolchain). | unset — the English `Note: including file:`. Set it to `auto` to have the launcher ASK the compiler instead; see [A localized MSVC toolchain](#a-localized-msvc-toolchain) for why that is opt-in |
@@ -281,7 +348,13 @@ it folded a set-but-empty `FASTCACHE_ADDR` into the default -- so on a POSIX she
 where the spelling above *does* travel, `export FASTCACHE_ADDR=` reached the launcher
 as an opt-out and reached the build integration as "say nothing", and the build went
 on being fronted. The two readings of one variable now agree: absent means the
-default, present-and-empty means no caching, in both. Note this is why the paragraph
+default, present-and-empty means no caching, in both -- **on the configure that
+creates the build tree's `FASTCACHE_ADDR` entry**. After that the tree holds its
+address and the environment only seeds a tree with no entry, so a later
+`export FASTCACHE_ADDR=` is reported as not applied and the launcher keeps the held
+address; opt a tree that already holds one out with `-DFASTCACHE_ADDR=`. The
+launcher itself reads the variable at every compile only where the module did not
+choose it. Note this is why the paragraph
 above still sends a PowerShell user to `-D`: that platform's problem is that the
 variable never reaches the child at all, which no predicate on the receiving side can
 repair.
@@ -418,10 +491,14 @@ the identity probe is forced to English,
 ([#879](https://github.com/LASTRADA-Software/fastcached/issues/879)), so a value written
 by a generation-2 build is refused rather than replayed.
 
-The byte has moved twice since: to 4 for
-[#202](https://github.com/LASTRADA-Software/fastcached/issues/202), and to **5** for
+The byte has moved three times since: to 4 for
+[#202](https://github.com/LASTRADA-Software/fastcached/issues/202), to 5 for
 [#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270), which put back the
-half of the note anchor #891 gave away. Each of those is its own cold cache, and the
+half of the note anchor #891 gave away, and to **6**, where an MSVC-family compile's
+replayed warnings, errors and `note:` lines stopped naming the checkout that stored them
+and a stored path's `..` segments are collapsed
+([#1593](https://github.com/LASTRADA-Software/fastcached/issues/1593)). Each of those is
+its own cold cache, and the
 paragraph below applies to every one of them unchanged. **Expect one cold cache on the
 upgrade** — one, because a refused generation now falls through to the miss path and the
 STORE that follows overwrites the key with a value of this generation. A bump that
@@ -489,6 +566,43 @@ preprocessed key; a manifest records that key rather than a second copy of the
 object, so a direct hit follows one extra fetch instead of doubling the cached
 volume (which, since the memory tier keeps values uncompressed, would land on
 RAM where compression cannot help).
+
+### An object that names its checkout is not shared with another one
+
+The key is portable across checkouts by design, and a few things a compiler puts
+into an object are not: `__FILE__` expanded under an absolute source path (every
+CMake compile), `std::source_location`, MSVC's `assert` message. Those name the
+checkout that compiled the object, and served into another checkout they point
+assertion messages and log lines at a tree nobody is building. No key can see
+them -- the direct-mode key never sees the `__FILE__` expansion, and
+`source_location` is filled in after preprocessing -- so the launcher reads the
+**object** before storing it.
+
+An object whose program data names neither `FASTCACHE_SOURCE_DIR`,
+`FASTCACHE_BINARY_DIR` nor the compile's working directory is stored and shared
+exactly as before. One that names any of them is stored under a key that also
+folds in the directories it NAMES -- each absolute and resolved, so a relative
+export (`.`) identifies the checkout as well as an absolute one -- with a marker in
+its place under the ordinary key that lists them: the checkout that stored it hits
+it as usual, and any other checkout misses, compiles, and stores its own copy. Only
+what the object names is folded, so an object whose `__FILE__` names the source
+tree is still shared by a second build directory of the same checkout, and one
+naming the build directory is not. The working directory is looked for because it
+is what `cl /FC` makes a relative path absolute against, whatever the roots say. Debug records
+(`.debug$S`, DWARF) are not counted -- see
+[Debug paths in a replayed object](#debug-paths-in-a-replayed-object) -- so a debug
+build shares as much as it did. `FASTCACHE_VERBOSE` says which it was:
+`root-bound object (it names … in .rdata (UTF-16LE)); storing it under key=…` on
+the compile that stores, and `MISS key=… (root-bound: the cached object names its build-tree; …)` or
+`HIT key=… (root-bound: served from key=…)` on the ones after it.
+
+The scan errs on the side of calling an object bound, because the opposite mistake
+serves another checkout's paths: a spelling it over-recognises costs that
+translation unit its cross-checkout sharing and nothing else. Whatever cannot be
+read as bytes is always treated as bound: an LTO object, clang's coverage map
+(`-fcoverage-mapping`, which keeps the source's absolute path in a compressed
+stream), and any compressed section. A `?` where a root has a character the
+compiler's code page cannot hold (`cl` without `/utf-8`) is matched too.
 
 ### Why the dependency paths are in the key
 
@@ -568,6 +682,31 @@ it on demand:
 Writes use an atomic append (`FILE_APPEND_DATA` / `O_APPEND`) so the hundreds of
 concurrent compilers in one build interleave whole lines instead of shredding
 each other's. Recording failures are swallowed: statistics never break a build.
+
+A line is tab-separated and names its own format first: `v2`, then fifteen columns in
+this order — `outcome`, `prefetch-group`, `value-bytes`, `elapsed-ms`, `source`,
+`detail`, `preprocess-ms`, `cache-ms`, `direct-ms`, `direct-hit`, `timestamp` (seconds
+since the Unix epoch), `dispatch`, `dispatch-detail`, `dispatch-specifics` and
+`exit-code`, the code the compile exited with. A line with no version was written by
+an older launcher and is read by how many columns it has, as it always was; its exit
+code is *absent*, never a zero that would call every old compile a success. A line
+naming a version this launcher does not know — a newer launcher appending to the same
+log during an upgrade — is skipped, and `--show-stats` says how many it skipped, rather
+than being read by position and misread. The report counts failed compiles only among
+records that carry an exit code, which is what tells a compiler killed from outside
+apart from a cache that broke the build.
+
+The two dispatch columns are the distribution axis: the
+fixed reason tallied under `why distribution did not help`, and then what to act on
+about it when the reason alone does not say — the argument a worker would not take,
+in the worker's own words, the ceiling a job went over, what one worker could not
+do, or the flag this launcher would not send. A decline whose peer text would only
+name an endpoint, such as a redirect chain that found no leader, leaves it empty;
+`FASTCACHE_VERBOSE` carries that. The last column is recorded and never tallied, so
+the report stays one row per cause while the log still names the flag. It is cut
+at 320 bytes between characters, holds no control character (C0, DEL or C1), and
+spells a byte that begins no UTF-8 character as `?`, since part of it is a peer's
+text.
 
 ```
 $ fastcache-cc --show-stats
@@ -663,7 +802,8 @@ none of them is a caching failure.
 
 | Reason | Meaning |
 |--------|---------|
-| `the command line is not dispatchable` | `RemoteCompileArgs` found something on the line it cannot account for, so nothing was sent. Refusing costs one local compile, where stripping an unrecognised argument would change the generated code and hand back an object nobody asked for. `FASTCACHE_VERBOSE` names the offending flag; it is deliberately not in this tally, or you would get one row per command line instead of one per cause. |
+| `the command line is not dispatchable` | `RemoteCompileArgs` found something on the line it cannot account for, so nothing was sent. Refusing costs one local compile, where stripping an unrecognised argument would change the generated code and hand back an object nobody asked for. `FASTCACHE_VERBOSE` names the offending flag, and so does the last column of the invocation log; it is deliberately not in this tally, or you would get one row per command line instead of one per cause. |
+| `the command line carries an argument no worker passes to a compiler` | An argument on the line is one every worker refuses by a fixed rule -- a sub-tool pass-through such as `-Xclang`, a plugin loader, a linker switch, a path the worker would open. `--allow-compile-arg` cannot lift these, so the launcher reads the same table the workers read and compiles locally without asking for a lease. The last column of the invocation log names the argument. |
 | `the dispatch preprocess failed` | A worker is fed a *second* preprocess, with `#line` markers that the cache key's copy suppresses, and that run failed. The key's own preprocess had already succeeded, so this is about the marker-emitting form of the command specifically. |
 | `this toolchain has no usable fingerprint` | The toolchain digest does not identify this compiler, so no worker could match it. Deliberately refused here rather than sent: a scheduler asked for an unidentifiable fingerprint answers `NoWorker`, which reads as "the fleet has nobody on your toolchain" and sends you to look at the fleet for a problem on this machine. `fastcache-cc --print-toolchain-fingerprint <compiler>` says what this machine computes and why it is unusable. |
 | `no worker serves this toolchain` | Nothing in the fleet carries your compiler's fingerprint. A machine is missing, or a fingerprint has drifted — upgrading the toolchain on the clients and not the workers looks exactly like this. Never read as a capacity problem: more machines of the wrong compiler change nothing. |
@@ -672,8 +812,10 @@ none of them is a caching failure.
 | `another client was already building this key` | Duplicate-work suppression, and **not a failure**: another client holds the lease for this exact object and this compile ran locally instead. Sixty clients missing one key after a header change is the ordinary shape of a shared cache. A high count here is the design working. |
 | `the fleet refused this client` | A credential, membership or lease refusal — the fleet would not let this client ask. Fixed where the client is configured or on the scheduler's member list, never by adding machines. |
 | `the worker refused the job` | A lease was granted and the worker then said no: a lease it would not honour, a scratch root it cannot write, a compiler it could not spawn. **One machine to go and look at**, and `FASTCACHE_VERBOSE` names it. |
+| `a worker would not take an argument of this compile` | The worker's allowlist has no row for a flag on this command line, which every worker of the same build refuses alike — so it is a flag this *fleet* does not dispatch, not one machine. The last column of the invocation log carries the worker's sentence naming the argument. If it runs no program and names no path, add it on the workers with `--allow-compile-arg`; otherwise those compiles stay local, correctly. Until the worker had a code of its own for this it answered `malformed-frame`, and this row read as the wire disagreement below. |
+| `the job is larger than a worker accepts` | The translation unit's frame, or the size its compressed envelope declares, is over the ceiling a worker's compile surface takes. That ceiling is fixed in the worker's build, so every worker of one build refuses the same unit alike: a property of the unit, not of one machine and not a wire disagreement. Nothing to fix; the compile runs here, correctly, and the last column of the invocation log carries the worker's sentence naming the ceiling. |
 | `the fleet named no leader to ask` | The scheduler chain answered `NotLeader` until the redirect ceiling. Transient during an election and permanent when a fleet is misconfigured; the rate is what separates those, which is why it is not folded in with the credential refusal above. |
-| `this launcher and the fleet disagree about the wire` | A protocol, codec or framing mismatch. Expected and bounded during a staggered upgrade; a count that keeps rising afterwards names a machine that never came back. |
+| `this launcher and the fleet disagree about the wire` | A protocol, codec or framing mismatch, or a peer answering a compile with a refusal from another surface. Expected and bounded during a staggered upgrade; a count that keeps rising afterwards names a machine that never came back. Two machines of one build cannot produce it. |
 | `the fleet refused with a reason this launcher does not know` | A refusal code newer than this launcher. Upgrade `fastcache-cc`; the verbose line carries the code the fleet actually sent. |
 | `the fleet could not be reached` | The scheduler or the worker did not answer, broke mid-reply, or ran out of budget. If every compile shows this, check the address in `FASTCACHE_SCHEDULER` before suspecting the fleet — a wrong one looks exactly like a fleet that is entirely down. |
 | `a worker compile failed and was retried locally` | The remote compiler exited non-zero, so the result was discarded and the translation unit compiled here to confirm. Broken code produces this on every machine and is not a fleet problem; a *rising* count against a build that keeps succeeding is a worker producing failures that are not real, and the verbose line names the machine. |
@@ -720,6 +862,7 @@ ask.
 | `uses __TIME__/__DATE__/__TIMESTAMP__` | Deliberate: the TU is non-deterministic and would never hit. Reported as *uncacheable*, not as an error. |
 | `a command-line path is drive-relative under no root`, `a reported dependency path is drive-relative under no root` | Deliberate, and Windows-only. A path like `C:foo\bar.hpp` resolves against drive `C:`'s **own** current directory, which no cache entry records — so the launcher can neither key it (a header moved inside it would not re-key) nor check it on replay (there is no directory to `stat` it against). Caching such a compile could serve a stale dependency record under a zero exit code, so it is not cached at all. Reported as *uncacheable*, not as an error. Spell the path absolutely (`C:\foo\bar.hpp`), make it relative, or bring it under `FASTCACHE_SOURCE_DIR`/`FASTCACHE_BINARY_DIR`. The first is the rule applied to the command line, the second to what the compiler reported; `FASTCACHE_VERBOSE` names the offending path itself. |
 | `daemon does not support authentication; the configured credential was ignored` | `FASTCACHE_TOKEN` is set but the daemon predates the AUTH verb. Caching works normally — the daemon steps over the verb it does not know and serves the command — but this traffic is **not** authenticated. Said once per invocation rather than per exchange. Upgrade the daemon, or unset the token if it was not meant to apply here. |
+| `no machine ticket: this machine's node did not answer MINT-TICKET`, `... refused MINT-TICKET`, `... answered MINT-TICKET with none`, `... FASTCACHE_ADDR names no endpoint ...` | This machine's node could not mint the ticket an exchange with another machine presents, so that exchange went unauthenticated and was refused; the reason is recorded in place of the refusal because it names the thing to fix. The node is asked over loopback at `FASTCACHE_ADDR`'s port, whatever `FASTCACHE_SCHEDULER` names: start it, or point `FASTCACHE_ADDR` at the port it listens on. The build succeeds either way; only the remote work is lost. `FASTCACHE_VERBOSE=1` says it once per invocation, with the endpoint and the node's own words. |
 | `rejected (unauthenticated): ...` | The daemon requires a credential. `authentication required` means none was sent — set `FASTCACHE_TOKEN`. `authentication failed` means one was sent and was wrong. The two are deliberately different messages because they are different mistakes. Either way the build succeeds and only the caching is lost — the compile is still dispatched if `FASTCACHE_SCHEDULER` names a scheduler, and runs locally otherwise. |
 | `fetch exchange failed`, `fetch decoded malformed` | Transport or protocol trouble mid-request. Also how a `FASTCACHE_TIMEOUT` expiry surfaces: a daemon that accepted the connection and then went quiet. If these appear in bulk and each compile stalls for the full timeout first, suspect a wedged daemon rather than a flaky network. `fetch exchange failed` is also what a plainly wrong `FASTCACHE_ADDR` looks like — every compile, at once, with the fleet still doing the work. The two differ in what happens next: `fetch exchange failed` carries on and dispatches, while `fetch decoded malformed` — a daemon that answered with a value this launcher cannot read, which in practice means a mixed install — ends the invocation at a local compile. |
 | `fetch decoded another generation's value` | The daemon served a value that IS a compile value, well formed, written under a canonicalization generation this build does not implement. **Ordinary during a rolling upgrade**, and not a damaged cache — which is the whole reason it is not `fetch decoded malformed`. Either direction: a producer behind this launcher reads exactly like one ahead of it. The compile happens locally, nothing is stored, and it clears once every server and launcher in the fleet are on one generation. The wire code's side of it is [`foreign-value-generation`](../protocols/compile-cache.md#error-codes). |
@@ -727,6 +870,7 @@ ask.
 | `rejected (payload-too-large): …` | The object exceeded the daemon's `--storage-max-value`. Raise it, or accept that this TU will not cache. |
 | `rejected (…)` (other codes) | The daemon refused the command and said why; see [the error-code table](../protocols/compile-cache.md#error-codes). |
 | `could not write object on hit` | The object output path was not writable. |
+| `the cached object names its <parts>; this compile's differs, or its copy was evicted; compiled this one's own` | Not a fault, and still a miss. The object stored under this key names the checkout that compiled it -- a `__FILE__` or a `std::source_location` -- so it is [not shared](#an-object-that-names-its-checkout-is-not-shared-with-another-one), and this compile built and stored its own copy, which the next compile here hits. `<parts>` is what the object names, from `source-root`, `build-tree` and `working-directory`; an object naming only the build tree or the working directory also misses from a second build directory of the SAME checkout. The reason cannot say which part differed -- this end never sees the producer's -- and neither does the `MISS` trace line under `FASTCACHE_VERBOSE`, which carries the same text. A translation unit that shows up here from every checkout is one whose source keeps it from ever being shared across them; spelling its sources relatively AND compiling without `/FC` (which MSBuild turns on by default as "Use Full Paths", and which makes `cl` write the absolute path whatever the command line said), or not baking the file name into program data, is what changes that. |
 | `a worker answered about a different compile` | **A defect somewhere in the fleet, not a fleet declining to help.** The worker's reply did not belong to the request that asked for it — see [`correlation`](../protocols/compile-cache.md#distributed-execution). The object is refused unread and the translation unit is compiled locally, so the build is correct and the caching of it is unaffected (the outcome is still a miss). This is the one reason printed unconditionally rather than only under `FASTCACHE_VERBOSE`, and the line names the worker, the correlation this client expected and the one that arrived. Accepting such a reply would store a wrong object under a correct key and serve it to every other machine that fetches it, so there is no configuration that relaxes this. If it appears at all, find the machine the line names. |
 | `a reported dependency path is not text this host can read`, `a captured region names a path that is not text this host can read` | Deliberate, and Windows-only. `cl.exe` writes the paths in `/showIncludes` in the **console output** code page, while this launcher's own roots arrive as UTF-8 -- so a header under a non-ASCII directory can reach it as bytes it cannot read as text. Such a path prefix-matches no root, which would key a project header as toolchain content and serve a stale object under a zero exit code, so the compile is not cached at all. Reported as *uncacheable*, not as an error. The fix is the console: `chcp 65001` makes `cl` emit UTF-8 and this stops appearing. |
 
@@ -766,7 +910,7 @@ retrying, the other never will be:
 | Outcome | Meaning |
 |---|---|
 | *(silence)* | The cached object is the object this compiler produces. |
-| `WRONG OBJECT served for key …` | It is not. The message names what differed — a section such as `.text$mn` is stale code; `.debug$S` or `.chks64` is a foreign build path. The fresh object was used, so this build is unaffected. Find the machine that stored it. |
+| `WRONG OBJECT served for key …` | It is not. The message names what differed — a section such as `.text$mn` is stale code; `.debug$S` or `.chks64` is a foreign build path. The fresh object was used, so this build is unaffected. Find the machine that stored it. The compile is recorded as `VERIFY-MISMATCH` rather than `HIT` — in `invocations.log`, on the `FASTCACHE_VERBOSE` trace line, and as `wrong object` in `--show-stats`, which rates the hit rate against it — because the build did not use what the cache served. |
 | `could not verify the hit for key …` | The check did not complete: the fresh compile failed, or a file could not be read. Nothing is known about the cached object either way, and the next hit may well answer. |
 | `cannot verify hits for this toolchain …` | This build cannot lay out the object format its own compiler produced, so it can say nothing about any hit — not this one and not the next. A property of the toolchain, not a statement about your cache. |
 
@@ -923,7 +1067,7 @@ Two things this is **not**:
   dependency record naming a path the consumer lacks. Project headers — the ones
   that actually move — are covered by the key, so this is now confined to the
   toolchain.
-- The cache key normalization is deliberately young (`objkey-v6`). Tune it
+- The cache key normalization is deliberately young (`objkey-v7`). Tune it
   against real developer↔CI hit rates before relying on it broadly. Bumping the
   schema re-keys the cache: existing entries miss once and are rewritten.
 - Localized path separators may be normalized to `/` in some segments. Ninja

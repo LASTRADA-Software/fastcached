@@ -43,8 +43,8 @@ TEST_CASE("SecretExposureWatcher: the memory rule, on every platform", "[config]
 
     SECTION("a new finding is reported, and the same one again is not")
     {
-        std::array<SecretFileFinding, 1> const found { SecretFileFinding { .path = key,
-                                                                           .exposure = SecretExposure::AnyLocalAccount } };
+        std::array<SecretFileFinding, 1> const found { SecretFileFinding {
+            .path = key, .exposure = SecretExposure::AnyLocalAccount, .hint = &FastCache::SecretExposureHint } };
 
         auto const first = watcher.Transitions(found);
         REQUIRE(first.size() == 1);
@@ -58,10 +58,10 @@ TEST_CASE("SecretExposureWatcher: the memory rule, on every platform", "[config]
         // The remedy differs between the two, so the sentence the operator is holding
         // has stopped describing the file. This is what makes the memory
         // `(path, exposure)` rather than `path`.
-        std::array<SecretFileFinding, 1> const narrow { SecretFileFinding { .path = key,
-                                                                            .exposure = SecretExposure::OwnersOwnGroup } };
-        std::array<SecretFileFinding, 1> const wide { SecretFileFinding { .path = key,
-                                                                          .exposure = SecretExposure::AnyLocalAccount } };
+        std::array<SecretFileFinding, 1> const narrow { SecretFileFinding {
+            .path = key, .exposure = SecretExposure::OwnersOwnGroup, .hint = &FastCache::SecretExposureHint } };
+        std::array<SecretFileFinding, 1> const wide { SecretFileFinding {
+            .path = key, .exposure = SecretExposure::AnyLocalAccount, .hint = &FastCache::SecretExposureHint } };
 
         REQUIRE(watcher.Transitions(narrow).size() == 1);
         CHECK(watcher.Transitions(wide).size() == 1);
@@ -69,8 +69,8 @@ TEST_CASE("SecretExposureWatcher: the memory rule, on every platform", "[config]
 
     SECTION("a path that leaves the set is forgotten")
     {
-        std::array<SecretFileFinding, 1> const found { SecretFileFinding { .path = key,
-                                                                           .exposure = SecretExposure::AnyLocalAccount } };
+        std::array<SecretFileFinding, 1> const found { SecretFileFinding {
+            .path = key, .exposure = SecretExposure::AnyLocalAccount, .hint = &FastCache::SecretExposureHint } };
 
         REQUIRE(watcher.Transitions(found).size() == 1);
         CHECK(watcher.Transitions({}).empty());
@@ -80,8 +80,10 @@ TEST_CASE("SecretExposureWatcher: the memory rule, on every platform", "[config]
     SECTION("several files are reported independently, in the caller's order")
     {
         std::array<SecretFileFinding, 2> const both {
-            SecretFileFinding { .path = key, .exposure = SecretExposure::AnyLocalAccount },
-            SecretFileFinding { .path = token, .exposure = SecretExposure::AnyLocalAccount },
+            SecretFileFinding {
+                .path = key, .exposure = SecretExposure::AnyLocalAccount, .hint = &FastCache::SecretExposureHint },
+            SecretFileFinding {
+                .path = token, .exposure = SecretExposure::AnyLocalAccount, .hint = &FastCache::SecretExposureHint },
         };
 
         auto const first = watcher.Transitions(both);
@@ -91,7 +93,7 @@ TEST_CASE("SecretExposureWatcher: the memory rule, on every platform", "[config]
 
         // One of the two fixed: the other is still standing and still silent.
         std::array<SecretFileFinding, 1> const remaining { SecretFileFinding {
-            .path = token, .exposure = SecretExposure::AnyLocalAccount } };
+            .path = token, .exposure = SecretExposure::AnyLocalAccount, .hint = &FastCache::SecretExposureHint } };
         CHECK(watcher.Transitions(remaining).empty());
     }
 
@@ -99,8 +101,8 @@ TEST_CASE("SecretExposureWatcher: the memory rule, on every platform", "[config]
     {
         // A platform that would not answer is not one that answered "safe", so the
         // memory has to hold that state too rather than treating it as absence.
-        std::array<SecretFileFinding, 1> const unknown { SecretFileFinding { .path = key,
-                                                                             .exposure = SecretExposure::Undetermined } };
+        std::array<SecretFileFinding, 1> const unknown { SecretFileFinding {
+            .path = key, .exposure = SecretExposure::Undetermined, .hint = &FastCache::SecretExposureHint } };
 
         REQUIRE(watcher.Transitions(unknown).size() == 1);
         CHECK(watcher.Transitions(unknown).empty());
@@ -381,7 +383,7 @@ TEST_CASE("ReportSecretExposure: the arm for a process with no file to reload", 
     auto const key = scratch / "tls.key";
 
     FastCache::SecretSubjectFiles<Config> const subjects { [](Config const& cfg) {
-        return FastCache::DaemonSecretFiles(cfg, /*secretNamedOnCommandLine*/ false);
+        return FastCache::DaemonSecretFileSubjects(cfg, /*secretNamedOnCommandLine*/ false);
     } };
 
     Config cfg {};

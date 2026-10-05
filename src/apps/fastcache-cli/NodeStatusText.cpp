@@ -89,6 +89,54 @@ std::string_view NameOfSchedulerRole(CompileCacheWire::WireSchedulerRole role) n
     return "unknown";
 }
 
+std::string_view NameOfSharedCacheSource(CompileCacheWire::WireSharedCacheSource source) noexcept
+{
+    // A `switch` for `NameOfToolchainState`'s reason and one more: the enum is transmitted with
+    // explicit values and no `Last`, so no `EnumTable` can hold it. A source added and not spelled
+    // here fails the GCC and Clang legs (`-Wswitch`, fatal under `PEDANTIC_COMPILER_WERROR`) and the
+    // clang-tidy sweep; the MSVC and clang-cl legs do not fail, having no `/WX` or `-Werror` and cl's
+    // C4062 being off even at `/W4` (`SharedCacheStatusOf` says the same about its own switch).
+    switch (source)
+    {
+        case CompileCacheWire::WireSharedCacheSource::None:
+            return "none";
+        case CompileCacheWire::WireSharedCacheSource::Setting:
+            return "setting";
+        case CompileCacheWire::WireSharedCacheSource::Override:
+            return "override";
+        case CompileCacheWire::WireSharedCacheSource::ThisMachine:
+            return "this-machine";
+    }
+    // Unreachable: `ReadSharedCacheStatus` leaves a record carrying a source this build has no
+    // name for ABSENT rather than passing the byte through.
+    return "unknown";
+}
+
+std::string_view NameOfSharedCacheState(CompileCacheWire::WireSharedCacheState state) noexcept
+{
+    switch (state)
+    {
+        case CompileCacheWire::WireSharedCacheState::NotTried:
+            return "not-tried";
+        case CompileCacheWire::WireSharedCacheState::Proven:
+            return "proven";
+        case CompileCacheWire::WireSharedCacheState::Unresolved:
+            return "unresolved";
+        case CompileCacheWire::WireSharedCacheState::WrongKey:
+            return "wrong-key";
+        case CompileCacheWire::WireSharedCacheState::Unreachable:
+            return "unreachable";
+        case CompileCacheWire::WireSharedCacheState::Serving:
+            return "serving";
+        case CompileCacheWire::WireSharedCacheState::Unavailable:
+            return "unavailable";
+        case CompileCacheWire::WireSharedCacheState::ProofRefused:
+            return "proof-refused";
+    }
+    // Unreachable for `NameOfSharedCacheSource`'s reason.
+    return "unknown";
+}
+
 std::optional<std::vector<ConditionMention>> ConditionsAskingForAttention(
     std::optional<std::vector<CompileCacheWire::NodeConditionFields>> const& conditions)
 {

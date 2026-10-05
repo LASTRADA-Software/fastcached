@@ -45,6 +45,7 @@ constexpr std::string_view Key = "obj-abcdef";
                                  .fingerprint = Toolchain,
                                  .objectKey = Key,
                                  .args = {},
+                                 .family = Cc::DriverFamily::Gnu,
                                  .preprocessed = "int main() { return 0; }",
                                  .sourceName = "main.cpp",
                                  .compileDir = {},
@@ -257,6 +258,10 @@ TEST_CASE("A lease taken from the configured leader is released back to it", "[n
     auto const& calls = fleet.Calls();
     REQUIRE(calls.size() == 3); // LEASE, COMPILE, RELEASE -- no redirect hop
     CHECK(calls.front().endpoint == SchedulerA);
+    // The compile goes to the worker the lease NAMES, never back to the scheduler that granted it:
+    // the e2e runs both on one node, so a client dialling the scheduler instead would pass there.
+    CHECK(calls[1].opRaw == Raw(Wire::Op::Compile));
+    CHECK(calls[1].endpoint == Worker);
     CHECK(calls.back().opRaw == Raw(Wire::Op::Release));
     CHECK(calls.back().endpoint == SchedulerA);
     CHECK_FALSE(fleet.IsInFlight(SchedulerA, Key));
@@ -292,7 +297,6 @@ TEST_CASE("A node running no worker is never leased, and a worker beside it stil
 
     Node::NodeConfig schedulerOnly;
     schedulerOnly.slots = 0;
-    schedulerOnly.serveScheduler = true;
     // A small always-on box, so that if it WERE registered it would still lose every
     // pick to the worker below -- which is what keeps the second section from going red
     // for the first section's reason.
@@ -323,4 +327,39 @@ TEST_CASE("A node running no worker is never leased, and a worker beside it stil
         REQUIRE(grant.has_value());
         CHECK(Wire::AsStringView(Unwrap(grant).endpoint) == Worker);
     }
+}
+
+TEST_CASE("A grant the client reads carries where the worker was last seen, beside the name it advertises",
+          "[node][fleet][dialhint]")
+{
+    // The laptop advertises a DNS name, and its VPN reconnected: the scheduler saw the new
+    // address on the heartbeat, and the grant the launcher's own framing decodes names it as
+    // the hint while the endpoint -- what the token signs -- stays the name.
+    constexpr std::string_view Laptop = "laptop.corp:6677";
+    Testing::FleetHarness fleet;
+    fleet.AddScheduler(std::string { SchedulerA });
+    fleet.ElectLeader(SchedulerA);
+    auto const id = fleet.RegisterWorkerNamed(SchedulerA, Laptop, Toolchain);
+
+    // Registered through the harness's loopback setup caller, so no hint yet: loopback is
+    // vetoed, which is also the control that the hint below comes from the heartbeat.
+    auto const unseen = AskForLease(fleet, SchedulerA);
+    REQUIRE(unseen.IsHit());
+    auto const before = Wire::DecodeLeaseGrant(unseen.value);
+    REQUIRE(before.has_value());
+    CHECK(Unwrap(before).dialHint.empty());
+    REQUIRE(fleet.Calls().back().endpoint == SchedulerA);
+
+    fleet.HeartbeatFrom(SchedulerA, id, "10.8.0.42", { "10.8.0.42" });
+    auto const outcome = fleet.Exchange(
+        SchedulerA,
+        Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = Toolchain, .key = "obj-second", .acceptedCodecs = {} }),
+        Cc::Credential {},
+        Cc::ExchangeBudget {});
+    REQUIRE(outcome.IsHit());
+    CHECK(fleet.Calls().back().endpoint == SchedulerA);
+    auto const grant = Wire::DecodeLeaseGrant(outcome.value);
+    REQUIRE(grant.has_value());
+    CHECK(Wire::AsStringView(Unwrap(grant).endpoint) == Laptop);
+    CHECK(Wire::AsStringView(Unwrap(grant).dialHint) == "10.8.0.42:6677");
 }

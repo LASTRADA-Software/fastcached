@@ -22,8 +22,9 @@ touching it and without root.
 
 **Which column applies depends on who you are.** The machine-wide file describes
 the *system service* — its cache lives where only the service account can write
-— so only a process that could be that service reads it: root, or an elevated
-administrator, or `LocalSystem`. Run fastcached as yourself and the machine-wide
+— so only a process that could be that service reads it: root, an elevated
+administrator, or a Windows service logon (the service's own account, or
+`LocalSystem`). Run fastcached as yourself and the machine-wide
 row is passed over entirely, whatever its permissions; you get your own config,
 or the built-in defaults.
 

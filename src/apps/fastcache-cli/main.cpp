@@ -180,14 +180,6 @@ void ReportAdvisories(Answer const& answer, bool quiet)
     return ExitCodeOf(Outcome::Usage);
 }
 
-/// The credential the admin surface is presented, when one was configured.
-/// @param command The parsed command.
-/// @return The bearer, or nullopt.
-[[nodiscard]] std::optional<std::string> AdminBearer(Command const& command)
-{
-    return command.credential.Configured() ? std::optional<std::string> { command.credential.secret } : std::nullopt;
-}
-
 /// A session's frames, to stdout, each flushed as it is presented.
 ///
 /// Flushed per frame because a pipe is block-buffered: without it a reader downstream of
@@ -352,7 +344,7 @@ class StopReactorOnExit
     core::net::PlatformLoop reactor { clock };
     // Declared BEFORE the pool that reads it, so it is destroyed after that pool has joined: a read
     // still inside it when the pool drains would otherwise run on a destroyed object.
-    NodeSubscription subscription { command.timeouts, command.credential };
+    NodeSubscription subscription { command.timeouts, NodeCredentialsOf(command) };
     core::async::ThreadPoolExecutor streamPool { 1 };
     core::async::ThreadPoolExecutor stopWaiter { 1 };
     core::async::ThreadPoolExecutor terminalPool { 1 };
@@ -460,10 +452,13 @@ class StopReactorOnExit
         memcached = std::move(*exchange);
     }
 
+    // What each `0xFC` endpoint is shown: the token to `--addr` alone, a ticket from this machine's
+    // node to any other machine, nothing to loopback.
+    auto const nodeCredentials = NodeCredentialsOf(command);
     std::unique_ptr<NodeExchange> node;
     if (wire.needsNode)
     {
-        auto exchange = NodeExchange::Open(command.cache, command.timeouts, command.credential);
+        auto exchange = NodeExchange::Open(command.cache, command.timeouts, nodeCredentials);
         if (exchange.has_value())
         {
             node = std::move(*exchange);
@@ -485,11 +480,10 @@ class StopReactorOnExit
         }
     }
 
-    auto gatherer =
-        LadderGatherer { command.admin, command.cache, command.timeouts, AdminBearer(command), resp.get(), node.get() };
+    auto gatherer = LadderGatherer { command.admin, command.cache, command.timeouts, resp.get(), node.get() };
 
     // A leader a `NotLeader` names is dialled as `--addr` was: the same timeouts, the same credential.
-    auto nodeDialer = NodeDialer { command.timeouts, command.credential };
+    auto nodeDialer = NodeDialer { command.timeouts, nodeCredentials };
 
     auto const context = VerbContext { .operands = command.operands,
                                        .options = command.verbOptions,
@@ -528,7 +522,7 @@ class StopReactorOnExit
     auto const unanswered = answer.outcome == Outcome::Unreachable || answer.outcome == Outcome::Protocol;
     if (unanswered && !wire.needsNode)
     {
-        if (auto probe = NodeExchange::Open(command.cache, command.timeouts, command.credential); probe.has_value())
+        if (auto probe = NodeExchange::Open(command.cache, command.timeouts, nodeCredentials); probe.has_value())
         {
             auto const kind = ProbeRemote(**probe);
             auto probed = context;
@@ -608,21 +602,14 @@ int main(int argc, char* argv[])
             break;
     }
 
-    // **The two conversions below are the boundary, and they are written out rather than
-    // hidden.** `ReadSecretFile` now keeps the file's bytes in storage that is zeroed when
-    // it is released, so the read itself leaves nothing behind (#1125). Where each secret
-    // LANDS is a different question, and the two destinations decline for DIFFERENT
-    // reasons -- which is why they are stated separately rather than under one:
+    // **Where each secret LANDS is the boundary, and it is written out rather than hidden.**
+    // `ReadSecretFile` keeps the file's bytes in storage that is zeroed when it is released, so
+    // the read itself leaves nothing behind (#1125), and the two destinations differ:
     //
-    //  - `Cc::Credential::secret` (`fastcache-cc/CacheProtocol.hpp`) COULD hold a
-    //    `SecureString`: that header already includes `Net/ISocket.hpp` and
-    //    `Async/Task.hpp`, and `Core/SecureBytes.cpp` is already a `_fc_cc_core` row. What
-    //    stops it is not a dependency wall but that retyping RELOCATES this boundary
-    //    instead of removing it -- the secret would still be copied out at
-    //    `Wire::AuthRequest`, at `std::optional<std::string>` in `CredentialOrNone`, and
-    //    into the RESP `AUTH` vector `SocketExchange.cpp` encodes. Every one of those is
-    //    heap residue, which makes this #1125's OWN subject continued rather than a
-    //    larger separate one; it is filed as #1578.
+    //  - `Credential::secret` is a `SecureString`, so the token stays in wiped storage for as
+    //    long as the command holds it. What is NOT covered is the one copy a wire needs spelled
+    //    out, made where it is sent: the RESP `AUTH` vector `SocketExchange.cpp` encodes. That
+    //    residue is #1578. The token never goes to the admin surface at all (`HttpGet`).
     //
     //    **That vector is NAMED `argv` and is not a process argument list.**
     //    `fastcache-cli` spawns no process, and `Call` hands the vector to
@@ -633,16 +620,14 @@ int main(int argc, char* argv[])
     //  - `dashboardToken` (`Protocol/CompileCacheWire.hpp`) genuinely cannot: that header
     //    is header-only because the launcher does not link `FastCache`, and
     //    `SecureBytes.hpp` needs `SecureBytes.cpp` for `SecureZero`, so naming it there
-    //    would put a link requirement on every consumer of the wire grammar.
-    //
-    // An explicit `std::string` here says exactly where the covered part stops, which an
-    // implicit conversion would not.
+    //    would put a link requirement on every consumer of the wire grammar. An explicit
+    //    `std::string` there says exactly where the covered part stops.
     if (!command.tokenFile.empty())
     {
         auto const secret = ReadSecretFile(command.tokenFile);
         if (!secret.has_value())
             return ReportUsageError(secret.error());
-        command.credential.secret = std::string { secret->View() };
+        command.credential.secret = SecureString { secret->View() };
     }
     if (!command.dashboardTokenFile.empty())
     {

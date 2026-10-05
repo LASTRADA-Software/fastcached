@@ -117,7 +117,10 @@ class CowTreeStorage final: public IStorage
         /// Backing file path.
         std::filesystem::path path;
 
-        /// Soft cap on total value bytes held; 0 disables eviction.
+        /// Cap on the store's ON-DISK FOOTPRINT -- pages in use times the page size, tree,
+        /// values, free list and meta included, compressed values at their compressed
+        /// size -- so a codec that halves the values doubles what the budget holds. 0
+        /// disables eviction. Not a cap on the file's length; see `FootprintBytes`.
         std::size_t maxBytes { 0 };
 
         /// Durability mode for the page store.
@@ -175,6 +178,27 @@ class CowTreeStorage final: public IStorage
         bool resumed { false };
     };
 
+    /// Why a conversion stopped, and whether it had begun rewriting the store when it did.
+    ///
+    /// An operator's exit code turns on `Transient()` (`CommandEnding`). A conversion that stopped
+    /// part-way has left the store part-way, which `Open` refuses by name until a re-run finishes
+    /// it; one whose store file could not be found or opened may find it at the next run. Every
+    /// other refusal before rewriting is a DECISION about what it found -- a layout it cannot read,
+    /// a conversion another build started, a store another process holds -- and running it again
+    /// unchanged gets the same answer.
+    struct MigrationFailure
+    {
+        StorageError error;       ///< Why it stopped.
+        bool rewriting { false }; ///< Whether it had begun rewriting records: past the read-only validation pass.
+
+        /// Whether a re-run may get past what stopped it.
+        /// @return True when it stopped part-way, or on an I/O error before it began.
+        [[nodiscard]] bool Transient() const noexcept
+        {
+            return rewriting || error.code == StorageErrorCode::IoError;
+        }
+    };
+
     /// Open or create the storage. Replays existing entries into the
     /// in-memory LRU mirror.
     ///
@@ -211,18 +235,18 @@ class CowTreeStorage final: public IStorage
     /// @param options Storage options; `path` and `pageSize` are used.
     ///                Durability is chosen here rather than taken from the
     ///                caller — see the implementation.
-    /// @return What was converted; `UnsupportedFormatVersion` when the store is
-    ///         NEWER than this build can read, since there is no converting
-    ///         forwards from a layout nothing here knows; `IoError` when the
-    ///         path names no store at all.
-    [[nodiscard]] static std::expected<MigrationReport, StorageError> Migrate(Options const& options);
+    /// @return What was converted; otherwise why not, and whether it had begun rewriting:
+    ///         `UnsupportedFormatVersion` when the store is NEWER than this build can read,
+    ///         since there is no converting forwards from a layout nothing here knows;
+    ///         `IoError` when the path names no store at all.
+    [[nodiscard]] static std::expected<MigrationReport, MigrationFailure> Migrate(Options const& options);
 
     /// `Migrate` over an injected page store, so the conversion can be driven
     /// against a synthesised store of a known vintage rather than only against
     /// a file somebody still has.
     /// @param store Borrowed page store; must outlive the call.
     /// @return As `Migrate`.
-    [[nodiscard]] static std::expected<MigrationReport, StorageError> MigrateStore(CowTree::IPageStore& store);
+    [[nodiscard]] static std::expected<MigrationReport, MigrationFailure> MigrateStore(CowTree::IPageStore& store);
 
     /// Test seam: open over an injected page store (e.g. an InMemoryPageStore
     /// with fault injection) instead of a FilePageStore on disk. Used by the
@@ -351,6 +375,14 @@ class CowTreeStorage final: public IStorage
     [[nodiscard]] std::optional<CowTree::FilePageStore::LockState> StoreLockState() const noexcept;
 
   private:
+    /// `MigrateStore`'s conversion, which says where it stopped.
+    /// @param store Borrowed page store; must outlive the call.
+    /// @param rewriting Set true at the one point the conversion leaves its read-only passes and
+    ///        begins rewriting records; read by the caller only when this fails.
+    /// @return As `MigrateStore`, with the error alone.
+    [[nodiscard]] static std::expected<MigrationReport, StorageError> ConvertStore(CowTree::IPageStore& store,
+                                                                                   bool& rewriting);
+
     explicit CowTreeStorage(Options options) noexcept;
 
     /// Build the tree over `_store`, replay, and set stats. Shared by the
@@ -658,7 +690,31 @@ class CowTreeStorage final: public IStorage
         return sizeof(LruNode) + Overheads + (2 * keyLength);
     }
 
-    /// Evict from the LRU tail until bytesUsed <= maxBytes (best effort).
+    /// The store's on-disk footprint: `PagesInUse()` times the page size.
+    ///
+    /// **The bound `maxBytes` is enforced against, and what `bytesUsed` reports.** It
+    /// counts what the store OCCUPIES -- compressed values at their stored size, every
+    /// tree page, the free list's own pages and the two meta slots -- and excludes the
+    /// free pages inside the file, which a write can reuse. Freeing a page lowers it at
+    /// once, so an eviction loop against it terminates.
+    ///
+    /// Not the file's length, deliberately: a free page in the middle of the file cannot
+    /// be cut, so a budget on the length would evict entries without shrinking anything
+    /// and could empty the cache. The page store holds the length to this figure instead
+    /// (`FilePageStore::PagesInUse` states the relation): the file is never shorter, and
+    /// longer only by free pages that a later flush or later churn removes.
+    [[nodiscard]] std::uint64_t FootprintBytes() const noexcept;
+
+    /// Evict, cold entries first, until `FootprintBytes() <= maxBytes` (best effort).
+    ///
+    /// An entry's cost is the pages it frees, which for an inline value is nothing until
+    /// its leaf empties -- leaves are freed when empty and never merged -- so a store of
+    /// small values may evict several entries to free one page.
+    ///
+    /// Run after every write and by `Resize`, never by `Open`: a store opened over its
+    /// budget -- one written under the old denomination, or one whose budget an operator
+    /// lowered -- comes down to it at its first write, rather than holding startup for a
+    /// drain that may be most of the store.
     void EvictToFit();
 
     /// Erase one bounded slice of entries the mirror does not hold, and report whether
@@ -674,7 +730,9 @@ class CowTreeStorage final: public IStorage
     /// One forward pass suffices and the walk never restarts. A cold entry cannot be
     /// created -- every store goes through `TouchOrInsert`, so anything written after
     /// startup is mirrored by construction -- which makes the cold set monotonically
-    /// shrinking and `_coldExhausted` permanent for the session.
+    /// shrinking and `_coldExhausted` permanent for the session. Which is why the cursor
+    /// and the flag follow what the slice ERASED, not what it walked: a victim walked
+    /// past and left standing is never walked again.
     ///
     /// @return true when at least one entry was erased.
     bool EvictColdSlice();
@@ -727,8 +785,13 @@ class CowTreeStorage final: public IStorage
     /// second place that erased a node would be a second place that could
     /// leave the cursor dangling -- and the one to forget the fix-up would be
     /// whichever is written next.
+    ///
+    /// **`it` may be stored INSIDE `_index`**: `EraseFromLru` hands over the map's own
+    /// value. So the index entry is erased LAST, through a map iterator found first, and
+    /// nothing reads `it` after that -- the erase that drops the map node is the one that
+    /// ends the reference.
     /// @param it Mirror node to drop. Must be dereferenceable.
-    void EraseNode(Iterator it);
+    void EraseNode(Iterator const& it);
 
     LruList _lru;
 
@@ -772,6 +835,10 @@ class CowTreeStorage final: public IStorage
     /// These two are maintained ONLY in `StoreEntry` and `EraseEntry`, which every
     /// mutation funnels through, so no call site can forget them. Seeded at `Open`
     /// from the meta and pushed back to the tree whenever they change.
+    ///
+    /// `_storeBytes` is the LOGICAL value total the meta records, and it bounds nothing
+    /// any more: the budget is the footprint (`FootprintBytes`). It is kept true because
+    /// the meta carries it; `_storeKeyBytes` still feeds `indexBytesAtCapacity`.
     std::uint64_t _storeBytes { 0 };
     std::uint64_t _storeKeyBytes { 0 };
     /// How far the cold-victim walk has read, empty until it has read anything. In
@@ -801,7 +868,8 @@ class CowTreeStorage final: public IStorage
 /// @param path    The store the conversion acted on.
 /// @param outcome What `CowTreeStorage::Migrate` returned for it.
 /// @return The line, without a trailing newline and without a program prefix.
-[[nodiscard]] std::string DescribeMigration(std::filesystem::path const& path,
-                                            std::expected<CowTreeStorage::MigrationReport, StorageError> const& outcome);
+[[nodiscard]] std::string DescribeMigration(
+    std::filesystem::path const& path,
+    std::expected<CowTreeStorage::MigrationReport, CowTreeStorage::MigrationFailure> const& outcome);
 
 } // namespace FastCache

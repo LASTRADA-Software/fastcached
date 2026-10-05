@@ -83,6 +83,9 @@ identitySeed|the seed a node identity key is derived from, drawn when it is mint
 keyFileBytes|the contents of a node-key file, which carry that seed (NodeKey, #178)
 _secret|the shared secret a credential holder keeps -- AuthPolicy, AdminCredential, and the credential-source fakes that stand in for them (Auth/AuthPolicy, Server/AdminCredential, #1125)
 requirePass|the client-authentication secret of the daemon, which ConfigReloader multiplies by every retained snapshot (Config/Config, #1125)
+cookieKey|the key every discovery challenge cookie is MACed under, drawn per epoch: whoever holds it can mint a challenge this node will believe it issued (Cluster/ChallengeCookies)
+machineTicket|a minted machine ticket: a bearer credential, signed by the identity key of this machine, until it expires (Distributed/MachineTicket)
+secret|the text credential a client presents: Cc::Credential::secret in the launcher and the node, and Credential::secret in fastcache-cli (#1125, #1578)
 '
 # The rows are the per-node identity's (#178): the table's claim is "these names hold key
 # material", and a node's signing key and a session's derived keys are exactly that. Each name is
@@ -105,20 +108,19 @@ requirePass|the client-authentication secret of the daemon, which ConfigReloader
 # `_secret` does not reach `_secretKey` and `requirePass` does not reach
 # `requirePassExplicit` -- which is a provenance BIT and holds no secret.
 #
-# THREE names were considered for #1125 and are deliberately NOT rows, each for a different
+# `secret` is a row since both of its holders are `SecureString`: `Cc::Credential::secret`
+# (`apps/fastcache-cc/CacheProtocol.hpp`) since the launcher began presenting machine tickets,
+# and `fastcache-cli`'s own `Credential::secret` since its node verbs began presenting them too.
+# What the row cannot reach is the one plain copy a wire needs spelled out, made where it is sent
+# and named for something else: the RESP `AUTH` vector `SocketExchange.cpp` encodes. That residue
+# is #1578. (The admin surface is sent no credential at all, so no bearer copy exists.) **That vector is NAMED `argv` and is not a process
+# argument list** -- `fastcache-cli` spawns no process at all, and it is written here because
+# the name produced exactly that misreading once.
+#
+# TWO names were considered for #1125 and are deliberately NOT rows, each for a different
 # reason, because an omission that looks like an oversight gets 'fixed' into a refusal
 # nobody can satisfy:
 #
-#   `secret`  -- reaches `Cc::Credential::secret` in `apps/fastcache-cc/CacheProtocol.hpp`.
-#                NOT a dependency wall: that header already includes `Net/ISocket.hpp` and
-#                `Core/SecureBytes.cpp` is already a `_fc_cc_core` row. The reason is that
-#                retyping it RELOCATES the plain copy rather than removing it -- to
-#                `Wire::AuthRequest`, to an `optional<std::string>` in `CredentialOrNone`,
-#                and to the RESP `AUTH` vector `SocketExchange.cpp` encodes. All three are
-#                heap residue, so that is #1125's OWN subject continued and not a larger
-#                one; it is filed as #1578. **That vector is NAMED `argv` and is not a
-#                process argument list** -- `fastcache-cli` spawns no process at all, and
-#                it is written here because the name produced exactly that misreading once.
 #   `dashboardToken`
 #             -- a real wall, and the reason differs: `Protocol/CompileCacheWire.hpp` is
 #                header-only because the launcher does not LINK `FastCache`, and
@@ -127,9 +129,18 @@ requirePass|the client-authentication secret of the daemon, which ConfigReloader
 #                lease's public identifier all spell it, and none is key material. This is
 #                the `key` argument again.
 #
-# Where those secrets LAND is therefore still plain storage, and that is a stated boundary
-# rather than a gap this table forgot -- `fastcache-cli`'s `main.cpp` writes the conversion
-# out longhand at the two sites where it happens.
+# Where those secrets LAND is therefore still plain storage in places, and that is a stated
+# boundary rather than a gap this table forgot -- `fastcache-cli`'s `main.cpp` says where.
+#
+# A MINTED TICKET leaves `SecureString` exactly once, and on purpose: MINT-TICKET's `Ok`
+# reply IS the ticket, so `EncodeReply` copies it into the plain reply vector the endpoint
+# writes and then frees without a wipe. The wire carries the ticket anyway, and a reply
+# buffer is no declaration a name can reach -- a stated boundary, not a missed holder.
+#
+# And a holder spelled `auto` is INVISIBLE here, in the open direction: the type is read
+# from the spelling immediately before the name, so `auto const machineTicket = ...` reads
+# as clean whatever it holds. That is why the minter spells `SecureString const
+# machineTicket` out (`SessionResponder.cpp`); the scan cannot demand it.
 
 # Types that OWN bytes. A borrowing view (`std::span`, `BytesView`, `std::string_view`)
 # is deliberately absent: it owns no storage, so there is nothing for it to zero, and
@@ -186,14 +197,36 @@ SourceFiles() {
 # This tree's style puts a `*` on continuation lines, so the residue is narrow, and a prose
 # line has to look like a DECLARATION to produce a finding at all. Stated because a reader
 # who takes "comments are stripped" literally will over-trust it.
-CodeLines() {
-    awk '!/^[[:space:]]*(\/\/|\/\*|\*)/ { print NR ":" $0 }' "$1" 2>/dev/null
+#
+# And the identifiers are matched in the SAME awk, one process per file: each code line that
+# names an identifier as a whole word comes out as `<identifier index>:<line>:<text>`, grouped
+# by identifier in table order and in line order within one -- the order the per-identifier
+# `grep` this replaced produced them in. That grep was one fork and one spawn per (file,
+# identifier), 13 identifiers over every candidate file; with the per-(mention, type) grep
+# below, it took this check from 16 s on master to 79 s on one Git Bash host, and past the
+# ARM64 leg's TIMEOUT. POSIX awk has no `\b`, so a whole word is bounded by a non-word
+# character or the line's ends.
+#
+# The identifiers arrive through the ENVIRONMENT, never `-v`: macOS's awk (the one true awk)
+# refuses a `-v` value holding a newline ("newline in string"), and the list is one identifier
+# per line -- which took this check and its self-test red on the macOS leg only.
+# $1: the file. $2: the identifiers, one per line.
+MentionLines() {
+    FASTCACHED_CREDENTIAL_IDENTIFIERS="$2" awk '
+        BEGIN { n = split(ENVIRON["FASTCACHED_CREDENTIAL_IDENTIFIERS"], id, "\n") }
+        /^[[:space:]]*(\/\/|\/\*|\*)/ { next }
+        {
+            for (i = 1; i <= n; i++)
+                if (id[i] != "" && $0 ~ ("(^|[^[:alnum:]_])" id[i] "([^[:alnum:]_]|$)"))
+                    hits[i] = hits[i] (i - 1) ":" NR ":" $0 "\n"
+        }
+        END { for (i = 1; i <= n; i++) printf "%s", hits[i] }' "$1" 2>/dev/null
 }
 
 # $1: root. Prints "file:line:text" for every offending declaration; sets Matched counts.
 #
 # FILES OUTER, IDENTIFIERS INNER, and a candidate pass in front of both -- the cost fix
-# rather than a tidy-up (#1331). `CodeLines` is a property of the FILE alone, so running
+# rather than a tidy-up (#1331). `MentionLines` is a property of the FILE alone, so running
 # it inside the identifier loop re-derived the same stripped text once per identifier,
 # four times per file here and a fifth the day somebody adds a row.
 #
@@ -218,18 +251,20 @@ CodeLines() {
 ScanRoot() {
     local root="$1"
     local files identifier reason ownedType findings totalMatches file hits
-    local line text code index
+    local line text index declaration
 
     files=$(SourceFiles "$root")
     [ -n "$files" ] || Refuse "no source files under $root -- an empty population agrees with every rule"
 
     # The vocabulary, read once. `identCounts` is what the refusal below reads.
-    local identNames=() identReasons=() identCounts=() alternation=""
+    local identNames=() identReasons=() identCounts=() alternation="" identList=""
     while IFS='|' read -r identifier reason; do
         [ -n "$identifier" ] || continue
         identNames+=("$identifier")
         identReasons+=("$reason")
         identCounts+=(0)
+        identList="${identList}${identifier}
+"
         # Built with shell string ops rather than a `$( )`, because a subshell FORK
         # is the cost this whole function is now organised around: measured under
         # Git Bash, `x=$(true)` is 12.97 ms against 21.2 ms for an entire `grep`,
@@ -249,7 +284,7 @@ ScanRoot() {
     # count and can produce no finding, so excluding it changes no number this
     # function reports. It is a SUPERSET filter -- comments are not stripped here,
     # so a file mentioning an identifier only in a comment still gets opened and
-    # still contributes zero once `CodeLines` has stripped it. The anchoring is the
+    # still contributes zero once `MentionLines` has stripped it. The anchoring is the
     # same `\b` as below, so it cannot reach `clusterKeyFile` either.
     #
     # `find -exec ... {} +` rather than passing the file list as arguments: 765
@@ -268,24 +303,16 @@ ScanRoot() {
     while IFS= read -r file; do
         [ -n "$file" ] || continue
 
-        # ONCE per file, for every identifier that follows.
-        code=$(CodeLines "$file")
-        [ -n "$code" ] || continue
-
-        index=0
-        while [ "$index" -lt "${#identNames[@]}" ]; do
-            identifier="${identNames[$index]}"
-
-            # Every code line mentioning this identifier as a whole word. The matcher is
-            # unchanged: `\b`-anchored, so a row cannot reach `clusterKeyFile`.
-            hits=$(grep -E "\\b${identifier}\\b" <<< "$code" 2>/dev/null)
-            if [ -z "$hits" ]; then
-                index=$((index + 1))
-                continue
-            fi
+        # ONCE per file, for every identifier: each code line naming one as a whole word,
+        # bounded so a row cannot reach `clusterKeyFile`.
+        hits=$(MentionLines "$file" "$identList")
+        [ -n "$hits" ] || continue
 
             while IFS= read -r hit; do
                 [ -n "$hit" ] || continue
+                index="${hit%%:*}"
+                hit="${hit#*:}"
+                identifier="${identNames[$index]}"
                 identCounts[$index]=$(( ${identCounts[$index]} + 1 ))
                 totalMatches=$((totalMatches + 1))
                 line="${hit%%:*}"
@@ -302,18 +329,22 @@ ScanRoot() {
                 # matched inside `std::string_view` on the next one, because a substring
                 # search has no idea where a token ends. Both are the same mistake: a
                 # pattern is broader than its author reads it as.
+                #
+                # Matched with the shell's own `=~`, never a `grep` per (mention, type): that
+                # was one process per pair, and at 560 mentions and 5 types it was most of this
+                # check's cost -- 79 s against master's 16 s on one Git Bash host, past the
+                # ctest TIMEOUT on the ARM64 leg. POSIX ERE has no `\b`, so the identifier's
+                # end is spelled as a non-word character or the end of the line.
                 while IFS= read -r ownedType; do
                     [ -n "$ownedType" ] || continue
                     # <type> [const] [&|*] <identifier>, and nothing else between.
-                    if grep -qE "${ownedType}[[:space:]]+(const[[:space:]]*)?[&*]*[[:space:]]*${identifier}\\b" <<< "$text"; then
+                    declaration="${ownedType}[[:space:]]+(const[[:space:]]*)?[&*]*[[:space:]]*${identifier}([^[:alnum:]_]|\$)"
+                    if [[ "$text" =~ $declaration ]]; then
                         findings="${findings}${file}:${line}: ${identifier} declared as ${ownedType}
 "
                     fi
                 done <<< "$OwningTypes"
             done <<< "$hits"
-
-            index=$((index + 1))
-        done
     done <<< "$candidates"
 
     # The per-identifier verdict, unchanged in meaning and now asked after the walk
@@ -369,7 +400,10 @@ SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
 SecureString _secret;
+SecureString secret;
 SecureString requirePass;
+SecureByteBuffer cookieKey;
+SecureString machineTicket;
 std::array<std::byte, 32> publicKey;
 
 EOF
@@ -406,7 +440,10 @@ SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureString _secret;
+SecureString secret;
 SecureString requirePass;
+SecureByteBuffer cookieKey;
+SecureString machineTicket;
 EOF
     verdict=$(bash "$0" --root "$tmp/blind" 2>&1)
     if grep -q "identifier 'keyFileBytes' matches nothing" <<< "$verdict"; then
@@ -452,7 +489,10 @@ SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
 SecureString _secret;
+SecureString secret;
 SecureString requirePass;
+SecureByteBuffer cookieKey;
+SecureString machineTicket;
 inline std::string SealWith(std::span<std::byte const> sharedSecret, int claims);
 bool Authenticate(std::span<std::byte const> sharedSecret, std::string_view token);
 EOF
@@ -526,6 +566,21 @@ EOF
         printf 'ok   case 10: a credential named in a block comment is not a declaration\n'
     else
         printf 'FAIL case 10: block-comment mention reported as a violation. Got: %s\n' "$verdict"; return 1
+    fi
+    cases=$((cases + 1))
+
+    # Case 11: the machine-ticket row, asked in the direction case 9 names -- a row the real tree
+    # matches is not a row whose VIOLATION is reported. A minted ticket is a bearer credential until
+    # it expires, and `std::string machineTicket` is the declaration most likely to be written next
+    # by a caller carrying one into AUTH.
+    mkdir -p "$tmp/ticket"
+    cp "$tmp/clean/a.hpp" "$tmp/ticket/a.hpp"
+    printf 'std::string machineTicket {};\n' >> "$tmp/ticket/a.hpp"
+    verdict=$(bash "$0" --root "$tmp/ticket" 2>&1)
+    if grep -q 'machineTicket declared as std::string' <<< "$verdict"; then
+        printf 'ok   case 11: a machine ticket in a plain std::string is reported\n'
+    else
+        printf 'FAIL case 11: machine-ticket violation not reported. Got: %s\n' "$verdict"; return 1
     fi
     cases=$((cases + 1))
 

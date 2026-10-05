@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/IdentityKeyLabel.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 
 #include <cstddef>
@@ -39,9 +40,9 @@ class KeyPairLeaseSigner final: public ILeaseSigner
         return _key.PublicKey();
     }
 
-    [[nodiscard]] Ed25519Signature Sign(std::span<std::byte const> message) const override
+    [[nodiscard]] Ed25519Signature Sign(LabelledMessage const& message) const override
     {
-        return _key.Sign(message);
+        return SignLabelled(_key, message);
     }
 
   private:

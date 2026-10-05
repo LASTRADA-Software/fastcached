@@ -62,6 +62,10 @@ enum class MetaSlot : std::uint8_t
     B = 1, ///< Second meta page (file offset PageSize).
 };
 
+/// How many meta pages a store keeps: one per `MetaSlot`, each `PageSize()` bytes, ahead of
+/// every data page.
+inline constexpr std::size_t MetaSlotCount = 2;
+
 /// The meta slot that is not `slot`.
 ///
 /// One spelling, because "write the slot we did not last make durable" is the

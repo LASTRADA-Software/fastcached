@@ -16,16 +16,11 @@ namespace
     constexpr std::string_view MetricsPath = "/metrics";
 } // namespace
 
-LadderGatherer::LadderGatherer(Endpoint admin,
-                               Endpoint cache,
-                               DialTimeouts timeouts,
-                               std::optional<std::string> bearer,
-                               IExchange* resp,
-                               INodeExchange* node) noexcept:
+LadderGatherer::LadderGatherer(
+    Endpoint admin, Endpoint cache, DialTimeouts timeouts, IExchange* resp, INodeExchange* node) noexcept:
     _admin { std::move(admin) },
     _cache { std::move(cache) },
     _timeouts { timeouts },
-    _bearer { std::move(bearer) },
     _resp { resp },
     _node { node }
 {
@@ -183,7 +178,7 @@ StatsAttempt LadderGatherer::AskMetrics()
 
     attempt.asked = true;
     attempt.where = EndpointText(*admin);
-    auto const response = HttpGet(*admin, MetricsPath, _timeouts, _bearer);
+    auto const response = HttpGet(*admin, MetricsPath, _timeouts);
     if (!response.has_value())
     {
         attempt.note = response.error().detail;

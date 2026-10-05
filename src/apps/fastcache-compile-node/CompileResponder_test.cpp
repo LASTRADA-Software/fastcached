@@ -2,14 +2,17 @@
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
 #include "FrameEndpoint.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeConfig.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeSurfaces.hpp"
 #include "Responders.hpp"
+#include "WorkerLease.hpp"
 
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
@@ -46,6 +49,11 @@
 #include <core/async/ThreadPoolExecutor.hpp>
 #include <core/net/BlockingConnector.hpp>
 #include <core/net/BlockingSocket.hpp>
+#include <core/platform/Clock.hpp>
+#include <tests/CompileReplyFakes.hpp>
+#include <tests/LeaseRosterFakes.hpp>
+#include <tests/LocalityFakes.hpp>
+#include <tests/MembershipFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -100,28 +108,6 @@ class ThreadRecordingRunner final: public Cc::IProcessRunner
     std::atomic<std::size_t> _runs { 0 };
 };
 
-/// Answers `IsThisMachine` for exactly one host.
-///
-/// A stand-in rather than `CachedLocalityOracle`, because what these cases ask is WHICH
-/// question the responder puts, not how this machine's addresses are found.
-class ThisMachineIs final: public ILocalityOracle
-{
-  public:
-    /// @param host The one host that is this machine.
-    explicit ThisMachineIs(std::string host):
-        _host { std::move(host) }
-    {
-    }
-
-    [[nodiscard]] bool IsThisMachine(std::string_view host) const override
-    {
-        return host == _host;
-    }
-
-  private:
-    std::string _host;
-};
-
 /// Everything a compile responder needs, and nothing that decides a thread.
 ///
 /// The two executors are deliberately NOT members: which one is the reactor and which
@@ -143,11 +129,12 @@ struct Fixture
     /// This machine is `127.0.0.1` and nothing else, which is what a cordon asks. The
     /// cordon's own locality case uses a member that is NOT this machine, so a gate asking
     /// membership instead would admit it.
-    ThisMachineIs locality { "127.0.0.1" };
+    Testing::ThisMachineIs locality { "127.0.0.1" };
 
     Fixture():
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
-        protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics }
+        protocol { jobs,    Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+                   metrics, Cc::IgnoreJobRefusals() }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -159,13 +146,15 @@ struct Fixture
 
 /// A framed COMPILE naming @p fingerprint.
 /// @param fingerprint The toolchain to claim.
+/// @param leaseToken The grant it presents; a placeholder the unchecked validator accepts by default.
 /// @return The request frame.
-[[nodiscard]] std::vector<std::byte> CompileFrame(std::string_view fingerprint = "gcc-13")
+[[nodiscard]] std::vector<std::byte> CompileFrame(std::string_view fingerprint = "gcc-13",
+                                                  std::string_view leaseToken = "l1")
 {
     constexpr std::string_view Source = "int main(){return 0;}";
     auto const enveloped =
         Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(Source.size()), Wire::AsBytes(Source));
-    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = leaseToken,
                                                       .fingerprint = fingerprint,
                                                       .args = {},
                                                       .source = enveloped,
@@ -248,12 +237,13 @@ enum class ReplyHold : std::uint8_t
 /// @param responder Who to ask.
 /// @param reactor The loop standing in for the node's own.
 /// @param frame The request.
-/// @param peer The caller's host.
+/// @param peer What the caller's connection established.
+/// @param holding Whether the reply's hold is released before the answer is handed over.
 /// @return What was answered, and on which threads.
 [[nodiscard]] Answered AnswerFrom(CompileResponder& responder,
                                   core::async::IExecutor& reactor,
                                   std::vector<std::byte> frame,
-                                  std::string peer = "127.0.0.1",
+                                  ConnectionFacts peer,
                                   ReplyHold holding = ReplyHold::Release)
 {
     std::promise<Answered> done;
@@ -264,7 +254,7 @@ enum class ReplyHold : std::uint8_t
     [](CompileResponder* target,
        core::async::IExecutor* loop,
        std::vector<std::byte> request,
-       std::string caller,
+       ConnectionFacts caller,
        ReplyHold keep,
        std::promise<Answered> out) -> core::async::DetachedTask {
         co_await core::async::ResumeOn { *loop };
@@ -273,7 +263,7 @@ enum class ReplyHold : std::uint8_t
         // `request` is a local of THIS frame, which stays alive across the suspension
         // inside `Answer` -- the contract `IFrameResponder::Answer` states for the span
         // it borrows, and the same way the endpoint's own connection task holds it.
-        auto reply = co_await target->Answer(request, PeerIdentity { .host = std::move(caller) });
+        auto reply = co_await target->Answer(request, std::move(caller));
 
         // What the reply held is released BEFORE the answer is handed over, as the
         // endpoint releases it once the reply is written: released after, a case reading
@@ -287,6 +277,22 @@ enum class ReplyHold : std::uint8_t
         co_return;
     }(&responder, &reactor, std::move(frame), std::move(peer), holding, std::move(done));
     return future.get();
+}
+
+/// `AnswerFrom` for a caller known only by its host.
+/// @param responder Who to ask.
+/// @param reactor The loop standing in for the node's own.
+/// @param frame The request.
+/// @param peer The caller's host.
+/// @param holding Whether the reply's hold is released before the answer is handed over.
+/// @return What was answered, and on which threads.
+[[nodiscard]] Answered AnswerFrom(CompileResponder& responder,
+                                  core::async::IExecutor& reactor,
+                                  std::vector<std::byte> frame,
+                                  std::string peer = "127.0.0.1",
+                                  ReplyHold holding = ReplyHold::Release)
+{
+    return AnswerFrom(responder, reactor, std::move(frame), ConnectionFacts { .host = std::move(peer) }, holding);
 }
 
 } // namespace
@@ -382,8 +388,9 @@ TEST_CASE("The merged surface applies the worker's own membership rule", "[node]
     core::async::ThreadPoolExecutor reactor { 1 };
     core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
-    Distributed::ClusterMembership const listed { Distributed::MembershipParticipant::FleetMemberList, { "10.0.0.1:6676" } };
-    CompileResponder responder { fix.protocol, capacity, listed, fix.locality, jobs, reactor, fix.metrics, fix.logger };
+    Testing::RosterFold const listed { { "pc-01" } };
+    CompileResponder responder { fix.protocol, capacity, listed.admitted, fix.locality,
+                                 jobs,         reactor,  fix.metrics,     fix.logger };
 
     auto const stranger = AnswerFrom(responder, reactor, CompileFrame(), "10.9.9.9");
     CHECK(ErrorOf(stranger.reply) == Wire::ErrorCode::NotAMember);
@@ -396,8 +403,75 @@ TEST_CASE("The merged surface applies the worker's own membership rule", "[node]
                                             static_cast<std::uint8_t>(Wire::Op::Compile));
     CHECK(early.has_value());
 
-    // And a member is served.
-    auto const member = AnswerFrom(responder, reactor, CompileFrame(), "10.0.0.1");
+    // And a machine admitted by a verified ticket for a key the roster holds is served.
+    auto const member =
+        AnswerFrom(responder,
+                   reactor,
+                   CompileFrame(),
+                   ConnectionFacts { .host = "10.0.0.1", .authenticatedMachine = Testing::IdentityOf("pc-01") });
+    CHECK(StatusOf(member.reply) == Wire::Status::Ok);
+    CHECK(fix.runner.Runs() == 1);
+}
+
+TEST_CASE("A worker refuses a non-member its scheduler granted a lease to under the checked validator",
+          "[node][compile-responder][lease]")
+{
+    // #235, the worker half, with nothing stood in: a grant SIGNED by the scheduler's own identity
+    // key and naming this worker's endpoint, verified by the production factory's checked validator
+    // against a roster that holds that key -- and a caller the scheduler admitted but this worker's
+    // policy does not. The production shape is a leader whose policy admits more than this
+    // worker's -- `--fleet-open` there and not here. The refusal is the worker's own, by WHICH code,
+    // and counted; the grant is not why.
+    Fixture fix;
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
+    static constexpr std::string_view fleet = "fleet-a";
+    static constexpr std::string_view thisWorker = "10.0.0.5:6676";
+    core::platform::ManualWallClock wall { std::chrono::system_clock::time_point { std::chrono::seconds { 1704067200 } } };
+
+    Testing::FixedLeaseRoster const roster { { "scheduler" } };
+    AnnouncedEndpoint advertised { std::string { thisWorker } };
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    LeaseCheckInForce inForce;
+    NodeConfig cfg;
+    cfg.clusterId = std::string { fleet };
+    auto validator = MakeWorkerLeaseValidator(
+        cfg, &roster, advertised, {}, SocketActivation::No, wall, lease, fix.metrics, fix.logger, inForce);
+    REQUIRE(validator.has_value());
+    REQUIRE(inForce.Current() == BuiltLeaseCheck::Signed);
+    lease.fleet.Pin(std::string { fleet });
+    Cc::WorkerProtocol checked { fix.jobs,    *std::move(validator),  { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+                                 fix.metrics, Cc::IgnoreJobRefusals() };
+
+    // What the scheduler granted: real, signed, naming this worker.
+    auto const grant = [&wall](std::string_view serial) {
+        return Distributed::MintLeaseToken(Testing::TestLeaseSigner("scheduler"),
+                                           Distributed::LeaseClaims { .serial = std::string { serial },
+                                                                      .endpoint = std::string { thisWorker },
+                                                                      .fingerprint = "gcc-13",
+                                                                      .key = "obj-abc",
+                                                                      .expiresAt = wall.now() + std::chrono::minutes { 10 },
+                                                                      .clusterId = std::string { fleet },
+                                                                      .epoch = 9,
+                                                                      .signer = {} });
+    };
+
+    CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
+    Testing::RosterFold const listed { { "pc-01" } };
+    CompileResponder responder { checked, capacity, listed.admitted, fix.locality, jobs, reactor, fix.metrics, fix.logger };
+
+    auto const stranger = AnswerFrom(responder, reactor, CompileFrame("gcc-13", grant("granted-to-a-stranger")), "10.9.9.9");
+    CHECK(ErrorOf(stranger.reply) == Wire::ErrorCode::NotAMember);
+    CHECK(fix.runner.Runs() == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == 1);
+
+    // The control: the SAME kind of grant from a member is verified and served, so the stranger was
+    // refused for who it is and not for its lease.
+    auto const member =
+        AnswerFrom(responder,
+                   reactor,
+                   CompileFrame("gcc-13", grant("granted-to-a-member")),
+                   ConnectionFacts { .host = "10.0.0.1", .authenticatedMachine = Testing::IdentityOf("pc-01") });
     CHECK(StatusOf(member.reply) == Wire::Status::Ok);
     CHECK(fix.runner.Runs() == 1);
 }
@@ -485,31 +559,14 @@ TEST_CASE("A compile declaring more than the budget is refused, not charged", "[
     CHECK(capacity.InFlight() == 0);
 }
 
-TEST_CASE("The compile surface requires no connection credential", "[node][compile-responder]")
+TEST_CASE("The compile surface advertises the worker's own ceilings", "[node][compile-responder]")
 {
-    // `Op::Compile` is a `RequiresAuth` row, so this answer is what decides whether the
-    // merged listener demands a credential before it. It must not: a compile already
-    // carries one, per job rather than per connection -- the lease token the scheduler
-    // signed for this worker's endpoint, checked inside `WorkerProtocol`. Answering
-    // `true` here would refuse every client the dedicated port serves today.
     Fixture fix;
     core::async::ThreadPoolExecutor reactor { 1 };
     core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder const responder { fix.protocol, capacity, fix.membership, fix.locality,
                                        jobs,         reactor,  fix.metrics,    fix.logger };
-
-    CHECK_FALSE(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Compile)));
-
-    // Which is the whole reason the question takes the verb: the scheduler verbs on
-    // this same listener still require what #289 added, and a surface-wide answer has
-    // no correct value.
-    CHECK(Wire::DecidePrePayload({ .opRaw = static_cast<std::uint8_t>(Wire::Op::Compile),
-                                   .declaredLength = 1024,
-                                   .sessionCap = responder.MaxRequestBytes(),
-                                   .authRequired = responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Compile)),
-                                   .credentialAccepted = false })
-          == Wire::PrePayloadDecision::Serve);
 
     // The ceilings it advertises are the worker's own, not a second set: the request cap
     // is the constant `WorkerProtocol` was built with, and the in-flight budget is the
@@ -636,11 +693,7 @@ class ShortWindowResponder final: public IFrameResponder
     {
         return _inner.RefusePeer(peer, opRaw);
     }
-    [[nodiscard]] bool AuthRequired(std::uint8_t opRaw) const noexcept override
-    {
-        return _inner.AuthRequired(opRaw);
-    }
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> payload) const override
     {
         return _inner.CheckCredential(payload);
     }
@@ -733,11 +786,13 @@ class IdleListener final: public core::net::IListener
             std::unexpect, core::net::NetError { .code = core::net::NetErrorCode::Eof, .systemCode = 0, .context = {} }
         };
     }
-    void close() noexcept override {}
     [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return 0;
     }
+
+  protected:
+    void doClose() noexcept override {}
 };
 
 /// A free loopback port, taken and released.
@@ -771,12 +826,13 @@ class IdleListener final: public core::net::IListener
 /// the case's own thread.
 /// @param port Where the endpoint listens.
 /// @param frame The request.
-/// @param progressSeen Where to count the progress pulses that preceded the answer; may be null.
+/// @param progressSeen Where to count the progress pulses that preceded the answer, as each one
+///        is READ -- so a case can wait on the count while the compile is still held; may be null.
 /// @return The reply -- empty when the peer closed without answering -- or nullopt when the
 ///         dial itself failed.
 [[nodiscard]] std::optional<std::vector<std::byte>> TryExchange(std::uint16_t port,
                                                                 std::vector<std::byte> frame,
-                                                                std::size_t* progressSeen = nullptr)
+                                                                std::atomic<std::size_t>* progressSeen = nullptr)
 {
     core::net::BlockingConnector connector;
     auto socket = core::async::syncRun(
@@ -784,10 +840,9 @@ class IdleListener final: public core::net::IListener
     if (!socket.has_value())
         return std::nullopt;
 
-    std::size_t pulses = 0;
     auto reply = core::async::syncRun([](core::net::ISocket* peer,
                                          std::vector<std::byte> request,
-                                         std::size_t* seen) -> core::async::Task<std::vector<std::byte>> {
+                                         std::atomic<std::size_t>* seen) -> core::async::Task<std::vector<std::byte>> {
         auto const written = co_await peer->write(std::span<std::byte const> { request });
         if (!written.has_value())
             co_return std::vector<std::byte> {};
@@ -820,16 +875,14 @@ class IdleListener final: public core::net::IListener
                 co_return received;
 
             if (seen != nullptr)
-                ++*seen;
+                seen->fetch_add(1, std::memory_order_acq_rel);
             // Drained by the DECLARED length, exactly as a real reader does, so anything
             // a later version puts in this payload cannot desynchronise the stream.
             received.erase(received.begin(), received.begin() + static_cast<std::ptrdiff_t>(want));
         }
-    }((*socket).get(), std::move(frame), &pulses));
+    }((*socket).get(), std::move(frame), progressSeen));
 
     (*socket)->close();
-    if (progressSeen != nullptr)
-        *progressSeen = pulses;
     return reply;
 }
 
@@ -840,7 +893,7 @@ class IdleListener final: public core::net::IListener
 /// @return The reply, or empty when the peer closed without answering.
 [[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port,
                                               std::vector<std::byte> frame,
-                                              std::size_t* progressSeen = nullptr)
+                                              std::atomic<std::size_t>* progressSeen = nullptr)
 {
     auto const reply = TryExchange(port, std::move(frame), progressSeen);
     REQUIRE(reply.has_value());
@@ -859,51 +912,6 @@ class IdleListener final: public core::net::IListener
     auto const reply = pending.get();
     REQUIRE(reply.has_value());
     return Unwrap(reply);
-}
-
-/// Send @p frame and read the whole reply stream, right up to the peer's EOF.
-///
-/// **The half `Exchange` cannot answer.** That helper stops at the first terminal
-/// status, which is what every case asserting about the ANSWER wants -- and it is
-/// therefore blind to a frame that arrives AFTER the answer, which is exactly what a
-/// missing `SettlePulse` produces. Reading to EOF is what makes the ordering
-/// observable.
-///
-/// The write side is shut before reading, so the node sees the request is complete and
-/// this side is not the reason the connection stays open. The node closes after the
-/// reply, which is what ends the read loop.
-///
-/// Asserts nothing, for `TryExchange`'s reason: its one caller runs it on a helper thread.
-/// @param port The loopback port to dial.
-/// @param frame A complete request.
-/// @return Every byte the node wrote, in order, or nullopt when the dial itself failed.
-[[nodiscard]] std::optional<std::vector<std::byte>> TryExchangeUntilEof(std::uint16_t port, std::vector<std::byte> frame)
-{
-    core::net::BlockingConnector connector;
-    auto socket = core::async::syncRun(
-        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
-    if (!socket.has_value())
-        return std::nullopt;
-
-    auto stream = core::async::syncRun(
-        [](core::net::ISocket* peer, std::vector<std::byte> request) -> core::async::Task<std::vector<std::byte>> {
-            auto const written = co_await peer->write(std::span<std::byte const> { request });
-            if (!written.has_value())
-                co_return std::vector<std::byte> {};
-
-            std::vector<std::byte> received;
-            while (true)
-            {
-                std::array<std::byte, 4096> chunk {};
-                auto const read = co_await peer->read(std::span<std::byte> { chunk });
-                if (!read.has_value() || *read == 0)
-                    co_return received;
-                received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
-            }
-        }((*socket).get(), std::move(frame)));
-
-    (*socket)->close();
-    return stream;
 }
 
 /// The status of every whole frame in @p stream, in order.
@@ -929,6 +937,60 @@ class IdleListener final: public core::net::IListener
         stream = stream.subspan(whole);
     }
     return statuses;
+}
+
+/// Send @p frame and read the whole reply stream, right up to the peer's EOF.
+///
+/// **The half `Exchange` cannot answer.** That helper stops at the first terminal
+/// status, which is what every case asserting about the ANSWER wants -- and it is
+/// therefore blind to a frame that arrives AFTER the answer, which is exactly what a
+/// missing `SettlePulse` produces. Reading to EOF is what makes the ordering
+/// observable.
+///
+/// The write side is shut before reading, so the node sees the request is complete and
+/// this side is not the reason the connection stays open. The node closes after the
+/// reply, which is what ends the read loop.
+///
+/// Asserts nothing, for `TryExchange`'s reason: its one caller runs it on a helper thread.
+/// @param port The loopback port to dial.
+/// @param frame A complete request.
+/// @param progressSeen Where to count the whole progress pulses received so far, updated as
+///        bytes ARRIVE -- so a case can wait on the count while the compile is still held;
+///        may be null.
+/// @return Every byte the node wrote, in order, or nullopt when the dial itself failed.
+[[nodiscard]] std::optional<std::vector<std::byte>> TryExchangeUntilEof(std::uint16_t port,
+                                                                        std::vector<std::byte> frame,
+                                                                        std::atomic<std::size_t>* progressSeen = nullptr)
+{
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    if (!socket.has_value())
+        return std::nullopt;
+
+    auto stream = core::async::syncRun([](core::net::ISocket* peer,
+                                          std::vector<std::byte> request,
+                                          std::atomic<std::size_t>* seen) -> core::async::Task<std::vector<std::byte>> {
+        auto const written = co_await peer->write(std::span<std::byte const> { request });
+        if (!written.has_value())
+            co_return std::vector<std::byte> {};
+
+        std::vector<std::byte> received;
+        while (true)
+        {
+            std::array<std::byte, 4096> chunk {};
+            auto const read = co_await peer->read(std::span<std::byte> { chunk });
+            if (!read.has_value() || *read == 0)
+                co_return received;
+            received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+            if (seen != nullptr)
+                seen->store(static_cast<std::size_t>(std::ranges::count(StatusSequence(received), Wire::Status::Progress)),
+                            std::memory_order_release);
+        }
+    }((*socket).get(), std::move(frame), progressSeen));
+
+    (*socket)->close();
+    return stream;
 }
 
 /// A config naming @p port for the node surface.
@@ -976,6 +1038,34 @@ class IdleListener final: public core::net::IListener
     // reimplemented. A file arguing that in one helper while hand-rolling the next is
     // how the third copy gets written.
     return DrainWithin([&capacity] { return capacity.InFlight() != 0; },
+                       DrainBound { .ceiling = bound, .poll = std::chrono::milliseconds { 5 } })
+           == DrainResult::Drained;
+}
+
+/// How long a held compile waits for its pulses before it is released anyway: half the production cadence.
+///
+/// **The bound is what pins the RATE.** Released on pulses that were read, a case no longer races the cadence --
+/// but a bound long enough to be safe for any cadence accepts every cadence, and a build that dropped the interval
+/// its case configured and pulsed at `DefaultProgressInterval` passed 7 and 8 runs in 10 (review of `d3bbc085`,
+/// I1). At half the default it cannot: its first pulse is 5 s away. A build pulsing at the configured 20-40 ms needs
+/// its two pulses sixty times over before this bound is at risk -- over 2.4 s of a reactor the host did not run.
+constexpr auto PulseRateBound = std::chrono::duration_cast<std::chrono::milliseconds>(Wire::DefaultProgressInterval / 2);
+
+/// Wait until the client has READ @p many progress pulses, for at most @p bound.
+///
+/// **What a held compile is released on, never a wall-clock hold.** A hold counts the case's
+/// thread and the pulse counts the node REACTOR's turns, and under load the two part company:
+/// a reactor that gets no CPU from before a pulse is due until after the release finds the
+/// answer ready as well, and sending it rather than a pulse in front of it is right -- which a
+/// timed hold reads as a missing pulse. Released after this, the pulses are on the wire
+/// before the answer can be, whatever the schedule.
+/// @param seen The count `TryExchange` or `TryExchangeUntilEof` keeps as it reads.
+/// @param many How many to wait for.
+/// @param bound How long to allow.
+/// @return Whether that many were read inside @p bound.
+[[nodiscard]] bool PulsedWithin(std::atomic<std::size_t> const& seen, std::size_t many, std::chrono::milliseconds bound)
+{
+    return DrainWithin([&seen, many] { return seen.load(std::memory_order_acquire) < many; },
                        DrainBound { .ceiling = bound, .poll = std::chrono::milliseconds { 5 } })
            == DrainResult::Drained;
 }
@@ -1064,7 +1154,8 @@ struct MergedWorker
     ///        seconds to observe one frame.
     MergedWorker(Fixture& fix, NodeIoLoop& io, std::chrono::milliseconds progressInterval = Wire::DefaultProgressInterval):
         jobs { runner, fix.scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
-        protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, fix.metrics },
+        protocol { jobs,        Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, &Testing::TestWorkerKey(),
+                   fix.metrics, Cc::IgnoreJobRefusals() },
         // **Five seconds rather than the thirty-second default: the NET, not the
         // diagnostic.** `DrainedWithin` above is what reports a slot that never came
         // back, as an ordinary red assertion with a number. This only bounds how long a
@@ -1293,15 +1384,18 @@ TEST_CASE("A held compile pulses at its client, and the object still arrives beh
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    std::size_t pulses = 0;
+    std::atomic<std::size_t> pulses { 0 };
     auto pending = std::async(std::launch::async, [port, &pulses] { return TryExchange(port, CompileFrame(), &pulses); });
     REQUIRE(worker.runner.WaitForStarted(1));
 
-    // Long enough for several intervals, so the assertion below is about a CADENCE and
-    // not about one frame that might have been a coincidence of scheduling. Derived from
-    // the interval this case configured rather than written as a number, so it cannot
-    // stop covering it if that moves.
-    std::this_thread::sleep_for(Interval * 6);
+    // Released once the client has READ several pulses, so the assertion below is about a
+    // CADENCE and not about one frame that might have been a coincidence of scheduling --
+    // and never after a wall-clock hold, which is what this case did until a starved reactor
+    // was shown to write one pulse and then the answer: see `PulsedWithin`. Released whatever
+    // the wait found and BEFORE anything is asserted, so a build that never pulses fails the
+    // checks below instead of holding the compile to its runner's bound.
+    constexpr std::size_t PulsesBeforeRelease = 2;
+    auto const pulsed = PulsedWithin(pulses, PulsesBeforeRelease, PulseRateBound);
     worker.runner.Release();
 
     auto const reply = ReplyFrom(pending);
@@ -1312,8 +1406,9 @@ TEST_CASE("A held compile pulses at its client, and the object still arrives beh
     // stopped would produce, and a client measuring SILENCE would abandon that worker
     // exactly as it abandons a mute one -- so one pulse is indistinguishable from none
     // for the purpose this exists to serve.
-    INFO("pulses observed: " << pulses);
-    CHECK(pulses >= 2);
+    INFO("pulses observed: " << pulses.load());
+    CHECK(pulsed);
+    CHECK(pulses.load() >= PulsesBeforeRelease);
 
     // And the answer really is the answer: a compile that ran, with the object the
     // client asked for behind however many pulses preceded it.
@@ -1342,7 +1437,7 @@ TEST_CASE("A compile that finishes inside one interval pulses nothing", "[node][
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    std::size_t pulses = 0;
+    std::atomic<std::size_t> pulses { 0 };
     auto pending = std::async(std::launch::async, [port, &pulses] { return TryExchange(port, CompileFrame(), &pulses); });
     REQUIRE(worker.runner.WaitForStarted(1));
     worker.runner.Release();
@@ -1350,7 +1445,7 @@ TEST_CASE("A compile that finishes inside one interval pulses nothing", "[node][
     auto const reply = ReplyFrom(pending);
     REQUIRE_FALSE(reply.empty());
     CHECK(StatusOf(reply) == Wire::Status::Ok);
-    CHECK(pulses == 0);
+    CHECK(pulses.load() == 0);
 
     CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
     worker.capacity.Drain();
@@ -1380,21 +1475,27 @@ TEST_CASE("The pulse stops before the reply, so the answer is the last thing on 
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    auto pending = std::async(std::launch::async, [port] { return TryExchangeUntilEof(port, CompileFrame()); });
+    std::atomic<std::size_t> pulses { 0 };
+    auto pending =
+        std::async(std::launch::async, [port, &pulses] { return TryExchangeUntilEof(port, CompileFrame(), &pulses); });
     REQUIRE(worker.runner.WaitForStarted(1));
-    std::this_thread::sleep_for(Interval * 6);
+    // Released on pulses the client has READ, never after a wall-clock hold -- see
+    // `PulsedWithin` -- and before anything is asserted, for the case above's reason.
+    constexpr std::size_t PulsesBeforeRelease = 2;
+    auto const pulsed = PulsedWithin(pulses, PulsesBeforeRelease, PulseRateBound);
     worker.runner.Release();
 
     auto const stream = ReplyFrom(pending);
     auto const statuses = StatusSequence(stream);
     INFO("statuses: " << statuses.size());
 
-    // At least one pulse AND the answer, or the two claims below are vacuous: with a
+    // The pulses read above AND the answer, or the two claims below are vacuous: with a
     // single frame `statuses.back()` is the answer and the `all_of` runs over nothing,
     // so a build that pulses not at all would pass an ordering test about pulses. That
     // is the empty-range trap this project keeps a rule about, and it was observed here
     // -- a counterfactual that stopped the pulse left this case green.
-    REQUIRE(statuses.size() >= 2);
+    CHECK(pulsed);
+    REQUIRE(statuses.size() >= PulsesBeforeRelease + 1);
 
     // Every frame but the last is a pulse, and the last is the answer. Stated as two
     // claims about the SEQUENCE rather than as a count, because the count is timing and

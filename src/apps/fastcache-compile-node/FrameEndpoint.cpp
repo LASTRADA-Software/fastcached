@@ -10,11 +10,13 @@
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 #include <FastCache/Protocol/SealedFrameSocket.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
+#include <FastCache/Transport/AcceptLoopReporter.hpp>
 #include <FastCache/Transport/LingeringClose.hpp>
 #include <FastCache/Transport/NativeListen.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -28,6 +30,7 @@
 #include <span>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -266,6 +269,51 @@ struct TrackedConnection
     std::chrono::milliseconds window { 0 };
 };
 
+/// Charges what a sealing layer holds before it can check a tag to the surface's in-flight budget.
+///
+/// **The same budget, not a second one**: a sealed frame is held WHOLE before its header reaches
+/// the endpoint, so without this a proven peer could park `MaxRequestBytes()` per connection
+/// outside the budget -- which since every node serves the fleet's shared cache is 256 MiB on every
+/// node. A compare-and-swap rather than the endpoint's load-then-add, because a refusal here has
+/// no reply to race with: it must not let two frames both see room that only one of them has.
+class SealedFrameCharge final: public ISealedFrameBudget
+{
+  public:
+    /// @param inFlight The surface's in-flight byte count; must outlive this.
+    /// @param responder The surface, whose `MaxInFlightBytes()` is the ceiling; must outlive this.
+    SealedFrameCharge(std::atomic<std::size_t>& inFlight, IFrameResponder const& responder) noexcept:
+        _inFlight { inFlight },
+        _responder { responder }
+    {
+    }
+
+    /// @copydoc ISealedFrameBudget::TryHold
+    [[nodiscard]] bool TryHold(std::size_t bytes) noexcept override
+    {
+        auto const budget = _responder.MaxInFlightBytes();
+        auto held = _inFlight.load(std::memory_order_acquire);
+        // A `while` retrying a lost compare-and-swap, which no `for` head can state.
+        while (true)
+        {
+            // Zero is *no ceiling*, as the endpoint reads it.
+            if (budget != 0 && held + bytes > budget)
+                return false;
+            if (_inFlight.compare_exchange_weak(held, held + bytes, std::memory_order_acq_rel, std::memory_order_acquire))
+                return true;
+        }
+    }
+
+    /// @copydoc ISealedFrameBudget::Release
+    void Release(std::size_t bytes) noexcept override
+    {
+        _inFlight.fetch_sub(bytes, std::memory_order_acq_rel);
+    }
+
+  private:
+    std::atomic<std::size_t>& _inFlight;
+    IFrameResponder const& _responder;
+};
+
 struct FrameServer::State
 {
     NodeIoLoop& io;
@@ -311,6 +359,10 @@ struct FrameServer::State
 
     std::atomic<std::size_t> openConnections { 0 };
     std::atomic<std::size_t> inFlightBytes { 0 };
+
+    /// Where every connection's sealing layer charges a frame it holds before checking its tag:
+    /// `inFlightBytes`, against the surface's own ceiling. Declared after both it reads.
+    SealedFrameCharge sealedCharge { inFlightBytes, responder };
 
     /// How many of this server's own loops -- the accept loop and the sweeper --
     /// are still running.
@@ -638,6 +690,79 @@ struct FrameServer::State
     }
 };
 
+std::optional<HeaderRefusal> DecideHeaderRefusal(HeaderGate const& gate,
+                                                 PeerIdentity const& peer,
+                                                 Wire::RequestHeader const& decoded,
+                                                 std::size_t cap)
+{
+    // Refused with a reply naming BOTH numbers, because "too large" without the
+    // ceiling tells an operator nothing about a 64 KiB limit. The bytes are never
+    // taken: the check is on the declared length, before the read.
+    //
+    // Encoded and counted by the SURFACE, exactly as the pre-payload refusal below
+    // is, and this branch was the one that was not: it answered `payload-too-large`
+    // correctly and moved nothing, so the cheapest probe there is -- a header and no
+    // body -- left the series an operator alerts on perfectly flat (#326, undone by
+    // the merge and reinstated by #447). Two ceilings, one fact: this is the
+    // surface-wide cap and `DecidePrePayload` holds the per-verb one, an operator
+    // does the same thing about both, so they share one counter and one decision
+    // rather than splitting.
+    if (decoded.payloadLength > cap)
+        return HeaderRefusal { .reply = gate.responder.RefusalReply(
+                                   Wire::PrePayloadDecision::PayloadTooLarge,
+                                   decoded.opRaw,
+                                   std::format(
+                                       "{} exceeds the {} {}-byte request cap", decoded.payloadLength, gate.what, cap)),
+                               .resynchronize = Resynchronize::Oversize };
+
+    // Admission. The predicate belongs to the responder; this only asks it early.
+    if (auto refusal = gate.responder.RefusePeer(peer, decoded.opRaw); refusal.has_value())
+        return HeaderRefusal { .reply = *std::move(refusal), .resynchronize = Resynchronize::StepOver };
+
+    // The per-verb ceiling and the opcode, through the same `DecidePrePayload` the daemon
+    // asks. No credential is required of any verb: the node checks no password, and
+    // admission is `RefusePeer`'s, asked above.
+    auto const decision = Wire::DecidePrePayload({ .opRaw = decoded.opRaw,
+                                                   .declaredLength = decoded.payloadLength,
+                                                   .sessionCap = cap,
+                                                   .authRequired = false,
+                                                   .credentialAccepted = false });
+    if (decision != Wire::PrePayloadDecision::Serve)
+        // Encoded and counted by the surface, not here: the endpoint owns WHEN the
+        // question is asked, the responder owns the answer.
+        return HeaderRefusal { .reply = gate.responder.RefusalReply(decision, decoded.opRaw, {}),
+                               .resynchronize = Resynchronize::StepOver };
+
+    // Checked on the DECLARED length, before a payload byte is read, so an
+    // over-budget request costs no allocation at all. The connection cap alone would
+    // not bound memory: N connections each declaring the per-request maximum is
+    // still N times it.
+    //
+    // Refused rather than closed -- this is only reached for a declaration the
+    // surface WOULD have accepted, so the peer is told to come back rather than made
+    // to reconnect over a transient budget.
+    //
+    // The figure in the message is the one the DECISION was taken on, read once.
+    // Loaded a second time to format it, the refusal could name a number that does
+    // not explain it -- another connection releasing in between yields "has 0 of N
+    // bytes in flight" beside a refusal for having too many.
+    //
+    // Counted by the surface too, and it is the same regression the oversize branch
+    // above was: the dedicated compile port answered this with
+    // `CompileRefusal::EndpointBusy` and moved
+    // `worker_jobs_refused_endpoint_busy_total`, which the operator documentation
+    // still promises, and the merged listener answered it with a bare code (#447).
+    if (auto const budget = gate.responder.MaxInFlightBytes(), held = gate.inFlightBytes;
+        budget != 0 && held + decoded.payloadLength > budget)
+        return HeaderRefusal { .reply = gate.responder.EndpointRefusalReply(
+                                   EndpointRefusal::InFlightBudget,
+                                   decoded.opRaw,
+                                   std::format("{} has {} of {} bytes in flight", gate.what, held, budget)),
+                               .resynchronize = Resynchronize::StepOver };
+
+    return std::nullopt;
+}
+
 namespace
 {
 
@@ -739,45 +864,54 @@ namespace
     /// Answer an `AUTH` frame and record what it established on this connection.
     ///
     /// Separated from `ServeConnection` because it needs none of the loop: one
-    /// payload, one flag, one reply. That keeps the loop under the
+    /// payload, one field, one reply. That keeps the loop under the
     /// cognitive-complexity ceiling and puts the credential rules where they can be
     /// read without the framing around them.
     ///
-    /// @param responder The surface whose credential this is.
+    /// @param responder The surface that checks the credential -- on the merged listener, the
+    ///        session component.
     /// @param payload The AUTH request body, already bounded by `MaxAuthPayload`.
-    /// @param opRaw The AUTH opcode as received, so the refusal reaches the surface
-    ///        that owns the credential rather than being encoded here.
-    /// @param credentialAccepted This connection's flag; set only on `Accepted`.
+    /// @param opRaw The AUTH opcode as received, so a refusal the surface did not encode
+    ///        itself still reaches it rather than being encoded here.
+    /// @param identity This connection's facts; its `authenticatedMachine` is ASSIGNED, and its
+    ///        `revokedMachine` is set by a ticket refused for a revoked key and never cleared.
     /// @return The reply frame to write.
     [[nodiscard]] std::vector<std::byte> AnswerAuth(IFrameResponder const& responder,
                                                     std::span<std::byte const> payload,
                                                     std::uint8_t opRaw,
-                                                    bool& credentialAccepted)
+                                                    PeerIdentity& identity)
     {
-        auto const outcome = responder.CheckCredential(payload);
+        auto verdict = responder.CheckCredential(payload);
 
-        // `NoPolicy` answers Ok and sets NOTHING. A surface with no credential must
-        // not break a token-configured client, and must not mark it authenticated
-        // either -- nothing was verified, and a later reconfiguration would otherwise
-        // inherit the blessing.
-        if (outcome == CredentialOutcome::Accepted)
-            credentialAccepted = true;
+        // ASSIGNED, never merged: a refused AUTH clears whatever an earlier one established,
+        // so a connection cannot keep a machine it can no longer vouch for by presenting
+        // something worse afterwards. Only `Accepted` carries a machine; `NoPolicy` answers Ok
+        // and establishes nothing, because nothing was verified.
+        identity.authenticatedMachine =
+            verdict.outcome == CredentialOutcome::Accepted ? std::move(verdict.machine) : std::nullopt;
+
+        // MERGED, never assigned, and the one fact here that is: a ticket refused for a REVOKED
+        // key shows the connection is the forgotten machine's, and a revocation is permanent -- so
+        // no later AUTH may clear it, and the verbs pipelined behind this one are refused as that
+        // machine's rather than judged by an address `--fleet-open` would admit.
+        if (verdict.revokedMachine.has_value())
+            identity.revokedMachine = std::move(verdict.revokedMachine);
 
         // Total over the enumerators, so a fifth outcome cannot be answered by
         // falling through to Ok -- the one wrong answer here, because it would tell a
         // client its credential was accepted.
         //
-        // Both refusals are ANSWERED BY THE SURFACE, which owns the credential and so
-        // owns the counter. Encoded here they moved nothing at all, and the second one
-        // is the expensive silence: a peer presenting a WRONG token is exactly what
-        // `SchedulerRequestsRefusedUnauthenticated` exists to make visible, that
-        // counter fires only on the pre-payload gate, and so credential guessing was
-        // invisible to the one series an operator would go looking at (#447).
-        switch (outcome)
+        // A refusal is ANSWERED BY THE SURFACE, which owns the counter: the reply it already
+        // encoded and counted when it has one, and otherwise the endpoint row it routes.
+        switch (verdict.outcome)
         {
             case CredentialOutcome::Malformed:
+                if (!verdict.refusalReply.empty())
+                    return std::move(verdict.refusalReply);
                 return responder.EndpointRefusalReply(EndpointRefusal::CredentialMalformed, opRaw, {});
             case CredentialOutcome::Rejected:
+                if (!verdict.refusalReply.empty())
+                    return std::move(verdict.refusalReply);
                 return responder.EndpointRefusalReply(EndpointRefusal::CredentialRejected, opRaw, "authentication failed");
             case CredentialOutcome::NoPolicy:
             case CredentialOutcome::Accepted:
@@ -909,8 +1043,8 @@ namespace
         if (state.responder.NodeProver() == nullptr)
             return ConnectionSocket { .socket = std::shared_ptr<core::net::ISocket> { std::move(owned) },
                                       .sealing = nullptr };
-        auto sealed =
-            std::make_shared<SealedFrameSocket>(std::move(owned), SealedFrameEnd::Server, state.responder.MaxRequestBytes());
+        auto sealed = std::make_shared<SealedFrameSocket>(
+            std::move(owned), SealedFrameEnd::Server, state.responder.MaxRequestBytes(), &state.sealedCharge);
         auto* const sealing = sealed.get();
         return ConnectionSocket { .socket = std::move(sealed), .sealing = sealing };
     }
@@ -927,11 +1061,45 @@ namespace
         if (sealing == nullptr)
             return;
         auto const fault = sealing->Fault();
-        if (!fault.has_value())
+        // Over budget is not KNOWN to be a broken seal -- its tag was never read -- and a surface
+        // already answered and counted it (`AnswerSealedOverBudget`), so counting it here as well
+        // would count one refusal twice.
+        if (!fault.has_value() || *fault == SealFault::OverBudget)
             return;
         state.metrics.Increment(IMetricsSink::Counter::NodeSealedFramesRefused);
         state.logger.Logf(
             LogLevel::Warn, "{}: closed a proven connection from {}: {}", state.what, peer, DescribeSealFault(*fault));
+    }
+
+    /// Tell a proven peer its sealed frame found no room in the in-flight budget, and let the
+    /// surface that owns the verb count it.
+    ///
+    /// **A reply and then a close**, where an unsealed frame over budget gets a reply and a
+    /// resynchronization: the frame was refused BEFORE it was held, so its tag was never checked,
+    /// and a sealed stream cannot be stepped over without checking one -- the next frame's position
+    /// in the sequence is the tag's. The verb is the unverified header's and chooses only which
+    /// surface answers; the answer goes out sealed, so only the key's holder can read it.
+    /// @param state The server state. A pointer, as every coroutine here takes it: a reference
+    ///        parameter to a coroutine is one the frame outlives the caller's knowledge of.
+    /// @param socket The connection.
+    /// @param sealing Its sealing layer, or null.
+    core::async::Task<void> AnswerSealedOverBudget(FrameServer::State* state,
+                                                   core::net::ISocket* socket,
+                                                   SealedFrameSocket const* sealing)
+    {
+        if (sealing == nullptr || sealing->Fault() != SealFault::OverBudget)
+            co_return;
+        auto const verb = sealing->RefusedVerb().value_or(std::uint8_t { 0xFF });
+        auto const reply = state->responder.EndpointRefusalReply(
+            EndpointRefusal::InFlightBudget,
+            verb,
+            std::format("{} has {} of {} bytes in flight, and a sealed frame of {} bytes is held whole before its seal "
+                        "can be checked",
+                        state->what,
+                        state->inFlightBytes.load(std::memory_order_acquire),
+                        state->responder.MaxInFlightBytes(),
+                        sealing->RefusedBytes()));
+        std::ignore = co_await WriteAll(EndpointWriter::Loop, socket, reply);
     }
 
     /// Encode the refusal a connection owes its peer after a sweep deferred to it.
@@ -1747,139 +1915,6 @@ namespace
         co_return true;
     }
 
-    /// How a refused request gets back to a frame boundary, so the connection stays
-    /// usable.
-    ///
-    /// **A PRIVATE enum -- nothing transmits it and nothing stores it -- so it states no
-    /// ordinals.** An explicit `= N` here would assert a contract that does not exist.
-    enum class Resynchronize : std::uint8_t
-    {
-        StepOver, ///< Read and discard exactly what the header declared.
-        Oversize, ///< The declaration is past the cap, so the step-over is bounded too.
-    };
-
-    /// A refusal decided from a request HEADER, before a payload byte is read.
-    ///
-    /// Returned by value and owning: the reply is bytes this endpoint will hand to a
-    /// write, not a view into anything the decision borrowed. `.agent/rules/wire-and-protocol.md`
-    /// is explicit that a struct a decoder returns by value must not borrow from what it
-    /// decoded, and the same reasoning governs a decision returned to a caller that then
-    /// suspends.
-    struct HeaderRefusal
-    {
-        std::vector<std::byte> reply; ///< What to send. Encoded and counted by the surface.
-        Resynchronize resynchronize;  ///< How to reach the next frame boundary afterwards.
-    };
-
-    /// Whether this header is refused, and with what.
-    ///
-    /// **Four refusals, one question, and it writes nothing** -- which is what makes
-    /// lifting it out of `ServeConnection` legal at all (#675). That loop holds the
-    /// endpoint's exactly-one-writer property, so an extraction that takes a write with
-    /// it turns the property into an agreement between two functions; this takes the
-    /// DECISION and leaves every byte to the loop, which is why the four `WriteAll`
-    /// calls that used to sit in these branches are now one.
-    ///
-    /// **The ORDER is the load-bearing part and it is now stated in one place.** Each
-    /// step's reasoning is on the step:
-    ///
-    ///  1. The surface-wide cap, on the DECLARED length, so nothing is allocated.
-    ///  2. Admission, ahead of any resource decision -- a peer this surface will not
-    ///     serve must not be able to reach one, or a flood of refusable frames exhausts
-    ///     the budget and makes the surface answer `EndpointBusy` to the peers it does
-    ///     serve, which is the denial reconstructed one step out (#285, #377).
-    ///  3. The credential and the per-verb ceiling, through the same `DecidePrePayload`
-    ///     the daemon's loop calls, so the two surfaces cannot disagree about which
-    ///     verbs are open before authentication.
-    ///  4. The in-flight byte budget, last, for the reason step 2 gives.
-    ///
-    /// @param state The server state: the responder, the budget and the surface's name.
-    /// @param peer Who is at the other end: the kernel's host, and what this connection has
-    ///        proved. A source port is ephemeral and is not an identity, so the address is all an
-    ///        admission policy had before #1428 -- and a proof is the second thing it now has.
-    /// @param decoded The request header, as it decoded.
-    /// @param cap The surface-wide request ceiling, read once by the caller.
-    /// @param credentialAccepted Whether an AUTH frame on THIS connection was verified.
-    /// @return The refusal, or nullopt when the request is to be served.
-    [[nodiscard]] std::optional<HeaderRefusal> DecideHeaderRefusal(FrameServer::State* state,
-                                                                   PeerIdentity const& peer,
-                                                                   Wire::RequestHeader const& decoded,
-                                                                   std::size_t cap,
-                                                                   bool credentialAccepted)
-    {
-        // Refused with a reply naming BOTH numbers, because "too large" without the
-        // ceiling tells an operator nothing about a 64 KiB limit. The bytes are never
-        // taken: the check is on the declared length, before the read.
-        //
-        // Encoded and counted by the SURFACE, exactly as the pre-payload refusal below
-        // is, and this branch was the one that was not: it answered `payload-too-large`
-        // correctly and moved nothing, so the cheapest probe there is -- a header and no
-        // body -- left the series an operator alerts on perfectly flat (#326, undone by
-        // the merge and reinstated by #447). Two ceilings, one fact: this is the
-        // surface-wide cap and `DecidePrePayload` holds the per-verb one, an operator
-        // does the same thing about both, so they share one counter and one decision
-        // rather than splitting.
-        if (decoded.payloadLength > cap)
-            return HeaderRefusal {
-                .reply = state->responder.RefusalReply(
-                    Wire::PrePayloadDecision::PayloadTooLarge,
-                    decoded.opRaw,
-                    std::format("{} exceeds the {} {}-byte request cap", decoded.payloadLength, state->what, cap)),
-                .resynchronize = Resynchronize::Oversize
-            };
-
-        // Admission. The predicate belongs to the responder; this only asks it early.
-        if (auto refusal = state->responder.RefusePeer(peer, decoded.opRaw); refusal.has_value())
-            return HeaderRefusal { .reply = *std::move(refusal), .resynchronize = Resynchronize::StepOver };
-
-        // The credential, decided from the header and this connection's state (#289). A
-        // SECOND question at the same point rather than a wider first one: `RefusePeer`
-        // answers on the peer and the verb and returns an encoded refusal; this one
-        // answers on the verb alone and feeds the decision alongside the declared length
-        // and per-connection state, so folding them together would make neither
-        // predicate's name describe it.
-        auto const decision = Wire::DecidePrePayload({ .opRaw = decoded.opRaw,
-                                                       .declaredLength = decoded.payloadLength,
-                                                       .sessionCap = cap,
-                                                       .authRequired = state->responder.AuthRequired(decoded.opRaw),
-                                                       .credentialAccepted = credentialAccepted });
-        if (decision != Wire::PrePayloadDecision::Serve)
-            // Encoded and counted by the surface, not here: the endpoint owns WHEN the
-            // question is asked, the responder owns the answer.
-            return HeaderRefusal { .reply = state->responder.RefusalReply(decision, decoded.opRaw, {}),
-                                   .resynchronize = Resynchronize::StepOver };
-
-        // Checked on the DECLARED length, before a payload byte is read, so an
-        // over-budget request costs no allocation at all. The connection cap alone would
-        // not bound memory: N connections each declaring the per-request maximum is
-        // still N times it.
-        //
-        // Refused rather than closed -- this is only reached for a declaration the
-        // surface WOULD have accepted, so the peer is told to come back rather than made
-        // to reconnect over a transient budget.
-        //
-        // The figure in the message is the one the DECISION was taken on, read once.
-        // Loaded a second time to format it, the refusal could name a number that does
-        // not explain it -- another connection releasing in between yields "has 0 of N
-        // bytes in flight" beside a refusal for having too many.
-        //
-        // Counted by the surface too, and it is the same regression the oversize branch
-        // above was: the dedicated compile port answered this with
-        // `CompileRefusal::EndpointBusy` and moved
-        // `worker_jobs_refused_endpoint_busy_total`, which the operator documentation
-        // still promises, and the merged listener answered it with a bare code (#447).
-        if (auto const budget = state->responder.MaxInFlightBytes(),
-            held = state->inFlightBytes.load(std::memory_order_acquire);
-            budget != 0 && held + decoded.payloadLength > budget)
-            return HeaderRefusal { .reply = state->responder.EndpointRefusalReply(
-                                       EndpointRefusal::InFlightBudget,
-                                       decoded.opRaw,
-                                       std::format("{} has {} of {} bytes in flight", state->what, held, budget)),
-                                   .resynchronize = Resynchronize::StepOver };
-
-        return std::nullopt;
-    }
-
     /// Step over a refused request's body, so the next read starts on a frame boundary.
     ///
     /// **It reads and never writes**, which is what lets it out of `ServeConnection` at
@@ -2145,13 +2180,17 @@ namespace
             auto const peer = socket->peerAddress();
 
             // Who this connection IS, as an admission policy sees it: the address above, plus
-            // whatever it goes on to PROVE. Per CONNECTION, exactly as `credentialAccepted`
-            // below is and for the same reason -- the responder is shared by every connection on
-            // this surface, so an id proved here must not admit anybody else (#1428).
+            // whatever it goes on to PROVE or present. Per CONNECTION, because the responder is
+            // shared by every connection on this surface, so an id proved here must not admit
+            // anybody else (#1428).
             //
-            // `proven` starts DISENGAGED, which is what *nothing was proved* means everywhere that
-            // reads it, and is only ever engaged by a `ProveNode` this loop verified (#178).
-            PeerIdentity identity { .host = peer, .proven = std::nullopt };
+            // `proven` and `authenticatedMachine` start DISENGAGED, which is what *nothing was
+            // established* means everywhere that reads them: `proven` is only ever engaged by a
+            // `ProveNode` this loop verified (#178), and `authenticatedMachine` only by an `AUTH`
+            // whose verdict was `Accepted`.
+            PeerIdentity identity {
+                .host = peer, .proven = std::nullopt, .authenticatedMachine = std::nullopt, .revokedMachine = std::nullopt
+            };
 
             // The handshake outstanding on this connection, or none. Opened by the surface's
             // prover on request and SPENT by the next proof whatever its outcome, which is why
@@ -2165,13 +2204,6 @@ namespace
             // internally, so a per-request reader would discard bytes already pulled
             // off the socket -- which is exactly the pipelined second frame.
             ByteReader reader { *socket, /*maxLineBytes*/ 1, cap };
-
-            // Per CONNECTION, exactly as the daemon keeps it: the responder is shared
-            // by every connection on this surface, so a credential accepted here must
-            // not bless anyone else. It starts false and is only ever set by an AUTH
-            // frame this loop verified -- never seeded from the policy, which would
-            // authenticate a connection on the strength of a check that never ran.
-            bool credentialAccepted = false;
 
             while (!state->shuttingDown.load(std::memory_order_acquire))
             {
@@ -2196,6 +2228,14 @@ namespace
                     break; // A foreign magic: no declared length, so nowhere to
                            // resynchronize to. Closing is the only thing left.
 
+                // An `AUTH` replaces what the connection established the moment its header is
+                // read, WHATEVER happens next: a header refusal below steps over it and never
+                // reaches `AnswerAuth`, and a machine left standing there would go on being served
+                // to a client that has just been told its `AUTH` was refused. `AnswerAuth` then
+                // assigns what a served one established.
+                if (decoded->opRaw == static_cast<std::uint8_t>(Wire::Op::Auth))
+                    identity.authenticatedMachine.reset();
+
                 // **Four header refusals, one question, one write.** The decision is
                 // `DecideHeaderRefusal`, which writes nothing -- that is what makes
                 // lifting it out of this loop legal (#675). What stays here is the byte
@@ -2209,7 +2249,13 @@ namespace
                 // closes it, i.e. never usefully. Writing first costs nothing and the
                 // resynchronization is just as good: a peer that sends what it declared
                 // is still stepped over exactly.
-                if (auto const refusal = DecideHeaderRefusal(state, identity, *decoded, cap, credentialAccepted);
+                if (auto const refusal = DecideHeaderRefusal(
+                        HeaderGate { .responder = state->responder,
+                                     .what = state->what,
+                                     .inFlightBytes = state->inFlightBytes.load(std::memory_order_acquire) },
+                        identity,
+                        *decoded,
+                        cap);
                     refusal.has_value())
                 {
                     if (!co_await WriteAll(EndpointWriter::Loop, socket.get(), refusal->reply))
@@ -2256,12 +2302,12 @@ namespace
                 //
                 // Lifted out of this loop rather than written inline: the loop sits at
                 // its cognitive-complexity ceiling, and an arm needing one payload and
-                // one flag is exactly the part that reads fine without the framing.
+                // one field is exactly the part that reads fine without the framing.
                 if (decoded->opRaw == static_cast<std::uint8_t>(Wire::Op::Auth))
                 {
                     if (!co_await WriteAll(EndpointWriter::Loop,
                                            socket.get(),
-                                           AnswerAuth(state->responder, *payload, decoded->opRaw, credentialAccepted)))
+                                           AnswerAuth(state->responder, *payload, decoded->opRaw, identity)))
                         break;
                     continue;
                 }
@@ -2463,6 +2509,14 @@ namespace
                 // whose peer did nothing wrong.
                 if (co_await SettleWatch(&state->io.Reactor(), watch) == AfterWatch::EndConnection)
                     break;
+
+                // Last, once the reply is written and the watch has settled -- so no read is parked
+                // when the linger reads -- for a verb answered once per connection.
+                if (reply.endsConnection)
+                {
+                    (void) co_await CloseLingering(socket.get(), nullptr, RefusalLinger(state->responder.MaxRequestBytes()));
+                    break;
+                }
             }
         }
         catch (...)
@@ -2488,6 +2542,9 @@ namespace
         // Deregistered before the socket is destroyed, or the sweeper would hold a
         // pointer into a freed object.
         state->Untrack(socket.get());
+        // Answered before the close, and sealed like every frame after a proof: the peer is told
+        // what an unsealed one would be -- the surface is busy -- by the surface that owns the verb.
+        co_await AnswerSealedOverBudget(state, socket.get(), sealing);
         NoteSealFault(*state, sealing, socket->peerAddress());
         socket->close();
         co_return;
@@ -2662,36 +2719,34 @@ core::async::Task<void> FrameServer::Run()
     state->io.NoteLoopStarted();
     SweepOverdue(state);
 
+    // Per loop: the backoff and the warning rate limit are this surface's, not the process's.
+    AcceptLoopReporter acceptErrors { state->what, state->what, state->logger, state->io.AcceptLoops() };
     while (!state->shuttingDown.load(std::memory_order_acquire))
     {
         auto accepted = co_await state->listener.accept();
         if (!accepted.has_value())
         {
-            // `Close()` resolves a parked accept with Cancelled, which is how this
-            // loop learns it is done -- there is no poll timeout any more, so a stop
-            // is observed at once rather than after a quarter second.
-            //
-            // **`WouldBlock` alone, and NOT `Net::IsDeadlineExpiry`, deliberately.**
-            // This listener arms no poll timeout, so `Timeout` cannot arrive here at
-            // all and the second operand would be dead. That is a REACHABILITY
-            // reason: it is a fact about this listener, so an edit that gives it a
-            // poll timeout must switch this to `core::net::isDeadlineExpiry` in the same change.
-            //
-            // Not a semantic one. `WouldBlock` at an accept whose listener DOES arm a
-            // timeout is exactly a deadline expiring -- that is what the admin surface
-            // and the Raft peer server call `core::net::isDeadlineExpiry` for -- so "on an accept
-            // WouldBlock is not an expiry" is false in general and must not be carried
-            // back to those callers, which would stop accepting entirely.
-            //
-            // Recorded HERE because the note used to live only beside the predicate,
-            // where three reviewers in a row did not find it and filed the narrow test
-            // as a defect (#824).
-            auto const code = accepted.error().code;
-            if (code == core::net::NetErrorCode::WouldBlock)
-                continue;
-            state->logger.Logf(LogLevel::Debug, "{}: accept loop ended ({})", state->what, accepted.error().toString());
-            break;
+            // **A failed accept is almost never a failed listener**, and this loop used to end on
+            // any code but `WouldBlock`, at `Debug`, with the listener left open: a client that
+            // reset its queued connection -- `WSAECONNRESET` from `AcceptEx`, a launcher killed
+            // mid-exchange or out of budget -- stopped the node's 0xFC surface for nine hours
+            // while the port still listened. `core::net::AcceptErrorPolicy` decides now, for every
+            // loop in the tree: `close()` resolving the parked accept with `Cancelled` is still how
+            // this loop learns it is done, a dead listener is closed and ends it, and nothing a
+            // peer does can.
+            auto const step = acceptErrors.OnError(
+                accepted.error(), state->io.Reactor().clock().now(), state->shuttingDown.load(std::memory_order_acquire));
+            if (step.next == AcceptLoopNext::EndAndClose)
+                state->listener.close();
+            if (step.next != AcceptLoopNext::AcceptAgain)
+                break;
+            // Bounded (`core::net::AcceptErrorPolicy::MaxBackoff`), which is also how late a stop
+            // posted while this waits is observed; the reactor's clock, so a test loop drives it.
+            if (step.delay > std::chrono::milliseconds {})
+                co_await state->io.Reactor().delay(step.delay);
+            continue;
         }
+        acceptErrors.OnAccepted(state->io.Reactor().clock().now());
 
         auto socket = *std::move(accepted);
 
@@ -2705,6 +2760,7 @@ core::async::Task<void> FrameServer::Run()
             ServeConnection(state, std::move(socket));
     }
 
+    acceptErrors.OnLoopEnded();
     state->loopsAlive.fetch_sub(1, std::memory_order_acq_rel);
     co_return;
 }
@@ -2802,6 +2858,11 @@ FrameEndpoint::~FrameEndpoint()
 std::size_t FrameEndpoint::InFlightBytes() const noexcept
 {
     return _server->InFlightBytes();
+}
+
+std::size_t FrameEndpoint::OpenConnections() const noexcept
+{
+    return _server->OpenConnections();
 }
 
 std::unique_ptr<FrameEndpoint> FrameEndpoint::StartWithListener(NodeIoLoop& io,

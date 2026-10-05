@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Cluster/RosterCertificate.hpp>
+#include <FastCache/Cluster/SplitEvidence.hpp>
+#include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetSample.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
+#include <FastCache/Distributed/UnservedToolchains.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -67,8 +72,8 @@ enum class SchedulerRole : std::uint8_t
 /// A private, in-process enum: no wire and no file carries it, so the explicit `= 0` is
 /// the only value spelled and the rest may be reordered freely.
 ///
-/// `Forgotten` is not a weaker `Outsider`: it says a host was a member and a POSITIVE act
-/// removed it (#1309). Every decision here tests for `Member`, so a third value fails
+/// `Forgotten` is not a weaker `Outsider`: it says a machine was admitted and a POSITIVE act
+/// removed it -- the cluster revoked its key (#178, #1555). Every decision here tests for `Member`, so a third value fails
 /// closed at all of them; what it buys is the DISTINCTION, which is what a per-surface
 /// counted refusal and an operator's remedy need. `PrecedenceOf` is why it survives being
 /// composed -- see `AnyOfMembership`.
@@ -78,7 +83,7 @@ enum class Membership : std::uint8_t
     Outsider = 0,
     /// An authenticated member of this cluster.
     Member,
-    /// A host a `--cluster-forget-client` removed. Refused, and counted apart from an
+    /// A machine whose key a `--cluster-forget` revoked. Refused, and counted apart from an
     /// ordinary outsider, because a decommissioned machine still dialling is an event.
     Forgotten,
     /// The count, for a table over this enum.
@@ -87,56 +92,108 @@ enum class Membership : std::uint8_t
 
 /// Which participant in the admission fold produced an answer.
 ///
-/// Admission is a fold over several routes and the question an operator asks after changing one
-/// of them is *which one decided* -- an operator who drops a host from `--fleet-member` and finds
-/// it still served needs to know the cluster admitted it (#1471).
-/// **There is no `None`.** An empty `MembershipParticipantSet` already says nobody decided, and
-/// an enumerator meaning *nothing* would be a contradiction the moment it can sit in a set beside
-/// a real route: a decision could then claim both that the cluster admitted a host and that no
-/// route did. One fact, one representation.
+/// Admission is a fold over several routes, and the question an operator asks after changing one
+/// of them is *which one decided* (#1471). **No route is an address**: a machine that is not this
+/// one is admitted by a key it proved or a ticket it presented, or by `--fleet-open`, never by
+/// where it dials from -- so the routes are this machine, the open policy, and the two kinds of
+/// key evidence, with the revocation that outranks them all.
 ///
-/// A private, in-process enum -- no wire and no file carries it -- so only the zero value is
-/// spelled and the rest may be reordered freely.
+/// **There is no `None`.** An empty `MembershipParticipantSet` already says nobody decided, and an
+/// enumerator meaning *nothing* would be a contradiction the moment it sat in a set beside a real
+/// route. The zero row is `Reserved` instead, which no decision can name (`Add` ignores it).
+///
+/// A private, in-process enum -- no wire and no file carries it; the wire mirror is
+/// `Distributed/MembershipWire.hpp` -- so only the zero value is spelled and the rest may be
+/// reordered freely.
 enum class MembershipParticipant : std::uint8_t
 {
-    /// `--fleet-member`'s host list: a client admitted locally, which never joins consensus.
-    FleetMemberList = 0,
-    /// The cluster's committed member set.
-    ClusterMembers,
-    /// A `--cluster-forget-client` tombstone. Outranks every admission route, so when this is
-    /// the answer it is always the one that decided.
-    ClientTombstone,
-    /// A policy that admits everybody (`OpenMembership`): one machine, or a fleet whose
-    /// reachability is its boundary.
+    /// RESERVED (was `FleetMemberList`). Never a live participant: `MembershipParticipantSet::Add`
+    /// ignores it, so no decision can name it, and `EnumTable`'s zero row stays a reserved row.
+    Reserved = 0,
+    /// The caller is on this machine (`LoopbackMembership`): a process here already has this
+    /// machine's CPU, and the `fastcache-cc` a developer runs against their own node is the reason
+    /// the node exists.
+    Loopback,
+    /// A policy that admits everybody (`OpenMembership`, `--fleet-open`): one machine, or a fleet
+    /// whose reachability is its boundary.
     OpenPolicy,
     /// A caller that PROVED, on this connection, an identity key the cluster holds live for the id
-    /// it claimed (#178, [#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
-    ///
-    /// Not a property of an ADDRESS: it is answered by `IMembershipOracle::ExplainKey` about the
-    /// identity ONE connection proved, and folded with the address routes per connection by
-    /// `ExplainConnection`, on this same `PrecedenceOf` -- so a client tombstone still outranks it
-    /// and a proof cannot resurrect a forgotten host.
+    /// it claimed (`ProveNode`, sealed; #178, [#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
+    /// The one route that satisfies `CompileCacheWire::IdentityRequirement::ProvenNodeOnly`.
     ProvenIdentity,
-    /// A caller that proved an identity key the cluster has REVOKED: the forgotten machine itself
-    /// (#178).
-    ///
-    /// `Forgotten`, so it outranks every admission route -- `--fleet-member` included, which is the
-    /// point: the host a removed machine dials from is exactly the one a node nobody reconfigured
-    /// still lists. Asked on every verb, so a key revoked while the connection is open refuses the
-    /// next one.
+    /// A caller whose AUTH presented a machine ticket this connection VERIFIED, signed by a key the
+    /// cluster holds live. Admits a CALLER -- a lease, a status, a cache request -- and never stands
+    /// in for a proof: a ticket does not satisfy `ProvenNodeOnly`.
+    MachineTicket,
+    /// Either kind of key evidence names a key the cluster has REVOKED: the forgotten machine itself
+    /// (#178). `Forgotten`, so it outranks every admission route, loopback and `--fleet-open`
+    /// included. Asked on every verb, so a key revoked while the connection is open refuses the next.
     KeyTombstone,
     /// The count, for a table over this enum.
     Last,
 };
 
+/// How a connection showed which key it speaks for: the two kinds of evidence `ExplainKey` is asked
+/// about, each naming its own admission route.
+///
+/// A private, in-process enum -- no wire and no file carries it -- so the values are free.
+enum class KeyEvidence : std::uint8_t
+{
+    SessionProof,  ///< A `ProveNode` handshake this connection verified.
+    MachineTicket, ///< An AUTH ticket this connection verified.
+    Last,          ///< The count, for a table over this enum.
+};
+
+/// Which kinds of key evidence named a REVOKED key: the half of a `Forgotten` answer that decides
+/// what the caller may be TOLD (`RevocationIsProven`).
+///
+/// **A ticket is not possession.** A proof is a signature over this handshake, so the machine at
+/// the other end holds the revoked key and is told what happened to it. A ticket is bytes, and
+/// anybody who captured one presents it as well as its machine does; told `revoked`, that holder
+/// learns the machine was forgotten -- a third party's roster fact, before admission. So the
+/// evidence travels with the verdict, set where the key was asked about, and a gate reads it
+/// rather than inferring it from which facts a connection happens not to carry.
+struct KeyEvidenceSet
+{
+    /// One bit per enumerator, indexed by its value.
+    std::uint8_t bits { 0 };
+
+    static_assert(static_cast<std::size_t>(KeyEvidence::Last) <= 8,
+                  "KeyEvidenceSet holds one bit per kind of key evidence in a std::uint8_t");
+
+    /// @param evidence A kind of key evidence.
+    /// @return This set, with @p evidence added.
+    constexpr KeyEvidenceSet& Add(KeyEvidence evidence) noexcept
+    {
+        bits |= static_cast<std::uint8_t>(1U << static_cast<unsigned>(evidence));
+        return *this;
+    }
+
+    /// @param other Evidence to include as well.
+    /// @return This set, unioned with @p other.
+    constexpr KeyEvidenceSet& Add(KeyEvidenceSet other) noexcept
+    {
+        bits |= other.bits;
+        return *this;
+    }
+
+    /// @param evidence A kind of key evidence.
+    /// @return Whether @p evidence is in this set.
+    [[nodiscard]] constexpr bool Has(KeyEvidence evidence) const noexcept
+    {
+        return (bits & static_cast<std::uint8_t>(1U << static_cast<unsigned>(evidence))) != 0;
+    }
+
+    [[nodiscard]] constexpr bool operator==(KeyEvidenceSet const&) const = default;
+};
+
 /// Which routes produced an answer: a set, never one winner.
 ///
 /// **A set because more than one route can be right at once, and reporting one of them is the
-/// defect this ticket is about.** Admission is a fold by `PrecedenceOf`, and two routes answering
-/// `Member` tie -- a host may sit in `--fleet-member` AND in the cluster's committed set. Keeping
-/// only the first is not a simplification, it is a wrong answer to the operator's actual question:
-/// told `FleetMemberList` decided, they remove the host from `--fleet-member` and find it still
-/// served by the cluster, which is the scenario #1471 opens with.
+/// defect #1471 is about.** Admission is a fold by `PrecedenceOf`, and two routes answering
+/// `Member` tie -- a connection may both prove a key and present a ticket, or be on this machine
+/// and under `--fleet-open`. Keeping only the first is a wrong answer to the operator's actual
+/// question: told one route decided, they change it and find the caller still served by the other.
 ///
 /// Empty means nobody decided -- the fold consulted no participant, or every one answered
 /// `Outsider`, which is a refusal by ABSENCE rather than by row. That is the same distinction this
@@ -152,10 +209,12 @@ struct MembershipParticipantSet
                   "ninth route needs a wider mask here, and the failure must be a BUILD error "
                   "rather than a silently dropped attribution");
 
-    /// @param participant The route to include.
+    /// @param participant The route to include. `Reserved` is ignored: no decision can name it.
     /// @return This set, with @p participant added.
     constexpr MembershipParticipantSet& Add(MembershipParticipant participant) noexcept
     {
+        if (participant == MembershipParticipant::Reserved)
+            return *this;
         bits |= static_cast<std::uint8_t>(1U << static_cast<unsigned>(participant));
         return *this;
     }
@@ -190,6 +249,78 @@ struct MembershipParticipantSet
     [[nodiscard]] constexpr bool operator==(MembershipParticipantSet const&) const = default;
 };
 
+/// What an admission route says about WHO the caller is, which an operator's control verbs are
+/// decided from: the `standing` column of `MembershipRoutes`.
+///
+/// **A private, in-process enum** -- no wire and no file carries it -- so only the zero value is
+/// spelled, and the zero value is the one that confers nothing.
+enum class CallerStanding : std::uint8_t
+{
+    /// The route admits a caller without saying who it is: `--fleet-open`, a tombstone, no route.
+    Anonymous = 0,
+    /// The route names a MACHINE the roster holds -- a proven key or a verified ticket -- and that
+    /// machine has an operator's standing only while its seat in the applied state is a voter's
+    /// (`MembershipDecision::votedBy`). A ticket proves a machine, never an operator.
+    MachineSeat,
+    /// The route is an operator's standing by itself: the caller is on the asked node's own machine.
+    Operator,
+};
+
+/// One row of `MembershipRoutes`.
+struct MembershipRouteTrait
+{
+    MembershipParticipant route; ///< The admission route.
+    CallerStanding standing;     ///< What it says about who the caller is (`CallerStanding`).
+};
+
+/// What each admission route says about WHO the caller it admits is: the column an operator's
+/// CONTROL verbs are decided from (`CompileCacheWire::IdentityRequirement::OperatorStanding`, and
+/// its prerequisite `IdentifiedCaller`).
+///
+/// **`OpenPolicy` never identifies.** `--fleet-open` admits everybody, so a caller it admits is
+/// anybody who can route to the port -- a caller the fleet may SERVE, never one that may decide
+/// who is in it: on an open node, an anonymous caller that could approve its own enrollment is the
+/// whole admission policy undone by one flag. `KeyTombstone` admits nobody, and `Reserved` is no
+/// route.
+///
+/// **A proven key and a verified ticket identify a MACHINE, and that is all they do.** Any process
+/// on a machine the fleet admitted can have its node mint a ticket, so a ticket that stood for an
+/// operator made every process on every laptop an operator of the whole fleet -- `fleet-open`, the
+/// shared cache, a forget, an auto-approve window. So each confers an operator's standing only
+/// while the machine it names holds a voter's seat. **Loopback is an operator** at the node being
+/// asked: a process on this machine already has it.
+///
+/// A COLUMN rather than a list at the gate, so a route added later answers this question by
+/// declaring its row -- `RowsInEnumeratorOrder` fails the build if it arrives without one.
+inline constexpr EnumTable<MembershipParticipant, MembershipRouteTrait> MembershipRoutes { {
+    { .route = MembershipParticipant::Reserved, .standing = CallerStanding::Anonymous },
+    { .route = MembershipParticipant::Loopback, .standing = CallerStanding::Operator },
+    { .route = MembershipParticipant::OpenPolicy, .standing = CallerStanding::Anonymous },
+    { .route = MembershipParticipant::ProvenIdentity, .standing = CallerStanding::MachineSeat },
+    { .route = MembershipParticipant::MachineTicket, .standing = CallerStanding::MachineSeat },
+    { .route = MembershipParticipant::KeyTombstone, .standing = CallerStanding::Anonymous },
+} };
+
+static_assert(RowsInEnumeratorOrder(MembershipRoutes, &MembershipRouteTrait::route),
+              "MembershipRoutes must hold one row per MembershipParticipant, in enumerator order");
+
+/// @param route An admission route.
+/// @return What it says about who the caller is (`MembershipRoutes`).
+[[nodiscard]] constexpr CallerStanding StandingOfRoute(MembershipParticipant route) noexcept
+{
+    return MembershipRoutes[static_cast<std::size_t>(route)].standing;
+}
+
+/// Whether any route in @p routes identifies the caller it admitted.
+/// @param routes The routes that admitted a caller.
+/// @return True when at least one of them is an identifying route (`MembershipRoutes`).
+[[nodiscard]] constexpr bool AnyRouteIdentifies(MembershipParticipantSet routes) noexcept
+{
+    return std::ranges::any_of(MembershipRoutes, [routes](MembershipRouteTrait const& row) {
+        return row.standing != CallerStanding::Anonymous && routes.Has(row.route);
+    });
+}
+
 /// One admission answer and every route that produced it.
 ///
 /// Returned by the seam's ONE virtual, so the figure a status verb reports and the verdict a
@@ -198,6 +329,13 @@ struct MembershipDecision
 {
     Membership verdict { Membership::Outsider }; ///< What the fold concluded.
     MembershipParticipantSet decidedBy {};       ///< Every route that concluded it.
+    KeyEvidenceSet revokedBy {};                 ///< For `Forgotten`: how the revoked key was shown.
+
+    /// For `Member`: the key evidence whose machine holds a VOTER's seat in the applied state --
+    /// what turns a `CallerStanding::MachineSeat` route into an operator's standing. Set by the key
+    /// roster in the same answer as the route it attributes, so a key and its seat are never read
+    /// from two different publishes.
+    KeyEvidenceSet votedBy {};
 
     [[nodiscard]] bool operator==(MembershipDecision const&) const = default;
 };
@@ -206,21 +344,25 @@ struct MembershipDecision
 ///
 /// **`Outsider` is never attributed.** It is `PrecedenceOf` 0 and loses to every other
 /// participant: an oracle answering it has no OPINION about the caller rather than an answer it
-/// produced. A forgotten-client list answers `Outsider` about loopback deliberately -- "the
-/// tombstone says nothing about this machine" -- and naming the author of a silence would report
-/// the tombstone as the reason a host was refused when the tombstone never mentioned it. That
-/// confident wrong signal is the thing #1471 exists to remove, so the rule is asked here and
-/// nowhere else.
+/// produced, and naming the author of a silence would report a route as the reason a host was
+/// refused when that route never mentioned it. That confident wrong signal is the thing #1471
+/// exists to remove, so the rule is asked here and nowhere else.
 ///
 /// A free function rather than a member, because the rule is a property of this VOCABULARY and is
-/// true of every `IMembershipOracle`: it began as a protected member of `HostSetMembership`, where
-/// five of the six implementations could not reach it and each would have restated it.
+/// true of every `IMembershipOracle`: it began as a protected member of one host-list oracle, where
+/// most of the implementations could not reach it and each would have restated it.
+///
+/// **And a participant that is `Reserved` has no opinion either.** `Add` cannot record it, so
+/// attributing a `Member` to it would ADMIT with an empty set -- the admission nobody claims,
+/// which is the same confident wrong signal from the other side. A mislabelled participant
+/// therefore fails CLOSED: it is silent, and silence admits nobody.
 /// @param verdict What the oracle answered.
 /// @param participant Which route it is, used only when the verdict is not `Outsider`.
-/// @return The verdict, attributed unless it is `Outsider`.
+/// @return The verdict, attributed unless it is `Outsider` or the participant is `Reserved`, in
+///         which case no opinion at all.
 [[nodiscard]] constexpr MembershipDecision DecidedBy(Membership verdict, MembershipParticipant participant) noexcept
 {
-    if (verdict == Membership::Outsider)
+    if (verdict == Membership::Outsider || participant == MembershipParticipant::Reserved)
         return {};
     return { .verdict = verdict, .decidedBy = MembershipParticipantSet {}.Add(participant) };
 }
@@ -228,11 +370,12 @@ struct MembershipDecision
 /// Which answer wins when several oracles disagree: **forgotten beats member beats
 /// outsider**.
 ///
-/// A forget has to outrank a listing, or the decommissioning case this exists for cannot
-/// work: a host named by `--fleet-member` on a node that has not been reconfigured is
-/// exactly the host an operator has just forgotten in the cluster. The composer folds on
-/// this rather than `any_of`, which flattened every non-`Member` answer to `Outsider` and
-/// destroyed the distinction with no diagnostic.
+/// A forget has to outrank every admission route, or the decommissioning case this exists for
+/// cannot work: `Forgotten` is produced only by `KeyTombstone` now -- a revoked key, whichever
+/// evidence named it -- and it beats this machine's own loopback and `--fleet-open`, so a
+/// forgotten machine is refused from every address. The composer folds on this rather than
+/// `any_of`, which flattened every non-`Member` answer to `Outsider` and destroyed the
+/// distinction with no diagnostic.
 ///
 /// @param membership An answer.
 /// @return Its rank, higher winning.
@@ -320,12 +463,136 @@ struct CallerContext
     /// the cluster's roster (#178).
     ///
     /// What the verbs a joining machine sends require (`CompileCacheWire::IdentityRequirement`):
-    /// an address admits a client, never a machine into the fleet. Disengaged for every connection
-    /// that proved nothing, and for one whose key is revoked -- which `membership` already refuses
-    /// as `Forgotten`. Filled by `Distributed::CallerContextOf`, the one place a connection becomes a
-    /// context, so the verb gate and the admission answer are read off one fold.
+    /// loopback, `--fleet-open` or a verified machine TICKET admit a caller, never a machine into
+    /// the fleet -- only a session proof does (`MembershipParticipant::ProvenIdentity`). Disengaged
+    /// for every connection that proved nothing, for one admitted by ticket alone, and for one whose
+    /// key is revoked -- which `membership` already refuses as `Forgotten`. Filled by
+    /// `Distributed::CallerContextOf`, the one place a connection becomes a context, so the verb
+    /// gate and the admission answer are read off one fold.
     std::optional<std::string> provenNodeId {};
+
+    /// The identity key that proof verified under, engaged exactly when `provenNodeId` is (W-4).
+    ///
+    /// What `Register` records for a worker, so a grant can name the key its reply must be signed
+    /// under. The connection's fact, never a claim in a frame: filled by `CallerContextOf` from the
+    /// same fold that engaged `provenNodeId`.
+    std::optional<Ed25519PublicKey> provenKey {};
+
+    /// Whether a route that IDENTIFIES the caller admitted it -- this machine, a live proven key or
+    /// a verified ticket (`MembershipRoutes`) -- rather than `--fleet-open` alone.
+    ///
+    /// What an operator's control verbs require (`CompileCacheWire::IdentityRequirement::
+    /// IdentifiedCaller`). False by default, the direction a context nobody filled must fail in:
+    /// `Distributed::CallerContextOf` fills it from the same fold that admitted the connection.
+    bool identified { false };
+
+    /// Whether the caller has an operator's STANDING: a route that is one by itself (this machine),
+    /// or an identifying route whose machine holds a voter's seat in the applied state
+    /// (`MembershipRoutes`' `standing` column, `MembershipDecision::votedBy`).
+    ///
+    /// What an operator's control verbs require (`CompileCacheWire::IdentityRequirement::
+    /// OperatorStanding`). A machine ticket proves a MACHINE, never an operator, so a learner's
+    /// ticket leaves this false. False by default, for `identified`'s reason.
+    bool operatorStanding { false };
 };
+
+/// One row of `IdentityRequirements`: what a verb's identity column asks of a caller, and what a
+/// caller that fails it is told.
+struct IdentityRequirementRow
+{
+    CompileCacheWire::IdentityRequirement requirement;  ///< The column value this row answers.
+    bool (*satisfiedBy)(CallerContext const&) noexcept; ///< Whether @p caller meets it.
+    CompileCacheWire::ErrorCode refusal;                ///< The code a caller that does not is refused.
+    std::string_view remedy;                            ///< What follows the verb's name in that refusal's message.
+
+    /// The requirement asked FIRST, whose refusal a caller failing both is given: what lets one
+    /// requirement build on another without a gate learning the order. Always an earlier
+    /// enumerator (`PrerequisitesPrecede`), so the chain ends.
+    std::optional<CompileCacheWire::IdentityRequirement> prerequisite {};
+};
+
+/// What each identity requirement asks of a caller: the ONE reading every gate that enforces the
+/// verb column shares -- the scheduler's `RefuseUnlessIdentified` and the enrollment surface alike --
+/// so the rule is a row and never a condition written at one handler.
+inline constexpr EnumTable<CompileCacheWire::IdentityRequirement, IdentityRequirementRow> IdentityRequirements { {
+    { .requirement = CompileCacheWire::IdentityRequirement::AddressAdmits,
+      .satisfiedBy = [](CallerContext const&) noexcept { return true; },
+      .refusal = CompileCacheWire::ErrorCode::NotAMember,
+      .remedy = "is refused nobody the surface admits" },
+    { .requirement = CompileCacheWire::IdentityRequirement::ProvenNodeOnly,
+      .satisfiedBy = [](CallerContext const& caller) noexcept { return caller.provenNodeId.has_value(); },
+      .refusal = CompileCacheWire::ErrorCode::NodeIdentityRequired,
+      .remedy = "is sent only by a machine that proved its identity on this connection; prove it first, and have it "
+                "admitted: it asks to enroll, and --enroll-approve admits it" },
+    { .requirement = CompileCacheWire::IdentityRequirement::IdentifiedCaller,
+      .satisfiedBy = [](CallerContext const& caller) noexcept { return caller.identified; },
+      .refusal = CompileCacheWire::ErrorCode::IdentifiedCallerRequired,
+      .remedy = "is an operator's control verb, and --fleet-open admits nobody to it: run it on this machine, or "
+                "on a voter of the cluster" },
+    { .requirement = CompileCacheWire::IdentityRequirement::OperatorStanding,
+      .satisfiedBy = [](CallerContext const& caller) noexcept { return caller.operatorStanding; },
+      .refusal = CompileCacheWire::ErrorCode::OperatorStandingRequired,
+      .remedy = "is an operator's control verb, and a machine ticket or key proves a machine, not an operator: run "
+                "it on a voter, or promote this machine",
+      .prerequisite = CompileCacheWire::IdentityRequirement::IdentifiedCaller },
+} };
+
+static_assert(RowsInEnumeratorOrder(IdentityRequirements, &IdentityRequirementRow::requirement),
+              "IdentityRequirements must hold one row per IdentityRequirement, in enumerator order");
+
+/// Whether every prerequisite is an EARLIER requirement, which is what ends `UnmetRequirement`'s walk.
+/// @return True when no row names itself or a later row as its prerequisite.
+[[nodiscard]] consteval bool PrerequisitesPrecede() noexcept
+{
+    return std::ranges::all_of(IdentityRequirements, [](IdentityRequirementRow const& row) {
+        return !row.prerequisite.has_value() || *row.prerequisite < row.requirement;
+    });
+}
+
+static_assert(PrerequisitesPrecede(), "an identity requirement's prerequisite must be an earlier requirement");
+
+/// @param requirement A verb's identity column.
+/// @return Its row.
+[[nodiscard]] constexpr IdentityRequirementRow const& RequirementRowOf(
+    CompileCacheWire::IdentityRequirement requirement) noexcept
+{
+    return IdentityRequirements[static_cast<std::size_t>(requirement)];
+}
+
+/// The row whose refusal @p caller is given for a verb requiring @p requirement: its prerequisites
+/// first, so a caller failing more than one is told the most basic thing it lacks.
+///
+/// The ONE reading both gates that enforce the verb column share -- the scheduler's
+/// `RefuseUnlessIdentified` and the enrollment surface's -- so the order is the table's.
+/// @param requirement A verb's identity column.
+/// @param caller Who is asking.
+/// @return The unmet row, or null when @p caller meets the requirement and every prerequisite.
+[[nodiscard]] constexpr IdentityRequirementRow const* UnmetRequirement(CompileCacheWire::IdentityRequirement requirement,
+                                                                       CallerContext const& caller) noexcept
+{
+    auto const& row = RequirementRowOf(requirement);
+    if (row.prerequisite.has_value())
+        if (auto const* const unmet = UnmetRequirement(*row.prerequisite, caller); unmet != nullptr)
+            return unmet;
+    return row.satisfiedBy(caller) ? nullptr : &row;
+}
+
+/// The leader acting on its own authority, for an admission an armed window made rather than a caller.
+///
+/// A member, from this machine, proving nothing: what the gate on the admission verbs requires of
+/// somebody the cluster trusts to decide who joins, which the leader itself is. The ONE place this
+/// shape is spelled for this purpose, so when `CallerContext` changes shape it changes here once.
+/// @return The context.
+[[nodiscard]] inline CallerContext SelfCaller()
+{
+    return CallerContext {
+        .membership = Membership::Member,
+        .peerId = "127.0.0.1",
+        .provenNodeId = std::nullopt,
+        .identified = true,
+        .operatorStanding = true,
+    };
+}
 
 /// What the scheduler decided, in the vocabulary of the wire but not yet on it.
 ///
@@ -402,7 +669,7 @@ struct SchedulerReply
 /// *operator* problems -- an empty fleet is a misconfiguration, a busy one is
 /// under-capacity, a non-member is a policy decision somebody made -- even though
 /// the client answers all of them identically.
-class SchedulerService
+class SchedulerService final: public Cluster::IAnnouncedJoinMemos
 {
   public:
     /// @param clock Time source for registry expiry and lease timeouts; must
@@ -420,8 +687,9 @@ class SchedulerService
     ///        to hand out. Must outlive the service.
     /// @param clusterId Which fleet this scheduler leads, copied. Goes inside every
     ///        grant's signature, so a worker refuses a grant from a fleet that is not its
-    ///        own (#322). **Empty is legal** and means a node with no `--cluster-id`: a
-    ///        verifier that names none expects none.
+    ///        own (#322). A node never passes an empty one: its formation record mints a
+    ///        cluster id at the first start. The comparison a verifier makes is
+    ///        equality, so an empty id would still only ever match an empty one.
     SchedulerService(core::platform::IClock& clock,
                      core::platform::WallClockRef wallClock,
                      IMetricsSink& metrics,
@@ -455,6 +723,16 @@ class SchedulerService
     ///        service could derive: only the consensus driver knows the term, and a
     ///        node without one still mints grants.
     void SetRole(SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch);
+
+    /// Be told every role `SetRole` publishes, after it is published.
+    ///
+    /// A WIRING door, set once before consensus drives this service: what else on the node must
+    /// follow leadership -- the enrollment list's auto-approve deadline ends at demotion -- is
+    /// told by the one call consensus already makes, rather than by a second path that could
+    /// miss a change. Called outside every lock this service holds.
+    /// @param observer What to call with each role; empty clears it. Must outlive this service's
+    ///        last `SetRole`.
+    void ObserveRole(std::function<void(SchedulerRole)> observer);
 
     /// Give this scheduler a cluster to administer.
     ///
@@ -493,10 +771,15 @@ class SchedulerService
     /// @param history Closed buckets this node is handing over, oldest first. Routed
     ///                 to the sink under the worker's ENDPOINT, and dropped when
     ///                 there is no sink.
+    /// @param interfaceAddresses What the worker says it answers on right now. Recorded
+    ///                 beside `caller.peerId` -- where the kernel saw this heartbeat arrive
+    ///                 from -- and both REPLACE the entry's, so a lease's dial hint follows
+    ///                 a VPN reconnect. Empty clears the entry's list and so withdraws the hint.
     [[nodiscard]] SchedulerReply Heartbeat(CallerContext const& caller,
                                            std::string_view workerId,
                                            NodeLoad const& load,
-                                           std::span<FleetBucket const> history = {});
+                                           std::span<FleetBucket const> history = {},
+                                           std::span<std::string const> interfaceAddresses = {});
 
     /// Record that a machine EXISTS, and take whatever history it is handing over.
     ///
@@ -519,48 +802,20 @@ class SchedulerService
     ///        endpoint a worker's batch would be -- history belongs to the MACHINE, never to a
     ///        worker id, and this is the verb that makes that true where there is no worker.
     ///
-    /// **And the roster travels on it (#178).** A voter's announcement carries its endorsement
-    /// of the roster it applied, taken here through `AcceptEndorsement`; the `Ok` carries the
-    /// roster a strict majority of the current voters endorse, unexpired -- or nothing until
-    /// they have, since a worker refuses anything less and a half-certified roster would only
-    /// be counted as refused.
-    /// @return `Ok` carrying the certified roster or nothing, or a refusal.
+    /// A certified roster used to ride on it (#178), and is gone from the grammar: every node
+    /// verifies grants against the state its own consensus applied.
+    /// @return `Ok` with an empty payload, or a refusal.
     [[nodiscard]] SchedulerReply AnnounceNode(CallerContext const& caller,
                                               NodePresence const& presence,
                                               std::span<FleetBucket const> history = {});
 
-    /// What taking one endorsement did.
+    /// Every join memo a recorded member announced, each under the id it PROVED.
     ///
-    /// **PRIVATE: persisted and transmitted nowhere.**
-    enum class EndorsementOutcome : std::uint8_t
-    {
-        Accepted, ///< A voter's endorsement of the current roster, kept.
-        Stale,    ///< Of a roster other than the one this state holds: ordinary during a change.
-        Refused,  ///< Not a voter's, or its signature does not verify; counted.
-        NoState,  ///< This node administers no cluster, so it certifies nothing.
-    };
-
-    /// Take one voter's endorsement of the roster.
-    ///
-    /// The door a node's OWN endorsement comes through as well as every one NODE-ANNOUNCE
-    /// carries -- a lone scheduler certifies its roster without dialling itself. The endorser
-    /// must be a voter in this node's applied state with a key, the signature must verify under
-    /// that key, and it must name this fleet and the roster this state holds.
-    /// @param endorsement The endorsement.
-    /// @return What it did.
-    EndorsementOutcome AcceptEndorsement(Cluster::RosterEndorsement const& endorsement);
-
-    /// The roster this node would hand a worker now.
-    /// @param now This machine's wall clock.
-    /// @return It, with every unexpired endorsement of it, or nothing until a strict majority
-    ///         of the current voters has endorsed it -- or when this node runs no cluster.
-    [[nodiscard]] std::optional<Cluster::CertifiedRoster> CertifiedRosterNow(
-        std::chrono::system_clock::time_point now) const;
-
-    /// `CertifiedRosterNow` at this node's own wall clock: what an approved enrollment hands a
-    /// worker as its trust root (#178), by the clock every endorsement here is judged at.
-    /// @return The certified roster, or nothing until a majority of the voters has endorsed it.
-    [[nodiscard]] std::optional<Cluster::CertifiedRoster> CurrentCertifiedRoster() const;
+    /// Filed by `AnnounceNode` and kept only for machines this node's applied state records, so a
+    /// member that leaves takes its memos with it; the leader's formation controller reads them
+    /// as the announced half of `Cluster::SplitEvidenceFor`.
+    /// @return The memos, one entry per (member, fleet asked).
+    [[nodiscard]] std::vector<Cluster::AskedJoinBy> AnnouncedJoinMemos() const override;
 
     /// Retire one registration at the worker's own request.
     ///
@@ -659,57 +914,37 @@ class SchedulerService
     /// @return `Ok` once the entry is appended, or a refusal.
     [[nodiscard]] SchedulerReply ClusterSet(CallerContext const& caller, std::string_view name, std::string_view value);
 
-    /// Forget a machine: remove the id wherever the cluster records it, as a member or as
-    /// an enrolled principal, and revoke the key it was admitted under (#1555).
+    /// Forget a machine: remove the id's member record and revoke the key it was admitted
+    /// under (#1555).
     ///
     /// The one membership change nothing automatic makes: discovery only ever
     /// adds, because a peer vanishes from a broadcast far more often than it
     /// leaves. Removing is an operator's decision and this is where they make it.
-    /// One verb for both lists and for the key, because they are one intention --
+    /// One verb for the record and for the key, because they are one intention --
     /// see `Cluster::CommandKind::Forget`.
     /// @param caller Who is asking.
-    /// @param memberId Who to forget: a member's id or a principal's.
+    /// @param memberId Who to forget: a member's id.
     /// @return `Ok` once the entry is appended, or a refusal.
     [[nodiscard]] SchedulerReply ClusterForget(CallerContext const& caller, std::string_view memberId);
-
-    /// An operator admits a CLIENT host: a machine that may ask this fleet for capacity and
-    /// never joins consensus.
-    ///
-    /// Gated exactly as `ClusterForget` is -- leadership, membership and the credential --
-    /// because what it changes is replicated state. It is a separate verb from
-    /// `ClusterAdmit` rather than a flag on it: a member is counted by the quorum and a
-    /// client never is, so one verb answering both would make the quorum's membership
-    /// depend on a field (#1309).
-    ///
-    /// @param caller Who asked, and what the transport already established about them.
-    /// @param host The client host, as a peer's source address spells it.
-    /// @return The reply to send.
-    [[nodiscard]] SchedulerReply ClusterAdmitClient(CallerContext const& caller, std::string_view host);
-
-    /// An operator forgets a client host.
-    ///
-    /// The positive act that `--fleet-member` removal is not: dropping a host from a list on
-    /// one node decommissions it nowhere else, which is the fail-OPEN direction #1309 exists
-    /// to close. The cluster records the forget, and every member refuses that host.
-    ///
-    /// @param caller Who asked, and what the transport already established about them.
-    /// @param host The client host to forget.
-    /// @return The reply to send.
-    [[nodiscard]] SchedulerReply ClusterForgetClient(CallerContext const& caller, std::string_view host);
 
     /// Add a member to the cluster, or record that one has moved.
     ///
     /// The counterpart `ClusterForget` had none of, and its absence was the reason
     /// a fleet without `--discovery` could shrink and never grow: nothing anywhere
-    /// could put a member into the replicated state, so `--raft-peer` stayed the
+    /// could put a member into the replicated state, so a typed peer list stayed the
     /// only answer and growing a cluster meant restarting every machine in it.
     ///
     /// One verb for adding and for moving, because they are one intention — a node
     /// that moved has the same identity and a new address, and making an operator
     /// remove it first would leave a window in which the cluster has agreed it does
-    /// not exist. The scheduler endpoint is not a parameter: a member announces its
-    /// own once elected, and a value typed here about somebody else would be a
-    /// guess that outranks what they say about themselves.
+    /// not exist.
+    ///
+    /// **The `0xFC` endpoint is the MEMBER's word, never an operator's.** An enrollment approval
+    /// passes the one the joiner stated in its `Enroll`; an operator's verb passes none, which keeps
+    /// whatever is recorded -- a promotion of a learner is the same machine at the same port, and
+    /// clearing its endpoint would hide it from every resolver until it next announced. A member
+    /// that MOVED says so itself: its next proven NODE-ANNOUNCE re-proposes its record
+    /// (`AnnounceNode`, `Cluster::AnnouncedEndpointDesires`).
     ///
     /// **The reply carries a `Wire::ClusterAdmitReceipt`: what was RECORDED, never
     /// what is in force.** `Offer` reports only that a command was appended, and that
@@ -739,6 +974,8 @@ class SchedulerService
     /// @param caller Who is asking.
     /// @param memberId The member's identity.
     /// @param raftEndpoint host:port its consensus port answers on.
+    /// @param schedulerEndpoint host:port its `0xFC` port answers on, as the member itself stated it;
+    ///        nullopt for a caller with no opinion, which keeps whatever is recorded.
     /// @param publicKey The member's identity key as its 43-character text, or nullopt for a
     ///        caller with no opinion, which keeps whatever key is recorded.
     /// @param seat Which set of the configuration to record it in; nullopt for a caller
@@ -747,40 +984,9 @@ class SchedulerService
     [[nodiscard]] SchedulerReply ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
                                               std::string_view raftEndpoint,
+                                              std::optional<std::string_view> schedulerEndpoint,
                                               std::optional<std::string_view> publicKey,
                                               std::optional<Cluster::MemberSeat> seat);
-
-    /// Admit a PRINCIPAL: a machine the cluster knows by its key and never counts (#178).
-    ///
-    /// The verb an approved `Worker` enrollment reaches, beside `ClusterAdmit` for a
-    /// `Member` one, and gated exactly as it is -- leadership, membership and the credential
-    /// -- because what it changes is replicated state. It takes the key as a KEY rather than
-    /// as text: its one caller read it off the wire as 32 bytes, and a round trip through a
-    /// spelling would be a second parser to be wrong in. A key the cluster has revoked, or
-    /// holds under another id, is `Cluster::ValidateAgainst`'s refusal, in `Offer`.
-    /// @param caller Who is asking.
-    /// @param principalId The principal's identity.
-    /// @param publicKey The key it proves that identity with.
-    /// @param role What it is admitted to do.
-    /// @return `Ok` once the entry is appended, or a refusal.
-    [[nodiscard]] SchedulerReply AdmitPrincipal(CallerContext const& caller,
-                                                std::string_view principalId,
-                                                Ed25519PublicKey const& publicKey,
-                                                Cluster::PrincipalRole role);
-
-    /// Admit a WORKER principal an operator names by id and key, with no enrollment window (#178).
-    ///
-    /// `AdmitPrincipal` behind the one parser for a key an operator typed: the text arrives as
-    /// `ClusterAdmit`'s does and is refused by `MalformedAdmissionKey`'s row when it is not a key.
-    /// Answered with `ClusterAdmitReceipt`, the endpoint field empty, spelling back the key the
-    /// command RECORDED.
-    /// @param caller Who is asking.
-    /// @param workerId The id the worker minted into its `--cluster-dir`.
-    /// @param publicKey Its key, as `--print-identity` printed it.
-    /// @return The receipt, or why it was refused.
-    [[nodiscard]] SchedulerReply ClusterAdmitWorker(CallerContext const& caller,
-                                                    std::string_view workerId,
-                                                    std::string_view publicKey);
 
     /// Refuse a verb only a machine that proved its identity may send, unless @p caller did (#178).
     ///
@@ -831,6 +1037,14 @@ class SchedulerService
         return _leases.LiveLeases(limit);
     }
 
+    /// The toolchains clients asked this scheduler for within `UnservedToolchains::Window` that no
+    /// live worker serves -- what the leader's `unserved-toolchain` condition names.
+    ///
+    /// Filtered against the registry at READ, so a worker that starts serving one clears it at
+    /// once, and one whose last worker expired comes back while clients still ask.
+    /// @return Sorted by label, then fingerprint.
+    [[nodiscard]] std::vector<UnservedToolchain> UnservedToolchainsNow() const;
+
     /// The registry, for the admin endpoint and for tests.
     [[nodiscard]] WorkerRegistry const& Workers() const noexcept
     {
@@ -844,16 +1058,16 @@ class SchedulerService
     }
 
   private:
-    /// Put a client verb to consensus: the two client verbs differ only by their command
-    /// kind, so the gate, the no-cluster refusal and the offer are written once.
-    ///
-    /// @param caller Who asked.
-    /// @param kind `AdmitClient` or `ForgetClient`.
-    /// @param host The client host the command records.
-    /// @return The reply to send.
-    [[nodiscard]] SchedulerReply OfferClientVerb(CallerContext const& caller,
-                                                 Cluster::CommandKind kind,
-                                                 std::string_view host);
+    /// Note where a PROVEN member says its `0xFC` port answers, when that differs from its record.
+    /// @param caller Who announced; only its PROVEN id is read.
+    /// @param endpoint Where it says its `0xFC` port answers.
+    void NoteAnnouncedEndpoint(CallerContext const& caller, std::string_view endpoint);
+
+    /// File @p memos under @p caller's proven id, replacing what it announced before, and drop
+    /// every machine's memos this node's state no longer records.
+    /// @param caller Who announced; nothing is filed for a caller that proved no id.
+    /// @param memos What it announced.
+    void RecordJoinMemos(CallerContext const& caller, std::span<CompileCacheWire::JoinMemoFields const> memos);
 
     /// Where handed-over history goes; null until the admin surface sets one.
     IFleetHistorySink* _history { nullptr };
@@ -980,10 +1194,12 @@ class SchedulerService
     /// @param lease The lease just acquired.
     /// @param endpoint The worker it was granted on.
     /// @param fingerprint The toolchain it was granted against.
+    /// @param workerKey The identity key that worker proved at registration, raw, or empty (W-4).
     /// @return What the client presents to that worker.
     [[nodiscard]] std::string MintGrantToken(Distributed::Lease const& lease,
                                              std::string_view endpoint,
-                                             std::string_view fingerprint);
+                                             std::string_view fingerprint,
+                                             std::string_view workerKey);
 
     core::platform::WallClockRef _wallClock;
     IMetricsSink& _metrics;
@@ -1051,6 +1267,8 @@ class SchedulerService
 
     WorkerRegistry _workers;
     LeaseTable _leases;
+    /// What `Lease` refused `no-worker`, by toolchain. See `UnservedToolchainsNow`.
+    UnservedToolchains _unserved;
 
     /// This node's standing, and where the leader is.
     ///
@@ -1078,17 +1296,18 @@ class SchedulerService
     mutable std::mutex _leaderMutex;
     std::string _leaderEndpoint {}; ///< Guarded by `_leaderMutex`.
 
+    /// Told every published role (`ObserveRole`). Guarded by `_leaderMutex`, called outside it.
+    std::function<void(SchedulerRole)> _roleObserver;
+
     /// The cluster, when this node runs one. Null is a legitimate state.
     IClusterAdmin* _admin { nullptr };
 
-    /// The latest endorsement each voter sent, by endorser (#178).
+    /// The join memos each recorded member last announced, by the id it proved.
     ///
-    /// Bounded by the voters: only a verified voter's endorsement is kept, one per voter. One of
-    /// an older roster is replaced as soon as that voter endorses the current one, and is never
-    /// served meanwhile: `CertifiedRosterNow` serves only endorsements of the roster this state
-    /// holds.
-    mutable std::mutex _endorsementsMutex;
-    std::map<std::string, Cluster::RosterEndorsement, std::less<>> _endorsements; ///< Guarded by `_endorsementsMutex`.
+    /// Bounded by the members: one entry per machine the state records, each at most
+    /// `CompileCacheWire::MaxAnnouncedJoinMemos`, replaced at its next announcement.
+    mutable std::mutex _joinMemosMutex;
+    std::map<std::string, std::vector<Cluster::AskedJoinBy>, std::less<>> _joinMemos; ///< Guarded by `_joinMemosMutex`.
 };
 
 } // namespace FastCache::Distributed

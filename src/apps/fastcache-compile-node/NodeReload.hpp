@@ -1,11 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeDefaults.hpp"
+#include "NodeFormation.hpp"
+#include "NodeIdentity.hpp"
 #include "NodeMembership.hpp"
 
+#include <FastCache/Cluster/FleetEndpoints.hpp>
+#include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Core/Logger.hpp>
+
+#include <expected>
+#include <functional>
+#include <optional>
+#include <span>
+#include <string>
 
 namespace FastCache::Node
 {
@@ -20,6 +32,45 @@ namespace FastCache::Node
 /// one translation unit no test can reach would force each of them to spell
 /// `ConfigReloaderOf<NodeConfig>` again, which is a second name for one concept.
 using NodeReloader = ConfigReloaderOf<NodeConfig>;
+
+/// Reads the formation the RUNNING body was adopted from: the record and the remembered endpoints,
+/// never minting (`RunningFormationOf` in production).
+///
+/// Asked at every reload rather than carried from the start, because a reform changes the record
+/// while the process runs: a candidate shaped by the record the START kept would put the node back,
+/// in its live configuration, into a mode it has left -- and the worker reads where it registers
+/// from there. And never the FILE, which a move saves before the body it ends has drained: a
+/// candidate shaped by that is a mode the node has not entered.
+using KeptFormationReader = std::function<std::expected<KeptFormation, std::string>()>;
+
+/// What the start resolved ONCE, which every reload candidate is shaped by again rather than
+/// resolving.
+///
+/// A reload must not mint, re-derive a directory or re-ask DNS, since any of those could land
+/// somewhere the running node is not. So the start's answers travel here -- all but the formation,
+/// which a reform changes and is read as the running body adopted it (`KeptFormationReader`).
+struct ReloadBasis
+{
+    std::optional<NodeStateDirectoryChoice> stateDirectory; ///< Where the start put this node's state.
+    NodeHostNames hostNames;                                ///< This machine's names, as the start asked them.
+    KeptFormationReader formation; ///< The formation the running body adopted; a reload never mints one.
+    NodeIdentity identity;         ///< The id and key the start resolved.
+};
+
+/// How the node's reloader reads its file: a FRESH configuration, the file applied through the
+/// appliers argv reaches, then the command line -- the startup order -- and then shaped by
+/// @p basis as the start shaped its own.
+///
+/// **A named function rather than a lambda in `main`, because each shaping step is load-bearing
+/// and none fails the build when dropped.** A candidate shaped by no formation record runs no
+/// consensus the running node does, so every scheduler's reload was declined, with a message
+/// about a flag nobody changed; a candidate without the identity holds an empty id, an
+/// unreloadable field that has CHANGED. `main.cpp` is in no test target, so this is where a test
+/// can see them.
+/// @param args The command line after the program name; must outlive the reader.
+/// @param basis What the start resolved.
+/// @return The reader to hand the reloader.
+[[nodiscard]] NodeReloader::Reparse ReloadCandidateReader(std::span<char const* const> args, ReloadBasis basis);
 
 /// Act on one SIGHUP, and say what happened either way.
 ///
@@ -39,6 +90,7 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
 ///
 /// @param reloader The pipeline, or null when this worker has no configuration file.
 /// @param membership Who this node admits, updated from the accepted snapshot.
+/// @param conditions Where `unqualified-host-name` is answered again, since `--advertise` reloads.
 /// @param logger Where the outcome is reported.
 ///
 /// Returns nothing: the heartbeat thread notices a reload by comparing snapshots, so
@@ -55,6 +107,6 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
 /// ([#868](https://github.com/LASTRADA-Software/fastcached/issues/868)). Read as "the
 /// worker cannot subscribe at all" the rule is one frame too wide, and it would leave
 /// the secret-file check startup-only on the binary that holds five such files.
-void ApplyReloadRequest(NodeReloader* reloader, NodeMembership& membership, ILogger& logger);
+void ApplyReloadRequest(NodeReloader* reloader, NodeMembership& membership, NodeConditions& conditions, ILogger& logger);
 
 } // namespace FastCache::Node

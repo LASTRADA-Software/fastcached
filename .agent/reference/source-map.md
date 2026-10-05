@@ -49,7 +49,12 @@ src/FastCache/
                 endpoints) -- the last four candidates for graduation into core-cpp. LingeringClose (how a
                 server closes after answering: half-close, listen until the
                 peer closes or a bound says stop, then close -- a bare close
-                over unread input is a reset that destroys the answer)
+                over unread input is a reset that destroys the answer).
+                AcceptLoopReporter: how every accept loop carries out core-cpp's
+                AcceptErrorPolicy verdicts -- one class rather than five copies, so
+                the node's 0xFC surface, the Raft peer server, the admin surface and
+                the daemon's binds log alike and share one AcceptLoopHealth entry
+                that /healthz and the node's conditions read
   Cli/          UsageDoc (usage text as data: sections of aligned rows and
                 prose, rendered with an ANSI palette) and Options (OptionSpec
                 row type, the matching rules, the one parse loop). Dependency-
@@ -115,13 +120,9 @@ src/FastCache/
                 peer port". `Apply` is total because it runs after commitment, when
                 refusing is no longer an option; `Validate` is where a change can be
                 refused, and it runs on the proposer.
-                Roster + RosterCertificate (#178): the roster a lease is checked
-                against -- voters, principals and revoked keys, projected from the
-                state at a version `Apply` derives -- and a voter's endorsement of
-                it, `[cluster, version, SHA-256(roster), notAfter]` signed with that
-                voter's identity key. `CertifyRoster` is the one majority rule: a
-                roster is adopted only if a strict majority of the voters the
-                ADOPTER already trusts endorse it, never of the voters it names.
+                Roster (#178): the roster a lease is checked against -- members
+                (voters and learners) and revoked keys, projected from the state at a version
+                `Apply` derives.
   Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
                 most-free-slots pick tie-broken by utilization, heartbeat
                 expiry over IClock) and
@@ -151,18 +152,23 @@ src/FastCache/
                 FleetChart derives every series from those buckets -- a rate is a
                 delta between adjacent buckets that can both ANSWER for it -- and
                 renders them as standalone SVG.
-                RosterTrust is what a worker that runs no consensus checks a lease
-                against (#178): the certified roster it holds, rooted in its
-                `--voter-key` anchors until the first adoption and in the roster
-                itself after, with RosterStore keeping it in `--cluster-dir` over
-                the durable-file seam the Raft store uses. A consensus member uses
-                StateLeaseRoster instead -- its applied state IS the roster.
+                StateLeaseRoster is what every worker checks a lease against (#178):
+                the state its own consensus applied IS the roster, so there is no
+                certificate, no endorsement and no lapse.
                 NodeProof is the handshake a machine joining the fleet proves its
                 identity key with on the 0xFC surface (#178): the server signs its
                 challenge first, the caller signs the whole transcript, and both
                 derive one session key per direction from an ephemeral X25519
                 exchange -- pure functions over the transcript, so every field a
                 signature covers is a unit test that changes it.
+                MachineTicket is what a machine presents per exchange instead of
+                a proof: a claim set signed by its own identity key for ONE
+                audience, header-only so the launcher mints nothing and reads
+                nothing it could not parse. TicketVerifier checks one against
+                the roster a node holds -- signature first, then the roster,
+                audience, expiry and a per-node spent set -- and names every
+                refusal by reason; MachineStanding says where a machine stands in
+                that roster, for `explain-admission <machine>`.
   Protocol/     IProtocolHandler, ProtocolAutodetect,
                 Framing/ByteReader (line and length-prefixed), MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
@@ -189,7 +195,8 @@ src/FastCache/
                 contributes rows to, so the fleet page can be served without
                 Server/ ever learning about Distributed/) and AdminCredential
                 (the Basic/Bearer scheme table, over ConstantTimeEquals)
-  Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
+  Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / ServiceHost over
+                IServiceControlManager, the SCM on Windows),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
                 CpuAffinity, HostMemory, HostInfo (what a machine IS: OS, version,
                 architecture, disk space -- the facts a scheduler weighs),
@@ -261,12 +268,17 @@ src/apps/
                             `Compile` on its own port. It may also BE the scheduler,
                             hold a cache tier for this machine's clients, and run
                             consensus — four surfaces, each off unless asked for
-                            except the cache, and all four admitting this machine and
-                            `--fleet-member` peers only. Carries its own daemon shell:
+                            except the cache, and all four admitting this machine,
+                            a proven key or a machine ticket its roster holds, and
+                            nobody else unless `--fleet-open`. Carries its own daemon shell:
                             `NodeConfig` and its option table live in their own
                             translation unit (main.cpp is in no test target) so
                             `MakeNodeServiceSpec` and the install-time
-                            `NodeServiceRejection` can be tested. It takes a *fingerprint* from a job
+                            `NodeServiceRejection` can be tested. SessionResponder owns
+                            the `Session` family on every node -- AUTH, which a
+                            verified ticket answers, and loopback-only MINT-TICKET --
+                            and NodeAudience says which endpoints a ticket may name
+                            to be presented here. It takes a *fingerprint* from a job
                             and never a program: the compiler comes from this
                             node's own `--toolchain` table, which is what keeps a
                             build accelerator from being a remote shell. Links

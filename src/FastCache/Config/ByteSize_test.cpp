@@ -10,52 +10,53 @@
 
 TEST_CASE("ParseByteSize: plain integers parse as bytes", "[config][bytesize]")
 {
-    REQUIRE(FastCache::ParseByteSize("0", "x").value() == 0U);
-    REQUIRE(FastCache::ParseByteSize("1", "x").value() == 1U);
-    REQUIRE(FastCache::ParseByteSize("1024", "x").value() == 1024U);
-    REQUIRE(FastCache::ParseByteSize("67108864", "x").value() == 67108864U);
+    REQUIRE(FastCache::ParseByteSize("0").value() == 0U);
+    REQUIRE(FastCache::ParseByteSize("1").value() == 1U);
+    REQUIRE(FastCache::ParseByteSize("1024").value() == 1024U);
+    REQUIRE(FastCache::ParseByteSize("67108864").value() == 67108864U);
 }
 
 TEST_CASE("ParseByteSize: lowercase k/m/g multipliers", "[config][bytesize]")
 {
-    REQUIRE(FastCache::ParseByteSize("4k", "x").value() == 4U * 1024U);
-    REQUIRE(FastCache::ParseByteSize("256m", "x").value() == 256U * 1024U * 1024U);
-    REQUIRE(FastCache::ParseByteSize("2g", "x").value() == 2ULL * 1024U * 1024U * 1024U);
+    REQUIRE(FastCache::ParseByteSize("4k").value() == 4U * 1024U);
+    REQUIRE(FastCache::ParseByteSize("256m").value() == 256U * 1024U * 1024U);
+    REQUIRE(FastCache::ParseByteSize("2g").value() == 2ULL * 1024U * 1024U * 1024U);
 }
 
 TEST_CASE("ParseByteSize: uppercase K/M/G multipliers", "[config][bytesize]")
 {
-    REQUIRE(FastCache::ParseByteSize("4K", "x").value() == 4U * 1024U);
-    REQUIRE(FastCache::ParseByteSize("256M", "x").value() == 256U * 1024U * 1024U);
-    REQUIRE(FastCache::ParseByteSize("2G", "x").value() == 2ULL * 1024U * 1024U * 1024U);
+    REQUIRE(FastCache::ParseByteSize("4K").value() == 4U * 1024U);
+    REQUIRE(FastCache::ParseByteSize("256M").value() == 256U * 1024U * 1024U);
+    REQUIRE(FastCache::ParseByteSize("2G").value() == 2ULL * 1024U * 1024U * 1024U);
 }
 
 TEST_CASE("ParseByteSize: empty input is TypeMismatch", "[config][bytesize]")
 {
-    auto const result = FastCache::ParseByteSize("", "max-memory");
+    auto const result = FastCache::ParseByteSize("");
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-    REQUIRE(result.error().field == "max-memory");
+    // No field: whoever reached the parser -- a row, a file key -- stamps its own.
+    REQUIRE(result.error().field.empty());
 }
 
 TEST_CASE("ParseByteSize: non-numeric input is TypeMismatch", "[config][bytesize]")
 {
-    auto const result = FastCache::ParseByteSize("abc", "x");
+    auto const result = FastCache::ParseByteSize("abc");
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
 }
 
 TEST_CASE("ParseByteSize: unknown suffix is TypeMismatch", "[config][bytesize]")
 {
-    auto const result = FastCache::ParseByteSize("5x", "max-memory");
+    auto const result = FastCache::ParseByteSize("5x");
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-    REQUIRE(result.error().field == "max-memory");
+    REQUIRE(result.error().field.empty());
 }
 
 TEST_CASE("ParseByteSize: suffix without digits is TypeMismatch", "[config][bytesize]")
 {
-    auto const result = FastCache::ParseByteSize("m", "x");
+    auto const result = FastCache::ParseByteSize("m");
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
 }
@@ -65,14 +66,14 @@ TEST_CASE("ParseByteSize: digits-followed-by-trailing-junk is TypeMismatch", "[c
     // After stripping a numeric tail check, "12ab" has trailing 'b' as a suffix
     // candidate (unknown -> TypeMismatch). "12kx" keeps 'x' as final and is
     // unknown-suffix too. Both must fail.
-    REQUIRE_FALSE(FastCache::ParseByteSize("12ab", "x").has_value());
-    REQUIRE_FALSE(FastCache::ParseByteSize("12kx", "x").has_value());
+    REQUIRE_FALSE(FastCache::ParseByteSize("12ab").has_value());
+    REQUIRE_FALSE(FastCache::ParseByteSize("12kx").has_value());
 }
 
 TEST_CASE("ParseByteSize: overflow on multiply yields OutOfRange", "[config][bytesize]")
 {
     // size_t::max / 2^30 ≈ 1.7e10, so 10^11 * G overflows a 64-bit size_t.
-    auto const result = FastCache::ParseByteSize("99999999999G", "x");
+    auto const result = FastCache::ParseByteSize("99999999999G");
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
 }
@@ -80,7 +81,7 @@ TEST_CASE("ParseByteSize: overflow on multiply yields OutOfRange", "[config][byt
 TEST_CASE("ParseByteSize: size_t::max as plain bytes still parses", "[config][bytesize]")
 {
     auto const maxStr = std::to_string(std::numeric_limits<std::size_t>::max());
-    auto const result = FastCache::ParseByteSize(maxStr, "x");
+    auto const result = FastCache::ParseByteSize(maxStr);
     REQUIRE(result.has_value());
     REQUIRE(result.value() == std::numeric_limits<std::size_t>::max());
 }
@@ -88,30 +89,30 @@ TEST_CASE("ParseByteSize: size_t::max as plain bytes still parses", "[config][by
 TEST_CASE("ParseByteSize: percent resolves against host total", "[config][bytesize]")
 {
     constexpr auto HostTotal = std::size_t { 16ULL * 1024U * 1024U * 1024U }; // 16 GiB
-    REQUIRE(FastCache::ParseByteSize("50%", "x", HostTotal).value() == HostTotal / 2U);
-    REQUIRE(FastCache::ParseByteSize("100%", "x", HostTotal).value() == HostTotal);
-    REQUIRE(FastCache::ParseByteSize("0%", "x", HostTotal).value() == 0U);
-    REQUIRE(FastCache::ParseByteSize("25%", "x", HostTotal).value() == HostTotal / 4U);
+    REQUIRE(FastCache::ParseByteSize("50%", HostTotal).value() == HostTotal / 2U);
+    REQUIRE(FastCache::ParseByteSize("100%", HostTotal).value() == HostTotal);
+    REQUIRE(FastCache::ParseByteSize("0%", HostTotal).value() == 0U);
+    REQUIRE(FastCache::ParseByteSize("25%", HostTotal).value() == HostTotal / 4U);
 }
 
 TEST_CASE("ParseByteSize: percent > 100 yields OutOfRange", "[config][bytesize]")
 {
     constexpr auto HostTotal = std::size_t { 4ULL * 1024U * 1024U * 1024U };
-    auto const result = FastCache::ParseByteSize("150%", "max_memory", HostTotal);
+    auto const result = FastCache::ParseByteSize("150%", HostTotal);
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::OutOfRange);
 }
 
 TEST_CASE("ParseByteSize: percent without host total is TypeMismatch", "[config][bytesize]")
 {
-    auto const result = FastCache::ParseByteSize("50%", "max_memory"); // hostTotalBytes defaults to 0
+    auto const result = FastCache::ParseByteSize("50%"); // hostTotalBytes defaults to 0
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
 }
 
 TEST_CASE("ParseByteSize: bare '%' is TypeMismatch", "[config][bytesize]")
 {
-    auto const result = FastCache::ParseByteSize("%", "x", 4096);
+    auto const result = FastCache::ParseByteSize("%", 4096);
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
 }
@@ -152,7 +153,7 @@ TEST_CASE("Everything FormatByteSize prints, ParseByteSize accepts", "[config][b
     {
         auto const text = FastCache::FormatByteSize(value);
         INFO(value << " formats as " << text);
-        auto const back = FastCache::ParseByteSize(text, "x");
+        auto const back = FastCache::ParseByteSize(text);
         REQUIRE(back.has_value());
         CHECK(*back == value);
     }
@@ -160,9 +161,9 @@ TEST_CASE("Everything FormatByteSize prints, ParseByteSize accepts", "[config][b
 
 TEST_CASE("ParseByteSize: a B suffix is plain bytes", "[config][bytesize]")
 {
-    CHECK(FastCache::ParseByteSize("4096B", "x").value() == 4096U);
-    CHECK(FastCache::ParseByteSize("4096b", "x").value() == 4096U);
+    CHECK(FastCache::ParseByteSize("4096B").value() == 4096U);
+    CHECK(FastCache::ParseByteSize("4096b").value() == 4096U);
     // And it is not a multiplier anybody can confuse with the others.
-    CHECK(FastCache::ParseByteSize("1B", "x").value() == 1U);
-    CHECK(FastCache::ParseByteSize("1K", "x").value() == 1024U);
+    CHECK(FastCache::ParseByteSize("1B").value() == 1U);
+    CHECK(FastCache::ParseByteSize("1K").value() == 1024U);
 }

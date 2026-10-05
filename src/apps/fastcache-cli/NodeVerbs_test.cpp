@@ -6,6 +6,7 @@
 #include "StatsGatherer.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/MembershipWire.hpp>
@@ -30,11 +31,16 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include <core/Ranges.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
 #include <core/net/BlockingSocket.hpp>
+#include <core/net/TcpClient.hpp>
 #include <tests/HexBytes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -43,9 +49,10 @@ using namespace FastCache::Cli;
 using FastCache::Testing::Unwrap;
 using namespace FastCache::Cli::Testing;
 
-// `Cc` and not `Wire`: `Cli::Wire` is this tool's own enum of the three transports,
-// and a `namespace Wire` alias beside it is ambiguous at every use.
-namespace Cc = FastCache::CompileCacheWire;
+// `CacheWire` and not `Wire`: `Cli::Wire` is this tool's own enum of the three transports, and a
+// `namespace Wire` alias beside it is ambiguous at every use. Nor `Cc`, which `using namespace
+// FastCache` already brings in as the launcher's namespace (`Protocol/TicketChoice.hpp`).
+namespace CacheWire = FastCache::CompileCacheWire;
 
 namespace
 {
@@ -65,18 +72,18 @@ namespace
 /// A framed `NodeStatus` reply carrying @p fields.
 /// @param fields What the node is.
 /// @return The reply frame.
-[[nodiscard]] std::vector<std::byte> StatusReply(Cc::NodeStatusFields const& fields)
+[[nodiscard]] std::vector<std::byte> StatusReply(CacheWire::NodeStatusFields const& fields)
 {
-    return Cc::EncodeReply(Cc::Status::Ok, Cc::EncodeNodeStatus(fields));
+    return CacheWire::EncodeReply(CacheWire::Status::Ok, CacheWire::EncodeNodeStatus(fields));
 }
 
 /// A framed refusal.
 /// @param code Which refusal.
 /// @param detail Words for a person.
 /// @return The reply frame.
-[[nodiscard]] std::vector<std::byte> RefusalReply(Cc::ErrorCode code, std::string_view detail = {})
+[[nodiscard]] std::vector<std::byte> RefusalReply(CacheWire::ErrorCode code, std::string_view detail = {})
 {
-    return Cc::EncodeErrorReply(code, detail);
+    return CacheWire::EncodeErrorReply(code, detail);
 }
 
 /// The value of a record field, or nullptr.
@@ -120,7 +127,7 @@ namespace
 /// @return The opcode.
 [[nodiscard]] std::uint8_t OpOf(std::span<std::byte const> request)
 {
-    auto const header = Cc::DecodeRequestHeader(request);
+    auto const header = CacheWire::DecodeRequestHeader(request);
     REQUIRE(header.has_value());
     return Unwrap(header).opRaw;
 }
@@ -135,7 +142,8 @@ namespace
     sink.Increment(IMetricsSink::Counter::WorkerJobsCompleted, jobsCompleted);
     auto snapshot = MetricsSnapshot {};
     snapshot.storage = storage;
-    return Cc::EncodeReply(Cc::Status::Ok, EncodeStatsReading(CaptureStatsReading(sink, snapshot, EverySurface)));
+    return CacheWire::EncodeReply(CacheWire::Status::Ok,
+                                  EncodeStatsReading(CaptureStatsReading(sink, snapshot, EverySurface)));
 }
 
 } // namespace
@@ -146,9 +154,9 @@ TEST_CASE("`node` reports what the endpoint is", "[cli][node][verbs]")
         { .version = "0.2.0-124-gd911b33e",
           .nodeId = "node-a",
           .uptimeSeconds = 3600,
-          .surfaces = { { .surface = Cc::WireSurface::Admin, .port = 9101, .tls = false },
-                        { .surface = Cc::WireSurface::Raft, .port = 9102, .tls = false } },
-          .components = Cc::NodeComponentBit::CacheTier | Cc::NodeComponentBit::Worker }) } };
+          .surfaces = { { .surface = CacheWire::WireSurface::Admin, .port = 9101, .tls = false },
+                        { .surface = CacheWire::WireSurface::Raft, .port = 9102, .tls = false } },
+          .components = CacheWire::NodeComponentBit::CacheTier | CacheWire::NodeComponentBit::Worker }) } };
 
     auto const answer = RunNodeVerb("node", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -158,7 +166,7 @@ TEST_CASE("`node` reports what the endpoint is", "[cli][node][verbs]")
     // taken on the handler's word -- a handler sending the wrong opcode would otherwise
     // pass every case, the fake answering from a script regardless of what it was asked.
     REQUIRE(node.Sent().size() == 1);
-    CHECK(OpOf(SentFrame(node)) == static_cast<std::uint8_t>(Cc::Op::NodeStatus));
+    CHECK(OpOf(SentFrame(node)) == static_cast<std::uint8_t>(CacheWire::Op::NodeStatus));
     CHECK(node.Unused() == 0);
 
     CHECK(RequiredCell(answer, "version").lexical == "0.2.0-124-gd911b33e");
@@ -191,7 +199,7 @@ TEST_CASE("`node` renders an absent surface as an absent FIELD, never a zero por
 
     SECTION("a node with no minted identity reports node-id ABSENT, not empty")
     {
-        // An empty string renders as a value somebody could paste into `--raft-peer`.
+        // An empty string renders as a value somebody could paste into `--cluster-admit`.
         CHECK(RequiredCell(answer, "node-id").kind == CellKind::Absent);
     }
 
@@ -214,14 +222,14 @@ TEST_CASE("`node` says what the worker is DOING, which the component bits cannot
     // hard-codes one agrees with whichever arm happens to name it.
     struct Row
     {
-        Cc::ToolchainState state;
+        CacheWire::ToolchainState state;
         std::string_view rendered;
         std::uint32_t served;
     };
     auto const rows = std::array {
-        Row { .state = Cc::ToolchainState::Surveying, .rendered = "surveying", .served = 0 },
-        Row { .state = Cc::ToolchainState::Serving, .rendered = "serving", .served = 4 },
-        Row { .state = Cc::ToolchainState::NothingToServe, .rendered = "nothing-to-serve", .served = 0 },
+        Row { .state = CacheWire::ToolchainState::Surveying, .rendered = "surveying", .served = 0 },
+        Row { .state = CacheWire::ToolchainState::Serving, .rendered = "serving", .served = 4 },
+        Row { .state = CacheWire::ToolchainState::NothingToServe, .rendered = "nothing-to-serve", .served = 0 },
     };
 
     for (auto const& row: rows)
@@ -232,7 +240,7 @@ TEST_CASE("`node` says what the worker is DOING, which the component bits cannot
               .nodeId = {},
               .uptimeSeconds = 5,
               .surfaces = {},
-              .components = Cc::NodeComponentBit::Worker,
+              .components = CacheWire::NodeComponentBit::Worker,
               .runtime = { .toolchains = row.state, .toolchainsServed = row.served, .toolchainsDiscovered = 4 } }) } };
 
         auto const answer = RunNodeVerb("node", node);
@@ -264,7 +272,7 @@ TEST_CASE("`node` renders a node that published no runtime facts as ABSENT field
                                                 .nodeId = {},
                                                 .uptimeSeconds = 5,
                                                 .surfaces = {},
-                                                .components = Cc::NodeComponentBit::Worker }) } };
+                                                .components = CacheWire::NodeComponentBit::Worker }) } };
 
     auto const answer = RunNodeVerb("node", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -283,21 +291,22 @@ TEST_CASE("`node` reports capacity, registration and consensus role", "[cli][nod
     // The three facts #1294 is for, rendered together because that is how an operator
     // reads them: a follower with full slots and no registrations is a different fault
     // from a leader with none free.
-    ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
-                                                .nodeId = "node-a",
-                                                .uptimeSeconds = 60,
-                                                .surfaces = {},
-                                                .components = Cc::NodeComponentBit::Worker | Cc::NodeComponentBit::Scheduler,
-                                                .runtime = { .toolchains = Cc::ToolchainState::Serving,
-                                                             .toolchainsServed = 2,
-                                                             .toolchainsDiscovered = 2,
-                                                             .compileSlots = 8,
-                                                             .compilesInFlight = 3,
-                                                             .schedulerRole = Cc::WireSchedulerRole::Follower,
-                                                             .leaderEndpoint = "10.0.0.9:6676",
-                                                             .registrarsRegistered = 2,
-                                                             .registrarsTotal = 3,
-                                                             .lastRegistrationSecondsAgo = 41 } }) } };
+    ScriptedNodeExchange node { { StatusReply(
+        { .version = "1.2.3",
+          .nodeId = "node-a",
+          .uptimeSeconds = 60,
+          .surfaces = {},
+          .components = CacheWire::NodeComponentBit::Worker | CacheWire::NodeComponentBit::Scheduler,
+          .runtime = { .toolchains = CacheWire::ToolchainState::Serving,
+                       .toolchainsServed = 2,
+                       .toolchainsDiscovered = 2,
+                       .compileSlots = 8,
+                       .compilesInFlight = 3,
+                       .schedulerRole = CacheWire::WireSchedulerRole::Follower,
+                       .leaderEndpoint = "10.0.0.9:6676",
+                       .registrarsRegistered = 2,
+                       .registrarsTotal = 3,
+                       .lastRegistrationSecondsAgo = 41 } }) } };
 
     auto const answer = RunNodeVerb("node", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -321,8 +330,8 @@ TEST_CASE("`node` renders a never-registered node and an election as ABSENT, not
                                                 .nodeId = {},
                                                 .uptimeSeconds = 5,
                                                 .surfaces = {},
-                                                .components = Cc::NodeComponentBit::Scheduler,
-                                                .runtime = { .schedulerRole = Cc::WireSchedulerRole::Undecided,
+                                                .components = CacheWire::NodeComponentBit::Scheduler,
+                                                .runtime = { .schedulerRole = CacheWire::WireSchedulerRole::Undecided,
                                                              .registrarsRegistered = 0,
                                                              .registrarsTotal = 3 } }) } };
 
@@ -350,13 +359,14 @@ TEST_CASE("`node` omits the scheduler fields entirely on a node that runs none",
     // The distinction the case above cannot make on its own: `undecided` with an absent
     // leader is a node IN an election, and a plain worker is not in one. If the role
     // field appeared here at all, those two would render alike.
-    ScriptedNodeExchange node { { StatusReply(
-        { .version = "1.2.3",
-          .nodeId = {},
-          .uptimeSeconds = 5,
-          .surfaces = {},
-          .components = Cc::NodeComponentBit::Worker,
-          .runtime = { .toolchains = Cc::ToolchainState::Serving, .toolchainsServed = 1, .toolchainsDiscovered = 1 } }) } };
+    ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                .nodeId = {},
+                                                .uptimeSeconds = 5,
+                                                .surfaces = {},
+                                                .components = CacheWire::NodeComponentBit::Worker,
+                                                .runtime = { .toolchains = CacheWire::ToolchainState::Serving,
+                                                             .toolchainsServed = 1,
+                                                             .toolchainsDiscovered = 1 } }) } };
 
     auto const answer = RunNodeVerb("node", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -375,55 +385,74 @@ TEST_CASE("`node` renders the enrollment window, and says nothing where there is
     // carry a distinction the counters cannot. Both enrollment series are rendered by
     // every node and read zero on a machine that has no window at all, so *no window
     // here* and *a window nothing has come through* are the same number. ABSENT
-    // against `closed` is where those part company, which is why a case asserting only
+    // against `manual` is where those part company, which is why a case asserting only
     // the open reading would leave the field's whole purpose untested.
-    SECTION("an open window names itself and says how many are waiting")
+    SECTION("an armed auto-approve window names itself and says how many are waiting")
     {
         ScriptedNodeExchange node { { StatusReply(
             { .version = "1.2.3",
               .nodeId = "node-a",
               .uptimeSeconds = 90,
               .surfaces = {},
-              .components = Cc::NodeComponentBit::Scheduler | Cc::NodeComponentBit::Consensus,
-              .runtime = { .schedulerRole = Cc::WireSchedulerRole::Leader,
-                           .enrollment = Cc::WireEnrollmentState::Open,
+              .components = CacheWire::NodeComponentBit::Scheduler | CacheWire::NodeComponentBit::Consensus,
+              .runtime = { .schedulerRole = CacheWire::WireSchedulerRole::Leader,
+                           .enrollment = CacheWire::WireEnrollmentState::AutoApprove,
                            .enrollmentPending = 3 } }) } };
 
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Affirmative);
-        CHECK(RequiredCell(answer, "enrollment").lexical == "open");
+        CHECK(RequiredCell(answer, "enrollment").lexical == "auto-approve");
         CHECK(RequiredCell(answer, "enrollment-pending").lexical == "3");
         CHECK(RequiredCell(answer, "enrollment-pending").kind == CellKind::Number);
     }
 
-    SECTION("a shut window on a node that HAS one is reported shut, not omitted")
+    SECTION("an armed window that says how long it has says so beside its name")
     {
         ScriptedNodeExchange node { { StatusReply(
             { .version = "1.2.3",
               .nodeId = "node-a",
               .uptimeSeconds = 90,
               .surfaces = {},
-              .components = Cc::NodeComponentBit::Scheduler | Cc::NodeComponentBit::Consensus,
-              .runtime = { .schedulerRole = Cc::WireSchedulerRole::Leader,
-                           .enrollment = Cc::WireEnrollmentState::Closed,
+              .components = CacheWire::NodeComponentBit::Scheduler | CacheWire::NodeComponentBit::Consensus,
+              .runtime = { .schedulerRole = CacheWire::WireSchedulerRole::Leader,
+                           .enrollment = CacheWire::WireEnrollmentState::AutoApprove,
+                           .enrollmentPending = 0,
+                           .enrollmentAutoApproveSecondsLeft = 900 } }) } };
+
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(RequiredCell(answer, "enrollment").lexical == "auto-approve (15 min left)");
+        CHECK(RequiredCell(answer, "enrollment-auto-approve-seconds-left").lexical == "900");
+        CHECK(RequiredCell(answer, "enrollment-auto-approve-seconds-left").kind == CellKind::Number);
+    }
+
+    SECTION("a manual window on a node that HAS one is reported manual and not omitted")
+    {
+        ScriptedNodeExchange node { { StatusReply(
+            { .version = "1.2.3",
+              .nodeId = "node-a",
+              .uptimeSeconds = 90,
+              .surfaces = {},
+              .components = CacheWire::NodeComponentBit::Scheduler | CacheWire::NodeComponentBit::Consensus,
+              .runtime = { .schedulerRole = CacheWire::WireSchedulerRole::Leader,
+                           .enrollment = CacheWire::WireEnrollmentState::Manual,
                            .enrollmentPending = 0 } }) } };
 
         auto const answer = RunNodeVerb("node", node);
-        CHECK(RequiredCell(answer, "enrollment").lexical == "closed");
+        CHECK(RequiredCell(answer, "enrollment").lexical == "manual");
 
         // Zero pending is a READING on a node that has a window, so it is a number
         // rather than a missing field -- the counters' zero is what cannot say this.
         CHECK(RequiredCell(answer, "enrollment-pending").lexical == "0");
     }
 
-    SECTION("a node that runs no consensus says NOTHING rather than a reassuring closed")
+    SECTION("a node that runs no consensus says NOTHING rather than a reassuring manual")
     {
         ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
                                                     .nodeId = "node-a",
                                                     .uptimeSeconds = 5,
                                                     .surfaces = {},
-                                                    .components = Cc::NodeComponentBit::Worker,
-                                                    .runtime = { .toolchains = Cc::ToolchainState::Serving,
+                                                    .components = CacheWire::NodeComponentBit::Worker,
+                                                    .runtime = { .toolchains = CacheWire::ToolchainState::Serving,
                                                                  .toolchainsServed = 1,
                                                                  .toolchainsDiscovered = 1 } }) } };
 
@@ -444,7 +473,7 @@ TEST_CASE("`node` reports a component bit this client has no name for", "[cli][n
                                                 .nodeId = "node-a",
                                                 .uptimeSeconds = 1,
                                                 .surfaces = {},
-                                                .components = Cc::NodeComponentBit::Worker | Unknown }) } };
+                                                .components = CacheWire::NodeComponentBit::Worker | Unknown }) } };
 
     auto const answer = RunNodeVerb("node", node);
     CHECK(RequiredCell(answer, "components").lexical.contains("worker"));
@@ -460,7 +489,7 @@ TEST_CASE("`node-metrics` reports every figure the node's reading carries", "[cl
     auto const answer = RunNodeVerb("node-metrics", node);
     CHECK(answer.outcome == Outcome::Affirmative);
     REQUIRE(node.Sent().size() == 1);
-    CHECK(OpOf(SentFrame(node)) == static_cast<std::uint8_t>(Cc::Op::NodeMetrics));
+    CHECK(OpOf(SentFrame(node)) == static_cast<std::uint8_t>(CacheWire::Op::NodeMetrics));
 
     CHECK(RequiredCell(answer, "fastcache_worker_jobs_completed_total").lexical == "12");
     CHECK(RequiredCell(answer, "fastcached_items").lexical == "3");
@@ -487,12 +516,12 @@ TEST_CASE("`node-metrics` against a node of the previous wire version is refused
     // never meets a version-9 BODY: the node's request check refuses the version-10 frame first, as
     // `UnsupportedVersion` naming its range. That refusal is the realistic old-build case, and it
     // must reach the operator as a refusal that names both versions -- not as an unreadable reading.
-    ScriptedNodeExchange node { { RefusalReply(Cc::ErrorCode::UnsupportedVersion,
+    ScriptedNodeExchange node { { RefusalReply(CacheWire::ErrorCode::UnsupportedVersion,
                                                "unsupported wire version 10; this server speaks 9..9") } };
 
     auto const answer = RunNodeVerb("node-metrics", node);
     REQUIRE(node.Sent().size() == 1);
-    CHECK(static_cast<std::uint8_t>(SentFrame(node)[1]) == Cc::CurrentVersion);
+    CHECK(static_cast<std::uint8_t>(SentFrame(node)[1]) == CacheWire::CurrentVersion);
     CHECK(answer.outcome == Outcome::Refused);
     REQUIRE(answer.advisories.size() == 1);
     CHECK(answer.advisories[0].contains("this server speaks 9..9"));
@@ -506,7 +535,7 @@ TEST_CASE("A node verb's refusal is reported by name and exits `refused`", "[cli
     // share a code, which is the pair `OutcomeTable` exists to keep apart.
     SECTION("a non-member is told which gate refused it")
     {
-        ScriptedNodeExchange node { { RefusalReply(Cc::ErrorCode::NotAMember,
+        ScriptedNodeExchange node { { RefusalReply(CacheWire::ErrorCode::NotAMember,
                                                    "this node reports its identity and counters to fleet members only") } };
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Refused);
@@ -520,7 +549,7 @@ TEST_CASE("A node verb's refusal is reported by name and exits `refused`", "[cli
         // The `fastcached` daemon's answer: it speaks `0xFC` and serves the cache verbs,
         // and has no node component at all. This is the sentence that replaces *the
         // server closed the connection without answering*.
-        ScriptedNodeExchange node { { RefusalReply(Cc::UnimplementedVerb) } };
+        ScriptedNodeExchange node { { RefusalReply(CacheWire::UnimplementedVerb) } };
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Refused);
         REQUIRE(answer.advisories.size() == 1);
@@ -530,7 +559,7 @@ TEST_CASE("A node verb's refusal is reported by name and exits `refused`", "[cli
 
     SECTION("and served-elsewhere is NOT reported as an old endpoint")
     {
-        ScriptedNodeExchange node { { RefusalReply(Cc::ErrorCode::DispatchNotPermitted) } };
+        ScriptedNodeExchange node { { RefusalReply(CacheWire::ErrorCode::DispatchNotPermitted) } };
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Refused);
         REQUIRE(answer.advisories.size() == 1);
@@ -555,8 +584,8 @@ TEST_CASE("A node verb separates *nothing answered* from *the answer was unreada
         // framing. Built as a well-framed reply with a body that is not a node status,
         // so only the BODY decode fails -- a garbage frame would fail one step earlier
         // and prove something else.
-        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok,
-                                                      Cc::AsBytes(std::string_view { "not a node status" })) } };
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(
+            CacheWire::Status::Ok, CacheWire::AsBytes(std::string_view { "not a node status" })) } };
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Protocol);
         REQUIRE(answer.advisories.size() == 1);
@@ -569,7 +598,7 @@ TEST_CASE("A node verb separates *nothing answered* from *the answer was unreada
         // with differs, so only the reading decode fails.
         auto body = EncodeStatsReading(StatsReading {});
         body[7] ^= std::byte { 0x01 };
-        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, body) } };
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, body) } };
         auto const answer = RunNodeVerb("node-metrics", node);
         CHECK(answer.outcome == Outcome::Protocol);
         REQUIRE(answer.advisories.size() == 1);
@@ -654,7 +683,7 @@ TEST_CASE("`version` is ANSWERED by a compile node rather than merely explained"
                                                 .nodeId = "node-a",
                                                 .uptimeSeconds = 9,
                                                 .surfaces = {},
-                                                .components = Cc::NodeComponentBit::Worker }) } };
+                                                .components = CacheWire::NodeComponentBit::Worker }) } };
 
     auto const* const verb = FindVerb("version");
     REQUIRE(verb != nullptr);
@@ -842,9 +871,9 @@ namespace
 
 TEST_CASE("`del` on a node sends one cache-drop per key and counts what was removed", "[cli][node][fallback][cache-drop]")
 {
-    ScriptedNodeExchange node {
-        { Cc::EncodeReply(Cc::Status::Ok, {}), Cc::EncodeReply(Cc::Status::Miss, {}), Cc::EncodeReply(Cc::Status::Ok, {}) }
-    };
+    ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, {}),
+                                  CacheWire::EncodeReply(CacheWire::Status::Miss, {}),
+                                  CacheWire::EncodeReply(CacheWire::Status::Ok, {}) } };
 
     auto const answer = DelOnNode(node, { "a", "b", "c" });
 
@@ -859,10 +888,11 @@ TEST_CASE("`del` on a node sends one cache-drop per key and counts what was remo
     {
         auto const& sent = SentFrame(node, index);
         auto const key = Keys[index];
-        CHECK(OpOf(sent) == static_cast<std::uint8_t>(Cc::Op::CacheDrop));
-        auto const payload = Cc::DecodeCacheDropPayload(std::span<std::byte const> { sent }.subspan(Cc::RequestHeaderSize));
+        CHECK(OpOf(sent) == static_cast<std::uint8_t>(CacheWire::Op::CacheDrop));
+        auto const payload =
+            CacheWire::DecodeCacheDropPayload(std::span<std::byte const> { sent }.subspan(CacheWire::RequestHeaderSize));
         REQUIRE(payload.has_value());
-        CHECK(Cc::AsStringView(Unwrap(payload)) == key);
+        CHECK(CacheWire::AsStringView(Unwrap(payload)) == key);
     }
 
     // The reach is said, because it surprises: a shared cache behind the node refills it.
@@ -875,7 +905,8 @@ TEST_CASE("`del` on a node that holds none of the keys answers no, which is not 
 {
     // A repair's second run. `Negative` exits 1 -- an ANSWER -- where a refusal exits 4, and
     // an operator scripting the repair must be able to tell the two apart.
-    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Miss, {}), Cc::EncodeReply(Cc::Status::Miss, {}) } };
+    ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Miss, {}),
+                                  CacheWire::EncodeReply(CacheWire::Status::Miss, {}) } };
 
     auto const answer = DelOnNode(node, { "a", "b" });
 
@@ -887,10 +918,10 @@ TEST_CASE("`del` on a node that holds none of the keys answers no, which is not 
 
 TEST_CASE("`del` on a node stops at a refusal, names it, and says how far it got", "[cli][node][fallback][cache-drop]")
 {
-    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, {}),
-                                  RefusalReply(Cc::ErrorCode::NotAMember,
+    ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, {}),
+                                  RefusalReply(CacheWire::ErrorCode::NotAMember,
                                                "this node serves its cache to its own machine only"),
-                                  Cc::EncodeReply(Cc::Status::Ok, {}) } };
+                                  CacheWire::EncodeReply(CacheWire::Status::Ok, {}) } };
 
     auto const answer = DelOnNode(node, { "a", "b", "c" });
 
@@ -906,7 +937,7 @@ TEST_CASE("`del` on a node too old to know the verb says so rather than miscount
 {
     // A node built before #1276 answers `UnimplementedVerb`. Counted as a miss it would print
     // `0` and exit 1 -- *nothing matched* -- about keys that are all still there.
-    ScriptedNodeExchange node { { RefusalReply(Cc::UnimplementedVerb, "unknown opcode 0x15") } };
+    ScriptedNodeExchange node { { RefusalReply(CacheWire::UnimplementedVerb, "unknown opcode 0x15") } };
 
     auto const answer = DelOnNode(node, { "a" });
 
@@ -921,12 +952,23 @@ TEST_CASE("`del` on a node too old to know the verb says so rather than miscount
 namespace
 {
 
+/// The identity key a case admits a member under: every member is admitted with one, since
+/// `Apply` drops an admission that would leave a member holding none.
+/// @param id The member.
+/// @return A key distinct per id.
+[[nodiscard]] Ed25519PublicKey MemberKey(std::string_view id)
+{
+    auto key = Ed25519PublicKey {};
+    key.fill(static_cast<std::byte>(0x40 + id.back()));
+    return key;
+}
+
 /// A framed `ClusterStatus` reply carrying @p state.
 /// @param state What the cluster has agreed.
 /// @return The reply frame.
 [[nodiscard]] std::vector<std::byte> ClusterStatusReply(Cluster::ClusterState const& state)
 {
-    return Cc::EncodeReply(Cc::Status::Ok, Cluster::Encode(state));
+    return CacheWire::EncodeReply(CacheWire::Status::Ok, Cluster::Encode(state));
 }
 
 /// The rows of a table answer.
@@ -956,8 +998,8 @@ namespace
 TEST_CASE("cluster-members reports who the cluster agreed on, and an unled member as ABSENT", "[cli][node][cluster]")
 {
     // The two states a `schedulerEndpoint` has, side by side in one reply. A member that
-    // has never led carries none -- a leader announces its own record on election -- so
-    // the empty string is the ORDINARY case and rendering it as a value would hand an
+    // has announced none carries none -- a bootstrap peer before its first announcement --
+    // so the empty string is a state of its own and rendering it as a value would hand an
     // operator an address to paste that reaches nothing. Built through `Apply`, which is how a
     // leader acquires the state this reply carries: a member literal with an endpoint and no
     // announcement recorded is a state `DecodeState` refuses, because `Apply` never makes it.
@@ -967,15 +1009,13 @@ TEST_CASE("cluster-members reports who the cluster agreed on, and an unled membe
                              .key = "node-a",
                              .value = "10.0.0.7:6675",
                              .schedulerEndpoint = "10.0.0.7:6674",
-                             .publicKey = std::nullopt,
-                             .role = std::nullopt });
+                             .publicKey = MemberKey("node-a") });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "node-b",
                              .value = "10.0.0.8:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = std::nullopt,
-                             .role = std::nullopt });
+                             .publicKey = MemberKey("node-b") });
     ScriptedNodeExchange node { { ClusterStatusReply(state) } };
 
     auto const answer = RunNodeVerb("cluster-members", node);
@@ -1009,13 +1049,13 @@ TEST_CASE("cluster-members says which absence a scheduler endpoint is: never ann
     // a leader acquires the state this reply carries.
     Cluster::ClusterState state;
     auto const admit = [&state](std::string id, std::string raft, std::string scheduler) {
+        auto const key = MemberKey(id);
         Apply(state,
               Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                                  .key = std::move(id),
                                  .value = std::move(raft),
                                  .schedulerEndpoint = std::move(scheduler),
-                                 .publicKey = std::nullopt,
-                                 .role = std::nullopt });
+                                 .publicKey = key });
     };
     admit("node-b", "10.0.0.8:6675", {});
     admit("node-c", "10.0.0.9:6675", "10.0.0.9:6674");
@@ -1039,13 +1079,45 @@ TEST_CASE("cluster-members says which absence a scheduler endpoint is: never ann
     CHECK(rows[1][schedulerState].lexical == "cleared");
 }
 
-TEST_CASE("cluster-members shows each member's key whole, and absent for one that stated none",
-          "[cli][node][cluster][identity]")
+TEST_CASE("cluster-members reports a learner recorded with no consensus endpoint as ABSENT", "[cli][node][cluster][learner]")
+{
+    // A learner dials in, so the cluster records it with no consensus endpoint at all -- and an
+    // empty text cell is a blank, which a TSV reader collapses and shifts every field after it.
+    // Both rows, so a column rendering every row alike cannot pass.
+    Cluster::ClusterState state;
+    Apply(state,
+          Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                             .key = "office",
+                             .value = "10.0.0.7:6675",
+                             .schedulerEndpoint = {},
+                             .publicKey = MemberKey("office") });
+    Apply(state,
+          Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
+                             .key = "laptop",
+                             .value = {},
+                             .schedulerEndpoint = {},
+                             .publicKey = MemberKey("laptop") });
+    ScriptedNodeExchange node { { ClusterStatusReply(state) } };
+
+    auto const answer = RunNodeVerb("cluster-members", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+
+    auto const& rows = RowsOf(answer);
+    REQUIRE(rows.size() == 2);
+    auto const id = ColumnOf(answer, "id");
+    auto const raft = ColumnOf(answer, "raft");
+
+    CHECK(rows[0][id].lexical == "laptop");
+    CHECK(rows[0][raft].kind == CellKind::Absent);
+    CHECK(rows[1][id].lexical == "office");
+    CHECK(rows[1][raft].lexical == "10.0.0.7:6675");
+}
+
+TEST_CASE("cluster-members shows each member's key whole", "[cli][node][cluster][identity]")
 {
     // #178. The key is the string an operator holds against a member's own `node` output, so
-    // it is rendered WHOLE through the one encoder -- and ABSENT, never empty, for a member
-    // that has not stated one: an empty cell reads as a key nobody could type. Both rows are
-    // asserted, so a column rendering every row alike cannot pass.
+    // it is rendered WHOLE through the one encoder. Both rows are asserted, each under its own
+    // key, so a column rendering every row alike cannot pass.
     auto key = Ed25519PublicKey {};
     key.fill(std::byte { 0x6B });
 
@@ -1055,15 +1127,13 @@ TEST_CASE("cluster-members shows each member's key whole, and absent for one tha
                              .key = "node-b",
                              .value = "10.0.0.8:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = key,
-                             .role = std::nullopt });
+                             .publicKey = key });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "node-c",
                              .value = "10.0.0.9:6675",
                              .schedulerEndpoint = {},
-                             .publicKey = std::nullopt,
-                             .role = std::nullopt });
+                             .publicKey = MemberKey("node-c") });
 
     ScriptedNodeExchange node { { ClusterStatusReply(state) } };
     auto const answer = RunNodeVerb("cluster-members", node);
@@ -1074,7 +1144,7 @@ TEST_CASE("cluster-members shows each member's key whole, and absent for one tha
     auto const column = ColumnOf(answer, "key");
     CHECK(rows[0][column].lexical == FormatEd25519PublicKey(key));
     CHECK(rows[0][column].lexical.size() == Ed25519PublicKeyTextLength);
-    CHECK(rows[1][column].kind == CellKind::Absent);
+    CHECK(rows[1][column].lexical == FormatEd25519PublicKey(MemberKey("node-c")));
 }
 
 TEST_CASE("cluster-settings names every key this build knows, set or not", "[cli][node][cluster]")
@@ -1084,8 +1154,7 @@ TEST_CASE("cluster-settings names every key this build knows, set or not", "[cli
     REQUIRE_FALSE(Cluster::SettingTable.empty());
     auto const known = std::string { Cluster::SettingTable[0].name };
 
-    ScriptedNodeExchange node { { ClusterStatusReply(
-        { .members = {}, .settings = {}, .clients = {}, .forgotten = {}, .principals = {}, .revokedKeys = {} }) } };
+    ScriptedNodeExchange node { { ClusterStatusReply({ .members = {}, .settings = {}, .revokedKeys = {} }) } };
 
     auto const answer = RunNodeVerb("cluster-settings", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -1110,12 +1179,8 @@ TEST_CASE("cluster-settings keeps a setting this build does not know", "[cli][no
     // client's table has never heard of. Dropping the row would hide a live fact
     // because the READER is the older binary -- and the operator would be told the
     // cluster agrees something it does not.
-    ScriptedNodeExchange node { { ClusterStatusReply({ .members = {},
-                                                       .settings = { { .name = "a-key-from-a-newer-build", .value = "7" } },
-                                                       .clients = {},
-                                                       .forgotten = {},
-                                                       .principals = {},
-                                                       .revokedKeys = {} }) } };
+    ScriptedNodeExchange node { { ClusterStatusReply(
+        { .members = {}, .settings = { { .name = "a-key-from-a-newer-build", .value = "7" } }, .revokedKeys = {} }) } };
 
     auto const answer = RunNodeVerb("cluster-settings", node);
     CHECK(answer.outcome == Outcome::Affirmative);
@@ -1150,7 +1215,7 @@ TEST_CASE("a cluster change reports ACCEPTED, never committed", "[cli][node][clu
         // A typed empty payload: `{}` is ambiguous against `std::span`, and these two
         // verbs are acknowledged with a reply that carries no body at all.
         std::vector<std::byte> const noPayload;
-        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, noPayload) } };
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, noPayload) } };
         auto const answer = RunNodeVerb(spec.first, node, spec.second);
         CHECK(answer.outcome == Outcome::Affirmative);
         CHECK(RequiredCell(answer, "state").lexical == "replicating");
@@ -1166,9 +1231,9 @@ TEST_CASE("cluster-admit reports what the leader RECORDED, never what is in forc
     //
     // What it RECORDED it knows instantly and alone; whether a majority has taken it, it
     // cannot know. The field names carry that distinction, so they are what this asserts.
-    auto const receipt = Cc::EncodeClusterAdmitReceipt(
-        Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::nullopt });
-    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
+    auto const receipt = CacheWire::EncodeClusterAdmitReceipt(
+        CacheWire::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::nullopt });
+    ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, receipt) } };
 
     auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675" });
     REQUIRE(answer.outcome == Outcome::Affirmative);
@@ -1176,7 +1241,7 @@ TEST_CASE("cluster-admit reports what the leader RECORDED, never what is in forc
     // Distinct values, neither a substring of the other, so a transposed pair reddens
     // rather than agreeing with itself.
     CHECK(RequiredCell(answer, "member-id-as-received").lexical == "node-c");
-    CHECK(RequiredCell(answer, std::format("{}-as-recorded", Cc::ConsensusEndpointField)).lexical == "10.0.0.9:6675");
+    CHECK(RequiredCell(answer, std::format("{}-as-recorded", CacheWire::ConsensusEndpointField)).lexical == "10.0.0.9:6675");
 
     // The ceiling, asserted on the WORD: `SchedulerService::Offer`'s own phrase, not a
     // second spelling of one state. Anything stronger here would be the confident wrong
@@ -1197,20 +1262,20 @@ TEST_CASE("cluster-admit sends the key it was given and reports the key the lead
 
     SECTION("a key operand travels, and the recorded key is printed")
     {
-        auto const receipt = Cc::EncodeClusterAdmitReceipt(
-            Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = keyText });
-        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
+        auto const receipt = CacheWire::EncodeClusterAdmitReceipt(
+            CacheWire::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = keyText });
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, receipt) } };
 
         auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675", keyText });
         REQUIRE(answer.outcome == Outcome::Affirmative);
         CHECK(RequiredCell(answer, "public-key-as-recorded").lexical == keyText);
 
         REQUIRE(node.Sent().size() == 1);
-        auto const sent = std::span<std::byte const> { node.Sent().front() }.subspan(Cc::RequestHeaderSize);
-        auto const view = Cc::DecodeClusterAdmitPayload<Cc::Op::ClusterAdmit>(sent);
+        auto const sent = std::span<std::byte const> { node.Sent().front() }.subspan(CacheWire::RequestHeaderSize);
+        auto const view = CacheWire::DecodeClusterAdmitPayload<CacheWire::Op::ClusterAdmit>(sent);
         REQUIRE(view.has_value());
         REQUIRE(Unwrap(view).publicKey.has_value());
-        CHECK(Cc::AsStringView(Unwrap(Unwrap(view).publicKey)) == keyText);
+        CHECK(CacheWire::AsStringView(Unwrap(Unwrap(view).publicKey)) == keyText);
     }
 
     SECTION("a key operand that is not a key is refused here, and nothing is sent")
@@ -1225,19 +1290,37 @@ TEST_CASE("cluster-admit sends the key it was given and reports the key the lead
         CHECK(node.Sent().empty());
     }
 
+    SECTION("a small-order or non-canonical key is refused here by name, and nothing is sent")
+    {
+        // Well-formed text naming a point no signature proves anything under: the all-zero key,
+        // under which the all-zero signature verifies every message, and p + 3, a second spelling.
+        for (auto const& [text, fault]:
+             { std::pair { std::string_view { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, PublicKeyFault::SmallOrder },
+               std::pair { std::string_view { "8P_______________________________________38" },
+                           PublicKeyFault::NonCanonical } })
+        {
+            INFO("key: " << text);
+            ScriptedNodeExchange node { {} };
+            auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675", std::string { text } });
+            CHECK(answer.outcome == Outcome::Usage);
+            CHECK(AdvisoryText(answer).contains(DescribePublicKeyFault(fault)));
+            CHECK(node.Sent().empty());
+        }
+    }
+
     SECTION("no key operand sends none, and the receipt's none is said as what it means")
     {
-        auto const receipt = Cc::EncodeClusterAdmitReceipt(
-            Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::nullopt });
-        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
+        auto const receipt = CacheWire::EncodeClusterAdmitReceipt(CacheWire::ClusterAdmitReceipt {
+            .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::nullopt });
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, receipt) } };
 
         auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675" });
         REQUIRE(answer.outcome == Outcome::Affirmative);
         CHECK(RequiredCell(answer, "public-key-as-recorded").lexical.contains("none stated"));
 
         REQUIRE(node.Sent().size() == 1);
-        auto const sent = std::span<std::byte const> { node.Sent().front() }.subspan(Cc::RequestHeaderSize);
-        auto const view = Cc::DecodeClusterAdmitPayload<Cc::Op::ClusterAdmit>(sent);
+        auto const sent = std::span<std::byte const> { node.Sent().front() }.subspan(CacheWire::RequestHeaderSize);
+        auto const view = CacheWire::DecodeClusterAdmitPayload<CacheWire::Op::ClusterAdmit>(sent);
         REQUIRE(view.has_value());
         CHECK_FALSE(Unwrap(view).publicKey.has_value());
     }
@@ -1252,7 +1335,7 @@ TEST_CASE("cluster-admit refuses a reply whose receipt it cannot read", "[cli][n
     // The empty body is exactly what the other two verbs are acknowledged with, which is
     // what makes this the discriminating arrangement rather than a malformed-bytes one.
     std::vector<std::byte> const noPayload;
-    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, noPayload) } };
+    ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, noPayload) } };
 
     auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675" });
     CHECK(answer.outcome == Outcome::Protocol);
@@ -1266,7 +1349,7 @@ TEST_CASE("NotLeader is followed to the endpoint it names, and separated from an
     // error table's default sentence, so testing for empty gets neither.
     SECTION("a message that parses names where to ask instead")
     {
-        ScriptedNodeExchange node { { RefusalReply(Cc::ErrorCode::NotLeader, "10.0.0.9:6674") } };
+        ScriptedNodeExchange node { { RefusalReply(CacheWire::ErrorCode::NotLeader, "10.0.0.9:6674") } };
         auto const answer = RunNodeVerb("cluster-members", node);
         CHECK(answer.outcome == Outcome::Refused);
         CHECK(AdvisoryText(answer).contains("10.0.0.9:6674"));
@@ -1280,7 +1363,7 @@ TEST_CASE("NotLeader is followed to the endpoint it names, and separated from an
         // dialled it would spend a hop the real leader never hears. The assertion is
         // that no address is offered, which is what separates the two arms; asserting
         // only that the diagnostic mentions the leader passes under both.
-        ScriptedNodeExchange node { { RefusalReply(Cc::ErrorCode::NotLeader, "no leader: try again") } };
+        ScriptedNodeExchange node { { RefusalReply(CacheWire::ErrorCode::NotLeader, "no leader: try again") } };
         auto const answer = RunNodeVerb("cluster-members", node);
         CHECK(answer.outcome == Outcome::Refused);
         CHECK(AdvisoryText(answer).contains("no leader is known"));
@@ -1293,7 +1376,7 @@ TEST_CASE("a cluster reply this build cannot read is REFUSED, not rendered as an
     // A partial read looks exactly like a fleet that admits nobody, and that would be
     // read as a fact rather than as a failure to decode.
     std::vector<std::byte> const notAClusterState { std::byte { 0xFF }, std::byte { 0xFE } };
-    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, notAClusterState) } };
+    ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, notAClusterState) } };
 
     auto const answer = RunNodeVerb("cluster-members", node);
     CHECK(answer.outcome == Outcome::Protocol);
@@ -1305,12 +1388,11 @@ TEST_CASE("a cluster reply another build encoded is refused by its version", "[c
     // The same refusal as above, for the cause an upgrade produces -- and it says so,
     // because *cannot read* alone fits a damaged body too and the two send an operator
     // to different machines.
-    auto body = Cluster::Encode(Cluster::ClusterState {
-        .members = {}, .settings = {}, .clients = {}, .forgotten = {}, .principals = {}, .revokedKeys = {} });
+    auto body = Cluster::Encode(Cluster::ClusterState { .members = {}, .settings = {}, .revokedKeys = {} });
     // The state's version is the first field's only byte, after its u32 length prefix.
     REQUIRE(body.size() > 4);
     body[4] = std::byte { 2 };
-    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, body) } };
+    ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, body) } };
 
     auto const answer = RunNodeVerb("cluster-members", node);
     CHECK(answer.outcome == Outcome::Protocol);
@@ -1327,26 +1409,26 @@ TEST_CASE("the cluster verbs send the opcodes the wire table names", "[cli][node
     {
         std::string_view verb;
         std::vector<std::string> operands;
-        Cc::Op op;
+        CacheWire::Op op;
     };
 
     for (auto const& expectation:
-         { Expectation { .verb = "cluster-members", .operands = {}, .op = Cc::Op::ClusterStatus },
-           Expectation { .verb = "cluster-settings", .operands = {}, .op = Cc::Op::ClusterStatus },
-           Expectation { .verb = "cluster-set", .operands = { "fleet-open", "1" }, .op = Cc::Op::ClusterSet },
-           Expectation { .verb = "cluster-forget", .operands = { "node-b" }, .op = Cc::Op::ClusterForget },
-           Expectation { .verb = "cluster-admit", .operands = { "node-c", "10.0.0.9:6675" }, .op = Cc::Op::ClusterAdmit },
+         { Expectation { .verb = "cluster-members", .operands = {}, .op = CacheWire::Op::ClusterStatus },
+           Expectation { .verb = "cluster-settings", .operands = {}, .op = CacheWire::Op::ClusterStatus },
+           Expectation { .verb = "cluster-set", .operands = { "fleet-open", "1" }, .op = CacheWire::Op::ClusterSet },
+           Expectation { .verb = "cluster-forget", .operands = { "node-b" }, .op = CacheWire::Op::ClusterForget },
+           Expectation {
+               .verb = "cluster-admit", .operands = { "node-c", "10.0.0.9:6675" }, .op = CacheWire::Op::ClusterAdmit },
            Expectation { .verb = "cluster-admit-learner",
                          .operands = { "node-c", "10.0.0.9:6675" },
-                         .op = Cc::Op::ClusterAdmitLearner } })
+                         .op = CacheWire::Op::ClusterAdmitLearner } })
     {
         INFO("verb: " << expectation.verb);
-        ScriptedNodeExchange node { { ClusterStatusReply(
-            { .members = {}, .settings = {}, .clients = {}, .forgotten = {}, .principals = {}, .revokedKeys = {} }) } };
+        ScriptedNodeExchange node { { ClusterStatusReply({ .members = {}, .settings = {}, .revokedKeys = {} }) } };
         (void) RunNodeVerb(expectation.verb, node, expectation.operands);
 
         REQUIRE(node.Sent().size() == 1);
-        auto const header = Cc::DecodeRequestHeader(SentFrame(node));
+        auto const header = CacheWire::DecodeRequestHeader(SentFrame(node));
         REQUIRE(header.has_value());
         // `opRaw` and not an `Op`: the header decoder deliberately hands back the BYTE,
         // unvalidated against `OpTable`, so a verb this build does not carry is still
@@ -1385,6 +1467,16 @@ class BorrowedNode final: public INodeExchange
     [[nodiscard]] std::string_view Address() const override
     {
         return _node->Address();
+    }
+
+    [[nodiscard]] std::span<std::string const> Advisories() const override
+    {
+        return _node->Advisories();
+    }
+
+    [[nodiscard]] std::optional<FastCache::Cc::MintFailure> MissingTicket() const override
+    {
+        return _node->MissingTicket();
     }
 
   private:
@@ -1426,13 +1518,13 @@ class ScriptedDialer final: public INodeDialer
 /// A leader's `Ok` carrying @p document.
 [[nodiscard]] ScriptedNodeExchange::Outcome FleetDocumentReply(std::string_view document)
 {
-    return Cc::EncodeReply(Cc::Status::Ok, Cc::AsBytes(document));
+    return CacheWire::EncodeReply(CacheWire::Status::Ok, CacheWire::AsBytes(document));
 }
 
 /// A refusal of @p code saying @p message.
-[[nodiscard]] ScriptedNodeExchange::Outcome Refusal(Cc::ErrorCode code, std::string_view message)
+[[nodiscard]] ScriptedNodeExchange::Outcome Refusal(CacheWire::ErrorCode code, std::string_view message)
 {
-    return Cc::EncodeErrorReply(code, message);
+    return CacheWire::EncodeErrorReply(code, message);
 }
 
 /// Run `fleet` against @p node, following redirects through @p dial.
@@ -1452,11 +1544,11 @@ class ScriptedDialer final: public INodeDialer
 }
 
 /// The FLEET-TEXT request frame @p frame carries.
-[[nodiscard]] Cc::FleetTextRequest FleetRequestOf(std::vector<std::byte> const& frame)
+[[nodiscard]] CacheWire::FleetTextRequest FleetRequestOf(std::vector<std::byte> const& frame)
 {
-    REQUIRE(frame.size() >= Cc::RequestHeaderSize);
-    REQUIRE(frame[2] == static_cast<std::byte>(Cc::Op::FleetText));
-    auto const request = Cc::DecodeFleetTextRequest(std::span { frame }.subspan(Cc::RequestHeaderSize));
+    REQUIRE(frame.size() >= CacheWire::RequestHeaderSize);
+    REQUIRE(frame[2] == static_cast<std::byte>(CacheWire::Op::FleetText));
+    auto const request = CacheWire::DecodeFleetTextRequest(std::span { frame }.subspan(CacheWire::RequestHeaderSize));
     REQUIRE(request.has_value());
     return Unwrap(request);
 }
@@ -1566,7 +1658,7 @@ TEST_CASE("fleet follows a follower to the leader it names and says so on stderr
     // #1391. A follower's registry is a fraction presented as the whole, so it answers NotLeader
     // naming the leader -- an instruction, which this verb follows rather than relays. The same
     // request goes to the leader, and the table on stdout is the leader's with nothing added.
-    ScriptedNodeExchange follower { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.2:6674") }, "10.0.0.7:6674" };
+    ScriptedNodeExchange follower { { Refusal(CacheWire::ErrorCode::NotLeader, "10.0.0.2:6674") }, "10.0.0.7:6674" };
     ScriptedNodeExchange leader { { FleetDocumentReply("id\tslots\nw1\t8\n") }, "10.0.0.2:6674" };
     ScriptedDialer dial { { &leader } };
 
@@ -1585,14 +1677,53 @@ TEST_CASE("fleet follows a follower to the leader it names and says so on stderr
     CHECK(answer.advisories[0].contains("10.0.0.2:6674"));
 }
 
+TEST_CASE("fleet redirected to a leader it could not mint for says the mint failed, not only the refusal",
+          "[cli][node][fleet][ticket]")
+{
+    // The leader is dialled through `INodeDialer`, so what its connection said while opening --
+    // that this machine's node did not answer `MINT-TICKET` -- rides the seam back. Its
+    // `NotAMember` is then the missing ticket's doing, and is worded as that.
+    auto const said = std::format("{} (at 127.0.0.1:6674: cannot reach it)",
+                                  FastCache::Cc::ReasonFor(FastCache::Cc::MintFailure::Unreachable));
+    ScriptedNodeExchange follower { { Refusal(CacheWire::ErrorCode::NotLeader, "10.0.0.2:6674") }, "10.0.0.7:6674" };
+    ScriptedNodeExchange leader { { Refusal(CacheWire::ErrorCode::NotAMember, "not a member") }, "10.0.0.2:6674" };
+    leader.OpenedWithoutTicket(FastCache::Cc::MintFailure::Unreachable, said);
+    ScriptedDialer dial { { &leader } };
+
+    auto const answer = RunFleet(follower, &dial, { "workers" });
+
+    CHECK(answer.outcome == Outcome::Refused);
+    CHECK(std::ranges::contains(answer.advisories, said));
+    auto const* const refusal =
+        core::findIfOrNull(answer.advisories, [](std::string const& line) { return line.contains("does not know"); });
+    REQUIRE(refusal != nullptr);
+    CHECK(refusal->contains("10.0.0.2:6674"));
+    CHECK(refusal->contains(FastCache::Cc::ReasonFor(FastCache::Cc::MintFailure::Unreachable)));
+}
+
+TEST_CASE("fleet relays a leader's NotAMember in its own words when a ticket was presented", "[cli][node][fleet][ticket]")
+{
+    // The control: the same refusal to a connection that DID present a ticket is not the mint's.
+    ScriptedNodeExchange follower { { Refusal(CacheWire::ErrorCode::NotLeader, "10.0.0.2:6674") }, "10.0.0.7:6674" };
+    ScriptedNodeExchange leader { { Refusal(CacheWire::ErrorCode::NotAMember, "not a member") }, "10.0.0.2:6674" };
+    ScriptedDialer dial { { &leader } };
+
+    auto const answer = RunFleet(follower, &dial, { "workers" });
+
+    CHECK(answer.outcome == Outcome::Refused);
+    CHECK(std::ranges::none_of(answer.advisories, [](std::string const& line) {
+        return line.contains("no machine ticket") || line.contains("does not know");
+    }));
+}
+
 TEST_CASE("fleet stops following at the bound and names every node it asked", "[cli][node][fleet]")
 {
     // Three nodes each naming the next as leader, the last naming the first: no leader at all.
     // Bounded by `MaxLeaderRedirects`, which the fleet subscription follows too.
     REQUIRE(MaxLeaderRedirects == 2);
-    ScriptedNodeExchange first { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.2:6674") }, "10.0.0.1:6674" };
-    ScriptedNodeExchange second { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.3:6674") }, "10.0.0.2:6674" };
-    ScriptedNodeExchange third { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.1:6674") }, "10.0.0.3:6674" };
+    ScriptedNodeExchange first { { Refusal(CacheWire::ErrorCode::NotLeader, "10.0.0.2:6674") }, "10.0.0.1:6674" };
+    ScriptedNodeExchange second { { Refusal(CacheWire::ErrorCode::NotLeader, "10.0.0.3:6674") }, "10.0.0.2:6674" };
+    ScriptedNodeExchange third { { Refusal(CacheWire::ErrorCode::NotLeader, "10.0.0.1:6674") }, "10.0.0.3:6674" };
     ScriptedDialer dial { { &first, &second, &third } };
 
     auto const answer = RunFleet(first, &dial, { "workers" });
@@ -1607,7 +1738,7 @@ TEST_CASE("fleet relays a NotLeader that names nobody rather than dialling it", 
 {
     // An election: the refusal carries no address, which is a different fact from somebody else
     // leading, and there is nothing to follow.
-    ScriptedNodeExchange node { { Refusal(Cc::ErrorCode::NotLeader, {}) } };
+    ScriptedNodeExchange node { { Refusal(CacheWire::ErrorCode::NotLeader, {}) } };
     ScriptedDialer dial { {} };
 
     auto const answer = RunFleet(node, &dial, { "workers" });
@@ -1620,7 +1751,7 @@ TEST_CASE("fleet relays a NotLeader that names nobody rather than dialling it", 
     {
         // Splitting is not parsing: `SplitHostPort` would read `no leader: try again` as a host and a
         // port of ` try again`. The one predicate `DecideLeaderHop` asks refuses it.
-        ScriptedNodeExchange unparseable { { Refusal(Cc::ErrorCode::NotLeader, "no leader: try again") } };
+        ScriptedNodeExchange unparseable { { Refusal(CacheWire::ErrorCode::NotLeader, "no leader: try again") } };
         ScriptedDialer none { {} };
         auto const relayed = RunFleet(unparseable, &none, { "workers" });
         CHECK(relayed.outcome == Outcome::Refused);
@@ -1632,7 +1763,7 @@ TEST_CASE("fleet relays a NotLeader that names nobody rather than dialling it", 
 
     SECTION("and with no dialler a named leader is relayed rather than followed")
     {
-        ScriptedNodeExchange follower { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.2:6674") } };
+        ScriptedNodeExchange follower { { Refusal(CacheWire::ErrorCode::NotLeader, "10.0.0.2:6674") } };
         auto const relayed = RunFleet(follower, nullptr, { "workers" });
         CHECK(relayed.outcome == Outcome::Refused);
         CHECK(Remarks(relayed, "ask 10.0.0.2:6674 instead"));
@@ -1643,7 +1774,7 @@ TEST_CASE("fleet relays the leader's list of sections for a key it does not serv
 {
     // The leader's words, one key per line, as they arrived -- not folded into a parenthesised
     // suffix -- and a refusal, which is a different exit code from nothing answering.
-    ScriptedNodeExchange node { { Refusal(Cc::ErrorCode::UnknownFleetSelector,
+    ScriptedNodeExchange node { { Refusal(CacheWire::ErrorCode::UnknownFleetSelector,
                                           "unknown section; this build serves:\n  kpi       the headline figures\n") } };
 
     auto const answer = RunFleet(node, nullptr, { "worker" });
@@ -1657,8 +1788,8 @@ TEST_CASE("fleet relays the leader's list of sections for a key it does not serv
 
 TEST_CASE("fleet names the dashboard credential flag when the leader refuses the caller", "[cli][node][fleet]")
 {
-    auto const refusal =
-        Refusal(Cc::ErrorCode::Unauthenticated, "the fleet is served to a caller presenting the dashboard credential");
+    auto const refusal = Refusal(CacheWire::ErrorCode::Unauthenticated,
+                                 "the fleet is served to a caller presenting the dashboard credential");
 
     ScriptedNodeExchange bare { { refusal } };
     auto const withoutToken = RunFleet(bare, nullptr, { "workers" });
@@ -1680,7 +1811,7 @@ TEST_CASE("fleet reports a node or a leader it could not reach as unreachable", 
     CHECK(Remarks(unreached, "cannot reach 10.0.0.7:6674"));
 
     // A leader that does not answer is the leader's address in the remark, not the follower's.
-    ScriptedNodeExchange follower { { Refusal(Cc::ErrorCode::NotLeader, "10.0.0.9:6674") } };
+    ScriptedNodeExchange follower { { Refusal(CacheWire::ErrorCode::NotLeader, "10.0.0.9:6674") } };
     ScriptedDialer dial { {} };
     auto const leaderGone = RunFleet(follower, &dial, { "workers" });
     CHECK(leaderGone.outcome == Outcome::Unreachable);
@@ -1733,9 +1864,9 @@ namespace
 /// @return The gatherer.
 [[nodiscard]] LadderGatherer GathererFor(INodeExchange& node, std::uint16_t cachePort = 6674)
 {
-    return LadderGatherer { Endpoint {},     Endpoint { .host = "10.0.0.4", .port = cachePort },
-                            DialTimeouts {}, std::nullopt,
-                            nullptr,         &node };
+    return LadderGatherer {
+        Endpoint {}, Endpoint { .host = "10.0.0.4", .port = cachePort }, DialTimeouts {}, nullptr, &node
+    };
 }
 
 /// What the `/metrics` rung says it did not ask, for a gatherer.
@@ -1755,7 +1886,7 @@ namespace
 /// @param surfaces Every surface the node says it opened.
 /// @param cachePort The port this invocation is already talking `0xFC` to.
 /// @return The refusal text, as both callers receive it.
-[[nodiscard]] std::string AdminRefusalFor(std::vector<Cc::SurfaceReport> surfaces, std::uint16_t cachePort = 6674)
+[[nodiscard]] std::string AdminRefusalFor(std::vector<CacheWire::SurfaceReport> surfaces, std::uint16_t cachePort = 6674)
 {
     ScriptedNodeExchange node {
         { StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = std::move(surfaces) }) },
@@ -1773,7 +1904,8 @@ TEST_CASE("a node that opened no admin surface is told which flag opens one", "[
     // this arm is what an ORDINARY node answers -- and it is therefore the first thing
     // a new `fleet` user meets. It used to say only what was true and name nothing to
     // do about it, where the other three arms each already point somewhere.
-    auto const detail = AdminRefusalFor({ Cc::SurfaceReport { .surface = Cc::WireSurface::Raft, .port = 6680 } });
+    auto const detail =
+        AdminRefusalFor({ CacheWire::SurfaceReport { .surface = CacheWire::WireSurface::Raft, .port = 6680 } });
 
     CHECK(detail.contains("--admin-listen"));
     // The load-bearing clause. Without it the sentence reads as something being WRONG
@@ -1797,8 +1929,10 @@ TEST_CASE("the other three admin arms name no flag, because none of them is a no
     auto silentGatherer = GathererFor(silent);
     auto const undiscovered = MetricsNoteOf(silentGatherer);
 
-    auto const tls = AdminRefusalFor({ Cc::SurfaceReport { .surface = Cc::WireSurface::Admin, .port = 9000, .tls = true } });
-    auto const collides = AdminRefusalFor({ Cc::SurfaceReport { .surface = Cc::WireSurface::Admin, .port = 6674 } });
+    auto const tls = AdminRefusalFor(
+        { CacheWire::SurfaceReport { .surface = CacheWire::WireSurface::Admin, .port = 9000, .tls = true } });
+    auto const collides =
+        AdminRefusalFor({ CacheWire::SurfaceReport { .surface = CacheWire::WireSurface::Admin, .port = 6674 } });
 
     CHECK_FALSE(undiscovered.contains("--admin-listen"));
     CHECK_FALSE(tls.contains("--admin-listen"));
@@ -1809,14 +1943,13 @@ TEST_CASE("the stats ladder relays the same remedy when it skips /metrics", "[cl
 {
     // The note the cases above read, as the ladder renders it: folded into "<source> was not
     // asked: <note>". A remedy that only reads correctly as the bare note is half a fix.
-    ScriptedNodeExchange node {
-        { StatusReply({ .version = "0.2.0",
-                        .nodeId = {},
-                        .uptimeSeconds = 5,
-                        .surfaces = { Cc::SurfaceReport { .surface = Cc::WireSurface::Raft, .port = 6680 } } }),
-          NodeFailure(ExchangeFailure::Transport, "the node-metrics verb went unanswered") },
-        "10.0.0.4:6674"
-    };
+    ScriptedNodeExchange node { { StatusReply({ .version = "0.2.0",
+                                                .nodeId = {},
+                                                .uptimeSeconds = 5,
+                                                .surfaces = { CacheWire::SurfaceReport {
+                                                    .surface = CacheWire::WireSurface::Raft, .port = 6680 } } }),
+                                  NodeFailure(ExchangeFailure::Transport, "the node-metrics verb went unanswered") },
+                                "10.0.0.4:6674" };
     auto gatherer = GathererFor(node);
 
     auto const answer = ChooseStats(gatherer.Gather());
@@ -1835,18 +1968,16 @@ TEST_CASE("the stats ladder records where it asked each source, and no address f
     // `0xFC` address for node-metrics, the cache's for INFO, an IPv6 literal bracketed so its port reads.
     // WHAT DISTINGUISHES: /metrics was not asked, and an address beside it would name a listener nothing
     // dialled -- and node-metrics was asked and failed, which still says where.
-    ScriptedNodeExchange node {
-        { StatusReply({ .version = "0.2.0",
-                        .nodeId = {},
-                        .uptimeSeconds = 5,
-                        .surfaces = { Cc::SurfaceReport { .surface = Cc::WireSurface::Raft, .port = 6680 } } }),
-          NodeFailure(ExchangeFailure::Transport, "the node-metrics verb went unanswered") },
-        "10.0.0.4:6674"
-    };
+    ScriptedNodeExchange node { { StatusReply({ .version = "0.2.0",
+                                                .nodeId = {},
+                                                .uptimeSeconds = 5,
+                                                .surfaces = { CacheWire::SurfaceReport {
+                                                    .surface = CacheWire::WireSurface::Raft, .port = 6680 } } }),
+                                  NodeFailure(ExchangeFailure::Transport, "the node-metrics verb went unanswered") },
+                                "10.0.0.4:6674" };
     ScriptedExchange resp { Answers({ Bulk("fastcached_version:0.4.1\r\n") }) };
     auto gatherer =
-        LadderGatherer { Endpoint {}, Endpoint { .host = "fd00::9", .port = 6379 }, DialTimeouts {}, std::nullopt, &resp,
-                         &node };
+        LadderGatherer { Endpoint {}, Endpoint { .host = "fd00::9", .port = 6379 }, DialTimeouts {}, &resp, &node };
 
     auto const attempts = gatherer.Gather();
     auto const whereOf = [&attempts](StatsOrigin origin) {
@@ -1874,7 +2005,6 @@ TEST_CASE("the stats ladder records where it asked /metrics, whatever the scrape
         LadderGatherer { admin,
                          Endpoint { .host = "10.0.0.4", .port = 6674 },
                          DialTimeouts { .connect = std::chrono::seconds { 5 }, .io = std::chrono::milliseconds { 50 } },
-                         std::nullopt,
                          nullptr,
                          nullptr };
 
@@ -1885,6 +2015,76 @@ TEST_CASE("the stats ladder records where it asked /metrics, whatever the scrape
     CHECK(metrics->asked);
     CHECK_FALSE(metrics->record.has_value());
     CHECK(metrics->where == std::format("127.0.0.1:{}", admin.port));
+}
+
+namespace
+{
+
+/// @param listener The bound listener.
+/// @return The accepted socket, or the accept error.
+[[nodiscard]] core::async::Task<core::net::AcceptResult> AcceptOneAdmin(BlockingListener* listener)
+{
+    co_return co_await listener->accept();
+}
+
+/// One read, as a task `core::async::syncRun` can drive.
+/// @param socket The socket.
+/// @param buffer Where the bytes go; not empty.
+/// @return Bytes read, `0` for EOF, or the failure.
+[[nodiscard]] core::async::Task<core::net::IoResult> ReadAdminSome(core::net::ISocket* socket, std::span<std::byte> buffer)
+{
+    co_return co_await socket->read(buffer);
+}
+
+} // namespace
+
+TEST_CASE("the /metrics scrape presents no credential, whatever this invocation holds", "[cli][node][stats][auth]")
+{
+    // The admin surface is plain HTTP on a port that may be on any host, and `--token-file`'s secret is never the
+    // credential there. It used to travel as `Authorization: Bearer` in the clear. The gatherer takes no credential
+    // at all now, so this asks the wire: a real loopback listener reads the request head the scrape sent.
+    auto listener = BlockingListener::Bind("127.0.0.1", 0);
+    if (listener == nullptr || !listener->IsBound() || listener->boundPort() == 0)
+        SKIP("this host would not bind a loopback listener on any port; the /metrics rung cannot be dialled here");
+    listener->SetTimeouts(std::chrono::seconds { 5 }, std::chrono::seconds { 5 });
+    auto const admin = Endpoint { .host = "127.0.0.1", .port = listener->boundPort() };
+
+    // The head the server read, returned to this thread rather than asserted on the server's.
+    auto head = std::string {};
+    {
+        auto const server = std::jthread { [&listener, &head] {
+            auto accepted = core::async::syncRun(AcceptOneAdmin(listener.get()));
+            if (!accepted.has_value())
+                return;
+            auto const socket = *std::move(accepted);
+            socket->setReceiveDeadline(std::chrono::seconds { 5 });
+            auto buffer = std::array<std::byte, 1024> {};
+            while (!head.contains("\r\n\r\n"))
+            {
+                auto const got = core::async::syncRun(ReadAdminSome(socket.get(), buffer));
+                if (!got.has_value() || *got == 0)
+                    break;
+                head.append(reinterpret_cast<char const*>(buffer.data()), *got);
+            }
+            constexpr std::string_view Response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            std::ignore = core::async::syncRun(
+                core::net::sendAll(socket.get(), std::as_bytes(std::span { Response.data(), Response.size() })));
+            socket->close();
+        } };
+
+        auto gatherer =
+            LadderGatherer { admin,
+                             Endpoint { .host = "10.0.0.4", .port = 6674 },
+                             DialTimeouts { .connect = std::chrono::seconds { 5 }, .io = std::chrono::seconds { 5 } },
+                             nullptr,
+                             nullptr };
+        std::ignore = gatherer.Gather();
+    }
+
+    // The control: the server did read the scrape, so an absent header is a finding, not an empty read.
+    REQUIRE(head.starts_with("GET /metrics HTTP/1.1\r\n"));
+    CHECK_FALSE(head.contains("Authorization"));
+    CHECK_FALSE(head.contains("Bearer"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1908,7 +2108,7 @@ namespace
 [[nodiscard]] std::vector<std::byte> OkWithUnreadableBody()
 {
     auto const garbage = std::to_array({ std::byte { 0xFF } });
-    return Cc::EncodeReply(Cc::Status::Ok, garbage);
+    return CacheWire::EncodeReply(CacheWire::Status::Ok, garbage);
 }
 
 /// The identity a gatherer reports for one scripted reply.
@@ -1928,11 +2128,10 @@ TEST_CASE("an endpoint's identity keeps its four states apart by type", "[cli][n
     // THE state that must not collapse is the first: nobody could ask. Inferring `cache`
     // for it reports *INFO did not answer* against a port that may speak no RESP.
     auto notAskedGatherer =
-        LadderGatherer { Endpoint {}, Endpoint { .host = "10.0.0.4", .port = 6674 }, DialTimeouts {}, std::nullopt, nullptr,
-                         nullptr };
+        LadderGatherer { Endpoint {}, Endpoint { .host = "10.0.0.4", .port = 6674 }, DialTimeouts {}, nullptr, nullptr };
     auto const notAsked = notAskedGatherer.IdentifyEndpoint();
     auto const silent = IdentityFor(NodeFailure(ExchangeFailure::Transport, "the server closed the connection"));
-    auto const daemon = IdentityFor(RefusalReply(Cc::UnimplementedVerb));
+    auto const daemon = IdentityFor(RefusalReply(CacheWire::UnimplementedVerb));
     auto const node = IdentityFor(StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }));
 
     CHECK_FALSE(notAsked.kind.has_value());
@@ -1954,8 +2153,8 @@ TEST_CASE("the identity and the probe classify every reply the same way", "[cli]
     auto const replies = std::to_array<ScriptedNodeExchange::Outcome>({
         StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = {} }),
         OkWithUnreadableBody(),
-        RefusalReply(Cc::UnimplementedVerb),
-        RefusalReply(Cc::ErrorCode::NotAMember),
+        RefusalReply(CacheWire::UnimplementedVerb),
+        RefusalReply(CacheWire::ErrorCode::NotAMember),
         NodeFailure(ExchangeFailure::Transport, "the server closed the connection"),
     });
 
@@ -1990,7 +2189,7 @@ TEST_CASE("an endpoint is identified once however many callers ask", "[cli][node
 
     // Counted by VERB, since the node-metrics rung sends its own request on the same connection.
     auto const statusRequests = std::ranges::count_if(node.Sent(), [](std::vector<std::byte> const& frame) {
-        return frame.size() > 2 && frame[2] == static_cast<std::byte>(Cc::Op::NodeStatus);
+        return frame.size() > 2 && frame[2] == static_cast<std::byte>(CacheWire::Op::NodeStatus);
     });
     CHECK(statusRequests == 1);
     CHECK(node.Unused() == 0);
@@ -2033,7 +2232,7 @@ TEST_CASE("a node whose description this client cannot read is a node it cannot 
     CHECK_FALSE(readable.unreadable);
 
     // A refusal is not a node at all, and says nothing about a description.
-    CHECK_FALSE(IdentityFor(RefusalReply(Cc::UnimplementedVerb)).unreadable);
+    CHECK_FALSE(IdentityFor(RefusalReply(CacheWire::UnimplementedVerb)).unreadable);
 }
 
 TEST_CASE("a node-status refused on the wire version names both versions and does not deny a node", "[cli][node][identity]")
@@ -2041,15 +2240,15 @@ TEST_CASE("a node-status refused on the wire version names both versions and doe
     // Refused before the verb was read, so nothing says whether a node is there: the sentence
     // names this client's wire and carries the server's own range, and never claims "not a
     // compile node", which is what every other refusal is worded as.
-    auto const refused =
-        IdentityFor(RefusalReply(Cc::ErrorCode::UnsupportedVersion, "unsupported wire version 8; this server speaks 6..6"));
+    auto const refused = IdentityFor(
+        RefusalReply(CacheWire::ErrorCode::UnsupportedVersion, "unsupported wire version 8; this server speaks 6..6"));
     CHECK(refused.kind == RemoteKind::FastcacheWireOnly);
-    CHECK(refused.detail.contains(std::format("0xFC wire {}", static_cast<unsigned>(Cc::CurrentVersion))));
+    CHECK(refused.detail.contains(std::format("0xFC wire {}", static_cast<unsigned>(CacheWire::CurrentVersion))));
     CHECK(refused.detail.contains("this server speaks 6..6"));
     CHECK_FALSE(refused.detail.contains("not a compile node"));
 
     // The control: an unimplemented verb keeps the daemon's sentence.
-    CHECK(IdentityFor(RefusalReply(Cc::UnimplementedVerb)).detail.contains("not a compile node"));
+    CHECK(IdentityFor(RefusalReply(CacheWire::UnimplementedVerb)).detail.contains("not a compile node"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2060,17 +2259,18 @@ TEST_CASE("cordon and uncordon send the cordon verb carrying the action each nam
 {
     // The bytes, not only the rendering: a scripted node answers both actions the same
     // way, so a verb that sent the wrong one would render exactly as a right one.
-    for (auto const& [verb, action]: { std::pair { std::string_view { "cordon" }, Cc::CordonAction::Cordon },
-                                       std::pair { std::string_view { "uncordon" }, Cc::CordonAction::Lift } })
+    for (auto const& [verb, action]: { std::pair { std::string_view { "cordon" }, CacheWire::CordonAction::Cordon },
+                                       std::pair { std::string_view { "uncordon" }, CacheWire::CordonAction::Lift } })
     {
         INFO("verb: " << verb);
-        ScriptedNodeExchange node { { Cc::EncodeReply(
-            Cc::Status::Ok, Cc::EncodeCordonFields({ .state = Cc::WireCordonState::Serving, .inFlight = 0 })) } };
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(
+            CacheWire::Status::Ok,
+            CacheWire::EncodeCordonFields({ .state = CacheWire::WireCordonState::Serving, .inFlight = 0 })) } };
         (void) RunNodeVerb(verb, node);
 
         REQUIRE(node.Sent().size() == 1);
         CHECK(OpOf(SentFrame(node)) == 0x13);
-        CHECK(SentFrame(node) == Cc::EncodeCordonRequest(action));
+        CHECK(SentFrame(node) == CacheWire::EncodeCordonRequest(action));
     }
 }
 
@@ -2078,8 +2278,9 @@ TEST_CASE("cordon reports the state it left the worker in and what is still runn
 {
     SECTION("draining names the running compiles and what `node` will say when they are gone")
     {
-        ScriptedNodeExchange node { { Cc::EncodeReply(
-            Cc::Status::Ok, Cc::EncodeCordonFields({ .state = Cc::WireCordonState::Draining, .inFlight = 2 })) } };
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(
+            CacheWire::Status::Ok,
+            CacheWire::EncodeCordonFields({ .state = CacheWire::WireCordonState::Draining, .inFlight = 2 })) } };
         auto const answer = RunNodeVerb("cordon", node);
 
         CHECK(answer.outcome == Outcome::Affirmative);
@@ -2094,8 +2295,9 @@ TEST_CASE("cordon reports the state it left the worker in and what is still runn
 
     SECTION("drained says nothing is running, and lifting it warns of nothing")
     {
-        ScriptedNodeExchange node { { Cc::EncodeReply(
-            Cc::Status::Ok, Cc::EncodeCordonFields({ .state = Cc::WireCordonState::Serving, .inFlight = 0 })) } };
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(
+            CacheWire::Status::Ok,
+            CacheWire::EncodeCordonFields({ .state = CacheWire::WireCordonState::Serving, .inFlight = 0 })) } };
         auto const answer = RunNodeVerb("uncordon", node);
 
         CHECK(RequiredCell(answer, "cordon").lexical == "serving");
@@ -2106,7 +2308,7 @@ TEST_CASE("cordon reports the state it left the worker in and what is still runn
     SECTION("a reply body this build cannot read is refused, not rendered")
     {
         std::vector<std::byte> const noPayload;
-        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, noPayload) } };
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, noPayload) } };
         auto const answer = RunNodeVerb("cordon", node);
 
         CHECK(answer.outcome == Outcome::Protocol);
@@ -2123,8 +2325,8 @@ TEST_CASE("`node` renders the cordon, and says nothing on a node with no worker"
               .nodeId = "node-a",
               .uptimeSeconds = 5,
               .surfaces = {},
-              .components = Cc::NodeComponentBit::Worker,
-              .runtime = { .compileSlots = 4, .compilesInFlight = 1, .cordon = Cc::WireCordonState::Draining } }) } };
+              .components = CacheWire::NodeComponentBit::Worker,
+              .runtime = { .compileSlots = 4, .compilesInFlight = 1, .cordon = CacheWire::WireCordonState::Draining } }) } };
         auto const answer = RunNodeVerb("node", node);
         CHECK(RequiredCell(answer, "cordon").lexical == "draining");
     }
@@ -2135,7 +2337,7 @@ TEST_CASE("`node` renders the cordon, and says nothing on a node with no worker"
                                                     .nodeId = "node-a",
                                                     .uptimeSeconds = 5,
                                                     .surfaces = {},
-                                                    .components = Cc::NodeComponentBit::Scheduler,
+                                                    .components = CacheWire::NodeComponentBit::Scheduler,
                                                     .runtime = {} }) } };
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Affirmative);
@@ -2152,12 +2354,12 @@ TEST_CASE("`node` reports where peers dial its consensus, apart from the port it
             { .version = "1.2.3",
               .nodeId = "node-a",
               .uptimeSeconds = 5,
-              .surfaces = { { .surface = Cc::WireSurface::Raft, .port = 6680, .tls = false } },
-              .components = Cc::NodeComponentBit::Scheduler,
+              .surfaces = { { .surface = CacheWire::WireSurface::Raft, .port = 6680, .tls = false } },
+              .components = CacheWire::NodeComponentBit::Scheduler,
               .runtime = { .consensusEndpoint = "10.0.0.4:6680" } }) } };
         auto const answer = RunNodeVerb("node", node);
-        CHECK(RequiredCell(answer, Cc::ConsensusEndpointField).lexical == "10.0.0.4:6680");
-        CHECK(RequiredCell(answer, Cc::ConsensusEndpointField).kind == CellKind::Text);
+        CHECK(RequiredCell(answer, CacheWire::ConsensusEndpointField).lexical == "10.0.0.4:6680");
+        CHECK(RequiredCell(answer, CacheWire::ConsensusEndpointField).kind == CellKind::Text);
         // Two cells, each carrying its own fact: a renderer that put the endpoint in the
         // port's place, or the port in the endpoint's, fails one of these.
         CHECK(RequiredCell(answer, "raft-port").lexical == "6680");
@@ -2169,65 +2371,105 @@ TEST_CASE("`node` reports where peers dial its consensus, apart from the port it
                                                     .nodeId = "node-a",
                                                     .uptimeSeconds = 5,
                                                     .surfaces = {},
-                                                    .components = Cc::NodeComponentBit::Worker,
+                                                    .components = CacheWire::NodeComponentBit::Worker,
                                                     .runtime = {} }) } };
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Affirmative);
-        CHECK(CellOf(answer, Cc::ConsensusEndpointField) == nullptr);
+        CHECK(CellOf(answer, CacheWire::ConsensusEndpointField) == nullptr);
     }
 }
 
 // ---------------------------------------------------------------------------
-// #1471: `explain-admission` asks a node which routes decided about one host.
+// #1471: `explain-admission` asks a node which routes decided about a machine, or about the
+// connection asking.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("explain-admission sends the host asked about, under the opcode the wire table names", "[cli][node][admission]")
+TEST_CASE("explain-admission sends the machine asked about, under the opcode the wire table names", "[cli][node][admission]")
 {
     // The BYTES, not only the rendering: the reply is scripted, so a verb that sent the
-    // wrong opcode -- or the right one carrying no host -- renders exactly as a right one.
-    ScriptedNodeExchange node { { Cc::EncodeReply(
-        Cc::Status::Ok, Cc::EncodeAdmissionExplanation({ .verdict = Cc::WireMembership::Member, .decidedBy = 0 })) } };
-    (void) RunNodeVerb("explain-admission", node, { "10.0.0.9" });
+    // wrong opcode -- or the right one carrying no subject -- renders exactly as a right one.
+    ScriptedNodeExchange node { { CacheWire::EncodeReply(
+        CacheWire::Status::Ok,
+        CacheWire::EncodeAdmissionExplanation({ .verdict = CacheWire::WireMembership::Member, .decidedBy = 0 })) } };
+    (void) RunNodeVerb("explain-admission", node, { "pc-07" });
 
     REQUIRE(node.Sent().size() == 1);
     CHECK(OpOf(SentFrame(node)) == 0x1B);
-    CHECK(SentFrame(node) == Cc::EncodeExplainAdmissionRequest("10.0.0.9"));
+    CHECK(SentFrame(node) == CacheWire::EncodeExplainAdmissionRequest("pc-07"));
+}
+
+TEST_CASE("explain-admission with no operand sends an empty subject", "[cli][node][admission]")
+{
+    // The question a refused caller can still have answered: about its own connection.
+    ScriptedNodeExchange node { { CacheWire::EncodeReply(
+        CacheWire::Status::Ok,
+        CacheWire::EncodeAdmissionExplanation(
+            { .verdict = CacheWire::WireMembership::Outsider, .decidedBy = 0, .subject = "10.0.0.7" })) } };
+    auto const answer = RunNodeVerb("explain-admission", node, {});
+
+    REQUIRE(node.Sent().size() == 1);
+    CHECK(SentFrame(node) == CacheWire::EncodeExplainAdmissionRequest(""));
+    // The subject is what the NODE says this connection is, and a connection has no standing.
+    CHECK(RequiredCell(answer, "subject").lexical == "10.0.0.7");
+    CHECK(RequiredCell(answer, "standing").kind == CellKind::Absent);
+    CHECK(RequiredCell(answer, "verdict").lexical == "refused");
 }
 
 TEST_CASE("explain-admission names EVERY route that decided, never only the winner", "[cli][node][admission]")
 {
-    // The whole of #1471: an operator who drops a host from `--fleet-member` and finds it
-    // still served has to be told the cluster admits it too. Each section asserts what
-    // DISTINGUISHES its case -- a renderer naming only the first route passes the
-    // one-route sections and fails this first one alone.
-    auto const explain = [](Cc::AdmissionExplanationFields fields) {
-        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, Cc::EncodeAdmissionExplanation(fields)) } };
-        return RunNodeVerb("explain-admission", node, { "10.0.0.9" });
+    // The whole of #1471: an operator who closes a node and finds a machine still served has
+    // to be told its key admits it too. Each section asserts what DISTINGUISHES its case -- a
+    // renderer naming only the first route passes the one-route sections and fails this first
+    // one alone.
+    auto const explain = [](CacheWire::AdmissionExplanationFields const& fields) {
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok,
+                                                             CacheWire::EncodeAdmissionExplanation(fields)) } };
+        return RunNodeVerb("explain-admission", node, { "pc-07" });
     };
 
-    SECTION("a host admitted by two routes has both named")
+    SECTION("a machine admitted by two routes has both named, and its standing")
     {
-        auto const answer =
-            explain({ .verdict = Cc::WireMembership::Member,
-                      .decidedBy = Cc::WireMembershipRoute::FleetMemberList | Cc::WireMembershipRoute::ClusterMembers });
+        auto const answer = explain(
+            { .verdict = CacheWire::WireMembership::Member,
+              .decidedBy = CacheWire::WireMembershipRoute::ProvenIdentity | CacheWire::WireMembershipRoute::MachineTicket,
+              .standing = CacheWire::WireMachineStanding::Learner,
+              .subject = "pc-07" });
 
         CHECK(answer.outcome == Outcome::Affirmative);
-        CHECK(RequiredCell(answer, "host").lexical == "10.0.0.9");
+        CHECK(RequiredCell(answer, "subject").lexical == "pc-07");
+        CHECK(RequiredCell(answer, "standing").lexical == "learner");
         CHECK(RequiredCell(answer, "verdict").lexical == "admitted");
-        CHECK(RequiredCell(answer, "decided-by").lexical.contains("--fleet-member"));
-        CHECK(RequiredCell(answer, "decided-by").lexical.contains("member set"));
+        CHECK(RequiredCell(answer, "decided-by").lexical == "proven-key, ticket");
     }
 
-    SECTION("a forgotten host names the tombstone and says re-listing it will not help")
+    SECTION("every standing is spelled, and a different one per standing")
     {
-        auto const answer =
-            explain({ .verdict = Cc::WireMembership::Forgotten, .decidedBy = Cc::WireMembershipRoute::ClientTombstone });
+        // A renderer spelling every standing alike would pass the section above.
+        auto seen = std::vector<std::string> {};
+        for (auto const& row: Distributed::MachineStandingWire)
+        {
+            auto const answer = explain(
+                { .verdict = CacheWire::WireMembership::Outsider, .decidedBy = 0, .standing = row.tag, .subject = "x" });
+            auto const spelled = RequiredCell(answer, "standing").lexical;
+            INFO(spelled);
+            CHECK_FALSE(spelled.empty());
+            CHECK_FALSE(std::ranges::contains(seen, spelled));
+            seen.push_back(spelled);
+        }
+    }
+
+    SECTION("a forgotten machine names its revoked key and says reopening the node will not help")
+    {
+        auto const answer = explain(
+            { .verdict = CacheWire::WireMembership::Forgotten, .decidedBy = CacheWire::WireMembershipRoute::KeyTombstone });
 
         CHECK(RequiredCell(answer, "verdict").lexical == "forgotten");
-        CHECK(RequiredCell(answer, "decided-by").lexical == "--cluster-forget-client");
-        // The advisory is the half an operator acts on: a tombstone outranks every
-        // admission route, so the obvious remedy is the wrong one.
-        CHECK(AdvisoryText(answer).contains("--fleet-member"));
+        CHECK(RequiredCell(answer, "decided-by").lexical == "key-revoked");
+        // The advisory is the half an operator acts on: a revoked key outranks every
+        // admission route, so the obvious remedy is the wrong one, and the right one is named.
+        CHECK(AdvisoryText(answer).contains("--fleet-open"));
+        CHECK(AdvisoryText(answer).contains("--cluster-admit"));
+        CHECK(AdvisoryText(answer).contains("NEW key"));
     }
 
     SECTION("a host nobody has an opinion about renders an ABSENT route cell, never an author")
@@ -2235,31 +2477,31 @@ TEST_CASE("explain-admission names EVERY route that decided, never only the winn
         // The silence case, and the reason the verb exists. `Outsider` is refused by
         // ABSENCE: attributing it to a route would report a list as the reason a host was
         // refused when that list never mentioned it.
-        auto const answer = explain({ .verdict = Cc::WireMembership::Outsider, .decidedBy = 0 });
+        auto const answer = explain({ .verdict = CacheWire::WireMembership::Outsider, .decidedBy = 0 });
 
         CHECK(RequiredCell(answer, "verdict").lexical == "refused");
         CHECK(RequiredCell(answer, "decided-by").kind == CellKind::Absent);
-        CHECK_FALSE(AdvisoryText(answer).contains("--fleet-member"));
+        CHECK_FALSE(AdvisoryText(answer).contains("--cluster-admit"));
     }
 
-    SECTION("a route bit this client is too old to name is COUNTED, and the named ones still shown")
+    SECTION("a route bit this client cannot name is printed as its NUMBER, and the named ones still shown")
     {
-        // A newer node may set a bit this build has no row for. Dropping it would say
-        // FEWER things decided this than did, which is the reading that sends somebody to
-        // change a route that was never consulted.
-        constexpr auto unknownBit = std::uint32_t { 0x8000'0000 };
-        auto const answer = explain(
-            { .verdict = Cc::WireMembership::Member, .decidedBy = Cc::WireMembershipRoute::FleetMemberList | unknownBit });
+        // A newer node may set a bit this build has no row for. Dropping it would say FEWER
+        // things decided this than did; printing its number lets the operator ask a client of the
+        // node's own version which route it is.
+        // The first bit above every route this build names.
+        constexpr auto unknownBit = std::uint32_t { 0x100 };
+        auto const answer = explain({ .verdict = CacheWire::WireMembership::Member,
+                                      .decidedBy = CacheWire::WireMembershipRoute::Loopback | unknownBit });
 
-        CHECK(RequiredCell(answer, "decided-by").lexical.contains("--fleet-member"));
-        CHECK(RequiredCell(answer, "decided-by").lexical.contains("1 route(s) this client is too old to name"));
+        CHECK(RequiredCell(answer, "decided-by").lexical == "loopback, 0x100");
     }
 
     SECTION("a body this client cannot read is refused by name, never rendered as nobody deciding")
     {
         std::vector<std::byte> const noPayload;
-        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, noPayload) } };
-        auto const answer = RunNodeVerb("explain-admission", node, { "10.0.0.9" });
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(CacheWire::Status::Ok, noPayload) } };
+        auto const answer = RunNodeVerb("explain-admission", node, { "pc-07" });
 
         CHECK(answer.outcome == Outcome::Protocol);
         CHECK(AdvisoryText(answer).contains("cannot read"));
@@ -2275,18 +2517,24 @@ TEST_CASE("every admission route the node can send has a spelling an operator ca
     for (auto const& row: Distributed::MembershipWireRoutes)
     {
         INFO("route bit: " << static_cast<std::uint32_t>(row.bit));
-        ScriptedNodeExchange node { { Cc::EncodeReply(
-            Cc::Status::Ok,
-            Cc::EncodeAdmissionExplanation(
-                { .verdict = Cc::WireMembership::Member, .decidedBy = static_cast<std::uint32_t>(row.bit) })) } };
-        auto const answer = RunNodeVerb("explain-admission", node, { "10.0.0.9" });
+        // The one route no node can send: it travels as no bit, so there is nothing to spell.
+        if (row.bit == 0)
+        {
+            CHECK(row.route == Distributed::MembershipParticipant::Reserved);
+            continue;
+        }
+        ScriptedNodeExchange node { { CacheWire::EncodeReply(
+            CacheWire::Status::Ok,
+            CacheWire::EncodeAdmissionExplanation(
+                { .verdict = CacheWire::WireMembership::Member, .decidedBy = static_cast<std::uint32_t>(row.bit) })) } };
+        auto const answer = RunNodeVerb("explain-admission", node, { "pc-07" });
 
         auto const& described = RequiredCell(answer, "decided-by");
         CHECK(described.kind == CellKind::Text);
         CHECK_FALSE(described.lexical.empty());
-        // And that it is a SPELLING rather than the bit falling through as unnamed, which
-        // is what a missing row would produce and what every other assertion here allows.
-        CHECK_FALSE(described.lexical.contains("too old to name"));
+        // And that it is a SPELLING rather than the bit falling through as a number, which is
+        // what a missing row would produce and what every other assertion here allows.
+        CHECK_FALSE(described.lexical.starts_with("0x"));
     }
 }
 
@@ -2300,13 +2548,10 @@ TEST_CASE("cluster-members says which seat each member was admitted into", "[cli
     // is red on at least one row.
     Cluster::ClusterState state;
     auto const admit = [&state](Cluster::CommandKind kind, std::string id, std::string raft) {
+        auto const key = MemberKey(id);
         Apply(state,
-              Cluster::Command { .kind = kind,
-                                 .key = std::move(id),
-                                 .value = std::move(raft),
-                                 .schedulerEndpoint = {},
-                                 .publicKey = std::nullopt,
-                                 .role = std::nullopt });
+              Cluster::Command {
+                  .kind = kind, .key = std::move(id), .value = std::move(raft), .schedulerEndpoint = {}, .publicKey = key });
     };
     admit(Cluster::CommandKind::AddMember, "node-a", "10.0.0.7:6675");
     admit(Cluster::CommandKind::AddLearner, "node-b", "10.0.0.8:6675");
@@ -2335,17 +2580,17 @@ TEST_CASE("cluster-admit-learner reports the seat it asked for, as asked rather 
     // The receipt carries no seat -- it is the verb's byte, and a field echoing the request
     // is the constant the receipt refuses to carry -- so the field NAME says where the value
     // came from. Both verbs, so a handler that spelled one seat for both is red.
-    auto const receipt = Cc::EncodeClusterAdmitReceipt(
-        Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::nullopt });
+    auto const receipt = CacheWire::EncodeClusterAdmitReceipt(
+        CacheWire::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675", .publicKey = std::nullopt });
 
-    ScriptedNodeExchange learner { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
+    ScriptedNodeExchange learner { { CacheWire::EncodeReply(CacheWire::Status::Ok, receipt) } };
     auto const asLearner = RunNodeVerb("cluster-admit-learner", learner, { "node-c", "10.0.0.9:6675" });
     REQUIRE(asLearner.outcome == Outcome::Affirmative);
     CHECK(RequiredCell(asLearner, "seat-as-requested").lexical == "learner");
     CHECK(RequiredCell(asLearner, "member-id-as-received").lexical == "node-c");
     CHECK(RequiredCell(asLearner, "state").lexical == "appended, not committed");
 
-    ScriptedNodeExchange voter { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
+    ScriptedNodeExchange voter { { CacheWire::EncodeReply(CacheWire::Status::Ok, receipt) } };
     auto const asVoter = RunNodeVerb("cluster-admit", voter, { "node-c", "10.0.0.9:6675" });
     REQUIRE(asVoter.outcome == Outcome::Affirmative);
     CHECK(RequiredCell(asVoter, "seat-as-requested").lexical == "voter");
@@ -2357,17 +2602,17 @@ TEST_CASE("`node` reports which set consensus counts it in", "[cli][node][verbs]
     // that tells an operator which of them will stand when the leader goes. Every standing,
     // so a renderer that named one of them wrongly is red.
     for (auto const& [standing, name]:
-         { std::pair { Cc::WireConsensusStanding::Voter, std::string_view { "voter" } },
-           std::pair { Cc::WireConsensusStanding::Learner, std::string_view { "learner" } },
-           std::pair { Cc::WireConsensusStanding::NoCluster, std::string_view { "no-cluster" } },
-           std::pair { Cc::WireConsensusStanding::Outsider, std::string_view { "outsider" } } })
+         { std::pair { CacheWire::WireConsensusStanding::Voter, std::string_view { "voter" } },
+           std::pair { CacheWire::WireConsensusStanding::Learner, std::string_view { "learner" } },
+           std::pair { CacheWire::WireConsensusStanding::NoCluster, std::string_view { "no-cluster" } },
+           std::pair { CacheWire::WireConsensusStanding::Outsider, std::string_view { "outsider" } } })
     {
         INFO("standing: " << name);
         ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
                                                     .nodeId = "node-a",
                                                     .uptimeSeconds = 5,
                                                     .surfaces = {},
-                                                    .components = Cc::NodeComponentBit::Consensus,
+                                                    .components = CacheWire::NodeComponentBit::Consensus,
                                                     .runtime = { .consensusStanding = standing } }) } };
         auto const answer = RunNodeVerb("node", node);
         CHECK(RequiredCell(answer, "consensus-standing").lexical == name);
@@ -2378,11 +2623,98 @@ TEST_CASE("`node` reports which set consensus counts it in", "[cli][node][verbs]
                                                 .nodeId = "node-a",
                                                 .uptimeSeconds = 5,
                                                 .surfaces = {},
-                                                .components = Cc::NodeComponentBit::Worker,
+                                                .components = CacheWire::NodeComponentBit::Worker,
                                                 .runtime = {} }) } };
     auto const answer = RunNodeVerb("node", none);
     CHECK(answer.outcome == Outcome::Affirmative);
     CHECK(CellOf(answer, "consensus-standing") == nullptr);
+}
+
+namespace
+{
+
+/// A `node` answer from a node that says @p shared about the fleet's shared cache.
+/// @param shared The record, or nothing for a node too old to carry one.
+/// @return The answer.
+[[nodiscard]] Answer NodeSaying(std::optional<CacheWire::SharedCacheStatusFields> shared)
+{
+    ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                .nodeId = "node-a",
+                                                .uptimeSeconds = 5,
+                                                .surfaces = {},
+                                                .components = CacheWire::NodeComponentBit::CacheTier,
+                                                .runtime = { .sharedCache = std::move(shared) } }) } };
+    return RunNodeVerb("node", node);
+}
+
+} // namespace
+
+TEST_CASE("`node` reports the fleet's shared cache as cells", "[cli][node][verbs][shared-cache]")
+{
+    // Cells, so a JSON or CSV consumer compares the state word rather than parsing a sentence.
+    auto const answer =
+        NodeSaying(CacheWire::SharedCacheStatusFields { .source = CacheWire::WireSharedCacheSource::Setting,
+                                                        .machineId = "cache-c",
+                                                        .endpoint = "10.0.0.3:6674",
+                                                        .state = CacheWire::WireSharedCacheState::Unreachable,
+                                                        .detail = "connection refused" });
+    REQUIRE(answer.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(answer, "shared-cache").lexical == "setting");
+    CHECK(RequiredCell(answer, "shared-cache-machine").lexical == "cache-c");
+    CHECK(RequiredCell(answer, "shared-cache-endpoint").lexical == "10.0.0.3:6674");
+    CHECK(RequiredCell(answer, "shared-cache-state").lexical == "unreachable");
+    CHECK(RequiredCell(answer, "shared-cache-detail").lexical == "connection refused");
+}
+
+TEST_CASE("`node` says none for a node with no shared cache, and nothing only for one too old to say",
+          "[cli][node][verbs][shared-cache]")
+{
+    // A node with none says `none`, and what it did not name is ABSENT at the cell, never blank.
+    auto const none = NodeSaying(CacheWire::SharedCacheStatusFields {});
+    REQUIRE(none.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(none, "shared-cache").lexical == "none");
+    CHECK(RequiredCell(none, "shared-cache-state").lexical == "not-tried");
+    CHECK(RequiredCell(none, "shared-cache-machine").kind == CellKind::Absent);
+    CHECK(RequiredCell(none, "shared-cache-endpoint").kind == CellKind::Absent);
+    CHECK(RequiredCell(none, "shared-cache-detail").kind == CellKind::Absent);
+
+    // A node that sent no record: the field is there and absent, and nothing else is claimed.
+    auto const silent = NodeSaying(std::nullopt);
+    REQUIRE(silent.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(silent, "shared-cache").kind == CellKind::Absent);
+    CHECK(CellOf(silent, "shared-cache-state") == nullptr);
+    CHECK(CellOf(silent, "shared-cache-machine") == nullptr);
+}
+
+TEST_CASE("`node` names every shared-cache source and state in one token", "[cli][node][verbs][shared-cache]")
+{
+    // Every enumerator, so a spelling that named one of them wrongly -- or two alike -- is red.
+    for (auto const& [source, word]:
+         { std::pair { CacheWire::WireSharedCacheSource::None, std::string_view { "none" } },
+           std::pair { CacheWire::WireSharedCacheSource::Setting, std::string_view { "setting" } },
+           std::pair { CacheWire::WireSharedCacheSource::Override, std::string_view { "override" } },
+           std::pair { CacheWire::WireSharedCacheSource::ThisMachine, std::string_view { "this-machine" } } })
+    {
+        INFO("source: " << word);
+        auto shared = CacheWire::SharedCacheStatusFields {};
+        shared.source = source;
+        CHECK(RequiredCell(NodeSaying(shared), "shared-cache").lexical == word);
+    }
+    for (auto const& [state, word]:
+         { std::pair { CacheWire::WireSharedCacheState::NotTried, std::string_view { "not-tried" } },
+           std::pair { CacheWire::WireSharedCacheState::Proven, std::string_view { "proven" } },
+           std::pair { CacheWire::WireSharedCacheState::Unresolved, std::string_view { "unresolved" } },
+           std::pair { CacheWire::WireSharedCacheState::WrongKey, std::string_view { "wrong-key" } },
+           std::pair { CacheWire::WireSharedCacheState::Unreachable, std::string_view { "unreachable" } },
+           std::pair { CacheWire::WireSharedCacheState::Serving, std::string_view { "serving" } },
+           std::pair { CacheWire::WireSharedCacheState::Unavailable, std::string_view { "unavailable" } },
+           std::pair { CacheWire::WireSharedCacheState::ProofRefused, std::string_view { "proof-refused" } } })
+    {
+        INFO("state: " << word);
+        auto shared = CacheWire::SharedCacheStatusFields {};
+        shared.state = state;
+        CHECK(RequiredCell(NodeSaying(shared), "shared-cache-state").lexical == word);
+    }
 }
 
 namespace
@@ -2394,21 +2726,21 @@ namespace
 /// @param severity Its severity word.
 /// @param state Its state word.
 /// @return The row.
-[[nodiscard]] Cc::NodeConditionFields ConditionRow(std::string id,
-                                                   std::string persistence,
-                                                   std::string severity,
-                                                   std::string state)
+[[nodiscard]] CacheWire::NodeConditionFields ConditionRow(std::string id,
+                                                          std::string persistence,
+                                                          std::string severity,
+                                                          std::string state)
 {
-    return Cc::NodeConditionFields { .id = std::move(id),
-                                     .persistence = std::move(persistence),
-                                     .severity = std::move(severity),
-                                     .state = std::move(state),
-                                     .detail = "what the node saw",
-                                     .remedy = "what to do about it" };
+    return CacheWire::NodeConditionFields { .id = std::move(id),
+                                            .persistence = std::move(persistence),
+                                            .severity = std::move(severity),
+                                            .state = std::move(state),
+                                            .detail = "what the node saw",
+                                            .remedy = "what to do about it" };
 }
 
 /// A node that raises one LATCHED row and one LIVE row, with a third row clear.
-[[nodiscard]] std::vector<Cc::NodeConditionFields> LatchedAndLiveRaised()
+[[nodiscard]] std::vector<CacheWire::NodeConditionFields> LatchedAndLiveRaised()
 {
     return { ConditionRow("scratch-root-unmappable", "latched", "warning", "raised"),
              ConditionRow("enrollment-window-open", "live", "alert", "raised"),
@@ -2416,7 +2748,7 @@ namespace
 }
 
 /// A node that sent every row and raised none.
-[[nodiscard]] std::vector<Cc::NodeConditionFields> NoneRaisedRows()
+[[nodiscard]] std::vector<CacheWire::NodeConditionFields> NoneRaisedRows()
 {
     return { ConditionRow("scratch-root-unmappable", "latched", "warning", "clear"),
              ConditionRow("enrollment-window-open", "live", "alert", "not-evaluated") };
@@ -2425,13 +2757,14 @@ namespace
 /// A `NodeStatus` reply carrying @p conditions, or none at all.
 /// @param conditions What the node reports; `std::nullopt` is a build older than conditions.
 /// @return The reply frame.
-[[nodiscard]] std::vector<std::byte> StatusWithConditions(std::optional<std::vector<Cc::NodeConditionFields>> conditions)
+[[nodiscard]] std::vector<std::byte> StatusWithConditions(
+    std::optional<std::vector<CacheWire::NodeConditionFields>> conditions)
 {
     return StatusReply({ .version = "1.2.3",
                          .nodeId = "node-a",
                          .uptimeSeconds = 5,
                          .surfaces = {},
-                         .components = Cc::NodeComponentBit::Worker,
+                         .components = CacheWire::NodeComponentBit::Worker,
                          .runtime = { .conditions = std::move(conditions) } });
 }
 
@@ -2488,8 +2821,8 @@ TEST_CASE("`node-conditions` lists every row, exits by whether any asks, and ref
         CHECK(answer.outcome == Outcome::Affirmative);
 
         std::vector<std::string> expected;
-        expected.reserve(Cc::ConditionFieldTable.size());
-        for (auto const& field: Cc::ConditionFieldTable)
+        expected.reserve(CacheWire::ConditionFieldTable.size());
+        for (auto const& field: CacheWire::ConditionFieldTable)
             expected.emplace_back(field.name);
         CHECK(answer.value.columns == expected);
 
@@ -2534,7 +2867,7 @@ TEST_CASE("`fleet conditions` carries the leader's rows, latched and live apart 
     // expected the leader to write.
     Distributed::FleetSnapshot snapshot;
     snapshot.role = Distributed::SchedulerRole::Leader;
-    auto machine = [](std::string endpoint, std::optional<std::vector<Cc::NodeConditionFields>> conditions) {
+    auto machine = [](std::string endpoint, std::optional<std::vector<CacheWire::NodeConditionFields>> conditions) {
         auto report = Distributed::NodeReport {};
         report.endpoint = std::move(endpoint);
         report.conditions = std::move(conditions);
@@ -2578,8 +2911,8 @@ TEST_CASE("`node` reports the identity key whole, and absent on a node that hold
     // RFC 8032 TEST 1's public key, and its text as a DIFFERENT implementation spells it
     // (Python's `base64.urlsafe_b64encode`, padding stripped) -- so the cell is pinned to an
     // answer the one encoder did not produce.
-    auto key = Cc::NodeRuntimeFields {};
-    key.identityPublicKey = FastCache::Testing::ArrayFromHex<Cc::IdentityPublicKeyBytes>(
+    auto key = CacheWire::NodeRuntimeFields {};
+    key.identityPublicKey = FastCache::Testing::ArrayFromHex<CacheWire::IdentityPublicKeyBytes>(
         "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
 
     ScriptedNodeExchange keyed { { StatusReply(
@@ -2596,4 +2929,72 @@ TEST_CASE("`node` reports the identity key whole, and absent on a node that hold
     auto const none = RunNodeVerb("node", keyless);
     CHECK(none.outcome == Outcome::Affirmative);
     CHECK(RequiredCell(none, "public-key").kind == CellKind::Absent);
+}
+
+TEST_CASE("`node` reports the fleet id to paste and the pin it trusts by, `none` when unpinned", "[cli][node][verbs][pin]")
+{
+    // `fleet-id` is what another machine's --fleet-id takes, verbatim; `none` under the pin is the
+    // answer an operator asks for: this node trusts on first use.
+    auto voter = Ed25519PublicKey {};
+    voter.fill(std::byte { 0x51 });
+    auto const pasteText = Cluster::FormatPinnedFleet(
+        Cluster::PinnedFleet { .clusterId = "0123456789abcdef0123456789abcdef", .voterKeys = { voter } });
+    auto const Paste = std::string_view { pasteText };
+    for (auto const& [pin, shown]:
+         { std::pair { CacheWire::NodeFleetPinFields {}, std::string_view { "none" } },
+           std::pair { CacheWire::NodeFleetPinFields { .fleet = "fedcba9876543210fedcba9876543210@another-voter-key" },
+                       std::string_view { "fedcba9876543210fedcba9876543210@another-voter-key" } } })
+    {
+        INFO("pin: " << shown);
+        ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                    .nodeId = "node-a",
+                                                    .uptimeSeconds = 5,
+                                                    .surfaces = {},
+                                                    .components = CacheWire::NodeComponentBit::Consensus,
+                                                    .runtime = { .fleetId = std::string { Paste }, .fleetPin = pin } }) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(RequiredCell(answer, "fleet-id").lexical == Paste);
+        CHECK(RequiredCell(answer, "fleet-pin").lexical == shown);
+    }
+
+    // A node too old to say has neither cell, rather than a pin of `none` it never stated.
+    ScriptedNodeExchange old { { StatusReply({ .version = "1.2.3",
+                                               .nodeId = "node-a",
+                                               .uptimeSeconds = 5,
+                                               .surfaces = {},
+                                               .components = CacheWire::NodeComponentBit::Consensus,
+                                               .runtime = {} }) } };
+    auto const answer = RunNodeVerb("node", old);
+    CHECK(answer.outcome == Outcome::Affirmative);
+    CHECK(CellOf(answer, "fleet-id") == nullptr);
+    CHECK(CellOf(answer, "fleet-pin") == nullptr);
+}
+
+TEST_CASE("`node` says a fleet id --fleet-id would refuse is not one to paste, rather than printing it bare",
+          "[cli][node][verbs][pin]")
+{
+    // A fleet with more voters than a pin may name: the string the node builds names every one, and the
+    // parser refuses it. Printed bare it reads as a pin to paste, which every machine then refuses.
+    auto fleet = Cluster::PinnedFleet { .clusterId = "0123456789abcdef0123456789abcdef", .voterKeys = {} };
+    for (auto const index: std::views::iota(std::size_t { 0 }, Cluster::MaxPinnedVoterKeys + 1))
+    {
+        auto key = Ed25519PublicKey {};
+        key.fill(static_cast<std::byte>(index + 1));
+        fleet.voterKeys.push_back(key);
+    }
+    auto const tooMany = Cluster::FormatPinnedFleet(fleet);
+    REQUIRE_FALSE(Cluster::ParsePinnedFleet(tooMany).has_value());
+    ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                .nodeId = "node-a",
+                                                .uptimeSeconds = 5,
+                                                .surfaces = {},
+                                                .components = CacheWire::NodeComponentBit::Consensus,
+                                                .runtime = { .fleetId = tooMany } }) } };
+    auto const answer = RunNodeVerb("node", node);
+    auto const cell = RequiredCell(answer, "fleet-id").lexical;
+    CHECK(cell != tooMany);
+    CHECK(cell.starts_with(tooMany)); // the keys are still there to choose a pin from
+    CHECK(cell.contains("--fleet-id refuses this as it stands"));
+    CHECK(cell.contains(std::format("more than {} voter keys", Cluster::MaxPinnedVoterKeys)));
+    CHECK(cell.contains("name at most"));
 }

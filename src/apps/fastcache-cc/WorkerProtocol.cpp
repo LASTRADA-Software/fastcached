@@ -5,6 +5,7 @@
 #include "WorkerProtocol.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Protocol/CompileReplySeal.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
@@ -59,8 +60,11 @@ namespace
         { .refusal = JobRefusal::UnknownFingerprint,
           .code = Wire::ErrorCode::FingerprintMismatch,
           .counter = IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint },
+        // Its own code since a cl-debug build met it (`ErrorCode::WorkerRejectedArgument`).
+        // It was `MalformedFrame` -- about a frame that parsed perfectly -- and the launcher
+        // duly reported every such refusal as a wire disagreement between two ends of one build.
         { .refusal = JobRefusal::RejectedArgument,
-          .code = Wire::ErrorCode::MalformedFrame,
+          .code = Wire::ErrorCode::WorkerRejectedArgument,
           .counter = IMetricsSink::Counter::WorkerJobsRefusedRejectedArgument },
         { .refusal = JobRefusal::ScratchUnavailable,
           .code = Wire::ErrorCode::WorkerScratchUnavailable,
@@ -130,23 +134,11 @@ namespace
                       RefusedVerbs, [](Wire::Op op) { return op == Wire::Op::Compile; }, &Wire::RefusedVerb::op),
                   "a refusal row for COMPILE is dead: the lookup never reaches it");
 
-    /// What a worker whose roster lapsed says about when it did.
-    /// @param reading The roster's standing, `Expired`.
-    /// @param now This machine's clock.
-    /// @return The detail.
-    [[nodiscard]] std::string RosterLapsedDetail(Distributed::RosterReading const& reading,
-                                                 std::chrono::system_clock::time_point now)
-    {
-        if (!reading.certifiedUntil.has_value() || now <= *reading.certifiedUntil)
-            return "this worker's roster is not certified by a majority of its voters, so it can verify no grant";
-        return std::format("this worker's roster lost its certification {} seconds ago and no leader it reaches has "
-                           "re-certified it, so it can verify no grant",
-                           std::chrono::duration_cast<std::chrono::seconds>(now - *reading.certifiedUntil).count());
-    }
 } // namespace
 
 LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
                                     IAdvertisedEndpointSource const& advertisedEndpoint,
+                                    std::span<std::byte const> identityKey,
                                     core::platform::WallClockRef clock,
                                     Distributed::WorkerLeaseState& lease,
                                     IMetricsSink& metrics,
@@ -160,8 +152,15 @@ LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
     // The endpoint is the one capture that is a REFERENCE on purpose: it is read per
     // request, so what is captured is where to ask rather than the answer (#1279). It
     // outlives this validator by contract, exactly as `lease` does.
-    return [signers = &roster, endpoint = &advertisedEndpoint, clock, &lease, &metrics, slack](
-               std::string_view token, std::string_view fingerprint) -> LeaseDecision {
+    // The key by VALUE: it is this machine's, fixed for the process, and a copy is what lets the
+    // validator outlive whatever handed it over.
+    return [signers = &roster,
+            endpoint = &advertisedEndpoint,
+            ownKey = std::string { Wire::AsStringView(identityKey) },
+            clock,
+            &lease,
+            &metrics,
+            slack](std::string_view token, std::string_view fingerprint) -> LeaseDecision {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
         // that later, with `UnknownFingerprint`. So the two comparisons compose rather
@@ -184,28 +183,23 @@ LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
         auto const advertised = endpoint->Current();
 
         // The roster FIRST, because nothing below means anything without it (#178): a grant
-        // is verified against the keys the roster holds, and a roster nobody re-certified in
-        // time may still name a voter the cluster has since revoked. A fact about THIS WORKER,
-        // like `Unregistered` below, so answering it before the signature is no oracle.
-        auto const reading = signers->Read(now);
-        if (reading.standing == Distributed::RosterStanding::Absent)
-            return LeaseDecision { .refusal =
-                                       Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::NoRoster,
-                                                                   .detail = "this worker holds no roster its trust anchors "
-                                                                             "certify, so it can verify no grant yet" },
-                                   .remaining = std::nullopt };
-        if (reading.standing == Distributed::RosterStanding::Expired)
-            return LeaseDecision { .refusal =
-                                       Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::RosterExpired,
-                                                                   .detail = RosterLapsedDetail(reading, now) },
+        // is verified against the voters the state this node applied records, and before it
+        // records any -- or once no leader that state counts has spoken for too long -- there is
+        // nothing a grant could safely be checked against. A fact about THIS WORKER, like
+        // `Unregistered` below, so answering it before the signature is no oracle. The standing's
+        // ROW says which refusal (`RosterStandingTable`).
+        if (auto const& standing = Distributed::RosterStandingTable[static_cast<std::size_t>(signers->Read(now).standing)];
+            standing.refusal.has_value())
+            return LeaseDecision { .refusal = Distributed::LeaseRefusal { .reason = *standing.refusal,
+                                                                          .detail = std::string { standing.detail } },
                                    .remaining = std::nullopt };
 
         // The fleet is READ per request rather than captured at construction, because
         // this validator is built at startup and the identity arrives later, in the
         // REGISTER reply (#401). Absent means this worker has not registered, and a
         // worker that does not know its fleet honours no grant -- which is the window
-        // the ticket closes. An engaged but EMPTY identity is a scheduler that names
-        // no cluster, is legal, and expects a grant that names none either.
+        // the ticket closes. An engaged but EMPTY identity is a reply that named an
+        // empty fleet, which no node sends; it matches only a grant that names none.
         auto const cluster = lease.fleet.Pinned();
         //
         // Answered BEFORE the MAC, and that is not the oracle the MAC-first rule
@@ -230,7 +224,8 @@ LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
         auto verified = Distributed::VerifyLeaseToken(
             *signers,
             token,
-            Distributed::LeaseExpectation { .endpoint = advertised, .fingerprint = fingerprint, .clusterId = *cluster },
+            Distributed::LeaseExpectation {
+                .endpoint = advertised, .fingerprint = fingerprint, .clusterId = *cluster, .identityKey = ownKey },
             now,
             slack);
         if (verified.has_value())
@@ -336,15 +331,31 @@ LeaseValidator UncheckedLeaseValidator()
     };
 }
 
+IJobRefusalObserver& IgnoreJobRefusals() noexcept
+{
+    struct Ignoring final: IJobRefusalObserver
+    {
+        void OnJobRefused(JobError const& /*error*/) override {}
+    };
+    // A function-local static: stateless, so sharing one across every protocol and every
+    // thread shares nothing, and it outlives any protocol handed it.
+    static Ignoring ignoring;
+    return ignoring;
+}
+
 WorkerProtocol::WorkerProtocol(ICompileJobRunner& jobs,
                                LeaseValidator validator,
                                Wire::CodecList acceptedCodecs,
+                               Ed25519KeyPair const* replyKey,
                                IMetricsSink& metrics,
+                               IJobRefusalObserver& refusals,
                                std::size_t maxDecompressedBytes):
     _jobs { jobs },
     _validator { std::move(validator) },
     _acceptedCodecs { std::move(acceptedCodecs) },
+    _replyKey { replyKey },
     _metrics { metrics },
+    _refusals { refusals },
     _maxDecompressedBytes { maxDecompressedBytes }
 {
 }
@@ -540,6 +551,9 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
         // for every refusal that has nothing to add, which reproduces the previous
         // empty-message wire exactly.
         auto const& descriptor = DescriptorFor(outcome.error().reason);
+        // Told WHICH, at the moment the counter below is told HOW MANY and for the same row,
+        // so the node can name the argument somewhere an operator looks.
+        _refusals.OnJobRefused(outcome.error());
         return Refuse(
             _metrics, SurfaceRefusal { .code = descriptor.code, .counter = descriptor.counter }, outcome.error().detail);
     }
@@ -602,24 +616,47 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     // carry the history.)
     auto const enveloped = Envelope(outcome->object, fields->acceptedCodecs, _acceptedCodecs);
 
-    return Wire::EncodeReply(
-        Wire::Status::Ok,
-        Wire::EncodeCompileResult(Wire::CompileResult { .exitCode = static_cast<std::uint32_t>(outcome->exitCode),
-                                                        .object = enveloped,
-                                                        .stdoutText = Wire::AsBytes(outcome->stdoutText),
-                                                        .stderrText = Wire::AsBytes(outcome->stderrText),
-                                                        // Carried through from the runner, never recomputed from
-                                                        // `fields` here -- see `ICompileJobRunner` (#280).
-                                                        .correlation = Wire::AsBytes(outcome->correlation) }));
+    // Signed over what is about to be SENT -- the correlation the runner produced and the object
+    // as enveloped -- so the launcher can tell this worker from whatever else has come to answer
+    // at its address, before the object reaches any cache (W-4). A worker holding no key signs
+    // nothing, and the launcher refuses the reply rather than trusting it.
+    auto const signature =
+        _replyKey != nullptr ? std::optional { SealCompileReply(*_replyKey, Wire::AsBytes(outcome->correlation), enveloped) }
+                             : std::nullopt;
+
+    return Wire::EncodeReply(Wire::Status::Ok,
+                             Wire::EncodeCompileResult(Wire::CompileResult {
+                                 .exitCode = static_cast<std::uint32_t>(outcome->exitCode),
+                                 .object = enveloped,
+                                 .stdoutText = Wire::AsBytes(outcome->stdoutText),
+                                 .stderrText = Wire::AsBytes(outcome->stderrText),
+                                 // Carried through from the runner, never recomputed from
+                                 // `fields` here -- see `ICompileJobRunner` (#280).
+                                 .correlation = Wire::AsBytes(outcome->correlation),
+                                 .signature = signature.has_value() ? std::span<std::byte const> { *signature }
+                                                                    : std::span<std::byte const> {} }));
 }
 
-WorkerRegistrar::WorkerRegistrar(CredentialNotice& notice,
-                                 std::string fingerprint,
+core::async::Task<CacheOutcome> ExchangeWithSchedulerAsync(core::net::ISocket* scheduler, std::vector<std::byte> frame)
+{
+    // Silent and never consulted: a notice reports a credential the peer ignored, and this
+    // exchange presents none. Constructed in this frame rather than taken from a call, since it is
+    // held across the await -- the shape #1545 miscompiled keeps a call's RESULT there.
+    CredentialNotice notice { CredentialNotice::Sink {} };
+    // The credential spelled, never defaulted: this is the one place that decides it is none.
+    co_return co_await ExchangeFramed(scheduler, &notice, std::move(frame), Credential {});
+}
+
+CacheOutcome ExchangeWithScheduler(core::net::ISocket& scheduler, std::vector<std::byte> frame)
+{
+    return core::async::syncRun(ExchangeWithSchedulerAsync(&scheduler, std::move(frame)));
+}
+
+WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
                                  std::string endpoint,
                                  std::uint32_t slots,
                                  Wire::CodecList acceptedCodecs,
                                  Wire::CapacityFields capacity):
-    _notice { notice },
     _fingerprint { std::move(fingerprint) },
     _endpoint { std::move(endpoint) },
     _slots { slots },
@@ -629,16 +666,25 @@ WorkerRegistrar::WorkerRegistrar(CredentialNotice& notice,
     // of scalars and is now a struct holding a vector, so a copy allocates.
     _capacity { std::move(capacity) }
 {
+    // The one field of the record a scheduler would refuse the whole registration over and that
+    // decides nothing: a compiler named in bytes that are not text, or at length, keeps its worker
+    // in the fleet and loses only the name. The fingerprint and the endpoint go as given: both are
+    // matched, so a repaired one would register a different worker.
+    _capacity.toolchainLabel = std::string { SendableToolchainLabel(_capacity.toolchainLabel) };
 }
 
-std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocket& scheduler, Credential const& credential)
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocket& scheduler,
+                                                               std::span<std::string const> interfaceAddresses)
 {
+    // A copy per registration: the addresses are this round's, the rest is the registrar's.
+    auto capacity = _capacity;
+    capacity.interfaceAddresses.assign(interfaceAddresses.begin(), interfaceAddresses.end());
     auto const frame = Wire::EncodeRegister(Wire::RegisterRequest { .fingerprint = _fingerprint,
                                                                     .endpoint = _endpoint,
                                                                     .slots = _slots,
                                                                     .acceptedCodecs = _acceptedCodecs,
-                                                                    .capacity = _capacity });
-    auto const outcome = core::async::syncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
+                                                                    .capacity = capacity });
+    auto const outcome = ExchangeWithScheduler(scheduler, frame);
     if (!outcome.IsHit())
         // The scheduler's own words, code and message both, which is the whole
         // reason this is not a bool: "not a member of this cluster" and "fingerprint
@@ -649,7 +695,9 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocke
         // `NotLeader` whose message is prose, or names a bare port, is not a
         // redirect, and that judgement belongs in one place for the launcher's
         // lease chain and this alike.
-        return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
+        return std::unexpected { AnnounceRefusal { .kind = AnnounceRefusalKindOf(outcome),
+                                                   .reason = DescribeOutcome(outcome),
+                                                   .leader = RedirectTarget(outcome) } };
 
     // The reply is a record since wire version 4, not a bare id. A payload this
     // build cannot read is a refusal rather than a worker id of whatever the bytes
@@ -662,12 +710,11 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocke
     _workerId = std::move(reply->workerId);
     _clusterId = std::move(reply->clusterId);
     _epoch = reply->epoch;
-    // An EMPTY fleet identity is not refused, and that is deliberate. It is what a
-    // scheduler with no `--cluster-id` sends, which is the one-machine deployment --
-    // `SchedulerService`'s own contract says empty is legal and that a verifier
-    // naming none expects none. Refusing it here would close #401's window by
-    // breaking every single-machine install, which is the shape #303 is about.
-    // "Registered" is what pins a worker; the identity is what it pins TO.
+    // An EMPTY fleet identity is not refused here. No node sends one -- every node's
+    // formation record mints a cluster id -- and the lease check compares for
+    // equality, so a worker pinned to one honours only a grant that names no cluster
+    // either: it fails closed without a refusal of its own. "Registered" is what pins a
+    // worker; the identity is what it pins TO.
     if (_workerId.empty())
         // Accepted and unusable: every later heartbeat needs the id, so a worker
         // that kept going here would heartbeat nothing into a fleet that thinks it
@@ -681,31 +728,29 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocke
     return {};
 }
 
-std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(core::net::ISocket& scheduler,
-                                                                            CredentialNotice& notice,
-                                                                            std::string_view endpoint,
-                                                                            Wire::CapacityFields const& capacity,
-                                                                            Wire::LoadFields const& load,
-                                                                            std::span<std::byte const> endorsement,
-                                                                            Credential const& credential)
+std::expected<void, AnnounceRefusal> AnnounceNodePresence(core::net::ISocket& scheduler,
+                                                          std::string_view endpoint,
+                                                          Wire::CapacityFields const& capacity,
+                                                          Wire::LoadFields const& load,
+                                                          std::span<Wire::JoinMemoFields const> joinMemos)
 {
     auto const frame = Wire::EncodeNodeAnnounce(
-        Wire::NodeAnnounceRequest { .endpoint = endpoint, .capacity = capacity, .load = load, .endorsement = endorsement });
-    auto outcome = core::async::syncRun(ExchangeFramed(&scheduler, &notice, frame, credential));
+        Wire::NodeAnnounceRequest { .endpoint = endpoint, .capacity = capacity, .load = load, .joinMemos = joinMemos });
+    auto outcome = ExchangeWithScheduler(scheduler, frame);
     if (outcome.IsHit())
-        return std::move(outcome.value);
+        return {};
 
     // No `UnknownLease` arm, and its absence is the point rather than an omission: there is no
     // id to forget. A registrar clears its worker id on that refusal so the caller's retry
     // re-registers; presence has nothing corresponding, because the ENDPOINT is the key and it
     // does not stop being the key when a scheduler restarts.
-    return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
+    return std::unexpected { AnnounceRefusal {
+        .kind = AnnounceRefusalKindOf(outcome), .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
 std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(core::net::ISocket& scheduler,
                                                                 std::uint32_t inFlight,
-                                                                Wire::LoadFields const& load,
-                                                                Credential const& credential)
+                                                                Wire::LoadFields const& load)
 {
     if (_workerId.empty())
         // Never registered; nothing to refresh. Named rather than silent, because
@@ -715,7 +760,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(core::net::ISock
         return std::unexpected { AnnounceRefusal { .reason = "not registered", .leader = std::nullopt } };
 
     auto const frame = Wire::EncodeHeartbeat(_workerId, inFlight, load);
-    auto const outcome = core::async::syncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
+    auto const outcome = ExchangeWithScheduler(scheduler, frame);
     if (outcome.IsHit())
         return {};
 
@@ -731,10 +776,11 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(core::net::ISock
     // leader it names may well be holding the very registration this id belongs to,
     // since the registry is replicated. Clearing it here would turn every election
     // into a re-registration storm across the whole fleet.
-    return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
+    return std::unexpected { AnnounceRefusal {
+        .kind = AnnounceRefusalKindOf(outcome), .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
-std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(core::net::ISocket& scheduler, Credential const& credential)
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(core::net::ISocket& scheduler)
 {
     if (_workerId.empty())
         // Never registered, so there is nothing on the other end to retire. Named
@@ -743,7 +789,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(core::net::ISocke
         return std::unexpected { AnnounceRefusal { .reason = "not registered", .leader = std::nullopt } };
 
     auto const frame = Wire::EncodeWithdraw(_workerId);
-    auto const outcome = core::async::syncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
+    auto const outcome = ExchangeWithScheduler(scheduler, frame);
     if (outcome.IsHit())
         return {};
 
@@ -753,7 +799,8 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(core::net::ISocke
     // an `UnknownOpcode` from a scheduler too old to know the verb, leaves the same
     // fallback standing: the entry stops being heartbeated and expires on its own.
     // A withdrawal is an optimisation over that, never a replacement for it.
-    return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
+    return std::unexpected { AnnounceRefusal {
+        .kind = AnnounceRefusalKindOf(outcome), .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
 } // namespace FastCache::Cc

@@ -563,6 +563,15 @@ endfunction()
 # `fastcached_scan_code_lines` below, and O(n^2) in the same way, so a caller filters on a
 # whole-file `string(FIND)` first.
 #
+# **A line with no comment introducer is copied with its neighbours, not on its own.** Outside
+# a block comment, every whole line before the next one carrying `//` or `/*` is a line
+# `fastcached_strip_comment_line` would hand back unchanged -- its own fast path -- so the run
+# is appended in ONE step, with the per-line `\r` removal done as `\r\n` to `\n` over the run.
+# Walking them one at a time cost a loop turn, a function call and two copies of the rest of
+# the file per line, and that was most of what `test-loops` spent on the tree: measured, the
+# walk over every scoped file took it to 92 s of its 180 s budget on a loaded host. Only lines
+# carrying an introducer take the per-line path, which is unchanged.
+#
 # @param content The file content.
 # @param outVar Set to the content with comments removed and newlines preserved.
 function(fastcached_strip_comments content outVar)
@@ -570,6 +579,48 @@ function(fastcached_strip_comments content outVar)
     set(rest "${content}")
     set(inBlockComment FALSE)
     while(TRUE)
+        if(NOT inBlockComment)
+            string(FIND "${rest}" "//" introducerAt)
+            string(FIND "${rest}" "/*" blockIntroducerAt)
+            if(introducerAt EQUAL -1 OR (NOT blockIntroducerAt EQUAL -1 AND blockIntroducerAt LESS introducerAt))
+                set(introducerAt "${blockIntroducerAt}")
+            endif()
+            if(introducerAt EQUAL -1)
+                # Nothing left that could open a comment: the rest is code, line ends and all.
+                string(REPLACE "\r\n" "\n" rest "${rest}")
+                string(REGEX REPLACE "\r$" "" rest "${rest}")
+                string(APPEND code "${rest}")
+                break()
+            endif()
+            string(SUBSTRING "${rest}" 0 ${introducerAt} runHead)
+            string(FIND "${runHead}" "\n" runEnd REVERSE)
+            if(NOT runEnd EQUAL -1)
+                math(EXPR runEnd "${runEnd} + 1")
+                string(SUBSTRING "${rest}" 0 ${runEnd} run)
+                string(REPLACE "\r\n" "\n" run "${run}")
+                string(APPEND code "${run}")
+                string(SUBSTRING "${rest}" ${runEnd} -1 rest)
+            endif()
+            # A line that is ONLY a line comment -- the doc comment on nearly every declaration
+            # -- strips to its indentation: the `//` is the first introducer and nothing stands
+            # before it, which is what `fastcached_strip_comment_line` returns for it. Answered
+            # here because the function CALL was the largest single cost of the walk.
+            if(rest MATCHES "^([ \t]*)//")
+                string(APPEND code "${CMAKE_MATCH_1}")
+                string(FIND "${rest}" "\n" newline)
+                if(newline EQUAL -1)
+                    break()
+                endif()
+                string(APPEND code "\n")
+                math(EXPR skip "${newline} + 1")
+                string(LENGTH "${rest}" restLength)
+                if(skip GREATER_EQUAL restLength)
+                    break()
+                endif()
+                string(SUBSTRING "${rest}" ${skip} -1 rest)
+                continue()
+            endif()
+        endif()
         string(FIND "${rest}" "\n" newline)
         if(newline EQUAL -1)
             set(line "${rest}")
@@ -764,8 +815,52 @@ endfunction()
 ## @param FILTER A regex every candidate must match, in BOTH modes. Omit for no filter.
 ## @param FILES_OUT Name of the variable to receive the paths, relative to the root and sorted.
 ## @param MODE_OUT Name of the variable to receive the mode's name, for the caller's verdict.
+## @param CONTAINING Literal strings; with CONTAINING_OUT, which files of FILES_OUT hold any of them.
+## @param CONTAINING_BYTES Bytes, as two lowercase hex digits from `00` to `7f`; with
+##        CONTAINING_OUT, which files of FILES_OUT hold any of them, judged on the true bytes.
+## @param CONTAINING_OUT Name of the variable to receive that subset, sorted. FILES_OUT is unchanged.
+## @param MISSING_OUT Name of the variable to receive the files of FILES_OUT this tree does not
+##        have -- named by the index and absent, or a link to nothing -- sorted. Never a file
+##        that is there and unreadable. Without it, a CONTAINING question over such a file is
+##        REFUSED by name, since leaving it out of the answer would pass it.
+#
+# ## CONTAINING: which files a check has to READ
+#
+# A scan whose rule can only fire on a line carrying some literal reads every file to find the
+# few that do. On a DrvFs checkout -- which is where every local gate tree takes its sources
+# from -- a read is a 9P round trip, and reading `src/` cost a check seconds a single `git grep`
+# spends in under half of one; with two or three lanes gating at once those seconds are what
+# took the hygiene checks past their budgets. So the question is asked ONCE, of git, in git mode:
+# `git grep -l -F` over the same pathspecs, intersected with FILES_OUT so the FILTER holds. The
+# walk has no index to ask and reads each file, which is what every caller did before.
+#
+# FILES_OUT stays the whole set, so a count a check prints is the count it always printed; a
+# file outside CONTAINING_OUT is one whose contents could not have fired the rule. A `git grep`
+# that fails, or exits 0 having said ANYTHING on stderr, is not trusted and every file is read
+# instead: git exits 0 over a file it could not open, so the status alone would pass that file.
+# A file nobody can read is refused by name, whichever path found it.
+#
+# ## CONTAINING_BYTES: a question about BYTES, which a text read cannot answer
+#
+# `file(READ)` is not a byte read. Measured: it drops the CR of a CRLF on Windows AND on Linux
+# (a 30-byte file with two CRLFs reads as 28), ends at a 0x1A on Windows (nine bytes read as
+# one), and while the string it returns HOLDS a NUL, the regex engine stops at one, so nothing
+# behind a NUL is ever matched. Every one of those losses reports clean. So a byte needle is
+# never looked for in text:
+#
+#   * git mode asks ONE `git grep -l -a -P` for a class of `\xHH` escapes, under `LC_ALL=C` so
+#     PCRE matches bytes rather than code points -- and `-P` because a NUL cannot be passed in
+#     an argument, which rules out `-F`. `-a` makes a file git calls binary searched as text,
+#     all of it. A git built without PCRE cannot answer; that is SAID, and the walk's reading
+#     answers instead, so a missing feature costs time and never a verdict.
+#   * the walk reads each file as HEX, which is exact, and matches a token only at a byte
+#     boundary (see `fastcached_files_holding_bytes`).
+#
+# Restricted to `00`-`7f` because that is where a byte and a code point are the same number in
+# every locale either side could be in; nothing here needs more.
 function(fastcached_tracked_files sourceDir)
-    cmake_parse_arguments(PARSE_ARGV 1 arg "" "FILTER;FILES_OUT;MODE_OUT" "PATHSPECS;GLOBS")
+    cmake_parse_arguments(PARSE_ARGV 1 arg "" "FILTER;FILES_OUT;MODE_OUT;CONTAINING_OUT;MISSING_OUT"
+        "PATHSPECS;GLOBS;CONTAINING;CONTAINING_BYTES")
 
     foreach(required FILES_OUT MODE_OUT GLOBS)
         if(NOT arg_${required})
@@ -791,12 +886,39 @@ function(fastcached_tracked_files sourceDir)
         set(hasFilter TRUE)
     endif()
 
+    # Both or neither: needles with nowhere to put the answer, or a place for an answer nothing
+    # asked, is a call that does not say what it means.
+    set(hasContaining FALSE)
+    if(NOT "${arg_CONTAINING}" STREQUAL "" OR NOT "${arg_CONTAINING_BYTES}" STREQUAL "")
+        set(hasContaining TRUE)
+    endif()
+    if(hasContaining AND "${arg_CONTAINING_OUT}" STREQUAL "")
+        message(FATAL_ERROR "fastcached_tracked_files: CONTAINING needs CONTAINING_OUT to answer into")
+    endif()
+    if(NOT hasContaining AND NOT "${arg_CONTAINING_OUT}" STREQUAL "")
+        message(FATAL_ERROR "fastcached_tracked_files: CONTAINING_OUT names no CONTAINING to answer")
+    endif()
+    set(hasMissing FALSE)
+    if(NOT "${arg_MISSING_OUT}" STREQUAL "")
+        set(hasMissing TRUE)
+    endif()
+    foreach(token IN LISTS arg_CONTAINING_BYTES)
+        if(NOT token MATCHES "^[0-7][0-9a-f]$")
+            # An uppercase digit would never match the lowercase hex a read produces, and a
+            # byte above 7f is a different number to PCRE in a UTF-8 locale: both would be a
+            # needle that silently finds nothing.
+            message(FATAL_ERROR
+                "fastcached_tracked_files: CONTAINING_BYTES takes two lowercase hex digits from "
+                "00 to 7f, and '${token}' is not one")
+        endif()
+    endforeach()
+
     set(found "")
+    set(pathspecArguments "")
     set(mode "")
 
     fastcached_work_tree_state("${sourceDir}" workTreeState)
     if(workTreeState STREQUAL "work-tree")
-        set(pathspecArguments "")
         if(arg_PATHSPECS)
             set(pathspecArguments -- ${arg_PATHSPECS})
         endif()
@@ -847,13 +969,458 @@ function(fastcached_tracked_files sourceDir)
         if(mode STREQUAL "")
             set(mode "directory walk (no git index)")
         endif()
+
+        # A directory the walk cannot LIST is one whose files it never finds: `file(GLOB_RECURSE)`
+        # skips it without a word, so everything under it is left out of FILES_OUT -- every file
+        # PASSED, for every caller, whatever it asked. Measured on ext4 under chmod 000: the
+        # directory itself is listed as an entry and `EXISTS` (`access(R_OK)`) calls it absent,
+        # which is the signal. So each pattern's fixed directory prefix is walked for directories
+        # and one this process cannot read is REFUSED by name. git mode needs none of this: the
+        # index names every file whatever the directory's permissions.
+        #
+        # Blind spot, failing OPEN: on Windows neither `EXISTS` nor `IS_READABLE` sees an access
+        # list, and a glob has no error channel, so a deny-list directory in a WALK there is still
+        # skipped. The walk is the no-index case -- a source export -- and CI's Windows legs run
+        # in git mode.
+        set(unlistable "")
+        foreach(pattern IN LISTS arg_GLOBS)
+            # The pattern's directory part up to its first wildcard: `src/*` walks `src`, `*` the root.
+            string(REGEX REPLACE "/?[^/]*[*?[].*$" "" prefix "${pattern}")
+            set(prefixPath "${sourceDir}")
+            if(NOT prefix STREQUAL "")
+                set(prefixPath "${sourceDir}/${prefix}")
+            endif()
+            if(NOT IS_DIRECTORY "${prefixPath}")
+                continue()
+            endif()
+            # The prefix itself first: unreadable, it lists as nothing at all.
+            if(NOT EXISTS "${prefixPath}")
+                if(prefix STREQUAL "")
+                    set(prefix ".")
+                endif()
+                list(APPEND unlistable "${prefix}")
+                continue()
+            endif()
+            file(GLOB_RECURSE entries LIST_DIRECTORIES true RELATIVE "${sourceDir}" "${prefixPath}/*")
+            foreach(entry IN LISTS entries)
+                if(NOT IS_DIRECTORY "${sourceDir}/${entry}" OR EXISTS "${sourceDir}/${entry}")
+                    continue()
+                endif()
+                set(excluded FALSE)
+                foreach(name IN LISTS excludeNames)
+                    if("${entry}/" MATCHES "(^|/)${name}/")
+                        set(excluded TRUE)
+                        break()
+                    endif()
+                endforeach()
+                if(NOT excluded)
+                    list(APPEND unlistable "${entry}")
+                endif()
+            endforeach()
+        endforeach()
+        if(unlistable)
+            list(REMOVE_DUPLICATES unlistable)
+            list(SORT unlistable)
+            list(JOIN unlistable ", " unlistableNames)
+            message(FATAL_ERROR
+                "fastcached_tracked_files: cannot list a directory -- ${unlistableNames} in "
+                "${sourceDir}: the walk finds no file inside a directory it cannot read, so every "
+                "file under it would be left out of the answer, which is a file passed. Make it "
+                "readable and ask again.")
+        endif()
     endif()
 
     list(REMOVE_DUPLICATES found)
     list(SORT found)
 
+    # EVERY file a question is asked about is ACCOUNTED FOR: judged, reported missing, or refused
+    # by name. A file silently left out of an answer is a file PASSED, and three states did that
+    # here while every check read clean -- measured by planting `::htonl(` in a chmod-000
+    # `Endian.hpp`: the per-file read before this seam refused, the seam exited 0.
+    #
+    #   * `git grep` exits 0 over a file it cannot open. It says so on stderr only
+    #     (`error: failed to stat 'X': Permission denied`, on ext4 under chmod 000 and on Windows
+    #     under a deny-read access list alike) and leaves the file out of `-l` and `-L` both.
+    #   * It skips a tracked file deleted from the work tree without a word, stderr included.
+    #   * It never searches a symlink, so a link to nothing was read, found absent, and skipped.
+    #
+    # So: any stderr from a search makes that search UNTRUSTED and the question is answered by
+    # reading every file; a file the tree lacks (deleted, or a link to nothing) is
+    # MISSING_OUT's answer when the caller asked that, and refused otherwise; and a file that is
+    # there and cannot be read is refused whatever was asked -- never passed, and never MISSING,
+    # which is a statement about the tree that would be false.
+    #
+    # An unreadable file is told from an absent one by the DIRECTORY, not the file: `EXISTS` is
+    # `access(R_OK)` on POSIX and so calls an unreadable file absent, and `file(TIMESTAMP)` answers
+    # empty for both. A literal `file(GLOB)` lists names out of the directory, which needs no
+    # access to the file itself (see `fastcached_classify_unopened`).
+    #
+    # A MISSING-only question reads no contents, so there an unreadable file is simply PRESENT,
+    # which is true; it is refused only where a verdict about its contents was asked for.
+    set(links "")
+    set(absent "")
+    set(unreadable "")
+    set(needsAccounting FALSE)
+    if(hasContaining OR hasMissing)
+        set(needsAccounting TRUE)
+    endif()
+    if(mode STREQUAL "git ls-files" AND needsAccounting)
+        # git searches REGULAR files only: `git grep` skips a tracked symlink outright, neither
+        # searching what it points at nor listing it with `-L`, where the per-file read every
+        # caller did before followed the link. So the symlinks are set apart once, from the
+        # index's modes, and every question below answers them by reading.
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" ls-files -s ${pathspecArguments}
+            OUTPUT_VARIABLE staged
+            RESULT_VARIABLE stagedStatus)
+        if(NOT stagedStatus EQUAL 0)
+            message(FATAL_ERROR
+                "fastcached_tracked_files: `git ls-files -s` could not read the index of "
+                "${sourceDir} (status ${stagedStatus}), so which files are symlinks is unknown")
+        endif()
+        string(REGEX MATCHALL "(^|\n)120000 [^\t\n]*\t[^\n]*" linkRows "${staged}")
+        foreach(linkRow IN LISTS linkRows)
+            string(REGEX REPLACE "^\n?120000 [^\t]*\t" "" linkPath "${linkRow}")
+            if(linkPath IN_LIST found)
+                list(APPEND links "${linkPath}")
+            endif()
+        endforeach()
+        list(REMOVE_DUPLICATES links)
+
+        # Which files git can OPEN: `-L` with a pattern that never matches lists every regular
+        # file it read, an empty one included, which no matching pattern would reach. A file of
+        # the set outside that listing -- and not a link, which git never reads -- is the only
+        # kind asked on its own, so the per-file cost is paid for the files in doubt and not
+        # for the tree. Measured over DrvFs for `src/*` (903 files): 0.46 s for this, against
+        # 1.60 s for `git ls-files -d`, whose `lstat`s are serial where the search is threaded.
+        # The listing is untrusted like any search: stderr sends every file to be asked.
+        fastcached_git_grep_pcre("${sourceDir}" -L "(?!)" "${pathspecArguments}" "${found}"
+            openable openAnswered openNamed)
+        list(APPEND unreadable ${openNamed})
+        if(openAnswered)
+            set(unlisted "${found}")
+            foreach(listed IN LISTS openable links unreadable)
+                list(REMOVE_ITEM unlisted "${listed}")
+            endforeach()
+            set(askEach ${links} ${unlisted})
+        else()
+            set(askEach "${found}")
+        endif()
+    elseif(needsAccounting)
+        # A walk FOUND each file in a directory listing, so only one it cannot open is in doubt.
+        set(askEach "${found}")
+    else()
+        set(askEach "")
+    endif()
+    foreach(candidate IN LISTS askEach)
+        if(NOT EXISTS "${sourceDir}/${candidate}" AND NOT candidate IN_LIST unreadable)
+            fastcached_classify_unopened("${sourceDir}" "${candidate}" why)
+            list(APPEND ${why} "${candidate}")
+        endif()
+    endforeach()
+
+    if(hasContaining)
+        set(containing "")
+        if(NOT "${arg_CONTAINING}" STREQUAL "")
+            set(readText "${found}")
+            if(mode STREQUAL "git ls-files")
+                set(needleArguments "")
+                foreach(needle IN LISTS arg_CONTAINING)
+                    list(APPEND needleArguments -e "${needle}")
+                endforeach()
+                execute_process(
+                    COMMAND "${GIT_EXECUTABLE}" -C "${sourceDir}" grep -l -F --no-color
+                            ${needleArguments} ${pathspecArguments}
+                    OUTPUT_VARIABLE grepped
+                    ERROR_VARIABLE grepError
+                    RESULT_VARIABLE grepStatus
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+                fastcached_search_verdict("grep -l -F" "${sourceDir}" "${grepStatus}" "${grepError}"
+                    "${found}" textAnswered textNamed)
+                list(APPEND unreadable ${textNamed})
+                if(textAnswered)
+                    string(REPLACE "\n" ";" grepFiles "${grepped}")
+                    foreach(candidate IN LISTS grepFiles)
+                        if(candidate IN_LIST found)
+                            list(APPEND containing "${candidate}")
+                        endif()
+                    endforeach()
+                    set(readText "${links}")
+                endif()
+            endif()
+            foreach(unjudgeable IN LISTS absent unreadable)
+                list(REMOVE_ITEM readText "${unjudgeable}")
+            endforeach()
+            fastcached_files_holding_text("${sourceDir}" "${readText}" "${arg_CONTAINING}"
+                holdingText unopenedText)
+            list(APPEND containing ${holdingText})
+            foreach(candidate IN LISTS unopenedText)
+                fastcached_classify_unopened("${sourceDir}" "${candidate}" why)
+                list(APPEND ${why} "${candidate}")
+            endforeach()
+        endif()
+
+        if(NOT "${arg_CONTAINING_BYTES}" STREQUAL "")
+            set(readBytes "${found}")
+            if(mode STREQUAL "git ls-files")
+                set(byteClass "")
+                foreach(token IN LISTS arg_CONTAINING_BYTES)
+                    string(APPEND byteClass "\\x${token}")
+                endforeach()
+                fastcached_git_grep_pcre("${sourceDir}" -l "[${byteClass}]" "${pathspecArguments}"
+                    "${found}" grepFiles grepAnswered bytesNamed)
+                list(APPEND unreadable ${bytesNamed})
+                if(grepAnswered)
+                    foreach(candidate IN LISTS grepFiles)
+                        if(candidate IN_LIST found)
+                            list(APPEND containing "${candidate}")
+                        endif()
+                    endforeach()
+                    set(readBytes "${links}")
+                endif()
+            endif()
+            foreach(unjudgeable IN LISTS absent unreadable)
+                list(REMOVE_ITEM readBytes "${unjudgeable}")
+            endforeach()
+            fastcached_files_holding_bytes("${sourceDir}" "${readBytes}" "${arg_CONTAINING_BYTES}"
+                holdingBytes unopenedBytes)
+            list(APPEND containing ${holdingBytes})
+            foreach(candidate IN LISTS unopenedBytes)
+                fastcached_classify_unopened("${sourceDir}" "${candidate}" why)
+                list(APPEND ${why} "${candidate}")
+            endforeach()
+        endif()
+
+        list(REMOVE_DUPLICATES unreadable)
+        list(SORT unreadable)
+        if(unreadable)
+            list(JOIN unreadable ", " unreadableNames)
+            message(FATAL_ERROR
+                "fastcached_tracked_files: cannot judge a file it cannot read -- ${unreadableNames} "
+                "in ${sourceDir}: tracked, present, and not readable by this process (its "
+                "permissions or an access list). A file left out of the answer is a file passed, so "
+                "this is refused rather than reported clean; make it readable and ask again.")
+        endif()
+        list(REMOVE_DUPLICATES absent)
+        list(SORT absent)
+        if(absent AND NOT hasMissing)
+            list(JOIN absent ", " absentNames)
+            message(FATAL_ERROR
+                "fastcached_tracked_files: cannot judge a file it cannot read -- ${absentNames} "
+                "in ${sourceDir}: named by the index and not in the work tree (deleted, or a link "
+                "to nothing). A file left out of the answer is a file passed, so this is refused "
+                "rather than reported clean; restore it, or commit its removal.")
+        endif()
+        list(REMOVE_DUPLICATES containing)
+        list(SORT containing)
+        set(${arg_CONTAINING_OUT} "${containing}" PARENT_SCOPE)
+    endif()
+
+    if(hasMissing)
+        # Which files of the set this tree does not have: the index names them and the checkout
+        # lacks them, or a link names nothing. Never a file that is there and unreadable. A
+        # per-file `EXISTS` is a round trip each over DrvFs -- measured, 1353 of them cost 15-86 s
+        # on a loaded host -- so git mode asks only the files its `-L` listing did not name.
+        list(REMOVE_DUPLICATES absent)
+        list(SORT absent)
+        set(${arg_MISSING_OUT} "${absent}" PARENT_SCOPE)
+    endif()
+
     set(${arg_FILES_OUT} "${found}" PARENT_SCOPE)
     set(${arg_MODE_OUT} "${mode}" PARENT_SCOPE)
+endfunction()
+
+## Whether one `git grep` can be trusted, and which files of the set its stderr named.
+## @param what The search, for the message: `grep -l -F`.
+## @param sourceDir The repository root.
+## @param status Its exit status.
+## @param stderr Its standard error.
+## @param found The file set, so only its own files are named.
+## @param outAnswered Name of the variable set TRUE when the answer can be used as given.
+## @param outNamed Name of the variable to receive the set's files the stderr quotes.
+#
+# Trusted means status 0 or 1 AND nothing on stderr. The status alone is not enough: git exits 0
+# over a file it could not open, which is the defect this exists for. Any stderr at all is read
+# as "some file may be missing from this answer", and the caller reads every file instead -- a
+# benign line somebody's git prints costs time, never a verdict. A file the stderr QUOTES is one
+# git could not open; naming it here is what lets a Windows access list, which `EXISTS` cannot
+# see, be refused in this seam's words rather than by a failing `file(READ)`.
+function(fastcached_search_verdict what sourceDir status stderr found outAnswered outNamed)
+    set(named "")
+    string(REGEX MATCHALL "'[^'\n]+'" quoted "${stderr}")
+    foreach(quote IN LISTS quoted)
+        string(REGEX REPLACE "^'(.*)'$" "\\1" quote "${quote}")
+        if(quote IN_LIST found)
+            list(APPEND named "${quote}")
+        endif()
+    endforeach()
+    set(answered TRUE)
+    if(NOT (status EQUAL 0 OR status EQUAL 1) OR NOT "${stderr}" STREQUAL "")
+        string(STRIP "${stderr}" stderr)
+        message(STATUS
+            "fastcached_tracked_files: `git ${what}` did not answer cleanly for ${sourceDir} "
+            "(status ${status}: ${stderr}), so this question is answered by reading every file "
+            "instead -- exact, and slower")
+        set(answered FALSE)
+    endif()
+    set(${outAnswered} "${answered}" PARENT_SCOPE)
+    set(${outNamed} "${named}" PARENT_SCOPE)
+endfunction()
+
+## Why a file of the set could not be opened.
+## @param sourceDir The repository root.
+## @param candidate The path, relative to it.
+## @param outVar Name of the variable to receive `absent` or `unreadable` -- the name of the list
+##        the caller appends it to.
+#
+# `absent` is a file the directory does not list, or a link whose target it does not list;
+# `unreadable` is one it lists and this process cannot open. The directory answers because the
+# file cannot: `EXISTS` is `access(R_OK)` on POSIX, and `file(TIMESTAMP)` is empty for both. A
+# literal `file(GLOB)` matches names read out of the directory, so it lists an unreadable file
+# and a dangling link, and not a deleted file -- measured on ext4 under chmod 000. The glob's own
+# metacharacters are bracketed so a path is matched as itself.
+#
+# A link is followed to the END of its chain, never one hop: a link to a link to nothing names a
+# directory entry that IS listed -- the middle link -- so stopping there calls it `unreadable`.
+# Bounded at 40 hops, Linux's own `MAXSYMLINKS`; a chain longer than that, or a cycle, is one the
+# kernel refuses to open with `ELOOP`, which is a link to nothing reachable -- `absent`.
+function(fastcached_classify_unopened sourceDir candidate outVar)
+    set(path "${sourceDir}/${candidate}")
+    foreach(hop RANGE 1 40)
+        if(NOT IS_SYMLINK "${path}")
+            break()
+        endif()
+        file(READ_SYMLINK "${path}" target)
+        if(NOT IS_ABSOLUTE "${target}")
+            get_filename_component(linkDirectory "${path}" DIRECTORY)
+            set(target "${linkDirectory}/${target}")
+        endif()
+        set(path "${target}")
+    endforeach()
+    if(IS_SYMLINK "${path}")
+        set(${outVar} "absent" PARENT_SCOPE)
+        return()
+    endif()
+    string(REGEX REPLACE "([*?[])" "[\\1]" pattern "${path}")
+    file(GLOB listed LIST_DIRECTORIES true "${pattern}")
+    if(listed)
+        set(${outVar} "unreadable" PARENT_SCOPE)
+    else()
+        set(${outVar} "absent" PARENT_SCOPE)
+    endif()
+endfunction()
+
+## One `git grep -a -P` over a file set, in bytes.
+## @param sourceDir The repository root.
+## @param listing `-l` for the files that match, `-L` for the files that do not.
+## @param pattern The PCRE pattern.
+## @param pathspecArguments `--` and the pathspecs, or empty.
+## @param found The file set, so only its own files are named.
+## @param outFiles Name of the variable to receive the listed files.
+## @param outAnswered Name of the variable set to TRUE when git's answer can be used as given.
+## @param outNamed Name of the variable to receive the set's files git's stderr quotes.
+#
+# `LC_ALL=C` so PCRE matches bytes rather than code points. A git that cannot run the search --
+# one built without PCRE refuses `-P` -- or that says anything at all on stderr is not trusted
+# (`fastcached_search_verdict`), and the caller answers by reading instead: a missing feature
+# costs time and never a verdict, where a search that failed read as one that found nothing
+# would cost the verdict.
+function(fastcached_git_grep_pcre sourceDir listing pattern pathspecArguments found outFiles outAnswered outNamed)
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env LC_ALL=C
+                "${GIT_EXECUTABLE}" -C "${sourceDir}" grep ${listing} -a -P --no-color
+                -e "${pattern}" ${pathspecArguments}
+        OUTPUT_VARIABLE grepped
+        ERROR_VARIABLE grepError
+        RESULT_VARIABLE grepStatus
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    fastcached_search_verdict("grep ${listing} -P" "${sourceDir}" "${grepStatus}" "${grepError}"
+        "${found}" answered named)
+    set(files "")
+    if(answered AND grepStatus EQUAL 0)
+        string(REPLACE "\n" ";" files "${grepped}")
+    endif()
+    set(${outFiles} "${files}" PARENT_SCOPE)
+    set(${outAnswered} "${answered}" PARENT_SCOPE)
+    set(${outNamed} "${named}" PARENT_SCOPE)
+endfunction()
+
+## Which files hold any of some literal strings, read one at a time.
+## @param sourceDir The repository root.
+## @param files Paths relative to it.
+## @param needles The literals.
+## @param outVar Name of the variable to receive the files that hold one, in the order given.
+## @param outUnopened Name of the variable to receive the files that could not be opened, which
+##        the caller accounts for -- never skipped here, since a skipped file is a passed one.
+##        The seam classifies every file in doubt BEFORE reading, so this is reached only by a
+##        file that changed in between; neutering it turns no self-test case red, and that is
+##        why: it is the race's guard, not a second classifier.
+function(fastcached_files_holding_text sourceDir files needles outVar outUnopened)
+    set(holding "")
+    set(unopened "")
+    foreach(candidate IN LISTS files)
+        if(IS_DIRECTORY "${sourceDir}/${candidate}")
+            continue()
+        endif()
+        if(NOT EXISTS "${sourceDir}/${candidate}")
+            list(APPEND unopened "${candidate}")
+            continue()
+        endif()
+        file(READ "${sourceDir}/${candidate}" candidateContent)
+        foreach(needle IN LISTS needles)
+            string(FIND "${candidateContent}" "${needle}" needleAt)
+            if(NOT needleAt EQUAL -1)
+                list(APPEND holding "${candidate}")
+                break()
+            endif()
+        endforeach()
+    endforeach()
+    set(${outVar} "${holding}" PARENT_SCOPE)
+    set(${outUnopened} "${unopened}" PARENT_SCOPE)
+endfunction()
+
+## Which files hold any of some bytes, read as HEX so every byte is seen.
+## @param sourceDir The repository root.
+## @param files Paths relative to it.
+## @param tokens The bytes, as two lowercase hex digits each.
+## @param outVar Name of the variable to receive the files that hold one, in the order given.
+## @param outUnopened Name of the variable to receive the files that could not be opened, which
+##        the caller accounts for, as `fastcached_files_holding_text` does.
+#
+# A token searched in raw hex also matches ACROSS a byte boundary -- `a0 7b` contains `07` --
+# so the raw search only says where to look. A file with a raw hit is spaced, a blank after
+# every pair, and the token is searched with its blank: a three-character needle whose third
+# character is a blank can only start at a multiple of three, which is a whole byte.
+function(fastcached_files_holding_bytes sourceDir files tokens outVar outUnopened)
+    set(holding "")
+    set(unopened "")
+    foreach(candidate IN LISTS files)
+        if(IS_DIRECTORY "${sourceDir}/${candidate}")
+            continue()
+        endif()
+        if(NOT EXISTS "${sourceDir}/${candidate}")
+            list(APPEND unopened "${candidate}")
+            continue()
+        endif()
+        file(READ "${sourceDir}/${candidate}" hex HEX)
+        set(spaced "")
+        foreach(token IN LISTS tokens)
+            string(FIND "${hex}" "${token}" rawAt)
+            if(rawAt EQUAL -1)
+                continue()
+            endif()
+            if(spaced STREQUAL "")
+                string(REGEX REPLACE "(..)" "\\1 " spaced "${hex}")
+            endif()
+            string(FIND "${spaced}" "${token} " at)
+            if(NOT at EQUAL -1)
+                list(APPEND holding "${candidate}")
+                break()
+            endif()
+        endforeach()
+    endforeach()
+    set(${outVar} "${holding}" PARENT_SCOPE)
+    set(${outUnopened} "${unopened}" PARENT_SCOPE)
 endfunction()
 
 # ---------------------------------------------------------------------------
@@ -898,4 +1465,47 @@ function(fastcached_first_party_cxx sourceDir filesOut declinedOut modeOut)
     set(${filesOut} "${found}" PARENT_SCOPE)
     set(${declinedOut} "${declined}" PARENT_SCOPE)
     set(${modeOut} "${mode}" PARENT_SCOPE)
+endfunction()
+
+# The COMMAND prefix that runs @p gitExecutable with every variable
+# `scripts/lib/git-scrub-variables.txt` names removed from its environment -- how a
+# self-test spells git for a repository it created, the CMake twin of `scratch_git` in
+# `scripts/lib/git-scrub.sh`. That file says why: an inherited `GIT_DIR` turns a fixture's
+# `git init` into a write of whatever repository it names.
+#
+#   fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
+#   execute_process(COMMAND ${scratchGit} init -q "${tree}" ...)
+#
+# `cmake -E env --unset=...` rather than `unset(ENV{...})`, because an environment change in a
+# `cmake -P` script is process-wide: it would reach the check under test as well, and the scrub
+# is for the fixture's own writes. Refuses -- `FATAL_ERROR` -- when the list names nothing or
+# names something that is not a `GIT_*` variable, since there is no unscrubbed fallback.
+#
+# @param gitExecutable The git to run.
+# @param outVar Set to the command prefix, a list.
+function(fastcached_scratch_git gitExecutable outVar)
+    set(listFile "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/git-scrub-variables.txt")
+    if(NOT EXISTS "${listFile}")
+        message(FATAL_ERROR "fastcached_scratch_git: ${listFile} is missing, so git is NOT run unscrubbed")
+    endif()
+    file(STRINGS "${listFile}" lines)
+    set(unsets "")
+    foreach(line IN LISTS lines)
+        string(FIND "${line}" "#" hashAt)
+        if(NOT hashAt EQUAL -1)
+            string(SUBSTRING "${line}" 0 ${hashAt} line)
+        endif()
+        string(STRIP "${line}" line)
+        if(line STREQUAL "")
+            continue()
+        endif()
+        if(NOT line MATCHES "^GIT_[A-Z_]+$")
+            message(FATAL_ERROR "fastcached_scratch_git: ${listFile} names '${line}', which is not a GIT_* variable")
+        endif()
+        list(APPEND unsets "--unset=${line}")
+    endforeach()
+    if(unsets STREQUAL "")
+        message(FATAL_ERROR "fastcached_scratch_git: ${listFile} names no variable, so git is NOT run unscrubbed")
+    endif()
+    set(${outVar} "${CMAKE_COMMAND};-E;env;${unsets};${gitExecutable}" PARENT_SCOPE)
 endfunction()

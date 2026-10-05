@@ -1,10 +1,9 @@
 # fastcached - Fast Cache Daemon
 
-A layered C++23 server: a memcached- and Redis-compatible cache daemon, plus a
-portable compile cache (`fastcache-cc`) and a distributed compile fleet
-(`fastcache-compile-node`). Each layer reaches its collaborators through a narrow
-interface, so the whole thing is testable end-to-end against an in-memory
-transport, a manual clock and a scripted reactor.
+A layered C++23 server: a memcached- and Redis-compatible cache daemon, plus a portable compile
+cache (`fastcache-cc`) and a distributed compile fleet (`fastcache-compile-node`). Each layer
+reaches its collaborators through a narrow interface, so the whole thing is testable end-to-end
+against an in-memory transport, a manual clock and a scripted reactor.
 
 ## Project Architecture
 
@@ -22,7 +21,7 @@ src/FastCache/
   Transport/    What this project keeps of its own beside core-cpp's sockets:
                 NativeListen (ClientListenOptions, how every loop's listener binds;
                 BindAndListen, AcceptRaw and BlockingListener for threads that block;
-                AdoptInheritedListener -- graduation candidates) and LingeringClose
+                AdoptInheritedListener -- graduation candidates), LingeringClose, AcceptLoopReporter
   Cli/          UsageDoc (usage text as data) and Options (the one parse loop),
                 dependency-free so fastcache-cc compiles them in rather than linking
   Cache/        IStorage atomic primitives, CacheEntry, CacheEngine, InMemoryLruStorage,
@@ -38,11 +37,11 @@ src/FastCache/
   Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and its challenge),
                 RosterKeys, PeerDirectory, ClusterState + ClusterStateMachine,
                 MembershipPolicy — who is a member, WHERE they answer, and the settings
-                every member must agree on; Roster + RosterCertificate
+                every member must agree on; Roster, FleetPin
   Distributed/  WorkerRegistry, LeaseTable, SchedulerService — the fleet's capacity
                 decisions, pure with respect to I/O; FleetSample + IFleetHistorySink,
                 FleetHistory, FleetNodeHistories; FleetView and FleetChart (page, SVG,
-                JSON); RosterTrust + RosterStore; NodeProof (the join handshake and the
+                JSON); StateLeaseRoster; NodeProof (the join handshake and the
                 session keys that seal the connection after it)
   Protocol/     IProtocolHandler, ProtocolAutodetect, Framing/ByteReader, MemcachedText,
                 MemcachedMeta, MemcachedBinary, RedisResp, CompileCacheHandler (the 0xFC
@@ -109,24 +108,22 @@ concurrent clients are bounded by memory rather than by a worker count, and `--t
 runs that many independent single-threaded reactors, each pinned to a core, with every
 connection pinned to one reactor for its lifetime.
 
-`main.cpp` wraps the storage in a `ShardedStorage`, whose per-shard mutex serialises
-access, **whenever more than one thread can reach the storage** — four conditions say
-so: a persistent backend (so the disk backend is always wrapped), an explicit
-multi-shard layout, the reactor running on more than one thread, and the metrics
-endpoint, whose `fc-admin` thread calls `engine.Snapshot()` concurrently with the
-reactor. **That third one is the DEFAULT rather than an opt-in**: `--threads` unset
-means `hardware_concurrency()`, so on any multi-core host the wrapper is on without
-anybody asking for it, and reading it as "`--threads` above one" describes a
+`main.cpp` wraps the storage in a `ShardedStorage`, whose per-shard mutex serialises access,
+**whenever more than one thread can reach the storage** — four conditions say so: a persistent
+backend (so the disk backend is always wrapped), an explicit multi-shard layout, the reactor
+running on more than one thread, and the metrics endpoint, whose `fc-admin` thread calls
+`engine.Snapshot()` concurrently with the reactor. **That third one is the DEFAULT rather than an
+opt-in**: `--threads` unset means `hardware_concurrency()`, so on any multi-core host the wrapper
+is on without anybody asking for it, and reading it as "`--threads` above one" describes a
 single-threaded default this daemon does not have.
 
-**No completion port is ever drained from several threads**, on Windows or anywhere
-else. That migrates a coroutine across threads, which no awaitable here allows,
-and `RunMultiReactorWindows` runs one thread per reactor exactly as the POSIX path
-does. The one `ThreadPoolExecutor { 1 }` on each of the three serving paths runs the
-EXPIRY SWEEP; it drains no completion port and overlaps no `fsync` with anything. This
-paragraph claimed the opposite until
-[#896](https://github.com/LASTRADA-Software/fastcached/issues/896), and why a wrong
-sentence *here* is worse than a stale one is in
+**No completion port is ever drained from several threads**, on Windows or anywhere else. That
+migrates a coroutine across threads, which no awaitable here allows, and `RunMultiReactorWindows`
+runs one thread per reactor exactly as the POSIX path does. The one `ThreadPoolExecutor { 1 }` on
+each of the three serving paths runs the EXPIRY SWEEP; it drains no completion port and overlaps
+no `fsync` with anything. This paragraph claimed the opposite until
+[#896](https://github.com/LASTRADA-Software/fastcached/issues/896), and why a wrong sentence
+*here* is worse than a stale one is in
 [`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md).
 
 ## The rulebook
@@ -173,7 +170,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   is asked for one the way it answers: `cl` has no `--version`, and bare `cl` is its probe.
 - A root and the paths a driver emits are reconciled on both sides, or neither.
 - Bump `manifest-v*` whenever `objkey-v*` moves. The reverse is not required.
-- A compile that writes a second artefact (a module BMI, a PCH) is refused, not cached.
+- A compile that writes a second artefact (a BMI, a PCH, `cl`'s `/Zi` PDB) or reads a PCH (`/Yu`) is refused.
 - The compiler identity is the driver AND the target it generates for. The **key** folds
   the target, the **fingerprint** must not.
 - The FINGERPRINT folds the driver's argument GRAMMAR (`DriverGrammarName`) — a NAME, never
@@ -243,7 +240,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   `Silent` is distinguishable from `Expired`.
 - Leadership and membership are one `Gate()`, run for every verb, reads included; only leadership
   stops applying at demotion, so a `GateScope` says which and `Scheduling` is the default.
-- Duplicate suppression is asked **before** capacity.
+- Duplicate suppression is asked **before** capacity; an all-EXCLUDED lease is `NoWorker`, counted apart.
 - A lease has three transitions and expiry is the third: the **client** resolves it, on every
   path out of the compile, over a fresh connection.
 - A listen flag answers "does this port face the network" only when this process bound the port;
@@ -257,6 +254,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Asymmetric crypto has ONE seam: `Core/Ed25519`, `Core/X25519`, `Core/Hkdf` over the vendored
   Monocypher (`ctest -R crypto-seam`), RFC 8032 Ed25519 and never Monocypher's default EdDSA over
   BLAKE2b; a missing primitive is added THERE.
+- Monocypher's COFACTORED verify accepts a SMALL-ORDER key — the all-zero key and signature
+  verified every message — so `Ed25519Verify` refuses a small-order or non-canonical A and R first,
+  and every door a key ENTERS by refuses one BY NAME (`Ed25519PublicKeyFaultOf`).
 - A credential lives in `SecureByteBuffer` and the wipe is an **allocator**, not a destructor.
   Container-agnostic is not SUFFICIENT — SSO keeps a short secret where no allocator is called, so
   a secret is never a `std::basic_string`: `SecureString` holds its characters in a `std::vector`,
@@ -267,9 +267,6 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - **There is no pre-shared key** (#178): `--cluster-key-file` and `Cluster/ClusterSigning.hpp`
   were DELETED, never shimmed, and every proof is an Ed25519 signature under a machine's OWN
   identity key, each construction carrying a versioned LABEL signed as its first FIELD.
-- #402 moved the discovery proof's MAC *input* and **`DiscoveryWire::CurrentVersion` deliberately
-  did not move**; it DID move at #178, as `RaftWire`'s did for #1308. The question is always which
-  of the two changed, the MAC or the GRAMMAR.
 - The signature is checked before any other claim is reported on. The expiry bounds how long a
   *captured* token is useful and is **not** a capacity bound.
 - A grant is spendable **once**, at the worker it names, and the spend runs LAST; keyed by a
@@ -281,11 +278,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - **A lower term is a REGRESSION, and calling it a reset is a claim the worker cannot make**:
   report what is OBSERVED, name both causes, and say that the RATE separates them. **A confident
   wrong signal is worse than a vague right one.**
-- A scheduler IS a consensus member, alone or not, so every grant is signed by the ISSUING voter's
-  own identity key; one without `--listen-raft` is refused.
-- A worker checks that signature against a ROSTER, adopting a newer one only on a STRICT MAJORITY
-  of the voters in the roster it HOLDS, never of the offer's own; past `notAfter` plus slack every
-  grant is `RosterExpired`.
+- A scheduler IS a consensus voter, alone or not, so every grant is signed by the ISSUING voter's
+  own identity key; which modes schedule is `NodeModeTable`'s `scheduler` column, never a flag.
+- A worker checks that signature against the ROSTER its own consensus APPLIED (`StateLeaseRoster`):
+  every worker is a member, since principal mode is retired, so there is no certified roster, no
+  `--voter-key` and no `RosterExpired`.
 - An OUTBOUND credential is read where it is PRESENTED, through one seam
   (`Node::ICredentialSource`), never captured at construction — which is what lets `--requirepass`
   be `Reloadable::Yes`; a site that never reaches for the seam is a SCAN.
@@ -295,8 +292,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - The worker's key files — every row of `NodeSecretFileTable()`, the identity key among them — are
   asked about at the START **and at every accepted reload**, from `main` and never from
   `WorkerBody`, of the FILESYSTEM rather than of the reloader's two snapshots.
-- A worker being dropped is an **event** (`ExpireStale`); a node restarting inside the heartbeat
-  window is the second route to the same pin, closed by `Register`.
+- A worker being dropped is an **event** (`ExpireStale`); a restart inside the heartbeat window is
+  the second route, closed by `Register`; a SUSPEND withdraws within 1.5 s and never gates recovery.
 - A discovery layout describes a **directory layout, not a vendor**: one installation may match
   two rows, and `vswhere`'s answer is memoized across them, empty answers included.
 - A port this node LISTENS on is a row of `NodeSurfaceTable()` and an opener takes the
@@ -331,9 +328,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A WORKER follows `NotLeader` too, or the client half arrives at an empty fleet: `Gate()` refuses
   `Register` as well, a leader is remembered only once a round was ACCEPTED there, and `NotLeader`
   must not clear the worker id where `UnknownLease` must.
-- `--scheduler` is a LIST for reaching the fleet, never for choosing a leader: each value is
-  dialled at most once per round, `NotLeader` never consults it, and a one-shot verb falls back
-  only where nothing was SENT. Assert WHICH endpoint took the request.
+- `--scheduler` aims the ONE-SHOT verbs alone: a serving node is refused it by name and registers
+  where its formation record says (`SchedulersOf`; its OWN scheduler at the endpoint it SERVES,
+  `ActivatedNodeEndpoint`). A LIST, never a leader choice: each value dialled at most once a round,
+  `NotLeader` never consults it, a verb falls back only where nothing was SENT. Assert WHICH endpoint.
 - `NotLeader` is an instruction, not an answer about the fleet: a client follows it to the
   endpoint it names (`RedirectTarget`), the RELEASE goes to whoever ISSUED the lease, and it is
   judged by PARSING — one predicate, `ParseDialEndpoint` — and bounded.
@@ -352,50 +350,59 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   diagnostic; `~WorkerServer` bounds it, says what it abandons and ends the process itself.
 - A REGISTER endpoint is **not** verified against the caller — `DispatchWorkerEndpointMismatch`
   only counts it; the fix is a credential, as discovery's `(node, endpoint)` signature is.
-- `CallerContext::peerId` is the kernel's peer host and IS trusted — membership is decided from
-  it. It carries no port; a peer dials from an ephemeral one.
-- An address is a stand-in for *one of our nodes* and stops being one when it is not stable, so a
-  caller that PROVES a live identity key is a member wherever it dialled from — and since #178 an
-  address admits CLIENTS only: the verbs a machine JOINS the fleet with are
-  `IdentityRequirement::ProvenNodeOnly`, loopback included. One fold,
-  `Distributed::ExplainConnection`, reached only through `Node::RefuseUnlessMember`; a REVOKED key
-  is `Forgotten` from every address.
-- **A proof is worth nothing unless every frame after it is SEALED**: the answer to `ProveNode` is
-  the first sealed frame WHATEVER it says, a bad tag closes the connection unanswered, and a
-  connection proves ONCE. The test is a relay injecting a `Register`, neutered by a seal that
-  accepts any tag.
+- `CallerContext::peerId` is the kernel's peer host and IS trusted: it decides membership, and a
+  lease's DIAL HINT only where the worker REPORTS it; the token signs the NAME. It carries no port.
+- **No address admits another machine**: a caller that PROVES a live identity key is a member wherever
+  it dialled from, as is one presenting a VERIFIED machine ticket; loopback and `--fleet-open` admit a
+  CALLER, never a machine. The verbs a machine JOINS with are `ProvenNodeOnly`, loopback included, which
+  no ticket satisfies. One fold, `Distributed::ExplainConnection`, reached only through
+  `Node::RefuseUnlessMember`; a REVOKED key is `Forgotten` from every address, and a consensus node
+  presents none before its OWN cluster records its key (`HoldUntilRecorded`).
+- **A proof is worth nothing unless every frame after it is SEALED**: the answer to `ProveNode` is the
+  first sealed frame WHATEVER it says, a bad tag closes the connection unanswered, and a connection
+  proves ONCE. The test is a relay injecting a `Register`, neutered by a seal that accepts any tag.
 - A node's cache tier serves **this machine**, always: locality is a property of the VERB, never
   of the bind and never of a member list, so `CacheResponder` takes no membership oracle — its
   absence IS the fix. It arrives through `Platform/ILocalityOracle`, refreshed on an INTERVAL and
-  never on a miss, and is folded with `SameHost`.
-- Cluster membership is one ROUTE to admission, never the whole policy: `--fleet-member` admits
-  *clients*, so what the cluster agrees is **added** and never substituted, composed at the
-  `IMembershipOracle` seam (`AnyOfMembership`). Absence from `ClusterState` is not removal, and
-  `NodeMembership::Adopt` writes only `--fleet-member`'s list.
-- A CLIENT is revoked by a replicated TOMBSTONE, `--cluster-forget-client`, outranking every
-  admission route including `--fleet-open`: `Membership::Forgotten`, `PrecedenceOf`, and a fold
-  rather than `any_of`; published from `PublishCluster`, never from `Adopt`, and loopback is never
-  forgotten.
-- And the fold REPORTS: `Op::ExplainAdmission` answers a verdict AND the SET of routes that
-  produced it, through the same oracle the surfaces enforce; an unknown VERDICT is refused while
-  an unknown ROUTE bit is KEPT, and there is one mapping, `Distributed/MembershipWire.hpp`.
+  never on a miss, and is folded with `SameHost`. A ticket widens it no more than a proof does; the
+  fleet's shared cache is another VERB PAIR (`SharedFetch`/`SharedStore`), never FETCH widened.
+- A ticket route keys on a VERIFIED ticket, never on AUTH answered Ok (`NoPolicy` answers Ok): signed
+  by the machine's own key for ONE audience (never loopback or a wildcard), minted on this machine
+  (`MintTicket`), spent once per node, refused by reason (`TicketRefusalTable`), and a refused AUTH
+  CLEARS an earlier one. Absence from `ClusterState` is not removal; `NodeMembership::Adopt` writes
+  only `--fleet-open`'s bit.
+- A machine is revoked by its KEY, never its address: `--cluster-forget` drops the record and
+  revokes the key in ONE entry, and a revoked key is `Membership::Forgotten` from EVERY address,
+  loopback and `--fleet-open` included (`PrecedenceOf`, a fold rather than `any_of`); published from
+  `PublishCluster`, never from `Adopt`. No member is recorded without a key.
+- And the fold REPORTS: `Op::ExplainAdmission` answers for a MACHINE (its roster standing) or for
+  the CALLER (the SET of routes that admitted it), through the oracle the surfaces enforce; an
+  unknown VERDICT or STANDING is refused, an unknown ROUTE bit KEPT, one mapping, `MembershipWire.hpp`.
+- An operator's CONTROL verbs — `--cluster-admit*`, `--cluster-forget`, `--cluster-set`,
+  `ENROLL-CONTROL` — need a caller a route IDENTIFIES, and `--fleet-open` identifies nobody: two
+  COLUMNS (`IdentityRequirement::IdentifiedCaller`, the route table's), refused `IdentifiedCallerRequired`.
 - REMOVAL is the direction a live admission path has to get right, and the direction a test skips:
-  adding a member fails CLOSED and self-heals, removing one fails **OPEN**. So `NodeMembership` IS
-  the oracle rather than handing one out; the forget warns where the admit is SILENT; and a reload
-  may not WIDEN admission on a worker that runs no consensus and names no `--voter-key`.
-- An enrollment window is served by a node that runs consensus (`ServesEnrollment`). **No secret
-  crosses it** (#178): the joiner sends its role and PUBLIC key, the approved reply is the roster,
-  and no key file is read at approval or written by the joiner.
+  adding a member fails CLOSED and self-heals, removing one fails **OPEN**. So `NodeMembership` IS the
+  oracle; the forget warns where the admit is SILENT; and a reload may not WIDEN admission while the
+  running worker's BUILT lease check verifies nothing (`LeaseCheckInForce`, read by `ReloadCheckWith`).
+- A WORKER with its consensus port closed is refused at startup, install included, on what it RUNS
+  (`WorkerWithConsensusClosedRefusal`): it would register nowhere. A learner is not this case.
+- Enrollment is served by a node that runs consensus (`ServesEnrollment`); a leader RECORDS every
+  joiner, bounded and with no window to open, and a person or an armed deadline approves. **No secret
+  crosses it** (#178): role and PUBLIC key in, the roster out, no key file read or written by either end.
 - A node that runs no consensus refuses the enrollment family `NoCluster`, never
   `UnimplementedVerb`, which a client reads as *this seed's build is too old*; asserted as NOT
   `UnimplementedVerb`, since both refuse.
 - Rejecting an already-APPROVED joiner does NOT un-admit it; the remedy is `--cluster-forget` for
-  either role (#1555), which the Warn names.
-- **The key an operator compared is the key an approval admits**: a pending row keeps the FIRST
-  key its id asked with, and a later poll under that id with another key is another machine —
-  counted in `claimsChanged`, answered `Pending`, never recorded.
-- `--node-status`'s `enrollment` field is ABSENT on a node with no window and `closed` on one
-  whose window is shut — the distinction the two enrollment counters' zero cannot carry.
+  any member (#1555), which the Warn names.
+- **The key an operator compared is the key an approval admits**: a row keeps the FIRST key its id asked
+  with; another key under that id is `claimsChanged`, answered `Pending`, never recorded nor AUTO-approved.
+  Every `Enroll` is SIGNED by that key over all it states (`VerifyEnrollRequest`), before any other claim.
+  **Auto-approve is a DEADLINE, not a mode**: the leader's clock, in memory, ended by a restart or demotion.
+- Only a VERIFIED answer keeps a join waiting: a full list, a `NotLeader` naming nobody and a
+  redirect are wire refusals nobody signs, and count towards the give-up exactly as silence does.
+- NODE-STATUS's `enrollment` field (`fastcache-cli node`) is ABSENT on a node serving no enrollment, `manual`
+  otherwise, and `auto-approve` with the minutes left while a deadline is armed — never a counter's.
 - A compile is awaited onto a `ThreadPoolExecutor` sized to the slot cap, never served inline and
   never on a reactor; on the merged `0xFC` surface that is TWO hops, and **back before the reply
   is returned**, so a test asserts the THREAD IDENTITIES. It spends `WorkerServer::Capacity()`,
@@ -427,26 +434,36 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 **[`.agent/rules/consensus-and-cluster.md`](.agent/rules/consensus-and-cluster.md)**
 — Raft, discovery, membership. Before `Consensus/`, `Cluster/`.
 - A discovery proof is a signature by the node's OWN identity key over a nonce *this* node
-  chose, covering the `(node, endpoint)` pair AND the key (#178), checked BEFORE the roster.
-- A proof only ever answers a challenge this node issued, and the nonce is spent either way.
+  chose, covering its whole fleet SUMMARY AND the key (#178), checked BEFORE the roster.
+- A proof only ever answers a challenge this node issued (a COOKIE it recomputes, never a table entry),
+  spent once a proof of it VERIFIES; a forgery spends nothing.
 - **Nonces and minted node ids come from `ISecureRandom`, never a seeded engine**, and a failed
   draw is a REFUSAL (#1527). Its test is CROSS-PROCESS: `ctest -R secure-random-cross-process`.
-- Discovery never changes membership, and since #178 it admits NOBODY: it reports who proved a
-  key the roster already holds, with no KEY opinion, re-asked of the roster at every publish.
+- Discovery never changes membership and admits NOBODY: it answers a challenge from ANY cluster, reports who
+  proved a key the roster holds, and hands another fleet's proven summary to formation, never desired.
+- **A fleet's proof binds a KEY, never the truth of its summary, so a LAN join is trust-on-first-use
+  unless `--fleet-id` PINS it — a KEY pin** (an id alone is REFUSED): ONE predicate, `AdmitsFleet`, INSIDE
+  `ClassifyEncounter`, of every `Enroll` answer and redirect, the dissolve and the record. **It anchors the
+  JOIN**, then the applied state rules. A `--fleet-seed` outranks any beacon, and a joined machine never
+  YIELDS to another fleet (`foreign-fleet-visible`).
+- **A split heals BY ITSELF only on a VOTER's key** (their speaker recorded here as a voter under it), through
+  ONE replicated `DissolveInto` its losing LEADER proposes; a memo's or a learner's key is an OPERATOR's call.
 - **Every Raft peer connection proves each end's OWN identity key before a message is read**
-  (#178) — `Consensus::IRaftPeerIdentity` over `IRaftPeerKeys`, **each signature covering the
-  WHOLE transcript**. Without one, a STARTUP refusal, never a per-connection fallback.
+  (#178) — `Consensus::IRaftPeerIdentity` over `IRaftPeerKeys`, **each signature covering the WHOLE
+  transcript**, the session's DIRECTION included. Without one, a STARTUP refusal, never a fallback.
 - The ACCEPTOR challenges first and checks the SIGNATURE before any claim, then `OwnId` before
   `WrongTarget`; every verdict but an unknown key or a forgery is SIGNED, refusals included.
   **An unsigned refusal of a member is a confident wrong signal.**
 - Every session frame carries an HMAC under the HKDF session key (`Core/SessionSeal.hpp`) over an
   implicit sequence number, and a message naming another sender closes the connection: the ids
   are bound and the ENDPOINT deliberately is not.
-- **An applied forget closes the sessions its revoked key proved, at their next frame once the
-  configuration no longer counts the member** (#1555) — `StillProves`, asked per frame and
-  PULLED; the roster is `--raft-peer`'s `@<key>` until the replicated state says otherwise.
-- `RaftWire::CurrentVersion` and `MinSupportedVersion` are both 4, each bump a GRAMMAR change —
-  the opposite of discovery's #402, where only the MAC input moved.
+- **An applied forget closes the sessions its revoked key proved, at their next frame OR the next
+  reconcile pass once the configuration no longer counts the member** (#1555) — `StillProves`, per frame
+  AND, for attached inbound sessions, per pass (`RecheckProofs`' unsealed WAKE), still PULLED. The roster
+  is the node's own cluster's or its approved enrollment roster until the replicated state says otherwise.
+- `RaftWire::CurrentVersion` and `MinSupportedVersion` are both 4, each bump a GRAMMAR change; #402
+  moved the discovery proof's MAC *input* and **`DiscoveryWire::CurrentVersion` deliberately did not
+  move** (it did at #178, a grammar change). The question is always which changed, MAC or GRAMMAR.
 - `RaftClusterHarness` authenticates EVERY message through the real session objects, with a
   REQUIRED identity factory; an intruder case says nothing without the formation case beside it.
 - `RaftNode` reads no clock, opens no socket and draws no randomness of its own.
@@ -459,25 +476,26 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   (#1552): `CanRestore` first, answered `Rejected`, staying BEHIND rather than stopping the tier.
 - A seeded draw must be identical on every standard library — `UniformInRange`, never
   `std::uniform_int_distribution`.
-- A node being admitted must never have bootstrapped a cluster of itself, so `RaftConfig::voters`
-  and `learners` may legally both be **empty**. Who a node dials is not who it counts.
+- A node must have DISSOLVED its solitary cluster (its store ARCHIVED, never deleted) before it adopts a
+  roster, so `RaftConfig::voters` and `learners` may both be **empty**. Who a node dials is not who it counts.
 - **Voting is a property of the CONFIGURATION, never of a role (#1449)** — a `StandingTable` row
   through `Membership::StandingOf`, never a fifth `Role`, and a learner refuses a vote by ROW.
   Every quorum read counts VOTERS through `Membership::QuorumOf`; replication reaches both sets.
-- The quorum follows the replicated state, one change at a time, and a member is never COUNTED
-  before it is dialable AND has CAUGHT UP (#1537). **One at a time is load-bearing for READS as
-  well as for commitment**, because CheckQuorum reads the committed configuration.
+- The quorum follows the replicated state, one change at a time; a VOTER is never COUNTED before it is dialable
+  AND has CAUGHT UP (#1537), while a LEARNER has no endpoint and a leader NEVER DIALS one. **One at a time is
+  load-bearing for READS as well as for commitment**, because CheckQuorum reads the committed configuration.
 - Absence from `ClusterState` is not removal, and **a learner is never removed for being absent**.
   **A FORGET is not absence**: it leaves the quorum whoever typed the member (#1555), THIS node
-  once FORGOTTEN — record gone AND (host tombstoned OR key revoked), never the record alone —
-  proposes its own removal last and steps down (#1539), and forgetting the only voter is refused
-  by name (`PrepareForget`).
+  once FORGOTTEN — record gone AND key revoked, never the record alone — proposes its own removal
+  last and steps down (#1539), and forgetting the only voter is refused by name (`PrepareForget`).
+- A member record's `schedulerEndpoint` is its `0xFC` endpoint, learners included: set at join from
+  `Enroll`, moved only by a PROVEN NODE-ANNOUNCE (same seat and key), one change in flight per member.
 - **A forget outranks an observation (#1528)**: `MembershipProposals` refuses a forgotten desire
   BY NAME (`MembershipPlan::forgotten`), at the decision rather than by pruning it.
 - **`--cluster-forget=<id>` is ONE act (#1555)** — the record goes and its key is revoked in the
   same entry (`PrepareForget`), because there is no verb for either half alone.
 - The SEAT an operator chose is the record (`ClusterMember::seat`, `MemberSeatTable`); a desire
-  carries NONE (#1535), and a discovered machine is a LEARNER until an OPERATOR promotes it.
+  carries NONE (#1535), and an approved joiner is a LEARNER until an OPERATOR promotes it.
 - The Raft store is FORMAT 2 and every log record carries its format: a store another build wrote
   is `UnsupportedFormatVersion`, judged before the CRC. A log's FIRST record decides; a foreign
   LATER record is a torn tail.
@@ -500,12 +518,18 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   resolved value reaches every configuration this process builds.
 - **The hostname is a fleet-page LABEL and decides nothing**, and it still passes the UTF-8 gate
   at `SchedulerService::Register`. **No prefix matching on ids.**
-- **A replicated setting must not decide where a node sends a CREDENTIAL** — removed rather than
-  wired, and refused BY NAME through `RefusedSettingTable`.
-- **A mode rides on the PORT, never on the absence of a NAME**: one predicate, `RunsConsensus`,
-  asked of the surface row so `--print-surfaces` and the mode cannot disagree.
+- **A replicated setting must not decide where a node sends a CREDENTIAL** — refused BY NAME
+  through `RefusedSettingTable`; `shared-cache` complies: it names an ID, the peer proves that
+  ID's roster key before anything is sent, and the leg carries no credential.
+- **A mode is the STATE held in the cluster dir, never a flag or a port**: a `NodeModeTable` row, read
+  through ONE predicate, `RunsConsensus`, which the surface rows ask too, so they cannot disagree.
+- A name that reaches only this machine CONFINES consensus to loopback, never closes it: a fleet of its
+  own with every way to grow shut (`ConsensusConfinedToThisMachine`, `host-name-reaches-only-this-machine`).
 - **Only an ABSENT `node-key` mints** (#178): a key file that is there and cannot be used is
-  refused by name and left untouched, never re-minted; its path is DERIVED (`NodeKeyPath`).
+  refused by name and left untouched, never re-minted; its path is DERIVED (`NodeKeyPath`), under
+  the state directory EVERY node has.
+- A state file is replaced through ONE writer (`ReplaceFileWith`): flush, CHECKED close, rename, then the
+  DIRECTORY flushed; on Windows an open reader survives it only if it shares DELETE AND the rename is POSIX.
 - **`ValidateAgainst` is the courtesy, `Apply` the guarantee.** A revoked key is never admitted
   again (`KeyRevoked`, permanent), and a forget's revocation is what `Apply` never drops.
 - **A flag that parses a key CARRIES it, never parses and drops it**: `--cluster-admit@<key>`
@@ -531,9 +555,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A reply carries a status byte and NO kind, so step-over-what-you-do-not-know is REQUEST-side
   only: `Status::Progress` moved `MinSupportedVersion` with `CurrentVersion`. Its `static_assert`ed
   verb column, empty payload and terminal-status loop are in the rules file.
-- Silence is only measurable against something that would otherwise be said, so the worker's
-  cadence and the client's idle bound are ONE `static_assert`ed pair of numbers in
-  `CompileCacheWire`.
+- Silence is only measurable against something that would otherwise be said, so the worker's cadence
+  and the client's idle bound are ONE `static_assert`ed pair of numbers in `CompileCacheWire`.
 - A pulse is a SECOND writer for the length of the answer, so the endpoint settles it before it
   writes anything and one still parked past the bound ends the connection — `SettleWatch`'s rule on
   the write side, with the vacuous "every frame but the last is a pulse" test beside it.
@@ -550,9 +573,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   `(op, code, why)` table row rather than a `switch` case, spelling ONE named constant every
   surface and the client share. *Unimplemented* is not *served elsewhere*, and a row for a verb the
   surface DOES serve is dead: `static_assert` that one cannot be added.
-- A wire constant has TWO facts, its name and its value, and a symbol both ends spell tests only
-  the first. Pin the **byte** as well, and keep one test on the raw enumerator — the anchor, not a
-  smell.
+- A wire constant has TWO facts, its name and its value, and a symbol both ends spell tests only the
+  first. Pin the **byte** as well, and keep one test on the raw enumerator — the anchor, not a smell.
 - **A new verb is not one dispatch, and none of the other places fails the BUILD**: a `switch` arm
   in the daemon (a missing one DROPS the frame), a `RelocatedVerbs` row, a documentation row for
   any counter it adds, and the live-stats layout pin.
@@ -577,7 +599,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) rather than marking what it does not.
 - A listening socket claims its address exclusively — `SO_EXCLUSIVEADDRUSE` on Windows, where
   `SO_REUSEADDR` lets a second process take a port already being served. Sharing a port is
-  `core::net::PortSharing::Shared`, and only that.
+  `core::net::PortSharing::Shared`, and only that. A port a node binds itself is bound AGAIN by every
+  serving body, never duplicated: on Windows an IOCP association belongs to the SOCKET (error 87).
 - A struct a decoder returns **by value** must not borrow from the bytes it decoded:
   `Decode(Encode(x))` is a use-after-free the moment one member becomes a view. A `*View` type
   borrows and says so, anything else owns, and the choice is per type by a CONJUNCTION.
@@ -647,10 +670,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   otherwise drops bytes. `Testing::ParkingReadableSocket` COUNTS orphans.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through
   `Schedule`/`CancelPending`, and bound any sleep a peer can move the deadline of.
-- A reactor resumes what it parks or FREES it, and may free only what nothing else owns —
-  `Schedule` BORROWS, so ownership travels with the park (`ParkedWork::abandon`) and what is freed
-  is the chain ROOT. Resuming is a hang, not an alternative; `Resume()` disowns and resumes in ONE
-  expression.
+- A reactor resumes what it parks or FREES it, and may free only what nothing else owns — `Schedule`
+  BORROWS, so ownership travels with the park (`ParkedWork::abandon`) and what is freed is the chain
+  ROOT. Resuming is a hang, not an alternative; `Resume()` disowns and resumes in ONE expression.
 - Re-declaring ONE overload in a derived interface HIDES the base's others, and here it hid the one
   carrying ownership. Nothing diagnoses it; the detection is the compiler, and the `no viable
   conversion` errors from converting the sites enumerate the defect's reach.
@@ -678,20 +700,21 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 **[`.agent/rules/platform-service-and-config.md`](.agent/rules/platform-service-and-config.md)**
 — service registration, config lookup, the CLI table. Before `Platform/`, `Config/`,
 `packaging/`.
-- A service to register is a `ServiceSpec`; what it runs as is part of it, and an empty
-  `serviceAccount` means **root**.
+- A service to register is a `ServiceSpec`; what it runs as is part of it, as are how it STARTS and
+  which ports it OPENS, and an empty `serviceAccount` means **root**. An MSI upgrade RE-APPLIES a
+  registration and never deletes one; the MSI's service table decides every start mode.
 - `--install-service` registers the *command-line* config, never the merged one, and carries the
   config PATH rather than the file's values or a resolved default.
 - An install is judged by the **startup** rules as well as the install-time ones: a registration
-  replays its command line forever, so refuse it while somebody is watching.
+  replays its command line forever, so refuse it while somebody watches; under the SCM, `RefuseStart`.
 - A refusal that depends on nothing but the parsed configuration belongs in a table — the option
   row for a grammar, `StartupPolicyRejection` for a cross-flag rule, never the tier that happens
   to need it. An install returns before any tier exists.
 - **The addresses a node OPENS and the ones it DIALS are two tables, and one predicate cannot
   serve both.** Opened surfaces are `NodeSurfaceTable()`'s rows; `--advertise`, `--scheduler` and
-  `--upstream` take `ParseDialEndpoint`, where a bare port names no machine, while
-  `--fleet-member` is matched through `HostOfEndpoint` and must NOT — only an EMPTY element is
-  refusable there. Shape and PRESENCE stay separate rules; `--bind` is in neither.
+  `--upstream` take `ParseDialEndpoint`, where a bare port names no machine, while `--fleet-seed`
+  takes `<host>` or `<host>:<port>` through `Cluster::NormalizeSeed`, one grammar for a typed seed and
+  a remembered one. Shape and PRESENCE stay separate rules; `--bind` is in neither.
 - Whatever reaches a supervisor must survive this project's own parser round trip — including the
   flags the *installer itself* adds, the daemon's only when the spec names an application.
 - Whether the operator **named** a setting is provenance, recorded by the parse in
@@ -701,9 +724,10 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   unreadable or untrusted.
 - A machine-wide config is obeyed only when only an administrator could have written it
   (`Platform/FileTrust`).
-- That is INTEGRITY; secrecy is a second question the same access list cannot answer.
-  `--seed-config` gives the FILE a protected list of its own, not the MSI, and an existing file
-  is repaired only when it is *currently* broadly readable, never by content.
+- That is INTEGRITY; secrecy is a second question the same access list cannot answer. `--seed-config`
+  protects the FILE (not the MSI; repaired only while broadly readable, never by content), and a
+  directory a SERVICE mints a credential in is `PathPrivacy::Private`, the DEFAULTED state directory
+  included: a PROTECTED list or REFUSED.
 - A secret reached BY PATH is not provenance-gated — the path is not the secret and the file is —
   while `--requirepass` out of a config file still is. Which `=<path>` rows are which is a TABLE
   per binary, classification is MANDATORY (`--tls-cert` is named PUBLIC, not left off), and BOTH
@@ -716,7 +740,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   `ApplyOneOption` stamps the row's own spelling.
 - A configuration FILE reaches the same fields through the SAME appliers, in that order. A RELOAD
   rebuilds the candidate the way the START built it, through one `AssembleEffectiveConfig` (file,
-  then argv, then the environment) that `ConfigReloader` takes as a REQUIRED argument. Which key
+  then argv, then the environment) that `ConfigReloader` takes as a REQUIRED argument; a REFORM shapes
+  its body from the configuration IN FORCE (`INodeConfigSource`), never the start's. Which key
   a row answers to is a COLUMN (`yamlKey`); a key naming no row, or written twice, is REFUSED;
   and a row a file may not carry is on a named list with a per-row reason the guard READS.
 - A flag whose meaning is its presence is a boolean in the file and `apply` runs on `true` alone
@@ -746,8 +771,10 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - Each slice records its resume point in its own transaction, so an interrupted run is refused
   by name and finished by re-running it.
 - A tree walk is bounded by `PageCount()`, and must not overlap a commit.
-- A tier's `bytesUsed` is denominated differently per tier: memory counts STORED (compressed)
-  bytes, disk counts `originalLen` — so measure the store FILE for a compression test.
+- Both tiers' `bytesUsed` count STORED bytes; the disk tier's is its page FOOTPRINT, which
+  `--cache-disk` bounds, never the file's length. A compression test asserts ENTRIES, not bytes.
+- A flush never extends a file whose free list can hold its own list, nor writes it into a page
+  the superseded meta needs; a leaked page is lost CAPACITY, so only `batched` carries a budget.
 - The LRU mirror holds what this SESSION touched — `TouchOrInsert` is its only writer and no
   `Open` path calls it — so eviction reaches the COLD set first, and that is LRU rather than a
   workaround. A figure describing the store reads the STORE at the store's own denomination;
@@ -788,10 +815,9 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   `1` is the instrument failing. Where the answer cannot be determined, report that as its own
   outcome rather than the nearest neighbour.
 - **A state-collapsing bug is likeliest in the tool whose JOB is that state distinction**, and its
-  repair must report the unrequired failure by name AND KEEP GOING. **The repair for one collapse
-  is the prime site for the next, and the location is the `*)` arm** — **a `case` with a `*)` is
-  an unguarded table** — and a verdict computed from a SUMMARY beside its own disproof is its
-  own defect.
+  repair must report the unrequired failure by name AND KEEP GOING. **The repair for one collapse is
+  the prime site for the next, and the location is the `*)` arm** — **a `case` with a `*)` is an
+  unguarded table** — and a verdict computed from a SUMMARY beside its own disproof is its own defect.
 - Absent is not zero: a process with no cache reports no cache, and *names* the field to do it.
 - Its converse: an absence must not be counted as an event, so an outcome that can be *not
   attempted* is an enum and not a `bool` (`NoUpstream`), fixed at the SEAM.
@@ -805,9 +831,12 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   narrowed*. `ctest -R counter-attribution`.
 - A duration is a `_sum`/`_count` pair, never a gauge.
 - A condition an operator must act on is a row of `NodeConditionTable`, never a log line alone.
-  **Latched and live are drawn apart on every surface**; `none raised` is SAID and a node that
-  sent no list is ABSENT; `undecided` is *nobody evaluated it* and must not read as `clear`;
-  rows travel as WORDS, the remedy included. The `[conditions]` Catch2 tag, in three binaries.
+  **Latched and live are drawn apart on every surface**; `none raised` is SAID and a node that sent no list
+  is ABSENT; `undecided` is *nobody evaluated it* and never reads `clear`; a FLEET row is the LEADER's, so a
+  follower says `not-evaluated`; rows travel as WORDS, remedy included; `[conditions]` spans three binaries.
+- A setback that repeats every round is logged on its TRANSITION, never per round: ONE per-process
+  `SchedulerReachability`, keyed on the round's OUTCOME, one Warn per scheduler per cadence, a recovery
+  at its loss's level; its row is `scheduler-unreachable`, raised from the same state.
 - A merged snapshot is one tier's answer standing in for all of them: `SnapshotTiers()` reports
   the split, the `tier` label comes from a table, and a tier the cache lacks renders no line.
 - The fleet page is served by the leader; anyone else answers `503` **naming** the leader, never
@@ -858,10 +887,9 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - Neither a `.pkg` nor an MSI has a conffile mechanism — only a `.default` ships.
 - Every `build.yml` checkout that could configure passes `fetch-depth: 0`, and the release
   job's asset list stays the **last** key of its `with:` mapping.
-- **A new INSTALLED binary is not one CMake row**: CPack installs the whole Runtime component
-  while the three `Package (...)` jobs name their build targets by hand, and none of those
-  contexts is required. Three `--target` lines in `build.yml`, the macOS redistributable loop
-  (a different list: payload, not symlinks) and `FASTCACHED_MACOS_LINKED_TOOLS`. Guard: #1202.
+- **A new INSTALLED binary is not one CMake row**: it needs its app-table COMPONENT (one MSI feature
+  per app), three `--target` lines in `build.yml`, the macOS payload loop (not the symlink list)
+  and `FASTCACHED_MACOS_LINKED_TOOLS`; no `Package (...)` context is required. Guard: #1202.
 
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
@@ -945,23 +973,22 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - `cmake/portable/CompileCache.cmake` stays stock-CMake-only and must never fail a configure: ask
   `ENABLED_LANGUAGES` first, and CHECK a flag rather than gating on a compiler-ID string. What it
   computes is checked as a computation (`ctest -R debug-prefix-map-rules`).
-- A sanitizer that is on in the cache is not one that is on in the build — a tool that silently
-  does nothing is worse than one that is visibly off.
+- A sanitizer on in the cache is not proof it is on in the build; a silent no-op is worse than off.
 - **`NDEBUG` is not optimisation, and `CMAKE_BUILD_TYPE` is a LABEL that decides nothing.** A
   benchmark states its build on **stderr** before any case runs and marks every figure, from a
   macro the COMPILER defines in the asking TU. `ctest -R bench-build-banner`.
 - A Windows **Debug** leg is run for `_ITERATOR_DEBUG_LEVEL=2`, not for the compiler, so it runs
-  `ctest` rather than only building: `iterator-debug-canary` must die and
-  `scripts/iterator-debug-gate.ps1` refuses a build where it survives.
+  `ctest`: `iterator-debug-canary` must die; `scripts/iterator-debug-gate.ps1` refuses it surviving.
+- **No MSVC-style debug-info link is incremental** (`cmake/IncrementalLink.cmake`): LNK1163 failed
+  relinks a retry cleared, cause INCONCLUSIVE, so never launcher-gated. `ctest -R incremental-link`.
 - **No executable raises a modal error dialog, and the BUILD installs that, never each `main`** —
   `cmake/ErrorPopups.cmake` attaches one TU to every executable and
   `ctest -R error-popup-coverage` reads the LINK LINES. A new `catch_discover_tests` names
   `FASTCACHED_ERROR_DIALOG_ENVIRONMENT` or the check refuses its cases (#1389).
-- So a sanitizer job proves nothing until something proves the sanitizer. `scripts/tsan-gate.sh`
-  will not report clean until every artefact's OWN OBJECT FILES carry an **undefined**
-  `__tsan_init` and `src/tests/TsanCanary.cpp` has gone red with `.tsan-suppressions` active. A
-  known race lives there with its issue number; deleting the entry is part of closing the issue,
-  never of going green.
+- So a sanitizer job proves nothing until something proves the sanitizer. `scripts/tsan-gate.sh` will
+  not report clean until every artefact's OWN OBJECT FILES carry an **undefined** `__tsan_init` and
+  `src/tests/TsanCanary.cpp` has gone red with `.tsan-suppressions` active. A known race lives there
+  with its issue number; deleting the entry is part of closing the issue, never of going green.
 - That proof is asked of the OBJECTS because a binary cannot answer it — the link pulls the
   runtime in whole. Not `__tsan_func_entry`, which is per-FUNCTION.
 - The canary's job is to be caught EVERY time, so a change to it is judged by a RATE and never by
@@ -970,9 +997,9 @@ what differs between compilers, standard libraries, hosts and tool versions.
   unique" both fire — and a generator that produced nothing fails rather than reporting success.
   Report what changed, not that the script finished.
 - Its mirror on the other side of the same pipe: **a `<<<` operand of 64 KiB or more
-  DEADLOCKS on Git Bash** — bash writes a herestring into a PIPE in full before starting the
-  reader. Measured to the byte, and it is SIZE rather than content, so feed a LISTING through
-  `< <(printf '%s\n' "$x")`. Master's tracked-file list sat 508 bytes short (#1591).
+  DEADLOCKS on Git Bash** (#1591), SIZE not content. Feed an external filter through
+  `pipe_lines_into` (two: `pipe_pair_into`), a pipe answering with the FILTER's status — never a
+  `<(...)`, stdin OR argument, which CAN make it the writer's PARENT; one came back 148 (#1630; its cause INFERRED).
 - `producer | grep -q` is a false **negative** under `set -o pipefail`, and it fails on the
   SUCCESS path; it is a SCAN in `check-e2e-helpers.sh`, since a rule stated in the files that obey
   it reaches no file that does not. The remedy is a HERESTRING, which is not a pipe.
@@ -985,14 +1012,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   file's reader will meet it**: `check-tsan-scope.cmake` refuses past a WATERMARK, a pinned
   CONDITION that must not track `CMakeLists.txt`, or the comparison is `x > x`.
 - A `paths-ignore` filter on a workflow whose checks are **required** makes a pull request
-  unmergeable, not fast: no check run is created, so the context never reports. Master is a
-  *ruleset*, so the protection API tells you nothing. Gate at the **job** level;
-  `scripts/ci-scope.sh` decides.
+  unmergeable, not fast: no check run is created, so the context never reports. Master is a *ruleset*,
+  so the protection API tells you nothing. Gate at the **job** level; `scripts/ci-scope.sh` decides.
 - A **merge queue** is the third door to that same never-arrives failure: it dispatches
   `merge_group`, which `pull_request_target` does not fire on. Check the concurrency key, state
-  `merge_group` in the scope classifier, add no JOB to `build.yml`;
-  `ctest -R merge-queue-contexts`. **Neither the SET nor its COUNT is written in prose**, and
-  nothing GUARDS this.
+  `merge_group` in the scope classifier, add no JOB to `build.yml`; `ctest -R merge-queue-contexts`.
+  **Neither the SET nor its COUNT is written in prose**, and nothing GUARDS this.
 - A **CONFLICTING** pull request is the fourth door: GitHub computes no merge ref, so a
   `pull_request` workflow dispatches NOTHING and ITS contexts are ABSENT rather than pending —
   while `pull_request_target` ones report normally throughout, which is the tell pointing the wrong
@@ -1036,9 +1061,8 @@ what differs between compilers, standard libraries, hosts and tool versions.
   **`IFS=$'\t' read` does not read TSV.** **A fixture built on `message(FATAL_ERROR)` cannot test
   that verdicts are read from OUTPUT.** And **a self-test that stops early must not look like one
   that judged something**, so they print how many cases they ran.
-- A bracket-vulnerable `cmake -P` reader is judged per **(reader, file, surviving lines)** and
-  never per script: one left alone because today's files happen to be safe is a defect scheduled
-  for later.
+- A bracket-vulnerable `cmake -P` reader is judged per **(reader, file, surviving lines)** and never
+  per script: one left alone because today's files happen to be safe is a defect scheduled for later.
 - **And the usual remedy is wrong where the brackets are the DATA** — a Catch2 tag IS `[async]`,
   so blanking `[`/`]` makes that reader refuse a good tree; it is a list-free `FIND`/`SUBSTRING`
   walk instead. Consolidating the splitting idiom is **#495**, not the ticket in front of you.
@@ -1080,13 +1104,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - And it must be configured with the same TARGET SET CI builds: a changed file with no compile
   command is dropped silently, and must be. Account for every file in the diff the sweep did not
   reach, before trusting its count.
-- **A registration that exists in ONE configuration reports nothing in every other, which reads
-  like a pass.** So the blind-spot table is TWO registrations — the MEASUREMENT
-  (`tidy-blind-spots`, Linux, ASan and TLS on) and the table's own rules
-  (`tidy-blind-spots-table`, default set, every platform, no build) — beside
-  `conditional-check-reach`, which DERIVES each option-gated registration from the `if()` nesting
-  and asserts some `build.yml` job configures a build it can run in AND runs `ctest`. Both DERIVE
-  their subject and never name it (#589). Still missing: a check over GUARDS rather than
+- **A registration that exists in ONE configuration reports nothing in every other, which reads like a
+  pass.** So the blind-spot table is TWO registrations — the MEASUREMENT (`tidy-blind-spots`, Linux,
+  ASan and TLS on) and the table's own rules (`tidy-blind-spots-table`, default set, every platform,
+  no build) — beside `conditional-check-reach`, which DERIVES each option-gated registration from the
+  `if()` nesting and asserts some `build.yml` job configures a build it can run in AND runs `ctest`.
+  Both DERIVE their subject and never name it (#589). Still missing: a check over GUARDS rather than
   platforms, unioned over (leg × configuration) and never over legs (#858).
 - **Running the launcher is not testing it.** The synthetic fixtures prove it RUNS and produces AN
   object; `scripts/launcher-replay-e2e.sh` builds three times and runs the replayed binary.
@@ -1138,9 +1161,8 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - **After a revert, test for the REVERT, never for the defect.** A revert leaves the reverted
   commit in the ancestry forever, so `--is-ancestor <fix>` answers YES for every branch; the only
   useful question is `--is-ancestor <revert>` coming back NO.
-- **A subject line is an abbreviated identifier with no prefix to disagree about.** Same family as
-  a ctest index and two worktrees one token apart — **a leg travels with its compiler and its
-  machine.**
+- **A subject line is an abbreviated identifier with no prefix to disagree about.** Same family as a
+  ctest index and two worktrees one token apart — **a leg travels with its compiler and its machine.**
 - **A reason that generalises further than the fact it was drawn from is worse than the narrow
   one**, because it reads as licence somewhere it was never measured — and it is introduced while
   TIDYING, which is when it is least likely to be re-checked.
@@ -1162,14 +1184,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - **A build under WSL is I/O-bound on `/mnt/<drive>`, not CPU-bound.** Keep the BUILD TREE on the
   Linux filesystem (`cmake -S /mnt/... -B "$HOME/bld/<name>"`); sources may stay. Derive `-j` from
   the host and set `CTEST_PARALLEL_LEVEL`, or the suite runs SERIAL in silence.
-- **When the SUBJECT under test is the build environment, a green local gate is not weak evidence
-  — it is none.** An exclusion list bets on the world's layout; an inclusion list states your own.
-  Git Bash rewrites a `/`-led MSVC flag into a path — `MSYS2_ARG_CONV_EXCL='*'` **and**
-  `MSYS_NO_PATHCONV=1`, both spellings, always — and flags are dropped from a TABLE keyed on the
-  driver NAME, never by sniffing a leading `/`. **And that switch belongs to the SPAWN, never to
-  an environment `ctest` inherits**: no test in `src/tests` inherits it on Windows, Windows script
-  tests run Git's `bin/bash.exe`, and a check in a work tree the git on PATH cannot read is
-  REFUSED (#1355).
+- **When the SUBJECT under test is the build environment, a green local gate is not weak evidence — it
+  is none.** An exclusion list bets on the world's layout; an inclusion list states your own. Git Bash
+  rewrites a `/`-led MSVC flag into a path — `MSYS2_ARG_CONV_EXCL='*'` **and** `MSYS_NO_PATHCONV=1`,
+  both spellings, always — and flags are dropped from a TABLE keyed on the driver NAME, never by
+  sniffing a leading `/`. **And that switch belongs to the SPAWN, never to an environment `ctest`
+  inherits**: no test in `src/tests` inherits it on Windows, Windows script tests run Git's
+  `bin/bash.exe`, and a check in a work tree the git on PATH cannot read is REFUSED (#1355).
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
@@ -1231,9 +1252,9 @@ and what they may assume.
 - A `$<TARGET_FILE:x>` naming a target that was NOT built is a hard error at **generate** time, not a
   skipped test: guard the block on `TARGET x` as well as on the feature that makes the test
   interesting. `ctest -R target-file-guards` reads TWO sources; never merge their counts.
-- A fixture whose client is always LOCAL cannot test who is admitted: `Classify` returns `Member` for
-  the whole of `127.0.0.0/8` before the member list, so only the host's OWN non-loopback address
-  reaches it. Assert BOTH directions with the refusal COUNTER moving; no such address is a loud SKIP.
+- A fixture whose client is always LOCAL cannot test who is admitted: loopback is admitted before any
+  other route is asked, so relabel the peer (`src/tests/RelabelledPeerListener.hpp`) and assert BOTH
+  directions with the refusal COUNTER moving, beside a control that the relabelling is live.
 - A script-driven test naming more than one executable is registered in `src/tests`, not beside a
   binary.
 - An abbreviated identifier is a DISPLAY form: the full one is read, never padded, truncated or
@@ -1279,7 +1300,10 @@ and what they may assume.
 - A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`, and the membership oracles are
   `src/tests/MembershipFakes.hpp` (`ctest -R membership-fakes`). A WRONG fake makes its cases pass,
   so no failure ever finds it, and a copy's cost GROWS — the shared fake takes the participant
-  REQUIRED and undefaulted.
+  REQUIRED and undefaulted. A host-answering fake may stand only for a route production answers by
+  HOST — Loopback for this machine, OpenPolicy for any (`HostLabels`); a ticket, a proof or a
+  revoked key is the production fold (`Testing::RosterFold`) with the key PRESENTED on the
+  connection.
 - And a fake that resolves SYNCHRONOUSLY what production SUSPENDS on cannot exercise a suspension
   protocol, however correct its assertions: every property defined by parking is vacuous over
   `InMemorySocket`. The survey of which have a real-socket case is in the rules file.
@@ -1299,6 +1323,11 @@ and what they may assume.
   Background work inherits the shell's traps, and in a fixture the EXIT trap IS the cleanup.
   `trap - EXIT TERM INT HUP` inside the subshell is **insufficient** — it misses the window before
   the subshell starts — while `kill -KILL` is decisive; BOTH stay, each naming the window it closes.
+- **A fixture handed a launcher records ONLY into its run's own state directory**, through ONE seam
+  (`Enter-E2ELauncherState`, `e2e_launcher_state_enter`) entered first. `ctest -R launcher-state-isolation`.
+- A fixture's git WRITE runs through `scratch_git` / `fastcached_scratch_git`, never bare `git`: an
+  inherited `GIT_DIR` turns a scratch `git init` into a write of the repository it names (`core.worktree`
+  in the shared config). `ctest -R scratch-git`; never EXPORT `GIT_DIR` around a harness.
 - A fleet property that spans two machines needs `src/tests/FleetHarness.hpp`, whose `OnCompile`
   places the interleaving rather than waiting for one. It lives in `src/tests/` because
   `src/FastCache/` must not include an app header. A harness earns its place by a property shown RED
@@ -1313,12 +1342,11 @@ and what they may assume.
 
 ## Issues and pull requests
 
-Labels here have teeth: a pull request carrying no `type/` label **fails a check**,
-because that label decides which section of the generated release notes the change
-lands in (`.github/release.yml`), and nothing downstream can recover it afterwards.
-CI derives `area/` and `os/` from the changed paths and reads `type/` from a
-conventional-commit title when there is one — a prose title, which most of this
-repository's are, means setting the label by hand.
+Labels here have teeth: a pull request carrying no `type/` label **fails a check**, because that
+label decides which section of the generated release notes the change lands in
+(`.github/release.yml`), and nothing downstream can recover it afterwards. CI derives `area/` and
+`os/` from the changed paths and reads `type/` from a conventional-commit title when there is one
+— a prose title, which most of this repository's are, means setting the label by hand.
 [`CONTRIBUTING.md`](CONTRIBUTING.md) carries the taxonomy and the reasoning.
 
 A label applied by hand can be **destroyed by CI seconds later**, and the gate then
@@ -1331,42 +1359,38 @@ it and read that warning rather than assuming the gate is flaky (#347).
 Deferred work is a GitHub issue linked from the matching rulebook file's
 `## Open work` section, never a residual recorded only in prose.
 
-**A ticket is a claim about a tree, taken once, and every merge since is an unrecorded
-condition change — so a premise is CHECKED against the tree before it is built on, never
-read.** The rulebook carries this for performance figures (*a quantity UNDER CONDITIONS,
-and the citation is where the conditions get lost*); a ticket is the same object with a
-longer half-life and no units, and the difference is that a figure at least LOOKS like it
-might be stale while a sentence does not. **Not one instance has been visible from reading
-the ticket** — every one was found by checking, and the check is cheap: a `grep` for a
-cited symbol, `gh issue view` on a cited number, `git log -S` on a cited claim. **The cost
-is asymmetric**: a stale figure makes somebody re-measure, a stale premise sends a whole
-lane to build against a tree that does not exist.
+**A ticket is a claim about a tree, taken once, and every merge since is an unrecorded condition
+change — so a premise is CHECKED against the tree before it is built on, never read.** The
+rulebook carries this for performance figures (*a quantity UNDER CONDITIONS, and the citation is
+where the conditions get lost*); a ticket is the same object with a longer half-life and no units,
+and the difference is that a figure at least LOOKS like it might be stale while a sentence does
+not. **Not one instance has been visible from reading the ticket** — every one was found by
+checking, and the check is cheap: a `grep` for a cited symbol, `gh issue view` on a cited number,
+`git log -S` on a cited claim. **The cost is asymmetric**: a stale figure makes somebody
+re-measure, a stale premise sends a whole lane to build against a tree that does not exist.
 
 Three consequences, none of which follows from the headline:
 
 - **The ticket may not be OPEN.** Work has been dispatched against issues closed days
   earlier, one of them escalated and decided at owner level. Asking `gh issue view` is one
   call and it is not the same question as *is the body accurate*.
-- **"Does not reproduce" is a first-class outcome with a DELIVERABLE**, not a close and not
-  a shrug: the falsified claims with `file:line`, plus **a test at the production seam that
-  stays green**, committed `Refs #N` rather than `Closes #N`. A test that records why a
-  ticket does not reproduce is worth keeping, and it must not silently close a design
-  question underneath it.
-- **A ticket whose acceptance clause cannot be EXECUTED is a different failure from one
-  that is merely stale, and it can be closed by nobody, ever** — a clause naming a removal
-  from a reply that carries no such field could not have been shown red even on a tree
-  where the defect existed. The other variant is a ticket dispatched as buildable that is a
-  signature record by design, with no acceptance clause at all. Separate these from
-  stale bodies rather than filing them together. This generalises the counts rule in
-  [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md) — *a ticket
-  cannot be closed against a count that no longer describes the tree* — from counts to
-  claims.
+- **"Does not reproduce" is a first-class outcome with a DELIVERABLE**, not a close and not a
+  shrug: the falsified claims with `file:line`, plus **a test at the production seam that stays
+  green**, committed `Refs #N` rather than `Closes #N`. A test that records why a ticket does not
+  reproduce is worth keeping, and it must not silently close a design question underneath it.
+- **A ticket whose acceptance clause cannot be EXECUTED is a different failure from one that is
+  merely stale, and it can be closed by nobody, ever** — a clause naming a removal from a reply
+  that carries no such field could not have been shown red even on a tree where the defect
+  existed. The other variant is a ticket dispatched as buildable that is a signature record by
+  design, with no acceptance clause at all. Separate these from stale bodies rather than filing
+  them together. This generalises the counts rule in
+  [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md) — *a ticket cannot
+  be closed against a count that no longer describes the tree* — from counts to claims.
 
-When several sessions work this repository in parallel — a manager plus two or three
-developers — the lane ownership, rebase and merge protocol, review gates and the
-type-label check's cancelled-versus-failed distinction are in
-[`.agent/guides/team-run.md`](.agent/guides/team-run.md). It carries no board state by
-design; what is done and what is left lives in the issues.
+When several sessions work this repository in parallel — a manager plus two or three developers —
+the lane ownership, rebase and merge protocol, review gates and the type-label check's
+cancelled-versus-failed distinction are in [`.agent/guides/team-run.md`](.agent/guides/team-run.md).
+It carries no board state by design; what is done and what is left lives in the issues.
 
 ## Design Patterns & Principles
 
@@ -1377,22 +1401,20 @@ Prefer `std::expected<T, E>` for fallible API surface. The error taxonomy is spl
 exceptions for programmer errors (precondition violation, contract misuse).
 
 ### Dependency injection
-**This is a load-bearing principle, not a nice-to-have.** Anything that touches I/O,
-time, randomness, the filesystem, the network, or any other ambient/global resource is
-reached through an interface — never a concrete type, a singleton, or a free function
-with hidden state. The existing seams are `IClock`, `IReactor`, `ISocket`/`IListener`,
-`IStorage`, `ILogger`, `IDaemonHost`, `ISignalSource`, `IAdmissionControl`,
-`IMetricsSink`. Collaborators are passed in (usually by reference or `unique_ptr` at
-construction), so every layer can be exercised in isolation: tests substitute
-deterministic fakes — `ManualClock`, `TestReactor`, `InMemoryTransport`, `NullLogger`,
-`CapturingLogger`, `ScriptedSignalSource` — and the whole server runs end-to-end
-without a real socket or a real clock.
+**This is a load-bearing principle, not a nice-to-have.** Anything that touches I/O, time,
+randomness, the filesystem, the network, or any other ambient/global resource is reached through
+an interface — never a concrete type, a singleton, or a free function with hidden state. The
+existing seams are `IClock`, `IReactor`, `ISocket`/`IListener`, `IStorage`, `ILogger`,
+`IDaemonHost`, `ISignalSource`, `IAdmissionControl`, `IMetricsSink`. Collaborators are passed in
+(usually by reference or `unique_ptr` at construction), so every layer can be exercised in
+isolation: tests substitute deterministic fakes — `ManualClock`, `TestReactor`,
+`InMemoryTransport`, `NullLogger`, `CapturingLogger`, `ScriptedSignalSource` — and the whole
+server runs end-to-end without a real socket or a real clock.
 
-**Define the interface first and inject it.** Wanting a global, a `static` mutable, or
-a direct `::time()`/`::read()`/`new ConcreteThing` call in business logic is the signal
-to introduce or reuse a seam. Deviate only with a *strong, explicitly stated* reason
-(e.g. a genuinely pure leaf computation with no environment coupling); the default
-answer is "inject it".
+**Define the interface first and inject it.** Wanting a global, a `static` mutable, or a direct
+`::time()`/`::read()`/`new ConcreteThing` call in business logic is the signal to introduce or
+reuse a seam. Deviate only with a *strong, explicitly stated* reason (e.g. a genuinely pure leaf
+computation with no environment coupling); the default answer is "inject it".
 
 ### Data-driven design
 **Behaviour is described by data; code interprets that data.** Equally load-bearing and
@@ -1429,25 +1451,22 @@ wrapper. `PooledBuffer` returns to its `BufferPool` on destruction; `Task<T>`'s
 `Task` cannot tear the coroutine down across a suspend point.
 
 ### Caching an expensive repeated answer
-**An answer that costs a spawn, a syscall or a walk, and is asked for more than once,
-is cached — but only where staleness degrades safely.** That second clause is the whole
-rule, so **decide safety FIRST, because it decides whether to cache at all**: staleness
-that costs a refusal, a miss or a retry is safe (it fails **closed** and self-heals),
-while staleness that produces a wrong answer which LOOKS right is not, however
-expensive the probe. **Expense is not the criterion; what a stale answer *does* is** —
-`DiscoverTargetTriple` is deliberately not memoized because a stale triple is a wrong
-hit rather than a miss
-([#188](https://github.com/LASTRADA-Software/fastcached/issues/188)).
+**An answer that costs a spawn, a syscall or a walk, and is asked for more than once, is cached —
+but only where staleness degrades safely.** That second clause is the whole rule, so **decide safety
+FIRST, because it decides whether to cache at all**: staleness that costs a refusal, a miss or a
+retry is safe (it fails **closed** and self-heals), while staleness that produces a wrong answer
+which LOOKS right is not, however expensive the probe. **Expense is not the criterion; what a stale
+answer *does* is** — `DiscoverTargetTriple` is deliberately not memoized because a stale triple is a
+wrong hit rather than a miss ([#188](https://github.com/LASTRADA-Software/fastcached/issues/188)).
 
-Where it IS safe, a cache still owes five things: **measure before choosing, on every
-platform** (`GetAdaptersAddresses` against `getifaddrs` — two orders of magnitude, so a
-design that is free where you develop can dominate a request where you ship); **fast by
-construction before fast by cache** (`IsLoopbackHost` first and lock-free), so the cache
-bounds only the rare path; **refresh on an INTERVAL, never on a miss**, or a remote peer
-has a free amplifier — one expensive probe per request, just by asking;
-**name both staleness directions in the header**, which is what makes a longer interval
-defensible; and **an injected seam with an injected clock**, because a cache with a
-hidden clock is untestable by construction. Each is derived with its measurement in
+Where it IS safe, a cache still owes five things: **measure before choosing, on every platform**;
+**fast by construction before fast by cache** (`IsLoopbackHost` first and lock-free), so the cache
+bounds only the rare path; **refresh on an INTERVAL or on a HOST EVENT (a network change, a wake),
+never on a miss**: a host event is neither a miss nor something a peer can provoke, while a miss
+hands a remote peer a free amplifier — one expensive probe per request, just by asking; **name both
+staleness directions in the header**, which is what makes a longer interval defensible; and **an
+injected seam with an injected clock**, because a cache with a hidden clock is untestable by
+construction. Each is derived with its measurement in
 [`.agent/rules/compile-cache.md`](.agent/rules/compile-cache.md) and
 [`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md).
 
@@ -1469,12 +1488,11 @@ wrong quantity**. Record a table of conditions, not a number.
 All three, with the measurements that produced them, are in
 [`.agent/rules/compile-cache.md`](.agent/rules/compile-cache.md).
 
-**And prefer not needing the cache. Computing a value once and returning what you
-already have beats caching it**: a wider return value is also the STRONGER answer, not
-merely the cheaper one, since two derivations a few milliseconds apart can disagree.
-**Evidence a caller may not have is a disengaged `optional`, never an empty field** —
-empty roots and an empty stamp are both ordinary answers, so neither can carry "there
-was no probe".
+**And prefer not needing the cache. Computing a value once and returning what you already have
+beats caching it**: a wider return value is also the STRONGER answer, not merely the cheaper one,
+since two derivations a few milliseconds apart can disagree. **Evidence a caller may not have is a
+disengaged `optional`, never an empty field** — empty roots and an empty stamp are both ordinary
+answers, so neither can carry "there was no probe".
 
 ## C++ Coding Guidelines
 
@@ -1492,23 +1510,21 @@ was no probe".
 - **C-style loops are forbidden.** Use range-based `for`, `std::views::iota`, and other range views for generation/transformation.
 - **`std::span`** for arrays and contiguous sequences.
 - **`auto` type deduction** for readability; **structured bindings** for tuple-like returns.
-- **Run the local gate before pushing** — `scripts/local-gate.sh`: clang-format **and
-  clang-tidy** at the pinned version, then `clang-debug` and `gcc-release`. The default
-  agent preset is one compiler at `-O0`; CI is four more, and defects invisible below a
-  release build or a second standard library are why the script exists. See
-  [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md).
-  **It builds in `out/build/gate-clang-debug` and `out/build/gate-gcc-release`, which it
-  OWNS** — never the `out/build/clang-debug` and `out/build/gcc-release` this file tells
-  you to build in. Sharing a directory leaves every ordinary build in the tree uncached
-  for good, because a reference build turns the compiler cache off with a `-D` and
-  `option()` never overrides a cache entry (#487).
+- **Run the local gate before pushing** — `scripts/local-gate.sh`: clang-format **and clang-tidy**
+  at the pinned version, then `clang-debug` and `gcc-release`. The default agent preset is one
+  compiler at `-O0`; CI is four more, and defects invisible below a release build or a second
+  standard library are why the script exists. See
+  [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md). **It builds in
+  `out/build/gate-clang-debug` and `out/build/gate-gcc-release`, which it OWNS** — never the
+  `out/build/clang-debug` and `out/build/gcc-release` this file tells you to build in. Sharing a
+  directory leaves every ordinary build in the tree uncached for good, because a reference build
+  turns the compiler cache off with a `-D` and `option()` never overrides a cache entry (#487).
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins**
   (`.clang-format-version` and `.clang-tidy-version`, each an exact PyPI release). Successive LLVM
-  releases disagree with each other, so a
-  tree clean under whichever binary is on `PATH` can still be rejected. Format through
-  `scripts/check-clang-format-version.sh --resolve`, resolve clang-tidy through
-  `scripts/check-clang-tidy-version.sh --resolve`
-  and use a build directory of its own; the `clang-debug` preset is **not** that sweep.
+  releases disagree with each other, so a tree clean under whichever binary is on `PATH` can still
+  be rejected. Format through `scripts/check-clang-format-version.sh --resolve`, resolve
+  clang-tidy through `scripts/check-clang-tidy-version.sh --resolve` and use a build directory of
+  its own; the `clang-debug` preset is **not** that sweep.
 - **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT`. The `clang-debug` preset enables `clang-tidy` at whatever version `PATH` resolves to, which is why **`scripts/local-gate.sh` passes `-DCLANG_TIDY_EXE=` the declared build `check-clang-tidy-version.sh --resolve` identifies, and refuses to start when there is none** rather than letting the preset pick — so running the preset by hand is not the sweep CI enforces.
 - **No `g_`-prefix on globals either — and the rule lives in `.clang-tidy`, not only here.** A file-scope or `thread_local` name is spelled like any other name of its kind: `CamelCase` if it is a constant, `camelBack` if it is mutable. There is no "forbid this prefix" option in `readability-identifier-naming` (its `...Prefix` keys only ever *require* one), so the `GlobalVariableCase`/`GlobalConstantCase`/`StaticVariableCase` rows are what reject `g_foo` — and with `WarningsAsErrors: "*"` that is a build failure rather than a review comment. A function-local `static` is `camelBack` whether or not it is `const`: `StaticConstantCase` is left unset precisely so a local constant falls back to that, which keeps `g_` rejected there without demanding PascalCase for locals that are `static` only for their lifetime. The prefix is a substitute for a naming convention rather than one, and it makes ambient state read as normal; if a bare name looks wrong at the call site, that is the "inject it" rule above telling you something.
 - **No `k`-prefix on identifiers.** Do not use the Google-style `kFoo` prefix for constants, enumerators, or any other symbol — it violates the project `.clang-tidy` naming convention. Use `Foo` (PascalCase) for constants/enumerators and `foo`/`fooBar` for locals and members instead.
@@ -1524,24 +1540,17 @@ was no probe".
 
 ## Building
 
-Line endings are LF everywhere, enforced by `.gitattributes` (`* text=auto eol=lf`)
-rather than by each developer's `core.autocrlf`. A CRLF `*.sh` does not misbehave —
-it fails to start at all.
+Line endings are LF everywhere, enforced by `.gitattributes` (`* text=auto eol=lf`) rather than by
+each developer's `core.autocrlf`. A CRLF `*.sh` does not misbehave — it fails to start at all.
 
-Dependency sources are shared across build trees per machine, so a fresh worktree does
-not re-clone Catch2, yaml-cpp, zstd and lz4 — which matters here because the work
-happens in throwaway worktrees, making that a per-BRANCH cost rather than a
-per-machine one. `CPM_SOURCE_CACHE` defaults to `%LOCALAPPDATA%\fastcached\cpm` or
-`~/.cache/fastcached/cpm`; anything that already set it wins, including the environment
-variable CI uses to point it inside the workspace for its own cache action. Override
-with `FASTCACHED_CPM_CACHE`, and a machine where no home directory can be found simply
-fetches into the build tree as before. Measured (Git Bash, Windows 11, cold build tree,
-native Windows volumes rather than DrvFs): **45 s and 118 MB fetched without it, 24 s
-and 1.1 MB with** — and over DrvFs, where #545 found it, the same fetch is slow enough
-to read as a hang. *Volumes* rather than a filesystem NAME, because the two halves of
-this measurement do not share one: the cache sits under `%LOCALAPPDATA%` and the build
-tree does not, so on the machine this was taken on they are different filesystems. The
-contrast the figure exists to draw is native-against-DrvFs, and that holds either way.
+Dependency sources are shared across build trees per machine, so a fresh worktree does not re-clone
+Catch2, yaml-cpp, zstd and lz4 — which matters here because the work happens in throwaway worktrees,
+making that a per-BRANCH cost rather than a per-machine one. `CPM_SOURCE_CACHE` defaults to
+`%LOCALAPPDATA%\fastcached\cpm` or `~/.cache/fastcached/cpm`; anything that already set it wins,
+including the environment variable CI uses to point it inside the workspace for its own cache
+action. Override with `FASTCACHED_CPM_CACHE`, and a machine where no home directory can be found
+simply fetches into the build tree as before. What it saves is measured, with its conditions, in
+[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md) (#545).
 
 CMake presets live in `CMakePresets.json`. Common entry points:
 
@@ -1589,28 +1598,25 @@ cmake --build --preset clangcl-debug
 
 `PEDANTIC_COMPILER_WERROR=ON` is the default for Windows presets — warnings break the build, fix them at the source.
 
-`USE_COMPILER_CACHE` (default ON, `cmake/portable/CompileCache.cmake`) fronts the
-compiler with `fastcache-cc` when it is on `PATH` and a daemon answers — at
-`127.0.0.1:6674`, or wherever `FASTCACHE_ADDR=host:port` points. Configure *proves*
-the cache works by compiling one tiny file through it, because a launcher that
-cannot reach its daemon still compiles fine and would otherwise cost every TU a
-failed connect in silence. Falls through to `ccache`; `sccache` sits above it in
-preference order but is never selected automatically (`ALLOW_SCCACHE_FALLBACK`,
-default OFF, #815). With either launcher active the
-module scan and PCH are turned off and MSVC debug info is forced to `/Z7`, because
-a hit reproduces only the object file. Full behaviour, including
-`FASTCACHE_AUTO_INSTALL`, is in
+`USE_COMPILER_CACHE` (default ON, `cmake/portable/CompileCache.cmake`) fronts the compiler with
+`fastcache-cc` when it is on `PATH` and a daemon answers — at `127.0.0.1:6674`, or wherever
+`FASTCACHE_ADDR=host:port` points. Configure *proves* the cache works by compiling one tiny file
+through it, because a launcher that cannot reach its daemon still compiles fine and would
+otherwise cost every TU a failed connect in silence. Falls through to `ccache`; `sccache` sits
+above it in preference order but is never selected automatically (`ALLOW_SCCACHE_FALLBACK`,
+default OFF, #815). With either launcher active the module scan and PCH are turned off and MSVC
+debug info is forced to `/Z7`, because a hit reproduces only the object file. Full behaviour,
+including `FASTCACHE_AUTO_INSTALL`, is in
 [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md).
 
 ## Testing
 
 Catch2 tests live next to the implementation files, so `Foo.cpp` has a `Foo_test.cpp`. A `test_main.cpp` serves as the entry point.
 
-Not every test is a Catch2 case: script-driven tests are registered in
-`src/tests/CMakeLists.txt`, the `smoke`-labelled ones reporting a missing
-prerequisite as skipped. `ctest -R repository-hygiene`, `ctest -R net-boundary` and
-`ctest -R test-name-hygiene` need no daemon, socket or compiler and run in the
-default set.
+Not every test is a Catch2 case: script-driven tests are registered in `src/tests/CMakeLists.txt`,
+the `smoke`-labelled ones reporting a missing prerequisite as skipped. `ctest -R
+repository-hygiene`, `ctest -R net-boundary` and `ctest -R test-name-hygiene` need no daemon,
+socket or compiler and run in the default set.
 
 The rules that have each already cost a debugging session — bounded waits, where a
 script-driven test must be registered, per-run port allocation, and the shared
@@ -1618,16 +1624,13 @@ script-driven test must be registered, per-run port allocation, and the shared
 
 ## Releasing
 
-Cutting a release is pushing a tag; CI runs the entire suite against the tagged
-tree and drafts a GitHub release, and a human publishes it with `/publish-release`.
-The steps and the constraints are in
-[`.agent/rules/packaging-and-release.md`](.agent/rules/packaging-and-release.md).
+Cutting a release is pushing a tag; CI runs the entire suite against the tagged tree and drafts a
+GitHub release, and a human publishes it with `/publish-release`. The steps and the constraints
+are in [`.agent/rules/packaging-and-release.md`](.agent/rules/packaging-and-release.md).
 
 ## Profiling
 
-Tracy instrumentation is opt-in (`TRACY_ENABLE`, default OFF) and collapses to
-`(void) 0` when off. Instrument through the `FC_*` macros in
-`FastCache/Core/Profiling.hpp`, never Tracy directly — and never let
-`FC_ZONE_SCOPED*` straddle a `co_await`. Building the profiling daemon, adding
-zones and analysing a capture:
-[`.agent/guides/profiling-tracy.md`](.agent/guides/profiling-tracy.md).
+Tracy instrumentation is opt-in (`TRACY_ENABLE`, default OFF) and collapses to `(void) 0` when off.
+Instrument through the `FC_*` macros in `FastCache/Core/Profiling.hpp`, never Tracy directly — and
+never let `FC_ZONE_SCOPED*` straddle a `co_await`. Building the profiling daemon, adding zones and
+analysing a capture: [`.agent/guides/profiling-tracy.md`](.agent/guides/profiling-tracy.md).

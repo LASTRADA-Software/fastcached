@@ -2,16 +2,23 @@
 #include "CliAnswer.hpp"
 #include "NodeClient.hpp"
 #include "ScriptedExchange.hpp"
+#include "SocketExchange.hpp"
+
+#include <FastCache/Protocol/TicketChoice.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <core/net/testing/SocketDecorator.hpp>
+#include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -41,7 +48,181 @@ namespace
     return Wire::EncodeErrorReply(code, detail);
 }
 
+/// A scripted socket per endpoint, and every endpoint dialled, in order.
+///
+/// Each socket stays owned here, so what it was SENT can be read after the connection that wrote it is
+/// gone; the dial hands out a decorator over it. An endpoint with no script is unreachable.
+class ScriptedNodes
+{
+  public:
+    /// Answer dials to @p endpoint with @p replies.
+    /// @param endpoint `host:port`, as `EndpointText` spells it.
+    /// @param replies The bytes the socket reads back.
+    void Serve(std::string endpoint, std::vector<std::byte> replies)
+    {
+        _sockets.insert_or_assign(std::move(endpoint),
+                                  std::make_unique<FastCache::Testing::ScriptedSocket>(std::move(replies)));
+    }
+
+    /// @return A dial over the scripted sockets.
+    [[nodiscard]] SocketDial Dial()
+    {
+        return [this](Endpoint const& endpoint,
+                      DialTimeouts /*timeouts*/) -> std::expected<std::unique_ptr<core::net::ISocket>, ExchangeError> {
+            auto const text = EndpointText(endpoint);
+            _dialled.push_back(text);
+            auto const found = _sockets.find(text);
+            if (found == _sockets.end())
+                return std::unexpected(ExchangeError { .kind = ExchangeFailure::Unreachable, .detail = "unscripted" });
+            return std::make_unique<core::net::testing::SocketDecorator>(*found->second);
+        };
+    }
+
+    /// @param endpoint An endpoint that was served.
+    /// @return Everything written to it.
+    [[nodiscard]] std::vector<std::byte> SentTo(std::string const& endpoint) const
+    {
+        auto const found = _sockets.find(endpoint);
+        REQUIRE(found != _sockets.end());
+        return found->second->Sent();
+    }
+
+    /// @return Every endpoint dialled, in order.
+    [[nodiscard]] std::vector<std::string> const& Dialled() const noexcept
+    {
+        return _dialled;
+    }
+
+  private:
+    std::map<std::string, std::unique_ptr<FastCache::Testing::ScriptedSocket>> _sockets;
+    std::vector<std::string> _dialled;
+};
+
+/// @param reply A command's reply.
+/// @return What a connection that presented a credential reads: AUTH's `Ok`, then @p reply.
+[[nodiscard]] std::vector<std::byte> BehindAuth(std::vector<std::byte> const& reply)
+{
+    auto replies = Wire::EncodeReply(Wire::Status::Ok, {});
+    replies.insert(replies.end(), reply.begin(), reply.end());
+    return replies;
+}
+
+/// @param machineTicket What this machine's node mints.
+/// @return Its reply to `MINT-TICKET`.
+[[nodiscard]] std::vector<std::byte> Minted(std::string_view machineTicket)
+{
+    return Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes(machineTicket));
+}
+
+/// @param first The first part.
+/// @param second The second.
+/// @return @p first then @p second.
+[[nodiscard]] std::vector<std::byte> Joined(std::vector<std::byte> first, std::vector<std::byte> const& second)
+{
+    first.insert(first.end(), second.begin(), second.end());
+    return first;
+}
+
 } // namespace
+
+TEST_CASE("node-status against a remote node presents a ticket minted for it; against loopback it sends the request "
+          "alone",
+          "[cli][node][ticket]")
+{
+    auto const request = Wire::EncodeNodeStatusRequest();
+    auto const status = Reply(Wire::Status::Ok, {});
+
+    SECTION("a node on another machine")
+    {
+        ScriptedNodes nodes;
+        nodes.Serve("127.0.0.1:6674", Minted("minted-for-it"));
+        nodes.Serve("node.example.com:6674", BehindAuth(status));
+
+        auto opened = NodeExchange::Open(
+            Endpoint { .host = "node.example.com", .port = 6674 }, DialTimeouts {}, NodeCredentials {}, nodes.Dial());
+        REQUIRE(opened.has_value());
+        REQUIRE(Unwrap(opened)->Send(request).has_value());
+
+        // This machine's node was asked, on loopback at the dialled node's port, for exactly that audience.
+        CHECK(nodes.Dialled() == std::vector<std::string> { "node.example.com:6674", "127.0.0.1:6674" });
+        CHECK(nodes.SentTo("127.0.0.1:6674") == Wire::EncodeMintTicketRequest("node.example.com:6674"));
+        // And the node was shown the ticket, then asked.
+        CHECK(
+            nodes.SentTo("node.example.com:6674")
+            == Joined(Wire::EncodeAuth({ .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = "minted-for-it" }),
+                      request));
+    }
+
+    SECTION("this machine's own node")
+    {
+        ScriptedNodes nodes;
+        nodes.Serve("127.0.0.1:6674", status);
+
+        auto opened = NodeExchange::Open(
+            Endpoint { .host = "127.0.0.1", .port = 6674 }, DialTimeouts {}, NodeCredentials {}, nodes.Dial());
+        REQUIRE(opened.has_value());
+        REQUIRE(Unwrap(opened)->Send(request).has_value());
+
+        CHECK(nodes.Dialled() == std::vector<std::string> { "127.0.0.1:6674" });
+        CHECK(nodes.SentTo("127.0.0.1:6674") == request);
+    }
+}
+
+TEST_CASE("The token goes to the endpoint it was given for; a redirect's leader is shown a ticket for itself",
+          "[cli][node][ticket]")
+{
+    // `--addr` names the endpoint the token belongs to. A leader a `NotLeader` named is another
+    // machine, and is shown what every other machine is: a ticket naming it, minted where
+    // `--mint-from` says.
+    auto const token = Credential { .username = {}, .secret = SecureString { "the-token" } };
+    auto const credentials = NodeCredentials { .password = &token,
+                                               .passwordFor = "sched-a.example.com:6675",
+                                               .mintFrom = Endpoint { .host = "127.0.0.1", .port = 7700 } };
+    auto const request = Wire::EncodeNodeStatusRequest();
+    auto const status = Reply(Wire::Status::Ok, {});
+    ScriptedNodes nodes;
+    nodes.Serve("sched-a.example.com:6675", BehindAuth(status));
+    nodes.Serve("leader.example.com:6675", BehindAuth(status));
+    nodes.Serve("127.0.0.1:7700", Minted("minted-for-leader"));
+
+    auto named = NodeExchange::Open(
+        Endpoint { .host = "sched-a.example.com", .port = 6675 }, DialTimeouts {}, credentials, nodes.Dial());
+    REQUIRE(named.has_value());
+    REQUIRE(Unwrap(named)->Send(request).has_value());
+    auto leader = NodeExchange::Open(
+        Endpoint { .host = "leader.example.com", .port = 6675 }, DialTimeouts {}, credentials, nodes.Dial());
+    REQUIRE(leader.has_value());
+    REQUIRE(Unwrap(leader)->Send(request).has_value());
+
+    CHECK(nodes.SentTo("sched-a.example.com:6675")
+          == Joined(Wire::EncodeAuth({ .kind = Wire::AuthKind::Password, .username = {}, .secret = "the-token" }), request));
+    CHECK(nodes.Dialled()
+          == std::vector<std::string> { "sched-a.example.com:6675", "leader.example.com:6675", "127.0.0.1:7700" });
+    CHECK(nodes.SentTo("127.0.0.1:7700") == Wire::EncodeMintTicketRequest("leader.example.com:6675"));
+    CHECK(
+        nodes.SentTo("leader.example.com:6675")
+        == Joined(Wire::EncodeAuth({ .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = "minted-for-leader" }),
+                  request));
+}
+
+TEST_CASE("A node verb whose mint fails goes on unauthenticated and says why", "[cli][node][ticket]")
+{
+    auto const request = Wire::EncodeNodeStatusRequest();
+    ScriptedNodes nodes;
+    nodes.Serve("node.example.com:6674", Reply(Wire::Status::Ok, {}));
+
+    auto opened = NodeExchange::Open(
+        Endpoint { .host = "node.example.com", .port = 6674 }, DialTimeouts {}, NodeCredentials {}, nodes.Dial());
+    REQUIRE(opened.has_value());
+    auto const& exchange = Unwrap(opened);
+    REQUIRE(exchange->Send(request).has_value());
+
+    CHECK(nodes.SentTo("node.example.com:6674") == request);
+    auto const advisories = exchange->Advisories();
+    REQUIRE(advisories.size() == 1);
+    CHECK(advisories.front().contains(Cc::ReasonFor(Cc::MintFailure::Unreachable)));
+    CHECK(advisories.front().contains("127.0.0.1:6674"));
+}
 
 TEST_CASE("A client tells the three refusal states apart", "[cli][node][refusal]")
 {

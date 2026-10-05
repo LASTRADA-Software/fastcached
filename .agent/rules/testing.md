@@ -356,6 +356,40 @@ no other. The two weaker claims beside it — *exited non-zero* and *named the p
 both stayed GREEN under the neuter, because a fixture that proceeds fails downstream
 and announces its port on the accepting path too.
 
+### A teardown confirms EXIT, and what runs next shares nothing with it
+
+`dist-compile-e2e.ps1` killed each process and waited five seconds, but it threw the
+answer away. Its two COFF drivers shared one scratch directory and one port block, so a
+killed isolation worker that outlived the wait was still holding `iso-worker.log` when the
+next driver's `Remove-Item` reached it. The run failed with "being used by another
+process", which read as a fault of the case that ran next, and nothing named the process.
+Reproduced by making the kill land 8 s late. With every kill late, the same removal met
+the isolation scheduler's `raft-log` first, so the fix could not be a per-driver LOG name.
+
+Two halves, and neither is a longer wait:
+- The FIXTURE shares no directory and no port between phases: per driver in
+  `dist-compile-e2e.ps1`, and per phase in `node-scratch-isolation-e2e.ps1`, which
+  already did. It shares none between RUNS either. With one root cleared at each start,
+  an immediate rerun died in 0 s on `raft-log`, naming the file while the holders' PIDs
+  sat in the previous run's log. So `New-E2ERunRoot` claims a root no run reuses: an
+  exclusive `CreateNew` of `.claim`, held open for the run. `Clear-E2EStaleRoots`
+  sweeps old roots, leaves a claimed one alone, and names the processes whose command
+  line mentions any root that will not go. It never fails the run.
+  - **A pipe HIDES this overlap.** The survivors inherit the caller's pipe, so the
+    caller waits for them and the next run cannot start early. To reproduce it, run each
+    fixture in its own console with no pipe (ShellExecute, output via a transcript).
+  - The sweep names only holders whose command line mentions the root. A daemon given
+    no path of the root on its command line holds files there anonymously.
+- The teardown is `scripts/lib/E2EProcesses.psm1`'s `Stop-E2EProcesses`. It kills
+  everything, then confirms each process EXITED within ONE shared bound, and returns a
+  line naming the PID and the recorded command line of each that did not.
+  - It has three answers, not two: still running is not "could not be asked".
+  - PowerShell turns a property getter's exception into `$null` rather than throwing.
+    On a Process with no handle, `HasExited` AND `Id` both read `$null`, and a `$null`
+    key makes `ContainsKey` throw from inside a `finally`.
+  - Its cases live beside it (`Invoke-E2EProcessesSelfTest`), and every importing
+    fixture runs them from its own `-SelfTest`.
+
 ## A bounded wait must also say WHICH KIND of failure it was
 
 <!-- agent-tripwire: when it times out, which KIND of failure it was -->
@@ -899,12 +933,11 @@ it is — routing it through `Unwrap` does not even compile.
 **A per-process counter is not unique, because every `TEST_CASE` is a process.**
 `catch_discover_tests` registers each case as its own ctest test, so a fixture that
 names a scratch directory from a `static` counter hands the same path to every
-concurrent case -- and the constructors of these fixtures all begin with
-`remove_all`, which turns a name collision into **deleted data**: the second case
-wipes the files the first is still reading. `tests/ScratchPath.hpp` is the one
-definition now (`UniqueScratchPath`, pid + counter, and the RAII
-`ScratchDirectory` over it), and four things about how it got there are worth
-keeping:
+concurrent case -- and a name that gets cleared before it is used turns a collision
+into **deleted data**: the second case wipes the files the first is still reading.
+`tests/ScratchPath.hpp` is the one definition now -- `UniqueScratchPath` (pid +
+counter, cleared before it is handed out) and the RAII `ScratchDirectory` over it --
+and what got it there is worth keeping:
 
 - **It has been written SIX times.** The first fix was private to
   `Stats_test.cpp`; three later files reintroduced it; the fifth,
@@ -939,10 +972,22 @@ keeping:
   not reach it re-derived it. A helper is shared only if it sits where everything
   that needs it can include from; `src` is on all three test targets' paths, which
   is why this and `tests/Unwrap.hpp` live together.
-- **The constructor's `remove_all` is safe only because the name carries the
-  pid.** What it can then reach is this process's own leftovers or a dead
-  process's -- never a live peer's. Removing something you did not create is the
-  step that made a collision destructive rather than merely confusing.
+- **`UniqueScratchPath` clears its own name before returning it**, safe only
+  because the name carries the pid: what it can then reach is this process's own
+  leftover or a dead process's -- never a live peer's. Removing something you did
+  not create is the step that makes a collision destructive rather than merely
+  confusing.
+  - **The guarantee stops at the name it returned, and it fails SILENTLY there.**
+    A sibling built by appending a suffix to that name, or a name reparented
+    under a different directory, is a DIFFERENT path this clearing never
+    reaches -- no error, no exception, just a leftover a caller who assumed the
+    guarantee extended there will never see coming. Such a caller passes its
+    own parent through `UniqueScratchPath`'s parent parameter, or clears what
+    it builds itself.
+  - **A caller that CREATES a directory at the returned name must use
+    `ScratchDirectory`**, whose destructor removes it again. A raw
+    `create_directories` call with no matching removal is a LEAK, and a leak is
+    what turns pid reuse into a live process inheriting a dead one's state.
 - **A caller-supplied name becomes a child of a unique parent, not the whole
   name.** `ScratchTree`/`ScopedTree` take names like `"cache-hit"` and one that is
   itself a nested path, and those names are what a reader recognises; they hang
@@ -1023,6 +1068,15 @@ the rule it is right for -- the obligation is *supply a value*, so make the righ
 answer the only reachable one -- while the ONE reason a fixture had for using a host
 list rather than an open oracle stays at that fixture's construction site, in its own
 words. Those reasons differed across all four copies and were the only part that did.
+
+**And a host-answering fake may stand only for a route production answers by HOST** (W-15):
+Loopback for this machine and OpenPolicy for any caller, which `HostLabels` (`MembershipFakes.hpp`,
+an `EnumTable` over `MembershipParticipant`) says row by row, refusing the rest by exception at
+construction. A ticket, a proof or a revoked key is never derived from a host in production, so a
+host list labelled `MachineTicket` admitted an address that presented no ticket at all -- a route
+production does not have, and so a green case over it. Those routes are the production fold,
+`Testing::RosterFold` (loopback plus a key roster, with the voters a case about operators names),
+and the case PRESENTS the key or ticket on the connection.
 
 `ctest -R membership-fakes` enforces it, over every `*_test.cpp`, and the enforcement
 is a `class`/`struct` whose base clause names `IMembershipOracle` -- bounded by
@@ -1492,7 +1546,12 @@ Time moves only in `Step`. It is the fleet's counterpart to
 makes: rules about a **sequence** across two machines are not reached by any amount
 of single-transition testing.
 
-Three things about it are load-bearing.
+Three things about it are load-bearing, and a fourth is what keeps the other three honest: **the
+harness admits no caller a node would refuse** (W-8). A node given no oracle is decided by the fold
+every node composes when it is not open -- loopback and a key roster of its own applied state --
+never by "everybody is a proven member"; a password AUTH establishes nothing; and the roster is
+adopted at a COMMIT, never per exchange. A harness more permissive than production lets a fold or
+publish regression stay green, which is the defect a harness exists to catch.
 
 **It is in `src/tests/`, not beside `RaftClusterHarness`.** That header lives in
 `Consensus/` because everything it touches lives in `Consensus/`. A fleet spans
@@ -1593,9 +1652,11 @@ with what it tests.
 **A body of assertions with a prerequisite the host may lack becomes its own ctest
 test**, not another case in an existing one. A script exits once, so a case inside a
 suite can do no more than print a line and let the run go green, and skipped and
-passed are then the same result. `dist-compile-membership-e2e` is that shape — one
-script, two registrations, `--case membership` — and the reasoning is under *A
-fixture whose client is always local cannot test who is admitted*, below.
+passed are then the same result. The better answer, where one exists, is to remove the
+prerequisite: the #235 pair needed a non-loopback address of this host's own, and was
+a script mode of its own for that reason until a relabelled socket gave every host one
+in process — see *A fixture whose client is always local cannot test who is admitted*,
+below.
 
 ## A shared failure message describes one caller, and lies to the others
 
@@ -1817,6 +1878,16 @@ all-red run would equally be a harness that had stopped working. A green test no
 has watched fail is an untested test — the sentence `compile-cache.md` applies to a
 guard, applied here to the thing the guard is made of.
 
+**A neuter that turns a red into a HANG proves nothing**, so a case whose broken rule would
+make the code under test LOOP must be built to end red. Two shapes, both measured in one
+fix round on lane 2a (T19/T20): a case that let a reforming body reform at EVERY body grew
+the test process past 69 GB under its neuter, and a lock probe that destroyed a
+`std::async` future inside the call it was watching deadlocked under its own -- a
+`std::async` future WAITS in its destructor. So a fixture asks for a repeat only once (a
+reforming body reforms once, then the case asserts), and never lets such a future go out of
+scope inside the call it observes. This is the *A failing `REQUIRE` above an explicit
+`Stop()` turns a RED into a HANG* entry's sibling on the neuter side.
+
 **Three of the five were acceptance criteria**, written by the person who understood
 the defect best, at the moment they understood it best. That is not carelessness.
 *What would prove this fixed* and *what would fail if it were not* are different
@@ -1897,6 +1968,14 @@ mutation, and read back through that binding afterwards.
 - Neutering is what catches it, and only if the neuter is the one the fixture's shape
   hides: reverting `Oracle()` to the two-object form reddens the corrected case and
   nothing else, and reddened the original not at all.
+- **A harness drives the production CHANNEL and SURFACE over a fake wire, never its own
+  reimplementation of either** (lane 2a, T21): a copy cannot state a field the real one gets
+  wrong. The formation harness's own `MachineChannel`/`MachineProbe` stayed green under the
+  join defect 5ea99fa9f fixed; over production's `DialledEnrollChannel` the same neuter turns
+  seven cases red (measured on that lane). Its sibling: **seed the harness where production
+  seeds**. A body handed the WHOLE applied state up front made the adoption that follows the
+  state deletable with nothing red, until a second learner joined a body that was not rebuilt
+  -- the update path had never run.
 
 ## A query that FAILED is not an observation about the subject
 
@@ -2121,10 +2200,10 @@ All three are named failures.
 <!-- agent-tripwire: A fixture whose client is always LOCAL cannot test who is admitted -->
 
 `scripts/dist-compile-e2e.sh` had twelve cases, three real processes each, and every
-leg of every one of them was loopback. `ClusterMembership::Classify` admits loopback
-**before** it consults a member list — deliberately, because that is what makes an
-unconfigured node useful on its own machine — so the branch underneath was reached by
-nothing:
+leg of every one of them was loopback. Admission asked loopback **before** it consulted
+anything else — deliberately, because that is what makes an unconfigured node useful on
+its own machine — and it still does: the fold's loopback participant answers first, so
+every route behind it was reached by nothing. At #235 the route behind it was a host list:
 
 ```cpp
 if (IsLoopbackHost(peerAddress))
@@ -2132,6 +2211,8 @@ if (IsLoopbackHost(peerAddress))
 ...
 return any_of(_hosts, SameHost) ? Member : Outsider;      // nothing at all
 ```
+
+Today it is a proven key and a verified ticket, and the shape of the trap is unchanged.
 
 That is how [#235](https://github.com/LASTRADA-Software/fastcached/issues/235)
 survived. A worker that admitted **only** its own machine — and therefore refused
@@ -2141,45 +2222,62 @@ proved dispatch works and could not have noticed that dispatch works for nobody 
 
 **The cheap fix does not work, and it looks exactly like it does.** A second loopback
 address is the obvious move and was the ticket's own first suggestion:
-`IsLoopbackHost` matches `127.` rather than `127.0.0.1`, and says so in its own
-comment, so a client on `127.0.0.2` takes the same early return. The fixture would
+`IsLoopbackHost` answers for the whole of `127.0.0.0/8` rather than `127.0.0.1`, and says so in
+its own comment, so a client on `127.0.0.2` takes the same early return. The fixture would
 change, the addresses in the log would differ, and the test would go on proving what
 it proved before — which is the shape of the defect, applied to its own repair.
 
-**What reaches the branch is the host's own non-loopback address**, and it needs no
-second machine: bind the worker there, let the scheduler grant that endpoint, and the
-connection the worker accepts arrives from outside `127/8`.
+**What reaches the branch is a peer that is not this machine**, and it needs neither a
+second machine nor a second address: `src/tests/RelabelledPeerListener.hpp` hands the
+endpoint real loopback sockets whose `peerAddress()` reports a fixed non-loopback host.
+Every read, write, deadline and half-close is the kernel's, so the endpoint's own framing
+and AUTH state machine run unchanged, and only the question admission starts from gets a
+different answer. The pair lives in `FrameEndpoint_test.cpp` (*(#235, rebuilt)*); the
+fleet-wide cases in `FleetTickets_test.cpp` reach the same branch through
+`FleetHarness::SetCallerHost`, set FIRST in every case.
 
-Four things about the shape, and the last two are the ones that generalise.
+It replaced a mode of `dist-compile-e2e.sh`, since deleted, that bound a worker
+on the host's own LAN address and was registered as a ctest test of its own because a
+host without such an address had to report SKIPPED. The relabelled socket has no such
+prerequisite, so nothing is skipped and the mode is gone rather than kept beside it.
 
-- **Assert both directions; only the pair proves anything.** Listed in
-  `--fleet-member` → dispatched and served. Absent → refused `not-a-member`, the build
-  compiles locally, and `fastcache_worker_jobs_refused_not_a_member_total` **moves** —
-  the assertion #235 needed and did not have. The admitted leg alone passes over
-  loopback too, since loopback is admitted above the list, so it cannot show the
-  address ever reached the list; the refusing leg is what shows it, because a loopback
-  peer would have been admitted there as well. Measured, with the address forced back
-  to `127.0.0.1`: the admitting leg stays **green** and the refusing leg goes red. That
-  asymmetry is the finding — one of the two legs cannot tell the difference, which is
-  why a suite made of legs like it reported nothing for twelve cases.
-- **The scheduler admits the client in both legs.** #235's shape is a lease that is
-  granted and then a worker that refuses it, which is invisible from the side anybody
-  watches — no scheduler counter moves. A refusal arriving from the scheduler instead
-  is a different test passing under the same name, so the client-side assertion matches
-  `refused the job: rejected (not-a-member)` rather than the error code alone.
-- **The baseline is not zero, and pretending it is hides the instrument.** The
-  fixture's own `wait_for_port` dials the compile port from that same address, so the
-  refusing leg has already refused one caller before its compile runs. That reading is
-  taken *after* startup and the compile is asserted as a **delta** from it — and its
-  being at least one is itself an assertion, because a zero there would mean the probe
-  arrived as a loopback caller and the leg proves nothing.
-- **A machine with no non-loopback address reports SKIPPED, loudly.** This is the only
-  body of assertions in that file with a prerequisite a host may lack, which is why it
-  is its own ctest test (`ctest -R dist-compile-membership-e2e`) rather than a
-  thirteenth case: a script exits once, so a case inside the suite could do no more
-  than print a line and let the run go green. A quiet fall back to loopback would be a
-  pass reported for a case that never ran — this ticket's own failure mode, wearing the
-  hat of its fix.
+Its three legs have three homes now, and two of them moved in meaning as well as place.
+
+- **Leg 1's route is a ticket, not `--fleet-open`.** The mode opened its admitting worker
+  with the flag because a caller presenting no key had no other way in; since #178 no
+  address admits anybody, and the route a launcher on another machine takes is the ticket
+  its own node minted, so that is what the rebuilt admitted leg presents.
+- **Leg 2's launcher half lives in the Dispatch tests.** The node refusing `not-a-member`
+  is the rebuilt pair's second leg; that the launcher then compiles LOCALLY is the
+  launcher's decision, not the node's: a worker's refusal is `DispatchStatus::Declined`
+  (`Dispatch_test.cpp`, *A worker refusing the job is a decline, not a compile*), and a
+  declined dispatch is a local compile.
+- **Leg 3 is the SERVED direction of #290**, and has a case of its own: *(#235, rebuilt)
+  the same peer on the same listener is served the cache as this machine*. The node's
+  locality oracle names the relabelled host, so the caller IS this machine: its FETCH
+  returns the stored bytes with `NodeCacheRequestsRefusedNotLocal` flat, and its COMPILE
+  on the same connection is refused by membership. The refusing direction needs a peer
+  that is genuinely somebody else and stays `NodeFrameSurface_test`'s *(#290) one peer on
+  one listener*.
+
+Three things about the shape, and they generalise.
+
+- **Assert both directions; only the pair proves anything.** A ticket for an admitted
+  machine → the COMPILE is served. No ticket, same address → refused `not-a-member`,
+  nothing compiled, and `WorkerJobsRefusedNotAMember` **moves** — the assertion #235
+  needed and did not have. The admitted leg alone passes over loopback too, since
+  loopback is admitted before any other route is asked, so it cannot show the peer ever
+  reached the other routes; the refusing leg is what shows it, because a loopback peer
+  would have been admitted there as well.
+- **Keep a control on the SAME fixture that is not relabelled.** The refusing leg sent
+  through a listener that is not relabelled is served as this machine's. Neutering the
+  relabelling (`peerAddress()` forwarding the real peer) turns the refusal legs red and
+  leaves the control green — the asymmetry that says the relabelling is live rather than
+  assumed.
+- **A refusal is asserted by the counter of the rule that refused, not by the code.**
+  Several rules answer `not-a-member`; a revoked machine's verb, for one, is refused with
+  that code and counted on `NodeRequestsRefusedKeyRevoked`, never on the door's stranger
+  row, and the revoked-door case asserts both counters for that reason.
 
 ## A fixture must state which PATH it exercised
 
@@ -2214,6 +2312,17 @@ them ran the code that runs in production.
   export has no `.git`, takes the walk, says so, and reaches the same verdict — which
   is what makes the fallback sound there and unsound in a working checkout, where a
   dependency cache lives inside the source tree.
+- **A fixture that MAKES its tree a repository writes it through `scratch_git`, never bare
+  `git`** (`scripts/lib/git-scrub.sh`; `fastcached_scratch_git` in `CheckCommon.cmake`). Every
+  `git init`, `git add` and commit obeys `GIT_DIR`, `GIT_WORK_TREE` and the rest of
+  `scripts/lib/git-scrub-variables.txt` when they are in the environment, and then writes the
+  repository they NAME instead of the scratch tree: an exported `GIT_DIR` around a `ctest -L
+  hygiene` run made every scratch `git init` write `core.worktree` into the configuration all
+  of this repository's worktrees share (2026-10-02), which broke git in every one of them. The
+  scrub is folded into the command, per command and in a subshell, and `ctest -R scratch-git`
+  in the default set refuses a scratch write spelled any other way. A scratch READ is left
+  alone on purpose: under a hijacked `GIT_DIR` it answers about the wrong index and fails the
+  case loudly. And never EXPORT `GIT_DIR` around a harness at all; scope it to one command.
 
 ## A SKIP that ctest scores as a failure
 
@@ -2812,6 +2921,146 @@ inheritance is **version-dependent**: measured on bash 5.2.21, a background subs
 not run the parent's EXIT trap at all and the shape does not reproduce, so the platform
 that shows this is macOS's bash 3.2 — the one no development host here can measure. A
 green Linux run is not evidence about it.
+
+## A launcher fixture records only into its run's own state directory
+
+<!-- agent-tripwire: A fixture handed a launcher records ONLY into its run's own state directory -->
+
+The launcher records every invocation in `<state>/fastcache-cc/invocations.log`, and
+`-z` / `--zero-stats` DELETES that file. `<state>` is the DEVELOPER's — `%LOCALAPPDATA%` on
+Windows, `$XDG_STATE_HOME` or `$HOME/.local/state` elsewhere — unless the fixture says
+otherwise. The Windows launcher e2e (`run-launcher-e2e.ps1`) did not: every run deleted
+the developer's real statistics, and every compile it drove had first been appended to
+them. Three more fixtures appended without deleting. Nothing looked wrong from inside any
+of them — the result was right, and only somebody else's file had changed. The POSIX twin
+had exported `XDG_STATE_HOME` all along, which is why nobody noticed the Windows one.
+
+So a fixture handed a launcher — `$<TARGET_FILE:fastcache-cc>` (or any
+`$<TARGET_FILE…:fastcache-cc>`) on its registration, directly or through a variable
+carrying it, or a launcher parameter it declares — goes through ONE seam, **entered before
+the launcher first runs**: `Enter-E2ELauncherState` in `scripts/lib/E2EEnvironment.psm1`,
+or `e2e_launcher_state_enter` in `scripts/lib/e2e-common.sh`. Never a variable exported by
+hand. An export names the variables its author remembered, while the seam READS them from
+`StateDirectoryImpl` in `Stats.cpp` — only the branch of its `#if defined(_WIN32)` that
+applies on this platform — and refuses a preprocessor shape or a base it cannot read.
+
+**Scoped to the LAUNCHER, never the process.** `LOCALAPPDATA` is not the launcher's alone —
+sccache, the CPM source cache and the VS tooling read it too — and `HOME` re-homes git. So
+the PowerShell seam redirects around ONE launcher child (`Use-E2ELauncherState $h { ... }`)
+and puts the caller's values back before the next line runs, an unset variable UNSET
+again; the bash seam puts a shim in front of the launcher that sets the variables and
+`exec`s it. Only the variables the launcher reads on THIS platform are redirected, because
+its children — `cl`, `clang-cl` — inherit them. A process-wide redirect without a restore
+was the defect `dist-compile-e2e.ps1` carried.
+
+**A caller with no log at all is the common case, not an edge**: every CI runner, anybody
+who has never run the launcher, anybody who just ran `-z`. It is a case of its own in every
+check below, and nothing in the seam may end a `set -euo pipefail` fixture on a missing
+file — a review found exactly that silent exit in every bash fixture, while every sentinel
+it had been verified against held a record.
+
+Four checks, each with the direction it fails in:
+
+1. **A read-only guard when the seam is entered.** The seam asks the launcher where it will
+   record, through the redirect, and refuses a path outside the run's root. It asks with
+   `--show-stats`, which names the log while the log is empty. `-z` names it too, but only
+   by deleting what is there — which on exactly the failure being checked is the caller's
+   log. This guard, and not the readers, is what catches a state variable the readers
+   cannot see: a base taken from a helper or from `std::getenv` is invisible to BOTH
+   readers, and a review built exactly that launcher and watched `Enter` refuse it with
+   every sentinel untouched. Blind spot: none at the moment it runs — but it runs ONCE, so
+   the runs after it are checks 2 and 3's to judge.
+2. **A positive control: this run's launcher runs were redirected, and its own log holds
+   records**, asked BEFORE any `-z`. That the caller's log was spared is no evidence that
+   the launcher recorded HERE, because a launcher recording nowhere spares it too. The bash
+   shim also records, for every run, the value each state variable HAD when it ran, and
+   the control refuses any that does not name the run's root. A fixture whose every run
+   sets `FASTCACHE_NO_STATS=1` has no record to count — its runs write neither the log nor
+   the toolchain fingerprint cache, which only a dispatch or `--print-toolchain-fingerprint`
+   writes — so for it that shim record IS the control: at least one run beyond the guard,
+   each with every variable at the run's root. `FASTCACHE_NO_STATS` does not gate
+   everything, though: a PERSISTENT refusal from the daemon writes a throttle stamp
+   (`refusal-*.stamp`, `RefusalNotice.cpp`, reached from `main.cpp`'s fetch path) into the
+   same state directory. It is not used as the control, because `compile-cache-daemon-start`'s
+   daemon never refuses on the path that fixture tests; it lands in the run's root, since the
+   stamp and the log resolve one state directory.
+3. **The caller's side, asked directly, on EVERY exit.** The caller's logs are snapshotted
+   when the fixture STARTS — `e2e_begin`, or the `.ps1` fixture's startup
+   `Assert-E2ELauncherFixture` — and check 4 holds every run that names the launcher
+   variable BELOW that point: a bash fixture may not name it above `e2e_begin` at all, and
+   a `.ps1` fixture can only run it inside the wrapper, which exists only after `Enter`. So
+   damage done before the seam is entered is measured and does not become the "before"
+   picture. At the end — from the bash EXIT trap the seam chains in front of the fixture's
+   own, and from the `.ps1` fixture's `finally` through `Exit-E2ELauncherState` — a log
+   present at the start must keep every byte (not deleted, not shorter, the same tail) and
+   gain no record naming one of this run's trees; a log ABSENT at the start must still be
+   absent or hold no record of this run. A fixture that fails midway therefore still
+   reports the damage it did, which is where a leak shows. Blind spots, failing OPEN: a
+   launcher reached WITHOUT naming the variable (a second copy of its path taken from the
+   command line, or the other shapes check 4 lists) can run above the snapshot, and its
+   damage then IS the "before" picture;
+   a record whose source is relative, or spelled through `subst` or an 8.3 name, names no
+   tree; and only the LOG is judged — `toolchains/` and the refusal throttle stamps in the
+   same directory are not, since other builds on the machine write both and cannot be told
+   apart from this run.
+4. **No launcher runs outside the seam.** A `.ps1` fixture calls `Assert-E2ELauncherFixture`
+   at startup, BEFORE its skips and self-test modes, so a machine that skips the fixture
+   still judges it. It reads the fixture's syntax tree — `$script:`, `$global:` and
+   `$using:` spellings included, and the parameter reached as `$PSBoundParameters["Launcher"]`,
+   `$PSBoundParameters.Launcher` or `$MyInvocation.BoundParameters.Launcher` — and refuses a
+   launcher run outside the wrapper. A path
+   `Resolve-Path`, `Split-Path` or `Join-Path` derives from `$Launcher` is accepted only
+   where it ends at a KNOWN sink — an assignment, `Test-Path`, `Write-Host`, another of
+   those three — and every other consumer is refused: `&`, `.`, an executor or its
+   `-ArgumentList`, a later pipeline stage, a method's argument, `Get-Item`, `cmd /c`, a
+   hashtable. A `Start-Job` is accepted only binding the path to a block parameter named
+   `Launcher`. Every shape two reviews found is a refused control row. A bash fixture is
+   held to the ORDER instead, since the shim becomes the launcher variable only at
+   `e2e_launcher_state_enter`: nothing may name the variable above `e2e_begin`; between
+   `e2e_begin` and the seam only a test, a message or its absolute-path rewrite may, and
+   none of them may hold a command substitution naming it, because
+   `[ -n "$("$launcher" -z)" ]` is a test that RUNS it — nor pipe a message or hand it to
+   `eval`, `source`, `.`, `sh -c` or `bash -c`, because `echo "$launcher -z" | sh` is a
+   message that RUNS it; and no EXIT trap (`trap … EXIT`, or `trap … 0`, its other
+   spelling) may be installed after the seam, which would replace the check it chained in
+   front of the fixture's own (a background subshell resetting its own inherited traps
+   excepted). Blind spots, failing OPEN, and caught at run time by checks 2 and 3 (except
+   above the snapshot, as check 3 says): a launcher reached without naming the variable at
+   all — in bash, a second copy of the path from the command line, a `${!name}`
+   indirection, or a function from a sourced library that runs it; in PowerShell,
+   `Get-Variable -Name ("Laun" + "cher") -ValueOnly` or
+   `$ExecutionContext.InvokeCommand.ExpandString('$Launcher')` — and a PowerShell path
+   derived from `$Launcher`, STORED in another variable and run through that, the
+   assignment being the one sink accepted without following the variable further. And one
+   rule that fails CLOSED where it could be wrong: a bash function defined above the seam that runs the
+   launcher when called below it reads as a use above it.
+
+**The enforcement is `ctest -R launcher-state-isolation`** (`scripts/check-launcher-state-isolation.sh`),
+which selects TWO registrations of that script. `launcher-state-isolation` finds every
+fixture handed a launcher and requires it to call its language's seam — a bash one in the
+order check 4 gives — and it fails CLOSED on what it cannot classify: a launcher reference
+or a carrier variable outside an `add_test`/`set` it can read, a block it cannot close, a
+registration naming no script, a script declaring no launcher parameter, a bash fixture
+calling no `e2e_begin`. Carriers are followed to a fixpoint, across files, and a census
+that found no fixture is a failure. It fails OPEN where a registration reaches the launcher
+without naming `$<TARGET_FILE…:fastcache-cc>` or a carrier — a path spelled from the build
+tree's layout, a `find_program` of its own — and nothing catches that. It also holds the
+two readers to one answer per platform. `launcher-state-isolation-selftest` (`--self-test`)
+is the check's proof that it can fail: a planted tree that must earn every verdict, and
+both seams DRIVEN against a stand-in launcher with the caller's log present, empty and
+absent. Both run in the default set on EVERY platform rather than inside
+`e2e-helpers-selftest`, which is not run on Windows — where the `.ps1` fixtures they are
+mostly about run. Their cost is process spawns, which Git Bash makes expensive, so they run
+one process per pass over the tree rather than one per file, and they are two registrations
+so that each keeps its own bound on a saturated host rather than sharing a raised one.
+
+A sentinel is the proof, not the developer's real log, and it is taken in all THREE
+states: pointed at a directory holding one fake record, at one holding an EMPTY log, and
+at one holding NO log. Require each to come out exactly as it went in. That is
+deterministic whatever else runs on the machine, while other lanes' builds legitimately
+append to the real log — and a sentinel that always holds a record cannot see the
+fresh-machine case, which is how the silent exit above survived a verification that
+passed.
 
 ## Open work
 

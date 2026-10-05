@@ -10,6 +10,8 @@
 #include "Stats.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Utf8.hpp>
+#include <FastCache/Platform/Environment.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -21,12 +23,14 @@
 #include <fstream>
 #include <optional>
 #include <ranges>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
+#include <tests/Unwrap.hpp>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -82,8 +86,9 @@ class ScopedStateDir
 
     [[nodiscard]] static std::optional<std::string> Current()
     {
-        char const* const value = std::getenv(VariableName);
-        return value != nullptr ? std::optional { std::string { value } } : std::nullopt;
+        // The tree's one environment reader, which the launcher compiles in: `std::getenv` is
+        // deprecated under the MSVC CRT, and clang-cl's analyser rejects it there.
+        return FastCache::ReadEnvironmentVariable(VariableName);
     }
 
     static void Set(std::string const& value)
@@ -157,6 +162,55 @@ TEST_CASE("ToStringView round-trips every outcome token")
     CHECK(ToStringView(Outcome::Miss) == "MISS");
     CHECK(ToStringView(Outcome::Uncacheable) == "UNCACHEABLE");
     CHECK(ToStringView(Outcome::Unavailable) == "UNAVAILABLE");
+    CHECK(ToStringView(Outcome::VerifyMismatch) == "VERIFY-MISMATCH");
+}
+
+TEST_CASE("A hit the verifier rejected is recorded as its own outcome and never as a hit")
+{
+    // The verifier compiles to the SAME output path, so on a mismatch the build links the
+    // fresh object: the cache's was wrong. Recording that as a HIT counted every wrong
+    // object the verifier caught as a success.
+    CHECK(OutcomeOfServedHit(HitVerdict::Mismatched) == Outcome::VerifyMismatch);
+    // Every other verdict leaves the served object where the build uses it.
+    for (auto const verdict:
+         { HitVerdict::NotChecked, HitVerdict::Matched, HitVerdict::Inconclusive, HitVerdict::Unsupported })
+        CHECK(OutcomeOfServedHit(verdict) == Outcome::Hit);
+}
+
+TEST_CASE("A rejected hit round-trips through the log as itself")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::VerifyMismatch, "main", "a.cpp", 10));
+    auto const records = ParseLog("");
+    REQUIRE(records.size() == 1);
+    CHECK(records.front().outcome == Outcome::VerifyMismatch);
+}
+
+TEST_CASE("FormatReport names wrong objects and rates the cache against them")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+    AppendRecord(MakeRecord(Outcome::Miss, "main", "b.cpp", 200));
+    AppendRecord(MakeRecord(Outcome::VerifyMismatch, "main", "c.cpp", 400));
+
+    auto const report = FormatReport("");
+    CHECK(report.contains("compiles     : 3"));
+    // The cache ANSWERED all three, one of them wrongly, so the rate is one of three --
+    // not one of two, which is what leaving the wrong object out of the denominator reads.
+    CHECK(report.contains("33.3% of 3 cacheable"));
+    CHECK(report.contains("wrong object : 1"));
+    CHECK(report.contains("WRONG OBJECT SERVED"));
+
+    auto const html = FormatHtmlReport("");
+    CHECK(html.contains("wrong objects"));
+}
+
+TEST_CASE("A report with no rejected hit says nothing about wrong objects")
+{
+    ScopedStateDir const scoped;
+    AppendRecord(MakeRecord(Outcome::Hit, "main", "a.cpp", 10));
+    CHECK_FALSE(FormatReport("").contains("wrong object"));
+    CHECK_FALSE(FormatHtmlReport("").contains("wrong objects"));
 }
 
 TEST_CASE("RecordingFor names what an operator reads for each dispatch status")
@@ -286,6 +340,152 @@ TEST_CASE("AppendRecord round-trips the dispatch axis through ParseLog")
     // The cache axis is untouched by any of this: the daemon answered honestly and
     // the object was compiled locally and stored, so the compile really was a miss.
     CHECK(entries.front().outcome == Outcome::Miss);
+}
+
+TEST_CASE("The log names the argument a worker refused, beside a tally that stays one row per cause")
+{
+    // What an operator needs to ACT on a refused argument is which argument, and until this
+    // column existed it reached only a `FASTCACHE_VERBOSE` line: the log said "declined" with
+    // a cause, and naming the flag took the node's counters and a bisection of a command line.
+    ScopedStateDir const scoped;
+    for (auto const* flag: { "-external:W0", "-fanalyzer" })
+    {
+        auto record = MakeDispatchRecord(DispatchOutcome::Declined,
+                                         RecordingFor(DispatchStatus::Declined, DeclineCause::ArgumentRefused).reason,
+                                         "a.cpp");
+        record.dispatchSpecifics = std::format("argument {} is not on this worker's accepted-flag list", flag);
+        AppendRecord(record);
+    }
+
+    auto const entries = ParseLog("");
+    REQUIRE(entries.size() == 2);
+    CHECK(entries[0].dispatchSpecifics == "argument -external:W0 is not on this worker's accepted-flag list");
+    CHECK(entries[1].dispatchSpecifics == "argument -fanalyzer is not on this worker's accepted-flag list");
+
+    // And the tally did NOT split by argument: two flags, one cause, one row.
+    auto const report = FormatReport("");
+    CHECK(report.contains("2x  a worker would not take an argument of this compile"));
+    CHECK_FALSE(report.contains("-external:W0"));
+}
+
+TEST_CASE("The specifics column is a peer's text made safe for one log line")
+{
+    // Part of this column is a worker's message, arriving verbatim. A tab in it would split
+    // the line into columns this build never wrote -- read back, the specifics would be cut at
+    // the tab and the rest dropped -- and an escape sequence would reach a terminal.
+    ScopedStateDir const scoped;
+    auto record = MakeDispatchRecord(DispatchOutcome::Declined, "a reason", "a.cpp");
+    record.dispatchSpecifics = std::string { "argument -x\tspliced\x1b[31m" } + std::string(1000, 'y');
+    AppendRecord(record);
+
+    auto const entries = ParseLog("");
+    REQUIRE(entries.size() == 1);
+    auto const& specifics = entries.front().dispatchSpecifics;
+    CHECK(specifics.starts_with("argument -x spliced [31m"));
+    CHECK(std::ranges::none_of(specifics, [](char c) { return static_cast<unsigned char>(c) < 0x20; }));
+    // Bounded, and marked as cut rather than silently shortened.
+    CHECK(specifics.size() < 400);
+    CHECK(specifics.ends_with("..."));
+}
+
+TEST_CASE("The specifics column is cut between characters and holds no C1 control")
+{
+    // The launcher's own specifics carry a client's text -- a path under a user directory is
+    // routinely not ASCII -- so the cap falls inside a character whenever one straddles it, and a
+    // byte cut leaves half of it: a log that no longer decodes as UTF-8. And U+009B is a whole CSI
+    // to a terminal reading UTF-8, which a C0-only filter lets through.
+    ScopedStateDir const scoped;
+    auto record = MakeDispatchRecord(DispatchOutcome::Declined, "a reason", "a.cpp");
+    // 319 ASCII bytes and then a two-byte U+00FC (C3 BC): the character occupies bytes 319 and
+    // 320, so a cut after byte 320 keeps its lead byte and drops its continuation.
+    constexpr std::size_t AsciiBeforeStraddle = 319;
+    std::string const straddling = "\xc3\xbc";
+    record.dispatchSpecifics = std::string(AsciiBeforeStraddle, 'p') + straddling + std::string(100, 'q');
+    // U+009B (C2 9B), a lone FF, and a two-byte U+00E9 (C3 A9) that must survive untouched.
+    auto csi = MakeDispatchRecord(DispatchOutcome::Declined, "a reason", "b.cpp");
+    csi.dispatchSpecifics = "argument -a\xc2\x9b"
+                            "31m-b and \xff a lone byte, and caf\xc3\xa9 kept";
+    AppendRecord(record);
+    AppendRecord(csi);
+
+    auto const entries = ParseLog("");
+    REQUIRE(entries.size() == 2);
+    auto const& cut = entries[0].dispatchSpecifics;
+    CHECK(FastCache::IsValidUtf8(cut));
+    // The whole character went rather than half of it, and the cut is still marked.
+    CHECK(cut == std::string(AsciiBeforeStraddle, 'p') + "...");
+
+    auto const& reduced = entries[1].dispatchSpecifics;
+    CHECK(FastCache::IsValidUtf8(reduced));
+    CHECK_FALSE(reduced.contains("\xc2\x9b"));
+    CHECK(reduced == "argument -a 31m-b and ? a lone byte, and caf\xc3\xa9 kept");
+}
+
+TEST_CASE("A log line from before the specifics column says nothing about an argument")
+{
+    // Thirteen fields: the dispatch axis, and no specifics. Absent must read as empty rather
+    // than as whatever the next line's fields would shift into place.
+    ScopedStateDir const scoped;
+    AppendRawLine("MISS\tmain\t0\t10\ta.cpp\t\t0\t0\t0\t0\t1700000000\tDECLINED\tthe worker refused the job");
+
+    auto const entries = ParseLog("");
+    REQUIRE(entries.size() == 1);
+    CHECK(entries.front().dispatch == DispatchOutcome::Declined);
+    CHECK(entries.front().dispatchDetail == "the worker refused the job");
+    CHECK(entries.front().dispatchSpecifics.empty());
+}
+
+TEST_CASE("Only a decline hands its peer's words to the log")
+{
+    // `main.cpp` copies whatever this answers into the record, so the choice is asserted here.
+    auto declined = DispatchResult {};
+    declined.status = DispatchStatus::Declined;
+    declined.decline = DeclineCause::ArgumentRefused;
+    declined.refusal = "argument -external:W0 is not on this worker's accepted-flag list";
+    declined.detail = "worker:6676 refused the job: rejected (worker-rejected-argument): ...";
+    CHECK(SpecificsFor(declined) == declined.refusal);
+
+    // An unreachable fleet's text names an endpoint and is the verbose line's business, and a
+    // compile that ran has nothing to act on -- even carrying a stale refusal field.
+    auto unreachable = declined;
+    unreachable.status = DispatchStatus::Unavailable;
+    CHECK(SpecificsFor(unreachable).empty());
+    auto compiled = declined;
+    compiled.status = DispatchStatus::Compiled;
+    CHECK(SpecificsFor(compiled).empty());
+}
+
+TEST_CASE("A decline records its peer's words only where they name what to act on")
+{
+    // `DeclinedBy` copies the peer's message into `refusal` for EVERY decline, so which ones reach
+    // the log is this row's decision. An exhausted redirect chain's message is the last leader's
+    // endpoint -- peer text, naming a machine the verbose line already names -- and must not.
+    auto declined = DispatchResult {};
+    declined.status = DispatchStatus::Declined;
+    declined.refusal = "leader-7.example:6674";
+
+    declined.decline = DeclineCause::NoLeader;
+    CHECK(SpecificsFor(declined).empty());
+    declined.decline = DeclineCause::ProtocolMismatch;
+    CHECK(SpecificsFor(declined).empty());
+
+    // The rows whose words ARE the remedy: the argument, the ceiling, what one machine could not do.
+    for (auto const cause: { DeclineCause::ArgumentRefused, DeclineCause::TooLarge, DeclineCause::WorkerRefused })
+    {
+        declined.decline = cause;
+        INFO("cause " << static_cast<int>(cause));
+        CHECK(SpecificsFor(declined) == declined.refusal);
+    }
+
+    // The launcher's own refusal names the argument it would not send.
+    auto denied = DispatchResult {};
+    denied.status = DispatchStatus::DeniedHere;
+    denied.refusal = "argument -Xclang is one no worker passes to a compiler";
+    CHECK(SpecificsFor(denied) == denied.refusal);
+
+    // A cause this build cannot name says nothing, as `RecordingFor` answers it.
+    declined.decline = DeclineCause::Last;
+    CHECK(SpecificsFor(declined).empty());
 }
 
 TEST_CASE("A build whose every dispatch failed says so rather than reading as an ordinary miss rate")
@@ -775,4 +975,143 @@ TEST_CASE("ParseLog defaults the timestamp to zero for pre-upgrade lines")
     auto const entries = ParseLog("");
     REQUIRE(entries.size() == 1);
     CHECK(entries.front().timestampUnixSeconds == 0);
+}
+
+namespace
+{
+
+/// Every line of the log, as written.
+/// @return The lines, newlines stripped.
+[[nodiscard]] std::vector<std::string> RawLogLines()
+{
+    std::ifstream in { LogPath(), std::ios::binary };
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line))
+        lines.push_back(line);
+    return lines;
+}
+
+/// The tab-separated fields of @p line.
+/// @param line The line. @return Its fields.
+[[nodiscard]] std::vector<std::string> FieldsOf(std::string const& line)
+{
+    std::vector<std::string> fields;
+    std::string field;
+    std::istringstream in { line };
+    while (std::getline(in, field, '\t'))
+        fields.push_back(field);
+    if (!line.empty() && line.back() == '\t')
+        fields.emplace_back();
+    return fields;
+}
+
+} // namespace
+
+TEST_CASE("A line this build writes names its format version and round-trips every column", "[stats][log-format]")
+{
+    // Reading one: the current format. The version is the first field, and every column after it
+    // comes back -- the exit code and the dispatch specifics included, which an unversioned reader
+    // would have had to find by counting.
+    ScopedStateDir const scoped;
+    auto record =
+        MakeDispatchRecord(DispatchOutcome::Declined, "a worker would not take an argument of this compile", "a.cpp");
+    record.dispatchSpecifics = "argument /volatile:iso is not on this worker's accepted-flag list";
+    record.timestampUnixSeconds = 1'790'000'000;
+    record.exitCode = 2;
+    AppendRecord(record);
+
+    auto const lines = RawLogLines();
+    REQUIRE(lines.size() == 1);
+    auto const fields = FieldsOf(lines.front());
+    CHECK(fields.front() == "v2");
+    CHECK(fields.size() == 16); // the marker and fifteen columns
+
+    auto const reading = ReadLog("");
+    CHECK(reading.unreadable == 0);
+    REQUIRE(reading.records.size() == 1);
+    auto const& read = reading.records.front();
+    CHECK(read.outcome == record.outcome);
+    CHECK(read.source == "a.cpp");
+    CHECK(read.dispatch == DispatchOutcome::Declined);
+    CHECK(read.dispatchDetail == record.dispatchDetail);
+    CHECK(read.dispatchSpecifics == record.dispatchSpecifics);
+    CHECK(read.timestampUnixSeconds == 1'790'000'000);
+    REQUIRE(read.exitCode.has_value());
+    CHECK(FastCache::Testing::Unwrap(read.exitCode) == 2);
+}
+
+TEST_CASE("A line without a version is read by arity as the launcher that wrote it meant", "[stats][log-format]")
+{
+    // Reading two: an older launcher's line, which carries no marker. Its columns are the ones
+    // that existed then, read by how many there are -- and the exit code, which did not exist,
+    // is ABSENT rather than a zero that would call every old compile a success.
+    ScopedStateDir const scoped;
+    AppendRawLine("MISS\tmain\t0\t10\ta.cpp\t\t0\t0\t0\t0\t1700000000\tDECLINED\tthe worker refused the job\targument -x");
+
+    auto const reading = ReadLog("main");
+    CHECK(reading.unreadable == 0);
+    REQUIRE(reading.records.size() == 1);
+    auto const& read = reading.records.front();
+    CHECK(read.outcome == Outcome::Miss);
+    CHECK(read.prefetchGroup == "main");
+    CHECK(read.timestampUnixSeconds == 1'700'000'000);
+    CHECK(read.dispatchSpecifics == "argument -x");
+    CHECK_FALSE(read.exitCode.has_value());
+}
+
+TEST_CASE("A line in a format this build does not know is skipped and counted and never read by position",
+          "[stats][log-format]")
+{
+    // Reading three: a later launcher appending to the same log, which is what a rolling upgrade
+    // looks like. Read by position, "v3" would be an outcome, its group a byte count, and a later
+    // column order would put one field's value into another's slot with nothing to notice.
+    ScopedStateDir const scoped;
+    AppendRawLine("v3\tHIT\tmain\t4096\t10\ta.cpp\t\t1\t2\t3\t0\t1700000000\tDISPATCHED\t\t\t0\tnew-column");
+    AppendRecord(MakeDispatchRecord(DispatchOutcome::Declined, "a reason", "b.cpp"));
+
+    auto const reading = ReadLog("");
+    CHECK(reading.unreadable == 1);
+    REQUIRE(reading.records.size() == 1);
+    CHECK(reading.records.front().source == "b.cpp");
+    // And the report says so, rather than showing a total one short with no reason.
+    CHECK(FormatReport("").contains("skipped      : 1 log line(s) in a format this launcher does not read"));
+}
+
+TEST_CASE("A current-format line whose columns do not add up is skipped rather than guessed at", "[stats][log-format]")
+{
+    // Reading four: the marker says version 2 and the columns say otherwise -- a torn append, or
+    // a hand edit. The version is a promise about the columns, so a line breaking it is refused
+    // whole rather than read as far as it goes.
+    ScopedStateDir const scoped;
+    AppendRawLine("v2\tHIT\tmain\t4096\t10");
+
+    auto const reading = ReadLog("");
+    CHECK(reading.unreadable == 1);
+    CHECK(reading.records.empty());
+}
+
+TEST_CASE("A record's timestamp comes from the injected wall clock", "[stats][log-format]")
+{
+    // Every line the installed launcher wrote had timestamp 0 -- nothing set it -- so the per-day
+    // chart had nothing to plot. The value now comes from a clock the caller hands in.
+    core::platform::ManualWallClock clock;
+    clock.setNow(std::chrono::system_clock::time_point { std::chrono::seconds { 1'790'000'123 } });
+    CHECK(RecordTimestamp(clock) == 1'790'000'123);
+}
+
+TEST_CASE("The report counts failed compiles only among records that carry an exit code", "[stats][log-format]")
+{
+    // A killed compiler and a cache that broke the build read identically in a log that kept no
+    // exit code. This separates them -- and a line from before the column counts as neither.
+    ScopedStateDir const scoped;
+    for (auto const code: { 0, 1, 0 })
+    {
+        auto record = MakeDispatchRecord(DispatchOutcome::NotAttempted, {}, "a.cpp");
+        record.exitCode = code;
+        AppendRecord(record);
+    }
+    AppendRawLine("MISS\tdefault\t0\t10\told.cpp\t\t0\t0\t0\t0\t1700000000\tNOT_ATTEMPTED\t\t");
+
+    CHECK(FormatReport("").contains("compile failed: 1 of 3 that recorded an exit code"));
 }

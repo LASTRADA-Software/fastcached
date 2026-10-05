@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/NodeMode.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -12,14 +13,46 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
-#include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace FastCache::Node
 {
+
+/// Publish which identity keys @p state holds live and which it revoked, into @p keys.
+///
+/// Members of either seat are live under their ids; a revoked key is revoked whatever id it was
+/// revoked under. A member whose seat's standing VOTES (`Cluster::MemberSeatTable`) is published as
+/// a voter, which is what lets its key or ticket send an operator's control verbs; a learner's
+/// proves a machine and nothing more. In one swap, so a reader never sees a key admitted by one
+/// roster and revoked by the next as neither, nor a key from one state and its seat from another.
+/// The ONE derivation from state to key admission: `NodeMembership::PublishCluster` calls it, and so
+/// does a test fleet whose machines must admit exactly what production would, never a copy of this
+/// loop.
+/// @param keys The roster the surfaces consult.
+/// @param state The cluster state as of the latest commit.
+inline void PublishClusterKeys(Distributed::KeyRosterMembership& keys, Cluster::ClusterState const& state)
+{
+    std::map<std::string, Ed25519PublicKey, std::less<>> live;
+    std::set<std::string, std::less<>> voters;
+    for (auto const& member: state.members)
+    {
+        live.emplace(member.id, member.publicKey);
+        if (Consensus::TraitsOf(Cluster::MemberSeatTable[static_cast<std::size_t>(member.seat)].standing).votes)
+            voters.insert(member.id);
+    }
+    std::vector<Ed25519PublicKey> revoked;
+    revoked.reserve(state.revokedKeys.size());
+    for (auto const& entry: state.revokedKeys)
+        revoked.push_back(entry.publicKey);
+    keys.Publish(std::move(live), std::move(revoked), std::move(voters));
+}
 
 /// This node's one answer to "who is this caller to us".
 ///
@@ -35,64 +68,58 @@ namespace FastCache::Node
 /// `SchedulerTier`, which made the cache's access policy depend on whether this node
 /// happened to be scheduling.
 ///
-/// ## Two lists, because there are two questions
+/// ## A credential, not an address
 ///
-/// `--fleet-member` says who may spend this node's CPU and read its cache tier, and
-/// that includes machines which are not cluster peers and never will be: a
-/// developer's laptop, a CI runner, anything running `fastcache-cc` against the
-/// fleet. The cluster's agreed member set says who is in the cluster. Answering both
-/// with one list meant the first replicated membership commit discarded everything an
-/// operator had listed, and agreeing something is routine -- a node joining, a node
-/// being forgotten, a settings change (#251).
-///
-/// So this owns one `ClusterMembership` per question and composes them, rather than
-/// letting either publisher speak for the other. Each is still replaced wholesale by
-/// whoever owns it, which is right: a publisher holds the whole truth about *its*
-/// question.
+/// A machine that is not this one is admitted by what it can PROVE -- a live identity key,
+/// through a session proof or a ticket its own key signed -- or by `--fleet-open`, never by
+/// the address it dials from. A client machine, which is no cluster peer and never will be,
+/// is admitted the same way as a member: the roster names its key.
 
 /// Whether this configuration admits a machine that is not this one.
 ///
-/// The same three routes `NodeMembership`'s constructor composes, asked of the
-/// configuration instead of a caller, and it lives HERE for that reason: when the
-/// fourth route lands -- the rulebook says it will, and that it will be a credential
-/// rather than a host list -- it is added a few lines below, and a reader adding it
-/// has this function in front of them. Left in `NodeConfig.cpp` it was a second
-/// reader of the same policy with nothing pointing at it, and a new route would
-/// silently stop the startup rule firing: an open compile port, every refusal counter
-/// at zero, and a fleet green from both ends.
+/// The routes `NodeMembership`'s constructor composes, asked of the configuration instead of
+/// a caller, and it lives HERE for that reason: a reader adding a route has this function in
+/// front of them. Left elsewhere it was a second reader of the same policy with nothing
+/// pointing at it, and a new route would silently stop the startup rule firing: an open
+/// compile port, every refusal counter at zero, and a fleet green from both ends.
 ///
-/// It cannot be answered by asking the oracle, which is why it is a separate function
-/// rather than a method. `Oracle()` answers "is this caller admitted" in the present
-/// tense; this asks whether the admitted set will EVER contain another machine, and
-/// `_cluster` is empty at construction by design. The `raftJoin` / `raftPeers` half
-/// predicts what consensus will later `Publish()` into this object, which no runtime
-/// query can see.
+/// **The route the rulebook promised has arrived, and it is a CREDENTIAL**: a roster admits
+/// machines by proof and by ticket, whatever address they dial from. So the question needs to
+/// know what the caller counts of that route, and the caller states it: `Absent` counts none,
+/// `Unknown` counts it on every node running consensus -- the only node that holds a roster, its
+/// applied state -- which is the fail-closed reading a guard wants, and `Formed` is consensus's own
+/// roster, which admits exactly the members the formation half below names. Removing a route fails OPEN through exactly this
+/// function, because a worker that reads it as false builds a lease check that verifies nothing.
 ///
-/// Only the host is looked at, matching what the oracle itself compares: a peer
-/// arrives from an ephemeral source port, so a port was never something a connection
-/// could be matched on.
+/// It cannot be answered by asking the oracle, which is why it is a separate function rather
+/// than a method. `Oracle()` answers "is this caller admitted" in the present tense; this asks
+/// whether the admitted set will EVER contain another machine, and the key roster is empty at
+/// construction by design. The formation half predicts the roster consensus will later publish
+/// into this object -- peers admitted by the keys they prove, never by an address -- which no
+/// runtime query can see.
 /// @param cfg The parsed configuration.
+/// @param roster What the caller knows about the roster this node verifies keys against.
 /// @return Whether the policy admits anything but this machine.
-[[nodiscard]] inline bool AdmitsRemotePeers(NodeConfig const& cfg)
+[[nodiscard]] inline bool AdmitsRemotePeers(NodeConfig const& cfg, RosterPresence roster)
 {
-    auto const remote = [](std::string_view endpoint) {
-        return !IsLoopbackHost(HostOfEndpoint(endpoint));
-    };
-
     // `--fleet-open` first: it admits every machine there is, and says so as a flag
-    // rather than as an empty list, so nothing here has to infer it.
+    // rather than as an absence, so nothing here has to infer it.
     if (cfg.fleetOpen)
         return true;
-    if (std::ranges::any_of(cfg.fleetMembers, remote))
+
+    // The fleet a formed node is in, or is asking into: its mode row's `members` column, which
+    // says for a pending node too that other machines are about to be members -- the roster
+    // consensus will later publish, peers admitted by the keys they prove, which no runtime query
+    // can see yet. Unless its consensus is confined to this machine (`ConsensusConfinedToThisMachine`):
+    // every way of becoming more than one machine is then shut, a pending node's ask included, so
+    // that roster can never name another machine.
+    if (cfg.formation.has_value() && Cluster::NodeModeRowFor(cfg.formation->mode).members == Cluster::FleetReach::Beyond
+        && !ConsensusConfinedToThisMachine(cfg))
         return true;
 
-    // A node waiting to be admitted has an EMPTY member set by construction and is
-    // about to be handed one -- so the absence of peers here is the strongest signal
-    // that remote ones are coming, not the weakest.
-    if (cfg.raftJoin)
-        return true;
-    return std::ranges::any_of(cfg.raftPeers,
-                               [&](Cluster::ClusterMember const& member) { return remote(member.raftEndpoint); });
+    // The key routes: a proof or a VERIFIED ticket admits only against a roster -- never an AUTH
+    // that merely answered `Ok`, which is why the question is the roster's presence.
+    return roster == RosterPresence::Unknown && RunsConsensus(cfg);
 }
 
 /// This node's admission policy, as the seam every surface holds.
@@ -109,46 +136,32 @@ class NodeMembership final: public Distributed::IMembershipOracle
   public:
     /// @param cfg The parsed configuration.
     /// @param logger Where an unreadable `fleet-open` row is reported, once.
-    /// @param conditions Where a `--fleet-member` entry the cluster has FORGOTTEN is raised (#1364),
-    ///        or null on a node that runs no consensus -- which has no committed tombstone set, so
-    ///        its row is answered from its scope rather than as a reassuring `clear`. Must outlive
-    ///        this.
-    NodeMembership(NodeConfig const& cfg, ILogger& logger, NodeConditions* conditions = nullptr):
+    NodeMembership(NodeConfig const& cfg, ILogger& logger):
+        _loopback {},
         _open {},
-        // The two lists differ in nothing but the QUESTION they answer, which is why each is
-        // told which route it is rather than deriving it from its type (#1471). An operator who
-        // removes a host from `--fleet-member` and finds it still served is asking exactly this,
-        // and before this both answered a bare `Member`.
-        _listed { Distributed::MembershipParticipant::FleetMemberList, cfg.fleetMembers },
-        _cluster { Distributed::MembershipParticipant::ClusterMembers },
-        _forgotten {},
         // Pointers into this object's own members, which is safe because the type is
-        // neither copyable nor movable and the composites are declared after all four.
+        // neither copyable nor movable and the composites are declared after all of them.
         _keys {},
-        _admitted { { &_forgotten, &_listed, &_cluster, &_keys } },
-        // `--fleet-open` is folded with the forget rather than replacing it, and that
-        // is a decision about what the flag MEANS (#1309). It says "I have not
+        // This machine, and whatever key a connection proved or presented. No address admits a
+        // machine that is not this one: a replicated member set is keys now, never hosts.
+        _admitted { { &_loopback, &_keys } },
+        // `--fleet-open` is folded with the key roster rather than replacing it, and that
+        // is a decision about what the flag MEANS (#1309, #178). It says "I have not
         // enumerated who may use this fleet; serve whoever asks" -- a blanket over
-        // hosts nobody named. A forget names one. Letting the blanket win would make
-        // the local flag resurrect a machine the cluster positively removed, on
-        // exactly the node nobody has reconfigured yet, which is the failure this
-        // participant exists to close arriving through the one door left open.
+        // machines nobody named. A forget names one, by revoking its key, and a revoked key
+        // is `Forgotten`. Letting the blanket win would make the local flag resurrect a
+        // machine the cluster positively removed, on exactly the node nobody has
+        // reconfigured yet.
         //
         // The directions are not comparable, which is what settles it: honouring the
         // forget wrongly refuses a machine, fails CLOSED, and is visible from the
-        // refused end. Ignoring it serves a decommissioned host indefinitely, fails
+        // refused end. Ignoring it serves a decommissioned machine indefinitely, fails
         // OPEN, and admission succeeding is the ordinary case -- nothing reports it.
-        //
-        // The key roster joins both folds for the same reason the forget does: a REVOKED key is
-        // `Forgotten` and must outrank `--fleet-open` exactly as a forgotten host does (#178).
-        _openly { { &_forgotten, &_open, &_keys } },
+        _openly { { &_loopback, &_open, &_keys } },
         _logger { logger },
-        _conditions { conditions },
-        _listing { cfg.fleetMembers },
         _flagOpen { cfg.fleetOpen },
         _isOpen { cfg.fleetOpen }
     {
-        ReportStaleListing(nullptr);
     }
 
     NodeMembership(NodeMembership const&) = delete;
@@ -159,26 +172,15 @@ class NodeMembership final: public Distributed::IMembershipOracle
 
     /// Adopt what an accepted reload says about who this node admits.
     ///
-    /// **The removal direction is what this exists for.** A member ADDED to the file
-    /// and not yet admitted fails closed -- a machine is refused until somebody
-    /// restarts the node, which is annoying, self-healing and visible. A member
-    /// REMOVED from the file and still admitted fails OPEN: a machine the operator has
-    /// just revoked keeps being served, and nothing reports it, because admission
-    /// succeeding is the ordinary case. Only one of those is worth a live path, and it
-    /// is the one a test naturally skips.
+    /// **The removal direction is what this exists for.** `--fleet-open` turned ON and
+    /// not yet in force fails closed -- a caller is refused until somebody restarts the
+    /// node, which is annoying, self-healing and visible. Turned OFF and still in force
+    /// it fails OPEN: every caller the roster does not admit keeps being served, and
+    /// nothing reports it, because admission succeeding is the ordinary case.
     ///
-    /// **`--fleet-open` is settled BEFORE the list, and the order is not arbitrary.**
-    /// Each half is individually atomic, so no request ever sees a half-written set;
-    /// what the order decides is which stale half a request between them may read.
-    /// Settling the flag first means a NARROWING reload briefly answers from the new
-    /// flag and the old list -- closed, since the list under `--fleet-open` was
-    /// whatever nobody was consulting -- while the other order would leave the node
-    /// OPEN for that instant, which is the one direction this whole path exists to
-    /// avoid.
-    ///
-    /// It writes `--fleet-member`'s list and only that, exactly as `Publish` writes the
-    /// cluster's and only that. Two publishers, one per question, is what keeps a
-    /// reload from discarding what consensus agreed -- which is #251 arriving through
+    /// It settles openness and only that, exactly as `PublishCluster` writes the
+    /// cluster's facts and only those: a reload that rebuilt the cluster's half from a
+    /// config file would discard what consensus agreed, which is #251 arriving through
     /// the other door.
     ///
     /// Safe to call while surfaces classify callers on their own threads.
@@ -187,10 +189,6 @@ class NodeMembership final: public Distributed::IMembershipOracle
     {
         _flagOpen.store(cfg.fleetOpen, std::memory_order_relaxed);
         SettleOpenness();
-        _listed.Publish(cfg.fleetMembers);
-        // The listing half of the stale-entry condition moved; the reload that REMOVES a forgotten
-        // host is exactly the one this row exists to watch clear.
-        ReportStaleListing(&cfg.fleetMembers);
     }
 
     /// @copydoc Distributed::IMembershipOracle::Explain
@@ -199,8 +197,8 @@ class NodeMembership final: public Distributed::IMembershipOracle
     /// the other and never by half of each.
     ///
     /// It attributes nothing of its own: whichever policy answered names ITSELF, so an
-    /// operator reading a refusal sees `OpenPolicy`, `FleetMemberList`, `ClusterMembers`
-    /// or `ClientTombstone` rather than "the node" -- which is the question #1471 asks
+    /// operator reading a refusal sees `Loopback`, `OpenPolicy` or a key route
+    /// rather than "the node" -- which is the question #1471 asks
     /// and the one this delegation is already the right shape for.
     [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view peerAddress) const override
     {
@@ -211,46 +209,33 @@ class NodeMembership final: public Distributed::IMembershipOracle
     ///
     /// Through the same fold `Explain` answers from, whichever it is, so opening a node changes what
     /// an ADDRESS is worth and never what a revoked key is worth.
-    [[nodiscard]] Distributed::MembershipDecision ExplainKey(ProvenIdentity const& proven) const override
+    [[nodiscard]] Distributed::MembershipDecision ExplainKey(ProvenIdentity const& identity,
+                                                             Distributed::KeyEvidence evidence) const override
     {
-        return _isOpen.load(std::memory_order_relaxed) ? _openly.ExplainKey(proven) : _admitted.ExplainKey(proven);
+        return _isOpen.load(std::memory_order_relaxed) ? _openly.ExplainKey(identity, evidence)
+                                                       : _admitted.ExplainKey(identity, evidence);
     }
 
-    /// How many `--cluster-forget-client` tombstones this node has APPLIED (#1471).
-    ///
-    /// Asked of the oracle rather than read off its set, because the lock that makes the set
-    /// safe to read is the oracle's: `HostSetMembership::Size()` takes the shared lock, and a
-    /// caller holding the vector would be reading something `PublishCluster` may be replacing.
-    ///
-    /// A count on THIS node, which is the question -- not what the leader committed. A node
-    /// that has not yet applied an entry answers a lower number, and that difference is what
-    /// tells an operator a forget has not propagated yet (#1471's third clause).
-    /// @return The number of forgotten client hosts this node is enforcing.
-    [[nodiscard]] std::size_t ForgottenClientCount() const
+    /// @copydoc Distributed::IMembershipOracle::LiveKeyOf
+    [[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view id) const override
     {
-        return _forgotten.Size();
+        return _isOpen.load(std::memory_order_relaxed) ? _openly.LiveKeyOf(id) : _admitted.LiveKeyOf(id);
     }
 
-    /// Record what the cluster agreed, alongside what the operator listed.
+    /// Publish what the cluster has committed: which identity keys are live and which are revoked,
+    /// and its `fleet-open` row (#1471, #178).
     ///
-    /// The seam consensus drives, and it does nothing under `--fleet-open` -- which
-    /// is right rather than an oversight: that flag says "admit everybody", and a
-    /// replicated member set narrows nothing an operator has already opened.
+    /// The seam consensus drives. It writes the cluster's facts and only those, so a reload's
+    /// `--fleet-open` survives every commit. A machine admitted at runtime is served without
+    /// anybody editing a config file on every other machine, which is what this seam was for --
+    /// admitted by its KEY, which is the one thing it publishes about machines: no address
+    /// joins admission, so a member's endpoint is not published here at all.
     ///
-    /// It writes the cluster's list and only that, so `--fleet-member` survives every
-    /// commit. Which list is written is decided here rather than passed in, so the
-    /// observer consensus installs cannot name the wrong one. A node admitted at
-    /// runtime is still served without anybody editing a config file on every other
-    /// machine, which is what this seam was for; it simply no longer costs the
-    /// operator's own answer to get that.
-    ///
-    /// It also reads the cluster's `fleet-open` row, which is why it takes the STATE
-    /// rather than the endpoint list (#1112). That row was accepted, replicated,
-    /// snapshotted and carried across restarts while changing no admission decision,
-    /// because admission read the flag and nothing read the row -- the failure
-    /// `SettingTable`'s own header describes, one step past the typo `FindSetting`
-    /// guards. Two publishers, one per question, would put the openness half on a
-    /// second call somebody can forget; one seam settles both, in `Adopt`'s order.
+    /// It also reads the cluster's `fleet-open` row, which is why it takes the STATE (#1112).
+    /// That row was accepted, replicated, snapshotted and carried across restarts while changing
+    /// no admission decision, because admission read the flag and nothing read the row. Two
+    /// publishers, one per question, would put the openness half on a second call somebody can
+    /// forget; one seam settles both, in `Adopt`'s order.
     ///
     /// Safe to call from the consensus thread while surfaces classify callers on
     /// theirs.
@@ -262,68 +247,18 @@ class NodeMembership final: public Distributed::IMembershipOracle
         // which stale half a request between them may read.
         _agreedOpen.store(AgreedOpenness(state), std::memory_order_relaxed);
         SettleOpenness();
-        Publish(state.Endpoints());
 
-        // The tombstones, after the members, and the order is the same rule as the
-        // flag's: each publish is individually atomic, so a request landing between
-        // them reads one of them stale. Members first means the stale half a widening
-        // commit can be read with is the OLD forget list, which still refuses the host
-        // the new one does -- a re-admit is briefly not yet in force. The other order
-        // would leave a just-forgotten host admitted for that instant, which is the
-        // direction that cannot be recovered from: the compile has already been
-        // served.
-        _forgotten.Publish(state.forgotten);
-        // The tombstone half moved: a forget can make an entry this node lists stale, and a
-        // re-admit can make it current again.
-        ReportStaleListing(nullptr);
-
-        // Which identity keys are live and which are revoked (#178), in one swap so a reader never
-        // sees a key admitted by one roster and revoked by the next as neither. Members of either
-        // seat and enrolled principals are live under their ids; a revoked key is revoked whatever
-        // id it was revoked under.
-        std::map<std::string, Ed25519PublicKey, std::less<>> live;
-        for (auto const& member: state.members)
-            if (member.publicKey.has_value())
-                live.emplace(member.id, *member.publicKey);
-        for (auto const& principal: state.principals)
-            live.emplace(principal.id, principal.publicKey);
-        std::vector<Ed25519PublicKey> revoked;
-        revoked.reserve(state.revokedKeys.size());
-        for (auto const& entry: state.revokedKeys)
-            revoked.push_back(entry.publicKey);
-        _keys.Publish(std::move(live), std::move(revoked));
-    }
-
-    /// Record the cluster's member set alone.
-    ///
-    /// The member-set HALF of `PublishCluster`, and deliberately still reachable: it
-    /// is what the member-set cases assert against, and splitting it out keeps those
-    /// cases about routing rather than about settings.
-    ///
-    /// **No production caller may use it, and none can**: the only one is consensus,
-    /// whose observer is handed a `ClusterState` and therefore has no endpoint list to
-    /// pass. That is what stops this being the second publisher somebody forgets the
-    /// openness half on -- the seam's TYPE refuses the mistake rather than a comment
-    /// asking people not to make it.
-    /// @param endpoints The cluster's members, as `host:port`.
-    void Publish(std::vector<std::string> const& endpoints)
-    {
-        _cluster.Publish(endpoints);
+        // Which identity keys are live and which are revoked (#178).
+        PublishClusterKeys(_keys, state);
     }
 
     /// The oracle every surface on this node consults.
     ///
     /// The open one is only ever the operator's stated choice: `--fleet-open` is a
     /// flag rather than what an unset field decays to, so nothing here guesses its
-    /// way into serving strangers. Everything else is the union of the two lists,
-    /// which for a node that named no members and has agreed nothing admits this
-    /// machine and refuses the network -- the safe default rather than a
-    /// misconfiguration.
-    ///
-    /// That default is exactly what a WORKER must be able to leave behind. It could
-    /// not until #235: the startup table refused `--fleet-member` on any node
-    /// without a scheduler, so a pure worker's oracle was an empty list by
-    /// construction and its compile port refused every dispatched job.
+    /// way into serving strangers. Everything else is this machine plus the fold of the
+    /// cluster's keys, which for a node that holds no roster admits this machine and
+    /// refuses the network -- the safe default rather than a misconfiguration.
     ///
     /// Answers `*this` since #405. It stays a named accessor rather than surfaces
     /// binding the object directly, because the name is what says *this is the seam*
@@ -336,43 +271,6 @@ class NodeMembership final: public Distributed::IMembershipOracle
     }
 
   private:
-    /// Raise or clear the stale-listing condition from what `--fleet-member` names and what the
-    /// cluster has forgotten (#1364).
-    ///
-    /// **Asked of `_forgotten` itself**, through the oracle's own `Explain`, so the host a surface
-    /// refuses as forgotten and the entry this reports as stale cannot be two readings of one set:
-    /// `SameHost`'s IPv6 fold, the loopback silence and the whole-string match all come with it.
-    ///
-    /// The entry is harmless -- the forget outranks it, so the host is refused either way -- which
-    /// is why this is a Warning rather than an alarm. What it costs is a list that says one thing
-    /// and a fleet that does another, and an operator who re-admits the host months later expecting
-    /// the list to govern.
-    /// @param listing The `--fleet-member` list now in force, or null when only the tombstones
-    ///        moved.
-    void ReportStaleListing(std::vector<std::string> const* listing)
-    {
-        if (_conditions == nullptr)
-            return;
-
-        // One lock over both the copy and the question, so a reload and a commit racing each other
-        // leave the row describing whichever of them landed LAST -- each writes its own half first
-        // and then asks, and the last to ask sees both halves.
-        std::scoped_lock const guard { _listingMutex };
-        if (listing != nullptr)
-            _listing = *listing;
-
-        std::vector<std::string> stale;
-        for (auto const& entry: _listing)
-            if (_forgotten.Explain(HostOfEndpoint(entry)).verdict == Distributed::Membership::Forgotten)
-                stale.push_back(entry);
-
-        if (stale.empty())
-            _conditions->Clear(NodeCondition::ForgottenFleetMember);
-        else
-            _conditions->Raise(NodeCondition::ForgottenFleetMember,
-                               ListDetail("--fleet-member names host(s) the cluster has forgotten, and so refuses:", stale));
-    }
-
     /// What the cluster's `fleet-open` row says.
     ///
     /// A named enumeration rather than `-1`/`0`/`1`, because the encoding is the part
@@ -463,48 +361,29 @@ class NodeMembership final: public Distributed::IMembershipOracle
         _isOpen.store(agreed == AgreedOpen::Open, std::memory_order_relaxed);
     }
 
+    /// This machine, whatever the roster says (`Loopback`).
+    Distributed::LoopbackMembership _loopback;
+
     Distributed::OpenMembership _open;
 
-    /// What `--fleet-member` named. Replaced wholesale by `Adopt` on an accepted
-    /// reload, and the only route by which a machine that is not a cluster peer is
-    /// admitted at all.
-    Distributed::ClusterMembership _listed;
-
-    /// What the cluster agreed, replaced on every committed membership change.
-    Distributed::ClusterMembership _cluster;
-
-    /// What the cluster has agreed to forget. Written by `PublishCluster` and by
-    /// nothing else -- deliberately NOT by `Adopt`: a forget is the cluster's fact,
-    /// and a reload that rebuilt it from a config file would erase every tombstone
-    /// agreed since startup, which is #251's shape in the one direction where the
-    /// erasure fails open.
-    Distributed::ForgottenMembership _forgotten;
-
     /// Which identity keys the cluster holds live and which it revoked (#178). Written by
-    /// `PublishCluster` and by nothing else, for `_forgotten`'s reason: a key is the cluster's fact.
+    /// `PublishCluster` and by nothing else -- deliberately NOT by `Adopt`: a revocation is the
+    /// cluster's fact, and a reload that rebuilt it from a config file would erase every forget
+    /// agreed since startup, which is #251's shape in the one direction where the erasure fails
+    /// open.
     Distributed::KeyRosterMembership _keys;
 
     /// The fold the surfaces consult when this node has not been opened. Declared
-    /// after the four participants it borrows.
+    /// after the participants it borrows.
     Distributed::AnyOfMembership _admitted;
 
-    /// The fold they consult when it has. `_open` admits everybody and `_forgotten`
-    /// still outranks it; see the constructor for why the flag does not simply win.
+    /// The fold they consult when it has. `_open` admits everybody and a revoked key in
+    /// `_keys` still outranks it -- and `_loopback` too, so this machine is attributed as
+    /// itself; see the constructor for why the flag does not simply win.
     Distributed::AnyOfMembership _openly;
 
     /// Where an unreadable `fleet-open` row is reported, once.
     ILogger& _logger;
-
-    /// Where a stale `--fleet-member` entry is reported; null on a node that runs no consensus.
-    NodeConditions* _conditions;
-
-    /// Guards `_listing`, and serialises the question asked of it with the answer written.
-    std::mutex _listingMutex;
-
-    /// The `--fleet-member` entries as the operator spelled them, for the stale-entry condition.
-    /// `_listed` keeps only their hosts, and a condition naming `10.0.0.7` where the operator
-    /// typed `10.0.0.7:6674` would send them looking for an entry their file does not contain.
-    std::vector<std::string> _listing;
 
     /// What `--fleet-open` says on THIS node. Separate from `_isOpen` since #1112,
     /// which is the whole shape of that ticket: the effective answer is now a

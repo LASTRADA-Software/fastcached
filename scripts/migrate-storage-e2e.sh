@@ -40,15 +40,17 @@ WORK="$(mktemp -d)"
 #
 # Fixed in the TRAP rather than at that one wait, because the leak is a property
 # of every exit path out of `create_store`, not of the wait that happened to be
-# the first one noticed. Space-separated rather than an array: bash 3.2.
-_MIGRATE_DAEMON_PIDS=""
+# the first one noticed.
+#
+# Reaped by `reap_background_jobs`, which takes every background job of this shell
+# and is BOUNDED where the per-pid ledger and `kill; wait` it replaced were not: it
+# escalates to SIGKILL and names a daemon that outlives even that rather than
+# waiting on it forever, which is how a local gate once hung for 80 minutes in
+# `compile-cache-e2e.sh`'s copy of this loop.
 _migrate_cleanup() {
-    local pid
-    for pid in $_MIGRATE_DAEMON_PIDS; do
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-    done
+    reap_background_jobs
     rm -rf "$WORK"
+    e2e_exit_if_reap_left_survivors
 }
 trap _migrate_cleanup EXIT
 
@@ -105,8 +107,6 @@ create_store() {
     # `wait` would then block forever. Found exactly that way.
     "$FASTCACHED" --config "$EMPTY_CONFIG" --port="$p" "$@" &
     local pid=$!
-    # Tracked before anything can fail, so the EXIT trap reaps it on every path.
-    _MIGRATE_DAEMON_PIDS="$_MIGRATE_DAEMON_PIDS $pid"
 
     # Waits for the number of stores the CALLER asserts, and that count is a
     # parameter for exactly that reason. It used to break on the FIRST `.cow` to
@@ -157,8 +157,10 @@ create_store() {
     # be readable by the conversion. Narrower than what it used to cover, and the
     # one part of this function that is still a duration rather than a condition.
     sleep 0.3
-    kill "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
+    # Stopped and REQUIRED to go, rather than `kill; wait`, which was unbounded. The
+    # bound is the daemon's stop plus flushing a store this small; it is not a
+    # timeout on the conversion, which has not started yet.
+    stop_and_require_exit "$pid" "the daemon that wrote $watch" 15
 }
 
 # ---------------------------------------------------------------- single file

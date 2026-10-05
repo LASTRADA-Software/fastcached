@@ -49,6 +49,10 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# `fastcached_scratch_git`: the fixture's own git runs with the inherited `GIT_DIR` and its
+# kin removed, or under an exported `GIT_DIR` its `git init` writes THAT repository.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -241,13 +245,14 @@ function(fastcached_stage_and_run name target from to outOutput outApplied)
                 "case `${name}` asks for the git enumeration path and no git was found. "
                 "Skipping it silently would leave the mode CI actually takes untested")
         endif()
-        execute_process(COMMAND "${GIT_EXECUTABLE}" init -q "${tree}"
+        fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
+        execute_process(COMMAND ${scratchGit} init -q "${tree}"
                         OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE initStatus)
-        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${tree}" add -A
+        execute_process(COMMAND ${scratchGit} -C "${tree}" add -A
                         OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE addStatus)
         set(rmStatus 0)
         if(untrackSeamTest)
-            execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${tree}" rm -q --cached src/FastCache/Core/Ranges_test.cpp
+            execute_process(COMMAND ${scratchGit} -C "${tree}" rm -q --cached src/FastCache/Core/Ranges_test.cpp
                             OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE rmStatus)
         endif()
         if(NOT initStatus EQUAL 0 OR NOT addStatus EQUAL 0 OR NOT rmStatus EQUAL 0)

@@ -122,6 +122,71 @@ if(_comments EQUAL 0)
         "The walk matched nothing, so this check proved nothing rather than passing.")
 endif()
 
+# The second rule, and the second one that bit: **a property a search sets is PUBLIC, and a
+# public property's Id has no lower-case letter.** WiX refuses the package otherwise
+# (WIX0012), and a private-looking name is exactly what a search property gets when it is
+# "read only by the rollback actions": three such names took `Package (Windows .msi)` red
+# at the WiX step, minutes into the job, with every check in this tree green. The walk finds
+# each `<Property Id="...">` with a body, and asks whether that body holds a search.
+set(_searchOffences "")
+set(_searchProperties 0)
+foreach(_name IN LISTS _fragments)
+    file(READ "${_dir}/${_name}" _text)
+    set(_cursor 0)
+    string(LENGTH "${_text}" _length)
+    while(_cursor LESS _length)
+        string(SUBSTRING "${_text}" ${_cursor} -1 _rest)
+        string(FIND "${_rest}" "<Property Id=\"" _open)
+        if(_open EQUAL -1)
+            break()
+        endif()
+        math(EXPR _idStart "${_cursor} + ${_open} + 14")
+        string(SUBSTRING "${_text}" ${_idStart} -1 _afterId)
+        string(FIND "${_afterId}" "\"" _idEnd)
+        string(FIND "${_afterId}" ">" _tagEnd)
+        if(_idEnd EQUAL -1 OR _tagEnd EQUAL -1)
+            list(APPEND _searchOffences "${_name}: a <Property Id=\" that never ends")
+            break()
+        endif()
+        string(SUBSTRING "${_afterId}" 0 ${_idEnd} _id)
+        math(EXPR _beforeEnd "${_tagEnd} - 1")
+        string(SUBSTRING "${_afterId}" ${_beforeEnd} 1 _slash)
+        math(EXPR _cursor "${_idStart} + ${_tagEnd} + 1")
+        if(_slash STREQUAL "/")
+            continue() # a value, never a search
+        endif()
+        string(SUBSTRING "${_text}" ${_cursor} -1 _body)
+        string(FIND "${_body}" "</Property>" _bodyEnd)
+        if(_bodyEnd EQUAL -1)
+            list(APPEND _searchOffences "${_name}: <Property Id=\"${_id}\"> is never closed")
+            break()
+        endif()
+        string(SUBSTRING "${_body}" 0 ${_bodyEnd} _body)
+        if(_body MATCHES "<(Registry|Directory|File|Component|IniFile)Search[ \t\r\n]")
+            math(EXPR _searchProperties "${_searchProperties} + 1")
+            if(_id MATCHES "[a-z]")
+                list(APPEND _searchOffences "${_name}: ${_id}")
+            endif()
+        endif()
+    endwhile()
+endforeach()
+
+if(_searchProperties EQUAL 0)
+    message(FATAL_ERROR
+        "check-wix-fragment: found no property set by a search in ${_count} fragment(s), so the "
+        "upper-case rule proved nothing rather than passing.")
+endif()
+
+if(_searchOffences)
+    string(REPLACE ";" "\n  " _searchText "${_searchOffences}")
+    message(FATAL_ERROR
+        "check-wix-fragment: a property a search sets must be public, and a public property's Id "
+        "has no lower-case letter (WIX0012):\n"
+        "  ${_searchText}\n"
+        "Spell it in upper case. The name is not a statement of who reads it: a private-looking "
+        "name for a value only rollback actions use still fails the package build.")
+endif()
+
 if(_offences)
     string(REPLACE ";" "\n  " _offenceText "${_offences}")
     message(FATAL_ERROR
@@ -135,4 +200,5 @@ if(_offences)
 endif()
 
 message(STATUS
-    "check-wix-fragment: ${_comments} comment(s) across ${_count} fragment(s) carry no illegal double hyphen")
+    "check-wix-fragment: ${_comments} comment(s) across ${_count} fragment(s) carry no illegal double hyphen, "
+    "and ${_searchProperties} search-set propert(ies) are public")

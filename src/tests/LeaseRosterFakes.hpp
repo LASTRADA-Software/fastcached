@@ -50,24 +50,43 @@ class FixedLeaseRoster final: public Distributed::ILeaseRoster
     {
     }
 
-    /// Revoke @p machine: it leaves the voters and its key joins the revoked, as `Forget` does (#1555).
+    /// Admit @p machine as a member that is not a voter: `MachineKeysOf` answers its test key, and
+    /// `KeysOf` still does not, since a grant is a voter's alone.
+    /// @param machine The machine.
+    void AdmitMachine(std::string machine)
+    {
+        std::scoped_lock const lock { _lock };
+        _machines.push_back(std::move(machine));
+    }
+
+    /// Revoke @p machine: it leaves the voters and the admitted machines, and its key joins the
+    /// revoked, as `Forget` does (#1555).
     /// @param machine The machine.
     void Revoke(std::string const& machine)
     {
         std::scoped_lock const lock { _lock };
         std::erase(_voters, machine);
+        std::erase(_machines, machine);
         _revoked.push_back(machine);
+    }
+
+    /// Revoke @p machine's key and leave the machine admitted, so `MachineKeysOf` answers that key
+    /// live AND revoked at once. What a roster that does not filter its live answer against its
+    /// revocations says -- `StateLeaseRoster` relies on the applied state keeping the two apart --
+    /// so a verifier that trusts `live` alone is testable against it.
+    /// @param machine The machine.
+    void RevokeKeyOnly(std::string machine)
+    {
+        std::scoped_lock const lock { _lock };
+        _revoked.push_back(std::move(machine));
     }
 
     /// Set what `Read` answers from now on.
     /// @param standing The standing.
-    /// @param certifiedUntil When its certification lapses, if it has one.
-    void SetStanding(Distributed::RosterStanding standing,
-                     std::optional<std::chrono::system_clock::time_point> certifiedUntil = std::nullopt)
+    void SetStanding(Distributed::RosterStanding standing)
     {
         std::scoped_lock const lock { _lock };
         _standing = standing;
-        _certifiedUntil = certifiedUntil;
     }
 
     [[nodiscard]] Distributed::LeaseSignerKeys KeysOf(std::string_view signer) const override
@@ -84,15 +103,26 @@ class FixedLeaseRoster final: public Distributed::ILeaseRoster
     [[nodiscard]] Distributed::RosterReading Read(std::chrono::system_clock::time_point /*now*/) const override
     {
         std::scoped_lock const lock { _lock };
-        return Distributed::RosterReading { .standing = _standing, .certifiedUntil = _certifiedUntil };
+        return Distributed::RosterReading { .standing = _standing };
+    }
+
+    [[nodiscard]] Distributed::LeaseSignerKeys MachineKeysOf(std::string_view machine) const override
+    {
+        std::scoped_lock const lock { _lock };
+        auto keys = Distributed::LeaseSignerKeys {};
+        for (auto const& revoked: _revoked)
+            keys.revoked.push_back(TestKeyPair(revoked).PublicKey());
+        if (std::ranges::contains(_voters, machine) || std::ranges::contains(_machines, machine))
+            keys.live = TestKeyPair(std::string { machine }).PublicKey();
+        return keys;
     }
 
   private:
     mutable std::mutex _lock;
     std::vector<std::string> _voters;
+    std::vector<std::string> _machines; ///< Members admitted beside the voters, by `AdmitMachine`.
     std::vector<std::string> _revoked;
     Distributed::RosterStanding _standing { Distributed::RosterStanding::Current };
-    std::optional<std::chrono::system_clock::time_point> _certifiedUntil;
 };
 
 } // namespace FastCache::Testing

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Logger.hpp>
+#include <FastCache/Platform/ServiceStatusPlan.hpp>
+#include <FastCache/Platform/StopPending.hpp>
+
 #include <functional>
 #include <memory>
 #include <string>
@@ -9,10 +13,15 @@
 namespace FastCache
 {
 
+/// Declared, not included: `ServiceHostOptions` holds only a pointer to one, and every includer of
+/// this header would otherwise pull in the hub's threading headers.
+class IHostEventSink;
+
 /// Abstract host for the daemon body. Three implementations:
 ///   - ForegroundHost:       run body() inline (development, tests)
 ///   - PosixDaemonHost:      double-fork+setsid+stdio redirect+pidfile, run body() in the child
-///   - WindowsServiceHost:   register with SCM, run body() inside ServiceMain
+///   - ServiceHost:          register with a service manager (`IServiceControlManager`; the
+///                           SCM on Windows), run body() inside its service main
 ///
 /// The body function returns a process exit code.
 class IDaemonHost
@@ -38,7 +47,40 @@ class IDaemonHost
     /// POSIX host does nothing (SIGTERM does the work); SCM host
     /// transitions the service to STOP_PENDING.
     virtual void RequestStop() noexcept {}
+
+    /// Report a start this process refuses before any body can run, the way this host's
+    /// supervisor reads a failed start, instead of `Run`.
+    ///
+    /// **The default reports nothing and is right for two of the three hosts**: in the
+    /// foreground the exit code IS the report, and a POSIX daemon has not forked yet -- its
+    /// supervisor reads the exit code and the refusal was said on the terminal. The SCM is the
+    /// exception: it waits for a service it started to connect, and a process that exits before
+    /// connecting is reported as error 1053, *did not respond in a timely fashion*, with the
+    /// refusal nowhere an operator running `sc start` looks. So the service host connects and
+    /// reports the stop with @p exitCode as the service-specific code (`ServiceStatusPlan.hpp`).
+    /// @param exitCode Why the start is refused, as the process's exit code; never zero.
+    /// @return The process exit code: @p exitCode.
+    [[nodiscard]] virtual int Refuse(int exitCode)
+    {
+        return exitCode;
+    }
 };
+
+/// Refuse a start: say why through @p logger, then report it through @p host.
+///
+/// **One call per refusal, and the order is the point**: a refusal logged and then returned from
+/// `main` without the host is the defect `IDaemonHost::Refuse` closes, so both halves are one
+/// operation rather than two lines a new refusal can copy half of.
+/// @param host The host this process runs under -- chosen BEFORE the configuration is judged.
+/// @param logger Where the reason goes: the event log under a service, the terminal otherwise.
+/// @param reason Why this process will not start.
+/// @param exitCode The exit code that says so; never zero.
+/// @return The process exit code.
+[[nodiscard]] inline int RefuseStart(IDaemonHost& host, ILogger& logger, std::string_view reason, int exitCode)
+{
+    logger.Log(LogLevel::Error, reason);
+    return host.Refuse(exitCode);
+}
 
 /// Foreground host: runs the body inline. Used by `fastcached` when neither
 /// `--daemon` nor a Windows service registration is in play, and by tests.
@@ -85,10 +127,30 @@ class ForegroundHost final: public IDaemonHost
 [[nodiscard]] std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& pidfile,
                                                                std::string const& workingDirectory);
 
+/// What the Windows service host needs beyond the service's name.
+struct ServiceHostOptions
+{
+    StopPendingPlan stop {}; ///< What a stop reports while the body winds down.
+
+    /// Where power events (suspend, resume) are delivered, or null to not accept them. Must
+    /// outlive `Run`. A hint only: see `HostEvent` for why nothing may depend on one arriving.
+    IHostEventSink* hostEvents { nullptr };
+
+    /// When RUNNING is reported. `BodyStart` is what a host told nothing does; a daemon whose body
+    /// says when it serves passes `BodySignals`, so `net start` and an installer's start action
+    /// answer for a service that serves rather than for a process that is up.
+    ServiceReadiness readiness { ServiceReadiness::BodyStart };
+
+    /// How a `BodySignals` start reports while it waits for the body to serve.
+    StartPendingPlan start { DefaultStartPendingPlan };
+};
+
 /// Construct a Windows Service host registered with the SCM. Returns
 /// nullptr on non-Windows platforms.
 /// @param serviceName Service name as registered with SCM.
+/// @param options How a stop is reported, and where power events go.
 /// @return Owning host or nullptr.
-[[nodiscard]] std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& serviceName);
+[[nodiscard]] std::unique_ptr<IDaemonHost> MakeWindowsServiceHost(std::string const& serviceName,
+                                                                  ServiceHostOptions options);
 
 } // namespace FastCache

@@ -152,27 +152,6 @@ fastcached_globs_to_regex("${FastCachedByteOrderScanGlobs}" scanRegex)
 
 # ---------------------------------------------------------------------------
 # Collect the files to judge.
-set(scanFiles "")
-set(missingRoots "")
-foreach(row IN LISTS FastCachedByteOrderScanRoots)
-    fastcached_row_fields("${row}" scanRoot scanRootReason)
-    set(rootPath "${FASTCACHED_SOURCE_DIR}/${scanRoot}")
-    if(IS_DIRECTORY "${rootPath}")
-        # ONE traversal per root, filtered afterwards. See fastcached_globs_to_regex.
-        file(GLOB_RECURSE rootAll LIST_DIRECTORIES false "${rootPath}/*")
-        set(rootFiles ${rootAll})
-        list(FILTER rootFiles INCLUDE REGEX "${scanRegex}")
-        list(APPEND scanFiles ${rootFiles})
-    else()
-        # A renamed or mistyped root would otherwise take a whole surface out of
-        # this check's view while it went on reporting success.
-        list(APPEND missingRoots
-            "  ${scanRoot}\n      is named in the scan table but is not a directory. It is scanned because: ${scanRootReason}")
-    endif()
-endforeach()
-list(REMOVE_DUPLICATES scanFiles)
-list(SORT scanFiles)
-
 set(byteOrderNames "")
 foreach(row IN LISTS FastCachedByteOrderNames)
     fastcached_row_fields("${row}" byteOrderName byteOrderReason)
@@ -203,6 +182,43 @@ list(JOIN byteOrderNames "|" byteOrderAlternation)
 # six -- "a second copy is not a cross-check, it is a second thing to be wrong",
 # arriving inside a check written to enforce a rule.
 list(JOIN byteOrderNames "/" byteOrderDisplay)
+
+set(scanFiles "")
+set(scanHolding "")
+set(missingRoots "")
+foreach(row IN LISTS FastCachedByteOrderScanRoots)
+    fastcached_row_fields("${row}" scanRoot scanRootReason)
+    set(rootPath "${FASTCACHED_SOURCE_DIR}/${scanRoot}")
+    if(IS_DIRECTORY "${rootPath}")
+        # Through `fastcached_tracked_files`, this tree's one answer to HOW a check finds its
+        # files, rather than a `GLOB_RECURSE` of the root. On a DrvFs checkout -- where every
+        # gate tree takes its sources from -- walking `src/` cost more than reading every file
+        # it found, and several lanes gating at once took this check past its budget. One
+        # walk pattern, so the fallback traverses the root once; the globs are the FILTER.
+        fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
+            PATHSPECS "${scanRoot}/"
+            GLOBS "${scanRoot}/*"
+            FILTER "^${scanRoot}/.*${scanRegex}"
+            CONTAINING ${byteOrderNames} CONTAINING_OUT rootHolding
+            FILES_OUT rootFiles MODE_OUT rootMode)
+        list(TRANSFORM rootFiles PREPEND "${FASTCACHED_SOURCE_DIR}/")
+        list(APPEND scanFiles ${rootFiles})
+        # Only these can hold a call: the rule fires on a line naming one of the functions,
+        # and the seam asked git which files name any -- so only these are READ.
+        list(TRANSFORM rootHolding PREPEND "${FASTCACHED_SOURCE_DIR}/")
+        list(APPEND scanHolding ${rootHolding})
+    else()
+        # A renamed or mistyped root would otherwise take a whole surface out of
+        # this check's view while it went on reporting success.
+        list(APPEND missingRoots
+            "  ${scanRoot}\n      is named in the scan table but is not a directory. It is scanned because: ${scanRootReason}")
+    endif()
+endforeach()
+list(REMOVE_DUPLICATES scanFiles)
+list(SORT scanFiles)
+list(REMOVE_DUPLICATES scanHolding)
+list(SORT scanHolding)
+
 set(byteOrderQualified "(^|[^A-Za-z0-9_:])::[ ]*(${byteOrderAlternation})[ ]*\\(")
 set(byteOrderBare "(^|[^A-Za-z0-9_:.>])(${byteOrderAlternation})[ ]*\\(")
 
@@ -221,7 +237,7 @@ set(byteOrderBare "(^|[^A-Za-z0-9_:.>])(${byteOrderAlternation})[ ]*\\(")
 set(violations "")
 set(bareUses 0)
 
-foreach(scanFile IN LISTS scanFiles)
+foreach(scanFile IN LISTS scanHolding)
     file(RELATIVE_PATH relativeFile "${FASTCACHED_SOURCE_DIR}" "${scanFile}")
     file(READ "${scanFile}" content)
 

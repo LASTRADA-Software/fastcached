@@ -10,7 +10,7 @@
 # only in the other binary -- enrollment and `--print-surfaces` -- because an operator
 # who has learned one tool cannot otherwise discover the other half of the surface
 # (#1307). That paragraph is prose in one executable about another executable's flag
-# table, and nothing else connects the two: rename `--enroll-open` in `NodeConfig.cpp`
+# table, and nothing else connects the two: rename `--enroll-list` in `NodeConfig.cpp`
 # and every test in both binaries stays green while the help sends people to a flag that
 # does not exist. A sentence is not a reader.
 #
@@ -26,7 +26,7 @@
 #     flag at the row indent. A flag mentioned only inside another row's description
 #     (`--scheduler` appears in a dozen, some of them opening a wrapped line) is not an
 #     option, and whole-token matching is what stops `--enroll` passing because
-#     `--enroll-open` exists.
+#     `--enroll-list` exists.
 #
 # ## What it does NOT cover, stated rather than left to be discovered
 #

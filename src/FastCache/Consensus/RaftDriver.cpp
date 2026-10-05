@@ -348,8 +348,11 @@ RaftDriver::Progress RaftDriver::CurrentProgress() const
                       // timer loop and every peer reader move this, and the lock ends
                       // with this statement.
                       .knownLeader = _node.KnownLeader(),
+                      .lastLeaderContact = _node.LastLeaderContact(),
                       .matchIndex = _node.MatchIndices(),
-                      .installRefusal = _installRefusal };
+                      .installRefusal = _installRefusal,
+                      .appliedIndex = _node.LastApplied(),
+                      .lastLogIndex = _node.Log().LastIndex() };
 }
 
 std::expected<LogIndex, ConsensusError> RaftDriver::Land(std::expected<RaftNode::Proposal, ConsensusError> proposed)

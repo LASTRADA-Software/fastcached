@@ -6,10 +6,13 @@
 #include "NodeClient.hpp"
 #include "RespClient.hpp"
 
+#include <FastCache/Core/SecureBytes.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -154,17 +157,43 @@ class MemcachedExchange final: public IMemcachedExchange
 /// because `IsTerminalStatus` exists in the wire header precisely so every reader asks,
 /// and a client that would misread a pulse is one that cannot later grow a verb that
 /// produces them.
+/// How a connection is opened: a TCP dial in production, a scripted socket in a test.
+using SocketDial = std::function<std::expected<std::unique_ptr<core::net::ISocket>, ExchangeError>(Endpoint const& endpoint,
+                                                                                                   DialTimeouts timeouts)>;
+
+/// Dial @p endpoint over TCP.
+/// @param endpoint Where.
+/// @param timeouts How long.
+/// @return The connected socket, or why there is none.
+[[nodiscard]] std::expected<std::unique_ptr<core::net::ISocket>, ExchangeError> DialTcp(Endpoint const& endpoint,
+                                                                                        DialTimeouts timeouts);
+
 class NodeExchange final: public INodeExchange
 {
   public:
-    /// Dial @p endpoint and present @p credential.
+    /// Dial @p endpoint and present what @p credentials answers for it.
+    ///
+    /// **Asked per endpoint** (`Cc::ChooseCredential`): the token to the endpoint it belongs to, a
+    /// machine ticket minted by this machine's node to any other machine, nothing to loopback. A
+    /// mint that fails is an ADVISORY and the connection goes on unauthenticated -- the node then
+    /// answers as it does to a machine it does not know, and the advisory says why.
     /// @param endpoint Where to dial.
     /// @param timeouts How long to wait.
-    /// @param credential What to present; nothing is presented when unconfigured.
+    /// @param credentials What each endpoint is shown.
+    /// @param dial How a connection is opened, the mint's included.
     /// @return The open connection, or why there is none.
     [[nodiscard]] static std::expected<std::unique_ptr<NodeExchange>, ExchangeError> Open(Endpoint const& endpoint,
                                                                                           DialTimeouts timeouts,
-                                                                                          Credential const& credential);
+                                                                                          NodeCredentials const& credentials,
+                                                                                          SocketDial const& dial);
+
+    /// `Open` over a TCP dial.
+    /// @param endpoint Where to dial.
+    /// @param timeouts How long to wait.
+    /// @param credentials What each endpoint is shown.
+    /// @return The open connection, or why there is none.
+    [[nodiscard]] static std::expected<std::unique_ptr<NodeExchange>, ExchangeError> Open(
+        Endpoint const& endpoint, DialTimeouts timeouts, NodeCredentials const& credentials);
 
     ~NodeExchange() override;
     NodeExchange(NodeExchange const&) = delete;
@@ -185,7 +214,13 @@ class NodeExchange final: public INodeExchange
     /// `SocketExchange::Advisories` is: the operator ASKED for authentication, so
     /// silently proceeding without it is the one outcome they cannot see.
     /// @return The remarks, in the order they were made.
-    [[nodiscard]] std::span<std::string const> Advisories() const noexcept;
+    [[nodiscard]] std::span<std::string const> Advisories() const noexcept override;
+
+    /// @copydoc INodeExchange::MissingTicket
+    [[nodiscard]] std::optional<Cc::MintFailure> MissingTicket() const noexcept override
+    {
+        return _missingTicket;
+    }
 
     /// Send one framed request and read nothing: the first half of a stream (#1399).
     ///
@@ -230,37 +265,50 @@ class NodeExchange final: public INodeExchange
     /// @return The frame, or why there is none.
     [[nodiscard]] std::expected<NodeReply, ExchangeError> ReadOne(Reading reading);
 
+    /// Present @p request on @p exchange and hand the connection back when it may be used.
+    /// @param exchange The open connection.
+    /// @param request What to present.
+    /// @return The connection, or why the credential stops it here.
+    [[nodiscard]] static std::expected<std::unique_ptr<NodeExchange>, ExchangeError> Authenticated(
+        std::unique_ptr<NodeExchange> exchange, CompileCacheWire::AuthRequest const& request);
+
     std::unique_ptr<core::net::ISocket> _socket;
     std::string _endpoint;
     /// Bytes read and not yet consumed by a reply; held across calls for the reason
     /// `SocketExchange::_pending` is.
-    std::string _pending;
+    ///
+    /// **Wiping storage, because a reply here can BE a credential**: `MINT-TICKET`'s `Ok` carries
+    /// the ticket. A consumed frame is zeroed before the rest moves down over it, and the storage
+    /// is zeroed when it is released -- a `std::string` did neither.
+    SecureCharBuffer _pending;
     std::vector<std::string> _advisories;
+    std::optional<Cc::MintFailure> _missingTicket; ///< Why no ticket was presented, when one was due.
 };
 
-/// The production `INodeDialer`: `NodeExchange::Open` with this invocation's timeouts and credential.
+/// The production `INodeDialer`: `NodeExchange::Open` with this invocation's timeouts and credentials.
 class NodeDialer final: public INodeDialer
 {
   public:
     /// @param timeouts How long a dial may take.
-    /// @param credential What to present on every dial; must outlive this. Held by reference, so
-    ///        the secret is not copied once more.
-    NodeDialer(DialTimeouts timeouts, Credential const& credential) noexcept:
+    /// @param credentials What each endpoint is shown; must outlive this. Held by reference, so the
+    ///        secret is not copied once more -- and asked per dial, so a leader a redirect names is
+    ///        shown a ticket naming it, never the token `--addr` was given.
+    NodeDialer(DialTimeouts timeouts, NodeCredentials const& credentials) noexcept:
         _timeouts { timeouts },
-        _credential { credential }
+        _credentials { credentials }
     {
     }
 
     /// @copydoc INodeDialer::Dial
     [[nodiscard]] std::expected<std::unique_ptr<INodeExchange>, ExchangeError> Dial(Endpoint const& endpoint) override
     {
-        return NodeExchange::Open(endpoint, _timeouts, _credential)
+        return NodeExchange::Open(endpoint, _timeouts, _credentials)
             .transform([](std::unique_ptr<NodeExchange> exchange) -> std::unique_ptr<INodeExchange> { return exchange; });
     }
 
   private:
     DialTimeouts _timeouts;
-    Credential const& _credential;
+    NodeCredentials const& _credentials;
 };
 
 /// One HTTP response.
@@ -284,16 +332,21 @@ struct HttpResponse
 /// server close first, and this way the client does not depend on that behaviour to
 /// get its metrics.
 ///
+/// **It presents NO credential, and that is the design rather than an omission.** The admin
+/// surface is plain HTTP on a port that can be `$FASTCACHE_ADMIN_ADDR` on any host or one
+/// DISCOVERED on `--addr`'s host, and `--token-file`'s secret is never the credential there:
+/// `/metrics` needs none, and a node's dashboard has its own (`--dashboard-token-file`). Sent
+/// anyway, it crossed the network in the clear to whichever host the port was found on. A
+/// credential this request ever needs is a SEPARATE one, configured for it by name.
+///
 /// @param endpoint Where to dial.
 /// @param path The request target, e.g. `/metrics`.
 /// @param timeouts How long to wait.
-/// @param bearer A bearer token to present, or nullopt.
 /// @param maxBodyBytes Cap on the response body; a larger one is a `Malformed` failure.
 /// @return The response, or why there is none.
 [[nodiscard]] std::expected<HttpResponse, ExchangeError> HttpGet(Endpoint const& endpoint,
                                                                  std::string_view path,
                                                                  DialTimeouts timeouts,
-                                                                 std::optional<std::string> const& bearer,
                                                                  std::size_t maxBodyBytes = 8U * 1024U * 1024U);
 
 } // namespace FastCache::Cli

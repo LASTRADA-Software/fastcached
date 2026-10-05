@@ -2,10 +2,10 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 #include "NodeAnnounce.hpp"
+#include "NodeFormation.hpp"
 #include "NodeIoLoop.hpp"
 #include "WorkerTier.hpp"
 
-#include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 
@@ -13,9 +13,12 @@
 #include <chrono>
 #include <format>
 #include <functional>
+#include <optional>
+#include <stop_token>
 #include <utility>
 
 #include <CacheProtocol.hpp>
+#include <Dispatch.hpp>
 
 namespace FastCache::Node
 {
@@ -42,12 +45,9 @@ namespace
     /// a reinstalled compiler rejoins the fleet without anybody restarting a service.
     constexpr std::uint64_t SweepEveryBeats = 45;
 
-    /// Per-call send/recv ceiling on the heartbeat's own connection to the scheduler.
-    ///
-    /// Was ten seconds passed as BOTH the dial bound and the I/O bound, which is the
-    /// collapse `Cc::DialEndpoint` used to make: ten seconds is a reasonable ceiling
-    /// on an exchange and a very long time to wait for a TCP handshake.
-    constexpr std::chrono::milliseconds HeartbeatIoTimeout { 10'000 };
+    // The suspend's one dial must be able to fail and still leave the handler budget to return
+    // in: a connect bound at or past the budget spends all of it on a scheduler that is not there.
+    static_assert(SuspendDialTimeout < SuspendWithdrawBudget);
 
     /// Tell `node-status` what a finished survey concluded.
     ///
@@ -179,26 +179,27 @@ namespace
         return compilers;
     }
 
-    /// Adopt a reloaded compile-argument allowlist, and say so when it changed.
-    /// @param jobs The runner the set is applied to.
-    /// @param logger Where the change is announced, at Warn.
-    /// @param inForce The set applied now; replaced when the candidate differs.
-    /// @param candidate The set the live configuration names.
-    void AdoptAllowlist(Cc::CompileJobRunner& jobs,
-                        ILogger& logger,
-                        std::vector<std::string>& inForce,
-                        std::vector<std::string> const& candidate)
-    {
-        auto const said = AllowlistAnnouncement(AllowlistMoment::Reload, inForce, candidate);
-        if (!said)
-            return;
-
-        inForce = candidate;
-        jobs.ReplaceExtraAllowedArgs(inForce);
-        logger.Log(LogLevel::Warn, *said);
-    }
-
 } // namespace
+
+void AdoptAllowlist(Cc::CompileJobRunner& jobs,
+                    RefusedArgumentsReport& refused,
+                    ILogger& logger,
+                    std::vector<std::string>& inForce,
+                    std::vector<std::string> const& candidate)
+{
+    auto const said = AllowlistAnnouncement(AllowlistMoment::Reload, inForce, candidate);
+    if (!said)
+        return;
+
+    inForce = candidate;
+    jobs.ReplaceExtraAllowedArgs(inForce);
+    // The report RE-JUDGES what it named against the set now in force, rather than clearing. It
+    // cannot assume every refusal from here on was judged by that set: `CompileJobRunner::Run`
+    // copies the set when a job starts, so a job begun before the line above reports after it --
+    // and the report answers that by asking the set in force, not by trusting the order here.
+    refused.AllowlistChanged(inForce);
+    logger.Log(LogLevel::Warn, *said);
+}
 
 WorkerMachine MakeSystemWorkerMachine()
 {
@@ -215,7 +216,7 @@ WorkerMachine MakeSystemWorkerMachine()
                            .scratchBase = ScratchBaseDirectory() };
 }
 
-std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(WorkerTierParts const& parts,
+std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> WorkerTier::Start(WorkerTierParts const& parts,
                                                                           WorkerMachineFactory const& makeMachine)
 {
     // Through `WorkerSlotsOf`, never `OfferableSlots` directly -- its header says which
@@ -226,12 +227,18 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
         return std::unique_ptr<WorkerTier> {};
 
     // The link the heartbeat announces through, built HERE so a worker cannot exist
-    // without one: the tier's constructor takes it by value.
-    auto link = SchedulerLink::For(parts.cfg.schedulers);
+    // without one: the tier's constructor takes it by value. Aimed where this node registers
+    // NOW (`AppliedSchedulers`: its own scheduler, or the voters its applied state records,
+    // else the formation record's answer), re-read at every round, never at `--scheduler`,
+    // which aims one-shot verbs and is refused on a node that serves.
+    auto link = SchedulerLink::Over(parts.schedulers);
     if (!link.has_value())
-        return std::unexpected { std::string {
-            "a worker was started with no --scheduler, which the startup table exists to refuse: it would never "
-            "register, never be leased and never be sent a job. Name the scheduler's --listen-node endpoint" } };
+        return std::unexpected { Refusal(
+            NodeRefusalCause::EarlierRule,
+            "this worker has nowhere to register: its formation record names no scheduler -- a node serves its own "
+            "only while its consensus port is open, and a learner registers with the fleet endpoints it remembers -- "
+            "so it would never be leased and never be sent a job. Open consensus (--listen-raft), or give "
+            "--fleet-seed=<host> to join a fleet") };
 
     // Only now, with a worker decided: see `MakeSystemWorkerMachine`.
     auto machine = makeMachine();
@@ -250,12 +257,12 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
     auto discovered = DiscoverToolchainEntries(parts.cfg, discovery, *machine.runner, parts.logger);
     if (!discovered.has_value())
         // The entry was named above, at Error, by the survey that could not read it.
-        return std::unexpected { std::string { "a malformed --toolchain was named" } };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, "a malformed --toolchain was named") };
 
     auto claim = ClaimScratchRoot(
         !discovered->entries.empty(), *machine.claimant, machine.scratchBase, parts.logger, parts.conditions);
     if (!claim.has_value())
-        return std::unexpected { std::move(claim).error() };
+        return std::unexpected { Refusal(NodeRefusalCause::ScratchRoot, std::move(claim).error()) };
 
     // What this worker keeps between lease checks: the grants it has already run (#614),
     // the scheduler term the last authentic grant named (#421), and where a term going
@@ -273,16 +280,20 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
     //
     // It borrows `main`'s one `AnnouncedEndpoint` -- see `WorkerTierParts::announced` for why
     // there is exactly one per process rather than one per component that needs an address.
-    auto validator = MakeWorkerLeaseValidator(parts.cfg,
-                                              parts.leaseRoster,
-                                              parts.announced,
-                                              parts.activation,
-                                              core::platform::defaultSystemWallClock(),
-                                              *leaseState,
-                                              parts.metrics,
-                                              parts.logger);
+    auto validator =
+        MakeWorkerLeaseValidator(parts.cfg,
+                                 parts.leaseRoster,
+                                 parts.announced,
+                                 parts.prover != nullptr ? std::span<std::byte const> { parts.prover->Key().PublicKey() }
+                                                         : std::span<std::byte const> {},
+                                 parts.activatedNodeEndpoint.has_value() ? SocketActivation::Yes : SocketActivation::No,
+                                 core::platform::defaultSystemWallClock(),
+                                 *leaseState,
+                                 parts.metrics,
+                                 parts.logger,
+                                 parts.leaseCheck);
     if (!validator.has_value())
-        return std::unexpected { std::move(validator).error() };
+        return std::unexpected { Refusal(NodeRefusalCause::LeaseValidation, std::move(validator).error()) };
 
     return std::unique_ptr<WorkerTier> { new WorkerTier(parts,
                                                         std::move(machine),
@@ -305,11 +316,11 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     _cfg { parts.cfg },
     _reloader { parts.reloader },
     _cacheTier { parts.cacheTier },
-    _credential { parts.credential },
     _prover { parts.prover },
     _metrics { parts.metrics },
     _logger { parts.logger },
     _announced { parts.announced },
+    _locality { parts.locality },
     _machine { std::move(machine) },
     _discovered { std::move(discovered) },
     _scratchClaim { std::move(scratchClaim) },
@@ -322,10 +333,18 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
             Cc::ToolchainSurvey::InFlight() },
     _appliedExtraArgs { parts.cfg.extraAllowedArgs },
     _leaseState { std::move(leaseState) },
+    _refusedArguments { parts.conditions, parts.logger, parts.cfg.extraAllowedArgs },
     // The envelope ceiling is THIS surface's request cap, named rather than left to the
     // decoder's default. `AvailableCodecs()`, never a literal: this list is what the
     // worker answers a compile in, chosen against what the client accepts (#265).
-    _protocol { _jobs, std::move(validator), Cc::AvailableCodecs(), parts.metrics, WorkerMaxRequestBytes },
+    // Every reply signed under the key this machine PROVES itself with -- the one the scheduler
+    // records at registration and names in each grant -- so a launcher can tell this worker from
+    // whatever else answers at its address (W-4). None where nothing proves: such a worker
+    // registers nowhere, so no grant names it.
+    _protocol {
+        _jobs,         std::move(validator), Cc::AvailableCodecs(), parts.prover != nullptr ? &parts.prover->Key() : nullptr,
+        parts.metrics, _refusedArguments,    WorkerMaxRequestBytes
+    },
     _slots { slots },
     // Sized to the slot cap, which is what makes an admitted job always find a thread,
     // and declared before the capacity and the responder, so neither outlives it.
@@ -342,10 +361,10 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
                                   .served = 0,
                                   .discovered = static_cast<std::uint32_t>(_discovered.entries.size()) } },
     _advertisedWire { Distributed::CapacityToWire(parts.capacity) },
-    _registrarNotice { [&logger =
-                            parts.logger](std::string_view text) { logger.Logf(LogLevel::Warn, "scheduler: {}", text); } },
-    _dialer { HeartbeatIoTimeout },
-    _link { std::move(link) }
+    _dialer { parts.schedulerDialer },
+    _link { std::move(link) },
+    _hostInbox { [this] { _capacity.WakeHeartbeat(); }, parts.suspendWait },
+    _hostSubscription { parts.hostEvents, _hostInbox }
 {
     // Counted as well as logged because it is otherwise visible nowhere: a rise means
     // nodes are dying rather than stopping.
@@ -364,8 +383,27 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     // binary is running on each machine, mid-upgrade most often. And the hostname, a
     // LABEL that decides nothing (#1024). Both ride the capacity record because it is
     // REGISTER's one extensible field.
-    _advertisedWire.version = VersionString;
+    //
+    // The version's own ceiling is `AdvertisedVersion`'s to hold, asked from both this
+    // registrar and the presence loop rather than each stamping its own copy; the name's
+    // is held here, at the most the host query can return at all.
+    static_assert(MaxHostNameBytes <= CompileCacheWire::MaxDisplayNameBytes,
+                  "a scheduler must record any host name this node can send");
+    _advertisedWire.version = AdvertisedVersion();
     _advertisedWire.displayName = parts.host.Facts().hostName;
+}
+
+std::string RegisteredToolchainLabel(ServedToolchain const& toolchain, ILogger& logger)
+{
+    auto const withheld = Cc::ToolchainLabelWithheldBecause(toolchain.label);
+    if (!withheld.has_value())
+        return toolchain.label;
+    logger.Logf(LogLevel::Warn,
+                "scheduler: {} registers without its toolchain label, because {}; it is served all the same, and "
+                "the fleet page shows no name for it",
+                toolchain.compiler,
+                *withheld);
+    return {};
 }
 
 std::vector<Cc::WorkerRegistrar> WorkerTier::RegistrarsFor(std::map<std::string, ServedToolchain> const& served)
@@ -386,8 +424,8 @@ std::vector<Cc::WorkerRegistrar> WorkerTier::RegistrarsFor(std::map<std::string,
         // A copy per registrar: the label is the one field of this record that is NOT
         // node-wide (#194).
         auto perToolchain = _advertisedWire;
-        perToolchain.toolchainLabel = toolchain.label;
-        built.emplace_back(_registrarNotice, fingerprint, advertised, _slots, Cc::AvailableCodecs(), perToolchain);
+        perToolchain.toolchainLabel = RegisteredToolchainLabel(toolchain, _logger);
+        built.emplace_back(fingerprint, advertised, _slots, Cc::AvailableCodecs(), perToolchain);
     }
     return built;
 }
@@ -405,7 +443,7 @@ void WorkerTier::Serve(std::map<std::string, ServedToolchain> served)
     PublishToolchains(_runtime, _toolchains.size(), _discovered.entries.size());
 }
 
-void WorkerTier::AnnounceAs(std::string endpoint)
+void WorkerTier::AnnounceAs(std::string endpoint, core::platform::IClock const& statusClock)
 {
     // Published FIRST, so the registrars built below carry the new address and the lease
     // check moves in the same step. The old registrars still hold the address they
@@ -420,17 +458,20 @@ void WorkerTier::AnnounceAs(std::string endpoint)
 
     // Republished for `node-status`, because the registered count drops to zero until the
     // round that follows re-registers -- and a status still claiming those toolchains
-    // registered would be describing entries that were just withdrawn.
-    PublishToolchains(_runtime, _toolchains.size(), _discovered.entries.size());
+    // registered would be describing entries that were just withdrawn. Nothing was accepted,
+    // so the instant of the last acceptance is kept.
+    PublishRegistration(_runtime, statusClock, _registrars, 0);
 }
 
-WorkerHeartbeat WorkerTier::Launch(core::platform::IClock const& statusClock)
+WorkerHeartbeat WorkerTier::Launch(core::platform::IClock const& statusClock, SchedulerReachability& reachability)
 {
     return WorkerHeartbeat { std::jthread {
-        [this, &statusClock](std::stop_token const& stop) { Heartbeat(stop, statusClock); } } };
+        [this, &statusClock, &reachability](std::stop_token const& stop) { Heartbeat(stop, statusClock, reachability); } } };
 }
 
-void WorkerTier::Heartbeat(std::stop_token const& stop, core::platform::IClock const& statusClock)
+void WorkerTier::Heartbeat(std::stop_token const& stop,
+                           core::platform::IClock const& statusClock,
+                           SchedulerReachability& reachability)
 {
     // One sampler for the whole loop, not one per heartbeat: CPU utilization is a
     // difference between two readings, so a sampler per beat would report nothing,
@@ -442,14 +483,14 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, core::platform::IClock c
                                  .withdrawals = _withdrawals,
                                  .capacity = _capacity,
                                  .loadSampler = *loadSampler,
+                                 .locality = _locality,
+                                 .addressCapNoticed = _addressCapNoticed,
                                  .cacheTier = _cacheTier,
                                  .metrics = _metrics,
-                                 .credential = _credential,
-                                 .notice = _registrarNotice,
                                  .prover = _prover,
                                  .lease = *_leaseState,
-                                 .fleetMismatch = _fleetAssertionFailed,
-                                 .logger = _logger };
+                                 .logger = _logger,
+                                 .reachability = reachability };
 
     // The configuration snapshot this thread last surveyed against, so a reload is
     // noticed by COMPARISON rather than by a flag somebody else sets. Seeded BEFORE the
@@ -505,7 +546,7 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, core::platform::IClock c
         // Compared SEPARATELY from `reloaded`: extending the allowlist changes nothing
         // this worker advertises, so gating it on that answer would be a reload an
         // operator watched do nothing.
-        AdoptAllowlist(_jobs, _logger, _appliedExtraArgs, liveCfg.extraAllowedArgs);
+        AdoptAllowlist(_jobs, _refusedArguments, _logger, _appliedExtraArgs, liveCfg.extraAllowedArgs);
 
         // Compared SEPARATELY from `reloaded` as well, and for the opposite half of that
         // reason: this changes what the fleet must be TOLD while changing nothing about
@@ -520,7 +561,7 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, core::platform::IClock c
         if (auto moved = AdvertisedEndpointChange(_announced.Current(), snapshot))
         {
             _logger.Log(LogLevel::Warn, moved->announcement);
-            AnnounceAs(std::move(moved->endpoint));
+            AnnounceAs(std::move(moved->endpoint), statusClock);
         }
         auto const depth = RecheckDepthFor(reloaded, beat, SweepEveryBeats);
         auto const voice = SurveyVoiceFor(reloaded, depth);
@@ -545,10 +586,70 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, core::platform::IClock c
         PublishRegistration(_runtime, statusClock, _registrars, AnnounceRound(round, _link, _dialer));
 
         // A cordon, or its lifting, reaches the scheduler at once rather than a whole
-        // interval later (#1303); a stop ends the wait immediately.
-        if (_capacity.WaitForHeartbeat(stop, announcedCordon, NodeAnnounceInterval) == HeartbeatWake::Stopped)
+        // interval later (#1303), and so does a resume or a network change; a stop ends the
+        // wait immediately. Sooner while this node's own cluster has not recorded it, so the
+        // registrations follow the record by seconds rather than by a whole interval
+        // (`NextAnnounceWait`).
+        if (AwaitNextRound(stop,
+                           _capacity,
+                           _hostInbox,
+                           announcedCordon,
+                           NextAnnounceWait(_prover),
+                           [this, &round, &statusClock] { WithdrawForSuspend(round, statusClock); })
+            == HeartbeatWake::Stopped)
             break;
     }
+}
+
+void WorkerTier::WithdrawForSuspend(HeartbeatRound const& round, core::platform::IClock const& statusClock)
+{
+    RetireAllRegistrations(RegistrarsFor(_toolchains), _registrars, _withdrawals);
+    // Republished: node-status must not claim registrations that were just withdrawn. Nothing
+    // was accepted, so the instant of the last acceptance is kept.
+    PublishRegistration(_runtime, statusClock, _registrars, 0);
+    auto const retired = WithdrawOnce(round, _link, _dialer);
+    _logger.Logf(LogLevel::Info,
+                 "this machine is going to sleep: withdrew {} registration(s) so no client is leased it meanwhile",
+                 retired);
+}
+
+HeartbeatWake AwaitNextRound(std::stop_token const& stop,
+                             CompileCapacity& capacity,
+                             HostEventInbox& inbox,
+                             bool announcedCordon,
+                             std::chrono::milliseconds interval,
+                             std::function<void()> const& withdrawForSuspend)
+{
+    auto wake = capacity.WaitForHeartbeat(stop, announcedCordon, interval);
+    auto withdrew = false;
+    // Taken whatever woke the wait: an event can land as the interval runs out, and the round
+    // about to run answers it either way.
+    while (wake != HeartbeatWake::Stopped)
+    {
+        auto const action = inbox.Take();
+        if (action == std::optional { HostEventAction::WithdrawNow })
+        {
+            withdrawForSuspend();
+            // Settled here rather than by the callback, so no withdrawal can forget to let the
+            // suspend go and hold the machine for the whole budget.
+            inbox.Settle();
+            withdrew = true;
+            wake = inbox.HasPending() ? HeartbeatWake::HostEvent
+                                      : capacity.WaitForHeartbeat(stop, capacity.IsCordoned(), interval);
+            continue;
+        }
+        // A wake whose event was already taken: the posting thread sets the action BEFORE it wakes
+        // this one, so a suspend taken on another wake leaves its own wake request behind. After a
+        // withdrawal that request owes nothing, and a round for it would register the machine that
+        // is about to sleep -- so wait on.
+        if (withdrew && !action.has_value() && wake == HeartbeatWake::HostEvent)
+        {
+            wake = capacity.WaitForHeartbeat(stop, capacity.IsCordoned(), interval);
+            continue;
+        }
+        break;
+    }
+    return wake;
 }
 
 void WorkerTier::StopAndDrain()

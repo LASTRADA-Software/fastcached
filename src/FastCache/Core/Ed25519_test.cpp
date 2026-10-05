@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <iterator>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -115,6 +116,89 @@ constexpr std::array Rfc8032Vectors {
 /// The group order L = 2^252 + 27742317777372353535851937790883648493, little-endian, as
 /// RFC 8032 §5.1 defines it -- the bound a signature's S must stay below.
 constexpr std::string_view GroupOrderL = "edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010";
+
+/// Every encoding of a point of small order, sign bit clear -- libsodium's blocklist
+/// (`ge25519_has_small_order`), spelled HERE rather than read from the seam, so the seam's copy is
+/// checked against a second one. Re-derived independently in exact arithmetic before it was
+/// written down: the torsion subgroup generated from the order-8 point has exactly the first five
+/// y coordinates, and of the nineteen y + p below 2^255 only 0 + p and 1 + p are of small order.
+constexpr std::array<std::string_view, 7> SmallOrderEncodings {
+    "0000000000000000000000000000000000000000000000000000000000000000", // 0, order 4
+    "0100000000000000000000000000000000000000000000000000000000000000", // 1, the identity
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05", // order 8
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a", // order 8
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p - 1, order 2
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p, i.e. 0, non-canonical
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p + 1, i.e. 1, non-canonical
+};
+
+/// @p encoding with the sign of x (bit 255) set: the other half of every blocklist row.
+/// @param encoding An encoded point, sign bit clear.
+/// @return The same y with the opposite sign of x.
+[[nodiscard]] Ed25519PublicKey WithSignBitSet(Ed25519PublicKey encoding)
+{
+    encoding.back() |= std::byte { 0x80 };
+    return encoding;
+}
+
+/// A signature whose R is @p r and whose S is zero -- the forgery that needs no secret at all when
+/// A and R are both of small order, since the cofactored equation then reads [8](-hA - R) = 0.
+/// @param r The encoded point to put in R.
+/// @return The signature.
+[[nodiscard]] Ed25519Signature SignatureWithR(Ed25519PublicKey const& r)
+{
+    auto signature = Ed25519Signature {};
+    std::ranges::copy(r, signature.begin());
+    return signature;
+}
+
+/// Messages a forged signature is tried against: empty, short, and the RFC's longest.
+[[nodiscard]] std::vector<std::vector<std::byte>> ForgeryMessages()
+{
+    return { {}, FromHex("72"), FromHex("6120736d616c6c2d6f726465722052"), FromHex(Test1024Message) };
+}
+
+/// The message every `SmallOrderRSignatures` entry signs: "a small-order R".
+constexpr std::string_view SmallOrderRMessage = "6120736d616c6c2d6f726465722052";
+
+/// Signatures of `SmallOrderRMessage` by RFC 8032 TEST 1's key whose R is each `SmallOrderEncodings`
+/// row, in order, sign bit clear and then set.
+///
+/// Made in exact arithmetic outside this build: S = h * a mod L, with a the key's clamped scalar
+/// and h = SHA-512(R || A || M) mod L. The cofactored equation holds for each, since
+/// [8](SB - hA - R) = [8](-R) = 0, so these are signatures that VERIFIED before the seam refused a
+/// small-order R -- by the key's holder, of an R nobody honest would pick. A is the RFC's, so only
+/// the question asked of R refuses them.
+constexpr std::array<std::string_view, SmallOrderEncodings.size() * 2> SmallOrderRSignatures {
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "be86bb2483fdbd46579f9f074cbffad6e290c9b2d6069bfc22383dc5dcb0ad03",
+    "0000000000000000000000000000000000000000000000000000000000000080"
+    "51c934d9a69e7f78650055b6176e402014a0233f1617933d74f47f5d915fc50f",
+    "0100000000000000000000000000000000000000000000000000000000000000"
+    "0fab24bf05c36de39d4e5ce078799b6a8ac08e9a041b7b75923021634ef83207",
+    "0100000000000000000000000000000000000000000000000000000000000080"
+    "8d346451d7b24d485e60dc69652c42486422f43116793d7de7a400eaf7ea2002",
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"
+    "1b1aa7f052e632b27b24a3a6ea3abe85ac07787fa5ca26149986738574b3b202",
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85"
+    "5508f278e231503068d0823d7aa00cd3a9c96dc60d69a29934903bc884f7fc0f",
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"
+    "0574ebe8d16710b3fa5821a51e9efae537d4a965a60f6ab5c3494ac62cd96203",
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa"
+    "4ddce84135432330486d5ea980a9aefcbbdc5c44469d78254d680f581cd6a406",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+    "b4873f47bd2d7b21d2ba3d72551e12ac1f469030e99314b56c88f82d6c48d404",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    "a783c9c8578daac3daae64fbf484866f42517c415469f2c16a3e13f34bfcfb00",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+    "3003a4b37aba2832d0cb74622ca0445ca3c61218cd073b3907fcc70e44005c0b",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    "21036dabf9c31a11361d0a9831d7085b90e5974827e9816dabd77f16cb5e000e",
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+    "b5b703bdbed4aa336c074c3b717b3d3f4e498063684dda44cd3d98425ba64b0c",
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    "7fe55432b881742a7655103da7bd5dbcb65d162be570daa90f3b4718f7fe310a",
+};
 
 /// The key pair @p vector's seed determines. The seed's length is the RFC's, so this cannot refuse.
 /// @param vector The vector.
@@ -323,22 +407,194 @@ TEST_CASE("A public key's text is refused by what is wrong with it", "[core][cry
 
     // Cut short and run long -- the second is also what padding looks like, which a key's
     // spelling never carries.
-    CHECK(faultOf(Whole.substr(0, 42)) == PublicKeyTextFault::WrongLength);
-    CHECK(faultOf(std::string { Whole } + "=") == PublicKeyTextFault::WrongLength);
-    CHECK(faultOf("") == PublicKeyTextFault::WrongLength);
+    CHECK(faultOf(Whole.substr(0, 42)) == PublicKeyFault::WrongLength);
+    CHECK(faultOf(std::string { Whole } + "=") == PublicKeyFault::WrongLength);
+    CHECK(faultOf("") == PublicKeyFault::WrongLength);
 
     // The standard alphabet's spelling of the same key: `_` becomes `/`.
     auto standard = std::string { Whole };
     std::ranges::replace(standard, '_', '/');
-    CHECK(faultOf(standard) == PublicKeyTextFault::NotBase64Url);
+    CHECK(faultOf(standard) == PublicKeyFault::NotBase64Url);
 
     // A last character carrying a bit no 32-byte key has: `o` is 101000 and `p` is 101001, and
     // a decoder that dropped the two spare bits would read both as one key.
     auto nonCanonical = std::string { Whole };
     nonCanonical.back() = 'p';
-    CHECK(faultOf(nonCanonical) == PublicKeyTextFault::NotBase64Url);
+    CHECK(faultOf(nonCanonical) == PublicKeyFault::NotBase64Url);
 
     // Every fault has a sentence, and the sentence says what a key looks like.
-    CHECK(DescribePublicKeyTextFault(PublicKeyTextFault::WrongLength).contains("43"));
-    CHECK(DescribePublicKeyTextFault(PublicKeyTextFault::NotBase64Url).contains("base64url"));
+    CHECK(DescribePublicKeyFault(PublicKeyFault::WrongLength).contains("43"));
+    CHECK(DescribePublicKeyFault(PublicKeyFault::NotBase64Url).contains("base64url"));
+}
+
+TEST_CASE("Ed25519Verify refuses the all-zero key with the all-zero signature, for any message",
+          "[core][crypto][ed25519][negative]")
+{
+    // The reproduction: y = 0 is a point of order 4, as A and as R, and S = 0. Monocypher's
+    // cofactored equation multiplies the whole difference by 8, so it held for every message --
+    // an attacker who never saw the challenge could "prove" any self-certified key this way.
+    std::size_t accepted = 0;
+    for (auto const& message: ForgeryMessages())
+        if (Ed25519Verify(Ed25519PublicKey {}, message, Ed25519Signature {}))
+            ++accepted;
+    CHECK(accepted == 0);
+}
+
+TEST_CASE("Ed25519Verify refuses every small-order key with a small-order R and S = 0, either sign",
+          "[core][crypto][ed25519][negative]")
+{
+    // Each row as A, both signs, with R the all-zero point, the row itself and the row as signed:
+    // every combination is a forgery the cofactored equation accepts, needing no secret and no
+    // arithmetic, and none may verify. Either question refuses these; the next two cases take
+    // one at a time.
+    std::size_t tried = 0;
+    std::size_t accepted = 0;
+    for (auto const hex: SmallOrderEncodings)
+    {
+        auto const row = ArrayFromHex<Ed25519PublicKeyBytes>(hex);
+        for (auto const& key: { row, WithSignBitSet(row) })
+        {
+            for (auto const& signature: { Ed25519Signature {}, SignatureWithR(row), SignatureWithR(key) })
+            {
+                for (auto const& message: ForgeryMessages())
+                {
+                    ++tried;
+                    if (Ed25519Verify(key, message, signature))
+                        ++accepted;
+                }
+            }
+        }
+    }
+    CHECK(tried == SmallOrderEncodings.size() * 2 * 3 * ForgeryMessages().size());
+    CHECK(accepted == 0);
+}
+
+TEST_CASE("Ed25519Verify refuses a small-order key even when R is an ordinary point", "[core][crypto][ed25519][negative]")
+{
+    // The forgery that isolates A: R = B, the base point, and S = 1, so SB - R = 0 and the
+    // cofactored equation is left with [8](-hA), which is zero for every h when A has small order.
+    // R is of prime order here, so nothing but the question asked of A refuses this.
+    constexpr std::string_view BaseTimesOne = "5866666666666666666666666666666666666666666666666666666666666666"
+                                              "0100000000000000000000000000000000000000000000000000000000000000";
+    auto const signature = ArrayFromHex<Ed25519SignatureBytes>(BaseTimesOne);
+    std::size_t accepted = 0;
+    for (auto const hex: SmallOrderEncodings)
+    {
+        auto const row = ArrayFromHex<Ed25519PublicKeyBytes>(hex);
+        for (auto const& key: { row, WithSignBitSet(row) })
+        {
+            for (auto const& message: ForgeryMessages())
+            {
+                if (Ed25519Verify(key, message, signature))
+                    ++accepted;
+            }
+        }
+    }
+    CHECK(accepted == 0);
+}
+
+TEST_CASE("Ed25519Verify refuses a small-order R even under an honest key", "[core][crypto][ed25519][negative]")
+{
+    auto const keyPair = KeyPairOf(Rfc8032Vectors[0]);
+    auto const message = FromHex(SmallOrderRMessage);
+
+    // The control: the same key signs and verifies the same message honestly, so a refusal below
+    // is about R and nothing else.
+    REQUIRE(Ed25519Verify(keyPair.PublicKey(), message, keyPair.Sign(message)));
+
+    for (auto const index: std::views::iota(std::size_t { 0 }, SmallOrderRSignatures.size()))
+    {
+        CAPTURE(index);
+        auto const signature = ArrayFromHex<Ed25519SignatureBytes>(SmallOrderRSignatures[index]);
+
+        // Each entry's R is its row, so the table cannot drift from the blocklist it covers.
+        auto const row = ArrayFromHex<Ed25519PublicKeyBytes>(SmallOrderEncodings[index / 2]);
+        auto const r = index % 2 == 0 ? row : WithSignBitSet(row);
+        REQUIRE(std::ranges::equal(std::span { signature }.first<Ed25519PublicKeyBytes>(), r));
+
+        CHECK_FALSE(Ed25519Verify(keyPair.PublicKey(), message, signature));
+    }
+}
+
+TEST_CASE("Ed25519PublicKeyFaultOf names every small-order encoding, either sign", "[core][crypto][ed25519][negative]")
+{
+    for (auto const hex: SmallOrderEncodings)
+    {
+        CAPTURE(hex);
+        auto const row = ArrayFromHex<Ed25519PublicKeyBytes>(hex);
+        CHECK(Ed25519PublicKeyFaultOf(row) == std::optional { PublicKeyFault::SmallOrder });
+        CHECK(Ed25519PublicKeyFaultOf(WithSignBitSet(row)) == std::optional { PublicKeyFault::SmallOrder });
+        CHECK_FALSE(Ed25519PublicKeyIsUsable(row));
+        CHECK_FALSE(Ed25519PublicKeyIsUsable(WithSignBitSet(row)));
+    }
+}
+
+TEST_CASE("Ed25519PublicKeyFaultOf names a y at or above p non-canonical, and nothing below it",
+          "[core][crypto][ed25519][negative]")
+{
+    // Monocypher masks bit 255 and reduces y modulo p, so it decodes y + p as y. p + 3 is a point
+    // ON the curve that way -- a second spelling of y = 3, which a revocation keyed on bytes would
+    // miss -- p + 2 is not a point at all, and 2^255 - 1 is the largest y there is. Each is refused
+    // by the ENCODING, with either sign; p - 2, one below the order-2 row, is canonical.
+    constexpr auto NonCanonicalEncodings =
+        std::array<std::string_view, 3> { "f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+                                          "efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+                                          "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f" };
+    for (auto const hex: NonCanonicalEncodings)
+    {
+        CAPTURE(hex);
+        auto const key = ArrayFromHex<Ed25519PublicKeyBytes>(hex);
+        CHECK(Ed25519PublicKeyFaultOf(key) == std::optional { PublicKeyFault::NonCanonical });
+        CHECK(Ed25519PublicKeyFaultOf(WithSignBitSet(key)) == std::optional { PublicKeyFault::NonCanonical });
+    }
+    CHECK_FALSE(Ed25519PublicKeyFaultOf(
+                    ArrayFromHex<Ed25519PublicKeyBytes>("ebffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"))
+                    .has_value());
+}
+
+TEST_CASE("Every key a seed derives is usable, and still signs and verifies", "[core][crypto][ed25519]")
+{
+    // The positive control the refusals above need: the check refuses the torsion subgroup and the
+    // non-canonical spellings, never a key a node actually mints. A spread of seeds, and the RFC's.
+    for (auto const fill: { 0x00, 0x01, 0x42, 0x7F, 0x80, 0xFF })
+    {
+        CAPTURE(fill);
+        std::vector<std::byte> seed(Ed25519SeedBytes, static_cast<std::byte>(fill));
+        seed.front() ^= std::byte { 0x5A };
+        auto const keyPair = Ed25519KeyPair::FromSeed(seed);
+        REQUIRE(keyPair.has_value());
+        CHECK(Ed25519PublicKeyIsUsable(keyPair->PublicKey()));
+        auto const message = FromHex(SmallOrderRMessage);
+        CHECK(Ed25519Verify(keyPair->PublicKey(), message, keyPair->Sign(message)));
+    }
+    for (auto const& vector: Rfc8032Vectors)
+    {
+        CAPTURE(vector.name);
+        CHECK(Ed25519PublicKeyIsUsable(ArrayFromHex<Ed25519PublicKeyBytes>(vector.publicKey)));
+    }
+}
+
+TEST_CASE("A public key's text is refused when its point is small-order or non-canonical",
+          "[core][crypto][ed25519][negative]")
+{
+    // The all-zero key, which is a perfectly formed 43 characters, and p + 3.
+    auto const zero = ParseEd25519PublicKey("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    REQUIRE_FALSE(zero.has_value());
+    CHECK(zero.error() == PublicKeyFault::SmallOrder);
+
+    auto const nonCanonical = ParseEd25519PublicKey("8P_______________________________________38");
+    REQUIRE_FALSE(nonCanonical.has_value());
+    CHECK(nonCanonical.error() == PublicKeyFault::NonCanonical);
+
+    // Every row, through the one encoder, so the text of each is refused and not only its bytes.
+    for (auto const hex: SmallOrderEncodings)
+    {
+        CAPTURE(hex);
+        auto const parsed = ParseEd25519PublicKey(FormatEd25519PublicKey(ArrayFromHex<Ed25519PublicKeyBytes>(hex)));
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error() == PublicKeyFault::SmallOrder);
+    }
+
+    CHECK(DescribePublicKeyFault(PublicKeyFault::SmallOrder).contains("small order"));
+    CHECK(DescribePublicKeyFault(PublicKeyFault::NonCanonical).contains("non-canonically"));
 }

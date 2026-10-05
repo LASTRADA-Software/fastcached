@@ -53,7 +53,8 @@ class ClusterStateMachine final: public Consensus::IRaftStateMachine
     /// Whether @p command decodes as a command this build applies.
     ///
     /// `DecodeCommand`'s refusal, restated for bytes this node HOLDS (#1542): another
-    /// build's encoding -- an older command version, or a verb this build lacks -- is
+    /// build's encoding -- an older command version, a verb this build lacks, or one it
+    /// retired -- is
     /// `UnsupportedFormatVersion` with both versions stated, and only bytes that are not
     /// a command at all are `StorageFailure`.
     /// @param command An entry's payload.

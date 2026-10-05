@@ -29,10 +29,13 @@ namespace FastCache::Node
 /// machine compiled minutes ago. Pointing the launcher at its local node puts
 /// `LocalCache` in that path, and that is what makes a rebuild on a slow link free.
 ///
-/// A node answers `Store`, `Fetch` and `CacheDrop` and nothing else. The scheduler's verbs
-/// belong to `SchedulerProtocol` and `Compile` to `WorkerProtocol`; each refuses
-/// the others with `DispatchNotPermitted`, as a reply rather than a close, so a
-/// client that reached the wrong port learns which.
+/// A tier answers the fetch and store verbs its `CacheTierProfile` names, plus `CacheDrop`
+/// where the profile serves it, and nothing else: the private tier `Fetch`, `Store` and
+/// `CacheDrop`, the fleet's shared tier `SharedFetch` and `SharedStore`. The other tier's verbs
+/// are refused `DispatchNotPermitted` here, naming the other tier: they are served on this node,
+/// by the tier whose profile names them. The scheduler's verbs belong to `SchedulerProtocol`
+/// and `Compile` to `WorkerProtocol`; each refuses the others with `DispatchNotPermitted`, as a
+/// reply rather than a close, so a client that reached the wrong port learns which.
 ///
 /// `Auth` is the exception, and refusing it correctly is a **wire contract**: it
 /// is answered `CompileCacheWire::UnimplementedVerb`, because that is the one
@@ -54,6 +57,10 @@ class CacheProxy
     ///        nothing rises is a probed port that looks unused (#326, #491) -- and
     ///        because `Cc::Refuse` takes a sink, so there is no way to spell a counted
     ///        refusal without one.
+    ///
+    /// Which tier this is -- the verbs it answers and the counters its refusals move -- is
+    /// `cache.Profile()`, read on every request rather than taken here as well: a second copy
+    /// is a second place for the proxy and its storage to disagree about which tier they are.
     CacheProxy(LocalCache& cache, IMetricsSink& metrics) noexcept:
         _cache { cache },
         _metrics { metrics }

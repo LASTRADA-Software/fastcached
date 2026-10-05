@@ -160,6 +160,15 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# No C++20 module scanning, whatever builds this tree. This project has no module units, so the
+# scan is pure overhead -- and it is not only overhead: under it Ninja runs dyndep edges, and the
+# ninja 1.13.2 Visual Studio 18 ships asserts in them (`edge && !edge->outputs_ready()`,
+# build.cc:435) and then hangs on the assertion dialog. It used to be off only while a compiler
+# launcher was in use (`cmake/portable/CompileCache.cmake`, which keeps its own reason), so every
+# reference build -- `-DUSE_COMPILER_CACHE=OFF`, the local gate among them -- scanned and could
+# hang. A normal variable, so a cache entry cannot turn it back on.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 
@@ -211,6 +220,11 @@ option(FASTCACHED_BUILD_TUI "Build core-cpp's terminal UI (fastcache-cli live-st
 # the USE_COMPILER_CACHE option.
 
 include(CompileCache)
+
+# No MSVC-style link in a debug-info configuration is incremental -- on every such build,
+# never only a launcher-fronted one. Here, before any dependency or target exists, so all
+# of them read it. Why: cmake/IncrementalLink.cmake.
+include(IncrementalLink)
 
 # Default install/runtime/library output directories.
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
@@ -309,10 +323,19 @@ if(FASTCACHED_BUILD_TESTS)
     # reads the version below and refuses once it moves past the one that
     # mechanism was reasoned about, with the re-evaluation and the guard that has
     # to survive it spelled out in the refusal (#312).
+    #
+    # SYSTEM, for the reason libunicode and core-cpp are: third-party headers are not governed
+    # by this project's warning policy. Without it, the CPM route handed Catch2's headers to
+    # every test TU as an ordinary include, and clang-cl reported -Wmicrosoft-cast from
+    # `catch_tostring.hpp` under this project's /W4 -- sixteen times per clangcl-release build,
+    # which /WX turns into a failure in code this project does not own. The find_package route
+    # was already system (an IMPORTED target's include directories are), so this makes the two
+    # routes agree rather than adding a special case.
     CPMAddPackage(
         NAME Catch2
         GITHUB_REPOSITORY catchorg/Catch2
         VERSION 3.6.0
+        SYSTEM YES
     )
 
     # Locate the directory shipping Catch.cmake (providing catch_discover_tests)
@@ -490,8 +513,8 @@ endif()
 CPMAddPackage(
     NAME core-cpp
     GITHUB_REPOSITORY contour-terminal/core-cpp
-    GIT_TAG v0.5.0
-    VERSION 0.5.0
+    GIT_TAG v0.6.0
+    VERSION 0.6.0
     SYSTEM YES
     EXCLUDE_FROM_ALL YES
     OPTIONS
@@ -519,6 +542,7 @@ include(Monocypher)
 # point, so yaml-cpp, Catch2 and Tracy are left uninstrumented rather than
 # instrumented and then filtered back out of the report.
 
+include(PedanticSuppressions)
 include(PedanticCompiler)
 include(Sanitizers)
 include(Coverage)
@@ -693,7 +717,10 @@ if(WIN32)
     #
     # bcrypt: BCryptGenRandom, behind Core/ISecureRandom -- where every handshake nonce
     # and every minted node id comes from (#1527). PUBLIC for the same reason.
-    target_link_libraries(FastCache PUBLIC ws2_32 iphlpapi bcrypt)
+    #
+    # ole32 + oleaut32: COM and BSTRs, behind Platform/WindowsFirewall -- the
+    # INetFwPolicy2 rules a service registration opens and an uninstall removes.
+    target_link_libraries(FastCache PUBLIC ws2_32 iphlpapi bcrypt ole32 oleaut32)
     target_compile_definitions(FastCache PUBLIC
         WIN32_LEAN_AND_MEAN
         NOMINMAX
@@ -709,6 +736,16 @@ add_subdirectory(src/FastCache)
 # that gates each one. The shipped binaries are fastcached and fastcache-cc;
 # compile-cache-testclient is test infrastructure and is off by default.
 
+# The component every package's SHARED payload installs under: the docs, the licence, the VC++
+# runtime. On Windows that is the required Cli feature, so an operator deselecting a service
+# never deselects the files every feature needs; elsewhere it is the one Runtime payload.
+if(WIN32)
+    set(FASTCACHED_SHARED_COMPONENT "Cli")
+else()
+    set(FASTCACHED_SHARED_COMPONENT "Runtime")
+endif()
+set_property(GLOBAL APPEND PROPERTY FASTCACHED_FIRST_PARTY_COMPONENTS "${FASTCACHED_SHARED_COMPONENT}")
+
 add_subdirectory(src/apps)
 
 # ----------------------------------------------------------------------------
@@ -722,7 +759,7 @@ install(FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
         "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
     DESTINATION "${FASTCACHED_INSTALL_DOCDIR}"
-    COMPONENT Runtime
+    COMPONENT "${FASTCACHED_SHARED_COMPONENT}"
 )
 
 # ----------------------------------------------------------------------------

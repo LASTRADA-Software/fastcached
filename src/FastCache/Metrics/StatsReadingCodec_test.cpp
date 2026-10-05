@@ -355,7 +355,151 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    // Moved by #178's node identity handshake: five counters joined the catalogue -- a proof whose
+    // Moved when a node could be pinned to one fleet (`--fleet-id`): two counters joined the
+    // catalogue -- a proven fleet the pin kept a solitary node from asking
+    // (`formation_yields_refused_pin`), and a move into another cluster a pinned node refused
+    // (`formation_admissions_refused_pin`) -- which changes which cells every live-stats reading
+    // carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when a worker began bounding its trust in the state it applied by its own consensus:
+    // one counter joined the catalogue for a grant refused because no leader that state counts has
+    // spoken for `LeaderSilenceBound` (`worker_jobs_refused_lease_isolated`), which changes which
+    // cells every live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when a joiner began signing its `Enroll`: one counter joined the catalogue for a request
+    // whose signature does not verify under the key it asks with (`enrollment_requests_refused_forged`),
+    // which changes which cells every live-stats reading carries. Clients and nodes upgrade together,
+    // as below.
+    //
+    // Moved when the certified roster retired: four counters left the catalogue with it
+    // (`worker_jobs_refused_lease_roster_expired`, `worker_rosters_refused_uncertified`,
+    // `worker_rosters_refused_expired`, `scheduler_roster_endorsements_refused`), and the snapshot's
+    // `rosterExpiresInSeconds` field went with the lapse it counted down to -- its presence bit
+    // retired, never reused. Every node verifies grants against the state it applied, which has
+    // no lapse. Clients and nodes upgrade together, as below.
+    //
+    // Moved by the state-file replace probe: one counter joined the catalogue for a serving body that
+    // found its state files replaced by the classic rename (`state_file_replaces_fell_back`), which
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together, as
+    // below.
+    //
+    // Moved when a pending node began holding an admission's signature to a key it proved for the
+    // fleet it asked: one counter joined the catalogue (`formation_admissions_unverified`). Clients
+    // and nodes upgrade together, as below.
+    //
+    // Moved by the ceilings on what REGISTER and NODE-ANNOUNCE keep: two counters joined the
+    // catalogue for a registration (`dispatch_worker_registrations_field_too_long`) and an
+    // announcement (`dispatch_node_announcements_field_too_long`) refused for a string longer than a
+    // scheduler records, which changes which cells every live-stats reading carries. Clients and
+    // nodes upgrade together, as below.
+    //
+    // Moved by the unserved-toolchain record before that: two counters joined the catalogue for the LEASE a
+    // scheduler refuses before it keeps anything the lease names -- a key, fingerprint or label
+    // that is not UTF-8 (`dispatch_leases_malformed`) and one longer than a scheduler records
+    // (`dispatch_leases_field_too_long`) -- which changes which cells every live-stats reading
+    // carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved by a lease exclusion list before that: `dispatch_leases_all_excluded` joined the catalogue after
+    // `withdrawn`, for a lease whose every matching worker the client had excluded. Clients and
+    // nodes upgrade together, as below.
+    //
+    // Moved by the fleet's shared cache: fifteen counters joined the catalogue -- the
+    // shared tier's hits, misses, store failures and seven refusals, and the client's wrong-key,
+    // failed-proof, unresolved, stale-hint and sessions-opened tallies. Clients and nodes upgrade
+    // together, as below.
+    //
+    // Moved when a machine became forgotten by its key alone before that:
+    // `node_requests_refused_host_forgotten` left the catalogue with the host tombstones it
+    // counted, which changes which cells every live-stats reading carries. Clients and nodes
+    // upgrade together, as below.
+    //
+    // Moved by the machine ticket before that: eleven counters joined the catalogue -- a ticket a node
+    // accepted (`node_tickets_accepted`) and one row per way a node refuses one (`malformed`,
+    // `not_utf8`, `no_roster`, `unknown_machine`, `forged`, `revoked`, `wrong_audience`,
+    // `expired`, `replayed`, `spent_set_full`) -- which changes which cells every live-stats
+    // reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when a pending node began refusing an admission its proven fleet did not vouch for: one
+    // counter joined the catalogue (`formation_admissions_refused`). Clients and nodes upgrade
+    // together, as below.
+    //
+    // Moved when the enroll door began holding a joiner's id to the one id bound: one counter joined
+    // the catalogue, for a request refused because its id is longer than `MaxIdBytes`
+    // (`enrollment_requests_refused_id_too_long`). Clients and nodes upgrade together, as below.
+    //
+    // Moved when zero-config formation gained its controller: two counters joined the catalogue --
+    // the joins a solitary node decided to ask for (`formation_yields`) and the ones it gave up on
+    // when the fleet stopped answering (`formation_joins_abandoned`) -- which changes which cells
+    // every live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when an approval began naming the key it admits: one counter joined the catalogue, for
+    // an approval refused because its key is not the row's (`enrollment_approvals_refused_key_mismatch`),
+    // which changes which cells every live-stats reading carries. Clients and nodes upgrade
+    // together, as below.
+    //
+    // Moved when the enrollment list became bounded per source host: two counters joined the
+    // catalogue -- a request refused because its host already held its share
+    // (`enrollment_requests_refused_host_cap`), and the rows `--enroll-clear` dropped
+    // (`enrollment_requests_cleared`) -- which changes which cells every live-stats reading
+    // carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when a leader could arm an auto-approve deadline: one counter joined the catalogue,
+    // for the joiners it admitted with nobody comparing a key (`enrollment_approvals_auto`), which
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together,
+    // as below.
+    //
+    // Moved when a leader began recording every joiner without an open window: two counters
+    // joined the catalogue -- a request forgotten after its machine stopped asking before anybody
+    // decided about it (`enrollment_requests_expired`), and a joiner an operator admitted by name
+    // (`enrollment_approvals_manual`) -- which changes which cells every live-stats reading
+    // carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when discovery began budgeting its signature checks: one counter joined the catalogue
+    // for a proof answering a live challenge whose signature was not checked, past the check budget
+    // (`discovery_proof_checks_withheld`). That changes which cells every live-stats reading
+    // carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when discovery stopped replying with more than it was sent and began rate-limiting its
+    // answers: one counter joined the catalogue for a challenge or a proof withheld, larger than
+    // the datagram that provoked it or past the answer budget (`discovery_replies_withheld`). That
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together, as
+    // below.
+    //
+    // Moved when discovery began challenging other fleets: one counter joined the catalogue for a
+    // beacon dropped at a bound, a new node past the outstanding challenges or a new fleet past
+    // the ones remembered (`discovery_beacons_over_bound`). That changes which cells every
+    // live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when a member's seat began saying how it is reached: the no-session drop split in
+    // two, and one counter joined the catalogue for a message to a peer the transport can place
+    // nowhere, neither dialled nor dialling in (`raft_sends_dropped_unknown_peer`), apart from a
+    // learner that dials in and has no session attached (`raft_sends_dropped_no_session`). That
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together,
+    // as below.
+    //
+    // Moved when a learner's transport began reading what the leader writes on the session it
+    // dialled: eight counters joined the catalogue for a frame the reading end cannot use. Five are
+    // the dialler's, for the direction only it reads -- a tag that does not verify
+    // (`raft_peer_dials_ended_frame_tag`), a message naming another member (`_frame_sender`), a
+    // frame this build cannot read (`_frame_unreadable`), one over the cap (`_frame_over_cap`) and
+    // one that is not this wire (`_frame_bad_magic`) -- and three are the acceptor's endings that
+    // had been logged and never counted (`raft_peer_frames_refused_unreadable`, `_over_cap`,
+    // `_bad_magic`). That changes which cells every live-stats reading carries. Clients and nodes
+    // upgrade together, as below.
+    //
+    // Moved when a leader began writing to a learner on the session the learner dialled: two
+    // counters joined the catalogue -- a message dropped for a peer this node neither dials nor
+    // holds a session from (`raft_sends_dropped_no_session`), and a session a newer one from the
+    // same id superseded (`raft_inbound_sessions_superseded`) -- which changes which cells every
+    // live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved by zero-config formation: two counters left the catalogue with the enrollment window
+    // an operator opened -- `enrollment_requests_refused_closed`, since every request is now
+    // recorded, and `enrollment_windows_opened`, since there is nothing left to open -- which
+    // changes which cells every live-stats reading carries. Clients and nodes upgrade together,
+    // as below.
+    //
+    // Moved by #178's node identity handshake before that: five counters joined the catalogue -- a proof whose
     // key the cluster does not hold or has revoked (`node_proofs_refused_unknown_key`,
     // `_revoked_key`), a request refused on a connection a revoked key marked
     // (`node_requests_refused_key_revoked`), a sealed frame that failed its tag
@@ -409,7 +553,69 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved by #1484 before that: the counter cells carry a second bitmap saying WHICH absence
     // each absent cell is, so `StatsReadingWire::Grammar` went to `-4`.
-    CHECK(StatsReadingLayout == 0x901eb685752f8f7aULL);
+    //
+    // Moved when the node's password gate went: seven counters no writer could move any more left
+    // the catalogue (the scheduler's three credential rows, the compile surface's three, and the
+    // enrollment surface's unauthenticated row). Clients and nodes upgrade together, as above.
+    //
+    // Moved when a node began minting machine tickets: five counters joined the catalogue
+    // (`node_tickets_minted` and the four `node_ticket_mints_refused_*` rows). Clients and nodes
+    // upgrade together, as above.
+    //
+    // Moved when lane 2b's admission counters were appended after lane 2a's formation rows, in
+    // integration order (ruling 8). Read off the built test, never computed by hand.
+    //
+    // Moved again when an operator's control verbs began refusing a caller only `--fleet-open`
+    // admitted: two counters joined the catalogue, one per surface that refuses one. Clients and
+    // nodes upgrade together, as above.
+    //
+    // Moved when lane 2c's fifteen shared-cache counters joined the catalogue, after lane 2b's in
+    // integration order (ruling 8). Read off the built test, never computed by hand.
+    //
+    // Moved when lane 3's `dispatch_leases_all_excluded` joined the catalogue after `withdrawn`, in
+    // integration order (ruling 8). Read off the built test, never computed by hand.
+    //
+    // Moved when lane 2a's `formation_admissions_unverified` joined the catalogue after lane 3's
+    // rows, in integration order (ruling 8). Read off the built test, never computed by hand.
+    //
+    // Moved when lane 2a's `state_file_replaces_fell_back` joined the catalogue after it, in
+    // integration order (ruling 8). Read off the built test, never computed by hand.
+    //
+    // Moved when step 20 put lane 2a batch 2's counters after integration's own rows (ruling 8),
+    // `formation_admissions_unverified` after `dispatch_node_announcements_field_too_long` and
+    // `state_file_replaces_fell_back` last. Read off the built test, never computed by hand.
+    //
+    // Moved when batch 3 picked the certified roster's retirement onto that order: its four
+    // counters and the `rosterExpiresInSeconds` field left, as the first paragraph says. Read off
+    // the built test, never computed by hand.
+    //
+    // Moved when batch 3 picked `enrollment_requests_refused_forged` after
+    // `enrollment_requests_refused_revoked_key`, where the lane put it. Read off the built test,
+    // never computed by hand.
+    //
+    // Moved when batch 3 picked `worker_jobs_refused_lease_isolated` where the lane put it. Read off
+    // the built test, never computed by hand.
+    //
+    // Moved when batch 3 merged the rest of lane 2a in one: its counters joined where the lane put
+    // them. Read off the built test, never computed by hand.
+    //
+    // Moved when integration appended `state_directory_syncs_unsupported` after
+    // `state_file_replaces_fell_back` (R-A), and again when it appended
+    // `node_proofs_refused_roster_not_yet_applied` after that (M3). Read off the built test, never
+    // computed by hand.
+    //
+    // Moved when the two `..._refused_operator_standing_required` counters joined after their
+    // identified-caller twins (W-1: a learner's ticket is no operator). Read off the built test,
+    // never computed by hand.
+    //
+    // Moved when `raft_peer_dials_ended_silent` joined after `raft_peer_dials_ended_frame_bad_magic`
+    // (W-3: a learner's two-way session ends at its idle bound). Read off the built test, never
+    // computed by hand.
+    //
+    // Moved when the disk budget became the store's page footprint: `StorageStats` gained
+    // `fileBytes`, the length of the file backing a tier, which every storage block now carries
+    // beside `bytesUsed`. Clients and nodes upgrade together. Read off the built test.
+    CHECK(StatsReadingLayout == 0xdf701fde48c24916ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

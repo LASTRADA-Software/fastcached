@@ -23,6 +23,19 @@ endfunction()
 option(PEDANTIC_COMPILER "Compile the project with almost all warnings turned on." OFF)
 option(PEDANTIC_COMPILER_WERROR "Enables -Werror to force warnings to be treated as errors." OFF)
 
+# PEDANTIC_COMPILER_MSVC_SUPPRESSIONS -- set by the including project BEFORE `include()`: the
+# warnings `/W4` makes visible that the project has decided to suppress, one `<flag>|<rationale>`
+# row each, for example
+#
+#     set(PEDANTIC_COMPILER_MSVC_SUPPRESSIONS
+#         "/wd4324|reports intended padding from alignas, every site a deliberate cache-line layout")
+#
+# A row is for a warning that reports INTENDED behaviour and has no source change that keeps the
+# behaviour; anything a source edit can address is fixed at the source. The rationale is
+# mandatory -- a row without one stops the configure -- so that a row nobody can judge cannot be
+# added. No ';' in a row: a list splits on it. Unset, nothing is suppressed. The rows apply under
+# `PEDANTIC_COMPILER`, beside `/W4`, and to an MSVC-frontend driver only (cl and clang-cl).
+
 # Always show diagnostics in colored output.
 try_add_compile_options(-fdiagnostics-color=always)
 
@@ -36,9 +49,25 @@ if(${PEDANTIC_COMPILER})
         #try_add_compile_options(/Zc:externConstexpr)
         try_add_compile_options(/Zc:inline)
         #try_add_compile_options(/Zc:templateScope)
-        # if(${PEDANTIC_COMPILER_WERROR})
-        #    try_add_compile_options(/WX)
-        # endif()
+
+        # The suppressions `/W4` makes necessary, applied under the SAME condition as `/W4` --
+        # `PEDANTIC_COMPILER`, never `PEDANTIC_COMPILER_WERROR`, which decides fatality and not
+        # which warnings exist. The ROWS are the including project's, in
+        # `PEDANTIC_COMPILER_MSVC_SUPPRESSIONS` (see the top of this file); this module owns only
+        # the mechanism: where they apply, and that none arrives without its rationale.
+        foreach(row IN LISTS PEDANTIC_COMPILER_MSVC_SUPPRESSIONS)
+            string(FIND "${row}" "|" separator)
+            if(separator LESS 1)
+                message(FATAL_ERROR "PedanticCompiler: suppression row `${row}` names no flag or no rationale; a row is `<flag>|<rationale>` -- or a ';' in the row, which foreach(IN LISTS) splits into two")
+            endif()
+            string(SUBSTRING "${row}" 0 ${separator} suppression)
+            math(EXPR rationaleStart "${separator} + 1")
+            string(SUBSTRING "${row}" ${rationaleStart} -1 rationale)
+            if(rationale STREQUAL "")
+                message(FATAL_ERROR "PedanticCompiler: suppression row `${row}` has an empty rationale")
+            endif()
+            try_add_compile_options(${suppression})
+        endforeach()
     elseif(("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU") OR ("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang"))
         message(STATUS "Enabling pedantic compiler options: yes (Clang/GCC)")
         # TODO: check https://github.com/lefticus/cppbestpractices/blob/master/02-Use_the_Tools_Available.md#compilers
@@ -159,15 +188,24 @@ endif()
 # paired `-Wno-error=` rows stop being belt-and-braces and start carrying their
 # own weight, which is what they are for.
 if(${PEDANTIC_COMPILER_WERROR})
-    # The SAME condition the block sat under before it was lifted, and the frontend
-    # half is load-bearing. `clang-cl` reports `CMAKE_CXX_COMPILER_ID` as `Clang`
-    # with `CMAKE_CXX_COMPILER_FRONTEND_VARIANT` as `MSVC`, and the MSVC arm above
-    # deliberately adds no `-Werror` (its `/WX` has been commented out since before
-    # any of this). Guarding on the ID alone therefore does not "restore" the old
-    # behaviour -- it EXTENDS `-Werror` to a configuration that never had it, and
-    # `Windows-clangcl-release` went red on `_wfopen is deprecated` immediately.
-    if(NOT ("${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
-       AND (("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU") OR ("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")))
+    # Warnings are fatal on EVERY driver when this is on, each in its own spelling, and the
+    # FRONTEND picks the spelling, never the compiler ID. `clang-cl` reports ID `Clang` with
+    # frontend `MSVC`: it takes the MSVC pedantic arm above (`/W4`), so it takes `/WX` here --
+    # not `-Werror`, and not the GNU-spelled `-Wno-error=` rows below, which name diagnostics of
+    # the GNU arm's set.
+    #
+    # The MSVC half used to be missing. Its `/WX` sat commented out inside the pedantic arm from
+    # the first commit, so every Windows preset set this ON and nothing became fatal, while
+    # AGENT.md said warnings break the Windows build. Master's four Windows CI legs were green
+    # over fourteen first-party warning sites.
+    #
+    # A warning `/WX` meets is fixed at the SOURCE. One that reports intended behaviour, and has
+    # no source change that keeps the behaviour, becomes a row of `pedanticMsvcSuppressions`
+    # beside `/W4` -- a statement about which warnings exist, so it is `PEDANTIC_COMPILER`'s --
+    # never an exemption from fatality here.
+    if("${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
+        try_add_compile_options(/WX)
+    elseif(("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU") OR ("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang"))
         try_add_compile_options(-Werror)
 
         # Fatality only. `-Wno-error=X` says "keep X visible, do not fail on

@@ -171,6 +171,7 @@ if(FASTCACHED_PACKAGE_ROOT_PREFIX)
         list(GET _fields 2 _kind)
         list(GET _fields 3 _name)
         list(GET _fields 4 _component)
+        set_property(GLOBAL APPEND PROPERTY FASTCACHED_FIRST_PARTY_COMPONENTS "${_component}")
 
         # An absolute source is a generated file already in the build tree; a
         # relative one is shipped from this directory.
@@ -330,18 +331,28 @@ if(WIN32)
     #
     # etc/ mirrors the macOS layout (<prefix>/etc/fastcached.yaml.default) so
     # both packages spell the template's home the same way.
-    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/config/fastcached.yaml"
-        DESTINATION "etc"
-        RENAME "fastcached.yaml.default"
-        COMPONENT Runtime
-    )
+    #
+    # Each template installs with the feature of the app that reads it, so the MSI
+    # lays down a daemon template only where the daemon is selected, and a build
+    # without that app installs no template for it.
+    get_property(_daemonComponent GLOBAL PROPERTY FASTCACHED_COMPONENT_OF_fastcached)
+    get_property(_nodeComponent GLOBAL PROPERTY FASTCACHED_COMPONENT_OF_fastcache-compile-node)
+    if(_daemonComponent)
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/config/fastcached.yaml"
+            DESTINATION "etc"
+            RENAME "fastcached.yaml.default"
+            COMPONENT "${_daemonComponent}"
+        )
+    endif()
     # The worker's reference, same terms, same source file (#397). Seeded by the
     # same custom action, which takes the pair rather than one hardcoded name.
-    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/config/fastcache-compile-node.yaml"
-        DESTINATION "etc"
-        RENAME "fastcache-compile-node.yaml.default"
-        COMPONENT Runtime
-    )
+    if(_nodeComponent)
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/config/fastcache-compile-node.yaml"
+            DESTINATION "etc"
+            RENAME "fastcache-compile-node.yaml.default"
+            COMPONENT "${_nodeComponent}"
+        )
+    endif()
 
     set(FASTCACHED_WIX_PATCH_FILE "${CMAKE_CURRENT_SOURCE_DIR}/windows/service-actions.xml"
         CACHE INTERNAL "WiX patch fragment registering the fastcached service")

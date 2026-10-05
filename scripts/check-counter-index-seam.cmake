@@ -39,9 +39,14 @@ cmake_minimum_required(VERSION 3.28)
 # ---------------------------------------------------------------------------
 # What counts as converting a counter.
 #
-# A `static_cast` or `std::to_underlying` whose parenthesised operand, up to the end
-# of the statement, names `counter` or `Counter` as a whole word -- `counter`,
-# `row.counter`, `IMetricsSink::Counter::Last`, `NodeCounter::WorkerJobsCompleted`.
+# A `static_cast` or `std::to_underlying` whose parenthesised operand names `counter`
+# or `Counter` as a word ending there -- `counter`, `row.counter`,
+# `IMetricsSink::Counter::Last`, `NodeCounter::WorkerJobsCompleted`. The operand is the
+# BALANCED parenthesised expression the cast opens, walked character by character
+# (`fastcached_casts_a_counter`), so a name AFTER the cast's closing parenthesis is not
+# its operand: `Table[static_cast<std::size_t>(outcome)].counter` casts an outcome, and a
+# scan that read it as a counter conversion OVERSTATED what is wrong -- the same defect as
+# understating it, and the one this check shipped with until a caller met it.
 # Stated with its limits rather than implied:
 #
 #   - an operand spelled otherwise (`Row`, `c`, an alias) is NOT seen; `CounterCells`
@@ -49,8 +54,18 @@ cmake_minimum_required(VERSION 3.28)
 #   - the reverse direction, an integer made into a `Counter`, is NOT this rule;
 #   - `counters` (a plural, a different name) is not a match, and neither is a
 #     `Counter` that appears BEFORE the cast on the line;
-#   - the operand runs to the next `;`, so a longer expression naming a counter after
-#     the cast is refused rather than missed -- wider than exact, which fails closed.
+#   - the scan reads one line at a time, so an operand that continues onto the next
+#     line is NOT seen; an operand not closed on its line runs to the next `;` or the
+#     line's end, which is wider than exact and fails closed for what IS on the line;
+#   - the walk counts parentheses as characters and knows no literal, so a `)` inside a
+#     character or string literal ends the operand early. That fails OPEN: in
+#     `static_cast<std::size_t>(Parse(')') + counter)` the operand is read as
+#     `Parse('`, the counter after it is not seen, and the conversion is ACCEPTED. A `(`
+#     inside a literal fails the other way, running the operand on to the `;`. Neither
+#     shape exists in this tree; the direction is stated so nobody has to re-derive it.
+#
+# The regex below is the cheap first pass, and it is WIDER than the rule: its operand
+# runs to the next `;`. Only a line it matches is walked.
 #
 # Full-line and trailing `//` comments are stripped first, so prose that spells the
 # cast in backticks is not a violation: a check that failed on the reasoning would
@@ -123,11 +138,72 @@ foreach(row IN LISTS FastCachedCounterConverters)
     list(APPEND allowedCounts "${rowCount}")
     list(APPEND allowedReasons "${rowReason}")
 endforeach()
+# Whether @p code casts a counter: whether the operand of some `static_cast<...>(` or
+# `to_underlying(` on it names `counter`/`Counter` as a word ending there.
+#
+# The operand is the balanced parenthesised expression the cast opens -- depth counted
+# character by character, which no CMake regex can do -- and it ends at its matching `)`.
+# One that is not closed before a `;` or the line's end runs to there, which is wider than
+# exact and fails closed. Every cast on the line is asked, not only the first.
+# @param code One line, comments stripped.
+# @param outVar Set TRUE or FALSE.
+function(fastcached_casts_a_counter code outVar)
+    set(rest "${code}")
+    while(TRUE)
+        string(REGEX MATCH "(static_cast<[^>]*>|to_underlying)[ \t]*\\(" opener "${rest}")
+        if(opener STREQUAL "")
+            break()
+        endif()
+        string(FIND "${rest}" "${opener}" openerAt)
+        string(LENGTH "${opener}" openerLength)
+        math(EXPR operandAt "${openerAt} + ${openerLength}")
+        string(SUBSTRING "${rest}" ${operandAt} -1 rest)
+
+        # The statement ends the operand at the latest: nothing past a `;` is walked.
+        string(FIND "${rest}" ";" statementEnd)
+        if(statementEnd EQUAL -1)
+            string(LENGTH "${rest}" statementEnd)
+        endif()
+        set(depth 1)
+        set(operandLength ${statementEnd})
+        set(index 0)
+        while(index LESS statementEnd)
+            string(SUBSTRING "${rest}" ${index} 1 character)
+            if(character STREQUAL "(")
+                math(EXPR depth "${depth} + 1")
+            elseif(character STREQUAL ")")
+                math(EXPR depth "${depth} - 1")
+                if(depth EQUAL 0)
+                    set(operandLength ${index})
+                    break()
+                endif()
+            endif()
+            math(EXPR index "${index} + 1")
+        endwhile()
+        string(SUBSTRING "${rest}" 0 ${operandLength} operand)
+        if(operand MATCHES "[Cc]ounter([^A-Za-z0-9_]|$)")
+            set(${outVar} TRUE PARENT_SCOPE)
+            return()
+        endif()
+    endwhile()
+    set(${outVar} FALSE PARENT_SCOPE)
+endfunction()
+
 fastcached_globs_to_regex("${FastCachedCounterSourceGlobs}" sourceRegex)
 
-file(GLOB_RECURSE treeAll LIST_DIRECTORIES false "${sourceRoot}/*")
-set(sources ${treeAll})
-list(FILTER sources INCLUDE REGEX "${sourceRegex}")
+# Through `fastcached_tracked_files`, this tree's one answer to HOW a check finds its files,
+# rather than a traversal of its own: on DrvFs -- where every local gate tree takes its
+# sources from -- walking the tree and reading every file it found cost seconds a single
+# `git grep` spends in under half of one, and several lanes gating at once took this check
+# past its budget. CONTAINING names the literal every match must contain, so a file without
+# it is not read at all; the count printed is still over the whole set.
+fastcached_tracked_files("${sourceRoot}"
+    GLOBS "*"
+    FILTER "${sourceRegex}"
+    CONTAINING "${FastCachedCounterPrefilter}" CONTAINING_OUT sourcesHolding
+    FILES_OUT sources MODE_OUT sourcesMode)
+list(TRANSFORM sources PREPEND "${sourceRoot}/")
+list(TRANSFORM sourcesHolding PREPEND "${sourceRoot}/")
 
 # `list(LENGTH)`, never `if(sources STREQUAL "")`: copying an empty glob result leaves
 # `sources` UNDEFINED, and `if()` then compares the literal name. Measured in
@@ -152,7 +228,11 @@ foreach(source IN LISTS sources)
     file(RELATIVE_PATH relativeSource "${sourceRoot}" "${source}")
 
     # Whole-file prefilter: almost no file names a counter, and splitting every file
-    # into lines costs a default-set check seconds (#492).
+    # into lines costs a default-set check seconds (#492). Now answered by the file set:
+    # a file without the prefilter's literal is not read at all.
+    if(NOT "${source}" IN_LIST sourcesHolding)
+        continue()
+    endif()
     file(READ "${source}" content)
     string(FIND "${content}" "${FastCachedCounterPrefilter}" prefilterAt)
     if(prefilterAt EQUAL -1)
@@ -171,6 +251,10 @@ foreach(source IN LISTS sources)
         math(EXPR lineNumber "${lineNumber} + 1")
         string(REGEX REPLACE "//.*$" "" code "${line}")
         if(NOT code MATCHES "${FastCachedCounterConversionRegex}")
+            continue()
+        endif()
+        fastcached_casts_a_counter("${code}" castsOne)
+        if(NOT castsOne)
             continue()
         endif()
         math(EXPR matchedHere "${matchedHere} + 1")

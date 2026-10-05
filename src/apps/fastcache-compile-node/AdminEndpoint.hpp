@@ -3,6 +3,7 @@
 
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeRefusal.hpp"
 #include "NodeRoster.hpp"
 #include "NodeSurfaces.hpp"
 
@@ -115,11 +116,6 @@ struct NodeScrapeSources
     /// present answer is a different fact entirely — a node that runs consensus and
     /// holds no configuration — and renders, which is the whole of #435.
     std::function<ConsensusStatus()> consensus;
-
-    /// The roster this node verifies lease grants against (#178), or **null** where nothing was
-    /// wired. A node whose roster has no certificate reports no lapse through it, which is the
-    /// one spelling of that absence: `NodeRoster::ExpiresInSeconds` decides it.
-    NodeRoster const* roster {};
 };
 
 /// Build the provider that answers each `/metrics` scrape.
@@ -141,17 +137,6 @@ struct NodeScrapeSources
 [[nodiscard]] AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sources,
                                                                          std::chrono::steady_clock::time_point startedAt);
 
-/// Read the dashboard credential out of the file an operator named.
-///
-/// Fallible and reported rather than warned about, for the reason the endpoint's
-/// own failure is: a credential file that could not be read must not silently
-/// become "no credential", which is the one failure mode that turns a guarded
-/// fleet map into an open one.
-///
-/// The trailing newline every editor adds is trimmed, so a secret typed into a
-/// file works without the operator having to know that.
-/// @param path Where the secret is.
-/// @return The credential, or why it could not be used.
 /// Read a secret an operator put in a file.
 ///
 /// Trailing newlines are trimmed because every editor adds one and an operator
@@ -161,11 +146,26 @@ struct NodeScrapeSources
 /// different secret. An empty file is refused: a credential nobody can fail to match
 /// is worse than none, because the surface still looks guarded.
 ///
+/// A file that was read and holds nothing is `CredentialFile` -- the next start reads it the same
+/// -- while one that could not be opened, or whose read failed part way, is `CredentialIo`: the
+/// next start may open it (a permission restored, a mount back, a file its provisioner had not
+/// written yet), whatever the errno.
+///
 /// @param path The file to read.
 /// @return The secret, or why it could not be used.
-[[nodiscard]] std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesystem::path const& path);
+[[nodiscard]] std::expected<FastCache::SecureString, NodeRefusal> ReadSecretFile(std::filesystem::path const& path);
 
-[[nodiscard]] std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path);
+/// Read the dashboard credential out of the file an operator named.
+///
+/// Fallible and reported rather than warned about, for the reason the endpoint's
+/// own failure is: a credential file that could not be read must not silently
+/// become "no credential", which is the one failure mode that turns a guarded
+/// fleet map into an open one.
+///
+/// Read as `ReadSecretFile` reads any secret, trailing newline and refusal causes included.
+/// @param path Where the secret is.
+/// @return The credential, or why it could not be used.
+[[nodiscard]] std::expected<AdminCredential, NodeRefusal> ReadDashboardToken(std::filesystem::path const& path);
 
 /// The routes that serve the fleet dashboard.
 ///
@@ -197,6 +197,11 @@ enum class HistoryFile : std::uint8_t
     Received, ///< What every other machine handed over.
     Last
 };
+
+/// What one of a node's history files is called, in whatever directory holds it.
+/// @param which Which file.
+/// @return Its name.
+[[nodiscard]] std::string_view HistoryFileNameOf(HistoryFile which) noexcept;
 
 /// Where one of a node's history files lives.
 ///
@@ -501,9 +506,10 @@ class FleetSampler final: public IFleetHistoryView
 
 /// Where a node keeps its fleet history.
 ///
-/// The cluster directory first, because the history is a leader's record and a
-/// leader is a cluster member; the cache directory next, because a node given one
-/// has somewhere durable already; and otherwise nothing, which means memory-only.
+/// The node's state directory first (`ChosenStateDirectory`: `--cluster-dir`, or the
+/// default the start resolved), because the history is a leader's record and a leader
+/// is a cluster member; the cache directory next, for a node that resolved no state
+/// directory but was given one; and otherwise nothing, which means memory-only.
 /// No new flag: a third place to say "put state here" is a third place for an
 /// operator to point at the wrong disk.
 /// @param cfg The parsed configuration.
@@ -561,6 +567,8 @@ class AdminEndpoint
     /// @param metrics The sink to render.
     /// @param snapshot What to report per scrape.
     /// @param logger Where to announce the bound address.
+    /// @param acceptLoops The node's accept-loop registry: what `/healthz` answers from, and
+    ///        where this surface's own loop reports if it stops. Must outlive the endpoint.
     /// @param routes Routes beyond `/metrics` and `/healthz`; may be empty.
     /// @param tls Server TLS context, or nullptr to serve plaintext.
     /// @return The running endpoint, or why it could not be served.
@@ -570,6 +578,7 @@ class AdminEndpoint
         IMetricsSink& metrics,
         AdminHttpServer::SnapshotProvider snapshot,
         ILogger& logger,
+        core::net::AcceptLoopHealth& acceptLoops,
         std::vector<AdminRoute> routes = {},
         core::net::ITlsContext* tls = nullptr);
 
@@ -607,6 +616,7 @@ class AdminEndpoint
                   AdminHttpServer::SnapshotProvider snapshot,
                   std::string boundEndpoint,
                   ILogger& logger,
+                  core::net::AcceptLoopHealth& acceptLoops,
                   std::vector<AdminRoute> routes,
                   core::net::ITlsContext* tls,
                   ServedSurfaces surfaces);
@@ -677,7 +687,7 @@ struct AdminSurface
 /// @param conditions Where whether this surface serves a GENERATED certificate is answered, with
 ///        its fingerprint (#1364) -- once it serves, since a surface that did not start has nothing
 ///        to report. A node asking for no surface answers nothing here; the row's scope does.
-[[nodiscard]] std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(
+[[nodiscard]] std::expected<AdminSurface, NodeRefusal> StartAdminSurfaceOrExplain(
     NodeConfig const& cfg,
     IHostFactsSource const& host,
     IMetricsSink& metrics,
@@ -686,7 +696,8 @@ struct AdminSurface
     FleetSampler const* sampler,
     AdminCredential const& credential,
     ILogger& logger,
-    NodeConditions& conditions);
+    NodeConditions& conditions,
+    core::net::AcceptLoopHealth& acceptLoops);
 
 /// Read the dashboard credential `--dashboard-token-file` names, once, for every surface that
 /// guards the fleet with it.
@@ -697,6 +708,6 @@ struct AdminSurface
 /// @param cfg The parsed configuration.
 /// @return The credential -- a default one when no file is named -- or why the file could not be
 ///         used. An unreadable file is refused, never read as "no credential".
-[[nodiscard]] std::expected<AdminCredential, std::string> LoadDashboardCredentialOrExplain(NodeConfig const& cfg);
+[[nodiscard]] std::expected<AdminCredential, NodeRefusal> LoadDashboardCredentialOrExplain(NodeConfig const& cfg);
 
 } // namespace FastCache::Node

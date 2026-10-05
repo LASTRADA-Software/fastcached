@@ -12,6 +12,11 @@
 namespace FastCache::Consensus
 {
 
+/// How often a leader sends heartbeats unless a configuration says otherwise: `RaftConfig`'s
+/// default, and the cadence a learner's two-way session measures its silence in
+/// (`SessionIdleTable`), so the two cannot come to disagree by one being edited alone.
+inline constexpr std::chrono::milliseconds DefaultHeartbeatInterval { 50 };
+
 /// How a node is configured to take part in a cluster.
 ///
 /// Supplied whole at construction and fixed thereafter, so a constructed
@@ -67,7 +72,7 @@ struct RaftConfig
     /// no more often than followers time out means followers depose a healthy
     /// leader on a regular basis, which does not corrupt anything and does mean
     /// the cluster spends its time electing instead of working.
-    std::chrono::milliseconds heartbeatInterval { 50 };
+    std::chrono::milliseconds heartbeatInterval { DefaultHeartbeatInterval };
 
     /// Validate the configuration.
     ///

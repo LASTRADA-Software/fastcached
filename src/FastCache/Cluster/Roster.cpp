@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/Base64.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
@@ -20,14 +21,12 @@ namespace FastCache::Cluster
 
 namespace
 {
-    /// Fields in an encoded roster: the layout version, then the three groups.
-    constexpr std::size_t RosterFields = 4;
+    /// Fields in an encoded roster: the layout version, then the two groups.
+    constexpr std::size_t RosterFields = 3;
 
-    /// Fields one member occupies: id, consensus endpoint, seat, key (empty when none).
-    constexpr std::size_t MemberFields = 4;
-
-    /// Fields one principal occupies: id, key, role.
-    constexpr std::size_t PrincipalFields = 3;
+    /// Fields one member occupies: id, consensus endpoint, seat, key, `0xFC` endpoint (empty when
+    /// none).
+    constexpr std::size_t MemberFields = 5;
 
     /// Fields one revoked key occupies: whose it was, and the key.
     constexpr std::size_t RevokedFields = 2;
@@ -96,9 +95,11 @@ Roster ProjectRoster(ClusterState const& state)
     Roster roster;
     roster.members.reserve(state.members.size());
     for (auto const& member: state.members)
-        roster.members.push_back(RosterMember {
-            .id = member.id, .raftEndpoint = member.raftEndpoint, .seat = member.seat, .publicKey = member.publicKey });
-    roster.principals = state.principals;
+        roster.members.push_back(RosterMember { .id = member.id,
+                                                .raftEndpoint = member.raftEndpoint,
+                                                .seat = member.seat,
+                                                .publicKey = member.publicKey,
+                                                .schedulerEndpoint = member.schedulerEndpoint });
     roster.revoked = state.revokedKeys;
     return roster;
 }
@@ -107,18 +108,11 @@ std::vector<std::byte> EncodeRoster(Roster const& roster)
 {
     auto const members = EncodeGroup(roster.members, [](RosterMember const& member) {
         auto const seat = std::array { static_cast<std::byte>(member.seat) };
-        auto const key =
-            member.publicKey.has_value() ? std::span<std::byte const> { *member.publicKey } : std::span<std::byte const> {};
         return WireFields::Encode({ WireFields::AsBytes(member.id),
                                     WireFields::AsBytes(member.raftEndpoint),
                                     std::span<std::byte const> { seat },
-                                    key });
-    });
-    auto const principals = EncodeGroup(roster.principals, [](ClusterPrincipal const& principal) {
-        auto const role = std::array { static_cast<std::byte>(principal.role) };
-        return WireFields::Encode({ WireFields::AsBytes(principal.id),
-                                    std::span<std::byte const> { principal.publicKey },
-                                    std::span<std::byte const> { role } });
+                                    std::span<std::byte const> { member.publicKey },
+                                    WireFields::AsBytes(member.schedulerEndpoint) });
     });
     auto const revoked = EncodeGroup(roster.revoked, [](RevokedKey const& entry) {
         return WireFields::Encode({ WireFields::AsBytes(entry.id), std::span<std::byte const> { entry.publicKey } });
@@ -126,7 +120,6 @@ std::vector<std::byte> EncodeRoster(Roster const& roster)
     auto const version = std::array { static_cast<std::byte>(RosterFormatVersion) };
     return WireFields::Encode({ std::span<std::byte const> { version },
                                 std::span<std::byte const> { members },
-                                std::span<std::byte const> { principals },
                                 std::span<std::byte const> { revoked } });
 }
 
@@ -142,49 +135,55 @@ std::expected<Roster, ConsensusError> DecodeRoster(std::span<std::byte const> by
         return std::unexpected(UnsupportedWireVersion(
             std::format("roster encoding version {} (this build reads {})", version, RosterFormatVersion)));
     if (fields->size() != RosterFields)
-        return std::unexpected(MalformedWireFrame("a roster is not its version and three groups"));
+        return std::unexpected(MalformedWireFrame("a roster is not its version and two groups"));
 
-    auto members =
-        DecodeGroup<RosterMember>((*fields)[1], MemberFields, [](auto const& entry) -> std::optional<RosterMember> {
+    // The refusal named apart from the rest, as `DecodeState` names it: a member with no key, or
+    // the all-zero one, is one the state cannot record, so no roster projected out of one carries
+    // it -- and a kept roster that does says so in its own words rather than as damage anywhere.
+    // The flag describes the entry the decoder refused, since `DecodeGroup` stops at the first.
+    auto keylessMember = false;
+    auto members = DecodeGroup<RosterMember>(
+        (*fields)[1], MemberFields, [&keylessMember](auto const& entry) -> std::optional<RosterMember> {
             auto const seat = entry[2].size() == 1
                                   ? Consensus::DecodeWireEnum<MemberSeat>(static_cast<std::uint8_t>(entry[2][0]))
                                   : std::nullopt;
-            if (!seat.has_value())
+            auto const key = RequiredKey(entry[3]);
+            keylessMember = entry[3].empty() || (key.has_value() && IsZeroEd25519PublicKey(*key));
+            if (!seat.has_value() || !key.has_value() || keylessMember)
                 return std::nullopt;
-            auto key = std::optional<Ed25519PublicKey> {};
-            if (!entry[3].empty())
-            {
-                key = RequiredKey(entry[3]);
-                if (!key.has_value())
-                    return std::nullopt;
-            }
             return RosterMember { .id = std::string { WireFields::AsStringView(entry[0]) },
                                   .raftEndpoint = std::string { WireFields::AsStringView(entry[1]) },
                                   .seat = *seat,
-                                  .publicKey = key };
+                                  .publicKey = *key,
+                                  .schedulerEndpoint = std::string { WireFields::AsStringView(entry[4]) } };
         });
-    auto principals = DecodeGroup<ClusterPrincipal>(
-        (*fields)[2], PrincipalFields, [](auto const& entry) -> std::optional<ClusterPrincipal> {
-            auto const key = RequiredKey(entry[1]);
-            auto const role = entry[2].size() == 1
-                                  ? Consensus::DecodeWireEnum<PrincipalRole>(static_cast<std::uint8_t>(entry[2][0]))
-                                  : std::nullopt;
-            if (!key.has_value() || !role.has_value())
-                return std::nullopt;
-            return ClusterPrincipal { .id = std::string { WireFields::AsStringView(entry[0]) },
-                                      .publicKey = *key,
-                                      .role = *role };
-        });
-    auto revoked = DecodeGroup<RevokedKey>((*fields)[3], RevokedFields, [](auto const& entry) -> std::optional<RevokedKey> {
+    auto revoked = DecodeGroup<RevokedKey>((*fields)[2], RevokedFields, [](auto const& entry) -> std::optional<RevokedKey> {
         auto const key = RequiredKey(entry[1]);
         if (!key.has_value())
             return std::nullopt;
         return RevokedKey { .id = std::string { WireFields::AsStringView(entry[0]) }, .publicKey = *key };
     });
-    if (!members.has_value() || !principals.has_value() || !revoked.has_value())
+    if (!members.has_value() && keylessMember)
+        return std::unexpected(MalformedWireFrame("a roster member holds no identity key"));
+    if (!members.has_value() || !revoked.has_value())
         return std::unexpected(MalformedWireFrame("a roster entry is malformed"));
 
-    return Roster { .members = *std::move(members), .principals = *std::move(principals), .revoked = *std::move(revoked) };
+    // A LIVE key no signature can prove anything under is refused by the holder's name: a roster is
+    // what a joiner trusts its fleet's voters by, and a small-order key in it would be a voter
+    // anybody can sign as. A revoked entry is not asked -- revoking such a key grants nothing.
+    auto const unusable = [](std::string const& id, Ed25519PublicKey const& key) -> std::optional<std::string> {
+        auto const fault = Ed25519PublicKeyFaultOf(key);
+        if (!fault.has_value())
+            return std::nullopt;
+        return std::format("{}'s key {} is refused: {}", id, FormatEd25519PublicKey(key), DescribePublicKeyFault(*fault));
+    };
+    for (auto const& member: *members)
+    {
+        if (auto why = unusable(member.id, member.publicKey); why.has_value())
+            return std::unexpected(MalformedWireFrame(*std::move(why)));
+    }
+
+    return Roster { .members = *std::move(members), .revoked = *std::move(revoked) };
 }
 
 RosterDigest DigestOfRoster(std::span<std::byte const> encoded)

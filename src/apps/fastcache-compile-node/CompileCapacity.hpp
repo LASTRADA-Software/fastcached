@@ -44,16 +44,17 @@ enum class SlotAdmission : std::uint8_t
 
 /// How the heartbeat's wait between two rounds ended.
 ///
-/// Three answers, because the caller does something different for each: a stop ends
-/// the loop, and the other two start a round -- but only one of them is an event worth
+/// Four answers, because the caller does something different for each: a stop ends
+/// the loop, and the other three start a round -- but only the wakes are events worth
 /// asserting, since a heartbeat that merely came round again would announce a changed
-/// cordon too, a whole interval late.
+/// cordon too, a whole interval late, and a resumed machine an interval after it woke.
 ///
 /// Private to this process: nothing transmits or persists it.
 enum class HeartbeatWake : std::uint8_t
 {
     Elapsed,       ///< The interval passed and the cordon is still what was announced.
     CordonChanged, ///< The cordon moved away from what the last round announced.
+    HostEvent,     ///< A host event asked for a round now (resume, network change, suspend).
     Stopped,       ///< A stop was requested, before the wait or during it.
 };
 
@@ -227,12 +228,16 @@ class CompileCapacity
     /// @param stop Participates in the wait; a request ends it at once.
     /// @param announced The cordon the last round carried to the scheduler.
     /// @param interval How long to wait when nothing changes.
-    /// @return Which of the three ENDED it: a stop wins over a cordon that moved as well,
-    ///         and a cordon that moved without waking the wait before the interval ran
-    ///         out is `Elapsed`, since the interval is what ended it.
+    /// @return Which of them ENDED it: a stop wins over everything, a host event over a
+    ///         cordon that moved as well, and a cordon that moved without waking the wait
+    ///         before the interval ran out is `Elapsed`, since the interval is what ended it.
     [[nodiscard]] HeartbeatWake WaitForHeartbeat(std::stop_token const& stop,
                                                  bool announced,
                                                  std::chrono::milliseconds interval);
+
+    /// End the heartbeat's wait now, for a reason that is not the cordon -- a host event. The
+    /// request is consumed by the wait it ends.
+    void WakeHeartbeat() noexcept;
 
     /// Reserve @p want bytes of request payload.
     /// @param want How many bytes this request declared.
@@ -340,13 +345,16 @@ class CompileCapacity
 
     std::atomic<bool> _shuttingDown { false };
     std::atomic<bool> _cordoned { false };
+    /// Set by `WakeHeartbeat`, consumed by the `WaitForHeartbeat` it ends. Guarded by `_drainMutex`,
+    /// and beside the flags above rather than the mutex, where it costs no padding.
+    bool _wakeRequested { false };
     std::atomic<std::size_t> _bytesInFlight { 0 };
     std::atomic<std::size_t> _inFlight { 0 };
 
     std::mutex _drainMutex;
     std::condition_variable _drained;
-    /// Notified by `Cordon` whenever the cordon moves; waited on by `WaitForHeartbeat`.
-    /// `_any` because the wait takes a stop token.
+    /// Notified by `Cordon` whenever the cordon moves, and by `WakeHeartbeat`; waited on by
+    /// `WaitForHeartbeat`. `_any` because the wait takes a stop token.
     std::condition_variable_any _cordonMoved;
 };
 
@@ -383,6 +391,15 @@ enum class DrainAction : std::uint8_t
     Abandon,
     Last, ///< Not an action; `EnumTable`'s length.
 };
+
+/// How often a stop says what it is still waiting for.
+///
+/// A stop that says nothing for the whole timeout is indistinguishable from one
+/// that has hung, which is the reading this whole change exists to prevent -- so
+/// the interval is short enough that an operator watching `systemctl stop` sees
+/// the count fall rather than a pause. Declared here rather than beside `Drain` so a
+/// case can pin it: one releasing its slot on the report alone accepts any cadence.
+inline constexpr std::chrono::seconds DrainReportInterval { 2 };
 
 /// Decide what a stop does next.
 ///
@@ -499,37 +516,6 @@ namespace CompileRefusal
     inline constexpr Cc::SurfaceRefusal UnknownOpcode {
         .code = CompileCacheWire::ErrorCode::UnknownOpcode,
         .counter = IMetricsSink::Counter::WorkerFramesRefusedUnknownOpcode,
-    };
-    /// An `AUTH` payload that would not decode.
-    ///
-    /// Unreachable on this surface for the reason `Unauthenticated` below is:
-    /// `MergedResponder` routes the `Session` family to the scheduler, which owns the
-    /// credential. It carries a row anyway, so that a shape in which a compile surface
-    /// did check one cannot answer on the wire while nothing rises -- which is the
-    /// whole of #327 and, on the merged listener, of #447.
-    ///
-    /// Its OWN counter rather than the undecodable-payload one, although both answer
-    /// `MalformedFrame`. That is the rulebook's load-bearing clause -- the row is the
-    /// refusal, not the code -- and a dead row is exactly where it is easiest to get
-    /// wrong: nothing would ever have shown the two summed.
-    inline constexpr Cc::SurfaceRefusal MalformedCredential {
-        .code = CompileCacheWire::ErrorCode::MalformedFrame,
-        .counter = IMetricsSink::Counter::WorkerFramesRefusedMalformedCredential,
-    };
-    /// An `AUTH` payload that decoded and did not verify.
-    ///
-    /// Its own counter rather than `Unauthenticated` below, for the reason
-    /// `MalformedCredential` above has one: three refusals answer `unauthenticated` or
-    /// `malformed-frame` across this worker and an operator acts on each differently.
-    /// Unreachable here today, which is exactly where the split is easiest to forget.
-    inline constexpr Cc::SurfaceRefusal RejectedCredential {
-        .code = CompileCacheWire::ErrorCode::Unauthenticated,
-        .counter = IMetricsSink::Counter::WorkerFramesRefusedRejectedCredential,
-    };
-    /// A compile verb reached before a credential. Zero on every shipped shape.
-    inline constexpr Cc::SurfaceRefusal Unauthenticated {
-        .code = CompileCacheWire::ErrorCode::Unauthenticated,
-        .counter = IMetricsSink::Counter::WorkerFramesRefusedUnauthenticated,
     };
 } // namespace CompileRefusal
 

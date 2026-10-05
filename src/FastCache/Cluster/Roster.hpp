@@ -18,33 +18,39 @@
 namespace FastCache::Cluster
 {
 
-/// A member as the roster carries it: who, where it is dialled, which seat, which key (#178).
+/// A member as the roster carries it: who, where its consensus and `0xFC` ports answer, which seat,
+/// which key (#178).
 ///
-/// None of the scheduler endpoint's bookkeeping, which changes every time a member leads: a
-/// roster is what a machine that runs no consensus needs to know about who may vouch for whom,
-/// and a field that moves on every election would move its digest with it.
+/// The `0xFC` endpoint as RECORDED, and none of its bookkeeping (`schedulerEndpointHistory`): what
+/// a machine an approval admits needs is where to reach its fleet's voters. So the digest moves when
+/// a member announces a move -- which a roster's digest could not afford while voters certified it
+/// per digest, and can since the certified roster retired.
 struct RosterMember
 {
-    Consensus::NodeId id;                      ///< Its identity.
-    std::string raftEndpoint;                  ///< Where its consensus port answers.
-    MemberSeat seat { MemberSeat::Voter };     ///< Whether it votes.
-    std::optional<Ed25519PublicKey> publicKey; ///< The key it proves itself with, when one is recorded.
+    Consensus::NodeId id;                  ///< Its identity.
+    std::string raftEndpoint;              ///< Where its consensus port answers.
+    MemberSeat seat { MemberSeat::Voter }; ///< Whether it votes.
+    Ed25519PublicKey publicKey {};         ///< The key it proves itself with -- required, as the state's is.
+
+    /// Where its `0xFC` port answers, as the cluster RECORDS it (`ClusterMember::schedulerEndpoint`);
+    /// empty when the record states none. What a learner it admits remembers the fleet's voters at,
+    /// rather than a guess from their consensus host -- so it moves the roster's digest when a member
+    /// announces a move, as anything the record holds does.
+    std::string schedulerEndpoint;
 
     [[nodiscard]] friend bool operator==(RosterMember const&, RosterMember const&) = default;
 };
 
 /// Who the cluster says its machines are, projected out of `ClusterState` (#178).
 ///
-/// The one shape a roster has, whichever surface carries it: enrollment hands a joiner its
-/// first one, and NODE-ANNOUNCE's certified roster carries every later one. Sorted exactly as
-/// `ClusterState` sorts -- members and principals by id, revoked keys by id and then key -- so
-/// every voter projecting the same state produces the same bytes, which is what lets their
-/// endorsements of it be compared at all.
+/// The one shape a roster has: what an approval hands a joiner, which then applies its fleet's
+/// replicated state. Sorted exactly as `ClusterState` sorts -- members by id, revoked keys by id and
+/// then key -- so every node projecting the same state produces the same bytes, and
+/// the fingerprint a joiner prints is the one the leader's list shows.
 struct Roster
 {
-    std::vector<RosterMember> members;        ///< Every member, voters and learners.
-    std::vector<ClusterPrincipal> principals; ///< Machines admitted by key rather than as members.
-    std::vector<RevokedKey> revoked;          ///< Keys the cluster will never admit again.
+    std::vector<RosterMember> members; ///< Every member, voters and learners.
+    std::vector<RevokedKey> revoked;   ///< Keys the cluster will never admit again.
 
     [[nodiscard]] friend bool operator==(Roster const&, Roster const&) = default;
 };
@@ -56,10 +62,18 @@ struct Roster
 
 /// The layout `EncodeRoster` writes, first in every encoding.
 ///
-/// A roster is signed through its digest, so an encoding a build did not write must be refused
-/// by name rather than read -- and a digest over bytes two builds lay out differently is two
-/// digests of one roster, which is a certification that can never reach a majority.
-inline constexpr std::uint8_t RosterFormatVersion = 1;
+/// An admission is signed over the roster's digest, and a person compares its fingerprint, so an
+/// encoding a build did not write must be refused by name rather than read -- a digest over bytes
+/// two builds lay out differently is two fingerprints of one roster.
+///
+/// **2** since each member carries its recorded `0xFC` endpoint. Bumped on the lane rather than left
+/// for the wire's flag day because a roster is PERSISTED: a learner's formation record keeps its
+/// approval's (`FormationRecord::fleet`), and a start decoding a version-1 record as this layout would
+/// report damage that is not there.
+///
+/// **3** since the principals group left the encoding with principal mode: a version-2 roster is
+/// three groups, this one two.
+inline constexpr std::uint8_t RosterFormatVersion = 3;
 
 /// Encode @p roster canonically: one encoding per roster, whoever encodes it.
 /// @param roster The roster.
@@ -69,8 +83,8 @@ inline constexpr std::uint8_t RosterFormatVersion = 1;
 /// Decode a roster.
 ///
 /// Refuses another layout version by NAME (`UnsupportedVersion`), and anything else that is not
-/// a roster as `MalformedFrame`: a wrong width, a seat or role this build does not know, a
-/// principal or revoked entry with no key.
+/// a roster as `MalformedFrame`: a wrong width, a seat this build does not know, a revoked entry
+/// with no key -- and a member with no key, or the all-zero one, refused by name.
 /// @param bytes The encoding.
 /// @return The roster, or why the bytes are not one.
 [[nodiscard]] std::expected<Roster, ConsensusError> DecodeRoster(std::span<std::byte const> bytes);

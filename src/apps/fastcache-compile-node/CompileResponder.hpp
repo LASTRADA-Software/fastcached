@@ -154,38 +154,12 @@ class CompileResponder final: public IFrameResponder
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t opRaw) const override;
 
-    /// @copydoc IFrameResponder::AuthRequired
-    ///
-    /// **No, and stated rather than inherited.** `Op::Compile` is a `RequiresAuth` row of
-    /// the wire table, so this answer is what decides whether the merged listener demands
-    /// a connection credential before it -- and demanding one would refuse every client
-    /// the dedicated port serves today, for a door that is supposed to be additional.
-    ///
-    /// The reason it is safe is that a compile already carries its own credential, one
-    /// layer in and per job rather than per connection: the lease token the scheduler
-    /// signed for **this worker's endpoint**, verified by the validator this node chose
-    /// at startup. A connection-scoped secret would be strictly weaker than that -- it
-    /// says who is attached, where the lease says which job was granted, to whom, and
-    /// for how long -- and holding both would mean an operator configuring a second
-    /// secret to reach a surface the first one already governs.
-    ///
-    /// So the answer follows the VERB, which is exactly what #290 made expressible: the
-    /// scheduler verbs on this same listener still require the credential #289 added.
-    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return false;
-    }
-
     /// @copydoc IFrameResponder::CheckCredential
     ///
-    /// There is no connection-scoped policy here, so this answers `NoPolicy` for every
-    /// payload. It is unreachable in practice -- `AUTH` is a `Session` verb and
-    /// `MergedResponder` routes the credential to the scheduler -- and is written down
-    /// rather than left to a default for the reason the interface is pure virtual: a
-    /// surface that inherits an answer inherits an open door by saying nothing.
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    /// `NoPolicy`: AUTH is the Session family's; this surface is never routed one.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
     {
-        return FastCache::CheckCredential(nullptr, payload);
+        return NotTheSessionSurface();
     }
 
     /// @copydoc IFrameResponder::RefusalReply
@@ -211,12 +185,9 @@ class CompileResponder final: public IFrameResponder
     /// still tells a reader to watch -- stopped moving when that port was retired
     /// (#447).
     ///
-    /// The credential arms cannot fire here: `AUTH` belongs to the `Session` family,
-    /// which `MergedResponder` routes to the scheduler, and this surface answers
-    /// `AuthRequired` false because a compile carries its own per-job lease. They are
-    /// counted anyway, for the reason `RefusalFor` gives about its own two dead arms:
-    /// if either ever fires, what changed is who may compile here, and a counter is how
-    /// an operator would find out.
+    /// The credential arms are uncounted and say why in their rows: `AUTH` belongs to the
+    /// `Session` family, which `MergedResponder` routes to the session component, and a
+    /// compile carries its own per-job lease rather than a connection credential.
     [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
                                                               std::uint8_t opRaw,
                                                               std::string_view detail) const override;

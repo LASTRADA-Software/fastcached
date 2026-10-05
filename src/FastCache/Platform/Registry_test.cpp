@@ -43,7 +43,7 @@ TEST_CASE("A REG_SZ value comes back verbatim", "[registry]")
     // No embedded NUL survived the read. A value stored without a terminator and
     // sized from the reported byte count keeps one, and such a string opens no
     // path and compares equal to nothing -- which is why TrimAtNul exists.
-    CHECK(FastCache::Testing::Unwrap(build).find('\0') == std::string::npos);
+    CHECK_FALSE(FastCache::Testing::Unwrap(build).contains('\0'));
 }
 
 TEST_CASE("A value of the wrong type is absent rather than reinterpreted", "[registry]")

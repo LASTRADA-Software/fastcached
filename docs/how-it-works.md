@@ -374,10 +374,13 @@ names the reason directly:
 fastcache-cc: not dispatched (rejected (no-worker)); compiling locally
 ```
 
-Rule out the cheap thing first: **`FASTCACHE_TOKEN` must not be set on a client
-that dispatches.** A compile node accepts no credential today, so a token makes
-every lease refused and every compile local, behind a perfectly green build
-([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)).
+Rule out the cheap thing first: **is this machine admitted to the fleet?** A client is
+admitted by the machine ticket its own node mints, so the machine needs a node running
+at `FASTCACHE_ADDR` and that node's key admitted to the cluster; otherwise every lease is
+refused `not-a-member` and every compile is local, behind a perfectly green build.
+`fastcache-cli explain-admission <machine>` on the scheduler says where it stands.
+(`FASTCACHE_TOKEN` is not the cause any more: it is sent to the cache at
+`FASTCACHE_ADDR` alone.)
 
 Otherwise it is a fingerprint mismatch. Compare the two machines as above; if they
 differ, their toolchains genuinely differ, and the fix is to make them the same
@@ -461,32 +464,29 @@ member holds.
 
 ### Joining an existing cluster
 
-A machine being added to a running fleet is started with **`--raft-join`**, and
-that flag is not optional. Without it the node bootstraps a cluster *of itself*:
-it elects itself, takes a term and a log, and afterwards refuses every leader its
-own configuration does not name. Two clusters cannot be merged by any local rule,
-so a joining node must never form one.
+A machine being added to a running fleet is **admitted**, never configured: no flag
+names the cluster it joins. It starts, as every node does, as a cluster of one, and that
+is why joining is a change of state rather than a startup option. A node that bootstrapped
+a cluster has elected itself, taken a term and a log, and refuses every leader its own
+configuration does not name, and two clusters cannot be merged by any local rule. So a
+joiner **dissolves** its own cluster before it adopts the fleet's roster, and its
+formation record says so from then on.
 
-The sequence, and what you see at each step:
+The sequence:
 
-1. Start the joiner with `--raft-join` and the cluster's key. It names itself in
-   `--raft-peer` plus enough existing members to reach one. (With a different key it
-   is never replicated to: every member refuses its connections, and each counts
-   `fastcache_raft_peer_connections_refused_proof_total`.) It logs
-   `no cluster yet; waiting to be admitted` and then waits. That line is how you
-   know the flag took effect — a node that says `1 member(s)` instead has
-   bootstrapped a cluster of itself and must be stopped, its state directory
-   removed, and started again.
-2. Tell any member to admit it: `--cluster-admit=n4=10.0.0.4:6680`. The leader
-   logs `cluster: proposing a quorum of 4 member(s) at index …`.
-3. The leader starts replicating to the joiner, which refuses at first — its log
-   is empty — and the leader walks back to the beginning. This is why the joiner
-   must be reachable *before* it is admitted.
-4. The joiner logs `consensus: this node is now a follower in term N of …`, and
-   the admitting side logs `cluster: recorded n4 at 10.0.0.4:6680`.
-5. From then on membership is a **replicated log entry**, so the new node survives
+1. The joiner asks a member to admit it
+   ([enrollment](tools/fastcache-compile-node.md#enrolling-a-machine-instead-of-typing-it)), and an operator there
+   approves its identity key.
+2. The joiner dissolves its cluster of one, records itself a **learner** of the fleet's,
+   and starts from an empty configuration, which it learns from the leader. It reaches
+   the fleet's voters itself.
+3. The leader starts replicating to the joiner, which refuses at first — its log is
+   empty — and the leader walks back to the beginning. This is why the joiner must
+   reach the fleet before it can be counted.
+4. From then on membership is a **replicated log entry**, so the new node survives
    its own restart and everybody else's without anyone editing a file on the other
-   machines.
+   machines. It stays a learner, counted by no quorum, until an operator promotes it
+   with `--cluster-admit`.
 
 Nothing about the existing members changes. They are not restarted and their
 command lines are not edited.
@@ -560,11 +560,17 @@ commit, developer branches and toolchain bumps. Size it for that shape rather
 than for steady load.
 
 **Some compiles never distribute, by design.** A C++ module interface unit and
-anything writing a precompiled header produce a second artefact beside the object,
-and only the object travels — so they are compiled locally and not cached either.
-So is a command line that names its own input language (`/TP`, `-x c++`), because
-the launcher must state the language of the preprocessed text it sends and would
-otherwise silently override yours.
+anything writing a precompiled header or `cl`'s shared `/Zi` PDB produce a second
+artefact beside the object, and only the object travels — so they are compiled
+locally and not cached either. So is a `cl` compile that uses a precompiled
+header (`/Yu`): its object names the `pch.obj` it was compiled against by
+absolute path, and with `cl` 19.51 a hit in another checkout failed to link while
+one after a PCH rebuild silently lost its debug info. clang-cl's `/Yu` object
+carries no such tie and is cached. So is a command line whose language selector
+the launcher cannot restate — `-x assembler`, or `/Tc<file>` / `/Tp<file>`, which
+name a file. A plain `/TP`, `/TC` or `-x c++`, which CMake emits for every C++
+source it hands MSVC, is folded into the language the launcher states and
+dispatched.
 
 **Caching never breaks a build.** Every error path — an unreachable daemon, a
 refused lease, a malformed value, a stale dependency record — ends in the

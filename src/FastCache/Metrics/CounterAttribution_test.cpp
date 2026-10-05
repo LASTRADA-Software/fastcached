@@ -19,6 +19,8 @@
 #include <utility>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 /// @file CounterAttribution_test.cpp
 /// `CounterSoleWriterTable` against the tree it describes.
 ///
@@ -51,8 +53,20 @@
 ///    exactly "attributed too narrowly", and it needs no notion of what a write looks like.
 ///
 /// A file that only READS a counter is on the second list, so property 2 never asks about it.
+///
+/// ## Counters declared ahead of their writer
+///
+/// A catalogue row landing before the task that writes it is legitimate -- a fleet feature
+/// crosses several tasks, and the wire layout, the surface attribution and the catalogue row want
+/// to move together in the change that pins the format, before dispatch or the host exist to
+/// write them. `DeclaredAheadOfItsWriterTable` names each such counter and what will write it, and
+/// the mechanism-figures case below excludes them from its pinned totals BY NAME rather than
+/// discovering an absence and shrugging. The staleness case beside it is the other half: a row
+/// left in the table after its counter gets a real writer is refused, so the table cannot become a
+/// second, silent way to mark a row "attributed but nobody has to prove it".
 
 using namespace FastCache;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -83,7 +97,6 @@ constexpr std::array WriterFiles {
     SurfaceWriterFile { .surface = MetricsSurface::CompileScheduler,
                         .path = "src/FastCache/Distributed/SchedulerService.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/FastCache/Distributed/LeaseToken.hpp" },
-    SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/FastCache/Distributed/RosterTrust.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-cc/CodecEnvelope.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-cc/WorkerProtocol.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker,
@@ -92,18 +105,29 @@ constexpr std::array WriterFiles {
                         .path = "src/apps/fastcache-compile-node/CompileResponder.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker,
                         .path = "src/apps/fastcache-compile-node/CompileResponder.hpp" },
-    SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-compile-node/NodeRoster.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-compile-node/WorkerTier.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::ConsensusPeerWire,
                         .path = "src/FastCache/Consensus/RaftPeerRefusals.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::ConsensusPeerWire,
+                        .path = "src/FastCache/Consensus/RaftPeerTransport.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::LiveStats, .path = "src/FastCache/Protocol/LiveStream.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::LiveStats,
                         .path = "src/apps/fastcache-compile-node/LiveStatsResponder.cpp" },
-    SurfaceWriterFile { .surface = MetricsSurface::NodeCacheTier, .path = "src/apps/fastcache-compile-node/CacheProxy.cpp" },
-    SurfaceWriterFile { .surface = MetricsSurface::NodeCacheTier, .path = "src/apps/fastcache-compile-node/LocalCache.cpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeCacheTier,
+                        .path = "src/apps/fastcache-compile-node/PrivateTierProfile.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeCacheTier,
+                        .path = "src/apps/fastcache-compile-node/SharedCacheSession.cpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeCacheTier,
+                        .path = "src/apps/fastcache-compile-node/SharedCacheUpstream.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeDiscovery, .path = "src/FastCache/Cluster/DiscoveryService.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeEnrollment,
                         .path = "src/apps/fastcache-compile-node/EnrollmentResponder.cpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeEnrollment,
+                        .path = "src/apps/fastcache-compile-node/EnrollmentWindow.cpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
+                        .path = "src/FastCache/Distributed/TicketVerifier.cpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
+                        .path = "src/FastCache/Distributed/TicketVerifier.hpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
                         .path = "src/apps/fastcache-compile-node/FleetTextResponder.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
@@ -116,6 +140,16 @@ constexpr std::array WriterFiles {
                         .path = "src/apps/fastcache-compile-node/NodeStatusResponder.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
                         .path = "src/apps/fastcache-compile-node/Responders.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeFormation,
+                        .path = "src/apps/fastcache-compile-node/FormationController.cpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
+                        .path = "src/apps/fastcache-compile-node/SessionResponder.cpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeSharedCache,
+                        .path = "src/apps/fastcache-compile-node/SharedCacheResponder.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeSharedCache,
+                        .path = "src/apps/fastcache-compile-node/SharedTierProfile.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeFormation,
+                        .path = "src/apps/fastcache-compile-node/NodeStateFiles.cpp" },
 };
 
 /// A production file that names a counter and writes none.
@@ -138,9 +172,11 @@ constexpr std::array ReadsOnlyFiles {
                     .why = "names counters in CounterField<> and RefusalsPerMinute<> to render a reading captured "
                            "elsewhere; fastcache-cli writes no counter at all" },
     ReadsOnlyFile { .path = "src/apps/fastcache-compile-node/AdminEndpoint.cpp",
-                    .why = "Read()s NodeCacheHits and NodeCacheMisses into the fleet sample; LocalCache.cpp writes them" },
+                    .why = "Read()s NodeCacheHits and NodeCacheMisses into the fleet sample; PrivateTierProfile.hpp "
+                           "names them for LocalCache to move" },
     ReadsOnlyFile { .path = "src/apps/fastcache-compile-node/CacheTier.cpp",
-                    .why = "Read()s NodeCacheHits and NodeCacheMisses into its own report; LocalCache.cpp writes them" },
+                    .why = "Read()s NodeCacheHits and NodeCacheMisses into its own report; PrivateTierProfile.hpp "
+                           "names them for LocalCache to move" },
 };
 
 /// The files that DECLARE the vocabulary rather than using it.
@@ -165,6 +201,56 @@ constexpr std::array DeclaringFiles {
 constexpr std::array TestOnlyHeaders {
     std::string_view { "src/apps/fastcache-cli/LiveSourceRig.hpp" },
 };
+
+/// A counter this task's own change catalogues before the production file that will write it
+/// exists.
+struct DeclaredAheadOfItsWriter
+{
+    IMetricsSink::Counter counter; ///< The row.
+    std::string_view reason;       ///< What will write it, so a standing exemption cannot be silent.
+};
+
+/// Counters catalogued ahead of their writer, each naming what will move it.
+///
+/// **A stated decision, not a silent one** -- the `RefuseWithoutCounter` shape this tree uses
+/// elsewhere: a row carries its REASON, so a counter declared ahead of its writer cannot be
+/// spelled the same way as one nobody noticed has no writer at all. And a row whose counter HAS a
+/// production writer now is refused STALE by the case beside this table rather than left in
+/// place -- an exemption nobody has to keep true is a licence that outlives its argument. The
+/// task that lands a writer for one of these rows deletes that row in the same change, so an
+/// empty table once the fleet's shared cache is fully wired up is what the check guarantees
+/// rather than what anybody has to remember to state.
+constexpr std::array<DeclaredAheadOfItsWriter, 0> DeclaredAheadOfItsWriterTable {};
+
+/// Whether @p counter is named in `DeclaredAheadOfItsWriterTable`.
+/// @param counter The row.
+/// @return True while the table still carries a row for it.
+[[nodiscard]] bool IsDeclaredAheadOfItsWriter(IMetricsSink::Counter counter)
+{
+    return std::ranges::any_of(DeclaredAheadOfItsWriterTable,
+                               [counter](DeclaredAheadOfItsWriter const& row) { return row.counter == counter; });
+}
+
+/// @p spellings with every `DeclaredAheadOfItsWriterTable` counter removed.
+///
+/// What the mechanism-figures case's pinned totals describe: a counter with no production writer
+/// yet is not a gap in the attribution while its own exemption row says why, so it must not count
+/// against a census of what this tree actually writes.
+/// @param spellings Every counter, in enumerator order.
+/// @return The counters that are not currently exempt.
+[[nodiscard]] std::vector<std::string> ExcludingDeclaredAheadOfItsWriter(std::vector<std::string> const& spellings)
+{
+    std::vector<std::string> out;
+    for (auto const counter: Enumerators<IMetricsSink::Counter>())
+    {
+        if (IsDeclaredAheadOfItsWriter(counter))
+            continue;
+        auto const index = CounterIndex(counter);
+        REQUIRE(index.has_value());
+        out.push_back(spellings.at(Unwrap(index)));
+    }
+    return out;
+}
 
 /// The repository root this build was configured from.
 /// @return The root path.
@@ -362,6 +448,136 @@ constexpr std::array TestOnlyHeaders {
     return !surfaces.contains(surface);
 }
 
+/// The five ways a catalogue row is written, read out of the tree.
+struct WriterMechanismSets
+{
+    std::set<std::string> incremented; ///< `Increment(Counter::X)` call sites.
+    std::set<std::string> refusalRow;  ///< A `SurfaceRefusal` row's `.counter = Counter::X`.
+    std::set<std::string> outcomeRow;  ///< A `LeaseToken` outcome row's `.workerCounter = Counter::X`.
+    std::set<std::string> returned;    ///< A classifier `return`ing the row for its caller to spend.
+    std::set<std::string> profileRow;  ///< A `CacheTierProfile` row's `.hits = Counter::X` and its siblings.
+};
+
+/// Whether @p prefix, the text before `Counter::` with its qualifiers stripped, ends in a
+/// designated member other than the two the refusal and outcome rows use.
+///
+/// That is a `CacheTierProfile` row: a tier's counters are its members, `.hits = Counter::X`, and
+/// `LocalCache`/`CacheProxy` spend them through the profile, so no call site names the counter.
+/// Read as ANY other member rather than as a list of the profile's member names, because a list
+/// here would be a second copy of the struct that goes quietly stale when a member is added --
+/// and the breadth is paid for by the pinned figure, since a designated member naming a counter
+/// anywhere else moves it and fails the build.
+/// @param prefix The line up to the counter, qualifiers stripped.
+/// @return True for `.<member> = ` where the member is neither `counter` nor `workerCounter`.
+[[nodiscard]] bool EndsInProfileMember(std::string_view prefix)
+{
+    constexpr auto Assign = std::string_view { " = " };
+    if (!prefix.ends_with(Assign))
+        return false;
+    auto const member = prefix.substr(0, prefix.size() - Assign.size());
+    auto const dot = member.rfind('.');
+    if (dot == std::string_view::npos)
+        return false;
+    auto const name = member.substr(dot + 1);
+    return !name.empty() && std::ranges::all_of(name, IsIdentifierChar) && name != "counter" && name != "workerCounter";
+}
+
+/// Classify every counter name this tree's production sources write, by which of the five
+/// mechanisms names it.
+///
+/// Shared by the mechanism-figures case and by the staleness check beside
+/// `DeclaredAheadOfItsWriterTable`, which both need to know whether a counter has a real writer
+/// yet -- pulled out rather than duplicated, since two copies of a text scan are how they drift.
+/// @param spellings Every counter, in enumerator order -- the vocabulary a mention must match.
+/// @return The five sets.
+[[nodiscard]] WriterMechanismSets ClassifyWriterMechanisms(std::vector<std::string> const& spellings)
+{
+    WriterMechanismSets sets;
+    for (auto const& path: ProductionSources())
+    {
+        auto const text = ReadWhole(path);
+        if (!text.contains("Counter::"))
+            continue;
+        for (auto const raw: LinesOf(text))
+        {
+            auto const start = raw.find_first_not_of(" \t");
+            if (start == std::string_view::npos || raw.substr(start).starts_with("//"))
+                continue;
+
+            constexpr auto Needle = std::string_view { "Counter::" };
+            // The advance is the loop's FIRST statement, as `MetricsDocumentation_test.cpp`'s
+            // walk does it, so no `continue` below can skip it: a skipped advance re-finds the
+            // same mention forever, a hang rather than a red.
+            auto next = raw.find(Needle);
+            while (next != std::string_view::npos)
+            {
+                auto const at = std::exchange(next, raw.find(Needle, next + Needle.size()));
+                auto end = at + Needle.size();
+                while (end < raw.size() && IsIdentifierChar(raw[end]))
+                    ++end;
+
+                auto const name = std::string { raw.substr(at + Needle.size(), end - at - Needle.size()) };
+                // A name that is no catalogue row -- `Counter::Last`, the sentinel an unstated
+                // profile column carries -- is stepped past.
+                if (std::ranges::find(spellings, name) == spellings.end())
+                    continue;
+
+                // The text before `Counter::` still carries the qualification, and all three
+                // spellings occur -- bare, `IMetricsSink::`, and `FastCache::IMetricsSink::`.
+                // Testing the raw prefix for `Increment(` therefore matched NOTHING and the
+                // figure came back 0, which the pinned comparison caught rather than the eye.
+                auto prefix = raw.substr(0, at);
+                for (auto const qualifier: { std::string_view { "IMetricsSink::" }, std::string_view { "FastCache::" } })
+                    while (prefix.ends_with(qualifier))
+                        prefix.remove_suffix(qualifier.size());
+
+                if (prefix.ends_with("Increment(") || prefix.ends_with("Increment( "))
+                    sets.incremented.insert(name);
+                if (prefix.ends_with(".counter = "))
+                    sets.refusalRow.insert(name);
+                if (prefix.ends_with(".workerCounter = "))
+                    sets.outcomeRow.insert(name);
+                if (prefix.ends_with("return "))
+                    sets.returned.insert(name);
+                if (EndsInProfileMember(prefix))
+                    sets.profileRow.insert(name);
+            }
+        }
+    }
+    return sets;
+}
+
+/// Every counter this tree currently writes, by any of the five mechanisms.
+/// @param spellings Every counter, in enumerator order.
+/// @return The union of `ClassifyWriterMechanisms`'s five sets.
+[[nodiscard]] std::set<std::string> AnyWriterNames(std::vector<std::string> const& spellings)
+{
+    auto const sets = ClassifyWriterMechanisms(spellings);
+    std::set<std::string> out;
+    for (auto const* each: { &sets.incremented, &sets.refusalRow, &sets.outcomeRow, &sets.returned, &sets.profileRow })
+        out.insert(each->begin(), each->end());
+    return out;
+}
+
+/// Whether @p row is a STALE exemption: its counter already has a real production writer.
+///
+/// Named rather than spelled inline, for the reason `AttributedTooNarrowly` is: the case that
+/// proves this predicate can say yes has to exercise the same expression the check runs, or the
+/// control proves nothing about it.
+/// @param row The exemption row.
+/// @param spellings Every counter, in enumerator order.
+/// @param anyWriter Every counter this tree currently writes.
+/// @return True when @p row's counter is no longer writerless.
+[[nodiscard]] bool ExemptionIsStale(DeclaredAheadOfItsWriter const& row,
+                                    std::vector<std::string> const& spellings,
+                                    std::set<std::string> const& anyWriter)
+{
+    // `CounterIndex` is the one place a `Counter` becomes an index (`ctest -R counter-index-seam`,
+    // #1366); a cast written here would be a second one.
+    auto const index = CounterIndex(row.counter);
+    return index.has_value() && anyWriter.contains(spellings.at(*index));
+}
+
 } // namespace
 
 TEST_CASE("counter-attribution: the Counter enum parses back exactly as the build sees it",
@@ -442,8 +658,12 @@ TEST_CASE("counter-attribution: no counter is attributed more narrowly than its 
     REQUIRE(spellings.size() == EnumeratorCount<IMetricsSink::Counter>);
 
     std::map<std::string, IMetricsSink::Counter> byName;
-    for (auto const index: Enumerators<IMetricsSink::Counter>())
-        byName.emplace(spellings.at(static_cast<std::size_t>(index)), index);
+    for (auto const counter: Enumerators<IMetricsSink::Counter>())
+    {
+        auto const index = CounterIndex(counter);
+        REQUIRE(index.has_value());
+        byName.emplace(spellings.at(Unwrap(index)), counter);
+    }
 
     std::vector<std::string> tooNarrow;
     auto checked = std::size_t { 0 };
@@ -488,80 +708,50 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     auto const spellings = CounterSpellings();
     REQUIRE(spellings.size() == EnumeratorCount<IMetricsSink::Counter>);
 
-    // Four ways a row is written, and the whole reason the figures are worth pinning: a session
+    // Counters `DeclaredAheadOfItsWriterTable` names are catalogued before their writer, so they
+    // cannot appear in any of the five sets below by construction -- counting them against a
+    // figure that describes what this tree ACTUALLY writes would be the exact silent gap this
+    // file exists to catch, just relocated from a row to a census. Excluded HERE rather than
+    // hidden inside the classification, so the exemption count is a number this case states
+    // rather than one folded away.
+    auto const nonExempt = ExcludingDeclaredAheadOfItsWriter(spellings);
+    INFO(spellings.size() - nonExempt.size() << " counter(s) declared ahead of their writer, per "
+                                                "DeclaredAheadOfItsWriterTable");
+    CHECK(nonExempt.size() + DeclaredAheadOfItsWriterTable.size() == spellings.size());
+
+    // Five ways a row is written, and the whole reason the figures are worth pinning: a session
     // widening the attribution by reading only `SurfaceRefusal` tables reaches 101 of the 109
     // and leaves eleven rows looking unwritten. The text before the name on its own line
     // decides -- measured against a multi-line window, which agrees exactly.
-    std::set<std::string> incremented;
-    std::set<std::string> refusalRow;
-    std::set<std::string> outcomeRow;
-    std::set<std::string> returned;
-
-    for (auto const& path: ProductionSources())
-    {
-        auto const text = ReadWhole(path);
-        if (!text.contains("Counter::"))
-            continue;
-        for (auto const raw: LinesOf(text))
-        {
-            auto const start = raw.find_first_not_of(" \t");
-            if (start == std::string_view::npos || raw.substr(start).starts_with("//"))
-                continue;
-
-            constexpr auto Needle = std::string_view { "Counter::" };
-            auto at = raw.find(Needle);
-            while (at != std::string_view::npos)
-            {
-                auto end = at + Needle.size();
-                while (end < raw.size() && IsIdentifierChar(raw[end]))
-                    ++end;
-
-                auto const name = std::string { raw.substr(at + Needle.size(), end - at - Needle.size()) };
-                if (std::ranges::find(spellings, name) == spellings.end())
-                    continue;
-
-                // The text before `Counter::` still carries the qualification, and all three
-                // spellings occur -- bare, `IMetricsSink::`, and `FastCache::IMetricsSink::`.
-                // Testing the raw prefix for `Increment(` therefore matched NOTHING and the
-                // figure came back 0, which the pinned comparison caught rather than the eye.
-                auto prefix = raw.substr(0, at);
-                for (auto const qualifier: { std::string_view { "IMetricsSink::" }, std::string_view { "FastCache::" } })
-                    while (prefix.ends_with(qualifier))
-                        prefix.remove_suffix(qualifier.size());
-
-                if (prefix.ends_with("Increment(") || prefix.ends_with("Increment( "))
-                    incremented.insert(name);
-                if (prefix.ends_with(".counter = "))
-                    refusalRow.insert(name);
-                if (prefix.ends_with(".workerCounter = "))
-                    outcomeRow.insert(name);
-                if (prefix.ends_with("return "))
-                    returned.insert(name);
-
-                at = raw.find(Needle, end);
-            }
-        }
-    }
+    auto const sets = ClassifyWriterMechanisms(spellings);
+    auto const& incremented = sets.incremented;
+    auto const& refusalRow = sets.refusalRow;
+    auto const& outcomeRow = sets.outcomeRow;
+    auto const& returned = sets.returned;
+    auto const& profileRow = sets.profileRow;
 
     // Pinned rather than pointed at: these describe this tree at one instant, and a figure that
     // tracked its own subject would silently re-attribute a real measurement to conditions it
     // was never taken under. Drift is a red build, which is what the previous "106 of 144" --
-    // a sentence with nothing watching it -- did not get.
-    CHECK(incremented.size() == 46);
-    CHECK(refusalRow.size() == 115);
+    // a sentence with nothing watching it -- did not get. Unaffected by the exemption above: none
+    // of these five sets can contain a counter with no writer, exempt or not.
+    CHECK(incremented.size() == 58);
+    CHECK(refusalRow.size() == 146);
     CHECK(outcomeRow.size() == 10);
     CHECK(returned.size() == 4);
+    // Ten members of the private tier's profile and six of the shared tier's, which leaves its
+    // upstream members absent.
+    CHECK(profileRow.size() == 16);
 
-    std::set<std::string> anyWriter;
-    for (auto const* each: { &incremented, &refusalRow, &outcomeRow, &returned })
-        anyWriter.insert(each->begin(), each->end());
+    auto const anyWriter = AnyWriterNames(spellings);
 
-    // No catalogue row is written by none of the four. The check for that is the whole
-    // catalogue, not a count: a row nobody writes is a row whose surface was guessed.
-    CHECK(anyWriter.size() == spellings.size());
-    CHECK(spellings.size() - incremented.size() == 125);
+    // No NON-EXEMPT catalogue row is written by none of the five. The check for that is the whole
+    // catalogue minus the exemptions, not a count: a row nobody writes and nobody has excused is a
+    // row whose surface was guessed.
+    CHECK(anyWriter.size() == nonExempt.size());
+    CHECK(nonExempt.size() - incremented.size() == 172);
 
-    // 115 rows have a refusal row; 114 of them have no increment site. Two figures one apart
+    // 146 rows have a refusal row; 145 of them have no increment site. Two figures one apart
     // measuring different things is how a census gets quoted wrong -- the first draft of the
     // comment beside `CounterSoleWriterTable` said 101 for both -- so the REACH of a
     // SurfaceRefusal-only reading is asserted separately from the row count.
@@ -569,10 +759,67 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     for (auto const& name: refusalRow)
         if (!incremented.contains(name))
             reachedByRefusalRowsAlone.insert(name);
-    CHECK(reachedByRefusalRowsAlone.size() == 114);
+    CHECK(reachedByRefusalRowsAlone.size() == 145);
 
-    // And four rows are written two ways, which is why the column sums to 175 over 171 rows.
-    CHECK(incremented.size() + refusalRow.size() + outcomeRow.size() + returned.size() == spellings.size() + 4);
+    // And four rows are written two ways, which is why the column sums to four more than the rows.
+    // Said in words rather than as two totals: the totals were a second claim nothing checked, and
+    // they had drifted one off the sets above them.
+    CHECK(incremented.size() + refusalRow.size() + outcomeRow.size() + returned.size() + profileRow.size()
+          == nonExempt.size() + 4);
+}
+
+TEST_CASE("counter-attribution: a counter declared ahead of its writer is exempt, but not forever",
+          "[metrics][hygiene][counter-attribution]")
+{
+    auto const spellings = CounterSpellings();
+    REQUIRE(spellings.size() == EnumeratorCount<IMetricsSink::Counter>);
+    auto const anyWriter = AnyWriterNames(spellings);
+
+    // THE point of this table: a row survives only while its counter genuinely has no writer. Once
+    // a later task lands one, this loop is what makes leaving the row in place a red build rather
+    // than a comment nobody re-reads.
+    std::vector<std::string> stale;
+    for (auto const& row: DeclaredAheadOfItsWriterTable)
+    {
+        REQUIRE_FALSE(row.reason.empty());
+        if (ExemptionIsStale(row, spellings, anyWriter))
+        {
+            auto const index = CounterIndex(row.counter);
+            REQUIRE(index.has_value());
+            stale.push_back(spellings.at(Unwrap(index)));
+        }
+    }
+    INFO("a row here whose counter now has a production writer must be deleted in the change that "
+         "added the writer, not left as a stale exemption");
+    CHECK(stale.empty());
+    for (auto const& name: stale)
+        UNSCOPED_INFO("stale exemption: " << name);
+
+    // Proving the check can fail, in both directions this table protects against.
+
+    // (1) The predicate says YES for a counter that already has a real writer: NodeCacheHits is
+    // the private tier's profile row, which LocalCache spends, so a synthetic row claiming it is
+    // "declared ahead of its writer" must read as stale.
+    DeclaredAheadOfItsWriter const syntheticStale { .counter = IMetricsSink::Counter::NodeCacheHits,
+                                                    .reason = "neutered: NodeCacheHits already has a writer" };
+    CHECK(ExemptionIsStale(syntheticStale, spellings, anyWriter));
+
+    // And NO for a counter that has no writer. The table is EMPTY once every counter it named has
+    // one -- the state it exists to reach -- so the writerless counter is synthesised rather than
+    // borrowed from a row: the same writer set with that one name taken out, as if its writer had
+    // never been written.
+    auto const hitsIndex = CounterIndex(IMetricsSink::Counter::NodeCacheHits);
+    REQUIRE(hitsIndex.has_value());
+    auto asIfUnwritten = anyWriter;
+    REQUIRE(asIfUnwritten.erase(spellings.at(Unwrap(hitsIndex))) == 1);
+    CHECK_FALSE(ExemptionIsStale(syntheticStale, spellings, asIfUnwritten));
+
+    // (2) The mechanism-figures case's own guarantee, the other direction: a writerless counter
+    // with NO exemption row is not excluded, so it counts against `nonExempt` and against nothing
+    // in the writer set -- exactly the gap `anyWriter.size() == nonExempt.size()` exists to catch.
+    auto const nonExempt = ExcludingDeclaredAheadOfItsWriter(spellings);
+    CHECK(anyWriter.size() == nonExempt.size());
+    CHECK_FALSE(asIfUnwritten.size() == nonExempt.size());
 }
 
 TEST_CASE("counter-attribution: a name that prefixes another is not credited with its mentions",

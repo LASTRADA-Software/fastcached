@@ -7,6 +7,8 @@
 #include <mutex>
 #include <stop_token>
 
+#include <core/platform/Clock.hpp>
+
 namespace FastCache
 {
 
@@ -46,5 +48,51 @@ template <typename Rep, typename Period>
     (void) wake.wait_for(guard, stop, interval, [] { return false; });
     return stop.stop_requested() ? WaitEnd::Stopped : WaitEnd::Elapsed;
 }
+
+/// A stop-aware wait as a seam: what a thread that paces itself by an interval waits through, so
+/// the interval is read from a clock a test drives rather than from the wall.
+///
+/// **It hands out the clock its intervals pass on** (`Clock`), so a component that waits through it
+/// and reads time beside it reads ONE clock: handed the two separately, a caller could pass a wait
+/// over one clock and a different clock, and the component would read a time its waits never pass.
+class IStopAwareWait
+{
+  public:
+    IStopAwareWait() = default;
+    IStopAwareWait(IStopAwareWait const&) = delete;
+    IStopAwareWait(IStopAwareWait&&) = delete;
+    IStopAwareWait& operator=(IStopAwareWait const&) = delete;
+    IStopAwareWait& operator=(IStopAwareWait&&) = delete;
+    virtual ~IStopAwareWait() = default;
+
+    /// Block for @p interval, or until @p stop is requested, whichever is first.
+    /// @param stop Participates in the wait; a request ends it at once.
+    /// @param interval How long to wait when nobody asks for a stop.
+    /// @return `Stopped` when a stop was requested, before or during the wait; `Elapsed` otherwise.
+    [[nodiscard]] virtual WaitEnd WaitFor(std::stop_token const& stop, std::chrono::milliseconds interval) const = 0;
+
+    /// @return The clock every interval this waits passes on; read time from it, never from another.
+    [[nodiscard]] virtual core::platform::IClock const& Clock() const noexcept = 0;
+};
+
+/// The process's own: `WaitForStopOr`, on the steady clock.
+class SystemStopAwareWait final: public IStopAwareWait
+{
+  public:
+    /// @copydoc IStopAwareWait::WaitFor
+    [[nodiscard]] WaitEnd WaitFor(std::stop_token const& stop, std::chrono::milliseconds interval) const override
+    {
+        return WaitForStopOr(stop, interval);
+    }
+
+    /// @copydoc IStopAwareWait::Clock
+    [[nodiscard]] core::platform::IClock const& Clock() const noexcept override
+    {
+        return _clock;
+    }
+
+  private:
+    core::platform::SteadyClock _clock; ///< The steady clock `WaitForStopOr`'s interval passes on.
+};
 
 } // namespace FastCache

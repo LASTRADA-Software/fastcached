@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "ReactorHome.hpp"
+
 #include <atomic>
 #include <cstddef>
 #include <memory>
@@ -8,8 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include <core/net/AcceptLoopHealth.hpp>
 #include <core/net/IConnector.hpp>
-#include <core/net/IListener.hpp>
 #include <core/net/PlatformLoop.hpp>
 #include <core/net/ThreadedAddressResolver.hpp>
 #include <core/platform/Clock.hpp>
@@ -49,7 +51,7 @@ class FrameServer;
 /// while also being included by anything wanting `<winsock2.h>` is the classic
 /// redefinition. Every other signature takes `NodeIoLoop&`, which is
 /// forward-declarable.
-class NodeIoLoop
+class NodeIoLoop final: public IReactorHome
 {
   public:
     NodeIoLoop();
@@ -60,7 +62,7 @@ class NodeIoLoop
     NodeIoLoop& operator=(NodeIoLoop&&) = delete;
 
     /// Joins the loop thread. The adopted servers stop the reactor themselves.
-    ~NodeIoLoop();
+    ~NodeIoLoop() override;
 
     /// @return The reactor every adopted loop and every socket here is pinned to.
     [[nodiscard]] core::net::PlatformLoop& Reactor() noexcept
@@ -78,6 +80,17 @@ class NodeIoLoop
         return _resolver;
     }
 
+    /// @return Which of the surfaces running on this loop are degraded or have stopped accepting.
+    ///
+    /// Here because every framed surface of the node runs on this loop and reports to it already
+    /// (`NoteLoopFinished`); ONE registry per loop, which the node's liveness probe and its
+    /// `surface-not-accepting` and `surface-accept-degraded` conditions all read, so they cannot
+    /// disagree.
+    [[nodiscard]] core::net::AcceptLoopHealth& AcceptLoops() noexcept
+    {
+        return _acceptLoops;
+    }
+
     /// @return A connector whose sockets belong to `Reactor()`.
     ///
     /// Reactor-driven, so a dial from inside an answer suspends rather than
@@ -85,6 +98,12 @@ class NodeIoLoop
     [[nodiscard]] core::net::IConnector& Connector() noexcept
     {
         return *_connector;
+    }
+
+    /// @copydoc IReactorHome::Loop
+    [[nodiscard]] core::net::EventLoop& Loop() noexcept override
+    {
+        return _reactor;
     }
 
     /// Register a server whose loop must finish before the reactor may stop.
@@ -103,8 +122,8 @@ class NodeIoLoop
     /// accepting on.
     void Start();
 
-    /// Take ownership of a listener this reactor owns, and free it once the
-    /// reactor has stopped.
+    /// Take ownership of something this reactor owns -- a listener, a kept socket
+    /// and the timer armed on it -- and free it once the reactor has stopped.
     ///
     /// **The rule is `core::net::EventLoop::TeardownIsSerialisedWithDispatch()`**: an object a
     /// reactor owns is destroyed on that reactor's worker thread, or with that
@@ -133,15 +152,17 @@ class NodeIoLoop
     /// points at, which is the "with that reactor stopped" arm of the rule, reached
     /// by construction rather than by racing for it.
     ///
-    /// The cost is that a retired listener's memory lives until this loop does. The
-    /// descriptor does not: `FrameServer::Shutdown()` has already closed it on the
-    /// reactor, so the port is free the moment the endpoint stops. The number
-    /// retained is the number of endpoints this loop ever served.
+    /// The cost is that a retired object's memory lives until this loop does. The
+    /// descriptor need not: `FrameServer::Shutdown()` has already closed a listener on
+    /// the reactor, so the port is free the moment the endpoint stops, and a kept
+    /// shared-cache session closes on its own idle timer. The number retained is the
+    /// number of endpoints this loop ever served, plus the sessions their pools held
+    /// when they went.
     ///
     /// Safe from any thread; an endpoint may be dropped from one that is not the
-    /// owner's. @p listener may be null, which retires nothing.
-    /// @param listener The listener to hold until the reactor has stopped.
-    void Retire(std::unique_ptr<core::net::IListener> listener);
+    /// owner's. @p owned may be null, which retires nothing.
+    /// @param owned What to hold until the reactor has stopped.
+    void Retire(std::shared_ptr<void> owned) override;
 
     /// Note that one more loop is running.
     ///
@@ -186,7 +207,10 @@ class NodeIoLoop
     std::vector<FrameServer*> _loops;
     std::atomic<std::size_t> _loopsRunning { 0 };
 
-    /// Listeners handed over by `Retire`, freed when this loop is.
+    core::net::AcceptLoopHealth
+        _acceptLoops; ///< The surfaces here that are degraded or stopped accepting; see `AcceptLoops()`.
+
+    /// What `Retire` was handed, freed when this loop is.
     ///
     /// **Its POSITION is the mechanism.** Declared after `_reactor` and before
     /// `_thread`, so destruction -- which runs in reverse -- joins the thread first,
@@ -195,7 +219,7 @@ class NodeIoLoop
     /// `_reactor` and a listener outlives the reactor its destructor asks; below
     /// `_thread` and it is freed while the loop still turns, which is the defect.
     std::mutex _retiredMutex;
-    std::vector<std::unique_ptr<core::net::IListener>> _retired;
+    std::vector<std::shared_ptr<void>> _retired;
 
     std::jthread _thread;
 };

@@ -282,6 +282,92 @@ TEST_CASE("A remembered leader that stops answering walks the whole configured l
     CHECK_FALSE(link.Lost().has_value());
 }
 
+namespace
+{
+/// Where a node registers, as a case scripts it: what `Current` answers until the case moves it.
+class ScriptedSchedulers final: public ISchedulerEndpointSource
+{
+  public:
+    /// @param endpoints What it answers first.
+    explicit ScriptedSchedulers(std::vector<std::string> endpoints):
+        _endpoints { std::move(endpoints) }
+    {
+    }
+
+    [[nodiscard]] std::vector<std::string> Current() const override
+    {
+        ++_reads;
+        return _endpoints;
+    }
+
+    /// @return How many times the link asked.
+    [[nodiscard]] int Reads() const noexcept
+    {
+        return _reads;
+    }
+
+    /// Answer @p endpoints from now on.
+    /// @param endpoints The new list.
+    void Move(std::vector<std::string> endpoints)
+    {
+        _endpoints = std::move(endpoints);
+    }
+
+  private:
+    std::vector<std::string> _endpoints;
+    mutable int _reads { 0 };
+};
+} // namespace
+
+TEST_CASE("A link over a source re-reads it at every round, and a moved list is walked from the next one",
+          "[node][schedulerlink][retarget]")
+{
+    // T26's carry: a voter that moves its 0xFC endpoint is recorded in the applied state, and the next
+    // round -- not the next reform -- dials it. The read is in `BeginRound`, which every round makes.
+    ScriptedSchedulers source { { std::string { Configured } } };
+    auto built = SchedulerLink::Over(source);
+    REQUIRE(built.has_value());
+    auto link = Unwrap(built);
+    CHECK(NextRoundOpensAt(link) == Configured);
+    link.Accepted();
+    auto const readsAfterFirst = source.Reads();
+
+    source.Move({ std::string { Second } });
+    CHECK(NextRoundOpensAt(link) == Second);
+    CHECK(source.Reads() == readsAfterFirst + 1);
+    CHECK(link.Configured() == std::vector<std::string> { std::string { Second } });
+
+    // A source that knows nothing for a moment forgets nothing the link knew.
+    source.Move({});
+    CHECK(NextRoundOpensAt(link) == Second);
+    CHECK_FALSE(SchedulerLink::Over(source).has_value());
+}
+
+TEST_CASE("A retargeted walk keeps its place by endpoint, and keeps a remembered leader", "[node][schedulerlink][retarget]")
+{
+    // The endpoint that last accepted stays where a round opens when it is still listed, wherever it
+    // now sits; one that is gone hands the opening to the list's first entry.
+    auto link = LinkTo({ Configured, Second });
+    link.BeginRound();
+    REQUIRE(link.Lost() == std::optional { std::string { Second } });
+    link.Accepted();
+
+    link.Retarget({ std::string { Third }, std::string { Second } });
+    CHECK(NextRoundOpensAt(link) == Second);
+    CHECK(link.Lost() == std::optional { std::string { Third } });
+
+    link.Retarget({ std::string { Third }, std::string { Configured } });
+    CHECK(NextRoundOpensAt(link) == Third);
+
+    // A remembered leader is no configured endpoint, and a moved list says nothing about who leads.
+    link.BeginRound();
+    REQUIRE(link.Redirect(std::string { Leader }));
+    link.Accepted();
+    link.Retarget({ std::string { Other } });
+    CHECK(NextRoundOpensAt(link) == Leader);
+    CHECK(link.Lost() == std::optional { std::string { Other } });
+}
+
 TEST_CASE("DescribeAnnounceRound: a steady heartbeat round does not claim a registration", "[node][scheduler]")
 {
     using namespace FastCache::Node;
@@ -290,7 +376,7 @@ TEST_CASE("DescribeAnnounceRound: a steady heartbeat round does not claim a regi
     // registered", every interval, forever. Asserted on the WORDING and not only the
     // level, because that is what was wrong -- a test checking the level alone passes
     // with the sentence still collapsed.
-    auto const steady = DescribeAnnounceRound(6, 0, 6, false);
+    auto const steady = DescribeAnnounceRound(6, 0, 6);
     CHECK(steady.level == FastCache::LogLevel::Trace);
     CHECK(!steady.message.contains("registered,"));
     CHECK(steady.message.contains("still registered"));
@@ -301,19 +387,19 @@ TEST_CASE("DescribeAnnounceRound: a real registration is an event and says so", 
 {
     using namespace FastCache::Node;
 
-    auto const fresh = DescribeAnnounceRound(0, 6, 6, false);
+    auto const fresh = DescribeAnnounceRound(0, 6, 6);
     CHECK(fresh.level == FastCache::LogLevel::Info);
 
     // The ACCEPTED form is a fixture contract: `E2eRegisteredMarker` is
     // "1 of 1 toolchain(s) registered" and distinguishes an accepted worker from one
     // the scheduler turned away (#445). Pinned here as bytes, because rewording it
     // breaks three e2e fixtures by TIMEOUT rather than by a failed assertion.
-    CHECK(DescribeAnnounceRound(0, 1, 1, false).message == "1 of 1 toolchain(s) registered");
+    CHECK(DescribeAnnounceRound(0, 1, 1).message == "1 of 1 toolchain(s) registered");
     CHECK(fresh.message.contains("6 of 6 toolchain(s) registered"));
 
     // And it must be distinguishable from the steady round, which is the whole point.
-    CHECK(fresh.message != DescribeAnnounceRound(6, 0, 6, false).message);
-    CHECK(fresh.level != DescribeAnnounceRound(6, 0, 6, false).level);
+    CHECK(fresh.message != DescribeAnnounceRound(6, 0, 6).message);
+    CHECK(fresh.level != DescribeAnnounceRound(6, 0, 6).level);
 }
 
 TEST_CASE("DescribeAnnounceRound: a heartbeat that fell through to a register is its own outcome", "[node][scheduler]")
@@ -322,32 +408,29 @@ TEST_CASE("DescribeAnnounceRound: a heartbeat that fell through to a register is
 
     // The case worth catching: the scheduler forgot this worker and it re-announced.
     // Fully accepted, so a count-based check calls it healthy -- and it is an event.
-    auto const mixed = DescribeAnnounceRound(4, 2, 6, false);
+    auto const mixed = DescribeAnnounceRound(4, 2, 6);
     CHECK(mixed.level == FastCache::LogLevel::Info);
     CHECK(mixed.message.contains("2 of 6 toolchain(s) re-registered"));
 
     // Three outcomes, three sentences. None may collide with another.
-    auto const steady = DescribeAnnounceRound(6, 0, 6, false);
-    auto const fresh = DescribeAnnounceRound(0, 6, 6, false);
+    auto const steady = DescribeAnnounceRound(6, 0, 6);
+    auto const fresh = DescribeAnnounceRound(0, 6, 6);
     CHECK(mixed.message != steady.message);
     CHECK(mixed.message != fresh.message);
 }
 
-TEST_CASE("DescribeAnnounceRound: a shortfall is Warn, unless a leader was named", "[node][scheduler]")
+TEST_CASE("DescribeAnnounceRound: a shortfall is Debug, because each refusal it counts is said on its own",
+          "[node][scheduler]")
 {
     using namespace FastCache::Node;
 
-    // Preserved from the code this replaced: reporting a shortfall at Warn on every
-    // election trains an operator to ignore the line that matters, because the caller
-    // follows the redirect inside this same round.
-    CHECK(DescribeAnnounceRound(0, 0, 1, false).level == FastCache::LogLevel::Warn);
-    CHECK(DescribeAnnounceRound(0, 0, 1, true).level == FastCache::LogLevel::Debug);
+    // A shortfall is registrars a scheduler refused or redirected. Each refusal is said by
+    // `SchedulerReachability` -- at Warn on its transition, then quietly -- and each redirect as the
+    // round follows it, so the per-round count of them is Debug whatever caused it.
+    CHECK(DescribeAnnounceRound(0, 0, 1).level == FastCache::LogLevel::Debug);
 
-    // A shortfall still says which half happened, so "the scheduler refused two" and
-    // "two never got a heartbeat in" are not one sentence.
-    // The SHORTFALL form is the other half of that contract -- the self-test stages
-    // "0 of 1 toolchain(s) registered" as the line a turned-away worker writes, so it
-    // is pinned as bytes too.
-    CHECK(DescribeAnnounceRound(0, 0, 1, false).message == "0 of 1 toolchain(s) registered");
-    CHECK(DescribeAnnounceRound(3, 1, 6, false).message == "4 of 6 toolchain(s) registered");
+    // The SHORTFALL form is still a fixture contract as bytes: the e2e helpers' self-test stages
+    // "0 of 1 toolchain(s) registered" as the line a turned-away worker writes.
+    CHECK(DescribeAnnounceRound(0, 0, 1).message == "0 of 1 toolchain(s) registered");
+    CHECK(DescribeAnnounceRound(3, 1, 6).message == "4 of 6 toolchain(s) registered");
 }

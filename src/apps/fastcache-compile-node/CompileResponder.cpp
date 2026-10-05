@@ -99,19 +99,17 @@ namespace
     /// a wire change bought for nothing. The compiler still enumerates it -- no
     /// `default`, so a fifth outcome is a build failure here exactly as it is there.
     ///
-    /// Two of the four cannot happen. `UnknownOpcode` is refused by the router before
-    /// a verb reaches this responder, and `Unauthenticated` needs `AuthRequired` to
-    /// have said yes, which this surface never does. They get counters anyway, because
-    /// a refusal answered while nothing rises is indistinguishable on `/metrics` from
-    /// a port nobody is talking to -- and if either ever fires, what changed is who may
-    /// compile here.
+    /// `UnknownOpcode` cannot happen -- the router refuses it before a verb reaches this
+    /// responder -- and gets a counter anyway, because a refusal answered while nothing
+    /// rises is indistinguishable on `/metrics` from a port nobody is talking to.
     ///
-    /// `Serve` is not a refusal and the interface says so, but a total function has to
-    /// answer it. It follows `ErrorCodeFor`'s own choice rather than inventing a
-    /// second one.
+    /// `Unauthenticated` has no row: the node checks no password, so the endpoint never asks
+    /// `DecidePrePayload` to require a credential and no event could move one. `Serve` is not
+    /// a refusal and the interface says so; a total function answers it with the same
+    /// absence rather than inventing an event.
     /// @param decision What `DecidePrePayload` returned.
-    /// @return The row pairing the wire code with its counter.
-    [[nodiscard]] constexpr Cc::SurfaceRefusal RefusalFor(Wire::PrePayloadDecision decision) noexcept
+    /// @return The row pairing the wire code with its counter, or nothing where no event is.
+    [[nodiscard]] constexpr std::optional<Cc::SurfaceRefusal> RefusalFor(Wire::PrePayloadDecision decision) noexcept
     {
         switch (decision)
         {
@@ -123,7 +121,7 @@ namespace
             case Wire::PrePayloadDecision::Serve:
                 break;
         }
-        return CompileRefusal::Unauthenticated;
+        return std::nullopt;
     }
 
     /// One row per `EndpointRefusal`, in enumerator order.
@@ -153,10 +151,14 @@ namespace
         // `.rationale` is spelled out as empty on every counted row rather than left to
         // default. Clang and GCC reject the omission under this project's pedantic
         // flags (`-Wmissing-designated-field-initializers`) and MSVC does not say a
-        // word, so the three rows below built clean on Windows and failed four CI legs.
+        // word, so counted rows built clean on Windows and failed four CI legs.
         { .refusal = EndpointRefusal::InFlightBudget, .answer = CompileRefusal::EndpointBusy, .rationale = {} },
-        { .refusal = EndpointRefusal::CredentialMalformed, .answer = CompileRefusal::MalformedCredential, .rationale = {} },
-        { .refusal = EndpointRefusal::CredentialRejected, .answer = CompileRefusal::RejectedCredential, .rationale = {} },
+        { .refusal = EndpointRefusal::CredentialMalformed,
+          .answer = std::nullopt,
+          .rationale = CredentialIsTheSessionsRationale },
+        { .refusal = EndpointRefusal::CredentialRejected,
+          .answer = std::nullopt,
+          .rationale = CredentialIsTheSessionsRationale },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .answer = std::nullopt,
           .rationale = AnswerDeadlineIsTheEndpointsRationale },
@@ -212,7 +214,10 @@ std::vector<std::byte> CompileResponder::RefusalReply(Wire::PrePayloadDecision d
     // The caller's wording, and it is empty for every decision but the frame ceiling.
     // That one names both numbers -- a 256 MiB cap is not guessable from "too large" --
     // and it arrives from the endpoint because the endpoint is what enforced it.
-    return Cc::Refuse(_metrics, RefusalFor(decision), detail);
+    if (auto const row = RefusalFor(decision); row.has_value())
+        return Cc::Refuse(_metrics, *row, detail);
+    return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCodeFor(decision), .rationale = NodeChecksNoPasswordRationale },
+                                    detail);
 }
 
 std::vector<std::byte> CompileResponder::EndpointRefusalReply(EndpointRefusal refusal,

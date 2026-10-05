@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Server/Connection.hpp>
 #include <FastCache/Server/Server.hpp>
+#include <FastCache/Transport/AcceptLoopReporter.hpp>
 
 #include <memory>
 #include <optional>
@@ -76,6 +77,8 @@ namespace
 Server::Server(core::net::IListener& listener,
                CacheEngine& engine,
                ILogger& logger,
+               core::net::AcceptLoopHealth& acceptLoops,
+               std::string surface,
                core::net::IAdmissionControl* admission,
                IMetricsSink* metrics,
                SessionContext session,
@@ -84,6 +87,8 @@ Server::Server(core::net::IListener& listener,
     _listener { listener },
     _engine { engine },
     _logger { logger },
+    _acceptLoops { acceptLoops },
+    _surface { std::move(surface) },
     _admission { admission },
     _metrics { metrics },
     _session { session },
@@ -99,14 +104,30 @@ core::async::Task<void> Server::Run()
     // what it needs to know then is that the accept is registered rather than that
     // `Run()` was called. See `IsAccepting()`.
     AcceptingScope const accepting { _accepting };
+    // `core::net::AcceptErrorPolicy` decides, as it does for every accept loop in the tree, and
+    // `AcceptLoopReporter` says so: only a closed or dead listener ends this loop. It used to end on
+    // ANY failed accept, at `Debug` -- a client that reset its queued connection stopped the bind
+    // for as long as the daemon ran.
+    AcceptLoopReporter acceptErrors { _surface, _surface, _logger, _acceptLoops };
+    // The reactor's clock where there is one, and the blocking wait's own where there is not, so
+    // the rate limit and the backoff read the same seam that paces them.
+    auto const now = [this] {
+        return _session.reactor != nullptr ? _session.reactor->clock().now() : DefaultDrainWait().Now();
+    };
     while (!_shuttingDown.load(std::memory_order_acquire))
     {
         auto accepted = co_await _listener.accept();
         if (!accepted.has_value())
         {
-            _logger.Logf(LogLevel::Debug, "Server: accept ended ({})", accepted.error().toString());
-            co_return;
+            auto const step = acceptErrors.OnError(accepted.error(), now(), _shuttingDown.load(std::memory_order_acquire));
+            if (step.next == AcceptLoopNext::EndAndClose)
+                _listener.close();
+            if (step.next != AcceptLoopNext::AcceptAgain)
+                co_return;
+            co_await WaitOutBackoff(_session.reactor, &DefaultDrainWait(), step.delay);
+            continue;
         }
+        acceptErrors.OnAccepted(now());
 
         // Admission control: refuse if the cap is full. We still accepted
         // the socket (the OS already did the SYN-ACK), so close it and
@@ -154,6 +175,8 @@ core::async::Task<void> Server::Run()
             ConnectionHoldings { .engine = _engine, .logger = _logger, .session = _session, .logSource = _logSource });
         RunConnectionDetached(std::move(connection), &_logger, std::move(lease));
     }
+    // Shut down between accepts: a loop that was degraded says it stopped.
+    acceptErrors.OnLoopEnded();
     co_return;
 }
 

@@ -67,10 +67,8 @@ namespace
         if (ntdll == nullptr)
             return {};
 
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- GetProcAddress
-        // returns FARPROC and there is no other way to call through it.
-        auto* const entry =
-            reinterpret_cast<RtlGetVersionFn>(reinterpret_cast<void*>(::GetProcAddress(ntdll, "RtlGetVersion")));
+        // GetProcAddress returns FARPROC, and a cast is the only way to call through it.
+        auto* const entry = reinterpret_cast<RtlGetVersionFn>(::GetProcAddress(ntdll, "RtlGetVersion"));
         if (entry == nullptr)
             return {};
 
@@ -94,7 +92,8 @@ namespace
     /// @return The host name, or empty.
     [[nodiscard]] std::string QueryHostName()
     {
-        std::array<char, 256> buffer {};
+        // One byte past the longest name reported, for its terminator.
+        std::array<char, MaxHostNameBytes + 1> buffer {};
 #if defined(_WIN32)
         auto size = static_cast<DWORD>(buffer.size());
         if (GetComputerNameExA(ComputerNameDnsHostname, buffer.data(), &size) == 0)

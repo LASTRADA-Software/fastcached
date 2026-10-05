@@ -567,7 +567,27 @@ struct SlotCeilings
         // reporting why.
         auto const external =
             busyCores <= std::uint64_t { load.inFlight } ? 0U : static_cast<std::uint32_t>(busyCores) - load.inFlight;
-        result.byExternalCpu = external >= registeredSlots ? 0U : registeredSlots - external;
+
+        // Somebody else's cores are charged against the slots only once they reach
+        // past the HEADROOM the slots leave -- the cores the fleet was never offered.
+        // Charging all of them charged the whole of somebody's work against the
+        // fleet's share: `--slots=4` on a 32-core desk was fully withdrawn by four
+        // busy cores with twenty-eight idle, and a reserve was spent twice, once when
+        // the slots were derived and again the moment the owner used the cores it
+        // holds back.
+        //
+        // Headroom and not a cap at the idle cores, and the difference is the
+        // oversubscription contract: `OfferableSlots` takes an operator's count
+        // untouched, so `--slots=64` on 16 cores is a promise of 64, and `min(slots,
+        // idle)` broke it the moment a heartbeat carried any CPU figure at all --
+        // 16 on an idle machine, named `external-cpu`. With no headroom (slots at or
+        // above the cores) every external core is charged, which is the rule this
+        // replaced; with slots at or below the cores it is the idle cores capped at
+        // the slots. Where the two agree -- slots equal to the cores -- nothing
+        // noticed either defect.
+        auto const headroom = cores > registeredSlots ? cores - registeredSlots : 0U;
+        auto const charged = external > headroom ? external - headroom : 0U;
+        result.byExternalCpu = charged >= registeredSlots ? 0U : registeredSlots - charged;
         result.available = *result.byExternalCpu;
         if (*result.byExternalCpu < registeredSlots)
             result.binding = SlotLimit::ExternalCpu;

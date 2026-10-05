@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeProofClient.hpp"
 #include "NodeProofResponder.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
@@ -21,10 +22,9 @@ namespace
 
     /// A `NodeChallenge` or `ProveNode` payload that would not decode into its fixed-width fields.
     ///
-    /// Counted apart from the rejection below for `SchedulerCredentialsMalformed`'s reason: a peer
-    /// that cannot form the frame is a version or client-library mismatch, and one forming it
-    /// correctly and failing to verify is the security question. Summed, the second hides inside
-    /// the first whenever an old client is in the fleet.
+    /// Counted apart from the rejection below: a peer that cannot form the frame is a version or client-library mismatch,
+    /// and one forming it correctly and failing to verify is the security question. Summed, the second hides inside the
+    /// first whenever an old client is in the fleet.
     constexpr Cc::SurfaceRefusal RefusedMalformed { .code = Wire::ErrorCode::MalformedFrame,
                                                     .counter = IMetricsSink::Counter::NodeProofsMalformed };
 
@@ -45,11 +45,26 @@ namespace
     constexpr Cc::SurfaceRefusal RefusedUnknownKey { .code = Wire::ErrorCode::NodeKeyUnknown,
                                                      .counter = IMetricsSink::Counter::NodeProofsRefusedUnknownKey };
 
+    /// A signature that verified under a key this node's roster lacks, while the state that roster is
+    /// published from has not caught up with the log this node recovered at start.
+    ///
+    /// Not `RefusedUnknownKey`: the key may be one the cluster holds and this node has not applied
+    /// yet -- a lone voter before its election commits, a follower before its leader first speaks --
+    /// and "admit it" would then be a confident wrong signal at every start. Transient, so the prover
+    /// asks again on a short backoff.
+    ///
+    /// One field per line, which the trailing comma keeps: the counter-attribution scan reads a row's
+    /// `.counter = Counter::X` on ONE line, and a wrapped one reads as a counter nobody writes.
+    constexpr Cc::SurfaceRefusal RefusedNotYetApplied {
+        .code = Wire::ErrorCode::RosterNotYetApplied,
+        .counter = IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied,
+    };
+
     /// A signature that verified under a key this cluster REVOKED: the forgotten machine itself.
     ///
     /// Refused, and the connection is MARKED rather than closed: every later verb on it is refused
     /// as the forgotten machine's, from any address. Closing it would let the machine simply redial
-    /// and be judged by its address, which `--fleet-member` may still admit.
+    /// and be judged by its address, which `--fleet-open` still admits.
     constexpr Cc::SurfaceRefusal RefusedRevokedKey { .code = Wire::ErrorCode::NodeKeyRevoked,
                                                      .counter = IMetricsSink::Counter::NodeProofsRefusedRevokedKey };
 
@@ -94,11 +109,6 @@ namespace
         "a size or opcode refusal says the peer is confused about the framing rather than about which machine it is; "
         "summed into the node-proof series it would bury the refusals that mean an identity is wrong somewhere";
 
-    /// Why a credential refusal here belongs to the scheduler.
-    constexpr std::string_view CredentialIsTheSchedulersRationale =
-        "the credential is the scheduler's -- AUTH is a Session verb and MergedResponder routes it there -- so the "
-        "peer that presented it is counted against the component that checked it, once";
-
     /// One row per `EndpointRefusal`: what this surface does about it.
     struct NodeProofEndpointRefusal
     {
@@ -119,10 +129,10 @@ namespace
                        "summed into a series read as a wrong key somewhere it is what makes that series unreadable" },
         { .refusal = EndpointRefusal::CredentialMalformed,
           .answer = std::nullopt,
-          .rationale = CredentialIsTheSchedulersRationale },
+          .rationale = CredentialIsTheSessionsRationale },
         { .refusal = EndpointRefusal::CredentialRejected,
           .answer = std::nullopt,
-          .rationale = CredentialIsTheSchedulersRationale },
+          .rationale = CredentialIsTheSessionsRationale },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .answer = std::nullopt,
           .rationale = AnswerDeadlineIsTheEndpointsRationale },
@@ -238,6 +248,30 @@ std::expected<NodeChallengeIssued, std::vector<std::byte>> NodeProofResponder::C
     };
 }
 
+std::string NodeProofResponder::UnknownKeyReason(ProvenIdentity const& proven) const
+{
+    auto const ownId = proven.id == _nodeId;
+    if (ownId && proven.key != _identity.PublicKey())
+        return std::format("{} is this node's own id, proved under a key that is not this node's: another machine is "
+                           "running with a copy of this node's --cluster-dir. Give that machine a state directory of "
+                           "its own, so it mints its own id and key",
+                           proven.id);
+    if (!ownId)
+        return std::format("this cluster holds no such key for {}: it joins by asking to enroll (--fleet-seed names a "
+                           "fleet no beacon reaches), and --enroll-approve admits it",
+                           proven.id);
+    // This node's own id and key, recorded under ANOTHER key: its node-key was replaced while its
+    // id survived, which waiting will not fix -- the diagnosis this node's prover gives itself. Only
+    // for its OWN id: a stranger's proof of a recorded member's id may as well be another machine
+    // claiming that id, and "forget it" is then the one remedy that must not be offered.
+    if (auto const recorded = _roster.LiveKeyOf(proven.id); recorded.has_value() && *recorded != proven.key)
+        return ReplacedNodeKeyDiagnosis(proven.id);
+    return std::format("{} is this node's own identity, which its own cluster has not recorded yet: a member the "
+                       "cluster was started with is recorded once the cluster has elected a leader, so nothing "
+                       "needs admitting",
+                       proven.id);
+}
+
 NodeProofVerdict NodeProofResponder::Verify(NodeHandshake const& handshake, std::span<std::byte const> payload)
 {
     auto const proof = Wire::DecodeProveNodePayload(payload);
@@ -265,7 +299,10 @@ NodeProofVerdict NodeProofResponder::Verify(NodeHandshake const& handshake, std:
     };
 
     // The signature under the key the caller presented, and the roster only after: a caller who
-    // cannot sign learns nothing about which ids and keys this cluster holds.
+    // cannot sign learns nothing about which ids and keys this cluster holds. AUTH's ticket keeps
+    // the same promise the other way round -- a ticket is checked under the ROSTER's key for the id
+    // it claims, so its roster-dependent refusals share one message (`TicketRefusalSays`) -- and
+    // what either path tells a caller is about a signature it holds, never about an id it only names.
     if (!Distributed::VerifyNodeProof(handshake.request, handshake.reply, *proof))
         return sealed(Cc::Refuse(_metrics,
                                  RefusedRejected,
@@ -277,7 +314,7 @@ NodeProofVerdict NodeProofResponder::Verify(NodeHandshake const& handshake, std:
 
     // The one door to what the cluster holds: the admission oracle's key question, so the answer a
     // proof gets here and the answer every later verb on the connection gets are one fold.
-    auto const standing = _roster.ExplainKey(identity);
+    auto const standing = _roster.ExplainKey(identity, Distributed::KeyEvidence::SessionProof);
     if (standing.decidedBy.Has(Distributed::MembershipParticipant::KeyTombstone))
         return sealed(Cc::Refuse(_metrics,
                                  RefusedRevokedKey,
@@ -285,12 +322,18 @@ NodeProofVerdict NodeProofResponder::Verify(NodeHandshake const& handshake, std:
                                  "as the forgotten machine's"),
                       std::move(identity));
     if (!Distributed::RestsOnProvenIdentity(standing))
-        return sealed(Cc::Refuse(_metrics,
-                                 RefusedUnknownKey,
-                                 std::format("this cluster holds no such key for {}: admit it with --enroll-from or "
-                                             "--cluster-admit-worker",
-                                             identity.id)),
-                      std::nullopt);
+    {
+        // Asked only once the roster has no opinion, so a key it holds is accepted whatever the
+        // reading: "not yet" replaces only the refusal that may be wrong until the state catches up.
+        if (_consensus.CurrentAppliedState() != AppliedStateReading::CaughtUp)
+            return sealed(Cc::Refuse(_metrics,
+                                     RefusedNotYetApplied,
+                                     std::format("this node has not applied its cluster's state since it started, so it "
+                                                 "cannot judge {}'s key yet; it is asked again in a moment",
+                                                 identity.id)),
+                          std::nullopt);
+        return sealed(Cc::Refuse(_metrics, RefusedUnknownKey, UnknownKeyReason(identity)), std::nullopt);
+    }
 
     _metrics.Increment(IMetricsSink::Counter::NodeProofsAccepted);
     return sealed(Wire::EncodeReply(Wire::Status::Ok, {}), std::move(identity));

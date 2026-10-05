@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The variables git reads to decide WHICH repository it is writing and what configuration it
+# writes it under, removed from the environment of every git command a fixture runs against a
+# repository it created.
+# One name per line; `#` starts a comment. Read by `scratch_git`
+# (`scripts/lib/git-scrub.sh`) and `fastcached_scratch_git` (`scripts/lib/CheckCommon.cmake`),
+# which refuse to run git at all when this names nothing.
+#
+# Why: a self-test's `( cd "$tree" && git init -q . )` obeys an INHERITED `GIT_DIR`. On
+# 2026-10-02 a WSL `ctest -L hygiene` ran with `GIT_DIR` and `GIT_WORK_TREE` exported so WSL
+# git could read a worktree; every self-test's scratch `git init` then reinitialised the
+# repository those named and wrote `core.worktree` into the configuration EVERY worktree of the
+# repository shares, which broke git in all of them. The scratch tree itself was never touched.
+#
+# How the list is derived, so that it is re-derived rather than remembered: it is the UNION of
+#   - everything `git rev-parse --local-env-vars` prints -- git's own answer to which variables
+#     describe THE CURRENT REPOSITORY, and the set git itself clears before it runs a command in
+#     another one (a submodule). `scratch-git-selftest` asserts this file is a superset of what
+#     the RUNNING git prints, so a git that adds a variable turns that test red rather than
+#     leaving the name inherited;
+#   - the configuration-file trio `GIT_CONFIG`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`,
+#     because a fixture's `git config` writes whichever file they name (`GIT_CONFIG` is also in
+#     git's own list; the other two are not);
+#   - `GIT_NAMESPACE`, which moves every ref a fixture's commit or tag writes under
+#     `refs/namespaces/<name>/` and is in neither of the above.
+# Nothing else. A name added for another reason says why on its own line.
+
+# git rev-parse --local-env-vars (git 2.51), in the order it prints them
+GIT_ALTERNATE_OBJECT_DIRECTORIES
+GIT_CONFIG
+GIT_CONFIG_PARAMETERS
+GIT_CONFIG_COUNT
+GIT_OBJECT_DIRECTORY
+GIT_DIR
+GIT_WORK_TREE
+GIT_IMPLICIT_WORK_TREE
+GIT_GRAFT_FILE
+GIT_INDEX_FILE
+GIT_NO_REPLACE_OBJECTS
+GIT_REPLACE_REF_BASE
+GIT_PREFIX
+GIT_SHALLOW_FILE
+GIT_COMMON_DIR
+
+# the configuration-file trio's other two
+GIT_CONFIG_GLOBAL
+GIT_CONFIG_SYSTEM
+
+# outside both
+GIT_NAMESPACE

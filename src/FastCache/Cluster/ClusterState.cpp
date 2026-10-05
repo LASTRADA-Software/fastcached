@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
@@ -25,7 +26,7 @@
 namespace FastCache::Cluster
 {
 
-std::expected<ClusterMember, std::string> ParseMemberSpec(std::string_view spec)
+std::expected<MemberSpec, std::string> ParseMemberSpec(std::string_view spec)
 {
     auto const notASpec = [spec] {
         return std::unexpected { std::format("not <id>=<host>:<port>[@<key>]: {}", spec) };
@@ -49,12 +50,22 @@ std::expected<ClusterMember, std::string> ParseMemberSpec(std::string_view spec)
         auto parsed = ParseEd25519PublicKey(keyText);
         if (!parsed.has_value())
             return std::unexpected { std::format(
-                "{} names a key that is not one ({}): {}", spec, keyText, DescribePublicKeyTextFault(parsed.error())) };
+                "{} names a key that is not one ({}): {}", spec, keyText, DescribePublicKeyFault(parsed.error())) };
         publicKey = *parsed;
     }
 
     if (id.empty() || endpoint.empty())
         return notASpec();
+
+    // The one id bound, here because every door that takes a member passes through this grammar:
+    // `--cluster-admit` and its siblings, and the leader re-parsing what it was sent. A member id past
+    // it is one every peer's fleet summary decoder refuses, so a leader it names is refused too.
+    if (id.size() > CompileCacheWire::MaxIdBytes)
+        return std::unexpected { std::format("{} names a member id of {} bytes, longer than the {} an id may be: "
+                                             "every peer refuses a fleet summary naming a longer one",
+                                             spec,
+                                             id.size(),
+                                             CompileCacheWire::MaxIdBytes) };
 
     // Both halves of the question a dialer asks. A split alone is not enough:
     // `10.0.0.4:0` splits and names no port anybody can connect to, so a member
@@ -63,24 +74,13 @@ std::expected<ClusterMember, std::string> ParseMemberSpec(std::string_view spec)
     if (!parts.has_value() || !ParseTcpPort(parts->second).has_value())
         return notASpec();
 
-    // Every field named, including the one this token cannot carry. A member's
-    // scheduler endpoint is a port peers never connect to, so nothing an operator
-    // types about a PEER could supply it -- the node announces its own. Saying so
-    // with `{}` rather than leaving it out is what keeps a field added to the
-    // middle of the struct from becoming a silent zero here.
-    //
-    // A voter, because that is what `--raft-peer` bootstraps and what `--cluster-admit`
-    // records; the learner spelling is a different flag rather than a different token,
-    // so the one grammar an operator copies between them stays one grammar.
-    return ClusterMember { .id = std::string { id },
-                           .raftEndpoint = std::string { endpoint },
-                           .schedulerEndpoint = {},
-                           .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
-                           .seat = MemberSeat::Voter,
-                           .publicKey = publicKey };
+    // No seat and no scheduler endpoint: which set a member is admitted into is the flag,
+    // never a second grammar, and a member's scheduler endpoint is a port peers never
+    // connect to, so nothing an operator types about a PEER could supply it.
+    return MemberSpec { .id = std::string { id }, .raftEndpoint = std::string { endpoint }, .publicKey = publicKey };
 }
 
-std::string FormatMemberSpec(ClusterMember const& member)
+std::string FormatMemberSpec(MemberSpec const& member)
 {
     if (!member.publicKey.has_value())
         return std::format("{}={}", member.id, member.raftEndpoint);
@@ -100,9 +100,11 @@ namespace
     /// layouts. It moves when a command's LAYOUT does, and when a verb an entry already
     /// written may carry stops meaning what it meant. A fact `Apply` derives from commands
     /// it already reads -- `SchedulerEndpointHistory` -- is state, and moves `StateVersion`
-    /// alone. So does a new VERB (#1309's `AdmitClient`/`ForgetClient`): the layout is
+    /// alone. So does a new VERB (#1309's client verbs, since retired): the layout is
     /// unchanged, and a build that lacks the verb refuses its byte by name as
-    /// `UnknownMessageType` rather than as another encoding.
+    /// `UnknownMessageType` rather than as another encoding. So does RETIRING one: its byte
+    /// stays reserved and `Validate` refuses it by name, so an old entry is refused rather
+    /// than read as something else, and the layout did not move.
     ///
     /// What a move costs is a node whose OWN log holds an older entry: it refuses to start,
     /// by name, rather than replay entries it would read differently (#1542). This used to
@@ -119,11 +121,18 @@ namespace
     /// removed record held. A v3 entry naming a keyed member decodes cleanly here and would
     /// be replayed as a forget that revokes a key the build that wrote it never revoked. A
     /// NEW verb's byte is refused by name; a CHANGED verb's is not, so only this can detect it.
-    constexpr std::uint8_t CommandVersion = 4;
+    ///
+    /// 5 added a seventh and an eighth field, the survivor's creation time and its leader's key, for
+    /// `DissolveInto` -- fields the layout had no room for.
+    ///
+    /// 6 removed the sixth field, the principal's role, with `AdmitPrincipal` (principal mode is
+    /// retired): a v5 entry is a different arrangement, and reading it as this one would take its
+    /// creation time for a leader key.
+    constexpr std::uint8_t CommandVersion = 6;
 
     /// Fields in an encoded command: the header, then key, value, scheduler endpoint,
-    /// public key and role.
-    constexpr std::size_t CommandFields = 6;
+    /// public key, creation time and leader key.
+    constexpr std::size_t CommandFields = 7;
 
     /// Wire tag in front of every encoded state: a snapshot, and a `ClusterStatus` body.
     ///
@@ -133,7 +142,11 @@ namespace
     /// the forgotten hosts, and states every group's count up front (#1309). 5 added each
     /// member's `MemberSeat` (#1449). 6 added each member's public key, the principals and
     /// the revoked keys (#178). 7 added the roster version every voter endorses (#178).
-    constexpr std::uint8_t StateVersion = 7;
+    /// 8 removed the client and forgotten-host groups (spec §7): a machine is admitted and
+    /// forgotten by its key alone. 9 added the dissolve order a healing split replicates, as a
+    /// group of zero or one. 10 removed the principals group and its count (principal mode is
+    /// retired: every machine that joins is a learner member).
+    constexpr std::uint8_t StateVersion = 10;
 
     /// Fields one member occupies in an encoded state: id, Raft, scheduler, the
     /// scheduler endpoint's history, the seat, and the public key.
@@ -147,18 +160,40 @@ namespace
     /// Fields one setting occupies: name, value.
     constexpr std::size_t SettingFields = 2;
 
-    /// Fields one principal occupies: id, public key, role.
-    constexpr std::size_t PrincipalFields = 3;
-
     /// Fields one revoked key occupies: whose it was, and the key.
     constexpr std::size_t RevokedKeyFields = 2;
 
-    /// Fields in front of the groups: the version, then the member, setting, client,
-    /// forgotten-host, principal and revoked-key counts, then the roster version.
-    constexpr std::size_t StateHeaderFields = 8;
+    /// Fields one dissolve order occupies: the survivor's id, the key that proved it, its leader's
+    /// endpoint, its creation time and its leader's key.
+    constexpr std::size_t DissolveOrderFields = 5;
+
+    /// Fields in front of the groups: the version, then the member, setting and revoked-key
+    /// counts, then the roster version, then how many dissolve orders follow (zero or one).
+    constexpr std::size_t StateHeaderFields = 6;
 
     /// Where the roster version sits in the header.
-    constexpr std::size_t RosterVersionField = 7;
+    constexpr std::size_t RosterVersionField = 4;
+
+    /// The refusal a RETIRED verb gets, or nullopt for a verb this build still speaks.
+    ///
+    /// One sentence for both, because the remedy is one: the verbs that admit and forget a
+    /// machine by its key. Asked by `Validate` of a command somebody built, and by
+    /// `DecodeCommand` of bytes somebody wrote -- so an entry an earlier build committed is
+    /// refused where every entry is read, and a node whose own log holds one refuses to
+    /// start (`ClusterStateMachine::CanRead`, #1542) while a peer's is skipped by name.
+    /// @param kind The verb.
+    /// @return `InvalidConfiguration` naming the retirement, or nullopt.
+    [[nodiscard]] std::optional<ConsensusError> RetiredVerbRefusal(CommandKind kind)
+    {
+        if (kind != CommandKind::RetiredAdmitClient && kind != CommandKind::RetiredForgetClient
+            && kind != CommandKind::RetiredAdmitPrincipal)
+            return std::nullopt;
+        return InvalidConfiguration("that cluster verb is retired: a machine is admitted and forgotten by its key "
+                                    "(--cluster-admit, --cluster-forget)");
+    }
+
+    /// Where the dissolve-order count sits in the header: right after the roster version.
+    constexpr std::size_t DissolveOrderCountField = RosterVersionField + 1;
 
     /// A key field's bytes: empty when no key is stated, the 32 bytes when one is.
     /// @param key The key, or nothing.
@@ -170,8 +205,8 @@ namespace
 
     /// Read a key field: empty is no key, exactly 32 bytes is one, anything else is refused.
     ///
-    /// The one reader of a key's width, so a member's optional key, a principal's required
-    /// one and a command's cannot come to disagree about what a short field means.
+    /// The one reader of a key's width, so a member's key -- required -- and a command's optional
+    /// one cannot come to disagree about what a short field means.
     /// @param field The field.
     /// @return Absent, a key, or nullopt-of-the-outer when the width is wrong.
     [[nodiscard]] std::optional<std::optional<Ed25519PublicKey>> ReadKeyField(std::span<std::byte const> field)
@@ -192,6 +227,7 @@ namespace
     /// revoked or a borrowed key is.
     enum class KeyStanding : std::uint8_t
     {
+        Unusable,      ///< A small-order or non-canonical point (`Ed25519PublicKeyFaultOf`): never admitted.
         Available,     ///< Nobody else holds it, and it was never revoked.
         Revoked,       ///< In `revokedKeys`: never admitted again, whoever asks.
         HeldElsewhere, ///< Held live by another id: one key, one identity.
@@ -204,6 +240,10 @@ namespace
     /// @return Its standing.
     [[nodiscard]] KeyStanding StandingOf(ClusterState const& state, std::string_view id, Ed25519PublicKey const& key)
     {
+        // Unusable before anything the state says, because it is a fact about the POINT: a key
+        // under which a signature verifies without a secret proves nothing for anybody.
+        if (!Ed25519PublicKeyIsUsable(key))
+            return KeyStanding::Unusable;
         // Revoked first: a key that is both revoked and held would be a state `Apply` never
         // makes, and the permanent answer is the one worth giving if one ever arrived.
         if (state.IsRevoked(key))
@@ -213,73 +253,53 @@ namespace
         return KeyStanding::Available;
     }
 
-    /// Whether @p id is recorded as a principal.
-    /// @param state The state.
-    /// @param id The id.
-    /// @return True when a principal carries it.
-    [[nodiscard]] bool IsPrincipal(ClusterState const& state, std::string_view id)
+    /// The identity key the member @p command admits would be recorded under: the one it states,
+    /// else the one @p state records for its id; or nothing, when neither has one. A stated
+    /// all-zero key is no key and is never recorded
+    /// (`IsZeroEd25519PublicKey`): it is what a command built without naming one carries, so it
+    /// refuses rather than falling back to the recorded key an honest move would have kept by
+    /// stating none.
+    ///
+    /// **One answer, asked by both `ValidateAgainst` and `Apply`**, never a copy in each: the
+    /// courtesy refuses what the guarantee drops, and `Apply` records exactly the key returned,
+    /// so the guard cannot be skipped without the record losing its key. A machine is forgotten
+    /// by revoking its key, so a member admitted without one would leave nothing a forget could
+    /// revoke -- and two proposals judged against one state can both be appended before either
+    /// commits: a keyless re-admission judged against a keyed record, committed after a forget
+    /// removed that record, would re-create it with no key, and the removal would fail OPEN.
+    /// @param state The state the command applies to.
+    /// @param command An `AddMember` or `AddLearner`.
+    /// @return The key to record, or nullopt when the admitted machine would hold none.
+    [[nodiscard]] std::optional<Ed25519PublicKey> KeyToRecord(ClusterState const& state, Command const& command)
     {
-        return std::ranges::contains(state.principals, id, &ClusterPrincipal::id);
-    }
-
-    /// Whether @p id is recorded as a member.
-    /// @param state The state.
-    /// @param id The id.
-    /// @return True when a member carries it.
-    [[nodiscard]] bool IsMember(ClusterState const& state, std::string_view id)
-    {
-        return std::ranges::contains(state.members, id, &ClusterMember::id);
+        if (command.publicKey.has_value())
+            return IsZeroEd25519PublicKey(*command.publicKey) ? std::nullopt : command.publicKey;
+        auto const recorded = std::ranges::find(state.members, command.key, &ClusterMember::id);
+        return recorded != state.members.end() ? std::optional { recorded->publicKey } : std::nullopt;
     }
 
     /// The first rule of the roster @p state breaks, or nothing.
     ///
     /// The combinations `Apply` never produces, asked of a decoded state for the reason
     /// `DecodeState` refuses an endpoint with no announcement behind it: read as it stands,
-    /// a state holding a revoked key live, one key under two ids, or one id in both lists
-    /// would make every reader pick which half to believe.
+    /// a state holding a revoked key live, or one key under two ids, would make every reader
+    /// pick which half to believe.
     /// @param state A decoded state.
     /// @return Why it cannot be one `Apply` produced, or nullopt.
     [[nodiscard]] std::optional<std::string_view> BrokenRosterRule(ClusterState const& state)
     {
         auto live = std::vector<Ed25519PublicKey> {};
         for (auto const& member: state.members)
-            if (member.publicKey.has_value())
-                live.push_back(*member.publicKey);
-        for (auto const& principal: state.principals)
-        {
-            if (IsMember(state, principal.id))
-                return "an id is recorded both as a member and as a principal";
-            live.push_back(principal.publicKey);
-        }
+            live.push_back(member.publicKey);
 
         if (std::ranges::any_of(live, [&state](Ed25519PublicKey const& key) { return state.IsRevoked(key); }))
             return "a revoked key is still held";
+        if (!std::ranges::all_of(live, Ed25519PublicKeyIsUsable))
+            return "a held key is a small-order or non-canonical point, which proves nothing";
         std::ranges::sort(live);
         if (std::ranges::adjacent_find(live) != live.end())
             return "one key is held by two ids";
         return std::nullopt;
-    }
-
-    /// Record `host` in a sorted host list, unless an entry already names the same machine.
-    ///
-    /// Unique by `SameHost`, the comparison admission makes, so `::ffff:10.0.0.1` and
-    /// `10.0.0.1` are one entry rather than two a forget would have to find separately.
-    /// @param hosts The list, sorted.
-    /// @param host The host to record.
-    void InsertHost(std::vector<std::string>& hosts, std::string_view host)
-    {
-        if (std::ranges::any_of(hosts, [host](std::string const& entry) { return SameHost(entry, host); }))
-            return;
-        hosts.emplace_back(host);
-        std::ranges::sort(hosts);
-    }
-
-    /// Remove every entry naming the same machine as `host`.
-    /// @param hosts The list.
-    /// @param host The host to remove.
-    void EraseHost(std::vector<std::string>& hosts, std::string_view host)
-    {
-        std::erase_if(hosts, [host](std::string const& entry) { return SameHost(entry, host); });
     }
 
     /// Keep a sorted-by-key vector's ordering after an insertion.
@@ -331,25 +351,6 @@ std::optional<std::string> ClusterState::SettingOf(std::string_view name) const
     return it != settings.end() ? std::optional { it->value } : std::nullopt;
 }
 
-std::vector<std::string> ClusterState::Endpoints() const
-{
-    std::vector<std::string> out;
-    out.reserve(members.size());
-    for (auto const& member: members)
-        out.push_back(member.raftEndpoint);
-    return out;
-}
-
-bool ClusterState::AdmitsClient(std::string_view host) const
-{
-    return std::ranges::any_of(clients, [host](std::string const& entry) { return SameHost(entry, host); });
-}
-
-bool ClusterState::HasForgotten(std::string_view host) const
-{
-    return std::ranges::any_of(forgotten, [host](std::string const& entry) { return SameHost(entry, host); });
-}
-
 bool ClusterState::IsRevoked(Ed25519PublicKey const& key) const
 {
     return std::ranges::contains(revokedKeys, key, &RevokedKey::publicKey);
@@ -360,26 +361,36 @@ std::optional<std::string> ClusterState::HolderOf(Ed25519PublicKey const& key) c
     for (auto const& member: members)
         if (member.publicKey == key)
             return member.id;
-    for (auto const& principal: principals)
-        if (principal.publicKey == key)
-            return principal.id;
     return std::nullopt;
+}
+
+std::optional<Ed25519PublicKey> LiveKeyOf(ClusterState const& state, std::string_view id)
+{
+    auto const member = std::ranges::find(state.members, id, &ClusterMember::id);
+    if (member == state.members.end())
+        return std::nullopt;
+    return member->publicKey;
 }
 
 std::vector<std::byte> Encode(Command const& command)
 {
     auto const header = std::array { static_cast<std::byte>(CommandVersion), static_cast<std::byte>(command.kind) };
 
-    // Absent travels as a zero-length field, as it does for every optional on these wires:
-    // a role byte of zero would be `Worker`, which is a claim, not an absence.
-    auto const role =
-        command.role.has_value() ? std::vector { static_cast<std::byte>(*command.role) } : std::vector<std::byte> {};
+    // Absent travels as a zero-length field, as it does for every optional on these wires: an
+    // eight-byte zero would be a creation time, which is a claim, not an absence.
+    auto created = std::vector<std::byte> {};
+    if (command.createdAtUnixSeconds.has_value())
+    {
+        auto const bytes = WireFields::ToBigEndian<std::uint64_t>(*command.createdAtUnixSeconds);
+        created.assign(bytes.begin(), bytes.end());
+    }
     return WireFields::Encode({ std::span<std::byte const> { header },
                                 WireFields::AsBytes(command.key),
                                 WireFields::AsBytes(command.value),
                                 WireFields::AsBytes(command.schedulerEndpoint),
                                 OptionalKeyBytes(command.publicKey),
-                                std::span<std::byte const> { role } });
+                                std::span<std::byte const> { created },
+                                OptionalKeyBytes(command.leaderKey) });
 }
 
 std::expected<Command, ConsensusError> DecodeCommand(std::span<std::byte const> payload)
@@ -396,7 +407,7 @@ std::expected<Command, ConsensusError> DecodeCommand(std::span<std::byte const> 
 
     auto const fields = WireFields::SplitExactly(payload, CommandFields);
     if (!fields.has_value())
-        return std::unexpected(MalformedWireFrame("a cluster command is not six fields"));
+        return std::unexpected(MalformedWireFrame("a cluster command is not seven fields"));
 
     auto const header = (*fields)[0];
     if (header.empty())
@@ -420,30 +431,40 @@ std::expected<Command, ConsensusError> DecodeCommand(std::span<std::byte const> 
         return std::unexpected(UnknownWireMessage(
             std::format("cluster command verb {} this build does not know", static_cast<unsigned>(header[1]))));
 
+    // A RETIRED verb's byte is a known enumerator, reserved so it is never read as another
+    // verb -- and refused here, where every entry is read, rather than only where a proposal
+    // is judged: the entries carrying one were written by an earlier build, which is the
+    // same fact an unknown verb states, with the retirement named.
+    if (auto const retired = RetiredVerbRefusal(*kind); retired.has_value())
+        return std::unexpected(UnknownWireMessage(std::format("cluster command verb {} is retired, and this build "
+                                                              "applies no entry carrying it -- {}",
+                                                              static_cast<unsigned>(header[1]),
+                                                              retired->context)));
+
     auto const publicKey = ReadKeyField((*fields)[4]);
     if (!publicKey.has_value())
         return std::unexpected(MalformedWireFrame("a cluster command's key is neither absent nor 32 bytes"));
 
-    // A role byte this build does not name is a newer vocabulary, refused by name as an
-    // unknown verb is -- applying it as whichever role it aliases would admit a machine to
-    // do something nobody granted.
-    auto role = std::optional<PrincipalRole> {};
-    if (auto const roleField = (*fields)[5]; !roleField.empty())
+    // Empty is absent, eight bytes is a time, anything else is damage.
+    auto created = std::optional<std::uint64_t> {};
+    if (auto const createdField = (*fields)[5]; !createdField.empty())
     {
-        if (roleField.size() != 1)
-            return std::unexpected(MalformedWireFrame("a cluster command's role is not one byte"));
-        role = Consensus::DecodeWireEnum<PrincipalRole>(static_cast<std::uint8_t>(roleField[0]));
-        if (!role.has_value())
-            return std::unexpected(UnknownWireMessage(
-                std::format("cluster command role {} this build does not know", static_cast<unsigned>(roleField[0]))));
+        created = WireFields::FromBigEndian<std::uint64_t>(createdField);
+        if (!created.has_value())
+            return std::unexpected(MalformedWireFrame("a cluster command's creation time is not eight bytes"));
     }
+
+    auto const leaderKey = ReadKeyField((*fields)[6]);
+    if (!leaderKey.has_value())
+        return std::unexpected(MalformedWireFrame("a cluster command's leader key is neither absent nor 32 bytes"));
 
     return Command { .kind = *kind,
                      .key = std::string { WireFields::AsStringView((*fields)[1]) },
                      .value = std::string { WireFields::AsStringView((*fields)[2]) },
                      .schedulerEndpoint = std::string { WireFields::AsStringView((*fields)[3]) },
                      .publicKey = *publicKey,
-                     .role = role };
+                     .createdAtUnixSeconds = created,
+                     .leaderKey = *leaderKey };
 }
 
 std::vector<std::byte> Encode(ClusterState const& state)
@@ -459,11 +480,11 @@ std::vector<std::byte> Encode(ClusterState const& state)
     };
     auto const memberCount = countOf(state.members.size());
     auto const settingCount = countOf(state.settings.size());
-    auto const clientCount = countOf(state.clients.size());
-    auto const forgottenCount = countOf(state.forgotten.size());
-    auto const principalCount = countOf(state.principals.size());
     auto const revokedCount = countOf(state.revokedKeys.size());
     auto const rosterVersion = WireFields::ToBigEndian<std::uint64_t>(state.rosterVersion);
+    auto const dissolveCount = countOf(state.dissolveOrder.has_value() ? 1U : 0U);
+    auto const dissolveCreated = WireFields::ToBigEndian<std::uint64_t>(
+        state.dissolveOrder.has_value() ? state.dissolveOrder->createdAtUnixSeconds : 0);
 
     // Every history and seat byte is written before any span into them is taken,
     // because the list below holds spans and a vector that grew under them would leave
@@ -477,20 +498,12 @@ std::vector<std::byte> Encode(ClusterState const& state)
         memberBytes.push_back(static_cast<std::byte>(member.seat));
     }
 
-    // One role byte per principal, for the same reason and under the same rule.
-    std::vector<std::byte> roleBytes;
-    roleBytes.reserve(state.principals.size());
-    for (auto const& principal: state.principals)
-        roleBytes.push_back(static_cast<std::byte>(principal.role));
-
     fields.emplace_back(header);
     fields.emplace_back(memberCount);
     fields.emplace_back(settingCount);
-    fields.emplace_back(clientCount);
-    fields.emplace_back(forgottenCount);
-    fields.emplace_back(principalCount);
     fields.emplace_back(revokedCount);
     fields.emplace_back(rosterVersion);
+    fields.emplace_back(dissolveCount);
     auto cursor = std::span<std::byte const> { memberBytes };
     for (auto const& member: state.members)
     {
@@ -499,7 +512,7 @@ std::vector<std::byte> Encode(ClusterState const& state)
         fields.push_back(WireFields::AsBytes(member.schedulerEndpoint));
         fields.push_back(cursor.first(1));
         fields.push_back(cursor.subspan(1, 1));
-        fields.push_back(OptionalKeyBytes(member.publicKey));
+        fields.emplace_back(member.publicKey);
         cursor = cursor.subspan(2);
     }
     for (auto const& setting: state.settings)
@@ -507,22 +520,18 @@ std::vector<std::byte> Encode(ClusterState const& state)
         fields.push_back(WireFields::AsBytes(setting.name));
         fields.push_back(WireFields::AsBytes(setting.value));
     }
-    for (auto const& client: state.clients)
-        fields.push_back(WireFields::AsBytes(client));
-    for (auto const& host: state.forgotten)
-        fields.push_back(WireFields::AsBytes(host));
-    auto roles = std::span<std::byte const> { roleBytes };
-    for (auto const& principal: state.principals)
-    {
-        fields.push_back(WireFields::AsBytes(principal.id));
-        fields.emplace_back(principal.publicKey);
-        fields.push_back(roles.first(1));
-        roles = roles.subspan(1);
-    }
     for (auto const& revoked: state.revokedKeys)
     {
         fields.push_back(WireFields::AsBytes(revoked.id));
         fields.emplace_back(revoked.publicKey);
+    }
+    if (state.dissolveOrder.has_value())
+    {
+        fields.push_back(WireFields::AsBytes(state.dissolveOrder->clusterId));
+        fields.emplace_back(state.dissolveOrder->provenKey);
+        fields.push_back(WireFields::AsBytes(state.dissolveOrder->leaderNodeEndpoint));
+        fields.emplace_back(dissolveCreated);
+        fields.emplace_back(state.dissolveOrder->leaderKey);
     }
     return WireFields::Encode(WireFields::FieldList { fields });
 }
@@ -541,33 +550,31 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
             std::format("cluster state encoding version {} (this build reads {})", version, StateVersion)));
 
     if (fields->size() < StateHeaderFields)
-        return std::unexpected(MalformedWireFrame("a cluster state does not state its six counts and its roster version"));
+        return std::unexpected(MalformedWireFrame(
+            "a cluster state does not state its three counts, its roster version and its dissolve count"));
     auto const memberCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[1]);
     auto const settingCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[2]);
-    auto const clientCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[3]);
-    auto const forgottenCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[4]);
-    auto const principalCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[5]);
-    auto const revokedCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[6]);
-    if (!memberCount.has_value() || !settingCount.has_value() || !clientCount.has_value() || !forgottenCount.has_value()
-        || !principalCount.has_value() || !revokedCount.has_value())
+    auto const revokedCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[3]);
+    if (!memberCount.has_value() || !settingCount.has_value() || !revokedCount.has_value())
         return std::unexpected(MalformedWireFrame("a cluster state's counts are not four bytes each"));
     auto const rosterVersion = WireFields::FromBigEndian<std::uint64_t>((*fields)[RosterVersionField]);
     if (!rosterVersion.has_value())
         return std::unexpected(MalformedWireFrame("a cluster state's roster version is not eight bytes"));
+    auto const dissolveCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[DissolveOrderCountField]);
+    if (!dissolveCount.has_value() || *dissolveCount > 1)
+        return std::unexpected(MalformedWireFrame("a cluster state carries more than one dissolve order"));
 
-    // Members as sextuples, settings as pairs, clients and forgotten hosts one field each,
-    // principals as triples and revoked keys as pairs -- and the TOTAL is checked against
-    // what actually arrived. A truncated snapshot must be refused rather than read as a
-    // member with an empty endpoint -- that member would be replicated onward as an address
-    // nobody can dial -- and a declared count larger than the fields present is the same
-    // fault stated by the other end. 64-bit arithmetic, so six counts near `UINT32_MAX`
-    // cannot wrap into agreement.
+    // Members as sextuples, settings as pairs and revoked keys as pairs -- and the TOTAL is
+    // checked against what actually arrived. A truncated snapshot
+    // must be refused rather than read as a member with an empty endpoint -- that member
+    // would be replicated onward as an address nobody can dial -- and a declared count
+    // larger than the fields present is the same fault stated by the other end. 64-bit
+    // arithmetic, so counts near `UINT32_MAX` cannot wrap into agreement.
     auto const memberSpan = std::uint64_t { *memberCount } * MemberFields;
     auto const settingSpan = std::uint64_t { *settingCount } * SettingFields;
-    auto const principalSpan = std::uint64_t { *principalCount } * PrincipalFields;
     auto const revokedSpan = std::uint64_t { *revokedCount } * RevokedKeyFields;
-    auto const expected =
-        StateHeaderFields + memberSpan + settingSpan + *clientCount + *forgottenCount + principalSpan + revokedSpan;
+    auto const dissolveSpan = std::uint64_t { *dissolveCount } * DissolveOrderFields;
+    auto const expected = StateHeaderFields + memberSpan + settingSpan + revokedSpan + dissolveSpan;
     if (expected != fields->size())
         return std::unexpected(MalformedWireFrame("a cluster state's fields do not match its counts"));
 
@@ -579,9 +586,6 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
     state.rosterVersion = *rosterVersion;
     state.members.reserve(*memberCount);
     state.settings.reserve(*settingCount);
-    state.clients.reserve(*clientCount);
-    state.forgotten.reserve(*forgottenCount);
-    state.principals.reserve(*principalCount);
     state.revokedKeys.reserve(*revokedCount);
     // Walked by member rather than by field: `memberSpan` is exactly `*memberCount` sextuples,
     // so each member's first field is its ordinal times `MemberFields` -- the same indices the
@@ -604,16 +608,21 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
         if (!seat.has_value())
             return std::unexpected(MalformedWireFrame("a member's seat names none this build knows"));
 
+        // REQUIRED. An empty field, or the all-zero key, is the member
+        // `Apply` drops (`KeyToRecord`) -- a machine is forgotten by its key, so such a record
+        // is one no forget could remove from every address -- and is refused by name.
         auto const publicKey = ReadKeyField((*fields)[StateHeaderFields + index + 5]);
         if (!publicKey.has_value())
             return std::unexpected(MalformedWireFrame("a member's key is neither absent nor 32 bytes"));
+        if (!publicKey->has_value() || IsZeroEd25519PublicKey(**publicKey))
+            return std::unexpected(MalformedWireFrame("a member is recorded with no identity key"));
 
         auto member = ClusterMember { .id = at(index),
                                       .raftEndpoint = at(index + 1),
                                       .schedulerEndpoint = at(index + 2),
                                       .schedulerEndpointHistory = *history,
                                       .seat = *seat,
-                                      .publicKey = *publicKey };
+                                      .publicKey = **publicKey };
 
         // The one combination `Apply` never produces. Read as it stands it would be a
         // member holding an endpoint it reports never having announced, and every
@@ -628,39 +637,33 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
         auto const index = memberSpan + (ordinal * SettingFields);
         state.settings.push_back(Setting { .name = at(index), .value = at(index + 1) });
     }
-    auto const clientsEnd = settingsEnd + *clientCount;
-    for (auto const index: std::views::iota(settingsEnd, clientsEnd))
-        state.clients.push_back(at(index));
-    auto const forgottenEnd = clientsEnd + *forgottenCount;
-    for (auto const index: std::views::iota(clientsEnd, forgottenEnd))
-        state.forgotten.push_back(at(index));
 
-    // A principal's key is REQUIRED, so absent is as malformed as a short one here, and a
-    // role byte this build does not name is refused rather than read as `Worker`.
     auto const field = [&](std::size_t index) {
         return (*fields)[StateHeaderFields + index];
     };
-    for (auto const ordinal: std::views::iota(std::size_t { 0 }, std::size_t { *principalCount }))
-    {
-        auto const index = forgottenEnd + (ordinal * PrincipalFields);
-        auto const publicKey = ReadKeyField(field(index + 1));
-        auto const roleField = field(index + 2);
-        auto const role = roleField.size() == 1
-                              ? Consensus::DecodeWireEnum<PrincipalRole>(static_cast<std::uint8_t>(roleField[0]))
-                              : std::nullopt;
-        if (!publicKey.has_value() || !publicKey->has_value() || !role.has_value())
-            return std::unexpected(
-                MalformedWireFrame("a principal carries no 32-byte key, or a role this build does not know"));
-        state.principals.push_back(ClusterPrincipal { .id = at(index), .publicKey = **publicKey, .role = *role });
-    }
-    auto const principalsEnd = forgottenEnd + principalSpan;
     for (auto const ordinal: std::views::iota(std::size_t { 0 }, std::size_t { *revokedCount }))
     {
-        auto const index = principalsEnd + (ordinal * RevokedKeyFields);
+        auto const index = settingsEnd + (ordinal * RevokedKeyFields);
         auto const publicKey = ReadKeyField(field(index + 1));
         if (!publicKey.has_value() || !publicKey->has_value())
             return std::unexpected(MalformedWireFrame("a revoked key is not 32 bytes"));
         state.revokedKeys.push_back(RevokedKey { .id = at(index), .publicKey = **publicKey });
+    }
+    if (*dissolveCount == 1)
+    {
+        auto const index = settingsEnd + revokedSpan;
+        auto const provenKey = ReadKeyField(field(index + 1));
+        auto const created = WireFields::FromBigEndian<std::uint64_t>(field(index + 3));
+        auto const leaderKey = ReadKeyField(field(index + 4));
+        if (!provenKey.has_value() || !provenKey->has_value() || !created.has_value() || !leaderKey.has_value()
+            || !leaderKey->has_value())
+            return std::unexpected(
+                MalformedWireFrame("a dissolve order carries no 32-byte key, no eight-byte age, or no 32-byte leader key"));
+        state.dissolveOrder = DissolveOrder { .clusterId = at(index),
+                                              .provenKey = **provenKey,
+                                              .leaderNodeEndpoint = at(index + 2),
+                                              .createdAtUnixSeconds = *created,
+                                              .leaderKey = **leaderKey };
     }
 
     if (auto const broken = BrokenRosterRule(state); broken.has_value())
@@ -672,11 +675,10 @@ namespace
 {
     /// A member as the roster sees it: who, where it is dialled, which seat, which key --
     /// and none of the scheduler endpoint's bookkeeping, which changes as members lead.
-    using RosterMemberFacts =
-        std::tuple<std::string const&, std::string const&, MemberSeat, std::optional<Ed25519PublicKey> const&>;
+    using RosterMemberFacts = std::tuple<std::string const&, std::string const&, MemberSeat, Ed25519PublicKey const&>;
 
     /// Whether @p before and @p after hold different rosters: the members as the roster sees
-    /// them, the principals and the revoked keys.
+    /// them, and the revoked keys.
     /// @param before The state before a command.
     /// @param after The state after it.
     /// @return True when the roster changed.
@@ -685,7 +687,7 @@ namespace
         auto const facts = [](ClusterMember const& member) {
             return RosterMemberFacts { member.id, member.raftEndpoint, member.seat, member.publicKey };
         };
-        return !std::ranges::equal(before.members, after.members, {}, facts, facts) || before.principals != after.principals
+        return !std::ranges::equal(before.members, after.members, {}, facts, facts)
                || before.revokedKeys != after.revokedKeys;
     }
 
@@ -702,14 +704,18 @@ namespace
             // did not also restate -- which is how an operator promotes and demotes.
             case CommandKind::AddMember:
             case CommandKind::AddLearner: {
-                // Dropped when the rules a key obeys no longer hold (#178): an id that is a
-                // principal, or a key that is revoked or somebody else's. `ValidateAgainst`
-                // refuses all three before the append; this is the second proposal judged
-                // against the same state, committed after the first changed it.
-                if (IsPrincipal(state, command.key))
-                    return;
+                // Dropped when the rules a key obeys no longer hold (#178): a key that is
+                // revoked or somebody else's. `ValidateAgainst` refuses both before the append;
+                // this is the second proposal judged against the same state, committed after the
+                // first changed it.
                 if (command.publicKey.has_value()
                     && StandingOf(state, command.key, *command.publicKey) != KeyStanding::Available)
+                    return;
+                // And a member is never recorded with no key -- `ValidateAgainst`'s rule, through
+                // the same function, for the race it describes: a forget committed between a
+                // keyless re-admission's judgement and its commit.
+                auto const key = KeyToRecord(state, command);
+                if (!key.has_value())
                     return;
 
                 // Update in place when the id is already known. One verb for "join" and
@@ -718,7 +724,7 @@ namespace
                 auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
 
                 // The endpoint is replaced wholesale and its HISTORY is not, which is what
-                // lets a report say *cleared* rather than *never announced* after a re-admit
+                // lets a report say *cleared* rather than *never announced* after a record re-proposed with none
                 // (#1340). Derived here from what the state already records, so no command
                 // carries it. Only a removal forgets it: a forget is a positive act, and an
                 // id admitted from absence has announced nothing yet.
@@ -734,11 +740,7 @@ namespace
                                     .seat = SeatAdmittedBy(command.kind).value_or(MemberSeat::Voter),
                                     // No opinion keeps what is recorded: a machine that moves
                                     // keeps its identity, and only `Forget` takes one away.
-                                    .publicKey = command.publicKey.or_else(
-                                        [&] { return it != state.members.end() ? it->publicKey : std::nullopt; }) };
-                // Admitting a member at a host re-admits that host: a forget it carries is
-                // over (#1309).
-                EraseHost(state.forgotten, HostOfEndpoint(command.value));
+                                    .publicKey = *key };
                 if (it != state.members.end())
                 {
                     // Wholesale, both endpoints. A record is re-proposed only when it has
@@ -753,36 +755,22 @@ namespace
                 return;
             }
             case CommandKind::Forget: {
-                // Whatever record carries the id -- a member or a principal, never both, which
-                // `BrokenRosterRule` holds a decoded state to -- goes, and the key it held is
-                // revoked with it (#1555). Derived HERE, from the record being removed, so a key
+                // The member record carrying the id goes, and the key it held is revoked with
+                // it (#1555). Derived HERE, from the record being removed, so a key
                 // replaced between the proposal and the commit is the one revoked.
                 auto revoked = std::vector<Ed25519PublicKey> {};
                 if (auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
                     it != state.members.end())
                 {
-                    // A forget is a positive act, so it leaves a TOMBSTONE for the member's host
-                    // (#1309): a node whose own `--fleet-member` list still names that machine is
-                    // then refused it, rather than serving a decommissioned member until every
-                    // list is edited. Never for loopback, which is always this machine's own and a
-                    // tombstone could never narrow -- the key is what reaches a member there.
-                    auto host = std::string { HostOfEndpoint(it->raftEndpoint) };
-                    if (it->publicKey.has_value())
-                        revoked.push_back(*it->publicKey);
+                    // No host is recorded: the key is what a forget takes away, and an address
+                    // is not an identity.
+                    revoked.push_back(it->publicKey);
                     state.members.erase(it);
-                    if (!IsLoopbackHost(host))
-                        InsertHost(state.forgotten, host);
-                }
-                else if (auto const principal = std::ranges::find(state.principals, command.key, &ClusterPrincipal::id);
-                         principal != state.principals.end())
-                {
-                    revoked.push_back(principal->publicKey);
-                    state.principals.erase(principal);
                 }
 
                 // And the key the proposing leader held live for the id (`PrepareForget`), which
-                // reaches a member the state records without one or not at all -- one a
-                // `--raft-peer` line typed with its key. Never a key another id now holds: that
+                // reaches what the record cannot: a key a bootstrap member was named with that the
+                // state records nowhere, or records under another key. Never a key another id now holds: that
                 // one was admitted since, and revoking it would forget a machine nobody named.
                 if (command.publicKey.has_value() && !state.HolderOf(*command.publicKey).has_value())
                     revoked.push_back(*command.publicKey);
@@ -799,40 +787,26 @@ namespace
                 return;
             }
 
-            case CommandKind::AdmitClient: {
-                auto const host = HostOfEndpoint(command.key);
-                InsertHost(state.clients, host);
-                EraseHost(state.forgotten, host);
+            // Retired: `Validate` refuses every one, so nothing proposes one, and a node whose own
+            // log holds one refuses to start (`ClusterStateMachine::CanRead`). Named rather
+            // than swept into a `default`, and applied as nothing, because `Apply` is total.
+            case CommandKind::RetiredAdmitClient:
+            case CommandKind::RetiredForgetClient:
+            case CommandKind::RetiredAdmitPrincipal:
                 return;
-            }
 
-            case CommandKind::ForgetClient: {
-                auto const host = HostOfEndpoint(command.key);
-                EraseHost(state.clients, host);
-                InsertHost(state.forgotten, host);
-                return;
-            }
-
-            case CommandKind::AdmitPrincipal: {
-                // Dropped rather than applied when any of `ValidateAgainst`'s rules has stopped
-                // holding since it was judged -- above all a forget committed first, whose
-                // revocation this must never undo.
-                if (!command.publicKey.has_value() || !command.role.has_value() || IsMember(state, command.key)
-                    || StandingOf(state, command.key, *command.publicKey) != KeyStanding::Available)
+            case CommandKind::DissolveInto:
+                // The last order wins: a fleet that decided again decided about a newer survivor.
+                // Dropped when a field `Validate` requires has gone missing, as every verb here is.
+                if (!command.publicKey.has_value() || !command.createdAtUnixSeconds.has_value()
+                    || !command.leaderKey.has_value())
                     return;
-
-                auto const admitted =
-                    ClusterPrincipal { .id = command.key, .publicKey = *command.publicKey, .role = *command.role };
-                auto const it = std::ranges::find(state.principals, command.key, &ClusterPrincipal::id);
-                if (it != state.principals.end())
-                {
-                    *it = admitted;
-                    return;
-                }
-                state.principals.push_back(admitted);
-                SortByKey(state.principals, &ClusterPrincipal::id);
+                state.dissolveOrder = DissolveOrder { .clusterId = command.key,
+                                                      .provenKey = *command.publicKey,
+                                                      .leaderNodeEndpoint = command.value,
+                                                      .createdAtUnixSeconds = *command.createdAtUnixSeconds,
+                                                      .leaderKey = *command.leaderKey };
                 return;
-            }
 
             case CommandKind::SetSetting: {
                 auto const it = std::ranges::find(state.settings, command.key, &Setting::name);
@@ -922,6 +896,29 @@ std::optional<std::string> RefuseLeaseLifetime(std::string_view value)
     return std::move(parsed).error();
 }
 
+std::optional<std::string> RefuseSharedCache(std::string_view value)
+{
+    if (value.empty())
+        return std::nullopt;
+    // An address typed where an id belongs: the one mistake this row is shaped against, named
+    // with the flag that DOES take an address.
+    if (ParseDialEndpoint(value).has_value())
+        return std::format("{}: '{}' is an address, and this setting names a machine by its id (see --cluster-status); "
+                           "an address belongs in --upstream on the node that reads through",
+                           SharedCacheSetting,
+                           value);
+    // Whitespace and control bytes, which no id carries and every table renders ambiguously.
+    // Bytes above ASCII pass: an id is opaque to consensus, and the UTF-8 gate has already
+    // run on every setting's value.
+    auto const noIdCarries = [](char c) {
+        auto const byte = static_cast<unsigned char>(c);
+        return byte <= 0x20 || byte == 0x7F;
+    };
+    if (std::ranges::any_of(value, noIdCarries))
+        return std::format("{}: '{}' is not a machine id", SharedCacheSetting, value);
+    return std::nullopt;
+}
+
 namespace
 {
     /// What `AddMember` and `AddLearner` record; all three become a `ClusterMember`.
@@ -930,7 +927,7 @@ namespace
     /// the completeness check below proves one row per VERB, not one entry per field,
     /// so a fourth string added to `Command` and copied by `Apply` would get neither an
     /// entry here nor a compile error. That is the same residual
-    /// `RegistrationTextFields` records about `WorkerRegistration`, and the reason both
+    /// `RegistrationFields` records about `WorkerRegistration`, and the reason both
     /// are tables rather than checks written out.
     constexpr std::array<TextField<Command>, 3> AddMemberText { {
         { .name = "a member id", .project = [](Command const& c) -> std::string_view { return c.key; } },
@@ -948,23 +945,20 @@ namespace
         { .name = "a cluster setting's value", .project = [](Command const& c) -> std::string_view { return c.value; } },
     } };
 
-    /// What `AdmitClient` and `ForgetClient` record: the host, as an entry in `clients`
-    /// or in `forgotten`, which every renderer of the state prints.
-    constexpr std::array<TextField<Command>, 1> ClientHostText { {
-        { .name = "a client host", .project = [](Command const& c) -> std::string_view { return c.key; } },
-    } };
-
-    /// What `AdmitPrincipal` records: the id, which every renderer of the state prints.
-    constexpr std::array<TextField<Command>, 1> PrincipalText { {
-        { .name = "a principal id", .project = [](Command const& c) -> std::string_view { return c.key; } },
+    /// What `DissolveInto` records: the survivor's id and its leader's endpoint, which every member
+    /// then dials and every renderer of the state prints.
+    constexpr std::array<TextField<Command>, 2> DissolveText { {
+        { .name = "a surviving fleet's id", .project = [](Command const& c) -> std::string_view { return c.key; } },
+        { .name = "a surviving fleet's leader endpoint",
+          .project = [](Command const& c) -> std::string_view { return c.value; } },
     } };
 
     /// Whether a verb carries one of `Command`'s optional fields (#178).
     ///
-    /// **Private: never transmitted or persisted.** Three answers, because the two fields
-    /// are three different facts across the verbs: a member's key is an opinion a proposal
-    /// may not have, a principal's is what the verb acts on, and every other verb has no use
-    /// for one -- where it is a field somebody misunderstood.
+    /// **Private: never transmitted or persisted.** Three answers, because each field is three
+    /// different facts across the verbs: a member's key is an opinion a proposal may not have, a
+    /// survivor's is what a dissolve acts on, and every other verb has no use for one -- where it
+    /// is a field somebody misunderstood.
     enum class FieldUse : std::uint8_t
     {
         Refused,  ///< The verb has no use for it; carrying one is refused.
@@ -979,7 +973,8 @@ namespace
         std::string_view noun;                      ///< What a refusal calls a command of this verb.
         std::span<TextField<Command> const> fields; ///< What it must be able to name.
         FieldUse publicKey;                         ///< Whether it takes `Command::publicKey`.
-        FieldUse role;                              ///< Whether it takes `Command::role`.
+        FieldUse createdAt;                         ///< Whether it takes `Command::createdAtUnixSeconds`.
+        FieldUse leaderKey;                         ///< Whether it takes `Command::leaderKey`.
     };
 
     /// One row per `CommandKind`, in enumerator order.
@@ -992,37 +987,50 @@ namespace
           .noun = "a member admission",
           .fields = AddMemberText,
           .publicKey = FieldUse::Optional,
-          .role = FieldUse::Refused },
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
         { .kind = CommandKind::Forget,
           .noun = "a forget",
           .fields = {},
           .publicKey = FieldUse::Optional,
-          .role = FieldUse::Refused },
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
         { .kind = CommandKind::SetSetting,
           .noun = "a setting",
           .fields = SetSettingText,
           .publicKey = FieldUse::Refused,
-          .role = FieldUse::Refused },
-        { .kind = CommandKind::AdmitClient,
-          .noun = "a client command",
-          .fields = ClientHostText,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
+        { .kind = CommandKind::RetiredAdmitClient,
+          .noun = "a retired verb",
+          .fields = {},
           .publicKey = FieldUse::Refused,
-          .role = FieldUse::Refused },
-        { .kind = CommandKind::ForgetClient,
-          .noun = "a client command",
-          .fields = ClientHostText,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
+        { .kind = CommandKind::RetiredForgetClient,
+          .noun = "a retired verb",
+          .fields = {},
           .publicKey = FieldUse::Refused,
-          .role = FieldUse::Refused },
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
         { .kind = CommandKind::AddLearner,
           .noun = "a member admission",
           .fields = AddMemberText,
           .publicKey = FieldUse::Optional,
-          .role = FieldUse::Refused },
-        { .kind = CommandKind::AdmitPrincipal,
-          .noun = "a principal admission",
-          .fields = PrincipalText,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
+        { .kind = CommandKind::RetiredAdmitPrincipal,
+          .noun = "a retired verb",
+          .fields = {},
+          .publicKey = FieldUse::Refused,
+          .createdAt = FieldUse::Refused,
+          .leaderKey = FieldUse::Refused },
+        { .kind = CommandKind::DissolveInto,
+          .noun = "a dissolve",
+          .fields = DissolveText,
           .publicKey = FieldUse::Required,
-          .role = FieldUse::Required },
+          .createdAt = FieldUse::Required,
+          .leaderKey = FieldUse::Required },
     } };
 
     static_assert(RowsInEnumeratorOrder(CommandShapes, &CommandShapeRow::kind),
@@ -1057,6 +1065,12 @@ std::expected<void, ConsensusError> Validate(Command const& command)
     if (verb >= EnumeratorCount<CommandKind>)
         return std::unexpected(InvalidConfiguration("unknown command"));
 
+    // A retired verb is refused by name BEFORE anything it carries is judged, so the answer
+    // is always the one that is true -- *retired* -- rather than whichever field rule an old
+    // entry happens to break first.
+    if (auto retired = RetiredVerbRefusal(command.kind); retired.has_value())
+        return std::unexpected(*std::move(retired));
+
     if (command.key.empty())
         return std::unexpected(InvalidConfiguration("a cluster command names nothing"));
 
@@ -1067,24 +1081,43 @@ std::expected<void, ConsensusError> Validate(Command const& command)
     if (auto const field = FirstFieldNotText(command, shape.fields); field.has_value())
         return std::unexpected(InvalidConfiguration(NotTextRefusal(*field)));
 
-    // The two optional fields (#178), by the same table: which verbs take a key and a role
-    // is a column, so a verb added later states it rather than inheriting a default.
+    // The optional fields (#178), by the same table: which verbs take a key, a creation time
+    // and a leader key is a column, so a verb added later states it rather than inheriting a
+    // default.
     if (auto refused = RefuseFieldUse(shape, shape.publicKey, command.publicKey.has_value(), "public key");
         !refused.has_value())
         return refused;
-    if (auto refused = RefuseFieldUse(shape, shape.role, command.role.has_value(), "principal role"); !refused.has_value())
+    if (auto refused = RefuseFieldUse(shape, shape.createdAt, command.createdAtUnixSeconds.has_value(), "creation time");
+        !refused.has_value())
+        return refused;
+    if (auto refused = RefuseFieldUse(shape, shape.leaderKey, command.leaderKey.has_value(), "leader key");
+        !refused.has_value())
         return refused;
 
     switch (command.kind)
     {
         case CommandKind::AddMember:
         case CommandKind::AddLearner:
-            // An endpoint is required, and this is the check that closes the recorded
-            // residual: a member the cluster agreed to admit but cannot reach is worse
-            // than one it refused, because the fleet counts it towards quorum and
-            // routes to it.
-            if (command.value.empty())
-                return std::unexpected(InvalidConfiguration("a member must be admitted with an endpoint"));
+            // An endpoint is required exactly where the seat is DIALLED, and this is the
+            // check that closes the recorded residual: a voter the cluster agreed to admit
+            // but cannot reach is worse than one it refused, because the fleet counts it
+            // towards quorum and routes to it. A learner is the other link -- it dials in,
+            // and nobody opens a socket to it -- so it is admitted with none. The seat's
+            // column decides (`SeatNeedsEndpoint`), never the verb: a promotion is an
+            // `AddMember`, so a learner that never had an address is refused it by name.
+            if (command.value.empty() && SeatNeedsEndpoint(SeatAdmittedBy(command.kind).value_or(MemberSeat::Voter)))
+                return std::unexpected(
+                    InvalidConfiguration("a voter must be admitted with an endpoint every member can dial"));
+            // The `0xFC` endpoint is what OTHER machines are sent to, so the record holds one a peer
+            // can dial or states none. Asked HERE, where every route into the record meets -- an
+            // approval, an operator's admit, an announcement, a leader's own word -- so no route
+            // accepts what another refuses: a loopback, `localhost` or wildcard endpoint would send
+            // whoever resolves it back to itself.
+            if (!command.schedulerEndpoint.empty() && !IsPeerDialableEndpoint(command.schedulerEndpoint))
+                return std::unexpected(InvalidConfiguration(
+                    std::format("{} is no endpoint another machine can dial -- a loopback, localhost or wildcard "
+                                "host reaches only the dialler -- so a member record states it as none instead",
+                                command.schedulerEndpoint)));
             return {};
 
         case CommandKind::Forget:
@@ -1126,37 +1159,23 @@ std::expected<void, ConsensusError> Validate(Command const& command)
                 return {};
             }
 
-        case CommandKind::AdmitClient:
-        case CommandKind::ForgetClient: {
-            if (!command.value.empty() || !command.schedulerEndpoint.empty())
-                return std::unexpected(InvalidConfiguration("a client command carries a host and nothing else"));
-            auto const host = HostOfEndpoint(command.key);
-            if (host.empty())
-                return std::unexpected(InvalidConfiguration("a client command must name a host"));
-            // A caller on a node's own machine is admitted to that node whatever any
-            // list says (`ClusterMembership::Classify`), so an ADMIT about loopback
-            // would be accepted, replicated and snapshotted while deciding nothing.
-            //
-            // A FORGET about loopback is the opposite and is the reason this refusal
-            // must not be relaxed on the strength of the sentence above: since #1309 a
-            // tombstone OUTRANKS every admission route, so an entry naming loopback
-            // would refuse the local builds a node exists to serve, on every surface at
-            // once. `Distributed::ForgottenVerdicts` guards it a second time, because a
-            // rule enforced only here is one a later route can reach around -- and the
-            // consequence is invisible from this end.
-            if (IsLoopbackHost(host))
-                return std::unexpected(InvalidConfiguration(
-                    std::format("{} is loopback, which every node always admits from its own machine", host)));
-            return {};
-        }
+        // Refused above, before any field was judged; named here so the switch stays total.
+        case CommandKind::RetiredAdmitClient:
+        case CommandKind::RetiredForgetClient:
+        case CommandKind::RetiredAdmitPrincipal:
+            break;
 
-        // A principal is admitted by its key alone (#178): it has no consensus endpoint,
-        // because consensus never dials it, and no scheduler endpoint, because it never
-        // leads. Either one carried is a request for a member, sent through the wrong verb.
-        case CommandKind::AdmitPrincipal:
-            if (!command.value.empty() || !command.schedulerEndpoint.empty())
-                return std::unexpected(
-                    InvalidConfiguration(std::format("{} carries an id and a key and nothing else", shape.noun)));
+        // Every member dials the endpoint, and one day archives its own store under the survivor's
+        // side of the heal -- so the id is held to the one id bound, and the endpoint to the one
+        // dial rule a summary's endpoints meet.
+        case CommandKind::DissolveInto:
+            if (!command.schedulerEndpoint.empty())
+                return std::unexpected(InvalidConfiguration("a dissolve carries no scheduler endpoint"));
+            if (command.key.size() > CompileCacheWire::MaxIdBytes)
+                return std::unexpected(InvalidConfiguration(std::format(
+                    "a dissolve names a fleet id past the {} bytes every id is held to", CompileCacheWire::MaxIdBytes)));
+            if (!ParseDialEndpoint(command.value).has_value())
+                return std::unexpected(InvalidConfiguration("a dissolve names a leader endpoint nobody can dial"));
             return {};
 
         // The count rather than a verb; falls out to the refusal below.
@@ -1180,6 +1199,12 @@ std::expected<void, ConsensusError> ValidateAgainst(ClusterState const& state, C
         auto const& key = *command.publicKey;
         switch (StandingOf(state, command.key, key))
         {
+            case KeyStanding::Unusable:
+                return std::unexpected(InvalidConfiguration(
+                    std::format("{} cannot be {}'s key: {}",
+                                FormatEd25519PublicKey(key),
+                                command.key,
+                                DescribePublicKeyFault(Ed25519PublicKeyFaultOf(key).value_or(PublicKeyFault::SmallOrder)))));
             case KeyStanding::Available:
                 return {};
             case KeyStanding::Revoked: {
@@ -1205,24 +1230,24 @@ std::expected<void, ConsensusError> ValidateAgainst(ClusterState const& state, C
     switch (command.kind)
     {
         case CommandKind::AddMember:
-        case CommandKind::AddLearner:
-            // One id, one list: a principal admitted by key is not also a member, and moving
-            // one into consensus is a decision this verb must not make on the side.
-            if (IsPrincipal(state, command.key))
+        case CommandKind::AddLearner: {
+            // Never with NO key, stated or recorded: a machine is forgotten by revoking
+            // its key, so a member admitted without one leaves nothing a forget could revoke,
+            // and the next observation of it would admit it again. A re-admission that names
+            // no key keeps the recorded one, which is a key.
+            if (!KeyToRecord(state, command).has_value())
                 return std::unexpected(InvalidConfiguration(
-                    std::format("{} is a principal, admitted by its key; it cannot also be a member", command.key)));
+                    std::format("{} would be admitted with no identity key; a machine is admitted and forgotten by its "
+                                "key, so give --cluster-admit={}@<key>",
+                                command.key,
+                                command.key)));
             return refuseKey();
-
-        case CommandKind::AdmitPrincipal:
-            if (IsMember(state, command.key))
-                return std::unexpected(InvalidConfiguration(
-                    std::format("{} is a member of this cluster; a principal is a machine that is not", command.key)));
-            return refuseKey();
+        }
 
         case CommandKind::Forget:
             // The key the proposer holds live for the id must not be ANOTHER id's, or the
             // forget would revoke a machine nobody named. Held by this id, or by nobody -- a
-            // member a `--raft-peer` line typed, recorded nowhere -- is the key it means.
+            // bootstrap member, recorded nowhere -- is the key it means.
             if (command.publicKey.has_value())
                 if (auto const holder = state.HolderOf(*command.publicKey); holder.has_value() && *holder != command.key)
                     return std::unexpected(InvalidConfiguration(
@@ -1232,13 +1257,35 @@ std::expected<void, ConsensusError> ValidateAgainst(ClusterState const& state, C
                                     command.key)));
             return {};
 
-        case CommandKind::SetSetting:
-        case CommandKind::AdmitClient:
-        case CommandKind::ForgetClient:
+        case CommandKind::SetSetting: {
+            // The one setting whose value names a machine: it must name one that can PROVE itself,
+            // or every node would refuse to use what the operator just configured. A courtesy --
+            // a forget committing later leaves the setting in place, and every node then finds no
+            // live key for it and uses no shared cache, which fails closed.
+            if (command.key != SharedCacheSetting || command.value.empty())
+                return {};
+            if (LiveKeyOf(state, command.value).has_value())
+                return {};
+            // `InvalidConfiguration` even for a forgotten id, never `KeyRevoked`: that code is
+            // permanent, and the ID may be admitted again under a fresh key, after which this
+            // same command is accepted. The revocation is still worth naming.
+            auto const revoked = std::ranges::contains(state.revokedKeys, command.value, &RevokedKey::id);
+            return std::unexpected(InvalidConfiguration(
+                std::format("{} names {}, and this cluster holds no live key for it{}: a shared cache is trusted only "
+                            "by the key it proves, so name a current member",
+                            SharedCacheSetting,
+                            command.value,
+                            revoked ? " (its key was revoked when it was forgotten)" : "")));
+        }
+
+        case CommandKind::DissolveInto:
             return {};
 
-        // `Validate` refused it above; named rather than swept up by a `default`, for the
+        // `Validate` refused them above; named rather than swept up by a `default`, for the
         // reason `Apply` names it.
+        case CommandKind::RetiredAdmitClient:
+        case CommandKind::RetiredForgetClient:
+        case CommandKind::RetiredAdmitPrincipal:
         case CommandKind::Last:
             break;
     }

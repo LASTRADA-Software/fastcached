@@ -78,7 +78,9 @@ void AppendU64(std::string& out, std::uint64_t value)
                                          std::int64_t hourStart,
                                          std::uint64_t hourGranted)
 {
-    constexpr std::size_t Slots = EnumeratorCount<FleetMetric>;
+    // NOT `EnumeratorCount<FleetMetric>`: that is THIS build's width, and v1 wrote
+    // nine values forever, whatever this build's enum has grown to since.
+    constexpr std::size_t Slots = 9;
     constexpr std::size_t V1MinuteSlots = 24 * 60;
     constexpr std::size_t V1HourSlots = 7 * 24;
     constexpr std::int64_t MinuteMillis = 60 * 1000;
@@ -111,6 +113,118 @@ void AppendU64(std::string& out, std::uint64_t value)
     return file;
 }
 
+/// The body a v2 `FleetHistory` writes -- generation, then the minute/hour/day
+/// rings, at `LegacyValueWidth`. Shared between `VersionTwoFile`, which frames it as
+/// a standalone `FCFH` file, and a hand-built `FCNH` nested body, which is exactly
+/// this with no framing of its own.
+/// @param generation What the file claims.
+/// @param minuteStart Bucket start of the one present minute bucket.
+/// @param minuteGranted Its `DispatchGranted` reading (Fleet-scoped: readable back
+///        only by loading the ring directly, never through `BackfillInto`).
+/// @param minuteJobsInFlight Its `JobsInFlight` reading (Node-scoped, at the LAST of
+///        the nine legacy slots -- the one a width bug would misplace first).
+/// @return The body, unframed.
+[[nodiscard]] std::string VersionTwoBody(std::uint64_t generation,
+                                         std::int64_t minuteStart,
+                                         std::uint64_t minuteGranted,
+                                         std::uint64_t minuteJobsInFlight = 0)
+{
+    constexpr std::size_t LegacyValueWidth = 9;
+
+    std::string body;
+    AppendU64(body, generation);
+
+    AppendU64(body, 1U); // the minute ring: one bucket
+    AppendU64(body, static_cast<std::uint64_t>(minuteStart));
+    AppendU64(body, static_cast<std::uint64_t>(minuteStart)); // sample == start
+    AppendU64(body, 1U);                                      // present
+    AppendU64(body, 1U);                                      // coverage
+    for (auto const slot: std::views::iota(std::size_t { 0 }, LegacyValueWidth))
+    {
+        auto value = std::uint64_t { 0 };
+        if (slot == static_cast<std::size_t>(FleetMetric::DispatchGranted))
+            value = minuteGranted;
+        else if (slot == static_cast<std::size_t>(FleetMetric::JobsInFlight))
+            value = minuteJobsInFlight;
+        AppendU64(body, value);
+    }
+    for ([[maybe_unused]] auto const slot: std::views::iota(std::size_t { 0 }, LegacyValueWidth))
+    {
+        AppendU64(body, 0U); // low
+        AppendU64(body, 0U); // high
+        AppendU64(body, 0U); // total
+    }
+    AppendU64(body, 0U); // the hour ring: empty
+    AppendU64(body, 0U); // the day ring: empty
+    return body;
+}
+
+/// A history file in the v2 layout, written by hand -- frozen forever at the nine
+/// values and nine folds per bucket every version 1 and 2 file was ever written with.
+///
+/// By hand and not by an older binary, for the same reason `VersionOneFile` is: a
+/// fixture produced by the current build is v3 and exercises nothing. This is what
+/// proves `ReadVersion2` still reads a real v2 file once `FleetMetric` has grown a
+/// slot past the width this format froze at.
+/// @param generation What the file claims.
+/// @param minuteStart Bucket start of the one present minute bucket.
+/// @param minuteGranted Its `DispatchGranted` reading.
+/// @return The complete file, header included.
+[[nodiscard]] std::string VersionTwoFile(std::uint64_t generation, std::int64_t minuteStart, std::uint64_t minuteGranted)
+{
+    auto const body = VersionTwoBody(generation, minuteStart, minuteGranted);
+
+    std::string file;
+    file += "FCFH";
+    file.push_back(static_cast<char>(2));
+    AppendU64(file, body.size());
+    AppendU64(file, Crc32c::Compute(std::span { reinterpret_cast<std::byte const*>(body.data()), body.size() }));
+    file += body;
+    return file;
+}
+
+/// A `NodeStoreFile` in the v1 layout, written by hand -- one machine, whose nested
+/// body carries no envelope of its own and is exactly `VersionTwoBody`'s shape,
+/// because that is the shape every v1 `NodeStoreFile` was ever written with.
+///
+/// By hand for the same reason the other two hand-built fixtures are: a file this
+/// build produces is v2 and would exercise nothing. This is what proves the OUTER
+/// envelope's version, not a per-nested-body one, is what selects `ReadVersion2` for
+/// a real v1 file once `FleetMetric` has grown past the width it was written with.
+/// @param endpoint The one machine's key in the store.
+/// @param highWater Its recorded high-water mark.
+/// @param generation What its nested history claims.
+/// @param minuteStart Bucket start of the one present minute bucket.
+/// @param minuteGranted Its `DispatchGranted` reading.
+/// @param minuteJobsInFlight Its `JobsInFlight` reading -- Node-scoped, so it is the
+///        one `BackfillInto` will actually sum back out, unlike the dispatch counter.
+/// @return The complete file, header included.
+[[nodiscard]] std::string VersionOneNodeStoreFile(std::string_view endpoint,
+                                                  std::uint64_t highWater,
+                                                  std::uint64_t generation,
+                                                  std::int64_t minuteStart,
+                                                  std::uint64_t minuteGranted,
+                                                  std::uint64_t minuteJobsInFlight)
+{
+    auto const nested = VersionTwoBody(generation, minuteStart, minuteGranted, minuteJobsInFlight);
+
+    std::string body;
+    AppendU64(body, 1U); // one machine
+    AppendU64(body, endpoint.size());
+    body += endpoint;
+    AppendU64(body, highWater);
+    AppendU64(body, nested.size());
+    body += nested;
+
+    std::string file;
+    file += "FCNH";
+    file.push_back(static_cast<char>(1));
+    AppendU64(file, body.size());
+    AppendU64(file, Crc32c::Compute(std::span { reinterpret_cast<std::byte const*>(body.data()), body.size() }));
+    file += body;
+    return file;
+}
+
 /// Write @p bytes to @p path.
 void WriteFile(std::filesystem::path const& path, std::string_view bytes)
 {
@@ -128,6 +242,27 @@ void WriteFile(std::filesystem::path const& path, std::string_view bytes)
 }
 
 } // namespace
+
+TEST_CASE("FleetMetric's ordinals are pinned, not just documented", "[distributed][fleethistory]")
+{
+    // The header's own static_assert catches a renumbering that keeps every
+    // enumerator's declaration in the same relative order; this is the anchor beside
+    // it that would still catch a rewrite creative enough to dodge that -- the same
+    // reason a wire constant is pinned by value as well as by name. `DispatchAllExcluded`
+    // is the one enumerator this rule has actually had to protect so far: it landed
+    // at the END, at 9, rather than beside `DispatchWithdrawn` where `LeaseOutcomeTable`
+    // carries it.
+    CHECK(static_cast<std::uint8_t>(FleetMetric::DispatchGranted) == 0);
+    CHECK(static_cast<std::uint8_t>(FleetMetric::DispatchNoWorker) == 1);
+    CHECK(static_cast<std::uint8_t>(FleetMetric::DispatchNoCapacity) == 2);
+    CHECK(static_cast<std::uint8_t>(FleetMetric::DispatchWithdrawn) == 3);
+    CHECK(static_cast<std::uint8_t>(FleetMetric::DispatchDuplicate) == 4);
+    CHECK(static_cast<std::uint8_t>(FleetMetric::CacheHits) == 5);
+    CHECK(static_cast<std::uint8_t>(FleetMetric::CacheMisses) == 6);
+    CHECK(static_cast<std::uint8_t>(FleetMetric::OfferableSlots) == 7);
+    CHECK(static_cast<std::uint8_t>(FleetMetric::JobsInFlight) == 8);
+    CHECK(static_cast<std::uint8_t>(FleetMetric::DispatchAllExcluded) == 9);
+}
 
 TEST_CASE("A fresh history is empty and every bucket is a gap", "[distributed][fleethistory]")
 {
@@ -256,12 +391,12 @@ TEST_CASE("A history file's words are big-endian, and not only self-consistent",
     clock.Advance(std::chrono::minutes { 1 });
     history.Record(Reading(23));
     REQUIRE(history.Generation() == 2);
-    REQUIRE(history.Save(file));
+    REQUIRE(history.Save(file, StateFile::FleetHistory));
 
     auto const raw = ReadFile(file);
     REQUIRE(raw.size() > 21);
     CHECK(raw.substr(0, 4) == "FCFH");
-    CHECK(raw[4] == char { 2 }); // the version this build writes
+    CHECK(raw[4] == char { 3 }); // the version this build writes
 
     // The body length, big-endian, and it really is the body's length.
     std::string expectedLength;
@@ -288,7 +423,7 @@ TEST_CASE("History survives a save and reload", "[distributed][fleethistory]")
         clock.Advance(std::chrono::minutes { 1 });
         history.Record(Reading(23));
         generation = history.Generation();
-        REQUIRE(history.Save(file));
+        REQUIRE(history.Save(file, StateFile::FleetHistory));
     }
 
     FleetHistory restored { clock };
@@ -330,7 +465,7 @@ TEST_CASE("A history file that cannot be trusted starts empty rather than throwi
         {
             FleetHistory good { clock };
             good.Record(Reading(3));
-            REQUIRE(good.Save(file));
+            REQUIRE(good.Save(file, StateFile::FleetHistory));
         }
         // Flip a byte well past the header, so the checksum is what catches it.
         {
@@ -533,11 +668,47 @@ TEST_CASE("A version 1 history is inflated forward rather than discarded", "[dis
     CHECK(FoldOf(week.back(), FleetMetric::DispatchGranted).high == 0);
 
     // And it saves forward, in the current format.
-    auto const upgraded = scratch.Path() / "v2.bin";
-    REQUIRE(history.Save(upgraded));
+    auto const upgraded = scratch.Path() / "v3.bin";
+    REQUIRE(history.Save(upgraded, StateFile::FleetHistory));
     FleetHistory again { clock };
     REQUIRE(again.Load(upgraded));
     CHECK(GrantedOf(again.Buckets(FleetRange::Day).back()) == 11);
+}
+
+TEST_CASE("A version 2 history reads back at the width it was written with", "[distributed][fleethistory]")
+{
+    // The regression `FleetMetric` growing a slot could have caused: if `ReadVersion2`
+    // derived its width from the live enum instead of staying pinned at nine, a real
+    // v2 file would misalign every field past the first bucket once this build's
+    // count moved -- or worse, read the wrong bytes into a plausible-looking number
+    // rather than failing outright.
+    Testing::ScratchDirectory const scratch { "fleet-history-v2" };
+    auto const file = scratch.Path() / "v2.bin";
+
+    PlacedWallClock clock;
+    auto const nowMillis = std::chrono::duration_cast<std::chrono::milliseconds>(clock.now().time_since_epoch()).count();
+    auto const minuteStart = (nowMillis / 60'000) * 60'000;
+
+    WriteFile(file, VersionTwoFile(42, minuteStart, 17));
+
+    FleetHistory history { clock };
+    REQUIRE(history.Load(file));
+    CHECK(history.Generation() == 42);
+
+    auto const day = history.Buckets(FleetRange::Day);
+    REQUIRE_FALSE(day.empty());
+    CHECK(GrantedOf(day.back()) == 17);
+
+    // The slot no v2 file ever carried reads back at zero -- not garbage, and not a
+    // neighbour's reading shifted into it.
+    CHECK(day.back().values[static_cast<std::size_t>(FleetMetric::DispatchAllExcluded)] == 0);
+
+    // And it saves forward, in the current format.
+    auto const upgraded = scratch.Path() / "v3.bin";
+    REQUIRE(history.Save(upgraded, StateFile::FleetHistory));
+    FleetHistory again { clock };
+    REQUIRE(again.Load(upgraded));
+    CHECK(GrantedOf(again.Buckets(FleetRange::Day).back()) == 17);
 }
 
 TEST_CASE("A history newer than this build is kept, and never written over", "[distributed][fleethistory]")
@@ -557,7 +728,7 @@ TEST_CASE("A history newer than this build is kept, and never written over", "[d
     {
         FleetHistory writer { clock };
         writer.Record(Reading(5));
-        REQUIRE(writer.Save(file));
+        REQUIRE(writer.Save(file, StateFile::FleetHistory));
     }
     auto bytes = ReadFile(file);
     REQUIRE(bytes.size() > 4);
@@ -574,7 +745,7 @@ TEST_CASE("A history newer than this build is kept, and never written over", "[d
     history.Record(Reading(9));
     CHECK_FALSE(history.Empty());
 
-    CHECK_FALSE(history.Save(file));
+    CHECK_FALSE(history.Save(file, StateFile::FleetHistory));
     CHECK(ReadFile(file) == before);
 }
 
@@ -590,7 +761,7 @@ TEST_CASE("A history older than every reader is not treated as newer", "[distrib
     {
         FleetHistory writer { clock };
         writer.Record(Reading(5));
-        REQUIRE(writer.Save(file));
+        REQUIRE(writer.Save(file, StateFile::FleetHistory));
     }
     auto bytes = ReadFile(file);
     bytes[4] = static_cast<char>(0);
@@ -599,7 +770,7 @@ TEST_CASE("A history older than every reader is not treated as newer", "[distrib
     FleetHistory history { clock };
     CHECK_FALSE(history.Load(file));
     CHECK_FALSE(history.ReadOnly());
-    CHECK(history.Save(file));
+    CHECK(history.Save(file, StateFile::FleetHistory));
 }
 
 TEST_CASE("A gap in sampling is not folded in as a peak", "[distributed][fleethistory]")
@@ -663,7 +834,7 @@ TEST_CASE("A restart keeps when a bucket was sampled, not when its window opened
         FleetHistory history { clock };
         history.Record(Reading(7));
         sampled = history.Buckets(FleetRange::Week).back().sampleMillis;
-        REQUIRE(history.Save(file));
+        REQUIRE(history.Save(file, StateFile::FleetHistory));
     }
 
     FleetHistory restored { clock };
@@ -902,7 +1073,7 @@ TEST_CASE("A leader's record of the other machines survives a restart", "[distri
         REQUIRE(received.AcceptHistory("a:1", batchA) == 4);
         REQUIRE(received.AcceptHistory("b:1", nodeB.ClosedBucketsAfter(-1, 100)) == 4);
         highA = received.HighWaterFor("a:1");
-        REQUIRE(received.Save(file));
+        REQUIRE(received.Save(file, StateFile::ReceivedHistory));
     }
 
     FleetNodeHistories restored { clock };
@@ -952,7 +1123,7 @@ TEST_CASE("A received-history file that cannot be trusted starts empty", "[distr
         {
             FleetHistory own { clock };
             own.Record(Reading(3));
-            REQUIRE(own.Save(file));
+            REQUIRE(own.Save(file, StateFile::FleetHistory));
         }
         FleetNodeHistories received { clock };
         CHECK_FALSE(received.Load(file));
@@ -968,7 +1139,7 @@ TEST_CASE("A received-history file that cannot be trusted starts empty", "[distr
             clock.Advance(std::chrono::minutes { 1 });
             FleetNodeHistories received { clock };
             REQUIRE(received.AcceptHistory("a:1", node.ClosedBucketsAfter(-1, 100)) == 1);
-            REQUIRE(received.Save(file));
+            REQUIRE(received.Save(file, StateFile::ReceivedHistory));
         }
         {
             std::fstream patch { file, std::ios::binary | std::ios::in | std::ios::out };
@@ -979,4 +1150,71 @@ TEST_CASE("A received-history file that cannot be trusted starts empty", "[distr
         CHECK_FALSE(received.Load(file));
         CHECK(received.Count() == 0);
     }
+}
+
+TEST_CASE("A v1 received-history file still reads, with its slots in place", "[distributed][fleethistory]")
+{
+    // The regression this exists to prevent: `NodeStoreFile`'s nested bodies grew a
+    // slot right along with `FleetMetric`, but the OUTER envelope's version is what
+    // has to say so -- a nested body carries none of its own. Without this, a real
+    // v1 file would be decoded through `ReadVersion3`'s wider shape and every field
+    // past the first missing one would land in the wrong place.
+    Testing::ScratchDirectory const scratch { "fleet-received-v1" };
+    auto const file = scratch.Path() / "v1.bin";
+
+    PlacedWallClock clock;
+    auto const nowMillis = std::chrono::duration_cast<std::chrono::milliseconds>(clock.now().time_since_epoch()).count();
+    // Comfortably closed, not the instant a fresh reader would call its open bucket.
+    auto const minuteStart = ((nowMillis / 60'000) - 5) * 60'000;
+
+    WriteFile(file, VersionOneNodeStoreFile("a:1", 5, 42, minuteStart, 17, 4));
+
+    FleetNodeHistories received { clock };
+    REQUIRE(received.Load(file));
+    CHECK(received.Count() == 1);
+    CHECK(received.HighWaterFor("a:1") == 5);
+
+    FleetHistory leader { clock };
+    auto view = leader.Buckets(FleetRange::OneHour);
+    received.BackfillInto(view, FleetRange::OneHour);
+
+    // `JobsInFlight`, not `DispatchGranted`: `BackfillInto` sums NODE-scoped slots
+    // only, and it is also the LAST of the nine legacy slots -- the one a width bug
+    // misreads first, since everything before it would have to already be wrong for
+    // the read to still be in bounds.
+    auto const found = std::ranges::find_if(view, [](FleetBucket const& b) { return b.present; });
+    REQUIRE(found != view.end());
+    CHECK(found->values[static_cast<std::size_t>(FleetMetric::JobsInFlight)] == 4);
+}
+
+TEST_CASE("A received-history file newer than this build is kept, and never written over", "[distributed][fleethistory]")
+{
+    // `NodeStoreFile`'s own version, mirroring the rule `RingFile` already has: a
+    // node rolled back to an older build must not destroy what a later one wrote and
+    // could still read.
+    Testing::ScratchDirectory const scratch { "fleet-received-newer" };
+    auto const file = scratch.Path() / "newer.bin";
+
+    PlacedWallClock clock;
+    {
+        FleetHistory node { clock };
+        node.Record(Reading(0, 7));
+        clock.Advance(std::chrono::minutes { 1 });
+        FleetNodeHistories writer { clock };
+        REQUIRE(writer.AcceptHistory("a:1", node.ClosedBucketsAfter(-1, 100)) == 1);
+        REQUIRE(writer.Save(file, StateFile::ReceivedHistory));
+    }
+    auto bytes = ReadFile(file);
+    REQUIRE(bytes.size() > 4);
+    bytes[4] = static_cast<char>(200);
+    WriteFile(file, bytes);
+    auto const before = ReadFile(file);
+
+    FleetNodeHistories received { clock };
+    CHECK_FALSE(received.Load(file));
+    CHECK(received.Count() == 0);
+    CHECK(received.ReadOnly());
+
+    CHECK_FALSE(received.Save(file, StateFile::ReceivedHistory));
+    CHECK(ReadFile(file) == before);
 }

@@ -2,30 +2,56 @@
 #pragma once
 
 #include "Dispatch.hpp"
+#include "HitVerification.hpp"
 
 #include <FastCache/Cli/UsageDoc.hpp>
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Cc
 {
 
 /// What the launcher did with one compile — the outcome recorded per invocation.
+///
+/// Persisted as the TOKEN `ToStringView` names, never as the enumerator's value, so the
+/// order here is private and a reader of an older log meets an unknown token rather than
+/// a renumbered one.
 enum class Outcome : std::uint8_t
 {
     Hit,         ///< Served from the cache; no compiler run.
     Miss,        ///< Compiled and stored.
     Uncacheable, ///< Deliberately not cached (time macros, unparsable line).
     Unavailable, ///< Cache error; fell back to a real compile.
+    /// Served from the cache, then compiled again by `FASTCACHE_VERIFY`, and the fresh
+    /// object DIFFERED -- so the build used the fresh one and the cache's was wrong.
+    ///
+    /// Its own outcome and never a `Hit`, because it is the opposite of one: the object
+    /// the build links came from the compiler, and the one the cache holds is exactly the
+    /// failure class the verifier exists to surface. Tallied as a hit it would raise the
+    /// hit rate by the number of wrong objects served, and the one line an operator reads
+    /// to judge the cache would read best when the cache was at its worst.
+    VerifyMismatch,
 };
 
 /// @param outcome The outcome to name.
 /// @return The stable token written to the log (also parsed back when reporting).
 [[nodiscard]] std::string_view ToStringView(Outcome outcome) noexcept;
+
+/// What a served hit is recorded as, given what verifying it found.
+///
+/// Here rather than in the launcher's `main.cpp`, which is in no test target (#909). Only
+/// a mismatch changes the answer: an unsampled, matching, inconclusive or unsupported
+/// verification leaves the served object in place, and that is a hit.
+/// @param verdict What `FASTCACHE_VERIFY` found, or `NotChecked`.
+/// @return `VerifyMismatch` for a rejected hit; `Hit` otherwise.
+[[nodiscard]] Outcome OutcomeOfServedHit(HitVerdict verdict) noexcept;
 
 /// What the launcher did about DISTRIBUTION on one compile — an axis of its own,
 /// beside `Outcome` rather than folded into it.
@@ -89,6 +115,11 @@ enum class DispatchOutcome : std::uint8_t
     /// here is a fleet declining to help, and this one is a defect somebody has to
     /// look at. Folded in with `Unreachable` it would read as a network blip.
     Mismatched,
+    /// A reply to a dispatched compile was not signed by the worker its grant named, and this
+    /// client refused the object (W-4): an address answering on a machine that is not that
+    /// worker. Kept apart from `Mismatched`, which is a fleet machine confusing two jobs; this is
+    /// somebody else's machine, and its object would have poisoned the fleet's shared cache.
+    Unauthenticated,
     /// A worker ran the compiler and this client did not keep the object — a
     /// non-zero remote exit code retried locally, or an artefact that could not be
     /// written. The exchange worked and the compile was still done twice.
@@ -143,6 +174,20 @@ struct DispatchRecording
 /// @return The state to record and the reason to tally it under.
 [[nodiscard]] DispatchRecording RecordingFor(DispatchStatus status, DeclineCause cause) noexcept;
 
+/// What the invocation log records as `Record::dispatchSpecifics` for what `Dispatch` returned.
+///
+/// Beside `RecordingFor` and for its reason: `main.cpp` is in no test target, so which field
+/// reaches the log is decided here, where a case can assert it. `DispatchResult::refusal` is
+/// recorded only where it names what to act on -- the argument a worker would not take, the
+/// ceiling a job went over, what one worker could not do, the argument this launcher would not
+/// send -- and chosen by the row of the status and, for a decline, of its cause. Nothing else
+/// carries anything: a compile that ran has nothing to act on, and a text that would name an
+/// endpoint -- an unreachable fleet's, an exhausted redirect chain's -- or a code the reason
+/// already stands for is the verbose line's business.
+/// @param result What `Dispatch` returned.
+/// @return The specifics to record; empty when there are none.
+[[nodiscard]] std::string SpecificsFor(DispatchResult const& result);
+
 /// One recorded invocation.
 struct Record
 {
@@ -182,6 +227,17 @@ struct Record
     /// list always reconcile — see `FoldRecords`.
     std::string dispatchDetail;
 
+    /// What to act on about `dispatchDetail`, when the cause alone does not say: the argument
+    /// a worker would not take (in its own words), the flag this launcher would not send, the
+    /// ceiling a translation unit exceeded. Empty when there is nothing more to say.
+    ///
+    /// **Recorded, never tallied** -- the one variable-text column on the dispatch axis. It is
+    /// kept apart from `dispatchDetail` precisely so the tally stays one row per cause while
+    /// the log still says WHICH flag, which is what an operator needs in order to act without
+    /// `FASTCACHE_VERBOSE` or the node's counters. `AppendRecord` bounds it and strips control
+    /// characters, since part of it is a peer's text.
+    std::string dispatchSpecifics;
+
     // Phase breakdown of elapsedMs. A hit is not "cache latency": it also pays a
     // full preprocess to derive the key, so a slow hit needs these to attribute.
     std::uint64_t preprocessMs {}; ///< Deriving the key (preprocess + compiler id).
@@ -205,7 +261,31 @@ struct Record
     /// did not exist yet) or a caller that never set it — and is excluded from
     /// any time-bucketed view rather than plotted as an epoch-zero data point.
     std::uint64_t timestampUnixSeconds {};
+
+    /// What the compile this invocation ran exited with: the code the build saw.
+    ///
+    /// Disengaged for a line from before the column existed, which is NOT a success -- it is a
+    /// record that cannot say. The column exists because a fetch that failed and a compile that
+    /// failed were one line in this log: a night of `cl.exe` killed from outside read, record by
+    /// record, exactly like a cache that broke the build.
+    std::optional<std::int32_t> exitCode;
 };
+
+/// What reading the invocation log found.
+struct LogReading
+{
+    std::vector<Record> records; ///< Every line this build could read, in log order.
+    /// Lines skipped rather than read: a format version this build does not know -- a later
+    /// launcher appending to the same log is what a rolling upgrade looks like -- or a line of
+    /// the current version whose columns do not add up. Never read by position instead, which
+    /// is how a newer line would be misread as an older one.
+    std::uint64_t unreadable {};
+};
+
+/// When a record is written, from the injected wall clock.
+/// @param clock The clock to read; production passes `core::platform::defaultSystemWallClock()`.
+/// @return Seconds since the Unix epoch; `Record::timestampUnixSeconds`.
+[[nodiscard]] std::uint64_t RecordTimestamp(core::platform::IWallClock const& clock) noexcept;
 
 /// Append one record to the per-user log, creating it on first use.
 ///
@@ -251,6 +331,11 @@ void AppendRecord(Record const& record);
 /// @return The parsed records, in file order. Empty when the log is absent
 ///         or empty.
 [[nodiscard]] std::vector<Record> ParseLog(std::string_view groupFilter);
+
+/// `ParseLog`, and how many lines it could not read.
+/// @param groupFilter When non-empty, only records of this prefetch group.
+/// @return What was read, and what was skipped.
+[[nodiscard]] LogReading ReadLog(std::string_view groupFilter);
 
 /// Render the same data as `FormatReport`, as a self-contained HTML dashboard
 /// (inline CSS/JS, no network dependency): headline hit rate, per-outcome

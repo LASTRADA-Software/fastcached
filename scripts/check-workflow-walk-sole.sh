@@ -56,6 +56,9 @@ if [ "${1:-}" = "--self-test" ]; then
     selfTestCases=0
     selfTestStatus=0
     me="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    # From beside THIS script, not the root the run was handed: that may be a staged tree.
+    # shellcheck source=scripts/lib/git-scrub.sh
+    . "${me%/*}/lib/git-scrub.sh"
     scratch="$(mktemp -d)" || { echo "cannot create a scratch directory" >&2; exit 2; }
     # shellcheck disable=SC2064  # expand $scratch now, not at trap time
     trap "rm -rf '$scratch'" EXIT
@@ -75,10 +78,10 @@ if [ "${1:-}" = "--self-test" ]; then
         cp "${me%/*}/lib/third-party-roots.sh" "$scratch/tree/scripts/lib/"
         cp "${me%/*}/lib/third-party-roots.txt" "$scratch/tree/scripts/lib/"
         : > "$scratch/tree/exemptions.txt"
-        git -C "$scratch/tree" init -q 2>/dev/null
+        scratch_git -C "$scratch/tree" init -q 2>/dev/null
     }
 
-    Track() { git -C "$scratch/tree" add -A -f >/dev/null 2>&1; }
+    Track() { scratch_git -C "$scratch/tree" add -A -f >/dev/null 2>&1; }
 
     # @param 1 what is being staged  @param 2 want-pass|want-fail|want-refuse
     Case() {
@@ -137,8 +140,11 @@ if [ "${1:-}" = "--self-test" ]; then
     Case "a DEPTH-RELATIVE pattern is not a fixed indent and passes" want-pass
 
     Stage
+    # No `sed` anywhere in this prose -- not even inside "used": the sed-stripping rule would
+    # remove the shape itself and this case would pass with comment-stripping switched off,
+    # which is what it did until the prose was reworded (measured by neutering that rule).
     printf '%s\n' '# reads .github/workflows; the shape below is quoted in prose' \
-        '# it used to say /^  [A-Za-z0-9_-]+:/ and that was the defect' \
+        '# it once read /^  [A-Za-z0-9_-]+:/ and that was the defect' \
         'awk -f scripts/lib/workflow-walk.awk -f mine.awk "$1" "$1"' \
         > "$scratch/tree/scripts/documented.sh"
     Case "the shape inside a full-line COMMENT is documentation and passes" want-pass
@@ -197,10 +203,12 @@ fi
 Problems=0
 Fail() { echo "  FAIL: $*" >&2; Problems=$((Problems + 1)); }
 
-# Every first-party shell script and awk program under `scripts/`, one per line.
-# Enumerated through git, which is the one answer to which files are this
-# project's: a directory walk would take a stray copy in a build tree as a
-# subject and report on a file nobody tracks.
+# Every first-party shell script and awk program under `scripts/`, one per line, into
+# `SubjectList` -- a global rather than stdout, so it runs ONCE: returned through
+# `$(...)` it ran twice, the first time only so `FastCachedDeclined` survived the
+# subshell. Enumerated through git, which is the one answer to which files are this
+# project's: a directory walk would take a stray copy in a build tree as a subject
+# and report on a file nobody tracks.
 Subjects() {
     local tracked firstParty declined
     tracked="$(git -C "${FastCachedRoot}" ls-files -- 'scripts/*.sh' 'scripts/*.awk')" || return 2
@@ -216,10 +224,19 @@ Subjects() {
     fi
     declined="$(third_party_paths "${FastCachedRoot}" "${tracked}")" || return 2
     FastCachedDeclined="$(third_party_declined_summary 'script(s)' "${declined}")"
-    printf '%s\n' "${firstParty}"
+    SubjectList="${firstParty}"
 }
 
-# The fixed-indent awk literals in @p 1, as `<line>:<text>`, or nothing.
+# The subjects that name a workflow, and their fixed-indent awk literals, for every file
+# named after the arguments -- in ONE awk pass, as records:
+#
+#   SCANNED<TAB><path>                 the file names `workflows`, so it is in scope
+#   UNBALANCED<TAB><path>              its `walk-sole-fixtures` markers do not balance
+#   HIT<TAB><path><TAB><line>:<text>   a fixed-indent literal, the line as it was judged
+#
+# One process for the whole tree, not a `grep` per script and an `awk`, a `sed` and a
+# `grep` per script that names a workflow: under a loaded ctest a process start costs
+# far more than the scan, and this timed out at 60 s. What is judged is unchanged:
 #
 # Full-line comments are stripped first, because a COMMENT is not a call site --
 # and here that is load-bearing rather than tidy: every migrated check documents
@@ -231,37 +248,60 @@ Subjects() {
 # shape and neither reads a workflow: one edits awk source, the other writes a
 # fixture. They are recognised by the `s` before the slash and by `sed` on the
 # line, which is narrower than it sounds and is why the exemption file exists.
-FixedIndentLiterals() {
-    local cleaned status=0
-    # A REGION may exempt itself, and this file is the reason the mechanism exists:
-    # the self-test below plants the very shape this scan refuses, as string
-    # literals, so without a region the scan flags itself over the real tree. The
-    # rulebook's rule is exactly this -- *a file that matches its own scan by
-    # construction exempts a REGION, never itself* -- and exempting the FILE would
-    # turn the scan off for the one file whose fixtures are its own evidence.
-    #
-    # The markers are BALANCED or this refuses. A `begin` whose `end` was deleted
-    # would skip the rest of the file in silence, which is the whole-file exemption
-    # arriving by accident.
-    cleaned="$(awk '
-        /walk-sole-fixtures: begin/ { begins++; inRegion = 1; print ""; next }
-        /walk-sole-fixtures: end/   { ends++; inRegion = 0; print ""; next }
-        inRegion                    { print ""; next }
-        { print }
-        END { if (begins != ends) exit 3 }
-    ' "$1")" || status=$?
-    if [ "${status}" -ne 0 ]; then
-        echo "check-workflow-walk-sole: ${1} has unbalanced \`walk-sole-fixtures\` markers, so an" >&2
-        echo "  exempt REGION would run to the end of the file. Refused rather than scanned." >&2
-        return 2
-    fi
-    printf '%s\n' "${cleaned}" \
-        | sed -e 's/^[[:space:]]*#.*$//' -e 's/sed[^|;&]*//g' -e 's/[^[:alnum:]]s\/\^[^/]*\/[^/]*\///g' \
-        | grep -nE '/\^(  +|\[ \]\{[2-9][0-9]*\})' || true
+#
+# A REGION may exempt itself, and this file is the reason the mechanism exists:
+# the self-test below plants the very shape this scan refuses, as string
+# literals, so without a region the scan flags itself over the real tree. The
+# rulebook's rule is exactly this -- *a file that matches its own scan by
+# construction exempts a REGION, never itself* -- and exempting the FILE would
+# turn the scan off for the one file whose fixtures are its own evidence.
+#
+# The markers are BALANCED or the file is refused. A `begin` whose `end` was deleted
+# would skip the rest of the file in silence, which is the whole-file exemption
+# arriving by accident. `workflows` is looked for in the RAW line, comments and
+# regions included, as the per-file `grep -Fq` did.
+#
+# The literal `[`, `]`, `{` and `}` of the pattern are bracket expressions rather than
+# escapes, so every awk reads them the same way.
+ScanSubjects() {
+    awk '
+        function flush(    i) {
+            if (file == "" || !hasWorkflow)
+                return
+            printf "SCANNED\t%s\n", file
+            if (begins != ends)
+                printf "UNBALANCED\t%s\n", file
+            else
+                for (i = 1; i <= hits; i++)
+                    printf "HIT\t%s\t%s\n", file, hit[i]
+        }
+        FNR == 1 {
+            flush()
+            file = FILENAME
+            hasWorkflow = 0
+            begins = 0
+            ends = 0
+            inRegion = 0
+            hits = 0
+        }
+        index($0, "workflows") > 0 { hasWorkflow = 1 }
+        /walk-sole-fixtures: begin/ { begins++; inRegion = 1; next }
+        /walk-sole-fixtures: end/   { ends++; inRegion = 0; next }
+        inRegion { next }
+        /^[ \t\r\f\v]*#/ { next }
+        {
+            line = $0
+            gsub(/sed[^|;&]*/, "", line)
+            gsub(/[^A-Za-z0-9]s\/\^[^\/]*\/[^\/]*\//, "", line)
+            if (line ~ /\/\^(  +|[[] []][{][2-9][0-9]*[}])/)
+                hit[++hits] = FNR ":" line
+        }
+        END { flush() }
+    ' "$@"
 }
 
-Subjects > /dev/null || exit 2
-SubjectList="$(Subjects)" || exit 2
+SubjectList=""
+Subjects || exit 2
 
 # The exemption rows: `<path><TAB><reason>`. Read before the scan, so a row for a
 # file that is not a subject at all is refused rather than quietly unused.
@@ -270,37 +310,83 @@ if [ -r "${FastCachedExemptions}" ]; then
     ExemptPaths="$(sed -e 's/^[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "${FastCachedExemptions}" | cut -f1)"
 fi
 
+# True when @p 1 is one whole line of the newline-separated @p 2. A `case`, not a
+# `grep -Fqx` per subject: the lookup is a membership test and needs no process.
+IsLineOf() {
+    case $'\n'"$2"$'\n' in
+        *$'\n'"$1"$'\n'*) return 0 ;;
+    esac
+    return 1
+}
+
+# Judge one scanned subject's hits, which arrive together after its SCANNED record.
+# @param 1 the subject  @param 2 its hits, one `<line>:<text>` per line, or nothing
+JudgeSubject() {
+    [ -n "$2" ] || return 0
+    if IsLineOf "$1" "${ExemptPaths}"; then
+        ExemptUsed="${ExemptUsed}${1}"$'\n'
+        return 0
+    fi
+    Flagged=$((Flagged + 1))
+    Fail "${1} carries an awk regex anchored on a fixed indentation, which is a column count standing in for a depth. Read the workflow through scripts/lib/workflow-walk.awk, which answers the depth itself; if this site STAGES a fragment rather than reading one, add a row to scripts/check-workflow-walk-sole-exemptions.txt saying so."
+    local hit
+    while IFS= read -r hit; do
+        [ -n "${hit}" ] && printf '        %s\n' "${hit}" >&2
+    done <<< "$2"
+}
+
+# The readable subjects, as paths: an unreadable one was skipped, and still is.
+Readable=()
+while IFS= read -r subject; do
+    [ -n "${subject}" ] || continue
+    [ -r "${FastCachedRoot}/${subject}" ] && Readable[${#Readable[@]}]="${FastCachedRoot}/${subject}"
+done <<< "${SubjectList}"
+
 Scanned=0
 Flagged=0
 ExemptUsed=""
-while IFS= read -r subject; do
-    [ -n "${subject}" ] || continue
-    path="${FastCachedRoot}/${subject}"
-    [ -r "${path}" ] || continue
-    # Only a file that READS a workflow. A script matching indented lines in a TSV
-    # table or in markdown is not modelling YAML, and flagging it would be the
-    # over-broad half of this scan rather than its point.
-    grep -Fq -- 'workflows' "${path}" || continue
-    Scanned=$((Scanned + 1))
-    if ! hits="$(FixedIndentLiterals "${path}")"; then
-        Fail "${subject} could not be scanned, so nothing about it has been established."
-        continue
-    fi
-    [ -n "${hits}" ] || continue
-    if grep -Fqx -- "${subject}" <<< "${ExemptPaths}"; then
-        ExemptUsed="${ExemptUsed}${subject}"$'\n'
-        continue
-    fi
-    Flagged=$((Flagged + 1))
-    Fail "${subject} carries an awk regex anchored on a fixed indentation, which is a column count standing in for a depth. Read the workflow through scripts/lib/workflow-walk.awk, which answers the depth itself; if this site STAGES a fragment rather than reading one, add a row to scripts/check-workflow-walk-sole-exemptions.txt saying so."
-    printf '%s\n' "${hits}" | sed 's/^/        /' >&2
-done <<< "${SubjectList}"
+Records=""
+if [ "${#Readable[@]}" -gt 0 ]; then
+    Records="$(ScanSubjects "${Readable[@]}")" || { echo "check-workflow-walk-sole: the scan did not complete. Refused." >&2; exit 2; }
+fi
+# Only a file that READS a workflow is a subject. A script matching indented lines in a
+# TSV table or in markdown is not modelling YAML, and flagging it would be the
+# over-broad half of this scan rather than its point.
+current=""
+currentHits=""
+while IFS=$'\t' read -r kind path rest; do
+    [ -n "${kind}" ] || continue
+    subject="${path#"${FastCachedRoot}"/}"
+    case "${kind}" in
+        SCANNED)
+            [ -z "${current}" ] || JudgeSubject "${current}" "${currentHits}"
+            current="${subject}"
+            currentHits=""
+            Scanned=$((Scanned + 1))
+            ;;
+        UNBALANCED)
+            echo "check-workflow-walk-sole: ${path} has unbalanced \`walk-sole-fixtures\` markers, so an" >&2
+            echo "  exempt REGION would run to the end of the file. Refused rather than scanned." >&2
+            Fail "${subject} could not be scanned, so nothing about it has been established."
+            current=""
+            currentHits=""
+            ;;
+        HIT)
+            currentHits="${currentHits}${rest}"$'\n'
+            ;;
+        *)
+            echo "check-workflow-walk-sole: the scan wrote a record of kind '${kind}', which this reader does not know. Refused." >&2
+            exit 2
+            ;;
+    esac
+done <<< "${Records}"
+[ -z "${current}" ] || JudgeSubject "${current}" "${currentHits}"
 
 # A row that matched nothing is refused. An exemption kept past its subject goes
 # on excusing whatever next takes that path, and reads as a considered decision.
 while IFS= read -r row; do
     [ -n "${row}" ] || continue
-    if ! grep -Fqx -- "${row}" <<< "${ExemptUsed}"; then
+    if ! IsLineOf "${row}" "${ExemptUsed}"; then
         Fail "the exemption row for '${row}' matched nothing: either the file no longer carries a fixed-indent literal, or it is no longer scanned. Delete the row rather than leaving it to excuse the next site at that path."
     fi
 done <<< "${ExemptPaths}"
@@ -313,7 +399,10 @@ fi
 
 echo "check-workflow-walk-sole: enumerated via git ls-files"
 [ -z "${FastCachedDeclined:-}" ] || echo "check-workflow-walk-sole: ${FastCachedDeclined}"
-exemptCount="$(grep -c . <<< "${ExemptPaths}" || true)"
+exemptCount=0
+while IFS= read -r row; do
+    [ -n "${row}" ] && exemptCount=$((exemptCount + 1))
+done <<< "${ExemptPaths}"
 echo "check-workflow-walk-sole: ${Scanned} script(s) that name a workflow scanned, ${Flagged} carrying a private fixed-indent walk, ${exemptCount:-0} exempt by row"
 if [ "${Problems}" -ne 0 ]; then
     echo "check-workflow-walk-sole: ${Problems} problem(s); a second model of workflow YAML is how the first five got written" >&2

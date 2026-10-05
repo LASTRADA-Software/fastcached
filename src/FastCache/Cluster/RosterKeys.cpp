@@ -13,7 +13,7 @@ namespace
     /// The keys a command line typed, by id.
     /// @param bootstrap The members it named.
     /// @return Each member that carried a key, by id.
-    [[nodiscard]] std::map<Consensus::NodeId, Ed25519PublicKey> TypedKeys(std::span<ClusterMember const> bootstrap)
+    [[nodiscard]] std::map<Consensus::NodeId, Ed25519PublicKey> TypedKeys(std::span<MemberSpec const> bootstrap)
     {
         std::map<Consensus::NodeId, Ed25519PublicKey> typed;
         for (auto const& member: bootstrap)
@@ -23,7 +23,7 @@ namespace
     }
 } // namespace
 
-RosterKeys::RosterKeys(Ed25519KeyPair own, std::span<ClusterMember const> bootstrap):
+RosterKeys::RosterKeys(Ed25519KeyPair own, std::span<MemberSpec const> bootstrap):
     _own { std::move(own) },
     _bootstrap { TypedKeys(bootstrap) }
 {
@@ -33,8 +33,7 @@ void RosterKeys::Adopt(ClusterState const& state)
 {
     std::map<Consensus::NodeId, Ed25519PublicKey> stated;
     for (auto const& member: state.members)
-        if (member.publicKey.has_value())
-            stated.emplace(member.id, *member.publicKey);
+        stated.emplace(member.id, member.publicKey);
 
     std::unique_lock const lock { _lock };
     _stated = std::move(stated);
@@ -55,9 +54,9 @@ Ed25519PublicKey RosterKeys::OwnPublicKey() const
     return _own.PublicKey();
 }
 
-Ed25519Signature RosterKeys::SignAsSelf(std::span<std::byte const> message) const
+Ed25519Signature RosterKeys::SignAsSelf(LabelledMessage const& message) const
 {
-    return _own.Sign(message);
+    return SignLabelled(_own, message);
 }
 
 Consensus::PeerKeys RosterKeys::KeysOf(Consensus::NodeId const& peer) const

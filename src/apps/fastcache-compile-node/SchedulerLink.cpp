@@ -15,6 +15,14 @@ std::optional<SchedulerLink> SchedulerLink::For(std::vector<std::string> configu
     return SchedulerLink { std::move(configured) };
 }
 
+std::optional<SchedulerLink> SchedulerLink::Over(ISchedulerEndpointSource const& source)
+{
+    auto link = For(source.Current());
+    if (link.has_value())
+        link->_source = &source;
+    return link;
+}
+
 SchedulerLink::SchedulerLink(std::vector<std::string> configured):
     _configured { std::move(configured) },
     _current { _configured.front() }
@@ -26,8 +34,19 @@ std::string const& SchedulerLink::ConfiguredAt(std::size_t offset) const noexcep
     return _configured[(_home + offset) % _configured.size()];
 }
 
+void SchedulerLink::Retarget(std::vector<std::string> configured)
+{
+    if (configured.empty() || configured == _configured)
+        return;
+    auto const at = std::ranges::find(configured, _configured[_home]);
+    _home = at == configured.end() ? 0 : static_cast<std::size_t>(std::distance(configured.begin(), at));
+    _configured = std::move(configured);
+}
+
 void SchedulerLink::BeginRound()
 {
+    if (_source != nullptr)
+        Retarget(_source->Current());
     _hops = 0;
     if (_learned.has_value())
     {

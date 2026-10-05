@@ -205,7 +205,10 @@ endif()
 set(_declared "${CMAKE_MATCH_1}")
 
 file(READ "${_wire}" _wireText)
-if(NOT _wireText MATCHES "ErrorCode::UnsupportedVersion, \\.name = \"([^\"]*)\"")
+# Any whitespace between the two fields, newlines included: whether clang-format keeps `.name` on
+# the `.code` line depends on how many columns the row's OTHER fields take, which is no business of
+# this check. The row is still found by its code and read by its name, and nothing else.
+if(NOT _wireText MATCHES "ErrorCode::UnsupportedVersion,[ \t\r\n]*\\.name = \"([^\"]*)\"")
     message(FATAL_ERROR
         "check-version-fallback-warning: could not find UnsupportedVersion's wire name in "
         "${_wire}. The row moved or was reshaped, so the agreement below cannot be checked.")

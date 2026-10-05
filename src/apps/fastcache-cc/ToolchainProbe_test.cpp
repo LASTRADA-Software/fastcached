@@ -3,7 +3,9 @@
 #include "ToolchainHostTestUtils.hpp"
 #include "ToolchainProbe.hpp"
 
+#include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Platform/EnvironmentTestUtils.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -2154,6 +2156,40 @@ TEST_CASE("A toolchain label says what the compiler is, where a fingerprint cann
 
     // Empty only when there is no compiler to name.
     CHECK(ToolchainLabel("", "Version 1.2.3").empty());
+}
+
+TEST_CASE("A real toolchain's label is one a scheduler records", "[cc][toolchain][label]")
+{
+    using FastCache::Cc::ToolchainLabel;
+
+    // A scheduler refuses a lease whose label is not UTF-8 or is longer than it records, and the
+    // launcher then sends the lease with no label at all -- so a real compiler whose label fell
+    // outside the bound would be shown to an operator as a bare hash. The bound's own
+    // `static_assert` is over literals; this asks the function that writes the labels, on the
+    // banners real drivers print, including the longest names this project meets: target-prefixed
+    // cross drivers.
+    struct Real
+    {
+        std::string_view compiler;
+        std::string_view banner;
+    };
+    auto const reals = std::array {
+        Real { .compiler = "cl.exe", .banner = "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35207 for x64" },
+        Real { .compiler = "/usr/bin/g++-13", .banner = "g++-13 (Ubuntu 13.3.0-6ubuntu2) 13.3.0" },
+        Real { .compiler = "/usr/bin/x86_64-w64-mingw32-g++-posix",
+               .banner = "x86_64-w64-mingw32-g++-posix (GCC) 13-posix" },
+        Real { .compiler = "/opt/arm/bin/arm-none-linux-gnueabihf-g++",
+               .banner = "arm-none-linux-gnueabihf-g++ (Arm GNU Toolchain 13.3.Rel1 (Build arm-13.24)) 13.3.1 20240614" },
+        Real { .compiler = "/usr/bin/x86_64-unknown-linux-gnu-clang++", .banner = "clang version 18.1.8" },
+    };
+    for (auto const& [compiler, banner]: reals)
+    {
+        auto const label = ToolchainLabel(compiler, banner);
+        INFO(label);
+        CHECK_FALSE(label.empty());
+        CHECK(label.size() <= FastCache::CompileCacheWire::MaxToolchainLabelBytes);
+        CHECK(FastCache::IsValidUtf8(label));
+    }
 }
 
 // --- the banner is asked for in English (issue #200) -------------------------

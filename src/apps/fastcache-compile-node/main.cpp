@@ -17,32 +17,47 @@
 #include "ConsensusTier.hpp"
 #include "CordonCli.hpp"
 #include "DiscoveryTier.hpp"
+#include "EndpointDialer.hpp"
 #include "EnrollClient.hpp"
 #include "EnrollmentResponder.hpp"
 #include "EnrollmentWindow.hpp"
+#include "FleetSummaryResponder.hpp"
 #include "FleetTextResponder.hpp"
+#include "FormationLoop.hpp"
+#include "FormationRuntime.hpp"
 #include "LiveStatsResponder.hpp"
 #include "LiveStatsSources.hpp"
 #include "NodeAnnounce.hpp"
+#include "NodeAudience.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "NodeFirewall.hpp"
+#include "NodeFormation.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeKey.hpp"
 #include "NodeLogging.hpp"
+#include "NodeMachineStanding.hpp"
 #include "NodeMembership.hpp"
 #include "NodePresenceTier.hpp"
 #include "NodeProofResponder.hpp"
+#include "NodeRefusal.hpp"
 #include "NodeReload.hpp"
 #include "NodeRoster.hpp"
+#include "NodeStateFiles.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
+#include "OperatorCredentials.hpp"
+#include "RaftStoreArchiver.hpp"
 #include "SchedulerLink.hpp"
+#include "SchedulerReachability.hpp"
 #include "SchedulerTier.hpp"
 #include "ScratchClaim.hpp"
+#include "SessionResponder.hpp"
+#include "SharedCacheResponder.hpp"
 #include "WorkerLease.hpp"
 #include "WorkerTier.hpp"
 
@@ -56,6 +71,7 @@
 #include <FastCache/Config/SecretExposureWatcher.hpp>
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Config/YamlReader.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/ReadinessMarker.hpp>
@@ -69,16 +85,22 @@
 #include <FastCache/Platform/CpuAffinity.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/Firewall.hpp>
+#include <FastCache/Platform/HostEvents.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
+#include <FastCache/Platform/HostNaming.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/InheritedListener.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
+#include <FastCache/Platform/NetworkChangeWatcher.hpp>
+#include <FastCache/Platform/ProcessExit.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Platform/WindowsEventLogger.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <algorithm>
 #include <array>
@@ -87,6 +109,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -207,13 +230,14 @@ void InstallNodeStopHandlers()
 /// it, and handing an owned descriptor on is a double close rather than a handover.
 ///
 /// Nothing here closes what it returns. On the two refusal paths the process exits
-/// immediately, and on the success path ownership passes to the listener -- which
-/// takes it even when the adoption itself fails.
+/// immediately, and on the success path ownership passes to `Node::ActivationHold`,
+/// which keeps it for the process and hands every body a copy its listener owns --
+/// and takes even when the adoption itself fails.
 /// @param cfg What the operator asked for.
 /// @param logger Where the handoff is announced.
 /// @return The descriptor, `std::nullopt` when nothing was handed over, or why the
 ///         handoff cannot be served.
-[[nodiscard]] std::expected<std::optional<int>, std::string> ActivatedDescriptor(NodeConfig const& cfg, ILogger& logger)
+[[nodiscard]] std::expected<std::optional<int>, NodeRefusal> ActivatedDescriptor(NodeConfig const& cfg, ILogger& logger)
 {
     // When a supervisor already bound the port and handed the descriptor over,
     // binding it again would fail with "address already in use" -- against
@@ -230,8 +254,9 @@ void InstallNodeStopHandlers()
     // half-honoured, since silently ignoring the rest would leave an operator with a
     // port that accepts nothing and no clue why.
     if (inherited.size() > 1)
-        return std::unexpected { std::format("socket activation handed over {} listeners; this worker serves exactly one",
-                                             inherited.size()) };
+        return std::unexpected { Refusal(
+            NodeRefusalCause::HandedOverListeners,
+            std::format("socket activation handed over {} listeners; this worker serves exactly one", inherited.size())) };
 
     // Socket activation makes --advertise mandatory, because the fallback becomes a
     // guess the process cannot make. `--listen-node` was not used -- the socket unit
@@ -245,34 +270,78 @@ void InstallNodeStopHandlers()
     // locally. Nothing reports an error, and the fleet looks healthy from both ends.
     // Refusing at startup, where it can be explained, is the whole difference.
     if (cfg.advertise.empty())
-        return std::unexpected { std::string {
-            "--advertise is required under socket activation: the socket unit owns the port, so this worker "
-            "cannot know what address clients should use" } };
+        return std::unexpected { Refusal(NodeRefusalCause::HandedOverListeners,
+                                         "--advertise is required under socket activation: the socket unit owns the "
+                                         "port, so this worker cannot know what address clients should use") };
 
     logger.Logf(LogLevel::Info, "a supervisor handed over a listening socket; --listen-node is not used");
     return std::optional { inherited.front() };
 }
 
-/// What `main` returns when the operator's configuration is wrong.
-///
-/// Every refusal in this program is that same fact -- a flag missing, a flag that
-/// cannot be honoured, an endpoint that will not bind -- so it is one name rather
-/// than a `2` spelled seven times, and distinct from the `1` a supervisor reads as
-/// "it ran and then died".
-constexpr int ExitUsage = 2;
+// A one-shot verb stopped before it runs -- a configuration file that did not load, a command line
+// that did not parse -- ends as a command stopped at that step (`Platform/ProcessExit.hpp`,
+// `ExitReaderRows`' `Operator` row, which the daemon's one-shots read as well): 1 for an I/O arm,
+// 2 for a verdict. A START answers its `StartStage`'s code, because a supervisor reads that one.
+// One code for both is what made them indistinguishable to systemd. `RefuseUnderService` asks
+// `SelectsOneShotVerb`, and the daemon asks its own table the same question.
+//
+// **No site in this file spells an exit code.** A one-shot verb states its ENDING
+// (`CommandEnding`) and `CommandExitCode` is the one mapping to a code; a start answers through
+// `ExitCodeFor` or `ExitCodeOf`. `ProcessExit_test` holds both mains to that.
 
-/// What `main` returns when the worker served until it was asked to stop.
-constexpr int ExitOk = 0;
+/// Whether @p cfg selects a one-shot verb -- a row of `EarlyVerbs` -- rather than a start.
+/// @param cfg The configuration to ask, as far as it was assembled.
+/// @return True when a verb answers and exits.
+[[nodiscard]] bool SelectsOneShotVerb(NodeConfig const& cfg);
+
+/// Refuse a start decided before the configuration exists -- a command line that does not
+/// parse, a configuration file that does not load -- under the service argv names.
+///
+/// **Unless argv selects a one-shot verb**, which is no start: it answers the ending a command
+/// stopped at @p stage has, reported to the terminal and never to a service host, as every verb's
+/// own refusal is. Read off
+/// the command line, since the file is what did not load; after a parse failure, off what parsed
+/// before it -- where an operator types the verb.
+///
+/// **A registration replays its command line forever**, so an upgrade that retires a flag
+/// leaves a service whose every start stops here, and a file edited into a typo does the same.
+/// Under the SCM that exited before connecting: error 1053, *did not respond in a timely
+/// fashion*, with the reason on a stderr nobody holds and in no log at all. So the reason also
+/// goes to the event log, and the stop is reported with the step's exit code as the
+/// service-specific code (`IDaemonHost::Refuse`). Read off the command line alone because
+/// nothing else exists yet -- after a parse failure, off what parsed before it, which is where
+/// the installer puts `--daemon` and `--service-name`.
+/// @param commandLine What argv said, as far as it parsed.
+/// @param stage The step that refused, whose row says which code a supervisor reads.
+/// @param reason Why; already printed to stderr by the caller.
+/// @return The code of @p stage's ending for a one-shot verb, otherwise @p stage's exit code.
+[[nodiscard]] int RefuseUnderService(NodeConfig const& commandLine, StartStage stage, std::string_view reason)
+{
+    if (SelectsOneShotVerb(commandLine))
+        return RefusalExitCode(ExitReader::Operator, stage);
+    auto const code = ExitCodeFor(stage);
+    auto const host = commandLine.daemon
+                          ? MakeWindowsServiceHost(commandLine.serviceName,
+                                                   ServiceHostOptions { .stop = StopPendingPlanFor(std::nullopt) })
+                          : nullptr;
+    if (host == nullptr)
+        return code;
+    auto const eventLogger = MakeWindowsEventLogger(commandLine.serviceName, commandLine.logLevel);
+    if (eventLogger == nullptr)
+        return host->Refuse(code);
+    return RefuseStart(*host, *eventLogger, reason, code);
+}
 
 /// Report a one-shot operator verb's answer and say what to exit with.
 ///
 /// **Three verbs, one shape.** A cluster command, an enrollment decision and a
 /// machine asking to be let in all do the same two things with their runner's
-/// answer: print a refusal to stderr and exit `ExitUsage`, or print the answer to
-/// stdout and exit `ExitOk`. Written out at each site that was three copies of one
-/// branch pair -- blocks diverging by a name, which this codebase treats as a defect
-/// on its own -- and it is also what took `main` past the cognitive-complexity
-/// threshold the build enforces when the enrollment verbs added the second and
+/// answer: print a refusal to stderr and exit with its ending's code -- 2 for a
+/// decision, made here or replied by the peer, 1 for an answer that never arrived or
+/// decided nothing (`AnswerSource`) -- or print the answer to stdout and exit as
+/// completed. Written out at each site that was three copies of
+/// one branch pair -- blocks diverging by a name, which this codebase treats as a defect on its own -- and it is also what
+/// took `main` past the cognitive-complexity threshold the build enforces when the enrollment verbs added the second and
 /// third. `AnnounceOnce` above was split out of `WorkerBody` for the same reason, so
 /// this is the file's own idiom rather than a new one.
 ///
@@ -283,39 +352,17 @@ constexpr int ExitOk = 0;
 /// @param answer What the runner said.
 /// @param prefix Prepended to a successful answer, for the verbs that name the binary.
 /// @return The process exit code.
-[[nodiscard]] int ReportOneShotVerb(std::expected<std::string, std::string> const& answer, std::string_view prefix = {})
+[[nodiscard]] int ReportOneShotVerb(std::expected<std::string, UnfinishedCommand> const& answer,
+                                    std::string_view prefix = {})
 {
     if (!answer.has_value())
     {
-        std::cerr << "fastcache-compile-node: " << answer.error() << '\n';
-        return ExitUsage;
+        std::cerr << "fastcache-compile-node: " << answer.error().reason << '\n';
+        return CommandExitCode(answer.error().ending);
     }
 
     std::cout << prefix << *answer;
-    return ExitOk;
-}
-
-/// Whether this node will serve an enrollment surface.
-///
-/// Two clauses, and they answer different KINDS of question. `RunsConsensus` is the
-/// RULE, asked of the configuration, and `tier != nullptr` is a runtime fact about
-/// what was actually built, which only this translation unit knows and which no test
-/// links.
-///
-/// **There was a third clause, a named `--cluster-key-file`, and it is gone for good**: an
-/// approval no longer hands over any key (#178), so a window has nothing a key file could be
-/// missing for.
-///
-/// Named rather than spelled inline because `WorkerBody` is at the
-/// cognitive-complexity ceiling the build enforces, and because the two sites that
-/// need this answer must not be able to disagree: reporting a window no verb can act
-/// on is the reading the repeating open-window warning exists to make impossible.
-/// @param cfg The parsed configuration.
-/// @param tier The scheduler tier, or nullptr when none was started.
-/// @return True when both halves hold.
-[[nodiscard]] bool ServesEnrollment(NodeConfig const& cfg, Node::SchedulerTier const* tier) noexcept
-{
-    return Node::RunsConsensus(cfg) && tier != nullptr;
+    return CommandExitCode(CommandEnding::Completed);
 }
 
 /// The address held by @p slot, or nullptr when it holds nothing.
@@ -374,7 +421,7 @@ template <typename T>
 /// what invites shortening it to buy responsiveness it does not buy.
 constexpr std::chrono::seconds EnrollmentWarningTick { 1 };
 
-/// Log the enrollment window's due warning until asked to stop.
+/// Log the enrollment list's due warning -- machines waiting for a person -- until asked to stop.
 ///
 /// Split out of `WorkerBody` for `AnnounceOnce`'s two reasons below, the second being
 /// the load-bearing one: a `while` holding an `if` costs that function more
@@ -392,7 +439,7 @@ constexpr std::chrono::seconds EnrollmentWarningTick { 1 };
 /// @param window The window to ask.
 /// @param logger Where a due warning is written.
 /// @param stop Participates in the wait, so a requested stop ends it immediately.
-void WarnWhileWindowIsOpen(Node::EnrollmentWindow& window, ILogger& logger, std::stop_token const& stop)
+void WarnWhileJoinersWait(Node::EnrollmentWindow& window, ILogger& logger, std::stop_token const& stop)
 {
     while (!stop.stop_requested())
     {
@@ -444,7 +491,7 @@ using Node::NodeReloader;
 ///         two states a caller acts on differently and two optionals render alike. A node
 ///         that needs no id but holds a key gets an identity carrying only the key, so the
 ///         one `ApplyNodeIdentity` a reload runs applies it too.
-[[nodiscard]] std::expected<std::optional<Node::NodeIdentity>, std::string> AdoptNodeIdentity(
+[[nodiscard]] std::expected<std::optional<Node::NodeIdentity>, Node::NodeIdentityRefusal> AdoptNodeIdentity(
     NodeConfig& cfg,
     NodeConfig& cliOnly,
     ISecureRandom& random,
@@ -486,22 +533,22 @@ using Node::NodeReloader;
 /// reading of one file rather than two that a replaced file could make disagree.
 /// @param cfg The resolved configuration.
 /// @param random Where a minted key's seed comes from.
+/// @param keyGuard Who may read the key file, asked and established.
 /// @param logger Where the key, or its absence, is reported.
 /// @return The key pair, DISENGAGED on a node that holds none, or why there is none.
-[[nodiscard]] std::expected<std::optional<Ed25519KeyPair>, std::string> AdoptNodeKey(NodeConfig const& cfg,
-                                                                                     ISecureRandom& random,
-                                                                                     ILogger& logger)
+[[nodiscard]] std::expected<std::optional<Ed25519KeyPair>, NodeKeyRefusal> AdoptNodeKey(NodeConfig const& cfg,
+                                                                                        ISecureRandom& random,
+                                                                                        Node::INodeKeyFileGuard& keyGuard,
+                                                                                        ILogger& logger)
 {
-    auto nodeKey = Node::ResolveNodeKeyFor(cfg, random);
+    auto nodeKey = Node::ResolveNodeKeyFor(cfg, random, keyGuard);
     if (!nodeKey.has_value())
-        return std::unexpected { std::move(nodeKey).error().message };
-    if (!nodeKey->has_value())
-    {
-        logger.Logf(LogLevel::Info, "{}", Node::NoNodeKeySentence);
-        return std::optional<Ed25519KeyPair> {};
-    }
+        return std::unexpected { std::move(nodeKey).error() };
 
-    auto& held = **nodeKey;
+    // Every node holds one now: every node has a state directory (`NodeStateDirectory`). The
+    // result stays optional because the tiers that take it still model a node holding none,
+    // which no configuration reaches any more.
+    auto& held = *nodeKey;
     logger.Logf(LogLevel::Info,
                 "identity key {} ({})",
                 FormatEd25519PublicKey(held.pair.PublicKey()),
@@ -517,10 +564,39 @@ using Node::NodeReloader;
     return key.transform([](Ed25519KeyPair const& pair) { return pair.PublicKey(); });
 }
 
+/// Where a supervisor handed this body's node surface over, read off the socket.
+/// @param activated The descriptor, or nothing when this node binds its own.
+/// @return The address and port, `Node::AsConfigured` with no descriptor, or why the socket would not
+///         say -- a refusal about the socket the supervisor handed over (`HandedOverListeners`).
+[[nodiscard]] std::expected<Node::ActivatedNodeEndpoint, Node::NodeRefusal> ActivatedNodeEndpointOf(
+    std::optional<int> activated)
+{
+    if (!activated.has_value())
+        return Node::AsConfigured;
+    auto const bound = BoundEndpointOfDescriptor(*activated);
+    if (!bound.has_value())
+        return std::unexpected { Node::Refusal(
+            Node::NodeRefusalCause::HandedOverListeners,
+            "the socket a supervisor handed over will not say which address and port it listens on, so this "
+            "node cannot tell its own worker where its scheduler answers") };
+    return Node::ActivatedEndpoint { .host = bound->host, .port = bound->port };
+}
+
+/// Everything the node runs, under whichever host runs it.
+/// @param cfg The configuration the node started with.
+/// @param identityKey The machine's identity key, or nothing.
+/// @param logger Where the node reports.
+/// @param reloader The live configuration; null with no file.
+/// @param hostEvents Where the host's suspend, resume and network events arrive.
+/// @return The process's exit status.
 [[nodiscard]] int WorkerBody(NodeConfig const& cfg,
                              std::optional<Ed25519KeyPair> const& identityKey,
                              ILogger& logger,
-                             NodeReloader* reloader)
+                             NodeReloader* reloader,
+                             IHostEvents& hostEvents,
+                             Node::FormationBody const& formation,
+                             std::optional<int> activated,
+                             Node::LeaseCheckInForce& leaseCheck)
 {
     // ONE origin for every uptime this process reports. `/healthz` and the `0xFC`
     // `NodeStatus` verb both answer *how long has this been serving*, and two
@@ -530,20 +606,26 @@ using Node::NodeReloader;
     // rather than whichever startup step happened to be declared above the reader.
     auto const startedAt = std::chrono::steady_clock::now();
 
-    // Socket activation is resolved BEFORE the toolchains, and the order is
-    // deliberate. Computing a fingerprint walks the whole include tree and takes
-    // seconds; a bad handoff is decided in microseconds. Doing the cheap, fallible
-    // thing first means a misconfigured unit fails immediately instead of after a
-    // multi-second pause -- and it means the startup log reads in the order things
-    // actually happened, so an operator watching a worker come up sees what it did
-    // with the socket before the long quiet part.
-    auto const activatedOrError = ActivatedDescriptor(cfg, logger);
-    if (!activatedOrError.has_value())
+    // Socket activation was resolved before the first body, and before the toolchains
+    // (`RunNodeBodies`): `activated` is this body's own copy of what the supervisor handed over.
+    //
+    // And the ADDRESS and PORT it listens on, read off that socket here, once, before any tier
+    // that registers: under activation `--listen-node` describes nothing, so a node serving its
+    // own scheduler would otherwise register its worker and its presence where it does not serve
+    // (`SchedulersOf`). Read here rather than in the tiers, which take it as a value.
+    auto const activatedNodeEndpointOrError = ActivatedNodeEndpointOf(activated);
+    if (!activatedNodeEndpointOrError.has_value())
     {
-        logger.Logf(LogLevel::Error, "{}", activatedOrError.error());
-        return ExitUsage;
+        logger.Logf(LogLevel::Error, "{}; refusing to start", activatedNodeEndpointOrError.error().reason);
+        return ExitCodeFor(activatedNodeEndpointOrError.error().cause);
     }
-    auto const activated = *activatedOrError;
+    auto const& activatedNodeEndpoint = *activatedNodeEndpointOrError;
+
+    // Where the worker's heartbeat and the presence loop register, ONE for the process and re-read at
+    // every round: this node's own scheduler, or the voters its applied state records -- told by the
+    // consensus tier below at every apply -- else the formation record's answer (`AppliedSchedulers`).
+    // Declared before every tier that reads it or tells it, so it outlives them all.
+    Node::AppliedSchedulers appliedSchedulers { cfg, activatedNodeEndpoint };
 
     // The ONE derivation, shared with the startup refusal that judges it. This value
     // goes to the worker tier's lease validator and to its REGISTER, and a lease's MAC is
@@ -600,6 +682,24 @@ using Node::NodeReloader;
     // catalogue and sink agree is fixed before the process serves anything.
     Node::NodeConditions conditions;
     Node::EvaluateProcessConditions(conditions, metrics);
+    Node::EvaluateHostNameCondition(conditions, cfg);
+
+    // How a state file here is replaced, said -- and counted -- once per body when it falls back to the
+    // classic rename, which on Windows a reader holding the file open refuses, and when its filesystem
+    // cannot sync a directory, which degrades every replace there and raises `state-directory-unsynced`
+    // (`ReportReplaceRoute`). A node keeping no state directory replaces no state file, and says so.
+    if (auto const stateDirectory = Node::ChosenStateDirectory(cfg); stateDirectory.has_value())
+    {
+        Consensus::SystemDurableFiles durableFiles;
+        Platform::SystemReplacingRename const replacingRename;
+        static_cast<void>(
+            Node::ReportReplaceRoute(stateDirectory->path, durableFiles, replacingRename, logger, metrics, conditions));
+    }
+    else
+    {
+        conditions.NotEvaluated(Node::NodeCondition::StateDirectoryUnsynced,
+                                "this node keeps no state directory, so it replaces no state file");
+    }
 
     // One policy for all THREE surfaces -- the compile port here, the scheduler and
     // the cache below -- and it outlives every one of them. A node that answered "is
@@ -608,26 +708,24 @@ using Node::NodeReloader;
     // Not `const`: consensus republishes the member set into it while the node runs,
     // which is the whole point of membership being a replicated log entry rather than
     // a command-line list.
-    //
-    // It reports a `--fleet-member` entry the cluster has forgotten only where there IS a cluster:
-    // `RunsConsensus`, the one predicate every consensus-dependent site asks.
-    Node::NodeMembership membership { cfg, logger, AddressWhen(Node::RunsConsensus(cfg), conditions) };
+    Node::NodeMembership membership { cfg, logger };
 
     // **The roster every lease grant is verified against** (#178), built before anything that
-    // reads it: the worker's validator borrows it, consensus feeds it every applied state and
-    // every endorsement this node signs, and the presence loop carries the endorsement out and
-    // the certified roster back. A WALL clock, because a certificate's lapse was stamped on
-    // another machine.
+    // reads it: the worker's validator borrows it, and consensus feeds it every applied state.
     //
-    // Refusing here is where `RosterlessWorkerRefusal` is answered, since only the state
-    // directory knows whether it holds a roster, and a kept roster this build cannot use -- never
-    // a quiet fall back to the `--voter-key` anchors, which may name a voter revoked since.
-    core::platform::SystemWallClock const rosterWallClock;
-    auto rosterOrRefusal = Node::NodeRoster::Build(cfg, rosterWallClock, metrics, logger);
+    // Refusing here is where `RosterlessWorkerRefusal` is answered: a node that runs no consensus
+    // holds no roster, so a worker on it that other machines can reach could verify nothing. The
+    // startup table refused that shape already, so this is its belt.
+    //
+    // Its clock is the ONE silence is measured on: consensus reports how long ago a leader spoke,
+    // an age, and past `LeaderSilenceBound` without a leader its applied state counts every grant is
+    // refused (`consensus-leader-silent`).
+    core::platform::SteadyClock const rosterClock;
+    auto rosterOrRefusal = Node::NodeRoster::Build(cfg, rosterClock, &conditions);
     if (!rosterOrRefusal.has_value())
     {
-        logger.Logf(LogLevel::Error, "{}; refusing to start", rosterOrRefusal.error());
-        return ExitUsage;
+        logger.Logf(LogLevel::Error, "{}; refusing to start", rosterOrRefusal.error().reason);
+        return ExitCodeFor(rosterOrRefusal.error().cause);
     }
     auto const nodeRoster = std::move(*rosterOrRefusal);
 
@@ -656,6 +754,10 @@ using Node::NodeReloader;
     // It is NOT started yet. Every endpoint binds and adopts first, so that when the
     // thread does begin there is a listener behind every port a client might dial.
     Node::NodeIoLoop nodeIo;
+    // Before anything serves: a surface whose accept loop ends raises `surface-not-accepting`, one
+    // that degrades `surface-accept-degraded`, and either turns `/healthz` into a 503, all read
+    // from this one registry.
+    Node::WatchAcceptLoops(nodeIo.AcceptLoops(), conditions);
 
     // The two framed COMPONENTS this node may serve besides its worker port, each
     // owned as one object. Both are off unless asked for: handing out other machines'
@@ -676,20 +778,41 @@ using Node::NodeReloader;
     core::platform::SystemWallClock const schedulerWallClock;
 
     std::unique_ptr<Node::SchedulerTier> schedulerTier;
-    if (cfg.serveScheduler)
+    if (Node::ServesScheduler(cfg))
     {
-        auto started = Node::SchedulerTier::Start(
-            cfg, membership.Oracle(), schedulerClock, schedulerWallClock, metrics, logger, identityKey);
+        auto started = Node::SchedulerTier::Start(cfg,
+                                                  membership.Oracle(),
+                                                  schedulerClock,
+                                                  schedulerWallClock,
+                                                  metrics,
+                                                  logger,
+                                                  identityKey,
+                                                  conditions,
+                                                  Node::SchedulerConditionInterval);
         if (!started.has_value())
         {
             // Fatal for the same reason the admin endpoint's is: an operator who asked
             // for this is relying on it, and a node that started without it looks
             // healthy to everything that would otherwise have noticed.
-            logger.Logf(LogLevel::Error, "--serve-scheduler {}; refusing to start", started.error());
-            return ExitUsage;
+            logger.Logf(LogLevel::Error, "the scheduler {}; refusing to start", started.error().reason);
+            return ExitCodeFor(started.error().cause);
         }
         schedulerTier = std::move(*started);
     }
+
+    // **The formation, before anything that describes this node** (`MakeFormationRuntime`): the
+    // controller IS the summary every beacon, proof and enrollment answer reads, the observer every
+    // proven fleet goes to, and what consensus tells the applied state. Declared after the scheduler,
+    // whose service holds the join memos it reads, and before every tier that reads it, so it
+    // outlives them all. Its beat begins once consensus runs, below.
+    auto formationOrRefusal = Node::MakeFormationRuntime(
+        cfg, identityKey, formation, announced, schedulerTier.get(), metrics, logger, &conditions);
+    if (!formationOrRefusal.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}; refusing to start", formationOrRefusal.error());
+        return ExitCodeFor(StartStage::Formation);
+    }
+    auto const formationRuntime = *std::move(formationOrRefusal);
 
     // The node's own cache tier, in front of the shared one. It exists so a local
     // rebuild on a slow or bad network never reaches the wire: the shared cache holds
@@ -711,13 +834,23 @@ using Node::NodeReloader;
     // And who may cordon this worker is "this machine" for the same reason (#1303):
     // whether a machine's CPU serves the fleet is decided on that machine. One oracle,
     // asked by both, so the two surfaces cannot disagree about which machine this is.
+    //
+    // And it is what the worker's heartbeat REPORTS (`HeartbeatRound::locality`): the
+    // scheduler hints a dial at a reported address, the client mints its ticket for that
+    // address, and the ticket audience below answers from this same set -- so a hint can
+    // never name an address this node would refuse the ticket for. No second probe.
+    //
+    // And re-probed at the first question after a NETWORK CHANGE or a wake, not only on its
+    // interval: a VPN re-address would otherwise leave the ticket audience accepting the address
+    // this machine just lost, for up to one interval (W-7). A host event, never a miss, so no
+    // peer can provoke the probe.
     auto const hostAddresses = MakeSystemHostAddresses();
-    CachedLocalityOracle const locality { *hostAddresses, cacheClock };
+    CachedLocalityOracle locality { *hostAddresses, cacheClock };
+    HostEventSubscription const localityRefresh { hostEvents, locality };
 
-    // ONE source, and every site that presents this worker's credential borrows it.
-    // Declared here because the first of those sites is the cache tier immediately
-    // below and the last is the heartbeat round far further down, and a local declared
-    // between them would be an object two consumers reach and one of them outlives.
+    // ONE source, and the one site that presents this worker's credential borrows it: the
+    // cache tier's `--upstream` client, immediately below. Nothing that talks to a scheduler
+    // does -- a scheduler checks no password, and this machine's proof is its credential there.
     //
     // It reads the RELOADER rather than `cfg`, which is the whole of #404: `cfg` is
     // the configuration this worker STARTED with, and a rotated `--requirepass` lives
@@ -726,14 +859,79 @@ using Node::NodeReloader;
     // fallback -- it has no second moment for anything to arrive at.
     Node::ConfiguredCredential const credential { cfg, reloader };
 
-    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(nodeIo, cfg, credential, locality, cacheClock, metrics, logger);
+    // Where a node handshake's nonce and ephemeral key come from, on both ends: the operating
+    // system's generator (#1527). Its own instance rather than a share of `identityRandom`, which
+    // is a different lifetime -- an identity is minted once at startup and handshakes are drawn
+    // for as long as the process serves.
+    SystemSecureRandom proofRandom;
+
+    // **How this machine proves WHICH machine it is** (#178): its id, the identity key it holds,
+    // whom it may prove itself to as a scheduler's client -- the roster its grants are checked
+    // against -- and the generator above. Built wherever this node HOLDS an identity, not only
+    // where it names a scheduler: the fleet's shared cache is proved to with it too, from every
+    // node that has one. The presence tier still decides for itself whether it announces. Declared
+    // ABOVE the cache, worker and presence tiers, which borrow it.
+    //
+    // On a node that runs consensus it is also handed `membership` -- the oracle this node's own
+    // node-proof surface judges proofs by, below -- so neither announcing loop dials a scheduler of
+    // this node's cluster before that cluster has recorded this node (`HoldUntilRecorded`). Without
+    // it a node scheduling for itself proved itself to itself before its own first election and was
+    // refused `node-key-unknown` with a remedy to admit it, at every such start.
+    //
+    // The prover answers `own-record-awaited` on a consensus node that announces -- one whose
+    // formation record names somewhere it registers (`AwaitsItsOwnRecord`). One that registers
+    // nowhere announces to nobody, so the row has nothing to observe there and says so, rather than
+    // reading `clear` from a prover that is only ever asked to reach the shared cache.
+    auto const consensusAnnounces = Node::AwaitsItsOwnRecord(cfg, activatedNodeEndpoint);
+    std::optional<Node::NodeProofClient> prover;
+    if (identityKey.has_value())
+        prover.emplace(cfg.nodeId,
+                       *identityKey,
+                       *nodeRoster,
+                       AddressWhen<Distributed::IMembershipOracle const>(Node::RunsConsensus(cfg), membership),
+                       AddressWhen(consensusAnnounces, conditions),
+                       proofRandom);
+    if (Node::RunsConsensus(cfg) && !(consensusAnnounces && prover.has_value()))
+        conditions.NotEvaluated(Node::NodeCondition::OwnRecordAwaited,
+                                "this node registers with no scheduler, so it announces itself to none");
+
+    // The fleet's shared cache, built on EVERY node: dormant until the applied cluster state names
+    // this machine, when its host opens the tier on a thread of its own. Declared BEFORE the cache
+    // tier -- whose upstream reads its directory and borrows its host -- and before the surface
+    // that routes to it and the consensus tier that feeds it, so it is destroyed after all three.
+    // The first of those is enforced as well as ordered: an in-process upstream that outlived the
+    // host would end the process by name (`SharedCacheHost::Borrow`). Its condition is this node's
+    // to answer only where cluster state reaches it.
+    Node::SharedCacheService sharedCache { cfg,
+                                           membership.Oracle(),
+                                           cacheClock,
+                                           metrics,
+                                           logger,
+                                           AddressWhen(Node::RunsConsensus(cfg), conditions),
+                                           Node::ReconcileOn::OwnThread };
+
+    // What the private tier reads through to is chosen from these, by a table keyed on the kind:
+    // `--upstream` if typed, else the fleet's setting for a node with an identity, else nothing.
+    // Every one of them is declared above the tier and outlives it.
+    Node::UpstreamParts const upstreamParts { .upstream = cfg.upstream,
+                                              .credential = credential,
+                                              .directory = sharedCache.Directory(),
+                                              .prover = AddressOrNull(prover),
+                                              .io = nodeIo,
+                                              .clock = cacheClock,
+                                              .metrics = metrics,
+                                              .conditions = AddressWhen(Node::RunsConsensus(cfg), conditions),
+                                              .logger = logger,
+                                              .host = &sharedCache.Host() };
+
+    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(cfg, upstreamParts, locality, cacheClock, metrics, logger);
     if (!cacheTierOrRefusal.has_value())
     {
         // No flag prefix here, unlike its neighbours: this tier can fail over two
         // different flags -- the directory and the port -- and only
         // `StartCacheTierOrExplain` knows which, so it names it.
-        logger.Logf(LogLevel::Error, "{}; refusing to start", cacheTierOrRefusal.error());
-        return ExitUsage;
+        logger.Logf(LogLevel::Error, "{}; refusing to start", cacheTierOrRefusal.error().reason);
+        return ExitCodeFor(cacheTierOrRefusal.error().cause);
     }
     // May legitimately be null: `StartCacheTierOrExplain` treats an emptied
     // `--listen-node`, and nowhere to keep objects, as reasons to
@@ -761,49 +959,39 @@ using Node::NodeReloader;
     auto const capacity =
         Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()), Node::IndexReserveBytesOf(cacheTier.get()));
 
-    // Where a node handshake's nonce and ephemeral key come from, on both ends: the operating
-    // system's generator (#1527). Its own instance rather than a share of `identityRandom`, which
-    // is a different lifetime -- an identity is minted once at startup and handshakes are drawn
-    // for as long as the process serves.
-    SystemSecureRandom proofRandom;
-
-    // **How this machine proves WHICH machine it is to a scheduler** (#178): its id, the identity
-    // key it holds, whom it may prove itself to -- the roster its grants are checked against --
-    // and the generator above. Built wherever this node names a scheduler; `SchedulerNeedsIdentity`
-    // refuses a node that does so without an identity, so a serving node that announces always
-    // has one. Declared ABOVE the worker and presence tiers, which borrow it.
-    std::optional<Node::NodeProofClient> prover;
-    if (identityKey.has_value() && !cfg.schedulers.empty())
-        prover.emplace(cfg.nodeId, *identityKey, *nodeRoster, proofRandom);
-
     // The worker: survey, scratch root, lease check, slot cap, compile responder and
     // heartbeat, as one object (#1387). Built BELOW the cache tier, because the slots it
     // offers are what the tier built leaves (#167), and ABOVE the node surface, which
     // routes the compile family to it and is therefore destroyed first. Null on a node
     // started with `--slots=0` (#206): no pool thread, no validator, no heartbeat.
-    auto workerOrRefusal =
-        Node::WorkerTier::Start(Node::WorkerTierParts { .cfg = cfg,
-                                                        .reloader = reloader,
-                                                        .capacity = capacity,
-                                                        .announced = announced,
-                                                        .activation = activated.has_value() ? Node::SocketActivation::Yes
-                                                                                            : Node::SocketActivation::No,
-                                                        .membership = membership.Oracle(),
-                                                        .locality = locality,
-                                                        .io = nodeIo,
-                                                        .host = *host,
-                                                        .cacheTier = cacheTier.get(),
-                                                        .credential = credential,
-                                                        .prover = AddressOrNull(prover),
-                                                        .leaseRoster = nodeRoster->Lease(),
-                                                        .metrics = metrics,
-                                                        .logger = logger,
-                                                        .conditions = conditions },
-                                &Node::MakeSystemWorkerMachine);
+    //
+    // Its heartbeat dials through `workerDialer`, declared above it so it outlives the tier.
+    Node::BlockingEndpointDialer workerDialer { Node::HeartbeatIoTimeout };
+    auto workerOrRefusal = Node::WorkerTier::Start(Node::WorkerTierParts { .cfg = cfg,
+                                                                           .reloader = reloader,
+                                                                           .capacity = capacity,
+                                                                           .announced = announced,
+                                                                           .activatedNodeEndpoint = activatedNodeEndpoint,
+                                                                           .schedulers = appliedSchedulers,
+                                                                           .membership = membership.Oracle(),
+                                                                           .locality = locality,
+                                                                           .io = nodeIo,
+                                                                           .host = *host,
+                                                                           .cacheTier = cacheTier.get(),
+                                                                           .prover = AddressOrNull(prover),
+                                                                           .leaseRoster = nodeRoster->Lease(),
+                                                                           .leaseCheck = leaseCheck,
+                                                                           .metrics = metrics,
+                                                                           .logger = logger,
+                                                                           .conditions = conditions,
+                                                                           .hostEvents = hostEvents,
+                                                                           .suspendWait = DefaultDrainWait(),
+                                                                           .schedulerDialer = workerDialer },
+                                                   &Node::MakeSystemWorkerMachine);
     if (!workerOrRefusal.has_value())
     {
-        logger.Logf(LogLevel::Error, "{}; refusing to start", workerOrRefusal.error());
-        return ExitUsage;
+        logger.Logf(LogLevel::Error, "{}; refusing to start", workerOrRefusal.error().reason);
+        return ExitCodeFor(workerOrRefusal.error().cause);
     }
     auto const workerTier = std::move(*workerOrRefusal);
 
@@ -858,14 +1046,26 @@ using Node::NodeReloader;
     // No test reaches this: `main.cpp` is the translation unit none of them links, so
     // the guard here is CONSTRUCTION rather than a case -- a test built around a second
     // copy of this expression would assert something other than what ships.
-    auto const servesEnrollment = ServesEnrollment(cfg, schedulerTier.get());
+    //
+    // And an identity key, which signs every admission the surface answers: one without would sign
+    // nothing, and an unsigned admission is one every joiner refuses. Every configuration holds one
+    // (`AdoptNodeKey`), so the clause narrows nothing that runs -- it is here so the surface and what
+    // `NodeStatus` reports stay one condition if that ever changes.
+    //
+    // And WHY when it does not: the reason is the joiner's answer (`EnrollmentAbsenceTable`), derived
+    // by the same function `ServesEnrollment` answers from, so the surface and its refusal cannot
+    // disagree about whether -- or why.
+    auto enrollmentAbsence = Node::EnrollmentAbsenceOf(cfg, schedulerTier != nullptr);
+    if (!enrollmentAbsence.has_value() && !identityKey.has_value())
+        enrollmentAbsence = Node::EnrollmentAbsence::NoIdentityKey;
+    auto const servesEnrollment = !enrollmentAbsence.has_value();
 
     // Where this node sits in its consensus configuration (#1449), for `NodeStatus`. A SLOT,
     // because the tier that answers is built below and this surface is built now -- see
     // `ConsensusStandingSlot`. Declared before the status that reads it, so destroyed after.
     Node::ConsensusStandingSlot consensusStanding;
 
-    // The runtime enrollment window, and the key source it hands over from.
+    // The enrollment list: who asked to join, and what an operator decided.
     //
     // Held whatever this node runs, because it is two words of state and a mutex, and
     // declared here so it outlives both the surface that mutates it and the status
@@ -874,13 +1074,28 @@ using Node::NodeReloader;
     // consensus tier itself asks so the surface and the tier cannot disagree about
     // whether this node has a cluster, AND a scheduler tier, without which the responder
     // has no references to hold. A node missing either leaves the component null and the
-    // whole family is refused at the door: a window that could never admit anybody
-    // should not be openable, and one nothing serves should not be reported.
+    // whole family is refused at the door: a list that could never admit anybody
+    // should not record requests, and one nothing serves should not be reported.
     //
-    // It reports itself as a condition only where it can be opened at all: `servesEnrollment`
-    // above, so a node with no window reports that row NOT EVALUATED rather than a reassuring
-    // `clear` for a window nothing can open (#1364).
-    Node::EnrollmentWindow enrollmentWindow { statusClock, AddressWhen(servesEnrollment, conditions) };
+    // It reports itself as a condition only where it is reachable at all: `servesEnrollment`
+    // above, so a node with no list reports those rows NOT EVALUATED rather than a reassuring
+    // `clear` for a list nothing can reach (#1364). A row forgotten undecided is counted in the
+    // node's own sink.
+    // A WALL clock: the instants an armed window's condition names are read against it.
+    core::platform::SystemWallClock const enrollmentWallClock;
+    Node::EnrollmentWindow enrollmentWindow {
+        statusClock, AddressWhen(servesEnrollment, conditions), &metrics, enrollmentWallClock
+    };
+
+    // What `--node-status` says about the fleet's shared cache: the directory for where it is, the
+    // cache tier's fleet half for how reaching another machine went, the host for whether this one
+    // serves it, and the announced endpoint for where it does. Every one of them is declared above
+    // and outlives it; a node with no tier, or none reading through to the fleet, passes a null
+    // fleet half and still reports what it can.
+    Node::NodeSharedCacheStatus const sharedCacheStatus { sharedCache.Directory(),
+                                                          cacheTier != nullptr ? cacheTier->SharedCacheStatus() : nullptr,
+                                                          &sharedCache.Host(),
+                                                          announced };
 
     Node::ConfiguredNodeStatus const nodeStatus {
         cfg,
@@ -911,22 +1126,12 @@ using Node::NodeReloader;
                                    .capacity = workerTier != nullptr ? &workerTier->Capacity() : nullptr,
                                    .scheduler = ServiceOrNull(schedulerTier.get()),
                                    .enrollment = AddressWhen(servesEnrollment, enrollmentWindow),
-                                   // `RunsConsensus`, not `servesEnrollment`: the committed
-                                   // tombstone set exists wherever this node participates in
-                                   // the cluster's state, which is a broader condition than
-                                   // serving an enrollment window (that also wants a scheduler
-                                   // tier). Asked of the ONE predicate rather than spelled as a
-                                   // conjunction here, which is the rule this file already
-                                   // carries for `servesEnrollment` two lines up.
-                                   //
-                                   // `NodeMembership` exists on every node; the committed SET
-                                   // only exists where consensus runs, so this pointer is what
-                                   // draws the distinction and a keyless node reports the field
-                                   // ABSENT rather than `0` (#1471).
-                                   .membership = AddressWhen(Node::RunsConsensus(cfg), membership),
-                                   // The same predicate, for the same reason: a standing is a
-                                   // claim about a configuration only a consensus node holds, so
-                                   // a node running none reports the field ABSENT (#1449).
+                                   // `RunsConsensus`, not `servesEnrollment`: a standing is a
+                                   // claim about a configuration only a consensus node holds, which
+                                   // is a broader condition than serving an enrollment window (that
+                                   // also wants a scheduler tier), so a node running none reports
+                                   // the field ABSENT (#1449). Asked of the ONE predicate rather
+                                   // than spelled as a conjunction here.
                                    .consensus = AddressWhen(Node::RunsConsensus(cfg), consensusStanding),
                                    // Every node has conditions, so this is never null here: a node
                                    // with nothing raised reports every row `clear` or
@@ -934,7 +1139,10 @@ using Node::NodeReloader;
                                    .conditions = &conditions,
                                    // Every node has one; one that holds no roster reports the
                                    // field ABSENT through it (#178).
-                                   .roster = nodeRoster.get() },
+                                   .roster = nodeRoster.get(),
+                                   // Every node has one, so a node with no shared cache says
+                                   // `none` rather than nothing.
+                                   .sharedCache = &sharedCacheStatus },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore
@@ -949,15 +1157,18 @@ using Node::NodeReloader;
     // this surface: see `LiveStatsSourceSlot`. Declared before every responder reading it, so it is
     // destroyed after them.
     LiveStatsSourceSlot liveSources;
-    Node::NodeStatusResponder nodeStatusResponder { nodeStatus, liveSources, membership.Oracle(), metrics };
+    // What `explain-admission <machine>` answers from: the roster grants are verified against, and
+    // the enrollment window where this node serves one.
+    Node::NodeMachineStanding const machineStanding { *nodeRoster, AddressWhen(servesEnrollment, enrollmentWindow) };
+    Node::NodeStatusResponder nodeStatusResponder { nodeStatus, liveSources, membership.Oracle(), machineStanding, metrics };
 
     // The dashboard credential, read ONCE for the surfaces that guard the fleet with it: `/fleet`
     // over HTTP, and over `0xFC` the fleet subject of a live-stats subscription and `fleet-text`.
     auto dashboardOrRefusal = Node::LoadDashboardCredentialOrExplain(cfg);
     if (!dashboardOrRefusal.has_value())
     {
-        logger.Logf(LogLevel::Error, "{}; refusing to start", dashboardOrRefusal.error());
-        return ExitUsage;
+        logger.Logf(LogLevel::Error, "{}; refusing to start", dashboardOrRefusal.error().reason);
+        return ExitCodeFor(dashboardOrRefusal.error().cause);
     }
     auto const dashboardCredential = std::move(*dashboardOrRefusal);
 
@@ -971,6 +1182,28 @@ using Node::NodeReloader;
     // the fleet subject of a subscription.
     Node::FleetTextResponder fleetTextResponder { liveSources, membership.Oracle(), dashboardCredential, metrics };
 
+    // The `Session` family's owner, on every built node: the node checks no password, and what an
+    // `AUTH` can establish -- which machine a ticket speaks for -- does not depend on which
+    // components this node runs.
+    //
+    // A ticket is spendable here when it names one of this node's own endpoints: the advertised
+    // one (read per ticket, since `--advertise` reloads), this machine's host name, or any address
+    // of this machine on the `Node` surface's ports. Who signed it is asked of the SAME roster a
+    // lease is checked against, so a revoked or forgotten machine's tickets stop at once.
+    Node::NodeAudience const ticketAudience {
+        announced, QueryHostFacts().hostName, Node::NodeAudience::PortsOf(cfg), locality
+    };
+    Distributed::SpentTickets spentTickets;
+    Distributed::TicketVerifier const ticketVerifier { nodeRoster->Lease(), ticketAudience, spentTickets };
+    core::platform::SystemWallClock const ticketWallClock;
+    Node::SessionResponder sessionResponder {
+        ticketVerifier,
+        Node::SessionKeys { .identityKey = identityKey.has_value() ? &*identityKey : nullptr, .machineId = cfg.nodeId },
+        proofRandom,
+        ticketWallClock,
+        metrics
+    };
+
     // The enrollment surface, built only where there is a cluster to be admitted to.
     //
     // An `optional` rather than a null pointer with a branch at the call site, because
@@ -981,57 +1214,68 @@ using Node::NodeReloader;
     // the two sites spelled different expressions.
     //
     // `membership.Oracle()` bound once, by reference, exactly as every other surface
-    // binds it. The credential is the SCHEDULER's -- `AUTH` routes there -- so this
-    // surface holds the same policy object rather than a second one, or a node with a
-    // token file would gate nine verbs and leave the tenth open.
+    // binds it.
+    //
+    // Every admission it answers is SIGNED by this node's identity key, which `servesEnrollment`
+    // requires, for the cluster id the summary here states -- the summary a joiner's probe proves
+    // that key with -- so the summary is taken before it.
+    // (Restated beside the dereference, which a reader -- and the optional-access check -- sees
+    // here and not three screens up; it narrows nothing `servesEnrollment` does not.)
+    //
+    // The formation's summary when it runs one, which every mode does; the summary the start
+    // computed for a node whose consensus is closed, which moves nowhere.
+    Node::FixedFleetSummary const answeredSummary { Node::AnsweredFleetSummary(cfg) };
+    auto const& summary = Node::SummarySourceOf(formationRuntime.get(), &answeredSummary);
+    // Where each pending row's challenge is drawn: the operating system's generator, its own
+    // instance for `proofRandom`'s reason -- a lifetime of its own.
+    SystemSecureRandom enrollmentChallengeRandom;
     std::optional<Node::EnrollmentResponder> enrollmentResponder;
-    if (servesEnrollment)
+    if (servesEnrollment && identityKey.has_value())
         enrollmentResponder.emplace(enrollmentWindow,
                                     schedulerTier->ServiceForSurfaces(),
                                     membership.Oracle(),
+                                    summary,
+                                    *identityKey,
+                                    enrollmentChallengeRandom,
                                     metrics,
-                                    logger,
-                                    schedulerTier->Policy());
+                                    logger);
 
     // The identity prover (#178), built wherever this node runs CONSENSUS: a proof is judged
-    // against the cluster's applied roster -- members, enrolled principals and revoked keys --
+    // against the cluster's applied roster -- members and revoked keys --
     // which only a consensus member holds, and it is asked of `membership`, whose `ExplainKey` is
     // the one door to that answer for the proof and for every later verb alike. A consensus node
-    // always holds an identity key (`HoldsNodeKey`).
-    //
-    // The credential is the SCHEDULER's, for the reason the enrollment surface holds the same
-    // object: `AUTH` is a `Session` verb and routes there, so a node with a token file must gate
-    // these two verbs with it as well -- and `schedulerTier` may legitimately be null on a
-    // consensus member that schedules nothing, which is what the conditional below reads.
+    // holds an identity key, as every node does.
     std::optional<Node::NodeProofResponder> nodeProofResponder;
     if (Node::RunsConsensus(cfg) && identityKey.has_value())
-        nodeProofResponder.emplace(cfg.nodeId,
-                                   *identityKey,
-                                   membership,
-                                   proofRandom,
-                                   metrics,
-                                   logger,
-                                   schedulerTier != nullptr ? schedulerTier->Policy() : nullptr);
+        nodeProofResponder.emplace(cfg.nodeId, *identityKey, membership, consensusStanding, proofRandom, metrics, logger);
+
+    // Which fleet this node is in, answered to anybody who asks: every node holds an identity key,
+    // and one that runs no consensus answers `NoCluster` itself rather than leaving the family
+    // missing at the door. The summary is fixed for the process, and it is the ONE this node
+    // announces: the discovery tier below is handed the same object, never a second derivation --
+    // nor does the enrollment surface above, which signs admissions for the cluster it states.
+    std::optional<Node::FleetSummaryResponder> fleetSummaryResponder;
+    if (identityKey.has_value())
+        fleetSummaryResponder.emplace(summary, *identityKey);
 
     auto nodeSurfaceOrRefusal = Node::StartNodeSurfaceOrExplain(
         nodeIo,
         cfg,
-        // Designated, so the NAME travels with each pointer. Four bare
-        // `IFrameResponder*` arguments are four a call site can silently transpose,
-        // and a transposed pair routes every cache verb to the scheduler -- which
-        // answers *served nowhere* for traffic this node is holding a tier for.
-        Node::SurfaceComponents { .cache = cacheTier != nullptr ? &cacheTier->Responder() : nullptr,
-                                  .scheduler = schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
-                                  // Absent on a node running no worker (#206): the router then
-                                  // answers the compile family's refusal for a node without one.
-                                  .compile = workerTier != nullptr ? &workerTier->Responder() : nullptr,
-                                  .node = &nodeStatusResponder,
-                                  .enrollment = AddressOrNull(enrollmentResponder),
-                                  .live = &liveStatsResponder,
-                                  .fleet = &fleetTextResponder,
-                                  // Absent on a node running no consensus: the router then
-                                  // answers the node-proof family `NoCluster`.
-                                  .nodeProof = AddressOrNull(nodeProofResponder) },
+        // Composed where the wiring test composes it: every component a required parameter
+        // of its own type, so one left out, or two transposed, fails the build here.
+        Node::ComposeSurfaceComponents(cacheTier.get(),
+                                       schedulerTier.get(),
+                                       workerTier.get(),
+                                       nodeStatusResponder,
+                                       enrollmentResponder.has_value() ? Node::EnrollmentOwner { &*enrollmentResponder }
+                                                                       : std::unexpected { enrollmentAbsence.value_or(
+                                                                             Node::EnrollmentAbsence::NoIdentityKey) },
+                                       liveStatsResponder,
+                                       fleetTextResponder,
+                                       AddressOrNull(nodeProofResponder),
+                                       AddressOrNull(fleetSummaryResponder),
+                                       sessionResponder,
+                                       sharedCache),
         activated,
         metrics,
         logger,
@@ -1044,10 +1288,10 @@ using Node::NodeReloader;
         });
     if (!nodeSurfaceOrRefusal.has_value())
     {
-        // No flag prefix: this can fail over --listen-node or over --serve-scheduler,
+        // No flag prefix: this can fail over --listen-node or over the scheduler,
         // and only `StartNodeSurfaceOrExplain` knows which, so it names the flag.
-        logger.Logf(LogLevel::Error, "{}; refusing to start", nodeSurfaceOrRefusal.error());
-        return ExitUsage;
+        logger.Logf(LogLevel::Error, "{}; refusing to start", nodeSurfaceOrRefusal.error().reason);
+        return ExitCodeFor(nodeSurfaceOrRefusal.error().cause);
     }
     // May legitimately be null, and for exactly one reason: a node with none of the
     // three components serves no 0xFC port, which has been logged. A bind FAILURE is
@@ -1055,14 +1299,13 @@ using Node::NodeReloader;
     // above rather than as a null. See `BindFailurePolicy` in NodeSurfaces.hpp.
     auto const nodeSurface = std::move(*nodeSurfaceOrRefusal);
 
-    // Says, once a minute and for as long as it is open, that this node is holding an
-    // enrollment window.
+    // Says, once a minute and for as long as any is waiting, that machines have asked to join
+    // and nobody has decided about them.
     //
-    // **Repeating rather than one line at open, and that is the whole of #1298's
-    // observability half.** A single line scrolls away, and this is the one state in
-    // which this machine will hand its cluster's key to a stranger that asked and was
-    // approved. An operator who opened a window and was called away has the log and
-    // `NodeStatus`, and only one of those reaches somebody who is not already looking.
+    // **Repeating rather than one line when the first asks**, because a single line scrolls away
+    // and a machine waiting for a person is waiting for somebody who may not be looking. The
+    // condition `enrollment-requests-waiting` carries the same fact to somebody who is not
+    // reading this log.
     //
     // A thread of its own rather than a ride on the heartbeat, because the heartbeat
     // belongs to the WORKER and this belongs to the leader -- a scheduler holding no
@@ -1071,7 +1314,7 @@ using Node::NodeReloader;
     // starts no thread.
     //
     // The DECISION is `TakeDueWarning`, which is pure over an injected clock and is
-    // tested against a `core::platform::ManualClock`. The driver is `WarnWhileWindowIsOpen` above,
+    // tested against a `core::platform::ManualClock`. The driver is `WarnWhileJoinersWait` above,
     // split out of this function exactly as `AnnounceOnce` was and for the same two
     // reasons -- it took `WorkerBody` past the cognitive-complexity ceiling the build
     // enforces, and a loop with a decision in it is more behaviour than belongs in the
@@ -1081,10 +1324,10 @@ using Node::NodeReloader;
     // which is what this was: that spelling STARTED a thread on every node in the fleet
     // and made the sentence above ("a node with no cluster starts no thread") false by
     // one word. The condition is `servesEnrollment`, so the thread and the surface
-    // cannot disagree about whether there is a window to watch.
+    // cannot disagree about whether there is a list to watch.
     std::optional<std::jthread> enrollmentWatch;
     if (servesEnrollment)
-        enrollmentWatch.emplace([&](std::stop_token const& stop) { WarnWhileWindowIsOpen(enrollmentWindow, logger, stop); });
+        enrollmentWatch.emplace([&](std::stop_token const& stop) { WarnWhileJoinersWait(enrollmentWindow, logger, stop); });
 
     // Consensus, when the operator configured a cluster -- which every scheduler has, even a
     // lone one (#178). It is what gives the scheduler tier a role at all: without it every
@@ -1094,51 +1337,66 @@ using Node::NodeReloader;
     // Started AFTER the scheduler tier, because its observers push into it, and
     // declared after too, so it is destroyed first and cannot call into a tier that
     // has gone.
-    auto consensusOrRefusal =
-        Node::StartConsensusOrExplain(cfg,
-                                      schedulerTier,
-                                      nodeSurface != nullptr ? nodeSurface->BoundEndpoint() : std::string {},
-                                      identityKey,
-                                      membership,
-                                      *nodeRoster,
-                                      rosterWallClock,
-                                      metrics,
-                                      logger,
-                                      &conditions);
+    auto consensusOrRefusal = Node::StartConsensusOrExplain(
+        cfg,
+        schedulerTier,
+        announced,
+        identityKey,
+        membership,
+        *nodeRoster,
+        appliedSchedulers,
+        Node::SharedCacheListeners { .directory = sharedCache.Directory(),
+                                     .host = sharedCache.Host(),
+                                     .upstream = cacheTier != nullptr ? &cacheTier->Upstream() : nullptr },
+        metrics,
+        logger,
+        &conditions,
+        Node::FormationHooksOf(formationRuntime.get()));
     if (!consensusOrRefusal.has_value())
     {
         // No flag prefix here, for the reason the cache tier's line below has none:
-        // consensus fails over --node-id, --raft-peer, --listen-raft or
+        // consensus fails over --node-id, --raft-self, --listen-raft or
         // --cluster-dir, and only the tier knows which, so its message names the
         // flag. It used to prefix `--node-id `, which rendered the peer refusal as
         // "--node-id --node-id=n1 names no --raft-peer" -- and that message is now
         // `StartupPolicyRejection`'s own row, which names the flag by construction.
-        logger.Logf(LogLevel::Error, "{}; refusing to start", consensusOrRefusal.error());
-        return ExitUsage;
+        logger.Logf(LogLevel::Error, "{}; refusing to start", consensusOrRefusal.error().reason);
+        return ExitCodeFor(consensusOrRefusal.error().cause);
     }
     // Null on a node with no `--listen-raft`: a pure worker, since #178 makes every scheduler a
     // consensus member.
     auto const consensusTier = std::move(*consensusOrRefusal);
 
+    // The formation's beat, over the tier it proposes through. Declared after the tier, so the beat
+    // has stopped and let go of it before the tier is destroyed.
+    auto const formationBeat = Node::BeginFormation(formationRuntime.get(), consensusTier.get());
+
     // Attached as soon as the tier exists and before anything serves, and detached before the
     // tier is destroyed: the attachment is declared after it. A null tier attaches nothing.
     auto const consensusStandingAttached = consensusStanding.Attach(consensusTier.get());
+
+    // The consensus tier runs its own reactor and owns its own registry; the node reads one.
+    if (consensusTier != nullptr)
+        consensusTier->AcceptLoops().forward(nodeIo.AcceptLoops());
 
     // Discovery, when the operator configured it. Declared AFTER consensus and so
     // destroyed before it, because its observer pushes into the tier above: a
     // discovery loop outliving the thing it hands peers to is a dangling reference
     // that only fires while a node is shutting down.
-    auto discoveryOrRefusal = Node::StartDiscoveryOrExplain(cfg, consensusTier, metrics, logger);
+    // `summary` is the one summary the FLEET-SUMMARY responder signs, so a beacon and an answer from
+    // this node are one derivation; every fleet it proves goes on to the formation.
+    auto discoveryOrRefusal = Node::StartDiscoveryOrExplain(
+        cfg, consensusTier, summary, conditions, metrics, logger, Node::DiscoveryFormationOf(formationRuntime.get()));
     if (!discoveryOrRefusal.has_value())
     {
         // Fatal; why is `RowFor(NodeSurface::Discovery).bindFailureReason` (#352).
         // Not restated here -- this line and that row would be the two places the
         // ticket is about.
-        logger.Logf(LogLevel::Error, "--discovery {}; refusing to start", discoveryOrRefusal.error());
-        return ExitUsage;
+        logger.Logf(LogLevel::Error, "--discovery {}; refusing to start", discoveryOrRefusal.error().reason);
+        return ExitCodeFor(discoveryOrRefusal.error().cause);
     }
-    // May legitimately be null: no `--discovery` means the cluster is the
-    // `--raft-peer` list an operator typed, which is the ordinary deployment.
+    // May legitimately be null: no `--discovery` means the cluster is the members
+    // an operator admitted, which is an ordinary deployment.
     auto const discoveryTier = std::move(*discoveryOrRefusal);
 
     // The admin endpoint, when the operator asked for one. Off by default and on
@@ -1190,9 +1448,7 @@ using Node::NodeReloader;
             // scrape say NO cluster rather than a cluster of nobody. The tier is
             // declared above, so it outlives the provider: locals are destroyed in
             // reverse.
-            .consensus = Node::ConsensusScrapeSource(consensusTier.get()),
-            // The roster's lapse (#178), declared above the provider for the tier's reason.
-            .roster = nodeRoster.get() },
+            .consensus = Node::ConsensusScrapeSource(consensusTier.get()) },
         startedAt);
 
     // Absent when this node runs no scheduler: there is then no registry to report,
@@ -1215,7 +1471,13 @@ using Node::NodeReloader;
     // Declared AFTER the tiers it reads and BEFORE the surface that reads it, which
     // is what makes both sets of pointers safe: locals are destroyed in reverse.
     static core::platform::SystemWallClock const wall;
-    Node::FleetSampler sampler { fleetSources, metrics, snapshotProvider, wall, Node::HistoryPaths::For(cfg), logger };
+    Node::FileTrustNodeKeyGuard historyGuard;
+    Node::FleetSampler sampler { fleetSources,
+                                 metrics,
+                                 snapshotProvider,
+                                 wall,
+                                 Node::SetAsideForeignHistory(Node::HistoryPaths::For(cfg), historyGuard, logger),
+                                 logger };
 
     // Wired here because this is the one scope holding both: the scheduler tier is
     // built before the sampler that receives for it, so the sink cannot be a
@@ -1249,18 +1511,37 @@ using Node::NodeReloader;
                                                                                       Node::NodeServedSurfacesFor(cfg) } };
     auto const liveSourcesAttached = liveSources.Attach(nodeLiveSources);
 
-    auto surfaceOrRefusal = Node::StartAdminSurfaceOrExplain(
-        cfg, *host, metrics, std::move(snapshotProvider), fleetSources, &sampler, dashboardCredential, logger, conditions);
+    auto surfaceOrRefusal = Node::StartAdminSurfaceOrExplain(cfg,
+                                                             *host,
+                                                             metrics,
+                                                             std::move(snapshotProvider),
+                                                             fleetSources,
+                                                             &sampler,
+                                                             dashboardCredential,
+                                                             logger,
+                                                             conditions,
+                                                             nodeIo.AcceptLoops());
 
     // Fatal here and not in the daemon, which is a real difference between the two
     // binaries rather than a defect in either; the row says why
     // (`RowFor(NodeSurface::Admin).bindFailureReason`, #352).
     if (!surfaceOrRefusal.has_value())
     {
-        logger.Logf(LogLevel::Error, "{}; refusing to start", surfaceOrRefusal.error());
-        return ExitUsage;
+        logger.Logf(LogLevel::Error, "{}; refusing to start", surfaceOrRefusal.error().reason);
+        return ExitCodeFor(surfaceOrRefusal.error().cause);
     }
     auto const adminSurface = std::move(*surfaceOrRefusal);
+
+    // How loudly a scheduler that does not answer, or refuses, is said: ONE for the process, lent to
+    // the worker's heartbeat and to the presence loop below, so a machine says each loss and each
+    // recovery once rather than once per loop. Declared before both handles, so it outlives the
+    // threads that report into it.
+    core::platform::SteadyClock const reachabilityClock;
+    // Over the list `NodePresence::Start` builds its link from, so the scope and the loop cannot
+    // disagree about whether this node announces. Only an announcing node answers the row; `Settle`
+    // answers the rest.
+    auto const announces = Node::AnnouncesToAScheduler(cfg, activatedNodeEndpoint);
+    Node::SchedulerReachability schedulerReachability { reachabilityClock, announces ? &conditions : nullptr };
 
     // Both surfaces have bound and adopted, so the loop can start accepting. Doing
     // it here rather than at construction is the ordering `ConsensusTier::Launch`
@@ -1276,7 +1557,8 @@ using Node::NodeReloader;
                                                                            .scheduler = schedulerTier != nullptr,
                                                                            .adminSurface = adminSurface.endpoint != nullptr,
                                                                            .enrollment = servesEnrollment,
-                                                                           .consensus = Node::RunsConsensus(cfg) }))
+                                                                           .consensus = Node::RunsConsensus(cfg),
+                                                                           .announces = announces }))
         logger.Logf(LogLevel::Error,
                     "condition {} was never evaluated although this node runs what evaluates it; every surface "
                     "reports it undecided",
@@ -1289,7 +1571,7 @@ using Node::NodeReloader;
     // through is destroyed: the handle is declared after it.
     std::optional<Node::WorkerHeartbeat> heartbeat;
     if (workerTier != nullptr)
-        heartbeat.emplace(workerTier->Launch(statusClock));
+        heartbeat.emplace(workerTier->Launch(statusClock, schedulerReachability));
 
     // **Started unconditionally, and that one word is the whole of #1440.** A node with
     // `--slots=0` has no `workerTier`, so before this existed such a machine reached the fleet
@@ -1300,17 +1582,24 @@ using Node::NodeReloader;
     // That is the ordering rationale `WorkerHeartbeat` used to carry, and it moved here with
     // the history: this loop is now the only thing in the process that reads the sampler's
     // handover cursor.
-    auto const presence = Node::NodePresence::Start(Node::NodePresenceParts { .cfg = cfg,
-                                                                              .capacity = capacity,
-                                                                              .announced = announced,
-                                                                              .cacheTier = cacheTier.get(),
-                                                                              .metrics = metrics,
-                                                                              .sampler = sampler,
-                                                                              .credential = credential,
-                                                                              .logger = logger,
-                                                                              .conditions = conditions,
-                                                                              .roster = nodeRoster.get(),
-                                                                              .prover = AddressOrNull(prover) });
+    //
+    // Its rounds dial through `presenceDialer`, declared just above it so it outlives the loop.
+    Node::BlockingEndpointDialer presenceDialer { Node::PresenceIoTimeout };
+    auto const presence =
+        Node::NodePresence::Start(Node::NodePresenceParts { .cfg = cfg,
+                                                            .schedulers = appliedSchedulers,
+                                                            .capacity = capacity,
+                                                            .announced = announced,
+                                                            .cacheTier = cacheTier.get(),
+                                                            .metrics = metrics,
+                                                            .sampler = sampler,
+                                                            .logger = logger,
+                                                            .conditions = conditions,
+                                                            .prover = AddressOrNull(prover),
+                                                            .reachability = schedulerReachability,
+                                                            .dialer = presenceDialer,
+                                                            .hostEvents = hostEvents,
+                                                            .askedJoins = Node::AskedJoinsOf(formationRuntime.get()) });
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.
@@ -1325,7 +1614,7 @@ using Node::NodeReloader;
     // The endpoint this node actually LISTENS on, which since #290 stage 3 is the one
     // 0xFC surface -- there is no second port to disambiguate and no config value that
     // describes a socket this process did not open.
-    auto const listeningOn = Node::AdvertisedEndpoint(cfg);
+    auto const listeningOn = Node::DescribeListeningEndpoint(cfg, activated.has_value());
     // The admission policy is part of this line, and that is #235's second half: a
     // worker given no policy starts, binds the wildcard, registers, is leased out
     // and refuses every dispatched compile -- and until this said so, the one line
@@ -1340,7 +1629,9 @@ using Node::NodeReloader;
                 "{} on {}, advertising {}, {}, {}",
                 ReadinessMarkerText(ReadinessMarker::CompileNode),
                 listeningOn,
-                advertise,
+                // Named even when there is none: a withheld name reads `withheld (localhost)`,
+                // never the empty field `advertising ,` that says nothing about why.
+                Node::DescribeAdvertisedEndpoint(cfg),
                 // The toolchain count this node is BRINGING UP, not the count it is
                 // serving: the survey runs on the heartbeat thread and has almost
                 // certainly not finished when this prints (#365) -- and a ready line is a
@@ -1349,6 +1640,9 @@ using Node::NodeReloader;
                                             workerTier != nullptr ? std::optional { workerTier->Slots() } : std::nullopt,
                                             workerTier != nullptr ? workerTier->StartupToolchainCount() : 0),
                 Node::AdmissionSummary(cfg));
+    // The line's fact, handed to the service host, which reports RUNNING on it. After the line, so
+    // whoever is told the node serves finds the line already written.
+    DaemonControls::Instance().MarkServing();
 
     // **Main waits here now, and there is no accept loop to interrupt.** This was
     // `core::async::syncRun(server.Run())` -- the dedicated listener's accept loop, which blocked
@@ -1358,7 +1652,10 @@ using Node::NodeReloader;
     //
     // That deletes the watcher rather than rehoming it: it existed only because a
     // parked `accept()` cannot be woken by a flag.
-    while (!DaemonControls::Instance().StopRequested())
+    //
+    // A reform ends it the same way: a move that changed this node's shape saved the record, and
+    // `main` starts the next body from it once this one has drained exactly as for a stop.
+    while (!DaemonControls::Instance().StopRequested() && !formation.durables.reform.Pending())
     {
         // Taken here rather than in the handler, for the reason the handler's own note
         // gives. `TakeReloadRequest` clears the flag atomically, so a burst of SIGHUPs
@@ -1368,10 +1665,10 @@ using Node::NodeReloader;
         // this call publishes a new configuration and says so, and the next beat picks
         // it up on its own.
         if (DaemonControls::Instance().TakeReloadRequest())
-            Node::ApplyReloadRequest(reloader, membership, logger);
+            Node::ApplyReloadRequest(reloader, membership, conditions, logger);
         std::this_thread::sleep_for(StopPollInterval);
     }
-    logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");
+    logger.Log(LogLevel::Info, Node::DrainSentence(formation.durables.reform.Pending()));
 
     // **Every compile drained HERE, while the node's reactor is still turning** -- see
     // `WorkerTier::StopAndDrain` for why destruction order cannot express it.
@@ -1401,11 +1698,109 @@ using Node::NodeReloader;
     // in the gap finds it unreachable and compiles locally, which is the same
     // fallback every other refusal takes.
     logger.Logf(LogLevel::Info, "compile node stopped");
-    // A node that came up, served, and then found it had nothing to compile with
-    // exits as the refusal it would have been before #365 -- late, but with the same
-    // code and the same diagnostic. A supervisor that restarts on failure must not
-    // read this as a clean stop.
-    return workerTier != nullptr && workerTier->EndedInRefusal() ? ExitUsage : ExitOk;
+    // A node that came up, served, and then found it had nothing to compile with exits late but
+    // with the same diagnostic, and a supervisor must not read that as a clean stop. Which exit is
+    // `WorkerEnding`'s: a failure a compiler installed since would fix.
+    if (auto const ending = workerTier != nullptr ? workerTier->Ending() : std::nullopt; ending.has_value())
+        return ExitCodeFor(*ending);
+    return ExitCodeOf(ProcessExit::Served);
+}
+
+/// What `main` serves with, across reforms: what outlives every body.
+struct ServingParts
+{
+    Cluster::IFormationStore& store;        ///< Where the record is kept.
+    Cluster::FleetEndpointsFile& endpoints; ///< Where the fleet endpoints are remembered.
+    Node::IStoreArchiver& archiver;         ///< What finishes a left cluster's store at every reform.
+    Node::ReformRequest& reform;            ///< Raised by a move; ends a body and starts the next.
+    Node::FormationRuntimeParts runtime;    ///< What every body's formation acts through.
+    Node::LeaseCheckInForce& leaseCheck;    ///< Where every body's worker records the lease check it built.
+};
+
+/// Wait @p wait, returning early once a stop is asked: the pause between two reforms.
+/// @param wait How long.
+void PauseUnlessStopped(std::chrono::milliseconds wait)
+{
+    auto const until = std::chrono::steady_clock::now() + wait;
+    while (!DaemonControls::Instance().StopRequested() && std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(StopPollInterval);
+}
+
+/// Serve until a body ends other than for a reform (`Node::RunNodeBodies`).
+///
+/// What is left here is what only `main` can build -- the socket activation, read once for the
+/// process, and the serving body itself; what a reform decides is `Node::RunNodeBodies`', which a
+/// test target builds.
+/// @param cfg The configuration the start shaped: the first body's, and every reformed body's while
+///        this node has no file. With one, a reformed body is adopted into the reloader's snapshot.
+/// @param identityKey This node's identity key.
+/// @param logger Where every body logs.
+/// @param reloader The live configuration, or null when this node has no file.
+/// @param running What the start adopted; rewritten to what the running body was adopted from.
+/// @param hostEvents Where the host's resume and network events arrive, for every body.
+/// @param parts What outlives every body.
+/// @return The last body's exit code.
+[[nodiscard]] int ServeNodeBodies(NodeConfig const& cfg,
+                                  std::optional<Ed25519KeyPair> const& identityKey,
+                                  ILogger& logger,
+                                  NodeReloader* reloader,
+                                  IHostEvents& hostEvents,
+                                  Node::AdoptedFormation& running,
+                                  ServingParts const& parts)
+{
+    // Socket activation is resolved BEFORE the toolchains, and the order is
+    // deliberate. Computing a fingerprint walks the whole include tree and takes
+    // seconds; a bad handoff is decided in microseconds. Doing the cheap, fallible
+    // thing first means a misconfigured unit fails immediately instead of after a
+    // multi-second pause -- and it means the startup log reads in the order things
+    // actually happened, so an operator watching a worker come up sees what it did
+    // with the socket before the long quiet part.
+    //
+    // And ONCE, for the process: the handoff clears the environment it read, and a body's
+    // listener closes what it adopts. The hold keeps the original and every body serves a copy
+    // (`Node::ActivationHold`), so a reformed body never binds a port the supervisor holds.
+    auto const activatedOrError = ActivatedDescriptor(cfg, logger);
+    if (!activatedOrError.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}", activatedOrError.error().reason);
+        return ExitCodeFor(activatedOrError.error().cause);
+    }
+    SystemInheritedDescriptors const inheritedDescriptors;
+    Node::ActivationHold const activation { *activatedOrError, inheritedDescriptors };
+
+    core::platform::SteadyClock const loopClock;
+    auto publisher = std::optional<Node::ReloaderPublisher> {};
+    if (reloader != nullptr)
+        publisher.emplace(*reloader);
+    auto const bodies = Node::NodeBodies {
+        .adoption = Node::ReformAdoption { .store = parts.store,
+                                           .archiver = parts.archiver,
+                                           .endpoints = parts.endpoints,
+                                           .publisher = publisher.has_value() ? &*publisher : nullptr },
+        .reform = parts.reform,
+        .activation = activation,
+        .controls = Node::LoopControls { .stopRequested = [] { return DaemonControls::Instance().StopRequested(); },
+                                         .pause = PauseUnlessStopped,
+                                         .clock = loopClock },
+    };
+    auto const durables = Node::FormationDurables { parts.store, parts.endpoints, parts.reform, parts.runtime };
+    // The configuration IN FORCE, which an accepted reload changes and `cfg` does not.
+    Node::LiveNodeConfig const inForce { cfg, reloader };
+    return Node::RunNodeBodies(
+        inForce,
+        running,
+        bodies,
+        [&](NodeConfig const& shaped, Cluster::FormationRecord const& record, std::optional<int> served) {
+            return WorkerBody(shaped,
+                              identityKey,
+                              logger,
+                              reloader,
+                              hostEvents,
+                              Node::FormationBody { .record = record, .durables = durables, .reloader = reloader },
+                              served,
+                              parts.leaseCheck);
+        },
+        logger);
 }
 
 /// What every early verb is handed.
@@ -1439,6 +1834,10 @@ struct EarlyVerbContext
     /// Where a refusal goes. Still the CONSOLE logger, because every verb here answers
     /// an operator at a terminal; the switch to an event log happens below them all.
     ILogger& logger;
+
+    /// Where the environment and this process's privilege are read -- the machine-wide state
+    /// directory a service registration owns among them.
+    IConfigPathProbe const& pathProbe;
 };
 
 /// One verb that answers an operator and exits, ahead of the startup table.
@@ -1454,7 +1853,7 @@ struct EarlyVerbRow
 
 /// Print the resolved surface map, and judge it (`--print-surfaces`).
 /// @param context The configuration and the console logger.
-/// @return `ExitOk` when the configuration would start, `ExitUsage` when it would not.
+/// @return Completed's code when the configuration would start, Declined's when it would not.
 [[nodiscard]] int RunPrintSurfaces(EarlyVerbContext const& context)
 {
     // **The ordering is right; the exit code was the defect** (#582). This printed the
@@ -1473,51 +1872,42 @@ struct EarlyVerbRow
     auto const report = ReportSurfaces(context.cfg);
     std::cout << report.text;
     if (!report.refusal.has_value())
-        return ExitOk;
+        return CommandExitCode(CommandEnding::Completed);
     context.logger.Logf(LogLevel::Error, "{}", *report.refusal);
-    return ExitUsage;
+    return CommandExitCode(CommandEnding::Declined);
 }
 
 /// Print this node's identity, minting what the state directory does not hold yet
 /// (`--print-identity`, #178).
 ///
 /// **Minting is the point, not a side effect**, which is what separates this verb from every
-/// other one in `EarlyVerbs`: a cluster's members each need every other member's key on their
-/// `--raft-peer` before any of them starts, and the key does not exist until something mints
-/// it. The start that follows reads the same files back as `Recorded`. Through the resolvers
-/// the start uses, so an id or a key this prints is the one that start will run as -- and a
-/// key file that is there and cannot be used is refused here exactly as it is there.
+/// other one in `EarlyVerbs`: an operator admitting a member needs its key before it is
+/// admitted, and the key does not exist until something mints it. The start that follows reads the same files back as
+/// `Recorded`. Through the resolvers the start uses, so an id or a key this prints is the one that start will run as -- and
+/// a key file that is there and cannot be used is refused here exactly as it is there.
 /// @param context The configuration and the console logger.
-/// @return `ExitOk` once printed; `ExitUsage` for a node with nowhere to keep an identity, or
-///         one whose identity could not be read or minted.
+/// @return Completed's code once printed; otherwise the ending minting came to (`EndingOf`).
 [[nodiscard]] int RunPrintIdentity(EarlyVerbContext const& context)
 {
     auto& cfg = context.cfg;
-    if (!Node::HoldsNodeKey(cfg))
-    {
-        context.logger.Logf(LogLevel::Error, "{}", Node::PrintIdentityNeedsStateDirectory);
-        return ExitUsage;
-    }
-
     SystemSecureRandom random;
-    auto key = Node::ResolveNodeKeyFor(cfg, random);
-    if (!key.has_value() || !key->has_value())
+    Node::FileTrustNodeKeyGuard keyGuard;
+    auto key = Node::ResolveNodeKeyFor(cfg, random, keyGuard);
+    if (!key.has_value())
     {
-        context.logger.Logf(LogLevel::Error,
-                            "{}",
-                            key.has_value() ? std::string { Node::PrintIdentityNeedsStateDirectory } : key.error().message);
-        return ExitUsage;
+        context.logger.Logf(LogLevel::Error, "{}", key.error().message);
+        return CommandExitCode(EndingOf(key.error().fault));
     }
-    auto const publicKey = (*key)->pair.PublicKey();
+    auto const publicKey = key->pair.PublicKey();
 
-    // The id travels with the key (#178): a consensus member is admitted under it, and a worker
-    // with a `--cluster-dir` proves it on every connection to a scheduler -- and is admitted under
-    // it by `--cluster-admit-worker=<id>@<key>`, typed from these very lines.
+    // The id travels with the key (#178): a member is admitted under it -- `--enroll-approve`
+    // names both, as these very lines print them -- and proves it on every connection to a
+    // scheduler.
     auto identity = Node::ResolveNodeIdentity(Node::NodeStateDirectory(cfg), cfg.nodeId, random);
     if (!identity.has_value())
     {
-        context.logger.Logf(LogLevel::Error, "{}", identity.error());
-        return ExitUsage;
+        context.logger.Logf(LogLevel::Error, "{}", identity.error().message);
+        return CommandExitCode(EndingOf(identity.error().fault));
     }
     identity->publicKey = publicKey;
     Node::ApplyNodeIdentity(cfg, *identity);
@@ -1527,9 +1917,10 @@ struct EarlyVerbRow
         if (auto const dial = ConsensusDialAddressOf(cfg); dial.has_value())
             dialAddress = *dial;
 
-    std::cout << Node::DescribeIdentity(
-        cfg.nodeId, publicKey, dialAddress, RunsConsensus(cfg) ? Node::IdentityRole::Member : Node::IdentityRole::Worker);
-    return ExitOk;
+    std::cout << Node::DescribeIdentity(cfg.nodeId, publicKey, dialAddress);
+    // And where it is kept: an unelevated run prints a PER-USER identity the service never holds.
+    std::cout << Node::DescribeIdentityOrigin(cfg);
+    return CommandExitCode(CommandEnding::Completed);
 }
 
 /// Write the packaged configuration template to this binary's own system path
@@ -1542,7 +1933,9 @@ struct EarlyVerbRow
 /// path and the path the startup lookup walks one answer rather than two that agree
 /// until somebody edits one.
 /// @param context The configuration and the console logger.
-/// @return `ExitOk` once the file is in place, `ExitUsage` when it could not be written.
+/// @return Completed's code once the file is in place; otherwise the ending seeding came to (`EndingOf`),
+///         declined for a template it could not use and failed for a file it began writing --
+///         the one mapping `fastcached --seed-config` answers through as well.
 [[nodiscard]] int RunSeedConfig(EarlyVerbContext const& context)
 {
     auto const seeded =
@@ -1552,16 +1945,16 @@ struct EarlyVerbRow
     if (!seeded.has_value())
     {
         context.logger.Logf(LogLevel::Error, "{}", seeded.error().ToString());
-        return ExitUsage;
+        return CommandExitCode(EndingOf(seeded.error().code));
     }
     context.logger.Logf(LogLevel::Info, "{}", SeedOutcomeSentence(*seeded, context.cfg.seedConfigTemplate));
-    return ExitOk;
+    return CommandExitCode(CommandEnding::Completed);
 }
 
 /// Register or remove this worker's service entry (`--install-service`,
 /// `--uninstall-service`).
 /// @param context The merged configuration, the command line alone, and the logger.
-/// @return The registration's own exit code, or `ExitUsage` when it was refused.
+/// @return The code of the registration's own ending, or Declined's when it was refused.
 [[nodiscard]] int RunServiceRegistration(EarlyVerbContext const& context)
 {
     // Only an install has to be viable; an uninstall merely names a registration to
@@ -1571,14 +1964,19 @@ struct EarlyVerbRow
     // Judged on the MERGED configuration, and registered from the command line alone --
     // which is not a contradiction. What the service will run with is the file plus
     // these arguments, so judging the command line alone would refuse the documented
-    // setup, where `--scheduler` and the toolchains come out of the packaged file. What
+    // setup, where the toolchains come out of the packaged file. What
     // is baked in is still only what was typed, plus the `--config` path that supplies
     // the rest.
-    if (context.cfg.installService)
+    //
+    // Only a configuration the formation SHAPED is judged here. One whose record was held is
+    // unshaped -- it runs no consensus, so the rules about an admitting node stay silent -- and is
+    // judged after the registration has secured the directory, on the configuration the service
+    // starts with (`InstallWithServiceFirewall`).
+    if (context.cfg.installService && context.cfg.formation.has_value())
         if (auto const rejection = NodeInstallRejection(context.cfg))
         {
             context.logger.Logf(LogLevel::Error, "{}", *rejection);
-            return ExitUsage;
+            return CommandExitCode(CommandEnding::Declined);
         }
 
     // The identity the registration will bake in, resolved here because a registration
@@ -1599,8 +1997,8 @@ struct EarlyVerbRow
     if (auto const adopted = AdoptNodeIdentity(context.cfg, context.cliOnly, identityRandom, context.logger, std::nullopt);
         !adopted.has_value())
     {
-        context.logger.Logf(LogLevel::Error, "{}; refusing to install", adopted.error());
-        return ExitUsage;
+        context.logger.Logf(LogLevel::Error, "{}; refusing to install", adopted.error().message);
+        return CommandExitCode(EndingOf(adopted.error().fault));
     }
 
     // `cliOnly`, never `cfg`: a registration replays its arguments at every start, so
@@ -1609,43 +2007,67 @@ struct EarlyVerbRow
     // service, and nothing changes. What the registration does carry is the `--config`
     // path, so the service reads the current file at every start rather than a snapshot
     // of it.
-    auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), context.cliOnly);
-    auto const result = context.cfg.installService ? InstallService(spec, context.cfg.serviceScope)
-                                                   : UninstallService(spec, context.cfg.serviceScope);
-    if (result.exitCode == 0)
+    //
+    // The firewall follows the registration: opened for what the SERVICE will open at its next
+    // start -- the merged configuration shaped by the formation record read AFTER the registration
+    // secured the state directory, and read from exactly the directory it secured
+    // (`InstallNodeService`) -- and closed on removal once the delete succeeded or found no
+    // registration, never after a refused one (`WithRemovalFirewall`), since a rule outliving its
+    // service admits nothing but misleads whoever reads the list.
+    auto const firewall = MakeSystemFirewall();
+    auto const result = [&] {
+        if (context.cfg.installService)
+            return Node::InstallNodeService(
+                context.cfg,
+                context.cliOnly,
+                context.pathProbe,
+                CurrentExecutablePath(),
+                [&](ServiceSpec const& spec) { return InstallService(spec, context.cfg.serviceScope); },
+                [&](ServiceSpec const& spec) { return UninstallService(spec, context.cfg.serviceScope); },
+                firewall.get());
+        auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), context.cliOnly, context.pathProbe);
+        return WithRemovalFirewall(UninstallService(spec, context.cfg.serviceScope), firewall.get(), spec.serviceName);
+    }();
+    if (result.Ending() == CommandEnding::Completed)
         std::cout << "fastcache-compile-node: " << result.message << '\n';
     else
         std::cerr << "fastcache-compile-node: " << result.message << '\n';
-    return result.exitCode;
+    return result.ExitCode();
 }
 
 /// Convert this node's disk tier to the format this build reads (`--migrate-cache`).
 /// @param context The configuration and the console logger.
-/// @return 0 once converted, `ExitUsage` when the store could not be.
+/// @return Completed's code once converted; otherwise the conversion's ending, declined when it changed nothing
+///         and failed when it stopped part-way -- as `fastcached --migrate-storage` answers.
 [[nodiscard]] int RunMigrateCache(EarlyVerbContext const& context)
 {
     auto const outcome = MigrateDiskTier(context.cfg);
     if (!outcome.has_value())
     {
-        context.logger.Logf(LogLevel::Error, "{}", outcome.error());
-        return ExitUsage;
+        context.logger.Logf(LogLevel::Error, "{}", outcome.error().reason);
+        return CommandExitCode(outcome.error().ending);
     }
     std::cout << "fastcache-compile-node: " << *outcome << '\n';
-    return 0;
+    return CommandExitCode(CommandEnding::Completed);
+}
+
+/// Say one line of an operator verb's credential handling on stderr.
+/// @param text The line.
+void SayOperatorCredential(std::string_view text)
+{
+    std::cerr << "fastcache-compile-node: " << text << '\n';
 }
 
 /// Put a cluster question to a running cluster and report the answer (`--cluster-*`).
 ///
-/// No reloader exists at this point and none ever will on this path: a cluster verb
-/// answers and the process returns. The seam is threaded through anyway, so the day one
-/// of these is asked from a running worker it reads the live secret rather than the one
-/// this process was started with.
+/// Each endpoint the verb dials is shown a ticket minted by this machine's own node
+/// (`OperatorCredentials`), so the verb works from any machine the cluster holds the key of.
 /// @param context The configuration.
 /// @return What the verb answered, rendered by `ReportOneShotVerb`.
 [[nodiscard]] int RunClusterVerb(EarlyVerbContext const& context)
 {
-    Node::ConfiguredCredential const credential { context.cfg, nullptr };
-    return ReportOneShotVerb(RunClusterAdmin(context.cfg, context.cfg.cluster, credential));
+    Node::OperatorCredentials operatorCredentials { context.cfg, Node::DefaultOneShotDialer(), &SayOperatorCredential };
+    return ReportOneShotVerb(RunClusterAdmin(context.cfg, context.cfg.cluster, operatorCredentials.Credentials()));
 }
 
 /// Cordon this machine's own worker, or lift its cordon (`--cordon`, `--uncordon`).
@@ -1653,8 +2075,7 @@ struct EarlyVerbRow
 /// @return What the verb answered, rendered by `ReportOneShotVerb`.
 [[nodiscard]] int RunCordonVerb(EarlyVerbContext const& context)
 {
-    Node::ConfiguredCredential const credential { context.cfg, nullptr };
-    return ReportOneShotVerb(Node::RunCordonAdmin(context.cfg, context.cfg.cordon, credential));
+    return ReportOneShotVerb(Node::RunCordonAdmin(context.cfg, context.cfg.cordon));
 }
 
 /// Decide who may join, on behalf of an operator (`--enroll-*`).
@@ -1662,18 +2083,8 @@ struct EarlyVerbRow
 /// @return What the verb answered, rendered by `ReportOneShotVerb`.
 [[nodiscard]] int RunEnrollVerb(EarlyVerbContext const& context)
 {
-    Node::ConfiguredCredential const credential { context.cfg, nullptr };
-    return ReportOneShotVerb(Node::RunEnrollAdmin(context.cfg, context.cfg.enroll, credential));
-}
-
-/// Ask another cluster to let this machine in (`--enroll-from`).
-/// @param context The configuration.
-/// @return What the exchange answered, rendered by `ReportOneShotVerb`.
-[[nodiscard]] int RunEnrollFrom(EarlyVerbContext const& context)
-{
-    SystemSecureRandom enrollRandom;
-    Node::ConfiguredCredential const credential { context.cfg, nullptr };
-    return ReportOneShotVerb(Node::RunEnrollClient(context.cfg, credential, enrollRandom), "fastcache-compile-node: ");
+    Node::OperatorCredentials operatorCredentials { context.cfg, Node::DefaultOneShotDialer(), &SayOperatorCredential };
+    return ReportOneShotVerb(Node::RunEnrollAdmin(context.cfg, context.cfg.enroll, operatorCredentials.Credentials()));
 }
 
 /// The verbs that answer an operator and exit, in the order they are asked.
@@ -1686,7 +2097,7 @@ struct EarlyVerbRow
 /// Each row carries the reason it sits where it does. That ordering used to be expressed
 /// by the LAYOUT of seven `if` blocks in `main` -- true, readable only by scrolling, and
 /// with nothing that made reordering them show up as a change to the thing being ordered.
-constexpr std::array<EarlyVerbRow, 9> EarlyVerbs { {
+constexpr std::array<EarlyVerbRow, 8> EarlyVerbs { {
     // **Below the logger and still above the startup table** (#582). Its refusal has to
     // reach the same terminal a start prints to, rendered the same way -- an operator
     // who meets that sentence here and again at boot should be reading one message, not
@@ -1725,16 +2136,17 @@ constexpr std::array<EarlyVerbRow, 9> EarlyVerbs { {
     // Converting the store acts on the files and exits. After the service row for the
     // same reason that one is early -- it costs microseconds to decide -- and before
     // everything below it, because a node whose store is of the wrong vintage cannot
-    // start at all: making the operator satisfy `--scheduler` or a toolchain probe first
+    // start at all: making the operator satisfy a toolchain probe first
     // would be demanding they fix a running configuration before being allowed to fix
     // the store that stops it running.
     { .applies = [](NodeConfig const& cfg) { return cfg.migrateCache; }, .run = &RunMigrateCache },
 
     // A question asked OF a running cluster, rather than a worker starting up. After the
     // service row, because an installation is about this machine and this is about
-    // somebody else's; before the `--scheduler` and `--toolchain` checks, because a
-    // cluster command needs the first and not the second.
-    { .applies = [](NodeConfig const& cfg) { return cfg.cluster.action != ClusterAction::None; }, .run = &RunClusterVerb },
+    // somebody else's; before the startup table, which refuses `--scheduler` on a node
+    // that serves: a cluster command is what that flag aims, and it needs no toolchain.
+    { .applies = [](NodeConfig const& cfg) { return Node::IsOneShotVerb(cfg, Node::OneShotVerb::Cluster); },
+      .run = &RunClusterVerb },
 
     // An operator taking THIS machine out of the fleet or putting it back (#1303). Beside
     // the cluster row because it is the same kind of thing -- a question put to a running
@@ -1746,22 +2158,14 @@ constexpr std::array<EarlyVerbRow, 9> EarlyVerbs { {
     // An operator deciding who may join, rather than a worker starting up. Beside the
     // cluster row because it is the same kind of thing -- a question put to a running
     // cluster by a person at a terminal, answered, and the process exits.
-    { .applies = [](NodeConfig const& cfg) { return cfg.enroll.action != EnrollAction::None; }, .run = &RunEnrollVerb },
-
-    // A machine asking to be LET IN to somebody else's cluster. Beside the cluster row
-    // and after it, because the two are the same kind of thing from opposite ends --
-    // that one is an operator administering a cluster they are already in, this one is a
-    // machine that is not in one yet.
-    //
-    // Before the startup table below, and that is the point rather than an accident:
-    // those rules judge a configuration this node will SERVE with, and this one serves
-    // nothing at all. A node enrolling has no --scheduler and no toolchain, and being
-    // refused for either would refuse exactly the fresh install the mode exists for.
-    // What this mode itself requires -- somewhere to write the key, and a consensus
-    // identity to be admitted AS -- it refuses by name itself, which is the shape
-    // `RunClusterAdmin` already uses for its own `--scheduler`.
-    { .applies = [](NodeConfig const& cfg) { return !cfg.enrollFrom.empty(); }, .run = &RunEnrollFrom },
+    { .applies = [](NodeConfig const& cfg) { return Node::IsOneShotVerb(cfg, Node::OneShotVerb::Enroll); },
+      .run = &RunEnrollVerb },
 } };
+
+bool SelectsOneShotVerb(NodeConfig const& cfg)
+{
+    return std::ranges::any_of(EarlyVerbs, [&cfg](EarlyVerbRow const& verb) { return verb.applies(cfg); });
+}
 
 } // namespace
 
@@ -1823,14 +2227,15 @@ int main(int argc, char** argv)
     // explicit bit -- which is the shape the daemon has, and which has shipped a
     // flag that parsed but never merged four times.
     NodeConfig cliOnly;
-    auto const flow = ParseOptionsInto(NodeOptions(), argvSpan.subspan(1), cliOnly);
+    auto const flow = ParseNodeCommandLine(argvSpan.subspan(1), cliOnly);
     if (!flow.has_value())
     {
         // The FIELD as well as the reason. Without it an unrecognised argument reads
         // as `unrecognised argument` and names nothing at all -- the daemon and the
         // test client have always printed both, and this is the binary whose flags
         // an operator is most likely to be typing by hand.
-        std::cerr << "fastcache-compile-node: " << flow.error().field << ": " << flow.error().context << '\n';
+        auto const unparsed = std::format("{}: {}", flow.error().field, flow.error().context);
+        std::cerr << "fastcache-compile-node: " << unparsed << '\n';
 
         // Said only where it explains something. A non-ASCII argument does not reach
         // a Windows process as UTF-8 unless its active code page is UTF-8, which
@@ -1844,7 +2249,13 @@ int main(int argc, char** argv)
         if (auto const codePage = ActiveCodePage(); codePage.has_value() && *codePage != Utf8CodePage)
             std::cerr << "fastcache-compile-node: this host's active code page is " << *codePage
                       << ", not UTF-8, so a non-ASCII argument does not reach this process as the bytes you typed\n";
-        return ExitUsage;
+
+        // What the command line NAMED, from the whole of it rather than from what parsed before
+        // the bad token: the verb it asked for and the service it runs as are the operator's
+        // wherever they typed them, so `--no-such-flag --print-surfaces` is the worksheet's refusal.
+        NodeConfig named;
+        ApplyRecognisedOptions(NodeOptions(), argvSpan.subspan(1), named);
+        return RefuseUnderService(named, StartStage::CommandLine, unparsed);
     }
 
     if (cliOnly.help)
@@ -1853,12 +2264,20 @@ int main(int argc, char** argv)
         // that module stays free of ambient probes -- and on Windows the call also
         // enables virtual-terminal processing, so it must precede any output.
         std::cout << HelpText(StdoutSupportsColor() ? UsageColor::Colored : UsageColor::Plain);
-        return 0;
+        return CommandExitCode(CommandEnding::Completed);
     }
     if (cliOnly.version)
     {
         std::cout << "fastcache-compile-node " << FASTCACHE_NODE_VERSION << '\n';
-        return 0;
+        return CommandExitCode(CommandEnding::Completed);
+    }
+    // The parse above IS the check: an argument its row refuses has exited there, naming the flag.
+    // Answered before any file is read for `--version`'s reason, and because what the installer
+    // asks is whether the values it is about to remember are ones this node reads (B3-1).
+    if (cliOnly.checkArguments)
+    {
+        std::cout << "fastcache-compile-node: every argument parses\n";
+        return CommandExitCode(CommandEnding::Completed);
     }
 
     // Both of the above answer without reading anything, deliberately: a file this
@@ -1879,7 +2298,8 @@ int main(int argc, char** argv)
     // there. `EffectiveConfigPath` owns that rule -- a named path is strict and a
     // discovered one is skipped when it is absent, unreadable or untrusted -- and
     // it is the same rule and the same code the daemon's lookup uses.
-    auto const lookup = EffectiveConfigPath(cliOnly.configPath, SystemConfigPathProbe {}, NodeApplicationName);
+    SystemConfigPathProbe const pathProbe;
+    auto const lookup = EffectiveConfigPath(cliOnly.configPath, pathProbe, NodeApplicationName);
 
     // A file that is there and readable and was passed over anyway has to say so.
     // Silence would leave an operator editing a file this worker has quietly
@@ -1917,7 +2337,7 @@ int main(int argc, char** argv)
         else if (!fileIsAdvisory)
         {
             std::cerr << "fastcache-compile-node: " << loaded.error().ToString() << '\n';
-            return ExitUsage;
+            return RefuseUnderService(cliOnly, ConfigurationFileStage(loaded.error().code), loaded.error().ToString());
         }
         else
             std::cerr << "fastcache-compile-node: ignoring " << lookup.path.string() << ": " << loaded.error().ToString()
@@ -1931,6 +2351,55 @@ int main(int argc, char** argv)
         // wrote. Declining a file means the command line stands alone -- which is
         // also the ordinary no-file case, where `cliOnly` is already the answer.
         cfg = cliOnly;
+
+    // **Where this node keeps its identity, before any verb can ask** -- an install mints the id
+    // there and `--print-surfaces` names it. From this process's privilege and environment,
+    // through the probe the config lookup used, into both configurations as `ApplyNodeIdentity`
+    // writes the id. An invocation that would write there and has none refuses here, by name;
+    // one that writes nothing -- an uninstall among them -- goes on (`StateDirectoryRefusal`).
+    Node::ApplyNodeStateDirectory(cfg, pathProbe);
+    Node::ApplyNodeStateDirectory(cliOnly, pathProbe);
+    if (auto const refusal = Node::StateDirectoryRefusal(cfg); refusal.has_value())
+    {
+        // A directory the environment could not name is an arm that failed, not a verdict on the
+        // configuration: the next start may find it (`NodeIdentityIo`).
+        std::cerr << "fastcache-compile-node: " << *refusal << '\n';
+        return RefuseUnderService(cliOnly, StartStage::NodeIdentityIo, *refusal);
+    }
+
+    // **The formation record, READ before any verb or rule is asked** -- a mode is the state held
+    // in the cluster dir, and it decides whether this node runs consensus, opens the Raft port and
+    // serves a scheduler. Read and never written here: an install, a `--print-surfaces` and the
+    // startup rules below are judged by the mode the node WILL run in, which before a first start
+    // is the solitary record that start mints (`ProspectiveRecord`). The mint itself waits until
+    // this command line has been judged, as the identity's does.
+    //
+    // A record that cannot be read is held rather than refused here, so the verbs that write
+    // nothing -- an uninstall among them -- still run; the start refuses it by name below, and an
+    // install reads it again once its handover has secured the directory, deriving the service's
+    // firewall rules from that (`InstallWithServiceFirewall`). So is a directory another account
+    // may write in or wrote into: its writers, then who owns each file, are asked before any is
+    // read (`ReadStateDirectoryFormation`), as the key resolution asks again.
+    auto const formationDirectory = Node::ChosenStateDirectory(cfg);
+    std::optional<Cluster::FileFormationStore> formationStore;
+    std::optional<Cluster::FleetEndpointsFile> endpointsFile;
+    auto keptFormation = std::expected<Node::KeptFormation, std::string> { std::unexpected {
+        std::string { "this node has no state directory to keep its formation record in" } } };
+    if (formationDirectory.has_value())
+    {
+        formationStore.emplace(formationDirectory->path);
+        endpointsFile.emplace(formationDirectory->path);
+        keptFormation = Node::ReadStateDirectoryFormation(formationDirectory->path);
+    }
+    if (keptFormation.has_value())
+    {
+        auto const prospect = Node::ProspectiveRecord(*keptFormation);
+        auto applied = Node::ApplyFormation(cfg, prospect, keptFormation->remembered).and_then([&] {
+            return Node::ApplyFormation(cliOnly, prospect, keptFormation->remembered);
+        });
+        if (!applied.has_value())
+            keptFormation = std::unexpected { std::move(applied).error() };
+    }
 
     // The admin verbs below answer an operator at a terminal, so they report to one
     // -- even under `--daemon`, which the registered command line carries and which
@@ -1954,7 +2423,7 @@ int main(int argc, char** argv)
     //
     // The order is `EarlyVerbs`' order, and each row carries the reason it sits where it
     // does.
-    EarlyVerbContext const verbContext { .cfg = cfg, .cliOnly = cliOnly, .logger = *consoleLogger };
+    EarlyVerbContext const verbContext { .cfg = cfg, .cliOnly = cliOnly, .logger = *consoleLogger, .pathProbe = pathProbe };
     for (auto const& verb: EarlyVerbs)
         if (verb.applies(cfg))
             return verb.run(verbContext);
@@ -1970,6 +2439,28 @@ int main(int argc, char** argv)
     // machine that has one.
     auto const eventLogger = cfg.daemon ? MakeWindowsEventLogger(cfg.serviceName, cfg.logLevel) : nullptr;
     ILogger& logger = eventLogger ? static_cast<ILogger&>(*eventLogger) : static_cast<ILogger&>(*consoleLogger);
+
+    // **The SCM's host, chosen HERE, before anything below judges the configuration** -- and the
+    // same object the body runs under at the end. Every refusal between here and `Run` returned
+    // from `main` before connecting to the SCM, which then reported error 1053, *did not respond
+    // in a timely fashion*, for a service that had refused by name into the event log. Each now
+    // goes through `RefuseStart`, which connects and reports the stop with the refusing step's
+    // exit code as the service-specific code (`ExitCodeFor`). Null off Windows and without `--daemon`: there the foreground
+    // host answers, whose refusal is the exit code -- a POSIX daemon has not forked yet.
+    //
+    // The host's events hub is declared with it, since the Windows host is handed it here and
+    // both outlive the body the host runs; the network watcher that feeds it starts below.
+    HostEventHub hostEvents;
+    // RUNNING once the node serves (`MarkServing` beside the readiness line), never as its body
+    // begins: a node that then could not bind its port had already been reported started, and an
+    // installer's start action answered success over it (B4-6).
+    auto serviceHost = cfg.daemon ? MakeWindowsServiceHost(cfg.serviceName,
+                                                           ServiceHostOptions { .stop = StopPendingPlanFor(cfg.drainTimeout),
+                                                                                .hostEvents = &hostEvents,
+                                                                                .readiness = ServiceReadiness::BodySignals })
+                                  : nullptr;
+    ForegroundHost foreground;
+    IDaemonHost& startHost = serviceHost ? *serviceHost : static_cast<IDaemonHost&>(foreground);
 
     // Its OWN version, first thing, the way `fastcached` already does
     // ("fastcached {} starting"). A manually bundled install is built once,
@@ -1987,8 +2478,9 @@ int main(int argc, char** argv)
     logger.Logf(LogLevel::Info, "fastcache-compile-node {} starting", VersionString);
 
     // An empty `--scheduler` and "no --toolchain and no discovery" were both refused
-    // HERE, as inline `if`s, and both are now `StartupPolicyRejection` rows -- the
-    // toolchain pair by #403, the scheduler by #386. Neither reads anything but the
+    // HERE, as inline `if`s, and both became `StartupPolicyRejection` rows -- the
+    // toolchain pair by #403, the scheduler by #386, which the formation record then
+    // retired: where a worker registers is no flag any more. Neither reads anything but the
     // parsed configuration, which is what that table is for, and a rule in this tier
     // is one that a RELOAD cannot consult and that no test can reach: this file is in
     // no test target, so the copy that ran at startup was the untested one while the
@@ -2004,10 +2496,24 @@ int main(int argc, char** argv)
     // runs, so a diagnosis printed there goes nowhere in the one deployment where a
     // scheduler is most likely to be misconfigured.
     if (auto const rejection = StartupPolicyRejection(cfg))
-    {
-        logger.Logf(LogLevel::Error, "{}", *rejection);
-        return ExitUsage;
-    }
+        return RefuseStart(startHost, logger, *rejection, ExitCodeFor(StartStage::StartupRules));
+
+    // **This machine's names, BOUNDED** (`HostNamingBound`), after the refusal above so a typo
+    // is not kept waiting on DNS, and before the identity, because the member entry this node
+    // synthesises for itself dials the name. The bare host name stands in when the lookup does
+    // not answer in time, and the warning says so -- peers may not resolve it. Nothing serves
+    // yet, which is why this is a bound rather than a wait behind serving.
+    Node::ThreadedHostNamingLookup namingLookup { [] { return MakeSystemHostNaming(); } };
+    auto const names = Node::ResolveHostNames(namingLookup, QueryHostFacts().hostName, Node::HostNamingBound);
+    if (auto const warning = Node::HostNamingWarning(names); warning.has_value())
+        logger.Logf(LogLevel::Warn, "{}", *warning);
+    Node::ApplyHostNames(cfg, names.names);
+    Node::ApplyHostNames(cliOnly, names.names);
+
+    // Asked again of the names, because a rule over an address derived from them answered the
+    // awaited name above as "supplied at startup", and it is supplied now.
+    if (auto const rejection = StartupPolicyRejection(cfg))
+        return RefuseStart(startHost, logger, *rejection, ExitCodeFor(StartStage::StartupRules));
 
     // **This node's identity, resolved once and applied to every configuration this
     // process builds** (#1024). It is minted into `--cluster-dir` on the first start
@@ -2031,30 +2537,58 @@ int main(int argc, char** argv)
     // node's own member entry and its key into the configuration together -- and every
     // reload candidate after it. Read, or minted into the state directory when there is
     // none there; a key file that is there and cannot be used is a refusal, never a re-mint.
-    // A node with no state directory holds none, and says so.
     SystemSecureRandom identityRandom;
-    auto const identityKey = AdoptNodeKey(cfg, identityRandom, logger);
+
+    Node::FileTrustNodeKeyGuard identityKeyGuard;
+    auto const identityKey = AdoptNodeKey(cfg, identityRandom, identityKeyGuard, logger);
     if (!identityKey.has_value())
-    {
-        logger.Logf(LogLevel::Error, "{}; refusing to start", identityKey.error());
-        return ExitUsage;
-    }
+        return RefuseStart(startHost,
+                           logger,
+                           std::format("{}; refusing to start", identityKey.error().message),
+                           ExitCodeFor(StageOf(identityKey.error().fault)));
     auto const publicKey = PublicHalf(*identityKey);
 
     auto const identity = AdoptNodeIdentity(cfg, cliOnly, identityRandom, logger, publicKey);
     if (!identity.has_value())
-    {
-        logger.Logf(LogLevel::Error, "{}; refusing to start", identity.error());
-        return ExitUsage;
-    }
+        return RefuseStart(startHost,
+                           logger,
+                           std::format("{}; refusing to start", identity.error().message),
+                           ExitCodeFor(StageOf(identity.error().fault)));
 
-    // An `@<key>` this node's own `--raft-peer` states is a claim about the machine it is
-    // typed on, so one that is not the key it holds is refused rather than announced.
-    if (auto const contradiction = Node::SelfKeyContradiction(cfg, publicKey); contradiction.has_value())
-    {
-        logger.Logf(LogLevel::Error, "{}; refusing to start", *contradiction);
-        return ExitUsage;
-    }
+    // **The formation record this node runs by**, kept -- minted and SAVED when the state
+    // directory holds none -- before any tier starts. After the table above for the identity's
+    // reason: a configuration the node refuses must not leave a record behind. And after the
+    // KEY, whose resolution is what judges the state directory -- and creates it, its owner's
+    // alone -- so nothing is written into a directory other accounts could have planted in.
+    // The identity already saw the mode it runs in: the record, or the one this mints.
+    if (!keptFormation.has_value())
+        return RefuseStart(startHost,
+                           logger,
+                           std::format("{}; refusing to start", keptFormation.error()),
+                           ExitCodeFor(StartStage::Formation));
+    // Engaged whenever a record was read -- the store is what read it -- so this is the same
+    // fact stated where the dereference can see it.
+    if (!formationStore.has_value() || !endpointsFile.has_value())
+        return RefuseStart(startHost,
+                           logger,
+                           "no state directory keeps this node's formation record; refusing to start",
+                           ExitCodeFor(StartStage::Formation));
+
+    // **Adopted** (`AdoptFormation`), HERE where a refusal can still be reported: minted and SAVED
+    // when the state directory holds none, and a move a crash interrupted finished -- the store a
+    // dissolve left in the root archived -- before any consensus tier opens the directory. Every
+    // reform adopts it again the same way (`RunNodeBodies`).
+    Node::RaftStoreArchiver archiver { Node::NodeStateDirectory(cfg) };
+    Node::ReformRequest reform;
+    auto adopted = Node::AdoptFormation(
+        cfg, *formationStore, archiver, *endpointsFile, identityRandom, core::platform::defaultSystemWallClock());
+    if (!adopted.has_value())
+        return RefuseStart(
+            startHost, logger, std::format("{}; refusing to start", adopted.error()), ExitCodeFor(StartStage::Formation));
+    if (auto applied = Node::ApplyFormation(cliOnly, adopted->record, adopted->remembered); !applied.has_value())
+        return RefuseStart(
+            startHost, logger, std::format("{}; refusing to start", applied.error()), ExitCodeFor(StartStage::Formation));
+    logger.Logf(LogLevel::Info, "{}, cluster {}", Node::DescribeFormationMode(cfg), cfg.clusterId);
 
     // Built only when there IS a file, and holding the SAME argv the startup parse
     // used -- so a reload reproduces the startup order exactly: a fresh configuration,
@@ -2068,33 +2602,29 @@ int main(int argc, char** argv)
     // destroyed first -- the ordering `WatchSecretExposure` requires. And the host is
     // chosen afterwards because the POSIX one redirects stdout to /dev/null inside
     // `Run()`: every startup warning has to be emitted before that.
+    //
+    // **What the running worker's lease check IS**, declared before the reloader that reads it at
+    // every reload and destroyed after it: a reload may not widen admission on a worker that built
+    // the unchecked one (`Node::ReloadCheckWith`). Recorded by the factory that builds the check,
+    // in whichever body runs, so the guard asks what was BUILT rather than a flag shape.
+    Node::LeaseCheckInForce leaseCheck;
     std::optional<NodeReloader> reloader;
     if (!lookup.path.empty())
-        reloader.emplace(
-            cfg,
-            lookup.path,
-            [argvSpan, identity = identity->value_or(Node::NodeIdentity {})](
-                std::filesystem::path const& path) -> std::expected<NodeConfig, ConfigError> {
-                // A FRESH configuration, never the live one. A file that fails halfway
-                // is then discarded whole rather than leaving the running worker
-                // holding part of a document nobody wrote.
-                NodeConfig candidate;
-                auto const loaded =
-                    ReadYamlSettings(path).and_then([&candidate, &path, argvSpan](std::vector<YamlSetting> const& settings) {
-                        return ApplyNodeConfiguration(settings, path, argvSpan.subspan(1), candidate);
-                    });
-                if (!loaded.has_value())
-                    return std::unexpected(loaded.error());
-                // The identity again, through the same function the start used. A
-                // candidate rebuilt without it holds an empty `--node-id`, which is an
-                // unreloadable field that has CHANGED -- so every reload would be
-                // refused by name, on a worker whose configuration was perfectly
-                // valid. Resolved once at startup and applied here, never re-resolved:
-                // this runs on a signal, and a reload must not be able to mint.
-                Node::ApplyNodeIdentity(candidate, identity);
-                return candidate;
-            },
-            &ValidateNodeReloadable);
+        reloader.emplace(cfg,
+                         lookup.path,
+                         Node::ReloadCandidateReader(argvSpan.subspan(1),
+                                                     Node::ReloadBasis {
+                                                         .stateDirectory = cfg.stateDirectory,
+                                                         .hostNames = names.names,
+                                                         // The record the RUNNING body was adopted from,
+                                                         // which a reform rewrites -- never the file, which a
+                                                         // move saves on the beat thread before the body it
+                                                         // ends has drained. A reload runs on the body's stop
+                                                         // loop, the thread a reform adopts on between bodies.
+                                                         .formation = Node::RunningFormationOf(*adopted),
+                                                         .identity = identity->value_or(Node::NodeIdentity {}),
+                                                     }),
+                         Node::ReloadCheckWith(leaseCheck));
 
     // A secret is only as private as the file holding it, and this worker has one per
     // row of `NodeSecretFileTable()` beside its configuration file, where the daemon has
@@ -2116,7 +2646,7 @@ int main(int argc, char** argv)
     // the packaging ships. The `fileApplied` guard it used to carry is DROPPED because
     // it can never decide anything, and that is the whole claim -- MEASURED against the
     // control flow above rather than reasoned from what a reload might do. A non-empty
-    // `lookup.path` that would not load already exited `ExitUsage` far above, except
+    // `lookup.path` that would not load already exited far above, except
     // under `fileIsAdvisory`, which is `--uninstall-service` and returns at the service
     // block. So every run that reaches this line with a path either applied the file or
     // never had one. Even in the unreachable case the gate answers the same: `cfg` IS
@@ -2159,7 +2689,7 @@ int main(int argc, char** argv)
     // same fact this expression already reads, one column and one bool later.
     SecretSubjectFiles<NodeConfig> const secretFiles =
         [configFile = lookup.path, argvNamedSecret = !cliOnly.requirePass.empty()](NodeConfig const& live) {
-            return NodeSecretFiles(live, configFile, argvNamedSecret);
+            return NodeSecretFileSubjects(live, configFile, argvNamedSecret);
         };
     SecretExposureReport report = [&logger](std::string_view warning) {
         logger.Logf(LogLevel::Warn, "{}", warning);
@@ -2174,17 +2704,28 @@ int main(int argc, char** argv)
     else
         ReportSecretExposure<NodeConfig>(cfg, secretFiles, report);
 
+    // The host's events: power through the SCM, network changes through the watcher. The hub is
+    // declared with the start host above, and the watcher below the hub it delivers into, because
+    // both outlive the body the host runs. Started BEFORE a POSIX host forks, which is harmless only
+    // because no POSIX watcher exists: one that did would have to start inside the body, since a
+    // thread does not survive the fork. A watcher the OS refused is reported and not fatal, because
+    // no consumer may depend on a host event arriving (`HostEvent` says why).
+    core::platform::SteadyClock networkClock;
+    auto const networkWatcher = StartNetworkChangeWatcher(hostEvents, networkClock, NetworkDebounce {});
+    if (!networkWatcher.has_value())
+        logger.Logf(LogLevel::Warn, "network changes will not be reported: {}", networkWatcher.error());
+
     // The host is chosen last, so everything that can be reported to a terminal
     // already has been. `--daemon` is what a SUPERVISOR THAT WANTS BACKGROUNDING
     // passes: the Windows SCM needs it, and systemd and launchd must not pass it,
     // because they supervise the process they started and reap a job that forks
     // as "exited".
-    std::unique_ptr<IDaemonHost> host;
+    //
+    // Windows' host was chosen above, before the refusals it reports, and is the one taken here.
+    std::unique_ptr<IDaemonHost> host = std::move(serviceHost);
+#if !defined(_WIN32)
     if (cfg.daemon)
     {
-#if defined(_WIN32)
-        host = MakeWindowsServiceHost(cfg.serviceName);
-#else
         // **A worker states its own working directory, and it is not `/`** (#784).
         //
         // Daemonizing has to leave the invocation directory, and `/` was what this
@@ -2220,12 +2761,32 @@ int main(int argc, char** argv)
                         scratchBaseError.message());
         auto const daemonWorkingDirectory = scratchBaseError ? std::filesystem::path { "/" } : daemonDirectory;
         host = MakePosixDaemonHost(cfg.pidfile, daemonWorkingDirectory.string());
-#endif
     }
+#endif
     if (!host)
         host = std::make_unique<ForegroundHost>();
 
     auto* const reloaderPtr = reloader.has_value() ? &*reloader : nullptr;
-    return host->Run(
-        [&cfg, &identityKey, &logger, reloaderPtr] { return WorkerBody(cfg, *identityKey, logger, reloaderPtr); });
+
+    // What every body's formation acts through, built once here -- the one place production seams are
+    // constructed -- and handed to each body's runtime (`Node::FormationRuntimeParts`).
+    SystemStopAwareWait const formationWait;
+    Node::BlockingEndpointDialer formationDialer { Node::FormationRuntime::IoTimeout };
+    auto const formationSrv = MakeSystemSrvResolver();
+    auto const parts = ServingParts { .store = *formationStore,
+                                      .endpoints = *endpointsFile,
+                                      .archiver = archiver,
+                                      .reform = reform,
+                                      .runtime =
+                                          Node::FormationRuntimeParts {
+                                              .wall = core::platform::defaultSystemWallClock(),
+                                              .random = identityRandom,
+                                              .dialer = formationDialer,
+                                              .srv = *formationSrv,
+                                              .wait = formationWait,
+                                          },
+                                      .leaseCheck = leaseCheck };
+    return host->Run([&cfg, &identityKey, &logger, reloaderPtr, &hostEvents, &adopted, &parts] {
+        return ServeNodeBodies(cfg, *identityKey, logger, reloaderPtr, hostEvents, *adopted, parts);
+    });
 }

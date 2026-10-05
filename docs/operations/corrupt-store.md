@@ -37,24 +37,21 @@ Opening a store is not a scan. It reads the two meta slots, walks the free list,
 and looks up two reserved keys — the in-flight-conversion marker and the format
 marker. Nothing enumerates the records.
 
-**The free-list walk finds nothing, on every store this project writes.** It is
-reserved for a future format, and saying so here is the point: the walk can refuse
-with `Corrupt`, so left unqualified it reads as a failure you might one day meet,
-and you would go looking for a cause that cannot exist. `CommitTxn` pins the
-free-list head to `None` on every commit — the free list is in-memory only — so the
-chain the walk follows is empty by construction and its two refusals are
-unreachable. Everything below about `Corrupt` is therefore about the **meta slots
-and the two reserved keys**, which is where damage in `Open`'s reach can actually
-be.
+**The free-list walk is real.** The store writes its list of free pages at every
+group commit, and `Open` follows that chain: a link in it that points past the end of
+the file, or loops, refuses the store with `Corrupt`. Everything below about `Corrupt`
+is therefore about the **meta slots, the free-list chain and the two reserved keys**.
+A free-list *entry* past the end of the file is not damage: the store cuts free pages
+off the end of its file after a durable commit, and the last list written may still
+name them.
 
-That has one consequence worth knowing before you reach for the file size, because
-it is not damage and looks like it: since the walk never runs, `Open` leaves every
-data page marked live and no page a previous run freed is ever recycled. A store
-that has been restarted therefore holds pages nothing will reuse, and the file can
-sit well above the configured limit while the daemon's own gauge reads at or under
-it. That is [#990](https://github.com/LASTRADA-Software/fastcached/issues/990), a
-known defect and not corruption — the store is intact and serving. Do not treat a
-file larger than `--cache-disk` as evidence of damage on its own.
+**A file larger than `--cache-disk` is not evidence of damage on its own.** The limit
+counts the pages the store has in use; the file also holds free pages awaiting reuse —
+up to a group commit's worth of copy-on-write pages at steady state — and a store
+written by a build before the file-growth fix can hold far more free pages than live
+ones. Such a store is intact and serving; a fixed build shrinks it as the cache turns
+over, with no action from you. `fastcached_tier_file_bytes` beside
+`fastcached_tier_bytes_used` shows the gap.
 
 **Damage in what `Open` touches: the process refuses to start.** This is an
 outage, not a degradation. Both binaries treat a store that will not open as

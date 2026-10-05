@@ -75,6 +75,15 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
         // that is no longer there.
         existing->second.info.toolchainLabel = std::string { registration.toolchainLabel };
         existing->second.info.displayName = std::string { registration.displayName };
+        // Refreshed whole for `version`'s reason, and because a re-registration is a
+        // statement of where the worker is NOW: a VPN reconnect is one way to get here.
+        existing->second.info.observedHost = std::string { registration.observedHost };
+        existing->second.info.interfaceAddresses.assign(registration.interfaceAddresses.begin(),
+                                                        registration.interfaceAddresses.end());
+        // Refreshed for `observedHost`'s reason: the key the connection proves NOW is the one a
+        // grant must name, or a worker whose key was replaced signs replies nobody accepts.
+        existing->second.info.identityKey.assign(reinterpret_cast<char const*>(registration.identityKey.data()),
+                                                 registration.identityKey.size());
         // Reset rather than kept, both of them, and for one reason: a re-registering
         // worker has restarted, so whatever it was running is gone and whatever its
         // machine was doing is a reading from before that. Carrying either forward
@@ -116,17 +125,23 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
     auto id = std::format("w{}", _nextId++);
     _workers.emplace(
         id,
-        Entry { .info = WorkerInfo { .id = id,
-                                     .fingerprint = std::string { registration.fingerprint },
-                                     .endpoint = std::string { registration.endpoint },
-                                     .version = std::string { registration.version },
-                                     .toolchainLabel = std::string { registration.toolchainLabel },
-                                     .displayName = std::string { registration.displayName },
-                                     .slots = OfferableSlots(registration.capacity, RequestedSlots(registration)),
-                                     .inFlight = 0,
-                                     .capacity = registration.capacity,
-                                     .load = {},
-                                     .codecs = registration.codecs },
+        Entry { .info =
+                    WorkerInfo { .id = id,
+                                 .fingerprint = std::string { registration.fingerprint },
+                                 .endpoint = std::string { registration.endpoint },
+                                 .version = std::string { registration.version },
+                                 .toolchainLabel = std::string { registration.toolchainLabel },
+                                 .displayName = std::string { registration.displayName },
+                                 .slots = OfferableSlots(registration.capacity, RequestedSlots(registration)),
+                                 .inFlight = 0,
+                                 .capacity = registration.capacity,
+                                 .load = {},
+                                 .codecs = registration.codecs,
+                                 .observedHost = std::string { registration.observedHost },
+                                 .interfaceAddresses = { registration.interfaceAddresses.begin(),
+                                                         registration.interfaceAddresses.end() },
+                                 .identityKey = std::string { reinterpret_cast<char const*>(registration.identityKey.data()),
+                                                              registration.identityKey.size() } },
                 .lastSeen = now,
                 .registeredAt = now,
                 // Disengaged, not `now`: nothing has been sent here yet,
@@ -136,7 +151,9 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
     return id;
 }
 
-std::optional<std::string> WorkerRegistry::Heartbeat(std::string_view workerId, NodeLoad const& load)
+std::optional<std::string> WorkerRegistry::Heartbeat(std::string_view workerId,
+                                                     NodeLoad const& load,
+                                                     WorkerAddresses const& addresses)
 {
     std::scoped_lock const guard { _mutex };
     auto const it = _workers.find(std::string { workerId });
@@ -149,6 +166,12 @@ std::optional<std::string> WorkerRegistry::Heartbeat(std::string_view workerId, 
     it->second.info.inFlight = load.inFlight;
     it->second.info.load = load;
     it->second.lastSeen = _clock.now();
+    // Replaced whole on every beat, an empty list included: a VPN address that moved is
+    // what this exists to follow, and keeping an earlier list beside a fresh observed host
+    // would pair two exchanges' facts in one dial-hint decision. Copied, never kept as a
+    // view -- `addresses` borrows from a request that is gone when this returns.
+    it->second.info.observedHost = std::string { addresses.observedHost };
+    it->second.info.interfaceAddresses.assign(addresses.interfaceAddresses.begin(), addresses.interfaceAddresses.end());
     return it->second.info.endpoint;
 }
 
@@ -212,7 +235,8 @@ namespace
     }
 } // namespace
 
-std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view fingerprint)
+std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view fingerprint,
+                                                          std::span<std::string_view const> excluded)
 {
     std::scoped_lock const guard { _mutex };
     auto const now = _clock.now();
@@ -223,6 +247,7 @@ std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view finge
     Entry* best = nullptr;
     bool sawMatch = false;
     bool sawWithdrawn = false;
+    bool sawExcluded = false;
     for (auto& [id, entry]: _workers)
     {
         // Byte-identical, never "compatible". See the header: an over-strict match
@@ -230,6 +255,15 @@ std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view finge
         // then cached for everybody.
         if (entry.info.fingerprint != fingerprint || !IsLive(entry, now))
             continue;
+        // Asked before capacity, and not counted as a match: a worker this client
+        // cannot reach is neither free nor full from where it stands, and letting it
+        // fall through to the capacity count would report a network problem as a
+        // fleet that is merely busy or merely small.
+        if (std::ranges::contains(excluded, std::string_view { entry.info.endpoint }))
+        {
+            sawExcluded = true;
+            continue;
+        }
         sawMatch = true;
         // Asked through `FreeSlots` rather than against `slots` directly, so a
         // worker whose scratch disk has filled or whose owner is using it is skipped
@@ -258,18 +292,22 @@ std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view finge
         best->lastPickedAt = now;
         return best->info;
     }
-    // Three refusals rather than one "no", because they are three different
-    // operator problems: a fingerprint nobody serves, a fleet too small, and a
-    // fleet whose machines are busy elsewhere. All three end the same way at the
-    // client -- compile locally -- so the distinction exists entirely for whoever
-    // has to fix it.
+    // Four refusals rather than one "no", because they are four different operator
+    // problems: a fingerprint nobody serves, a fleet too small, a fleet whose
+    // machines are busy elsewhere, and a fleet the client itself could not reach.
+    // All four end the same way at the client -- compile locally -- so the
+    // distinction exists entirely for whoever has to fix it.
     //
     // `Withdrawn` wins over `NoCapacity` when both are true, and that is the useful
     // way round: "some of your machines are unavailable" is actionable today, while
     // "the fleet is small" is a purchase, and reporting the purchase would hide a
     // fleet-wide full disk behind a number that looks like growth.
+    //
+    // `Excluded` is asked only once nothing MATCHING was left after exclusion: a
+    // toolchain nobody serves is still `NoWorker`, whatever the client listed --
+    // the misconfiguration must not hide behind an exclusion that never applied.
     if (!sawMatch)
-        return std::unexpected(PickError::NoWorker);
+        return std::unexpected(sawExcluded ? PickError::Excluded : PickError::NoWorker);
     return std::unexpected(sawWithdrawn ? PickError::Withdrawn : PickError::NoCapacity);
 }
 

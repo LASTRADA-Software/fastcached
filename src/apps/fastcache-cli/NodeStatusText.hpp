@@ -35,6 +35,16 @@ namespace FastCache::Cli
 /// @return A stable lower-case name.
 [[nodiscard]] std::string_view NameOfSchedulerRole(CompileCacheWire::WireSchedulerRole role) noexcept;
 
+/// What to call where a node's idea of the fleet's shared cache comes from.
+/// @param source The wire tag.
+/// @return A stable lower-case name, one token in every format.
+[[nodiscard]] std::string_view NameOfSharedCacheSource(CompileCacheWire::WireSharedCacheSource source) noexcept;
+
+/// What to call how a node's last dealing with the fleet's shared cache went.
+/// @param state The wire tag.
+/// @return A stable lower-case name, one token in every format.
+[[nodiscard]] std::string_view NameOfSharedCacheState(CompileCacheWire::WireSharedCacheState state) noexcept;
+
 /// What a person is told when a node's conditions ask for nothing: the words `node` prints and the
 /// `node` panel draws, one spelling so neither can say it differently.
 inline constexpr std::string_view NoConditionsRaised = "none raised";

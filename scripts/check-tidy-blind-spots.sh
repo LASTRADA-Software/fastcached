@@ -137,6 +137,9 @@ fi
 # on purpose: a sibling ships with this file and is found by `BASH_SOURCE`, while the
 # tree under test must never be.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# `pipe_pair_into`, which feeds `comm` below (#1630). A sibling, found the same way.
+# shellcheck source=lib/third-party-roots.sh
+. "$here/lib/third-party-roots.sh" || refuse "cannot read $here/lib/third-party-roots.sh"
 
 repo="${FASTCACHED_SOURCE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 table="$repo/scripts/tidy-blind-spots.txt"
@@ -163,6 +166,16 @@ rc=0
 # `--table-only`. Skipped explicitly rather than by accident: a mode that names its
 # set may not report clean over a member it could not cover, and the verdict below
 # says which half ran.
+#
+# Each `comm` through `pipe_pair_into`, never `comm <(...) <(...)` inside the loop's own
+# process substitution, which makes comm the PARENT of both writers -- the shape a Windows
+# runner killed a grep in (#1630) -- and each status CHECKED: a comm that failed printed
+# nothing, and "nothing unanalysed, no stale row" is exactly the verdict that then passes.
+comm_status=0
+unanalysed="$(pipe_pair_into "$expected"$'\n' "$actual"$'\n' comm -13 /dev/fd/3 -)" || comm_status=$?
+[[ $comm_status -eq 0 ]] || refuse "comm exited $comm_status listing the measured units the table does not name, so which are analysed by nothing is not known -- the CHECK failing, not a verdict about the tree"
+stale="$(pipe_pair_into "$expected"$'\n' "$actual"$'\n' comm -23 /dev/fd/3 -)" || comm_status=$?
+[[ $comm_status -eq 0 ]] || refuse "comm exited $comm_status listing the table rows the measurement does not name, so which rows are stale is not known -- the CHECK failing, not a verdict about the tree"
 while IFS= read -r f; do
     [[ $tableOnly -eq 1 ]] && break
     [[ -z $f ]] && continue
@@ -171,7 +184,7 @@ while IFS= read -r f; do
     echo "  runs reads a line of it. The sweep counts it; nothing enforces it. Add a row with a reason," >&2
     echo "  or give it an analyser." >&2
     rc=1
-done < <(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
+done < <(printf '%s\n' "$unanalysed")
 
 while IFS= read -r f; do
     [[ $tableOnly -eq 1 ]] && break
@@ -183,7 +196,7 @@ while IFS= read -r f; do
         echo "  Delete its row: a stale exemption hides the next real one." >&2
     fi
     rc=1
-done < <(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
+done < <(printf '%s\n' "$stale")
 
 # Every row's reached-by column must name legs that EXIST, or `none`. A row naming a
 # leg that was renamed or deleted is a claim of coverage nothing provides, and it is

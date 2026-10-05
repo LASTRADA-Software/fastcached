@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 namespace FastCache
@@ -116,7 +120,7 @@ namespace FastCache
 ///
 /// The other half of comparing an advertised endpoint against a peer, and the same
 /// argument puts it here: this rule already had three authors before it was named
-/// -- `ClusterMembership::Publish`, `AdvertisesWildcard`, and the scheduler's
+/// -- a host-list admission oracle since retired, `AdvertisesWildcard`, and the scheduler's
 /// endpoint check (#242) -- each re-deriving that an endpoint which will not split
 /// is a legitimate bare host rather than a parse failure. Dropping such a host
 /// instead is how a member the set cannot represent silently stops being one.
@@ -172,6 +176,44 @@ namespace FastCache
     return !bare.empty() && bare == UnmappedHost(right);
 }
 
+namespace Detail
+{
+    /// @param text One dotted-quad octet.
+    /// @return Its value, or nullopt when it is not one to three decimal digits naming 0..255.
+    [[nodiscard]] inline std::optional<unsigned> ParseOctet(std::string_view text) noexcept
+    {
+        constexpr std::size_t MaxDigits = 3;
+        constexpr unsigned MaxOctet = 255;
+        if (text.empty() || text.size() > MaxDigits)
+            return std::nullopt;
+        auto value = 0U;
+        for (auto const c: text)
+        {
+            if (c < '0' || c > '9')
+                return std::nullopt;
+            value = (value * 10U) + static_cast<unsigned>(c - '0');
+        }
+        return value <= MaxOctet ? std::optional { value } : std::nullopt;
+    }
+
+    /// @param text A host.
+    /// @return Whether it is an IPv4 LITERAL -- exactly four decimal octets -- inside 127.0.0.0/8.
+    [[nodiscard]] inline bool IsIpv4LoopbackLiteral(std::string_view text) noexcept
+    {
+        constexpr std::size_t Octets = 4;
+        constexpr unsigned LoopbackNet = 127;
+        auto seen = std::size_t { 0 };
+        for (auto const part: std::views::split(text, '.'))
+        {
+            auto const octet = ParseOctet(std::string_view { part.begin(), part.end() });
+            if (!octet.has_value() || (seen == 0 && *octet != LoopbackNet))
+                return false;
+            ++seen;
+        }
+        return seen == Octets;
+    }
+} // namespace Detail
+
 /// Whether a host names this machine over the loopback interface.
 ///
 /// The one test for "is this caller on the same machine as me", spelled once
@@ -187,6 +229,14 @@ namespace FastCache
 /// The literal name `localhost` is **not** among them: it is whatever a resolver
 /// says it is, and a resolver is not something a security decision may depend on.
 ///
+/// **An IP LITERAL, parsed, and never a NAME.** This matched `127.` as a PREFIX, which a
+/// name satisfies too: `127.cache.example.com` read as loopback, so a bind spelled that
+/// way was judged unreachable from the network whatever it resolved to -- the fail-OPEN
+/// direction for every rule asking whether a port faces other machines. Now the host
+/// is four decimal octets inside `127.0.0.0/8`, or `::1`, or the mapped form of the
+/// first; anything else, every name included, is not loopback, so every decision this
+/// answers fails CLOSED.
+///
 /// An **empty** host is not local either, and that direction is deliberate. It is
 /// what `core::net::formatPeerAddress` answers for a peer it could not identify — a family it
 /// does not know, or a `getpeername` that failed — and a caller this machine cannot
@@ -198,15 +248,138 @@ namespace FastCache
 /// @return True when the peer is on this machine.
 [[nodiscard]] inline bool IsLoopbackHost(std::string_view host) noexcept
 {
-    // Any 127.x.x.x, not 127.0.0.1 alone: the whole /8 is loopback, and a client
-    // bound to 127.0.0.2 is no less local for it.
-    constexpr std::string_view V4Prefix = "127.";
-
     // Unmapped first, so `::ffff:127.0.0.1` and `127.0.0.1` take the same branch
     // rather than each needing one. `::1` is not a mapped form and survives it
-    // unchanged, which is why the equality still holds.
+    // unchanged, which is why the equality still holds. Any address in 127.0.0.0/8,
+    // not 127.0.0.1 alone: the whole /8 is loopback, and a client bound to 127.0.0.2
+    // is no less local for it.
     auto const bare = UnmappedHost(host);
-    return bare == "::1" || bare.starts_with(V4Prefix);
+    return bare == "::1" || Detail::IsIpv4LoopbackLiteral(bare);
+}
+
+/// @param left One name.
+/// @param right The other.
+/// @return True when they differ in ASCII case at most, which is how DNS compares names.
+///         Locale-free on purpose.
+[[nodiscard]] constexpr bool EqualsIgnoringAsciiCase(std::string_view left, std::string_view right) noexcept
+{
+    constexpr auto lower = [](char c) {
+        return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    return std::ranges::equal(left, right, [lower](char a, char b) { return lower(a) == lower(b); });
+}
+
+/// Whether a host NAME reaches this machine and no other, wherever it is resolved.
+///
+/// **A different question from `IsLoopbackHost`, and deliberately a second predicate rather than
+/// a wider first one.** That one decides who is ADMITTED, from what a kernel reports, and must not
+/// take a name a resolver answers. This one decides what this node may TELL A PEER to dial, and
+/// there a name matters precisely because the peer resolves it: `localhost` and every name under
+/// `.localhost` resolve to the loopback address on every machine (RFC 6761, section 6.3), so a
+/// peer told to dial one reaches ITSELF -- confidently, with no error at either end. The loopback
+/// literals `IsLoopbackHost` knows are included.
+///
+/// Compared without regard to ASCII case, and a single trailing root dot is ignored.
+/// @param host A host, without a port or brackets.
+/// @return True when every machine resolving @p host reaches itself.
+[[nodiscard]] inline bool NamesOnlyThisMachine(std::string_view host) noexcept
+{
+    if (IsLoopbackHost(host))
+        return true;
+    if (host.ends_with('.'))
+        host.remove_suffix(1);
+
+    constexpr std::string_view Localhost = "localhost";
+    if (EqualsIgnoringAsciiCase(host, Localhost))
+        return true;
+    return host.size() > Localhost.size() + 1 && host[host.size() - Localhost.size() - 1] == '.'
+           && EqualsIgnoringAsciiCase(host.substr(host.size() - Localhost.size()), Localhost);
+}
+
+/// Whether @p host names NO ONE machine, because every machine answers to it: a host
+/// `NamesOnlyThisMachine` answers for, or a wildcard.
+///
+/// **The one rule for "an audience a ticket may name"**, asked by the node that mints a ticket, the
+/// node that spends one (`Distributed::AudienceNamesOneMachine`) and the launcher deciding whether
+/// to ask for one at all (`Cc::ChooseCredential`). Every node is its own loopback and no node is the
+/// wildcard, so a ticket naming one would be spendable at any node that heard it presented -- the
+/// minter refuses it, and a launcher that asked anyway would move the minter's refusal counter for
+/// every exchange. Here, header-only, because the launcher does not link the library.
+///
+/// The loopback NAMES count though `IsLoopbackHost` does not: this is not a question about where a
+/// caller IS, which a name must never answer, but about whether a name could single out one machine,
+/// and RFC 6761 reserves `localhost` and every name under `.localhost` to resolve to loopback
+/// everywhere -- the same reading `NamesOnlyThisMachine` gives an advertised endpoint, so the two
+/// questions cannot disagree about a name.
+/// @param host A host, without a port or brackets.
+/// @return True when every machine would answer to it.
+[[nodiscard]] inline bool NamesNoOneMachine(std::string_view host) noexcept
+{
+    auto const unmapped = UnmappedHost(host);
+    return NamesOnlyThisMachine(unmapped) || unmapped == "0.0.0.0" || unmapped == "::";
+}
+
+/// Whether a host is link-local: scoped to the interface it was observed on, not to any
+/// particular machine.
+///
+/// A link-local address is zone-less text once it leaves the socket it came from -- `fe80::1`
+/// names a different machine on every link -- so it is scoped to the SCHEDULER's own link, never
+/// to the client dialling the hint. Handing it out anyway would spend a lease's dial-hint budget
+/// on an address the client cannot reach, which is exactly the failure mode a stale DNS record
+/// was supposed to avoid. It shows up more than the range alone would suggest: mDNS `.local`
+/// names commonly resolve to one, and a NAT'd or bridged host often has no other address on the
+/// interface the scheduler heard it from.
+///
+/// IPv4's link-local range is `169.254.0.0/16`, unmapped first as `IsLoopbackHost` does. IPv6's
+/// is `fe80::/10` -- the ten most significant bits fixed -- which is not a textual prefix a
+/// `starts_with` can spell: the range covers every address whose first 16-bit group, read as a
+/// number, falls in `[0xfe80, 0xfebf]`, so that group is parsed and compared numerically rather
+/// than pattern-matched. A zone id (`fe80::1%eth0`) sits after the address and never inside its
+/// first group, so it does not need stripping first.
+/// @param host A host, without a port or brackets; a zone id, if any, is ignored.
+/// @return True for an IPv4 or IPv6 link-local address.
+[[nodiscard]] inline bool IsLinkLocalHost(std::string_view host) noexcept
+{
+    constexpr std::string_view V4Prefix = "169.254.";
+    auto const bare = UnmappedHost(host);
+    if (bare.starts_with(V4Prefix))
+        return true;
+
+    auto const colon = bare.find(':');
+    if (colon == std::string_view::npos || colon == 0 || colon > 4)
+        return false;
+    auto const firstGroup = bare.substr(0, colon);
+    unsigned value = 0;
+    auto const [end, error] = std::from_chars(firstGroup.data(), firstGroup.data() + firstGroup.size(), value, 16);
+    if (error != std::errc {} || end != firstGroup.data() + firstGroup.size())
+        return false;
+    return value >= 0xfe80 && value <= 0xfebf;
+}
+
+/// Whether a host is an IP address written out rather than a name to resolve.
+///
+/// TEXTUAL and pure, deliberately not `inet_pton`: it decides whether a DNS record could
+/// be stale, which is a question about the SPELLING. A colon means an IPv6 literal -- a
+/// DNS name never carries one -- and otherwise four dot-separated decimal octets, each
+/// 0-255 in at most three digits. The IPv4-mapped form is unmapped first.
+/// @param host A host, without a port or brackets.
+/// @return True for an IPv4 or IPv6 literal.
+[[nodiscard]] inline bool IsIpLiteralHost(std::string_view host) noexcept
+{
+    auto const bare = UnmappedHost(host);
+    if (bare.contains(':'))
+        return true;
+    std::size_t octets = 0;
+    for (auto const part: std::views::split(bare, '.'))
+    {
+        auto const text = std::string_view { part.begin(), part.end() };
+        unsigned value = 0;
+        auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (text.empty() || text.size() > 3 || error != std::errc {} || end != text.data() + text.size() || value > 255)
+            return false;
+        ++octets;
+    }
+    return octets == 4;
 }
 
 /// Split an endpoint that may name only a port.
@@ -267,6 +440,49 @@ namespace FastCache
     if (!port.has_value())
         return std::nullopt;
     return std::pair { split->first, *port };
+}
+
+/// Whether @p host names every interface rather than a machine.
+///
+/// The two spellings of "every interface", plus the empty host -- which reaches `getaddrinfo`
+/// as nullptr under AI_PASSIVE and is therefore the wildcard as well, the case
+/// `--listen-node=:6674` is refused for. Brackets are the caller's to strip (`HostOfEndpoint`
+/// does), so `[::]` arrives here as `::`.
+/// @param host A host, unbracketed.
+/// @return True for a wildcard.
+[[nodiscard]] constexpr bool IsWildcardHost(std::string_view host) noexcept
+{
+    return host.empty() || host == "0.0.0.0" || host == "::";
+}
+
+/// Whether @p endpoint is one ANOTHER machine may be told to dial to reach this one: an endpoint
+/// `ParseDialEndpoint` accepts, whose host singles out one machine -- neither a name that reaches
+/// only the dialler's own machine nor a wildcard, which is `NamesNoOneMachine`'s question, asked
+/// rather than restated so a ticket's audience and a member's record cannot disagree about a host.
+///
+/// **The one rule for an endpoint that is RECORDED or STATED for peers**, asked wherever one is
+/// produced -- what a joiner states in `Enroll`, what a member announces, what a leader records for
+/// itself -- and again where the record is decided (`Cluster::Validate`), so no route into a member
+/// record accepts what another refuses. A peer told to dial `127.0.0.1:6674`, `localhost:6674` or
+/// `0.0.0.0:6674` reaches ITSELF, confidently and with no error at either end, which is worse than
+/// being told nothing.
+/// @param endpoint `host:port`, or `[v6]:port`.
+/// @return True when a peer dialling it could reach this machine.
+[[nodiscard]] inline bool IsPeerDialableEndpoint(std::string_view endpoint)
+{
+    auto const dial = ParseDialEndpoint(endpoint);
+    return dial.has_value() && !NamesNoOneMachine(dial->first);
+}
+
+/// @p endpoint when another machine may be told to dial it (`IsPeerDialableEndpoint`), else empty.
+///
+/// Empty rather than the spelling, because a record's empty endpoint is the stated "has none" and
+/// every reader treats it so, while a loopback or wildcard one is dialled.
+/// @param endpoint What this node would state.
+/// @return The endpoint to state or record, or empty.
+[[nodiscard]] inline std::string PeerDialableOrNone(std::string_view endpoint)
+{
+    return IsPeerDialableEndpoint(endpoint) ? std::string { endpoint } : std::string {};
 }
 
 /// Join a host and a port into text `SplitHostPort` reads back.

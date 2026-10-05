@@ -3,9 +3,11 @@
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -48,7 +50,7 @@ TEST_CASE("CliParser: --max-memory rejects unknown suffix", "[config][cli]")
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-    REQUIRE(result.error().field == "max-memory");
+    REQUIRE(result.error().field == "--max-memory");
 }
 
 TEST_CASE("CliParser: --log-timestamps sets the value and the explicit-override flag", "[config][cli]")
@@ -325,7 +327,7 @@ TEST_CASE("CliParser: --storage-max-value rejects nonsense", "[config][cli][stor
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-    REQUIRE(result.error().field == "storage-max-value");
+    REQUIRE(result.error().field == "--storage-max-value");
 }
 
 TEST_CASE("CliParser: --execution-model is no longer a recognised flag", "[config][cli]")
@@ -493,6 +495,38 @@ TEST_CASE("CliParser: --bind accepts IPv6 literals and hostnames verbatim (resol
     }
 }
 
+TEST_CASE("CliParser: a refusal names the row it was typed on, never a parser's guess", "[config][cli]")
+{
+    // The parsers these reach used to name a field by hand: `bind` for a bad host inside
+    // `--listen`, which the operator never typed, and dashless spellings no row carries. Each row
+    // here reaches a parser shared with another row, or one that wrote its own name.
+    struct Row
+    {
+        char const* argument; ///< A literal, so what argv holds is NUL-terminated.
+        std::string_view field;
+    };
+    auto const rows = std::array {
+        Row { .argument = "--listen=host with spaces:11211", .field = "--listen" },
+        Row { .argument = "--listen-tls=host:notaport", .field = "--listen-tls" },
+        Row { .argument = "--port=http", .field = "--port" },
+        Row { .argument = "--threads=many", .field = "--threads" },
+        Row { .argument = "--expiry-scan=0", .field = "--expiry-scan" },
+        Row { .argument = "--storage-durability=sometimes", .field = "--storage-durability" },
+        Row { .argument = "--log-level=loud", .field = "--log-level" },
+        Row { .argument = "--service-scope=nope", .field = "--service-scope" },
+        Row { .argument = "--service-start=boot", .field = "--service-start" },
+        Row { .argument = "--max-memory=5x", .field = "--max-memory" },
+    };
+    for (auto const& row: rows)
+    {
+        INFO(row.argument);
+        auto const args = std::array<char const*, 1> { row.argument };
+        auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().field == row.field);
+    }
+}
+
 TEST_CASE("CliParser: --bind rejects syntactically invalid addresses", "[config][cli][bind]")
 {
     SECTION("empty value")
@@ -501,7 +535,7 @@ TEST_CASE("CliParser: --bind rejects syntactically invalid addresses", "[config]
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-        REQUIRE(result.error().field == "bind");
+        REQUIRE(result.error().field == "--bind");
     }
     SECTION("embedded whitespace")
     {
@@ -509,7 +543,7 @@ TEST_CASE("CliParser: --bind rejects syntactically invalid addresses", "[config]
         auto const result = FastCache::ParseCli(std::span<char const* const> { args });
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().code == FastCache::ConfigErrorCode::TypeMismatch);
-        REQUIRE(result.error().field == "bind");
+        REQUIRE(result.error().field == "--bind");
     }
 }
 
@@ -839,4 +873,126 @@ TEST_CASE("CliParser: legacy --bind/--port keeps cfg.binds empty (main collapses
     REQUIRE(result->config.binds.empty());
     REQUIRE(result->config.bindAddress == "0.0.0.0");
     REQUIRE(result->config.port == 6379U);
+}
+
+TEST_CASE("Each outcome says whether the serving rules judge it and whether it is a one-shot command",
+          "[config][cli][startup][exit]")
+{
+    // `main` asks `JudgedByServingRules` before the bind-shape, keyspace and
+    // `DaemonStartupRejection` checks. An uninstall refused over the typo it was reached to
+    // recover from, or a `--healthcheck` refused because this build has no TLS, would be the
+    // refusal working against the operator -- while an install that skipped them would register
+    // a line every start then refuses. Driven through the parser, so each verdict is the one the
+    // flag an operator types actually reaches.
+    struct Line
+    {
+        std::vector<char const*> argv; ///< The command line, program name removed.
+        FastCache::CliOutcome outcome; ///< What it parses to.
+        bool judged;                   ///< Whether the serving rules refuse it.
+        FastCache::ExitReader reader;  ///< Who reads what it exits with.
+    };
+    // `reader`: a START is read by a supervisor (1 or 78); a one-shot command by an operator, so a
+    // refusal before it runs declines (2); a `--healthcheck` by a container runtime, which knows 0
+    // and 1 only -- Docker reserves 2 -- so every refusal of it is 1.
+    std::vector<Line> const lines {
+        { .argv = {}, .outcome = FastCache::CliOutcome::Run, .judged = true, .reader = FastCache::ExitReader::Supervisor },
+        { .argv = { "--help" },
+          .outcome = FastCache::CliOutcome::ShowHelp,
+          .judged = false,
+          .reader = FastCache::ExitReader::Operator },
+        { .argv = { "--version" },
+          .outcome = FastCache::CliOutcome::ShowVersion,
+          .judged = false,
+          .reader = FastCache::ExitReader::Operator },
+        { .argv = { "--install-service" },
+          .outcome = FastCache::CliOutcome::InstallService,
+          .judged = true,
+          .reader = FastCache::ExitReader::Operator },
+        { .argv = { "--uninstall-service" },
+          .outcome = FastCache::CliOutcome::UninstallService,
+          .judged = false,
+          .reader = FastCache::ExitReader::Operator },
+        { .argv = { "--healthcheck" },
+          .outcome = FastCache::CliOutcome::HealthCheck,
+          .judged = false,
+          .reader = FastCache::ExitReader::Prober },
+        { .argv = { "--seed-config=/tmp/fastcached.yaml.default" },
+          .outcome = FastCache::CliOutcome::SeedConfig,
+          .judged = false,
+          .reader = FastCache::ExitReader::Operator },
+        { .argv = { "--migrate-storage" },
+          .outcome = FastCache::CliOutcome::MigrateStorage,
+          .judged = false,
+          .reader = FastCache::ExitReader::Operator },
+    };
+
+    // Every outcome has a line, so one added without a verdict here is a failure, not a gap.
+    for (auto const outcome: FastCache::Enumerators<FastCache::CliOutcome>())
+        CHECK(std::ranges::any_of(lines, [outcome](Line const& line) { return line.outcome == outcome; }));
+
+    for (auto const& line: lines)
+    {
+        auto const parsed = FastCache::ParseCli(std::span<char const* const> { line.argv });
+        REQUIRE(parsed.has_value());
+        CHECK(parsed->outcome == line.outcome);
+        CHECK(FastCache::JudgedByServingRules(parsed->outcome) == line.judged);
+        CHECK(FastCache::ExitReaderOf(parsed->outcome) == line.reader);
+    }
+    // A command line that selected no outcome is refused as a start would be: it names no command.
+    CHECK(FastCache::ExitReaderOf(FastCache::CliOutcome::Last) == FastCache::ExitReader::Supervisor);
+}
+
+TEST_CASE("A command line that did not parse still names the verb typed anywhere in it", "[config][cli][exit]")
+{
+    // Which verb an operator typed decides what the refusal exits with, and the parse stops at the
+    // first bad token -- so a verb typed after one went unseen and the refusal answered a start's
+    // code. `RecognisedCli` reads the whole line through the option rows themselves. Both orders,
+    // and a line with no verb at all, which must stay a start's.
+    struct Line
+    {
+        std::vector<char const*> argv;
+        FastCache::CliOutcome outcome;
+    };
+    std::vector<Line> const lines {
+        { .argv = { "--no-such-flag", "--install-service" }, .outcome = FastCache::CliOutcome::InstallService },
+        { .argv = { "--install-service", "--no-such-flag" }, .outcome = FastCache::CliOutcome::InstallService },
+        { .argv = { "--port", "not-a-port", "--migrate-storage" }, .outcome = FastCache::CliOutcome::MigrateStorage },
+        { .argv = { "--no-such-flag", "--healthcheck" }, .outcome = FastCache::CliOutcome::HealthCheck },
+        { .argv = { "--no-such-flag", "--port=6379" }, .outcome = FastCache::CliOutcome::Run },
+    };
+    for (auto const& line: lines)
+    {
+        auto const args = std::span<char const* const> { line.argv };
+        INFO(line.argv.front() << " " << line.argv.back());
+        REQUIRE_FALSE(FastCache::ParseCli(args).has_value());
+        CHECK(FastCache::RecognisedCli(args).outcome == line.outcome);
+    }
+
+    // And the service host is read the same way: `--daemon` typed after the bad token counts.
+    auto const late = std::to_array<char const*>({ "--no-such-flag", "--daemon", "--service-name=fcsvc" });
+    auto const named = FastCache::RecognisedCli(std::span<char const* const> { late });
+    CHECK(named.config.daemon);
+    CHECK(named.config.serviceName == "fcsvc");
+}
+
+TEST_CASE("A command line refused halfway keeps what it said before the refusal", "[config][cli][startup]")
+{
+    // `main` refuses a start under the service the command line names. A registration writes
+    // `--daemon` and `--service-name` FIRST (`BuildServiceArgv`), so they precede any token a later
+    // build stops accepting -- and a parse that dropped everything on the first bad token left
+    // `main` nothing to ask, so the refusal never reached the SCM: `sc start` said error 1053.
+    std::array<char const*, 3> const argv { "--daemon", "--service-name=FastCachedTest", "--no-such-flag" };
+    FastCache::CliResult cli;
+    auto const flow = FastCache::ParseCliInto(std::span<char const* const> { argv }, cli);
+    REQUIRE_FALSE(flow.has_value());
+    CHECK(cli.config.daemon);
+    CHECK(cli.config.serviceName == "FastCachedTest");
+
+    // And `ParseCli` is the same parse: it refuses the same line, and accepts the line without
+    // the bad token with the same two settings.
+    CHECK_FALSE(FastCache::ParseCli(std::span<char const* const> { argv }).has_value());
+    auto const accepted = FastCache::ParseCli(std::span<char const* const> { argv }.first(2));
+    REQUIRE(accepted.has_value());
+    CHECK(accepted->config.daemon);
+    CHECK(accepted->config.serviceName == "FastCachedTest");
 }

@@ -5,6 +5,7 @@
 #include "CodecEnvelope.hpp"
 #include "CompileJob.hpp"
 
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -20,6 +21,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/async/Task.hpp>
 #include <core/net/ISocket.hpp>
 #include <core/platform/Clock.hpp>
 
@@ -236,8 +238,12 @@ using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, 
 ///        that is not a refusal and would otherwise be visible only in a log.
 /// @param roster Who may sign a grant, and whether that may be trusted now (#178). Read per
 ///        request, borrowed, and must outlive the validator -- as @p advertisedEndpoint must.
+/// @param identityKey This worker's own identity public key, the one it proves itself with: a
+///        grant naming another machine's key is refused (W-4). Copied; empty for a worker that
+///        holds none, which judges a grant by its endpoint alone.
 [[nodiscard]] LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
                                                   IAdvertisedEndpointSource const& advertisedEndpoint,
+                                                  std::span<std::byte const> identityKey,
                                                   core::platform::WallClockRef clock,
                                                   Distributed::WorkerLeaseState& lease,
                                                   IMetricsSink& metrics,
@@ -277,6 +283,40 @@ using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, 
 /// is not a scheduler and not a cache. That refusal is a *reply*: a client that
 /// sent the wrong verb to the wrong port learns which, rather than seeing a dropped
 /// connection it cannot tell from a dead host.
+/// Told of every job this worker refused before a compiler ran, with what the refusal named.
+///
+/// The counter a refusal moves says HOW MANY; nothing said WHICH. A node that refused 372 jobs
+/// over one argument showed `fastcache_worker_jobs_refused_rejected_argument_total 372` and named
+/// the argument nowhere an operator could see -- not its log, not its conditions -- so the one
+/// fact the remedy needs took a reproduction to find. This is where the node learns it, at the
+/// same moment and from the same row as the counter.
+///
+/// An interface rather than a callback, and required rather than defaulted, for
+/// `SchedulerTermRegressionNotice`'s reason: a defaulted observer is how a diagnostic comes to be
+/// dropped at every call site that never thought about it. A caller with nowhere to report
+/// passes `IgnoreJobRefusals()` and says so.
+///
+/// Called on whichever thread ran the job, so an implementation is thread-safe.
+class IJobRefusalObserver
+{
+  public:
+    IJobRefusalObserver() = default;
+    IJobRefusalObserver(IJobRefusalObserver const&) = delete;
+    IJobRefusalObserver& operator=(IJobRefusalObserver const&) = delete;
+    IJobRefusalObserver(IJobRefusalObserver&&) = delete;
+    IJobRefusalObserver& operator=(IJobRefusalObserver&&) = delete;
+    virtual ~IJobRefusalObserver() = default;
+
+    /// One job was refused.
+    /// @param error Why, as the runner reported it -- the reason `RefusalTable` counted it
+    ///        under, and its detail and subject.
+    virtual void OnJobRefused(JobError const& error) = 0;
+};
+
+/// The observer for a caller that reports refusals nowhere but their counters.
+/// @return An observer that does nothing; static, so it outlives every protocol given it.
+[[nodiscard]] IJobRefusalObserver& IgnoreJobRefusals() noexcept;
+
 class WorkerProtocol
 {
   public:
@@ -296,6 +336,11 @@ class WorkerProtocol
     ///        speak simply answers in a weaker codec; one built with a *wider* list
     ///        falls back to `Identity` rather than answering in a codec it cannot
     ///        produce.
+    /// @param replyKey The identity key this worker proves itself with, which every COMPILE reply
+    ///        is signed under (`SealCompileReply`, W-4) so the launcher can tell this worker from
+    ///        whatever else answers at its address; must outlive this. **Required and
+    ///        undefaulted**: null is a worker that signs nothing, whose every reply a launcher
+    ///        refuses and compiles locally, and that is a fact the call site states.
     /// @param metrics Where job outcomes are counted; must outlive this.
     ///
     /// The metrics sink is injected like every other collaborator rather than
@@ -303,6 +348,8 @@ class WorkerProtocol
     /// interface is header-only and depends on nothing but the standard library,
     /// so including it costs `fastcache-cc` — which compiles this file in without
     /// linking `FastCache` — nothing at link time.
+    /// @param refusals Told of every job the runner refused, beside the counter; must outlive
+    ///        this. Required: see `IJobRefusalObserver`.
     /// @param maxDecompressedBytes Ceiling on what a request's codec envelope may
     ///        declare it expands to. **The surface's own request cap**, passed in
     ///        rather than assumed: this class never sees the listener that enforced
@@ -312,7 +359,9 @@ class WorkerProtocol
     WorkerProtocol(ICompileJobRunner& jobs,
                    LeaseValidator validator,
                    CompileCacheWire::CodecList acceptedCodecs,
+                   Ed25519KeyPair const* replyKey,
                    IMetricsSink& metrics,
+                   IJobRefusalObserver& refusals,
                    std::size_t maxDecompressedBytes = DefaultMaxDecompressedBytes);
 
     /// Answer one complete request frame.
@@ -329,7 +378,9 @@ class WorkerProtocol
     ICompileJobRunner& _jobs;
     LeaseValidator _validator;
     CompileCacheWire::CodecList _acceptedCodecs;
+    Ed25519KeyPair const* _replyKey; ///< What every reply is signed under; null signs nothing.
     IMetricsSink& _metrics;
+    IJobRefusalObserver& _refusals; ///< Told which refusal, beside `_metrics`' how many.
     /// What a request's envelope may declare it expands to; see the constructor.
     std::size_t _maxDecompressedBytes;
 };
@@ -366,6 +417,32 @@ class WorkerProtocol
 ///         is not a decodable COMPILE, which the protocol refuses on its own terms.
 [[nodiscard]] std::size_t DeclaredRequestFootprint(std::span<std::byte const> frame) noexcept;
 
+/// One exchange with a scheduler, presenting NO credential.
+///
+/// **A node's credential with a scheduler is its proof, never a password.** `--requirepass` is the
+/// secret of the cache behind `--upstream`. A scheduler checks no password -- it answers a password
+/// AUTH `Ok` and establishes nothing -- so a node presenting one anyway handed that secret, in the
+/// clear and pipelined ahead of any seal, to every scheduler it dialled and to every endpoint a
+/// `NotLeader` named. Every verb a node sends a scheduler therefore goes through here, and this
+/// takes no credential: presenting one again is a new parameter, never a forgotten argument.
+/// @param scheduler Connected transport; not owned.
+/// @param frame A complete framed request.
+/// @return The outcome.
+[[nodiscard]] CacheOutcome ExchangeWithScheduler(core::net::ISocket& scheduler, std::vector<std::byte> frame);
+
+/// `ExchangeWithScheduler` for a caller that must not block -- the node's proof, which the
+/// shared-cache leg awaits on its reactor -- presenting NO credential, for the same reason and in
+/// the same way: the parameter does not exist, so presenting one is a new signature, never a
+/// forgotten argument. `ExchangeWithScheduler` is this, run to completion.
+///
+/// The seam every no-credential exchange goes through, so `ExchangeFramed`'s defaulted
+/// credential is reached from one place that spells it, and from no caller that could forget it.
+/// @param scheduler Connected transport; not owned, and must outlive the coroutine.
+/// @param frame A complete framed request.
+/// @return The outcome.
+[[nodiscard]] core::async::Task<CacheOutcome> ExchangeWithSchedulerAsync(core::net::ISocket* scheduler,
+                                                                         std::vector<std::byte> frame);
+
 /// Register this worker with a scheduler, and keep it registered.
 ///
 /// Separate from `WorkerProtocol` because it is the one part of a worker that
@@ -386,8 +463,35 @@ class WorkerProtocol
 /// Meanwhile the launcher followed the same refusal correctly and arrived at a
 /// leader whose registry this node had expired out of, so every lease answered
 /// `NoWorker` and the fleet distributed nothing while every counter read zero.
+///
+/// Whether a refusal is something the scheduler ANSWERED, or an exchange that never
+/// completed. A stall or a lost peer after the socket connected reaches this exactly
+/// as a genuine `Rejected` does -- both are "not a `Hit`" -- but they call for
+/// opposite remedies: naming the toolchain is right for one and naming the network is
+/// right for the other. Folding both into one string is what let a stalled connection
+/// log and count as `RegistrationRefused`/`PresenceRefused` and never raise
+/// `scheduler-unreachable`, so the node's own diagnosis was backwards for exactly the
+/// case an operator most needs it right for.
+enum class AnnounceRefusalKind : std::uint8_t
+{
+    Refused,   ///< The scheduler answered: a reason to log, or a redirect to follow.
+    Transport, ///< The exchange never completed; this machine cannot say why not.
+};
+
+/// @param outcome A round trip that did not land as a `Hit`.
+/// @return `Transport` for an exchange that never completed; `Refused` for
+///         everything else -- the same split `DescribeOutcome` draws in words.
+[[nodiscard]] inline AnnounceRefusalKind AnnounceRefusalKindOf(CacheOutcome const& outcome) noexcept
+{
+    return outcome.kind == CacheOutcomeKind::Transport ? AnnounceRefusalKind::Transport : AnnounceRefusalKind::Refused;
+}
+
 struct AnnounceRefusal
 {
+    /// Refused, or never answered at all. `Refused` for a refusal this type
+    /// synthesizes itself (no worker id yet, a malformed reply): neither is a
+    /// transport failure.
+    AnnounceRefusalKind kind { AnnounceRefusalKind::Refused };
     /// The scheduler's own words, ready to log.
     std::string reason;
     /// Where to announce instead, when this was a redirect. Filled from
@@ -413,8 +517,7 @@ class WorkerRegistrar
     ///        object comes back in. Two spellings here is how a node comes to advertise
     ///        something it does not answer in.
     /// @param capacity What this machine is, for the scheduler to size it by.
-    WorkerRegistrar(CredentialNotice& notice,
-                    std::string fingerprint,
+    WorkerRegistrar(std::string fingerprint,
                     std::string endpoint,
                     std::uint32_t slots,
                     CompileCacheWire::CodecList acceptedCodecs,
@@ -428,14 +531,21 @@ class WorkerRegistrar
     /// leader that has moved, a toolchain fingerprint that is not text. A worker
     /// that discarded them would disappear from the fleet with nothing anywhere
     /// saying why -- the node's own log can only report that it did not register.
+    /// Presents no credential (`ExchangeWithScheduler`).
     /// @param scheduler Connected transport; not owned.
-    /// @param credential Credential to present.
+    /// @param interfaceAddresses What this machine answers on this round. A parameter
+    ///        rather than part of the capacity this registrar was built with, because
+    ///        the capacity is fixed for the registrar's life and the addresses are not:
+    ///        a VPN reconnect moves them, and a re-registration must carry the new set.
+    ///        **Required, never defaulted**: a caller that forgot the list would
+    ///        register a worker the scheduler can never hint, and compile. A caller that
+    ///        genuinely has none passes `{}` and says so.
     /// @return Nothing when the scheduler accepted, and the assigned id is kept
     ///         internally; otherwise the refusal, carrying both the phrase to log
     ///         and -- when this was a `NotLeader` naming somewhere else -- the
     ///         endpoint to announce to instead.
     [[nodiscard]] std::expected<void, AnnounceRefusal> Register(core::net::ISocket& scheduler,
-                                                                Credential const& credential = {});
+                                                                std::span<std::string const> interfaceAddresses);
 
     /// Report liveness and current load.
     ///
@@ -452,14 +562,12 @@ class WorkerRegistrar
     /// @param scheduler Connected transport; not owned.
     /// @param inFlight Jobs running right now.
     /// @param load What else this machine has to say about itself right now.
-    /// @param credential Credential to present.
     /// @return Nothing when accepted; otherwise the refusal. An empty `WorkerId()`
     ///         afterwards is the "register again" signal; a set `leader` is the
     ///         "announce somewhere else" one, and the two are independent.
     [[nodiscard]] std::expected<void, AnnounceRefusal> Heartbeat(core::net::ISocket& scheduler,
                                                                  std::uint32_t inFlight,
-                                                                 CompileCacheWire::LoadFields const& load = {},
-                                                                 Credential const& credential = {});
+                                                                 CompileCacheWire::LoadFields const& load = {});
 
     /// Retire this registration, because the node no longer serves its toolchain.
     ///
@@ -480,12 +588,10 @@ class WorkerRegistrar
     /// this registrar is being discarded by its owner either way, and clearing would
     /// only lose the diagnostic.
     /// @param scheduler Connected transport; not owned.
-    /// @param credential Credential to present.
     /// @return Nothing when the scheduler accepted -- which includes it answering
     ///         `Ok` for an id it does not know, since that is the same end state --
     ///         otherwise the refusal, to be logged rather than acted on.
-    [[nodiscard]] std::expected<void, AnnounceRefusal> Withdraw(core::net::ISocket& scheduler,
-                                                                Credential const& credential = {});
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Withdraw(core::net::ISocket& scheduler);
 
     /// The id the scheduler assigned, empty until a successful `Register`.
     [[nodiscard]] std::string const& WorkerId() const noexcept
@@ -547,12 +653,6 @@ class WorkerRegistrar
     }
 
   private:
-    /// Where "your credential went unchecked" is said, once per process.
-    ///
-    /// A reference held at construction rather than a parameter on every verb: the
-    /// registrar announces and heartbeats over the same connection with the same
-    /// credential, so this is a property of the registrar, not of a call.
-    CredentialNotice& _notice;
     std::string _fingerprint;
     std::string _endpoint;
     std::uint32_t _slots;
@@ -571,26 +671,21 @@ class WorkerRegistrar
 /// registrar at all, and it is the reason this exists
 /// ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
 ///
-/// It lives beside the registrar so that how a node talks to a scheduler stays ONE place: the
-/// framed exchange, the credential and the notice are all the registrar's, and this borrows
-/// them rather than growing a second answer.
+/// It lives beside the registrar so that how a node talks to a scheduler stays ONE place:
+/// `ExchangeWithScheduler`, which presents no credential, rather than a second answer.
 /// @param scheduler The dialled connection.
-/// @param notice Where a credential the scheduler did not want is reported, once.
 /// @param endpoint Where this machine answers; the key its row is filed under.
 /// @param capacity What the machine is, including its version and cache budget.
 /// @param load What it is doing, and the history buckets it is handing over.
-/// @param endorsement This machine's encoded endorsement of the roster it applied, when it is a
-///        voter; empty otherwise (#178).
-/// @param credential What to present.
-/// @return The reply's payload on acceptance -- an encoded certified roster, or empty when the
-///         scheduler has none to hand out -- or why it was refused and where the leader is.
-[[nodiscard]] std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(
+/// @param joinMemos The fleets this machine once asked to admit it, as its formation record keeps
+///        them; empty on a node that asked none.
+/// @return Nothing on acceptance -- the `Ok` carries no payload -- or why it was refused and where
+///         the leader is.
+[[nodiscard]] std::expected<void, AnnounceRefusal> AnnounceNodePresence(
     core::net::ISocket& scheduler,
-    CredentialNotice& notice,
     std::string_view endpoint,
     CompileCacheWire::CapacityFields const& capacity,
     CompileCacheWire::LoadFields const& load = {},
-    std::span<std::byte const> endorsement = {},
-    Credential const& credential = {});
+    std::span<CompileCacheWire::JoinMemoFields const> joinMemos = {});
 
 } // namespace FastCache::Cc

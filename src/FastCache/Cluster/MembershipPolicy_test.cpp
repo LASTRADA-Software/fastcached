@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/MembershipPolicy.hpp>
+#include <FastCache/Cluster/RosterKeys.hpp>
+#include <FastCache/Cluster/SelfForgotten.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 
@@ -8,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -15,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -26,7 +30,7 @@ namespace
 /// A record the cluster has agreed on.
 /// @param id The identity.
 /// @param raft Where its consensus port answers.
-/// @param scheduler Where clients reach it while it leads.
+/// @param scheduler Where its `0xFC` port answers.
 /// @param seat Which set the operator admitted it into.
 /// @return The member.
 [[nodiscard]] ClusterMember Member(std::string id,
@@ -34,12 +38,14 @@ namespace
                                    std::string scheduler = {},
                                    MemberSeat seat = MemberSeat::Voter)
 {
+    // The key before the id is moved from, which the initializer below would do first.
+    auto const key = Testing::TestKeyPair(id).PublicKey();
     return ClusterMember { .id = std::move(id),
                            .raftEndpoint = std::move(raft),
                            .schedulerEndpoint = std::move(scheduler),
                            .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
                            .seat = seat,
-                           .publicKey = std::nullopt };
+                           .publicKey = key };
 }
 
 /// A learner the cluster has agreed on (#1449).
@@ -70,9 +76,15 @@ namespace
 /// @return The state.
 [[nodiscard]] ClusterState StateOf(std::vector<ClusterMember> members)
 {
-    return ClusterState {
-        .members = std::move(members), .settings = {}, .clients = {}, .forgotten = {}, .principals = {}, .revokedKeys = {}
-    };
+    return ClusterState { .members = std::move(members), .settings = {}, .revokedKeys = {} };
+}
+
+/// The identity key @p id holds: the shared test key, so two ids never hold one key.
+/// @param id The machine.
+/// @return Its public key.
+[[nodiscard]] Ed25519PublicKey Key(std::string const& id)
+{
+    return Testing::TestKeyPair(id).PublicKey();
 }
 
 /// `MembershipProposals`, spelled without the span conversion at every call.
@@ -211,15 +223,13 @@ TEST_CASE("A member the state has never heard of is proposed", "[cluster][member
                        .key = "n1",
                        .value = "10.0.0.1:6675",
                        .schedulerEndpoint = "10.0.0.1:7000",
-                       .publicKey = std::nullopt,
-                       .role = std::nullopt });
+                       .publicKey = std::nullopt });
     CHECK(proposals[1]
           == Command { .kind = CommandKind::AddLearner,
                        .key = "n2",
                        .value = "10.0.0.2:6675",
                        .schedulerEndpoint = {},
-                       .publicKey = std::nullopt,
-                       .role = std::nullopt });
+                       .publicKey = std::nullopt });
 }
 
 TEST_CASE("A record that differs in any field is re-proposed", "[cluster][membership]")
@@ -290,12 +300,31 @@ TEST_CASE("A half-record is dropped rather than proposed", "[cluster][membership
     // `Validate` would refuse it at the leader anyway, so proposing it would cost a
     // refusal per interval and change nothing -- and the diagnostic would name the
     // reconciler rather than whatever produced the half-record.
-    ClusterState const state;
+    //
+    // A record with no consensus endpoint is half a record only where its seat is DIALLED:
+    // `n2` is recorded a voter, so the desire that would re-admit it without an address is
+    // dropped. A learner's empty endpoint is a whole record, and has a case of its own below.
+    auto const state = StateOf({ Member("n2", "10.0.0.2:6675") });
     auto const proposals =
         Proposals(state, { Desire("", "10.0.0.1:6675"), Desire("n2", ""), Desire("n3", "10.0.0.3:6675") });
 
     REQUIRE(proposals.size() == 1);
     CHECK(proposals[0].key == "n3");
+}
+
+TEST_CASE("A learner's own empty endpoint is desired as it is and not skipped", "[cluster][membership][learner][formation]")
+{
+    // A learner dials in, so its record carries no consensus endpoint -- and the desire
+    // that moves its scheduler endpoint must not be mistaken for a half-record and dropped,
+    // or the learner's announcement never lands.
+    auto const state = StateOf({ Learner("laptop", "") });
+    auto const plan = Plan(state, { Desire("laptop", "", "laptop:6674") }, Voters({ "office" }));
+
+    REQUIRE(plan.proposals.size() == 1);
+    CHECK(plan.proposals[0].kind == CommandKind::AddLearner);
+    CHECK(plan.proposals[0].value.empty());
+    CHECK(plan.proposals[0].schedulerEndpoint == "laptop:6674");
+    CHECK(plan.forgotten.empty());
 }
 
 TEST_CASE("A quorum that already matches the state proposes nothing", "[cluster][membership][quorum]")
@@ -361,8 +390,8 @@ TEST_CASE("A member the cluster forgot is removed from the quorum", "[cluster][m
 TEST_CASE("A member an operator typed is never proposed for removal", "[cluster][membership][quorum]")
 {
     // The defect this parameter exists for, and it took a running cluster to find:
-    // `--raft-peer` puts a member in the CONFIGURATION and nothing puts it in the
-    // STATE, so on a cluster whose peers were typed rather than discovered the
+    // the bootstrap set puts a member in the CONFIGURATION and nothing puts it in the
+    // STATE, so on a cluster whose members were bootstrapped rather than admitted the
     // leader's own record is all the state holds. Read as "everybody else was
     // forgotten", that proposed removing every peer, one per commit, until a healthy
     // three-node cluster was one node counting only itself -- with the other two
@@ -404,6 +433,22 @@ TEST_CASE("A member with no dialable address is not counted", "[cluster][members
     CHECK_FALSE(QuorumChange(state, { "n1" }).has_value());
 }
 
+TEST_CASE("A learner with no endpoint is added to the configuration and a voter with none is not",
+          "[cluster][membership][quorum][learner][formation]")
+{
+    // Whether an addition waits for an address is the SEAT's link: a learner dials in, so
+    // replication reaches it over the session it opens and it needs none; a member recorded
+    // a voter is dialled, and one with no address would join and never catch up -- so it is
+    // never added, and so never promoted.
+    auto const learner = StateOf({ Member("office", "10.0.0.1:6675"), Learner("laptop", "") });
+    auto const added = QuorumChange(learner, Voters({ "office" }), "office");
+    REQUIRE(added.has_value());
+    CHECK(Unwrap(added) == Configured({ "office" }, { "laptop" }));
+
+    auto const voter = StateOf({ Member("office", "10.0.0.1:6675"), Member("desk", "") });
+    CHECK_FALSE(QuorumChange(voter, Voters({ "office" }), "office").has_value());
+}
+
 TEST_CASE("A counted member is not dropped for an unreadable address", "[cluster][membership][quorum]")
 {
     // The asymmetry is the point. Refusing to ADD an undialable member costs
@@ -416,7 +461,7 @@ TEST_CASE("A counted member is not dropped for an unreadable address", "[cluster
 
 TEST_CASE("A node given no bootstrap set proposes no removal", "[cluster][membership][quorum]")
 {
-    // A `--raft-join` node was told nothing about the cluster's shape, so every
+    // A node that joined a fleet was told nothing about the cluster's shape, so every
     // member is equally unexplained to it -- and once elected it would otherwise
     // remove all of them, one per commit, which is the identical failure the
     // bootstrap comparison exists to prevent reached through the one path that has
@@ -459,13 +504,13 @@ TEST_CASE("A member the cluster forgot leaves the quorum whoever typed it, becau
     RevokeUnder(state, "n3", 0x33);
     auto const typed = std::vector<Consensus::NodeId> { "n1", "n2", "n3" };
 
-    // Typed into this node's own `--raft-peer`, and removed anyway. n2 -- typed, absent and
+    // In this node's own bootstrap set, and removed anyway. n2 -- typed, absent and
     // never forgotten -- is the control beside it, and stays.
     auto const change = QuorumChange(state, { "n1", "n2", "n3" }, "n1", typed);
     REQUIRE(change.has_value());
     CHECK(Unwrap(change) == Voters({ "n1", "n2" }));
 
-    // On a `--raft-join` node, which has no bootstrap set to compare against: removed too, and
+    // On a joined node, which has no bootstrap set to compare against: removed too, and
     // this is the successor that has to do it when the forgotten member was the LEADER -- cut
     // off by its revoked key before the removal it proposes for itself could commit.
     auto const joined = QuorumChange(state, { "n1", "n2", "n3" }, "n1", std::vector<Consensus::NodeId> {});
@@ -495,11 +540,10 @@ TEST_CASE("A member admitted again after a forget is counted, whatever its old k
 TEST_CASE("A forgotten leader that shares its machine over loopback is forgotten by its revoked key",
           "[cluster][membership][quorum][forget]")
 {
-    // A loopback host is never tombstoned, so on a rig whose members share one machine the
-    // host half of a forget is absent. The revoked key is the other half, and it names the id.
+    // On a rig whose members share one machine an address names no machine at all, which is
+    // no loss: a forget is a key revocation, and the key names the id.
     auto state = StateOf({ Member("n2", "127.0.0.1:6681"), Member("n3", "127.0.0.1:6682") });
     RevokeUnder(state, "n1", 0x11);
-    REQUIRE(state.forgotten.empty());
 
     auto const change = Step(state,
                              Voters({ "n1", "n2", "n3" }),
@@ -726,11 +770,18 @@ struct Leader
     std::vector<Consensus::NodeId> boot; ///< What it was started with.
     std::vector<DesiredMember> desired;  ///< Itself, and whatever discovery has proved.
 
-    /// One pass: propose what the state does not yet say, and move the quorum one step.
+    /// The keys this node holds live: every machine of these cases, typed with its own key, as
+    /// a bootstrap member names it.
+    std::shared_ptr<Testing::SharedRoster const> typed = Testing::SharedRoster::Of({ "n1", "n2", "n3", "n4" });
+
+    /// One pass: propose what the state does not yet say, and move the quorum one step. A
+    /// desire that states no key takes the one this node holds live, as the tier's does
+    /// (`WithLiveKeys`) -- a member is never admitted without a key.
     void Pass()
     {
         auto const top = state;
-        for (auto const& command: Proposals(top, desired, active))
+        auto const keys = Testing::RosterPeerKeys { Testing::TestKeyPair(self), typed };
+        for (auto const& command: Proposals(top, WithLiveKeys(top, desired, keys), active))
             Apply(state, command);
         if (auto const change = Step(top, active, Self(), boot); change.has_value())
             active = Unwrap(change);
@@ -755,7 +806,7 @@ struct Leader
 
 /// A leader that bootstrapped alone and admitted `n2` and `n3` because discovery proved them.
 ///
-/// The shape `--discovery` builds: one machine names only itself in `--raft-peer`, so
+/// The shape formation builds: one machine bootstraps only itself, so
 /// every other member was admitted at runtime -- which is what makes it removable.
 /// @return The leader, settled: a pass proposes nothing.
 [[nodiscard]] Leader DiscoveredCluster()
@@ -775,12 +826,9 @@ struct Leader
 /// @return The command.
 [[nodiscard]] Command Forget(std::string id)
 {
-    return Command { .kind = CommandKind::Forget,
-                     .key = std::move(id),
-                     .value = {},
-                     .schedulerEndpoint = {},
-                     .publicKey = std::nullopt,
-                     .role = std::nullopt };
+    return Command {
+        .kind = CommandKind::Forget, .key = std::move(id), .value = {}, .schedulerEndpoint = {}, .publicKey = std::nullopt
+    };
 }
 } // namespace
 
@@ -796,77 +844,135 @@ TEST_CASE("A member the operator forgot stays forgotten while discovery still pr
     REQUIRE(leader.active == Voters({ "n1", "n2", "n3" }));
 
     Apply(leader.state, Forget("n3"));
-    REQUIRE(leader.state.HasForgotten("10.0.0.3"));
+    REQUIRE(leader.state.IsRevoked(Key("n3")));
 
     for (auto const pass: std::views::iota(0, 4))
     {
         leader.Pass();
         INFO("reconcile pass " << pass);
         CHECK_FALSE(leader.Records("n3"));
-        CHECK(leader.state.HasForgotten("10.0.0.3"));
+        CHECK(leader.state.IsRevoked(Key("n3")));
     }
 
     // And the forget reached the quorum: `n3` was admitted at runtime, so it is removed.
     CHECK(leader.active == Voters({ "n1", "n2" }));
 }
 
-TEST_CASE("A desire at a forgotten host is refused by name, and only when it would propose", "[cluster][membership][forget]")
-{
-    // Refused rather than dropped: a desire nothing proposes for and nothing reports reads
-    // exactly like one the state already matches, and the tier logs this list.
-    auto state = StateOf({ Member("n1", "10.0.0.1:6680") });
-    state.forgotten = { "10.0.0.3" };
-
-    auto const plan = Plan(state, { Desire("n3", "10.0.0.3:6680"), Desire("n4", "10.0.0.4:6680") });
-    REQUIRE(plan.proposals.size() == 1);
-    CHECK(plan.proposals[0].key == "n4");
-    REQUIRE(plan.forgotten.size() == 1);
-    CHECK(plan.forgotten[0].id == "n3");
-
-    // The SAME machine however it is spelled, through the comparison `Apply` lifts a
-    // tombstone by -- a dual-stack listener reports an IPv4 host in its mapped form.
-    CHECK(Plan(state, { Desire("n3", "[::ffff:10.0.0.3]:6680") }).proposals.empty());
-
-    // A record the state already matches proposes nothing and lifts nothing, so it is no
-    // refusal: a member whose host a CLIENT forget named is still recorded and counted,
-    // and a line saying it is "not re-admitted" would be false.
-    auto recorded = StateOf({ Member("n1", "10.0.0.1:6680"), Member("n3", "10.0.0.3:6680") });
-    recorded.forgotten = { "10.0.0.3" };
-    CHECK(Plan(recorded, { Desire("n3", "10.0.0.3:6680") }).forgotten.empty());
-
-    // And this node's own record is an observation like any other: a leader whose host
-    // was forgotten does not put itself back.
-    auto self = StateOf({});
-    self.forgotten = { "10.0.0.1" };
-    auto const own = Plan(self, { Desire("n1", "10.0.0.1:6680", std::string {}) });
-    CHECK(own.proposals.empty());
-    CHECK(own.forgotten.size() == 1);
-}
-
-TEST_CASE("A desire for an id whose key a forget revoked is refused, though its host was never tombstoned",
+TEST_CASE("A desire for an id whose key a forget revoked is refused, wherever it now dials from",
           "[cluster][membership][forget]")
 {
-    // #1555: on a rig whose members share one machine, a forget leaves no host tombstone, and
-    // until it revoked the key a member forgotten there came back at its next proof. The key
-    // names the id, so it is the id that is refused -- this node's own desire included.
-    auto state = StateOf({ Member("n2", "127.0.0.1:6681") });
-    RevokeUnder(state, "n1", 0x11);
-    REQUIRE(state.forgotten.empty());
-
-    auto const plan = Plan(state, { Desire("n1", "127.0.0.1:6680", std::string {}), Desire("n3", "127.0.0.1:6682") });
-    REQUIRE(plan.proposals.size() == 1);
-    CHECK(plan.proposals[0].key == "n3");
+    // A machine is forgotten by its key, and an address is not an identity: the forgotten
+    // machine dialling from somewhere new is still the forgotten machine, refused by name
+    // rather than dropped -- a desire nothing proposes for and nothing reports reads exactly
+    // like one the state already matches, and the tier logs this list.
+    auto state = ClusterState {};
+    Apply(state,
+          Command { .kind = CommandKind::AddMember,
+                    .key = "n2",
+                    .value = "10.0.0.2:6680",
+                    .schedulerEndpoint = {},
+                    .publicKey = Key("n2") });
+    Apply(state, Forget("n2"));
+    auto const active = Voters({ "n1" });
+    auto const desire = DesiredMember {
+        .id = "n2", .raftEndpoint = "10.9.9.9:6680", .schedulerEndpoint = std::nullopt, .publicKey = Key("n2")
+    };
+    auto const plan = MembershipProposals(state, active, std::span { &desire, 1 });
+    CHECK(plan.proposals.empty());
     REQUIRE(plan.forgotten.size() == 1);
-    CHECK(plan.forgotten[0].id == "n1");
+    CHECK(plan.forgotten.front().id == "n2");
 
-    // An id admitted again under a new identity is a member: its old key's entry is history,
-    // and a move of the member it now is still proposes.
-    auto readmitted = StateOf({ Member("n1", "127.0.0.1:6680"), Member("n2", "127.0.0.1:6681") });
-    RevokeUnder(readmitted, "n1", 0x11);
-    auto const moved = Plan(readmitted, { Desire("n1", "127.0.0.1:6690") });
+    // Whatever the desire says about its key, and wherever it answers: discovery states no
+    // key, and this node's own record is an observation like any other -- a leader that was
+    // forgotten does not put itself back. Beside a machine nobody forgot, which is proposed.
+    auto const mixed = Plan(
+        state,
+        { Desire("n2", "10.0.0.2:6680"), Desire("n2", "127.0.0.1:6680", std::string {}), Desire("n4", "10.0.0.4:6680") },
+        active);
+    REQUIRE(mixed.proposals.size() == 1);
+    CHECK(mixed.proposals[0].key == "n4");
+    CHECK(mixed.forgotten.size() == 2);
+}
+
+TEST_CASE("A machine re-admitted under a new key is served again, and its revoked key is not",
+          "[cluster][membership][forget]")
+{
+    // The operator's re-admission under a NEW key is the one way back, and after it the id is
+    // recorded again: a move of the machine it now is still proposes. A desire still carrying
+    // the key the forget revoked is the FORGOTTEN machine, whatever the record now says --
+    // refused by name here rather than proposed and refused `KeyRevoked` at every pass.
+    auto state = StateOf({ Member("n1", "10.0.0.1:6680"), Member("n2", "10.0.0.2:6680") });
+    Apply(state, Forget("n2"));
+    auto readmitted = Key("n2-again");
+    Apply(state,
+          Command { .kind = CommandKind::AddMember,
+                    .key = "n2",
+                    .value = "10.0.0.2:6680",
+                    .schedulerEndpoint = {},
+                    .publicKey = readmitted });
+    REQUIRE(state.IsRevoked(Key("n2")));
+    REQUIRE(std::ranges::contains(state.revokedKeys, "n2", &RevokedKey::id));
+
+    // A desire the record already matches is no refusal, and proposes nothing.
+    auto const settled = Plan(state, { Desire("n2", "10.0.0.2:6680") });
+    CHECK(settled.proposals.empty());
+    CHECK(settled.forgotten.empty());
+
+    // A move of the machine it now is -- no key stated, so the recorded new one stands.
+    auto const moved = Plan(state, { Desire("n2", "10.0.0.12:6680") });
     CHECK(moved.forgotten.empty());
     REQUIRE(moved.proposals.size() == 1);
-    CHECK(moved.proposals[0].value == "127.0.0.1:6690");
+    CHECK(moved.proposals[0].value == "10.0.0.12:6680");
+
+    // The old machine, still holding the revoked key, is refused by name.
+    auto stale = Desire("n2", "10.0.0.12:6680");
+    stale.publicKey = Key("n2");
+    auto const refused = Plan(state, { stale });
+    CHECK(refused.proposals.empty());
+    REQUIRE(refused.forgotten.size() == 1);
+    CHECK(refused.forgotten[0].id == "n2");
+}
+
+TEST_CASE("A desire that states no key takes the key this node holds live, and never over a recorded one",
+          "[cluster][membership][forget]")
+{
+    // Discovery states no key, and a member is never admitted without one. A bootstrap member
+    // the formation record names WITH its key, recorded nowhere yet, is admitted under that key
+    // -- the one this node holds live for it -- rather than proposed keyless and refused at
+    // every pass.
+    auto const typed = std::vector { MemberSpec { .id = "n2", .raftEndpoint = "10.0.0.2:6680", .publicKey = Key("n2") } };
+    RosterKeys roster { Testing::TestKeyPair("n1"), typed };
+    auto const desired = std::vector { Desire("n2", "10.0.0.2:6680"), Desire("n9", "10.0.0.9:6680") };
+
+    auto const state = StateOf({});
+    auto const keyed = WithLiveKeys(state, desired, roster);
+    REQUIRE(keyed.size() == 2);
+    CHECK(keyed[0].publicKey == std::optional { Key("n2") });
+    // Nobody holds a key for n9, so there is nothing to fill in, and its admission stays one
+    // `ValidateAgainst` refuses.
+    CHECK_FALSE(keyed[1].publicKey.has_value());
+
+    auto const plan = MembershipProposals(state, Voters({ "n1", "n2" }), keyed);
+    REQUIRE(plan.proposals.size() == 2);
+    CHECK(ValidateAgainst(state, plan.proposals[0]).has_value());
+    CHECK_FALSE(ValidateAgainst(state, plan.proposals[1]).has_value());
+
+    // Never kept: the desires this node holds are untouched, so a key filled in for one pass
+    // cannot outlive the facts it was read from.
+    CHECK_FALSE(desired[0].publicKey.has_value());
+
+    // A recorded key wins: re-admitted under a new key, the record stands and the desire keeps
+    // no opinion -- it does not bring the typed key back over the operator's decision.
+    auto readmitted = StateOf({ Member("n2", "10.0.0.2:6680") });
+    readmitted.members[0].publicKey = Key("n2-again");
+    roster.Adopt(readmitted);
+    auto const kept = WithLiveKeys(readmitted, desired, roster);
+    CHECK_FALSE(kept[0].publicKey.has_value());
+
+    // And a desire that states its own key keeps it.
+    auto stated = Desire("n2", "10.0.0.2:6680");
+    stated.publicKey = Key("n2-stated");
+    CHECK(WithLiveKeys(state, std::span { &stated, 1 }, roster).front().publicKey == std::optional { Key("n2-stated") });
 }
 
 TEST_CASE("A member nobody forgot is still admitted when discovery proves it", "[cluster][membership][forget]")
@@ -891,23 +997,28 @@ TEST_CASE("A member nobody forgot is still admitted when discovery proves it", "
 TEST_CASE("Only an operator's admit brings a forgotten member back", "[cluster][membership][forget]")
 {
     // Re-admission is a positive act too, and it is the operator's: `--cluster-admit`
-    // commits the record, which lifts the tombstone -- deliberately, since `Apply` clears
-    // a forgotten host whenever a member is admitted at it. After that the machine is
-    // desired and recorded again, and discovery's desire has nothing left to change.
+    // commits the record -- under a NEW key, because the one the forget revoked is never
+    // admitted again. After that the machine is desired and recorded again, and discovery's
+    // desire has nothing left to change.
     auto leader = DiscoveredCluster();
     Apply(leader.state, Forget("n3"));
     leader.Pass();
     leader.Pass();
     REQUIRE_FALSE(leader.Records("n3"));
 
-    Apply(leader.state,
-          Command { .kind = CommandKind::AddMember,
-                    .key = "n3",
-                    .value = "10.0.0.3:6680",
-                    .schedulerEndpoint = {},
-                    .publicKey = std::nullopt,
-                    .role = std::nullopt });
-    CHECK_FALSE(leader.state.HasForgotten("10.0.0.3"));
+    auto readmit = Command { .kind = CommandKind::AddMember,
+                             .key = "n3",
+                             .value = "10.0.0.3:6680",
+                             .schedulerEndpoint = {},
+                             .publicKey = Key("n3") };
+    // The revoked key is refused for good, and names whose it was.
+    auto const refused = ValidateAgainst(leader.state, readmit);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ConsensusErrorCode::KeyRevoked);
+
+    readmit.publicKey = Key("n3-reminted");
+    REQUIRE(ValidateAgainst(leader.state, readmit).has_value());
+    Apply(leader.state, readmit);
 
     for ([[maybe_unused]] auto const pass: std::views::iota(0, 4))
         leader.Pass();
@@ -932,8 +1043,7 @@ namespace
                      .key = std::move(id),
                      .value = std::move(raft),
                      .schedulerEndpoint = {},
-                     .publicKey = std::nullopt,
-                     .role = std::nullopt };
+                     .publicKey = std::nullopt };
 }
 } // namespace
 
@@ -991,7 +1101,7 @@ TEST_CASE("A machine recorded as a voter and discovered again stays a voter", "[
         CHECK(leader.active == Voters({ "n1", "n2" }));
     }
 
-    SECTION("typed into --raft-peer, so counted by the configuration and recorded nowhere")
+    SECTION("in the bootstrap set, so counted by the configuration and recorded nowhere")
     {
         // The case a desire's source cannot see: nothing puts a typed member in the state,
         // so to anything reading only the state it looks exactly like a newcomer.
@@ -1017,10 +1127,11 @@ TEST_CASE("A machine recorded as a voter and discovered again stays a voter", "[
 
 TEST_CASE("A forgotten leader proposes its own removal, after every other change", "[cluster][membership][quorum][forget]")
 {
-    // `n1` leads and the operator forgot it: its record gone, its host tombstoned --
-    // the two facts `Forget` writes.
-    auto state = StateOf({ Member("n2", "10.0.0.2:6680"), Member("n3", "10.0.0.3:6680") });
-    state.forgotten = { "10.0.0.1" };
+    // `n1` leads and the operator forgot it: its record gone and its key revoked -- the two
+    // facts `Forget` writes, written here by the forget itself.
+    auto state = StateOf({ Member("n1", "10.0.0.1:6680"), Member("n2", "10.0.0.2:6680"), Member("n3", "10.0.0.3:6680") });
+    Apply(state, Forget("n1"));
+    REQUIRE(state.IsRevoked(Key("n1")));
     auto const self = Member("n1", "10.0.0.1:6680");
     auto const typed = std::vector<Consensus::NodeId> { "n1", "n2", "n3" };
 
@@ -1044,7 +1155,7 @@ TEST_CASE("A forgotten leader proposes its own removal, after every other change
     CHECK(Unwrap(first) == Configured({ "n1", "n2", "n3" }, { "n4" }));
 }
 
-TEST_CASE("A leader is forgotten only by both facts a forget writes", "[cluster][membership][quorum][forget]")
+TEST_CASE("A leader is forgotten only by the record gone AND its key revoked", "[cluster][membership][quorum][forget]")
 {
     // Either fact alone is something else, and removing on it would be the flaw the
     // bootstrap rule exists for, reached from this node's side.
@@ -1056,10 +1167,10 @@ TEST_CASE("A leader is forgotten only by both facts a forget writes", "[cluster]
         CHECK_FALSE(Step(StateOf({}), Voters({ "n1", "n2", "n3" }), self, typed).has_value());
     }
 
-    SECTION("its host tombstoned while its record stands: a client forget naming a member's machine")
+    SECTION("a key revoked under its id while its record stands: re-admitted under a new key")
     {
         auto recorded = StateOf({ Member("n1", "10.0.0.1:6680") });
-        recorded.forgotten = { "10.0.0.1" };
+        RevokeUnder(recorded, "n1", 0x11);
         CHECK_FALSE(Step(recorded, Voters({ "n1", "n2", "n3" }), self, typed).has_value());
     }
 }
@@ -1070,32 +1181,54 @@ TEST_CASE("The last voter is never removed, and forgetting it is refused by name
     // would undo it -- so the policy never proposes it, and the forget that would ask
     // for it is refused while the operator is still reading the answer.
     auto state = StateOf({});
-    state.forgotten = { "10.0.0.1" };
+    RevokeUnder(state, "n1", 0x11);
     CHECK_FALSE(
         Step(state, Voters({ "n1" }), Member("n1", "10.0.0.1:6680"), std::vector<Consensus::NodeId> { "n1" }).has_value());
 
-    auto const refused = PrepareForget(Voters({ "n1" }), "n1", std::nullopt);
+    // Refused as the only voter even with a key to revoke: that refusal is asked first.
+    auto const keyed = StateOf({ Member("n1", "10.0.0.1:6680"), Member("n2", "10.0.0.2:6680") });
+    auto const refused = PrepareForget(keyed, Voters({ "n1" }), "n1", Key("n1"));
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().code == ConsensusErrorCode::InvalidConfiguration);
     CHECK(refused.error().context.starts_with("cannot forget n1: it is the cluster's only voter"));
 
     // Every other forget leaves somebody counted.
-    CHECK(PrepareForget(Voters({ "n1", "n2" }), "n1", std::nullopt).has_value());
-    CHECK(PrepareForget(Configured({ "n1" }, { "n2" }), "n2", std::nullopt).has_value());
-    CHECK(PrepareForget(Voters({ "n1" }), "n9", std::nullopt).has_value());
+    CHECK(PrepareForget(keyed, Voters({ "n1", "n2" }), "n1", std::nullopt).has_value());
+    CHECK(PrepareForget(keyed, Configured({ "n1" }, { "n2" }), "n2", std::nullopt).has_value());
+    CHECK(PrepareForget(keyed, Voters({ "n1" }), "n9", Key("n9")).has_value());
 
     // And the forget names the key this node holds live for the id (#1555), which is what
-    // revokes a member a `--raft-peer` line typed with its key. None held, none named.
+    // revokes a bootstrap member named with its key. None held, none named -- the record's own
+    // key is what `Apply` revokes then.
     auto typed = Ed25519PublicKey {};
     typed.fill(std::byte { 0x29 });
-    auto const keyed = PrepareForget(Voters({ "n1", "n2" }), "n2", typed);
-    REQUIRE(keyed.has_value());
-    CHECK(keyed.value().kind == CommandKind::Forget);
-    CHECK(keyed.value().key == "n2");
-    CHECK(keyed.value().publicKey == std::optional { typed });
-    auto const keyless = PrepareForget(Voters({ "n1", "n2" }), "w1", std::nullopt);
-    REQUIRE(keyless.has_value());
-    CHECK_FALSE(keyless.value().publicKey.has_value());
+    auto const withLive = PrepareForget(StateOf({}), Voters({ "n1", "n2" }), "n2", typed);
+    REQUIRE(withLive.has_value());
+    CHECK(withLive.value().kind == CommandKind::Forget);
+    CHECK(withLive.value().key == "n2");
+    CHECK(withLive.value().publicKey == std::optional { typed });
+    auto const recorded = StateOf({ Member("w1", "10.0.0.9:6680") });
+    auto const recordOnly = PrepareForget(recorded, Voters({ "n1", "n2" }), "w1", std::nullopt);
+    REQUIRE(recordOnly.has_value());
+    CHECK_FALSE(recordOnly.value().publicKey.has_value());
+}
+
+TEST_CASE("A forget with nothing to revoke is refused by name before it is proposed", "[cluster][membership][forget]")
+{
+    // A machine is forgotten by its key. A forget of an id nothing records a key for, when
+    // this node holds none live either, would remove a record and nothing else -- and the
+    // next observation of the machine would admit it again.
+    auto const state = ClusterState {};
+    auto const active = Voters({ "n1", "n2" });
+    auto const refused = PrepareForget(state, active, "n2", std::nullopt);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ConsensusErrorCode::InvalidConfiguration);
+    CHECK(refused.error().context.contains("cannot forget n2"));
+    CHECK(refused.error().context.contains("would revoke nothing"));
+
+    // A typed key suffices, and so does a key the state records for a member.
+    CHECK(PrepareForget(state, active, "n2", Key("n2")).has_value());
+    CHECK(PrepareForget(StateOf({ Member("n2", "10.0.0.2:6680") }), active, "n2", std::nullopt).has_value());
 }
 
 // --------------------------------------------------------------------------
@@ -1199,6 +1332,31 @@ TEST_CASE("A node's own key reaches the roster, and no opinion about a peer's le
         CHECK_FALSE(moved[0].publicKey.has_value());
         auto applied = state;
         Apply(applied, moved[0]);
-        CHECK(applied.members[0].publicKey == std::optional { key });
+        CHECK(applied.members[0].publicKey == key);
     }
+}
+
+TEST_CASE("A node is forgotten only when its record is gone and its key is revoked", "[cluster][membership][formation]")
+{
+    // #1539's reading, public: a formation controller asks it of the state it applies, and a leader
+    // asks it before proposing a forgotten member's removal. One reading, so the two cannot disagree.
+    auto state = ClusterState {};
+    CHECK_FALSE(IsSelfForgotten(state, "n2")); // a fresh state has recorded nothing: never a forget
+
+    auto revoked = Ed25519PublicKey {};
+    revoked.fill(std::byte { 0x22 });
+    state.revokedKeys.push_back(RevokedKey { .id = "n2", .publicKey = revoked });
+    CHECK(IsSelfForgotten(state, "n2"));
+    CHECK_FALSE(IsSelfForgotten(state, "n3")); // somebody else's revocation is not this node's
+
+    state.members.push_back(ClusterMember { .id = "n2",
+                                            .raftEndpoint = "",
+                                            .schedulerEndpoint = {},
+                                            .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
+                                            .seat = MemberSeat::Learner,
+                                            .publicKey = Key("n2-new") });
+    CHECK_FALSE(IsSelfForgotten(state, "n2")); // re-admitted under a new key: a member
+
+    // No host decides it: a machine is forgotten by its key wherever it dials from, and the state
+    // records no address a forget could name.
 }

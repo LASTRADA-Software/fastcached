@@ -13,11 +13,15 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -131,9 +135,10 @@ core::async::Task<core::net::IoResult> WriteOnce(core::net::ISocket* socket, std
 /// @param secret Whose key.
 /// @return The end.
 [[nodiscard]] std::unique_ptr<SealedFrameSocket> SealedServer(std::unique_ptr<core::net::ISocket> raw,
-                                                              std::string_view secret)
+                                                              std::string_view secret,
+                                                              ISealedFrameBudget* budget = nullptr)
 {
-    auto server = std::make_unique<SealedFrameSocket>(std::move(raw), SealedFrameEnd::Server, MaxPayload);
+    auto server = std::make_unique<SealedFrameSocket>(std::move(raw), SealedFrameEnd::Server, MaxPayload, budget);
     server->SealReceiving(Key(secret));
     return server;
 }
@@ -145,8 +150,8 @@ TEST_CASE("Before a key is agreed a sealing layer passes every byte through unto
     // Every connection on a surface that offers a proof is wrapped from accept, and a launcher on
     // that port never proves anything: it must see exactly the bytes it would have seen unwrapped.
     auto pair = core::net::testing::InMemorySocketPair::create();
-    SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload };
-    SealedFrameSocket server { std::move(pair.server), SealedFrameEnd::Server, MaxPayload };
+    SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload, nullptr };
+    SealedFrameSocket server { std::move(pair.server), SealedFrameEnd::Server, MaxPayload, nullptr };
 
     auto const frame = RequestFrame();
     REQUIRE(Written(caller, frame) == frame.size());
@@ -167,7 +172,7 @@ TEST_CASE("A sealed frame reaches the wire with its tag and the reader without i
     SECTION("on the wire, the frame and then the tag for its position")
     {
         auto pair = core::net::testing::InMemorySocketPair::create();
-        SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload };
+        SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload, nullptr };
         caller.SealSending(Key("caller-to-server"));
 
         REQUIRE(Written(caller, frame) == frame.size());
@@ -187,7 +192,7 @@ TEST_CASE("A sealed frame reaches the wire with its tag and the reader without i
     SECTION("at the reader, the frame alone")
     {
         auto pair = core::net::testing::InMemorySocketPair::create();
-        SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload };
+        SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload, nullptr };
         caller.SealSending(Key("caller-to-server"));
         auto const server = SealedServer(std::move(pair.server), "caller-to-server");
 
@@ -202,7 +207,7 @@ TEST_CASE("A frame written in pieces is sealed once, when it is whole", "[protoc
     // The endpoint writes a header and a payload as it has them; the tag is over both, so the
     // layer holds the first piece until the second arrives and reports every byte as taken.
     auto pair = core::net::testing::InMemorySocketPair::create();
-    SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload };
+    SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload, nullptr };
     caller.SealSending(Key("caller-to-server"));
     auto const server = SealedServer(std::move(pair.server), "caller-to-server");
 
@@ -220,8 +225,8 @@ TEST_CASE("A reply is sealed by the server's end and opened by the caller's", "[
     // The two ends read DIFFERENT grammars -- a request header is seven bytes, a reply's five --
     // so a layer that framed replies as requests would locate the tag in the wrong place.
     auto pair = core::net::testing::InMemorySocketPair::create();
-    SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload };
-    SealedFrameSocket server { std::move(pair.server), SealedFrameEnd::Server, MaxPayload };
+    SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload, nullptr };
+    SealedFrameSocket server { std::move(pair.server), SealedFrameEnd::Server, MaxPayload, nullptr };
     caller.SealReceiving(Key("server-to-caller"));
     server.SealSending(Key("server-to-caller"));
 
@@ -338,6 +343,140 @@ TEST_CASE("A peer that stops sending mid-frame has said goodbye, and the half fr
 
 TEST_CASE("Every seal fault says what happened", "[protocol][seal]")
 {
-    for (auto const fault: { SealFault::BadTag, SealFault::Oversized, SealFault::Unframed })
+    for (auto const fault: { SealFault::BadTag, SealFault::Oversized, SealFault::Unframed, SealFault::OverBudget })
         CHECK_FALSE(DescribeSealFault(fault).empty());
+}
+
+namespace
+{
+
+/// Read when nothing is whole yet: the read parks on the raw socket, and `syncRunWith` retrieves
+/// the park and reports it by throwing -- which here is the expected outcome, not a failure.
+/// @param socket The end to read.
+/// @return True when the read parked rather than answering.
+[[nodiscard]] bool ReadParks(core::net::ISocket& socket)
+{
+    try
+    {
+        std::ignore = ReadAvailable(socket);
+        return false;
+    }
+    catch (std::exception const&)
+    {
+        return true;
+    }
+}
+
+/// A budget a case fills and empties, recording what the layer holds. All public: a record a case
+/// reads, not an object with invariants.
+struct ScriptedBudget final: ISealedFrameBudget
+{
+    /// @param capacity How many bytes it will hold in all.
+    explicit ScriptedBudget(std::size_t capacity) noexcept:
+        room { capacity }
+    {
+    }
+
+    [[nodiscard]] bool TryHold(std::size_t bytes) noexcept override
+    {
+        ++asked;
+        if (held + bytes > room)
+            return false;
+        held += bytes;
+        return true;
+    }
+
+    void Release(std::size_t bytes) noexcept override
+    {
+        held -= bytes;
+    }
+
+    std::size_t room;        ///< How many bytes it will hold in all.
+    std::size_t held { 0 };  ///< What the layer holds now.
+    std::size_t asked { 0 }; ///< How many holds it asked for.
+};
+
+} // namespace
+
+TEST_CASE("A sealed frame is charged while it is gathered and given back once it verifies", "[protocol][seal][budget]")
+{
+    // The tag follows the payload, so a frame is held whole before anything can be asked of it --
+    // and that holding is charged to the owner's budget from the header, once, not after the fact.
+    FrameSealer sealer { Key("caller-to-server") };
+    auto const frame = RequestFrame(std::string(1000, 'k'));
+    auto const genuine = SealedRequest(sealer, frame);
+
+    ScriptedBudget budget { 1U << 20U };
+    auto pair = core::net::testing::InMemorySocketPair::create();
+    auto const server = SealedServer(std::move(pair.server), "caller-to-server", &budget);
+
+    auto const split = Wire::RequestHeaderSize + 10;
+    REQUIRE(Written(*pair.client, std::span<std::byte const> { genuine }.first(split)) > 0);
+    CHECK(ReadParks(*server)); // nothing whole yet
+    CHECK(budget.held == genuine.size());
+    CHECK(budget.asked == 1);
+
+    REQUIRE(Written(*pair.client, std::span<std::byte const> { genuine }.subspan(split)) > 0);
+    CHECK(ReadAvailable(*server) == frame);
+    CHECK(budget.held == 0);
+    CHECK(budget.asked == 1);
+    CHECK_FALSE(server->Fault().has_value());
+}
+
+TEST_CASE("A sealed frame whose tag fails gives back what it held while the connection is still open",
+          "[protocol][seal][budget]")
+{
+    // The fault's own release, asserted while the socket is ALIVE: the destructor releases too, so a
+    // case that lets the socket go before it looks cannot tell the two apart -- and between a fault
+    // and the connection's end the budget would otherwise hold a frame nobody will ever read.
+    auto const frame = RequestFrame(std::string(1000, 'k'));
+    auto const forged = ForgedRequest(frame);
+
+    ScriptedBudget budget { 1U << 20U };
+    auto pair = core::net::testing::InMemorySocketPair::create();
+    auto const server = SealedServer(std::move(pair.server), "caller-to-server", &budget);
+
+    auto const split = Wire::RequestHeaderSize + 10;
+    REQUIRE(Written(*pair.client, std::span<std::byte const> { forged }.first(split)) > 0);
+    CHECK(ReadParks(*server));
+    REQUIRE(budget.held == forged.size());
+
+    REQUIRE(Written(*pair.client, std::span<std::byte const> { forged }.subspan(split)) > 0);
+    CHECK_FALSE(ReadAvailable(*server).has_value());
+    REQUIRE(server->Fault() == SealFault::BadTag);
+    CHECK(budget.held == 0);
+    CHECK(budget.asked == 1);
+}
+
+TEST_CASE("A sealed frame the budget has no room for is refused before any of it is held", "[protocol][seal][budget]")
+{
+    // Not known to be a forgery -- the refusal names what the header said, so the owner can answer
+    // it -- and nothing is charged or kept: the refusal is the header's, before a byte of payload is
+    // read.
+    ScriptedBudget budget { 64 };
+    auto pair = core::net::testing::InMemorySocketPair::create();
+    auto const server = SealedServer(std::move(pair.server), "caller-to-server", &budget);
+    auto const frame = RequestFrame(std::string(1000, 'k'));
+    REQUIRE(Written(*pair.client, std::span<std::byte const> { frame }.first(Wire::RequestHeaderSize)) > 0);
+
+    CHECK_FALSE(ReadAvailable(*server).has_value());
+    CHECK(server->Fault() == SealFault::OverBudget);
+    CHECK(server->RefusedVerb() == std::optional { static_cast<std::uint8_t>(Wire::Op::Fetch) });
+    CHECK(server->RefusedBytes() == frame.size() + SessionTagBytes);
+    CHECK(budget.held == 0);
+}
+
+TEST_CASE("A sealed end that goes away mid-frame gives back what it held", "[protocol][seal][budget]")
+{
+    FrameSealer sealer { Key("caller-to-server") };
+    auto const genuine = SealedRequest(sealer, RequestFrame(std::string(1000, 'k')));
+    ScriptedBudget budget { 1U << 20U };
+    {
+        auto pair = core::net::testing::InMemorySocketPair::create();
+        auto const server = SealedServer(std::move(pair.server), "caller-to-server", &budget);
+        REQUIRE(Written(*pair.client, std::span<std::byte const> { genuine }.first(Wire::RequestHeaderSize + 1)) > 0);
+        CHECK(ReadParks(*server));
+        REQUIRE(budget.held == genuine.size());
+    }
+    CHECK(budget.held == 0);
 }

@@ -14,12 +14,14 @@
 # ends drift apart.
 #
 # The toolchain-fingerprint group (CmdLine, DirectManifest, Stats,
-# ToolchainFingerprint, ToolchainProbe) is here for the same reason and is not
+# ToolchainFingerprint, ToolchainProbe, and AtomicFile, which ToolchainProbe writes
+# its cache through) is here for the same reason and is not
 # optional: a worker derives its own fingerprint so an operator never has to paste
 # a digest, and it MUST derive it through the identical code its clients use. A
 # second implementation would register cleanly, heartbeat happily, and never be
 # matched -- with nothing anywhere reporting why.
 set(_fc_node_shared
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/AtomicFile.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/CacheProtocol.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/CmdLine.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/CodecEnvelope.cpp"
@@ -30,6 +32,7 @@ set(_fc_node_shared
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ParallelFor.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ProcessRunner.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/Stats.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/TicketCredentials.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainDiscovery.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainFingerprint.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainHost.cpp"
@@ -47,26 +50,44 @@ add_executable(fastcache-compile-node
     CordonCli.cpp
     DiscoveryTier.cpp
     EndpointDialer.cpp
+    FleetProbe.cpp
+    FleetSummaryResponder.cpp
+    ForeignFleetWatch.cpp
+    EnrollChannel.cpp
     EnrollClient.cpp
+    FormationController.cpp
+    FormationEffects.cpp
+    FormationLoop.cpp
+    FormationRuntime.cpp
+    RaftStoreArchiver.cpp
     EnrollmentResponder.cpp
     EnrollmentWindow.cpp
     NodeProofClient.cpp
     NodeProofResponder.cpp
     SchedulerLink.cpp
+    SchedulerReachability.cpp
     SchedulerTier.cpp
+    SessionResponder.cpp
     ScratchClaim.cpp
     LocalCache.cpp
+    HostEventInbox.cpp
     NodeAnnounce.cpp
     NodePresenceTier.cpp
     NodeRoster.cpp
     NodeConditions.cpp
     NodeConfig.cpp
+    NodeDefaults.cpp
+    NodeFirewall.cpp
+    NodeFormation.cpp
     NodeReload.cpp
+    RefusedArguments.cpp
     NodeFrameSurface.cpp
     NodeIdentity.cpp
     NodeKey.cpp
+    NodeStateFiles.cpp
     NodeSurfaces.cpp
     NodeToolchains.cpp
+    OperatorCredentials.cpp
     RemoteUpstream.cpp
     FrameEndpoint.cpp
     NodeIoLoop.cpp
@@ -79,6 +100,14 @@ add_executable(fastcache-compile-node
     LiveStatsSources.cpp
     FleetReadGate.cpp
     FleetTextResponder.cpp
+    SharedCacheTier.cpp
+    SharedCacheHost.cpp
+    SharedCacheResponder.cpp
+    SharedCacheDirectory.cpp
+    SharedCacheStatus.cpp
+    SharedCacheSession.cpp
+    SharedCacheUpstream.cpp
+    InProcessSharedUpstream.cpp
     ${_fc_node_shared}
 )
 target_include_directories(fastcache-compile-node PRIVATE
@@ -93,7 +122,7 @@ endif()
 
 install(TARGETS fastcache-compile-node
     RUNTIME DESTINATION "${FASTCACHED_INSTALL_BINDIR}"
-    COMPONENT Runtime
+    COMPONENT "${FASTCACHED_APP_COMPONENT}"
 )
 
 # The node's own unit tests. AdminEndpoint and SchedulerEndpoint are
@@ -117,8 +146,27 @@ if(FASTCACHED_BUILD_TESTS)
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
         EndpointDialer.cpp
+        FleetProbe.cpp
+        FleetProbe_test.cpp
+        FleetSummaryResponder.cpp
+        FleetSummaryResponder_test.cpp
+        ForeignFleetWatch.cpp
+        ForeignFleetWatch_test.cpp
+        EnrollChannel.cpp
+        EnrollChannel_test.cpp
         EnrollClient.cpp
         EnrollClient_test.cpp
+        FormationController.cpp
+        FormationController_test.cpp
+        FormationEffects.cpp
+        FormationEffects_test.cpp
+        FormationFleet_test.cpp
+        FormationLoop.cpp
+        FormationLoop_test.cpp
+        FormationRuntime.cpp
+        FormationRuntime_test.cpp
+        RaftStoreArchiver.cpp
+        RaftStoreArchiver_test.cpp
         FleetForgetPropagation_test.cpp
         EnrollmentResponder.cpp
         EnrollmentResponder_test.cpp
@@ -127,26 +175,38 @@ if(FASTCACHED_BUILD_TESTS)
         NodeProofClient.cpp
     NodeProofResponder.cpp
         NodeProofResponder_test.cpp
-        EnrollTrap_test.cpp
         ExchangeLog_test.cpp
+        HostEventInbox.cpp
+        HostEventInbox_test.cpp
         NodeAnnounce_test.cpp
+        NodeAudience_test.cpp
         NodePresenceTier_test.cpp
         SchedulerLink.cpp
         SchedulerLink_test.cpp
+        SchedulerReachability.cpp
+        SchedulerReachability_test.cpp
         SchedulerTier.cpp
         SchedulerTier_test.cpp
+        SessionResponder.cpp
+        SessionResponder_test.cpp
         ScratchClaim.cpp
         ScratchClaim_test.cpp
         LocalCache.cpp
         LocalCache_test.cpp
         RemoteUpstream.cpp
         RemoteUpstream_test.cpp
+        OperatorCredentials.cpp
+        OperatorCredentials_test.cpp
         NodeAnnounce.cpp
         NodePresenceTier.cpp
         NodeRoster.cpp
         NodeRoster_test.cpp
+        NodeRefusal_test.cpp
+        OneShotAnswer_test.cpp
         NodeConditions.cpp
         NodeConditions_test.cpp
+        RefusedArguments.cpp
+        RefusedArguments_test.cpp
         NodeConfig.cpp
         NodeCredential_test.cpp
         NodeReload.cpp
@@ -158,15 +218,27 @@ if(FASTCACHED_BUILD_TESTS)
         AuthRefusalContract_test.cpp
         FleetMachinePresence_test.cpp
         FleetRoster_test.cpp
+        FleetTickets_test.cpp
         FleetLeaseRouting_test.cpp
+        FleetExclusion_test.cpp
+        FleetDialHint_test.cpp
         NodeConfig_test.cpp
+        NodeDefaults.cpp
+        NodeDefaults_test.cpp
+        NodeFormation.cpp
+        NodeFormation_test.cpp
         NodeIdentity.cpp
         NodeIdentity_test.cpp
         NodeKey.cpp
         NodeKey_test.cpp
+        NodeStateFiles.cpp
+        NodeStateFiles_test.cpp
         RaftKeyRevocation_test.cpp
+        NodeFirewall.cpp
+        NodeFirewall_test.cpp
         NodeSurfaces.cpp
         NodeSurfaces_test.cpp
+        StartupRefusalCensus_test.cpp
         NodeMembership_test.cpp
         WorkerLease_test.cpp
         NodeToolchains.cpp
@@ -193,6 +265,21 @@ if(FASTCACHED_BUILD_TESTS)
         FleetReadGate_test.cpp
         MembershipGate_test.cpp
         FleetTextResponder_test.cpp
+        SharedCacheTier.cpp
+        SharedCacheHost.cpp
+        SharedCacheHost_test.cpp
+        SharedCacheResponder.cpp
+        SharedCacheResponder_test.cpp
+        SharedCacheDirectory.cpp
+        SharedCacheDirectory_test.cpp
+        SharedCacheStatus.cpp
+        SharedCacheStatus_test.cpp
+        SharedCacheSession.cpp
+        SharedCacheUpstream.cpp
+        SharedCacheUpstream_test.cpp
+        FleetSharedCache_test.cpp
+        InProcessSharedUpstream.cpp
+        InProcessSharedUpstream_test.cpp
         DocumentedCommandLines_test.cpp
         ${_fc_node_shared}
         # The CLI's reading of a `NodeMetrics` body and of a `/metrics` one, compiled in for the
@@ -205,6 +292,10 @@ if(FASTCACHED_BUILD_TESTS)
         # that proves every surface walks the node's real table renders through the code the CLI
         # draws its `node` line and panel with (#1364).
         "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cli/NodeStatusText.cpp"
+        # The launcher's reachability memo, so the fleet case can drive the chain from one
+        # launcher's unreachable worker to the next one's LEASE through the real scheduler.
+        # Tests only: the node never runs the memo.
+        "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ReachabilityMemo.cpp"
     )
     target_include_directories(fastcache-compile-node-tests PRIVATE
         "${CMAKE_SOURCE_DIR}/src"

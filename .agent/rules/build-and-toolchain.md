@@ -1292,12 +1292,55 @@ determinism rests on.
       suite's total was 583.63 s against 593.45 s and 576.26 s on passing runs of the
       same leg, with 5260 of 5282 tests normal. **The two that timed out take 2.5 s and
       5.5 s -- they were not slow, they were deadlocked, and raising a `TIMEOUT` would
-      have buried it** (#1515). The remedy is process substitution, whose reader drains
-      concurrently and which still reports `grep`'s own status rather than a producer's:
-      `< <(printf '%s
-' "$x")`. The audit of the sites still under the boundary, and
-      the scan that should refuse the next one, are
+      have buried it** (#1515). The remedy THEN was process substitution, whose reader
+      drains concurrently and which still reports `grep`'s own status rather than a
+      producer's: `< <(printf '%s\n' "$x")` -- **superseded below for an EXTERNAL
+      reader**, and kept only where the SHELL reads. The audit of the sites still under
+      the boundary, and the scan that should refuse the next one, are
       [#1591](https://github.com/LASTRADA-Software/fastcached/issues/1591).
+    - **And process substitution was itself the next defect, for an EXTERNAL reader.**
+      `grep < <(printf ...)` makes grep the PARENT of the writer, and on a GitHub Windows
+      runner such a grep came back **exit 148** in round 10, in `header_filter_taken_lines`:
+      128 + 20, where 20 is **SIGCHLD** in the MSYS2 runtime (`cygwin/signal.h`; `kill -l 20` says
+      CHLD), not Linux's SIGTSTP. That the writer's exit is what killed it is INFERRED:
+      neither the micro shape nor the real path reproduced locally, under load, on Git for
+      Windows 2.51 (MSYS 3.6.5, bash 5.2) or 2.55 (MSYS 3.6.10, bash 5.3, the runner's)
+      ([#1630](https://github.com/LASTRADA-Software/fastcached/issues/1630)). Round 8,
+      in `_third_party_select`, was a **status-2 refusal** whose grep status was never
+      printed; it was READ as a kill and was not measured as one, so it is not a second
+      instance.
+    - The parentage is MEASURED, each writer reading its own PPID out of `/proc`, on Git
+      Bash 5.2.37 and on bash 3.2.57. The filter is the writer's parent for `cmd < <(w)`
+      and `$(cmd < <(w))`, **and for an ARGUMENT `cmd <(w)` inside `$( )` or a
+      pipeline** -- the `diff <(a) <(b) | sed` and `$(comm -23 <(a) <(b))` this tree had
+      eight of, two of them deciding a verdict with comm's status unread. A top-level
+      `cmd <(w)` is a sibling, and `done < <(cmd <(w))` is a parent on 5.2 and a sibling on
+      3.2: **safety that depends on the construct around a line and on the bash version is
+      not a property a line can show**, so the rule is the one it can -- no external filter
+      reads a process substitution, in either position.
+    - What does not depend on the inference: in a PIPE the writer is the child of the shell
+      running the pipeline in every context measured, it drains concurrently, and
+      `PIPESTATUS[1]` is the filter's status even under `pipefail`. So an external filter is
+      fed through `pipe_lines_into`, or `pipe_pair_into` for a two-input `comm`/`diff`
+      (`/dev/fd/3` and `-`), both in `scripts/lib/third-party-roots.sh`; a `while read` loop
+      or a shell function is the SHELL reading, and stays on `< <(...)`.
+      `procsub-reader-scan` in `check-e2e-helpers.sh` refuses both shapes, reading the
+      arguments QUOTE-AWARE and allowing the prefixes a command carries (`VAR=x`,
+      `timeout N`, `nice`, `stdbuf`, `time`, `command`, `env`, a backtick), and names its
+      blind spots, all failing OPEN: a filter off its list, or behind a wrapper off the
+      prefix list (`ionice`, `sudo`); one invoked through a variable; a `<(` on a
+      continuation line; a quoted argument holding an escaped quote of its own kind, and
+      any quoting it does not model (`$'...'`, nested `$( )`); and the `run:` blocks of
+      `.github/workflows`, which it does not walk; and a file its own grep failed on
+      ([#1631](https://github.com/LASTRADA-Software/fastcached/issues/1631)). Its own canary lines sit
+      in a `procsub-scan` data REGION around the two heredocs alone, so
+      `check-e2e-helpers.sh` is scanned like any other file rather than exempted whole.
+    - **The status, once read, has to carry WHOSE failure it is.** Round 10's red was
+      `status 1 and [uncovered ]`: `Judge` read the coverage without its status, so a killed
+      grep blamed the filter. Fixing that with one status for every refusal would have blamed
+      the CHECK for a filter that does not compile, the other half of f6511b92b. So the
+      classifiers refuse with `HeaderFilterDoesNotCompile` (3) or `HeaderFilterCheckFailed`
+      (2), and both consumers name them through one `header_filter_refusal`.
     - So it is a **SCAN** now, in `check-e2e-helpers.sh` beside the `timeout` and
       bash-3.2 ones, off the same `_shell_scripts` enumeration. Five scripts already
       carried a comment explaining why they do NOT do this, and it spread anyway:
@@ -3194,6 +3237,15 @@ makes it anyway and says so there.
   [#545](https://github.com/LASTRADA-Software/fastcached/issues/545) is where it is
   being dealt with. Point a measurement at the machine's populated cache instead.
 
+  **What the shared per-machine cache buys, measured** (moved here from `AGENT.md`'s
+  Building section, which points at it): Git Bash, Windows 11, cold build tree, native
+  Windows volumes rather than DrvFs -- **45 s and 118 MB fetched without it, 24 s and
+  1.1 MB with** -- and over DrvFs, where #545 found it, the same fetch is slow enough to
+  read as a hang. *Volumes* rather than a filesystem NAME, because the two halves of this
+  measurement do not share one: the cache sits under `%LOCALAPPDATA%` and the build tree
+  does not, so on the machine this was taken on they are different filesystems. The
+  contrast the figure exists to draw is native-against-DrvFs, and that holds either way.
+
 ## Language and ABI pitfalls
 
 <!-- agent-tripwire: A return type is not part of a function's mangled name on Linux, so two functions differing only in return type silently collide -->
@@ -3228,6 +3280,14 @@ makes it anyway and says so there.
     toolchain fact, and had no `AGENT.md` tripwire -- so it fired in no session that
     did not already open a rules file, which is the population it was written for.
 
+- **A read that CONSUMES its object -- `std::future::get` -- is taken into a local before a
+  Catch2 assertion checks it, never inside one.** Measured with the pinned clang-tidy 22.1.8
+  on Windows (steps 17-19 of the integration): `REQUIRE(stopped.get())` and
+  `CHECK_FALSE(ReplyFrom(future).empty())` report `clang-analyzer-cplusplus.Move`, because
+  Catch2's macros name their expression TWICE under clang (once inside
+  `__builtin_constant_p`) and the MSVC STL's `std::future::get` moves `*this`. libstdc++'s
+  `get` does not, so only the Windows sweep sees it -- the same one-toolchain-only shape as
+  the entry above, and `NOLINT` is not the alternative here either.
 
 - **A return type is not part of a function's name on Linux, and MSVC's mangling
   hides that.** `Core/HostPort.hpp` added an `inline FastCache::ParsePort(
@@ -3389,6 +3449,45 @@ makes it anyway and says so there.
   against a real source file first, treats exit codes ≥ 126 as fatal rather than as
   findings, and refuses to print a clean verdict it did not earn. Use it, and if you
   write a one-off loop instead, make it fail loudly the same way.
+
+  **The exit status and the output are read TOGETHER, per unit.** A non-zero exit is
+  how clang-tidy reports findings AND how it reports a unit it did not process, and
+  the second can come with no diagnostic line at all. The sweep used to read only
+  `rc ≥ 126` as a failure and filter everything else through `grep 'error:|warning:'`,
+  so a unit exiting 1 in silence was summed into `CLEAN` -- measured end to end with a
+  stub that did exactly that on all 698 units: `TIDY SWEEP CLEAN (502 of 504
+  file(s) contributed code …)`, exit 0. `TidyUnitVerdict` now answers `unanalysed`
+  for it, and the table fails CLOSED: `clean` needs a zero exit, or a non-zero one
+  whose only DIAGNOSTIC lines are unknown-warning-option ones -- non-diagnostic lines
+  (`Error while processing`, `Stack dump:`) are tolerated there, because a crash exits
+  at or above 126 and is `fatal` first -- measured under Git Bash for a RELEASE-CRT
+  program: an access violation 139, a stack overflow, `__fastfail` and `abort()` 127. A
+  Debug-CRT `abort()` exits 3 (measured), and the pinned 22.1.8 `clang-tidy.exe` is a
+  release-CRT build by its import table (`VCRUNTIME140`, `MSVCP140`, `api-ms-win-crt-*`;
+  no `ucrtbased`, `vcruntime140d` or `msvcp140d`); a Debug-CRT crash with no diagnostic
+  line would land on `unanalysed`, still a failure -- and "no checks enabled" is the canary's
+  question. Those lines are judged by their TAG at the end of the line, never by the
+  words: a substring filter swallowed a finding that mentioned them. The build's
+  own path, `CMAKE_CXX_CLANG_TIDY` (what `local-gate.sh`'s clang-debug leg runs),
+  already fails: CMake's co-compile step returns clang-tidy's status and builds no
+  object, measured against the same stub.
+
+  **A tool that parses is not a tool that reports on HEADERS.** A header finding is
+  kept only when `HeaderFilterRegex` takes the header's path *as clang spells it on
+  that host*, and clang joins an include directory to a header name with the host's
+  separator: a cl or clang-cl database reports `D:\...\src\tests\X.hpp`, or
+  `D:\...\src\FastCache/Core/X.hpp` where `-I...\src` meets a `/` include. The
+  pattern wrote every separator as `/`, so the `clang-tidy-windows` leg discarded
+  every first-party header finding as non-user code and reported clean -- measured
+  with the pinned 22.1.8, native, over both Windows databases, by a planted `g_`
+  global in `src/tests/WindowsErrorPopups.hpp` that exited 0 before and 1 after.
+  The unit canary could not see it: the unit parsed. So the gate's coverage count
+  asks every header in the three spellings clang produces, generated on every host,
+  and `tidy-sweep.sh`'s `HeaderCanary` plants a finding in a sibling-included and an
+  `-I`-included header and stops unless the analyser reports both. On Windows by
+  hand, pass nothing: the repository's pattern is the one to test. Run from INSIDE the
+  build directory of a database that scans modules, since its `@*.modmap` response
+  files are relative.
 
   "Refuses a verdict it did not earn" is four separate refusals, and each one closes
   a path that ends in `CLEAN` over nothing: the plan's exit status is *observed*
@@ -3810,6 +3909,20 @@ carriage return, so such a script does not misbehave — it fails to start at al
     (166880b6) and took `Linux-gcc-release` red — so **the source is not the place**,
     and a fourth attempt needs a GCC 16 AND a g++-13/14 before it lands.
 
+- **Fatality is spelled per FRONTEND: `-Werror` on a GNU-style driver, `/WX` on an
+  MSVC-style one, `clang-cl` included** (it has clang's ID and MSVC's frontend, so it
+  takes `/W4` and therefore `/WX`). The MSVC `/WX` sat commented out from the first
+  commit, so no Windows preset was ever fatal, while AGENT.md said warnings break the
+  Windows build. Master's four Windows CI legs were green over fourteen first-party
+  warning sites, and the fatality table asserted the absence as correct.
+  - On MSVC a warning `/W4` makes visible is fixed at the source. One that reports
+    INTENDED behaviour, with no source change that keeps the behaviour, is a
+    `<flag>|<rationale>` row of `PEDANTIC_COMPILER_MSVC_SUPPRESSIONS` in
+    `cmake/PedanticSuppressions.cmake`, applied beside `/W4` — a statement about which
+    warnings exist, so `PEDANTIC_COMPILER`'s. It is never a `#pragma` at the site and
+    never a fatality exemption. C4324 is such a row: `alignas` padding
+    `InMemoryLruStorage`'s cache-line layout, and every struct holding one.
+
 - **`ctest -R pedantic-suppressions` is the reader, and it DRIVES the file rather
   than scanning it.** It includes `PedanticCompiler.cmake` twice per compiler
   persona — the pair `CMAKE_CXX_COMPILER_ID`/`CMAKE_CXX_COMPILER_FRONTEND_VARIANT`,
@@ -3827,12 +3940,14 @@ carriage return, so such a script does not misbehave — it fails to start at al
 
 - A guard nobody has watched refuse is not a guard, and *"it was seen failing before
   the fix"* is a fact about one commit that stops reproducing the moment the fix
-  lands. `ctest -R pedantic-suppressions-selftest` runs **ten cases** -- eight
+  lands. `ctest -R pedantic-suppressions-selftest` runs **fourteen cases** -- twelve
   synthetic subjects plus two absent inputs -- and names every one on every run,
   because a figure that disagrees with what the tool prints is the defect #723
-  exists to prevent. Three are shapes an unwatched guard accepts: the suppression
-  **copied** outward rather than moved, a subject that no longer adds `-pedantic`,
-  and an MSVC arm that adds nothing.
+  exists to prevent. Four are shapes an unwatched guard accepts: the suppression
+  **copied** outward rather than moved, one added **outside every condition** (in
+  each spelling family, `-Wno-X`, `-wdN`, `/w` and `-w`, since a classifier that
+  knew `/wdN` passed the rest), a subject that no longer adds `-pedantic`, and an
+  MSVC arm that adds nothing.
   - **The sharpest instance of it is a mode a failing tool tells you to re-run in.**
     `check-e2e-helpers.sh --case NAME` ended in a literal `exit 0`, so a run printing
     `BUG: the bound is sleeping through commands that have already finished` and a
@@ -4103,6 +4218,25 @@ so with either launcher active the module scan and precompiled headers are
 turned off and MSVC debug info is forced to `/Z7`
 (a modmap flag makes the launcher's preprocess step fail, and a PCH or shared
 PDB is a second artefact no hit can reproduce).
+
+- **An environment value SEEDS a build tree and never steers one** (`_fc_hold_setting`).
+  `FASTCACHE_ADDR` and `FASTCACHE_SCHEDULER` are taken from the environment only by the
+  configure that creates their cache entry; a later configure whose environment differs
+  REPORTS it, naming the `-D` that would apply it, and applies nothing. Both used to
+  retarget on an environment CHANGE unless the entry had been "changed by hand", judged by
+  comparing it with the value last applied — which cannot see a `-D` that typed the value
+  already held, `OptionSpec::explicitBit`'s blind spot in CMake, where nothing says a `-D`
+  was on this command line. Measured: `-DFASTCACHE_SCHEDULER=`, typed to say OFF from a
+  shell holding the variable, turned dispatch ON. And dispatch is baked into the launcher
+  in BOTH states and said beside it (`_fc_dispatch_state`), because the launcher used to
+  read it from whatever shell ran the build and 341 misses compiled locally in silence.
+  `ctest -R compile-cache-dispatch` compares the printed line with every `LAUNCHER =` line,
+  across reconfigures with and without a `-D` and across ninja's own regeneration. **Its
+  decisions are a verdict on every host, so a decision failure ends the check FAILED and never
+  beside its `SKIP: ` marker**: ctest lets `SKIP_REGULAR_EXPRESSION` outrank
+  `FAIL_REGULAR_EXPRESSION` (measured, `***Skipped` and `100% tests passed`), and only the
+  wiring needs a toolchain. `ctest -R compile-cache-dispatch-verdict` asks a nested ctest how
+  a planted failure is scored under the registration's own two patterns.
 
 - **Under MSVC and clang-cl the `sccache` fallback can silently produce a wrong
   build, and the configure warns about it now rather than leaving it to be
@@ -6031,6 +6165,43 @@ drive letter, a different distro and possibly WSL1. What transfers is *the build
 belong on a filesystem reached over a protocol*; what does not transfer is any of the numbers
 below.
 
+### git in a work tree both operating systems use re-hashes every tracked file
+
+The sources staying on `/mnt/<drive>` has one cost that no build-tree move removes, and it
+reads like a hang. **Windows git and WSL git in one work tree each re-hash every tracked file
+after the other has run.** The index caches per-file stat data, and the two record different
+stat data for the same DrvFs file. Each therefore finds every entry changed, and re-reads and
+re-hashes the whole tree over 9p before it can answer. A configure meets it whenever the other
+operating system's git touched the index last: `cmake/Version.cmake` runs `git status` for the
+version string's dirty suffix, so a lane that alternates a Windows `cl-debug` configure with a
+WSL gate configure in one worktree pays it on every WSL configure.
+
+Measured on 2026-09-28, in one worktree on `/mnt/d` (1,355 tracked files), WSL git 2.53.0 against
+Git for Windows, `git status --porcelain --untracked-files=no` timed with a monotonic clock at
+load1 of about 5-6:
+
+<!-- table-total: none -->
+| sequence | WSL `git status` |
+|---|---|
+| WSL after WSL, three times | 1.90, 1.94, 1.96 s |
+| WSL after a Windows `git status` (0.27-0.32 s), three rounds | 9.30, 8.88, 8.66 s |
+| WSL after WSL again, twice | 1.76, 1.81 s |
+
+About 4.6 times the cost, and it grows with load: the first WSL status after a Windows build of
+that tree took 148 s (load1 1.55 when it started, rising past 20 during the session), and in the
+same session the TAG `describe`,
+which never touches the work tree, once took 26.8 s. So **a git query on `/mnt/<drive>` has no
+bound worth writing down**, and no cheaper command removes the re-hash: any correct dirty
+check must stat every tracked file. `--no-optional-locks` makes it worse, since it never writes
+the refreshed index back, and `diff-index` without a refresh reports every stat mismatch as a
+change.
+
+That is why `cmake/Version.cmake` does not treat a query that did not answer within its bound
+as a negative. It names what that query lost -- the tag, the distance, or the dirty state
+(`-dirty-unknown`) -- and makes the version Provisional, which `FASTCACHED_REQUIRE_EXACT_VERSION`
+refuses. The 20 s bound stays: raising it hides the cost this section names.
+`ctest -R version-git-unanswered` drives each query past a small injected bound.
+
 ### The measurement, pinned (2026-09-18)
 
 Conditions are PINNED here and deliberately do not point at their source: a measurement's
@@ -6439,6 +6610,54 @@ and nothing would say so.
   adopting a narrower set: a difference that is invisible today and silent on the day it matters
   is worse than one that shows up as a count.
 
+## `git grep` exits 0 over a file it cannot read; stderr is the only signal
+
+<!-- agent-tripwire: untriaged: #1567 the git-grep-cannot-read rule has no AGENT.md bullet; one is proposed for the integration consolidation -->
+
+**`git grep` exits 0 over a tracked file it cannot open**, leaves it out of `-l` and `-L`
+both, and says so on stderr alone: `error: failed to stat 'X': Permission denied`.
+Measured with git 2.53 on ext4 under `chmod 000` as a non-root user and git 2.51.2 on
+Windows under a deny-read access list — the same status, the same line. It also skips a
+tracked file DELETED from the work tree without a word, stderr included, and never searches
+a symlink. Each of those is a file left out of an answer, and **a file left out of an
+answer is a file PASSED**: the reviewer's plant, `::htonl(` in a `chmod 000`
+`src/FastCache/Core/Endian.hpp`, made the byte-order check exit 0 through the seam when the
+per-file read it replaced had refused.
+
+So `fastcached_tracked_files` (`scripts/lib/CheckCommon.cmake`) owes an ACCOUNT of every file
+a question names — judged, reported missing, or refused by name — and the rules follow:
+
+- **Any stderr makes a search untrusted**, a status of 0 included, and the question is then
+  answered by reading every file. A benign line some git prints costs time and never a
+  verdict — that direction fails CLOSED on purpose.
+- **Unreadable is not missing.** A file that is there and cannot be read is refused whenever
+  contents were asked for (`cannot judge a file it cannot read`) and is never MISSING_OUT's —
+  a presence-only question answers "present", which is true. Deleted, or a link to nothing,
+  is MISSING_OUT's answer when the caller asked, and refused otherwise.
+- **The directory tells the two apart, not the file.** `EXISTS` is `access(R_OK)` on POSIX
+  and calls a `chmod 000` file absent; `file(TIMESTAMP)` is empty for both; a literal
+  `file(GLOB)` reads names out of the directory, so it lists an unreadable file and a
+  dangling link and not a deleted file. A link is followed to the END of its chain (a cycle
+  is nothing).
+- **A walk refuses a directory it cannot list**: `file(GLOB_RECURSE)` skips one silently, so
+  every file under it would go unfound. On POSIX the directory is still listed as an entry
+  and `EXISTS` calls it absent.
+- **Prove a plant bit with the primitive under test.** `cmake -E cat` exits 0 with no output
+  over a file a Windows access list denies, so it reads as "readable"; the self-test asks a
+  child `file(READ)` instead.
+
+The same defect in a shell script is the same rule: `check-tidy-sweep-database.sh` kept
+`2>/dev/null` on its `git grep`, and its walk's `grep -r` exit 2 vanished into a pipeline;
+both now refuse on any stderr. Census pattern for the next one: `git( -C [^ ]+)? grep` over
+`scripts/*.sh` and `scripts/*.cmake`. Enforced by `ctest -R tracked-files-selftest`, whose
+unreadable rows run on Windows (access list) and on POSIX legs as non-root.
+
+**Blind spot, and its direction.** On Windows neither `EXISTS` nor `IS_READABLE` sees an
+access list and a glob has no error channel, so a deny-list DIRECTORY in a walk is still
+skipped — **OPEN**. A deny-list FILE is caught in git mode by git's stderr naming it, and in
+a walk by CMake's own failing `file(READ)`. The walk is the no-index case; CI's Windows legs
+run in git mode.
+
 ## The enumerators of an enum are a view, and a hand-spelled walk is refused
 
 <!-- agent-tripwire: An enum's ENUMERATORS are `Enumerators<Enum>()` / `Enumerators(from)`, never `views::iota` to `EnumeratorCount<Enum>` -->
@@ -6556,6 +6775,119 @@ is deliberately outside it. For argv, the target is `std::span<char* const>{argv
 because argv is the raw array `std::span` exists for and an `iota(1, argc)` still indexes a bare
 pointer.
 
+## An MSVC-style debug-info link is never incremental
+
+<!-- agent-tripwire: No MSVC-style debug-info link is incremental -->
+
+CMake links Debug and RelWithDebInfo with `/debug /INCREMENTAL` on an MSVC-style toolchain.
+`cmake/IncrementalLink.cmake` rewrites the EXE, SHARED and MODULE linker flags of both to
+`/INCREMENTAL:NO`, in one place, before any dependency or target exists, and
+`ctest -R incremental-link` reads the GENERATED `build.ninja` rather than the module's word
+for it (the configure-output rule above).
+
+**What failed.** Five times on one Windows host on 2026-09-28, in two lanes' `cl-debug`
+trees, the incremental relink of a test executable stopped with
+`X.obj : fatal error LNK1163: invalid selection for COMDAT section 0x2F53`. Each time the
+section was the vftable of a header-inline polymorphic test class, a pick-LARGEST COMDAT
+that every including object declares identically, just after a header edit recompiled those
+objects. A plain retry with nothing recompiled linked.
+
+**The cause is INCONCLUSIVE, and the mitigation does not wait for it.** A standalone
+reproduction with this tree's flags failed 0 times in 860 links: 250 each with no launcher, a
+warm cache and a cold cache, and 110 with `/INCREMENTAL:NO`. Its control never failing means
+it clears nothing and implicates nothing, so it is not evidence for either reading. Every tree
+that failed builds through `fastcache-cc`, so *where* it happened cannot separate launcher from
+linker. What a launcher-fronted tree differs in is two things. (i) The bytes a HIT restores:
+measured identical to `cl`'s own apart from the one-byte COFF timestamp, and both failing
+objects that could be placed were `cl`'s own MISS output. (ii) The `/Z7` that
+`cmake/portable/CompileCache.cmake` forces. Neither is launcher CODE acting at link time; (ii)
+is a configuration. What survives either reading is incremental-link state, and a link that
+keeps no `.ilk` has none to go stale.
+
+**So it is never gated on the launcher.** A gate there bets on the one reading the evidence
+cannot make, and leaves `/Zi` plus `/INCREMENTAL` exposed, which was never tested. Two
+spellings are not stacked: the module REMOVES every form of the switch and states one, because
+which of two spellings wins is the linker's choice, and `/debug` with no switch at all links
+incrementally by default.
+
+**What it costs**, measured on the real `fastcache-compile-node-tests` inputs (118 objects,
+410 MB, copied out of an idle tree), with link 14.51.36252 on a host at 100% CPU and 9
+interleaved pairs:
+
+<!-- table-total: none -->
+| link | wall time |
+| --- | --- |
+| `/INCREMENTAL:NO`, full | 1.6-2.5 s, median 1.7 s |
+| `/INCREMENTAL`, one object changed | 0.3-2.7 s |
+
+That is at most about a second per link, and each test executable stops carrying a ~200 MB
+`.ilk`. These figures are conditions, not a constant: re-measure before citing them for a
+different executable or host.
+
+**clang-cl is covered by the same condition and is unaffected by it.** `MSVC` is true for cl
+and clang-cl. clang-cl links through `lld-link`, which never links incrementally and accepts
+`/INCREMENTAL:NO` silently (LLD 22.1.3, checked with `/debug`, alone and beside `/INCREMENTAL`).
+A GNU-style driver on Windows spells no such switch and is left alone.
+
+## clang-tidy's header filter is matched against the path a header was OPENED by, in every spelling
+
+<!-- agent-tripwire: untriaged: #1567 the separator-agnostic header filter has no AGENT.md bullet; one is proposed for the integration consolidation -->
+
+`HeaderFilterRegex` in `.clang-tidy` is matched against the path the preprocessor
+OPENED a header by, and that path is spelled by the build, not by the repository. The
+MSVC compile database spells its include directories with backslashes, so
+`#include <tests/ScratchPath.hpp>` opens `D:\...\src/tests/ScratchPath.hpp` — a
+backslashed include directory and a slashed `#include` name. **So every separator in
+the filter is `[/\\]`**, and the filter names this repository's own roots and no
+dependency location.
+
+**Spelled with `/` alone, the filter matched no header on a Windows run and the run
+still read clean.** Measured with clang-tidy 22.1.8 on Windows over
+`ConsensusTier_test.cpp`, a naming violation planted in a header under `src/tests/` and
+force-included through the backslashed include directory: 0 reports under the `/`-only
+filter — all 20,891 warnings suppressed as non-user code — and 2 under `[/\\]`. The
+same shape held on three more units. Nothing looked wrong, because the main file's
+findings still came through.
+
+**Two dimensions, each of which has already shipped a defect**, so a verdict is taken
+in both: WHERE a checkout lives (#1040 — a pattern anchored on a directory name matched
+CI's `.../fastcached/` and no lane worktree) and HOW its separators are spelled (the
+above). The guard that existed read **363/363 under both the broken and the fixed
+filter**, because it matched POSIX paths only — a guard that could not fail on the
+defect in front of it.
+
+- **One predicate, one table of spellings**: `scripts/lib/header-filter.sh` —
+  `header_filter_match` (coverage: a header counts only if it is taken in EVERY
+  spelling), `header_filter_reach` (a leak: a dependency or third-party header taken
+  in ANY spelling is one, since a filter taking catch2 only when backslashed drowns a
+  Windows sweep and no other), and `HeaderFilterSpellings` (`posix`, `windows`,
+  `msvc`).
+- **Two callers of it, for two reasons.** `ctest -R tidy-header-filter` asks at this
+  checkout's real root on EVERY platform, Windows included, where `local-gate.sh` does
+  not run; `local-gate.sh`'s coverage check asks the same predicate as the tidy
+  sweep's PRECONDITION, with the vendored/first-party split and its untracked-root
+  refusal. Neither may grow a private copy of the match.
+- **What must stay OUT is derived, not listed**: `header_filter_dependency_paths` lays every
+  `CPMAddPackage(NAME ...)` the tree declares out in both layouts (`_deps/<name>-src/`,
+  `.cache/CPM/<name>/<hash>/`) and both header shapes (`src/<name>/`, `include/<name>/`),
+  and a tree declaring none is refused — zero is a parser that found nothing. Tracked
+  third-party headers come from `scripts/lib/third-party-roots.txt`.
+- **A miss names its cause**: a header taken in one spelling and not another is
+  reported with `(<spelling> spelling)`, and the gate then says *separator*, never
+  *where this checkout lives* — the #1040 sentence would send the reader to the wrong
+  fix. A header missed in every spelling carries no suffix.
+- **The remedy is either separator, never a second copy of the pattern.** Two copies
+  — one `/`, one `\` — still miss MSVC's mix, and the self-tests pin exactly that.
+
+**Blind spot, and its direction.** Both callers model `llvm::Regex` with `grep -E`
+(POSIX ERE, where a backslash inside a bracket is literal, as it is in clang-tidy) and
+model *how a build opens a header* with three spellings. No registered check asks
+clang-tidy itself; the agreement above was checked by hand. A construct the two
+engines read differently, or a build that opens headers by a fourth spelling (a `\\?\`
+long-path prefix, an 8.3 short name), fails **OPEN**: the check says covered while
+clang-tidy discards. That is the reason to keep the filter to classes, alternation and
+`.*`, and to add a spelling row when a build is found opening headers another way.
+
 ## Open work
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
@@ -6570,13 +6902,23 @@ pointer.
   itself pinned by a case, so the bash or platform that moves it is a red rather than
   a Windows leg that hangs with no diagnosis.
 
+- **[#1631](https://github.com/LASTRADA-Software/fastcached/issues/1631)** — every
+  per-file scan in `check-e2e-helpers.sh`, `procsub-reader-scan` among them, reads
+  through an extractor ending in `|| true`, so a grep that fails on ONE file passes that
+  file: #1630's shape, failing OPEN. The canary before each scan catches only a failure
+  that empties every file. The house idiom across seven extractors, so it is a design
+  change of its own rather than a line of PR #1600.
+
 - **[#1567](https://github.com/LASTRADA-Software/fastcached/issues/1567)** — `## A correction is a search,
   not a recollection` has no `AGENT.md` tripwire. The nearest bullet is `testing.md`'s
   census rule, which this section itself calls borrowed, so the rule that a claim
   corrected in the places you REMEMBER writing it is not corrected fires in no session
   that does not open this file. Marked `untriaged:` and not `none:`, because `none`
   would claim the section needs no tripwire, and `ctest -R rulebook-tripwires` prints
-  the count against this issue on every run.
+  the count against this issue on every run. `## clang-tidy's header filter is matched
+  against the path a header was OPENED by, in every spelling` and `` ## `git grep` exits 0
+  over a file it cannot read; stderr is the only signal `` are in the same state until the
+  integration consolidation adds their proposed bullets.
 
 - **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six
   contexts are still `Undecided` in `check-merge-queue-contexts.sh`'s binding table

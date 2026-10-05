@@ -76,11 +76,11 @@ enum class ColourAnswer : std::uint8_t
 /// sees, and a light theme stays legible: a tone says *fine*, *look at this* or *act*, never a shade.
 struct TonePaletteRow
 {
-    FrameTone tone;                     ///< The enumerator this row describes.
+    FrameTone tone {};                  ///< The enumerator this row describes.
     std::optional<std::uint8_t> colour; ///< The foreground's palette index, or none to keep the terminal's.
-    bool bold;                          ///< Whether the run is bold.
-    bool dim;                           ///< Whether it is dimmed.
-    bool inverse;                       ///< Whether it is drawn in inverse video.
+    bool bold = false;                  ///< Whether the run is bold.
+    bool dim = false;                   ///< Whether it is dimmed.
+    bool inverse = false;               ///< Whether it is drawn in inverse video.
 };
 
 /// The one palette: a row per `FrameTone`, in enumerator order (#134 G1).

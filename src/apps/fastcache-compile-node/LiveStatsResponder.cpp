@@ -117,10 +117,7 @@ namespace
                          .rationale = "MergedResponder routes only the Live family here, and an opcode with no OpTable "
                                       "row belongs to no family, so it is answered at the door" };
             case Wire::PrePayloadDecision::Unauthenticated:
-                return { .counter = std::nullopt,
-                         .rationale =
-                             "AuthRequired() is false here by decision -- the listener's credential is the "
-                             "scheduler's -- and DecidePrePayload yields this only for a surface that requires one" };
+                return { .counter = std::nullopt, .rationale = NodeChecksNoPasswordRationale };
             case Wire::PrePayloadDecision::Serve:
                 break;
         }
@@ -144,11 +141,6 @@ namespace
         RefusalPolicy policy;    ///< What this surface does about it.
     };
 
-    /// Why neither credential arm counts here.
-    constexpr std::string_view CredentialIsTheSchedulersRationale =
-        "AUTH is the Session family, which MergedResponder routes to the scheduler; no credential outcome is ever "
-        "decided against this surface";
-
     /// What this surface does about each endpoint-decided refusal.
     constexpr EnumTable<EndpointRefusal, EndpointRefusalRow> EndpointRefusals { {
         { .refusal = EndpointRefusal::InFlightBudget,
@@ -156,9 +148,9 @@ namespace
           // operator losing the view at the moment the listener is busiest.
           .policy = { .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedEndpointBusy, .rationale = {} } },
         { .refusal = EndpointRefusal::CredentialMalformed,
-          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
+          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSessionsRationale } },
         { .refusal = EndpointRefusal::CredentialRejected,
-          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
+          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSessionsRationale } },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .policy = { .counter = std::nullopt, .rationale = AnswerDeadlineIsTheEndpointsRationale } },
         { .refusal = EndpointRefusal::NodeProofUnchallenged,
@@ -203,10 +195,10 @@ core::async::Task<FrameReply> LiveStatsResponder::Answer(std::span<std::byte con
 
 std::optional<std::vector<std::byte>> LiveStatsResponder::RefusePeer(PeerIdentity const& peer, std::uint8_t /*opRaw*/) const
 {
-    // The whole identity, narrowed to what a gate may act on. Since #1512 the re-gate sees the
-    // same two facts this door does, so there is no longer a reason to ask a smaller question
-    // here -- and asking one anyway would refuse a watcher the re-gate would have kept.
-    return RefuseWatcher(LiveWatcher { .host = peer.host, .proven = peer.proven });
+    // The whole connection, since a watcher and a peer are one type: the re-gate sees every fact
+    // this door does -- a proof and a ticket alike -- so asking a smaller question here would
+    // refuse a watcher the re-gate would have kept.
+    return RefuseWatcher(peer);
 }
 
 std::optional<std::vector<std::byte>> LiveStatsResponder::RefuseWatcher(LiveWatcher const& watcher) const
@@ -289,11 +281,10 @@ core::async::Task<std::vector<std::byte>> LiveStatsResponder::Serve(std::span<st
                                                                     PeerIdentity peer,
                                                                     IPushSink* sink)
 {
-    // Narrowed, not dropped (#1512). `LiveWatcher` is what a gate may act on -- the host and
-    // the identity its connection proved (#178) -- and it OWNS both because `Recheck` reads
-    // them again on every tick, long after this frame's storage is gone.
-    co_return co_await _stream.Serve(
-        frame, LiveWatcher { .host = std::move(peer.host), .proven = std::move(peer.proven) }, sink, this, &_reactor);
+    // Handed over whole (#1512): `LiveWatcher` is the same facts a gate acts on -- the host and
+    // every key the connection established (#178) -- and it OWNS them because `Recheck` reads them
+    // again on every tick, long after this frame's storage is gone.
+    co_return co_await _stream.Serve(frame, std::move(peer), sink, this, &_reactor);
 }
 
 } // namespace FastCache::Node

@@ -58,7 +58,7 @@ TEST_CASE("An empty member set is a node with no cluster, not a broken one", "[c
 {
     // The shape a machine has while it waits to be admitted to a running fleet.
     // Refusing it -- which this used to do -- is what made "add a node" mean
-    // "restart every node with a longer --raft-peer list", because the only
+    // "restart every node with a longer bootstrap list", because the only
     // startable alternative bootstraps a one-member cluster of its own, and a node
     // that has elected itself can never be admitted to somebody else's.
     auto config = Sound();

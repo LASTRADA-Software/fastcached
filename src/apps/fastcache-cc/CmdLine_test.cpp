@@ -218,6 +218,28 @@ TEST_CASE("The key probe and the dispatched line drop clang-cl's pass-through de
     CHECK(std::ranges::contains(*remote, "/EHsc"));
 }
 
+TEST_CASE("The end-of-options marker stays with the source, which never travels")
+{
+    // CMake's clang-cl rule ends `-c -- $in`. The launcher dropped the source and forwarded
+    // the `--`, the worker's allowlist has no row for it, and so every CMake + clang-cl unit
+    // came back `argument -- is not on this worker's accepted-flag list`. Found writing the
+    // clang-cl `-imsvc` case with the rule's own argument order.
+    std::vector<std::string> const argv {
+        R"(C:\LLVM\bin\clang-cl.exe)", "/nologo", "-TP", "/EHsc", "/W4", R"(/Foa.obj)", "-c", "--", R"(C:\src\main.cpp)",
+    };
+    auto const cmd = Parse(argv);
+    REQUIRE(cmd.parsedOk);
+    CHECK(cmd.source == R"(C:\src\main.cpp)");
+
+    auto const remote = RemoteCompileArgs(cmd, argv, {});
+    REQUIRE(remote.has_value());
+    CHECK_FALSE(std::ranges::contains(*remote, "--"));
+    // The control: the flag right before it travels, and the client's own preprocess still
+    // carries the marker in front of the source it protects.
+    CHECK(std::ranges::contains(*remote, "/W4"));
+    CHECK(std::ranges::contains(PreprocessCommand(cmd, argv), "--"));
+}
+
 TEST_CASE("ParseCommand does not treat an absolute path as an option for GNU drivers")
 {
     // A GNU driver only introduces options with '-', so /usr/src/a.cpp is a
@@ -1215,16 +1237,95 @@ TEST_CASE("A compile that writes a second artefact is not cacheable")
         CHECK_FALSE(cmd.parsedOk);
     }
 
-    // And an ordinary compile is untouched -- including `/Yu`, which USES a
-    // precompiled header rather than writing one.
-    for (auto const& argv: { std::vector<std::string> { "cl", "/c", "/Yupch.h", "a.cpp", "/Foa.obj" },
-                             std::vector<std::string> { "cl", "/c", "/O2", "a.cpp", "/Foa.obj" },
+    // And an ordinary compile is untouched.
+    for (auto const& argv: { std::vector<std::string> { "cl", "/c", "/O2", "a.cpp", "/Foa.obj" },
                              std::vector<std::string> { "g++", "-c", "-fmodules-ts", "a.cpp", "-o", "a.o" } })
     {
         auto const cmd = ParseCommand(argv);
         INFO("flag: " << argv[2]);
         CHECK_FALSE(cmd.sideArtefact);
         CHECK(cmd.parsedOk);
+    }
+}
+
+TEST_CASE("cl's shared-PDB debug formats are not cacheable, and clang-cl's same spellings are", "[cmdline][pdb]")
+{
+    // `cl /Zi` and `/ZI` write the translation unit's types into a PDB SHARED across the
+    // target, and the object only refers to it. A hit restores the object and leaves that
+    // PDB without this TU's types: a debugger that cannot see them, under a green build.
+    for (auto const* flag: { "/Zi", "-Zi", "/ZI", "-ZI" })
+    {
+        auto const cl = Parse({ "cl.exe", "/nologo", "/c", flag, "/Foa.obj", "a.cpp" });
+        INFO("cl " << flag);
+        CHECK(cl.sideArtefact);
+        CHECK_FALSE(cl.parsedOk);
+    }
+
+    // clang-cl reads the same spellings as `/Z7` -- debug info INSIDE the object -- so a
+    // hit reproduces everything the compile wrote. Refusing it would un-cache every
+    // clang-cl build CMake configures with its default `-Zi`, for nothing.
+    for (auto const* flag: { "/Zi", "-Zi", "/ZI", "-ZI" })
+    {
+        auto const clangCl = Parse({ "clang-cl.exe", "/nologo", "/c", flag, "/Foa.obj", "a.cpp" });
+        INFO("clang-cl " << flag);
+        CHECK_FALSE(clangCl.sideArtefact);
+        CHECK(clangCl.parsedOk);
+    }
+
+    // A later `/Z7` does not rescue the line: which one `cl` obeys is its own override
+    // rule, and a model more permissive than the driver produces wrong agreement.
+    CHECK(Parse({ "cl.exe", "/c", "/Zi", "/Z7", "/Foa.obj", "a.cpp" }).sideArtefact);
+
+    // The control: `/Z7` alone is the embedded format and stays cacheable.
+    auto const embedded = Parse({ "cl.exe", "/c", "/Z7", "/Foa.obj", "a.cpp" });
+    CHECK_FALSE(embedded.sideArtefact);
+    CHECK(embedded.parsedOk);
+}
+
+TEST_CASE("A compile that USES a precompiled header is not cacheable either", "[cmdline][pch]")
+{
+    // Measured with cl 19.51.36252 and link 14.51.36252 over a two-build /Yc + /Yu
+    // reproduction: a `cl /Yu` object carries `-INCLUDE:__@@_PchSym_...`, a symbol
+    // whose name differs per checkout, and an `LF_PRECOMP` record naming the ABSOLUTE
+    // path of the pch.obj it was compiled against. The key hashes the header's text
+    // and neither of those, so the same key was a hit in both builds:
+    //   - replayed into another checkout, the link FAILED with LNK2011 and LNK1120,
+    //     while the same checkout compiled directly linked clean;
+    //   - replayed into the same checkout after its PCH was rebuilt, the link exited 0
+    //     with LNK4206 and dropped the translation unit's debug info, in silence.
+    // Every spelling, fused (how a build writes it) and bare.
+    for (auto const* flag: { "/Yupch.h", "-Yupch.h", "/Yu", "-Yu" })
+    {
+        auto const cmd = Parse({ "cl.exe", "/nologo", "/c", flag, "/Fppch.pch", "/Foa.obj", "a.cpp" });
+        INFO("cl " << flag);
+        CHECK(cmd.sideArtefact);
+        CHECK_FALSE(cmd.parsedOk);
+    }
+
+    // `/Y-` makes `cl` ignore `/Yu` wherever it appears, and the launcher deliberately
+    // does not model that: getting it wrong costs a wrong hit, not modelling it costs a
+    // local compile of a line nobody writes. Err narrow.
+    CHECK(Parse({ "cl.exe", "/c", "/Yupch.h", "/Y-", "/Foa.obj", "a.cpp" }).sideArtefact);
+
+    // clang-cl measured clean under the same reproduction (clang 22.1.3): its `/Yu`
+    // object has no `LF_PRECOMP` record and no `__@@_PchSym_` directive, and every
+    // replay linked and ran. So the refusal is `cl`'s alone, and this is what makes the
+    // scoping a checked fact rather than a row's comment.
+    for (auto const* flag: { "/Yupch.h", "-Yupch.h", "/Yu", "-Yu" })
+    {
+        auto const clangCl = Parse({ "clang-cl.exe", "/nologo", "/c", flag, "/Fppch.pch", "/Foa.obj", "a.cpp" });
+        INFO("clang-cl " << flag);
+        CHECK_FALSE(clangCl.sideArtefact);
+        CHECK(clangCl.parsedOk);
+    }
+
+    // The neighbours that must survive: a bare `/Y-` or `/Yd` is not `/Yu`.
+    for (auto const* flag: { "/Y-", "/Yd" })
+    {
+        auto const neighbour = Parse({ "cl.exe", "/c", flag, "/Foa.obj", "a.cpp" });
+        INFO("cl " << flag);
+        CHECK_FALSE(neighbour.sideArtefact);
+        CHECK(neighbour.parsedOk);
     }
 }
 
@@ -1405,6 +1506,38 @@ TEST_CASE("A CMake-shaped MSVC command line is dispatchable")
     // blockers: with `/TP` handled, this one alone still made every CMake + MSVC
     // compile fall back to a local build.
     CHECK(std::ranges::none_of(out, [](std::string const& a) { return a.starts_with("/Fd"); }));
+}
+
+TEST_CASE("A language selector that names its language owns no following argument")
+{
+    // `/TP` was dropped as a folded language selector AND took the next argument with it,
+    // under a rule written for the separated `-x c++` form. CMake writes `/TP` first and a
+    // `-D` next, which is dropped from a dispatched line anyway -- so the swallow hid there,
+    // and surfaced only on a line whose `/TP` was followed by a warning or code-generation
+    // flag: `/TP /W4 /WX` reached the worker as `/WX` alone and compiled at the default level
+    // what the client compiled at `/W4`. Measured: a `/W4 /WX` template warning that fails
+    // the local compile passed on the worker, and the object was served.
+    for (auto const* selector: { "/TP", "-TP", "/TC", "-TC" })
+    {
+        std::vector<std::string> const argv { "cl", "/nologo", selector, "/W4", "/WX", "/EHsc", "/c", "a.cpp", "/Foa.obj" };
+        auto const cmd = ParseCommand(argv);
+        auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+        INFO("selector: " << selector);
+        REQUIRE(parsed.has_value());
+        auto const& out = Unwrap(parsed);
+        CHECK(std::ranges::contains(out, "/W4"));
+        CHECK(std::ranges::contains(out, "/WX"));
+        CHECK(std::ranges::contains(out, "/EHsc"));
+    }
+
+    // The control: the separated `-x` form DOES own its value, which must not reach a worker
+    // as a bare word it would open as a file -- and the flag after the value still travels.
+    std::vector<std::string> const gnu { "g++", "-x", "c++", "-Wall", "-c", "a.c", "-o", "a.o" };
+    auto const gnuCmd = ParseCommand(gnu);
+    auto const gnuOut = RemoteCompileArgs(gnuCmd, gnu, /*targetTriple=*/ {});
+    REQUIRE(gnuOut.has_value());
+    CHECK_FALSE(std::ranges::contains(Unwrap(gnuOut), "c++"));
+    CHECK(std::ranges::contains(Unwrap(gnuOut), "-Wall"));
 }
 
 TEST_CASE("A compile writing a shared PDB is not dispatched")

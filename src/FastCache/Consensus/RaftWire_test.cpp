@@ -211,7 +211,7 @@ TEST_CASE("The frame header is exactly what the format documents", "[consensus][
 
     REQUIRE(frame.size() > RaftWire::HeaderSize);
     CHECK(frame[0] == std::byte { 0xFA });
-    CHECK(frame[1] == std::byte { RaftWire::CurrentVersion });
+    CHECK(frame[1] == std::byte { 0x05 }); // version 5: the byte, not the constant
     CHECK(frame[2] == std::byte { 0x02 }); // RequestVoteResponse
 
     // payloadLength, big-endian: three fields of 8, 1 and 2 bytes, each with a
@@ -539,6 +539,7 @@ namespace
 {
     return RaftWire::ProofFrame { .dialler = "d",
                                   .target = "a",
+                                  .direction = RaftWire::SessionDirection::OneWay,
                                   .nonce = DistinctNonce(0x01),
                                   .ephemeral = DistinctEphemeral(0x21),
                                   .signature = DistinctSignature() };
@@ -566,6 +567,7 @@ TEST_CASE("Every handshake frame round-trips, field for field", "[consensus][raf
     RaftWire::ChallengeFrame const challenge { .nonce = DistinctNonce(0x10), .ephemeral = DistinctEphemeral(0x30) };
     RaftWire::ProofFrame const proof { .dialler = "the-dialler",
                                        .target = "the-target",
+                                       .direction = RaftWire::SessionDirection::TwoWay,
                                        .nonce = DistinctNonce(0x40),
                                        .ephemeral = DistinctEphemeral(0x60),
                                        .signature = DistinctSignature() };
@@ -658,13 +660,15 @@ TEST_CASE("A peer at an earlier grammar is refused at its handshake", "[consensu
     // 64-byte signature, and a verdict a signature, where version 3 carried 32-byte MACs under
     // the cluster's pre-shared key. Accepting a version 3 peer would be the per-connection
     // fallback to that key, so both are refused at the handshake, before anything is misread.
+    // Version 5 is the flag day's: the proof states the `SessionDirection` it asks for, a sixth
+    // field, and a version 4 proof of five is refused by its NUMBER rather than by its arity.
     //
     // The VALUE is pinned beside the name: every other case here spells
     // `CurrentVersion`, which would go on passing if the constant moved back.
-    CHECK(RaftWire::CurrentVersion == 4);
-    CHECK(RaftWire::MinSupportedVersion == 4);
+    CHECK(RaftWire::CurrentVersion == 5);
+    CHECK(RaftWire::MinSupportedVersion == 5);
 
-    for (auto const earlier: { std::uint8_t { 2 }, std::uint8_t { 3 } })
+    for (auto const earlier: { std::uint8_t { 2 }, std::uint8_t { 3 }, std::uint8_t { 4 } })
     {
         CAPTURE(earlier);
         CHECK_FALSE(RaftWire::IsSupported(earlier));
@@ -674,6 +678,24 @@ TEST_CASE("A peer at an earlier grammar is refused at its handshake", "[consensu
         auto const decoded = RaftWire::DecodeProof(header, payload);
         REQUIRE_FALSE(decoded.has_value());
         CHECK(decoded.error().code == ConsensusErrorCode::UnsupportedVersion);
+
+        // And the two frames the ACCEPTOR sends: in a mixed fleet the challenge is the frame an old
+        // peer meets first, so it is refused by its version as the proof is.
+        auto const challengeFrame = RaftWire::EncodeChallenge(
+            RaftWire::ChallengeFrame { .nonce = DistinctNonce(0x01), .ephemeral = DistinctEphemeral(0x21) }, earlier);
+        auto const [challengeHeader, challengePayload] = Split(challengeFrame);
+        auto const challenge = RaftWire::DecodeChallenge(challengeHeader, challengePayload);
+        REQUIRE_FALSE(challenge.has_value());
+        CHECK(challenge.error().code == ConsensusErrorCode::UnsupportedVersion);
+
+        auto const verdictFrame = RaftWire::EncodeVerdict(
+            RaftWire::VerdictFrame {
+                .verdict = RaftWire::HandshakeVerdict::Accepted, .acceptor = "a", .signature = DistinctSignature() },
+            earlier);
+        auto const [verdictHeader, verdictPayload] = Split(verdictFrame);
+        auto const verdict = RaftWire::DecodeVerdict(verdictHeader, verdictPayload);
+        REQUIRE_FALSE(verdict.has_value());
+        CHECK(verdict.error().code == ConsensusErrorCode::UnsupportedVersion);
     }
 }
 
@@ -688,7 +710,7 @@ TEST_CASE("Each handshake frame carries the fields of its version, at their widt
         return row->fieldCount;
     };
     CHECK(fieldsOf(RaftWire::MessageType::Challenge) == 2);
-    CHECK(fieldsOf(RaftWire::MessageType::Proof) == 5);
+    CHECK(fieldsOf(RaftWire::MessageType::Proof) == 6);
     CHECK(fieldsOf(RaftWire::MessageType::Verdict) == 3);
     CHECK(RaftWire::SignatureSize == 64);
     CHECK(RaftWire::EphemeralKeySize == 32);
@@ -743,6 +765,7 @@ TEST_CASE("A handshake frame is refused before any field is trusted", "[consensu
         auto const ephemeral = DistinctEphemeral(0x21);
         auto const signature = DistinctSignature();
         auto const shortField = WireFields::AsBytes(std::string_view { "short" });
+        auto const oneWay = std::array { std::byte { 0x00 } };
         auto const proofWith = [&](std::span<std::byte const> nonceField,
                                    std::span<std::byte const> ephemeralField,
                                    std::span<std::byte const> signatureField) {
@@ -750,6 +773,7 @@ TEST_CASE("A handshake frame is refused before any field is trusted", "[consensu
                 RaftWire::CurrentVersion,
                 std::array { WireFields::AsBytes(std::string_view { "d" }),
                              WireFields::AsBytes(std::string_view { "a" }),
+                             std::span<std::byte const> { oneWay },
                              nonceField,
                              ephemeralField,
                              signatureField });
@@ -811,4 +835,96 @@ TEST_CASE("Every handshake row has a ceiling and every Raft message has none", "
             CHECK(row.phase.Ceiling() <= RaftWire::MaxHandshakePayload);
         }
     }
+}
+
+TEST_CASE("A proof carries its session direction and the byte is what travels",
+          "[consensus][raft][wire][handshake][formation]")
+{
+    // The raw enumerators, the anchor: every other case spells the names, which would go on
+    // agreeing with each other if a value moved.
+    CHECK(static_cast<std::uint8_t>(RaftWire::SessionDirection::OneWay) == 0);
+    CHECK(static_cast<std::uint8_t>(RaftWire::SessionDirection::TwoWay) == 1);
+
+    for (auto const direction: { RaftWire::SessionDirection::OneWay, RaftWire::SessionDirection::TwoWay })
+    {
+        CAPTURE(static_cast<unsigned>(direction));
+        auto proof = SomeProof();
+        proof.direction = direction;
+        auto const frame = RaftWire::EncodeProof(proof);
+        auto const [header, payload] = Split(frame);
+
+        // The byte, at its position: the third field, one byte wide, after the two ids.
+        auto const fields = Unwrap(WireFields::SplitExactly(payload, 6));
+        REQUIRE(fields[2].size() == 1);
+        CHECK(fields[2][0] == std::byte { static_cast<std::uint8_t>(direction) });
+
+        CHECK(RaftWire::DecodeProof(header, payload) == proof);
+    }
+}
+
+TEST_CASE("A proof naming a direction this build does not know is refused", "[consensus][raft][wire][handshake][formation]")
+{
+    auto const frame = RaftWire::EncodeProof(SomeProof());
+    auto const [header, payload] = Split(frame);
+    auto const fields = Unwrap(WireFields::SplitExactly(payload, 6));
+
+    auto const decodesWith = [&](std::span<std::byte const> direction) {
+        auto const rebuilt = WireFields::Encode({ fields[0], fields[1], direction, fields[3], fields[4], fields[5] });
+        auto rebuiltHeader = header;
+        rebuiltHeader.payloadLength = static_cast<std::uint32_t>(rebuilt.size());
+        return RaftWire::DecodeProof(rebuiltHeader, rebuilt);
+    };
+
+    // The control: the frame's own byte, put back where it was, decodes.
+    CHECK(decodesWith(fields[2]).has_value());
+
+    auto const last = std::array { std::byte { static_cast<std::uint8_t>(RaftWire::SessionDirection::Last) } };
+    auto const bogus = std::array { std::byte { 0x07 } };
+    auto const wide = std::array { std::byte { 0x00 }, std::byte { 0x01 } };
+    for (auto const direction:
+         { std::span<std::byte const> { last }, std::span<std::byte const> { bogus }, std::span<std::byte const> { wide } })
+    {
+        auto const decoded = decodesWith(direction);
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == ConsensusErrorCode::MalformedFrame);
+        CHECK(decoded.error().context.contains("direction"));
+    }
+}
+
+TEST_CASE("A version-5 proof frame is exactly these bytes: the direction third, the transcript signed last",
+          "[consensus][raft][wire][handshake]")
+{
+    // The whole frame at version 5, written out: the header, then the six fields -- the dialler, the
+    // member it dialled, the session direction (one byte, 0x00 OneWay), its nonce, its ephemeral key
+    // and its signature. `SomeProof()`'s values ascend from 0x01, 0x21 and 0x80, written as the runs
+    // they are.
+    auto const ascending = [](int first, std::size_t count) {
+        auto out = std::vector<std::byte> {};
+        for (auto const index: std::views::iota(std::size_t { 0 }, count))
+            out.push_back(static_cast<std::byte>(first + static_cast<int>(index)));
+        return out;
+    };
+    auto golden = std::vector<std::byte> {};
+    auto const append = [&golden](std::vector<std::byte> const& part) {
+        golden.insert(golden.end(), part.begin(), part.end());
+    };
+    // clang-format off: the grid IS the specification -- one wire field per row.
+    append({ std::byte { 0xFA }, std::byte { 0x05 }, std::byte { 0x11 },                     // magic, version 5, Proof
+             std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x9B } }); // payload = 155
+    append({ std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x01 }, std::byte { 'd' } }); // dialler
+    append({ std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x01 }, std::byte { 'a' } }); // target
+    append({ std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x01 }, std::byte { 0x00 } }); // OneWay
+    append({ std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x20 } }); // nonce
+    // clang-format on
+    append(ascending(0x01, 32));
+    append({ std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x20 } }); // ephemeral key
+    append(ascending(0x21, 32));
+    append({ std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x40 } }); // signature
+    append(ascending(0x80, 64));
+
+    CHECK(RaftWire::EncodeProof(SomeProof()) == golden);
+    auto const [header, payload] = Split(golden);
+    auto const decoded = RaftWire::DecodeProof(header, payload);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == SomeProof());
 }

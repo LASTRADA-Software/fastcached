@@ -77,6 +77,11 @@ if(NOT DEFINED FASTCACHED_PEDANTIC_PROBE_DIR)
     set(FASTCACHED_PEDANTIC_PROBE_DIR "${FASTCACHED_SOURCE_DIR}/scripts/pedantic-flag-probe")
 endif()
 
+# The project's MSVC suppression rows, exactly as the top-level CMakeLists.txt hands them to the
+# module: the check asks what the module does with THESE, never with a copy. A synthetic subject
+# does not read them, which costs it nothing.
+include("${FASTCACHED_SOURCE_DIR}/cmake/PedanticSuppressions.cmake")
+
 # Which compilers to ask as. `PedanticCompiler.cmake` branches on
 # `CMAKE_CXX_COMPILER_FRONTEND_VARIANT` first and on `CMAKE_CXX_COMPILER_ID` inside,
 # so a persona is the PAIR -- and `clang-cl` is why: its ID is `Clang` and its
@@ -129,7 +134,7 @@ set(pedanticPersonaTable
 # truncated -- which is the quiet half of every table defect in this tree.
 set(pedanticFatalityFlags
     "^-Werror$|makes every existing warning fatal on a GNU-style driver, and selects no diagnostic"
-    "^/WX$|the MSVC spelling of the same, currently commented out in the subject"
+    "^/WX$|the MSVC-frontend spelling of the same, for cl and clang-cl alike, and selects no diagnostic"
     "^-Wno-error=|exempts one diagnostic from fatality and leaves it VISIBLE, so a preset without -Werror that sees it is getting exactly what this asks for"
 )
 
@@ -139,6 +144,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 
 set(violations "")
+set(unconditional "")
 set(vacuous "")
 
 # `fastcached_row_fields` lets the LAST field hold a '|', which is right for a
@@ -325,12 +331,59 @@ foreach(persona IN LISTS pedanticPersonaTable)
     endforeach()
 endforeach()
 
+# A suppression outside `if(${PEDANTIC_COMPILER})` altogether is the #611 defect with the
+# condition removed rather than swapped: present at BOTH `WERROR` settings, so the asymmetry loop
+# above cannot see it, and present with the pedantic set OFF, where the warning it suppresses is
+# never turned on. So every persona is asked once more with `PEDANTIC_COMPILER` OFF, at both
+# `WERROR` settings, and no flag that selects a diagnostic AWAY may appear, in any spelling a driver
+# takes: `pedanticWarningSuppressors`.
+#
+# The MSVC family is the warning selectors `cl` and `clang-cl` accept, with `-` or `/`: `w` (every
+# warning off), `wdN` (one off), `woN` (once), `w1N`..`w4N` (moved to a level `/W4` may not show),
+# and `W0` (the level that shows nothing). `weN` is NOT one: it makes a warning an error, which
+# hardens it. The same enumeration is fastcache-cc's argument allowlist
+# (src/apps/fastcache-cc/CompileJob.cpp, the `w`/`wd`/`we`/`wo`/`w1`..`w4` rows); it is C++ inside an
+# app, so it is cited rather than shared. The GNU family is `-w` (every warning off) and `-Wno-X`,
+# except the fatality-only `-Wno-error=X`, which the WERROR block owns. One list for every persona:
+# clang-cl takes `-Wno-X` too, and a spelling no driver takes cannot be recorded anyway.
+set(pedanticWarningSuppressors
+    "^[-/]w(d[0-9]+|o[0-9]+|[1-4][0-9]+)?$"
+    "^[-/]W0$"
+    "^-Wno-")
+set(pedanticWarningSuppressorExceptions "^-Wno-error=")
+foreach(persona IN LISTS pedanticPersonaTable)
+    fastcached_row_fields("${persona}"
+        personaId personaFrontend personaDriver personaAnchor personaPresets)
+    foreach(werror IN ITEMS OFF ON)
+        pedantic_flags_for("${personaId}" "${personaFrontend}" "${werror}" withoutPedantic OFF)
+        foreach(flag IN LISTS withoutPedantic)
+            set(suppresses FALSE)
+            foreach(pattern IN LISTS pedanticWarningSuppressors)
+                if(flag MATCHES "${pattern}")
+                    set(suppresses TRUE)
+                endif()
+            endforeach()
+            foreach(pattern IN LISTS pedanticWarningSuppressorExceptions)
+                if(flag MATCHES "${pattern}")
+                    set(suppresses FALSE)
+                endif()
+            endforeach()
+            if(suppresses)
+                list(APPEND unconditional
+                     "  ${personaDriver} (${personaPresets}): ${flag} is added when PEDANTIC_COMPILER is OFF (PEDANTIC_COMPILER_WERROR=${werror}), so a suppression outlives the warning set that makes it necessary -- it belongs under that set's condition, not outside every condition")
+            endif()
+        endforeach()
+    endforeach()
+endforeach()
+list(REMOVE_DUPLICATES unconditional)
+
 # No `missing` row: the two missing-input states are refused inline above, where
 # they are found, so nothing ever appends to such a bucket. A heading nobody can
 # reach reads as live coverage for a state that is handled somewhere else.
 set(pedanticReportSections
     "vacuous|This check has stopped checking anything"
     "violations|PEDANTIC_COMPILER_WERROR decides which warnings exist"
+    "unconditional|A suppression is added outside the warning set that makes it necessary"
 )
 
 set(report "")
@@ -358,6 +411,10 @@ if(NOT "${report}" STREQUAL "")
         "places naming one diagnostic is the defect, not the spelling of it. Move the flag, do not "
         "copy it -- and this check counts occurrences rather than testing membership, so the copy "
         "is refused by name rather than passing quietly.\n\n"
+        "A suppression added outside every condition is the same defect with the condition removed: "
+        "it sits beside the flag that makes it necessary, under `PEDANTIC_COMPILER` -- and a project's "
+        "MSVC suppression is a row of `PEDANTIC_COMPILER_MSVC_SUPPRESSIONS`, never a flag added by "
+        "hand.\n\n"
         "If a flag genuinely belongs to fatality and selects no diagnostic, add it -- with its "
         "reason -- to the table in ${CMAKE_CURRENT_LIST_FILE}.")
 endif()
@@ -379,9 +436,18 @@ message("pedantic suppressions: ${personaCount} compiler persona(s) asked, "
 # "OFF/ON adds -Werror" would pass a module that added it unconditionally, which
 # is a different defect with the same green.
 #
-# Asked of one persona: the nesting this guards is compiler-independent, and the
-# GNU/Clang branch is the only one that adds `-Werror` at all -- the MSVC arm's
-# `/WX` has been commented out since before this check existed.
+# Asked of every FRONTEND, each for its own spelling: `-Werror` on a GNU-style driver,
+# `/WX` on an MSVC-style one. The MSVC rows are what this table lacked while the
+# subject's `/WX` sat commented out -- every Windows preset set WERROR ON and got no
+# fatality at all, and the old `Clang;MSVC;...;0` rows asserted exactly that absence.
+# The `-Werror` rows for clang-cl ask for the spelling NOT taken: clang-cl is ID
+# `Clang`, so a module that tested the ID would hand it `-Werror`, the wrong spelling
+# for a driver whose warning set is the MSVC arm's.
+#
+# Columns, '|'-separated: compiler ID, frontend, PEDANTIC_COMPILER, PEDANTIC_COMPILER_WERROR, a
+# REGEX over the recorded flags, and how many flags the subject must add that match it. A regex so
+# a family is one row: clang-cl must get none of the GNU arm's `-Wno-error=` exemptions, which name
+# diagnostics of a warning set it does not have. No '|' in the regex: it is the column separator.
 #
 # Asserted only against the REPOSITORY's own module. The selftest drives this same
 # script against synthetic subjects that exist to violate the SUPPRESSION-pairing
@@ -389,26 +455,77 @@ message("pedantic suppressions: ${personaCount} compiler persona(s) asked, "
 # property they were never written to have. The subject is named in the status
 # line below, so a run that asserted nothing says whose module it did not ask.
 if(FASTCACHED_PEDANTIC_FILE STREQUAL "${FASTCACHED_SOURCE_DIR}/cmake/portable/PedanticCompiler.cmake")
-foreach(row IN ITEMS "GNU;GNU;ON;ON;1"   "GNU;GNU;ON;OFF;0"
-                     "GNU;GNU;OFF;ON;1"  "GNU;GNU;OFF;OFF;0"
-                     "Clang;MSVC;ON;ON;0" "Clang;MSVC;OFF;ON;0")
-    list(GET row 0 wantId)
-    list(GET row 1 wantFrontend)
-    list(GET row 2 wantPedantic)
-    list(GET row 3 wantWerror)
-    list(GET row 4 wantCount)
+set(pedanticFatalityTable
+    "GNU|GNU|ON|ON|^-Werror$|1"     "GNU|GNU|ON|OFF|^-Werror$|0"
+    "GNU|GNU|OFF|ON|^-Werror$|1"    "GNU|GNU|OFF|OFF|^-Werror$|0"
+    "GNU|GNU|ON|ON|^/WX$|0"
+    "MSVC|MSVC|ON|ON|^/WX$|1"       "MSVC|MSVC|ON|OFF|^/WX$|0"
+    "MSVC|MSVC|OFF|ON|^/WX$|1"      "MSVC|MSVC|OFF|OFF|^/WX$|0"
+    "Clang|MSVC|ON|ON|^/WX$|1"      "Clang|MSVC|ON|OFF|^/WX$|0"
+    "Clang|MSVC|OFF|ON|^/WX$|1"     "Clang|MSVC|OFF|OFF|^/WX$|0"
+    "Clang|MSVC|ON|ON|^-Werror$|0"  "Clang|MSVC|OFF|ON|^-Werror$|0"
+    "Clang|MSVC|ON|ON|^-Wno-error=|0" "Clang|MSVC|OFF|ON|^-Wno-error=|0"
+    "MSVC|MSVC|ON|ON|^-Wno-error=|0")
+set(fatalityRowsAsked 0)
+foreach(row IN LISTS pedanticFatalityTable)
+    # '|'-separated so a row survives being a list ELEMENT; ';' would flatten the table.
+    string(REPLACE "|" ";" fields "${row}")
+    list(GET fields 0 wantId)
+    list(GET fields 1 wantFrontend)
+    list(GET fields 2 wantPedantic)
+    list(GET fields 3 wantWerror)
+    list(GET fields 4 wantFlag)
+    list(GET fields 5 wantCount)
     pedantic_flags_for("${wantId}" "${wantFrontend}" "${wantWerror}" rowFlags "${wantPedantic}")
-    pedantic_count_flag(rowFlags "-Werror" seenCount)
+    set(seenCount 0)
+    foreach(candidate IN LISTS rowFlags)
+        if(candidate MATCHES "${wantFlag}")
+            math(EXPR seenCount "${seenCount} + 1")
+        endif()
+    endforeach()
     if(NOT seenCount EQUAL wantCount)
         message(FATAL_ERROR
             "check-pedantic-suppressions: ${wantId}/${wantFrontend} PEDANTIC_COMPILER=${wantPedantic} "
-            "PEDANTIC_COMPILER_WERROR=${wantWerror} added -Werror ${seenCount} time(s), expected ${wantCount}. "
-            "The row that motivated this is OFF/ON: `-Werror` used to be nested inside "
-            "`if(\${PEDANTIC_COMPILER})`, so an operator who asked for warnings to be fatal got a build "
-            "where they were not, and nothing said so (#819).")
+            "PEDANTIC_COMPILER_WERROR=${wantWerror} added ${seenCount} flag(s) matching `${wantFlag}`, expected ${wantCount}. "
+            "WERROR makes warnings fatal on every driver, in the frontend's own spelling -- -Werror for a "
+            "GNU-style driver, /WX for an MSVC-style one, clang-cl included -- and independently of "
+            "PEDANTIC_COMPILER: `-Werror` used to be nested inside `if(\${PEDANTIC_COMPILER})`, so an operator "
+            "who asked for warnings to be fatal got a build where they were not (#819), and `/WX` sat commented "
+            "out, so no Windows preset was ever fatal.")
     endif()
+    math(EXPR fatalityRowsAsked "${fatalityRowsAsked} + 1")
 endforeach()
-message(STATUS "check-pedantic-suppressions: fatality is independent of the pedantic set (4 combinations)")
+message(STATUS "check-pedantic-suppressions: fatality is independent of the pedantic set and spelled per frontend (${fatalityRowsAsked} rows)")
+
+# The project's suppression rows reach the module: each one's flag is recorded for both MSVC
+# personas with the pedantic set ON. Without this, moving the rows out of the file the module
+# reads would leave every assertion above green -- a suppression that never applies breaks no rule
+# about WHERE it applies -- while the build started failing on the warning.
+set(projectRowsSeen 0)
+foreach(row IN LISTS PEDANTIC_COMPILER_MSVC_SUPPRESSIONS)
+    string(FIND "${row}" "|" separator)
+    string(SUBSTRING "${row}" 0 ${separator} suppression)
+    foreach(persona IN ITEMS "MSVC|MSVC" "Clang|MSVC")
+        string(REPLACE "|" ";" personaFields "${persona}")
+        list(GET personaFields 0 rowId)
+        list(GET personaFields 1 rowFrontend)
+        pedantic_flags_for("${rowId}" "${rowFrontend}" OFF rowFlags ON)
+        if(NOT suppression IN_LIST rowFlags)
+            message(FATAL_ERROR
+                "check-pedantic-suppressions: the project's suppression `${suppression}` "
+                "(cmake/PedanticSuppressions.cmake) is not applied for ${rowId}/${rowFrontend} with "
+                "PEDANTIC_COMPILER ON -- the module no longer reads PEDANTIC_COMPILER_MSVC_SUPPRESSIONS, "
+                "or the row never reaches it, and the warning it suppresses is back in every MSVC build.")
+        endif()
+    endforeach()
+    math(EXPR projectRowsSeen "${projectRowsSeen} + 1")
+endforeach()
+if(projectRowsSeen EQUAL 0)
+    message(FATAL_ERROR
+        "check-pedantic-suppressions: PEDANTIC_COMPILER_MSVC_SUPPRESSIONS is empty after including "
+        "cmake/PedanticSuppressions.cmake, so the project-rows assertion above asked nothing.")
+endif()
+message(STATUS "check-pedantic-suppressions: ${projectRowsSeen} project suppression row(s) applied to both MSVC personas")
 else()
     message(STATUS "check-pedantic-suppressions: fatality table NOT asserted -- the subject is ${FASTCACHED_PEDANTIC_FILE}, not this repository's module")
 endif()

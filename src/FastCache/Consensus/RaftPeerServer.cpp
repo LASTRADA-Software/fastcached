@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
+#include <FastCache/Consensus/RaftSessionLink.hpp>
+#include <FastCache/Consensus/RaftSessionReader.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
+#include <FastCache/Transport/AcceptLoopReporter.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -12,7 +16,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -61,24 +64,93 @@ namespace
         core::net::ISocket* _socket;
     };
 
-    /// A connection that has proved its id: who it proved, with which key, and the session
-    /// its frames are bound to.
+    /// Keeps one two-way session attached to the transport for as long as it is being served.
+    ///
+    /// RAII for `RegisteredConnection`'s reason: a detach forgotten on one of the session's exits
+    /// is a transport still writing to a learner through a link whose reader has gone, and every
+    /// way out of `PeerServerAccess::Serve` is one of those exits. Holds nothing, and does
+    /// nothing, for a one-way session.
+    class AttachedLink
+    {
+      public:
+        /// @param links Where to attach; must outlive this.
+        /// @param link The session, or null when this end does not write on it.
+        AttachedLink(IRaftInboundLinks* links, std::shared_ptr<RaftSessionLink> link):
+            _links { links },
+            _link { std::move(link) }
+        {
+            if (_link != nullptr)
+                _links->Attach(_link);
+        }
+
+        AttachedLink(AttachedLink const&) = delete;
+        AttachedLink(AttachedLink&&) = delete;
+        AttachedLink& operator=(AttachedLink const&) = delete;
+        AttachedLink& operator=(AttachedLink&&) = delete;
+
+        ~AttachedLink()
+        {
+            if (_link != nullptr)
+                _links->Detach(*_link);
+        }
+
+      private:
+        IRaftInboundLinks* _links;
+        std::shared_ptr<RaftSessionLink> _link;
+    };
+
+    /// A connection that has proved its id: who it proved, with which key, the session its
+    /// frames are bound to, and which way it asked for them to flow.
     struct ProvenPeer
     {
         NodeId dialler;             ///< The member the connection proved.
         Ed25519PublicKey provenKey; ///< The key it proved that with; re-checked on every frame.
-        SessionKey session;         ///< What its frames are sealed under.
+        SessionKeys session;        ///< What its frames are sealed under; it writes `diallerToAcceptor`.
+
+        /// What the dialler's SIGNED proof asked for: whether this end writes on the connection
+        /// too. Carried from the judgement, because a two-way session this end never attaches is
+        /// a learner the leader never reaches, and nothing about that would be visible.
+        RaftWire::SessionDirection direction { RaftWire::SessionDirection::OneWay };
     };
 
-    /// The tag after a session frame, copied out of what the reader returned.
-    /// @param trailer Exactly `RaftWire::TagSize` bytes.
-    /// @return The tag.
-    [[nodiscard]] Sha256::Digest TagOf(std::span<std::byte const> trailer) noexcept
-    {
-        Sha256::Digest tag {};
-        std::ranges::copy(trailer.first(std::min(trailer.size(), tag.size())), tag.begin());
-        return tag;
-    }
+    /// How a `RaftSessionReader` ending is counted and logged at the ACCEPTING end.
+    ///
+    /// `PeerServerAccess::Serve` used to decide this inline, once per way its own loop could
+    /// end; now the loop lives in `ReadProvenSession`, shared with the dialling end, so what is
+    /// left here is exactly the acceptor's judgement of an ending -- a table rather than a
+    /// `switch` that would repeat the ordering `ReadProvenSession` already enforced. The
+    /// dialling end has a table of its own in `RaftPeerTransport.cpp`, phrased as the dialler.
+    using AcceptorSessionEndRow = SessionEndRow<AcceptorRefusal>;
+
+    /// One row per `SessionEnd`, in enumerator order.
+    ///
+    /// Every ending but a peer closing -- the ordinary way a connection ends -- moves an
+    /// `AcceptorRefusal` of its own, as the dialler's table does for the direction it reads. A bad
+    /// magic and an over-cap frame are refused before any tag verifies, so their counters say what
+    /// was OBSERVED on a proven connection, never that the proven member sent it: anything on the
+    /// path can produce either. Each counted row's sentence is its `AcceptorRefusals` row's.
+    constexpr EnumTable<SessionEnd, AcceptorSessionEndRow> SessionEndRows { {
+        { .end = SessionEnd::PeerClosed, .refusal = std::nullopt, .level = std::nullopt, .sentence = "" },
+        { .end = SessionEnd::BadMagic, .refusal = AcceptorRefusal::FrameBadMagic, .level = LogLevel::Warn, .sentence = "" },
+        { .end = SessionEnd::OverCap, .refusal = AcceptorRefusal::FrameOverCap, .level = LogLevel::Warn, .sentence = "" },
+        { .end = SessionEnd::BadTag, .refusal = AcceptorRefusal::FrameTag, .level = LogLevel::Warn, .sentence = "" },
+        { .end = SessionEnd::KeyWithdrawn,
+          .refusal = AcceptorRefusal::KeyWithdrawn,
+          .level = LogLevel::Warn,
+          .sentence = "" },
+        { .end = SessionEnd::WrongSender, .refusal = AcceptorRefusal::FrameSender, .level = LogLevel::Warn, .sentence = "" },
+        { .end = SessionEnd::Unreadable,
+          .refusal = AcceptorRefusal::FrameUnreadable,
+          .level = LogLevel::Warn,
+          .sentence = "" },
+        // Silent BY ROW: an acceptor arms no idle bound -- its dialler writes when it has
+        // something to say, and a one-way dialler says nothing on purpose -- so this end never
+        // names the ending. The row exists because the enum is shared with the dialler, which does.
+        { .end = SessionEnd::Silent, .refusal = std::nullopt, .level = std::nullopt, .sentence = "" },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(SessionEndRows, &AcceptorSessionEndRow::end),
+                  "SessionEndRows must hold one row per SessionEnd, in enumerator order");
 } // namespace
 
 /// Grants the per-connection coroutines access to the server's privates.
@@ -88,12 +160,18 @@ namespace
 /// expression that created it, so a captured `this` is a lifetime question at every
 /// suspension point rather than a documented one here. `Shutdown` drains before
 /// returning, which is what makes the borrowed pointers safe.
+///
+/// `SessionObserver` below reaches the server's counters and its logger through the two static
+/// methods here rather than being a friend of `RaftPeerServer` itself: it is defined in this
+/// file's anonymous namespace, where a `friend` declaration inside `RaftPeerServer.hpp` cannot
+/// name it, and `PeerServerAccess` already is the one name this header trusts with these members.
 struct PeerServerAccess
 {
     /// Serve one accepted connection: the handshake, then its frames.
     /// @param self The server; outlives this by `Shutdown`'s drain.
-    /// @param socket The accepted connection; owned for its lifetime.
-    static core::async::DetachedTask ServePeer(RaftPeerServer* self, std::unique_ptr<core::net::ISocket> socket);
+    /// @param accepted The accepted connection; owned for its lifetime, and shared with the
+    ///        transport while a two-way session is attached.
+    static core::async::DetachedTask ServePeer(RaftPeerServer* self, std::unique_ptr<core::net::ISocket> accepted);
 
     /// Challenge, read one proof, judge it and answer, all within the handshake bound.
     /// @param self The server.
@@ -112,10 +190,65 @@ struct PeerServerAccess
     /// @param peer The address the connection came from.
     /// @param proven Who it proved, and its session.
     static core::async::Task<void> Serve(RaftPeerServer* self, ByteReader* reader, std::string peer, ProvenPeer proven);
+
+    /// Bump the delivered-message counter.
+    /// @param self The server.
+    static void NoteDelivered(RaftPeerServer* self) noexcept;
+
+    /// Bump the skipped-frame counter and log it, naming the peer that sent it.
+    /// @param self The server.
+    /// @param peer The address the connection came from.
+    /// @param dialler The member the connection proved.
+    /// @param error What the decode reported; @c error.context names the frame's own description.
+    static void NoteSkipped(RaftPeerServer* self, std::string_view peer, NodeId const& dialler, ConsensusError const& error);
 };
 
-core::async::DetachedTask PeerServerAccess::ServePeer(RaftPeerServer* self, std::unique_ptr<core::net::ISocket> socket)
+namespace
 {
+    /// Feeds a proven session's per-frame progress back to the counters and the log line a real
+    /// connection needs, so `ReadProvenSession` itself never has to know either exists.
+    ///
+    /// Holds its own copies of `peer` and `dialler` rather than borrowing `PeerServerAccess::Serve`'s
+    /// -- cheap for a per-connection object, and it is what lets this type make no claim at all
+    /// about a coroutine frame's lifetime, which is `ReadProvenSession`'s rule to keep and not
+    /// this one's to reason about.
+    class SessionObserver final: public IProvenSessionObserver
+    {
+      public:
+        /// @param self The server; outlives every connection by `Shutdown`'s drain.
+        /// @param peer The address the connection came from.
+        /// @param dialler The member the connection proved.
+        SessionObserver(RaftPeerServer* self, std::string peer, NodeId dialler) noexcept:
+            _self { self },
+            _peer { std::move(peer) },
+            _dialler { std::move(dialler) }
+        {
+        }
+
+        void OnDelivered() override
+        {
+            PeerServerAccess::NoteDelivered(_self);
+        }
+
+        void OnSkipped(ConsensusError const& error) override
+        {
+            PeerServerAccess::NoteSkipped(_self, _peer, _dialler, error);
+        }
+
+      private:
+        RaftPeerServer* _self;
+        std::string _peer;
+        NodeId _dialler;
+    };
+} // namespace
+
+core::async::DetachedTask PeerServerAccess::ServePeer(RaftPeerServer* self, std::unique_ptr<core::net::ISocket> accepted)
+{
+    // Shared from the top, because a two-way session's socket is written by the transport for
+    // as long as it holds the link -- which can outlast this coroutine by the sender's last
+    // step. Every owner of the link lets go on this reactor (`RaftSessionLink`), so whichever
+    // is last destroys the socket here.
+    auto const socket = std::shared_ptr<core::net::ISocket> { std::move(accepted) };
     RegisteredConnection const registration { &self->_open, socket.get() };
 
     // No line is ever read on this wire, so the line cap is nominal. The payload cap
@@ -128,7 +261,20 @@ core::async::DetachedTask PeerServerAccess::ServePeer(RaftPeerServer* self, std:
     auto peer = socket->peerAddress();
 
     if (auto proven = co_await Handshake(self, socket.get(), &reader, peer); proven.has_value())
+    {
+        // Attached only once the verdict is written, so this end's last write on the socket is
+        // over before the transport's first: one writer at a time, which the socket's contract
+        // enforces by ending the process. Detached before the close below, on every way `Serve`
+        // ends.
+        auto link = AcceptorWrites(proven->direction)
+                        ? std::make_shared<RaftSessionLink>(proven->dialler,
+                                                            proven->provenKey,
+                                                            socket,
+                                                            FrameSealer { std::move(proven->session.acceptorToDialler) })
+                        : std::shared_ptr<RaftSessionLink> {};
+        AttachedLink const attached { &self->_links, std::move(link) };
         co_await Serve(self, &reader, std::move(peer), *std::move(proven));
+    }
 
     socket->close();
     self->_active.fetch_sub(1, std::memory_order_acq_rel);
@@ -272,7 +418,26 @@ core::async::Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPee
     deadline.reset();
     co_return ProvenPeer { .dialler = std::move(judgement.dialler),
                            .provenKey = judgement.provenKey,
-                           .session = *std::move(judgement.session) };
+                           .session = *std::move(judgement.session),
+                           .direction = judgement.direction };
+}
+
+void PeerServerAccess::NoteDelivered(RaftPeerServer* self) noexcept
+{
+    self->_delivered.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PeerServerAccess::NoteSkipped(RaftPeerServer* self,
+                                   std::string_view peer,
+                                   NodeId const& dialler,
+                                   ConsensusError const& error)
+{
+    // Counted rather than only logged, because it is the number that says a fleet is
+    // mid-upgrade: steady and non-zero means some peer speaks something this node does not,
+    // which is expected during a rollout and a misconfiguration afterwards.
+    self->_skipped.fetch_add(1, std::memory_order_relaxed);
+    self->_logger.Log(LogLevel::Debug,
+                      std::format("raft: skipped a frame from peer {} ({}): {}", dialler, peer, error.context));
 }
 
 core::async::Task<void> PeerServerAccess::Serve(RaftPeerServer* self,
@@ -280,126 +445,38 @@ core::async::Task<void> PeerServerAccess::Serve(RaftPeerServer* self,
                                                 std::string peer,
                                                 ProvenPeer proven)
 {
-    FrameOpener opener { std::move(proven.session) };
-
-    while (true)
-    {
-        auto const headerBytes = co_await reader->ReadExactly(RaftWire::HeaderSize);
-        if (!headerBytes.has_value())
-            break; // EOF, or the peer went away. Ordinary.
-
-        auto const header = RaftWire::DecodeHeader(*headerBytes);
-        if (!header.has_value())
-        {
-            // A wrong magic is the one condition under which the reader cannot find
-            // where this frame ends. There is nothing to resynchronize to, so every
-            // later byte would be a guess.
-            self->_logger.Log(
-                LogLevel::Warn,
-                std::format("raft: peer {} ({}) sent a frame with no valid magic; closing", proven.dialler, peer));
-            break;
-        }
-
-        if (header->payloadLength > self->_options.maxFrameBytes)
-        {
-            // Refused BEFORE the payload is buffered, exactly as the compile-cache
-            // handler's cap is: checking afterwards would let a peer force the very
-            // allocation the cap exists to deny, once per frame.
-            self->_logger.Log(LogLevel::Warn,
-                              std::format("raft: peer {} ({}) declared a {}-byte frame over the {}-byte cap; closing",
-                                          proven.dialler,
-                                          peer,
-                                          header->payloadLength,
-                                          self->_options.maxFrameBytes));
-            break;
-        }
-
-        auto const body = co_await reader->ReadExactly(std::size_t { header->payloadLength } + RaftWire::TagSize);
-        if (!body.has_value())
-            break;
-
-        auto const bytes = std::span<std::byte const> { *body };
-        auto const payload = bytes.first(header->payloadLength);
-
-        // The tag BEFORE anything the frame says is acted on -- before its type decides
-        // whether it is stepped over, and before its message reaches the node.
-        if (!opener.Open(*headerBytes, payload, TagOf(bytes.last(RaftWire::TagSize))))
-        {
-            self->NoteProvenRefusal(AcceptorRefusal::FrameTag, peer, proven.dialler, "");
-            break;
-        }
-
-        // The roster, asked again for every frame: a key revoked since the handshake ends the
-        // connection here, at the first frame after the decision, rather than whenever the
-        // connection happens to break. Asked after the tag, so a frame nobody sealed is counted
-        // as what it is.
-        if (!self->_identity.StillProves(proven.dialler, proven.provenKey))
-        {
-            self->NoteProvenRefusal(AcceptorRefusal::KeyWithdrawn, peer, proven.dialler, "");
-            break;
-        }
-
-        auto decoded = RaftWire::DecodeMessage(*header, payload);
-        if (decoded.has_value())
-        {
-            // The member the connection proved is the one that speaks on it. A message
-            // naming another sender is refused rather than delivered under that name:
-            // everything the node decides about a sender -- whom it votes for, whose
-            // entries it takes -- is then a fact about the key, not about a field.
-            if (auto const& sender = SenderOf(*decoded); sender != proven.dialler)
-            {
-                self->NoteProvenRefusal(
-                    AcceptorRefusal::FrameSender, peer, proven.dialler, std::format("the message named {}", sender));
-                break;
-            }
-
-            self->_sink.Deliver(*std::move(decoded));
-            self->_delivered.fetch_add(1, std::memory_order_relaxed);
-            continue;
-        }
-
-        // The payload and its tag have been consumed and verified, so the reader is still
-        // in sync -- which is the whole point of the declared length.
-        if (decoded.error().code == ConsensusErrorCode::UnknownMessageType)
-        {
-            // Stepped over, not fatal. A peer running a newer build is the ordinary
-            // condition during a rolling upgrade, and closing here would partition this
-            // node from every peer ahead of it.
-            self->_skipped.fetch_add(1, std::memory_order_relaxed);
-            self->_logger.Log(
-                LogLevel::Debug,
-                std::format("raft: skipped a frame from peer {} ({}): {}", proven.dialler, peer, decoded.error().context));
-            continue;
-        }
-
-        // A malformed payload, a handshake frame out of place, or a version other than
-        // the one the handshake settled: this reader and that sender disagree about the
-        // bytes, so the connection is no longer trustworthy even though this frame was
-        // consumed cleanly.
-        self->_logger.Log(LogLevel::Warn,
-                          std::format("raft: peer {} ({}) sent a frame this node cannot read ({}); closing",
-                                      proven.dialler,
-                                      peer,
-                                      decoded.error().context));
-        break;
-    }
+    FrameOpener opener { std::move(proven.session.diallerToAcceptor) };
+    auto const who = ProvenSessionPeer { .id = proven.dialler, .key = proven.provenKey };
+    SessionObserver observer { self, peer, proven.dialler };
+    auto const ending = co_await ReadProvenSession(reader,
+                                                   &opener,
+                                                   &who,
+                                                   &self->_identity,
+                                                   &self->_sink,
+                                                   SessionReadLimits { .maxFrameBytes = self->_options.maxFrameBytes },
+                                                   &observer);
+    self->NoteSessionEnd(ending, peer, proven.dialler);
 }
 
 RaftPeerServer::RaftPeerServer(core::net::IListener& listener,
                                core::net::EventLoop& reactor,
                                IRaftMessageSink& sink,
+                               IRaftInboundLinks& links,
                                ILogger& logger,
                                IMetricsSink& metrics,
                                IRaftPeerIdentity const& identity,
                                ISecureRandom& random,
+                               core::net::AcceptLoopHealth& acceptLoops,
                                PeerServerOptions options):
     _listener { listener },
     _reactor { reactor },
     _sink { sink },
+    _links { links },
     _logger { logger },
     _metrics { metrics },
     _identity { identity },
     _random { random },
+    _acceptLoops { acceptLoops },
     _options { options }
 {
 }
@@ -449,8 +526,12 @@ void RaftPeerServer::NoteProvenRefusal(AcceptorRefusal refusal,
                                        std::string_view dialler,
                                        std::string_view detail)
 {
-    // Not throttled: only the member that proved its id can provoke one, so the log cannot
-    // be filled from outside, and each is a member worth naming every time.
+    // Not throttled, and not because only the proven member can provoke one: anything on the path
+    // can flip a tag bit, and a bad magic or an over-cap frame is refused before any tag verifies.
+    // What bounds the volume is that each of these ENDS a proven connection, so another one costs a
+    // whole new handshake the member itself must dial -- at most one per its redial backoff, the
+    // `DialBackoffTable` row for the session's direction (`DialBackoffOf`). That is a rate the log
+    // can carry, and each line names a member worth naming.
     auto const& row = RowFor(refusal);
     _metrics.Increment(row.counter);
     _logger.Log(
@@ -459,21 +540,57 @@ void RaftPeerServer::NoteProvenRefusal(AcceptorRefusal refusal,
             "raft: refused peer {} at {} because {}{}{}", dialler, peer, row.says, detail.empty() ? "" : ": ", detail));
 }
 
+void RaftPeerServer::NoteSessionEnd(SessionEnding const& ending, std::string_view peer, NodeId const& dialler)
+{
+    auto const& row = SessionEndRows[static_cast<std::size_t>(ending.end)];
+
+    // Every ending but a close moves a counter of its own, logged in its refusal row's words.
+    if (row.refusal.has_value())
+    {
+        NoteProvenRefusal(*row.refusal, peer, dialler, ending.detail);
+        return;
+    }
+
+    // PeerClosed: silent BY ROW -- a fact the table states, not one inferred from an empty
+    // sentence and an empty detail, which a future log-only ending with a sentence and no
+    // detail would satisfy without meaning to be silent.
+    if (!row.level.has_value())
+        return;
+
+    _logger.Log(*row.level,
+                std::format("raft: peer {} ({}) {}{}{}; closing",
+                            dialler,
+                            peer,
+                            row.sentence,
+                            row.sentence.empty() || ending.detail.empty() ? "" : ": ",
+                            ending.detail));
+}
+
 core::async::Task<void> RaftPeerServer::Run()
 {
+    // `core::net::AcceptErrorPolicy` decides, as it does for every accept loop in the tree, and
+    // `AcceptLoopReporter` says so: a poll timeout -- how this loop wakes to observe `Shutdown()` on
+    // POSIX, where closing the listening socket does not unblock a parked accept() -- is accepted
+    // past silently, a peer that reset its queued connection with a rate-limited warning, and only
+    // a closed or dead listener ends the loop. It used to end on anything but the poll tick, at
+    // `Debug`, taking this node out of its cluster while the port still listened.
+    AcceptLoopReporter acceptErrors { "raft: peer", "raft", _logger, _acceptLoops };
     while (!_shuttingDown.load(std::memory_order_acquire))
     {
         auto accepted = co_await _listener.accept();
         if (!accepted.has_value())
         {
-            // A poll timeout is how this loop wakes to observe Shutdown() on
-            // POSIX, where closing the listening socket does not unblock a
-            // parked accept(). Not a failure.
-            if (core::net::isDeadlineExpiry(accepted.error().code))
-                continue;
-            _logger.Log(LogLevel::Debug, std::format("raft: peer accept loop ended ({})", accepted.error().toString()));
-            co_return;
+            auto const step = acceptErrors.OnError(
+                accepted.error(), _reactor.clock().now(), _shuttingDown.load(std::memory_order_acquire));
+            if (step.next == AcceptLoopNext::EndAndClose)
+                _listener.close();
+            if (step.next != AcceptLoopNext::AcceptAgain)
+                co_return;
+            if (step.delay > std::chrono::milliseconds {})
+                co_await _reactor.delay(step.delay);
+            continue;
         }
+        acceptErrors.OnAccepted(_reactor.clock().now());
 
         auto const before = _active.fetch_add(1, std::memory_order_acq_rel);
         if (before >= _options.maxConnections)
@@ -493,6 +610,8 @@ core::async::Task<void> RaftPeerServer::Run()
         // peer ever, and a cluster that never hears from the rest.
         PeerServerAccess::ServePeer(this, std::move(*accepted));
     }
+    // Shut down between accepts: a loop that was degraded says it stopped.
+    acceptErrors.OnLoopEnded();
     co_return;
 }
 

@@ -12,10 +12,12 @@
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
+#include <FastCache/Protocol/CompileCacheAuth.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
@@ -501,6 +503,40 @@ TEST_CASE("An unknown opcode is rejected but the connection survives", "[compile
     CHECK_FALSE(replies.at(1).payload.empty());
 }
 
+TEST_CASE("A retired opcode is refused UnknownOpcode at the surface, counted, and the connection survives",
+          "[compile-cache][handler][retired]")
+{
+    // `RetiredOpcodes` pins that no ROW claims 0x16, 0x17 or 0x1D; this pins what a SURFACE answers a
+    // frame naming one: `UnknownOpcode`, as for any byte no row claims -- never a friendlier
+    // refusal special-cased for the retired verbs, which a peer built before the retirement
+    // would read under the old verb's name.
+    for (auto const byte: Wire::RetiredOpcodes)
+    {
+        INFO("opcode " << static_cast<int>(byte));
+        CcFixture fix;
+        AtomicMetricsSink metrics;
+        SessionContext session {};
+        session.metrics = &metrics;
+
+        CompileValue value;
+        value.objectBlob = { std::byte { 0x42 } };
+        REQUIRE(fix.engine.Set("k", EncodeCompileValue(value), /*flags=*/0, /*exptime=*/0).has_value());
+
+        auto retired = FetchFrame("payload-the-server-must-skip");
+        retired[2] = std::byte { byte };
+
+        auto const replies = SplitReplies(ExchangeWith(fix, Concat({ retired, FetchFrame("k") }), session));
+        REQUIRE(replies.size() == 2);
+        auto const error = ErrorOf(replies.at(0));
+        REQUIRE(error.present);
+        CHECK(error.code == Wire::ErrorCode::UnknownOpcode);
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheFramesRefusedUnknownOpcode) == 1);
+
+        // The frame was stepped over by its declared length, so the request behind it is served.
+        CHECK(replies.at(1).status == Wire::Status::Ok);
+    }
+}
+
 TEST_CASE("A FETCH miss and a rejected FETCH are distinguishable", "[compile-cache][handler][version]")
 {
     // Both were the byte 0x00 before the format carried a status space, so a
@@ -608,6 +644,32 @@ TEST_CASE("A foreign value generation and a malformed value are refused by DIFFE
     // what says the value was not stored uncanonicalized -- which is the harm the
     // refusal exists to prevent, not a side effect of it.
     CHECK(replies.at(2).status == Wire::Status::Miss);
+}
+
+TEST_CASE("A version-14 AUTH in its own two-field grammar is refused by number, never read as malformed",
+          "[compile-cache][handler][version]")
+{
+    // What a client built before the office-fleet flag day sends: AUTH as two fields (username,
+    // secret), at version byte 0x0E. Refused on the NUMBER, before the payload is read -- so the
+    // answer names the range rather than calling a version mismatch a malformed frame, and no field is
+    // ever taken for the credential kind the version-15 grammar puts first.
+    CcFixture fix;
+    // clang-format off: the grid IS the old grammar -- one wire field per row.
+    auto const older = std::vector<std::byte> {
+        std::byte { 0xFC }, std::byte { 0x0E }, std::byte { 0x03 },             // magic, version 14, op = Auth
+        std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x0A }, // payload = (4+0) + (4+2)
+        std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, // username = ""
+        std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x00 }, std::byte { 0x02 }, // secret, 2 bytes
+        std::byte { 'p' }, std::byte { 'w' },
+    };
+    // clang-format on
+    auto const frame = SoleReply(Exchange(fix, older));
+    REQUIRE(frame.present);
+    auto const error = ErrorOf(frame);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::UnsupportedVersion);
+    CHECK(error.code != Wire::ErrorCode::MalformedFrame);
+    CHECK(error.message == "unsupported wire version 14; this server speaks 15..15");
 }
 
 TEST_CASE("A wire version change mid-connection is rejected", "[compile-cache][handler][version]")
@@ -771,7 +833,7 @@ TEST_CASE("The daemon refuses a fleet read by name and sends it to the fleet's s
     auto const error = ErrorOf(reply);
     REQUIRE(error.present);
     CHECK(error.code == Wire::ErrorCode::DispatchNotPermitted);
-    CHECK(error.message.contains("--serve-scheduler"));
+    CHECK(error.message.contains("the fleet's scheduler, a fastcache-compile-node"));
 }
 
 TEST_CASE("The daemon refuses an admission explanation by name and sends it to a compile node", "[compile-cache][handler]")
@@ -785,7 +847,7 @@ TEST_CASE("The daemon refuses an admission explanation by name and sends it to a
     // through -- so a client told `NoCluster` goes looking for consensus it does not need,
     // when the answer is that it asked the wrong binary.
     CcFixture fix;
-    auto const reply = SoleReply(Exchange(fix, Wire::EncodeExplainAdmissionRequest("10.0.0.42")));
+    auto const reply = SoleReply(Exchange(fix, Wire::EncodeExplainAdmissionRequest("pc-07")));
     REQUIRE(reply.present);
     auto const error = ErrorOf(reply);
     REQUIRE(error.present);
@@ -794,6 +856,60 @@ TEST_CASE("The daemon refuses an admission explanation by name and sends it to a
     // The WORDS, for the fleet case's reason: a relocated verb with no row is refused with the
     // same code and names no destination, so the code alone cannot tell the two apart.
     CHECK(error.message.contains("fastcache-compile-node"));
+}
+
+TEST_CASE("The daemon refuses a fleet summary by name and sends it to a compile node", "[compile-cache][handler][formation]")
+{
+    // WHICH refusal, not merely that there was one. `NoCluster` with the enrollment rows: a fleet
+    // summary asks which fleet a machine is in, and this daemon belongs to none. `UnimplementedVerb`
+    // would send a joiner off to upgrade a daemon that is current.
+    CcFixture fix;
+    auto const reply =
+        SoleReply(Exchange(fix, Wire::EncodeFleetSummaryRequest(std::array<std::byte, Wire::NodeChallengeBytes> {})));
+    REQUIRE(reply.present);
+    auto const error = ErrorOf(reply);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::NoCluster);
+    CHECK(error.code != Wire::UnimplementedVerb);
+    CHECK(error.message.contains("fastcache-compile-node"));
+}
+
+TEST_CASE("The daemon refuses a ticket mint by name and sends it to a compile node", "[compile-cache][handler]")
+{
+    // A cache holds no machine identity to sign a ticket from, so this endpoint answers the
+    // same way it answers every other verb that asks about the PROCESS rather than about a
+    // cached object: `DispatchNotPermitted`, naming the compile node that does hold one.
+    CcFixture fix;
+    auto const reply = SoleReply(Exchange(fix, Wire::EncodeMintTicketRequest("office.corp:6674")));
+    REQUIRE(reply.present);
+    auto const error = ErrorOf(reply);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(error.message.contains("fastcache-compile-node"));
+}
+
+TEST_CASE("The daemon refuses the fleet cache verbs by name and names the machine that serves them",
+          "[compile-cache][handler][shared-cache]")
+{
+    // The new-verb checklist's daemon half: a missing switch arm DROPS the frame (and on MSVC does not
+    // fail the build), and a missing RelocatedVerbs row answers the generic refusal naming nobody.
+    // `NotSharedCache`, never `UnknownOpcode`: a client told the verb is unknown concludes this build is
+    // too old, when it asked a fastcached for what only the named compile node serves.
+    auto const store = Wire::StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = {} };
+    for (auto const& frame:
+         { Wire::EncodeFetchAs(Wire::FleetSharedCacheVerbs, "k"), Wire::EncodeStoreAs(Wire::FleetSharedCacheVerbs, store) })
+    {
+        // A fixture per verb: an exchange half-closes the client, so one fixture answers one batch.
+        CcFixture fix;
+        auto const reply = SoleReply(Exchange(fix, frame));
+        REQUIRE(reply.present);
+        auto const error = ErrorOf(reply);
+        REQUIRE(error.present);
+        CHECK(error.code == Wire::ErrorCode::NotSharedCache);
+        // The ROW's words, for the fleet case's reason: `NotSharedCache`'s own default message says
+        // "shared-cache" too, so only the destination proves the RelocatedVerbs row answered.
+        CHECK(error.message.contains("fastcache-compile-node"));
+    }
 }
 
 TEST_CASE("A dropped frame is logged", "[compile-cache][handler][version]")
@@ -965,6 +1081,30 @@ struct AuthedSession
 }
 
 } // namespace
+
+TEST_CASE("The daemon cannot verify a machine, so a ticket is no password", "[protocol][auth][ticket]")
+{
+    // The ticket's bytes ARE the configured password, so only the kind can refuse it: a ticket
+    // whose bytes differ would be rejected by the password comparison alone, and the case could
+    // not tell the two rules apart.
+    auto const ticket =
+        Wire::EncodeAuth(Wire::AuthRequest { .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = "s3cret" });
+    auto const payload = std::span { ticket }.subspan(Wire::RequestHeaderSize);
+    auto const policy = AuthPolicy { std::string {}, SecureString { std::string_view { "s3cret" } } };
+    CHECK(CheckCredential(&policy, payload) == CredentialOutcome::Rejected);
+    CHECK(CheckCredential(nullptr, payload) == CredentialOutcome::NoPolicy);
+
+    // A kind this build does not know is a frame it could not parse, never a wrong password: a
+    // client of another release must not read as somebody guessing.
+    auto const unknownKind = std::array { std::byte { 0x03 } };
+    auto const unknown = WireFields::Encode(
+        { std::span<std::byte const> { unknownKind }, WireFields::AsBytes(""), WireFields::AsBytes("s3cret") });
+    CHECK(CheckCredential(&policy, unknown) == CredentialOutcome::Malformed);
+
+    // The control: the same bytes as a password are accepted.
+    auto const password = Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" });
+    CHECK(CheckCredential(&policy, std::span { password }.subspan(Wire::RequestHeaderSize)) == CredentialOutcome::Accepted);
+}
 
 TEST_CASE("Every gated verb is refused before AUTH, and the connection survives", "[compile-cache][handler][auth]")
 {
@@ -1233,12 +1373,14 @@ TEST_CASE("An oversize AUTH is refused on its own ceiling, not the session's", "
 TEST_CASE("A credential right up against the ceiling is still accepted", "[compile-cache][handler][auth]")
 {
     // The bound must be a bound, not an off-by-one that quietly rejects the
-    // largest legal credential.
+    // largest legal credential. The overhead is measured off the encoder rather than
+    // counted by hand, so a field added to AUTH moves it here too.
     CcFixture fix;
-    std::string const secret(Wire::MaxAuthPayload - (2 * sizeof(std::uint32_t)), 'x');
-    auto authed = RequireSecret("", secret);
+    auto const overhead = AuthFrame("", "").size() - Wire::RequestHeaderSize;
+    std::string const atTheCeiling(Wire::MaxAuthPayload - overhead, 'x');
+    auto authed = RequireSecret("", atTheCeiling);
 
-    auto const reply = ExchangeWith(fix, AuthFrame("", secret), authed.session);
+    auto const reply = ExchangeWith(fix, AuthFrame("", atTheCeiling), authed.session);
     CHECK(SoleReply(reply).status == Wire::Status::Ok);
 }
 
@@ -1265,7 +1407,7 @@ TEST_CASE("A gated verb keeps the operator's cap, not the AUTH ceiling", "[compi
 TEST_CASE("The cache refuses every scheduling verb, and says where they went", "[compile-cache][handler][distributed]")
 {
     // `fastcached` is a cache and nothing else. The fleet's scheduler moved to
-    // `fastcache-compile-node --serve-scheduler`, because handing out capacity is a
+    // `fastcache-compile-node`, because handing out capacity is a
     // decision only one node may make at a time and nothing here can establish which
     // node that is.
     //
