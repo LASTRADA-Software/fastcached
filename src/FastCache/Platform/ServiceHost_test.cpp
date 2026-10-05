@@ -8,9 +8,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <format>
 #include <memory>
 #include <mutex>
@@ -308,11 +310,13 @@ TEST_CASE("A start told to wait accepts a stop, and the service ends stopped wit
 {
     // R4-2: a start that waits for its body to serve can be long -- a large disk tier opening,
     // consensus recovering -- and one that accepted nothing while it started could be stopped by no
-    // `sc stop`, MSI ServiceControl or uninstall until it served. Sent the way they send it, which
-    // the manager refuses itself (1052) for a control the last report did not accept.
+    // `sc stop`, MSI ServiceControl or uninstall until it served. Sent the way they send it: the
+    // manager decides by the STATE first, so while the start is pending a stop is sent and a reload
+    // is refused `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` (1061) by the manager itself -- never 1052,
+    // which would mean the state allowed it and the report did not accept it.
     ServingWhenReadyService service { TestStartPlan, DefaultDrainWait() };
-    std::optional<bool> reloadWhileStarting;
-    std::optional<bool> stopWhileStarting;
+    std::expected<bool, std::uint32_t> reloadWhileStarting { std::unexpected { 0U } };
+    std::expected<bool, std::uint32_t> stopWhileStarting { std::unexpected { 0U } };
     auto stopProgressed = false;
 
     CHECK(service.host->Run([&] {
@@ -331,9 +335,9 @@ TEST_CASE("A start told to wait accepts a stop, and the service ends stopped wit
         return service.controls.StopRequested() ? 0 : 1;
     }) == 0);
 
-    CHECK_FALSE(reloadWhileStarting.has_value());
-    REQUIRE(stopWhileStarting.has_value());
-    CHECK(Testing::Unwrap(stopWhileStarting));
+    CHECK(reloadWhileStarting
+          == std::expected<bool, std::uint32_t> { std::unexpected { Testing::ScmError::ServiceCannotAcceptCtrl } });
+    CHECK(stopWhileStarting == std::expected<bool, std::uint32_t> { true });
     CHECK(stopProgressed);
     CHECK(service.controls.StopRequested());
     CHECK(service.manager->Violations().empty());
@@ -556,12 +560,14 @@ TEST_CASE("The scripted service manager holds a caller to the SCM's rules", "[pl
     }) == DispatchOutcome::Dispatched);
     CHECK(starting.Violations() == std::vector<std::string> { "a start's checkpoint did not advance" });
 
-    // And a control the last report did not accept is refused by the manager itself (1052) and never
-    // reaches the handler -- the rule the stop-while-starting case above stands on.
+    // And a control is decided by the last reported STATE first and its acceptance second, refused
+    // by the manager itself with Windows' own code and never reaching the handler -- the rule the
+    // stop-while-starting case above stands on. Every row of the documented table is pinned in the
+    // case below; these are the transitions a host goes through.
     ScriptedServiceControlManager refusing { ServiceManagerPresence::Present };
-    std::vector<std::optional<bool>> answers;
+    std::vector<std::expected<bool, std::uint32_t>> answers;
     auto handled = 0;
-    CHECK(refusing.Dispatch("x", [&] {
+    auto const refusingDispatched = refusing.Dispatch("x", [&] {
         std::ignore = refusing.RegisterHandler("x", [&handled](ServiceControlRequest, std::uint32_t) {
             ++handled;
             return true;
@@ -572,11 +578,112 @@ TEST_CASE("The scripted service manager holds a caller to the SCM's rules", "[pl
         refusing.SetStatus(ServiceStatusReport { .state = ServiceState::Running, .waitHintMs = 0, .acceptsStop = true });
         answers.push_back(refusing.Request(ServiceControlRequest::ParamChange)); // stop accepted, reload not
         answers.push_back(refusing.Request(ServiceControlRequest::Stop));
+        // A stop under way accepts no second one, whatever its report claims.
+        refusing.SetStatus(ServiceStatusReport {
+            .state = ServiceState::StopPending, .waitHintMs = 0, .checkPoint = 1, .acceptsStop = true });
+        answers.push_back(refusing.Request(ServiceControlRequest::Stop));
         refusing.SetStatus(ServiceStatusReport { .state = ServiceState::Stopped, .waitHintMs = 0 });
-    }) == DispatchOutcome::Dispatched);
-    CHECK(answers == std::vector<std::optional<bool>> { std::nullopt, std::nullopt, std::nullopt, true });
+        answers.push_back(refusing.Request(ServiceControlRequest::Stop));
+    });
+    CHECK(refusingDispatched == DispatchOutcome::Dispatched);
+    using Answer = std::expected<bool, std::uint32_t>;
+    CHECK(answers
+          == std::vector<Answer> {
+              Answer { std::unexpected { Testing::ScmError::InvalidServiceControl } }, // nothing reported yet
+              Answer { std::unexpected { Testing::ScmError::InvalidServiceControl } }, // a start accepting nothing
+              Answer { std::unexpected { Testing::ScmError::InvalidServiceControl } }, // running, reload not accepted
+              Answer { true },
+              Answer { std::unexpected { Testing::ScmError::ServiceCannotAcceptCtrl } }, // stop pending
+              Answer { std::unexpected { Testing::ScmError::ServiceNotActive } },        // stopped
+          });
     CHECK(handled == 1);
     CHECK(refusing.Violations().empty());
+}
+
+TEST_CASE("The scripted service manager sends a control as the ControlService remarks table says",
+          "[platform][service][fake]")
+{
+    // The fake is the instrument every service case stands on, so its decisions are pinned against
+    // Windows' DOCUMENTED behaviour, spelled here as codes rather than read from the fake's own
+    // table -- the remarks table of `ControlService`
+    // (https://learn.microsoft.com/windows/win32/api/winsvc/nf-winsvc-controlservice):
+    //   STOPPED        stop (c)  other (c)    (a) sent if accepted, else 1052
+    //   STOP_PENDING   stop (b)  other (b)    (b) 1061
+    //   START_PENDING  stop (a)  other (b)    (c) 1062
+    //   RUNNING        stop (a)  other (a)
+    // An interrogation is accepted by every service by default. SHUTDOWN and power broadcasts come
+    // from the system, not from `ControlService`, and the table does not cover them: the fake gives
+    // them the OTHER column, the narrower reading (round 11 review, I1).
+    using Answer = std::expected<bool, std::uint32_t>;
+    auto const sent = Answer { true };
+    auto const invalid = Answer { std::unexpected { Testing::ScmError::InvalidServiceControl } };
+    auto const cannot = Answer { std::unexpected { Testing::ScmError::ServiceCannotAcceptCtrl } };
+    auto const inactive = Answer { std::unexpected { Testing::ScmError::ServiceNotActive } };
+
+    constexpr auto Controls = std::array {
+        ServiceControlRequest::Stop,        ServiceControlRequest::Shutdown,   ServiceControlRequest::ParamChange,
+        ServiceControlRequest::Interrogate, ServiceControlRequest::PowerEvent,
+    };
+    struct Row
+    {
+        std::vector<ServiceState> path; ///< The states reported, ending in the one under test.
+        std::array<Answer, std::tuple_size_v<decltype(Controls)>> want; ///< Per control, in `Controls` order.
+        bool accepting;                                                 ///< Whether the last report accepts every control.
+    };
+    auto const rows = std::array {
+        Row { .path = { ServiceState::StartPending }, .want = { sent, cannot, cannot, cannot, cannot }, .accepting = true },
+        Row { .path = { ServiceState::StartPending },
+              .want = { invalid, cannot, cannot, cannot, cannot },
+              .accepting = false },
+        Row { .path = { ServiceState::StartPending, ServiceState::Running },
+              .want = { sent, sent, sent, sent, sent },
+              .accepting = true },
+        Row { .path = { ServiceState::StartPending, ServiceState::Running },
+              .want = { invalid, invalid, invalid, sent, invalid },
+              .accepting = false },
+        Row { .path = { ServiceState::StartPending, ServiceState::StopPending },
+              .want = { cannot, cannot, cannot, cannot, cannot },
+              .accepting = true },
+        Row { .path = { ServiceState::StartPending, ServiceState::StopPending },
+              .want = { cannot, cannot, cannot, cannot, cannot },
+              .accepting = false },
+        Row { .path = { ServiceState::StartPending, ServiceState::Stopped },
+              .want = { inactive, inactive, inactive, inactive, inactive },
+              .accepting = true },
+        Row { .path = { ServiceState::StartPending, ServiceState::Stopped },
+              .want = { inactive, inactive, inactive, inactive, inactive },
+              .accepting = false },
+    };
+
+    auto checked = std::size_t { 0 };
+    for (auto const& row: rows)
+    {
+        for (auto const index: std::views::iota(std::size_t { 0 }, Controls.size()))
+        {
+            auto const control = Controls.at(index);
+            auto const& want = row.want.at(index);
+            ScriptedServiceControlManager manager { ServiceManagerPresence::Present };
+            auto answer = Answer { std::unexpected { 0U } };
+            CHECK(manager.Dispatch("x", [&] {
+                std::ignore = manager.RegisterHandler("x", [](ServiceControlRequest, std::uint32_t) { return true; });
+                for (auto const state: row.path)
+                    manager.SetStatus(ServiceStatusReport { .state = state,
+                                                            .waitHintMs = 0,
+                                                            .checkPoint = 1,
+                                                            .acceptsStop = row.accepting,
+                                                            .acceptsReload = row.accepting,
+                                                            .acceptsPowerEvents = row.accepting });
+                answer = manager.Request(control);
+                if (row.path.back() != ServiceState::Stopped)
+                    manager.SetStatus(ServiceStatusReport { .state = ServiceState::Stopped, .waitHintMs = 0 });
+            }) == DispatchOutcome::Dispatched);
+            CAPTURE(static_cast<int>(row.path.back()), row.accepting, static_cast<int>(control));
+            CHECK(answer == want);
+            CHECK(manager.Violations().empty());
+            ++checked;
+        }
+    }
+    CHECK(checked == rows.size() * Controls.size());
 }
 
 TEST_CASE("A stop reports its progress until the body returns, and a second stop does not restart it", "[platform][service]")

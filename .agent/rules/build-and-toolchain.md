@@ -1326,14 +1326,15 @@ determinism rests on.
       or a shell function is the SHELL reading, and stays on `< <(...)`.
       `procsub-reader-scan` in `check-e2e-helpers.sh` refuses both shapes, reading the
       arguments QUOTE-AWARE and allowing the prefixes a command carries (`VAR=x`,
-      `timeout N`, `command`, `env`, a backtick), and names its blind spots, all failing
-      OPEN: a filter off its list; one invoked through a variable; a `<(` on a
+      `timeout N`, `nice`, `stdbuf`, `time`, `command`, `env`, a backtick), and names its
+      blind spots, all failing OPEN: a filter off its list, or behind a wrapper off the
+      prefix list (`ionice`, `sudo`); one invoked through a variable; a `<(` on a
       continuation line; a quoted argument holding an escaped quote of its own kind, and
       any quoting it does not model (`$'...'`, nested `$( )`); and the `run:` blocks of
       `.github/workflows`, which it does not walk; and a file its own grep failed on
-      ([#1631](https://github.com/LASTRADA-Software/fastcached/issues/1631)). Its own pattern and canary lines sit
-      in a `procsub-scan` data REGION, so `check-e2e-helpers.sh` is scanned like any
-      other file rather than exempted whole.
+      ([#1631](https://github.com/LASTRADA-Software/fastcached/issues/1631)). Its own canary lines sit
+      in a `procsub-scan` data REGION around the two heredocs alone, so
+      `check-e2e-helpers.sh` is scanned like any other file rather than exempted whole.
     - **The status, once read, has to carry WHOSE failure it is.** Round 10's red was
       `status 1 and [uncovered ]`: `Judge` read the coverage without its status, so a killed
       grep blamed the filter. Fixing that with one status for every refusal would have blamed

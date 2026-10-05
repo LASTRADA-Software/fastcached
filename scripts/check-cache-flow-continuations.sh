@@ -66,8 +66,10 @@ DecodeFailureReason|WarnAndCarryOn|an UNUSABLE value sits under this key and mus
 
 # The OTHER route to an exchange: `Cc::MakeTcpExchange(...)` builds one, and `->Exchange(...)` on
 # it reaches the cache without the door (round 10 review, M4). Every site that builds one is a
-# row here, <text the line carries>|<why it is not a cache exchange>, so a third is refused
-# rather than passed -- the run_scan rule: exact about the sites it knows, a REFUSAL for the rest.
+# row here, <text the line carries>|<why it is not a cache exchange>, and a row classifies ONE
+# site: a third spelled like one of these -- copying the dispatch site is the obvious way to write
+# it -- is refused as a second site for its row rather than passed (round 11 review, M1). The
+# run_scan rule: exact about the sites it knows, a REFUSAL for the rest.
 DoorRoutes='
 static auto const raw = Cc::MakeTcpExchange|ticket minting: an exchange with the local node, never the cache
 auto const exchange = Cc::MakeTcpExchange|dispatch: the scheduler and the worker, never the cache
@@ -193,7 +195,7 @@ EOF
 # another file and called here under a new name -- and any use of `IEndpointExchange` handed in
 # from outside this file. The two spellings this file has ever used are the ones it watches.
 run_door() {
-    local tree="$1" found reader=0 doors=0 inside=0 outside="" routes="" kind lineno text row anchor why used=""
+    local tree="$1" found reader=0 doors=0 inside=0 outside="" routes="" seconds="" kind lineno text row anchor why used=""
     if [ ! -f "$tree/$Subject" ]; then
         echo "REFUSED: $Subject is missing; the door rule has no subject and cannot pass"
         return 2
@@ -218,7 +220,11 @@ run_door() {
                 why=""
                 while IFS='|' read -r anchor row; do
                     [ -n "$anchor" ] || continue
-                    case "$text" in *"$anchor"*) why="$row"; used="${used}${anchor}|" ;; esac
+                    case "$text" in *"$anchor"*)
+                        why="$row"
+                        case "$used" in *"${anchor}|"*) seconds="${seconds}${lineno} " ;; esac
+                        used="${used}${anchor}|" ;;
+                    esac
                 done <<EOF
 $DoorRoutes
 EOF
@@ -243,6 +249,10 @@ EOF
     done
     for lineno in $routes; do
         echo "  UNCLASSIFIED ROUTE  $Subject:$lineno  Cc::MakeTcpExchange(...) -- a cache exchange belongs in CacheExchange; anything else is a DoorRoutes row saying why"
+        rc=1
+    done
+    for lineno in $seconds; do
+        echo "  SECOND SITE FOR A ROUTE ROW  $Subject:$lineno  Cc::MakeTcpExchange(...) matches a DoorRoutes row another site already took -- a row classifies ONE site; route a cache exchange through CacheExchange, or give this one a row of its own"
         rc=1
     done
     while IFS='|' read -r anchor row; do
@@ -386,6 +396,13 @@ SRC
     cases=$((cases+1))
     run_door "$tmp/doorPointer" >/dev/null 2>&1
     [ $? -eq 1 ] && echo "  case 14 (callee as a pointer) PASS" || { echo "  case 14 (callee as a pointer) FAIL -- not caught"; fail=1; }
+
+    # A row classifies ONE site (round 11 review, M1): a third exchange written by copying the
+    # dispatch site's spelling matches that row, and was passed as classified.
+    { baseline; door; echo '    auto const exchange = Cc::MakeTcpExchange(Notice(record.verbose)); exchange->Exchange(cfg.addr, frame);'; } | stage doorCopiedRoute
+    cases=$((cases+1))
+    run_door "$tmp/doorCopiedRoute" >/dev/null 2>&1
+    [ $? -eq 1 ] && echo "  case 18 (a row's second site)  PASS" || { echo "  case 18 (a row's second site)  FAIL -- not caught"; fail=1; }
 
     { baseline; door | grep -v 'auto const exchange'; } | stage doorStaleRoute
     cases=$((cases+1))

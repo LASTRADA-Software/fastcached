@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/IServiceControlManager.hpp>
 #include <FastCache/Platform/ServiceStatusPlan.hpp>
@@ -9,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -71,6 +73,78 @@ class RecordingDaemonHost final: public IDaemonHost
     std::size_t _runs = 0;
     std::vector<int> _refusals;
 };
+
+/// The Win32 errors a refused `ControlService` answers with (`winerror.h`). The VALUES are
+/// Windows', which a case compares against, so each is spelled rather than enumerated.
+namespace ScmError
+{
+    /// `ERROR_INVALID_SERVICE_CONTROL`: the state allows the control, the service does not accept it.
+    inline constexpr std::uint32_t InvalidServiceControl = 1052;
+    /// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`: the STATE allows no such control, whatever is accepted.
+    inline constexpr std::uint32_t ServiceCannotAcceptCtrl = 1061;
+    /// `ERROR_SERVICE_NOT_ACTIVE`: the service is stopped.
+    inline constexpr std::uint32_t ServiceNotActive = 1062;
+} // namespace ScmError
+
+/// What the SCM does with a control in one state: the three actions of the `ControlService`
+/// remarks table (https://learn.microsoft.com/windows/win32/api/winsvc/nf-winsvc-controlservice).
+///
+/// Private to the fake: never transmitted or persisted.
+enum class ScmControlAction : std::uint8_t
+{
+    SendIfAccepted, ///< (a): send it if the last report accepts it, else `InvalidServiceControl`.
+    CannotAccept,   ///< (b): `ServiceCannotAcceptCtrl`, the handler never called.
+    NotActive,      ///< (c): `ServiceNotActive`, the handler never called.
+    Last,           ///< Not an action.
+};
+
+/// The error an action refuses with.
+struct ScmControlActionRow
+{
+    ScmControlAction action { ScmControlAction::Last }; ///< The enumerator this row describes.
+    std::uint32_t refusal { 0 };                        ///< What a refused control answers.
+};
+
+/// Every action, in enumerator order.
+inline constexpr EnumTable<ScmControlAction, ScmControlActionRow> ScmControlActionTable { {
+    { .action = ScmControlAction::SendIfAccepted, .refusal = ScmError::InvalidServiceControl },
+    { .action = ScmControlAction::CannotAccept, .refusal = ScmError::ServiceCannotAcceptCtrl },
+    { .action = ScmControlAction::NotActive, .refusal = ScmError::ServiceNotActive },
+} };
+static_assert(RowsInEnumeratorOrder(ScmControlActionTable, &ScmControlActionRow::action),
+              "ScmControlActionTable must hold one row per ScmControlAction, in enumerator order");
+
+/// The SCM's action per reported state, for a stop and for every other control.
+struct ScmStateActionRow
+{
+    ServiceState state { ServiceState::Last };                 ///< The enumerator this row describes.
+    ScmControlAction stop { ScmControlAction::Last };          ///< `SERVICE_CONTROL_STOP`.
+    ScmControlAction otherControls { ScmControlAction::Last }; ///< Every other control.
+};
+
+/// The `ControlService` remarks table, row for row, for the states a `ServiceState` names.
+///
+/// **The STATE decides first**: in START_PENDING only a stop can be sent, and a reload is refused
+/// `ServiceCannotAcceptCtrl` (1061) however the report's acceptance reads -- never 1052, which is
+/// the answer only where the state allows the control. A fake that decided from the acceptance bits
+/// alone delivered what Windows never delivers (round 11 review, I1). `SERVICE_CONTROL_SHUTDOWN`
+/// and power broadcasts come from the system rather than `ControlService`, so the table does not
+/// cover them; they take the OTHER column here, the narrower reading, because a model more
+/// permissive than the manager produces wrong agreement.
+inline constexpr EnumTable<ServiceState, ScmStateActionRow> ScmStateActionTable { {
+    { .state = ServiceState::StartPending,
+      .stop = ScmControlAction::SendIfAccepted,
+      .otherControls = ScmControlAction::CannotAccept },
+    { .state = ServiceState::Running,
+      .stop = ScmControlAction::SendIfAccepted,
+      .otherControls = ScmControlAction::SendIfAccepted },
+    { .state = ServiceState::StopPending,
+      .stop = ScmControlAction::CannotAccept,
+      .otherControls = ScmControlAction::CannotAccept },
+    { .state = ServiceState::Stopped, .stop = ScmControlAction::NotActive, .otherControls = ScmControlAction::NotActive },
+} };
+static_assert(RowsInEnumeratorOrder(ScmStateActionTable, &ScmStateActionRow::state),
+              "ScmStateActionTable must hold one row per ServiceState, in enumerator order");
 
 /// Whether a scripted service manager has a manager to connect to at all.
 ///
@@ -201,16 +275,21 @@ class ScriptedServiceControlManager final: public IServiceControlManager
         return _handler && _handler(request, eventType);
     }
 
-    /// Send @p request the way `sc stop`, an MSI ServiceControl or a power broadcast does: the
-    /// manager hands the service only a control its LAST report accepted, and refuses any other
-    /// itself (`ERROR_INVALID_SERVICE_CONTROL`, 1052), with the handler never called.
+    /// Send @p request the way `sc stop`, an MSI ServiceControl or a power broadcast does, decided
+    /// as the SCM decides it (`ScmStateActionTable`): by the last reported STATE first, then by
+    /// what that report accepted. A refusal is the manager's own, with the handler never called.
+    /// Before any report the manager holds the service START_PENDING and accepting nothing.
     /// @param request The control.
     /// @param eventType The manager's event type: a `PBT_*` value for a power event.
-    /// @return What the handler answered, or nothing when the manager refused the control itself.
-    [[nodiscard]] std::optional<bool> Request(ServiceControlRequest request, std::uint32_t eventType = 0) const
+    /// @return What the handler answered, or the `ScmError` the manager refused the control with.
+    [[nodiscard]] std::expected<bool, std::uint32_t> Request(ServiceControlRequest request,
+                                                             std::uint32_t eventType = 0) const
     {
-        if (!Accepted(request))
-            return std::nullopt;
+        auto const last = LastReport();
+        auto const& row = ScmStateActionTable[static_cast<std::size_t>(last.state)];
+        auto const action = request == ServiceControlRequest::Stop ? row.stop : row.otherControls;
+        if (action != ScmControlAction::SendIfAccepted || !Accepts(last, request))
+            return std::unexpected { ScmControlActionTable[static_cast<std::size_t>(action)].refusal };
         return Deliver(request, eventType);
     }
 
@@ -279,26 +358,30 @@ class ScriptedServiceControlManager final: public IServiceControlManager
         Transition { .from = ServiceState::StopPending, .to = ServiceState::Stopped },
     };
 
-    /// @return Whether the last report accepted @p request; nothing reported accepts nothing but an
-    ///         interrogation, which the SCM answers itself.
-    [[nodiscard]] bool Accepted(ServiceControlRequest request) const
+    /// @return The last report, or what the manager holds before one: START_PENDING, accepting
+    ///         nothing.
+    [[nodiscard]] ServiceStatusReport LastReport() const
     {
         std::scoped_lock const lock { _mutex };
-        if (request == ServiceControlRequest::Interrogate)
-            return true;
-        if (_reports.empty())
-            return false;
-        auto const& last = _reports.back();
+        return _reports.empty() ? ServiceStatusReport { .state = ServiceState::StartPending } : _reports.back();
+    }
+
+    /// @return Whether @p report accepted @p request -- asked only where the state lets the control
+    ///         be sent. An interrogation is accepted by every service by default (`ControlService`
+    ///         remarks), so no report needs to name it.
+    [[nodiscard]] static bool Accepts(ServiceStatusReport const& report, ServiceControlRequest request)
+    {
         switch (request)
         {
             case ServiceControlRequest::Stop:
             case ServiceControlRequest::Shutdown:
-                return last.acceptsStop;
+                return report.acceptsStop;
             case ServiceControlRequest::ParamChange:
-                return last.acceptsReload;
+                return report.acceptsReload;
             case ServiceControlRequest::PowerEvent:
-                return last.acceptsPowerEvents;
+                return report.acceptsPowerEvents;
             case ServiceControlRequest::Interrogate:
+                return true;
             case ServiceControlRequest::Unsupported:
                 break;
         }

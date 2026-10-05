@@ -999,7 +999,7 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - Its mirror on the other side of the same pipe: **a `<<<` operand of 64 KiB or more
   DEADLOCKS on Git Bash** (#1591), SIZE not content. Feed an external filter through
   `pipe_lines_into` (two: `pipe_pair_into`), a pipe answering with the FILTER's status — never a
-  `<(...)`, stdin OR argument, which CAN make it the writer's PARENT; one came back 148 (#1630, INFERRED).
+  `<(...)`, stdin OR argument, which CAN make it the writer's PARENT; one came back 148 (#1630; its cause INFERRED).
 - `producer | grep -q` is a false **negative** under `set -o pipefail`, and it fails on the
   SUCCESS path; it is a SCAN in `check-e2e-helpers.sh`, since a rule stated in the files that obey
   it reaches no file that does not. The remedy is a HERESTRING, which is not a pipe.

@@ -1032,6 +1032,20 @@ EmptyPlanVerdict() {
     esac
 }
 
+# `ok` or `refuse`: may a run of `$1` mode go on when `$2` of the files it was told to sweep
+# planned no translation unit? The per-file form of `EmptyPlanVerdict` (round 11 review, M5):
+# `--only` naming five files of which three plan would sweep two and report clean, the other
+# three left as a stderr note. A diff-derived run chose its set itself, and a header or a file
+# the platform does not compile is an ordinary member of it. Pure, for `OnlyCoverageVerdict`'s
+# reason.
+#
+# @param 1 Sweep mode (`all`, `ci` or `only`).
+# @param 2 How many named files planned no translation unit.
+NamedUnplannedVerdict() {
+    [[ "$1" == only && "$2" -gt 0 ]] && { echo refuse; return; }
+    echo ok
+}
+
 # ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
@@ -1160,7 +1174,7 @@ TidyUnitVerdict() {
 # that stopped early -- a helper that `return`ed, a block skipped by a failed
 # precondition, a row deleted by mistake -- would otherwise print PASSED over fewer
 # judgements than it claims. Change it in the same edit that adds or removes a row.
-SelfTestCases=113
+SelfTestCases=116
 
 # The HEADER canary's decision: was a finding planted in each named header REPORTED?
 #
@@ -1605,6 +1619,11 @@ STUB
     Expect "--only refuses an empty plan"    "refuse"  "$(EmptyPlanVerdict only)"
     Expect "--all refuses an empty plan"     "refuse"  "$(EmptyPlanVerdict all)"
     Expect "--ci may find nothing to sweep"  "nothing" "$(EmptyPlanVerdict ci)"
+    # And per FILE: `--only` refuses a named file that planned no unit; a diff-derived run's
+    # header or other-platform file is an ordinary member of its set (round 11 review, M5).
+    Expect "--only refuses a named file that planned no unit" "refuse" "$(NamedUnplannedVerdict only 1)"
+    Expect "--only goes on when every named file planned"     "ok"     "$(NamedUnplannedVerdict only 0)"
+    Expect "--ci tolerates a changed file with no unit"       "ok"     "$(NamedUnplannedVerdict ci 3)"
     Expect "--ci tolerates an unknown unit"  "ok" "$(OnlyCoverageVerdict ci 0 3)"
     # NOT asserted here, deliberately: that the preprocessed dump is created inside
     # $scratch rather than $TMPDIR. Both paths delete it on the way out, so the
@@ -2323,6 +2342,21 @@ if [[ "${#plan[@]}" -eq 0 ]]; then
     echo "            compiles; nothing to sweep"
     exit 0
 fi
+# Every file `--only` named has to have planned: one that did not would be swept by nobody
+# while the run reports clean over the rest. The plan's second field is the repo path.
+unplanned=()
+if [[ "$mode" == only ]]; then
+    declare -A plannedPaths=()
+    for row in "${plan[@]}"; do
+        rest="${row#*$'\t'}"
+        plannedPaths["${rest%%$'\t'*}"]=1
+    done
+    for path in "${onlyPaths[@]}"; do
+        [[ -n "${plannedPaths[$path]+x}" ]] || unplanned+=("$path")
+    done
+fi
+[[ "$(NamedUnplannedVerdict "$mode" "${#unplanned[@]}")" == ok ]] \
+    || fatal "--only=${onlyList} names ${#unplanned[@]} file(s) that plan no translation unit in ${DB}/compile_commands.json, first '${unplanned[0]}'; sweeping the rest would report clean over a set smaller than the one named"
 echo "TIDY SWEEP: ${#plan[@]} translation unit(s), ${TIDY}, ${JOBS} at a time"
 EnsureGeneratedSources
 Canary

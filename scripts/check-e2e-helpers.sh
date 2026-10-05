@@ -4387,12 +4387,14 @@ fi
 # The arguments between the filter and its `<(` are read QUOTE-AWARE: a `|`, `;` or `&` inside a
 # quoted argument -- `grep -E 'a|b'`, an awk program's `;` -- does not end the command, and `2>&1`
 # is a redirection rather than a separator. And the prefixes a command may carry are allowed in
-# front of the filter: `VAR=value`, `timeout N`, `command`, `env`, and a backtick substitution.
+# front of the filter: `VAR=value`, `timeout N`, `nice [-n N]`, `stdbuf -oL`, `time [-p]`,
+# `command`, `env`, and a backtick substitution (the wrappers after round 11's review, M3).
 # The first version stopped at the first `|`, `;` or `&` anywhere, quotes included, and missed
 # nine everyday shapes no blind spot named (round 10 review, I3); each is a canary row below.
 #
 # BLIND SPOTS, all failing OPEN -- the line passes:
-#   - a filter not in the list below;
+#   - a filter not in the list below, and a filter behind a WRAPPER command not in the prefix
+#     list (`ionice`, `chrt`, `sudo`, ...);
 #   - one invoked through a variable (`"$python3_bin" x.py < <(...)`);
 #   - one whose `<(` sits on a continuation line after a `\`;
 #   - a quoted argument holding an escaped quote of its own kind (`"a\"|b"`), which ends the
@@ -4403,14 +4405,16 @@ fi
 # None is in the tree today; the census that said so was every `<(` in `scripts/` and in
 # `.github/workflows`, classified by hand (and by the round 10 review), not this regex.
 #
-# READ THROUGH ITS REGIONS: this file states the scan's own pattern and canary lines, so they sit
-# in a `procsub-scan` data region and the file is scanned like any other -- never exempted whole,
-# which would blind the scan to its 5700 lines (#492's shape; round 10 review, I4).
-# procsub-scan: data-begin
+# READ THROUGH ITS REGIONS: this file states the scan's own canary lines, so the two canary
+# heredocs sit in a `procsub-scan` data region and the file is scanned like any other -- never
+# exempted whole, which would blind the scan to its 5700 lines (#492's shape; round 10 review,
+# I4). The region holds the heredocs ALONE: the code around them is code the scan must read, and
+# the pattern's own text cannot match it, since its filter list is never followed by `<(` (round
+# 11 review, M2).
 _procsub_pattern() {
     local sq="'" dq='"'
     local position='(^|[$][(]|[;&|!{(`]|(^|[[:space:]])(then|do|if|else|elif|while|until|command|exec))[[:space:]]*'
-    local prefixes='(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|timeout[[:space:]]+[^[:space:]]+|command|env)[[:space:]]+)*'
+    local prefixes='(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|timeout[[:space:]]+[^[:space:]]+|nice([[:space:]]+-n[[:space:]]*[^[:space:]]+)?|stdbuf([[:space:]]+-[ioe][^[:space:]]*)+|time([[:space:]]+-p)?|command|env)[[:space:]]+)*'
     local filters='(grep|egrep|fgrep|sort|sed|awk|cut|wc|tr|uniq|head|tail|cat|comm|diff|cmp|paste|join|tee|nl|od|base64|sha256sum|md5sum|iconv|jq|xargs|git|perl|python3?|sh|bash)'
     local arguments="([[:space:]]([^|;&${sq}${dq}]|${sq}[^${sq}]*${sq}|${dq}[^${dq}]*${dq}|[0-9]?>&[0-9-])*)?"
     printf '%s' "${position}${prefixes}${filters}${arguments}[[:space:]]<\\("
@@ -4421,6 +4425,7 @@ _external_reads_procsub() {
 }
 
 procsub_canary_dir="$(mktemp -d)"
+# procsub-scan: data-begin
 cat > "${procsub_canary_dir}/must-catch.sh" <<'CANARY'
 selected="$(grep -E -- "$pattern" < <(printf '%s\n' "$3"))" || status=$?
 grep -q "^${root}/" < <(printf '%s\n' "$all") || continue
@@ -4441,6 +4446,9 @@ LC_ALL=C sort -u < <(printf '%s\n' "$x")
 command grep -q x < <(printf '%s\n' "$x")
 timeout 5 grep -q x < <(printf '%s\n' "$x")
 v=`grep -c x < <(printf '%s\n' "$x")`
+nice -n 5 grep x < <(printf '%s\n' "$x")
+stdbuf -oL grep x < <(printf '%s\n' "$x")
+time sort -u < <(printf '%s\n' "$x")
 CANARY
 cat > "${procsub_canary_dir}/must-not-catch.sh" <<'CANARY'
 done < <(printf '%s\n' "$paths")
@@ -4458,11 +4466,11 @@ collect_lines < <(printf '%s\n' "$x")
 echo 'grep -E "a|b" < <(printf x) is the shape' >&2
 LC_ALL=C pipe_lines_into "$x"$'\n' sort -u
 CANARY
+# procsub-scan: data-end
 _scan_canary "procsub-reader-scan-canary" _external_reads_procsub \
     "${procsub_canary_dir}/must-catch.sh" "${procsub_canary_dir}/must-not-catch.sh" \
-    19 "external filters reading a process substitution" "a shell read, a remedy or a string"
+    22 "external filters reading a process substitution" "a shell read, a remedy or a string"
 rm -rf "$procsub_canary_dir"
-# procsub-scan: data-end
 
 # And the region is a REGION: a canary line staged in this file OUTSIDE it is read, and caught.
 procsub_region_canary="$(mktemp -d)"

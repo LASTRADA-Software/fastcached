@@ -454,16 +454,27 @@ function Assert-FirewallGroupEmpty([string] $Group) {
     if ($verdict = Get-FirewallGroupEmptyVerdict @($rules | ForEach-Object { $_.DisplayName }) $Group) { throw $verdict }
 }
 
-# The firewall group @p Group on the REAL Windows Firewall, one line per rule: every property a
-# registration's firewall step sets -- name, enabled, direction, action, protocol, local port and
-# remote address -- sorted, so two snapshots compare as text. What Assert-FirewallGroupUnchanged reads.
+# One firewall rule as one snapshot line: every property a registration's firewall step sets --
+# name, enabled, direction, action, PROFILE, protocol, local port, remote address and the PROGRAM it
+# admits. A pure formatter, so the self-test can show a property the line omits would let a rollback
+# that changed it pass (round 11 review, M6: profile and program were omitted).
+# @param Rule The rule: DisplayName, Enabled, Direction, Action, Profile.
+# @param Port Its port filter: Protocol, LocalPort.
+# @param Address Its address filter: RemoteAddress.
+# @param Application Its application filter: Program.
+# @return The line.
+function Format-FirewallRuleLine($Rule, $Port, $Address, $Application) {
+    return "$($Rule.DisplayName) | enabled=$($Rule.Enabled) $($Rule.Direction) $($Rule.Action) profile=$($Rule.Profile) | $($Port.Protocol)/$(@($Port.LocalPort) -join ',') | remote=$(@($Address.RemoteAddress) -join ',') | program=$($Application.Program)"
+}
+
+# The firewall group @p Group on the REAL Windows Firewall, one Format-FirewallRuleLine per rule,
+# sorted, so two snapshots compare as text. What Assert-FirewallGroupUnchanged reads.
 # @param Group The group, `fastcached: <service>`.
 # @return The lines; none for an empty or absent group.
 function Get-FirewallGroupSnapshot([string] $Group) {
     return @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue | ForEach-Object {
-            $port = $_ | Get-NetFirewallPortFilter
-            $address = $_ | Get-NetFirewallAddressFilter
-            "$($_.DisplayName) | enabled=$($_.Enabled) $($_.Direction) $($_.Action) | $($port.Protocol)/$(@($port.LocalPort) -join ',') | remote=$(@($address.RemoteAddress) -join ',')"
+            Format-FirewallRuleLine $_ ($_ | Get-NetFirewallPortFilter) ($_ | Get-NetFirewallAddressFilter) `
+                ($_ | Get-NetFirewallApplicationFilter)
         } | Sort-Object)
 }
 
@@ -1211,6 +1222,21 @@ function Invoke-MsiServiceTableSelfTest {
     ExpectThrow 'unchanged: an empty group before the transaction proves nothing, and is refused' {
         if ($verdict = Get-FirewallGroupUnchangedVerdict @() @() 'fastcached: X') { throw $verdict }
     } 'held no rule BEFORE the transaction'
+    # And the snapshot LINE carries the profile and the program (round 11 review, M6): a rollback that
+    # put the port and the scope back but admitted another program, or another profile, is refused.
+    $ruleObject = [pscustomobject] @{ DisplayName = 'FastCached cache tcp/6674'; Enabled = 'True'; Direction = 'Inbound'; Action = 'Allow'; Profile = 'Any' }
+    $portFilter = [pscustomobject] @{ Protocol = 'TCP'; LocalPort = '6674' }
+    $addressFilter = [pscustomobject] @{ RemoteAddress = 'Any' }
+    $programBefore = Format-FirewallRuleLine $ruleObject $portFilter $addressFilter ([pscustomobject] @{ Program = 'C:\Program Files\fastcached\bin\fastcached.exe' })
+    $programAfter = Format-FirewallRuleLine $ruleObject $portFilter $addressFilter ([pscustomobject] @{ Program = 'C:\Elsewhere\fastcached.exe' })
+    $privateOnly = [pscustomobject] @{ DisplayName = 'FastCached cache tcp/6674'; Enabled = 'True'; Direction = 'Inbound'; Action = 'Allow'; Profile = 'Private' }
+    $profileAfter = Format-FirewallRuleLine $privateOnly $portFilter $addressFilter ([pscustomobject] @{ Program = 'C:\Program Files\fastcached\bin\fastcached.exe' })
+    ExpectThrow 'unchanged: a rollback that admits another PROGRAM is refused, naming it' {
+        if ($verdict = Get-FirewallGroupUnchangedVerdict @($programBefore) @($programAfter) 'fastcached: X') { throw $verdict }
+    } 'holds \[.*program=C:\\Elsewhere\\fastcached\.exe\]'
+    ExpectThrow 'unchanged: a rollback that changes the PROFILE is refused, naming it' {
+        if ($verdict = Get-FirewallGroupUnchangedVerdict @($programBefore) @($profileAfter) 'fastcached: X') { throw $verdict }
+    } 'holds \[.*profile=Private'
 
     # What failed, read whatever shape Windows Installer gave it: an action that could not START names
     # no CustomAction and no code (round 5), one that ran and failed does, and a clean log says nothing.
@@ -1280,7 +1306,7 @@ function Invoke-MsiServiceTableSelfTest {
         }
     }
 
-    $expectedCases = 77
+    $expectedCases = 79
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -1294,5 +1320,5 @@ Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert
     Get-NodeFirewallScopeVerdict, Assert-NodeFirewallScope, Get-NodeRegistrationArgumentVerdict,
     Assert-NodeRegistrationArgument, Get-MsiActionOrderVerdict, Assert-MsiActionOrder,
     Get-NodeRegistrationLacksVerdict, Assert-NodeRegistrationLacks, Get-FirewallGroupEmptyVerdict,
-    Assert-FirewallGroupEmpty, Get-FirewallGroupSnapshot, Get-FirewallGroupUnchangedVerdict,
+    Assert-FirewallGroupEmpty, Format-FirewallRuleLine, Get-FirewallGroupSnapshot, Get-FirewallGroupUnchangedVerdict,
     Assert-FirewallGroupUnchanged, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Invoke-MsiServiceTableSelfTest
