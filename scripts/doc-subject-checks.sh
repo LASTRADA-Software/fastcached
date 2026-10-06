@@ -906,6 +906,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Absolute from here on: the checks run from other working directories, so a relative
+# --source-dir named a different tree for each of them and three of them failed.
+[[ -d "$sourceDir" ]] || Fatal "--source-dir '$sourceDir' is not a directory"
+sourceDir="$(cd "$sourceDir" && pwd)"
+
 if [[ "$selfTest" == "yes" ]]; then
     SelfTest
     exit 0

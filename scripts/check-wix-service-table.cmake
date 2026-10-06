@@ -35,6 +35,36 @@
 # stopped while running is started again, and each remembered value is written
 # back or deleted as it was found -- so a failed step leaves nothing behind.
 #
+# The MSIRESTARTMANAGERCONTROL row pins Restart Manager OUT of every transaction ("Disable"): a
+# silent install otherwise restarts, at its end, every service it shut down at InstallValidate,
+# whatever the service table decided. PR 1634's CI measured FastCached started after the table had
+# made it manual and stopped it for the node, and then MEASURED whose session did it: the OLD
+# package's removal, nested in the upgrade, while this package's own logged "Disabled". So this row is
+# necessary and not sufficient; the FastCachedDisableForNode rows below are the other half (see the
+# comment on MSIRESTARTMANAGERCONTROL). Its offence names that defect below, since the footer
+# is generic. msi-custom-action-commands step 13 judges the same row, and refuses a custom action
+# setting the property.
+#
+# The FastCachedDisableForNode rows pin fastcached DISABLED beside the node, Return="check": an OLD
+# package's removal inside an upgrade keeps its own Restart Manager session, and PR 1634's CI MEASURED
+# Windows Installer restarting FastCached by name after the whole transaction had ended, onto the
+# port the node holds. Disabled, that start fails at the service control manager with no process.
+# And only a registration that EXISTS: the 1060 guard rows, since fastcached's own registration is
+# Return="ignore" and a checked disable of an absent service failed the node's whole install
+# (rm-nested review, I-1). msi-custom-action-commands step 14 runs the command both ways.
+#
+# The FASTCACHE_INSTALL_LOCATION rows pin how a MAINTENANCE transaction resolves
+# INSTALL_ROOT: from the product's OWN uninstall entry, when Installed, before
+# CostFinalize. CPack resolves it only on an upgrade, and an uninstall of a custom
+# root ran the default root's binary and left its service registered (CI run
+# 37456507637). msi-custom-action-commands step 12 judges the same row by its shape.
+#
+# One row is a UNIQUENESS pin rather than an element: its opener is the bare
+# `Before="InstallFinalize"`, so rule 1 requires that text exactly once, and the
+# element it opens to be the forced failure's. FastCacheFailForTest is therefore the
+# ONE action scheduled there, behind every other script action, which is what
+# "a failure there rolls back everything the script did" rests on (#1629).
+#
 # What it does NOT see: whether Windows Installer evaluates a condition the way it
 # reads, and anything about sequencing beyond the After= values pinned below. The
 # `Package (Windows .msi)` job is the only thing that runs the package. This fails
@@ -66,6 +96,18 @@ set(_table [=[
 <Property Id="FASTCACHED_IMAGEPATH"|</Property>|Key="SYSTEM\CurrentControlSet\Services\FastCached"
 <Property Id="FASTCACHED_IMAGEPATH"|</Property>|Name="ImagePath"
 <Property Id="FASTCACHED_IMAGEPATH"|</Property>|Root="HKLM"
+
+<Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Root="HKLM"
+<Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]"
+<Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Name="InstallLocation"
+<Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Bitness="always64"
+<Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Type="raw"
+<SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Id="INSTALL_ROOT"
+<SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Value="[FASTCACHE_INSTALL_LOCATION]"
+<SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Before="CostFinalize" Sequence="both"
+<SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Condition="Installed AND FASTCACHE_INSTALL_LOCATION"
+
+<Property Id="MSIRESTARTMANAGERCONTROL"|/>|Value="Disable"
 
 <CustomAction Id="FastCacheNodeDeleteLeftover"|/>|sc.exe" delete FastCacheCompileNode"
 <CustomAction Id="FastCacheNodeDeleteLeftover"|/>|Execute="deferred"
@@ -312,14 +354,30 @@ set(_table [=[
 <CustomAction Id="FastCachedStopForNode"|/>|net.exe stop FastCached"
 <CustomAction Id="FastCachedStopForNode"|/>|Return="ignore"
 <Custom Action="FastCachedStopForNode"|/>|After="FastCachedInstallService"
-<Custom Action="FastCachedStartService"|/>|After="FastCachedAwaitExitForNode"
+<CustomAction Id="FastCachedDisableForNode"|/>|cmd.exe" /c ([System64Folder]sc.exe query FastCached >nul 2>&1 & if errorlevel 1060 if not errorlevel 1061 exit 0) &
+<CustomAction Id="FastCachedDisableForNode"|/>|& [System64Folder]sc.exe config FastCached start= disabled"
+<CustomAction Id="FastCachedDisableForNode"|/>|Execute="deferred"
+<CustomAction Id="FastCachedDisableForNode"|/>|Impersonate="no"
+<CustomAction Id="FastCachedDisableForNode"|/>|Return="check"
+<Custom Action="FastCachedDisableForNode"|/>|After="FastCachedAwaitExitForNode"
+<Custom Action="FastCachedDisableForNode"|/>|Condition="FASTCACHED_SELECTED = "1" AND FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCachedStartService"|/>|After="FastCachedDisableForNode"
 
 <CustomAction Id="FastCacheClearRollbackState"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
 <CustomAction Id="FastCacheClearRollbackState"|/>|Execute="deferred"
 <Custom Action="FastCacheClearRollbackState"|/>|Before="FastCacheUndoRollbackState"
 <CustomAction Id="FastCacheClearRollbackState"|/>|Directory="System64Folder"
 <CustomAction Id="FastCacheDiscardRollbackState"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
-<CustomAction Id="FastCacheDiscardRollbackState"|/>|Execute="deferred"
+<CustomAction Id="FastCacheDiscardRollbackState"|/>|Execute="commit"
+<CustomAction Id="FastCacheDiscardRollbackState"|/>|Directory="System64Folder"
+<CustomAction Id="FastCacheFailForTest"|/>|Execute="deferred"
+<CustomAction Id="FastCacheFailForTest"|/>|Return="check"
+<CustomAction Id="FastCacheFailForTest"|/>|exit 1603
+<CustomAction Id="FastCacheFailForTest"|/>|Impersonate="no"
+<Custom Action="FastCacheFailForTest"|/>|Before="InstallFinalize"
+Before="InstallFinalize"|/>|FASTCACHE_FAIL_FOR_TEST = "1"
+<Custom Action="FastCacheFailForTest"|/>|FASTCACHE_FAIL_FOR_TEST = "1"
+<Property Id="FASTCACHE_FAIL_FOR_TEST"|/>|Secure="yes"
 <Custom Action="FastCacheDiscardRollbackState"|/>|After="FastCacheNodeStartService"
 <CustomAction Id="FastCachedRestartAfterStop"|/>|/v FastCachedWasRunning
 <CustomAction Id="FastCachedRestartAfterStop"|/>|sc.exe start FastCached"
@@ -531,13 +589,24 @@ endforeach()
 
 if(_offences)
     string(REPLACE ";" "\n  " _offenceText "${_offences}")
+    # The one row whose offence names its defect, since the footer below is generic.
+    set(_restartManagerText "")
+    string(FIND "${_offenceText}" "MSIRESTARTMANAGERCONTROL" _restartManagerOffence)
+    if(NOT _restartManagerOffence EQUAL -1)
+        set(_restartManagerText
+            "\nMSIRESTARTMANAGERCONTROL must be Disable: Windows Installer's Restart Manager restarts a service the "
+            "table left stopped. A silent install starts, at its end, every service it shut down at InstallValidate, "
+            "whatever the table decided, and that shutdown comes before StopServices, so the ServiceControl rows "
+            "record no rollback start. See the property's comment in service-actions.xml.")
+        string(CONCAT _restartManagerText ${_restartManagerText})
+    endif()
     message(FATAL_ERROR
         "check-wix-service-table: packaging/windows/service-actions.xml no longer carries the service "
         "table this check pins.\n"
         "  ${_offenceText}\n"
         "If the change is deliberate, change the row in scripts/check-wix-service-table.cmake in the "
         "same commit and say why there. A leftover-removal row lost its guard means the MSI can delete "
-        "a service it did not register.")
+        "a service it did not register.${_restartManagerText}")
 endif()
 
 message(STATUS

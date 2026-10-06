@@ -9,7 +9,7 @@
     service is registered and whether it is started:
 
       Node installed               node auto and started, with no property needed;
-                                   fastcached manual and stopped
+                                   fastcached DISABLED and stopped
       Daemon installed, no Node    fastcached auto and started (FASTCACHED_START_SERVICE=0 skips the start)
 
     It is applied on EVERY transaction that leaves a feature installed: a first
@@ -36,7 +36,11 @@
     there). A feature the upgrade no longer installs has its leftover
     registration deleted by the new product instead (the DeleteLeftover rows).
     The old product's ServiceControl rows stop its services, waiting, before any
-    file is replaced.
+    file is replaced. Windows Installer's Restart Manager is disabled
+    (MSIRESTARTMANAGERCONTROL, below): it started a service this table had left
+    stopped. An OLD package's removal, run inside an upgrade, still has its own
+    Restart Manager session, which is why fastcached beside the node is
+    disabled rather than manual (FastCachedDisableForNode).
 
     Installers up to and including 0.3.0 delete both services in their own
     uninstall, which a major upgrade runs first; the table above registers them
@@ -68,8 +72,128 @@
        install with error 1721. -->
   <CPackWiXFragment Id="#PRODUCT">
 
+    <!-- Windows Installer's Restart Manager takes no part in any transaction:
+         the service table and the ServiceControl rows own every stop and every
+         start, and their rollback owns every restart.
+
+         A silent install always uses Restart Manager otherwise ("Silent UI level
+         installations always shut down applications and services, and ... always
+         use Restart Manager", Using Windows Installer with Restart Manager). It
+         shuts down, at InstallValidate, a service holding a file the transaction
+         replaces, and starts it again at the end of the install, WHATEVER this
+         table decided. PR 1634's CI measured an upgrade of a machine where
+         FastCached ran START FastCached after the table had made it manual and
+         stopped it for the node: it could not bind the port the node holds,
+         crash-looped under its own recovery policy, and a restart landing while
+         a later transaction had the node stopped took the port and failed that
+         transaction ("an upgrade deselecting fastcached", 1603). Its printed
+         log then MEASURED whose Restart Manager that was: not this package's,
+         which logged "Disabled", but the OLD package's removal, nested in the
+         upgrade (below). So disabling it here is necessary and NOT sufficient:
+         FastCachedDisableForNode is the other half.
+
+         And twice harmful: the ServiceControl rows (FastCachedStopForFiles,
+         FastCacheCompileNodeStopForFiles) already stop each service, waiting,
+         before its files are replaced, and a stop of a RUNNING service records
+         the rollback start that puts a failed transaction's services back. Restart
+         Manager's shutdown came first, at InstallValidate, so StopServices found
+         the service stopped and recorded no rollback start.
+
+         Disable, not DisableShutdown, which keeps Restart Manager asking which
+         files are in use; and not MSIDISABLERMRESTART=1 alone, which keeps the
+         shutdown at InstallValidate and with it the lost rollback start. A
+         Property row, because Windows Installer reads this property from the
+         package: a custom action changing it has no effect. CPack's own sources
+         define no such property. msi-custom-action-commands (step 13) and
+         wix-service-table refuse the package without this row.
+
+         What it gives up: a NON-service process holding a replaced file (a
+         fastcache-cc inside a running build) is no longer offered for closing,
+         and has no window for the FilesInUse dialog to list, so its file is
+         replaced at the next boot (3010). And a maintenance transaction that
+         removes a service relies on its process having exited between the stop
+         and RemoveFiles, a margin the early shutdown used to give.
+
+         What it does NOT reach: the OLD product's removal, which
+         RemoveExistingProducts runs as a nested installation with the OLD
+         package's properties. PR 1634's CI MEASURED it on the upgrade from 0.3.0,
+         whose package sets no such property: this package logged "Disabled by
+         MSIRESTARTMANAGERCONTROL property", then the nested removal opened a
+         session of its own and "Successfully shut down all applications in the
+         service's session that held files in use" (FastCached), and the OUTER
+         engine restarted them after "Installation completed successfully",
+         after every action of this package, commit actions included: "Failed
+         while restarting applications. Error: 352", with FastCached started and
+         crashing on the port the node holds between the two lines. No property
+         of this package reaches a nested removal (RemoveExistingProducts sets
+         only ProductCode and REMOVE for it), and nothing of ours may run before
+         it (Error 2613), so that restart is answered where it lands: a service
+         this table leaves stopped beside the node is DISABLED, and a start of
+         it fails at the service control manager, with no process, no recovery
+         restart and no race for 6674 (FastCachedDisableForNode). -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+
+    <!-- A MAINTENANCE transaction (a repair, a feature change, an uninstall)
+         resolves INSTALL_ROOT from where this product IS installed: the
+         InstallLocation of its OWN uninstall entry, read by AppSearch and set
+         before CostFinalize, which derives every directory under the root from
+         it. CPack's properties.wxi sets INSTALL_ROOT only from
+         Uninstall\[WIX_UPGRADE_DETECTED], which is empty outside an upgrade, so
+         every maintenance transaction of a custom root fell back to the default
+         one: the uninstall ran the default root's fastcached.exe
+         uninstall-service over a product installed elsewhere (Info 1721,
+         ignored), removed the files, and left FastCached registered and pointing
+         at a deleted binary (CI run 37456507637). Every action spelling
+         [INSTALL_ROOT], as its command or as its Directory, ran against that
+         wrong root.
+
+         One property rather than each action naming its component's directory:
+         an INSTALLED component's directory is already right (that run logged
+         the custom root for CM_DP_Daemon.bin beside the default INSTALL_ROOT),
+         but a feature a change ADDS derives its directory from INSTALL_ROOT,
+         Directory="INSTALL_ROOT" is the working directory of most actions here,
+         and the PATH entry and ARPINSTALLLOCATION are spelled from it too. A
+         per-action directory would fix the commands and none of those.
+
+         "Changing the Target Location for a Directory" forbids changing a
+         target directory during a maintenance installation, and the
+         restriction covers EVERY option it lists: a type 51 before
+         CostFinalize as much as a type 35 after it. This row complies because
+         it changes nothing: it re-states where the product already IS, its own
+         InstallLocation, which the default resolution got wrong. A type 51
+         before CostFinalize, so every directory is resolved from it, as the
+         remember-property pattern restores a value.
+
+         A product installed by a build without this row keeps the old
+         behaviour for its own repair or uninstall, since that runs its own
+         package, until it has been upgraded once. Accepted: no backwards
+         compatibility is owed before production ready.
+
+         Only when Installed: a first install and an upgrade (a new product
+         code, so not Installed) keep CPack's resolution, the command line's
+         INSTALL_ROOT or the old product's location. A maintenance transaction
+         cannot move the product, so the installed location outranks an
+         INSTALL_ROOT on its command line. In both sequences, because each runs
+         CostFinalize. An entry with no InstallLocation changes nothing: the
+         default root, as before. msi-custom-action-commands refuses the package
+         without this row while any scheduled action names INSTALL_ROOT. -->
+    <Property Id="FASTCACHE_INSTALL_LOCATION" Secure="yes">
+      <RegistrySearch Id="FastCacheOwnInstallLocation" Root="HKLM"
+                      Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]"
+                      Name="InstallLocation" Type="raw" Bitness="always64" />
+    </Property>
+    <SetProperty Action="SetFastCacheInstallRootFromInstallLocation" Id="INSTALL_ROOT"
+                 Value="[FASTCACHE_INSTALL_LOCATION]"
+                 Before="CostFinalize" Sequence="both"
+                 Condition="Installed AND FASTCACHE_INSTALL_LOCATION" />
+
     <!-- 1 = start fastcached when the install leaves it the only service. -->
     <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
+
+    <!-- 1 = fail the install last, for the CI rollback proof (#1629). Secure so
+         an un-elevated msiexec's value reaches the server-side sequence, which
+         drops a public property that is not in SecureCustomProperties. -->
+    <Property Id="FASTCACHE_FAIL_FOR_TEST" Secure="yes" />
 
     <!-- What the node registration is told. There is no scheduler to name: a
          node that serves registers where its formation record says, and is
@@ -218,9 +342,14 @@
     </Property>
 
     <!-- And the start type each registration had, as the raw search spells a
-         DWORD: #2 for auto, #3 for manual. What the binary's own restore is told
-         when a failed transaction puts a re-applied registration back
-         (FastCachedRestoreRegistration, FastCacheNodeRestoreRegistration). -->
+         DWORD: #2 for auto, #3 for manual, #4 for disabled (fastcached beside
+         the node). What the binary's own restore is told when a failed
+         transaction puts a re-applied registration back
+         (FastCachedRestoreRegistration, FastCacheNodeRestoreRegistration). The
+         binary has no disabled start, so #4 reaches it as manual; the exact
+         restore after it puts the disabled start type back, and only a
+         transaction whose stash also failed is left manual, the state before
+         PR 1634 (the rule says why that is acceptable). -->
     <Property Id="FASTCACHED_START_BEFORE" Secure="yes">
       <RegistrySearch Id="FastCachedStartBeforeSearch" Root="HKLM"
                       Key="SYSTEM\CurrentControlSet\Services\FastCached"
@@ -377,7 +506,8 @@
          the test CLOSED and is left alone.
 
          After CostFinalize, which resolves INSTALL_ROOT (on an upgrade, from the
-         old product's install location). Unconditional, and each test below
+         old product's install location; in maintenance, from this product's,
+         SetFastCacheInstallRootFromInstallLocation). Unconditional, and each test below
          also asks that its prefix is not empty: every string starts with the
          empty string, so an unset prefix would match any registration. -->
     <SetProperty Action="SetFastCacheOwnImagePathPrefix" Id="FASTCACHE_OWN_IMAGEPATH_PREFIX"
@@ -582,6 +712,37 @@
     <CustomAction Id="FastCacheAwaitServiceExit"
                   Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$p=@(\&quot;[INSTALL_ROOT]bin\fastcached.exe\&quot;,\&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe\&quot;);$c=(Get-CimInstance Win32_Process -Filter \&quot;ProcessId=$PID\&quot;).CommandLine;$n=$c.LastIndexOf(' FastCacheNode'+'ImagePath:');$f=$c.LastIndexOf(' FastCached'+'ImagePath:');if($f -ge 0 -and $n -gt $f)[\{]foreach($s in $c.Substring($f,$n-$f),$c.Substring($n))[\{]$a=$s.IndexOf('\&quot;');$b=$s.IndexOf('\&quot;',$a+1);if($a -ge 0 -and $b -gt $a)[\{]$d=Split-Path -Parent $s.Substring($a+1,$b-$a-1);$p+=\&quot;$d\fastcached.exe\&quot;,\&quot;$d\fastcache-compile-node.exe\&quot;[\}][\}][\}];$w=New-Object Diagnostics.Stopwatch;$w.Start();while(Get-Process -Name fastcached,fastcache-compile-node -ErrorAction SilentlyContinue|Where-Object Path -In $p)[\{]if($w.Elapsed.TotalSeconds -gt 120)[\{]exit 1460[\}];Start-Sleep -Milliseconds 250[\}] # FastCachedImagePath:[FASTCACHED_IMAGEPATH] FastCacheNodeImagePath:[FASTCACHE_NODE_IMAGEPATH]&quot;"
+                  Execute="deferred" Impersonate="no" Return="check" />
+
+    <!-- And DISABLED, so nothing can start it beside the node: both would
+         answer on 6674, and a start of fastcached there can only fail on the
+         port and crash-loop under its recovery policy, racing the node for it
+         whenever the node is stopped. One start is certain on an upgrade from a
+         package that did not disable Restart Manager (0.3.0 and every build
+         before PR 1634): the old product's removal shuts a running FastCached
+         down, and Windows Installer restarts it by name after this whole
+         transaction has ended, which no action of this package can follow (the
+         comment on MSIRESTARTMANAGERCONTROL, MEASURED in PR 1634's CI). A start
+         of a disabled service fails at the service control manager with no
+         process. Removing the node re-applies the registration with an auto
+         start (FastCachedInstallService), and a failed transaction puts back
+         the start type it found (FastCachedRestoreRegistrationExactly).
+
+         Only a registration that EXISTS is disabled. FastCachedInstallService is
+         Return="ignore" on purpose, so fastcached may be absent here (its
+         install refused, say over a configuration an earlier install left), and
+         an absent service is no more startable than a disabled one: the node's
+         install must not fail and roll back over it, naming this action rather
+         than the refusal (rm-nested review, I-1). sc.exe answers 1060
+         (ERROR_SERVICE_DOES_NOT_EXIST) for exactly that, MEASURED, and that one
+         answer ends the action with 0; any other answer goes on to the disable.
+         Return="check" for a disable that fails on a service that is THERE: a
+         fastcached left startable beside the node is exactly the race above.
+         msi-custom-action-commands step 14 runs this command against a service
+         name nothing registers, both ways. -->
+    <CustomAction Id="FastCachedDisableForNode"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c ([System64Folder]sc.exe query FastCached &gt;nul 2&gt;&amp;1 &amp; if errorlevel 1060 if not errorlevel 1061 exit 0) &amp; [System64Folder]sc.exe config FastCached start= disabled"
                   Execute="deferred" Impersonate="no" Return="check" />
 
     <CustomAction Id="FastCachedStartService"
@@ -871,10 +1032,26 @@
                   Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
                   Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- The discard is a COMMIT action: it runs only after the whole script
+         succeeded and never in a rollback. A deferred one ran inside the
+         script, so any failure after it rolled back with the saved state
+         already deleted and every exact restore found nothing (#1629). -->
     <CustomAction Id="FastCacheDiscardRollbackState"
-                  Directory="INSTALL_ROOT"
+                  Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
-                  Execute="deferred" Impersonate="no" Return="ignore" />
+                  Execute="commit" Impersonate="no" Return="ignore" />
+
+    <!-- A late, deliberate failure, for the CI step that proves a failed upgrade
+         restores the previous installation exactly (#1629). Shipped, not a test
+         build, so CI tests the package that ships. Only
+         FASTCACHE_FAIL_FOR_TEST="1" runs it; an administrator who sets it fails
+         their own install and nothing else. Scheduled LAST before
+         InstallFinalize, behind every other script action, so a rollback from
+         here exercises every rollback action we have. -->
+    <CustomAction Id="FastCacheFailForTest"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c exit 1603"
+                  Execute="deferred" Impersonate="no" Return="check" />
 
     <!-- And each remembered value as the transaction found it: written back
          when there was one, deleted when there was none, so a failed
@@ -1037,7 +1214,9 @@
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCachedAwaitExitForNode" After="FastCachedStopForNode"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCachedStartService" After="FastCachedAwaitExitForNode"
+      <Custom Action="FastCachedDisableForNode" After="FastCachedAwaitExitForNode"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCachedStartService" After="FastCachedDisableForNode"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND NOT (FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHED_START_SERVICE = &quot;1&quot;" />
 
       <!-- The node is (re)registered on every transaction that leaves it
@@ -1090,6 +1269,8 @@
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheNodeStartService" After="FastCacheNodeStopForRestart"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <!-- A COMMIT action (see its definition): the saved state outlives every
+           script action, so a failure anywhere in the script restores from it. -->
       <Custom Action="FastCacheDiscardRollbackState" After="FastCacheNodeStartService"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
@@ -1116,6 +1297,10 @@
               Condition="(&amp;CM_C_Daemon = 2) AND (!CM_C_Daemon = 3) AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="FastCacheRemoveRollbackState" After="FastCachedUninstallService"
               Condition="REMOVE = &quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+
+      <!-- The last script action of all: see its definition. -->
+      <Custom Action="FastCacheFailForTest" Before="InstallFinalize"
+              Condition="FASTCACHE_FAIL_FOR_TEST = &quot;1&quot;" />
     </InstallExecuteSequence>
 
   </CPackWiXFragment>

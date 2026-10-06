@@ -86,7 +86,7 @@ registers the services that follow from the choice:
 
 | Installed | `FastCacheCompileNode` | `FastCached` |
 |---|---|---|
-| the node (with or without fastcached) | starts with Windows, started now | manual, stopped |
+| the node (with or without fastcached) | starts with Windows, started now | disabled, stopped |
 | fastcached without the node | — | starts with Windows, started now (pass `FASTCACHED_START_SERVICE=0` to leave it stopped) |
 
 The node needs no property to be registered: it finds its scheduler from the fleet it forms or
@@ -134,6 +134,25 @@ the upgrade needs no restart. **A failed upgrade from 0.3.0 does not restore 0.3
 the rollback puts 0.3.0's files back, but 0.3.0's own uninstall deleted its registrations before
 this installer ran, so they come back as this installer registers them, which 0.3.0's binaries may
 refuse. Run the upgrade again once its cause is fixed, or reinstall 0.3.0.
+
+`FastCached` is **disabled** beside the node, not merely manual, because an upgrade from 0.3.0 or
+earlier tries to start it after the upgrade has finished. Those installers let Windows Installer's
+Restart Manager stop a running `FastCached` while they are removed, and Windows Installer starts it
+again by name once the whole upgrade is over, after everything this installer does; this installer
+turns Restart Manager off for itself, but cannot for the old one's removal. Beside the node that
+start would fail on port 6674 and repeat under the service's recovery policy, so the start type is
+disabled and the start fails before any process runs. The upgrade still succeeds. Near the end of
+its verbose log, Windows Installer reports the refused restart as
+`RESTART MANAGER: Failed while restarting applications. Error: 352`, followed by the line
+`Previously shut down applications have been restarted.`, which does not mean `FastCached` is
+running: it stays stopped. Neither needs anything done. The same old removal also closes any program holding one of
+0.3.0's files without asking, for example a `fastcache-cc` inside a running build, as every silent
+Windows Installer removal does: finish or stop builds before upgrading. Without the node, the
+restart succeeds, so an upgrade from 0.3.0 that passes `FASTCACHED_START_SERVICE=0` still leaves
+`FastCached` running if it was running before: stop it first (`net stop FastCached`) to have it left
+stopped. To run `FastCached` beside the node anyway, on another port, set its start type yourself
+(`sc config FastCached start= demand`); the next repair, feature change or upgrade stops it and
+disables it again.
 
 Every transaction that keeps a service registers it again, and the optional properties are
 remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_FLEET_SEED` and `FASTCACHE_FLEET_ID` are written to

@@ -70,7 +70,6 @@ below).
 | A formation record below format 7 (builds of this branch only; no release wrote one) | `UnsupportedFormatVersion` | Move `formation` aside. The node re-forms as a new solitary cluster: re-enroll it. |
 | A configuration file naming `scheduler` (on a serving node), `fleet_member`, `scheduler_token_file`, `cluster_admit_client`, `cluster_forget_client`, `raft_peer`, `raft_join`, `cluster_id`, `serve_scheduler`, `voter_key`, `enroll_from` or `cluster_admit_worker` | refused by name, with its step | Remove the key |
 | A service registration replaying any of those flags, or `--scheduler` on a node that serves | refuses to start under the service manager | `--install-service` again. The MSI does this on upgrade. |
-| `fastcached` with `--storage-max-disk` and `--storage-durability=fsync` or `none` | refused at startup | Use `batched` (the default), or drop the budget |
 | MSI properties `FASTCACHE_NODE_SCHEDULER` and `FASTCACHE_NODE_ADVERTISE` | not read; an upgrade forgets the remembered advertised endpoint | Drop them from scripted installs |
 
 ## The supported procedure

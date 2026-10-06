@@ -78,9 +78,9 @@ belongs here is the part that constrains the code.
 **One code, two events, and WHERE decides which.** `Open` is not a scan: it reads
 the two meta slots, walks the free list and looks up two reserved keys — the
 in-flight-conversion marker and the format marker — and `Replay()` is deliberately
-a no-op. **The free-list walk is LIVE on every batched store**, and this paragraph
-said the opposite until the file-growth fix: since #990 `FilePageStore` writes the list
-at every group-commit flush and overrides the `freeRoot` that `CommitTxn` still pins to
+a no-op. **The free-list walk is LIVE on every store, under every durability** (#1624; it was every
+batched store until then), and this paragraph said the opposite until the file-growth fix:
+`FilePageStore` writes the list with every meta and overrides the `freeRoot` that `CommitTxn` still pins to
 `None`, so the walk reads real pages and its `Corrupt` refusals are reachable by damage.
 A free-list LINK past the end of the file is one of them; an ENTRY past the end is NOT,
 because the store now truncates its free tail after a durable flush and both surviving
@@ -133,8 +133,17 @@ under a different break:
   so a diagnostic would have to be a direct stream write and that is what the
   capture sees; it cannot see `fprintf`, which is stated rather than left to be
   assumed.
-- The next commit lands in the **damaged** slot — **under `Batched`, and the
-  scope is part of the rule**. A build that recovered correctly and then wrote
+- The next commit lands in the **damaged** slot, under `Batched` AND `Fsync` --
+  the reopen is a table row of both since #726, so the old `Batched`-only scope
+  is gone. **What is asserted is the FIRST meta write after the degraded open**:
+  since #1624 a clean close under `Fsync` writes a second one, the restate of the
+  commit's own frees, and it alternates onto the survivor's slot. That is not a
+  spend, because the commit is already fsynced in the damaged slot; the fixture
+  states per row whether the close restates and asserts the survivor holds a
+  restatement of the commit (one `txnId` later, the same root). Under `None`
+  nothing of this is promised -- the commit was never synced, which is the
+  power-loss decision under "Where a flush writes the free list" -- so no row
+  claims it. A build that recovered correctly and then wrote
   over its one good slot passes everything above while leaving the store one
   torn write from unopenable, and that is the only state where getting the
   alternation wrong is unrecoverable rather than wasteful. **Which slot a commit
@@ -398,12 +407,32 @@ why the next one is not.
   list page a surviving meta names is ever cut.
 
 **Since the disk budget became the page footprint, a leaked page is lost CAPACITY, not only
-file length** -- it counts against the budget and evicts a live entry, for good. That is why
-only `batched` may carry a budget: the other durabilities persist no free list, so every
-restart would leak every free page, and `fastcached` refuses the combination at startup
-(`DaemonStorageBudgetDurabilityRefusal`). Nothing reclaims a page leaked any other way yet --
-a crash's unflushed extensions, a store written before the fix -- so do not describe the
-footprint as exact on a store with a history.
+file length** -- it counts against the budget and evicts a live entry, for good. So no page may
+leak, and a disk budget starts under any durability (#1624):
+
+- **Every meta write carries a list.** `CommitMetaLocked` writes the list, then the meta, then
+  graduates the pending frees, for Fsync, None and every batched flush alike.
+- **A commit's list describes what the commits BEFORE it freed**, because a transaction's pages
+  are freed after its meta is written; the last commit's own frees reach a list only through a
+  later write. A clean close therefore restates the last durable meta under the next `txnId`
+  when a free is pending (`~FilePageStore`). **Only the destructor may**: while a tree still
+  runs, its next commit would take the same `txnId`, recovery breaks a tie towards slot A, and
+  that could revive the older root after its pages were reused. No commit follows a destructor.
+- **Recovery frees what a crash extended.** The meta records `dataPages`, and recovery frees
+  every page past it that the file holds, so a crash between a growth and its commit leaks nothing.
+- **The per-commit cost** is `ceil(F / 510)` list pages at 4 KiB, where F counts every entry the
+  list names, pending frees and the previous list's pages included. Fsync pays one extra fsync, and
+  only when a list page was written; None syncs nothing.
+- **The decision this took: `Open` walks free-list pages on a None store too.** None never syncs
+  them, so after a POWER LOSS (not a process crash) a None store can be refused `Corrupt` where it
+  used to open. That is consistent with None promising no crash consistency, and it is a decision
+  rather than an optimisation because making `Open` touch more of the store is one.
+- **The one residual**: a store written by ANY build before #1624 keeps the pages it already
+  lost -- not only one predating the file-growth fix, since every build before #1624 leaked
+  through all three routes above (a clean close after an interval flush, every Fsync or None
+  restart, every crash). Those pages are marked live, no list names them, and a layout-1 meta
+  records no `dataPages`, so nothing in this build can reclaim them either. Do not describe the
+  footprint as exact on a store with that history.
 
 ## What a refused `Open` can say
 
@@ -523,3 +552,16 @@ and one forward pass is complete. A failed walk is not an exhausted one.
 the mirror node, which a cold entry has none of, so whether it was ever read is not
 something the process knows — and an unknown recorded as a "no" is a claim the data does
 not support. It undercounts, which is the honest direction.
+
+## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
+
+- **[#1633](https://github.com/LASTRADA-Software/fastcached/issues/1633)** — under Fsync, a
+  meta that `CommitMetaLocked` has written whose fsync then FAILS leaves `_lastDurableSlot`
+  where it was, and `CowTree::AbortTxn` returns that transaction's pages to `_freeList`. The
+  next commit's list pages and data pages may then be written into pages that the possibly
+  persisted, higher-`txnId` meta references, so an I/O error followed by a crash can revive a
+  root over clobbered pages. The window predates #1624 for data pages; #1624 adds list pages to
+  it. Filed rather than fixed in that change because the likely remedy -- poisoning the store
+  after any fsync failure that follows a slot write -- changes the store's failure semantics.

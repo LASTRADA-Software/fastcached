@@ -26,16 +26,47 @@
 #
 # `Invoke-MsiServiceTableSelfTest` drives the service verdict over synthetic
 # observations in both directions, the waiting assertion against a service every
-# Windows host runs and a name no host has, and the package reader over an MSI
-# database it creates. It installs nothing. Its two blind spots both fail OPEN:
+# Windows host runs and a name no host has, the package reader over an MSI
+# database it creates, the registry walker over a scratch key in HKCU, and the
+# firewall snapshot over a group no host has. It installs nothing. Its blind
+# spots, each with the direction it fails in:
 #
 #   * `Get-InstalledProductCodes` is exercised only for an UpgradeCode nothing is
 #     installed under, because a non-empty answer needs an installed product.
+#     Fails OPEN.
 #   * The table's rows are checked for VOCABULARY only -- a known start mode and a
 #     known state -- never against the fragment. A row that is wrong the same way
 #     the fragment is wrong (both saying fastcached stays auto beside the node,
 #     say) passes here and passes the packaging job, because there the one agrees
-#     with the other. Only a reader of both catches that.
+#     with the other. Only a reader of both catches that. Fails OPEN.
+#   * `Assert-NodeStatePrivate` reads access lists a real install produced; only
+#     its pure verdicts run here (stated at the function). Fails CLOSED: it throws.
+#   * `Get-InstallationSnapshot` is assembled whole only by the packaging job,
+#     which alone has the services, the HKLM keys and the products it reads. Its
+#     parts run here -- the walker, the settled state through its observation seam,
+#     the comparison over synthetic records -- never the assembly. A field read
+#     wrongly reads wrongly on BOTH sides of a comparison, so that fails OPEN; the
+#     job's discrimination leg, which requires a successful upgrade to change the
+#     fields it names, is what shows those readers live.
+#   * `Get-FirewallGroupSnapshot` renders a POPULATED group only on the packaging
+#     job; here it reads an absent group live and its error decision through its
+#     seam. A line rendered wrongly is wrong on both sides too: fails OPEN.
+#   * `Get-SettledServiceState`'s real sleep runs only live; here it is
+#     `-StableSeconds 0` through the observation seam.
+#   * The transaction judgement (`Invoke-TransactionJudgement`, run by
+#     `Invoke-Msiexec` at the exit and by `Assert-TransactionSettled` past it)
+#     judges records the packaging job alone acquires over a real transaction.
+#     Here the verdict runs over synthetic records, the watch over a real process
+#     through a scripted observer, the event parse over every event shape it
+#     reads, and the event reader over the real System log in both directions. On
+#     a host that writes no 7036 (this repository's Windows 11 26200 development
+#     host writes none), a start that lives and dies between two observations
+#     WITHOUT terminating unexpectedly and without a 7036 "stopped" is seen by no
+#     witness, and the pass line says "7036 NOT SEEN". Fails OPEN there.
+#   * A step's LAST transaction is settled only if the step calls
+#     `Assert-ServiceTable` or `Assert-TransactionSettled` after it: every other
+#     transaction is refused by the next one's `Invoke-Msiexec`, but nothing runs
+#     after a step's last. Fails OPEN; every step ends in one today.
 #
 # And one limit of the assertion itself, not of its self-test: the stability
 # window is about five seconds after a row matches. A service that crashes
@@ -65,7 +96,9 @@ $ErrorActionPreference = 'Stop'
 #                          starting point of the upgrade, not a row of the
 #                          current table.
 #   NodeSelected        -- the node feature is installed: node auto and running,
-#                          fastcached manual and stopped (both would answer on 6674).
+#                          fastcached DISABLED and stopped (both would answer on 6674,
+#                          and an old package's removal inside an upgrade has Windows
+#                          Installer restart it by name after the transaction ends).
 #   NodeAlone           -- the node without fastcached: node auto and running, and
 #                          no fastcached registration left behind.
 #   DaemonAlone         -- fastcached without the node: auto and running, and no
@@ -75,7 +108,7 @@ $ErrorActionPreference = 'Stop'
 #   NothingInstalled    -- after an uninstall.
 $script:ServiceTable = [ordered]@{
     Release030WithNode   = [ordered]@{ FastCached = @('Auto', 'Running'); FastCacheCompileNode = @('Auto', 'Stopped') }
-    NodeSelected         = [ordered]@{ FastCacheCompileNode = @('Auto', 'Running'); FastCached = @('Manual', 'Stopped') }
+    NodeSelected         = [ordered]@{ FastCacheCompileNode = @('Auto', 'Running'); FastCached = @('Disabled', 'Stopped') }
     NodeAlone            = [ordered]@{ FastCacheCompileNode = @('Auto', 'Running'); FastCached = $null }
     DaemonAlone          = [ordered]@{ FastCacheCompileNode = $null; FastCached = @('Auto', 'Running') }
     DaemonAloneUnstarted = [ordered]@{ FastCacheCompileNode = $null; FastCached = @('Auto', 'Stopped') }
@@ -86,6 +119,50 @@ $script:ServiceTable = [ordered]@{
 # every assertion that names the row.
 $script:StartModes = @('Auto', 'Manual', 'Disabled')
 $script:States = @('Running', 'Stopped')
+
+# The services this package owns, by service name, each with the display name its
+# registration carries (`ServiceSpec::displayName`). A service control manager event
+# names a service by its display name in its text and by its service name in its
+# binary data; either is recognised, so a registration another build wrote under
+# another display name is still matched by its service name.
+$script:ServiceDisplayNames = [ordered]@{ FastCached = 'fastcached'; FastCacheCompileNode = 'fastcache-compile-node' }
+
+# The service control manager's events for a service that ended without being told
+# to: 7031 while the SCM still takes a recovery action for it, 7034 when it takes
+# none. The registrations' recovery steps are FINITE (`ServiceRestartAttempts`
+# restarts, then no action), so one service logs both: PR 1634's CI showed the node
+# logging 7034 at its eighth to eleventh termination.
+$script:UnexpectedTerminationEvents = @(7031, 7034)
+
+# What a transaction is judged over: the terminations, and "entered the running
+# state" (7036) where the host writes it.
+$script:TransactionEvents = @(7031, 7034, 7036)
+
+# The last transaction Invoke-Msiexec ran: what each service ran as when it began,
+# when it began, what it was expected to leave, and every process the watch saw a
+# service run under while it ran. Invoke-Msiexec judges it as it ends, and
+# Assert-ServiceTable once more over the window its stability interval adds.
+$script:LastMsiTransaction = $null
+
+# How long after msiexec EXITS a transaction is judged the second time, at the least. A restore's
+# own restart is unwaited (`FastCachedRestartAfterStop` is `sc.exe start`, which returns at START
+# PENDING), and PR 1634's CI timed a start that could not serve: started at 12:12:47, its first
+# unexpected termination at 12:12:48, the recovery's restart 1000 ms after that. Judged only at the
+# exit, such a crash lands after the read; before the judgement moved into Invoke-Msiexec, the snapshot
+# and the row's stability interval put the read about ten seconds past the exit, and this keeps that.
+$script:TransactionSettleSeconds = 10
+
+# The transaction whose node start was the first to be LOGGED as a 7036 in this process, or '' while
+# none was: once one was, this host writes them and this module reads them, so a later node start
+# that logs none is the reader failing, not the host (see Get-Witness7036State).
+$script:Witness7036LiveSince = ''
+
+# The line a verbose log carries when its package disables Restart Manager, as Windows Installer
+# wrote it on PR 1634's runner (Windows Server 2025), MEASURED in its MSI job's log:
+# "RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property; Windows Installer will use the
+# built-in FilesInUse functionality." The prefix only, so a change of the remainder's wording reads
+# as what it is.
+$script:RestartManagerDisabledLine = 'RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property'
 
 # ---------------------------------------------------------------------------
 # Services
@@ -215,19 +292,27 @@ function Assert-ServiceState {
 #            shown when it did not: on a CI runner the log is the only witness.
 # @param TimeoutSeconds How long each service may take.
 # @param StableSeconds How long a matched registration must stay unchanged.
+# @param Observe As Assert-ServiceState's; the self-test's seam.
+# @param ReadEvents As Invoke-TransactionJudgement's; the self-test's seam.
 function Assert-ServiceTable {
     param(
         [Parameter(Mandatory)] [string] $Row,
         [string] $Log = '',
         [int] $TimeoutSeconds = 30,
-        [int] $StableSeconds = 5
+        [int] $StableSeconds = 5,
+        [scriptblock] $Observe = { param($name) Get-ServiceObservation $name },
+        [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since }
     )
     if (-not $script:ServiceTable.Contains($Row)) {
         throw "no service table row '$Row'; the rows are: $($script:ServiceTable.Keys -join ', ')"
     }
     Write-Host "service table: $Row"
     try {
-        Assert-ServiceState -Expect $script:ServiceTable[$Row] -TimeoutSeconds $TimeoutSeconds -StableSeconds $StableSeconds
+        Assert-ServiceState -Expect $script:ServiceTable[$Row] -TimeoutSeconds $TimeoutSeconds -StableSeconds $StableSeconds -Observe $Observe
+        # The transaction that left this row, judged again now that the window reaches past the
+        # stability interval: a service restarted by its recovery policy after msiexec returned
+        # terminates inside it. Once per transaction.
+        Assert-TransactionSettled -ReadEvents $ReadEvents
     } catch {
         if ($Log) { Show-MsiLog $Log }
         foreach ($name in $script:ServiceTable[$Row].Keys) {
@@ -292,37 +377,62 @@ function Show-ServiceDiagnosis([string] $Name) {
 # Packages
 # ---------------------------------------------------------------------------
 
-# Reads one row of a package's Property table.
+# Reads the first column of the first row of one query against a package's database, read-only.
 #
-# Every COM object is released before returning, so the package is not held open
-# when msiexec or cpack next needs it.
+# The ONE place the module reads a package through COM: every COM object is released before
+# returning, so the package is not held open when msiexec or cpack next needs it.
+#
+# @param Path The .msi file.
+# @param Query MSI SQL (backtick-quoted identifiers).
+# @return The value as text, or $null when the query matches no row; each caller owns what that means.
+function Get-MsiScalar([string] $Path, [string] $Query) {
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    try {
+        $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @([string]$Path, 0))
+        try {
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @([string]$Query))
+            try {
+                $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+                $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+                if (-not $record) { return $null }
+                try {
+                    return $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, @(1))
+                } finally {
+                    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($record)
+                }
+            } finally {
+                $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
+                [void][Runtime.InteropServices.Marshal]::ReleaseComObject($view)
+            }
+        } finally {
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
+        }
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
+    }
+}
+
+# Reads one row of a package's Property table.
 #
 # @param Path The .msi file.
 # @param Name The property.
 # @return Its value; a package without it is refused by name.
 function Get-MsiProperty([string] $Path, [string] $Name) {
-    $installer = New-Object -ComObject WindowsInstaller.Installer
-    $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, 0))
-    try {
-        $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db,
-            @("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$Name'"))
-        try {
-            $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
-            $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
-            if (-not $record) { throw "$Path carries no $Name property" }
-            try {
-                return $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, @(1))
-            } finally {
-                [void][Runtime.InteropServices.Marshal]::ReleaseComObject($record)
-            }
-        } finally {
-            $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
-            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($view)
-        }
-    } finally {
-        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
-        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
-    }
+    $value = Get-MsiScalar $Path "SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$Name'"
+    if ($null -eq $value) { throw "$Path carries no $Name property" }
+    return $value
+}
+
+# Reads the Type of one row of a package's CustomAction table (#1629): the bit field that says
+# whether the action is deferred, committed, run in the system context, and so on.
+#
+# @param Path The .msi file.
+# @param Action The custom action's name.
+# @return Its Type as an integer; an action the package does not carry is refused by name.
+function Get-MsiCustomActionType([string] $Path, [string] $Action) {
+    $value = Get-MsiScalar $Path "SELECT ``Type`` FROM ``CustomAction`` WHERE ``Action`` = '$Action'"
+    if ($null -eq $value) { throw "$Path carries no $Action custom action" }
+    return [int]$value
 }
 
 # The ProductCodes Windows Installer holds as installed under one UpgradeCode.
@@ -467,15 +577,48 @@ function Format-FirewallRuleLine($Rule, $Port, $Address, $Application) {
     return "$($Rule.DisplayName) | enabled=$($Rule.Enabled) $($Rule.Direction) $($Rule.Action) profile=$($Rule.Profile) | $($Port.Protocol)/$(@($Port.LocalPort) -join ',') | remote=$(@($Address.RemoteAddress) -join ',') | program=$($Application.Program)"
 }
 
+# The error Get-NetFirewallRule raises for a group that holds no rule, by its id, measured on
+# PowerShell 7.6 (2026-10-06). The ONLY error a snapshot reads as "empty": any other -- access denied,
+# the firewall service down, a CIM failure -- is a read that FAILED, and an empty answer for it
+# would compare as "unchanged" on both sides of a transaction.
+$script:FirewallGroupNotFoundId = 'CmdletizationQuery_NotFound_RuleGroup,Get-NetFirewallRule'
+
 # The firewall group @p Group on the REAL Windows Firewall, one Format-FirewallRuleLine per rule,
 # sorted, so two snapshots compare as text. What Assert-FirewallGroupUnchanged reads.
 # @param Group The group, `fastcached: <service>`.
-# @return The lines; none for an empty or absent group.
-function Get-FirewallGroupSnapshot([string] $Group) {
-    return @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue | ForEach-Object {
+# @param Read Takes a group and returns its rules, as Get-NetFirewallRule -ErrorAction Stop does; a
+#        seam so the self-test can drive the error decision without a firewall.
+# @return The lines; none for an empty or absent group. Throws on a read that failed for any other
+#         reason than the group holding no rule.
+function Get-FirewallGroupSnapshot {
+    param(
+        [Parameter(Mandatory)] [string] $Group,
+        [scriptblock] $Read = { param($group) Get-NetFirewallRule -Group $group -ErrorAction Stop }
+    )
+    $rules = @(try { & $Read $Group } catch {
+            if ($_.FullyQualifiedErrorId -cne $script:FirewallGroupNotFoundId) { throw }
+        })
+    return @($rules | ForEach-Object {
             Format-FirewallRuleLine $_ ($_ | Get-NetFirewallPortFilter) ($_ | Get-NetFirewallAddressFilter) `
                 ($_ | Get-NetFirewallApplicationFilter)
         } | Sort-Object)
+}
+
+# The elements of @p From that @p Without does not match ONE FOR ONE, case-sensitively: a MULTISET
+# difference, so a line held twice where it was held once is a difference. A set test
+# (-cnotcontains) reads @('r') and @('r', 'r') as equal, and a firewall rule a rollback duplicated
+# renders as exactly that line twice (Format-FirewallRuleLine carries no rule Name).
+# @param From The lines to look for.
+# @param Without The lines to match them against, each usable once.
+# @return The unmatched lines of @p From, in its order; nothing when all matched.
+function Get-MultisetDifference([string[]] $From, [string[]] $Without) {
+    $remaining = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in @($Without)) { $remaining.Add($line) }
+    foreach ($line in @($From)) {
+        # List[string].IndexOf compares ordinally, so case-sensitively, as -cnotcontains did.
+        $at = $remaining.IndexOf($line)
+        if ($at -ge 0) { $remaining.RemoveAt($at) } else { $line }
+    }
 }
 
 # Does the group hold, after a transaction, exactly what it held before? A pure verdict so the
@@ -489,8 +632,8 @@ function Get-FirewallGroupUnchangedVerdict([string[]] $Before, [string[]] $After
     $before = @($Before | Where-Object { $_ })
     $after = @($After | Where-Object { $_ })
     if ($before.Count -eq 0) { return "the firewall group '$Group' held no rule BEFORE the transaction, so an unchanged group proves nothing" }
-    $lost = @($before | Where-Object { $after -cnotcontains $_ })
-    $left = @($after | Where-Object { $before -cnotcontains $_ })
+    $lost = @(Get-MultisetDifference $before $after)
+    $left = @(Get-MultisetDifference $after $before)
     if ($lost.Count -eq 0 -and $left.Count -eq 0) { return $null }
     return "the firewall group '$Group' changed: it lost [$($lost -join '; ')] and holds [$($left -join '; ')] it did not"
 }
@@ -597,8 +740,8 @@ function Get-DirectoryOwnerVerdict([string] $OwnerSid) {
 # for the module's own reason: two steps assert this -- the feature change and the
 # upgrade from an exposed 0.3.0 directory -- and a copy that drifts stops saying
 # what its neighbour says. It reads real access lists a real install produced, so
-# the self-test cannot reach it; that is a third blind spot of the same kind as the
-# two named at the top of this module, and it fails CLOSED -- it throws.
+# the self-test cannot reach it; that is one of the blind spots named at the top of
+# this module, and it fails CLOSED -- it throws.
 #
 # Whether the node's service reaches its state directory and its key the way the install means it
 # to: it may ADD to the directory -- it mints the key there -- and may NOT rewrite the directory's
@@ -734,25 +877,140 @@ function Get-MsiFailureLines([string[]] $Lines, [int] $Before = 3) {
 # The lines of a verbose log that name what happened, since its tail is only the
 # property dump.
 #
+# Every line goes to the HOST, never to the output stream. It wrote its lines to the output stream
+# until PR 1634's CI printed all three section headers over EMPTY sections, for a log a Select-String
+# had just read: called from Invoke-TransactionJudgement, whose output Invoke-Msiexec captures in
+# `Write-Host (Invoke-TransactionJudgement ...)`, the lines were captured, and the judgement's throw
+# discarded them while the headers, already written to the host, survived. The self-test asserts this
+# function writes nothing to the output stream.
+#
 # @param Path The log.
 function Show-MsiLog([string] $Path) {
     Write-Host "===== $Path (relevant lines) ====="
-    if (-not (Test-Path $Path)) { Write-Host "no log at $Path"; return }
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Host "no log at $Path"; return }
+    $lines = @(Get-Content -LiteralPath $Path)
     # What failed, FIRST and from the whole log: the tail below fills with the rollback's own
     # records, which pushed the one error line out of it.
     Write-Host '--- what failed ---'
-    Get-MsiFailureLines @(Get-Content -Path $Path) | ForEach-Object { $_ }
+    foreach ($line in @(Get-MsiFailureLines $lines)) { Write-Host $line }
     # Every line naming one of this package's actions, from the whole log: the tail below is the
     # property dump of a transaction that ended, and an action that ran with Return="ignore" -- the
     # node's registration among them -- leaves its failure only here.
     Write-Host '--- the package actions ---'
-    Select-String -Path $Path -Pattern 'FastCache\w+' |
-        Where-Object { $_.Line -match 'Action (start|ended)|returned actual error|CustomAction|Error 1[0-9]{3}' } | ForEach-Object { $_.Line }
+    foreach ($line in @($lines -match 'FastCache\w+' -match 'Action (start|ended)|returned actual error|CustomAction|Error 1[0-9]{3}')) { Write-Host $line }
     Write-Host '--- the tail ---'
-    Select-String -Path $Path -Pattern `
-        'Action (start|ended)', 'CustomAction', 'ServiceControl', 'FastCache', 'returned actual error',
-        'Note: 1: 1(4|7)[0-9][0-9]', 'Installation (success|failed)', 'error' |
-        Select-Object -Last 60 | ForEach-Object { $_.Line }
+    $tail = 'Action (start|ended)|CustomAction|ServiceControl|FastCache|returned actual error|Note: 1: 1(4|7)[0-9][0-9]|Installation (success|failed)|error'
+    foreach ($line in @($lines -match $tail | Select-Object -Last 60)) { Write-Host $line }
+}
+
+# How many RESTART MANAGER lines of one verbose log are printed. A transaction with a Restart Manager
+# session logs a handful (opened, the shutdown mode, each application it shuts down or restarts,
+# closed), and 0.3.0's nested removal logs its own after the outer package's, so the cap stands well
+# above what one upgrade writes; a log that exceeds it says so rather than ending silently.
+$script:RestartManagerLineCap = 100
+
+# The RESTART MANAGER lines of a verbose log, every one up to @p Cap. PR 1634's first print took the
+# first FOUR, which are the outer package's own lines, and cut 0.3.0's nested session that the print
+# was cited for. A pure function over the lines.
+#
+# @param Lines The log's lines.
+# @param Cap The most lines returned.
+# @return Lines, the lines (trimmed, in log order), and Omitted, how many matching lines the cap cut.
+function Get-MsiRestartManagerLines([string[]] $Lines, [int] $Cap = $script:RestartManagerLineCap) {
+    $all = @($Lines -match 'RESTART MANAGER' | ForEach-Object { $_.Trim() })
+    return [pscustomobject]@{ Lines = @($all | Select-Object -First $Cap); Omitted = [Math]::Max(0, $all.Count - $Cap) }
+}
+
+# Prints a verbose log's RESTART MANAGER lines, each behind @p Prefix, and says when the cap cut some.
+#
+# @param Path The log.
+# @param Prefix Put before each line.
+function Show-MsiRestartManagerLines([string] $Path, [string] $Prefix = '  log: ') {
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Host "$Prefix$Path was not written"; return }
+    $found = Get-MsiRestartManagerLines @(Get-Content -LiteralPath $Path)
+    if ($found.Lines.Count -eq 0) { Write-Host "${Prefix}no line names RESTART MANAGER"; return }
+    foreach ($line in $found.Lines) { Write-Host "$Prefix$line" }
+    if ($found.Omitted -gt 0) { Write-Host "${Prefix}TRUNCATED: $($found.Omitted) more RESTART MANAGER line(s) past the cap of $script:RestartManagerLineCap" }
+}
+
+# The time of day each line of a verbose log was written, carried forward to the lines that state
+# none (a property dump, a continuation). Windows Installer stamps its own records
+# `MSI (s) (D8:AC) [13:31:46:577]:` and an action's `Action start 13:31:46: <name>.` in the HOST's
+# local time and without a date, so a time of day is all a line can be placed by. A pure function.
+#
+# @param Lines The log's lines.
+# @return One TimeSpan per line, or $null for the lines before the first stamp.
+function Get-MsiLogTimeOfDay([string[]] $Lines) {
+    $current = $null
+    foreach ($line in $Lines) {
+        if ($line -match '\[(\d{1,2}):(\d{2}):(\d{2}):(\d{3})\]:') {
+            $current = [TimeSpan]::new(0, [int] $Matches[1], [int] $Matches[2], [int] $Matches[3], [int] $Matches[4])
+        } elseif ($line -match '^Action (start|ended) (\d{1,2}):(\d{2}):(\d{2}):') {
+            $current = [TimeSpan]::new([int] $Matches[2], [int] $Matches[3], [int] $Matches[4])
+        }
+        , $current
+    }
+}
+
+# What a verbose log was doing around each of @p Times: the actions starting and ending, the service
+# control operations, the custom actions, the product's messages, the start of a nested product
+# (`Running product`, how RemoveExistingProducts' removal of the old product opens in the same log),
+# and every RESTART MANAGER line, from @p BeforeSeconds before a time to @p AfterSeconds after it.
+# The windows of findings close together merge, and each line is returned once, in log order. Past the
+# cap the EARLIEST lines go: PR 1634's first refusal printed a 30-second window from its start, and the
+# cap ended it at the immediate sequence, 27 seconds before the end of the transaction its findings
+# followed. A pure function over the lines, so the self-test drives it.
+#
+# @param Lines The log's lines.
+# @param Times The instants, as the log's clock reads them: the host's LOCAL time of day.
+# @param BeforeSeconds How far before each instant a line may be.
+# @param AfterSeconds How far after it.
+# @param Cap The most lines returned, the latest of them.
+# @return Lines, and Omitted, how many of the earliest lines the cap cut.
+function Get-MsiLinesAround {
+    param(
+        [string[]] $Lines = @(),
+        [TimeSpan[]] $Times = @(),
+        [int] $BeforeSeconds = 10,
+        [int] $AfterSeconds = 5,
+        [int] $Cap = 200
+    )
+    $interesting = 'Action (start|ended)|Doing action:|Executing op: (ServiceControl|ActionStart|CustomAction)|ServiceControl|CustomAction|Product:|Running product|RESTART MANAGER|Windows Installer (installed|removed|reconfigured)'
+    $clock = @(Get-MsiLogTimeOfDay $Lines)
+    $day = [TimeSpan]::FromDays(1).Ticks
+    $kept = @(foreach ($index in @(0..($Lines.Count - 1) | Where-Object { $Lines.Count -gt 0 })) {
+            if ($null -eq $clock[$index] -or $Lines[$index] -notmatch $interesting) { continue }
+            foreach ($time in $Times) {
+                # Signed distance on a 24-hour circle, so a window across midnight still matches.
+                $ticks = (($clock[$index].Ticks - $time.Ticks) % $day + $day + $day / 2) % $day - $day / 2
+                if ($ticks -ge -[TimeSpan]::FromSeconds($BeforeSeconds).Ticks -and $ticks -le [TimeSpan]::FromSeconds($AfterSeconds).Ticks) {
+                    $Lines[$index].Trim()
+                    break
+                }
+            }
+        })
+    return [pscustomobject]@{ Lines = @($kept | Select-Object -Last $Cap); Omitted = [Math]::Max(0, $kept.Count - $Cap) }
+}
+
+# What a transaction's verbose log says around its findings: every RESTART MANAGER line, then the
+# actions around each finding's time. Shown when a judgement refuses, because a finding names an
+# instant and the log alone says what Windows Installer was doing then.
+#
+# @param Path The log.
+# @param Findings Get-TransactionServiceVerdict's records, each with a UTC Time.
+function Show-MsiLogAroundFindings([string] $Path, [object[]] $Findings) {
+    Write-Host "===== $Path around the findings ====="
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Host "no log at $Path"; return }
+    $lines = @(Get-Content -LiteralPath $Path)
+    Write-Host "--- every RESTART MANAGER line (at most $script:RestartManagerLineCap) ---"
+    Show-MsiRestartManagerLines -Path $Path -Prefix ''
+    $times = @($Findings | ForEach-Object { $_.Time.ToLocalTime().TimeOfDay } | Sort-Object -Unique)
+    $window = @{ BeforeSeconds = 10; AfterSeconds = 5 }
+    $around = Get-MsiLinesAround -Lines $lines -Times $times @window
+    Write-Host "--- the actions from $($window.BeforeSeconds) s before to $($window.AfterSeconds) s after each finding (local $(@($times | ForEach-Object { $_.ToString('hh\:mm\:ss\.fff') }) -join ', ')) ---"
+    if ($around.Omitted -gt 0) { Write-Host "TRUNCATED: the earliest $($around.Omitted) line(s) of those windows" }
+    foreach ($line in $around.Lines) { Write-Host $line }
+    if ($around.Lines.Count -eq 0) { Write-Host 'no action, service operation or Restart Manager line in those windows' }
 }
 
 # Who listens on @p Port and which of this package's service processes are alive: the holder of
@@ -788,6 +1046,16 @@ function Show-PortHolders([int] $Port) {
 #               accepted code is the one returned: an accepted code can still be
 #               something a reader of the run must be told.
 # @param What The transaction, for the messages.
+# @param Leaves The service table row the transaction leaves. It is JUDGED, inside this call:
+#               see Get-TransactionExpectation. Exactly one of Leaves and Expect is given.
+# @param Expect A named expectation of $script:TransactionExpectations, for a transaction that
+#               cannot honestly state a row (one that fails and rolls back); its reason says why.
+# @param Start Takes the arguments and returns the started msiexec Process; the self-test's seam, so
+#              a neutered refusal starts a harmless process there rather than msiexec.
+# @param Released The package is a RELEASED one (0.3.0, the latest release), not this build's: it may
+#                 predate MSIRESTARTMANAGERCONTROL, so its log is judged only if it sets the property.
+#                 Without it, a package that does not set `Disable` is refused, which is how this
+#                 build's MSI losing the property is seen rather than skipped.
 function Invoke-Msiexec {
     param(
         [Parameter(Mandatory)] [ValidateSet('/i', '/x')] [string] $Operation,
@@ -796,12 +1064,46 @@ function Invoke-Msiexec {
         [string[]] $Properties = @(),
         [int[]] $Accept = @(0),
         [hashtable] $Notice = @{},
-        [Parameter(Mandatory)] [string] $What
+        [Parameter(Mandatory)] [string] $What,
+        [string] $Leaves = '',
+        [string] $Expect = '',
+        [switch] $Released,
+        [scriptblock] $Start = { param($arguments) Start-Process msiexec.exe -PassThru -ArgumentList $arguments }
     )
+    # Judged, always: the expectation is resolved, and refused by name, before anything runs. Neither
+    # parameter is Mandatory because the refusal is the point: Get-TransactionExpectation names every
+    # row and every expectation a call may state, which a binder's "missing parameter" does not.
+    $expectation = Get-TransactionExpectation -Leaves $Leaves -Expect $Expect
+    # And the transaction before it SETTLED: judged a second time, over a window reaching past its
+    # exit (Assert-TransactionSettled, which Assert-ServiceTable runs). Refused here, so a call site
+    # that omits it is refused by the next transaction rather than passing over a late crash.
+    $previous = $script:LastMsiTransaction
+    if ($null -ne $previous -and -not $previous.Extended) {
+        throw "'$($previous.What)' was judged only at msiexec's exit, and '$What' would begin before it settled: call Assert-ServiceTable or Assert-TransactionSettled after every transaction, so a restart that crashes after the exit is judged"
+    }
     $logPath = [IO.Path]::GetFullPath($Log, (Get-Location).Path)
     $arguments = @($Operation, "`"$Package`"", '/qn', '/l*v', "`"$logPath`"") + $Properties
     Write-Host "$What`: msiexec $($arguments -join ' ')"
-    $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList $arguments
+    # What each service ran as when the transaction began, then the transaction WATCHED rather than
+    # waited for: a start nobody asked for (PR 1634's, inferred to be Restart Manager's) can live and die inside the
+    # transaction, and only an observation taken while it runs can see it.
+    $baseline = @{}
+    foreach ($name in $script:ServiceDisplayNames.Keys) {
+        $seen = Get-ServiceObservation $name
+        $baseline[$name] = if ($null -eq $seen) { 0 } else { $seen.ProcessId }
+    }
+    $startedUtc = [DateTime]::UtcNow
+    $p = & $Start $arguments
+    # Held now: Start-Process -PassThru without -Wait hands back a Process whose ExitCode can read
+    # $null once the process has exited unless its handle was taken first, which -Wait used to do.
+    # The self-test's watch case reads an exit code through exactly this shape.
+    $null = $p.Handle
+    $watch = Watch-ServiceProcesses -Process $p
+    $script:LastMsiTransaction = [pscustomobject]@{
+        What = $What; Log = $logPath; StartedUtc = $startedUtc; Baseline = $baseline; Expectation = $expectation
+        Polls = $watch.Polls; FailedPolls = $watch.FailedPolls; FirstFailure = $watch.FirstFailure; Observed = $watch.Observed
+        EndedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp(); Extended = $false
+    }
     if ($p.ExitCode -notin $Accept) {
         Show-MsiLog $logPath
         # A checked service action that failed rolled the transaction back, and the service's
@@ -812,6 +1114,66 @@ function Invoke-Msiexec {
     }
     Write-Host "$What exited $($p.ExitCode)"
     if ($Notice.ContainsKey($p.ExitCode)) { Write-Host "::notice::$What exited $($p.ExitCode): $($Notice[$p.ExitCode])" }
+    # A named expectation is bound to the outcome it is named for, not to a call site's -Accept.
+    if ($expectation.MustFail -and $p.ExitCode -eq 0) {
+        throw "'$What' states $($expectation.Name), which is for a transaction that FAILS and rolls back, and it returned 0: name the row it leaves"
+    }
+    # What the verbose log says Restart Manager did, SHOWN and not judged: the line's wording is not
+    # pinned anywhere this module can read, so a pattern asserted on it would be a guess. Every line,
+    # up to the cap: the first four were the outer package's own, and cut a nested removal's session.
+    Show-MsiRestartManagerLines -Path $logPath
+    # And JUDGED where the package says it disables Restart Manager: the log must say it did.
+    $disables = Get-MsiScalar $Package "SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = 'MSIRESTARTMANAGERCONTROL'"
+    $lines = if (Test-Path -LiteralPath $logPath) { @(Get-Content -LiteralPath $logPath) } else { @() }
+    $refusal = Get-RestartManagerLogVerdict -What $What -Disables $disables -Lines $lines -Released $Released.IsPresent
+    if ($null -ne $refusal) { throw $refusal }
+    if ($disables -ceq 'Disable') { Write-Host "  log: Restart Manager disabled, as the package states" }
+    else { Write-Host "  log: Restart Manager NOT judged: the released package sets MSIRESTARTMANAGERCONTROL to '$disables', so it promises nothing" }
+    Write-Host (Invoke-TransactionJudgement -Transaction $script:LastMsiTransaction)
+}
+
+# Whether a verbose log says what its package's Restart Manager setting promises. A package whose
+# Property table sets MSIRESTARTMANAGERCONTROL to `Disable` must log that Windows Installer disabled
+# it ($script:RestartManagerDisabledLine). THIS build's package must set it: one that does not lost
+# the row the static checks pin in the fragment, and a skip would read as a pass. Only a RELEASED
+# package (0.3.0, the latest release) may set anything else, or nothing, and promise nothing here.
+# A pure function over the lines.
+#
+# @param What The transaction, for the refusal.
+# @param Disables The package's MSIRESTARTMANAGERCONTROL value, $null when it has none.
+# @param Lines The log's lines.
+# @param Released Whether the package is a released one rather than this build's.
+# @return $null when the log keeps the promise or a released package makes none, else the refusal.
+function Get-RestartManagerLogVerdict([string] $What, [AllowNull()] [object] $Disables, [string[]] $Lines = @(), [bool] $Released = $false) {
+    if ($Disables -cne 'Disable') {
+        if ($Released) { return $null }
+        return "'$What': this build's package sets MSIRESTARTMANAGERCONTROL to '$Disables', not 'Disable': the built MSI lost the row the fragment carries, and Windows Installer's Restart Manager restarts a service the table left stopped (PR 1634); a RELEASED package is named with -Released"
+    }
+    if (@($Lines | Where-Object { $_.Contains($script:RestartManagerDisabledLine) }).Count -gt 0) { return $null }
+    return "'$What': the package sets MSIRESTARTMANAGERCONTROL=Disable and its verbose log never says '$script:RestartManagerDisabledLine': Windows Installer's Restart Manager took part, and it restarts a service the table left stopped (PR 1634); the log's RESTART MANAGER lines are above"
+}
+
+# Judges the last transaction a SECOND time, over a window reaching at least
+# $script:TransactionSettleSeconds past msiexec's exit, once: a restart that crashes after the exit
+# (a rollback's unwaited `sc.exe start`, a recovery restart) is judged here and nowhere else.
+# Assert-ServiceTable runs it after its stability interval; a transaction no row assertion follows
+# (a failed upgrade, a repair) calls it itself, and Invoke-Msiexec refuses to begin while the
+# previous transaction has not been through it.
+#
+# @param SettleSeconds The least time past the exit the window reaches; the remainder is waited.
+# @param ReadEvents As Invoke-TransactionJudgement's; the self-test's seam.
+function Assert-TransactionSettled {
+    param(
+        [int] $SettleSeconds = $script:TransactionSettleSeconds,
+        [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since }
+    )
+    $transaction = $script:LastMsiTransaction
+    if ($null -eq $transaction -or $transaction.Extended) { return }
+    $elapsed = ([Diagnostics.Stopwatch]::GetTimestamp() - $transaction.EndedTimestamp) / [Diagnostics.Stopwatch]::Frequency
+    if ($elapsed -lt $SettleSeconds) { Start-Sleep -Milliseconds ([int][Math]::Ceiling(($SettleSeconds - $elapsed) * 1000)) }
+    $elapsed = ([Diagnostics.Stopwatch]::GetTimestamp() - $transaction.EndedTimestamp) / [Diagnostics.Stopwatch]::Frequency
+    $transaction.Extended = $true
+    Write-Host (Invoke-TransactionJudgement -Transaction $transaction -ReadEvents $ReadEvents -When ('{0:0.0} s after msiexec exited' -f $elapsed))
 }
 
 # Asserts which lines a verbose log carries and which it must not.
@@ -887,6 +1249,527 @@ function Assert-MsiActionOrder([string] $Path, [string[]] $Actions) {
 # @return The pattern.
 function Get-MsiActionRanPattern([string] $Action) {
     return "Doing action: $([regex]::Escape($Action))\s*$"
+}
+
+# ---------------------------------------------------------------------------
+# What a transaction did to the services (PR 1634)
+# ---------------------------------------------------------------------------
+#
+# The service table row a transaction leaves is asserted AFTER it, so a service
+# that was started during it and died again -- or crash-looped, stopped between
+# two recovery restarts at the moment it was asked -- passes the row. That is
+# what PR 1634's CI showed (MEASURED): the upgrade from 0.3.0 started FastCached
+# at 12:12:47, after the table had made it manual and stopped it for the node;
+# it could not bind the port the node holds, terminated three times before
+# msiexec returned, and the row read "Manual and Stopped". That Windows
+# Installer's Restart Manager started it is INFERRED: nothing in the package
+# starts FastCached on that path, and FastCached stopped one second into the
+# transaction, at InstallValidate time.
+#
+# So Invoke-Msiexec JUDGES every transaction it runs, against the row it names
+# (`-Leaves`) or a named expectation (`-Expect`), and Assert-ServiceTable judges
+# the same transaction again over the longer window that reaches its own
+# stability interval. Three witnesses, each a pure function over records:
+#
+#   * the service control manager's unexpected-termination events (7031, 7034)
+#     naming a service of this package since the transaction began;
+#   * its "entered the running state" event (7036) for a service the
+#     expectation leaves NOT RUNNING (stopped, or not registered);
+#   * a process the watch saw such a service run under, other than the one it
+#     ran under when the transaction began.
+#
+# 7036 is a witness only where the host writes it. MEASURED on two hosts: the
+# Windows Server 2025 runner of PR 1634's CI writes it (its log printed "The
+# FastCached service entered the running state"); this repository's Windows 11
+# 26200 development host wrote none among 50,978 System records. So the watch
+# stays, and each transaction that starts the node says which of the two hosts
+# it ran on: the node's own start is the positive control (Get-Witness7036State).
+
+# Expectations a transaction states when no row honestly describes it, each with
+# its reason. A row is the default for everything else, and nothing defaults to
+# one of these: Invoke-Msiexec refuses a call that names neither.
+#
+#   MayTerminate  the services whose unexpected termination this transaction is
+#                 BUILT to cause; every other termination is still a finding.
+#   MustFail      the transaction fails on purpose: Invoke-Msiexec refuses one that
+#                 returns 0, so the exemption is bound to the outcome it is named for
+#                 rather than to the call site's -Accept.
+#
+# Neither row watches for a start: a rollback starts again what the transaction
+# stopped, and removes what it created and started, so which service may start
+# during it is the rollback's business, not a row's.
+$script:TransactionExpectations = [ordered]@{
+    RollsBack = @{
+        MayTerminate = @(); MustFail = $true
+        Reason = 'the transaction fails on purpose and rolls back: the rollback restarts what it stopped and removes what it created, so no row describes what may start during it; every unexpected termination is still a finding'
+    }
+    NodeCannotBind = @{
+        MayTerminate = @('FastCacheCompileNode'); MustFail = $true
+        Reason = 'the step holds 6674, so the node the transaction adds cannot bind and its refusal is logged as an unexpected termination (7031, or 7034 once its restarts are spent); the transaction then rolls back, so no start is judged; a termination of FastCached is still a finding'
+    }
+}
+
+# What a transaction is judged against: a service table row (`-Leaves`), or a named expectation
+# (`-Expect`). Exactly one; neither, both, or an unknown name is refused by name.
+#
+# @param Leaves A key of $script:ServiceTable, or empty.
+# @param Expect A key of $script:TransactionExpectations, or empty.
+# @return Name; NotRunning, the services that must not be STARTED during it (a row's Stopped and
+#         unregistered services); MayTerminate; MustFail; NodeStarts, whether the transaction starts
+#         the node (the 7036 positive control); and Reason.
+function Get-TransactionExpectation([string] $Leaves = '', [string] $Expect = '') {
+    if ([bool] $Leaves -eq [bool] $Expect) {
+        throw "Invoke-Msiexec judges every transaction: name the service table row it -Leaves ($($script:ServiceTable.Keys -join ', ')), or, for a transaction no row describes, a named -Expect ($($script:TransactionExpectations.Keys -join ', ')); exactly one"
+    }
+    if ($Leaves) {
+        if (-not $script:ServiceTable.Contains($Leaves)) {
+            throw "no service table row '$Leaves'; the rows are: $($script:ServiceTable.Keys -join ', ')"
+        }
+        $row = $script:ServiceTable[$Leaves]
+        $notRunning = @(foreach ($name in $row.Keys) { if ($null -eq $row[$name] -or $row[$name][1] -eq 'Stopped') { $name } })
+        $node = $row['FastCacheCompileNode']
+        return [pscustomobject]@{
+            Name = "row $Leaves"; NotRunning = $notRunning; MayTerminate = @(); MustFail = $false
+            NodeStarts = ($null -ne $node -and $node[1] -eq 'Running'); Reason = ''
+        }
+    }
+    if (-not $script:TransactionExpectations.Contains($Expect)) {
+        throw "no transaction expectation '$Expect'; the expectations are: $($script:TransactionExpectations.Keys -join ', ')"
+    }
+    $named = $script:TransactionExpectations[$Expect]
+    return [pscustomobject]@{
+        Name = "expectation $Expect"; NotRunning = @(); MayTerminate = @($named.MayTerminate); MustFail = [bool] $named.MustFail
+        NodeStarts = $false; Reason = $named.Reason
+    }
+}
+
+# Every process a service of this package runs under while @p Process runs, observed every
+# @p IntervalMilliseconds until it exits.
+#
+# An observation that FAILS is counted and the watch goes on, and the process is waited for on every
+# way out: an error escaping here would leave msiexec running, untracked, under a step that had
+# already thrown.
+#
+# @param Process The running process, its handle already taken.
+# @param Observe Takes a service name and returns what Get-ServiceObservation would.
+# @param IntervalMilliseconds The interval between observations.
+# @return Polls, the rounds in which every observation succeeded; FailedPolls, the rounds in which one
+#         failed, and FirstFailure, its error; and Observed, one record per sighting of a service
+#         running under a process (Time in UTC, Service, State, ProcessId).
+function Watch-ServiceProcesses {
+    param(
+        [Parameter(Mandatory)] [System.Diagnostics.Process] $Process,
+        [scriptblock] $Observe = { param($name) Get-ServiceObservation $name },
+        [int] $IntervalMilliseconds = 250
+    )
+    $observed = [System.Collections.Generic.List[object]]::new()
+    $polls = 0
+    $failedPolls = 0
+    $firstFailure = ''
+    try {
+        while (-not $Process.WaitForExit($IntervalMilliseconds)) {
+            $failed = $false
+            foreach ($name in $script:ServiceDisplayNames.Keys) {
+                try {
+                    $seen = & $Observe $name
+                } catch {
+                    $failed = $true
+                    if (-not $firstFailure) { $firstFailure = "$name`: $($_.Exception.Message)" }
+                    continue
+                }
+                if ($null -ne $seen -and $seen.ProcessId -gt 0) {
+                    $observed.Add([pscustomobject]@{ Time = [DateTime]::UtcNow; Service = $name; State = $seen.State; ProcessId = $seen.ProcessId })
+                }
+            }
+            if ($failed) { $failedPolls++ } else { $polls++ }
+        }
+    } finally {
+        $Process.WaitForExit()
+    }
+    return [pscustomobject]@{ Polls = $polls; FailedPolls = $failedPolls; FirstFailure = $firstFailure; Observed = $observed.ToArray() }
+}
+
+# One service control manager event as a record, from its XML and its rendered message.
+#
+# The service is read from the first of these that the event's shape carries:
+#   1. its binary data, the SERVICE name in UTF-16 (a real 7031's decodes to FastCacheCompileNode); a
+#      `/` in it is read as `<name>/<state code>`, a layout seen reported for 7036 but NOT verified
+#      here, so it decides only when param2 says nothing;
+#   2. a `ServiceName` data item, as 7045 ("a service was installed") carries it;
+#   3. param1, the display name.
+# Either name of a service of this package maps to its service name through ServiceDisplayNames; any
+# other is kept as it was. A 7036's state is its param2 ("running", "stopped"), the form Microsoft's
+# own event queries match on.
+#
+# @param Xml The event's XML (EventLogRecord.ToXml()).
+# @param Message The event's rendered message.
+# @return Id, Time (UTC), Service, State ('Running', 'Stopped' or '' when the event states none) and
+#         Message.
+function ConvertTo-ServiceControlEvent([string] $Xml, [string] $Message) {
+    [xml] $document = $Xml
+    $namespace = [System.Xml.XmlNamespaceManager]::new($document.NameTable)
+    $namespace.AddNamespace('e', 'http://schemas.microsoft.com/win/2004/08/events/event')
+    $data = { param([string] $name)
+        $node = $document.SelectSingleNode("/e:Event/e:EventData/e:Data[@Name='$name']", $namespace)
+        if ($null -eq $node) { '' } else { $node.InnerText } }
+    $id = [int] $document.SelectSingleNode('/e:Event/e:System/e:EventID', $namespace).InnerText
+    $stamp = $document.SelectSingleNode('/e:Event/e:System/e:TimeCreated', $namespace).GetAttribute('SystemTime')
+    $time = [DateTime]::Parse($stamp, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+    $binary = $document.SelectSingleNode('/e:Event/e:EventData/e:Binary', $namespace)
+    $name = ''
+    $code = ''
+    if ($null -ne $binary -and $binary.InnerText.Length -ge 4 -and $binary.InnerText.Length % 2 -eq 0) {
+        $hex = $binary.InnerText
+        $bytes = [byte[]] @(foreach ($at in 0..($hex.Length / 2 - 1)) { [Convert]::ToByte($hex.Substring($at * 2, 2), 16) })
+        $name = [Text.Encoding]::Unicode.GetString($bytes).TrimEnd([char] 0)
+        if ($name.Contains('/')) { $name, $code = $name.Split('/', 2) }
+    }
+    if (-not $name) { $name = & $data 'ServiceName' }
+    if (-not $name) { $name = & $data 'param1' }
+    foreach ($service in $script:ServiceDisplayNames.Keys) {
+        if ($name -eq $service -or $name -eq $script:ServiceDisplayNames[$service]) { $name = $service; break }
+    }
+    $state = ''
+    if ($id -eq 7036) {
+        $state = switch (& $data 'param2') { 'running' { 'Running' } 'stopped' { 'Stopped' } default {
+                switch ($code.Trim([char] 0)) { '4' { 'Running' } '1' { 'Stopped' } default { '' } } } }
+    }
+    return [pscustomobject]@{ Id = $id; Time = $time; Service = $name; State = $state; Message = ($Message -replace '\s+', ' ').Trim() }
+}
+
+# The service control manager's events of @p Ids since @p SinceUtc, as records. An empty answer is
+# NOTHING, not a failure: Get-WinEvent reports "no events were found" as an error, and only that
+# error is taken as the answer; every other one throws.
+#
+# @param SinceUtc The earliest instant, in UTC.
+# @param Ids The event ids.
+# @param MaxEvents At most this many, newest first; 0 for all.
+# @return One ConvertTo-ServiceControlEvent record per event; wrap the call in @() to count it.
+function Get-ServiceControlEvents {
+    param(
+        [Parameter(Mandatory)] [datetime] $SinceUtc,
+        [int[]] $Ids = $script:TransactionEvents,
+        [int] $MaxEvents = 0
+    )
+    $filter = @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = $Ids; StartTime = $SinceUtc.ToLocalTime() }
+    $bound = if ($MaxEvents -gt 0) { @{ MaxEvents = $MaxEvents } } else { @{} }
+    try {
+        $records = @(Get-WinEvent -FilterHashtable $filter @bound -ErrorAction Stop)
+    } catch {
+        if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { return }
+        throw
+    }
+    foreach ($record in $records) { ConvertTo-ServiceControlEvent $record.ToXml() $record.Message }
+}
+
+# The decision, apart from the acquisition: what a transaction did to the services that its
+# expectation did not allow.
+#
+# @param What The transaction, for the findings.
+# @param StartedUtc When it began; an event before it belongs to something else.
+# @param Events ConvertTo-ServiceControlEvent records.
+# @param Observed Watch-ServiceProcesses' Observed records.
+# @param Baseline Service name to the process it ran under when the transaction began, 0 for none.
+# @param NotRunning The services the expectation leaves not running: none may be STARTED.
+# @param MayTerminate The services whose unexpected termination the expectation allows.
+# @return One finding per unexpected termination and per start of a NotRunning service, each with a
+#         Kind ('Termination' or 'Start'), its Time (UTC) and a Text naming the service, the event id or process, the
+#         time and the message; NOTHING when there is none (wrap the call in @() to count it).
+function Get-TransactionServiceVerdict {
+    param(
+        [Parameter(Mandatory)] [string] $What,
+        [Parameter(Mandatory)] [datetime] $StartedUtc,
+        [object[]] $Events = @(),
+        [object[]] $Observed = @(),
+        [hashtable] $Baseline = @{},
+        [string[]] $NotRunning = @(),
+        [string[]] $MayTerminate = @()
+    )
+    $format = { param([datetime] $t) $t.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture) }
+    $finding = { param([string] $kind, [datetime] $time, [string] $text) [pscustomobject]@{ Kind = $kind; Time = $time; Text = $text } }
+    $ours = @($Events | Where-Object { $_.Time -ge $StartedUtc -and $script:ServiceDisplayNames.Contains($_.Service) } | Sort-Object Time)
+    foreach ($record in $ours) {
+        if ($record.Id -notin $script:UnexpectedTerminationEvents -or $record.Service -in $MayTerminate) { continue }
+        & $finding 'Termination' $record.Time "$($record.Service) terminated unexpectedly during '$What': event $($record.Id) at $(& $format $record.Time): $($record.Message)"
+    }
+    foreach ($name in $NotRunning) {
+        foreach ($record in @($ours | Where-Object { $_.Id -eq 7036 -and $_.Service -eq $name -and $_.State -eq 'Running' })) {
+            & $finding 'Start' $record.Time "$name, which the expectation leaves not running, was started during '$What': event 7036 at $(& $format $record.Time): $($record.Message)"
+        }
+        $before = if ($Baseline.ContainsKey($name)) { [int] $Baseline[$name] } else { 0 }
+        # A start that never reached RUNNING still ENDS with a 7036 "stopped" (PR 1634's stray start
+        # logged three of them and no "running"), and only a service that runs can stop: the process it
+        # ran under when the transaction began allows ONE stop, and every stop past that one followed a
+        # start.
+        $stops = @($ours | Where-Object { $_.Id -eq 7036 -and $_.Service -eq $name -and $_.State -eq 'Stopped' })
+        $allowed = if ($before -gt 0) { 1 } else { 0 }
+        foreach ($record in @($stops | Select-Object -Skip $allowed)) {
+            $was = if ($before -gt 0) { "a stop past the one of process $before, which it ran under when the transaction began" } else { 'a stop of a service that was not running when the transaction began' }
+            & $finding 'Start' $record.Time "$name, which the expectation leaves not running, was started during '$What': event 7036 (stopped) at $(& $format $record.Time), $was, follows a start: $($record.Message)"
+        }
+        $strays = @($Observed | Where-Object { $_.Service -eq $name -and $_.ProcessId -gt 0 -and $_.ProcessId -ne $before } |
+                Sort-Object Time | Group-Object ProcessId)
+        foreach ($stray in $strays) {
+            $first = $stray.Group[0]
+            $was = if ($before -gt 0) { "it ran as process $before when the transaction began" } else { 'it was not running when the transaction began' }
+            & $finding 'Start' $first.Time "$name, which the expectation leaves not running, was started during '$What': process $($first.ProcessId) seen $($first.State) at $(& $format $first.Time), $($stray.Count) time(s); $was"
+        }
+    }
+}
+
+# Whether the 7036 witness is LIVE in a transaction, from its one positive control: the node's own
+# start. A host that writes 7036 logs it whenever the node starts, and every transaction whose
+# expectation leaves the node running starts (or restarts) it.
+#
+# @param Events ConvertTo-ServiceControlEvent records.
+# @param StartedUtc When the transaction began.
+# @param NodeStarts Whether the transaction starts the node.
+# @return 'live' (the node's start was logged); 'unmatched' (the node started, no 7036 of the node's
+#         running was READ, and 7036s of other services were: the host writes them, so the reader or
+#         the matcher failed on the node's); 'not seen' (the node started and no 7036 at all was read:
+#         a host that writes none, or a reader that fails on all of them -- Invoke-TransactionJudgement
+#         refuses it once an earlier transaction of the process read 'live'); or 'no control' (the
+#         transaction starts no node, so nothing here can tell).
+function Get-Witness7036State([object[]] $Events = @(), [datetime] $StartedUtc, [bool] $NodeStarts) {
+    if (-not $NodeStarts) { return 'no control' }
+    $logged = @($Events | Where-Object { $_.Id -eq 7036 -and $_.Time -ge $StartedUtc })
+    if (@($logged | Where-Object { $_.Service -eq 'FastCacheCompileNode' -and $_.State -eq 'Running' }).Count -gt 0) { return 'live' }
+    if ($logged.Count -gt 0) { return 'unmatched' }
+    return 'not seen'
+}
+
+# Judges @p Transaction against its expectation, over every event since it began: refuses with each
+# finding, or returns the line that says what was judged, including which witnesses were live.
+#
+# @param Transaction The record Invoke-Msiexec keeps.
+# @param ReadEvents Takes the transaction's start in UTC and returns ConvertTo-ServiceControlEvent
+#                   records; the seam through which the self-test supplies them.
+# @return The pass line.
+function Invoke-TransactionJudgement {
+    param(
+        [Parameter(Mandatory)] $Transaction,
+        [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since },
+        [string] $When = 'at msiexec''s exit'
+    )
+    $expectation = $Transaction.Expectation
+    # A watch that never looked reports no start, which is not the same as none happening.
+    if ($Transaction.Polls -lt 1) {
+        throw "the services were never observed while '$($Transaction.What)' ran ($($Transaction.FailedPolls) observation round(s) failed, first: $($Transaction.FirstFailure)), so 'nothing was started' would describe nothing"
+    }
+    $events = @(& $ReadEvents $Transaction.StartedUtc)
+    $findings = @(Get-TransactionServiceVerdict -What $Transaction.What -StartedUtc $Transaction.StartedUtc -Events $events `
+            -Observed $Transaction.Observed -Baseline $Transaction.Baseline -NotRunning $expectation.NotRunning -MayTerminate $expectation.MayTerminate)
+    if ($findings.Count -gt 0) {
+        if ($Transaction.Log) {
+            Show-MsiLog $Transaction.Log
+            Show-MsiLogAroundFindings -Path $Transaction.Log -Findings $findings
+        }
+        Show-PortHolders 6674
+        $kinds = @($findings | ForEach-Object Kind | Sort-Object -Unique)
+        $hints = @(
+            if ('Termination' -in $kinds) { 'a TERMINATION is the service failing: read its time against the verbose log and the service''s own Application events (Show-ServiceDiagnosis), a refused start and a bad restore look like this' }
+            if ('Start' -in $kinds) { 'a START of a service the expectation leaves not running has had one cause so far, Windows Installer''s Restart Manager (PR 1634): the package disables it (MSIRESTARTMANAGERCONTROL), an OLD package''s removal inside an upgrade does not, and Windows Installer restarts what that removal shut down after the transaction ends, which is why fastcached beside the node is disabled; read the verbose log''s RESTART MANAGER lines and the actions running at that time' }
+        )
+        throw "'$($Transaction.What)' disturbed a service the table owns ($($expectation.Name)):`n  $(@($findings | ForEach-Object Text) -join "`n  ")`n$($hints -join "`n")"
+    }
+    $state = Get-Witness7036State -Events $events -StartedUtc $Transaction.StartedUtc -NodeStarts $expectation.NodeStarts
+    if ($state -eq 'unmatched') {
+        throw "'$($Transaction.What)' started the node, and of the 7036 events read since it began none is the node entering the running state while others are: this host writes them, so the event reader or its service matcher failed on the node's, and the 7036 witness is dead (read: $(@($events | Where-Object Id -eq 7036 | ForEach-Object { "$($_.Service) $($_.State)" }) -join '; '))"
+    }
+    if ($state -eq 'live' -and -not $script:Witness7036LiveSince) { $script:Witness7036LiveSince = $Transaction.What }
+    if ($state -eq 'not seen' -and $script:Witness7036LiveSince) {
+        throw "'$($Transaction.What)' started the node and no 7036 was read, while '$script:Witness7036LiveSince' read the node's: this host writes them, so the reader failed, and the 7036 witness is dead"
+    }
+    $witness = switch ($state) {
+        'live' { '7036 live (the node''s own start is logged)' }
+        'not seen' { '7036 NOT SEEN: the node started and no 7036 was read, so either this host writes none or the reader fails on all of them; the watch is the only start witness' }
+        default { '7036 unchecked: the transaction starts no node to be its control' }
+    }
+    $watched = if ($expectation.NotRunning.Count) { "no start of $($expectation.NotRunning -join ', ')" } else { 'no start judged' }
+    $gaps = if ($Transaction.FailedPolls -gt 0) { "; $($Transaction.FailedPolls) observation round(s) FAILED, first: $($Transaction.FirstFailure)" } else { '' }
+    $why = if ($expectation.Reason) { " -- $($expectation.Reason)" } else { '' }
+    return "  '$($Transaction.What)' judged $When against $($expectation.Name)$why`: no unexpected termination, $watched; $witness; $($Transaction.Polls) observation round(s)$gaps"
+}
+
+# ---------------------------------------------------------------------------
+# Installation snapshots (#1629)
+# ---------------------------------------------------------------------------
+
+# Service registry values that change on their own between two observations of an UNCHANGED
+# installation, with the reason each is excluded. Starts EMPTY on purpose: a row is added only with
+# the CI log line that shows the value moving, never pre-emptively (#1629).
+$script:VolatileServiceValues = @{}
+
+# Every value under @p Path and its subkeys, one sorted line each, '<subkey>\<name> <kind> <data>',
+# the data UNexpanded. '<absent>' alone when the key does not exist, so absence is a value that
+# compares rather than an empty list that matches anything.
+#
+# A row of VolatileServiceValues is keyed '<service>\<label>', where <label> is the line's own first
+# token: the value's name, behind its subkey path when it lives in a subkey ('Svc\Parameters\X').
+#
+# @param Path Key path relative to @p Hive.
+# @param Service The service the key belongs to, to look its volatile values up; empty for none.
+# @param Hive The hive @p Path is in: HKLM for every snapshot, HKCU for the self-test's scratch key.
+# @return The lines, always an array.
+function Get-RegistryTreeLines([string] $Path, [string] $Service = '', [Microsoft.Win32.RegistryKey] $Hive = [Microsoft.Win32.Registry]::LocalMachine) {
+    $key = $Hive.OpenSubKey($Path)
+    if ($null -eq $key) { return , @('<absent>') }
+    try {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $walk = {
+            param($k, [string] $prefix)
+            foreach ($name in $k.GetValueNames()) {
+                $label = if ($prefix) { "$prefix\$name" } else { $name }
+                if ($Service -and $script:VolatileServiceValues.ContainsKey("$Service\$label")) { continue }
+                $kind = $k.GetValueKind($name)
+                $data = $k.GetValue($name, $null, 'DoNotExpandEnvironmentNames')
+                $text = switch ($kind) {
+                    'Binary' { ($data | ForEach-Object { $_.ToString('x2') }) -join '' }
+                    'MultiString' { ($data | ForEach-Object { "`"$_`"" }) -join ',' }
+                    default { "$data" }
+                }
+                $lines.Add("$label $kind $text")
+            }
+            foreach ($sub in $k.GetSubKeyNames()) {
+                $child = $k.OpenSubKey($sub)
+                try { & $walk $child $(if ($prefix) { "$prefix\$sub" } else { $sub }) } finally { $child.Dispose() }
+            }
+        }
+        & $walk $key ''
+        return , @($lines | Sort-Object)
+    } finally { $key.Dispose() }
+}
+
+# Waits, bounded, until @p Name is in no *Pending state, then requires it to HOLD for @p StableSeconds,
+# and returns what was seen: the state ('absent' when not registered), plus '; unstable: <verdict>'
+# when the second observation disagrees with the first. A rollback restarts services as its last
+# acts, so a reading taken at msiexec's exit can catch Start Pending; and one reading cannot tell a
+# running service from a crash-looping one, so a crash loop must read differently from a steady
+# Running. 30 s is Assert-ServiceState's own bound, measured on a monotonic clock.
+#
+# @param Name The service name.
+# @param StableSeconds How long the settled state must hold before it is believed.
+# @param Observe Takes a service name and returns what Get-ServiceObservation would.
+function Get-SettledServiceState {
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [int] $StableSeconds = 5,
+        [scriptblock] $Observe = { param($name) Get-ServiceObservation $name }
+    )
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $seen = & $Observe $Name
+        if ($null -eq $seen) { return 'absent' }
+        if ($seen.State -notlike '*Pending') { break }
+        if ($clock.Elapsed.TotalSeconds -ge 30) { throw "$Name still $($seen.State) after 30 s" }
+        Start-Sleep -Milliseconds 500
+    }
+    Start-Sleep -Seconds $StableSeconds
+    $verdict = Get-ServiceStabilityVerdict $Name $seen (& $Observe $Name) $StableSeconds
+    if ($null -eq $verdict) { return $seen.State }
+    return "$($seen.State); unstable: $verdict"
+}
+
+# Everything an installation consists of that a rollback must put back, as comparable lines.
+#
+# @param UpgradeCode The product family.
+# @param Root The installation root.
+# @return An ordered hashtable from field name to sorted string[].
+function Get-InstallationSnapshot {
+    param([Parameter(Mandatory)] [string] $UpgradeCode, [Parameter(Mandatory)] [string] $Root)
+    $snapshot = [ordered]@{}
+    foreach ($name in 'FastCached', 'FastCacheCompileNode') {
+        $snapshot["service $name"] = Get-RegistryTreeLines "SYSTEM\CurrentControlSet\Services\$name" $name
+        $snapshot["state $name"] = @(Get-SettledServiceState $name)
+    }
+    $snapshot['installer values'] = Get-RegistryTreeLines 'SOFTWARE\fastcached\Installer'
+    $snapshot['rollback state'] = Get-RegistryTreeLines 'SOFTWARE\fastcached\InstallerRollback'
+    foreach ($group in 'fastcached: FastCached', 'fastcached: FastCacheCompileNode') {
+        $snapshot["firewall $group"] = @(Get-FirewallGroupSnapshot $group)
+    }
+    # Bound first: the reader returns its array as ONE pipeline object, so piping the call itself
+    # would sort a single nested Object[] and compare it by reference.
+    $codes = Get-InstalledProductCodes $UpgradeCode
+    $snapshot['products'] = @($codes | Sort-Object)
+    $snapshot['binary'] = @("fastcached.exe present: $(Test-Path -LiteralPath (Join-Path $Root 'bin\fastcached.exe'))")
+    return $snapshot
+}
+
+# The named differences between two snapshots: a pure decision, so the self-test drives it.
+#
+# @param Before The earlier snapshot.
+# @param After The later snapshot.
+# @return One "<field>: lost [..]; gained [..]" per differing field, NOTHING when equal (wrap the call
+#         in @() to count it). Throws, naming the field, on an element that is not a string.
+function Compare-InstallationSnapshot {
+    param([Parameter(Mandatory)] $Before, [Parameter(Mandatory)] $After)
+    $fields = @($Before.Keys) + @($After.Keys | Where-Object { -not $Before.Contains($_) })
+    foreach ($record in $Before, $After) {
+        foreach ($field in $record.Keys) {
+            $bad = @($record[$field] | Where-Object { $_ -isnot [string] } | ForEach-Object { if ($null -eq $_) { '$null' } else { $_.GetType().Name } })
+            if ($bad.Count) { throw "snapshot field '$field' holds a non-string element ($($bad[0])): the instrument is broken, not the installation" }
+        }
+    }
+    $out = foreach ($field in $fields) {
+        $hadBefore = $Before.Contains($field)
+        $hasAfter = $After.Contains($field)
+        $b = @(if ($hadBefore) { $Before[$field] })
+        $a = @(if ($hasAfter) { $After[$field] })
+        # A multiset difference: a line held twice where it was held once is a change.
+        $lost = @(Get-MultisetDifference $b $a)
+        $gained = @(Get-MultisetDifference $a $b)
+        $text = "${field}: lost [$($lost -join '; ')]; gained [$($gained -join '; ')]"
+        # Presence is a value: an EMPTY field one side lacks would otherwise match anything.
+        if ($hadBefore -ne $hasAfter -and -not ($lost.Count -or $gained.Count)) {
+            "$text <field absent $(if ($hadBefore) { 'after' } else { 'before' })>"
+        } elseif ($lost.Count -or $gained.Count) { $text }
+    }
+    # Enumerated, not wrapped: an empty answer is NOTHING, so a caller's @() counts it as zero.
+    return $out
+}
+
+# A COPY of @p Package with @p Statements applied, each change read back through @p Verify
+# (query -> expected value) before the copy is trusted. An UPDATE matching no row succeeds silently,
+# so an unverified control copy can be the unchanged package -- a control that cannot go red.
+#
+# @param Package The source .msi, left untouched.
+# @param Destination The patched copy.
+# @param Statements MSI SQL run in order against the copy.
+# @param Verify Query (first column of its first row) to the value it must read back.
+function New-MsiControlCopy {
+    param(
+        [Parameter(Mandatory)] [string] $Package, [Parameter(Mandatory)] [string] $Destination,
+        [Parameter(Mandatory)] [string[]] $Statements, [Parameter(Mandatory)] [hashtable] $Verify
+    )
+    Copy-Item -LiteralPath $Package -Destination $Destination -Force
+    Set-ItemProperty -LiteralPath $Destination -Name IsReadOnly -Value $false
+    $invoke = { param($o, [string] $m, [string] $k, $a) $o.GetType().InvokeMember($m, $k, $null, $o, $a) }
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    try {
+        # [string]: COM refuses a wrapped path with DISP_E_TYPEMISMATCH. Mode 1 is transact.
+        $db = & $invoke $installer 'OpenDatabase' 'InvokeMethod' @([string]$Destination, 1)
+        try {
+            foreach ($sql in $Statements) {
+                $view = & $invoke $db 'OpenView' 'InvokeMethod' @($sql)
+                try { & $invoke $view 'Execute' 'InvokeMethod' $null | Out-Null }
+                finally {
+                    & $invoke $view 'Close' 'InvokeMethod' $null | Out-Null
+                    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($view)
+                }
+            }
+            & $invoke $db 'Commit' 'InvokeMethod' $null | Out-Null
+        } finally {
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
+        }
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
+    }
+    # The read-back is a fresh read-only open, after the writing handle is gone.
+    foreach ($query in $Verify.Keys) {
+        $read = Get-MsiScalar $Destination $query
+        if ($null -eq $read) { $read = '<no row>' }
+        if ($read -cne $Verify[$query]) { throw "${Destination}: '$query' read '$read', expected '$($Verify[$query])'" }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1016,7 +1899,10 @@ function Invoke-MsiServiceTableSelfTest {
         foreach ($sql in @(
                 'CREATE TABLE `Property` (`Property` CHAR(72) NOT NULL, `Value` LONGCHAR NOT NULL LOCALIZABLE PRIMARY KEY `Property`)',
                 "INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('ProductCode', '{11111111-1111-1111-1111-111111111111}')",
-                "INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('UpgradeCode', '{22222222-2222-2222-2222-222222222222}')")) {
+                "INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('UpgradeCode', '{22222222-2222-2222-2222-222222222222}')",
+                'CREATE TABLE `CustomAction` (`Action` CHAR(72) NOT NULL, `Type` SHORT NOT NULL, `Source` CHAR(72), `Target` CHAR(255) PRIMARY KEY `Action`)',
+                "INSERT INTO ``CustomAction`` (``Action``, ``Type``) VALUES ('Committed', 3618)",
+                "INSERT INTO ``CustomAction`` (``Action``, ``Type``) VALUES ('Deferred', 3106)")) {
             $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @($sql))
             $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
             $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
@@ -1034,6 +1920,41 @@ function Invoke-MsiServiceTableSelfTest {
             Pass "package: reads $($property.Name)"
         }
         ExpectThrow 'package: a missing property is refused by name' { Get-MsiProperty $package 'ProductVersion' } 'carries no ProductVersion property'
+
+        # The custom action reader: two rows, so a reader answering with the wrong row is caught, and the
+        # commit bit (0x200) ALONE separates them -- 3618 is 0xE22 and 3106 is 0xC22, both a type-34
+        # in-script, no-impersonation action -- so the rows are the shapes the failed-upgrade CI step's
+        # control C reads and writes. A missing action is refused by name.
+        foreach ($action in @(@{ Name = 'Committed'; Type = 3618 }, @{ Name = 'Deferred'; Type = 3106 })) {
+            $type = Get-MsiCustomActionType $package $action.Name
+            if ($type -isnot [int] -or $type -ne $action.Type) { throw "package: custom action $($action.Name) read '$type', expected $($action.Type)" }
+            Pass "package: reads the Type of custom action $($action.Name)"
+        }
+        ExpectThrow 'package: a missing custom action is refused by name' { Get-MsiCustomActionType $package 'NoSuchAction' } 'carries no NoSuchAction custom action'
+
+        # The control copy (#1629): a matching UPDATE reads back, an UPDATE matching no row is refused by name.
+        $copy = Join-Path $scratch 'control.msi'
+        $readBack = @{ 'SELECT `Value` FROM `Property` WHERE `Property` = ''ProductCode''' = '{33333333-3333-3333-3333-333333333333}' }
+        New-MsiControlCopy -Package $package -Destination $copy `
+            -Statements @("UPDATE ``Property`` SET ``Value`` = '{33333333-3333-3333-3333-333333333333}' WHERE ``Property`` = 'ProductCode'") -Verify $readBack
+        if ((Get-MsiProperty $copy 'ProductCode') -ne '{33333333-3333-3333-3333-333333333333}') { throw 'control copy: the patched value is not in the copy' }
+        if ((Get-MsiProperty $package 'ProductCode') -ne '{11111111-1111-1111-1111-111111111111}') { throw 'control copy: the ORIGINAL was changed' }
+        Pass 'control copy: a matching UPDATE reads back, and the original is untouched'
+        ExpectThrow 'control copy: an UPDATE matching no row is refused by name' {
+            New-MsiControlCopy -Package $package -Destination (Join-Path $scratch 'nomatch.msi') `
+                -Statements @("UPDATE ``Property`` SET ``Value`` = 'x' WHERE ``Property`` = 'NoSuchProperty'") `
+                -Verify @{ 'SELECT `Value` FROM `Property` WHERE `Property` = ''NoSuchProperty''' = 'x' }
+        } "= 'NoSuchProperty'' read '<no row>', expected 'x'$"
+        ExpectThrow 'control copy: a row present with another value is refused, naming both' {
+            New-MsiControlCopy -Package $package -Destination (Join-Path $scratch 'wrong.msi') `
+                -Statements @("UPDATE ``Property`` SET ``Value`` = 'abc' WHERE ``Property`` = 'ProductCode'") `
+                -Verify @{ 'SELECT `Value` FROM `Property` WHERE `Property` = ''ProductCode''' = 'xyz' }
+        } "= 'ProductCode'' read 'abc', expected 'xyz'$"
+        ExpectThrow 'control copy: a readback differing only in case is refused' {
+            New-MsiControlCopy -Package $package -Destination (Join-Path $scratch 'case.msi') `
+                -Statements @("UPDATE ``Property`` SET ``Value`` = 'abc' WHERE ``Property`` = 'ProductCode'") `
+                -Verify @{ 'SELECT `Value` FROM `Property` WHERE `Property` = ''ProductCode''' = 'ABC' }
+        } "read 'abc', expected 'ABC'"
     } finally {
         Remove-Item -Recurse -Force $scratch -ErrorAction SilentlyContinue
     }
@@ -1089,8 +2010,8 @@ function Invoke-MsiServiceTableSelfTest {
     }
 
     # The directory-owner verdict Assert-NodeStatePrivate reads, driven without a real
-    # directory. The rest of that function reads a live ACL and is the module's third stated
-    # blind spot; this pure part is not.
+    # directory. The rest of that function reads a live ACL and is one of the module's stated
+    # blind spots; this pure part is not.
     if ($null -ne (Get-DirectoryOwnerVerdict 'S-1-5-32-544')) { throw 'owner verdict: Administrators must pass' }
     Pass 'owner: Administrators owns the state directory'
     ExpectThrow 'owner: a non-administrative owner is refused' {
@@ -1237,6 +2158,62 @@ function Invoke-MsiServiceTableSelfTest {
     ExpectThrow 'unchanged: a rollback that changes the PROFILE is refused, naming it' {
         if ($verdict = Get-FirewallGroupUnchangedVerdict @($programBefore) @($profileAfter) 'fastcached: X') { throw $verdict }
     } 'holds \[.*profile=Private'
+    # A rule the rollback DUPLICATED renders as the same line twice, and a set comparison reads that as
+    # unchanged (#1629, M1): the comparison is a multiset.
+    ExpectThrow 'unchanged: a rule the rollback duplicated is refused, naming the extra one' {
+        if ($verdict = Get-FirewallGroupUnchangedVerdict @($rule) @($rule, $rule) 'fastcached: X') { throw $verdict }
+    } 'lost \[\] and holds \[FastCached cache tcp/6674 .*remote=Any\] it did not$'
+
+    # The firewall snapshot's error decision (#1629, M2): a group that holds no rule reads as empty, and
+    # any OTHER failed read is thrown, never read as an empty group that then compares as unchanged.
+    $failWith = { param([string] $id, [string] $message)
+        { param($group) throw [Management.Automation.ErrorRecord]::new([Exception]::new($message), $id, 'NotSpecified', $group) }.GetNewClosure() }
+    $empty = @(Get-FirewallGroupSnapshot 'fastcached: X' -Read (& $failWith $script:FirewallGroupNotFoundId 'No MSFT_NetFirewallRule objects found'))
+    if ($empty.Count -ne 0) { throw "firewall snapshot: a group holding no rule answered '$($empty -join ' | ')'" }
+    Pass 'firewall snapshot: a group holding no rule reads as empty'
+    ExpectThrow 'firewall snapshot: any other failed read is thrown, never read as empty' {
+        Get-FirewallGroupSnapshot 'fastcached: X' -Read (& $failWith 'HRESULT 0x80070005,Get-NetFirewallRule' 'Access is denied')
+    } '^Access is denied$'
+    # And the id is the one the REAL firewall raises: a group no host has, read live.
+    $noGroup = @(Get-FirewallGroupSnapshot ('fastcached: SelfTest' + [guid]::NewGuid().ToString('N')))
+    if ($noGroup.Count -ne 0) { throw "firewall snapshot: a group no host has answered '$($noGroup -join ' | ')'" }
+    Pass 'firewall snapshot: live, a group no host has reads as empty rather than failing'
+
+    # The registry walker every snapshot field of a service is read through (#1629, M3), over a scratch
+    # key in HKCU: each value kind, a subkey, the data unexpanded, and one volatile row excluded for its
+    # own service and no other. Then the same key absent.
+    $hkcu = [Microsoft.Win32.Registry]::CurrentUser
+    $scratchKey = 'Software\fastcached-selftest-' + [guid]::NewGuid().ToString('N')
+    $volatileRow = 'SelfTestSvc\Sub\Volatile'
+    $created = $hkcu.CreateSubKey($scratchKey)
+    try {
+        $created.SetValue('Text', 'plain', [Microsoft.Win32.RegistryValueKind]::String)
+        $created.SetValue('Path', '%SystemRoot%\x', [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        $created.SetValue('Count', 2, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $created.SetValue('List', [string[]] @('a', 'b c'), [Microsoft.Win32.RegistryValueKind]::MultiString)
+        $created.SetValue('Bytes', [byte[]] @(0x01, 0xab), [Microsoft.Win32.RegistryValueKind]::Binary)
+        $sub = $created.CreateSubKey('Sub')
+        try {
+            $sub.SetValue('Inner', 'deep', [Microsoft.Win32.RegistryValueKind]::String)
+            $sub.SetValue('Volatile', 'moves', [Microsoft.Win32.RegistryValueKind]::String)
+        } finally { $sub.Dispose() }
+        $script:VolatileServiceValues[$volatileRow] = 'self-test row: drives the exclusion branch'
+        $expected = @('Bytes Binary 01ab', 'Count DWord 2', 'List MultiString "a","b c"', 'Path ExpandString %SystemRoot%\x',
+            'Sub\Inner String deep', 'Text String plain') | Sort-Object
+        $lines = Get-RegistryTreeLines $scratchKey 'SelfTestSvc' $hkcu
+        if (($lines -join ' | ') -cne ($expected -join ' | ')) { throw "registry tree: read [$($lines -join ' | ')], expected [$($expected -join ' | ')]" }
+        Pass 'registry tree: every kind, a subkey, unexpanded, and its own volatile row excluded'
+        $unexcluded = Get-RegistryTreeLines $scratchKey 'OtherSvc' $hkcu
+        if ($unexcluded -cnotcontains 'Sub\Volatile String moves') { throw "registry tree: another service's volatile row excluded a value: [$($unexcluded -join ' | ')]" }
+        Pass 'registry tree: a volatile row excludes nothing for another service'
+    } finally {
+        $script:VolatileServiceValues.Remove($volatileRow)
+        $created.Dispose()
+        $hkcu.DeleteSubKeyTree($scratchKey, $false)
+    }
+    $gone = Get-RegistryTreeLines $scratchKey 'SelfTestSvc' $hkcu
+    if ($gone -isnot [array] -or ($gone -join ' | ') -cne '<absent>') { throw "registry tree: an absent key read [$($gone -join ' | ')]" }
+    Pass 'registry tree: an absent key reads as the one line <absent>'
 
     # What failed, read whatever shape Windows Installer gave it: an action that could not START names
     # no CustomAction and no code (round 5), one that ran and failed does, and a clean log says nothing.
@@ -1262,6 +2239,63 @@ function Invoke-MsiServiceTableSelfTest {
         throw 'failure lines: a clean log reported a failure'
     }
     Pass 'failure lines: a clean log reports nothing'
+
+    # The RESTART MANAGER lines: every one up to the cap, and the cut counted. The first four are the
+    # four PR 1634's CI printed; the nested removal's session after them is what a cap of four cut.
+    $restartLog = @(
+        'MSI (s) (D8:0C) [13:31:45:209]: RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property; Windows Installer will use the built-in FilesInUse functionality.',
+        'MSI (s) (D8:AC) [13:31:46:577]: RESTART MANAGER: Session opened.', 'Property(S): noise',
+        'MSI (s) (D8:AC) [13:31:46:717]: RESTART MANAGER: Will attempt to shut down and restart applications in no UI modes.',
+        'MSI (c) (80:EC) [13:31:46:720]: RESTART MANAGER: Session opened.',
+        'MSI (s) (D8:AC) [13:31:47:001]: RESTART MANAGER: Successfully shut down all applications in the service''s session that held files in use.',
+        'MSI (s) (D8:AC) [13:32:20:100]: RESTART MANAGER: Restarted the applications.')
+    $found = Get-MsiRestartManagerLines $restartLog
+    if ($found.Lines.Count -ne 6 -or $found.Omitted -ne 0 -or $found.Lines[-1] -notmatch 'Restarted the applications') {
+        throw "restart manager lines: read $($found.Lines.Count), $($found.Omitted) omitted: $($found.Lines -join ' | ')"
+    }
+    Pass 'restart manager lines: every line is returned, the ones past the fourth included'
+    $found = Get-MsiRestartManagerLines $restartLog -Cap 4
+    if ($found.Lines.Count -ne 4 -or $found.Omitted -ne 2) { throw "restart manager lines: a cap of 4 returned $($found.Lines.Count), $($found.Omitted) omitted" }
+    Pass 'restart manager lines: a cap returns that many and counts what it cut'
+
+    # The log's clock: Windows Installer's own stamp and an action's, carried forward to a line with
+    # none, and nothing before the first stamp.
+    $clock = @(Get-MsiLogTimeOfDay @('=== Verbose logging started ===', 'MSI (s) (D8:AC) [13:31:46:577]: Doing action: X', 'Property(S): P = 1',
+            'Action start 9:05:07: InstallValidate.'))
+    if ($clock.Count -ne 4 -or $null -ne $clock[0] -or $clock[1] -ne [TimeSpan]::new(0, 13, 31, 46, 577) -or $clock[2] -ne $clock[1] -or
+        $clock[3] -ne [TimeSpan]::new(9, 5, 7)) {
+        throw "log clock: read [$($clock -join ', ')]"
+    }
+    Pass 'log clock: both stamps are read, carried to unstamped lines, and absent before the first'
+
+    # The lines around a finding: an action, a service operation, a Restart Manager line and a nested
+    # product's start inside the window; noise inside it, and an action outside it, are not; two
+    # findings' windows merge; and a window across midnight still matches.
+    $around = @(
+        'MSI (s) (D8:AC) [13:31:40:000]: Doing action: InstallInitialize',
+        'MSI (s) (D8:AC) [13:32:00:000]: Running product ''{FDCDAB73-40AF-4EDA-9340-7C33986C3207}'' with elevated privileges: Product is assigned.',
+        'Action start 13:32:01: InstallValidate.', 'Property(S): noise',
+        'MSI (s) (D8:AC) [13:32:19:900]: Executing op: ServiceControl(,Name=FastCached,Action=1,Wait=0,)',
+        'MSI (s) (D8:AC) [13:32:20:100]: RESTART MANAGER: Restarted the applications.',
+        'MSI (s) (D8:AC) [13:32:21:000]: Note: 1: 2205 2:  3: Error',
+        'MSI (s) (D8:AC) [13:32:40:000]: Product: fastcached -- Installation completed successfully.',
+        'MSI (s) (D8:AC) [00:00:02:000]: Doing action: AfterMidnight')
+    $got = Get-MsiLinesAround -Lines $around -Times @([TimeSpan]::new(0, 13, 32, 20, 306), [TimeSpan]::new(0, 13, 32, 24, 585)) -BeforeSeconds 30
+    if ($got.Omitted -ne 0 -or ($got.Lines -join '|') -notmatch '^MSI .*Running product .*\|Action start 13:32:01: InstallValidate\.\|.*ServiceControl\(,Name=FastCached.*\|.*RESTART MANAGER: Restarted the applications\.$') {
+        throw "lines around: kept [$($got.Lines -join ' | ')]"
+    }
+    Pass 'lines around: the actions, service operations and Restart Manager lines in the window, once, in log order'
+    $got = Get-MsiLinesAround -Lines $around -Times @([TimeSpan]::new(23, 59, 58)) -BeforeSeconds 1 -AfterSeconds 5
+    if (($got.Lines -join '|') -notmatch '^MSI .*Doing action: AfterMidnight$') { throw "lines around: across midnight kept [$($got.Lines -join ' | ')]" }
+    Pass 'lines around: a window across midnight matches the next day''s first seconds'
+    $got = Get-MsiLinesAround -Lines $around -Times @([TimeSpan]::new(0, 13, 32, 20)) -BeforeSeconds 30 -Cap 2
+    if ($got.Lines.Count -ne 2 -or $got.Omitted -ne 2 -or ($got.Lines -join '|') -notmatch 'ServiceControl\(,Name=FastCached.*\|.*RESTART MANAGER: Restarted the applications\.$') {
+        throw "lines around: a cap of 2 kept [$($got.Lines -join ' | ')], $($got.Omitted) omitted"
+    }
+    Pass 'lines around: a cap keeps the LATEST lines, nearest the findings, and counts the earliest it cut'
+    $got = Get-MsiLinesAround -Lines $around -Times @([TimeSpan]::new(0, 13, 32, 20))
+    if (($got.Lines -join '|') -match 'Running product|InstallValidate' -or $got.Lines.Count -ne 2) { throw "lines around: the default window kept [$($got.Lines -join ' | ')]" }
+    Pass 'lines around: the default window reaches 10 s back, not 30'
 
     # How the node's service reaches its state, over REAL access lists and under this module's strict
     # mode, which is where the inline version threw (round 6, C1): ONE entry naming the service is
@@ -1306,7 +2340,423 @@ function Invoke-MsiServiceTableSelfTest {
         }
     }
 
-    $expectedCases = 79
+    # The installation comparison, over synthetic snapshots (#1629): every outcome, and WHICH field.
+    $base = [ordered]@{ 'service FastCached' = @('ImagePath ExpandString "C:\r\fastcached.exe" --daemon', 'Start DWord 2'); 'state FastCached' = @('Running') }
+    $cmp = @(
+        @{ Case = 'equal snapshots'; After = $base; Match = $null }
+        @{ Case = 'one changed value'; After = [ordered]@{ 'service FastCached' = @('ImagePath ExpandString "C:\r\fastcached.exe" --daemon', 'Start DWord 3'); 'state FastCached' = @('Running') }; Match = '^service FastCached: lost \[Start DWord 2\]; gained \[Start DWord 3\]$' }
+        @{ Case = 'a changed state'; After = [ordered]@{ 'service FastCached' = $base['service FastCached']; 'state FastCached' = @('Stopped') }; Match = '^state FastCached: lost \[Running\]; gained \[Stopped\]$' }
+        @{ Case = 'a field only one side has'; After = [ordered]@{ 'service FastCached' = $base['service FastCached'] }; Match = '^state FastCached: lost \[Running\]; gained \[\]$' }
+        @{ Case = 'a key that vanished'; After = [ordered]@{ 'service FastCached' = @('<absent>'); 'state FastCached' = @('Running') }; Match = '^service FastCached: lost' }
+        @{ Case = 'a line held twice where it was held once'; After = [ordered]@{ 'service FastCached' = @($base['service FastCached']) + @('Start DWord 2'); 'state FastCached' = @('Running') }; Match = '^service FastCached: lost \[\]; gained \[Start DWord 2\]$' }
+    )
+    foreach ($row in $cmp) {
+        $diff = @(Compare-InstallationSnapshot -Before $base -After $row.After)
+        if ($null -eq $row.Match) { if ($diff.Count -ne 0) { throw "compare: $($row.Case): expected none, got [$($diff -join '; ')]" } }
+        elseif ($diff.Count -ne 1 -or $diff[0] -notmatch $row.Match) { throw "compare: $($row.Case): expected one difference matching '$($row.Match)', got [$($diff -join '; ')]" }
+        Pass "compare: $($row.Case)"
+    }
+
+    # Compare refuses an instrument failure BY FIELD, and sees an empty field only one side has.
+    ExpectThrow 'compare: a nested array element is refused, naming the field' {
+        Compare-InstallationSnapshot -Before ([ordered]@{ products = , @(, @('{A}')) }) -After ([ordered]@{ products = @('{A}') })
+    } "field 'products' holds a non-string element \(Object\[\]\)"
+    $oneSided = @(Compare-InstallationSnapshot -Before ([ordered]@{ a = @('x'); fw = @() }) -After ([ordered]@{ a = @('x') }))
+    if ($oneSided.Count -ne 1 -or $oneSided[0] -notmatch '^fw: lost \[\]; gained \[\] <field absent after>$') { throw "compare: an empty one-sided field: got [$($oneSided -join '; ')]" }
+    Pass 'compare: an empty field only one side has is a difference'
+
+    # The settled state, through the observation seam: Pending then Running holds; a restart does not.
+    $script:scripted = $null
+    $scriptedObserve = { param($name) $next = $script:scripted[0]; if ($script:scripted.Count -gt 1) { $script:scripted = $script:scripted[1..($script:scripted.Count - 1)] }; $next }
+    $running = { param($pid_) [pscustomobject]@{ StartMode = 'Auto'; State = 'Running'; ProcessId = $pid_ } }
+    $script:scripted = @([pscustomobject]@{ StartMode = 'Auto'; State = 'Start Pending'; ProcessId = 0 }, (& $running 10), (& $running 10))
+    $settled = Get-SettledServiceState -Name 'X' -StableSeconds 0 -Observe $scriptedObserve
+    if ($settled -cne 'Running') { throw "settled: Pending then steady Running read '$settled'" }
+    Pass 'settled: Pending then Running is a steady Running'
+    $script:scripted = @((& $running 10), (& $running 11))
+    $settled = Get-SettledServiceState -Name 'X' -StableSeconds 0 -Observe $scriptedObserve
+    if ($settled -notmatch '^Running; unstable: X restarted within 0 s \(process 10 became 11\)') { throw "settled: a restart read '$settled'" }
+    Pass 'settled: two process ids read as unstable'
+
+    # What a transaction did to the services (PR 1634), over synthetic records. The first is the
+    # upgrade from 0.3.0 that CI ran: FastCached Auto and running as 9268 before it, stopped one second
+    # in, started again at 12:12:47 after the table had made it manual, and terminated three times
+    # before msiexec returned. Every other row is one witness alone, or one thing that must NOT count.
+    $t0 = [DateTime]::new(2026, 10, 6, 12, 12, 14, [DateTimeKind]::Utc)
+    $termination = { param([int] $id, [int] $second, [string] $service)
+        [pscustomobject]@{ Id = $id; Time = $t0.AddSeconds($second); Service = $service; State = ''; Message = "The $service service terminated unexpectedly. It has done this 1 time(s)." } }
+    $entered = { param([int] $second, [string] $service, [string] $state)
+        [pscustomobject]@{ Id = 7036; Time = $t0.AddSeconds($second); Service = $service; State = $state; Message = "The $service service entered the $($state.ToLower()) state." } }
+    $sighting = { param([string] $service, [int] $processId, [int] $second, [string] $state = 'Running')
+        [pscustomobject]@{ Time = $t0.AddSeconds($second); Service = $service; State = $state; ProcessId = $processId } }
+    $upgradeFrom030 = @{
+        Events = @((& $termination 7031 34 'FastCached'), (& $termination 7031 36 'FastCached'), (& $termination 7031 38 'FastCached'),
+            (& $entered 33 'FastCached' 'Running'), (& $entered 30 'FastCacheCompileNode' 'Running'))
+        Observed = @((& $sighting 'FastCached' 9268 0 'Stop Pending'), (& $sighting 'FastCacheCompileNode' 8392 30), (& $sighting 'FastCached' 5120 33))
+        Baseline = @{ FastCached = 9268; FastCacheCompileNode = 0 }
+    }
+    $none = @{ Events = @(); Observed = @(); Baseline = @{} }
+    $transactionVerdicts = @(
+        @{ Case = 'the upgrade from 0.3.0 that CI ran: three terminations and a start seen by both start witnesses'; Input = $upgradeFrom030; NotRunning = @('FastCached')
+           Match = @("^Termination: FastCached terminated unexpectedly during 'T': event 7031 at 2026-10-06T12:12:48\.000Z: The FastCached service terminated unexpectedly",
+                     '^Termination: .*event 7031 at 2026-10-06T12:12:50\.000Z', '^Termination: .*event 7031 at 2026-10-06T12:12:52\.000Z',
+                     "^Start: FastCached, which the expectation leaves not running, was started during 'T': event 7036 at 2026-10-06T12:12:47\.000Z: The FastCached service entered the running state\.$",
+                     "^Start: FastCached, which the expectation leaves not running, was started during 'T': process 5120 seen Running at 2026-10-06T12:12:47\.000Z, 1 time\(s\); it ran as process 9268 when the transaction began$") }
+        @{ Case = 'a termination alone, with no start seen'; NotRunning = @()
+           Input = @{ Events = @(& $termination 7034 20 'FastCacheCompileNode'); Observed = @(); Baseline = @{} }
+           Match = @("^Termination: FastCacheCompileNode terminated unexpectedly during 'T': event 7034 at 2026-10-06T12:12:34\.000Z") }
+        @{ Case = 'a start seen by the watch alone, of a service that was not running'; NotRunning = @('FastCached')
+           Input = @{ Events = @(); Observed = @(& $sighting 'FastCached' 5120 33); Baseline = @{ FastCached = 0 } }
+           Match = @('^Start: .*process 5120 seen Running at 2026-10-06T12:12:47\.000Z, 1 time\(s\); it was not running when the transaction began$') }
+        @{ Case = 'a start seen by 7036 alone, between two observations of the watch'; NotRunning = @('FastCached')
+           Input = @{ Events = @((& $entered 33 'FastCached' 'Running'), (& $entered 34 'FastCached' 'Stopped')); Observed = @(); Baseline = @{ FastCached = 0 } }
+           Match = @('^Start: FastCached, .*event 7036 at 2026-10-06T12:12:47\.000Z', '^Start: FastCached, .*event 7036 \(stopped\) at 2026-10-06T12:12:48\.000Z, a stop of a service that was not running') }
+        @{ Case = 'a stop (7036 stopped) of the process a service ran under when it began is not a start'; NotRunning = @('FastCached')
+           Input = @{ Events = @(& $entered 1 'FastCached' 'Stopped'); Observed = @(); Baseline = @{ FastCached = 9268 } }
+           Match = @() }
+        @{ Case = 'a start that never reached RUNNING, of a service that was not running, is seen by its stop'; NotRunning = @('FastCached')
+           Input = @{ Events = @(& $entered 34 'FastCached' 'Stopped'); Observed = @(); Baseline = @{ FastCached = 0 } }
+           Match = @('^Start: FastCached, which the expectation leaves not running, was started during ''T'': event 7036 \(stopped\) at 2026-10-06T12:12:48\.000Z, a stop of a service that was not running when the transaction began, follows a start') }
+        @{ Case = 'PR 1634''s stray starts, which logged four stops and no running: every stop past the first is a start'; NotRunning = @('FastCached')
+           Input = @{ Events = @((& $entered 1 'FastCached' 'Stopped'), (& $entered 34 'FastCached' 'Stopped'), (& $entered 36 'FastCached' 'Stopped'), (& $entered 38 'FastCached' 'Stopped'))
+                      Observed = @(); Baseline = @{ FastCached = 9268 } }
+           Match = @('^Start: .*event 7036 \(stopped\) at 2026-10-06T12:12:48\.000Z, a stop past the one of process 9268', '^Start: .*event 7036 \(stopped\) at 2026-10-06T12:12:50\.000Z', '^Start: .*event 7036 \(stopped\) at 2026-10-06T12:12:52\.000Z') }
+        @{ Case = 'one stray process seen twice is one finding'; NotRunning = @('FastCached')
+           Input = @{ Events = @(); Observed = @((& $sighting 'FastCached' 5120 33), (& $sighting 'FastCached' 5120 34)); Baseline = @{ FastCached = 0 } }
+           Match = @('process 5120 seen Running at 2026-10-06T12:12:47\.000Z, 2 time\(s\)') }
+        @{ Case = 'the process a service ran under when it began is not a start'; NotRunning = @('FastCached')
+           Input = @{ Events = @(); Observed = @((& $sighting 'FastCached' 9268 0), (& $sighting 'FastCached' 9268 1 'Stop Pending')); Baseline = @{ FastCached = 9268 } }
+           Match = @() }
+        @{ Case = 'a service the expectation leaves running may be started'; NotRunning = @('FastCached')
+           Input = @{ Events = @(& $entered 30 'FastCacheCompileNode' 'Running'); Observed = @(& $sighting 'FastCacheCompileNode' 8392 30); Baseline = @{ FastCacheCompileNode = 0 } }
+           Match = @() }
+        @{ Case = 'a termination before the transaction began is not its'; NotRunning = @()
+           Input = @{ Events = @(& $termination 7031 -5 'FastCached'); Observed = @(); Baseline = @{} }
+           Match = @() }
+        @{ Case = "another service's termination is not this package's"; NotRunning = @()
+           Input = @{ Events = @(& $termination 7034 5 'sshd'); Observed = @(); Baseline = @{} }
+           Match = @() }
+        @{ Case = 'a termination the expectation allows is not a finding, and the other service''s still is'; NotRunning = @(); MayTerminate = @('FastCacheCompileNode')
+           Input = @{ Events = @((& $termination 7034 20 'FastCacheCompileNode'), (& $termination 7031 21 'FastCached')); Observed = @(); Baseline = @{} }
+           Match = @("^Termination: FastCached terminated unexpectedly during 'T': event 7031 at 2026-10-06T12:12:35\.000Z") }
+    )
+    foreach ($row in $transactionVerdicts) {
+        $may = if ($row.ContainsKey('MayTerminate')) { $row.MayTerminate } else { @() }
+        $findings = @(Get-TransactionServiceVerdict -What 'T' -StartedUtc $t0 -Events $row.Input.Events -Observed $row.Input.Observed `
+                -Baseline $row.Input.Baseline -NotRunning $row.NotRunning -MayTerminate $may | ForEach-Object { "$($_.Kind): $($_.Text)" })
+        if ($findings.Count -ne $row.Match.Count) { throw "transaction: $($row.Case): expected $($row.Match.Count) finding(s), got [$($findings -join '; ')]" }
+        foreach ($at in @(0..($findings.Count - 1) | Where-Object { $findings.Count -gt 0 })) {
+            if ($findings[$at] -notmatch $row.Match[$at]) { throw "transaction: $($row.Case): finding $at '$($findings[$at])' does not match '$($row.Match[$at])'" }
+        }
+        Pass "transaction: $($row.Case)"
+    }
+
+    # What each row makes an expectation of: the services it leaves NOT RUNNING (stopped, or not
+    # registered) are watched for a start, and the node's start is the 7036 control where it runs.
+    $wantNotRunning = @{
+        Release030WithNode = 'FastCacheCompileNode'; NodeSelected = 'FastCached'; NodeAlone = 'FastCached'
+        DaemonAlone = 'FastCacheCompileNode'; DaemonAloneUnstarted = 'FastCacheCompileNode,FastCached'; NothingInstalled = 'FastCacheCompileNode,FastCached'
+    }
+    foreach ($rowName in $script:ServiceTable.Keys) {
+        $expectation = Get-TransactionExpectation -Leaves $rowName
+        $notRunning = @($expectation.NotRunning | Sort-Object) -join ','
+        $want = @($wantNotRunning[$rowName] -split ',' | Sort-Object) -join ','
+        $nodeStarts = $rowName -in 'NodeSelected', 'NodeAlone'
+        if ($notRunning -cne $want -or $expectation.NodeStarts -ne $nodeStarts -or @($expectation.MayTerminate).Count -ne 0 -or $expectation.Name -cne "row $rowName") {
+            throw "expectation: row $rowName leaves [$notRunning] not running, node starts $($expectation.NodeStarts); expected [$want], $nodeStarts"
+        }
+    }
+    Pass 'expectation: each row watches what it leaves not running, and the node start is the control only where the node runs'
+    foreach ($name in $script:TransactionExpectations.Keys) {
+        $expectation = Get-TransactionExpectation -Expect $name
+        if (@($expectation.NotRunning).Count -ne 0 -or $expectation.NodeStarts -or -not $expectation.Reason -or $expectation.Name -cne "expectation $name" -or
+            $expectation.MustFail -isnot [bool] -or -not $expectation.MustFail) {
+            throw "expectation: $name read as $($expectation | ConvertTo-Json -Compress)"
+        }
+    }
+    if ((@((Get-TransactionExpectation -Expect NodeCannotBind).MayTerminate) -join ',') -cne 'FastCacheCompileNode' -or @((Get-TransactionExpectation -Expect RollsBack).MayTerminate).Count -ne 0) {
+        throw 'expectation: only NodeCannotBind allows a termination, and only the node''s'
+    }
+    Pass 'expectation: each named expectation carries its reason, must fail, judges no start, and only NodeCannotBind allows a termination'
+    ExpectThrow 'expectation: naming neither is refused' { Get-TransactionExpectation } 'judges every transaction: name the service table row it -Leaves'
+    ExpectThrow 'expectation: naming both is refused' { Get-TransactionExpectation -Leaves NodeSelected -Expect RollsBack } 'judges every transaction'
+    ExpectThrow 'expectation: an unknown row is refused by name' { Get-TransactionExpectation -Leaves NoSuchRow } "no service table row 'NoSuchRow'"
+    ExpectThrow 'expectation: an unknown expectation is refused by name' { Get-TransactionExpectation -Expect NoSuchExpectation } "no transaction expectation 'NoSuchExpectation'"
+    # And Invoke-Msiexec itself: a call naming neither is refused BEFORE anything runs, which the
+    # start seam records: a refusal moved after the start would still throw the same message, after a
+    # harmless pwsh here and after msiexec in production.
+    $script:SelfTestStarts = 0
+    $harmless = { param($arguments) $script:SelfTestStarts++
+        Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-Command', 'exit 0' -PassThru -NoNewWindow }
+    $nowhere = Join-Path ([IO.Path]::GetTempPath()) "no-such-$([guid]::NewGuid().ToString('N')).msi"
+    ExpectThrow 'expectation: Invoke-Msiexec naming neither refuses before running anything' {
+        Invoke-Msiexec -Operation '/i' -Package $nowhere -Log 'unused.log' -What 'W' -Start $harmless 6>$null
+    } 'judges every transaction'
+    if ($script:SelfTestStarts -ne 0) { throw "expectation: Invoke-Msiexec naming neither STARTED $script:SelfTestStarts process(es) before refusing" }
+    Pass 'expectation: and its refusal comes before the start'
+
+    # The 7036 witness's positive control: the node's own start, in every state.
+    foreach ($row in @(
+            @{ Case = 'the node''s start logged'; Events = @(& $entered 30 'FastCacheCompileNode' 'Running'); NodeStarts = $true; Want = 'live' }
+            @{ Case = 'the node started and no 7036 at all was read'; Events = @(); NodeStarts = $true; Want = 'not seen' }
+            @{ Case = 'the node started and only another service''s 7036 was read'; Events = @(& $entered 30 'FastCached' 'Running'); NodeStarts = $true; Want = 'unmatched' }
+            @{ Case = 'a node start BEFORE the transaction is not its control'; Events = @(& $entered -3 'FastCacheCompileNode' 'Running'); NodeStarts = $true; Want = 'not seen' }
+            @{ Case = 'no node start in the transaction'; Events = @(& $entered 30 'FastCacheCompileNode' 'Running'); NodeStarts = $false; Want = 'no control' })) {
+        $state = Get-Witness7036State -Events $row.Events -StartedUtc $t0 -NodeStarts $row.NodeStarts
+        if ($state -cne $row.Want) { throw "7036 control: $($row.Case) read '$state', expected '$($row.Want)'" }
+        Pass "7036 control: $($row.Case) is '$($row.Want)'"
+    }
+
+    # The event reader's parse, over every shape it reads: the binary data carries the SERVICE name
+    # (this one copied from a real 7031 event), a 7045 a ServiceName item, param1 the display name, and
+    # a 7036 its state in param2.
+    $eventXml = { param([int] $id, [string] $stamp, [hashtable] $items, [string] $binaryHex)
+        $binary = if ($binaryHex) { "<Binary>$binaryHex</Binary>" } else { '' }
+        $data = @(foreach ($key in @($items.Keys | Sort-Object)) { "<Data Name='$key'>$($items[$key])</Data>" }) -join ''
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Service Control Manager'/><EventID Qualifiers='49152'>$id</EventID><TimeCreated SystemTime='$stamp'/></System><EventData>$data$binary</EventData></Event>" }
+    $hexOf = { param([string] $text) (([Text.Encoding]::Unicode.GetBytes("$text$([char] 0)")) | ForEach-Object { $_.ToString('X2') }) -join '' }
+    $realBinary = '46006100730074004300610063006800650043006F006D00700069006C0065004E006F00640065000000'
+    $parses = @(
+        @{ Case = 'the service name is read from the binary data, the time in UTC'
+           Xml = (& $eventXml 7031 '2026-10-06T12:12:48.1234567Z' @{ param1 = 'fastcache-compile-node'; param2 = '1' } $realBinary); Message = "The node`r`n terminated."
+           Id = 7031; Service = 'FastCacheCompileNode'; State = ''; Text = 'The node terminated.'; Time = [DateTime]::new(2026, 10, 6, 12, 12, 48, [DateTimeKind]::Utc).AddTicks(1234567) }
+        @{ Case = "with no binary data, this package's display name reads as its service name"
+           Xml = (& $eventXml 7034 '2026-10-06T12:12:48Z' @{ param1 = 'fastcached'; param2 = '1' } ''); Message = 'm'
+           Id = 7034; Service = 'FastCached'; State = ''; Text = 'm'; Time = [DateTime]::new(2026, 10, 6, 12, 12, 48, [DateTimeKind]::Utc) }
+        @{ Case = 'another service keeps its own name'
+           Xml = (& $eventXml 7034 '2026-10-06T12:12:48Z' @{ param1 = 'OpenSSH SSH Server'; param2 = '1' } (& $hexOf 'sshd')); Message = 'm'
+           Id = 7034; Service = 'sshd'; State = ''; Text = 'm'; Time = [DateTime]::new(2026, 10, 6, 12, 12, 48, [DateTimeKind]::Utc) }
+        @{ Case = 'a 7045 names its service in a ServiceName item, with no param1 and no binary data'
+           Xml = (& $eventXml 7045 '2026-10-01T08:00:00Z' @{ ServiceName = 'cowork-svc'; ImagePath = 'C:\x.exe'; ServiceType = 'user mode service'; StartType = 'auto start'; AccountName = 'LocalSystem' } ''); Message = 'A service was installed in the system.'
+           Id = 7045; Service = 'cowork-svc'; State = ''; Text = 'A service was installed in the system.'; Time = [DateTime]::new(2026, 10, 1, 8, 0, 0, [DateTimeKind]::Utc) }
+        @{ Case = 'a 7036 reads its state from param2 and its service from the display name'
+           Xml = (& $eventXml 7036 '2026-10-06T12:13:23Z' @{ param1 = 'FastCached'; param2 = 'running' } ''); Message = 'The FastCached service entered the running state.'
+           Id = 7036; Service = 'FastCached'; State = 'Running'; Text = 'The FastCached service entered the running state.'; Time = [DateTime]::new(2026, 10, 6, 12, 13, 23, [DateTimeKind]::Utc) }
+        @{ Case = 'a 7036 whose binary data reads <name>/<code> and whose param2 says nothing'
+           Xml = (& $eventXml 7036 '2026-10-06T12:13:24Z' @{ param1 = 'fastcache-compile-node'; param2 = '' } (& $hexOf 'FastCacheCompileNode/1')); Message = 'm'
+           Id = 7036; Service = 'FastCacheCompileNode'; State = 'Stopped'; Text = 'm'; Time = [DateTime]::new(2026, 10, 6, 12, 13, 24, [DateTimeKind]::Utc) }
+    )
+    foreach ($row in $parses) {
+        $parsed = ConvertTo-ServiceControlEvent $row.Xml $row.Message
+        if ($parsed.Id -ne $row.Id -or $parsed.Service -cne $row.Service -or $parsed.State -cne $row.State -or $parsed.Message -cne $row.Text -or
+            $parsed.Time -ne $row.Time -or $parsed.Time.Kind -ne 'Utc') {
+            throw "event: $($row.Case): parsed as $($parsed | ConvertTo-Json -Compress)"
+        }
+        Pass "event: $($row.Case)"
+    }
+
+    # The reader against the real System log: nothing since tomorrow is an empty answer, not an error,
+    # and the positive control that keeps that empty answer honest: the same filter, over ids a host
+    # running for any time has some of, finds one. It asserts the FILTER only -- what the parse makes
+    # of whichever event is newest is the cases above, so an install (7045) arriving last is no red.
+    $nothing = @(Get-ServiceControlEvents -SinceUtc ([DateTime]::UtcNow.AddDays(1)))
+    if ($nothing.Count -ne 0) { throw "live events: $($nothing.Count) event(s) since tomorrow" }
+    Pass 'live events: no event since the future is an empty answer'
+    $common = @(7000, 7009, 7011, 7023, 7024, 7026, 7031, 7034, 7036, 7040, 7043, 7045)
+    $some = @(Get-ServiceControlEvents -SinceUtc ([DateTime]::UtcNow.AddDays(-365)) -Ids $common -MaxEvents 1)
+    if ($some.Count -ne 1 -or $some[0].Id -notin $common -or $some[0].Time.Kind -ne 'Utc') {
+        throw "live events: the service control manager filter found $($some.Count) event(s) of ids $($common -join ', ') in a year, so an empty answer from it cannot be believed"
+    }
+    Pass "live events: the filter finds a service control manager event ($($some[0].Id))"
+
+    # The judgement WIRED: the recorded transaction, its expectation, the event seam, and the message
+    # per finding KIND.
+    $record = { param([string] $leaves, [string] $expect, [int] $polls, [int] $failed, $observed)
+        [pscustomobject]@{ What = 'the upgrade from v0.3.0'; Log = ''; StartedUtc = $t0; Baseline = $upgradeFrom030.Baseline
+            Expectation = (Get-TransactionExpectation -Leaves $leaves -Expect $expect); Polls = $polls; FailedPolls = $failed
+            FirstFailure = $(if ($failed) { 'FastCached: Invalid class' } else { '' }); Observed = $observed
+            EndedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp() - 60 * [Diagnostics.Stopwatch]::Frequency; Extended = $false } }
+    $savedLatch = $script:Witness7036LiveSince
+    ExpectThrow 'judgement: a watch that never looked is refused, naming its failed rounds' {
+        Invoke-TransactionJudgement -Transaction (& $record 'NodeSelected' '' 0 3 @()) -ReadEvents { @() }
+    } "were never observed .*\(3 observation round\(s\) failed, first: FastCached: Invalid class\)"
+    $read = $upgradeFrom030.Events
+    ExpectThrow 'judgement: the upgrade from 0.3.0 is refused with each finding and both kinds'' remedies' {
+        Invoke-TransactionJudgement -Transaction (& $record 'NodeSelected' '' 120 0 $upgradeFrom030.Observed) `
+            -ReadEvents { param($since) if ($since -ne $t0) { throw "read from $since" }; $read } 6>$null
+    } "disturbed a service the table owns \(row NodeSelected\)(.|\n)*event 7031 at 2026-10-06T12:12:48(.|\n)*process 5120(.|\n)*a TERMINATION is the service failing(.|\n)*Restart Manager \(PR 1634\)"
+    try {
+        Invoke-TransactionJudgement -Transaction (& $record 'NodeSelected' '' 5 0 @()) -ReadEvents { @(& $termination 7034 20 'FastCacheCompileNode') } 6>$null
+        throw 'judgement: a termination alone was not refused'
+    } catch {
+        if ($_.Exception.Message -notmatch 'a TERMINATION is the service failing' -or $_.Exception.Message -match 'Restart Manager') {
+            throw "judgement: a termination alone was refused as '$($_.Exception.Message)'"
+        }
+    }
+    Pass 'judgement: a termination alone names no Restart Manager cause'
+
+    # A refusal SHOWS the transaction's log: what Show-MsiLog prints reaches the host even from inside
+    # a judgement whose output its caller captures and whose throw discards that output (PR 1634's CI
+    # printed three empty sections that way), and every RESTART MANAGER line and the actions around
+    # each finding follow it. The log is UTF-16, and its stamps are the findings' instants on this
+    # host's local clock, as Windows Installer writes them.
+    $stamp = { param([int] $second) $t0.AddSeconds($second).ToLocalTime().ToString('HH:mm:ss:fff', [Globalization.CultureInfo]::InvariantCulture) }
+    $judgedLog = Join-Path ([IO.Path]::GetTempPath()) ('msi-service-table-' + [guid]::NewGuid().ToString('N') + '.log')
+    Set-Content -LiteralPath $judgedLog -Encoding Unicode -Value @(
+        "MSI (s) (D8:0C) [$(& $stamp 0)]: RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property; Windows Installer will use the built-in FilesInUse functionality.",
+        "MSI (s) (D8:AC) [$(& $stamp 1)]: RESTART MANAGER: Session opened.",
+        "MSI (s) (D8:AC) [$(& $stamp 1)]: RESTART MANAGER: Will attempt to shut down and restart applications in no UI modes.",
+        "MSI (c) (80:EC) [$(& $stamp 1)]: RESTART MANAGER: Session opened.",
+        "MSI (s) (D8:AC) [$(& $stamp 2)]: RESTART MANAGER: Shut down the nested session's applications.",
+        "MSI (s) (D8:AC) [$(& $stamp 32)]: Doing action: FastCacheNodeStartService",
+        "MSI (s) (D8:AC) [$(& $stamp 33)]: RESTART MANAGER: Restarted FastCached.",
+        "MSI (s) (D8:AC) [$(& $stamp 38)]: Product: fastcached -- Installation completed successfully.")
+    try {
+        $judged = & $record 'NodeSelected' '' 5 0 @()
+        $judged.Log = $judgedLog
+        # Invoke-Msiexec's own shape: the judgement's output captured as Write-Host's argument.
+        $shown = @(& {
+                try { Write-Host (Invoke-TransactionJudgement -Transaction $judged -ReadEvents { @(& $termination 7031 34 'FastCached') }) } catch { 'refused' }
+            } 6>&1 | ForEach-Object { "$_" })
+        if ($shown -notcontains 'refused') { throw "log on refusal: the judgement did not refuse ($($shown.Count) line(s))" }
+        $text = $shown -join "`n"
+        foreach ($want in @('--- the tail ---\n(MSI [^\n]*\n)*MSI [^\n]*Doing action: FastCacheNodeStartService\n', 'RESTART MANAGER: Shut down the nested session''s applications',
+                '--- the actions from 10 s before to 5 s after each finding .*---\n.*Doing action: FastCacheNodeStartService\n.*RESTART MANAGER: Restarted FastCached\.\n.*Product: fastcached -- Installation completed successfully\.')) {
+            if ($text -notmatch $want) { throw "log on refusal: nothing shown matches '$want' in:`n$text" }
+        }
+        if (@(Show-MsiLog $judgedLog 6>$null).Count -ne 0) { throw 'log on refusal: Show-MsiLog wrote to the output stream' }
+        Pass 'log on refusal: the log reaches the host from inside a captured judgement, with every RESTART MANAGER line and the actions around each finding'
+    } finally {
+        Remove-Item -LiteralPath $judgedLog -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($row in @(
+            @{ Case = 'a rollback names its expectation and its reason, and judges no start'; Leaves = ''; Expect = 'RollsBack'; Events = @(); Failed = 0
+               Match = "against expectation RollsBack -- the transaction fails on purpose.*no start judged; 7036 unchecked" }
+            @{ Case = 'the node started with no 7036 read is named NOT SEEN, naming both causes'; Leaves = 'NodeSelected'; Expect = ''; Events = @(); Failed = 0
+               Match = 'judged at msiexec''s exit against row NodeSelected: no unexpected termination, no start of FastCached; 7036 NOT SEEN: .*either this host writes none or the reader fails' }
+            @{ Case = 'the node''s logged start makes 7036 live'; Leaves = 'NodeSelected'; Expect = ''; Events = @(& $entered 30 'FastCacheCompileNode' 'Running'); Failed = 0
+               Match = '7036 live' }
+            @{ Case = 'failed observation rounds are named'; Leaves = 'NodeAlone'; Expect = ''; Events = @(); Failed = 2
+               Match = '5 observation round\(s\); 2 observation round\(s\) FAILED, first: FastCached: Invalid class$' })) {
+        $events = $row.Events
+        $script:Witness7036LiveSince = ''
+        $line = Invoke-TransactionJudgement -Transaction (& $record $row.Leaves $row.Expect 5 $row.Failed @()) -ReadEvents { $events }
+        if ($line -notmatch $row.Match) { throw "judgement: $($row.Case): '$line' does not match '$($row.Match)'" }
+        Pass "judgement: $($row.Case)"
+    }
+
+    # The 7036 witness cannot die behind a green line: a node start whose 7036 the reader misses while
+    # it reads other services' is refused, and so is one that reads none at all once an earlier
+    # transaction of the process read the node's.
+    try {
+        $script:Witness7036LiveSince = ''
+        $others = @(& $entered 30 'msiserver' 'Running')
+        ExpectThrow 'judgement: a node start whose 7036 is missed while others are read is refused' {
+            Invoke-TransactionJudgement -Transaction (& $record 'NodeAlone' '' 5 0 @()) -ReadEvents { $others }
+        } 'none is the node entering the running state while others are(.|\n)*7036 witness is dead'
+        $nodeLogged = @(& $entered 30 'FastCacheCompileNode' 'Running')
+        $null = Invoke-TransactionJudgement -Transaction (& $record 'NodeAlone' '' 5 0 @()) -ReadEvents { $nodeLogged }
+        ExpectThrow 'judgement: once a node start read live, one that reads no 7036 is refused' {
+            Invoke-TransactionJudgement -Transaction (& $record 'NodeAlone' '' 5 0 @()) -ReadEvents { @() }
+        } "no 7036 was read, while 'the upgrade from v0.3.0' read the node's"
+    } finally {
+        $script:Witness7036LiveSince = $savedLatch
+    }
+
+    # Assert-ServiceTable judges the last transaction ONCE more, over its own longer window.
+    $saved = $script:LastMsiTransaction
+    try {
+        $script:LastMsiTransaction = & $record 'NothingInstalled' '' 5 0 @()
+        $late = @(& $termination 7031 60 'FastCached')
+        ExpectThrow 'judgement: Assert-ServiceTable judges the transaction again, over the longer window' {
+            Assert-ServiceTable -Row NothingInstalled -StableSeconds 0 -TimeoutSeconds 1 -Observe { param($name) $null } -ReadEvents { $late } 6>$null
+        } 'disturbed a service the table owns \(row NothingInstalled\)(.|\n)*event 7031 at 2026-10-06T12:13:14'
+        Assert-ServiceTable -Row NothingInstalled -StableSeconds 0 -TimeoutSeconds 1 -Observe { param($name) $null } -ReadEvents { $late } 6>$null
+        if (-not $script:LastMsiTransaction.Extended) { throw 'judgement: the transaction is not marked judged' }
+        Pass 'judgement: once judged over the longer window, a transaction is not judged again'
+    } finally {
+        $script:LastMsiTransaction = $saved
+    }
+
+    # The second judgement for a transaction no row assertion follows (I-A): a failed upgrade's rollback
+    # restarts fastcached with an unwaited `sc.exe start`, and a restore that cannot serve crashes after
+    # msiexec exits. Judged at the exit it passes; settled, its late 7031 is refused.
+    $saved = $script:LastMsiTransaction
+    try {
+        $failed = & $record '' 'RollsBack' 5 0 @()
+        $failed.EndedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
+        $script:LastMsiTransaction = $failed
+        $late = @(& $termination 7031 60 'FastCached')
+        $atExit = Invoke-TransactionJudgement -Transaction $failed -ReadEvents { @() }
+        if ($atExit -notmatch 'judged at msiexec''s exit against expectation RollsBack') { throw "settle: the exit judgement read '$atExit'" }
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        ExpectThrow 'settle: a rollback restart that crashes after the exit passes the exit judgement and is refused settled' {
+            Assert-TransactionSettled -SettleSeconds 1 -ReadEvents { $late } 6>$null
+        } 'disturbed a service the table owns \(expectation RollsBack\)(.|\n)*event 7031 at 2026-10-06T12:13:14'
+        if ($clock.Elapsed.TotalMilliseconds -lt 900) { throw "settle: the second judgement read after $($clock.Elapsed.TotalMilliseconds) ms, before the window reached 1 s past the exit" }
+        Pass "settle: and it waited until the window reached past the exit ($([int] $clock.Elapsed.TotalMilliseconds) ms)"
+        # Self-enforcing: the next transaction refuses to BEGIN while the previous one has not settled,
+        # before anything is started.
+        $failed.Extended = $false
+        $script:SelfTestStarts = 0
+        ExpectThrow 'settle: Invoke-Msiexec refuses to begin while the previous transaction is unsettled' {
+            Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $nowhere -Log 'unused.log' -What 'the next one' -Start $harmless 6>$null
+        } "'the upgrade from v0.3.0' was judged only at msiexec's exit, and 'the next one' would begin before it settled"
+        if ($script:SelfTestStarts -ne 0) { throw "settle: the refused transaction STARTED $script:SelfTestStarts process(es)" }
+        Pass 'settle: and its refusal comes before the start'
+        $script:LastMsiTransaction = $null
+        # A named expectation is bound to its outcome: a transaction stating RollsBack that returns 0
+        # is refused, through the start seam, before any Restart Manager or service judgement.
+        ExpectThrow 'expectation: a transaction naming a failing expectation that returns 0 is refused' {
+            Invoke-Msiexec -Expect RollsBack -Operation '/i' -Package $nowhere -Log (Join-Path ([IO.Path]::GetTempPath()) 'unused.log') -What 'a rollback that succeeded' -Start $harmless 6>$null
+        } "'a rollback that succeeded' states expectation RollsBack, which is for a transaction that FAILS and rolls back, and it returned 0"
+        if ($script:SelfTestStarts -ne 1) { throw "expectation: the failing-expectation case started $script:SelfTestStarts process(es), expected 1" }
+    } finally {
+        $script:LastMsiTransaction = $saved
+    }
+
+    # The Restart Manager promise: a package that disables it must log that it was disabled, with the
+    # line PR 1634's runner wrote; this build's package must disable it; a RELEASED package that does not
+    # promise it (0.3.0) is not judged.
+    $disabledLog = @('MSI (s) (D8:0C) [13:31:45:209]: RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property; Windows Installer will use the built-in FilesInUse functionality.')
+    $openedLog = @('MSI (s) (D8:8C) [13:31:14:256]: RESTART MANAGER: Session opened.')
+    foreach ($row in @(
+            @{ Case = 'a disabling package that logged it'; Disables = 'Disable'; Lines = $disabledLog; Released = $false; Refused = 'no' }
+            @{ Case = 'a disabling package whose log shows a session instead'; Disables = 'Disable'; Lines = $openedLog; Released = $false; Refused = 'never says' }
+            @{ Case = 'a disabling package with no log at all'; Disables = 'Disable'; Lines = @(); Released = $false; Refused = 'never says' }
+            @{ Case = 'a RELEASED disabling package whose log shows a session instead'; Disables = 'Disable'; Lines = $openedLog; Released = $true; Refused = 'never says' }
+            @{ Case = 'a released package without the property (0.3.0)'; Disables = $null; Lines = $openedLog; Released = $true; Refused = 'no' }
+            @{ Case = 'a released package with another value'; Disables = 'DisableShutdown'; Lines = $openedLog; Released = $true; Refused = 'no' }
+            @{ Case = 'this build''s package without the property'; Disables = $null; Lines = $openedLog; Released = $false; Refused = 'lost' }
+            @{ Case = 'this build''s package with another value'; Disables = 'DisableShutdown'; Lines = $disabledLog; Released = $false; Refused = 'lost' })) {
+        $verdict = Get-RestartManagerLogVerdict -What 'T' -Disables $row.Disables -Lines $row.Lines -Released $row.Released
+        $want = switch ($row.Refused) {
+            'no' { $null }
+            'never says' { "^'T': the package sets MSIRESTARTMANAGERCONTROL=Disable and its verbose log never says" }
+            'lost' { "^'T': this build's package sets MSIRESTARTMANAGERCONTROL to '[^']*', not 'Disable': the built MSI lost the row" } }
+        if (($null -ne $verdict) -ne ($null -ne $want) -or ($null -ne $want -and $verdict -notmatch $want)) {
+            throw "restart manager promise: $($row.Case) read '$verdict'"
+        }
+        Pass "restart manager promise: $($row.Case) $(if ($null -ne $want) { 'is refused' } else { 'passes' })"
+    }
+
+    # The watch over a real process: it observes until the process exits, keeps only a service seen
+    # running under a process, and leaves the exit code readable through the handle taken first --
+    # the shape Invoke-Msiexec starts msiexec in. Observed through the seam: no service here is ours.
+    $startProbe = {
+        $process = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Milliseconds 1500; exit 3' -PassThru -NoNewWindow
+        $null = $process.Handle
+        $process }
+    $probe = & $startProbe
+    $watched = Watch-ServiceProcesses -Process $probe -IntervalMilliseconds 100 -Observe {
+        param($name) if ($name -eq 'FastCached') { [pscustomobject]@{ StartMode = 'Manual'; State = 'Running'; ProcessId = 77 } } else { $null } }
+    if ($watched.Polls -lt 1 -or $watched.FailedPolls -ne 0 -or @($watched.Observed).Count -ne $watched.Polls -or
+        @($watched.Observed | Where-Object { $_.Service -ne 'FastCached' -or $_.ProcessId -ne 77 }).Count -ne 0) {
+        throw "watch: $($watched.Polls) poll(s) observed [$(@($watched.Observed | ForEach-Object { "$($_.Service) $($_.ProcessId)" }) -join '; ')]"
+    }
+    if ($probe.ExitCode -ne 3) { throw "watch: the watched process's exit code read '$($probe.ExitCode)', expected 3" }
+    Pass "watch: $($watched.Polls) observation(s) until the process exited, its exit code readable"
+    # An observation that FAILS is counted, the watch goes on, and the process is still waited for.
+    $probe = & $startProbe
+    $script:failuresLeft = 2
+    $watched = Watch-ServiceProcesses -Process $probe -IntervalMilliseconds 100 -Observe {
+        param($name) if ($script:failuresLeft -gt 0) { $script:failuresLeft--; throw 'Invalid class' }; $null }
+    if ($watched.FailedPolls -lt 1 -or $watched.Polls -lt 1 -or $watched.FirstFailure -notmatch '^FastCached(CompileNode)?: Invalid class$' -or -not $probe.HasExited) {
+        throw "watch: a failing observation read as $($watched.Polls) round(s), $($watched.FailedPolls) failed ('$($watched.FirstFailure)'), exited $($probe.HasExited)"
+    }
+    Pass "watch: a failed observation is counted ($($watched.FailedPolls) round(s)) and the watch goes on to the process's exit"
+
+    $expectedCases = 171
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -1314,11 +2764,15 @@ function Invoke-MsiServiceTableSelfTest {
 }
 
 Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert-ServiceState, Assert-ServiceTable,
-    Get-MsiProperty, Get-InstalledProductCodes, Assert-InstalledProduct, Show-MsiLog, Invoke-Msiexec, Assert-MsiLog,
+    Get-MsiProperty, Get-MsiCustomActionType, Get-InstalledProductCodes, Assert-InstalledProduct, Show-MsiLog, Invoke-Msiexec, Assert-MsiLog,
+    Get-MsiRestartManagerLines, Show-MsiRestartManagerLines, Get-MsiLogTimeOfDay, Get-MsiLinesAround, Show-MsiLogAroundFindings,
     Get-MsiActionRanPattern, Get-ServiceStabilityVerdict, Get-UpgradeVersionVerdict, Remove-FastCacheMachineState,
     Assert-NodeStatePrivate, Get-NodeServiceAccessVerdict, Get-DirectoryOwnerVerdict, Get-NodeFirewallVerdict, Assert-NodeFirewall,
     Get-NodeFirewallScopeVerdict, Assert-NodeFirewallScope, Get-NodeRegistrationArgumentVerdict,
     Assert-NodeRegistrationArgument, Get-MsiActionOrderVerdict, Assert-MsiActionOrder,
     Get-NodeRegistrationLacksVerdict, Assert-NodeRegistrationLacks, Get-FirewallGroupEmptyVerdict,
     Assert-FirewallGroupEmpty, Format-FirewallRuleLine, Get-FirewallGroupSnapshot, Get-FirewallGroupUnchangedVerdict,
-    Assert-FirewallGroupUnchanged, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Invoke-MsiServiceTableSelfTest
+    Assert-FirewallGroupUnchanged, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Get-InstallationSnapshot, Compare-InstallationSnapshot, New-MsiControlCopy,
+    Watch-ServiceProcesses, ConvertTo-ServiceControlEvent, Get-ServiceControlEvents, Get-TransactionExpectation,
+    Get-TransactionServiceVerdict, Get-Witness7036State, Assert-TransactionSettled, Get-RestartManagerLogVerdict,
+    Invoke-MsiServiceTableSelfTest

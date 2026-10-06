@@ -202,9 +202,9 @@ class FilePageStore final: public IPageStore
     /// so it exceeds this figure by exactly the free pages inside it. Three things keep
     /// that gap small: the free list's pages come out of the free pages rather than
     /// extending the file, `Allocate` takes the lowest free id so live pages collect at
-    /// the front, and each durable flush cuts the free tail. Both directions of the
+    /// the front, and each meta write cuts the free tail. Both directions of the
     /// relation: the file is NEVER shorter than the pages in use, and it may be LONGER by
-    /// its free pages -- those at the end until a flush cuts them, those in the interior
+    /// its free pages -- those at the end until a meta write cuts them, those in the interior
     /// until later writes reuse them. That is a batch of copy-on-write pages at steady
     /// state, and every page a large eviction freed in the middle of the file until churn
     /// migrates live data below them.
@@ -230,16 +230,18 @@ class FilePageStore final: public IPageStore
 
     /// Test helper: simulate a hard crash. Drops the OS handle WITHOUT
     /// flushing any buffered group-commit batch and suppresses the
-    /// destructor's graceful flush, so the unflushed window is discarded
-    /// exactly as it would be on power loss. The object must not be used
+    /// destructor's graceful flush and close-time restate, so the unflushed
+    /// window and the frees no durable list names yet are discarded
+    /// exactly as they would be on power loss. The object must not be used
     /// afterwards except to be destroyed.
     void SimulateCrashForTest() noexcept;
 
   private:
     /// Write the free list to DEDICATED pages and return the head.
     ///
-    /// Private: `freeRoot` is the STORE's business, and the flush is the only moment
-    /// at which a list is consistent with the meta that will name it.
+    /// Private: `freeRoot` is the STORE's business, and a meta write (`CommitMetaLocked`,
+    /// under every durability) is the only moment at which a list is consistent with the
+    /// meta that will name it.
     ///
     /// **The list's own pages come FROM `_freeList`, and the file is extended only for
     /// the shortfall** -- when `_freeList` holds fewer pages than the list needs to
@@ -253,7 +255,7 @@ class FilePageStore final: public IPageStore
     /// the meta about to be written, so neither recovery reads it and overwriting it
     /// damages nothing. Two kinds of page are NOT in `_freeList`, and both are refused
     /// for the same reason -- the last durable meta still needs them until the one this
-    /// flush writes is durable:
+    /// write makes is durable:
     ///
     /// - a **pending** free (`_pendingFree`): its freeing is not durable yet, and the
     ///   last durable meta's tree still references it;
@@ -262,10 +264,10 @@ class FilePageStore final: public IPageStore
     ///
     /// The list NAMES every page that is free in the new meta's world -- what stays in
     /// `_freeList`, the pending frees and the previous list's pages -- so a reopen
-    /// rebuilds exactly the free state this process holds once the flush lands, rather
+    /// rebuilds exactly the free state this process holds once the meta lands, rather
     /// than marking the last batch's frees live forever. Naming a page is not taking it.
     ///
-    /// On failure every member is as it was, so a retried flush starts from the same
+    /// On failure every member is as it was, so a retried write starts from the same
     /// state; a page the shortfall already extended is returned to `_freeList`.
     /// @return The head of the new chain, or `PageId::None()` when nothing is free.
     [[nodiscard]] auto WriteFreeListLocked() -> std::expected<PageId, CowTreeError>;
@@ -278,7 +280,7 @@ class FilePageStore final: public IPageStore
     /// @return The new page.
     [[nodiscard]] auto ExtendLocked() -> std::expected<PageId, CowTreeError>;
 
-    /// Cut the file back to its highest page that is not free, after a durable flush.
+    /// Cut the file back to its highest page that is not free, after a meta write landed.
     ///
     /// The truncatable tail is the run of highest ids that are in `_freeList` -- free in
     /// the meta just made durable AND in the one it superseded, which is the meta a
@@ -289,8 +291,8 @@ class FilePageStore final: public IPageStore
     /// the file for that reason, while a LINK past the end stays `Corrupt`, since no list
     /// page a surviving meta names is ever cut.
     ///
-    /// Not fatal when the length cannot be changed: the flush is already durable, the
-    /// pages stay in `_freeList`, and the next flush tries again.
+    /// Not fatal when the length cannot be changed: the meta is already durable, the
+    /// pages stay in `_freeList`, and the next meta write tries again.
     /// @return Empty when the file is as short as it can be; the I/O error otherwise.
     [[nodiscard]] auto TruncateFreeTailLocked() -> std::expected<void, CowTreeError>;
 
@@ -407,6 +409,9 @@ class FilePageStore final: public IPageStore
     /// of a freed page can be rejected, and counted for `PagesInUse()`.
     LivePages _live;
 
+    /// The last meta this store made durable, or recovered; restated by a clean close (F1).
+    std::optional<Meta> _lastDurableMeta;
+
     /// In-memory free list of recyclable page ids. Populated from the
     /// on-disk free-list chain on Open and updated on Free/Allocate.
     ///
@@ -418,15 +423,19 @@ class FilePageStore final: public IPageStore
 
     /// Pages holding the free list that the LAST DURABLE meta points at.
     ///
-    /// Kept so the next flush can free them once its own meta supersedes that one.
-    /// They must not be recycled before then: until the new meta is fsynced, the old
-    /// one is still the recoverable copy and its `freeRoot` still names these.
+    /// Kept so the next meta write can free them once its own meta supersedes that one.
+    /// They must not be recycled before then: until the new meta has landed -- and,
+    /// under a durability that syncs, been fsynced -- the old one is still the
+    /// recoverable copy and its `freeRoot` still names these.
     std::vector<std::uint64_t> _freeListPages;
 
-    /// Group-commit (Batched durability): pages freed since the last flush.
+    /// Pages whose freeing is not durable yet: under Batched, every page freed since
+    /// the last flush; under every durability, the previous list's pages once a new
+    /// list has been written (`WriteFreeListLocked`).
     /// They are NOT reusable yet — reusing a page before its freeing is
-    /// durable would let a crash-rollback (to the last flush) read a page that
-    /// a later in-batch write overwrote. On flush they graduate to `_freeList`.
+    /// durable would let a crash-rollback (to the last durable meta) read a page
+    /// that a later write overwrote. Once the next meta lands they graduate to
+    /// `_freeList` (`CommitMetaLocked`).
     std::vector<std::uint64_t> _pendingFree;
 
     /// Commits (meta writes) since the last Batched flush; drives the
@@ -440,10 +449,10 @@ class FilePageStore final: public IPageStore
     /// overwrite of the last durable meta slot.
     std::optional<Meta> _pendingMeta;
 
-    /// Slot currently holding the most recent fully-fsynced ("durable") meta.
-    /// The next Batched flush always writes to the *other* slot, so a torn
-    /// flush can never destroy the last durable meta. Initialised on
-    /// Bootstrap/Recover and advanced by `FlushBatchLocked`.
+    /// Slot currently holding the most recent durable meta (fully fsynced, under a
+    /// durability that syncs). The next meta write always goes to the *other*
+    /// slot, so a torn write can never destroy the last durable meta. Initialised
+    /// on Bootstrap/Recover and advanced by `CommitMetaLocked`.
     /// Atomic because `LastDurableSlot()` is `noexcept` on `IPageStore` and a
     /// `std::mutex::lock` can throw `std::system_error` -- which inside a
     /// `noexcept` function is `std::terminate`, not an error return. Every
@@ -466,8 +475,17 @@ class FilePageStore final: public IPageStore
     /// Flush the accumulated Batched writes after this many commits.
     static constexpr std::size_t BatchedFlushInterval = 64;
 
-    /// fsync + graduate pending frees. Caller must hold `_ioMutex`.
+    /// Make the buffered Batched meta durable through `CommitMetaLocked` and end the
+    /// batch. Caller must hold `_ioMutex`.
+    /// @return Empty on success, or with nothing buffered; the underlying I/O error otherwise.
     [[nodiscard]] auto FlushBatchLocked() -> std::expected<void, CowTreeError>;
+
+    /// Make @p meta durable, free list and all, under this store's durability: the one place a
+    /// meta reaches the disk. Stamps `freeRoot` and `dataPages`, writes the other slot, records
+    /// the result as `_lastDurableMeta` and graduates the pending frees. Caller must hold `_ioMutex`.
+    /// @param meta The meta to persist; its `freeRoot` and `dataPages` are overwritten.
+    /// @return Empty on success; the underlying I/O error otherwise.
+    [[nodiscard]] auto CommitMetaLocked(Meta meta) -> std::expected<void, CowTreeError>;
 
     /// Cached page buffer to satisfy the IPageStore lifetime contract on
     /// Read() — a returned BytesView must remain valid until the next
@@ -479,8 +497,11 @@ class FilePageStore final: public IPageStore
     std::size_t _fsyncCount { 0 };
 
     /// Set by `SimulateCrashForTest` so the destructor skips its graceful
-    /// flush (and avoids touching the already-closed handle).
+    /// flush and restate (and avoids touching the already-closed handle).
     bool _crashedForTest { false };
+
+    /// A page was freed since the last list this store made durable; a clean close persists it (F1).
+    bool _freeSetChanged { false };
 
     mutable std::mutex _ioMutex;
 };

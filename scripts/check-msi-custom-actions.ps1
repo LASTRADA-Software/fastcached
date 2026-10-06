@@ -41,7 +41,26 @@
 #      which runs in reverse, starts it only after InstallFiles' rollback restored the files. That
 #      holds for a maintenance transaction; in an upgrade the old files return only with
 #      RemoveExistingProducts' rollback, after the restarts, and no mark is written there to start
-#      anything (StopServices has stopped both services first).
+#      anything (StopServices has stopped both services first);
+#  11. the rollback state is discarded only once the transaction has SUCCEEDED: every action that
+#      deletes it is a commit action, a rollback action, or a stated deferred row -- and at least one
+#      SCHEDULED commit action does, so the step cannot pass with the discard gone. The deleters are
+#      found by ONE spelling, and the step fails OPEN for any other (stated at the step);
+#  12. a MAINTENANCE transaction resolves INSTALL_ROOT from the product's OWN install location:
+#      while any scheduled action a maintenance transaction can run names INSTALL_ROOT, the fragment
+#      sets it, when Installed, before CostFinalize, from a RegistrySearch of
+#      Uninstall\[ProductCode]'s InstallLocation. CPack resolves it only on an upgrade, and an
+#      uninstall of a custom root ran the default root's binary and left its service registered;
+#  13. Windows Installer's Restart Manager takes no part in a transaction: ONE Property row sets
+#      MSIRESTARTMANAGERCONTROL to "Disable", and nothing else sets it. Restart Manager restarts a
+#      service the table left stopped, and its shutdown, ahead of StopServices, cost the
+#      ServiceControl rows their rollback start;
+#  14. FastCachedDisableForNode disables only a registration that EXISTS: its command is started for
+#      real with every service name it spells swapped for one nothing registers, and must exit 0;
+#      and, the control that keeps that 0 honest, with the QUERY naming a service every host has and
+#      the disable still naming the absent one, it must exit 1060 -- a disable that fails on a
+#      service that is there fails the action. Neither run can change a service: the only one either
+#      would configure does not exist.
 # Every other action changes a service, the registry or the firewall, and is never started here.
 #
 # Usage: pwsh -NoProfile -File scripts/check-msi-custom-actions.ps1 -SourceDir <repository root>
@@ -61,6 +80,7 @@ $AnchorPhases = @{
     'Before:InstallFiles' = 'RootAbsent'   # after RemoveExistingProducts, before the files
     'After:InstallFiles'  = 'RootPresent'
     'Before:RemoveFiles'  = 'RootPresent'  # an uninstall, while the files are still there
+    'Before:InstallFinalize' = 'RootAbsent' # an uninstall has removed the root by then; an action here must not need it
 }
 
 # The actions that only READ, and are therefore started for real. Each names the processes its
@@ -76,12 +96,15 @@ $RunnableActions = @{
 # directly after InstallInitialize -- the premise of step 6, stated here because the template is
 # not in this repository to read. An anchor on a standard action with no row is refused.
 $StandardSequence = @{
+    AppSearch              = 50
+    CostFinalize           = 1000
     InstallValidate        = 1400
     InstallInitialize      = 1500
     RemoveExistingProducts = 1501
     RemoveFiles            = 3500
     InstallFiles           = 4000
     WriteRegistryValues    = 5000
+    InstallFinalize        = 6600
 }
 
 $failures = [System.Collections.Generic.List[string]]::new()
@@ -436,6 +459,190 @@ foreach ($action in $starters) {
 }
 if ($failures.Count -eq $failuresBeforeStarters) {
     Pass "all $($starters.Count) rollback actions that start a service are scheduled before InstallFiles, so they run after its rollback restored the files"
+}
+
+# 11. The rollback state is discarded only once the transaction has SUCCEEDED (#1629). A deferred
+# discard runs inside the script, so any failure after it -- a later checked action, a standard
+# action, the leftover deletes -- rolls back with the state already gone, and every exact restore
+# then reads a missing key and does nothing (Return="ignore"). A commit action runs only after the
+# whole script succeeded, and never in a rollback. The set of deleters is DERIVED from the command
+# lines, so a new one is a finding rather than invisible; each deferred one is a row with its reason.
+#
+# THE BLIND SPOT, and the direction it fails in: the derivation recognises ONE spelling, `reg.exe
+# delete HKLM\SOFTWARE\fastcached\InstallerRollback` naming the whole key, the way every deleter in the
+# fragment writes it today. A deleter spelled any other way -- PowerShell's Remove-Item, the
+# `HKEY_LOCAL_MACHINE\` form, a quoted key path, a delete of a SUBKEY, or a <RemoveRegistryKey>
+# element -- is not in the set at all, so this step fails OPEN for it: a deferred discard written
+# that way passes unseen. The positive control below does not close that; it only makes the step
+# refuse to pass when it found no commit-phase discard to judge.
+$DeferredStateDeleters = @{
+    FastCacheClearRollbackState  = 'empties the state BEFORE this transaction writes any, so an earlier transaction''s copy is never restored'
+    FastCacheRemoveRollbackState = 'an uninstall that is not an upgrade''s removal: no restore is armed in that transaction'
+}
+$deleters = @($actions | Where-Object { $_.ExeCommand -match 'reg\.exe"?\s+delete\s+HKLM\\SOFTWARE\\fastcached\\InstallerRollback(\s|$)' })
+if ($deleters.Count -eq 0) { Fail 'no action deletes the rollback state, so step 11 judged nothing' }
+$failuresBeforeDiscard = $failures.Count
+foreach ($action in $deleters) {
+    # Every arm is a stated decision: the default REFUSES unless a stated row allows it, so it is
+    # the guarded form of a table, never a catch-all that accepts.
+    switch ($action.Execute) {
+        'commit'   { continue }
+        'rollback' { continue } # the undo, run only by a failed transaction
+        default {
+            if (-not $DeferredStateDeleters.ContainsKey($action.Id)) {
+                Fail "$($action.Id) deletes the rollback state as a '$($action.Execute)' action: a failure after it rolls back with nothing to restore. Make it Execute=`"commit`" -- or, if it must delete BEFORE the transaction can succeed (as FastCacheClearRollbackState empties the previous transaction's copy), add a `$DeferredStateDeleters row stating why; making that one a commit action would break it."
+            }
+        }
+    }
+}
+foreach ($id in $DeferredStateDeleters.Keys) {
+    if (-not ($deleters | Where-Object { $_.Id -eq $id -and $_.Execute -eq 'deferred' })) { Fail "DeferredStateDeleters names $id, which is no longer a deferred deleter; delete the row" }
+}
+# The positive control: absence of a deferred discard is not the presence of a commit one. With the
+# discard deleted outright, every check above passes -- nothing deferred deletes the state -- while a
+# successful transaction leaves it behind. So the step also requires a SCHEDULED commit deleter.
+$discards = @($deleters | Where-Object { $_.Execute -eq 'commit' -and $schedule.ContainsKey($_.Id) })
+if ($discards.Count -eq 0) {
+    Fail 'no SCHEDULED commit action deletes the rollback state, so step 11 found no discard to judge and its pass would describe nothing: a successful transaction leaves the state behind. FastCacheDiscardRollbackState is the one expected, Execute="commit" with a Custom row.'
+}
+if ($failures.Count -eq $failuresBeforeDiscard) {
+    Pass "the rollback state is discarded only in the commit phase: $($deleters.Count) deleter(s) judged, $($discards.Count) scheduled commit discard(s) ($(@($discards | ForEach-Object Id) -join ', ')), $($DeferredStateDeleters.Count) deferred deleter(s) are stated rows"
+}
+
+# 12. A maintenance transaction resolves INSTALL_ROOT from the product's OWN install location.
+# CPack's properties.wxi sets it only from Uninstall\[WIX_UPGRADE_DETECTED], empty outside an
+# upgrade, so a repair, a feature change or an uninstall of a custom root fell back to the default
+# root: the uninstall ran a fastcached.exe that was not there and left the service registered
+# (CI run 37456507637).
+#
+# The set is DERIVED: every scheduled action whose Directory is INSTALL_ROOT or whose command spells
+# [INSTALL_ROOT], less those whose Condition carries a `NOT Installed` clause. No scheduled row
+# carries one today, so that exclusion removes nothing. It is not a verdict about reachability
+# either: a condition such as `NOT Installed OR REINSTALL` matches it and is excluded although a
+# maintenance transaction runs it. The exclusion moves the COUNT only, never the verdict, because
+# the resolver is required whenever the set is not empty, and an empty set is itself a failure.
+# The step does not read a component's Directory or the PATH entry, which resolve from
+# INSTALL_ROOT too; they need the same row, so any one action that names it covers them.
+$maintenanceRoot = @($actions | Where-Object {
+        $schedule.ContainsKey($_.Id) -and ($_.Directory -eq 'INSTALL_ROOT' -or $_.ExeCommand -match '\[INSTALL_ROOT\]')
+    } | Where-Object {
+        $row = $fragment.SelectSingleNode("//InstallExecuteSequence/Custom[@Action='$($_.Id)']")
+        $row.GetAttribute('Condition') -notmatch '(^|\s|\()NOT Installed(\s|\)|$)'
+    })
+$failuresBeforeMaintenanceRoot = $failures.Count
+if ($maintenanceRoot.Count -eq 0) { Fail 'no scheduled action a maintenance transaction can run names INSTALL_ROOT, so step 12 judged nothing' }
+$resolvers = @($fragment.SelectNodes('//SetProperty') | Where-Object { $_.GetAttribute('Id') -eq 'INSTALL_ROOT' })
+$needs = "$($maintenanceRoot.Count) scheduled action(s) a repair, a feature change or an uninstall runs name INSTALL_ROOT ($(@($maintenanceRoot | ForEach-Object Id | Select-Object -First 3) -join ', '), ...)"
+if ($resolvers.Count -ne 1) {
+    Fail "$($resolvers.Count) SetProperty rows set INSTALL_ROOT, and exactly one must, from the product's own install location: $needs, and without it CostFinalize resolves the DEFAULT root for a product installed elsewhere. Add SetProperty Id=`"INSTALL_ROOT`" Value=`"[<P>]`" Before=`"CostFinalize`" Sequence=`"both`" Condition=`"Installed AND <P>`", with <P> read by a RegistrySearch of HKLM Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode], Name InstallLocation, Type raw, Bitness always64."
+} else {
+    $resolver = $resolvers[0]
+    $resolverId = $resolver.GetAttribute('Action')
+    $source = if ($resolver.GetAttribute('Value') -match '^\[([A-Za-z_][A-Za-z0-9_.]*)\]$') { $Matches[1] } else { $null }
+    if ($null -eq $source) {
+        Fail "$resolverId sets INSTALL_ROOT to '$($resolver.GetAttribute('Value'))', not to ONE property a search read"
+    } else {
+        # Installed, and only when the search FOUND a location: an empty one would set no root at all.
+        if ($resolver.GetAttribute('Condition') -ne "Installed AND $source") {
+            Fail "$resolverId is conditioned '$($resolver.GetAttribute('Condition'))'; it must be 'Installed AND $source': a maintenance transaction only (a first install and an upgrade keep CPack's resolution), and only when the location was found"
+        }
+        $search = $fragment.SelectSingleNode("//Property[@Id='$source']/RegistrySearch")
+        $ownEntry = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]'
+        # Raw, as CPack's own FindInstallLocation reads the same value on an upgrade, and in the
+        # 64-bit view, where Windows Installer writes an x64 product's uninstall entry.
+        if ($null -eq $search -or $search.GetAttribute('Root') -ne 'HKLM' -or
+            -not $search.GetAttribute('Key').Equals($ownEntry, [StringComparison]::OrdinalIgnoreCase) -or
+            $search.GetAttribute('Name') -ne 'InstallLocation' -or $search.GetAttribute('Type') -ne 'raw' -or
+            $search.GetAttribute('Bitness') -ne 'always64') {
+            Fail "$source, which $resolverId sets INSTALL_ROOT from, is not read by a RegistrySearch of HKLM $ownEntry, Name InstallLocation, Type raw, Bitness always64: the product's OWN install location"
+        }
+    }
+    # Both sequences, because each runs CostFinalize: a full-UI transaction resolves its directories
+    # in the UI sequence and hands them to the execute sequence.
+    $sequence = $resolver.GetAttribute('Sequence')
+    if ($sequence -ne 'both') { Fail "$resolverId runs in Sequence '$sequence'; it must be 'both', since each sequence runs CostFinalize and resolves the root" }
+    # After AppSearch, which reads the location, and before CostFinalize, which resolves every
+    # directory under the root from it. A chain through another row is refused rather than walked.
+    $relation = if ($resolver.HasAttribute('After')) { 'After' } else { 'Before' }
+    $standard = $resolver.GetAttribute($relation)
+    if (-not $StandardSequence.ContainsKey($standard)) {
+        Fail "$resolverId is anchored $relation '$standard', which StandardSequence has no row for: anchor it on a standard action between AppSearch and CostFinalize"
+    } else {
+        $point = [double] $StandardSequence[$standard] + $(if ($relation -eq 'After') { 0.5 } else { -0.5 })
+        if (-not ($point -gt $StandardSequence['AppSearch'] -and $point -lt $StandardSequence['CostFinalize'])) {
+            Fail "$resolverId runs $relation $standard, outside AppSearch..CostFinalize: before AppSearch the location is unread, after CostFinalize every directory is already resolved from the default root"
+        }
+    }
+}
+if ($failures.Count -eq $failuresBeforeMaintenanceRoot) {
+    Pass "a maintenance transaction resolves INSTALL_ROOT from the product's own install location; $needs"
+}
+
+# 13. Windows Installer's Restart Manager takes no part in a transaction. A silent install otherwise
+# ALWAYS uses it: at InstallValidate it shuts down a service holding a file the transaction replaces,
+# and at the end of the install it starts that service again, whatever the service table decided. CI
+# MEASURED on PR 1634 that the upgrade from 0.3.0 started FastCached after the table had made it manual
+# and stopped it for the node, that it crash-looped on the port the node holds, and that a recovery
+# restart took that port during a later transaction, which failed with 1603. Its printed log then
+# MEASURED whose session that was: the OLD package's removal, nested in the upgrade, while this
+# package's own logged "Disabled" -- so this step is necessary and NOT sufficient, and step 14's
+# FastCachedDisableForNode is the other half (the comment on MSIRESTARTMANAGERCONTROL). Restart
+# Manager's shutdown also comes before StopServices, so the ServiceControl rows find the service
+# stopped and record no rollback start.
+#
+# Read from the fragment's Property rows. Windows Installer reads the property from the package's
+# Property table, so a SetProperty (a custom action) changing it has no effect and is refused rather
+# than counted. Fails OPEN for a value a transform or a command line supplies, which no package check
+# can see; the MSI job's per-transaction judgement (Invoke-Msiexec) is what would see its effect.
+$failuresBeforeRestartManager = $failures.Count
+$restartManagerDefect = "Windows Installer's Restart Manager restarts a service the table left stopped: a silent install shuts each service holding a replaced file down at InstallValidate and starts it again at the end, whatever the service table decided, and because that shutdown comes before StopServices, the ServiceControl rows record no rollback start. (The stray start PR 1634 measured came from an OLD package's nested removal, which this property cannot reach; FastCachedDisableForNode answers that one, and this property is still required for the package's own session)"
+$restartManagerRows = @($fragment.SelectNodes("//Property[@Id='MSIRESTARTMANAGERCONTROL']"))
+if ($restartManagerRows.Count -ne 1) {
+    Fail "$($restartManagerRows.Count) Property rows set MSIRESTARTMANAGERCONTROL, and exactly one must, Value=`"Disable`". $restartManagerDefect."
+} elseif ($restartManagerRows[0].GetAttribute('Value') -cne 'Disable') {
+    Fail "MSIRESTARTMANAGERCONTROL is '$($restartManagerRows[0].GetAttribute('Value'))', and it must be 'Disable'. $restartManagerDefect. DisableShutdown keeps Restart Manager asking which files are in use, and MSIDISABLERMRESTART=1 alone keeps the shutdown and so the lost rollback start: neither leaves every stop and start to the service table."
+}
+$restartManagerSetters = @($fragment.SelectNodes('//SetProperty') | Where-Object { $_.GetAttribute('Id') -eq 'MSIRESTARTMANAGERCONTROL' })
+if ($restartManagerSetters.Count -gt 0) {
+    Fail "$(@($restartManagerSetters | ForEach-Object { $_.GetAttribute('Action') }) -join ', ') set MSIRESTARTMANAGERCONTROL as a custom action, which has no effect: Windows Installer reads it from the Property table. Keep the one Property row."
+}
+if ($failures.Count -eq $failuresBeforeRestartManager) {
+    Pass 'Restart Manager takes no part in a transaction: one Property row sets MSIRESTARTMANAGERCONTROL to Disable, and no custom action sets it'
+}
+
+# 14. FastCachedDisableForNode disables only a registration that EXISTS (rm-nested review, I-1):
+# fastcached's registration is Return="ignore", so it may be absent, and a checked disable of an
+# absent service failed the node's whole install. The command is started for real, with each service
+# name it spells swapped for one nothing registers, so neither run can change a service.
+$failuresBeforeDisable = $failures.Count
+$disable = $actions | Where-Object { $_.Id -eq 'FastCachedDisableForNode' }
+if ($null -eq $disable) {
+    Fail 'FastCachedDisableForNode is not in the fragment, so nothing leaves fastcached disabled beside the node'
+} else {
+    $disableTarget = Format-Target $disable.ExeCommand
+    $absent = 'FastCacheAbsent' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $queries = [regex]::Matches($disableTarget, '\bquery FastCached\b').Count
+    $configs = [regex]::Matches($disableTarget, '\bconfig FastCached\b').Count
+    if ($queries -ne 1 -or $configs -ne 1) {
+        Fail "FastCachedDisableForNode spells 'query FastCached' $queries time(s) and 'config FastCached' $configs time(s); this step swaps exactly one of each, so it cannot run the command: $disableTarget"
+    } else {
+        $swap = { param([string] $queried, [string] $configured)
+            $disableTarget -replace '\bquery FastCached\b', "query $queried" -replace '\bconfig FastCached\b', "config $configured" }
+        $whenAbsent = Start-Target (& $swap $absent $absent) $system64
+        if ($whenAbsent -ne 0) {
+            Fail "FastCachedDisableForNode exited $whenAbsent for a service that is not registered; it must exit 0, or a refused fastcached registration (Return=`"ignore`") fails the node's whole install and rolls it back, naming this action rather than the refusal"
+        }
+        # The control: the query finds a service every host has, and the disable still names the
+        # absent one, so the disable runs and fails (1060). A guard that ended the command whatever
+        # the query answered would pass the run above and fail here.
+        $whenPresent = Start-Target (& $swap 'EventLog' $absent) $system64
+        if ($whenPresent -ne 1060) {
+            Fail "FastCachedDisableForNode exited $whenPresent when the queried service exists and the disable fails (1060 expected): a disable that fails on a registered fastcached must fail the action"
+        }
+    }
+}
+if ($failures.Count -eq $failuresBeforeDisable) {
+    Pass 'FastCachedDisableForNode exits 0 for an unregistered service and fails with the disable on a registered one'
 }
 
 # Positive controls: a walk that found nothing reports nothing wrong about it.
