@@ -3518,7 +3518,7 @@ jobs:
           }
 
           # The starting point: 0.3.0 with the node registered.
-          Invoke-Msiexec -Operation '/i' -Package $previous -Log 'previous.log' -Properties $release030NodeProperties -What "installing $release"
+          Invoke-Msiexec -Leaves Release030WithNode -Operation '/i' -Package $previous -Log 'previous.log' -Properties $release030NodeProperties -What "installing $release"
           Assert-InstalledProduct $family $productOf[$previous]
           Assert-ServiceTable -Row Release030WithNode -Log 'previous.log'
 
@@ -3527,7 +3527,14 @@ jobs:
           # (FastCacheAwaitServiceExit) -- 3010 was a file one of them still held, replaced at the
           # next boot, with the node's checked steps then running whichever binary was on the disk.
           # No property: the node registration exists and runs afterwards all the same.
-          Invoke-Msiexec -Operation '/i' -Package $first -Log 'upgrade.log' -What "the upgrade from $release"
+          # And nothing the table did not ask for may happen DURING it, which a row read afterwards
+          # cannot see: Invoke-Msiexec judges every transaction against the row it -Leaves (here: no
+          # unexpected termination, and no start of FastCached, which NodeSelected leaves stopped).
+          # FastCached ran before this upgrade, and PR 1634's CI measured it started again at the end
+          # after the table had stopped it for the node, crashing three times on the port the node
+          # holds before msiexec returned, while the row read Manual and Stopped between two recovery
+          # restarts. Windows Installer's Restart Manager is the inferred cause; the package disables it.
+          Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $first -Log 'upgrade.log' -What "the upgrade from $release"
           Assert-InstalledProduct $family $productOf[$first]
           # The ORDER is the fix (batch 4 review, B4-2): 0.3.0's own uninstall-service ran FIRST
           # (RemoveExistingProducts is scheduled afterInstallInitialize); the files waited for 0.3.0's
@@ -3562,7 +3569,7 @@ jobs:
           $installerKey = 'HKLM:\SOFTWARE\fastcached\Installer'
           New-Item -Path $installerKey -Force | Out-Null
           New-ItemProperty -Path $installerKey -Name 'NodeAdvertise' -Value '10.8.0.7:6674' -PropertyType String -Force | Out-Null
-          Invoke-Msiexec -Operation '/i' -Package $newer -Log 'upgrade-newer.log' -What 'an upgrade between two builds'
+          Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $newer -Log 'upgrade-newer.log' -What 'an upgrade between two builds'
           Assert-InstalledProduct $family $productOf[$newer]
           Assert-MsiLog -Path 'upgrade-newer.log' -Present $oldSession, (Get-MsiActionRanPattern 'FastCacheForgetNodeAdvertise') `
             -Absent (Get-MsiActionRanPattern 'FastCacheNodeUninstallService'), (Get-MsiActionRanPattern 'FastCachedUninstallService')
@@ -3575,7 +3582,7 @@ jobs:
           # Dropping fastcached on an upgrade, the node kept without its properties:
           # the old product's half keeps fastcached's registration, the new product
           # has no fastcached.exe to remove it with, so sc.exe deletes the leftover.
-          Invoke-Msiexec -Operation '/i' -Package $first -Log 'upgrade-node-only.log' -Properties 'ADDLOCAL=CM_C_Cli,CM_C_Node' `
+          Invoke-Msiexec -Leaves NodeAlone -Operation '/i' -Package $first -Log 'upgrade-node-only.log' -Properties 'ADDLOCAL=CM_C_Cli,CM_C_Node' `
             -What 'an upgrade deselecting fastcached'
           Assert-InstalledProduct $family $productOf[$first]
           Assert-MsiLog -Path 'upgrade-node-only.log' -Present $oldSession, (Get-MsiActionRanPattern 'FastCachedDeleteLeftover') `
@@ -3590,7 +3597,7 @@ jobs:
           # default, opens no rule, and so leaves nothing to orphan here -- an empty group there is
           # true whether or not its removal works.)
           Assert-NodeFirewall
-          Invoke-Msiexec -Operation '/i' -Package $newer -Log 'upgrade-deselect.log' -Properties $fastcachedOnly `
+          Invoke-Msiexec -Leaves DaemonAlone -Operation '/i' -Package $newer -Log 'upgrade-deselect.log' -Properties $fastcachedOnly `
             -What 'an upgrade deselecting the node'
           Assert-InstalledProduct $family $productOf[$newer]
           Assert-MsiLog -Path 'upgrade-deselect.log' -Present $oldSession, (Get-MsiActionRanPattern 'FastCacheNodeDeleteLeftover'), `
@@ -3599,15 +3606,15 @@ jobs:
           Assert-ServiceTable -Row DaemonAlone -Log 'upgrade-deselect.log'
           Assert-FirewallGroupEmpty 'fastcached: FastCacheCompileNode'
 
-          Invoke-Msiexec -Operation '/x' -Package $newer -Log 'uninstall-upgraded.log' -What 'uninstalling after the upgrades'
+          Invoke-Msiexec -Leaves NothingInstalled -Operation '/x' -Package $newer -Log 'uninstall-upgraded.log' -What 'uninstalling after the upgrades'
           Assert-InstalledProduct $family ''
           Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-upgraded.log'
 
           # The opt-out: fastcached registered auto and left stopped.
-          Invoke-Msiexec -Operation '/i' -Package $first -Log 'install-unstarted.log' -Properties $fastcachedOnly, 'FASTCACHED_START_SERVICE=0' `
+          Invoke-Msiexec -Leaves DaemonAloneUnstarted -Operation '/i' -Package $first -Log 'install-unstarted.log' -Properties $fastcachedOnly, 'FASTCACHED_START_SERVICE=0' `
             -What 'a fastcached-only install told not to start it'
           Assert-ServiceTable -Row DaemonAloneUnstarted -Log 'install-unstarted.log'
-          Invoke-Msiexec -Operation '/x' -Package $first -Log 'uninstall-unstarted.log' -What 'uninstalling the unstarted install'
+          Invoke-Msiexec -Leaves NothingInstalled -Operation '/x' -Package $first -Log 'uninstall-unstarted.log' -What 'uninstalling the unstarted install'
           Assert-InstalledProduct $family ''
           Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-unstarted.log'
 
@@ -3615,16 +3622,16 @@ jobs:
           # double-click -- a plain /i of the newer package with NO ADDLOCAL. MigrateFeatureStates
           # carries the old selection over, so it must stay fastcached-only: the node neither
           # installed nor registered, and fastcached auto and started as before.
-          Invoke-Msiexec -Operation '/i' -Package $first -Log 'install-daemon-only.log' -Properties $fastcachedOnly `
+          Invoke-Msiexec -Leaves DaemonAlone -Operation '/i' -Package $first -Log 'install-daemon-only.log' -Properties $fastcachedOnly `
             -What 'a fastcached-only install, host C'
           Assert-ServiceTable -Row DaemonAlone -Log 'install-daemon-only.log'
-          Invoke-Msiexec -Operation '/i' -Package $newer -Log 'upgrade-daemon-only.log' `
+          Invoke-Msiexec -Leaves DaemonAlone -Operation '/i' -Package $newer -Log 'upgrade-daemon-only.log' `
             -What 'a plain upgrade of a fastcached-only install, no ADDLOCAL'
           Assert-InstalledProduct $family $productOf[$newer]
           Assert-MsiLog -Path 'upgrade-daemon-only.log' -Present $oldSession `
             -Absent (Get-MsiActionRanPattern 'FastCacheNodeInstallService'), (Get-MsiActionRanPattern 'FastCacheNodeStartService')
           Assert-ServiceTable -Row DaemonAlone -Log 'upgrade-daemon-only.log'
-          Invoke-Msiexec -Operation '/x' -Package $newer -Log 'uninstall-daemon-only.log' -What 'uninstalling host C'
+          Invoke-Msiexec -Leaves NothingInstalled -Operation '/x' -Package $newer -Log 'uninstall-daemon-only.log' -What 'uninstalling host C'
           Assert-InstalledProduct $family ''
           Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-daemon-only.log'
 
@@ -3680,16 +3687,16 @@ jobs:
             # The latest release's installer registers its node only with a scheduler, and that
             # registration carries `--scheduler`: the upgrade below, with no property, must
             # register the node again without it, or the service refuses every start.
-            Invoke-Msiexec -Operation '/i' -Package $previous -Log 'latest.log' `
+            Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $previous -Log 'latest.log' `
               -Properties 'FASTCACHE_NODE_SCHEDULER=127.0.0.1:6675', 'FASTCACHE_NODE_ADVERTISE=127.0.0.1:6674' -What "installing $latest"
             Assert-InstalledProduct $family $previousCode
             Assert-ServiceTable -Row NodeSelected -Log 'latest.log'
 
-            Invoke-Msiexec -Operation '/i' -Package $first -Log 'upgrade-latest.log' -What "the upgrade from $latest"
+            Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $first -Log 'upgrade-latest.log' -What "the upgrade from $latest"
             Assert-InstalledProduct $family $firstCode
             Assert-ServiceTable -Row NodeSelected -Log 'upgrade-latest.log'
 
-            Invoke-Msiexec -Operation '/x' -Package $first -Log 'uninstall-latest.log' -What "uninstalling after the upgrade from $latest"
+            Invoke-Msiexec -Leaves NothingInstalled -Operation '/x' -Package $first -Log 'uninstall-latest.log' -What "uninstalling after the upgrade from $latest"
             Assert-InstalledProduct $family ''
             Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-latest.log'
             Remove-FastCacheMachineState
@@ -3786,14 +3793,14 @@ jobs:
             Write-Host "N's FastCached: auto, running, ImagePath $imagePath"
           }
           function Install-N([string] $Log) {
-            Invoke-Msiexec -Operation '/i' -Package $first -Log $Log -Properties $fastcachedOnly, "INSTALL_ROOT=`"$root`"" `
+            Invoke-Msiexec -Leaves DaemonAlone -Operation '/i' -Package $first -Log $Log -Properties $fastcachedOnly, "INSTALL_ROOT=`"$root`"" `
               -What 'build N, fastcached-only, into a custom root'
             Assert-InstalledProduct $family $firstCode
             Assert-ServiceTable -Row DaemonAlone -Log $Log
             Set-NRegistration
           }
           function Remove-All([string] $Log) {
-            Invoke-Msiexec -Operation '/x' -Package $first -Log $Log -What 'uninstalling build N'
+            Invoke-Msiexec -Leaves NothingInstalled -Operation '/x' -Package $first -Log $Log -What 'uninstalling build N'
             Assert-InstalledProduct $family ''
             Assert-ServiceTable -Row NothingInstalled -Log $Log
             Remove-FastCacheMachineState
@@ -3801,8 +3808,12 @@ jobs:
           }
           # A PowerShell function returns EVERYTHING it emits, so the helpers are piped to Out-Null
           # and the result is asserted to be the one snapshot rather than an array holding it.
+          # -Expect RollsBack: no row describes what may START during a rollback, so none is judged, and
+          # every unexpected termination still is -- the controls too, by analysis: each restores or
+          # leaves fastcached's REGISTRATION runnable, and starts it once the node's removal has stopped
+          # the node. A control that crashes a service is a finding about that restore, never exempted.
           function Invoke-FailedUpgrade([string] $Package, [string] $Log, [string] $What) {
-            Invoke-Msiexec -Operation '/i' -Package $Package -Log $Log -Properties $withNode, 'FASTCACHE_FAIL_FOR_TEST=1' `
+            Invoke-Msiexec -Expect RollsBack -Operation '/i' -Package $Package -Log $Log -Properties $withNode, 'FASTCACHE_FAIL_FOR_TEST=1' `
               -Accept @(1603) -What $What | Out-Null
             Assert-MsiLog -Path $Log -Present $failedHere | Out-Null
             $snapshot = Get-InstallationSnapshot -UpgradeCode $family -Root $root
@@ -3919,7 +3930,7 @@ jobs:
           # (manual under the node's table), its state, the node's registration, the installed
           # product, and the node's firewall group. Never `binary`: the upgrade keeps N's root (see
           # the header), so the custom root's binary must still be THERE, which is asserted instead.
-          Invoke-Msiexec -Operation '/i' -Package $newer -Log 'succeeded-upgrade.log' -Properties $withNode -What 'the same upgrade, succeeding'
+          Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $newer -Log 'succeeded-upgrade.log' -Properties $withNode -What 'the same upgrade, succeeding'
           Assert-MsiLog -Path 'succeeded-upgrade.log' -Present (Get-MsiActionRanPattern 'FastCacheNodeStartService') -Absent (Get-MsiActionRanPattern 'FastCacheFailForTest')
           $changed = @(Compare-InstallationSnapshot -Before $before -After (Get-InstallationSnapshot -UpgradeCode $family -Root $root))
           Write-Host "a successful upgrade changes:`n  $($changed -join "`n  ")"
@@ -3933,7 +3944,7 @@ jobs:
           $kept = Join-Path $root 'bin\fastcached.exe'
           if (-not (Test-Path -LiteralPath $kept)) { throw "a successful upgrade did not keep N's custom root: $kept is gone" }
           Write-Host "a successful upgrade kept N's custom root: $kept is present"
-          Invoke-Msiexec -Operation '/x' -Package $newer -Log 'succeeded-uninstall.log' -What 'uninstalling after the successful upgrade'
+          Invoke-Msiexec -Leaves NothingInstalled -Operation '/x' -Package $newer -Log 'succeeded-uninstall.log' -What 'uninstalling after the successful upgrade'
           Assert-InstalledProduct $family ''
           Assert-ServiceTable -Row NothingInstalled -Log 'succeeded-uninstall.log'
           Remove-FastCacheMachineState
@@ -3959,13 +3970,13 @@ jobs:
           function Show-InstallLog { Show-MsiLog 'install.log' }
           $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
 
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'install-default.log' -What 'the default install'
+          Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $msi -Log 'install-default.log' -What 'the default install'
           Assert-ServiceTable -Row NodeSelected -Log 'install-default.log'
-          Invoke-Msiexec -Operation '/x' -Package $msi -Log 'uninstall-default.log' -What 'uninstalling the default install'
+          Invoke-Msiexec -Leaves NothingInstalled -Operation '/x' -Package $msi -Log 'uninstall-default.log' -What 'uninstalling the default install'
           Assert-ServiceTable -Row NothingInstalled -Log 'uninstall-default.log'
           Remove-FastCacheMachineState
 
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'install.log' `
+          Invoke-Msiexec -Leaves DaemonAlone -Operation '/i' -Package $msi -Log 'install.log' `
             -Properties 'ADDLOCAL=CM_C_Cli,CM_C_Daemon,CM_C_Launcher' -What 'a fastcached-only install'
 
           Assert-ServiceTable -Row DaemonAlone -Log 'install.log'
@@ -4088,7 +4099,7 @@ jobs:
           $hold.ExclusiveAddressUse = $true
           $hold.Start()
           try {
-            Invoke-Msiexec -Operation '/i' -Package $msi -Log 'add-node-refused.log' -What 'adding the node while 6674 is held' `
+            Invoke-Msiexec -Expect NodeCannotBind -Operation '/i' -Package $msi -Log 'add-node-refused.log' -What 'adding the node while 6674 is held' `
               -Properties 'ADDLOCAL=CM_C_Node', 'FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8' -Accept @(1603)
           } finally {
             $hold.Stop()
@@ -4115,7 +4126,7 @@ jobs:
 
           # No property at all: this package has no advertised-endpoint property (W-10), so the node is
           # registered with no advertise flag and advertises this machine's name.
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'add-node.log' -What 'adding the node feature' `
+          Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $msi -Log 'add-node.log' -What 'adding the node feature' `
             -Properties 'ADDLOCAL=CM_C_Node'
           Assert-ServiceTable -Row NodeSelected -Log 'add-node.log'
 
@@ -4131,12 +4142,12 @@ jobs:
           # The fleet seed and the fleet pin ride the same repair, each the node registration's own
           # argument -- the pin VERBATIM, since it is security material nothing re-spells.
           $pin = '0123456789abcdef0123456789abcdef@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo'
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'scope-node.log' -What 'a repair stating a scope, a seed and a pin' `
+          Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $msi -Log 'scope-node.log' -What 'a repair stating a scope, a seed and a pin' `
             -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus', 'FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8', 'FASTCACHE_FLEET_SEED=seed.example.invalid', "FASTCACHE_FLEET_ID=$pin"
           Assert-NodeFirewallScope -Scope '10.0.0.0/8'
           Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed.example.invalid:6674'
           Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'repair-scope.log' -What 'a repair stating none of them' `
+          Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $msi -Log 'repair-scope.log' -What 'a repair stating none of them' `
             -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus'
           Assert-NodeFirewallScope -Scope '10.0.0.0/8'
           Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed.example.invalid:6674'
@@ -4149,7 +4160,7 @@ jobs:
           # the machine had survives it -- the registration's pin and the remembered one -- and the
           # node is RUNNING again (B4-6): the repair stopped it to replace its files, and only the
           # rollback's restart brings it back.
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'refused-pin.log' -What 'a repair stating a pin the node refuses' `
+          Invoke-Msiexec -Expect RollsBack -Operation '/i' -Package $msi -Log 'refused-pin.log' -What 'a repair stating a pin the node refuses' `
             -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus', 'FASTCACHE_FLEET_ID=0123456789abcdef0123456789abcdef' `
             -Accept @(1603)
           Assert-MsiLog -Path 'refused-pin.log' -Present 'CustomAction FastCacheNodeCheckArguments returned actual error code'
@@ -4167,7 +4178,7 @@ jobs:
           # is the witness, and the log proves no ServiceControl row stopped the node, so a new PID
           # is the transaction's own restart rather than a file replacement's.
           $nodeBefore = (Get-CimInstance Win32_Service -Filter "Name='FastCacheCompileNode'").ProcessId
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'reseed-node.log' -What 'a feature change giving the node a new seed' `
+          Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $msi -Log 'reseed-node.log' -What 'a feature change giving the node a new seed' `
             -Properties 'ADDLOCAL=CM_C_Node', 'FASTCACHE_FLEET_SEED=seed2.example.invalid'
           Assert-MsiLog -Path 'reseed-node.log' -Present (Get-MsiActionRanPattern 'FastCacheNodeStopForRestart') `
             -Absent 'ServiceControl\(.*Name=FastCacheCompileNode'
@@ -4179,7 +4190,7 @@ jobs:
           }
           Write-Host "the re-registered node was restarted (PID $nodeBefore, then $nodeAfter)"
 
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'remove-node.log' -Properties 'REMOVE=CM_C_Node' `
+          Invoke-Msiexec -Leaves DaemonAlone -Operation '/i' -Package $msi -Log 'remove-node.log' -Properties 'REMOVE=CM_C_Node' `
             -What 'removing the node feature'
           Assert-ServiceTable -Row DaemonAlone -Log 'remove-node.log'
 
@@ -4655,7 +4666,7 @@ jobs:
           Add-Content -Path $cfg -Value $marker
 
           $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'reinstall.log' -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus' `
+          Invoke-Msiexec -Leaves DaemonAlone -Operation '/i' -Package $msi -Log 'reinstall.log' -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus' `
             -What 'the reinstall'
 
           if (-not (Select-String -Path $cfg -Pattern ([regex]::Escape($marker)) -Quiet)) {
@@ -4680,7 +4691,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
           $msi = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
-          Invoke-Msiexec -Operation '/x' -Package $msi -Log 'uninstall.log' -What 'the uninstall'
+          Invoke-Msiexec -Leaves NothingInstalled -Operation '/x' -Package $msi -Log 'uninstall.log' -What 'the uninstall'
           Assert-ServiceTable -Row NothingInstalled -Log 'uninstall.log'
 
           # Documented behaviour on every platform: the configuration is the

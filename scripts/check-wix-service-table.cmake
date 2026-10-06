@@ -35,6 +35,14 @@
 # stopped while running is started again, and each remembered value is written
 # back or deleted as it was found -- so a failed step leaves nothing behind.
 #
+# The MSIRESTARTMANAGERCONTROL row pins Restart Manager OUT of every transaction ("Disable"): a
+# silent install otherwise restarts, at its end, every service it shut down at InstallValidate,
+# whatever the service table decided. PR 1634's CI measured FastCached started after the table had
+# made it manual and stopped it for the node; Restart Manager is the inferred cause, since nothing in
+# the package starts it there. Its offence names that defect below, since the footer
+# is generic. msi-custom-action-commands step 13 judges the same row, and refuses a custom action
+# setting the property.
+#
 # The FASTCACHE_INSTALL_LOCATION rows pin how a MAINTENANCE transaction resolves
 # INSTALL_ROOT: from the product's OWN uninstall entry, when Installed, before
 # CostFinalize. CPack resolves it only on an upgrade, and an uninstall of a custom
@@ -88,6 +96,8 @@ set(_table [=[
 <SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Value="[FASTCACHE_INSTALL_LOCATION]"
 <SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Before="CostFinalize" Sequence="both"
 <SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Condition="Installed AND FASTCACHE_INSTALL_LOCATION"
+
+<Property Id="MSIRESTARTMANAGERCONTROL"|/>|Value="Disable"
 
 <CustomAction Id="FastCacheNodeDeleteLeftover"|/>|sc.exe" delete FastCacheCompileNode"
 <CustomAction Id="FastCacheNodeDeleteLeftover"|/>|Execute="deferred"
@@ -562,13 +572,24 @@ endforeach()
 
 if(_offences)
     string(REPLACE ";" "\n  " _offenceText "${_offences}")
+    # The one row whose offence names its defect, since the footer below is generic.
+    set(_restartManagerText "")
+    string(FIND "${_offenceText}" "MSIRESTARTMANAGERCONTROL" _restartManagerOffence)
+    if(NOT _restartManagerOffence EQUAL -1)
+        set(_restartManagerText
+            "\nMSIRESTARTMANAGERCONTROL must be Disable: Windows Installer's Restart Manager restarts a service the "
+            "table left stopped. A silent install starts, at its end, every service it shut down at InstallValidate, "
+            "whatever the table decided, and that shutdown comes before StopServices, so the ServiceControl rows "
+            "record no rollback start. See the property's comment in service-actions.xml.")
+        string(CONCAT _restartManagerText ${_restartManagerText})
+    endif()
     message(FATAL_ERROR
         "check-wix-service-table: packaging/windows/service-actions.xml no longer carries the service "
         "table this check pins.\n"
         "  ${_offenceText}\n"
         "If the change is deliberate, change the row in scripts/check-wix-service-table.cmake in the "
         "same commit and say why there. A leftover-removal row lost its guard means the MSI can delete "
-        "a service it did not register.")
+        "a service it did not register.${_restartManagerText}")
 endif()
 
 message(STATUS

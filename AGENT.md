@@ -128,11 +128,10 @@ no `fsync` with anything. This paragraph claimed the opposite until
 
 ## The rulebook
 
-`.agent/rules/` holds this project's load-bearing constraints. **Every rule there
-has already been a bug**, most of them a silent one — a cache that stops sharing
-while every test passes, a service that registers and then cannot work, a series
-an operator was told to scrape that was never exported, a fleet that never
-distributes anything and goes green anyway.
+`.agent/rules/` holds this project's load-bearing constraints. **Every rule there has already been a
+bug**, most of them a silent one — a cache that stops sharing while every test passes, a service
+that registers and then cannot work, a series an operator was told to scrape that was never
+exported, a fleet that never distributes anything and goes green anyway.
 
 **Read the matching file before changing code in its area.** The bullets below are
 tripwires, not summaries: they are there so a rule fires even in a session that
@@ -149,11 +148,10 @@ it can be as long as it needs to be; what belongs here is the sentence that make
 rule fire and the pointer to where the argument lives. A tripwire that has acquired
 measurements, ticket archaeology or a counter-argument has stopped being one.
 
-Both halves are checked. Every `##` section over there says whether this file
-tripwires it and names the phrase, and `ctest -R rulebook-tripwires` verifies the
-phrase is still here; `ctest -R agent-md-budget` holds this file to
-`scripts/agent-md-budget.txt`, which is where its size lives and the only place it
-is written down.
+Both halves are checked. Every `##` section over there says whether this file tripwires it and names
+the phrase, and `ctest -R rulebook-tripwires` verifies the phrase is still here; `ctest -R
+agent-md-budget` holds this file to `scripts/agent-md-budget.txt`, which is where its size lives and
+the only place it is written down.
 
 > Link these as plain markdown, never as an `@`-prefixed path. Claude Code resolves
 > `@` imports recursively out of `CLAUDE.md`, so `@`-importing a rule file would
@@ -702,7 +700,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 `packaging/`.
 - A service to register is a `ServiceSpec`; what it runs as is part of it, as are how it STARTS and
   which ports it OPENS, and an empty `serviceAccount` means **root**. An MSI upgrade RE-APPLIES a
-  registration and never deletes one; the MSI's service table decides every start mode.
+  registration and never deletes one; the MSI's service table decides every start mode, so Restart
+  Manager is OFF (`MSIRESTARTMANAGERCONTROL=Disable`): it restarts what the table left stopped.
 - `--install-service` registers the *command-line* config, never the merged one, and carries the
   config PATH rather than the file's values or a resolved default.
 - An install is judged by the **startup** rules as well as the install-time ones: a registration

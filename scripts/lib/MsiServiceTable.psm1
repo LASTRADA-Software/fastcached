@@ -53,6 +53,15 @@
 #     seam. A line rendered wrongly is wrong on both sides too: fails OPEN.
 #   * `Get-SettledServiceState`'s real sleep runs only live; here it is
 #     `-StableSeconds 0` through the observation seam.
+#   * The transaction judgement (`Invoke-TransactionJudgement`, run by
+#     `Invoke-Msiexec` and `Assert-ServiceTable`) judges records the packaging job
+#     alone acquires over a real transaction. Here the verdict runs over synthetic
+#     records, the watch over a real process through a scripted observer, the
+#     event parse over every event shape it reads, and the event reader over the
+#     real System log in both directions. On a host that writes no 7036 (this
+#     repository's Windows 11 26200 development host writes none), a start that
+#     lives and dies between two observations WITHOUT terminating unexpectedly is
+#     seen by no witness, and the pass line says "7036 ABSENT". Fails OPEN there.
 #
 # And one limit of the assertion itself, not of its self-test: the stability
 # window is about five seconds after a row matches. A service that crashes
@@ -103,6 +112,30 @@ $script:ServiceTable = [ordered]@{
 # every assertion that names the row.
 $script:StartModes = @('Auto', 'Manual', 'Disabled')
 $script:States = @('Running', 'Stopped')
+
+# The services this package owns, by service name, each with the display name its
+# registration carries (`ServiceSpec::displayName`). A service control manager event
+# names a service by its display name in its text and by its service name in its
+# binary data; either is recognised, so a registration another build wrote under
+# another display name is still matched by its service name.
+$script:ServiceDisplayNames = [ordered]@{ FastCached = 'fastcached'; FastCacheCompileNode = 'fastcache-compile-node' }
+
+# The service control manager's events for a service that ended without being told
+# to: 7031 while the SCM still takes a recovery action for it, 7034 when it takes
+# none. The registrations' recovery steps are FINITE (`ServiceRestartAttempts`
+# restarts, then no action), so one service logs both: PR 1634's CI showed the node
+# logging 7034 at its eighth to eleventh termination.
+$script:UnexpectedTerminationEvents = @(7031, 7034)
+
+# What a transaction is judged over: the terminations, and "entered the running
+# state" (7036) where the host writes it.
+$script:TransactionEvents = @(7031, 7034, 7036)
+
+# The last transaction Invoke-Msiexec ran: what each service ran as when it began,
+# when it began, what it was expected to leave, and every process the watch saw a
+# service run under while it ran. Invoke-Msiexec judges it as it ends, and
+# Assert-ServiceTable once more over the window its stability interval adds.
+$script:LastMsiTransaction = $null
 
 # ---------------------------------------------------------------------------
 # Services
@@ -232,19 +265,31 @@ function Assert-ServiceState {
 #            shown when it did not: on a CI runner the log is the only witness.
 # @param TimeoutSeconds How long each service may take.
 # @param StableSeconds How long a matched registration must stay unchanged.
+# @param Observe As Assert-ServiceState's; the self-test's seam.
+# @param ReadEvents As Invoke-TransactionJudgement's; the self-test's seam.
 function Assert-ServiceTable {
     param(
         [Parameter(Mandatory)] [string] $Row,
         [string] $Log = '',
         [int] $TimeoutSeconds = 30,
-        [int] $StableSeconds = 5
+        [int] $StableSeconds = 5,
+        [scriptblock] $Observe = { param($name) Get-ServiceObservation $name },
+        [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since }
     )
     if (-not $script:ServiceTable.Contains($Row)) {
         throw "no service table row '$Row'; the rows are: $($script:ServiceTable.Keys -join ', ')"
     }
     Write-Host "service table: $Row"
     try {
-        Assert-ServiceState -Expect $script:ServiceTable[$Row] -TimeoutSeconds $TimeoutSeconds -StableSeconds $StableSeconds
+        Assert-ServiceState -Expect $script:ServiceTable[$Row] -TimeoutSeconds $TimeoutSeconds -StableSeconds $StableSeconds -Observe $Observe
+        # The transaction that left this row, judged again now that the window reaches past the
+        # stability interval: a service restarted by its recovery policy after msiexec returned
+        # terminates inside it. Once per transaction.
+        $transaction = $script:LastMsiTransaction
+        if ($null -ne $transaction -and -not $transaction.Extended) {
+            $transaction.Extended = $true
+            Write-Host (Invoke-TransactionJudgement -Transaction $transaction -ReadEvents $ReadEvents)
+        }
     } catch {
         if ($Log) { Show-MsiLog $Log }
         foreach ($name in $script:ServiceTable[$Row].Keys) {
@@ -863,6 +908,12 @@ function Show-PortHolders([int] $Port) {
 #               accepted code is the one returned: an accepted code can still be
 #               something a reader of the run must be told.
 # @param What The transaction, for the messages.
+# @param Leaves The service table row the transaction leaves. It is JUDGED, inside this call:
+#               see Get-TransactionExpectation. Exactly one of Leaves and Expect is given.
+# @param Expect A named expectation of $script:TransactionExpectations, for a transaction that
+#               cannot honestly state a row (one that fails and rolls back); its reason says why.
+# @param Start Takes the arguments and returns the started msiexec Process; the self-test's seam, so
+#              a neutered refusal starts a harmless process there rather than msiexec.
 function Invoke-Msiexec {
     param(
         [Parameter(Mandatory)] [ValidateSet('/i', '/x')] [string] $Operation,
@@ -871,12 +922,38 @@ function Invoke-Msiexec {
         [string[]] $Properties = @(),
         [int[]] $Accept = @(0),
         [hashtable] $Notice = @{},
-        [Parameter(Mandatory)] [string] $What
+        [Parameter(Mandatory)] [string] $What,
+        [string] $Leaves = '',
+        [string] $Expect = '',
+        [scriptblock] $Start = { param($arguments) Start-Process msiexec.exe -PassThru -ArgumentList $arguments }
     )
+    # Judged, always: the expectation is resolved, and refused by name, before anything runs. Neither
+    # parameter is Mandatory, because a missing Mandatory parameter PROMPTS, and a prompt on a CI
+    # runner's pwsh is a hang rather than a refusal.
+    $expectation = Get-TransactionExpectation -Leaves $Leaves -Expect $Expect
     $logPath = [IO.Path]::GetFullPath($Log, (Get-Location).Path)
     $arguments = @($Operation, "`"$Package`"", '/qn', '/l*v', "`"$logPath`"") + $Properties
     Write-Host "$What`: msiexec $($arguments -join ' ')"
-    $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList $arguments
+    # What each service ran as when the transaction began, then the transaction WATCHED rather than
+    # waited for: a start nobody asked for (PR 1634's, inferred to be Restart Manager's) can live and die inside the
+    # transaction, and only an observation taken while it runs can see it.
+    $baseline = @{}
+    foreach ($name in $script:ServiceDisplayNames.Keys) {
+        $seen = Get-ServiceObservation $name
+        $baseline[$name] = if ($null -eq $seen) { 0 } else { $seen.ProcessId }
+    }
+    $startedUtc = [DateTime]::UtcNow
+    $p = & $Start $arguments
+    # Held now: Start-Process -PassThru without -Wait hands back a Process whose ExitCode can read
+    # $null once the process has exited unless its handle was taken first, which -Wait used to do.
+    # The self-test's watch case reads an exit code through exactly this shape.
+    $null = $p.Handle
+    $watch = Watch-ServiceProcesses -Process $p
+    $script:LastMsiTransaction = [pscustomobject]@{
+        What = $What; Log = $logPath; StartedUtc = $startedUtc; Baseline = $baseline; Expectation = $expectation
+        Polls = $watch.Polls; FailedPolls = $watch.FailedPolls; FirstFailure = $watch.FirstFailure; Observed = $watch.Observed
+        Extended = $false
+    }
     if ($p.ExitCode -notin $Accept) {
         Show-MsiLog $logPath
         # A checked service action that failed rolled the transaction back, and the service's
@@ -887,6 +964,15 @@ function Invoke-Msiexec {
     }
     Write-Host "$What exited $($p.ExitCode)"
     if ($Notice.ContainsKey($p.ExitCode)) { Write-Host "::notice::$What exited $($p.ExitCode): $($Notice[$p.ExitCode])" }
+    # What the verbose log says Restart Manager did, SHOWN and not judged: the line's wording is not
+    # pinned anywhere this module can read, so a pattern asserted on it would be a guess.
+    if (-not (Test-Path -LiteralPath $logPath)) { Write-Host "  log: $logPath was not written" }
+    else {
+        $restartManager = @(Select-String -LiteralPath $logPath -Pattern 'RESTART MANAGER' | Select-Object -First 4)
+        if ($restartManager.Count) { $restartManager | ForEach-Object { Write-Host "  log: $($_.Line.Trim())" } }
+        else { Write-Host '  log: no line names RESTART MANAGER' }
+    }
+    Write-Host (Invoke-TransactionJudgement -Transaction $script:LastMsiTransaction)
 }
 
 # Asserts which lines a verbose log carries and which it must not.
@@ -962,6 +1048,316 @@ function Assert-MsiActionOrder([string] $Path, [string[]] $Actions) {
 # @return The pattern.
 function Get-MsiActionRanPattern([string] $Action) {
     return "Doing action: $([regex]::Escape($Action))\s*$"
+}
+
+# ---------------------------------------------------------------------------
+# What a transaction did to the services (PR 1634)
+# ---------------------------------------------------------------------------
+#
+# The service table row a transaction leaves is asserted AFTER it, so a service
+# that was started during it and died again -- or crash-looped, stopped between
+# two recovery restarts at the moment it was asked -- passes the row. That is
+# what PR 1634's CI showed (MEASURED): the upgrade from 0.3.0 started FastCached
+# at 12:12:47, after the table had made it manual and stopped it for the node;
+# it could not bind the port the node holds, terminated three times before
+# msiexec returned, and the row read "Manual and Stopped". That Windows
+# Installer's Restart Manager started it is INFERRED: nothing in the package
+# starts FastCached on that path, and FastCached stopped one second into the
+# transaction, at InstallValidate time.
+#
+# So Invoke-Msiexec JUDGES every transaction it runs, against the row it names
+# (`-Leaves`) or a named expectation (`-Expect`), and Assert-ServiceTable judges
+# the same transaction again over the longer window that reaches its own
+# stability interval. Three witnesses, each a pure function over records:
+#
+#   * the service control manager's unexpected-termination events (7031, 7034)
+#     naming a service of this package since the transaction began;
+#   * its "entered the running state" event (7036) for a service the
+#     expectation leaves NOT RUNNING (stopped, or not registered);
+#   * a process the watch saw such a service run under, other than the one it
+#     ran under when the transaction began.
+#
+# 7036 is a witness only where the host writes it. MEASURED on two hosts: the
+# Windows Server 2025 runner of PR 1634's CI writes it (its log printed "The
+# FastCached service entered the running state"); this repository's Windows 11
+# 26200 development host wrote none among 50,978 System records. So the watch
+# stays, and each transaction that starts the node says which of the two hosts
+# it ran on: the node's own start is the positive control (Get-Witness7036State).
+
+# Expectations a transaction states when no row honestly describes it, each with
+# its reason. A row is the default for everything else, and nothing defaults to
+# one of these: Invoke-Msiexec refuses a call that names neither.
+#
+#   MayTerminate  the services whose unexpected termination this transaction is
+#                 BUILT to cause; every other termination is still a finding.
+#
+# Neither row watches for a start: a rollback starts again what the transaction
+# stopped, and removes what it created and started, so which service may start
+# during it is the rollback's business, not a row's.
+$script:TransactionExpectations = [ordered]@{
+    RollsBack = @{
+        MayTerminate = @()
+        Reason = 'the transaction fails on purpose and rolls back: the rollback restarts what it stopped and removes what it created, so no row describes what may start during it; every unexpected termination is still a finding'
+    }
+    NodeCannotBind = @{
+        MayTerminate = @('FastCacheCompileNode')
+        Reason = 'the step holds 6674, so the node the transaction adds cannot bind and its refusal is logged as an unexpected termination (7034, measured in PR 1634); the transaction then rolls back, so no start is judged; a termination of FastCached is still a finding'
+    }
+}
+
+# What a transaction is judged against: a service table row (`-Leaves`), or a named expectation
+# (`-Expect`). Exactly one; neither, both, or an unknown name is refused by name.
+#
+# @param Leaves A key of $script:ServiceTable, or empty.
+# @param Expect A key of $script:TransactionExpectations, or empty.
+# @return Name; NotRunning, the services that must not be STARTED during it (a row's Stopped and
+#         unregistered services); MayTerminate; NodeStarts, whether the transaction starts the node
+#         (the 7036 positive control); and Reason.
+function Get-TransactionExpectation([string] $Leaves = '', [string] $Expect = '') {
+    if ([bool] $Leaves -eq [bool] $Expect) {
+        throw "Invoke-Msiexec judges every transaction: name the service table row it -Leaves ($($script:ServiceTable.Keys -join ', ')), or, for a transaction no row describes, a named -Expect ($($script:TransactionExpectations.Keys -join ', ')); exactly one"
+    }
+    if ($Leaves) {
+        if (-not $script:ServiceTable.Contains($Leaves)) {
+            throw "no service table row '$Leaves'; the rows are: $($script:ServiceTable.Keys -join ', ')"
+        }
+        $row = $script:ServiceTable[$Leaves]
+        $notRunning = @(foreach ($name in $row.Keys) { if ($null -eq $row[$name] -or $row[$name][1] -eq 'Stopped') { $name } })
+        $node = $row['FastCacheCompileNode']
+        return [pscustomobject]@{
+            Name = "row $Leaves"; NotRunning = $notRunning; MayTerminate = @()
+            NodeStarts = ($null -ne $node -and $node[1] -eq 'Running'); Reason = ''
+        }
+    }
+    if (-not $script:TransactionExpectations.Contains($Expect)) {
+        throw "no transaction expectation '$Expect'; the expectations are: $($script:TransactionExpectations.Keys -join ', ')"
+    }
+    $named = $script:TransactionExpectations[$Expect]
+    return [pscustomobject]@{
+        Name = "expectation $Expect"; NotRunning = @(); MayTerminate = @($named.MayTerminate); NodeStarts = $false; Reason = $named.Reason
+    }
+}
+
+# Every process a service of this package runs under while @p Process runs, observed every
+# @p IntervalMilliseconds until it exits.
+#
+# An observation that FAILS is counted and the watch goes on, and the process is waited for on every
+# way out: an error escaping here would leave msiexec running, untracked, under a step that had
+# already thrown.
+#
+# @param Process The running process, its handle already taken.
+# @param Observe Takes a service name and returns what Get-ServiceObservation would.
+# @param IntervalMilliseconds The interval between observations.
+# @return Polls, the rounds in which every observation succeeded; FailedPolls, the rounds in which one
+#         failed, and FirstFailure, its error; and Observed, one record per sighting of a service
+#         running under a process (Time in UTC, Service, State, ProcessId).
+function Watch-ServiceProcesses {
+    param(
+        [Parameter(Mandatory)] [System.Diagnostics.Process] $Process,
+        [scriptblock] $Observe = { param($name) Get-ServiceObservation $name },
+        [int] $IntervalMilliseconds = 250
+    )
+    $observed = [System.Collections.Generic.List[object]]::new()
+    $polls = 0
+    $failedPolls = 0
+    $firstFailure = ''
+    try {
+        while (-not $Process.WaitForExit($IntervalMilliseconds)) {
+            $failed = $false
+            foreach ($name in $script:ServiceDisplayNames.Keys) {
+                try {
+                    $seen = & $Observe $name
+                } catch {
+                    $failed = $true
+                    if (-not $firstFailure) { $firstFailure = "$name`: $($_.Exception.Message)" }
+                    continue
+                }
+                if ($null -ne $seen -and $seen.ProcessId -gt 0) {
+                    $observed.Add([pscustomobject]@{ Time = [DateTime]::UtcNow; Service = $name; State = $seen.State; ProcessId = $seen.ProcessId })
+                }
+            }
+            if ($failed) { $failedPolls++ } else { $polls++ }
+        }
+    } finally {
+        $Process.WaitForExit()
+    }
+    return [pscustomobject]@{ Polls = $polls; FailedPolls = $failedPolls; FirstFailure = $firstFailure; Observed = $observed.ToArray() }
+}
+
+# One service control manager event as a record, from its XML and its rendered message.
+#
+# The service is read from the first of these that the event's shape carries:
+#   1. its binary data, the SERVICE name in UTF-16 (a real 7031's decodes to FastCacheCompileNode); a
+#      `/` in it is read as `<name>/<state code>`, a layout seen reported for 7036 but NOT verified
+#      here, so it decides only when param2 says nothing;
+#   2. a `ServiceName` data item, as 7045 ("a service was installed") carries it;
+#   3. param1, the display name.
+# Either name of a service of this package maps to its service name through ServiceDisplayNames; any
+# other is kept as it was. A 7036's state is its param2 ("running", "stopped"), the form Microsoft's
+# own event queries match on.
+#
+# @param Xml The event's XML (EventLogRecord.ToXml()).
+# @param Message The event's rendered message.
+# @return Id, Time (UTC), Service, State ('Running', 'Stopped' or '' when the event states none) and
+#         Message.
+function ConvertTo-ServiceControlEvent([string] $Xml, [string] $Message) {
+    [xml] $document = $Xml
+    $namespace = [System.Xml.XmlNamespaceManager]::new($document.NameTable)
+    $namespace.AddNamespace('e', 'http://schemas.microsoft.com/win/2004/08/events/event')
+    $data = { param([string] $name)
+        $node = $document.SelectSingleNode("/e:Event/e:EventData/e:Data[@Name='$name']", $namespace)
+        if ($null -eq $node) { '' } else { $node.InnerText } }
+    $id = [int] $document.SelectSingleNode('/e:Event/e:System/e:EventID', $namespace).InnerText
+    $stamp = $document.SelectSingleNode('/e:Event/e:System/e:TimeCreated', $namespace).GetAttribute('SystemTime')
+    $time = [DateTime]::Parse($stamp, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+    $binary = $document.SelectSingleNode('/e:Event/e:EventData/e:Binary', $namespace)
+    $name = ''
+    $code = ''
+    if ($null -ne $binary -and $binary.InnerText.Length -ge 4 -and $binary.InnerText.Length % 2 -eq 0) {
+        $hex = $binary.InnerText
+        $bytes = [byte[]] @(foreach ($at in 0..($hex.Length / 2 - 1)) { [Convert]::ToByte($hex.Substring($at * 2, 2), 16) })
+        $name = [Text.Encoding]::Unicode.GetString($bytes).TrimEnd([char] 0)
+        if ($name.Contains('/')) { $name, $code = $name.Split('/', 2) }
+    }
+    if (-not $name) { $name = & $data 'ServiceName' }
+    if (-not $name) { $name = & $data 'param1' }
+    foreach ($service in $script:ServiceDisplayNames.Keys) {
+        if ($name -eq $service -or $name -eq $script:ServiceDisplayNames[$service]) { $name = $service; break }
+    }
+    $state = ''
+    if ($id -eq 7036) {
+        $state = switch (& $data 'param2') { 'running' { 'Running' } 'stopped' { 'Stopped' } default {
+                switch ($code.Trim([char] 0)) { '4' { 'Running' } '1' { 'Stopped' } default { '' } } } }
+    }
+    return [pscustomobject]@{ Id = $id; Time = $time; Service = $name; State = $state; Message = ($Message -replace '\s+', ' ').Trim() }
+}
+
+# The service control manager's events of @p Ids since @p SinceUtc, as records. An empty answer is
+# NOTHING, not a failure: Get-WinEvent reports "no events were found" as an error, and only that
+# error is taken as the answer; every other one throws.
+#
+# @param SinceUtc The earliest instant, in UTC.
+# @param Ids The event ids.
+# @param MaxEvents At most this many, newest first; 0 for all.
+# @return One ConvertTo-ServiceControlEvent record per event; wrap the call in @() to count it.
+function Get-ServiceControlEvents {
+    param(
+        [Parameter(Mandatory)] [datetime] $SinceUtc,
+        [int[]] $Ids = $script:TransactionEvents,
+        [int] $MaxEvents = 0
+    )
+    $filter = @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = $Ids; StartTime = $SinceUtc.ToLocalTime() }
+    $bound = if ($MaxEvents -gt 0) { @{ MaxEvents = $MaxEvents } } else { @{} }
+    try {
+        $records = @(Get-WinEvent -FilterHashtable $filter @bound -ErrorAction Stop)
+    } catch {
+        if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { return }
+        throw
+    }
+    foreach ($record in $records) { ConvertTo-ServiceControlEvent $record.ToXml() $record.Message }
+}
+
+# The decision, apart from the acquisition: what a transaction did to the services that its
+# expectation did not allow.
+#
+# @param What The transaction, for the findings.
+# @param StartedUtc When it began; an event before it belongs to something else.
+# @param Events ConvertTo-ServiceControlEvent records.
+# @param Observed Watch-ServiceProcesses' Observed records.
+# @param Baseline Service name to the process it ran under when the transaction began, 0 for none.
+# @param NotRunning The services the expectation leaves not running: none may be STARTED.
+# @param MayTerminate The services whose unexpected termination the expectation allows.
+# @return One finding per unexpected termination and per start of a NotRunning service, each with a
+#         Kind ('Termination' or 'Start') and a Text naming the service, the event id or process, the
+#         time and the message; NOTHING when there is none (wrap the call in @() to count it).
+function Get-TransactionServiceVerdict {
+    param(
+        [Parameter(Mandatory)] [string] $What,
+        [Parameter(Mandatory)] [datetime] $StartedUtc,
+        [object[]] $Events = @(),
+        [object[]] $Observed = @(),
+        [hashtable] $Baseline = @{},
+        [string[]] $NotRunning = @(),
+        [string[]] $MayTerminate = @()
+    )
+    $format = { param([datetime] $t) $t.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture) }
+    $finding = { param([string] $kind, [string] $text) [pscustomobject]@{ Kind = $kind; Text = $text } }
+    $ours = @($Events | Where-Object { $_.Time -ge $StartedUtc -and $script:ServiceDisplayNames.Contains($_.Service) } | Sort-Object Time)
+    foreach ($record in $ours) {
+        if ($record.Id -notin $script:UnexpectedTerminationEvents -or $record.Service -in $MayTerminate) { continue }
+        & $finding 'Termination' "$($record.Service) terminated unexpectedly during '$What': event $($record.Id) at $(& $format $record.Time): $($record.Message)"
+    }
+    foreach ($name in $NotRunning) {
+        foreach ($record in @($ours | Where-Object { $_.Id -eq 7036 -and $_.Service -eq $name -and $_.State -eq 'Running' })) {
+            & $finding 'Start' "$name, which the expectation leaves not running, was started during '$What': event 7036 at $(& $format $record.Time): $($record.Message)"
+        }
+        $before = if ($Baseline.ContainsKey($name)) { [int] $Baseline[$name] } else { 0 }
+        $strays = @($Observed | Where-Object { $_.Service -eq $name -and $_.ProcessId -gt 0 -and $_.ProcessId -ne $before } |
+                Sort-Object Time | Group-Object ProcessId)
+        foreach ($stray in $strays) {
+            $first = $stray.Group[0]
+            $was = if ($before -gt 0) { "it ran as process $before when the transaction began" } else { 'it was not running when the transaction began' }
+            & $finding 'Start' "$name, which the expectation leaves not running, was started during '$What': process $($first.ProcessId) seen $($first.State) at $(& $format $first.Time), $($stray.Count) time(s); $was"
+        }
+    }
+}
+
+# Whether the 7036 witness is LIVE in a transaction, from its one positive control: the node's own
+# start. A host that writes 7036 logs it whenever the node starts, and every transaction whose
+# expectation leaves the node running starts (or restarts) it.
+#
+# @param Events ConvertTo-ServiceControlEvent records.
+# @param StartedUtc When the transaction began.
+# @param NodeStarts Whether the transaction starts the node.
+# @return 'live' (the node's start was logged), 'absent' (the node started and no 7036 says so: this
+#         host does not write them, and the watch is the only start witness) or 'no control' (the
+#         transaction starts no node, so nothing here can tell).
+function Get-Witness7036State([object[]] $Events = @(), [datetime] $StartedUtc, [bool] $NodeStarts) {
+    if (-not $NodeStarts) { return 'no control' }
+    $seen = @($Events | Where-Object { $_.Id -eq 7036 -and $_.Time -ge $StartedUtc -and $_.Service -eq 'FastCacheCompileNode' -and $_.State -eq 'Running' })
+    if ($seen.Count -gt 0) { return 'live' }
+    return 'absent'
+}
+
+# Judges @p Transaction against its expectation, over every event since it began: refuses with each
+# finding, or returns the line that says what was judged, including which witnesses were live.
+#
+# @param Transaction The record Invoke-Msiexec keeps.
+# @param ReadEvents Takes the transaction's start in UTC and returns ConvertTo-ServiceControlEvent
+#                   records; the seam through which the self-test supplies them.
+# @return The pass line.
+function Invoke-TransactionJudgement {
+    param(
+        [Parameter(Mandatory)] $Transaction,
+        [scriptblock] $ReadEvents = { param($since) Get-ServiceControlEvents -SinceUtc $since }
+    )
+    $expectation = $Transaction.Expectation
+    # A watch that never looked reports no start, which is not the same as none happening.
+    if ($Transaction.Polls -lt 1) {
+        throw "the services were never observed while '$($Transaction.What)' ran ($($Transaction.FailedPolls) observation round(s) failed, first: $($Transaction.FirstFailure)), so 'nothing was started' would describe nothing"
+    }
+    $events = @(& $ReadEvents $Transaction.StartedUtc)
+    $findings = @(Get-TransactionServiceVerdict -What $Transaction.What -StartedUtc $Transaction.StartedUtc -Events $events `
+            -Observed $Transaction.Observed -Baseline $Transaction.Baseline -NotRunning $expectation.NotRunning -MayTerminate $expectation.MayTerminate)
+    if ($findings.Count -gt 0) {
+        if ($Transaction.Log) { Show-MsiLog $Transaction.Log }
+        Show-PortHolders 6674
+        $kinds = @($findings | ForEach-Object Kind | Sort-Object -Unique)
+        $hints = @(
+            if ('Termination' -in $kinds) { 'a TERMINATION is the service failing: read its time against the verbose log and the service''s own Application events (Show-ServiceDiagnosis), a refused start and a bad restore look like this' }
+            if ('Start' -in $kinds) { 'a START of a service the expectation leaves not running has had one cause so far, Windows Installer''s Restart Manager (PR 1634), which the package disables (MSIRESTARTMANAGERCONTROL); read the verbose log''s RESTART MANAGER lines and the actions running at that time' }
+        )
+        throw "'$($Transaction.What)' disturbed a service the table owns ($($expectation.Name)):`n  $(@($findings | ForEach-Object Text) -join "`n  ")`n$($hints -join "`n")"
+    }
+    $witness = switch (Get-Witness7036State -Events $events -StartedUtc $Transaction.StartedUtc -NodeStarts $expectation.NodeStarts) {
+        'live' { '7036 live (the node''s own start is logged)' }
+        'absent' { '7036 ABSENT: the node started and no 7036 says so, so this host does not write them and the watch is the only start witness' }
+        default { '7036 unchecked: the transaction starts no node to be its control' }
+    }
+    $watched = if ($expectation.NotRunning.Count) { "no start of $($expectation.NotRunning -join ', ')" } else { 'no start judged' }
+    $gaps = if ($Transaction.FailedPolls -gt 0) { "; $($Transaction.FailedPolls) observation round(s) FAILED, first: $($Transaction.FirstFailure)" } else { '' }
+    $why = if ($expectation.Reason) { " -- $($expectation.Reason)" } else { '' }
+    return "  '$($Transaction.What)' judged against $($expectation.Name)$why`: no unexpected termination, $watched; $witness; $($Transaction.Polls) observation round(s)$gaps"
 }
 
 # ---------------------------------------------------------------------------
@@ -1694,7 +2090,253 @@ function Invoke-MsiServiceTableSelfTest {
     if ($settled -notmatch '^Running; unstable: X restarted within 0 s \(process 10 became 11\)') { throw "settled: a restart read '$settled'" }
     Pass 'settled: two process ids read as unstable'
 
-    $expectedCases = 103
+    # What a transaction did to the services (PR 1634), over synthetic records. The first is the
+    # upgrade from 0.3.0 that CI ran: FastCached Auto and running as 9268 before it, stopped one second
+    # in, started again at 12:12:47 after the table had made it manual, and terminated three times
+    # before msiexec returned. Every other row is one witness alone, or one thing that must NOT count.
+    $t0 = [DateTime]::new(2026, 10, 6, 12, 12, 14, [DateTimeKind]::Utc)
+    $termination = { param([int] $id, [int] $second, [string] $service)
+        [pscustomobject]@{ Id = $id; Time = $t0.AddSeconds($second); Service = $service; State = ''; Message = "The $service service terminated unexpectedly. It has done this 1 time(s)." } }
+    $entered = { param([int] $second, [string] $service, [string] $state)
+        [pscustomobject]@{ Id = 7036; Time = $t0.AddSeconds($second); Service = $service; State = $state; Message = "The $service service entered the $($state.ToLower()) state." } }
+    $sighting = { param([string] $service, [int] $processId, [int] $second, [string] $state = 'Running')
+        [pscustomobject]@{ Time = $t0.AddSeconds($second); Service = $service; State = $state; ProcessId = $processId } }
+    $upgradeFrom030 = @{
+        Events = @((& $termination 7031 34 'FastCached'), (& $termination 7031 36 'FastCached'), (& $termination 7031 38 'FastCached'),
+            (& $entered 33 'FastCached' 'Running'), (& $entered 30 'FastCacheCompileNode' 'Running'))
+        Observed = @((& $sighting 'FastCached' 9268 0 'Stop Pending'), (& $sighting 'FastCacheCompileNode' 8392 30), (& $sighting 'FastCached' 5120 33))
+        Baseline = @{ FastCached = 9268; FastCacheCompileNode = 0 }
+    }
+    $none = @{ Events = @(); Observed = @(); Baseline = @{} }
+    $transactionVerdicts = @(
+        @{ Case = 'the upgrade from 0.3.0 that CI ran: three terminations and a start seen by both start witnesses'; Input = $upgradeFrom030; NotRunning = @('FastCached')
+           Match = @("^Termination: FastCached terminated unexpectedly during 'T': event 7031 at 2026-10-06T12:12:48\.000Z: The FastCached service terminated unexpectedly",
+                     '^Termination: .*event 7031 at 2026-10-06T12:12:50\.000Z', '^Termination: .*event 7031 at 2026-10-06T12:12:52\.000Z',
+                     "^Start: FastCached, which the expectation leaves not running, was started during 'T': event 7036 at 2026-10-06T12:12:47\.000Z: The FastCached service entered the running state\.$",
+                     "^Start: FastCached, which the expectation leaves not running, was started during 'T': process 5120 seen Running at 2026-10-06T12:12:47\.000Z, 1 time\(s\); it ran as process 9268 when the transaction began$") }
+        @{ Case = 'a termination alone, with no start seen'; NotRunning = @()
+           Input = @{ Events = @(& $termination 7034 20 'FastCacheCompileNode'); Observed = @(); Baseline = @{} }
+           Match = @("^Termination: FastCacheCompileNode terminated unexpectedly during 'T': event 7034 at 2026-10-06T12:12:34\.000Z") }
+        @{ Case = 'a start seen by the watch alone, of a service that was not running'; NotRunning = @('FastCached')
+           Input = @{ Events = @(); Observed = @(& $sighting 'FastCached' 5120 33); Baseline = @{ FastCached = 0 } }
+           Match = @('^Start: .*process 5120 seen Running at 2026-10-06T12:12:47\.000Z, 1 time\(s\); it was not running when the transaction began$') }
+        @{ Case = 'a start seen by 7036 alone, between two observations of the watch'; NotRunning = @('FastCached')
+           Input = @{ Events = @((& $entered 33 'FastCached' 'Running'), (& $entered 34 'FastCached' 'Stopped')); Observed = @(); Baseline = @{ FastCached = 0 } }
+           Match = @('^Start: FastCached, .*event 7036 at 2026-10-06T12:12:47\.000Z') }
+        @{ Case = 'a stop (7036 stopped) of a service left not running is not a start'; NotRunning = @('FastCached')
+           Input = @{ Events = @(& $entered 1 'FastCached' 'Stopped'); Observed = @(); Baseline = @{ FastCached = 9268 } }
+           Match = @() }
+        @{ Case = 'one stray process seen twice is one finding'; NotRunning = @('FastCached')
+           Input = @{ Events = @(); Observed = @((& $sighting 'FastCached' 5120 33), (& $sighting 'FastCached' 5120 34)); Baseline = @{ FastCached = 0 } }
+           Match = @('process 5120 seen Running at 2026-10-06T12:12:47\.000Z, 2 time\(s\)') }
+        @{ Case = 'the process a service ran under when it began is not a start'; NotRunning = @('FastCached')
+           Input = @{ Events = @(); Observed = @((& $sighting 'FastCached' 9268 0), (& $sighting 'FastCached' 9268 1 'Stop Pending')); Baseline = @{ FastCached = 9268 } }
+           Match = @() }
+        @{ Case = 'a service the expectation leaves running may be started'; NotRunning = @('FastCached')
+           Input = @{ Events = @(& $entered 30 'FastCacheCompileNode' 'Running'); Observed = @(& $sighting 'FastCacheCompileNode' 8392 30); Baseline = @{ FastCacheCompileNode = 0 } }
+           Match = @() }
+        @{ Case = 'a termination before the transaction began is not its'; NotRunning = @()
+           Input = @{ Events = @(& $termination 7031 -5 'FastCached'); Observed = @(); Baseline = @{} }
+           Match = @() }
+        @{ Case = "another service's termination is not this package's"; NotRunning = @()
+           Input = @{ Events = @(& $termination 7034 5 'sshd'); Observed = @(); Baseline = @{} }
+           Match = @() }
+        @{ Case = 'a termination the expectation allows is not a finding, and the other service''s still is'; NotRunning = @(); MayTerminate = @('FastCacheCompileNode')
+           Input = @{ Events = @((& $termination 7034 20 'FastCacheCompileNode'), (& $termination 7031 21 'FastCached')); Observed = @(); Baseline = @{} }
+           Match = @("^Termination: FastCached terminated unexpectedly during 'T': event 7031 at 2026-10-06T12:12:35\.000Z") }
+    )
+    foreach ($row in $transactionVerdicts) {
+        $may = if ($row.ContainsKey('MayTerminate')) { $row.MayTerminate } else { @() }
+        $findings = @(Get-TransactionServiceVerdict -What 'T' -StartedUtc $t0 -Events $row.Input.Events -Observed $row.Input.Observed `
+                -Baseline $row.Input.Baseline -NotRunning $row.NotRunning -MayTerminate $may | ForEach-Object { "$($_.Kind): $($_.Text)" })
+        if ($findings.Count -ne $row.Match.Count) { throw "transaction: $($row.Case): expected $($row.Match.Count) finding(s), got [$($findings -join '; ')]" }
+        foreach ($at in @(0..($findings.Count - 1) | Where-Object { $findings.Count -gt 0 })) {
+            if ($findings[$at] -notmatch $row.Match[$at]) { throw "transaction: $($row.Case): finding $at '$($findings[$at])' does not match '$($row.Match[$at])'" }
+        }
+        Pass "transaction: $($row.Case)"
+    }
+
+    # What each row makes an expectation of: the services it leaves NOT RUNNING (stopped, or not
+    # registered) are watched for a start, and the node's start is the 7036 control where it runs.
+    $wantNotRunning = @{
+        Release030WithNode = 'FastCacheCompileNode'; NodeSelected = 'FastCached'; NodeAlone = 'FastCached'
+        DaemonAlone = 'FastCacheCompileNode'; DaemonAloneUnstarted = 'FastCacheCompileNode,FastCached'; NothingInstalled = 'FastCacheCompileNode,FastCached'
+    }
+    foreach ($rowName in $script:ServiceTable.Keys) {
+        $expectation = Get-TransactionExpectation -Leaves $rowName
+        $notRunning = @($expectation.NotRunning | Sort-Object) -join ','
+        $want = @($wantNotRunning[$rowName] -split ',' | Sort-Object) -join ','
+        $nodeStarts = $rowName -in 'NodeSelected', 'NodeAlone'
+        if ($notRunning -cne $want -or $expectation.NodeStarts -ne $nodeStarts -or @($expectation.MayTerminate).Count -ne 0 -or $expectation.Name -cne "row $rowName") {
+            throw "expectation: row $rowName leaves [$notRunning] not running, node starts $($expectation.NodeStarts); expected [$want], $nodeStarts"
+        }
+    }
+    Pass 'expectation: each row watches what it leaves not running, and the node start is the control only where the node runs'
+    foreach ($name in $script:TransactionExpectations.Keys) {
+        $expectation = Get-TransactionExpectation -Expect $name
+        if (@($expectation.NotRunning).Count -ne 0 -or $expectation.NodeStarts -or -not $expectation.Reason -or $expectation.Name -cne "expectation $name") {
+            throw "expectation: $name read as $($expectation | ConvertTo-Json -Compress)"
+        }
+    }
+    if ((@((Get-TransactionExpectation -Expect NodeCannotBind).MayTerminate) -join ',') -cne 'FastCacheCompileNode' -or @((Get-TransactionExpectation -Expect RollsBack).MayTerminate).Count -ne 0) {
+        throw 'expectation: only NodeCannotBind allows a termination, and only the node''s'
+    }
+    Pass 'expectation: each named expectation carries its reason, judges no start, and only NodeCannotBind allows a termination'
+    ExpectThrow 'expectation: naming neither is refused' { Get-TransactionExpectation } 'judges every transaction: name the service table row it -Leaves'
+    ExpectThrow 'expectation: naming both is refused' { Get-TransactionExpectation -Leaves NodeSelected -Expect RollsBack } 'judges every transaction'
+    ExpectThrow 'expectation: an unknown row is refused by name' { Get-TransactionExpectation -Leaves NoSuchRow } "no service table row 'NoSuchRow'"
+    ExpectThrow 'expectation: an unknown expectation is refused by name' { Get-TransactionExpectation -Expect NoSuchExpectation } "no transaction expectation 'NoSuchExpectation'"
+    # And Invoke-Msiexec itself: a call naming neither is refused BEFORE anything runs. Its first
+    # statement resolves the expectation; and the start goes through the seam, so a neutered refusal
+    # would start a harmless process here, never msiexec.
+    ExpectThrow 'expectation: Invoke-Msiexec naming neither refuses before running anything' {
+        Invoke-Msiexec -Operation '/i' -Package (Join-Path ([IO.Path]::GetTempPath()) "no-such-$([guid]::NewGuid().ToString('N')).msi") -Log 'unused.log' -What 'W' `
+            -Start { param($arguments) Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-Command', 'exit 0' -PassThru -NoNewWindow } 6>$null
+    } 'judges every transaction'
+
+    # The 7036 witness's positive control: the node's own start, in every state.
+    foreach ($row in @(
+            @{ Case = 'the node''s start logged'; Events = @(& $entered 30 'FastCacheCompileNode' 'Running'); NodeStarts = $true; Want = 'live' }
+            @{ Case = 'the node started and nothing logged it'; Events = @(& $entered 30 'FastCached' 'Running'); NodeStarts = $true; Want = 'absent' }
+            @{ Case = 'a node start BEFORE the transaction is not its control'; Events = @(& $entered -3 'FastCacheCompileNode' 'Running'); NodeStarts = $true; Want = 'absent' }
+            @{ Case = 'no node start in the transaction'; Events = @(& $entered 30 'FastCacheCompileNode' 'Running'); NodeStarts = $false; Want = 'no control' })) {
+        $state = Get-Witness7036State -Events $row.Events -StartedUtc $t0 -NodeStarts $row.NodeStarts
+        if ($state -cne $row.Want) { throw "7036 control: $($row.Case) read '$state', expected '$($row.Want)'" }
+        Pass "7036 control: $($row.Case) is '$($row.Want)'"
+    }
+
+    # The event reader's parse, over every shape it reads: the binary data carries the SERVICE name
+    # (this one copied from a real 7031 event), a 7045 a ServiceName item, param1 the display name, and
+    # a 7036 its state in param2.
+    $eventXml = { param([int] $id, [string] $stamp, [hashtable] $items, [string] $binaryHex)
+        $binary = if ($binaryHex) { "<Binary>$binaryHex</Binary>" } else { '' }
+        $data = @(foreach ($key in @($items.Keys | Sort-Object)) { "<Data Name='$key'>$($items[$key])</Data>" }) -join ''
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Service Control Manager'/><EventID Qualifiers='49152'>$id</EventID><TimeCreated SystemTime='$stamp'/></System><EventData>$data$binary</EventData></Event>" }
+    $hexOf = { param([string] $text) (([Text.Encoding]::Unicode.GetBytes("$text$([char] 0)")) | ForEach-Object { $_.ToString('X2') }) -join '' }
+    $realBinary = '46006100730074004300610063006800650043006F006D00700069006C0065004E006F00640065000000'
+    $parses = @(
+        @{ Case = 'the service name is read from the binary data, the time in UTC'
+           Xml = (& $eventXml 7031 '2026-10-06T12:12:48.1234567Z' @{ param1 = 'fastcache-compile-node'; param2 = '1' } $realBinary); Message = "The node`r`n terminated."
+           Id = 7031; Service = 'FastCacheCompileNode'; State = ''; Text = 'The node terminated.'; Time = [DateTime]::new(2026, 10, 6, 12, 12, 48, [DateTimeKind]::Utc).AddTicks(1234567) }
+        @{ Case = "with no binary data, this package's display name reads as its service name"
+           Xml = (& $eventXml 7034 '2026-10-06T12:12:48Z' @{ param1 = 'fastcached'; param2 = '1' } ''); Message = 'm'
+           Id = 7034; Service = 'FastCached'; State = ''; Text = 'm'; Time = [DateTime]::new(2026, 10, 6, 12, 12, 48, [DateTimeKind]::Utc) }
+        @{ Case = 'another service keeps its own name'
+           Xml = (& $eventXml 7034 '2026-10-06T12:12:48Z' @{ param1 = 'OpenSSH SSH Server'; param2 = '1' } (& $hexOf 'sshd')); Message = 'm'
+           Id = 7034; Service = 'sshd'; State = ''; Text = 'm'; Time = [DateTime]::new(2026, 10, 6, 12, 12, 48, [DateTimeKind]::Utc) }
+        @{ Case = 'a 7045 names its service in a ServiceName item, with no param1 and no binary data'
+           Xml = (& $eventXml 7045 '2026-10-01T08:00:00Z' @{ ServiceName = 'cowork-svc'; ImagePath = 'C:\x.exe'; ServiceType = 'user mode service'; StartType = 'auto start'; AccountName = 'LocalSystem' } ''); Message = 'A service was installed in the system.'
+           Id = 7045; Service = 'cowork-svc'; State = ''; Text = 'A service was installed in the system.'; Time = [DateTime]::new(2026, 10, 1, 8, 0, 0, [DateTimeKind]::Utc) }
+        @{ Case = 'a 7036 reads its state from param2 and its service from the display name'
+           Xml = (& $eventXml 7036 '2026-10-06T12:13:23Z' @{ param1 = 'FastCached'; param2 = 'running' } ''); Message = 'The FastCached service entered the running state.'
+           Id = 7036; Service = 'FastCached'; State = 'Running'; Text = 'The FastCached service entered the running state.'; Time = [DateTime]::new(2026, 10, 6, 12, 13, 23, [DateTimeKind]::Utc) }
+        @{ Case = 'a 7036 whose binary data reads <name>/<code> and whose param2 says nothing'
+           Xml = (& $eventXml 7036 '2026-10-06T12:13:24Z' @{ param1 = 'fastcache-compile-node'; param2 = '' } (& $hexOf 'FastCacheCompileNode/1')); Message = 'm'
+           Id = 7036; Service = 'FastCacheCompileNode'; State = 'Stopped'; Text = 'm'; Time = [DateTime]::new(2026, 10, 6, 12, 13, 24, [DateTimeKind]::Utc) }
+    )
+    foreach ($row in $parses) {
+        $parsed = ConvertTo-ServiceControlEvent $row.Xml $row.Message
+        if ($parsed.Id -ne $row.Id -or $parsed.Service -cne $row.Service -or $parsed.State -cne $row.State -or $parsed.Message -cne $row.Text -or
+            $parsed.Time -ne $row.Time -or $parsed.Time.Kind -ne 'Utc') {
+            throw "event: $($row.Case): parsed as $($parsed | ConvertTo-Json -Compress)"
+        }
+        Pass "event: $($row.Case)"
+    }
+
+    # The reader against the real System log: nothing since tomorrow is an empty answer, not an error,
+    # and the positive control that keeps that empty answer honest: the same filter, over ids a host
+    # running for any time has some of, finds one. It asserts the FILTER only -- what the parse makes
+    # of whichever event is newest is the cases above, so an install (7045) arriving last is no red.
+    $nothing = @(Get-ServiceControlEvents -SinceUtc ([DateTime]::UtcNow.AddDays(1)))
+    if ($nothing.Count -ne 0) { throw "live events: $($nothing.Count) event(s) since tomorrow" }
+    Pass 'live events: no event since the future is an empty answer'
+    $common = @(7000, 7009, 7011, 7023, 7024, 7026, 7031, 7034, 7036, 7040, 7043, 7045)
+    $some = @(Get-ServiceControlEvents -SinceUtc ([DateTime]::UtcNow.AddDays(-365)) -Ids $common -MaxEvents 1)
+    if ($some.Count -ne 1 -or $some[0].Id -notin $common -or $some[0].Time.Kind -ne 'Utc') {
+        throw "live events: the service control manager filter found $($some.Count) event(s) of ids $($common -join ', ') in a year, so an empty answer from it cannot be believed"
+    }
+    Pass "live events: the filter finds a service control manager event ($($some[0].Id))"
+
+    # The judgement WIRED: the recorded transaction, its expectation, the event seam, and the message
+    # per finding KIND.
+    $record = { param([string] $leaves, [string] $expect, [int] $polls, [int] $failed, $observed)
+        [pscustomobject]@{ What = 'the upgrade from v0.3.0'; Log = ''; StartedUtc = $t0; Baseline = $upgradeFrom030.Baseline
+            Expectation = (Get-TransactionExpectation -Leaves $leaves -Expect $expect); Polls = $polls; FailedPolls = $failed
+            FirstFailure = $(if ($failed) { 'FastCached: Invalid class' } else { '' }); Observed = $observed; Extended = $false } }
+    ExpectThrow 'judgement: a watch that never looked is refused, naming its failed rounds' {
+        Invoke-TransactionJudgement -Transaction (& $record 'NodeSelected' '' 0 3 @()) -ReadEvents { @() }
+    } "were never observed .*\(3 observation round\(s\) failed, first: FastCached: Invalid class\)"
+    $read = $upgradeFrom030.Events
+    ExpectThrow 'judgement: the upgrade from 0.3.0 is refused with each finding and both kinds'' remedies' {
+        Invoke-TransactionJudgement -Transaction (& $record 'NodeSelected' '' 120 0 $upgradeFrom030.Observed) `
+            -ReadEvents { param($since) if ($since -ne $t0) { throw "read from $since" }; $read } 6>$null
+    } "disturbed a service the table owns \(row NodeSelected\)(.|\n)*event 7031 at 2026-10-06T12:12:48(.|\n)*process 5120(.|\n)*a TERMINATION is the service failing(.|\n)*Restart Manager \(PR 1634\)"
+    try {
+        Invoke-TransactionJudgement -Transaction (& $record 'NodeSelected' '' 5 0 @()) -ReadEvents { @(& $termination 7034 20 'FastCacheCompileNode') } 6>$null
+        throw 'judgement: a termination alone was not refused'
+    } catch {
+        if ($_.Exception.Message -notmatch 'a TERMINATION is the service failing' -or $_.Exception.Message -match 'Restart Manager') {
+            throw "judgement: a termination alone was refused as '$($_.Exception.Message)'"
+        }
+    }
+    Pass 'judgement: a termination alone names no Restart Manager cause'
+    foreach ($row in @(
+            @{ Case = 'a rollback names its expectation and its reason, and judges no start'; Leaves = ''; Expect = 'RollsBack'; Events = @(); Failed = 0
+               Match = "against expectation RollsBack -- the transaction fails on purpose.*no start judged; 7036 unchecked" }
+            @{ Case = 'the node started with no 7036 is named ABSENT'; Leaves = 'NodeSelected'; Expect = ''; Events = @(); Failed = 0
+               Match = 'against row NodeSelected: no unexpected termination, no start of FastCached; 7036 ABSENT' }
+            @{ Case = 'the node''s logged start makes 7036 live'; Leaves = 'NodeSelected'; Expect = ''; Events = @(& $entered 30 'FastCacheCompileNode' 'Running'); Failed = 0
+               Match = '7036 live' }
+            @{ Case = 'failed observation rounds are named'; Leaves = 'NodeAlone'; Expect = ''; Events = @(); Failed = 2
+               Match = '5 observation round\(s\); 2 observation round\(s\) FAILED, first: FastCached: Invalid class$' })) {
+        $events = $row.Events
+        $line = Invoke-TransactionJudgement -Transaction (& $record $row.Leaves $row.Expect 5 $row.Failed @()) -ReadEvents { $events }
+        if ($line -notmatch $row.Match) { throw "judgement: $($row.Case): '$line' does not match '$($row.Match)'" }
+        Pass "judgement: $($row.Case)"
+    }
+
+    # Assert-ServiceTable judges the last transaction ONCE more, over its own longer window.
+    $saved = $script:LastMsiTransaction
+    try {
+        $script:LastMsiTransaction = & $record 'NothingInstalled' '' 5 0 @()
+        $late = @(& $termination 7031 60 'FastCached')
+        ExpectThrow 'judgement: Assert-ServiceTable judges the transaction again, over the longer window' {
+            Assert-ServiceTable -Row NothingInstalled -StableSeconds 0 -TimeoutSeconds 1 -Observe { param($name) $null } -ReadEvents { $late } 6>$null
+        } 'disturbed a service the table owns \(row NothingInstalled\)(.|\n)*event 7031 at 2026-10-06T12:13:14'
+        Assert-ServiceTable -Row NothingInstalled -StableSeconds 0 -TimeoutSeconds 1 -Observe { param($name) $null } -ReadEvents { $late } 6>$null
+        if (-not $script:LastMsiTransaction.Extended) { throw 'judgement: the transaction is not marked judged' }
+        Pass 'judgement: once judged over the longer window, a transaction is not judged again'
+    } finally {
+        $script:LastMsiTransaction = $saved
+    }
+
+    # The watch over a real process: it observes until the process exits, keeps only a service seen
+    # running under a process, and leaves the exit code readable through the handle taken first --
+    # the shape Invoke-Msiexec starts msiexec in. Observed through the seam: no service here is ours.
+    $startProbe = {
+        $process = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Milliseconds 1500; exit 3' -PassThru -NoNewWindow
+        $null = $process.Handle
+        $process }
+    $probe = & $startProbe
+    $watched = Watch-ServiceProcesses -Process $probe -IntervalMilliseconds 100 -Observe {
+        param($name) if ($name -eq 'FastCached') { [pscustomobject]@{ StartMode = 'Manual'; State = 'Running'; ProcessId = 77 } } else { $null } }
+    if ($watched.Polls -lt 1 -or $watched.FailedPolls -ne 0 -or @($watched.Observed).Count -ne $watched.Polls -or
+        @($watched.Observed | Where-Object { $_.Service -ne 'FastCached' -or $_.ProcessId -ne 77 }).Count -ne 0) {
+        throw "watch: $($watched.Polls) poll(s) observed [$(@($watched.Observed | ForEach-Object { "$($_.Service) $($_.ProcessId)" }) -join '; ')]"
+    }
+    if ($probe.ExitCode -ne 3) { throw "watch: the watched process's exit code read '$($probe.ExitCode)', expected 3" }
+    Pass "watch: $($watched.Polls) observation(s) until the process exited, its exit code readable"
+    # An observation that FAILS is counted, the watch goes on, and the process is still waited for.
+    $probe = & $startProbe
+    $script:failuresLeft = 2
+    $watched = Watch-ServiceProcesses -Process $probe -IntervalMilliseconds 100 -Observe {
+        param($name) if ($script:failuresLeft -gt 0) { $script:failuresLeft--; throw 'Invalid class' }; $null }
+    if ($watched.FailedPolls -lt 1 -or $watched.Polls -lt 1 -or $watched.FirstFailure -notmatch '^FastCached(CompileNode)?: Invalid class$' -or -not $probe.HasExited) {
+        throw "watch: a failing observation read as $($watched.Polls) round(s), $($watched.FailedPolls) failed ('$($watched.FirstFailure)'), exited $($probe.HasExited)"
+    }
+    Pass "watch: a failed observation is counted ($($watched.FailedPolls) round(s)) and the watch goes on to the process's exit"
+
+    $expectedCases = 144
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -1710,4 +2352,6 @@ Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert
     Get-NodeRegistrationLacksVerdict, Assert-NodeRegistrationLacks, Get-FirewallGroupEmptyVerdict,
     Assert-FirewallGroupEmpty, Format-FirewallRuleLine, Get-FirewallGroupSnapshot, Get-FirewallGroupUnchangedVerdict,
     Assert-FirewallGroupUnchanged, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Get-InstallationSnapshot, Compare-InstallationSnapshot, New-MsiControlCopy,
+    Watch-ServiceProcesses, ConvertTo-ServiceControlEvent, Get-ServiceControlEvents, Get-TransactionExpectation,
+    Get-TransactionServiceVerdict, Get-Witness7036State,
     Invoke-MsiServiceTableSelfTest

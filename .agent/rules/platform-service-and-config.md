@@ -796,6 +796,79 @@ readable and silently ignored. Every rule below has already been one of them.
   states after `MigrateFeatureStates`, so no condition restates the feature-state expression.
   NOT after `CostFinalize`: on a major upgrade `MigrateFeatureStates` runs later and carries the
   old product's selection over, so a state read before it is the new package's default.
+- **Windows Installer's Restart Manager takes no part in a transaction** (`MSIRESTARTMANAGERCONTROL`
+  is `Disable`, one `Property` row of the fragment), because the service table and the
+  `ServiceControl` rows own every stop and every start, and their rollback every restart. A silent
+  install otherwise ALWAYS uses Restart Manager ("Silent UI level installations always shut down
+  applications and services, and ... always use Restart Manager"): at `InstallValidate` it shuts
+  down each service holding a file the transaction replaces, and at the end of the install it starts
+  it again, WHATEVER the table decided (`MSIDISABLERMRESTART`'s own page: at `0` "all system
+  services that were shut down to install the update are restarted").
+  - **What PR 1634's CI MEASURED, and what is INFERRED.** MEASURED: in the upgrade from 0.3.0, with
+    FastCached running, FastCached stopped one second in (InstallValidate time) and was started
+    again at 12:12:47, after the table had made it manual and stopped it for the node; it could not
+    bind 6674, which the node holds exclusively, terminated three times before msiexec returned, and
+    its 30-second recovery restart took 6674 while "an upgrade deselecting fastcached" had the node
+    stopped, failing that transaction with 1603. The row assertion after the upgrade read `Manual`
+    and `Stopped`, between two restarts. INFERRED: that Restart Manager made that start -- nothing in
+    the package or the binaries starts FastCached on that path, and the stop's timing is
+    `InstallValidate`'s; the verbose log that would say so was never printed, because that leg passed.
+    `Invoke-Msiexec` now prints each verbose log's `RESTART MANAGER` lines, unjudged, so the first run
+    with the fix shows what Windows Installer says it did.
+  - **And it cost the rollback its restart.** `FastCachedStopForFiles` and
+    `FastCacheCompileNodeStopForFiles` (`Stop="both" Wait="yes"`) stop each service before its files
+    are replaced, and `StopServices` records a rollback start only for a service it found RUNNING.
+    Restart Manager's shutdown came first, so `StopServices` found nothing to stop and a failed
+    transaction had no rollback start for it (INFERRED from the order; that a failed upgrade still
+    ended with FastCached running under Restart Manager was its end-of-install restart, equally
+    INFERRED). With it disabled, the OLD product's `FastCachedStopForFiles`, run inside
+    `RemoveExistingProducts`, stops a running FastCached and records the start, which the rollback
+    replays last, after the node's registration is undone.
+  - **`Disable`, not the other two answers.** `DisableShutdown` keeps Restart Manager detecting
+    which files are in use, and its documented scope ("a package that has not been authored to use
+    the Restart Manager") leaves which shutdowns it stops a reading rather than a statement.
+    `MSIDISABLERMRESTART=1` alone stops the RESTART and keeps the SHUTDOWN at `InstallValidate`, and
+    with it the lost rollback start. The property is read from the package's `Property` table; a
+    custom action changing it has no effect, so `msi-custom-action-commands` step 13 refuses a
+    `SetProperty` of it as well as a missing row or another value, and `wix-service-table` pins the
+    row. Both refusals name the defect. Both read the FRAGMENT, so a transform or a command line
+    setting the property is seen by neither (they fail OPEN there); the per-transaction judgement
+    below is what would see its effect.
+  - **What `Disable` gives up.** Restart Manager offered to close a NON-service process holding a
+    file the transaction replaces, and now nothing does, in full UI either: `fastcache-cc` inside a
+    running build or a `fastcache-cli` in a console has no window, so the FilesInUse dialog never
+    lists it, and its file is replaced at the next boot (exit 3010). The services cannot raise it
+    (no window) and are stopped before `InstallFiles`. And a MAINTENANCE transaction that removes a
+    service (`REMOVE=CM_C_Node`, `/x`) now relies on the service PROCESS having exited between its
+    stop (`StopServices`, `--uninstall-service`) and `RemoveFiles`: `FastCacheAwaitServiceExit` runs
+    on an upgrade only, and Restart Manager's shutdown at `InstallValidate` used to give that margin.
+    Both show as 3010 rather than as a failure: watch "removing the node feature" and the uninstall
+    legs for it.
+  - **Every transaction is JUDGED, inside `Invoke-Msiexec`**, because a row is read after the
+    transaction and a service started and killed inside it passes the row. A call names the row the
+    transaction leaves (`-Leaves <row>`) or, where no row honestly describes it, a named expectation
+    with its reason (`-Expect`, `$script:TransactionExpectations`: `RollsBack` for a transaction that
+    fails on purpose, `NodeCannotBind` for the step that holds 6674 so the node it adds cannot bind);
+    a call naming neither, both or an unknown one is refused before msiexec starts. Nothing defaults:
+    every `Invoke-Msiexec` in `build.yml` states one. `Assert-ServiceTable` judges the same transaction
+    once more, over the window its stability interval adds. Three witnesses, each a pure verdict over
+    records: an unexpected-termination event (7031, 7034) of either service since the transaction
+    began, unless the expectation is built to cause it; an "entered the running state" event (7036)
+    for a service the expectation leaves NOT RUNNING (stopped or unregistered); and a process the
+    watch saw such a service run under, other than the one it ran under when the transaction began.
+    The watch polls both services every 250 ms while msiexec runs; a failed poll is counted and named,
+    and msiexec is waited for on every way out.
+  - **7036 is a witness only where the host writes it**, MEASURED on two hosts: PR 1634's runner
+    (Windows Server 2025) writes it -- its log printed "The FastCached service entered the running
+    state" -- and this repository's Windows 11 26200 development host wrote none among 50,978 System
+    records. The node's own start is the positive control: every transaction whose row leaves the
+    node running starts it, and the pass line says `7036 live`, `7036 ABSENT` (no witness but the
+    watch, so a start that lives and dies between two polls without terminating unexpectedly is
+    unseen: fails OPEN there) or `7036 unchecked` (the transaction starts no node).
+  - **The upgrade FROM 0.3.0 still runs 0.3.0's own removal**, whose package sets no such property
+    and has no `ServiceControl` rows at all. Whether that nested removal opens a Restart Manager
+    session of its own is not documented and was not measured; that upgrade's judgement, and the
+    `RESTART MANAGER` lines it prints, are what would show it.
 - **A stop states its drain.** `StopPendingPlanFor(--drain-timeout)` is the wait hint -- the drain
   plus `StopTeardownMargin`, clamped to what the SCM can carry -- and the checkpoint advances
   every `StopCheckpointInterval` until the body returns. A fixed hint shorter than the drain reads

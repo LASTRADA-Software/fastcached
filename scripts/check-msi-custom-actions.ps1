@@ -50,7 +50,11 @@
 #      while any scheduled action a maintenance transaction can run names INSTALL_ROOT, the fragment
 #      sets it, when Installed, before CostFinalize, from a RegistrySearch of
 #      Uninstall\[ProductCode]'s InstallLocation. CPack resolves it only on an upgrade, and an
-#      uninstall of a custom root ran the default root's binary and left its service registered.
+#      uninstall of a custom root ran the default root's binary and left its service registered;
+#  13. Windows Installer's Restart Manager takes no part in a transaction: ONE Property row sets
+#      MSIRESTARTMANAGERCONTROL to "Disable", and nothing else sets it. Restart Manager restarts a
+#      service the table left stopped, and its shutdown, ahead of StopServices, cost the
+#      ServiceControl rows their rollback start.
 # Every other action changes a service, the registry or the firewall, and is never started here.
 #
 # Usage: pwsh -NoProfile -File scripts/check-msi-custom-actions.ps1 -SourceDir <repository root>
@@ -566,6 +570,35 @@ if ($resolvers.Count -ne 1) {
 }
 if ($failures.Count -eq $failuresBeforeMaintenanceRoot) {
     Pass "a maintenance transaction resolves INSTALL_ROOT from the product's own install location; $needs"
+}
+
+# 13. Windows Installer's Restart Manager takes no part in a transaction. A silent install otherwise
+# ALWAYS uses it: at InstallValidate it shuts down a service holding a file the transaction replaces,
+# and at the end of the install it starts that service again, whatever the service table decided. CI
+# MEASURED on PR 1634 that the upgrade from 0.3.0 started FastCached after the table had made it manual
+# and stopped it for the node, that it crash-looped on the port the node holds, and that a recovery
+# restart took that port during a later transaction, which failed with 1603; that Restart Manager made
+# the start is INFERRED (nothing in the package starts FastCached there). Its shutdown also comes
+# before StopServices, so the ServiceControl rows find the service stopped and record no rollback start.
+#
+# Read from the fragment's Property rows. Windows Installer reads the property from the package's
+# Property table, so a SetProperty (a custom action) changing it has no effect and is refused rather
+# than counted. Fails OPEN for a value a transform or a command line supplies, which no package check
+# can see; the MSI job's per-transaction judgement (Invoke-Msiexec) is what would see its effect.
+$failuresBeforeRestartManager = $failures.Count
+$restartManagerDefect = "Windows Installer's Restart Manager restarts a service the table left stopped: a silent install shuts each service holding a replaced file down at InstallValidate and starts it again at the end, whatever the service table decided (FastCached, made manual and stopped for the node, was started and crash-looped on the port the node holds), and because that shutdown comes before StopServices, the ServiceControl rows record no rollback start"
+$restartManagerRows = @($fragment.SelectNodes("//Property[@Id='MSIRESTARTMANAGERCONTROL']"))
+if ($restartManagerRows.Count -ne 1) {
+    Fail "$($restartManagerRows.Count) Property rows set MSIRESTARTMANAGERCONTROL, and exactly one must, Value=`"Disable`". $restartManagerDefect."
+} elseif ($restartManagerRows[0].GetAttribute('Value') -cne 'Disable') {
+    Fail "MSIRESTARTMANAGERCONTROL is '$($restartManagerRows[0].GetAttribute('Value'))', and it must be 'Disable'. $restartManagerDefect. DisableShutdown keeps Restart Manager asking which files are in use, and MSIDISABLERMRESTART=1 alone keeps the shutdown and so the lost rollback start: neither leaves every stop and start to the service table."
+}
+$restartManagerSetters = @($fragment.SelectNodes('//SetProperty') | Where-Object { $_.GetAttribute('Id') -eq 'MSIRESTARTMANAGERCONTROL' })
+if ($restartManagerSetters.Count -gt 0) {
+    Fail "$(@($restartManagerSetters | ForEach-Object { $_.GetAttribute('Action') }) -join ', ') set MSIRESTARTMANAGERCONTROL as a custom action, which has no effect: Windows Installer reads it from the Property table. Keep the one Property row."
+}
+if ($failures.Count -eq $failuresBeforeRestartManager) {
+    Pass 'Restart Manager takes no part in a transaction: one Property row sets MSIRESTARTMANAGERCONTROL to Disable, and no custom action sets it'
 }
 
 # Positive controls: a walk that found nothing reports nothing wrong about it.

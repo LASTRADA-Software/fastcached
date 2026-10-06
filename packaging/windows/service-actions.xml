@@ -36,7 +36,9 @@
     there). A feature the upgrade no longer installs has its leftover
     registration deleted by the new product instead (the DeleteLeftover rows).
     The old product's ServiceControl rows stop its services, waiting, before any
-    file is replaced.
+    file is replaced. Windows Installer's Restart Manager is disabled
+    (MSIRESTARTMANAGERCONTROL, below): it started a service this table had left
+    stopped.
 
     Installers up to and including 0.3.0 delete both services in their own
     uninstall, which a major upgrade runs first; the table above registers them
@@ -67,6 +69,47 @@
        product, with no fastcached.exe in it, and an action run there fails the
        install with error 1721. -->
   <CPackWiXFragment Id="#PRODUCT">
+
+    <!-- Windows Installer's Restart Manager takes no part in any transaction:
+         the service table and the ServiceControl rows own every stop and every
+         start, and their rollback owns every restart.
+
+         A silent install always uses Restart Manager otherwise ("Silent UI level
+         installations always shut down applications and services, and ... always
+         use Restart Manager", Using Windows Installer with Restart Manager). It
+         shuts down, at InstallValidate, a service holding a file the transaction
+         replaces, and starts it again at the end of the install, WHATEVER this
+         table decided. PR 1634's CI measured an upgrade of a machine where
+         FastCached ran START FastCached after the table had made it manual and
+         stopped it for the node: it could not bind the port the node holds,
+         crash-looped under its own recovery policy, and a restart landing while
+         a later transaction had the node stopped took the port and failed that
+         transaction ("an upgrade deselecting fastcached", 1603). That Restart
+         Manager made that start is inferred: nothing in this package starts
+         FastCached on that path.
+
+         And twice harmful: the ServiceControl rows (FastCachedStopForFiles,
+         FastCacheCompileNodeStopForFiles) already stop each service, waiting,
+         before its files are replaced, and a stop of a RUNNING service records
+         the rollback start that puts a failed transaction's services back. Restart
+         Manager's shutdown came first, at InstallValidate, so StopServices found
+         the service stopped and recorded no rollback start.
+
+         Disable, not DisableShutdown, which keeps Restart Manager asking which
+         files are in use; and not MSIDISABLERMRESTART=1 alone, which keeps the
+         shutdown at InstallValidate and with it the lost rollback start. A
+         Property row, because Windows Installer reads this property from the
+         package: a custom action changing it has no effect. CPack's own sources
+         define no such property. msi-custom-action-commands (step 13) and
+         wix-service-table refuse the package without this row.
+
+         What it gives up: a NON-service process holding a replaced file (a
+         fastcache-cc inside a running build) is no longer offered for closing,
+         and has no window for the FilesInUse dialog to list, so its file is
+         replaced at the next boot (3010). And a maintenance transaction that
+         removes a service relies on its process having exited between the stop
+         and RemoveFiles, a margin the early shutdown used to give. -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
 
     <!-- A MAINTENANCE transaction (a repair, a feature change, an uninstall)
          resolves INSTALL_ROOT from where this product IS installed: the
