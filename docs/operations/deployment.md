@@ -272,7 +272,7 @@ To remove it: `fastcached --uninstall-service --service-scope=<scope>`, or
 
 ## Windows service
 
-The MSI registers `fastcached` as an auto-start service — a manual one, left
+The MSI registers `fastcached` as an auto-start service — a disabled one, left
 stopped, when the fastcache-compile-node feature is installed too, since both answer
 on 6674 ([the MSI's service table](../getting-started/install.md#windows)) — and seeds
 `C:\ProgramData\fastcached\fastcached.yaml` from the template it ships, unless

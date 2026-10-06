@@ -51,7 +51,7 @@ which the package pins through `FASTCACHE_DISCOVERY_REPLY_PORT`).
 `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8` narrows the remote side of every rule to one address with
 an optional prefix, so pick one prefix that covers both the office LAN and the VPN pool. The
 node is the cache: if the **fastcached** feature is installed as well, its `FastCached` service
-stays manual and stopped, and must not be started beside the node, since both want port 6674.
+is disabled and stopped, since both want port 6674 and it must not be started beside the node.
 
 ### Pin the fleet
 

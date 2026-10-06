@@ -3530,15 +3530,21 @@ jobs:
           # And nothing the table did not ask for may happen DURING it, which a row read afterwards
           # cannot see: Invoke-Msiexec judges every transaction against the row it -Leaves (here: no
           # unexpected termination, and no start of FastCached, which NodeSelected leaves stopped).
-          # FastCached ran before this upgrade, and PR 1634's CI measured it started again at the end
-          # after the table had stopped it for the node, crashing three times on the port the node
-          # holds before msiexec returned, while the row read Manual and Stopped between two recovery
-          # restarts. Windows Installer's Restart Manager is the inferred cause; the package disables it.
+          # FastCached ran before this upgrade, and PR 1634's CI MEASURED where its stray start came
+          # from: 0.3.0's removal, nested in this upgrade with 0.3.0's own properties, opened a Restart
+          # Manager session and shut FastCached down, and Windows Installer restarted it by name after
+          # the whole transaction had ended ("Failed while restarting applications. Error: 352"), onto
+          # the port the node holds. Nothing of this package can run after that, so the table leaves
+          # FastCached DISABLED beside the node, and that start fails with no process.
           Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $first -Log 'upgrade.log' -What "the upgrade from $release"
           Assert-InstalledProduct $family $productOf[$first]
+          # The control that keeps the judgement above from passing VACUOUSLY: the nested session did
+          # shut FastCached down, so Windows Installer did try to restart it, and only the disabled
+          # start type kept that from starting anything. Wording MEASURED on PR 1634's runner.
+          Assert-MsiLog -Path 'upgrade.log' -Present 'RESTART MANAGER: Successfully shut down all applications in the service''s session that held files in use'
           # The ORDER is the fix (batch 4 review, B4-2): 0.3.0's own uninstall-service ran FIRST
           # (RemoveExistingProducts is scheduled afterInstallInitialize); the files waited for 0.3.0's
-          # service processes; FastCached, kept and made manual, was stopped and its PROCESS waited
+          # service processes; FastCached, kept and disabled, was stopped and its PROCESS waited
           # for -- it held 6674, which the node binds exclusively; and only then was the node
           # registered and started, both checked, so either failing fails the transaction above. And
           # what is registered now carries no --scheduler, which the node refuses at every start.
@@ -3707,7 +3713,7 @@ jobs:
       # rollback runs every rollback action we have. The scenario is chosen so that the upgrade
       # would CHANGE what is compared, and the last leg proves that a SUCCESSFUL run of it does:
       # N is installed fastcached-only into a custom root, and N+1 adds the node, which re-registers
-      # fastcached manual and stopped and creates a second service.
+      # fastcached disabled and stopped and creates a second service.
       #
       # The upgrade KEEPS N's root. CPack's WiX generator searches INSTALL_ROOT from the old
       # product's Uninstall\<code>\InstallLocation (its `FindInstallLocation` RegistrySearch, in
@@ -3812,11 +3818,14 @@ jobs:
           # every unexpected termination still is -- the controls too, by analysis: each restores or
           # leaves fastcached's REGISTRATION runnable, and starts it once the node's removal has stopped
           # the node. A control that crashes a service is a finding about that restore, never exempted.
+          # SETTLED after the snapshot: the rollback's restart of fastcached is an unwaited sc.exe start,
+          # so a restore that cannot serve crashes after msiexec exits, past the exit's judgement.
           function Invoke-FailedUpgrade([string] $Package, [string] $Log, [string] $What) {
             Invoke-Msiexec -Expect RollsBack -Operation '/i' -Package $Package -Log $Log -Properties $withNode, 'FASTCACHE_FAIL_FOR_TEST=1' `
               -Accept @(1603) -What $What | Out-Null
             Assert-MsiLog -Path $Log -Present $failedHere | Out-Null
             $snapshot = Get-InstallationSnapshot -UpgradeCode $family -Root $root
+            Assert-TransactionSettled | Out-Null
             if ($snapshot -isnot [System.Collections.Specialized.OrderedDictionary]) { throw "$What`: the snapshot is a $($snapshot.GetType().FullName), not one ordered dictionary" }
             return $snapshot
           }
@@ -3927,12 +3936,13 @@ jobs:
           # nothing else shows live: an unchanged field is equal on both sides however it was read, so
           # a reader that returned nothing would pass the subject. Only fields a successful N -> N+1
           # upgrade really changes are required: fastcached's ImagePath (the extra flag goes) and Start
-          # (manual under the node's table), its state, the node's registration, the installed
+          # (disabled under the node's table), its state, the node's registration, the installed
           # product, and the node's firewall group. Never `binary`: the upgrade keeps N's root (see
           # the header), so the custom root's binary must still be THERE, which is asserted instead.
           Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $newer -Log 'succeeded-upgrade.log' -Properties $withNode -What 'the same upgrade, succeeding'
           Assert-MsiLog -Path 'succeeded-upgrade.log' -Present (Get-MsiActionRanPattern 'FastCacheNodeStartService') -Absent (Get-MsiActionRanPattern 'FastCacheFailForTest')
           $changed = @(Compare-InstallationSnapshot -Before $before -After (Get-InstallationSnapshot -UpgradeCode $family -Root $root))
+          Assert-TransactionSettled
           Write-Host "a successful upgrade changes:`n  $($changed -join "`n  ")"
           foreach ($field in 'service FastCached', 'state FastCached', 'service FastCacheCompileNode', 'products',
                              'firewall fastcached: FastCacheCompileNode') {
@@ -3952,7 +3962,7 @@ jobs:
 
       # First the DEFAULT install, a plain /i naming no feature and no property, as
       # an operator who double-clicks the package gets it: every feature is selected
-      # by default, so the node is registered auto and running and fastcached manual
+      # by default, so the node is registered auto and running and fastcached disabled
       # and stopped. The [msi] round trip in DocumentedCommandLines_test proves the
       # no-property COMMAND parses and installs; only this transaction proves the
       # package's default feature selection reaches it. Uninstalled again, and the
@@ -4056,7 +4066,7 @@ jobs:
           Write-Host "daemon honoured its machine-wide config (answered on 6699)"
 
       # The service table under a FEATURE CHANGE, the transaction nothing above
-      # runs: adding the node makes fastcached manual and stops it (both would
+      # runs: adding the node disables fastcached and stops it (both would
       # answer on 6674), removing the node gives fastcached back its auto start and
       # removes the node's registration. A script for the previous steps' reason.
       - name: "Changing features re-applies the service table"
@@ -4069,7 +4079,7 @@ jobs:
 
           # A node that cannot START on a fastcached machine (batch 4 review, B4-1): the transaction
           # fails, and the rollback leaves fastcached exactly as it found it -- auto again (the node
-          # had made it manual), RUNNING again (the transaction stopped it for the node), and its
+          # had disabled it), RUNNING again (the transaction stopped it for the node), and its
           # command line and remembered scope unchanged. fastcached serves on 6699 here (the step
           # above moved it), so a listener this step holds on 6674 is what the node cannot bind: it
           # refuses inside its body, never reports RUNNING (it reports running once it serves), and
@@ -4144,11 +4154,13 @@ jobs:
           $pin = '0123456789abcdef0123456789abcdef@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo'
           Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $msi -Log 'scope-node.log' -What 'a repair stating a scope, a seed and a pin' `
             -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus', 'FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8', 'FASTCACHE_FLEET_SEED=seed.example.invalid', "FASTCACHE_FLEET_ID=$pin"
+          Assert-TransactionSettled
           Assert-NodeFirewallScope -Scope '10.0.0.0/8'
           Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed.example.invalid:6674'
           Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
           Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $msi -Log 'repair-scope.log' -What 'a repair stating none of them' `
             -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus'
+          Assert-TransactionSettled
           Assert-NodeFirewallScope -Scope '10.0.0.0/8'
           Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed.example.invalid:6674'
           Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
@@ -4160,7 +4172,7 @@ jobs:
           # the machine had survives it -- the registration's pin and the remembered one -- and the
           # node is RUNNING again (B4-6): the repair stopped it to replace its files, and only the
           # rollback's restart brings it back.
-          Invoke-Msiexec -Expect RollsBack -Operation '/i' -Package $msi -Log 'refused-pin.log' -What 'a repair stating a pin the node refuses' `
+          Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $msi -Log 'refused-pin.log' -What 'a repair stating a pin the node refuses' `
             -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus', 'FASTCACHE_FLEET_ID=0123456789abcdef0123456789abcdef' `
             -Accept @(1603)
           Assert-MsiLog -Path 'refused-pin.log' -Present 'CustomAction FastCacheNodeCheckArguments returned actual error code'

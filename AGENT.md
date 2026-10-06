@@ -700,8 +700,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 `packaging/`.
 - A service to register is a `ServiceSpec`; what it runs as is part of it, as are how it STARTS and
   which ports it OPENS, and an empty `serviceAccount` means **root**. An MSI upgrade RE-APPLIES a
-  registration and never deletes one; the MSI's service table decides every start mode, so Restart
-  Manager is OFF (`MSIRESTARTMANAGERCONTROL=Disable`): it restarts what the table left stopped.
+  registration, never deletes one, and its table decides every start mode: Restart Manager is OFF
+  (`MSIRESTARTMANAGERCONTROL`) and fastcached beside the node DISABLED: an OLD removal restarts it.
 - `--install-service` registers the *command-line* config, never the merged one, and carries the
   config PATH rather than the file's values or a resolved default.
 - An install is judged by the **startup** rules as well as the install-time ones: a registration

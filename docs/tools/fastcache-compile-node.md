@@ -2791,7 +2791,7 @@ msiexec /i fastcached.msi FASTCACHE_FLEET_SEED=office-a.vpn.example FASTCACHE_FL
 
 Select the **fastcache-compile-node** feature (silently: `ADDLOCAL=CM_C_Cli,CM_C_Node` on a
 first install, `ADDLOCAL=CM_C_Node` to add it to one that is there). On a
-machine that also runs fastcached, the MSI makes `FastCached` manual and stops it,
+machine that also runs fastcached, the MSI disables `FastCached` and stops it,
 because both would answer on 6674. Every transaction that keeps the node -- a repair, a
 feature change, an upgrade -- registers it again, and the optional properties are
 remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_FLEET_SEED` and `FASTCACHE_FLEET_ID` are kept under

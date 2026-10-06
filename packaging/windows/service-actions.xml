@@ -9,7 +9,7 @@
     service is registered and whether it is started:
 
       Node installed               node auto and started, with no property needed;
-                                   fastcached manual and stopped
+                                   fastcached DISABLED and stopped
       Daemon installed, no Node    fastcached auto and started (FASTCACHED_START_SERVICE=0 skips the start)
 
     It is applied on EVERY transaction that leaves a feature installed: a first
@@ -38,7 +38,9 @@
     The old product's ServiceControl rows stop its services, waiting, before any
     file is replaced. Windows Installer's Restart Manager is disabled
     (MSIRESTARTMANAGERCONTROL, below): it started a service this table had left
-    stopped.
+    stopped. An OLD package's removal, run inside an upgrade, still has its own
+    Restart Manager session, which is why fastcached beside the node is
+    disabled rather than manual (FastCachedDisableForNode).
 
     Installers up to and including 0.3.0 delete both services in their own
     uninstall, which a major upgrade runs first; the table above registers them
@@ -108,7 +110,25 @@
          and has no window for the FilesInUse dialog to list, so its file is
          replaced at the next boot (3010). And a maintenance transaction that
          removes a service relies on its process having exited between the stop
-         and RemoveFiles, a margin the early shutdown used to give. -->
+         and RemoveFiles, a margin the early shutdown used to give.
+
+         What it does NOT reach: the OLD product's removal, which
+         RemoveExistingProducts runs as a nested installation with the OLD
+         package's properties. PR 1634's CI MEASURED it on the upgrade from 0.3.0,
+         whose package sets no such property: this package logged "Disabled by
+         MSIRESTARTMANAGERCONTROL property", then the nested removal opened a
+         session of its own and "Successfully shut down all applications in the
+         service's session that held files in use" (FastCached), and the OUTER
+         engine restarted them after "Installation completed successfully",
+         after every action of this package, commit actions included: "Failed
+         while restarting applications. Error: 352", with FastCached started and
+         crashing on the port the node holds between the two lines. No property
+         of this package reaches a nested removal (RemoveExistingProducts sets
+         only ProductCode and REMOVE for it), and nothing of ours may run before
+         it (Error 2613), so that restart is answered where it lands: a service
+         this table leaves stopped beside the node is DISABLED, and a start of
+         it fails at the service control manager, with no process, no recovery
+         restart and no race for 6674 (FastCachedDisableForNode). -->
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
 
     <!-- A MAINTENANCE transaction (a repair, a feature change, an uninstall)
@@ -687,6 +707,25 @@
                   ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -Command &quot;$p=@(\&quot;[INSTALL_ROOT]bin\fastcached.exe\&quot;,\&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe\&quot;);$c=(Get-CimInstance Win32_Process -Filter \&quot;ProcessId=$PID\&quot;).CommandLine;$n=$c.LastIndexOf(' FastCacheNode'+'ImagePath:');$f=$c.LastIndexOf(' FastCached'+'ImagePath:');if($f -ge 0 -and $n -gt $f)[\{]foreach($s in $c.Substring($f,$n-$f),$c.Substring($n))[\{]$a=$s.IndexOf('\&quot;');$b=$s.IndexOf('\&quot;',$a+1);if($a -ge 0 -and $b -gt $a)[\{]$d=Split-Path -Parent $s.Substring($a+1,$b-$a-1);$p+=\&quot;$d\fastcached.exe\&quot;,\&quot;$d\fastcache-compile-node.exe\&quot;[\}][\}][\}];$w=New-Object Diagnostics.Stopwatch;$w.Start();while(Get-Process -Name fastcached,fastcache-compile-node -ErrorAction SilentlyContinue|Where-Object Path -In $p)[\{]if($w.Elapsed.TotalSeconds -gt 120)[\{]exit 1460[\}];Start-Sleep -Milliseconds 250[\}] # FastCachedImagePath:[FASTCACHED_IMAGEPATH] FastCacheNodeImagePath:[FASTCACHE_NODE_IMAGEPATH]&quot;"
                   Execute="deferred" Impersonate="no" Return="check" />
 
+    <!-- And DISABLED, so nothing can start it beside the node: both would
+         answer on 6674, and a start of fastcached there can only fail on the
+         port and crash-loop under its recovery policy, racing the node for it
+         whenever the node is stopped. One start is certain on an upgrade from a
+         package that did not disable Restart Manager (0.3.0 and every build
+         before PR 1634): the old product's removal shuts a running FastCached
+         down, and Windows Installer restarts it by name after this whole
+         transaction has ended, which no action of this package can follow (the
+         comment on MSIRESTARTMANAGERCONTROL, MEASURED in PR 1634's CI). A start
+         of a disabled service fails at the service control manager with no
+         process. Return="check": a fastcached left startable beside the node is
+         exactly that race. Removing the node re-applies the registration with
+         an auto start (FastCachedInstallService), and a failed transaction puts
+         back the start type it found (FastCachedRestoreRegistrationExactly). -->
+    <CustomAction Id="FastCachedDisableForNode"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config FastCached start= disabled"
+                  Execute="deferred" Impersonate="no" Return="check" />
+
     <CustomAction Id="FastCachedStartService"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[System64Folder]sc.exe&quot; start FastCached"
@@ -1156,7 +1195,9 @@
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCachedAwaitExitForNode" After="FastCachedStopForNode"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCachedStartService" After="FastCachedAwaitExitForNode"
+      <Custom Action="FastCachedDisableForNode" After="FastCachedAwaitExitForNode"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCachedStartService" After="FastCachedDisableForNode"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND NOT (FASTCACHE_NODE_SELECTED = &quot;1&quot;) AND FASTCACHED_START_SERVICE = &quot;1&quot;" />
 
       <!-- The node is (re)registered on every transaction that leaves it

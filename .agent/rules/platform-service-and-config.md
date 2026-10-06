@@ -756,8 +756,9 @@ readable and silently ignored. Every rule below has already been one of them.
     `wix-service-table` pins the rows.
 - **The MSI's service table decides every start mode**, and is applied on every transaction that
   leaves a feature installed -- a first install, a repair, a feature change and an upgrade. With
-  the node installed, the node is registered `auto` and started, and fastcached `manual` and
-  stopped through `net stop`, which waits (both would answer on 6674); with fastcached alone it
+  the node installed, the node is registered `auto` and started, and fastcached stopped through
+  `net stop`, which waits, and DISABLED (both would answer on 6674; below for why not `manual`);
+  with fastcached alone it
   is `auto` and started unless `FASTCACHED_START_SERVICE=0`. The node is re-registered on EVERY
   such transaction and needs no property -- a node that serves is refused `--scheduler`, and a
   registration kept as found would replay the one an earlier package wrote and fail at every
@@ -810,11 +811,11 @@ readable and silently ignored. Every rule below has already been one of them.
     bind 6674, which the node holds exclusively, terminated three times before msiexec returned, and
     its 30-second recovery restart took 6674 while "an upgrade deselecting fastcached" had the node
     stopped, failing that transaction with 1603. The row assertion after the upgrade read `Manual`
-    and `Stopped`, between two restarts. INFERRED: that Restart Manager made that start -- nothing in
-    the package or the binaries starts FastCached on that path, and the stop's timing is
-    `InstallValidate`'s; the verbose log that would say so was never printed, because that leg passed.
-    `Invoke-Msiexec` now prints each verbose log's `RESTART MANAGER` lines, unjudged, so the first run
-    with the fix shows what Windows Installer says it did.
+    and `Stopped`, between two restarts. That Restart Manager made that start was INFERRED then, and
+    the run with the printed log MEASURED it (the bullet "An OLD package's removal keeps its own
+    Restart Manager", below).
+    `Invoke-Msiexec` prints every `RESTART MANAGER` line of each verbose log (up to a stated cap of
+    100), and a refused judgement adds the actions from 10 s before to 5 s after each finding.
   - **And it cost the rollback its restart.** `FastCachedStopForFiles` and
     `FastCacheCompileNodeStopForFiles` (`Stop="both" Wait="yes"`) stop each service before its files
     are replaced, and `StopServices` records a rollback start only for a service it found RUNNING.
@@ -849,26 +850,67 @@ readable and silently ignored. Every rule below has already been one of them.
     transaction leaves (`-Leaves <row>`) or, where no row honestly describes it, a named expectation
     with its reason (`-Expect`, `$script:TransactionExpectations`: `RollsBack` for a transaction that
     fails on purpose, `NodeCannotBind` for the step that holds 6674 so the node it adds cannot bind);
-    a call naming neither, both or an unknown one is refused before msiexec starts. Nothing defaults:
-    every `Invoke-Msiexec` in `build.yml` states one. `Assert-ServiceTable` judges the same transaction
-    once more, over the window its stability interval adds. Three witnesses, each a pure verdict over
-    records: an unexpected-termination event (7031, 7034) of either service since the transaction
-    began, unless the expectation is built to cause it; an "entered the running state" event (7036)
-    for a service the expectation leaves NOT RUNNING (stopped or unregistered); and a process the
+    a call naming neither, both or an unknown one is refused before msiexec starts, and the start
+    seam asserts it never ran. Nothing defaults: every `Invoke-Msiexec` in `build.yml` states one. A
+    named expectation is `MustFail`, so a transaction stating one that returns 0 is refused: the
+    exemption is bound to the outcome it is named for, not to the call site's `-Accept`.
+    Three witnesses, each a pure verdict over records: an unexpected-termination event (7031, 7034)
+    of either service since the transaction began, unless the expectation is built to cause it; a 7036
+    for a service the expectation leaves NOT RUNNING (stopped or unregistered) -- "running", or a
+    "stopped" past the one stop the process it ran under at the start allows, since a start that dies
+    before RUNNING still ends in a stop (PR 1634's logged three and no "running"); and a process the
     watch saw such a service run under, other than the one it ran under when the transaction began.
     The watch polls both services every 250 ms while msiexec runs; a failed poll is counted and named,
     and msiexec is waited for on every way out.
+  - **And every transaction is judged TWICE**: at msiexec's exit, and once more by
+    `Assert-TransactionSettled`, over a window reaching at least 10 s past the exit
+    (`$script:TransactionSettleSeconds`), because a restore's own restart is an unwaited
+    `sc.exe start` and a start that cannot serve dies about a second later (PR 1634: started
+    12:12:47, 7031 at 12:12:48), after the exit's read. `Assert-ServiceTable` runs it after its
+    stability interval; the failed upgrade, every control, the successful upgrade beside them and the
+    two repairs with no row assertion call it themselves. It is SELF-ENFORCING but one transaction
+    short: `Invoke-Msiexec` refuses to BEGIN while the previous transaction has not been settled, so
+    only a step's LAST transaction relies on its call site -- every step ends in an
+    `Assert-ServiceTable` today, and that blind spot fails OPEN.
   - **7036 is a witness only where the host writes it**, MEASURED on two hosts: PR 1634's runner
     (Windows Server 2025) writes it -- its log printed "The FastCached service entered the running
     state" -- and this repository's Windows 11 26200 development host wrote none among 50,978 System
     records. The node's own start is the positive control: every transaction whose row leaves the
-    node running starts it, and the pass line says `7036 live`, `7036 ABSENT` (no witness but the
-    watch, so a start that lives and dies between two polls without terminating unexpectedly is
-    unseen: fails OPEN there) or `7036 unchecked` (the transaction starts no node).
-  - **The upgrade FROM 0.3.0 still runs 0.3.0's own removal**, whose package sets no such property
-    and has no `ServiceControl` rows at all. Whether that nested removal opens a Restart Manager
-    session of its own is not documented and was not measured; that upgrade's judgement, and the
-    `RESTART MANAGER` lines it prints, are what would show it.
+    node running starts it, and the pass line says `7036 live`, `7036 NOT SEEN` (no 7036 at all was
+    read: a host that writes none, or a reader that fails on all of them -- the watch is then the
+    only start witness, and a start that lives and dies between two polls without terminating
+    unexpectedly is unseen: fails OPEN there) or `7036 unchecked` (the transaction starts no node).
+    The witness cannot die behind a green line: a node start whose 7036 is missing while other
+    services' 7036s were read is REFUSED (the reader or its matcher failed), and so is a `NOT SEEN`
+    once an earlier transaction of the same process read `live`.
+  - **An OLD package's removal keeps its own Restart Manager, and Windows Installer restarts what it
+    shut down AFTER the whole transaction**, so fastcached beside the node is `disabled`, never
+    `manual`. MEASURED in PR 1634's CI, the upgrade from 0.3.0 (whose package sets no such property):
+    this package logged "Disabled by MSIRESTARTMANAGERCONTROL property"; 0.3.0's removal, which
+    `RemoveExistingProducts` runs as a nested installation with 0.3.0's properties, opened a session
+    of its own and "Successfully shut down all applications in the service's session that held files
+    in use" (FastCached); and the OUTER engine, after "Installation completed successfully" and after
+    every action of this package, commit actions included, logged "Failed while restarting
+    applications. Error: 352", with FastCached started and crashing on 6674 between the two lines.
+    Nothing reaches that session: `RemoveExistingProducts` sets only `ProductCode` and `REMOVE` for
+    the removal ("RemoveExistingProducts Action"), the Upgrade table has no column for a property,
+    nothing of ours may run before it (Error 2613), moving it before `InstallInitialize` takes the old
+    product's removal out of the transaction (#1629), an immediate action runs unelevated under UAC,
+    and `DisableAutomaticApplicationShutdown` is a machine POLICY. And it cannot be followed: the
+    restart comes after the last action. So it is answered where it lands --
+    `FastCachedDisableForNode` (`sc config FastCached start= disabled`, `Return="check"`) leaves a
+    start of FastCached beside the node failing at the service control manager, with no process, no
+    recovery restart and no race for 6674; the 352 is that refused start, and the upgrade still exits
+    0 (MEASURED: it did with the crash too). Not the binary: a bind conflict is an I/O arm, `Failed`
+    and restarted by design (`ProcessExit`, above), so a start that may not run must not be STARTABLE.
+    Removing the node re-applies fastcached `auto`, and a failed transaction puts back the start type
+    it found. The CI leg asserts the nested shutdown line beside the judgement, so "no start" cannot
+    pass for want of a restart attempt.
+    - The RESIDUAL is fastcached WITHOUT the node: Windows Installer's restart of a FastCached that ran
+      before the upgrade succeeds, so `FASTCACHED_START_SERVICE=0` on an upgrade from 0.3.0 leaves it
+      running; harmless (nothing else wants its port), and install.md says to stop it first. Every
+      package from PR 1634 on disables Restart Manager, so the hazard is an upgrade FROM 0.3.0 or
+      from a build before it -- dev builds carry 0.3.0's ProductVersion, so no version range can tell.
 - **A stop states its drain.** `StopPendingPlanFor(--drain-timeout)` is the wait hint -- the drain
   plus `StopTeardownMargin`, clamped to what the SCM can carry -- and the checkpoint advances
   every `StopCheckpointInterval` until the body returns. A fixed hint shorter than the drain reads

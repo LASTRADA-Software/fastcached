@@ -43,6 +43,11 @@
 # is generic. msi-custom-action-commands step 13 judges the same row, and refuses a custom action
 # setting the property.
 #
+# The FastCachedDisableForNode rows pin fastcached DISABLED beside the node, Return="check": an OLD
+# package's removal inside an upgrade keeps its own Restart Manager session, and PR 1634's CI MEASURED
+# Windows Installer restarting FastCached by name after the whole transaction had ended, onto the
+# port the node holds. Disabled, that start fails at the service control manager with no process.
+#
 # The FASTCACHE_INSTALL_LOCATION rows pin how a MAINTENANCE transaction resolves
 # INSTALL_ROOT: from the product's OWN uninstall entry, when Installed, before
 # CostFinalize. CPack resolves it only on an upgrade, and an uninstall of a custom
@@ -344,7 +349,13 @@ set(_table [=[
 <CustomAction Id="FastCachedStopForNode"|/>|net.exe stop FastCached"
 <CustomAction Id="FastCachedStopForNode"|/>|Return="ignore"
 <Custom Action="FastCachedStopForNode"|/>|After="FastCachedInstallService"
-<Custom Action="FastCachedStartService"|/>|After="FastCachedAwaitExitForNode"
+<CustomAction Id="FastCachedDisableForNode"|/>|sc.exe" config FastCached start= disabled"
+<CustomAction Id="FastCachedDisableForNode"|/>|Execute="deferred"
+<CustomAction Id="FastCachedDisableForNode"|/>|Impersonate="no"
+<CustomAction Id="FastCachedDisableForNode"|/>|Return="check"
+<Custom Action="FastCachedDisableForNode"|/>|After="FastCachedAwaitExitForNode"
+<Custom Action="FastCachedDisableForNode"|/>|Condition="FASTCACHED_SELECTED = "1" AND FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCachedStartService"|/>|After="FastCachedDisableForNode"
 
 <CustomAction Id="FastCacheClearRollbackState"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
 <CustomAction Id="FastCacheClearRollbackState"|/>|Execute="deferred"
