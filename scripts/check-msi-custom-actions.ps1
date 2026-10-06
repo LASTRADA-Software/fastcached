@@ -54,7 +54,13 @@
 #  13. Windows Installer's Restart Manager takes no part in a transaction: ONE Property row sets
 #      MSIRESTARTMANAGERCONTROL to "Disable", and nothing else sets it. Restart Manager restarts a
 #      service the table left stopped, and its shutdown, ahead of StopServices, cost the
-#      ServiceControl rows their rollback start.
+#      ServiceControl rows their rollback start;
+#  14. FastCachedDisableForNode disables only a registration that EXISTS: its command is started for
+#      real with every service name it spells swapped for one nothing registers, and must exit 0;
+#      and, the control that keeps that 0 honest, with the QUERY naming a service every host has and
+#      the disable still naming the absent one, it must exit 1060 -- a disable that fails on a
+#      service that is there fails the action. Neither run can change a service: the only one either
+#      would configure does not exist.
 # Every other action changes a service, the registry or the firewall, and is never started here.
 #
 # Usage: pwsh -NoProfile -File scripts/check-msi-custom-actions.ps1 -SourceDir <repository root>
@@ -577,16 +583,19 @@ if ($failures.Count -eq $failuresBeforeMaintenanceRoot) {
 # and at the end of the install it starts that service again, whatever the service table decided. CI
 # MEASURED on PR 1634 that the upgrade from 0.3.0 started FastCached after the table had made it manual
 # and stopped it for the node, that it crash-looped on the port the node holds, and that a recovery
-# restart took that port during a later transaction, which failed with 1603; that Restart Manager made
-# the start is INFERRED (nothing in the package starts FastCached there). Its shutdown also comes
-# before StopServices, so the ServiceControl rows find the service stopped and record no rollback start.
+# restart took that port during a later transaction, which failed with 1603. Its printed log then
+# MEASURED whose session that was: the OLD package's removal, nested in the upgrade, while this
+# package's own logged "Disabled" -- so this step is necessary and NOT sufficient, and step 14's
+# FastCachedDisableForNode is the other half (the comment on MSIRESTARTMANAGERCONTROL). Restart
+# Manager's shutdown also comes before StopServices, so the ServiceControl rows find the service
+# stopped and record no rollback start.
 #
 # Read from the fragment's Property rows. Windows Installer reads the property from the package's
 # Property table, so a SetProperty (a custom action) changing it has no effect and is refused rather
 # than counted. Fails OPEN for a value a transform or a command line supplies, which no package check
 # can see; the MSI job's per-transaction judgement (Invoke-Msiexec) is what would see its effect.
 $failuresBeforeRestartManager = $failures.Count
-$restartManagerDefect = "Windows Installer's Restart Manager restarts a service the table left stopped: a silent install shuts each service holding a replaced file down at InstallValidate and starts it again at the end, whatever the service table decided (FastCached, made manual and stopped for the node, was started and crash-looped on the port the node holds), and because that shutdown comes before StopServices, the ServiceControl rows record no rollback start"
+$restartManagerDefect = "Windows Installer's Restart Manager restarts a service the table left stopped: a silent install shuts each service holding a replaced file down at InstallValidate and starts it again at the end, whatever the service table decided, and because that shutdown comes before StopServices, the ServiceControl rows record no rollback start. (The stray start PR 1634 measured came from an OLD package's nested removal, which this property cannot reach; FastCachedDisableForNode answers that one, and this property is still required for the package's own session)"
 $restartManagerRows = @($fragment.SelectNodes("//Property[@Id='MSIRESTARTMANAGERCONTROL']"))
 if ($restartManagerRows.Count -ne 1) {
     Fail "$($restartManagerRows.Count) Property rows set MSIRESTARTMANAGERCONTROL, and exactly one must, Value=`"Disable`". $restartManagerDefect."
@@ -599,6 +608,41 @@ if ($restartManagerSetters.Count -gt 0) {
 }
 if ($failures.Count -eq $failuresBeforeRestartManager) {
     Pass 'Restart Manager takes no part in a transaction: one Property row sets MSIRESTARTMANAGERCONTROL to Disable, and no custom action sets it'
+}
+
+# 14. FastCachedDisableForNode disables only a registration that EXISTS (rm-nested review, I-1):
+# fastcached's registration is Return="ignore", so it may be absent, and a checked disable of an
+# absent service failed the node's whole install. The command is started for real, with each service
+# name it spells swapped for one nothing registers, so neither run can change a service.
+$failuresBeforeDisable = $failures.Count
+$disable = $actions | Where-Object { $_.Id -eq 'FastCachedDisableForNode' }
+if ($null -eq $disable) {
+    Fail 'FastCachedDisableForNode is not in the fragment, so nothing leaves fastcached disabled beside the node'
+} else {
+    $disableTarget = Format-Target $disable.ExeCommand
+    $absent = 'FastCacheAbsent' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $queries = [regex]::Matches($disableTarget, '\bquery FastCached\b').Count
+    $configs = [regex]::Matches($disableTarget, '\bconfig FastCached\b').Count
+    if ($queries -ne 1 -or $configs -ne 1) {
+        Fail "FastCachedDisableForNode spells 'query FastCached' $queries time(s) and 'config FastCached' $configs time(s); this step swaps exactly one of each, so it cannot run the command: $disableTarget"
+    } else {
+        $swap = { param([string] $queried, [string] $configured)
+            $disableTarget -replace '\bquery FastCached\b', "query $queried" -replace '\bconfig FastCached\b', "config $configured" }
+        $whenAbsent = Start-Target (& $swap $absent $absent) $system64
+        if ($whenAbsent -ne 0) {
+            Fail "FastCachedDisableForNode exited $whenAbsent for a service that is not registered; it must exit 0, or a refused fastcached registration (Return=`"ignore`") fails the node's whole install and rolls it back, naming this action rather than the refusal"
+        }
+        # The control: the query finds a service every host has, and the disable still names the
+        # absent one, so the disable runs and fails (1060). A guard that ended the command whatever
+        # the query answered would pass the run above and fail here.
+        $whenPresent = Start-Target (& $swap 'EventLog' $absent) $system64
+        if ($whenPresent -ne 1060) {
+            Fail "FastCachedDisableForNode exited $whenPresent when the queried service exists and the disable fails (1060 expected): a disable that fails on a registered fastcached must fail the action"
+        }
+    }
+}
+if ($failures.Count -eq $failuresBeforeDisable) {
+    Pass 'FastCachedDisableForNode exits 0 for an unregistered service and fails with the disable on a registered one'
 }
 
 # Positive controls: a walk that found nothing reports nothing wrong about it.

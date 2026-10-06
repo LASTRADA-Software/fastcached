@@ -845,6 +845,12 @@ readable and silently ignored. Every rule below has already been one of them.
     on an upgrade only, and Restart Manager's shutdown at `InstallValidate` used to give that margin.
     Both show as 3010 rather than as a failure: watch "removing the node feature" and the uninstall
     legs for it.
+  - **This build's package must PROMISE it, and its log must keep the promise**: `Invoke-Msiexec`
+    refuses a package whose Property table does not set `Disable`, unless the call names it
+    `-Released` (0.3.0, the latest release), and refuses a log of a `Disable` package that lacks
+    "RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property" (the wording MEASURED on the
+    Server 2025 runner). A skip would read as a pass: the static checks read the FRAGMENT, and a
+    built MSI that lost the row is exactly what only this sees.
   - **Every transaction is JUDGED, inside `Invoke-Msiexec`**, because a row is read after the
     transaction and a service started and killed inside it passes the row. A call names the row the
     transaction leaves (`-Leaves <row>`) or, where no row honestly describes it, a named expectation
@@ -906,6 +912,19 @@ readable and silently ignored. Every rule below has already been one of them.
     Removing the node re-applies fastcached `auto`, and a failed transaction puts back the start type
     it found. The CI leg asserts the nested shutdown line beside the judgement, so "no start" cannot
     pass for want of a restart attempt.
+    - **Only a registration that EXISTS is disabled, and the disable is `Return="check"`.**
+      `FastCachedInstallService` is `Return="ignore"` on purpose, so fastcached may be ABSENT there,
+      which is no more startable than disabled; a checked disable of it failed the node's whole install
+      over a step that was not the cause (rm-nested review, I-1). `sc.exe` answers 1060
+      (ERROR_SERVICE_DOES_NOT_EXIST, MEASURED) for exactly that, and that one answer ends the action
+      with 0; every other answer goes on to the disable. `msi-custom-action-commands` step 14 runs the
+      command for real against a name nothing registers, both ways, and changes no service.
+    - **The binary's own restore cannot spell `disabled`**: `ServiceStart` has no such row, so a
+      failed transaction's re-registration twin re-applies `#4` as `manual`, and the EXACT restore
+      after it puts `disabled` back. Only a transaction whose stash ALSO failed (the stash is
+      `Return="ignore"`) is left `manual`: the state before PR 1634, harmful only on a later upgrade
+      from a package whose removal still has its own Restart Manager, so accepted rather than given a
+      start mode the command line would never use.
     - The RESIDUAL is fastcached WITHOUT the node: Windows Installer's restart of a FastCached that ran
       before the upgrade succeeds, so `FASTCACHED_START_SERVICE=0` on an upgrade from 0.3.0 leaves it
       running; harmless (nothing else wants its port), and install.md says to stop it first. Every

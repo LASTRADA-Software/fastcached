@@ -38,8 +38,10 @@
 # The MSIRESTARTMANAGERCONTROL row pins Restart Manager OUT of every transaction ("Disable"): a
 # silent install otherwise restarts, at its end, every service it shut down at InstallValidate,
 # whatever the service table decided. PR 1634's CI measured FastCached started after the table had
-# made it manual and stopped it for the node; Restart Manager is the inferred cause, since nothing in
-# the package starts it there. Its offence names that defect below, since the footer
+# made it manual and stopped it for the node, and then MEASURED whose session did it: the OLD
+# package's removal, nested in the upgrade, while this package's own logged "Disabled". So this row is
+# necessary and not sufficient; the FastCachedDisableForNode rows below are the other half (see the
+# comment on MSIRESTARTMANAGERCONTROL). Its offence names that defect below, since the footer
 # is generic. msi-custom-action-commands step 13 judges the same row, and refuses a custom action
 # setting the property.
 #
@@ -47,6 +49,9 @@
 # package's removal inside an upgrade keeps its own Restart Manager session, and PR 1634's CI MEASURED
 # Windows Installer restarting FastCached by name after the whole transaction had ended, onto the
 # port the node holds. Disabled, that start fails at the service control manager with no process.
+# And only a registration that EXISTS: the 1060 guard rows, since fastcached's own registration is
+# Return="ignore" and a checked disable of an absent service failed the node's whole install
+# (rm-nested review, I-1). msi-custom-action-commands step 14 runs the command both ways.
 #
 # The FASTCACHE_INSTALL_LOCATION rows pin how a MAINTENANCE transaction resolves
 # INSTALL_ROOT: from the product's OWN uninstall entry, when Installed, before
@@ -349,7 +354,8 @@ set(_table [=[
 <CustomAction Id="FastCachedStopForNode"|/>|net.exe stop FastCached"
 <CustomAction Id="FastCachedStopForNode"|/>|Return="ignore"
 <Custom Action="FastCachedStopForNode"|/>|After="FastCachedInstallService"
-<CustomAction Id="FastCachedDisableForNode"|/>|sc.exe" config FastCached start= disabled"
+<CustomAction Id="FastCachedDisableForNode"|/>|cmd.exe" /c ([System64Folder]sc.exe query FastCached >nul 2>&1 & if errorlevel 1060 if not errorlevel 1061 exit 0) &
+<CustomAction Id="FastCachedDisableForNode"|/>|& [System64Folder]sc.exe config FastCached start= disabled"
 <CustomAction Id="FastCachedDisableForNode"|/>|Execute="deferred"
 <CustomAction Id="FastCachedDisableForNode"|/>|Impersonate="no"
 <CustomAction Id="FastCachedDisableForNode"|/>|Return="check"

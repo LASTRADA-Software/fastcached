@@ -1052,6 +1052,10 @@ function Show-PortHolders([int] $Port) {
 #               cannot honestly state a row (one that fails and rolls back); its reason says why.
 # @param Start Takes the arguments and returns the started msiexec Process; the self-test's seam, so
 #              a neutered refusal starts a harmless process there rather than msiexec.
+# @param Released The package is a RELEASED one (0.3.0, the latest release), not this build's: it may
+#                 predate MSIRESTARTMANAGERCONTROL, so its log is judged only if it sets the property.
+#                 Without it, a package that does not set `Disable` is refused, which is how this
+#                 build's MSI losing the property is seen rather than skipped.
 function Invoke-Msiexec {
     param(
         [Parameter(Mandatory)] [ValidateSet('/i', '/x')] [string] $Operation,
@@ -1063,6 +1067,7 @@ function Invoke-Msiexec {
         [Parameter(Mandatory)] [string] $What,
         [string] $Leaves = '',
         [string] $Expect = '',
+        [switch] $Released,
         [scriptblock] $Start = { param($arguments) Start-Process msiexec.exe -PassThru -ArgumentList $arguments }
     )
     # Judged, always: the expectation is resolved, and refused by name, before anything runs. Neither
@@ -1120,23 +1125,30 @@ function Invoke-Msiexec {
     # And JUDGED where the package says it disables Restart Manager: the log must say it did.
     $disables = Get-MsiScalar $Package "SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = 'MSIRESTARTMANAGERCONTROL'"
     $lines = if (Test-Path -LiteralPath $logPath) { @(Get-Content -LiteralPath $logPath) } else { @() }
-    $refusal = Get-RestartManagerLogVerdict -What $What -Disables $disables -Lines $lines
+    $refusal = Get-RestartManagerLogVerdict -What $What -Disables $disables -Lines $lines -Released $Released.IsPresent
     if ($null -ne $refusal) { throw $refusal }
     if ($disables -ceq 'Disable') { Write-Host "  log: Restart Manager disabled, as the package states" }
+    else { Write-Host "  log: Restart Manager NOT judged: the released package sets MSIRESTARTMANAGERCONTROL to '$disables', so it promises nothing" }
     Write-Host (Invoke-TransactionJudgement -Transaction $script:LastMsiTransaction)
 }
 
 # Whether a verbose log says what its package's Restart Manager setting promises. A package whose
 # Property table sets MSIRESTARTMANAGERCONTROL to `Disable` must log that Windows Installer disabled
-# it ($script:RestartManagerDisabledLine); a package that sets anything else, or nothing (0.3.0, the
-# latest release before PR 1634), promises nothing here. A pure function over the lines.
+# it ($script:RestartManagerDisabledLine). THIS build's package must set it: one that does not lost
+# the row the static checks pin in the fragment, and a skip would read as a pass. Only a RELEASED
+# package (0.3.0, the latest release) may set anything else, or nothing, and promise nothing here.
+# A pure function over the lines.
 #
 # @param What The transaction, for the refusal.
 # @param Disables The package's MSIRESTARTMANAGERCONTROL value, $null when it has none.
 # @param Lines The log's lines.
-# @return $null when the log keeps the promise or there is none, else the refusal.
-function Get-RestartManagerLogVerdict([string] $What, [AllowNull()] [object] $Disables, [string[]] $Lines = @()) {
-    if ($Disables -cne 'Disable') { return $null }
+# @param Released Whether the package is a released one rather than this build's.
+# @return $null when the log keeps the promise or a released package makes none, else the refusal.
+function Get-RestartManagerLogVerdict([string] $What, [AllowNull()] [object] $Disables, [string[]] $Lines = @(), [bool] $Released = $false) {
+    if ($Disables -cne 'Disable') {
+        if ($Released) { return $null }
+        return "'$What': this build's package sets MSIRESTARTMANAGERCONTROL to '$Disables', not 'Disable': the built MSI lost the row the fragment carries, and Windows Installer's Restart Manager restarts a service the table left stopped (PR 1634); a RELEASED package is named with -Released"
+    }
     if (@($Lines | Where-Object { $_.Contains($script:RestartManagerDisabledLine) }).Count -gt 0) { return $null }
     return "'$What': the package sets MSIRESTARTMANAGERCONTROL=Disable and its verbose log never says '$script:RestartManagerDisabledLine': Windows Installer's Restart Manager took part, and it restarts a service the table left stopped (PR 1634); the log's RESTART MANAGER lines are above"
 }
@@ -2694,20 +2706,28 @@ function Invoke-MsiServiceTableSelfTest {
     }
 
     # The Restart Manager promise: a package that disables it must log that it was disabled, with the
-    # line PR 1634's runner wrote; a package that does not promise it (0.3.0) is not judged.
+    # line PR 1634's runner wrote; this build's package must disable it; a RELEASED package that does not
+    # promise it (0.3.0) is not judged.
     $disabledLog = @('MSI (s) (D8:0C) [13:31:45:209]: RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property; Windows Installer will use the built-in FilesInUse functionality.')
     $openedLog = @('MSI (s) (D8:8C) [13:31:14:256]: RESTART MANAGER: Session opened.')
     foreach ($row in @(
-            @{ Case = 'a disabling package that logged it'; Disables = 'Disable'; Lines = $disabledLog; Refused = $false }
-            @{ Case = 'a disabling package whose log shows a session instead'; Disables = 'Disable'; Lines = $openedLog; Refused = $true }
-            @{ Case = 'a disabling package with no log at all'; Disables = 'Disable'; Lines = @(); Refused = $true }
-            @{ Case = 'a package without the property (0.3.0)'; Disables = $null; Lines = $openedLog; Refused = $false }
-            @{ Case = 'a package with another value, which the static checks refuse'; Disables = 'DisableShutdown'; Lines = $openedLog; Refused = $false })) {
-        $verdict = Get-RestartManagerLogVerdict -What 'T' -Disables $row.Disables -Lines $row.Lines
-        if (($null -ne $verdict) -ne $row.Refused -or ($row.Refused -and $verdict -notmatch "^'T': the package sets MSIRESTARTMANAGERCONTROL=Disable and its verbose log never says")) {
+            @{ Case = 'a disabling package that logged it'; Disables = 'Disable'; Lines = $disabledLog; Released = $false; Refused = 'no' }
+            @{ Case = 'a disabling package whose log shows a session instead'; Disables = 'Disable'; Lines = $openedLog; Released = $false; Refused = 'never says' }
+            @{ Case = 'a disabling package with no log at all'; Disables = 'Disable'; Lines = @(); Released = $false; Refused = 'never says' }
+            @{ Case = 'a RELEASED disabling package whose log shows a session instead'; Disables = 'Disable'; Lines = $openedLog; Released = $true; Refused = 'never says' }
+            @{ Case = 'a released package without the property (0.3.0)'; Disables = $null; Lines = $openedLog; Released = $true; Refused = 'no' }
+            @{ Case = 'a released package with another value'; Disables = 'DisableShutdown'; Lines = $openedLog; Released = $true; Refused = 'no' }
+            @{ Case = 'this build''s package without the property'; Disables = $null; Lines = $openedLog; Released = $false; Refused = 'lost' }
+            @{ Case = 'this build''s package with another value'; Disables = 'DisableShutdown'; Lines = $disabledLog; Released = $false; Refused = 'lost' })) {
+        $verdict = Get-RestartManagerLogVerdict -What 'T' -Disables $row.Disables -Lines $row.Lines -Released $row.Released
+        $want = switch ($row.Refused) {
+            'no' { $null }
+            'never says' { "^'T': the package sets MSIRESTARTMANAGERCONTROL=Disable and its verbose log never says" }
+            'lost' { "^'T': this build's package sets MSIRESTARTMANAGERCONTROL to '[^']*', not 'Disable': the built MSI lost the row" } }
+        if (($null -ne $verdict) -ne ($null -ne $want) -or ($null -ne $want -and $verdict -notmatch $want)) {
             throw "restart manager promise: $($row.Case) read '$verdict'"
         }
-        Pass "restart manager promise: $($row.Case) $(if ($row.Refused) { 'is refused' } else { 'passes' })"
+        Pass "restart manager promise: $($row.Case) $(if ($null -ne $want) { 'is refused' } else { 'passes' })"
     }
 
     # The watch over a real process: it observes until the process exits, keeps only a service seen
@@ -2736,7 +2756,7 @@ function Invoke-MsiServiceTableSelfTest {
     }
     Pass "watch: a failed observation is counted ($($watched.FailedPolls) round(s)) and the watch goes on to the process's exit"
 
-    $expectedCases = 168
+    $expectedCases = 171
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }

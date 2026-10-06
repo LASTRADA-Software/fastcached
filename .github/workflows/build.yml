@@ -3518,7 +3518,7 @@ jobs:
           }
 
           # The starting point: 0.3.0 with the node registered.
-          Invoke-Msiexec -Leaves Release030WithNode -Operation '/i' -Package $previous -Log 'previous.log' -Properties $release030NodeProperties -What "installing $release"
+          Invoke-Msiexec -Leaves Release030WithNode -Released -Operation '/i' -Package $previous -Log 'previous.log' -Properties $release030NodeProperties -What "installing $release"
           Assert-InstalledProduct $family $productOf[$previous]
           Assert-ServiceTable -Row Release030WithNode -Log 'previous.log'
 
@@ -3693,7 +3693,7 @@ jobs:
             # The latest release's installer registers its node only with a scheduler, and that
             # registration carries `--scheduler`: the upgrade below, with no property, must
             # register the node again without it, or the service refuses every start.
-            Invoke-Msiexec -Leaves NodeSelected -Operation '/i' -Package $previous -Log 'latest.log' `
+            Invoke-Msiexec -Leaves NodeSelected -Released -Operation '/i' -Package $previous -Log 'latest.log' `
               -Properties 'FASTCACHE_NODE_SCHEDULER=127.0.0.1:6675', 'FASTCACHE_NODE_ADVERTISE=127.0.0.1:6674' -What "installing $latest"
             Assert-InstalledProduct $family $previousCode
             Assert-ServiceTable -Row NodeSelected -Log 'latest.log'
