@@ -3698,14 +3698,53 @@ jobs:
       # #1629: a deliberately FAILED upgrade must leave the machine exactly as it was. The shipped
       # MSI fails last when FASTCACHE_FAIL_FOR_TEST=1, behind every other script action, so the
       # rollback runs every rollback action we have. The scenario is chosen so that the upgrade
-      # would CHANGE what is compared -- N installed fastcached-only into a custom root, N+1 adding
-      # the node into the default root moves fastcached's path and start type and creates a second
-      # service -- and the last leg proves that a SUCCESSFUL run of it does.
-      # Two controls run the same failure on patched COPIES and must go red: the exact restores
-      # switched off, and the rollback state discarded in the script again. Not covered, by design:
-      # the window from RemoveExistingProducts to WriteRegistryValues (ChecksBeforeTheRestores), and
-      # a failure after a leftover delete (nothing restores a deleted service; this scenario keeps
-      # both features, so none is deleted).
+      # would CHANGE what is compared, and the last leg proves that a SUCCESSFUL run of it does:
+      # N is installed fastcached-only into a custom root, and N+1 adds the node, which re-registers
+      # fastcached manual and stopped and creates a second service.
+      #
+      # The upgrade KEEPS N's root. CPack's WiX generator searches INSTALL_ROOT from the old
+      # product's Uninstall\<code>\InstallLocation (its `FindInstallLocation` RegistrySearch, in
+      # the generated properties.wxi), so N+1 lands in the custom root too and fastcached's
+      # executable path never changes. A plain re-registration would therefore put the ImagePath
+      # back as well as the exact restore does, and the custom root alone makes no ImagePath claim.
+      # So N's registration carries ONE thing only the exact restore puts back (Set-NRegistration):
+      # an extra `--log-level=info` on its command line, written through Win32_Service.Change as
+      # the exact restore writes it. `--log-level` is a CliParser.cpp option row that
+      # BuildServiceArgv re-emits only when it was typed (`emitIfExplicit`, ServiceControl.cpp), so
+      # it survives a registration round trip, and `info` is the default: the daemon starts and
+      # serves on its default binds with no new port or file. The twin FastCachedRestoreRegistration
+      # runs `fastcached.exe --install-service --service-start=<auto|manual>` plus its firewall
+      # argument and nothing else, and the command line it registers is BuildServiceCommandLine of
+      # THAT invocation (MakeDaemonServiceSpec), written whole by `Reapply`'s ChangeServiceConfig,
+      # so it carries no `--log-level`. That the twin drops the flag is INFERRED from that code;
+      # what is MEASURED is that FastCachedInstallService, an invocation of the same shape
+      # (`--install-service --service-start=... [firewall]`), registered N as `"<root>bin\
+      # fastcached.exe" --daemon --service-name=FastCached` and nothing more (run 37452107865's
+      # snapshot of N). The last leg measures it again: a successful upgrade's ImagePath changes.
+      # The custom root stays, because it shows that an upgrade keeps it: the last leg asserts the
+      # custom root's binary is still there after a SUCCESSFUL upgrade.
+      #
+      # Three controls run the same failure on patched COPIES, each isolating one claim:
+      #   A  every rollback row that rewrites fastcached's registration switched off -- the exact
+      #      restore, its re-registration twin, and the undo -- so NOTHING puts it back: the
+      #      comparison must go red on `service FastCached`, or it cannot see a restore that did
+      #      not run.
+      #   B  only the twin switched off: the comparison must be EMPTY, the exact restore putting N
+      #      back alone with the shipped commit-phase discard. A `service FastCached` difference
+      #      here is a defect in the exact restore, reported as one; any other field is outside
+      #      its job and reported as that.
+      #   C  the twin switched off AND the discard deferred again (its commit bit cleared): must go
+      #      red on `service FastCached`. B and C differ ONLY in the discard's phase, which is what
+      #      isolates the #1629 fix.
+      # Switching off the exact restore ALONE could not discriminate while N's registration matched
+      # what the twin rebuilds, which is why N now carries the flag: run 37452107865 MEASURED an
+      # empty difference with both exact restores conditioned off, before N carried it. The twin is the INFERRED restorer -- the only remaining rollback row
+      # that rewrites the registration, gated on the ImagePath AppSearch captured before the
+      # transaction, reading no rollback state -- and control A now pins that inference: with the
+      # twin off as well, the difference must appear. Hence the twin is off in B and C.
+      # Not covered, by design: the window from RemoveExistingProducts to WriteRegistryValues
+      # (ChecksBeforeTheRestores), and a failure after a leftover delete (nothing restores a
+      # deleted service; this scenario keeps both features, so none is deleted).
       - name: "A failed upgrade restores the previous installation exactly"
         shell: pwsh
         working-directory: out/build/cl-release
@@ -3728,12 +3767,30 @@ jobs:
           $fastcachedOnly = 'ADDLOCAL=CM_C_Cli,CM_C_Daemon,CM_C_Launcher'
           $withNode = 'ADDLOCAL=CM_C_Cli,CM_C_Daemon,CM_C_Launcher,CM_C_Node'
           $failedHere = 'CustomAction FastCacheFailForTest returned actual error code'
+          $extraFlag = '--log-level=info'
 
+          # What only the exact restore puts back (the header says why): a flag the twin's
+          # re-registration does not build. Through the service manager, as the exact restore itself
+          # writes, never into the key; restarted so the flagged command line is proven to SERVE
+          # before the subject depends on it; and read back from the key the snapshot reads.
+          function Set-NRegistration {
+            $service = Get-CimInstance Win32_Service -Filter "Name='FastCached'"
+            if (-not $service) { throw "FastCached is not registered, so N's registration cannot be set" }
+            $changed = Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{ PathName = "$($service.PathName) $extraFlag" }
+            if ($changed.ReturnValue -ne 0) { throw "Win32_Service.Change of FastCached's command line returned $($changed.ReturnValue)" }
+            Restart-Service -Name FastCached -ErrorAction Stop
+            Assert-ServiceState @{ FastCached = @('Auto', 'Running') } | Out-Null
+            $key = Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\FastCached'
+            $imagePath = $key.GetValue('ImagePath', '', 'DoNotExpandEnvironmentNames')
+            if (-not $imagePath.EndsWith(" $extraFlag")) { throw "FastCached's ImagePath reads '$imagePath', expected it to end in ' $extraFlag'" }
+            Write-Host "N's FastCached: auto, running, ImagePath $imagePath"
+          }
           function Install-N([string] $Log) {
             Invoke-Msiexec -Operation '/i' -Package $first -Log $Log -Properties $fastcachedOnly, "INSTALL_ROOT=`"$root`"" `
               -What 'build N, fastcached-only, into a custom root'
             Assert-InstalledProduct $family $firstCode
             Assert-ServiceTable -Row DaemonAlone -Log $Log
+            Set-NRegistration
           }
           function Remove-All([string] $Log) {
             Invoke-Msiexec -Operation '/x' -Package $first -Log $Log -What 'uninstalling build N'
@@ -3779,49 +3836,103 @@ jobs:
           if ($diff.Count) { Show-Snapshot $after 'after the failed upgrade'; throw "the failed upgrade did not restore build N exactly:`n$($diff -join "`n")" }
           Write-Host "the failed upgrade restored all $($before.Count) fields exactly"
 
-          # Control 1: the exact restores switched off. Must differ, in fastcached's registration.
-          $noRestore = Join-Path $env:RUNNER_TEMP 'control-no-restore.msi'
-          New-MsiControlCopy -Package $newer -Destination $noRestore -Statements @(
-              "UPDATE ``InstallExecuteSequence`` SET ``Condition``='0' WHERE ``Action``='FastCachedRestoreRegistrationExactly'",
-              "UPDATE ``InstallExecuteSequence`` SET ``Condition``='0' WHERE ``Action``='FastCacheNodeRestoreRegistrationExactly'") `
-            -Verify @{
-              "SELECT ``Condition`` FROM ``InstallExecuteSequence`` WHERE ``Action``='FastCachedRestoreRegistrationExactly'" = '0'
-              "SELECT ``Condition`` FROM ``InstallExecuteSequence`` WHERE ``Action``='FastCacheNodeRestoreRegistrationExactly'" = '0' } | Out-Null
-          $control = @(Compare-InstallationSnapshot -Before $before -After (Invoke-FailedUpgrade $noRestore 'control-no-restore.log' 'control 1: the exact restores switched off'))
-          Write-Host "control 1 differences:`n  $($control -join "`n  ")"
-          if (-not ($control | Where-Object { $_ -like 'service FastCached:*' })) { throw "control 1 did not go red on fastcached's registration, so the comparison cannot see a restore that did not run" }
+          # The controls. Each is a patched copy of N+1 put through the same failed upgrade, read back
+          # before it runs (New-MsiControlCopy's -Verify), and followed by Reset-ToN. A row is switched
+          # off by conditioning it '0'; its read-back is the same condition.
+          function Get-RowsSwitchedOff([string[]] $Actions) {
+            $verify = @{}
+            foreach ($action in $Actions) { $verify["SELECT ``Condition`` FROM ``InstallExecuteSequence`` WHERE ``Action``='$action'"] = '0' }
+            return @{
+              Statements = @(foreach ($action in $Actions) { "UPDATE ``InstallExecuteSequence`` SET ``Condition``='0' WHERE ``Action``='$action'" })
+              Verify = $verify }
+          }
+          function Invoke-Control([string] $Tag, [string] $What, [string[]] $Statements, [hashtable] $Verify) {
+            $copy = Join-Path $env:RUNNER_TEMP "$Tag.msi"
+            New-MsiControlCopy -Package $newer -Destination $copy -Statements $Statements -Verify $Verify | Out-Null
+            $differences = @(Compare-InstallationSnapshot -Before $before -After (Invoke-FailedUpgrade $copy "$Tag.log" $What))
+            Write-Host "$What, differences:`n  $($differences -join "`n  ")"
+            return $differences
+          }
+          # The twin: re-registers fastcached through its own --install-service, from what AppSearch
+          # captured before the transaction, so it needs no rollback state at all.
+          $twinOff = Get-RowsSwitchedOff @('FastCachedRestoreRegistration')
+
+          # Control A: the comparison sees a restore that did not run. EVERY rollback row that
+          # rewrites fastcached's registration is off:
+          #   FastCachedRestoreRegistrationExactly  the exact restore, from the rollback state;
+          #   FastCachedRestoreRegistration         its re-registration twin;
+          #   FastCachedUndoRegistration            the undo of a registration the transaction
+          #                                         CREATED -- conditioned NOT FASTCACHED_IMAGEPATH,
+          #                                         so already false here, and off so the claim
+          #                                         holds of the package rather than of this
+          #                                         scenario's properties.
+          # Not rows of this kind, so left on: FastCachedRestartAfterStop (starts the service, the
+          # `state` field, never the registration), Windows Installer's own StopServices rollback
+          # (FastCachedStopForFiles, Stop only), and the node's rows (FastCacheCompileNode's).
+          $allOff = Get-RowsSwitchedOff @('FastCachedRestoreRegistrationExactly', 'FastCachedRestoreRegistration', 'FastCachedUndoRegistration')
+          $control = @(Invoke-Control 'control-no-restore' "control A: every restore of fastcached's registration switched off" $allOff.Statements $allOff.Verify)
+          if (-not ($control | Where-Object { $_ -like 'service FastCached:*' })) { throw "control A did not go red on fastcached's registration, so the comparison cannot see a restore that did not run" }
           Reset-ToN 'control-no-restore'
 
-          # Control 2: the rollback state discarded inside the script again (commit bit cleared).
-          $deferred = Join-Path $env:RUNNER_TEMP 'control-deferred-discard.msi'
+          # Control B: the exact restore works ALONE. Only the twin is off, the shipped commit-phase
+          # discard kept: the exact restore must put build N back by itself. A difference in
+          # fastcached's registration is not a weak control; it is a defect in the exact restore,
+          # which the twin was masking. Any OTHER field is outside the exact restore's job, and is
+          # reported as that rather than blamed on it.
+          $control = @(Invoke-Control 'control-exact-alone' 'control B: only the twin switched off' $twinOff.Statements $twinOff.Verify)
+          if ($control.Count) {
+            $registration = @($control | Where-Object { $_ -like 'service FastCached:*' })
+            $elsewhere = @($control | Where-Object { $_ -notlike 'service FastCached:*' })
+            $findings = @()
+            if ($registration.Count) {
+              Write-Host "::error title=The exact restore is defective::with its re-registration twin switched off, FastCachedRestoreRegistrationExactly did not restore fastcached's registration by itself; the twin was masking it"
+              $findings += "a DEFECT in FastCachedRestoreRegistrationExactly, not in this check, which must not be loosened:`n$($registration -join "`n")"
+            }
+            if ($elsewhere.Count) {
+              Write-Host "::error title=Control B differs outside the exact restore's job::fields the exact restore does not write differ with only the twin switched off"
+              $findings += "fields OUTSIDE the exact restore's job (it writes only fastcached's registration), so not its defect:`n$($elsewhere -join "`n")"
+            }
+            throw "control B: with only the twin switched off, build N did not come back:`n$($findings -join "`n")"
+          }
+          Write-Host "control B: the exact restore alone restored all $($before.Count) fields"
+          Reset-ToN 'control-exact-alone'
+
+          # Control C: a discard inside the script costs the exact restore its state. The twin off as
+          # in B, and FastCacheDiscardRollbackState deferred again (commit bit cleared): B and C differ
+          # ONLY in the discard's phase, which isolates the #1629 fix.
           # Read the shipped Type, assert the commit bit (0x200) is set, and clear it.
           $type = [int](Get-MsiCustomActionType $newer 'FastCacheDiscardRollbackState')
           if (-not ($type -band 0x200)) { throw "FastCacheDiscardRollbackState has Type $type, without the commit bit: the fix is not in this package" }
           $cleared = $type -band (-bnot 0x200)
-          New-MsiControlCopy -Package $newer -Destination $deferred `
-            -Statements @("UPDATE ``CustomAction`` SET ``Type``=$cleared WHERE ``Action``='FastCacheDiscardRollbackState'") `
-            -Verify @{ "SELECT ``Type`` FROM ``CustomAction`` WHERE ``Action``='FastCacheDiscardRollbackState'" = "$cleared" } | Out-Null
-          $control = @(Compare-InstallationSnapshot -Before $before -After (Invoke-FailedUpgrade $deferred 'control-deferred-discard.log' 'control 2: the rollback state discarded in the script'))
-          Write-Host "control 2 differences:`n  $($control -join "`n  ")"
-          if (-not ($control | Where-Object { $_ -like 'service FastCached:*' })) { throw "control 2 did not go red: a discard inside the script must cost the exact restore its state" }
+          $deferredVerify = $twinOff.Verify.Clone()
+          $deferredVerify["SELECT ``Type`` FROM ``CustomAction`` WHERE ``Action``='FastCacheDiscardRollbackState'"] = "$cleared"
+          $control = @(Invoke-Control 'control-deferred-discard' 'control C: the twin switched off and the rollback state discarded in the script' `
+            ($twinOff.Statements + "UPDATE ``CustomAction`` SET ``Type``=$cleared WHERE ``Action``='FastCacheDiscardRollbackState'") $deferredVerify)
+          if (-not ($control | Where-Object { $_ -like 'service FastCached:*' })) { throw "control C did not go red: a discard inside the script must cost the exact restore its state" }
           Reset-ToN 'control-deferred-discard'
 
           # The scenario discriminates: a SUCCESSFUL run of the same upgrade changes every field the
           # subject relied on, and never runs the failure action. Each field below is one whose READER
           # nothing else shows live: an unchanged field is equal on both sides however it was read, so
-          # a reader that returned nothing would pass the subject. The custom root's binary goes, the
-          # installed product is N+1 rather than N, and the node's firewall group is created.
+          # a reader that returned nothing would pass the subject. Only fields a successful N -> N+1
+          # upgrade really changes are required: fastcached's ImagePath (the extra flag goes) and Start
+          # (manual under the node's table), its state, the node's registration, the installed
+          # product, and the node's firewall group. Never `binary`: the upgrade keeps N's root (see
+          # the header), so the custom root's binary must still be THERE, which is asserted instead.
           Invoke-Msiexec -Operation '/i' -Package $newer -Log 'succeeded-upgrade.log' -Properties $withNode -What 'the same upgrade, succeeding'
           Assert-MsiLog -Path 'succeeded-upgrade.log' -Present (Get-MsiActionRanPattern 'FastCacheNodeStartService') -Absent (Get-MsiActionRanPattern 'FastCacheFailForTest')
           $changed = @(Compare-InstallationSnapshot -Before $before -After (Get-InstallationSnapshot -UpgradeCode $family -Root $root))
           Write-Host "a successful upgrade changes:`n  $($changed -join "`n  ")"
-          foreach ($field in 'service FastCached', 'state FastCached', 'service FastCacheCompileNode', 'binary', 'products',
+          foreach ($field in 'service FastCached', 'state FastCached', 'service FastCacheCompileNode', 'products',
                              'firewall fastcached: FastCacheCompileNode') {
             if (-not ($changed | Where-Object { $_ -like "${field}:*" })) { throw "a successful upgrade left '$field' unchanged, so the failed one proved nothing about it" }
           }
           foreach ($value in 'ImagePath', 'Start') {
             if (-not ($changed | Where-Object { $_ -like 'service FastCached:*' -and $_ -match "\b$value\b" })) { throw "a successful upgrade left fastcached's $value unchanged, so the failed one proved nothing about it" }
           }
+          $kept = Join-Path $root 'bin\fastcached.exe'
+          if (-not (Test-Path -LiteralPath $kept)) { throw "a successful upgrade did not keep N's custom root: $kept is gone" }
+          Write-Host "a successful upgrade kept N's custom root: $kept is present"
           Invoke-Msiexec -Operation '/x' -Package $newer -Log 'succeeded-uninstall.log' -What 'uninstalling after the successful upgrade'
           Assert-InstalledProduct $family ''
           Assert-ServiceTable -Row NothingInstalled -Log 'succeeded-uninstall.log'

@@ -1296,8 +1296,8 @@ function Invoke-MsiServiceTableSelfTest {
 
         # The custom action reader: two rows, so a reader answering with the wrong row is caught, and the
         # commit bit (0x200) ALONE separates them -- 3618 is 0xE22 and 3106 is 0xC22, both a type-34
-        # in-script, no-impersonation action -- so the rows are the shapes control 2 reads and writes.
-        # A missing action is refused by name.
+        # in-script, no-impersonation action -- so the rows are the shapes the failed-upgrade CI step's
+        # control C reads and writes. A missing action is refused by name.
         foreach ($action in @(@{ Name = 'Committed'; Type = 3618 }, @{ Name = 'Deferred'; Type = 3106 })) {
             $type = Get-MsiCustomActionType $package $action.Name
             if ($type -isnot [int] -or $type -ne $action.Type) { throw "package: custom action $($action.Name) read '$type', expected $($action.Type)" }

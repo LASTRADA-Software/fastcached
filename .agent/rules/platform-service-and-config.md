@@ -698,9 +698,22 @@ readable and silently ignored. Every rule below has already been one of them.
     among them. It fails OPEN for a deleter spelled any other way (`Remove-Item`,
     `HKEY_LOCAL_MACHINE\`, a quoted path, a subkey, a `<RemoveRegistryKey>` element), as its own
     text states. The CI step `A failed upgrade restores the previous installation exactly` proves
-    the behaviour end to end, with BOTH controls: the same failed upgrade on a copy whose exact
-    restores are switched off, and on one whose discard is deferred again, must each differ in
-    fastcached's registration. With rollback DISABLED
+    the behaviour end to end, with THREE controls on patched copies: (A) every rollback row that
+    rewrites fastcached's registration off -- the exact restore, its re-registration twin
+    `FastCachedRestoreRegistration` and the undo -- must differ in fastcached's registration;
+    (B) only the twin off must differ in NOTHING, the exact restore working alone, and red there
+    is a defect in the exact restore rather than a weak control; (C) the twin off and the discard
+    deferred again must differ in fastcached's registration. B and C differ only in the
+    discard's phase, which is what isolates this fix. **Switching off the exact restore ALONE
+    could not discriminate while N's registration matched what the twin rebuilds**: CI run
+    37452107865 MEASURED an empty difference with both exact restores off. The twin is the
+    INFERRED restorer, since it re-registers from what AppSearch captured before the transaction
+    and reads no rollback state, and control A now pins that inference. **And an upgrade KEEPS the install root** (CPack's `FindInstallLocation`
+    RegistrySearch reads it from the old product's `InstallLocation`), so the executable path
+    alone is something any re-registration puts back. N's registration therefore carries what
+    only the exact restore restores: one extra flag on its command line (`--log-level=info`),
+    which the twin's `--install-service` does not build, so the twin alone can no longer put N
+    back. With rollback DISABLED
     no commit action runs either, so the key survives that transaction; the next transaction's
     `FastCacheClearRollbackState` empties it before it writes any.
   - **`FASTCACHE_FAIL_FOR_TEST="1"` is a shipped, property-gated late failure**
