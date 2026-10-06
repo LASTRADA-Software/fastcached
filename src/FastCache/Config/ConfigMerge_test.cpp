@@ -535,36 +535,24 @@ TEST_CASE("The daemon's startup rules refuse what its body used to refuse only o
         CHECK(FastCache::DaemonStartupRejection(config) == std::optional<std::string> { std::string { why } });
     }
 
-    SECTION("a disk budget under a durability that keeps no free list, named with both flags")
+    SECTION("a disk budget under every durability starts: each keeps its free list across a restart")
     {
-        // Only `batched` persists the free list, and the budget is the store's page footprint,
-        // so under the other two every restart would charge free pages against it for good.
+        // #1624: `fsync` and `none` now write the free list at every commit, so the budget no
+        // longer charges free pages after a restart and the refusal that guarded it is gone.
         config.storagePath = "/var/cache/fastcached";
         config.storageMaxDiskBytes = std::size_t { 1 } << 30U;
-        for (auto const durability: { FastCache::StorageDurability::Fsync, FastCache::StorageDurability::None })
+        for (auto const durability: { FastCache::StorageDurability::Batched,
+                                      FastCache::StorageDurability::Fsync,
+                                      FastCache::StorageDurability::None })
         {
             config.storageDurability = durability;
-            auto const refusal = FastCache::DaemonStartupRejection(config);
-            REQUIRE(refusal.has_value());
-            CHECK(FastCache::Testing::Unwrap(refusal) == FastCache::DaemonStorageBudgetDurabilityRefusal);
+            CHECK_FALSE(FastCache::DaemonStartupRejection(config).has_value());
         }
-        // The remedy names both flags, so an operator can act on it from the refusal alone.
-        CHECK(FastCache::DaemonStorageBudgetDurabilityRefusal.contains("--storage-max-disk"));
-        CHECK(FastCache::DaemonStorageBudgetDurabilityRefusal.contains("--storage-durability=batched"));
     }
 
-    SECTION("the controls: either half of that combination alone starts")
+    SECTION("a budget with no store bounds nothing and starts")
     {
-        config.storagePath = "/var/cache/fastcached";
-        config.storageMaxDiskBytes = std::size_t { 1 } << 30U;
-        config.storageDurability = FastCache::StorageDurability::Batched;
-        CHECK_FALSE(FastCache::DaemonStartupRejection(config).has_value());
-
-        config.storageMaxDiskBytes = 0;
         config.storageDurability = FastCache::StorageDurability::Fsync;
-        CHECK_FALSE(FastCache::DaemonStartupRejection(config).has_value());
-
-        // And no store at all: the durability and the budget then bound nothing.
         config.storagePath.clear();
         config.storageMaxDiskBytes = std::size_t { 1 } << 30U;
         CHECK_FALSE(FastCache::DaemonStartupRejection(config).has_value());

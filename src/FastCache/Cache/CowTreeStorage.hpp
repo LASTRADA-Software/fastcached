@@ -218,9 +218,10 @@ class CowTreeStorage final: public IStorage
     ///
     /// **Interruptible, not atomic** — and that is a decision rather than a
     /// shortcoming. Converting in one transaction would be atomic and would
-    /// also inflate the file by one page per record per tree level, permanently,
-    /// because a CoW commit frees replaced pages only at the commit and the
-    /// free list is not persisted (see `MigrationChunkRecords`). So the work
+    /// also inflate the file by one page per record per tree level, until churn
+    /// migrates the live data back down: a CoW commit frees replaced pages only
+    /// at the commit, and what it frees lies at the front of the file, where no
+    /// tail truncation reaches it (see `MigrationChunkRecords`). So the work
     /// commits in slices, and each slice records how far it got in the same
     /// transaction as the records it converted.
     ///

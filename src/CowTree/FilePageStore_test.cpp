@@ -8,10 +8,12 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include <CowTree/Bytes.hpp>
@@ -20,6 +22,7 @@
 #include <CowTree/FilePageStore.hpp>
 #include <CowTree/Meta.hpp>
 #include <CowTree/PageId.hpp>
+#include <tests/MetaLayoutBuilders.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -116,9 +119,11 @@ void PutFreeListId(std::span<std::byte> page, std::size_t slot, std::uint64_t id
 /// disagreed about `pageSize` would not fail: `RecoverExistingFile` takes the
 /// on-disk value and carries on.
 ///
-/// `Fsync` rather than the default `Batched`, which buffers `WriteMeta` until
-/// a flush boundary this fixture never reaches -- and the seeded meta has to
-/// be on disk, or the reopen finds no chain to walk.
+/// `Fsync` rather than the default `Batched` is historical: the seed used to put
+/// its meta on disk through `WriteMeta`, which `Batched` buffers until a flush
+/// boundary this fixture never reaches. Since #1624 the seed patches the meta
+/// into the closed file instead (see `SeedFreeListChain`), so the durability no
+/// longer decides whether the reopen finds a chain to walk.
 /// @param path Filesystem path of the store file.
 /// @return Whatever `FilePageStore::Open` answered.
 auto OpenFreeListStore(std::filesystem::path const& path)
@@ -128,81 +133,6 @@ auto OpenFreeListStore(std::filesystem::path const& path)
     opts.pageSize = FreeListPageSize;
     opts.durability = CowTree::FilePageStore::Durability::Fsync;
     return CowTree::FilePageStore::Open(opts);
-}
-
-/// Build a store at `path` whose durable meta names a free-list chain rooted
-/// at page 1, and close it. Page 3 is left live.
-///
-/// The chain's shape is the caller's, so a case that wants a damaged one says
-/// so in data rather than patching bytes into the closed file afterwards --
-/// which would mean restating `FilePageStore`'s private data-page offset here,
-/// the very thing the neighbouring sweep in `CowTreeStorage_test.cpp` argues a
-/// fixture must not do.
-///
-/// That rule is about the DATA-page offset, which is private. It does not reach
-/// the meta slots: `Meta.hpp` documents those offsets as the on-disk contract,
-/// and `WriteMeta` recomputes the CRC so damaged meta bytes cannot be expressed
-/// through the API at all. The `[meta][corrupt]` case below therefore does patch
-/// the closed file, deliberately -- said here as well as there, because a reader
-/// who lands on this comment must not carry away the opposite instruction.
-///
-/// Both pages are written BEFORE the meta that names `freeRoot`, so this store
-/// walks nothing while it is open -- the injection route is invisible in the
-/// file, which is the same one a patch-the-closed-file route would leave.
-///
-/// It is NOT a file any writer in this tree produces, and that is deliberate
-/// rather than an oversight: `CowTree::CommitTxn` writes
-/// `freeRoot = PageId::None()` unconditionally, so no real store has a chain
-/// at all. The block comment above the cases carries the whole argument.
-/// @param path Filesystem path to create the store at.
-/// @param nextOfOne What page 1 chains to.
-/// @param nextOfTwo What page 2 chains to.
-void SeedFreeListChain(std::filesystem::path const& path, CowTree::PageId nextOfOne, CowTree::PageId nextOfTwo)
-{
-    auto const store = OpenFreeListStore(path);
-    REQUIRE(store.has_value());
-
-    for (auto const expected: std::views::iota(std::uint64_t { 1 }, FreeListFixturePages + 1))
-    {
-        auto const id = (*store)->Allocate();
-        REQUIRE(id.has_value());
-        REQUIRE(id->value == expected);
-    }
-
-    // Two free-list PAGES. Since #990 the list lives in dedicated pages rather than
-    // being threaded through the free pages themselves -- a page holds `next`, a
-    // count, and that many ids -- so the fixture writes that shape. The two damage
-    // cases below are unchanged by it: an out-of-range `next` and a cycle are both
-    // still expressed by the `next` field, which is what they seed.
-    //
-    // Page 1 names nothing and page 2 names page 3, so a walk that RAN is visible as
-    // page 3 having become free while the list pages themselves stay live.
-    std::vector<std::byte> page(FreeListPageSize, std::byte { 0 });
-    PutNextLink(page, nextOfOne.value);
-    PutFreeListCount(page, 0);
-    REQUIRE((*store)->Write(CowTree::PageId { 1 }, CowTree::BytesView { page.data(), page.size() }).has_value());
-
-    std::ranges::fill(page, std::byte { 0 });
-    PutNextLink(page, nextOfTwo.value);
-    PutFreeListCount(page, 1);
-    PutFreeListId(page, 0, 3);
-    REQUIRE((*store)->Write(CowTree::PageId { 2 }, CowTree::BytesView { page.data(), page.size() }).has_value());
-
-    CowTree::Meta meta;
-    meta.pageSize = static_cast<std::uint32_t>(FreeListPageSize);
-    meta.txnId = 1;
-    meta.root = CowTree::PageId::None();
-    meta.freeRoot = CowTree::PageId { 1 };
-    meta.itemCount = 0;
-
-    // The slot is the store's, not this fixture's (#726). It used to be derived
-    // here as `txnId mod 2` to match a parity `Meta` documented and `CommitTxn`
-    // implemented; both are gone, because the parity was never maintained by a
-    // batched writer and deriving the slot from it is what spent a damaged
-    // store's surviving meta page. Nothing here needs a particular slot anyway:
-    // `RecoverExistingFile` tie-breaks on `txnId`, and the chain is the only
-    // thing about this file that is meant to be unusual.
-    REQUIRE((*store)->WriteMeta(meta).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -278,9 +208,9 @@ constexpr std::size_t MetaDamagePageSize = CowTree::MinPageSize;
 /// compares it against the stored word, so flipping the STORED word leaves the
 /// recomputed one unchanged and the comparison always mismatches -- measured
 /// `Corrupt` at both ends of it. What nothing reads is the zero PADDING past
-/// `MetaEncodedSize`, where a flip decodes clean (measured at offset 60 and at
-/// `pageSize - 1`). `DamageMetaSlot` asserts detection rather than trusting
-/// either claim.
+/// `MetaEncodedSize`, where a flip decodes clean (measured at `pageSize - 1`, and
+/// at offset 60 under meta layout 1 -- an offset layout 2 now spends on `dataPages`). `DamageMetaSlot` asserts detection
+/// rather than trusting either claim.
 constexpr std::size_t MetaDamageOffset = CowTree::MetaEncodedSize / 2;
 
 /// Read a whole file into memory.
@@ -328,6 +258,84 @@ void WriteWholeFile(std::filesystem::path const& path, std::span<std::byte const
     REQUIRE(f.good());
     f.write(reinterpret_cast<char const*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     REQUIRE(f.good());
+}
+
+/// Build a store at `path` whose durable meta names a free-list chain rooted
+/// at page 1, and close it. Page 3 is left live.
+///
+/// The chain's shape is the caller's, so a case that wants a damaged one says
+/// so in data. The pages go in through the store's API, so this fixture restates no
+/// data-page offset -- the thing the neighbouring sweep in `CowTreeStorage_test.cpp`
+/// argues a fixture must not do -- but the META that names the chain is patched into the
+/// closed file, as the `[meta][corrupt]` case below does: `WriteMeta` now stamps the
+/// store's own free list on every durability (#1624), so no caller's `freeRoot` can ride
+/// through it. That rule is about the DATA-page offset, which is private; `Meta.hpp`
+/// documents the meta slots as the on-disk contract.
+///
+/// Both pages are written BEFORE the meta that names `freeRoot`, so this store
+/// walks nothing while it is open -- the injection route is invisible in the
+/// file, which is the same one a patch-the-closed-file route would leave.
+///
+/// It is NOT a file any writer in this tree produces, and that is deliberate
+/// rather than an oversight: a real store's list is the store's own, written by
+/// every meta write since #1624, so no caller chooses its shape -- and a case
+/// that wants a damaged chain has no other route to one. The block comment
+/// above the cases carries the whole argument.
+/// @param path Filesystem path to create the store at.
+/// @param nextOfOne What page 1 chains to.
+/// @param nextOfTwo What page 2 chains to.
+void SeedFreeListChain(std::filesystem::path const& path, CowTree::PageId nextOfOne, CowTree::PageId nextOfTwo)
+{
+    auto store = OpenFreeListStore(path);
+    REQUIRE(store.has_value());
+
+    for (auto const expected: std::views::iota(std::uint64_t { 1 }, FreeListFixturePages + 1))
+    {
+        auto const id = (*store)->Allocate();
+        REQUIRE(id.has_value());
+        REQUIRE(id->value == expected);
+    }
+
+    // Two free-list PAGES. Since #990 the list lives in dedicated pages rather than
+    // being threaded through the free pages themselves -- a page holds `next`, a
+    // count, and that many ids -- so the fixture writes that shape. The two damage
+    // cases below are unchanged by it: an out-of-range `next` and a cycle are both
+    // still expressed by the `next` field, which is what they seed.
+    //
+    // Page 1 names nothing and page 2 names page 3, so a walk that RAN is visible as
+    // page 3 having become free while the list pages themselves stay live.
+    std::vector<std::byte> page(FreeListPageSize, std::byte { 0 });
+    PutNextLink(page, nextOfOne.value);
+    PutFreeListCount(page, 0);
+    REQUIRE((*store)->Write(CowTree::PageId { 1 }, CowTree::BytesView { page.data(), page.size() }).has_value());
+
+    std::ranges::fill(page, std::byte { 0 });
+    PutNextLink(page, nextOfTwo.value);
+    PutFreeListCount(page, 1);
+    PutFreeListId(page, 0, 3);
+    REQUIRE((*store)->Write(CowTree::PageId { 2 }, CowTree::BytesView { page.data(), page.size() }).has_value());
+
+    CowTree::Meta meta;
+    meta.pageSize = static_cast<std::uint32_t>(FreeListPageSize);
+    meta.txnId = 1;
+    meta.root = CowTree::PageId::None();
+    meta.freeRoot = CowTree::PageId { 1 };
+    meta.itemCount = 0;
+    meta.dataPages = FreeListFixturePages;
+
+    // Patched into the closed file, in the slot a commit would have chosen: every commit's
+    // `WriteMeta` now writes the STORE's own free list (#1624), so the caller's `freeRoot` can no
+    // longer ride through it. The slot is the other one from the durable meta (#726), and a fresh
+    // store's is A. Nothing here needs a particular slot anyway: `RecoverExistingFile` tie-breaks
+    // on `txnId`, and the chain is the only thing about this file that is meant to be unusual.
+    REQUIRE((*store)->LastDurableSlot() == CowTree::MetaSlot::A);
+    store->reset();
+    auto file = ReadWholeFile(path);
+    REQUIRE(CowTree::EncodeMeta(std::span { file }.subspan(FreeListPageSize * static_cast<std::size_t>(CowTree::MetaSlot::B),
+                                                           FreeListPageSize),
+                                meta)
+                .has_value());
+    WriteWholeFile(path, file);
 }
 
 /// Flip one byte inside meta slot `slot` of the closed store file at `path`.
@@ -1081,11 +1089,11 @@ TEST_CASE("An empty file that already existed is not blanked into a fresh store"
 // and they need a real file for it.
 //
 // The chain is seeded through `FilePageStore`'s own API so a case can choose its
-// shape -- a damaged link has no other route. It is not the only writer: since #990 a
-// batched store writes a real list at every flush, so these refusals ARE reachable by
-// damage in the field. What none of them covers is an ENTRY past the end of the file,
-// which is not damage at all once the store cuts its free tail -- the reopen half of
-// "A batched store cuts its free tail" pins that one.
+// shape -- a damaged link has no other route. It is not the only writer: a store writes a
+// real list at every meta write under every durability (a batched flush since #990, every
+// Fsync and None commit since #1624), so these refusals ARE reachable by damage in the field. What none of them covers is an
+// ENTRY past the end of the file, which is not damage at all once the store cuts its free tail -- the reopen half of "A
+// batched store cuts its free tail" pins that one.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("An intact free-list chain is walked at Open and its pages are recycled", "[filestore][open][freelist]")
@@ -1330,4 +1338,473 @@ TEST_CASE("One damaged meta slot opens on the surviving slot's commit", "[filest
         REQUIRE(repaired.has_value());
         REQUIRE(repaired->txnId > survivor->txnId);
     }
+}
+
+namespace
+{
+/// The meta with the higher txnId in a store file written at `GrowthPageSize`.
+/// A slot sits one such page apart, not one `MinPageSize`.
+/// @param path The store file.
+/// @return The newest decodable slot's meta.
+CowTree::Meta NewestMetaOnDisk(std::filesystem::path const& path)
+{
+    auto const file = ReadWholeFile(path);
+    auto const decode = [&](CowTree::MetaSlot slot) {
+        auto const page = std::span { file }.subspan(static_cast<std::size_t>(slot) * GrowthPageSize, GrowthPageSize);
+        return CowTree::DecodeMeta(CowTree::BytesView { page.data(), page.size() });
+    };
+    auto const a = decode(CowTree::MetaSlot::A);
+    auto const b = decode(CowTree::MetaSlot::B);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    return a->txnId > b->txnId ? *a : *b;
+}
+} // namespace
+
+TEST_CASE("A crash's extensions are free in the recovered world", "[filestore][durability][batched][crash][freelist]")
+{
+    // L3 of #1624: pages `ExtendLocked` added after the last durable meta are in the file but in no
+    // tree and no list. Recovery used to mark them live, so every crash leaked them for good.
+    TempFile tmp;
+    std::size_t inUseAtFlush = 0;
+    std::size_t extendedTo = 0;
+    {
+        FlushingStore s { tmp.path };
+        std::ignore = s.AllocateWritten(8);
+        s.CommitAndFlush();
+        inUseAtFlush = s.store->PagesInUse();
+        std::ignore = s.AllocateWritten(16); // extends: nothing is free
+        extendedTo = s.store->TotalDataPages();
+        s.store->SimulateCrashForTest();
+    }
+    FlushingStore s { tmp.path };
+    INFO("in use at the flush: " << inUseAtFlush << ", file extended to " << extendedTo << " data pages");
+    REQUIRE(s.store->TotalDataPages() == extendedTo); // the file still holds them
+    CHECK(s.store->PagesInUse() == inUseAtFlush);
+    // And the next flush cuts them: they are the free tail.
+    s.CommitAndFlush();
+    CHECK(s.store->TotalDataPages() < extendedTo);
+}
+
+TEST_CASE("A recorded page count above the file's length reclaims nothing and refuses nothing",
+          "[filestore][open][freelist]")
+{
+    // The truncation after a flush may leave the file SHORTER than a surviving meta's count.
+    // That is not damage, and there is nothing past the end to free.
+    TempFile tmp;
+    std::size_t inUse = 0;
+    {
+        FlushingStore s { tmp.path };
+        std::ignore = s.AllocateWritten(4);
+        for (auto const id: s.AllocateWritten(12))
+            REQUIRE(s.store->Free(id).has_value());
+        s.CommitAndFlush(); // meta records the full count
+        s.CommitAndFlush();
+        s.CommitAndFlush(); // the tail is cut below the count an older meta recorded
+        inUse = s.store->PagesInUse();
+    }
+    auto const recovered = NewestMetaOnDisk(tmp.path);
+    FlushingStore s { tmp.path };
+    // The premise, asserted rather than traced: the meta recovery lands on records MORE pages than
+    // the file now holds. A fixture whose cut fell short of it would test the ordinary range instead.
+    REQUIRE(recovered.dataPages.has_value());
+    auto const recorded = FastCache::Testing::Unwrap(recovered.dataPages);
+    INFO("recorded " << recorded << " data pages, the file holds " << s.store->TotalDataPages());
+    REQUIRE(recorded > s.store->TotalDataPages());
+    CHECK(s.store->PagesInUse() == inUse);
+}
+
+namespace
+{
+
+/// Page size of the version-1 conversion fixtures: the smallest, so the files stay small.
+constexpr std::size_t V1PageSize = CowTree::MinPageSize;
+
+/// Rewrite meta slot @p slot of the closed store at @p path in the version-1 layout, from its own contents.
+void DowngradeSlotToV1(std::filesystem::path const& path, CowTree::MetaSlot slot)
+{
+    auto bytes = ReadWholeFile(path);
+    auto const meta = DecodeSlot(bytes, slot);
+    REQUIRE(meta.has_value());
+    auto const v1 = CowTree::Testing::EncodeMetaV1(*meta, V1PageSize);
+    std::ranges::copy(v1, bytes.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(slot) * V1PageSize));
+    WriteWholeFile(path, bytes);
+    auto const after = ReadWholeFile(path);
+    auto const decoded = DecodeSlot(after, slot);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->version == 1U);
+}
+
+/// Open the tree over a Batched store at @p path, put @p key, commit, and close gracefully.
+void PutAndClose(std::filesystem::path const& path, std::string const& key)
+{
+    CowTree::FilePageStore::Options opts;
+    opts.path = path;
+    opts.pageSize = V1PageSize;
+    opts.durability = CowTree::FilePageStore::Durability::Batched;
+    auto store = CowTree::FilePageStore::Open(opts);
+    REQUIRE(store.has_value());
+    CowTree::CowTree tree { **store };
+    REQUIRE(tree.Open().has_value());
+    auto txn = tree.BeginWrite();
+    REQUIRE(txn.Put(B(key), B("value")).has_value());
+    REQUIRE(txn.Commit().has_value());
+}
+
+/// Whether the tree serves @p key.
+bool ServesKey(CowTree::CowTree& tree, std::string const& key)
+{
+    auto reader = tree.BeginRead();
+    auto const got = reader.Get(B(key));
+    return got.has_value() && got->has_value();
+}
+
+} // namespace
+
+TEST_CASE("A store whose slots are both version 1 opens and serves, and its next meta is version 2",
+          "[filestore][open][meta]")
+{
+    // Every store in service today was written with layout 1. Both binaries treat a store that will
+    // not open as fatal, so this is the upgrade path, not a courtesy.
+    TempFile tmp;
+    PutAndClose(tmp.path, "first");
+    PutAndClose(tmp.path, "second");
+    DowngradeSlotToV1(tmp.path, CowTree::MetaSlot::A);
+    DowngradeSlotToV1(tmp.path, CowTree::MetaSlot::B);
+
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+    opts.pageSize = V1PageSize;
+    opts.durability = CowTree::FilePageStore::Durability::Batched;
+    auto store = CowTree::FilePageStore::Open(opts);
+    REQUIRE(store.has_value());
+    {
+        CowTree::CowTree tree { **store };
+        REQUIRE(tree.Open().has_value());
+        CHECK(ServesKey(tree, "first"));
+        CHECK(ServesKey(tree, "second"));
+        auto txn = tree.BeginWrite();
+        REQUIRE(txn.Put(B("third"), B("value")).has_value());
+        REQUIRE(txn.Commit().has_value());
+    }
+    REQUIRE((*store)->Flush().has_value());
+    auto const slot = (*store)->LastDurableSlot();
+    auto const file = ReadWholeFile(tmp.path);
+    auto const written = DecodeSlot(file, slot);
+    REQUIRE(written.has_value());
+    CHECK(written->version == 2U);
+    REQUIRE(written->dataPages.has_value());
+    CHECK(FastCache::Testing::Unwrap(written->dataPages) == (*store)->TotalDataPages());
+}
+
+TEST_CASE("A store with one slot in each layout opens on the higher txnId, whichever layout that is",
+          "[filestore][open][meta]")
+{
+    // Review focus 3: the choice between the slots is the txnId's, never the layout's.
+    TempFile tmp;
+    PutAndClose(tmp.path, "first");
+    PutAndClose(tmp.path, "second");
+    auto const file = ReadWholeFile(tmp.path);
+    auto const a = DecodeSlot(file, CowTree::MetaSlot::A);
+    auto const b = DecodeSlot(file, CowTree::MetaSlot::B);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    REQUIRE(a->txnId != b->txnId);
+    auto const higher = a->txnId > b->txnId ? CowTree::MetaSlot::A : CowTree::MetaSlot::B;
+
+    for (auto const downgraded: { higher, CowTree::OtherSlot(higher) })
+    {
+        INFO("slot rewritten as version 1: " << (downgraded == CowTree::MetaSlot::A ? "A" : "B") << ", higher txnId is in "
+                                             << (higher == CowTree::MetaSlot::A ? "A" : "B"));
+        TempFile copy;
+        WriteWholeFile(copy.path, file);
+        DowngradeSlotToV1(copy.path, downgraded);
+
+        CowTree::FilePageStore::Options opts;
+        opts.path = copy.path;
+        opts.pageSize = V1PageSize;
+        opts.durability = CowTree::FilePageStore::Durability::Batched;
+        auto store = CowTree::FilePageStore::Open(opts);
+        REQUIRE(store.has_value());
+        CowTree::CowTree tree { **store };
+        REQUIRE(tree.Open().has_value());
+        CHECK(ServesKey(tree, "second"));
+    }
+}
+
+TEST_CASE("A fresh Batched store that crashes before its first flush reclaims every page it extended",
+          "[filestore][durability][batched][crash][freelist]")
+{
+    // #1624, L3 at birth: the blank metas `BootstrapNewFile` writes name no page, so they must say
+    // so (`dataPages == 0`). Left unknown, recovery reclaims nothing until the first flush, which
+    // is `BatchedFlushInterval` commits away.
+    TempFile tmp;
+    std::size_t emptyInUse = 0;
+    {
+        FlushingStore s { tmp.path };
+        emptyInUse = s.store->PagesInUse();
+        REQUIRE(emptyInUse == CowTree::MetaSlotCount);
+        std::ignore = s.AllocateWritten(20);
+        s.store->SimulateCrashForTest();
+    }
+    FlushingStore s { tmp.path };
+    CHECK(s.store->TotalDataPages() == 20);
+    CHECK(s.store->PagesInUse() == emptyInUse);
+}
+
+TEST_CASE("A version-1 meta restated through EncodeMeta decodes as version 2, never Corrupt", "[filestore][meta]")
+{
+    // A recovered version-1 meta is kept and restated; `EncodeMeta` writes the layout-2 bytes, so it
+    // must stamp version 2 too, or the slot decodes under the v1 row with its CRC in the wrong place.
+    CowTree::Meta meta;
+    meta.pageSize = static_cast<std::uint32_t>(V1PageSize);
+    meta.txnId = 5;
+    auto const v1 = CowTree::Testing::EncodeMetaV1(meta, V1PageSize);
+    auto const decoded = CowTree::DecodeMeta({ v1.data(), v1.size() });
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->version == 1U);
+
+    std::vector<std::byte> page(V1PageSize);
+    REQUIRE(CowTree::EncodeMeta({ page.data(), page.size() }, *decoded).has_value());
+    auto const again = CowTree::DecodeMeta({ page.data(), page.size() });
+    REQUIRE(again.has_value());
+    CHECK(again->version == 2U);
+    CHECK(again->txnId == 5U);
+}
+
+TEST_CASE("A Fsync or None store keeps its free pages free across a restart", "[filestore][durability][freelist]")
+{
+    // L2 of #1624: only a batched flush used to write a free list, so a strict or unsynced store came
+    // back with every free page marked live -- and under a disk budget that is capacity lost for good.
+    for (auto const durability: { CowTree::FilePageStore::Durability::Fsync, CowTree::FilePageStore::Durability::None })
+    {
+        TempFile tmp;
+        std::size_t inUse = 0;
+        std::size_t pages = 0;
+        {
+            CowTree::FilePageStore::Options opts;
+            opts.path = tmp.path;
+            opts.pageSize = GrowthPageSize;
+            opts.durability = durability;
+            auto opened = CowTree::FilePageStore::Open(opts);
+            REQUIRE(opened.has_value());
+            auto store = std::move(*opened);
+            CowTree::CowTree tree { *store };
+            REQUIRE(tree.Open().has_value());
+            // Enough keys to span many pages, then delete most: a purge-sized free set.
+            {
+                auto txn = tree.BeginWrite();
+                for (auto const i: std::views::iota(0, 400))
+                {
+                    auto const key = "key-" + std::to_string(i);
+                    auto const value = std::string(200, 'v');
+                    REQUIRE(txn.Put(B(key), B(value)).has_value());
+                }
+                REQUIRE(txn.Commit().has_value());
+            }
+            {
+                auto txn = tree.BeginWrite();
+                for (auto const i: std::views::iota(0, 360))
+                {
+                    auto const key = "key-" + std::to_string(i);
+                    REQUIRE(txn.Erase(B(key)).has_value());
+                }
+                REQUIRE(txn.Commit().has_value());
+            }
+            // A last, tiny commit: the list a commit writes describes what the commits BEFORE it
+            // freed, because `CommitTxn` frees a transaction's pages after its meta is written. So
+            // the purge above reaches the list through this commit, and only this commit's own few
+            // pages are missing from it -- which a clean close persists (F1).
+            {
+                auto txn = tree.BeginWrite();
+                REQUIRE(txn.Put(B("key-last"), B("v")).has_value());
+                REQUIRE(txn.Commit().has_value());
+            }
+            inUse = store->PagesInUse();
+            pages = store->TotalDataPages();
+        }
+        CowTree::FilePageStore::Options opts;
+        opts.path = tmp.path;
+        opts.durability = durability;
+        auto opened = CowTree::FilePageStore::Open(opts);
+        REQUIRE(opened.has_value());
+        auto store = std::move(*opened);
+        INFO("durability " << static_cast<int>(durability) << ": in use before close " << inUse);
+        // Exactly: the last commit's own frees reach a list through the clean close (F1).
+        CHECK(store->PagesInUse() == inUse);
+        // And a second session's allocations reuse them: as many pages as the first session had
+        // free, and the file does not grow. Counted from BEFORE the close, never from the reopened
+        // store, whose own free count is zero exactly when the list was lost -- and allocating
+        // nothing could not show growth at all.
+        auto const freeBeforeClose = pages + CowTree::MetaSlotCount - inUse;
+        REQUIRE(freeBeforeClose > 0);
+        for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, freeBeforeClose))
+            REQUIRE(store->Allocate().has_value());
+        CHECK(store->TotalDataPages() <= pages);
+    }
+}
+
+namespace
+{
+/// What a store looked like just before it closed.
+struct ClosedStore
+{
+    /// `PagesInUse()` just before the close.
+    std::size_t inUse = 0;
+    /// The meta in the store's last durable slot just before the close.
+    CowTree::Meta lastDurable {};
+};
+
+/// How `RewriteOneKeyAndClose` ends the store. Private to these cases: never stored or sent.
+enum class Ending : std::uint8_t
+{
+    Clean, ///< the destructor runs its close-time work
+    Crash, ///< `SimulateCrashForTest` first, so the destructor writes nothing
+};
+
+/// Run @p commits single-key rewrites on a fresh store under @p durability and close it.
+/// @param path       The store file.
+/// @param durability The policy to write under.
+/// @param commits    How many commits.
+/// @param ending     A clean close, or a simulated crash.
+/// @return The pages in use and the last durable meta just before the close.
+ClosedStore RewriteOneKeyAndClose(std::filesystem::path const& path,
+                                  CowTree::FilePageStore::Durability durability,
+                                  int commits,
+                                  Ending ending = Ending::Clean)
+{
+    CowTree::FilePageStore::Options opts;
+    opts.path = path;
+    opts.pageSize = GrowthPageSize;
+    opts.durability = durability;
+    auto opened = CowTree::FilePageStore::Open(opts);
+    REQUIRE(opened.has_value());
+    auto store = std::move(*opened);
+    CowTree::CowTree tree { *store };
+    REQUIRE(tree.Open().has_value());
+    for (auto const i: std::views::iota(0, commits))
+    {
+        auto const value = std::to_string(i);
+        auto txn = tree.BeginWrite();
+        REQUIRE(txn.Put(B("k"), B(value)).has_value());
+        REQUIRE(txn.Commit().has_value());
+    }
+    auto const meta = store->ReadMeta(store->LastDurableSlot());
+    REQUIRE(meta.has_value());
+    if (ending == Ending::Crash)
+        store->SimulateCrashForTest();
+    return { .inUse = store->PagesInUse(), .lastDurable = *meta };
+}
+} // namespace
+
+TEST_CASE("A clean close keeps the last commit's frees free", "[filestore][durability][freelist]")
+{
+    // L1 of #1624: `CowTree::CommitTxn` frees the replaced pages AFTER `WriteMeta`, and the 64th
+    // batched commit flushes INSIDE it -- so its frees reach a store with nothing left to flush, and
+    // the destructor flushed only when a meta was buffered. Fsync and None name them in no list at all.
+    struct Shape
+    {
+        CowTree::FilePageStore::Durability durability;
+        int commits;
+        std::size_t newListPages; ///< list pages the close writes where no list existed before
+    };
+    for (auto const shape:
+         { Shape { .durability = CowTree::FilePageStore::Durability::Batched, .commits = 64, .newListPages = 0 },
+           Shape { .durability = CowTree::FilePageStore::Durability::Fsync, .commits = 2, .newListPages = 1 },
+           Shape { .durability = CowTree::FilePageStore::Durability::None, .commits = 2, .newListPages = 1 } })
+    {
+        TempFile tmp;
+        auto const closed = RewriteOneKeyAndClose(tmp.path, shape.durability, shape.commits);
+        CowTree::FilePageStore::Options opts;
+        opts.path = tmp.path;
+        auto opened = CowTree::FilePageStore::Open(opts);
+        REQUIRE(opened.has_value());
+        auto store = std::move(*opened);
+        INFO("durability " << static_cast<int>(shape.durability));
+        // Nothing leaks: the pages in use are those before the close, plus the one page a list now
+        // occupies where the store had never written one (commit 1 freed nothing, so commit 2's list was empty).
+        CHECK(store->PagesInUse() == closed.inUse + shape.newListPages);
+        // And the close really restated: the second commit's rewrite freed the first leaf, which only
+        // the restate names (one commit frees nothing on a fresh store).
+        store.reset();
+        CHECK(NewestMetaOnDisk(tmp.path).txnId == closed.lastDurable.txnId + 1);
+    }
+}
+
+TEST_CASE("Opening and closing a store with nothing freed leaves the file byte-identical", "[filestore][persist]")
+{
+    // The close-time restate must fire only for a free: a store merely opened must not grow a new
+    // meta on the way out.
+    TempFile tmp;
+    // The seed's own close restated (its last commit freed a leaf), so this is the first open after
+    // a restating close -- the one a one-shot write on the way back in would show up in.
+    std::ignore = RewriteOneKeyAndClose(tmp.path, CowTree::FilePageStore::Durability::Fsync, 3);
+    auto const before = ReadWholeFile(tmp.path);
+    {
+        CowTree::FilePageStore::Options opts;
+        opts.path = tmp.path;
+        auto opened = CowTree::FilePageStore::Open(opts);
+        REQUIRE(opened.has_value());
+        auto store = std::move(*opened);
+    }
+    CHECK(ReadWholeFile(tmp.path) == before);
+}
+
+TEST_CASE("A close-time restate takes the next txnId and keeps the last commit's root", "[filestore][meta]")
+{
+    TempFile tmp;
+    auto const closed = RewriteOneKeyAndClose(tmp.path, CowTree::FilePageStore::Durability::Batched, 64);
+    auto const newest = NewestMetaOnDisk(tmp.path);
+    CHECK(newest.txnId == closed.lastDurable.txnId + 1);
+    // A RESTATE: the same world, field by field, so a reopen serves what the last commit left.
+    CHECK(newest.root == closed.lastDurable.root);
+    CHECK(newest.itemCount == closed.lastDurable.itemCount);
+    CHECK(newest.keyBytes == closed.lastDurable.keyBytes);
+    CHECK(newest.valueBytes == closed.lastDurable.valueBytes);
+    REQUIRE(closed.lastDurable.itemCount == 1); // a default-constructed meta would agree on zeros
+}
+
+TEST_CASE("A simulated crash skips the close-time restate", "[filestore][durability][crash][freelist]")
+{
+    // The crash tests mean a crash only while `SimulateCrashForTest` leaves the destructor's restate
+    // out. The clean-close case's batched shape, crashed instead of closed: the 64th commit flushed
+    // inside `WriteMeta` and freed its old leaf after it, so that leaf stays LIVE (no list names it)
+    // and the newest meta is the flush's own, not a restatement of it.
+    //
+    // Batched rather than the Fsync two-commit shape, whose count cannot tell the two apart: there
+    // the restate writes its list INTO the one free page, so a restated and an unrestated reopen
+    // both report one page more than before the close.
+    TempFile tmp;
+    auto const crashed = RewriteOneKeyAndClose(tmp.path, CowTree::FilePageStore::Durability::Batched, 64, Ending::Crash);
+    CHECK(NewestMetaOnDisk(tmp.path).txnId == crashed.lastDurable.txnId);
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+    auto opened = CowTree::FilePageStore::Open(opts);
+    REQUIRE(opened.has_value());
+    // A clean close of the same shape reopens at exactly `inUse` (the clean-close case's row).
+    CHECK((*opened)->PagesInUse() == crashed.inUse + 1);
+}
+
+TEST_CASE("A Fsync commit with nothing free costs the fsyncs it did before", "[filestore][durability]")
+{
+    // F2 adds a fsync only when a list page was written. The first commit of a fresh store frees
+    // nothing, so it must cost what it cost on master d2dd26622, where a probe measured a delta of
+    // 3 for each of the first three commits: `Write`'s per-page fsync for the one leaf, `SyncData`
+    // in `CommitTxn`, and the meta write's own; only the first of them has an empty free set.
+    // Watched red: with the list fsync made unconditional, the delta is 4.
+    constexpr std::size_t FsyncsPerCommitOnMaster = 3;
+    TempFile tmp;
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+    opts.durability = CowTree::FilePageStore::Durability::Fsync;
+    auto opened = CowTree::FilePageStore::Open(opts);
+    REQUIRE(opened.has_value());
+    auto store = std::move(*opened);
+    CowTree::CowTree tree { *store };
+    REQUIRE(tree.Open().has_value());
+    auto const before = store->FsyncCallCount();
+    auto txn = tree.BeginWrite();
+    REQUIRE(txn.Put(B("k"), B("v")).has_value());
+    REQUIRE(txn.Commit().has_value());
+    CHECK(store->FsyncCallCount() - before == FsyncsPerCommitOnMaster);
 }

@@ -89,6 +89,39 @@ namespace
     constexpr auto UnnamedLockError = FilePageStore::LockFailure::Unsupported;
 #endif
 
+    /// What a meta write syncs, per durability. Batched fsyncs the data before EVERY meta, because
+    /// its data pages were never synced; Fsync's were (`CowTree::CommitTxn` calls `SyncData` first),
+    /// so it needs a data fsync only for the list pages this write itself added; None syncs nothing.
+    struct DurabilitySyncs
+    {
+        bool dataBeforeMeta; ///< fsync before writing the meta, always
+        bool listBeforeMeta; ///< fsync before writing the meta when list pages were written
+        bool metaAfterWrite; ///< fsync after writing the meta
+    };
+
+    /// The sync row of @p durability.
+    ///
+    /// A `switch` with no `default`, rather than a search of a table: CowTree has no `EnumTable`,
+    /// and a search must answer SOMETHING for a durability that has no row -- which used to be
+    /// "sync nothing", the unsafe direction. Here a new enumerator is a `-Wswitch` diagnostic at
+    /// build time, and the trailing return, reachable only through an out-of-range value, syncs
+    /// everything.
+    /// @param durability The store's policy.
+    /// @return What a meta write under it syncs.
+    constexpr DurabilitySyncs SyncsFor(FilePageStore::Durability durability) noexcept
+    {
+        switch (durability)
+        {
+            case FilePageStore::Durability::Fsync:
+                return { .dataBeforeMeta = false, .listBeforeMeta = true, .metaAfterWrite = true };
+            case FilePageStore::Durability::Batched:
+                return { .dataBeforeMeta = true, .listBeforeMeta = true, .metaAfterWrite = true };
+            case FilePageStore::Durability::None:
+                return { .dataBeforeMeta = false, .listBeforeMeta = false, .metaAfterWrite = false };
+        }
+        return { .dataBeforeMeta = true, .listBeforeMeta = true, .metaAfterWrite = true };
+    }
+
 } // namespace
 
 auto FilePageStore::ClassifyLockFailure(int systemError) noexcept -> LockFailure
@@ -112,13 +145,29 @@ FilePageStore::FilePageStore(Options options) noexcept:
 
 FilePageStore::~FilePageStore()
 {
-    // Graceful shutdown: make any buffered group-commit writes durable so a
-    // clean stop never loses data (only a hard crash drops the last batch).
-    // A simulated crash (test seam) skips this and leaves the window unflushed.
-    if (!_crashedForTest && _options.durability == Durability::Batched && _commitsSinceFlush > 0)
+    // Graceful shutdown: make durable whatever a crash would have been allowed to lose -- the
+    // buffered group-commit window, and since #1624 the frees no durable list names yet.
+    // A simulated crash (test seam) skips this and leaves both exactly as a power loss would.
+    if (!_crashedForTest)
     {
         std::scoped_lock const lock { _ioMutex };
-        std::ignore = FlushBatchLocked();
+        // `_pendingMeta` replaces `Batched && _commitsSinceFlush > 0`, and the two agree under every
+        // durability: `WriteMeta` is the only place either is SET, and sets both together and only under
+        // Batched (`_pendingMeta = meta; ++_commitsSinceFlush`); `FlushBatchLocked` clears both
+        // together, or neither when its commit fails. So under Fsync and None `_pendingMeta` is never
+        // set and the branch is not taken -- exactly as `Batched` was false.
+        if (_pendingMeta.has_value())
+            std::ignore = FlushBatchLocked();
+        else if (_freeSetChanged && _lastDurableMeta.has_value())
+        {
+            // RESTATE the last durable meta under the next txnId, carrying the list. Only here:
+            // while a tree still runs, its next commit would take the same id, and recovery breaks
+            // a tie towards slot A -- which could revive this older root after its pages were
+            // reused. In a destructor no commit can follow.
+            auto restated = *_lastDurableMeta;
+            ++restated.txnId;
+            std::ignore = CommitMetaLocked(restated);
+        }
     }
     // The close below is what releases the exclusive claim, and there is
     // deliberately no explicit unlock before it: an unlock is a second thing
@@ -305,6 +354,9 @@ auto FilePageStore::BootstrapNewFile() -> std::expected<void, CowTreeError>
     blankMeta.root = PageId::None();
     blankMeta.freeRoot = PageId::None();
     blankMeta.itemCount = 0;
+    // A blank world names no page; saying so lets recovery free whatever a crash extends before
+    // the first flush (#1624). Unknown would reclaim nothing.
+    blankMeta.dataPages = 0;
 
     auto encodeA = EncodeMeta(BytesSpan { blank.data(), blank.size() }, blankMeta);
     if (!encodeA.has_value())
@@ -324,6 +376,7 @@ auto FilePageStore::BootstrapNewFile() -> std::expected<void, CowTreeError>
     // Both slots hold the blank txnId 0; treat A as the durable one so the
     // first Batched flush writes to B (preserving the alternating invariant).
     _lastDurableSlot = MetaSlot::A;
+    _lastDurableMeta = blankMeta;
     return {};
 }
 
@@ -441,6 +494,20 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
         _freeListPages.push_back(pageIndex);
         cursor = PageId { nextRaw };
     }
+
+    // Pages past the count the recovered meta recorded were extended after it was written, so
+    // nothing in its world -- tree or list -- can name them (#1624, L3). A version-1 meta records
+    // no count and reclaims nothing. A count ABOVE the file's length means the tail was cut after
+    // the meta (`TruncateFreeTailLocked` cuts only pages free in both metas), so the range is empty.
+    if (live.dataPages.has_value() && *live.dataPages < _totalDataPages)
+    {
+        for (auto const id: std::views::iota(*live.dataPages + 1, std::uint64_t { _totalDataPages } + 1))
+        {
+            _live.Erase(id);
+            _freeList.insert(id);
+        }
+    }
+    _lastDurableMeta = live;
 
     return {};
 }
@@ -799,6 +866,7 @@ auto FilePageStore::Free(PageId id) -> std::expected<void, CowTreeError>
         _pendingFree.push_back(id.value);
     else
         _freeList.insert(id.value);
+    _freeSetChanged = true;
     if (_readBufferPageIdx == id.value)
         _readBufferPageIdx = 0;
     return {};
@@ -812,52 +880,87 @@ auto FilePageStore::FlushBatchLocked() -> std::expected<void, CowTreeError>
         _commitsSinceFlush = 0;
         return {};
     }
-    // Copy the buffered meta out under the has_value() guard, before the Fsync
-    // and the reset() below (so the access is provably checked and never dangles).
-    auto pending = *_pendingMeta;
+    // Copy the buffered meta out under the has_value() guard, before the reset()
+    // below (so the access is provably checked and never dangles).
+    auto const pending = *_pendingMeta;
+    if (auto const r = CommitMetaLocked(pending); !r.has_value())
+        return std::unexpected(r.error());
+    _pendingMeta.reset();
+    _commitsSinceFlush = 0;
+    return {};
+}
 
+auto FilePageStore::CommitMetaLocked(Meta meta) -> std::expected<void, CowTreeError>
+{
+    // ONE place a meta reaches the disk, for every durability (#1624).
+    //
     // **The free list is written HERE, and `freeRoot` is the store's field alone.**
-    // The flush is the only moment at which a list is consistent with the meta that
-    // will name it: recovery lands on this meta, and the list is a snapshot of what
-    // was free at exactly this point, so every page it names is genuinely free in the
-    // world this meta describes. A page allocated after this flush is named by a
-    // transaction that did not commit, so re-handing it out after a crash is correct
-    // rather than a double allocation.
+    // The list is only consistent with the meta that will name it: recovery lands on
+    // this meta, and the list is a snapshot of what was free at exactly this point,
+    // so every page it names is genuinely free in the world this meta describes. A
+    // page allocated after this write is named by a transaction that did not commit,
+    // so re-handing it out after a crash is correct rather than a double allocation.
+    // It used to be written by a batched flush alone, so a strict or unsynced store
+    // came back with every free page marked live.
     //
     // Written before the data fsync below, so the list pages are durable before the
     // meta references them -- the same ordering rule the comment beneath states for
     // every other data page.
+    auto const syncs = SyncsFor(_options.durability);
     auto const freeRoot = WriteFreeListLocked();
     if (!freeRoot.has_value())
         return std::unexpected(freeRoot.error());
-    pending.freeRoot = *freeRoot;
+    meta.freeRoot = *freeRoot;
+    meta.dataPages = _totalDataPages;
+    bool const wroteList = freeRoot->value != 0;
 
     // Crash-safe group commit, in strict order:
-    //   1. fsync the buffered DATA pages so they are durable before any meta
-    //      references them (data pages carry no read-time checksum);
+    //   1. fsync the DATA pages (and the list pages) so they are durable before any
+    //      meta references them (data pages carry no read-time checksum);
     //   2. write the meta to the slot that does NOT hold the last durable meta,
     //      so a torn write here can never destroy the recoverable copy;
     //   3. fsync the META.
     // A crash between (1) and (3) simply leaves the previous durable slot intact
-    // and loses only this unflushed window — never a corrupt/unopenable store.
-    if (auto const r = Fsync(); !r.has_value())
-        return std::unexpected(r.error());
-    auto const target = OtherSlot(_lastDurableSlot);
-    if (auto const r = WriteSlotLocked(target, pending); !r.has_value())
-        return std::unexpected(r.error());
-    if (auto const r = Fsync(); !r.has_value())
-        return std::unexpected(r.error());
+    // and loses only this unflushed window -- never a corrupt/unopenable store.
+    // Which of the syncs a durability performs is `SyncsFor`.
+    if (syncs.dataBeforeMeta || (syncs.listBeforeMeta && wroteList))
+        if (auto const r = Fsync(); !r.has_value())
+            return std::unexpected(r.error());
 
+    // The slot that does NOT hold the last one we made durable. That is what leaves
+    // the previous meta standing, so a torn write here never loses both.
+    //
+    // The Fsync / None path used to write a slot the CALLER passed, derived in
+    // `CowTree::CommitTxn` from `txnId mod 2`, and `_lastDurableSlot` was
+    // neither read nor updated there (#726). The parity agrees with the
+    // alternation only while nothing has disturbed it -- and a batched flush
+    // disturbs it as a matter of course, writing the last commit's id into the
+    // alternating slot. So on a store an ordinary batched daemon wrote, the
+    // first commit there after a one-slot recovery targeted the surviving slot
+    // and overwrote the only good meta page in the file. Measured before the
+    // fix: one valid slot after that commit where batched leaves two.
+    auto const target = OtherSlot(_lastDurableSlot);
+    if (auto const r = WriteSlotLocked(target, meta); !r.has_value())
+        return std::unexpected(r.error());
+    if (syncs.metaAfterWrite)
+        if (auto const r = Fsync(); !r.has_value())
+            return std::unexpected(r.error());
+
+    // Only now: the write landed, so the next one must go to the other slot. Advancing
+    // it before the write would point recovery at a slot that may be half-written; not
+    // advancing it at all is the bug above, and under `None` it would additionally make
+    // every commit hammer one slot while the other kept a meta from before the process
+    // started.
     _lastDurableSlot = target;
-    _pendingMeta.reset();
+    _lastDurableMeta = meta;
     // Before the pending frees graduate, because the meta this one superseded still
-    // references them -- see `TruncateFreeTailLocked`. Not fatal: this flush is
-    // already durable, and an uncut tail stays free and is cut by a later flush.
+    // references them -- see `TruncateFreeTailLocked`. Not fatal: this write is
+    // already durable, and an uncut tail stays free and is cut by a later one.
     std::ignore = TruncateFreeTailLocked();
     // The freeing is now durable, so freed pages may be recycled.
     _freeList.insert(_pendingFree.begin(), _pendingFree.end());
     _pendingFree.clear();
-    _commitsSinceFlush = 0;
+    _freeSetChanged = false;
     return {};
 }
 
@@ -903,7 +1006,7 @@ auto FilePageStore::WriteMeta(Meta const& meta) -> std::expected<void, CowTreeEr
         // crash inside the unflushed window could leave BOTH alternating slots
         // torn and the store unopenable. Deferring the write — and flushing it
         // to the slot that does not hold the last durable meta (see
-        // FlushBatchLocked) — guarantees one durable, self-consistent meta is
+        // CommitMetaLocked) — guarantees one durable, self-consistent meta is
         // always on disk. The slot is chosen at flush time.
         _pendingMeta = meta;
         if (++_commitsSinceFlush >= BatchedFlushInterval)
@@ -911,35 +1014,8 @@ auto FilePageStore::WriteMeta(Meta const& meta) -> std::expected<void, CowTreeEr
         return {};
     }
 
-    // Fsync / None: write immediately, to the slot that does NOT hold the last
-    // one we made durable -- the same choice `FlushBatchLocked` makes, and for
-    // the same reason. That is what leaves the previous meta standing, so a torn
-    // write here never loses both.
-    //
-    // This used to write a slot the CALLER passed, derived in
-    // `CowTree::CommitTxn` from `txnId mod 2`, and `_lastDurableSlot` was
-    // neither read nor updated on this path (#726). The parity agrees with the
-    // alternation only while nothing has disturbed it -- and a batched flush
-    // disturbs it as a matter of course, writing the last commit's id into the
-    // alternating slot. So on a store an ordinary batched daemon wrote, the
-    // first commit here after a one-slot recovery targeted the surviving slot
-    // and overwrote the only good meta page in the file. Measured before the
-    // fix: one valid slot after that commit where batched leaves two.
-    auto const target = OtherSlot(_lastDurableSlot);
-    if (auto const r = WriteSlotLocked(target, meta); !r.has_value())
-        return std::unexpected(r.error());
-    if (_options.durability == Durability::Fsync)
-    {
-        if (auto const r = Fsync(); !r.has_value()) // strict: every commit is durable
-            return std::unexpected(r.error());
-    }
-    // Only now, and on both paths: the write landed, so the next one must go to
-    // the other slot. Advancing it before the write would point recovery at a
-    // slot that may be half-written; not advancing it at all is the bug above,
-    // and under `None` it would additionally make every commit hammer one slot
-    // while the other kept a meta from before the process started.
-    _lastDurableSlot = target;
-    return {};
+    // Fsync / None: write immediately, free list included.
+    return CommitMetaLocked(meta);
 }
 
 auto FilePageStore::LastDurableSlot() const noexcept -> MetaSlot

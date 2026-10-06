@@ -238,10 +238,13 @@ namespace
     /// and the replaced ones are only freed AT the commit, so a single
     /// transaction over the whole store allocates one fresh page per record per
     /// tree level and can reuse none of them -- measured at 3 pages per record,
-    /// a 20x file inflation on a 2000-record store. Worse, `CommitTxn` writes
-    /// `freeRoot = PageId::None()` ("free list is in-memory only for v1"), so
-    /// that garbage is not reclaimable by the next process either: it is
-    /// permanent growth of the operator's cache file.
+    /// a 20x file inflation on a 2000-record store. And it stays: since #1624
+    /// every meta write persists the free list, so the next process does see
+    /// those pages as free -- but as free pages INSIDE the file. What one such
+    /// transaction frees is the store's old pages, at the front, while what it
+    /// allocated sits at the extended end, so the tail truncation cuts nothing
+    /// and the operator's cache file stays inflated until churn migrates live
+    /// data back below them.
     ///
     /// Committing in slices bounds it. Each commit returns its replaced pages
     /// to the free list, and the next slice allocates out of that, so the file

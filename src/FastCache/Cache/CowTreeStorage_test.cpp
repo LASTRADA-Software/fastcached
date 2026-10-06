@@ -1874,17 +1874,39 @@ TEST_CASE("Recovering onto the surviving meta slot does not spend it", "[cowstor
     // what the `Batched`-only version had already done once.
     // `--storage-durability=fsync` is operator-selectable, which is what made
     // this reachable in production rather than only in a fixture.
+    //
+    // **What "spent" means, and why the survivor may still change by the close.**
+    // The hazard is the FIRST meta write after the degraded open: it is the only one
+    // made while the survivor is the file's only good meta, so it must go to the
+    // damaged slot. Since #1624 a clean close may write ONE more -- the restate of
+    // `~FilePageStore`, which names the frees a commit makes after its own meta --
+    // and that one alternates onto the survivor's slot as every write does. Whether
+    // that is safe is a question PER DURABILITY, because it rests on the commit being
+    // DURABLE in the damaged slot before the restate overwrites the survivor:
+    //   - `Fsync`: the commit's meta is fsynced in the damaged slot before the close
+    //     runs, so a torn restate still leaves a valid meta standing. Not a spend.
+    //     And it runs: the commit's frees reach no list but the restate's.
+    //   - `Batched`: the close flushes the frees with its ONE meta, into the damaged
+    //     slot, and does not restate, so the survivor is never written at all.
+    //   - `None`: syncs nothing, so none of this is promised -- that is the decision
+    //     `.agent/rules/storage.md` records for `None` and a power loss (such a store
+    //     can be refused `Corrupt`). There is no `None` row, and no claim for it here.
+    // Which a row does is stated, never derived, and the assertions below tell the two
+    // writes apart by `txnId`: the commit is the survivor's id plus one, a restate the
+    // commit's plus one with its root -- so a build that put the commit on the
+    // survivor fails either way.
     /// One row: what the REOPEN uses. The seed is always `Batched`, because that
     /// is what leaves the one-slot-per-generation shape -- and what an ordinary
     /// daemon leaves behind.
     struct DurabilityRow
     {
         CowTree::FilePageStore::Durability durability; ///< What the reopen uses.
+        bool closeRestates;                            ///< Whether the close writes a second meta.
         std::string_view what;                         ///< Which one, for `INFO`.
     };
     auto const durabilities = std::vector<DurabilityRow> {
-        { .durability = CowTree::FilePageStore::Durability::Batched, .what = "reopened Batched" },
-        { .durability = CowTree::FilePageStore::Durability::Fsync, .what = "reopened Fsync (#726)" },
+        { .durability = CowTree::FilePageStore::Durability::Batched, .closeRestates = false, .what = "reopened Batched" },
+        { .durability = CowTree::FilePageStore::Durability::Fsync, .closeRestates = true, .what = "reopened Fsync (#726)" },
     };
 
     for (auto const& durabilityRow: durabilities)
@@ -1922,18 +1944,35 @@ TEST_CASE("Recovering onto the surviving meta slot does not spend it", "[cowstor
 
             auto const after = ReadWholeFile(tmp.path);
 
-            // Byte-for-byte, not "still decodes": a slot rewritten with an equally
-            // valid meta would decode fine and would still have been the one spent.
-            auto const survivorAfter = SlotBytes(after, survivor);
-            REQUIRE(std::ranges::equal(survivorPage, survivorAfter));
-
-            // And the other half, which is what makes the first mean something: the
-            // commit did land somewhere, in the slot that was already damaged, and
-            // it is newer than what the store recovered from. Without this a build
-            // that wrote no meta at all would pass.
+            // The commit landed in the slot that was already damaged, and it is the
+            // FIRST write after the one recovery stood on: exactly one past it.
+            // Without this a build that wrote no meta at all would pass.
             auto const repaired = DecodeSlot(after, damaged);
             REQUIRE(repaired.has_value());
-            REQUIRE(repaired->txnId > survivorBefore->txnId);
+            REQUIRE(repaired->txnId == survivorBefore->txnId + 1);
+
+            auto const survivorAfter = SlotBytes(after, survivor);
+            if (!durabilityRow.closeRestates)
+            {
+                // Byte-for-byte, not "still decodes": a slot rewritten with an equally
+                // valid meta would decode fine and would still have been the one spent.
+                REQUIRE(std::ranges::equal(survivorPage, survivorAfter));
+            }
+            else
+            {
+                // Rewritten, and only AFTER the damaged slot held the commit: a
+                // restatement of it, one id later, over the same root. A build that
+                // wrote the commit onto the survivor leaves the damaged slot one
+                // id higher than this instead, and fails the assertion above.
+                auto const restated = DecodeSlot(after, survivor);
+                REQUIRE(restated.has_value());
+                REQUIRE(restated->txnId == repaired->txnId + 1);
+                REQUIRE(restated->root == repaired->root);
+                // A restatement and nothing else: the world it names is the commit's.
+                REQUIRE(restated->itemCount == repaired->itemCount);
+                REQUIRE(restated->keyBytes == repaired->keyBytes);
+                REQUIRE(restated->valueBytes == repaired->valueBytes);
+            }
         }
     }
 }

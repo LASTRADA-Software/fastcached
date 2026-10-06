@@ -38,12 +38,23 @@ and looks up two reserved keys — the in-flight-conversion marker and the forma
 marker. Nothing enumerates the records.
 
 **The free-list walk is real.** The store writes its list of free pages at every
-group commit, and `Open` follows that chain: a link in it that points past the end of
-the file, or loops, refuses the store with `Corrupt`. Everything below about `Corrupt`
-is therefore about the **meta slots, the free-list chain and the two reserved keys**.
-A free-list *entry* past the end of the file is not damage: the store cuts free pages
-off the end of its file after a durable commit, and the last list written may still
-name them.
+commit, under every `--storage-durability` setting, and `Open` follows that chain: a
+link in it that points past the end of the file, or loops, refuses the store with
+`Corrupt`. Everything below about `Corrupt` is therefore about the **meta slots, the
+free-list chain and the two reserved keys**. A free-list *entry* past the end of the
+file is not damage: the store cuts free pages off the end of its file after a durable
+commit, and the last list written may still name them.
+
+**Under `--storage-durability=none`, a power loss alone can do this.** `none` never
+syncs, so after a *power loss* the meta can be on disk while the free-list pages it
+names are not, and the walk then refuses the store with `Corrupt`. A process crash is
+not enough: the operating system still writes back what the process wrote. Before
+[#1624](https://github.com/LASTRADA-Software/fastcached/issues/1624) a `none` store
+kept no list and opened; it now refuses, and like any damage `Open` touches, that stops
+`fastcached` from starting. That is what `none`'s promise of no crash consistency
+costs. Here the power cut, not the disk, is the leading hypothesis, and the remedy is
+the one below: copy the file, then [delete it](#deleting-it) and restart. A compile
+node's tier always writes `batched`, so this route reaches only `fastcached`.
 
 **A file larger than `--cache-disk` is not evidence of damage on its own.** The limit
 counts the pages the store has in use; the file also holds free pages awaiting reuse —

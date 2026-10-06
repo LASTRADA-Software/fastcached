@@ -162,10 +162,6 @@ std::optional<std::string> DaemonStartupRejection(Config const& config)
         { .refuses = wantsTls && !buildServesTls, .message = DaemonTlsUnavailableRefusal },
         { .refuses = wantsTls && buildServesTls && (config.tlsCertPath.empty() || config.tlsKeyPath.empty()),
           .message = DaemonTlsMaterialRefusal },
-        // A disk budget only exists with a store to bound, and the durability only matters there.
-        { .refuses = !config.storagePath.empty() && config.storageMaxDiskBytes != 0
-                     && config.storageDurability != StorageDurability::Batched,
-          .message = DaemonStorageBudgetDurabilityRefusal },
     });
     for (auto const& rule: rules)
         if (rule.refuses)

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 
 #include <CowTree/Bytes.hpp>
 #include <CowTree/Errors.hpp>
@@ -15,8 +16,13 @@ namespace CowTree
 /// Magic bytes identifying a CowTree file: ASCII "FCOW" little-endian.
 inline constexpr std::uint32_t MetaMagic = 0x574F'4346U;
 
-/// On-disk meta-page layout version. Bump on any incompatible change.
-inline constexpr std::uint32_t MetaVersion = 1U;
+/// On-disk meta-page layout version this build WRITES. Bump on any incompatible change.
+/// Version 1 (no `dataPages`) is still read; see `MetaEncodedSizeV1`.
+inline constexpr std::uint32_t MetaVersion = 2U;
+
+/// On-disk spelling of a disengaged `Meta::dataPages`. Never 0: zero is a real count for an
+/// empty store, and decoding it as "known" would make recovery free every page.
+inline constexpr std::uint64_t MetaDataPagesUnknown = ~std::uint64_t { 0 };
 
 /// Default data page size used by FilePageStore unless overridden.
 inline constexpr std::size_t DefaultPageSize = 4096;
@@ -52,7 +58,7 @@ struct Meta
     /// Magic bytes (must equal `MetaMagic`).
     std::uint32_t magic { MetaMagic };
 
-    /// Layout version (must equal `MetaVersion`).
+    /// Layout version: `MetaVersion` when written by this build; a version-1 meta still decodes.
     std::uint32_t version { MetaVersion };
 
     /// Data page size in bytes. Each non-meta page is exactly this big.
@@ -97,6 +103,11 @@ struct Meta
     /// derived (#1006), and kept true because it is recorded.
     std::uint64_t valueBytes { 0 };
 
+    /// Data pages the file held when this meta was written (#1624). Pages past this count were
+    /// extended after the meta, so nothing in its world can name them and recovery frees them.
+    /// Disengaged for a version-1 meta, which recorded none and reclaims nothing.
+    std::optional<std::uint64_t> dataPages;
+
     /// CRC-32C over all preceding bytes when encoded on disk. Not used
     /// for in-memory comparisons.
     std::uint32_t crc32c { 0 };
@@ -104,12 +115,18 @@ struct Meta
 
 /// Number of bytes the encoded form of `Meta` occupies. Fits well within
 /// any supported page size; the rest of the meta page is zero-padded.
-inline constexpr std::size_t MetaEncodedSize = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 4;
+inline constexpr std::size_t MetaEncodedSize = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 4;
+
+/// Encoded size of the version-1 layout, which has no `dataPages`. Decode-only.
+inline constexpr std::size_t MetaEncodedSizeV1 = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 4;
 
 /// Encode a Meta into the front of the given byte span. The remainder of
 /// the span is zero-filled. The CRC is computed over the encoded payload
 /// (everything except the CRC field itself) and stored as the trailing
 /// 4 bytes of the encoded prefix.
+///
+/// Always writes `MetaVersion` (the current layout), whatever `meta.version` holds: the bytes are
+/// layout 2, so a restated version-1 meta must not keep its old stamp and decode as `Corrupt`.
 ///
 /// @param dst    Destination span; must be at least `pageSize` bytes
 ///               long. The span is zero-filled in full before encoding.
@@ -124,8 +141,8 @@ inline constexpr std::size_t MetaEncodedSize = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8
 ///
 /// @param src    Source span; must start with an encoded meta page.
 /// @return       Decoded meta on success; CowTreeError::Corrupt if the
-///               CRC mismatches; CowTreeError::InvalidArg if magic or
-///               version is wrong; CowTreeError::OutOfRange if `src` is
+///               CRC mismatches; CowTreeError::InvalidArg if the magic is wrong or
+///               the version is one this build does not know (CRC valid); CowTreeError::OutOfRange if `src` is
 ///               too small to hold an encoded meta.
 [[nodiscard]] std::expected<Meta, CowTreeError> DecodeMeta(BytesView src) noexcept;
 
