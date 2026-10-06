@@ -83,6 +83,7 @@ set(_table [=[
 <Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]"
 <Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Name="InstallLocation"
 <Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Bitness="always64"
+<Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Type="raw"
 <SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Id="INSTALL_ROOT"
 <SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Value="[FASTCACHE_INSTALL_LOCATION]"
 <SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Before="CostFinalize" Sequence="both"

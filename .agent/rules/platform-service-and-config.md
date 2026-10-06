@@ -745,8 +745,13 @@ readable and silently ignored. Every rule below has already been one of them.
     correct. The fix is one property rather than a component directory per action, because a
     feature that a change ADDS, every `Directory="INSTALL_ROOT"`, the PATH entry and
     `ARPINSTALLLOCATION` all resolve from it as well (INFERRED, none of them measured). It is a
-    type 51 action before `CostFinalize`, never a type 35, which is `MsiSetTargetPath` and is
-    documented as not for a maintenance installation. Step 12 of `msi-custom-action-commands`
+    type 51 action before `CostFinalize`. "Changing the Target Location for a Directory" forbids
+    changing a target directory during a maintenance installation, and that restriction covers
+    EVERY option it lists, type 51 included. This row complies because it does not CHANGE the
+    path: it re-states where the product already is, its own `InstallLocation`. A product
+    installed by a build without the row keeps the old behaviour for its own repair or `/x`,
+    which runs its own package, until it has been upgraded once. That is accepted, because no
+    backwards compatibility is owed before production ready. Step 12 of `msi-custom-action-commands`
     refuses the package without it while any scheduled action names `INSTALL_ROOT`, and
     `wix-service-table` pins the rows.
 - **The MSI's service table decides every start mode**, and is applied on every transaction that

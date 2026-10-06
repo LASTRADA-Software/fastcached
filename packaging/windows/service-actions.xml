@@ -88,12 +88,21 @@
          but a feature a change ADDS derives its directory from INSTALL_ROOT,
          Directory="INSTALL_ROOT" is the working directory of most actions here,
          and the PATH entry and ARPINSTALLLOCATION are spelled from it too. A
-         per-action directory would fix the commands and none of those. Nor a
-         type 35 action (MsiSetTargetPath): that one runs after CostFinalize,
-         MOVES a directory, and is documented as not for a maintenance
-         installation; this one restores the directory the product is in,
-         before anything is resolved from it, as the remember-property pattern
-         restores a value.
+         per-action directory would fix the commands and none of those.
+
+         "Changing the Target Location for a Directory" forbids changing a
+         target directory during a maintenance installation, and the
+         restriction covers EVERY option it lists: a type 51 before
+         CostFinalize as much as a type 35 after it. This row complies because
+         it changes nothing: it re-states where the product already IS, its own
+         InstallLocation, which the default resolution got wrong. A type 51
+         before CostFinalize, so every directory is resolved from it, as the
+         remember-property pattern restores a value.
+
+         A product installed by a build without this row keeps the old
+         behaviour for its own repair or uninstall, since that runs its own
+         package, until it has been upgraded once. Accepted: no backwards
+         compatibility is owed before production ready.
 
          Only when Installed: a first install and an upgrade (a new product
          code, so not Installed) keep CPack's resolution, the command line's
