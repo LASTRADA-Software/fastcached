@@ -31,11 +31,34 @@ namespace
     /// What every history file's remedy is.
     constexpr std::string_view HistoryRemedy = "Remove it to keep this node's history there again";
 
-    /// The sentence every refusal shares, naming the owner.
+    /// @p text with no full stop of its own: an operating system's message already ends in one
+    /// ("Access is denied."), and a sentence built around it would end in two.
+    /// @param text The message.
+    /// @return It, without trailing full stops or white space.
+    [[nodiscard]] std::string AsClause(std::string text)
+    {
+        while (!text.empty() && (text.back() == '.' || text.back() == ' ' || text.back() == '\r' || text.back() == '\n'))
+            text.pop_back();
+        return text;
+    }
+
+    /// Who CAN list a state directory this account could not: the remedy for a listing refused.
+#if defined(_WIN32)
+    constexpr std::string_view WhoCanListIt =
+        "Judge it as an account that may list it: elevated, as an administrator (a service's state directory is "
+        "readable by SYSTEM, the administrators and the service alone), or as the service itself";
+#else
+    constexpr std::string_view WhoCanListIt =
+        "Judge it as an account that may list it: root, or the account the service runs as";
+#endif
+
+    /// The sentence every refusal shares, naming the owner -- and nothing about who put it there,
+    /// which an owner does not say: a file the node's own service wrote is "another account's" to
+    /// an operator judging it from a seat the trusted-owner set does not cover.
     [[nodiscard]] std::string OwnedByAnother(std::filesystem::path const& path, FileOwner const& owner)
     {
-        return std::format("{} is owned by {}, which is neither the account this node runs as nor an administrative "
-                           "one: another account put it there",
+        return std::format("{} is owned by {}, which is neither the account judging it, an administrative one, nor "
+                           "an account this judgement counts as the node's own",
                            path.string(),
                            owner.name);
     }
@@ -91,21 +114,26 @@ namespace
                                                   NodeStateFileRow const* row,
                                                   bool temporary)
     {
+        // No row: refused whoever owns it (`UnknownEntry`), so its removal is the remedy whatever
+        // the seat -- the one case where naming the owner is not the whole answer.
         if (row == nullptr)
-            return std::format("{}, into the directory that holds this node's identity key, and this build keeps no "
-                               "entry by that name. Remove it; nothing in the directory is trusted while another "
-                               "account's entry is in it, and nothing was changed",
+            return std::format("{}, in the directory that holds this node's identity key, and this build keeps no "
+                               "entry by that name, so it is refused whoever owns it. Remove it; nothing was changed",
                                OwnedByAnother(path, owner));
         if (temporary)
-            return std::format("{}, as a temporary of {}, which holds {}: nothing in the directory is trusted while "
-                               "another account's entry is in it. Remove it; nothing was changed",
+            return std::format("{}, as a temporary of {}, which holds {}: nothing in the directory is trusted while an "
+                               "entry this judgement cannot vouch for is in it. {}. Only an entry nobody but this "
+                               "node should have written -- a planted one -- is removed; nothing was changed",
                                OwnedByAnother(path, owner),
                                row->Name(),
-                               row->holds);
-        return std::format("{}. It holds {}, and this node will not {}. {}; nothing was changed",
+                               row->holds,
+                               JudgeFromTheServiceSeat(owner.name));
+        return std::format("{}. It holds {}, and this node will not {}. {}. Only a file nobody but this node should "
+                           "have written -- a planted one -- calls for this: {}; nothing was changed",
                            OwnedByAnother(path, owner),
                            row->holds,
                            row->trusting,
+                           JudgeFromTheServiceSeat(owner.name),
                            row->remedy);
     }
 } // namespace
@@ -248,9 +276,10 @@ std::expected<void, NodeKeyRefusal> RefuseForeignStateFiles(std::filesystem::pat
         return std::unexpected { NodeKeyRefusal {
             .fault = NodeKeyFault::Unreadable,
             .message = std::format("cannot list {} to ask who owns what it holds: {}. Nothing in it is trusted until "
-                                   "it can be",
+                                   "it can be. {}",
                                    stateDirectory.string(),
-                                   error.message()) } };
+                                   AsClause(error.message()),
+                                   WhoCanListIt) } };
     };
     if (failure)
         return unlisted(failure);
@@ -377,15 +406,22 @@ HistoryPaths SetAsideForeignHistory(HistoryPaths paths, INodeKeyFileGuard& guard
     return paths;
 }
 
-std::expected<KeptFormation, std::string> ReadStateDirectoryFormation(std::filesystem::path const& stateDirectory)
+std::expected<KeptFormation, FormationUnread> ReadStateDirectoryFormation(std::filesystem::path const& stateDirectory,
+                                                                          INodeKeyFileGuard& guard)
 {
-    FileTrustNodeKeyGuard guard;
+    // The directory's judgement keeps its fault's STAGE: an I/O arm (`Unreadable`,
+    // `WritersUndetermined`) is retried under a supervisor, a verdict (`ForeignOwner`) is not.
     if (auto walked = JudgeStateDirectory(stateDirectory, guard); !walked.has_value())
-        return std::unexpected { std::move(walked).error().message };
+    {
+        auto refusal = std::move(walked).error();
+        return std::unexpected { FormationUnread { .reason = std::move(refusal.message), .stage = StageOf(refusal.fault) } };
+    }
     Cluster::FileFormationStore const store { stateDirectory };
     Cluster::FleetEndpointsFile endpoints { stateDirectory };
     return ReadKeptFormation(store, endpoints).transform_error([&stateDirectory](std::string const& error) {
-        return error + StateFileUnreadableHint(stateDirectory / Cluster::FormationRecordFileName);
+        return FormationUnread { .reason =
+                                     error + StateFileUnreadableHint(stateDirectory / Cluster::FormationRecordFileName),
+                                 .stage = StartStage::Formation };
     });
 }
 

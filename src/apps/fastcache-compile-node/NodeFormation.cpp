@@ -7,10 +7,12 @@
 #include <FastCache/Core/HostPort.hpp>
 
 #include <algorithm>
+#include <expected>
 #include <format>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <core/Ranges.hpp>
@@ -134,6 +136,9 @@ std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
     if (!view.clusterId.empty())
         cfg.clusterId = view.clusterId;
     cfg.formation = std::move(view);
+    // Shaped now, so no earlier reading's refusal describes it any more (the install shapes a
+    // configuration `main` could not).
+    cfg.formationUnread.reset();
     return {};
 }
 
@@ -283,8 +288,12 @@ Cluster::MemberSeat SeatInFormation(NodeConfig const& cfg, std::string_view id)
 
 std::optional<std::string> RaftClosedByFormation(NodeConfig const& cfg)
 {
+    // Not "yet" where a reading refused: no first start mints over a record it could not read, and
+    // the mode line above says why (`FormationAbsenceOf`).
     if (!cfg.formation.has_value())
-        return std::string { "not served (no formation record yet)" };
+        return std::string { cfg.formationUnread.has_value()
+                                 ? "not served (no formation record could be read; see the mode line)"
+                                 : "not served (no formation record yet)" };
     auto const& row = Cluster::NodeModeRowFor(cfg.formation->mode);
     if (ModeOpensRaftPort(row.mode))
         return std::nullopt;
@@ -317,6 +326,28 @@ Cluster::FormationRecord ProspectiveRecord(KeptFormation const& kept)
     return kept.record.value_or(Cluster::FormationRecord {});
 }
 
+std::expected<void, FormationUnread> ShapeByKeptFormation(NodeConfig& cfg,
+                                                          std::expected<KeptFormation, FormationUnread> const& kept)
+{
+    // A record that was read and that `ApplyFormation` refuses is the formation's own step.
+    auto shaped = kept.and_then([&cfg](KeptFormation const& held) {
+        return ApplyFormation(cfg, ProspectiveRecord(held), held.remembered).transform_error([](std::string reason) {
+            return FormationUnread { .reason = std::move(reason), .stage = StartStage::Formation };
+        });
+    });
+    if (!shaped.has_value())
+        cfg.formationUnread = shaped.error();
+    return shaped;
+}
+
+std::string FormationAbsenceOf(NodeConfig const& cfg)
+{
+    constexpr std::string_view unshaped = "no formation record shaped this configuration";
+    if (!cfg.formationUnread.has_value())
+        return std::string { unshaped };
+    return std::format("{}: {}", unshaped, cfg.formationUnread->reason);
+}
+
 std::expected<Cluster::FormationRecord, std::string> KeepFormation(KeptFormation const& kept,
                                                                    Cluster::IFormationStore& store,
                                                                    ISecureRandom& random,
@@ -339,7 +370,7 @@ std::expected<Cluster::FormationRecord, std::string> KeepFormation(KeptFormation
 std::string DescribeFormationMode(NodeConfig const& cfg)
 {
     if (!cfg.formation.has_value())
-        return "mode: none (no formation record shaped this configuration)";
+        return std::format("mode: none ({})", FormationAbsenceOf(cfg));
     auto const name = Cluster::NodeModeRowFor(cfg.formation->mode).name;
     if (cfg.formation->clusterId.empty())
         return std::format("mode: {} (no cluster minted yet; the first start mints one)", name);

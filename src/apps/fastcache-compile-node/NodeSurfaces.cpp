@@ -676,7 +676,18 @@ SurfaceReport ReportSurfaces(NodeConfig const& cfg)
     // unaltered. Not reworded, not prefixed, not summarised: it is the same sentence
     // the node prints when it refuses to start, so an operator who sees it here and
     // then sees it at boot is reading one message rather than matching two.
-    return SurfaceReport { .text = RenderSurfaces(cfg), .refusal = StartupPolicyRejection(cfg) };
+    //
+    // **Except a state directory no reading could shape the line from**, which is answered first and
+    // ends by its OWN arm (`UnreadStateStage`): the same sentence the start refuses with, but a
+    // transient read ends `Failed` (1) rather than `Declined` (2), and no flag row is asked of a
+    // configuration that has no mode.
+    if (auto const stage = UnreadStateStage(cfg); stage.has_value())
+        return SurfaceReport { .text = RenderSurfaces(cfg),
+                               .refusal = StateDirectoryUnreadRefusal(cfg),
+                               .ending = EndingOf(*stage) };
+    auto refusal = StartupPolicyRejection(cfg);
+    auto const ending = refusal.has_value() ? CommandEnding::Declined : CommandEnding::Completed;
+    return SurfaceReport { .text = RenderSurfaces(cfg), .refusal = std::move(refusal), .ending = ending };
 }
 
 ServedSurfaces NodeServedSurfacesFor(NodeConfig const& cfg)

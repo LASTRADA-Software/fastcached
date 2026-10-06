@@ -8,11 +8,13 @@
 #include <expected>
 #include <filesystem>
 #include <optional>
+#include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
 
 #include <apps/fastcache-compile-node/NodeKey.hpp>
+#include <core/Ranges.hpp>
 
 /// @file NodeKeyFakes.hpp
 /// The one scripted `INodeKeyFileGuard`.
@@ -70,6 +72,17 @@ class ScriptedNodeKeyGuard final: public Node::INodeKeyFileGuard
         _foreign.push_back(std::move(name));
     }
 
+    /// Answer `Another` for every entry named @p name, owned by the account @p owner names with the
+    /// platform id @p id -- how a case states WHICH account wrote a file, so the trusted-owner set
+    /// (`Node::OwnStateAccountsGuard`) is judged by the production fold over a scripted identity.
+    /// @param name The entry's file name.
+    /// @param owner The owner as an operator reads it (`NT SERVICE\FastCacheCompileNode`).
+    /// @param id The owner as the platform identifies it (a SID's string form).
+    void OwnedBy(std::filesystem::path name, std::string owner, std::string id)
+    {
+        _accounts.push_back(ScriptedOwner { .name = std::move(name), .owner = std::move(owner), .id = std::move(id) });
+    }
+
     /// Answer `IsLink` true for every entry named @p name, wherever it is.
     /// @param name The entry's file name.
     void LinkedEntry(std::filesystem::path name)
@@ -113,8 +126,12 @@ class ScriptedNodeKeyGuard final: public Node::INodeKeyFileGuard
     [[nodiscard]] FileOwner OwnerOf(std::filesystem::path const& file) override
     {
         _owners.push_back(file);
+        if (auto const* const scripted = core::findOrNull(_accounts, file.filename(), &ScriptedOwner::name))
+            return FileOwner { .standing = FileOwnerStanding::Another, .name = scripted->owner, .id = scripted->id };
         auto const foreign = std::ranges::contains(_foreign, file.filename());
-        return FileOwner { .standing = foreign ? FileOwnerStanding::Another : _script.owner, .name = "scripted-owner" };
+        return FileOwner { .standing = foreign ? FileOwnerStanding::Another : _script.owner,
+                           .name = "scripted-owner",
+                           .id = "scripted-owner-id" };
     }
 
     /// @copydoc Node::INodeKeyFileGuard::WritersOf
@@ -122,6 +139,21 @@ class ScriptedNodeKeyGuard final: public Node::INodeKeyFileGuard
     {
         _directories.push_back(directory);
         return _script.writers;
+    }
+
+    /// Answer `WritersBeyondOwner` with @p writers: who BESIDES the directory's owner may plant
+    /// entries -- what a caller that trusts that owner asks next.
+    /// @param writers `OwnerOnly`, `Others` or `Undetermined`.
+    void WritersBeyondOwnerAre(DirectoryWriters writers)
+    {
+        _beyondOwner = writers;
+    }
+
+    /// @copydoc Node::INodeKeyFileGuard::WritersBeyondOwner
+    [[nodiscard]] DirectoryWriters WritersBeyondOwner(std::filesystem::path const& directory) override
+    {
+        _directories.push_back(directory);
+        return _beyondOwner;
     }
 
     /// @copydoc Node::INodeKeyFileGuard::Protect
@@ -197,6 +229,17 @@ class ScriptedNodeKeyGuard final: public Node::INodeKeyFileGuard
     NodeKeyGuardScript _script;
     std::vector<std::filesystem::path> _asked;
     std::vector<std::filesystem::path> _foreign;
+
+    /// One entry `OwnedBy` scripted.
+    struct ScriptedOwner
+    {
+        std::filesystem::path name; ///< The entry's file name.
+        std::string owner;          ///< Its owner's name.
+        std::string id;             ///< Its owner's platform id.
+    };
+
+    std::vector<ScriptedOwner> _accounts;
+    DirectoryWriters _beyondOwner { DirectoryWriters::OwnerOnly };
     std::vector<std::filesystem::path> _links;
     std::vector<std::filesystem::path> _writable;
     std::vector<std::pair<std::filesystem::path, std::error_code>> _unanswered;

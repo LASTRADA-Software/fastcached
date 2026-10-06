@@ -1389,8 +1389,21 @@ The same holds for every file the node keeps in its state directory: the id, the
 formation record, the consensus store (`raft-state`, `raft-log`, `raft-snapshot`), the
 remembered cluster endpoints (`fleet-endpoints`) and the roster. One owned by another
 account refuses the start, naming the file, what it holds and its owner, and is left as it
-is -- remove it, or move the consensus store aside, as the refusal says. So does any entry
-the node does not keep. The history files are the exception, because a history may never
+is. Ownership is judged from the account asking. On Windows an elevated administrator
+running `--print-surfaces`, which writes nothing, counts the
+files and the directory of the node's own service account, `NT SERVICE\<--service-name>`, as
+the node's own, so `--print-surfaces` over a running service's directory judges the line as
+the service will run it. A start, foreground or as a service, `--print-identity` (which mints a
+key and an id where they are absent) and `--install-service` keep the strict rule: a foreground
+start by an administrator over the service's files is refused, as before. On POSIX nothing changes: root does not count a service user's files as the node's,
+so `sudo fastcache-compile-node --print-surfaces` over a dedicated user's directory is still
+refused -- judge it as that user. A file of any other account is refused; judge it as the
+service it belongs to, and remove it, or move the consensus store aside, only when nobody but
+this node should have written it. A directory that cannot be read ends the command, or the
+start, once and with that reason, before any setting is judged against a mode the node could
+not read: a read that failed (a listing refused, an access list that would not answer) exits
+1 and is retried by the service manager, a verdict on what was found exits 78. Any entry the
+node does not keep is refused too. The history files are the exception, because a history may never
 keep a node from starting: one owned by another account is set aside with a warning, not
 read and not written over, and the node keeps no history there until it is removed. The
 key is the only file there created readable by its owner and the administrators alone;
@@ -1484,7 +1497,11 @@ nobody reads:
 | `--listen-raft` names a usable port | That is where every peer dials it. A value that is not an address is refused with the text you typed. |
 
 The reverse holds too: `--raft-self` **without** consensus is refused rather than ignored,
-since there is no port to pair the host with and nothing would say so. (`--node-id` and
+since there is no port to pair the host with and nothing would say so. Whether a node runs
+consensus is its mode, kept in its state directory, so the refusal names one of two causes:
+an empty `--listen-raft=` that closed the port its mode opens, or a state directory whose
+formation record could not be read -- the mode is then unknown, and the refusal carries the
+reading's own refusal, the same reason `--print-surfaces` prints on its `mode: none` line. (`--node-id` and
 `--cluster-dir` are not refused there — the node keeps its identity in that directory,
 and the dashboard its history file, so a node with no consensus still has a use for
 both.)

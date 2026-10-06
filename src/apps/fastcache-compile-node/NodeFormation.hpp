@@ -10,6 +10,7 @@
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
+#include <FastCache/Platform/ProcessExit.hpp>
 
 #include <cstdint>
 #include <expected>
@@ -33,6 +34,21 @@ namespace FastCache::Node
 {
 
 struct NodeConfig;
+
+/// Why no formation record shaped a configuration, and the step of a start that gives up on it.
+///
+/// The STAGE is the arm that gave up, carried rather than re-derived: an I/O arm -- a listing, a
+/// read, an owner or access list the platform would not answer -- is `Failed` and retried under a
+/// supervisor, a verdict on what was found is `Refused` (`StartStageRows`). Flattened to a string,
+/// every one of them read as a verdict and a transient read became a node left stopped.
+struct FormationUnread
+{
+    std::string reason;                         ///< The reading's own refusal, naming what and why.
+    StartStage stage { StartStage::Formation }; ///< The step a start gives up at, which decides its exit.
+
+    /// Field-wise equality.
+    [[nodiscard]] friend bool operator==(FormationUnread const&, FormationUnread const&) = default;
+};
 
 /// What the formation record says, as the rest of the node reads it.
 ///
@@ -272,6 +288,25 @@ inline constexpr std::string_view FormationRecordGone =
 /// @param kept What the state directory holds.
 /// @return The record to apply.
 [[nodiscard]] Cluster::FormationRecord ProspectiveRecord(KeptFormation const& kept);
+
+/// Shape @p cfg by what its state directory keeps, as `main` shapes every configuration before any
+/// verb or rule is asked: by the `ProspectiveRecord` of @p kept.
+///
+/// **And where no record can shape it, @p cfg is told WHY** (`NodeConfig::formationUnread`): a reading
+/// the state directory refused, or a record `ApplyFormation` refused. Its mode is then unknown, and
+/// the mode line and the `--raft-self` row name that refusal (`FormationAbsenceOf`) -- never a flag,
+/// which that row once told an operator who had typed it was missing.
+/// @param cfg The configuration to shape.
+/// @param kept What `ReadStateDirectoryFormation` read, or why it could not.
+/// @return Nothing, or why no record shaped @p cfg.
+[[nodiscard]] std::expected<void, FormationUnread> ShapeByKeptFormation(
+    NodeConfig& cfg, std::expected<KeptFormation, FormationUnread> const& kept);
+
+/// Why no formation record shaped @p cfg: ONE sentence, which `--print-surfaces`' mode line and the
+/// startup rules both print, so the two cannot name different causes.
+/// @param cfg A configuration no record shaped.
+/// @return `no formation record shaped this configuration`, and the reading's refusal where there was one.
+[[nodiscard]] std::string FormationAbsenceOf(NodeConfig const& cfg);
 
 /// The record a starting node runs by: the kept one, or a solitary one minted and SAVED first.
 ///

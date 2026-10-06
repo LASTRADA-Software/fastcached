@@ -582,6 +582,11 @@ struct SurfaceReport
     /// because "would start" and "was refused with no words" are different answers
     /// and a string renders them the same.
     std::optional<std::string> refusal;
+
+    /// How `--print-surfaces` ends: `Completed` with no refusal, `Declined` for a verdict, and
+    /// `Failed` for a state directory whose reading failed on an I/O arm (`UnreadStateStage`) --
+    /// which a re-run may get past.
+    CommandEnding ending { CommandEnding::Completed };
 };
 
 /// Render the worksheet and judge the configuration behind it.

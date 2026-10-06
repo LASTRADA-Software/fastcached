@@ -560,6 +560,18 @@ namespace
         return Utf8FromWideText(text).value_or("an account this machine cannot name");
     }
 
+    /// @p sid in its string form (`S-1-5-...`), which is what `FileOwner::id` compares.
+    /// @param sid The SID.
+    /// @return Its string form, or empty when it cannot be spelled.
+    [[nodiscard]] std::string SidTextOf(PSID sid)
+    {
+        wchar_t* text = nullptr;
+        if (::ConvertSidToStringSidW(sid, &text) == FALSE)
+            return {};
+        auto const owned = LocalBlock { text };
+        return Utf8FromWideText(text).value_or(std::string {});
+    }
+
     /// Build a security descriptor from @p sddl, for a create that applies it from the first instant.
     /// @param sddl The access list.
     /// @return The descriptor, owned, or the error that refused it.
@@ -1044,11 +1056,12 @@ FileOwner FileOwnerOf(std::filesystem::path const& path)
         return FileOwner {};
 
     auto name = AccountNameOf(owner);
+    auto id = SidTextOf(owner);
     if (IsThisProcessUser(owner))
-        return FileOwner { .standing = FileOwnerStanding::ThisProcess, .name = std::move(name) };
+        return FileOwner { .standing = FileOwnerStanding::ThisProcess, .name = std::move(name), .id = std::move(id) };
     if (MatchesWellKnownSid(owner, AdministrativeOwners))
-        return FileOwner { .standing = FileOwnerStanding::Administrative, .name = std::move(name) };
-    return FileOwner { .standing = FileOwnerStanding::Another, .name = std::move(name) };
+        return FileOwner { .standing = FileOwnerStanding::Administrative, .name = std::move(name), .id = std::move(id) };
+    return FileOwner { .standing = FileOwnerStanding::Another, .name = std::move(name), .id = std::move(id) };
 #else
     struct ::stat info {};
 
@@ -1056,11 +1069,37 @@ FileOwner FileOwnerOf(std::filesystem::path const& path)
     if (::lstat(path.c_str(), &info) != 0)
         return FileOwner {};
     auto name = std::format("uid {}", info.st_uid);
+    auto id = name;
     if (info.st_uid == ::geteuid())
-        return FileOwner { .standing = FileOwnerStanding::ThisProcess, .name = std::move(name) };
+        return FileOwner { .standing = FileOwnerStanding::ThisProcess, .name = std::move(name), .id = std::move(id) };
     if (info.st_uid == 0)
-        return FileOwner { .standing = FileOwnerStanding::Administrative, .name = std::move(name) };
-    return FileOwner { .standing = FileOwnerStanding::Another, .name = std::move(name) };
+        return FileOwner { .standing = FileOwnerStanding::Administrative, .name = std::move(name), .id = std::move(id) };
+    return FileOwner { .standing = FileOwnerStanding::Another, .name = std::move(name), .id = std::move(id) };
+#endif
+}
+
+std::optional<std::string> AccountIdOf(std::string const& account)
+{
+#if defined(_WIN32)
+    std::array<std::byte, SECURITY_MAX_SID_SIZE> sid {};
+    if (account.empty() || !ResolveAccountSid(account, sid))
+        return std::nullopt;
+    auto text = SidTextOf(sid.data());
+    if (text.empty())
+        return std::nullopt;
+    return text;
+#else
+    (void) account;
+    return std::nullopt;
+#endif
+}
+
+bool IsAdministratorProcess()
+{
+#if defined(_WIN32)
+    return EffectiveTokenIsIn(WinBuiltinAdministratorsSid);
+#else
+    return ::geteuid() == 0;
 #endif
 }
 
@@ -1085,12 +1124,20 @@ DirectoryWriters DirectoryWritersOf(std::filesystem::path const& directory)
         case FileOwnerStanding::Undetermined:
         case FileOwnerStanding::Last:
             return DirectoryWriters::Undetermined;
+        // `NamedAccount` is never answered by `FileOwnerOf`, so it cannot reach here; were it to, a
+        // directory is judged as its owner left it, never by a caller's trust in an account.
+        case FileOwnerStanding::NamedAccount:
         case FileOwnerStanding::Another:
             return DirectoryWriters::ForeignOwner;
         case FileOwnerStanding::ThisProcess:
         case FileOwnerStanding::Administrative:
             break;
     }
+    return DirectoryWritersBeyondOwner(directory);
+}
+
+DirectoryWriters DirectoryWritersBeyondOwner(std::filesystem::path const& directory)
+{
 #if defined(_WIN32)
     auto const nobody = NoBroadPrincipalMay(directory, EntryPlantingRights);
     if (!nobody.has_value())
@@ -1256,9 +1303,14 @@ std::string DirectoryWritersHint(std::filesystem::path const& directory, Directo
         case DirectoryWriters::Undetermined:
             return std::format("could not determine who may create or delete entries in {}", directory.string());
         case DirectoryWriters::ForeignOwner:
-            return std::format("{} is owned by an account that is neither this process's nor an administrator's, which "
-                               "can grant itself anything in it: another account created it. Remove it, with what is "
-                               "in it, and this node creates its own, its owner's alone",
+            // Never "remove it" for its owner alone: the account a service runs as owns the
+            // directory that service created, and a judgement made from another seat says only
+            // that the seat differs. Removal is the remedy for a planted directory.
+            return std::format("{} is owned by an account that is neither this process's nor an administrator's, and "
+                               "an owner can grant itself anything in it. Ownership is judged from the account asking: "
+                               "if that account is the one the service using it runs as, judge it as that account. "
+                               "Only a directory nobody else should have created -- a planted one -- is removed, with "
+                               "what is in it",
                                directory.string());
         case DirectoryWriters::Others: {
             auto commands = std::string {};

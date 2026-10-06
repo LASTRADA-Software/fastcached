@@ -20,6 +20,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache::Node
 {
@@ -190,6 +191,13 @@ class INodeKeyFileGuard
     /// @return Who can write in it.
     [[nodiscard]] virtual DirectoryWriters WritersOf(std::filesystem::path const& directory) = 0;
 
+    /// Who BESIDES @p directory's owner and the administrators may create or delete entries in it:
+    /// `WritersOf` with the owner's question left out, for a caller that trusts the owner already
+    /// (`OwnStateAccountsGuard`). Never `ForeignOwner`.
+    /// @param directory The state directory.
+    /// @return `OwnerOnly`, `Others` or `Undetermined`.
+    [[nodiscard]] virtual DirectoryWriters WritersBeyondOwner(std::filesystem::path const& directory) = 0;
+
     /// Whether @p entry is a link rather than a file or directory of its own. The node writes
     /// none into its state directory, so one there was put there by somebody else, pointing
     /// wherever they chose -- and an owner read through it would answer for the target.
@@ -230,6 +238,9 @@ class FileTrustNodeKeyGuard final: public INodeKeyFileGuard
     /// @copydoc INodeKeyFileGuard::WritersOf
     [[nodiscard]] DirectoryWriters WritersOf(std::filesystem::path const& directory) override;
 
+    /// @copydoc INodeKeyFileGuard::WritersBeyondOwner
+    [[nodiscard]] DirectoryWriters WritersBeyondOwner(std::filesystem::path const& directory) override;
+
     /// @copydoc INodeKeyFileGuard::IsLink
     [[nodiscard]] bool IsLink(std::filesystem::path const& entry) override;
 
@@ -242,6 +253,148 @@ class FileTrustNodeKeyGuard final: public INodeKeyFileGuard
     /// @copydoc INodeKeyFileGuard::SyncDirectory
     [[nodiscard]] std::expected<void, Consensus::DirectorySyncFailure> SyncDirectory(
         std::filesystem::path const& directory) override;
+};
+
+/// Who is judging a state directory, as far as whose files it may count as the node's own.
+///
+/// **Private: never transmitted or persisted.**
+enum class JudgingCaller : std::uint8_t
+{
+    Administrator, ///< An administrator (`IsAdministratorProcess`): an elevated operator, an install.
+    Other,         ///< Anyone else -- the service itself among them, whose files are its own already.
+    Last,
+};
+
+/// What an invocation does with the state directory it judges -- which decides whether an
+/// administrator may judge it from the service's seat.
+///
+/// **Private: never transmitted or persisted.**
+enum class StateUse : std::uint8_t
+{
+    Inspects, ///< It reports on the directory and never runs the node over it (`--print-surfaces`).
+    Runs,     ///< It writes there: a start, foreground or supervised; an install; `--print-identity`, which mints.
+    Last,
+};
+
+/// One verb, and what it does with the state directory. A verb no row names RUNS.
+struct StateUseRow
+{
+    std::string_view verb;       ///< The flag that selects it.
+    bool NodeConfig::* selected; ///< Whether this invocation is that verb.
+    StateUse use;                ///< What it does with the directory.
+    std::string_view why;        ///< Why, measured against what it writes.
+};
+
+/// Every verb whose use of the state directory is stated rather than defaulted to `Runs`.
+/// @return The rows, first match wins.
+[[nodiscard]] std::span<StateUseRow const> StateUseRows() noexcept;
+
+/// What @p cfg's invocation does with its state directory (`StateUseRows`).
+/// @param cfg The configuration.
+/// @return The first selected row's use, `Runs` when no row is selected.
+[[nodiscard]] StateUse StateUseOf(NodeConfig const& cfg) noexcept;
+
+/// One row of the trusted-owner set: which account a caller counts as the node's own, beside its
+/// own account and the administrators', for one use of the directory, and why.
+struct OwnStateAccountRow
+{
+    JudgingCaller caller; ///< Who judges.
+    StateUse use;         ///< What the invocation does with the directory.
+
+    /// The account it counts as the node's own, derived from the configuration; nothing for none.
+    std::optional<std::string> (*account)(NodeConfig const& cfg);
+
+    std::string_view why; ///< Why that account and no other.
+};
+
+/// The account this node's SERVICE runs as: its per-service virtual account, `NT SERVICE\<name>`,
+/// named by `--service-name` -- the same derivation the registration hands the supervisor
+/// (`WindowsLogonName`, `NodeWindowsLogon`), so the two cannot name different accounts.
+/// @param cfg The configuration.
+/// @return The account, or nothing when the configuration names no service (an empty
+///         `--service-name`), which counts no account as the node's own.
+[[nodiscard]] std::optional<std::string> NodeServiceAccountOf(NodeConfig const& cfg);
+
+/// The trusted-owner set, one row per (caller, use) pair.
+///
+/// An ADMINISTRATOR running a verb that only INSPECTS the directory counts the files of the
+/// node's own service account as the node's, so the line is judged as the service will run it
+/// (the owner's ruling, 2026-10-06). Every other pair counts nothing beyond the caller's own
+/// account and the administrators': a start -- foreground or under the supervisor -- writes into
+/// the directory, and an elevated process consuming what a deprivileged, network-facing account
+/// wrote is the direction an escalation travels, accepted only where nothing is written.
+/// @return The rows.
+[[nodiscard]] std::span<OwnStateAccountRow const> OwnStateAccountRows() noexcept;
+
+/// Whether @p id is a PER-SERVICE SID: `S-1-5-80-` and exactly five sub-authorities. Not
+/// `S-1-5-80-0`, which is `NT SERVICE\ALL SERVICES`, a group -- `--service-name="ALL SERVICES"`
+/// resolves to it, and trusting it would trust every service's files.
+/// @param id A `FileOwner::id`.
+/// @return True for a per-service SID.
+[[nodiscard]] bool IsPerServiceSid(std::string_view id) noexcept;
+
+/// The ids of the accounts @p caller counts as the node's own for @p use (`OwnStateAccountRows`),
+/// resolved; only a per-service SID (`IsPerServiceSid`) is ever one.
+/// @param caller Who judges.
+/// @param use What the invocation does with the directory.
+/// @param cfg The configuration, for the service it names.
+/// @param idOf How an account resolves to `FileOwner::id`'s terms -- `AccountIdOf` in production.
+/// @return The ids; empty when the row names no account or it does not resolve to a service SID.
+[[nodiscard]] std::vector<std::string> OwnStateAccountIds(JudgingCaller caller,
+                                                          StateUse use,
+                                                          NodeConfig const& cfg,
+                                                          std::optional<std::string> (*idOf)(std::string const&));
+
+/// What a refusal of a file or directory another account owns tells an operator INSTEAD of a
+/// removal: ownership is judged from the account asking, so the seat that would judge it as the
+/// service is the remedy, and removal is the remedy for a planted one alone.
+/// @param owner The owner as an operator reads it.
+/// @return The sentence, with no full stop.
+[[nodiscard]] std::string JudgeFromTheServiceSeat(std::string_view owner);
+
+/// A guard that counts the files of the accounts it was given as the node's own
+/// (`FileOwnerStanding::NamedAccount`), and asks everything else of the guard it wraps.
+///
+/// **The trusted-owner set is THIS parameter, never a branch at a call site**, and the platform's
+/// verdict is otherwise untouched: only an owner the platform answered `Another` for, whose `id`
+/// is in the set, is promoted -- a file's to `NamedAccount`, and a directory's by asking who
+/// BESIDES that owner may plant entries there (`WritersBeyondOwner`), so a directory the service
+/// owns is judged as the service judges it and one others may write in stays refused.
+class OwnStateAccountsGuard final: public INodeKeyFileGuard
+{
+  public:
+    /// @param inner The guard every question is asked of; only its owner answer can be promoted.
+    /// @param ownIds The ids counted as the node's own; an empty id is never one.
+    OwnStateAccountsGuard(INodeKeyFileGuard& inner, std::vector<std::string> ownIds);
+
+    /// @copydoc INodeKeyFileGuard::ExposureOf
+    [[nodiscard]] SecretExposure ExposureOf(std::filesystem::path const& file) override;
+
+    /// @copydoc INodeKeyFileGuard::OwnerOf
+    [[nodiscard]] FileOwner OwnerOf(std::filesystem::path const& file) override;
+
+    /// @copydoc INodeKeyFileGuard::WritersOf
+    [[nodiscard]] DirectoryWriters WritersOf(std::filesystem::path const& directory) override;
+
+    /// @copydoc INodeKeyFileGuard::WritersBeyondOwner
+    [[nodiscard]] DirectoryWriters WritersBeyondOwner(std::filesystem::path const& directory) override;
+
+    /// @copydoc INodeKeyFileGuard::IsLink
+    [[nodiscard]] bool IsLink(std::filesystem::path const& entry) override;
+
+    /// @copydoc INodeKeyFileGuard::OthersMayWrite
+    [[nodiscard]] std::expected<bool, std::error_code> OthersMayWrite(std::filesystem::path const& entry) override;
+
+    /// @copydoc INodeKeyFileGuard::Protect
+    [[nodiscard]] SecretExposure Protect(std::filesystem::path const& file) override;
+
+    /// @copydoc INodeKeyFileGuard::SyncDirectory
+    [[nodiscard]] std::expected<void, Consensus::DirectorySyncFailure> SyncDirectory(
+        std::filesystem::path const& directory) override;
+
+  private:
+    INodeKeyFileGuard& _inner;
+    std::vector<std::string> _ownIds;
 };
 
 /// When a key file's exposure is judged: the rule differs in one cell, deliberately.
