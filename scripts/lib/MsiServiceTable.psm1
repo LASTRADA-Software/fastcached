@@ -854,25 +854,137 @@ function Get-MsiFailureLines([string[]] $Lines, [int] $Before = 3) {
 # The lines of a verbose log that name what happened, since its tail is only the
 # property dump.
 #
+# Every line goes to the HOST, never to the output stream. It wrote its lines to the output stream
+# until PR 1634's CI printed all three section headers over EMPTY sections, for a log a Select-String
+# had just read: called from Invoke-TransactionJudgement, whose output Invoke-Msiexec captures in
+# `Write-Host (Invoke-TransactionJudgement ...)`, the lines were captured, and the judgement's throw
+# discarded them while the headers, already written to the host, survived. The self-test asserts this
+# function writes nothing to the output stream.
+#
 # @param Path The log.
 function Show-MsiLog([string] $Path) {
     Write-Host "===== $Path (relevant lines) ====="
-    if (-not (Test-Path $Path)) { Write-Host "no log at $Path"; return }
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Host "no log at $Path"; return }
+    $lines = @(Get-Content -LiteralPath $Path)
     # What failed, FIRST and from the whole log: the tail below fills with the rollback's own
     # records, which pushed the one error line out of it.
     Write-Host '--- what failed ---'
-    Get-MsiFailureLines @(Get-Content -Path $Path) | ForEach-Object { $_ }
+    foreach ($line in @(Get-MsiFailureLines $lines)) { Write-Host $line }
     # Every line naming one of this package's actions, from the whole log: the tail below is the
     # property dump of a transaction that ended, and an action that ran with Return="ignore" -- the
     # node's registration among them -- leaves its failure only here.
     Write-Host '--- the package actions ---'
-    Select-String -Path $Path -Pattern 'FastCache\w+' |
-        Where-Object { $_.Line -match 'Action (start|ended)|returned actual error|CustomAction|Error 1[0-9]{3}' } | ForEach-Object { $_.Line }
+    foreach ($line in @($lines -match 'FastCache\w+' -match 'Action (start|ended)|returned actual error|CustomAction|Error 1[0-9]{3}')) { Write-Host $line }
     Write-Host '--- the tail ---'
-    Select-String -Path $Path -Pattern `
-        'Action (start|ended)', 'CustomAction', 'ServiceControl', 'FastCache', 'returned actual error',
-        'Note: 1: 1(4|7)[0-9][0-9]', 'Installation (success|failed)', 'error' |
-        Select-Object -Last 60 | ForEach-Object { $_.Line }
+    $tail = 'Action (start|ended)|CustomAction|ServiceControl|FastCache|returned actual error|Note: 1: 1(4|7)[0-9][0-9]|Installation (success|failed)|error'
+    foreach ($line in @($lines -match $tail | Select-Object -Last 60)) { Write-Host $line }
+}
+
+# How many RESTART MANAGER lines of one verbose log are printed. A transaction with a Restart Manager
+# session logs a handful (opened, the shutdown mode, each application it shuts down or restarts,
+# closed), and 0.3.0's nested removal logs its own after the outer package's, so the cap stands well
+# above what one upgrade writes; a log that exceeds it says so rather than ending silently.
+$script:RestartManagerLineCap = 100
+
+# The RESTART MANAGER lines of a verbose log, every one up to @p Cap. PR 1634's first print took the
+# first FOUR, which are the outer package's own lines, and cut 0.3.0's nested session that the print
+# was cited for. A pure function over the lines.
+#
+# @param Lines The log's lines.
+# @param Cap The most lines returned.
+# @return Lines, the lines (trimmed, in log order), and Omitted, how many matching lines the cap cut.
+function Get-MsiRestartManagerLines([string[]] $Lines, [int] $Cap = $script:RestartManagerLineCap) {
+    $all = @($Lines -match 'RESTART MANAGER' | ForEach-Object { $_.Trim() })
+    return [pscustomobject]@{ Lines = @($all | Select-Object -First $Cap); Omitted = [Math]::Max(0, $all.Count - $Cap) }
+}
+
+# Prints a verbose log's RESTART MANAGER lines, each behind @p Prefix, and says when the cap cut some.
+#
+# @param Path The log.
+# @param Prefix Put before each line.
+function Show-MsiRestartManagerLines([string] $Path, [string] $Prefix = '  log: ') {
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Host "$Prefix$Path was not written"; return }
+    $found = Get-MsiRestartManagerLines @(Get-Content -LiteralPath $Path)
+    if ($found.Lines.Count -eq 0) { Write-Host "${Prefix}no line names RESTART MANAGER"; return }
+    foreach ($line in $found.Lines) { Write-Host "$Prefix$line" }
+    if ($found.Omitted -gt 0) { Write-Host "${Prefix}TRUNCATED: $($found.Omitted) more RESTART MANAGER line(s) past the cap of $script:RestartManagerLineCap" }
+}
+
+# The time of day each line of a verbose log was written, carried forward to the lines that state
+# none (a property dump, a continuation). Windows Installer stamps its own records
+# `MSI (s) (D8:AC) [13:31:46:577]:` and an action's `Action start 13:31:46: <name>.` in the HOST's
+# local time and without a date, so a time of day is all a line can be placed by. A pure function.
+#
+# @param Lines The log's lines.
+# @return One TimeSpan per line, or $null for the lines before the first stamp.
+function Get-MsiLogTimeOfDay([string[]] $Lines) {
+    $current = $null
+    foreach ($line in $Lines) {
+        if ($line -match '\[(\d{1,2}):(\d{2}):(\d{2}):(\d{3})\]:') {
+            $current = [TimeSpan]::new(0, [int] $Matches[1], [int] $Matches[2], [int] $Matches[3], [int] $Matches[4])
+        } elseif ($line -match '^Action (start|ended) (\d{1,2}):(\d{2}):(\d{2}):') {
+            $current = [TimeSpan]::new([int] $Matches[2], [int] $Matches[3], [int] $Matches[4])
+        }
+        , $current
+    }
+}
+
+# What a verbose log was doing around each of @p Times: the actions starting and ending, the service
+# control operations, the custom actions, the product's messages, the start of a nested product
+# (`Running product`, how RemoveExistingProducts' removal of the old product opens in the same log),
+# and every RESTART MANAGER line, from @p BeforeSeconds before a time to @p AfterSeconds after it.
+# The windows of findings close together merge, and each line is returned once, in log order. A pure
+# function over the lines, so the self-test drives it.
+#
+# @param Lines The log's lines.
+# @param Times The instants, as the log's clock reads them: the host's LOCAL time of day.
+# @param BeforeSeconds How far before each instant a line may be.
+# @param AfterSeconds How far after it.
+# @param Cap The most lines returned.
+# @return Lines and Omitted, as Get-MsiRestartManagerLines'.
+function Get-MsiLinesAround {
+    param(
+        [string[]] $Lines = @(),
+        [TimeSpan[]] $Times = @(),
+        [int] $BeforeSeconds = 30,
+        [int] $AfterSeconds = 5,
+        [int] $Cap = 200
+    )
+    $interesting = 'Action (start|ended)|Doing action:|Executing op: (ServiceControl|ActionStart|CustomAction)|ServiceControl|CustomAction|Product:|Running product|RESTART MANAGER|Windows Installer (installed|removed|reconfigured)'
+    $clock = @(Get-MsiLogTimeOfDay $Lines)
+    $day = [TimeSpan]::FromDays(1).Ticks
+    $kept = @(foreach ($index in @(0..($Lines.Count - 1) | Where-Object { $Lines.Count -gt 0 })) {
+            if ($null -eq $clock[$index] -or $Lines[$index] -notmatch $interesting) { continue }
+            foreach ($time in $Times) {
+                # Signed distance on a 24-hour circle, so a window across midnight still matches.
+                $ticks = (($clock[$index].Ticks - $time.Ticks) % $day + $day + $day / 2) % $day - $day / 2
+                if ($ticks -ge -[TimeSpan]::FromSeconds($BeforeSeconds).Ticks -and $ticks -le [TimeSpan]::FromSeconds($AfterSeconds).Ticks) {
+                    $Lines[$index].Trim()
+                    break
+                }
+            }
+        })
+    return [pscustomobject]@{ Lines = @($kept | Select-Object -First $Cap); Omitted = [Math]::Max(0, $kept.Count - $Cap) }
+}
+
+# What a transaction's verbose log says around its findings: every RESTART MANAGER line, then the
+# actions around each finding's time. Shown when a judgement refuses, because a finding names an
+# instant and the log alone says what Windows Installer was doing then.
+#
+# @param Path The log.
+# @param Findings Get-TransactionServiceVerdict's records, each with a UTC Time.
+function Show-MsiLogAroundFindings([string] $Path, [object[]] $Findings) {
+    Write-Host "===== $Path around the findings ====="
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Host "no log at $Path"; return }
+    $lines = @(Get-Content -LiteralPath $Path)
+    Write-Host "--- every RESTART MANAGER line (at most $script:RestartManagerLineCap) ---"
+    Show-MsiRestartManagerLines -Path $Path -Prefix ''
+    $times = @($Findings | ForEach-Object { $_.Time.ToLocalTime().TimeOfDay } | Sort-Object -Unique)
+    $around = Get-MsiLinesAround -Lines $lines -Times $times
+    Write-Host "--- the actions from 30 s before to 5 s after each finding (local $(@($times | ForEach-Object { $_.ToString('hh\:mm\:ss\.fff') }) -join ', ')) ---"
+    foreach ($line in $around.Lines) { Write-Host $line }
+    if ($around.Lines.Count -eq 0) { Write-Host 'no action, service operation or Restart Manager line in those windows' }
+    if ($around.Omitted -gt 0) { Write-Host "TRUNCATED: $($around.Omitted) more line(s) in those windows" }
 }
 
 # Who listens on @p Port and which of this package's service processes are alive: the holder of
@@ -965,13 +1077,9 @@ function Invoke-Msiexec {
     Write-Host "$What exited $($p.ExitCode)"
     if ($Notice.ContainsKey($p.ExitCode)) { Write-Host "::notice::$What exited $($p.ExitCode): $($Notice[$p.ExitCode])" }
     # What the verbose log says Restart Manager did, SHOWN and not judged: the line's wording is not
-    # pinned anywhere this module can read, so a pattern asserted on it would be a guess.
-    if (-not (Test-Path -LiteralPath $logPath)) { Write-Host "  log: $logPath was not written" }
-    else {
-        $restartManager = @(Select-String -LiteralPath $logPath -Pattern 'RESTART MANAGER' | Select-Object -First 4)
-        if ($restartManager.Count) { $restartManager | ForEach-Object { Write-Host "  log: $($_.Line.Trim())" } }
-        else { Write-Host '  log: no line names RESTART MANAGER' }
-    }
+    # pinned anywhere this module can read, so a pattern asserted on it would be a guess. Every line,
+    # up to the cap: the first four were the outer package's own, and cut a nested removal's session.
+    Show-MsiRestartManagerLines -Path $logPath
     Write-Host (Invoke-TransactionJudgement -Transaction $script:LastMsiTransaction)
 }
 
@@ -1268,7 +1376,7 @@ function Get-ServiceControlEvents {
 # @param NotRunning The services the expectation leaves not running: none may be STARTED.
 # @param MayTerminate The services whose unexpected termination the expectation allows.
 # @return One finding per unexpected termination and per start of a NotRunning service, each with a
-#         Kind ('Termination' or 'Start') and a Text naming the service, the event id or process, the
+#         Kind ('Termination' or 'Start'), its Time (UTC) and a Text naming the service, the event id or process, the
 #         time and the message; NOTHING when there is none (wrap the call in @() to count it).
 function Get-TransactionServiceVerdict {
     param(
@@ -1281,15 +1389,15 @@ function Get-TransactionServiceVerdict {
         [string[]] $MayTerminate = @()
     )
     $format = { param([datetime] $t) $t.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture) }
-    $finding = { param([string] $kind, [string] $text) [pscustomobject]@{ Kind = $kind; Text = $text } }
+    $finding = { param([string] $kind, [datetime] $time, [string] $text) [pscustomobject]@{ Kind = $kind; Time = $time; Text = $text } }
     $ours = @($Events | Where-Object { $_.Time -ge $StartedUtc -and $script:ServiceDisplayNames.Contains($_.Service) } | Sort-Object Time)
     foreach ($record in $ours) {
         if ($record.Id -notin $script:UnexpectedTerminationEvents -or $record.Service -in $MayTerminate) { continue }
-        & $finding 'Termination' "$($record.Service) terminated unexpectedly during '$What': event $($record.Id) at $(& $format $record.Time): $($record.Message)"
+        & $finding 'Termination' $record.Time "$($record.Service) terminated unexpectedly during '$What': event $($record.Id) at $(& $format $record.Time): $($record.Message)"
     }
     foreach ($name in $NotRunning) {
         foreach ($record in @($ours | Where-Object { $_.Id -eq 7036 -and $_.Service -eq $name -and $_.State -eq 'Running' })) {
-            & $finding 'Start' "$name, which the expectation leaves not running, was started during '$What': event 7036 at $(& $format $record.Time): $($record.Message)"
+            & $finding 'Start' $record.Time "$name, which the expectation leaves not running, was started during '$What': event 7036 at $(& $format $record.Time): $($record.Message)"
         }
         $before = if ($Baseline.ContainsKey($name)) { [int] $Baseline[$name] } else { 0 }
         $strays = @($Observed | Where-Object { $_.Service -eq $name -and $_.ProcessId -gt 0 -and $_.ProcessId -ne $before } |
@@ -1297,7 +1405,7 @@ function Get-TransactionServiceVerdict {
         foreach ($stray in $strays) {
             $first = $stray.Group[0]
             $was = if ($before -gt 0) { "it ran as process $before when the transaction began" } else { 'it was not running when the transaction began' }
-            & $finding 'Start' "$name, which the expectation leaves not running, was started during '$What': process $($first.ProcessId) seen $($first.State) at $(& $format $first.Time), $($stray.Count) time(s); $was"
+            & $finding 'Start' $first.Time "$name, which the expectation leaves not running, was started during '$What': process $($first.ProcessId) seen $($first.State) at $(& $format $first.Time), $($stray.Count) time(s); $was"
         }
     }
 }
@@ -1340,7 +1448,10 @@ function Invoke-TransactionJudgement {
     $findings = @(Get-TransactionServiceVerdict -What $Transaction.What -StartedUtc $Transaction.StartedUtc -Events $events `
             -Observed $Transaction.Observed -Baseline $Transaction.Baseline -NotRunning $expectation.NotRunning -MayTerminate $expectation.MayTerminate)
     if ($findings.Count -gt 0) {
-        if ($Transaction.Log) { Show-MsiLog $Transaction.Log }
+        if ($Transaction.Log) {
+            Show-MsiLog $Transaction.Log
+            Show-MsiLogAroundFindings -Path $Transaction.Log -Findings $findings
+        }
         Show-PortHolders 6674
         $kinds = @($findings | ForEach-Object Kind | Sort-Object -Unique)
         $hints = @(
@@ -2009,6 +2120,58 @@ function Invoke-MsiServiceTableSelfTest {
     }
     Pass 'failure lines: a clean log reports nothing'
 
+    # The RESTART MANAGER lines: every one up to the cap, and the cut counted. The first four are the
+    # four PR 1634's CI printed; the nested removal's session after them is what a cap of four cut.
+    $restartLog = @(
+        'MSI (s) (D8:0C) [13:31:45:209]: RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property; Windows Installer will use the built-in FilesInUse functionality.',
+        'MSI (s) (D8:AC) [13:31:46:577]: RESTART MANAGER: Session opened.', 'Property(S): noise',
+        'MSI (s) (D8:AC) [13:31:46:717]: RESTART MANAGER: Will attempt to shut down and restart applications in no UI modes.',
+        'MSI (c) (80:EC) [13:31:46:720]: RESTART MANAGER: Session opened.',
+        'MSI (s) (D8:AC) [13:31:47:001]: RESTART MANAGER: Successfully shut down all applications in the service''s session that held files in use.',
+        'MSI (s) (D8:AC) [13:32:20:100]: RESTART MANAGER: Restarted the applications.')
+    $found = Get-MsiRestartManagerLines $restartLog
+    if ($found.Lines.Count -ne 6 -or $found.Omitted -ne 0 -or $found.Lines[-1] -notmatch 'Restarted the applications') {
+        throw "restart manager lines: read $($found.Lines.Count), $($found.Omitted) omitted: $($found.Lines -join ' | ')"
+    }
+    Pass 'restart manager lines: every line is returned, the ones past the fourth included'
+    $found = Get-MsiRestartManagerLines $restartLog -Cap 4
+    if ($found.Lines.Count -ne 4 -or $found.Omitted -ne 2) { throw "restart manager lines: a cap of 4 returned $($found.Lines.Count), $($found.Omitted) omitted" }
+    Pass 'restart manager lines: a cap returns that many and counts what it cut'
+
+    # The log's clock: Windows Installer's own stamp and an action's, carried forward to a line with
+    # none, and nothing before the first stamp.
+    $clock = @(Get-MsiLogTimeOfDay @('=== Verbose logging started ===', 'MSI (s) (D8:AC) [13:31:46:577]: Doing action: X', 'Property(S): P = 1',
+            'Action start 9:05:07: InstallValidate.'))
+    if ($clock.Count -ne 4 -or $null -ne $clock[0] -or $clock[1] -ne [TimeSpan]::new(0, 13, 31, 46, 577) -or $clock[2] -ne $clock[1] -or
+        $clock[3] -ne [TimeSpan]::new(9, 5, 7)) {
+        throw "log clock: read [$($clock -join ', ')]"
+    }
+    Pass 'log clock: both stamps are read, carried to unstamped lines, and absent before the first'
+
+    # The lines around a finding: an action, a service operation, a Restart Manager line and a nested
+    # product's start inside the window; noise inside it, and an action outside it, are not; two
+    # findings' windows merge; and a window across midnight still matches.
+    $around = @(
+        'MSI (s) (D8:AC) [13:31:40:000]: Doing action: InstallInitialize',
+        'MSI (s) (D8:AC) [13:32:00:000]: Running product ''{FDCDAB73-40AF-4EDA-9340-7C33986C3207}'' with elevated privileges: Product is assigned.',
+        'Action start 13:32:01: InstallValidate.', 'Property(S): noise',
+        'MSI (s) (D8:AC) [13:32:19:900]: Executing op: ServiceControl(,Name=FastCached,Action=1,Wait=0,)',
+        'MSI (s) (D8:AC) [13:32:20:100]: RESTART MANAGER: Restarted the applications.',
+        'MSI (s) (D8:AC) [13:32:21:000]: Note: 1: 2205 2:  3: Error',
+        'MSI (s) (D8:AC) [13:32:40:000]: Product: fastcached -- Installation completed successfully.',
+        'MSI (s) (D8:AC) [00:00:02:000]: Doing action: AfterMidnight')
+    $got = Get-MsiLinesAround -Lines $around -Times @([TimeSpan]::new(0, 13, 32, 20, 306), [TimeSpan]::new(0, 13, 32, 24, 585))
+    if ($got.Omitted -ne 0 -or ($got.Lines -join '|') -notmatch '^MSI .*Running product .*\|Action start 13:32:01: InstallValidate\.\|.*ServiceControl\(,Name=FastCached.*\|.*RESTART MANAGER: Restarted the applications\.$') {
+        throw "lines around: kept [$($got.Lines -join ' | ')]"
+    }
+    Pass 'lines around: the actions, service operations and Restart Manager lines in the window, once, in log order'
+    $got = Get-MsiLinesAround -Lines $around -Times @([TimeSpan]::new(23, 59, 58)) -BeforeSeconds 1 -AfterSeconds 5
+    if (($got.Lines -join '|') -notmatch '^MSI .*Doing action: AfterMidnight$') { throw "lines around: across midnight kept [$($got.Lines -join ' | ')]" }
+    Pass 'lines around: a window across midnight matches the next day''s first seconds'
+    $got = Get-MsiLinesAround -Lines $around -Times @([TimeSpan]::new(0, 13, 32, 20)) -Cap 2
+    if ($got.Lines.Count -ne 2 -or $got.Omitted -ne 2) { throw "lines around: a cap of 2 kept $($got.Lines.Count), $($got.Omitted) omitted" }
+    Pass 'lines around: a cap keeps that many and counts what it cut'
+
     # How the node's service reaches its state, over REAL access lists and under this module's strict
     # mode, which is where the inline version threw (round 6, C1): ONE entry naming the service is
     # exactly the list the install produces, and `.Count` on that lone pipeline result was an
@@ -2280,6 +2443,41 @@ function Invoke-MsiServiceTableSelfTest {
         }
     }
     Pass 'judgement: a termination alone names no Restart Manager cause'
+
+    # A refusal SHOWS the transaction's log: what Show-MsiLog prints reaches the host even from inside
+    # a judgement whose output its caller captures and whose throw discards that output (PR 1634's CI
+    # printed three empty sections that way), and every RESTART MANAGER line and the actions around
+    # each finding follow it. The log is UTF-16, and its stamps are the findings' instants on this
+    # host's local clock, as Windows Installer writes them.
+    $stamp = { param([int] $second) $t0.AddSeconds($second).ToLocalTime().ToString('HH:mm:ss:fff', [Globalization.CultureInfo]::InvariantCulture) }
+    $judgedLog = Join-Path ([IO.Path]::GetTempPath()) ('msi-service-table-' + [guid]::NewGuid().ToString('N') + '.log')
+    Set-Content -LiteralPath $judgedLog -Encoding Unicode -Value @(
+        "MSI (s) (D8:0C) [$(& $stamp 0)]: RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property; Windows Installer will use the built-in FilesInUse functionality.",
+        "MSI (s) (D8:AC) [$(& $stamp 1)]: RESTART MANAGER: Session opened.",
+        "MSI (s) (D8:AC) [$(& $stamp 1)]: RESTART MANAGER: Will attempt to shut down and restart applications in no UI modes.",
+        "MSI (c) (80:EC) [$(& $stamp 1)]: RESTART MANAGER: Session opened.",
+        "MSI (s) (D8:AC) [$(& $stamp 2)]: RESTART MANAGER: Shut down the nested session's applications.",
+        "MSI (s) (D8:AC) [$(& $stamp 32)]: Doing action: FastCacheNodeStartService",
+        "MSI (s) (D8:AC) [$(& $stamp 33)]: RESTART MANAGER: Restarted FastCached.",
+        "MSI (s) (D8:AC) [$(& $stamp 38)]: Product: fastcached -- Installation completed successfully.")
+    try {
+        $judged = & $record 'NodeSelected' '' 5 0 @()
+        $judged.Log = $judgedLog
+        # Invoke-Msiexec's own shape: the judgement's output captured as Write-Host's argument.
+        $shown = @(& {
+                try { Write-Host (Invoke-TransactionJudgement -Transaction $judged -ReadEvents { @(& $termination 7031 34 'FastCached') }) } catch { 'refused' }
+            } 6>&1 | ForEach-Object { "$_" })
+        if ($shown -notcontains 'refused') { throw "log on refusal: the judgement did not refuse ($($shown.Count) line(s))" }
+        $text = $shown -join "`n"
+        foreach ($want in @('--- the tail ---\n(MSI [^\n]*\n)*MSI [^\n]*Doing action: FastCacheNodeStartService\n', 'RESTART MANAGER: Shut down the nested session''s applications',
+                '--- the actions from 30 s before to 5 s after each finding .*---\n.*Doing action: FastCacheNodeStartService\n.*RESTART MANAGER: Restarted FastCached\.\n.*Product: fastcached -- Installation completed successfully\.')) {
+            if ($text -notmatch $want) { throw "log on refusal: nothing shown matches '$want' in:`n$text" }
+        }
+        if (@(Show-MsiLog $judgedLog 6>$null).Count -ne 0) { throw 'log on refusal: Show-MsiLog wrote to the output stream' }
+        Pass 'log on refusal: the log reaches the host from inside a captured judgement, with every RESTART MANAGER line and the actions around each finding'
+    } finally {
+        Remove-Item -LiteralPath $judgedLog -Force -ErrorAction SilentlyContinue
+    }
     foreach ($row in @(
             @{ Case = 'a rollback names its expectation and its reason, and judges no start'; Leaves = ''; Expect = 'RollsBack'; Events = @(); Failed = 0
                Match = "against expectation RollsBack -- the transaction fails on purpose.*no start judged; 7036 unchecked" }
@@ -2336,7 +2534,7 @@ function Invoke-MsiServiceTableSelfTest {
     }
     Pass "watch: a failed observation is counted ($($watched.FailedPolls) round(s)) and the watch goes on to the process's exit"
 
-    $expectedCases = 144
+    $expectedCases = 151
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -2345,6 +2543,7 @@ function Invoke-MsiServiceTableSelfTest {
 
 Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert-ServiceState, Assert-ServiceTable,
     Get-MsiProperty, Get-MsiCustomActionType, Get-InstalledProductCodes, Assert-InstalledProduct, Show-MsiLog, Invoke-Msiexec, Assert-MsiLog,
+    Get-MsiRestartManagerLines, Show-MsiRestartManagerLines, Get-MsiLogTimeOfDay, Get-MsiLinesAround, Show-MsiLogAroundFindings,
     Get-MsiActionRanPattern, Get-ServiceStabilityVerdict, Get-UpgradeVersionVerdict, Remove-FastCacheMachineState,
     Assert-NodeStatePrivate, Get-NodeServiceAccessVerdict, Get-DirectoryOwnerVerdict, Get-NodeFirewallVerdict, Assert-NodeFirewall,
     Get-NodeFirewallScopeVerdict, Assert-NodeFirewallScope, Get-NodeRegistrationArgumentVerdict,
