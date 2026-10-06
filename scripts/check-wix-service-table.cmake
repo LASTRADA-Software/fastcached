@@ -35,6 +35,12 @@
 # stopped while running is started again, and each remembered value is written
 # back or deleted as it was found -- so a failed step leaves nothing behind.
 #
+# One row is a UNIQUENESS pin rather than an element: its opener is the bare
+# `Before="InstallFinalize"`, so rule 1 requires that text exactly once, and the
+# element it opens to be the forced failure's. FastCacheFailForTest is therefore the
+# ONE action scheduled there, behind every other script action, which is what
+# "a failure there rolls back everything the script did" rests on (#1629).
+#
 # What it does NOT see: whether Windows Installer evaluates a condition the way it
 # reads, and anything about sequencing beyond the After= values pinned below. The
 # `Package (Windows .msi)` job is the only thing that runs the package. This fails
@@ -319,7 +325,16 @@ set(_table [=[
 <Custom Action="FastCacheClearRollbackState"|/>|Before="FastCacheUndoRollbackState"
 <CustomAction Id="FastCacheClearRollbackState"|/>|Directory="System64Folder"
 <CustomAction Id="FastCacheDiscardRollbackState"|/>|reg.exe" delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
-<CustomAction Id="FastCacheDiscardRollbackState"|/>|Execute="deferred"
+<CustomAction Id="FastCacheDiscardRollbackState"|/>|Execute="commit"
+<CustomAction Id="FastCacheDiscardRollbackState"|/>|Directory="System64Folder"
+<CustomAction Id="FastCacheFailForTest"|/>|Execute="deferred"
+<CustomAction Id="FastCacheFailForTest"|/>|Return="check"
+<CustomAction Id="FastCacheFailForTest"|/>|exit 1603
+<CustomAction Id="FastCacheFailForTest"|/>|Impersonate="no"
+<Custom Action="FastCacheFailForTest"|/>|Before="InstallFinalize"
+Before="InstallFinalize"|/>|FASTCACHE_FAIL_FOR_TEST = "1"
+<Custom Action="FastCacheFailForTest"|/>|FASTCACHE_FAIL_FOR_TEST = "1"
+<Property Id="FASTCACHE_FAIL_FOR_TEST"|/>|Secure="yes"
 <Custom Action="FastCacheDiscardRollbackState"|/>|After="FastCacheNodeStartService"
 <CustomAction Id="FastCachedRestartAfterStop"|/>|/v FastCachedWasRunning
 <CustomAction Id="FastCachedRestartAfterStop"|/>|sc.exe start FastCached"

@@ -41,7 +41,11 @@
 #      which runs in reverse, starts it only after InstallFiles' rollback restored the files. That
 #      holds for a maintenance transaction; in an upgrade the old files return only with
 #      RemoveExistingProducts' rollback, after the restarts, and no mark is written there to start
-#      anything (StopServices has stopped both services first).
+#      anything (StopServices has stopped both services first);
+#  11. the rollback state is discarded only once the transaction has SUCCEEDED: every action that
+#      deletes it is a commit action, a rollback action, or a stated deferred row -- and at least one
+#      SCHEDULED commit action does, so the step cannot pass with the discard gone. The deleters are
+#      found by ONE spelling, and the step fails OPEN for any other (stated at the step).
 # Every other action changes a service, the registry or the firewall, and is never started here.
 #
 # Usage: pwsh -NoProfile -File scripts/check-msi-custom-actions.ps1 -SourceDir <repository root>
@@ -61,6 +65,7 @@ $AnchorPhases = @{
     'Before:InstallFiles' = 'RootAbsent'   # after RemoveExistingProducts, before the files
     'After:InstallFiles'  = 'RootPresent'
     'Before:RemoveFiles'  = 'RootPresent'  # an uninstall, while the files are still there
+    'Before:InstallFinalize' = 'RootAbsent' # an uninstall has removed the root by then; an action here must not need it
 }
 
 # The actions that only READ, and are therefore started for real. Each names the processes its
@@ -82,6 +87,7 @@ $StandardSequence = @{
     RemoveFiles            = 3500
     InstallFiles           = 4000
     WriteRegistryValues    = 5000
+    InstallFinalize        = 6600
 }
 
 $failures = [System.Collections.Generic.List[string]]::new()
@@ -436,6 +442,54 @@ foreach ($action in $starters) {
 }
 if ($failures.Count -eq $failuresBeforeStarters) {
     Pass "all $($starters.Count) rollback actions that start a service are scheduled before InstallFiles, so they run after its rollback restored the files"
+}
+
+# 11. The rollback state is discarded only once the transaction has SUCCEEDED (#1629). A deferred
+# discard runs inside the script, so any failure after it -- a later checked action, a standard
+# action, the leftover deletes -- rolls back with the state already gone, and every exact restore
+# then reads a missing key and does nothing (Return="ignore"). A commit action runs only after the
+# whole script succeeded, and never in a rollback. The set of deleters is DERIVED from the command
+# lines, so a new one is a finding rather than invisible; each deferred one is a row with its reason.
+#
+# THE BLIND SPOT, and the direction it fails in: the derivation recognises ONE spelling, `reg.exe
+# delete HKLM\SOFTWARE\fastcached\InstallerRollback` naming the whole key, the way every deleter in the
+# fragment writes it today. A deleter spelled any other way -- PowerShell's Remove-Item, the
+# `HKEY_LOCAL_MACHINE\` form, a quoted key path, a delete of a SUBKEY, or a <RemoveRegistryKey>
+# element -- is not in the set at all, so this step fails OPEN for it: a deferred discard written
+# that way passes unseen. The positive control below does not close that; it only makes the step
+# refuse to pass when it found no commit-phase discard to judge.
+$DeferredStateDeleters = @{
+    FastCacheClearRollbackState  = 'empties the state BEFORE this transaction writes any, so an earlier transaction''s copy is never restored'
+    FastCacheRemoveRollbackState = 'an uninstall that is not an upgrade''s removal: no restore is armed in that transaction'
+}
+$deleters = @($actions | Where-Object { $_.ExeCommand -match 'reg\.exe"?\s+delete\s+HKLM\\SOFTWARE\\fastcached\\InstallerRollback(\s|$)' })
+if ($deleters.Count -eq 0) { Fail 'no action deletes the rollback state, so step 11 judged nothing' }
+$failuresBeforeDiscard = $failures.Count
+foreach ($action in $deleters) {
+    # Every arm is a stated decision: the default REFUSES unless a stated row allows it, so it is
+    # the guarded form of a table, never a catch-all that accepts.
+    switch ($action.Execute) {
+        'commit'   { continue }
+        'rollback' { continue } # the undo, run only by a failed transaction
+        default {
+            if (-not $DeferredStateDeleters.ContainsKey($action.Id)) {
+                Fail "$($action.Id) deletes the rollback state as a '$($action.Execute)' action: a failure after it rolls back with nothing to restore. Make it Execute=`"commit`" -- or, if it must delete BEFORE the transaction can succeed (as FastCacheClearRollbackState empties the previous transaction's copy), add a `$DeferredStateDeleters row stating why; making that one a commit action would break it."
+            }
+        }
+    }
+}
+foreach ($id in $DeferredStateDeleters.Keys) {
+    if (-not ($deleters | Where-Object { $_.Id -eq $id -and $_.Execute -eq 'deferred' })) { Fail "DeferredStateDeleters names $id, which is no longer a deferred deleter; delete the row" }
+}
+# The positive control: absence of a deferred discard is not the presence of a commit one. With the
+# discard deleted outright, every check above passes -- nothing deferred deletes the state -- while a
+# successful transaction leaves it behind. So the step also requires a SCHEDULED commit deleter.
+$discards = @($deleters | Where-Object { $_.Execute -eq 'commit' -and $schedule.ContainsKey($_.Id) })
+if ($discards.Count -eq 0) {
+    Fail 'no SCHEDULED commit action deletes the rollback state, so step 11 found no discard to judge and its pass would describe nothing: a successful transaction leaves the state behind. FastCacheDiscardRollbackState is the one expected, Execute="commit" with a Custom row.'
+}
+if ($failures.Count -eq $failuresBeforeDiscard) {
+    Pass "the rollback state is discarded only in the commit phase: $($deleters.Count) deleter(s) judged, $($discards.Count) scheduled commit discard(s) ($(@($discards | ForEach-Object Id) -join ', ')), $($DeferredStateDeleters.Count) deferred deleter(s) are stated rows"
 }
 
 # Positive controls: a walk that found nothing reports nothing wrong about it.

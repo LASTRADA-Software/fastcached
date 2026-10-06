@@ -71,6 +71,11 @@
     <!-- 1 = start fastcached when the install leaves it the only service. -->
     <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
 
+    <!-- 1 = fail the install last, for the CI rollback proof (#1629). Secure so
+         an un-elevated msiexec's value reaches the server-side sequence, which
+         drops a public property that is not in SecureCustomProperties. -->
+    <Property Id="FASTCACHE_FAIL_FOR_TEST" Secure="yes" />
+
     <!-- What the node registration is told. There is no scheduler to name: a
          node that serves registers where its formation record says, and is
          refused a typed one, so the node registers with no property at all.
@@ -871,10 +876,26 @@
                   Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
                   Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- The discard is a COMMIT action: it runs only after the whole script
+         succeeded and never in a rollback. A deferred one ran inside the
+         script, so any failure after it rolled back with the saved state
+         already deleted and every exact restore found nothing (#1629). -->
     <CustomAction Id="FastCacheDiscardRollbackState"
-                  Directory="INSTALL_ROOT"
+                  Directory="System64Folder"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; delete HKLM\SOFTWARE\fastcached\InstallerRollback /f /reg:64"
-                  Execute="deferred" Impersonate="no" Return="ignore" />
+                  Execute="commit" Impersonate="no" Return="ignore" />
+
+    <!-- A late, deliberate failure, for the CI step that proves a failed upgrade
+         restores the previous installation exactly (#1629). Shipped, not a test
+         build, so CI tests the package that ships. Only
+         FASTCACHE_FAIL_FOR_TEST="1" runs it; an administrator who sets it fails
+         their own install and nothing else. Scheduled LAST before
+         InstallFinalize, behind every other script action, so a rollback from
+         here exercises every rollback action we have. -->
+    <CustomAction Id="FastCacheFailForTest"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c exit 1603"
+                  Execute="deferred" Impersonate="no" Return="check" />
 
     <!-- And each remembered value as the transaction found it: written back
          when there was one, deleted when there was none, so a failed
@@ -1090,6 +1111,8 @@
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheNodeStartService" After="FastCacheNodeStopForRestart"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <!-- A COMMIT action (see its definition): the saved state outlives every
+           script action, so a failure anywhere in the script restores from it. -->
       <Custom Action="FastCacheDiscardRollbackState" After="FastCacheNodeStartService"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
@@ -1116,6 +1139,10 @@
               Condition="(&amp;CM_C_Daemon = 2) AND (!CM_C_Daemon = 3) AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="FastCacheRemoveRollbackState" After="FastCachedUninstallService"
               Condition="REMOVE = &quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+
+      <!-- The last script action of all: see its definition. -->
+      <Custom Action="FastCacheFailForTest" Before="InstallFinalize"
+              Condition="FASTCACHE_FAIL_FOR_TEST = &quot;1&quot;" />
     </InstallExecuteSequence>
 
   </CPackWiXFragment>

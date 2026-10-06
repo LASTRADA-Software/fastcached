@@ -686,6 +686,29 @@ readable and silently ignored. Every rule below has already been one of them.
     custom action runs, so a failed upgrade from 0.3.0 leaves both services unregistered. That is
     not refused: an administrator who disabled rollback opted out of it, and the runbook names
     running the upgrade again as the remedy.
+  - **The rollback state is discarded in the COMMIT phase** (`FastCacheDiscardRollbackState`,
+    `Execute="commit"`), never deferred: a deferred discard runs inside the script, so any failure
+    after it -- a later checked action, a standard action, the leftover deletes -- rolls back with
+    the saved state already deleted and every exact restore reads a missing key and does nothing
+    (#1629). A commit action runs only after the whole script succeeded and never in a rollback.
+    Step 11 of `msi-custom-action-commands` derives the actions that delete the key from their
+    command lines -- those spelling `reg.exe delete HKLM\SOFTWARE\fastcached\InstallerRollback`
+    on the whole key, the one spelling the fragment uses -- refuses a deferred one that is not a
+    stated `$DeferredStateDeleters` row, and refuses to pass unless a SCHEDULED commit action is
+    among them. It fails OPEN for a deleter spelled any other way (`Remove-Item`,
+    `HKEY_LOCAL_MACHINE\`, a quoted path, a subkey, a `<RemoveRegistryKey>` element), as its own
+    text states. The CI step `A failed upgrade restores the previous installation exactly` proves
+    the behaviour end to end, with BOTH controls: the same failed upgrade on a copy whose exact
+    restores are switched off, and on one whose discard is deferred again, must each differ in
+    fastcached's registration. With rollback DISABLED
+    no commit action runs either, so the key survives that transaction; the next transaction's
+    `FastCacheClearRollbackState` empties it before it writes any.
+  - **`FASTCACHE_FAIL_FOR_TEST="1"` is a shipped, property-gated late failure**
+    (`FastCacheFailForTest`, `Before="InstallFinalize"`, so behind every other script action): it
+    exists for the CI step that proves a failed upgrade restores the previous installation
+    exactly, and it is shipped rather than built apart so CI tests the package that ships. Only
+    the exact value `1` runs it; an administrator who sets it fails their own install and nothing
+    else.
   - A feature an upgrade no longer installs has its leftover registration deleted by the NEW
     product (`sc delete`, the `DeleteLeftover` rows), because the old half never removes one and
     the new product has no binary left to run `--uninstall-service` with. Only a registration
