@@ -767,6 +767,10 @@ class RacingReaderGuard final: public INodeKeyFileGuard
     {
         return _real.WritersOf(directory);
     }
+    [[nodiscard]] DirectoryWriters WritersBeyondOwner(std::filesystem::path const& directory) override
+    {
+        return _real.WritersBeyondOwner(directory);
+    }
 
     [[nodiscard]] bool IsLink(std::filesystem::path const& entry) override
     {
