@@ -13,13 +13,20 @@
 #include <array>
 #include <cassert>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <format>
 #include <memory>
 #include <optional>
+#include <ranges>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Node
 {
@@ -287,6 +294,11 @@ DirectoryWriters FileTrustNodeKeyGuard::WritersOf(std::filesystem::path const& d
     return DirectoryWritersOf(directory);
 }
 
+DirectoryWriters FileTrustNodeKeyGuard::WritersBeyondOwner(std::filesystem::path const& directory)
+{
+    return DirectoryWritersBeyondOwner(directory);
+}
+
 bool FileTrustNodeKeyGuard::IsLink(std::filesystem::path const& entry)
 {
     return IsLinkEntry(entry);
@@ -306,6 +318,197 @@ std::expected<bool, std::error_code> FileTrustNodeKeyGuard::OthersMayWrite(std::
 SecretExposure FileTrustNodeKeyGuard::Protect(std::filesystem::path const& file)
 {
     return SecureSecretFileForOwner(file);
+}
+
+std::optional<std::string> NodeServiceAccountOf(NodeConfig const& cfg)
+{
+    if (cfg.serviceName.empty())
+        return std::nullopt;
+    auto spec = ServiceSpec {};
+    spec.serviceName = cfg.serviceName;
+    spec.windowsLogon = NodeWindowsLogon;
+    return WindowsLogonName(spec);
+}
+
+namespace
+{
+    /// No account beyond the caller's own and the administrators'.
+    /// @return Nothing.
+    [[nodiscard]] std::optional<std::string> NoAccount(NodeConfig const& /*cfg*/)
+    {
+        return std::nullopt;
+    }
+
+    /// The verbs whose use of the state directory is stated; anything else RUNS.
+    constexpr auto StateUses = std::to_array<StateUseRow>({
+        { .verb = "--print-surfaces",
+          .selected = &NodeConfig::printSurfaces,
+          .use = StateUse::Inspects,
+          .why = "renders and judges the resolved configuration and writes nothing: `NodeIdentityNeed` answers "
+                 "None for it, so no directory, key or id is created, and the formation record is read, never kept" },
+        { .verb = "--print-identity",
+          .selected = &NodeConfig::printIdentity,
+          .use = StateUse::Runs,
+          .why = "MINTS a key and an id into a directory that lacks them, so it writes there, and an administrator "
+                 "minting a key into a directory the service owns is what the strict set exists to refuse" },
+        { .verb = "--install-service",
+          .selected = &NodeConfig::installService,
+          .use = StateUse::Runs,
+          .why = "registers a service and mints the id it bakes in, into the directory it hands over" },
+    });
+
+    /// The trusted-owner set: every (caller, use) pair once.
+    constexpr auto OwnStateAccounts = std::to_array<OwnStateAccountRow>({
+        { .caller = JudgingCaller::Administrator,
+          .use = StateUse::Inspects,
+          .account = NodeServiceAccountOf,
+          .why = "a verb that writes nothing, run by an administrator: whoever can create a file the service's own "
+                 "SID owns -- that service, or a holder of the restore privilege, who could plant an "
+                 "Administrators-owned file anyway -- is trusted already, so the line is judged as the service runs it" },
+        { .caller = JudgingCaller::Administrator,
+          .use = StateUse::Runs,
+          .account = NoAccount,
+          .why = "a start writes into the directory -- a formation record, the Raft store -- beside a service that may "
+                 "be running, and an elevated process would act on what a deprivileged, network-facing account wrote" },
+        { .caller = JudgingCaller::Other,
+          .use = StateUse::Inspects,
+          .account = NoAccount,
+          .why = "a caller that is no administrator trusts no account it does not run as" },
+        { .caller = JudgingCaller::Other,
+          .use = StateUse::Runs,
+          .account = NoAccount,
+          .why = "the service itself, which is no administrator: its files are its own already, so nothing changes" },
+    });
+
+    /// How many rows of the set name @p caller and @p use.
+    /// @param caller Who judges.
+    /// @param use What the invocation does.
+    /// @return The count, which must be one.
+    [[nodiscard]] constexpr std::size_t RowsFor(JudgingCaller caller, StateUse use) noexcept
+    {
+        return static_cast<std::size_t>(
+            std::ranges::count_if(OwnStateAccounts, [caller, use](OwnStateAccountRow const& row) {
+                return row.caller == caller && row.use == use;
+            }));
+    }
+
+    static_assert(std::ranges::all_of(Enumerators<JudgingCaller>(),
+                                      [](JudgingCaller caller) {
+                                          return std::ranges::all_of(Enumerators<StateUse>(), [caller](StateUse use) {
+                                              return RowsFor(caller, use) == 1;
+                                          });
+                                      }),
+                  "the trusted-owner set holds exactly one row per (JudgingCaller, StateUse) pair");
+} // namespace
+
+std::span<StateUseRow const> StateUseRows() noexcept
+{
+    return StateUses;
+}
+
+StateUse StateUseOf(NodeConfig const& cfg) noexcept
+{
+    auto const* const row = core::findIfOrNull(StateUses, [&cfg](StateUseRow const& r) { return cfg.*r.selected; });
+    return row != nullptr ? row->use : StateUse::Runs;
+}
+
+std::span<OwnStateAccountRow const> OwnStateAccountRows() noexcept
+{
+    return OwnStateAccounts;
+}
+
+bool IsPerServiceSid(std::string_view id) noexcept
+{
+    constexpr std::string_view prefix = "S-1-5-80-";
+    constexpr std::ptrdiff_t separators = 4; // between five sub-authorities
+    if (!id.starts_with(prefix))
+        return false;
+    auto const rest = id.substr(prefix.size());
+    auto const digitsAndSeparators =
+        std::ranges::all_of(rest, [](char ch) { return ch == '-' || (ch >= '0' && ch <= '9'); });
+    return digitsAndSeparators && std::ranges::count(rest, '-') == separators && !rest.starts_with('-')
+           && !rest.ends_with('-') && !rest.contains("--");
+}
+
+std::vector<std::string> OwnStateAccountIds(JudgingCaller caller,
+                                            StateUse use,
+                                            NodeConfig const& cfg,
+                                            std::optional<std::string> (*idOf)(std::string const&))
+{
+    auto const* const row = core::findIfOrNull(
+        OwnStateAccounts, [caller, use](OwnStateAccountRow const& r) { return r.caller == caller && r.use == use; });
+    if (row == nullptr)
+        return {};
+    auto const id = row->account(cfg).and_then(idOf);
+    if (!id.has_value() || !IsPerServiceSid(*id))
+        return {};
+    return { *id };
+}
+
+std::string JudgeFromTheServiceSeat(std::string_view owner)
+{
+    return std::format("Ownership is judged from the account asking: if {} is the account this node's service runs "
+                       "as, judge it as that service, or with --print-surfaces as an administrator naming that "
+                       "service with --service-name, which counts the service's files as the node's own -- and "
+                       "nothing needs to change",
+                       owner);
+}
+
+OwnStateAccountsGuard::OwnStateAccountsGuard(INodeKeyFileGuard& inner, std::vector<std::string> ownIds):
+    _inner { inner },
+    _ownIds { std::move(ownIds) }
+{
+    std::erase_if(_ownIds, [](std::string const& id) { return id.empty(); });
+}
+
+SecretExposure OwnStateAccountsGuard::ExposureOf(std::filesystem::path const& file)
+{
+    return _inner.ExposureOf(file);
+}
+
+FileOwner OwnStateAccountsGuard::OwnerOf(std::filesystem::path const& file)
+{
+    auto owner = _inner.OwnerOf(file);
+    auto const own = owner.standing == FileOwnerStanding::Another && std::ranges::contains(_ownIds, owner.id);
+    owner.standing = own ? FileOwnerStanding::NamedAccount : owner.standing;
+    return owner;
+}
+
+DirectoryWriters OwnStateAccountsGuard::WritersOf(std::filesystem::path const& directory)
+{
+    // The directory's OWNER is promoted as a file's is -- only one the platform called foreign,
+    // whose id is in the set -- and then asked about everybody BESIDES it, so a directory the
+    // service owns and others may plant in is still refused.
+    auto const writers = _inner.WritersOf(directory);
+    auto const own =
+        writers == DirectoryWriters::ForeignOwner && std::ranges::contains(_ownIds, _inner.OwnerOf(directory).id);
+    return own ? _inner.WritersBeyondOwner(directory) : writers;
+}
+
+DirectoryWriters OwnStateAccountsGuard::WritersBeyondOwner(std::filesystem::path const& directory)
+{
+    return _inner.WritersBeyondOwner(directory);
+}
+
+bool OwnStateAccountsGuard::IsLink(std::filesystem::path const& entry)
+{
+    return _inner.IsLink(entry);
+}
+
+std::expected<bool, std::error_code> OwnStateAccountsGuard::OthersMayWrite(std::filesystem::path const& entry)
+{
+    return _inner.OthersMayWrite(entry);
+}
+
+SecretExposure OwnStateAccountsGuard::Protect(std::filesystem::path const& file)
+{
+    return _inner.Protect(file);
+}
+
+std::expected<void, Consensus::DirectorySyncFailure> OwnStateAccountsGuard::SyncDirectory(
+    std::filesystem::path const& directory)
+{
+    return _inner.SyncDirectory(directory);
 }
 
 bool RefusesKeyExposure(SecretExposure exposure, KeyMoment moment) noexcept
@@ -417,10 +620,23 @@ std::expected<void, NodeKeyRefusal> JudgeStateDirectory(std::filesystem::path co
     // its cluster with nothing but a `minted` line to say so.
     if (auto const writers = guard.WritersOf(stateDirectory); RefusesKeyDirectory(writers))
     {
+        // A directory another account OWNS names that owner and the seat that would judge it --
+        // never "remove it" for its owner alone: the service creates its own directory whenever it
+        // finds none, and then owns it.
+        auto const hint = writers == DirectoryWriters::ForeignOwner
+                              ? std::format("{} is owned by {}, which is neither the account judging it, an "
+                                            "administrative one, nor an account this judgement counts as the node's "
+                                            "own, and an owner can grant itself anything in it. {}. Only a directory "
+                                            "nobody but this node should have created -- a planted one -- is removed, "
+                                            "with what is in it",
+                                            stateDirectory.string(),
+                                            guard.OwnerOf(stateDirectory).name,
+                                            JudgeFromTheServiceSeat(guard.OwnerOf(stateDirectory).name))
+                              : DirectoryWritersHint(stateDirectory, writers);
         auto message = std::format("{}. It holds this node's identity key, so no key in it is trusted and none is "
-                                   "minted there until it is; if another account may have put {} there, remove the "
-                                   "file too",
-                                   DirectoryWritersHint(stateDirectory, writers),
+                                   "minted there until it is; if another account may have planted {} there, remove "
+                                   "the file too",
+                                   hint,
                                    NodeKeyFileName);
 
         // **The key's exposure is asked HERE, before the remedy is handed out.** Restricting the

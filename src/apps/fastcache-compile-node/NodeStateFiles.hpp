@@ -154,12 +154,15 @@ struct NodeStateFileRow
 /// only then the record and the remembered endpoints (`ReadKeptFormation`), so a record another
 /// account could have written is never read. A refusal carries `StateFileUnreadableHint`'s remedy
 /// for the record. The one reading `main` makes for every invocation, judged from the account
-/// running it; `--install-service` reads the record again after its handover, without the owner
-/// judgement whose answer depends on that account (`StateDirectoryFormationReader`).
+/// running it -- through @p guard, which carries the accounts that caller counts as the node's own
+/// (`OwnStateAccountsGuard`); `--install-service` reads the record again after its handover, without
+/// the owner judgement whose answer depends on that account (`StateDirectoryFormationReader`).
 /// @param stateDirectory The directory the node resolved (`ChosenStateDirectory`).
-/// @return What is kept, or why it cannot be read.
-[[nodiscard]] std::expected<KeptFormation, std::string> ReadStateDirectoryFormation(
-    std::filesystem::path const& stateDirectory);
+/// @param guard Who owns and who may write each entry, as this caller judges it.
+/// @return What is kept, or why it cannot be read and the step a start gives up at for it: the
+///         directory judgement's own (`StageOf` its fault), or `Formation` for the record.
+[[nodiscard]] std::expected<KeptFormation, FormationUnread> ReadStateDirectoryFormation(
+    std::filesystem::path const& stateDirectory, INodeKeyFileGuard& guard);
 
 /// Set aside every history file another account owns, or other accounts may write, where the
 /// histories are read.

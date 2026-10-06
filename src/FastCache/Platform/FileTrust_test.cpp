@@ -599,6 +599,43 @@ TEST_CASE("FileTrust: a file this process created is its own, and so is its scra
     CHECK(FastCache::DirectoryWritersOf(scratch / "absent") == FastCache::DirectoryWriters::Undetermined);
 }
 
+TEST_CASE("FileTrust: an owner's platform id is what an account resolves to", "[platform][filetrust][secret]")
+{
+    // `FileOwner::id` is what a caller's trusted-owner set compares against an account it resolved
+    // (`AccountIdOf`), never a name. Run through the production code on the real filesystem, with
+    // nothing outside a scratch directory and the operating system's own account database.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-owner-id" };
+    scratch.Write("mine", "x");
+    auto const owner = FastCache::FileOwnerOf(scratch / "mine");
+    REQUIRE(owner.standing == FastCache::FileOwnerStanding::ThisProcess);
+    CHECK(FastCache::FileOwnerOf(scratch / "absent").id.empty());
+    CHECK_FALSE(FastCache::AccountIdOf("").has_value());
+#if defined(_WIN32)
+    // The owner's SID, spelled as a SID, and the account it names resolves back to it.
+    CHECK(owner.id.starts_with("S-1-"));
+    CHECK(FastCache::AccountIdOf(owner.name) == std::optional { owner.id });
+    // A per-service virtual account that every Windows installation has: `NT SERVICE\TrustedInstaller`
+    // resolves to its well-known per-service SID, which is what the node's own service account resolves
+    // like. And one no service holds resolves to NOTHING, so trusting it trusts no file.
+    CHECK(FastCache::AccountIdOf("NT SERVICE\\TrustedInstaller")
+          == std::optional<std::string> { "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464" });
+    CHECK_FALSE(FastCache::AccountIdOf("NT SERVICE\\FastCacheNoServiceIsNamedThis").has_value());
+#else
+    // POSIX names no account for this: no service runs as a per-service virtual account there.
+    CHECK(owner.id == owner.name);
+    CHECK(owner.id.starts_with("uid "));
+    CHECK_FALSE(FastCache::AccountIdOf(owner.name).has_value());
+#endif
+}
+
+TEST_CASE("FileTrust: who besides a directory's owner may plant entries is asked apart from the owner",
+          "[platform][filetrust][secret]")
+{
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-beyond-owner" };
+    CHECK(FastCache::DirectoryWritersBeyondOwner(scratch.Path()) == FastCache::DirectoryWriters::OwnerOnly);
+    CHECK(FastCache::DirectoryWritersBeyondOwner(scratch / "absent") == FastCache::DirectoryWriters::Undetermined);
+}
+
 TEST_CASE("FileTrust: a link is judged as itself, never as what it points at", "[platform][filetrust][secret]")
 {
     // A DANGLING link is where the two readings disagree: following it finds nothing and answers

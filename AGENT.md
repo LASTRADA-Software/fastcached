@@ -304,16 +304,14 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   pasted `RunsWorker(c) &&`; the merged listener reads `FamilyRoutes`.
 - What a node holds back from compiles is what its tier **built**, never what a flag asked for, so
   capacity is derived *below* the tier startup. Which tiers cost RAM is a `StorageTierTable`
-  column, a present zero is *unbounded*, and a disk tier's key index is **a working set rather
-  than a store** (`storage.md`).
+  column, a present zero is *unbounded*, and a disk tier's key index is **a working set rather than a store** (`storage.md`).
 - A node SERVES while it identifies its toolchains: the cheap half at startup, the walk on the
   heartbeat thread's first round, registering NOTHING until the fingerprint is real;
   `ToolchainSurvey` travels beside the map with a deleted default constructor.
 - A probe that did not RUN is not one that answered nothing, and an identity built on one is
   neither served nor cached: the guard is `exitCode == NotSpawned`, never the count.
 - A reply's codec is chosen from what the OTHER end said it accepts, never from this end's list
-  against itself — `AvailableCodecs()`, never a literal — and a test must separate the two ends
-  **disagreeing**.
+  against itself — `AvailableCodecs()`, never a literal — and a test must separate the two ends **disagreeing**.
 - A stored value's text regions are canonicalized by **every** server on this wire, through the
   one `CanonicalStoredValue` beside `CompileValue`; retirement is a schema bump, never a sniff.
   - And by every **VERSION** of them, or the rule holds at no moment a fleet is actually in.
@@ -514,6 +512,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   forever, never derived from the machine** — not the hostname, not the OS machine-id even as a
   SEED. `--node-id` overrides and is recorded, `--raft-self=<host>` states the address, and the
   resolved value reaches every configuration this process builds.
+- **An administrator counts the node's OWN service account's state files as the node's only in a verb that WRITES
+  NOTHING** (`StateUseRows`, `OwnStateAccountRows`); a start keeps the strict set, and no remedy removes for an owner alone.
 - **The hostname is a fleet-page LABEL and decides nothing**, and it still passes the UTF-8 gate
   at `SchedulerService::Register`. **No prefix matching on ids.**
 - **A replicated setting must not decide where a node sends a CREDENTIAL** — refused BY NAME

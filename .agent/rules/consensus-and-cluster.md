@@ -2201,6 +2201,40 @@ right, because the wire now trusts it.
     point opened as itself), never through what they point at, and the node writes none. The histories answer
     `StartWithout` -- no state of a history file may keep a node from starting -- and are set
     aside where they are read (`SetAsideForeignHistory`): not read, never written over, WARNED.
+    **Whose files count as the node's own is a SET, and it depends on WHO ASKS AND WHAT FOR** (owner
+    ruling, 2026-10-06; limited by the controller to verbs that write nothing). Ownership is judged
+    from the account asking, so an elevated `--print-surfaces` over the running service's own
+    directory met every file the service wrote as "another account's" -- MEASURED on a healthy node,
+    rc=2, `mode: none` -- while the service judged the same files its own. An ADMINISTRATOR
+    (`IsAdministratorProcess`) running a verb that only INSPECTS the directory (`StateUseRows`, a
+    COLUMN: `--print-surfaces` alone; `--print-identity` MINTS an absent key and id, so it `Runs`, as
+    does anything else) counts a file -- and the
+    directory -- owned by the node's own per-service virtual account, `NT SERVICE\<--service-name>`
+    (`NodeServiceAccountOf`, off the `NodeWindowsLogon` the registration uses), as the node's. The
+    argument is NOT "only that account can create one": a holder of the restore privilege can set
+    any owner -- it is that whoever can set this owner could plant an Administrators-owned file
+    anyway, which is trusted already. **And the direction is an elevated process reading what a
+    deprivileged, network-facing account wrote**, the way an escalation travels -- accepted for a
+    verb that writes nothing, and for nothing that RUNS: a start, foreground or supervised, and an
+    install keep the strict set, so a second process never writes into a live service's directory
+    on the strength of it. One row per (caller, use) pair (`OwnStateAccountRows`), one decorator
+    every reader of the directory in `main` takes (`OwnStateAccountsGuard`, a directory's owner
+    included through `WritersBeyondOwner`), compared by SID (`FileOwner::id`, `AccountIdOf`) and
+    never by name, and only a PER-SERVICE SID (`IsPerServiceSid`: `S-1-5-80-0` is the group `ALL
+    SERVICES`). **Blind spot, and the direction it fails in: OPEN, for an administrator alone** -- a
+    per-service SID is not checked to be THIS node's service (no `QueryServiceConfig` binary-path
+    check), so an administrator who deliberately types `--service-name=<another service>` has
+    `--print-surfaces` trust that service's files. Accepted: it takes an administrator naming another
+    service on the command line (`--service-name` is argv-only), and `--print-surfaces` writes nothing. An empty `--service-name` names no account; an account that does not resolve trusts
+    no file. **POSIX is unchanged**: `AccountIdOf` resolves nothing there, so `sudo --print-surfaces`
+    over a dedicated service user's directory is still refused; extending it would be a row naming
+    that user (`getpwnam`) and a uid comparison, nothing else. **A refusal names the owner and the
+    SEAT that would judge it as the service**: removing or moving a file or the directory aside is
+    the remedy for a PLANTED one only, never for one merely owned by another account. And a reading
+    that refused ends a start, and `--print-surfaces`, ONCE and FIRST by its own ARM
+    (`FormationUnread::stage`, `UnreadStateStage`): an I/O arm is `Failed` and retried by the
+    supervisor, a verdict `Refused`; the startup row (`StateDirectoryUnreadRefusal`) claims only the
+    permanent ones. AGENT.md tripwires it in one bullet, beside the state-directory one.
     **The table is the ONLY author of a state file's name**: `StateFile` (`Core/StateFiles.hpp`,
     header-only because four layers write these files) names every one, every writer's constant
     is a lookup into it, and the node's table is an `EnumTable` keyed by the same enum -- so a new

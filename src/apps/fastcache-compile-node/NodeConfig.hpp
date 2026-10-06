@@ -513,9 +513,20 @@ struct NodeConfig
     /// **Not a flag.** `ApplyFormation` writes it, into every configuration this process builds,
     /// before any rule judges one or any tier starts: the record where one is kept, and before
     /// the first start mints one, the solitary record that start will mint. Disengaged is a
-    /// configuration nothing formed -- a bare test configuration -- and it runs no consensus,
+    /// configuration nothing formed -- a bare test configuration, or one whose state directory
+    /// could not be read for its record (`formationUnread` says why) -- and it runs no consensus,
     /// because there is no mode to say it should (`RunsConsensus`).
     std::optional<NodeFormationView> formation;
+
+    /// Why NO record shaped this configuration, when its state directory was read for one and the
+    /// reading refused: that refusal, by name, and the step a start gives up at for it
+    /// (`ShapeByKeptFormation`).
+    ///
+    /// **Not a flag.** Disengaged wherever a record shaped it, and in a configuration nothing tried
+    /// to shape -- a bare test one. Engaged, the mode is UNKNOWN rather than absent, so the mode line
+    /// and the `--raft-self` row name this instead (`FormationAbsenceOf`): a sentence about a flag is
+    /// the wrong cause for a configuration whose mode was never read.
+    std::optional<FormationUnread> formationUnread;
 
     /// Which fleet this node belongs to.
     ///
@@ -1040,6 +1051,11 @@ inline constexpr std::string_view RetiredNodeFlagsGuide =
 [[nodiscard]] std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previous,
                                                                       NodeConfig const& candidate);
 
+/// The account the node's Windows service runs as: a per-service VIRTUAL account (`NT SERVICE\<name>`).
+/// One constant, read by the registration (`MakeNodeServiceSpec`) and by the trusted-owner set
+/// (`NodeServiceAccountOf`), so the account an administrator trusts is the one the service runs as.
+inline constexpr WindowsLogonAccount NodeWindowsLogon = WindowsLogonAccount::VirtualAccount;
+
 /// Describe this worker as a service to register.
 ///
 /// The worker's half of the `ServiceSpec` seam, mirroring the daemon's
@@ -1561,6 +1577,52 @@ static_assert(ConsensusNamesNoDialAddressRefusal.contains(ConsensusDialRemedy),
 inline constexpr std::string_view DiscoveryNeedsConsensusRefusal =
     "--discovery needs --listen-raft: discovery finds peers for a CLUSTER, and without a consensus port this node "
     "is not in one. It would broadcast, be answered, prove its identity and have nowhere to put the answer.";
+
+/// Why `--raft-self` is refused on a node whose mode opens the consensus port and whose empty
+/// `--listen-raft=` closed it: the host has no port to pair with and no cluster to be a member of.
+///
+/// One of TWO refusals of the flag on a node that runs no consensus, and they are never one sentence:
+/// the other is a configuration NO record shaped, whose mode is unknown (`RaftSelfWithNoModeRefusal`).
+/// The one sentence that served both said `--listen-raft` is what turns consensus on -- true before
+/// the mode moved into the state directory (#1600), and since then a wrong cause told to an operator
+/// who had typed it.
+inline constexpr std::string_view RaftSelfWithConsensusClosedRefusal =
+    "--raft-self names the host this node's peers dial, and --listen-raft is empty: this node's mode opens a "
+    "consensus port, and an empty --listen-raft= is what closes it, so the node runs no consensus -- there is no "
+    "port to pair the host with and no cluster for the pair to name a member of. Drop --raft-self, or give "
+    "--listen-raft a port (it has one by default).";
+
+/// Why a configuration whose state directory could not be read for its formation record is refused,
+/// FIRST, before any rule that would judge a flag by the mode it does not have.
+///
+/// The cause is the reading's own refusal (`NodeConfig::formationUnread`), through the sentence
+/// `--print-surfaces`' mode line prints (`FormationAbsenceOf`), so a run refuses once, with that,
+/// rather than with whichever flag row first meets a node that seems to run no consensus.
+/// @param cfg A configuration whose reading refused.
+/// @return The refusal.
+[[nodiscard]] std::string StateDirectoryUnreadRefusal(NodeConfig const& cfg);
+
+/// The step a start gives up at for a configuration no record shaped because its reading refused
+/// (`NodeConfig::formationUnread`): the reading's own arm, `Failed` for an I/O arm and `Refused`
+/// for a verdict, so a supervisor retries what the next start may get past.
+///
+/// What a start and `--print-surfaces` end an unread state directory with, AHEAD of the startup
+/// table, whose rows all end a start as the permanent `StartupRules`.
+/// @param cfg The configuration.
+/// @return The stage, or nothing for a configuration a record shaped or nothing tried to shape.
+[[nodiscard]] std::optional<StartStage> UnreadStateStage(NodeConfig const& cfg) noexcept;
+
+/// Why `--raft-self` is refused on a configuration NO formation record shaped.
+///
+/// Whether a node runs consensus is its MODE, the formation record kept in its state directory --
+/// never a flag -- and here no record shaped the configuration: the reading of the state directory
+/// refused, and that refusal, with its own remedy, is the cause. Built from `FormationAbsenceOf`,
+/// the sentence `--print-surfaces`' mode line prints, so the line and the refusal cannot name
+/// different causes; and it names no flag but the refused one and the directory's, since no flag
+/// stands in for an unknown mode.
+/// @param cfg A configuration no record shaped.
+/// @return The refusal.
+[[nodiscard]] std::string RaftSelfWithNoModeRefusal(NodeConfig const& cfg);
 
 /// Whether this build can terminate TLS: a property of the BUILD, which the startup table asks
 /// beside the configuration so a line naming TLS material on a build without it is refused where

@@ -137,6 +137,18 @@ namespace
 using namespace FastCache;
 using namespace FastCache::Node;
 
+/// The ids of the accounts THIS process counts as the node's own when it judges a state directory
+/// (`OwnStateAccountRows`): the node's service account for an administrator running a verb that
+/// only INSPECTS the directory (`StateUseOf`), nothing beyond its own and the administrators' for
+/// anything that runs the node -- a foreground start and the service under its supervisor alike.
+/// @param cfg The configuration, for the verb and the service it names.
+/// @return The ids.
+[[nodiscard]] std::vector<std::string> StateOwnIds(NodeConfig const& cfg)
+{
+    return OwnStateAccountIds(
+        IsAdministratorProcess() ? JudgingCaller::Administrator : JudgingCaller::Other, StateUseOf(cfg), cfg, &AccountIdOf);
+}
+
 /// How often the stop watcher looks at the stop flag.
 ///
 /// A signal handler may portably do almost nothing -- it sets a flag -- so
@@ -1471,7 +1483,8 @@ using Node::NodeReloader;
     // Declared AFTER the tiers it reads and BEFORE the surface that reads it, which
     // is what makes both sets of pointers safe: locals are destroyed in reverse.
     static core::platform::SystemWallClock const wall;
-    Node::FileTrustNodeKeyGuard historyGuard;
+    Node::FileTrustNodeKeyGuard platformHistoryGuard;
+    Node::OwnStateAccountsGuard historyGuard { platformHistoryGuard, StateOwnIds(cfg) };
     Node::FleetSampler sampler { fleetSources,
                                  metrics,
                                  snapshotProvider,
@@ -1871,10 +1884,9 @@ struct EarlyVerbRow
     // the startup table, and they do not all want the same answer.
     auto const report = ReportSurfaces(context.cfg);
     std::cout << report.text;
-    if (!report.refusal.has_value())
-        return CommandExitCode(CommandEnding::Completed);
-    context.logger.Logf(LogLevel::Error, "{}", *report.refusal);
-    return CommandExitCode(CommandEnding::Declined);
+    if (report.refusal.has_value())
+        context.logger.Logf(LogLevel::Error, "{}", *report.refusal);
+    return CommandExitCode(report.ending);
 }
 
 /// Print this node's identity, minting what the state directory does not hold yet
@@ -1891,7 +1903,8 @@ struct EarlyVerbRow
 {
     auto& cfg = context.cfg;
     SystemSecureRandom random;
-    Node::FileTrustNodeKeyGuard keyGuard;
+    Node::FileTrustNodeKeyGuard platformGuard;
+    Node::OwnStateAccountsGuard keyGuard { platformGuard, StateOwnIds(cfg) };
     auto key = Node::ResolveNodeKeyFor(cfg, random, keyGuard);
     if (!key.has_value())
     {
@@ -2380,26 +2393,35 @@ int main(int argc, char** argv)
     // firewall rules from that (`InstallWithServiceFirewall`). So is a directory another account
     // may write in or wrote into: its writers, then who owns each file, are asked before any is
     // read (`ReadStateDirectoryFormation`), as the key resolution asks again.
+    //
+    // Judged through ONE guard for the whole invocation (`OwnStateAccountsGuard`): this process's own
+    // account and the administrators', and -- for an administrator running a verb that only inspects
+    // the directory -- the node's service account, so an elevated `--print-surfaces` over the
+    // service's directory is judged as the service will run it. A start, foreground or under the
+    // supervisor, keeps the strict set: it writes there.
+    Node::FileTrustNodeKeyGuard platformStateGuard;
+    Node::OwnStateAccountsGuard stateGuard { platformStateGuard, StateOwnIds(cfg) };
     auto const formationDirectory = Node::ChosenStateDirectory(cfg);
     std::optional<Cluster::FileFormationStore> formationStore;
     std::optional<Cluster::FleetEndpointsFile> endpointsFile;
-    auto keptFormation = std::expected<Node::KeptFormation, std::string> { std::unexpected {
-        std::string { "this node has no state directory to keep its formation record in" } } };
+    auto keptFormation = std::expected<Node::KeptFormation, Node::FormationUnread> { std::unexpected {
+        // The formation's own step, which is `FormationUnread`'s default: no directory resolved yet.
+        Node::FormationUnread { .reason = "this node has no state directory to keep its formation record in" } } };
     if (formationDirectory.has_value())
     {
         formationStore.emplace(formationDirectory->path);
         endpointsFile.emplace(formationDirectory->path);
-        keptFormation = Node::ReadStateDirectoryFormation(formationDirectory->path);
+        keptFormation = Node::ReadStateDirectoryFormation(formationDirectory->path, stateGuard);
     }
-    if (keptFormation.has_value())
-    {
-        auto const prospect = Node::ProspectiveRecord(*keptFormation);
-        auto applied = Node::ApplyFormation(cfg, prospect, keptFormation->remembered).and_then([&] {
-            return Node::ApplyFormation(cliOnly, prospect, keptFormation->remembered);
-        });
-        if (!applied.has_value())
-            keptFormation = std::unexpected { std::move(applied).error() };
-    }
+
+    // Shaped by what was read; where nothing could shape it, told WHY (`ShapeByKeptFormation`), so the
+    // mode line and the `--raft-self` row name the reading's refusal -- that row told an operator who
+    // had typed `--listen-raft` that its absence was the cause.
+    auto shaped = Node::ShapeByKeptFormation(cfg, keptFormation).and_then([&] {
+        return Node::ShapeByKeptFormation(cliOnly, keptFormation);
+    });
+    if (!shaped.has_value())
+        keptFormation = std::unexpected { std::move(shaped).error() };
 
     // The admin verbs below answer an operator at a terminal, so they report to one
     // -- even under `--daemon`, which the registered command line carries and which
@@ -2495,6 +2517,16 @@ int main(int argc, char** argv)
     // the POSIX host has already redirected stdout to /dev/null by the time the body
     // runs, so a diagnosis printed there goes nowhere in the one deployment where a
     // scheduler is most likely to be misconfigured.
+    //
+    // **A state directory no reading could shape this line from ends the start FIRST, by its own
+    // arm** (`UnreadStateStage`): a transient read -- a listing, an access list the platform would
+    // not answer, a record that would not open -- is `Failed` and retried by the supervisor, as it
+    // was before the startup table learnt to name it; a verdict is `Refused`. Ahead of the table,
+    // whose every row ends a start as the permanent `StartupRules`, and whose flag rows would judge
+    // a mode this configuration does not have.
+    if (auto const stage = UnreadStateStage(cfg); stage.has_value())
+        return RefuseStart(
+            startHost, logger, std::format("{}; refusing to start", StateDirectoryUnreadRefusal(cfg)), ExitCodeFor(*stage));
     if (auto const rejection = StartupPolicyRejection(cfg))
         return RefuseStart(startHost, logger, *rejection, ExitCodeFor(StartStage::StartupRules));
 
@@ -2539,8 +2571,7 @@ int main(int argc, char** argv)
     // none there; a key file that is there and cannot be used is a refusal, never a re-mint.
     SystemSecureRandom identityRandom;
 
-    Node::FileTrustNodeKeyGuard identityKeyGuard;
-    auto const identityKey = AdoptNodeKey(cfg, identityRandom, identityKeyGuard, logger);
+    auto const identityKey = AdoptNodeKey(cfg, identityRandom, stateGuard, logger);
     if (!identityKey.has_value())
         return RefuseStart(startHost,
                            logger,
@@ -2564,7 +2595,7 @@ int main(int argc, char** argv)
     if (!keptFormation.has_value())
         return RefuseStart(startHost,
                            logger,
-                           std::format("{}; refusing to start", keptFormation.error()),
+                           std::format("{}; refusing to start", keptFormation.error().reason),
                            ExitCodeFor(StartStage::Formation));
     // Engaged whenever a record was read -- the store is what read it -- so this is the same
     // fact stated where the dereference can see it.

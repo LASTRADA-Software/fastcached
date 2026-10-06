@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
 #include "EnrollClient.hpp"
+#include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "NodeFormation.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeKey.hpp"
 #include "NodeStateFiles.hpp"
+#include "NodeSurfaces.hpp"
 #include "RaftStoreArchiver.hpp"
 
 #include <FastCache/Cluster/FleetEndpoints.hpp>
@@ -24,14 +27,18 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <ranges>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -40,6 +47,7 @@
     #include <unistd.h>
 #endif
 
+#include <core/Ranges.hpp>
 #include <tests/AccessList.hpp>
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/NodeConditionFakes.hpp>
@@ -1062,4 +1070,589 @@ TEST_CASE("A link named like the replace probe is no leftover of it, whatever it
     auto const walked = RefuseForeignStateFiles(scratch.Path(), guard);
     REQUIRE_FALSE(walked.has_value());
     CHECK(walked.error().fault == NodeKeyFault::UnknownEntry);
+}
+
+namespace
+{
+
+/// A state directory as a node from before formation records left it: an identity key and a
+/// consensus store -- term, vote and log -- and NO formation record.
+/// @param directory The state directory, which exists.
+void WriteStoreWithoutFormation(std::filesystem::path const& directory)
+{
+    ScriptedSecureRandom random { ScriptedSecureRandom::Ascending(Ed25519SeedBytes) };
+    FileTrustNodeKeyGuard guard;
+    REQUIRE(ResolveNodeKey(directory, random, guard).has_value());
+    auto store = Consensus::FileRaftStorage::Open(directory);
+    REQUIRE(store.has_value());
+    REQUIRE(store
+                ->SaveState(Consensus::PersistentState { .currentTerm = Consensus::Term { .value = 3 },
+                                                         .votedFor = std::string { "b3a14d8390da2f2cbe511e91100fba43" } })
+                .has_value());
+    REQUIRE(std::filesystem::exists(directory / Consensus::RaftStateFileName));
+    REQUIRE(std::filesystem::exists(directory / Consensus::RaftLogFileName));
+    REQUIRE_FALSE(std::filesystem::exists(directory / Cluster::FormationRecordFileName));
+}
+
+/// The line the redeploy judged, verbatim but for its two paths, as `main` judges it under
+/// `--print-surfaces`: parsed, its state directory read (`ReadStateDirectoryFormation`), shaped by
+/// what was read (`ShapeByKeptFormation`), then rendered and judged (`ReportSurfaces`).
+struct JudgedLine
+{
+    NodeConfig cfg;                                     ///< The configuration as `main` holds it.
+    std::expected<KeptFormation, FormationUnread> kept; ///< What the state directory gave.
+    SurfaceReport report;                               ///< What `--print-surfaces` prints and answers.
+};
+
+/// Judge the redeploy's line against @p stateDirectory, through @p guard as `main` does.
+/// @param stateDirectory What `--cluster-dir` names.
+/// @param tokenFile What `--dashboard-token-file` names.
+/// @param guard Who owns and may write each entry, as the judging caller sees it.
+/// @return The configuration, what was read and the verdict.
+[[nodiscard]] JudgedLine JudgeRedeployLine(std::filesystem::path const& stateDirectory,
+                                           std::filesystem::path const& tokenFile,
+                                           INodeKeyFileGuard& guard)
+{
+    auto const clusterDir = std::format("--cluster-dir={}", stateDirectory.string());
+    auto const token = std::format("--dashboard-token-file={}", tokenFile.string());
+    auto const args = std::vector<char const*> { "--advertise=127.0.0.1:6674",
+                                                 "--admin-listen=0.0.0.0:6677",
+                                                 "--dashboard",
+                                                 token.c_str(),
+                                                 "--listen-node=127.0.0.1:6674",
+                                                 "--node-id=b3a14d8390da2f2cbe511e91100fba43",
+                                                 "--raft-self=127.0.0.1",
+                                                 "--listen-raft=127.0.0.1:6680",
+                                                 clusterDir.c_str(),
+                                                 "--print-surfaces" };
+    auto cfg = NodeConfig {};
+    REQUIRE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { args }, cfg).has_value());
+    auto kept = ReadStateDirectoryFormation(stateDirectory, guard);
+    (void) ShapeByKeptFormation(cfg, kept);
+    auto report = ReportSurfaces(cfg);
+    return JudgedLine { .cfg = std::move(cfg), .kept = std::move(kept), .report = std::move(report) };
+}
+
+} // namespace
+
+TEST_CASE("A consensus store with no formation record is a first start's and the redeploy's line is accepted on it",
+          "[node][state][formation][consensus]")
+{
+    // The premise the refusal below was first blamed on, measured at the seam `main` runs: a store
+    // written before formation records -- key, term, vote, log, and no `formation` -- is read as a
+    // directory holding NO record, which the first start mints over (`ProspectiveRecord`). Nothing
+    // reads the consensus files to decide the mode, so their presence alone shapes the line as solitary.
+    ScratchDirectory const tokens { "raft-self-token" };
+    WriteText(tokens.Path() / "dashboard-token", "a-dashboard-token");
+    ScratchDirectory const scratch { "raft-self-pre-formation" };
+    WriteStoreWithoutFormation(scratch.Path());
+
+    FileTrustNodeKeyGuard guard;
+    auto const judged = JudgeRedeployLine(scratch.Path(), tokens.Path() / "dashboard-token", guard);
+    REQUIRE(judged.kept.has_value());
+    CHECK_FALSE(judged.kept->record.has_value());
+    REQUIRE(judged.cfg.formation.has_value());
+    CHECK_FALSE(judged.cfg.formationUnread.has_value());
+    CHECK(judged.report.text.contains("mode: solitary"));
+    INFO(judged.report.refusal.value_or(std::string {}));
+    CHECK_FALSE(judged.report.refusal.has_value());
+}
+
+TEST_CASE("A line whose state directory cannot be read is refused once naming the mode and the reading and never "
+          "--listen-raft",
+          "[node][state][formation][consensus]")
+{
+    // The redeploy's refusal: `--listen-raft` WAS given, and the row told the operator its absence was
+    // the cause -- a sentence from before the mode moved into the state directory. When the reading of
+    // that directory refuses, no record shapes the line and its mode is unknown, so the true cause is
+    // the reading's own refusal, and the row names it through the sentence the mode line prints.
+    //
+    // The directory the redeploy met: a consensus store with no formation record, which the reading
+    // refused (the case above shows the store alone is no reason). Here what it refuses is an entry no
+    // row names -- a refusal every platform and account can stage, of the same kind (`JudgeStateDirectory`).
+    ScratchDirectory const tokens { "raft-self-token-refused" };
+    WriteText(tokens.Path() / "dashboard-token", "a-dashboard-token");
+    ScratchDirectory const scratch { "raft-self-unreadable" };
+    WriteStoreWithoutFormation(scratch.Path());
+    WriteText(scratch.Path() / "planted", "nothing this build wrote");
+
+    FileTrustNodeKeyGuard guard;
+    auto const judged = JudgeRedeployLine(scratch.Path(), tokens.Path() / "dashboard-token", guard);
+    REQUIRE_FALSE(judged.kept.has_value());
+    REQUIRE(judged.kept.error().reason.contains("keeps no entry by that name"));
+    CHECK_FALSE(judged.cfg.formation.has_value());
+    CHECK(judged.cfg.formationUnread == std::optional<FormationUnread> { judged.kept.error() });
+
+    REQUIRE(judged.report.refusal.has_value());
+    auto const& refusal = Testing::Unwrap(judged.report.refusal);
+    INFO(refusal);
+    // The row that answered -- the FIRST row, ahead of every flag row (`--raft-self`'s, `--dashboard`'s)
+    // this line would otherwise meet -- and what it names: the mode, the state directory where the
+    // operator named it, and the reading's own refusal, which is the cause.
+    CHECK(refusal == StateDirectoryUnreadRefusal(judged.cfg));
+    CHECK(refusal.starts_with("this node's mode"));
+    CHECK(refusal.contains(std::format("{} (named by --cluster-dir)", scratch.Path().string())));
+    CHECK(refusal.contains(judged.kept.error().reason));
+    // And not the flag that was given: the stale sentence named it as the cause.
+    CHECK_FALSE(refusal.contains("--listen-raft"));
+    CHECK_FALSE(refusal.contains(RaftSelfWithConsensusClosedRefusal));
+
+    // One source: the mode line `--print-surfaces` prints carries the same reason, and the raft line
+    // no longer promises a record a first start will mint.
+    CHECK(judged.report.text.contains(std::format("mode: none ({})", FormationAbsenceOf(judged.cfg))));
+    CHECK(FormationAbsenceOf(judged.cfg).contains(judged.kept.error().reason));
+    CHECK(refusal.contains(FormationAbsenceOf(judged.cfg)));
+    CHECK(judged.report.text.contains("not served (no formation record could be read; see the mode line)"));
+    CHECK_FALSE(judged.report.text.contains("no formation record yet"));
+}
+
+namespace
+{
+
+/// The node's service account as an administrator's trusted-owner set names it by default.
+constexpr std::string_view NodeServiceAccount = "NT SERVICE\\FastCacheCompileNode";
+
+/// A SID this case gives the node's service account: a PER-SERVICE SID, five sub-authorities.
+constexpr std::string_view NodeServiceSid = "S-1-5-80-1111111111-2222222222-3333333333-4444444444-5555555555";
+
+/// Another service's virtual account.
+constexpr std::string_view OtherServiceAccount = "NT SERVICE\\SomeOtherService";
+
+/// The SID this case gives another service's virtual account.
+constexpr std::string_view OtherServiceSid = "S-1-5-80-6666666666-7777777777-8888888888-9999999999-1212121212";
+
+/// A plain user.
+constexpr std::string_view PlainUser = "DARKLEON\\mallory";
+
+/// The SID this case gives the plain user.
+constexpr std::string_view PlainUserSid = "S-1-5-21-1000000000-2000000000-3000000000-1001";
+
+/// `NT SERVICE\ALL SERVICES`, the group `--service-name="ALL SERVICES"` resolves to.
+constexpr std::string_view AllServicesAccount = "NT SERVICE\\ALL SERVICES";
+
+/// The group's SID, which is not a per-service SID.
+constexpr std::string_view AllServicesSid = "S-1-5-80-0";
+
+/// The scripted account directory: what `AccountIdOf` answers, for a fake identity on every platform.
+/// @param account `DOMAIN\name`.
+/// @return Its scripted SID, or nothing for an account this case does not know.
+[[nodiscard]] std::optional<std::string> ScriptedAccountId(std::string const& account)
+{
+    struct Account
+    {
+        std::string_view name; ///< `DOMAIN\name`.
+        std::string_view sid;  ///< Its SID.
+    };
+    constexpr auto Accounts = std::to_array<Account>({
+        { .name = NodeServiceAccount, .sid = NodeServiceSid },
+        { .name = OtherServiceAccount, .sid = OtherServiceSid },
+        { .name = PlainUser, .sid = PlainUserSid },
+        { .name = AllServicesAccount, .sid = AllServicesSid },
+    });
+    auto const* const row = core::findOrNull(Accounts, std::string_view { account }, &Account::name);
+    if (row == nullptr)
+        return std::nullopt;
+    return std::string { row->sid };
+}
+
+/// The state files a running service writes into its directory, every one of which an
+/// administrator met as "another account's" on the redeploy (MEASURED, 2026-10-06).
+constexpr auto ServiceWrittenFiles =
+    std::to_array<std::string_view>({ NodeKeyFileName, Consensus::RaftStateFileName, Consensus::RaftLogFileName });
+
+/// Whether @p text tells an operator to remove something BECAUSE of who owns it: the remedy the
+/// owner's second ruling forbids. A removal offered for a PLANTED entry is not this.
+/// @param text A refusal.
+/// @return True when it offers a removal outside the planted-only clause.
+[[nodiscard]] bool OffersRemovalForOwnership(std::string_view text)
+{
+    return text.contains("Remove it, with what is in it") || text.contains("another account put it there")
+           || text.contains("another account created it");
+}
+
+} // namespace
+
+TEST_CASE("An administrator judges the node's own service account's state files as the service will",
+          "[node][state][formation][trust]")
+{
+    // The owner ruling of 2026-10-06, as the controller limited it: an ADMINISTRATOR running a verb that
+    // writes nothing (`StateUse::Inspects`) counts a state file owned by the node's OWN per-service
+    // virtual account as the node's own, and the line is judged as the service will run it. Files of
+    // any other account stay refused BY NAME; a caller that is no administrator, and a START by an
+    // administrator, trust nothing more than before.
+    //
+    // Through the production fold (`OwnStateAccountIds`, `OwnStateAccountsGuard`) over a SCRIPTED
+    // identity: which account owns each file, and what each account resolves to, are the only fakes.
+    ScratchDirectory const tokens { "trust-token" };
+    WriteText(tokens.Path() / "dashboard-token", "a-dashboard-token");
+
+    auto cfg = NodeConfig {};
+    REQUIRE(NodeServiceAccountOf(cfg) == std::optional<std::string> { std::string { NodeServiceAccount } });
+
+    struct Case
+    {
+        std::string_view what;    ///< The case, as CAPTURE prints it.
+        JudgingCaller caller;     ///< Who judges.
+        StateUse use;             ///< What the invocation does with the directory.
+        std::string_view owner;   ///< The account owning every file the service writes.
+        std::string_view ownerId; ///< Its SID.
+        bool accepted;            ///< Whether the line is judged as the service runs it.
+    };
+    for (auto const& [what, caller, use, owner, ownerId, accepted]: std::to_array<Case>({
+             { .what = "administrator inspecting, the node's own service",
+               .caller = JudgingCaller::Administrator,
+               .use = StateUse::Inspects,
+               .owner = NodeServiceAccount,
+               .ownerId = NodeServiceSid,
+               .accepted = true },
+             { .what = "administrator inspecting, another service",
+               .caller = JudgingCaller::Administrator,
+               .use = StateUse::Inspects,
+               .owner = OtherServiceAccount,
+               .ownerId = OtherServiceSid,
+               .accepted = false },
+             { .what = "administrator inspecting, a plain user",
+               .caller = JudgingCaller::Administrator,
+               .use = StateUse::Inspects,
+               .owner = PlainUser,
+               .ownerId = PlainUserSid,
+               .accepted = false },
+             { .what = "no administrator inspecting, the node's own service",
+               .caller = JudgingCaller::Other,
+               .use = StateUse::Inspects,
+               .owner = NodeServiceAccount,
+               .ownerId = NodeServiceSid,
+               .accepted = false },
+             // The controller's ruling on I2: a FOREGROUND START by an administrator keeps the strict set.
+             // So does `--print-identity`, which mints a key and an id where they are absent: the same row
+             // (`StateUseOf` answers `Runs` for it, asserted beside the verb table).
+             { .what = "administrator starting the node, the node's own service",
+               .caller = JudgingCaller::Administrator,
+               .use = StateUse::Runs,
+               .owner = NodeServiceAccount,
+               .ownerId = NodeServiceSid,
+               .accepted = false },
+         }))
+    {
+        CAPTURE(what);
+        ScratchDirectory const scratch { "trust-state" };
+        WriteStoreWithoutFormation(scratch.Path());
+
+        auto platform = ScriptedNodeKeyGuard::OwnerOnly();
+        for (auto const name: ServiceWrittenFiles)
+            platform.OwnedBy(std::filesystem::path { name }, std::string { owner }, std::string { ownerId });
+        OwnStateAccountsGuard guard { platform, OwnStateAccountIds(caller, use, cfg, &ScriptedAccountId) };
+
+        auto const judged = JudgeRedeployLine(scratch.Path(), tokens.Path() / "dashboard-token", guard);
+        if (accepted)
+        {
+            REQUIRE(judged.kept.has_value());
+            CHECK(judged.report.text.contains("mode: solitary"));
+            INFO(judged.report.refusal.value_or(std::string {}));
+            CHECK_FALSE(judged.report.refusal.has_value());
+            CHECK(judged.report.ending == CommandEnding::Completed);
+            continue;
+        }
+        // Refused BY NAME: the file, its owner, and the seat that would judge it as the service --
+        // never a removal offered merely because another account owns it. A failed check that does
+        // NOT end the case, so every refused caller is judged even when one of them is accepted.
+        if (judged.kept.has_value())
+        {
+            FAIL_CHECK("the reading accepted files " << owner << " owns");
+            continue;
+        }
+        auto const& reason = judged.kept.error().reason;
+        CHECK(reason.contains(std::format("is owned by {}", owner)));
+        CHECK(std::ranges::any_of(ServiceWrittenFiles, [&reason, &scratch](std::string_view name) {
+            return reason.contains((scratch.Path() / name).string());
+        }));
+        CHECK(reason.contains("Ownership is judged from the account asking"));
+        CHECK(reason.contains("Only a file nobody but this node should have written -- a planted one"));
+        CHECK_FALSE(OffersRemovalForOwnership(reason));
+        // A verdict on the owner: refused, never retried, and answered ahead of every flag row.
+        CHECK(judged.kept.error().stage == StartStage::IdentityKey);
+        CHECK(ExitCodeFor(judged.kept.error().stage) == ExitCodeOf(ProcessExit::Refused));
+        REQUIRE(judged.report.refusal.has_value());
+        CHECK(Testing::Unwrap(judged.report.refusal) == StateDirectoryUnreadRefusal(judged.cfg));
+        CHECK(judged.report.ending == CommandEnding::Declined);
+    }
+}
+
+TEST_CASE("An administrator judges a state directory the node's own service owns as the service will",
+          "[node][state][formation][trust]")
+{
+    // The directory's OWNER is promoted as a file's is: the service creates its own directory whenever
+    // it finds none and then owns it, and an elevated `--print-surfaces` over that healthy node was
+    // told to remove the directory -- the node's identity and its consensus store. Promoted, the
+    // directory is still asked who BESIDES its owner may plant entries there.
+    ScratchDirectory const tokens { "trust-dir-token" };
+    WriteText(tokens.Path() / "dashboard-token", "a-dashboard-token");
+    auto const cfg = NodeConfig {};
+
+    struct Case
+    {
+        std::string_view what;    ///< The case, as CAPTURE prints it.
+        std::string_view owner;   ///< Who owns the directory and what the service wrote.
+        std::string_view ownerId; ///< Its SID.
+        DirectoryWriters beyond;  ///< Who besides the owner may plant entries there.
+        bool accepted;            ///< Whether the line is judged as the service runs it.
+    };
+    for (auto const& [what, owner, ownerId, beyond, accepted]: std::to_array<Case>({
+             { .what = "the node's own service, owner only",
+               .owner = NodeServiceAccount,
+               .ownerId = NodeServiceSid,
+               .beyond = DirectoryWriters::OwnerOnly,
+               .accepted = true },
+             { .what = "the node's own service, others may plant",
+               .owner = NodeServiceAccount,
+               .ownerId = NodeServiceSid,
+               .beyond = DirectoryWriters::Others,
+               .accepted = false },
+             { .what = "another service",
+               .owner = OtherServiceAccount,
+               .ownerId = OtherServiceSid,
+               .beyond = DirectoryWriters::OwnerOnly,
+               .accepted = false },
+         }))
+    {
+        CAPTURE(what);
+        ScratchDirectory const scratch { "trust-dir-state" };
+        WriteStoreWithoutFormation(scratch.Path());
+
+        auto platform = ScriptedNodeKeyGuard { Testing::NodeKeyGuardScript { .found = SecretExposure::None,
+                                                                             .afterProtect = SecretExposure::None,
+                                                                             .owner = FileOwnerStanding::ThisProcess,
+                                                                             .writers = DirectoryWriters::ForeignOwner } };
+        platform.WritersBeyondOwnerAre(beyond);
+        platform.OwnedBy(scratch.Path().filename(), std::string { owner }, std::string { ownerId });
+        for (auto const name: ServiceWrittenFiles)
+            platform.OwnedBy(std::filesystem::path { name }, std::string { owner }, std::string { ownerId });
+        OwnStateAccountsGuard guard {
+            platform, OwnStateAccountIds(JudgingCaller::Administrator, StateUse::Inspects, cfg, &ScriptedAccountId)
+        };
+
+        auto const judged = JudgeRedeployLine(scratch.Path(), tokens.Path() / "dashboard-token", guard);
+        if (accepted)
+        {
+            REQUIRE(judged.kept.has_value());
+            CHECK(judged.report.text.contains("mode: solitary"));
+            CHECK_FALSE(judged.report.refusal.has_value());
+            continue;
+        }
+        if (judged.kept.has_value())
+        {
+            FAIL_CHECK("the reading accepted a directory " << owner << " owns");
+            continue;
+        }
+        auto const& reason = judged.kept.error().reason;
+        CHECK_FALSE(OffersRemovalForOwnership(reason));
+        if (beyond == DirectoryWriters::Others)
+            CHECK(reason.contains("lets other accounts on this machine create or delete entries"));
+        else
+        {
+            CHECK(reason.contains(std::format("is owned by {}", owner)));
+            CHECK(reason.contains("Ownership is judged from the account asking"));
+            CHECK(reason.contains("Only a directory nobody but this node should have created -- a planted one"));
+        }
+    }
+}
+
+TEST_CASE("A state directory's reading ends a start and the worksheet by its own arm", "[node][state][formation][trust]")
+{
+    // I1: the reading's fault keeps its STAGE, so a transient arm is retried under a supervisor (exit
+    // 1, `Failed`) and a verdict is not (78, `Refused`) -- as each ended before the startup table learnt
+    // to name an unread directory, which had turned every one of them into the permanent
+    // `StartupRules`. `UnreadStateStage` is what `main` ends a start with, ahead of that table, and
+    // `--print-surfaces` ends by the same arm (1 against 2).
+    ScratchDirectory const tokens { "arm-token" };
+    WriteText(tokens.Path() / "dashboard-token", "a-dashboard-token");
+
+    struct Case
+    {
+        std::string_view what; ///< The case, as CAPTURE prints it.
+        void (*stage)(std::filesystem::path const& directory, ScriptedNodeKeyGuard& guard); ///< What fails.
+        StartStage expected;                                                                ///< The arm it ends with.
+        ProcessExit exit;                                                                   ///< How a start ends.
+        CommandEnding worksheet;                                                            ///< How `--print-surfaces` ends.
+    };
+    for (auto const& [what, stage, expected, exit, worksheet]: std::to_array<Case>({
+             { .what = "whether others may write a file could not be asked",
+               .stage =
+                   [](std::filesystem::path const& /*directory*/, ScriptedNodeKeyGuard& guard) {
+                       guard.WritersUnanswered(std::string { Consensus::RaftStateFileName },
+                                               std::make_error_code(std::errc::io_error));
+                   },
+               .expected = StartStage::IdentityKeyIo,
+               .exit = ProcessExit::Failed,
+               .worksheet = CommandEnding::Failed },
+             { .what = "another account owns a file",
+               .stage =
+                   [](std::filesystem::path const& /*directory*/, ScriptedNodeKeyGuard& guard) {
+                       guard.OwnedByAnother(std::string { Consensus::RaftStateFileName });
+                   },
+               .expected = StartStage::IdentityKey,
+               .exit = ProcessExit::Refused,
+               .worksheet = CommandEnding::Declined },
+             { .what = "an entry no row names",
+               .stage = [](std::filesystem::path const& directory,
+                           ScriptedNodeKeyGuard& /*guard*/) { WriteText(directory / "planted", "planted"); },
+               .expected = StartStage::IdentityKey,
+               .exit = ProcessExit::Refused,
+               .worksheet = CommandEnding::Declined },
+             { .what = "a formation record that is not one",
+               .stage =
+                   [](std::filesystem::path const& directory, ScriptedNodeKeyGuard& /*guard*/) {
+                       WriteText(directory / std::string { Cluster::FormationRecordFileName }, "not a record");
+                   },
+               .expected = StartStage::Formation,
+               .exit = ProcessExit::Failed,
+               .worksheet = CommandEnding::Failed },
+         }))
+    {
+        CAPTURE(what);
+        ScratchDirectory const scratch { "arm-state" };
+        WriteStoreWithoutFormation(scratch.Path());
+        auto guard = ScriptedNodeKeyGuard::OwnerOnly();
+        stage(scratch.Path(), guard);
+
+        auto const judged = JudgeRedeployLine(scratch.Path(), tokens.Path() / "dashboard-token", guard);
+        REQUIRE_FALSE(judged.kept.has_value());
+        CHECK(judged.kept.error().stage == expected);
+        CHECK(UnreadStateStage(judged.cfg) == std::optional { expected });
+        CHECK(ExitOf(expected) == exit);
+        CHECK(judged.report.ending == worksheet);
+        CHECK(Testing::Unwrap(judged.report.refusal) == StateDirectoryUnreadRefusal(judged.cfg));
+        // The startup table answers only a PERMANENT one; a transient one is `main`'s, by its arm.
+        auto const tableAnswers =
+            StartupPolicyRejection(judged.cfg) == std::optional { StateDirectoryUnreadRefusal(judged.cfg) };
+        CHECK(tableAnswers == (exit == ProcessExit::Refused));
+    }
+    CHECK(ExitCodeOf(ProcessExit::Failed) == 1);
+    CHECK(ExitCodeFor(StartStage::StartupRules) == ExitCodeOf(ProcessExit::Refused));
+}
+
+#if !defined(_WIN32)
+TEST_CASE("A state directory this account cannot list is refused with one full stop and who can list it",
+          "[node][state][formation][trust]")
+{
+    // MEASURED on Windows: "...: Access is denied.. Nothing in it is trusted until it can be", with no
+    // remedy. The system's message already ends in a full stop, and the refusal must say who may list it.
+    if (::geteuid() == 0)
+        SKIP("root lists any directory, so no listing can be refused here");
+    ScratchDirectory const scratch { "unlistable-state" };
+    WriteStoreWithoutFormation(scratch.Path());
+    std::filesystem::permissions(scratch.Path(), std::filesystem::perms::none);
+    auto guard = ScriptedNodeKeyGuard::OwnerOnly();
+    auto const kept = ReadStateDirectoryFormation(scratch.Path(), guard);
+    std::filesystem::permissions(scratch.Path(), std::filesystem::perms::owner_all);
+    REQUIRE_FALSE(kept.has_value());
+    INFO(kept.error().reason);
+    CHECK(kept.error().reason.contains("cannot list"));
+    CHECK_FALSE(kept.error().reason.contains(".."));
+    CHECK(kept.error().reason.contains("Judge it as an account that may list it"));
+    // A listing refused is an I/O arm: retried under a supervisor.
+    CHECK(kept.error().stage == StartStage::IdentityKeyIo);
+}
+#endif
+
+TEST_CASE("The trusted-owner set names the service --service-name names for a verb that writes nothing",
+          "[node][state][trust]")
+{
+    auto cfg = NodeConfig {};
+    cfg.serviceName = "FastCacheCompileNodeB";
+    CHECK(NodeServiceAccountOf(cfg) == std::optional<std::string> { "NT SERVICE\\FastCacheCompileNodeB" });
+    // A service named otherwise is another service: its account resolves to nothing this case knows,
+    // so an administrator trusts no account beyond its own and the administrators'.
+    CHECK(OwnStateAccountIds(JudgingCaller::Administrator, StateUse::Inspects, cfg, &ScriptedAccountId).empty());
+
+    cfg.serviceName = "FastCacheCompileNode";
+    CHECK(OwnStateAccountIds(JudgingCaller::Administrator, StateUse::Inspects, cfg, &ScriptedAccountId)
+          == std::vector<std::string> { std::string { NodeServiceSid } });
+    // Every other pair trusts nothing: a start writes, and anyone else trusts no account it is not.
+    CHECK(OwnStateAccountIds(JudgingCaller::Administrator, StateUse::Runs, cfg, &ScriptedAccountId).empty());
+    CHECK(OwnStateAccountIds(JudgingCaller::Other, StateUse::Inspects, cfg, &ScriptedAccountId).empty());
+    CHECK(OwnStateAccountIds(JudgingCaller::Other, StateUse::Runs, cfg, &ScriptedAccountId).empty());
+
+    // A group is never one: `--service-name="ALL SERVICES"` resolves to `S-1-5-80-0`.
+    cfg.serviceName = "ALL SERVICES";
+    CHECK(OwnStateAccountIds(JudgingCaller::Administrator, StateUse::Inspects, cfg, &ScriptedAccountId).empty());
+
+    // No service named: no account counts as the node's own, for anybody.
+    cfg.serviceName.clear();
+    CHECK_FALSE(NodeServiceAccountOf(cfg).has_value());
+    CHECK(OwnStateAccountIds(JudgingCaller::Administrator, StateUse::Inspects, cfg, &ScriptedAccountId).empty());
+
+    // Every (caller, use) pair has its row, with a reason, and only one names an account.
+    REQUIRE(OwnStateAccountRows().size() == EnumeratorCount<JudgingCaller> * EnumeratorCount<StateUse>);
+    cfg.serviceName = "FastCacheCompileNode";
+    for (auto const& row: OwnStateAccountRows())
+    {
+        CAPTURE(static_cast<int>(row.caller), static_cast<int>(row.use));
+        CHECK_FALSE(row.why.empty());
+        CHECK(row.account(cfg).has_value() == (row.caller == JudgingCaller::Administrator && row.use == StateUse::Inspects));
+    }
+}
+
+TEST_CASE("An elevated --print-identity over the service's state directory is refused as a start is", "[node][state][trust]")
+{
+    // `--print-identity` MINTS a key and an id into a directory that lacks them, so it is no verb that writes
+    // nothing: an administrator running it over the service's own files is refused, by name, exactly as a
+    // start is. Through the resolver the verb itself runs (`ResolveNodeKey`), with the guard `main` gives it.
+    auto cfg = NodeConfig {};
+    cfg.printIdentity = true;
+    CHECK(StateUseOf(cfg) == StateUse::Runs);
+    for (auto const caller: Enumerators<JudgingCaller>())
+    {
+        CAPTURE(static_cast<int>(caller));
+        ScratchDirectory const scratch { "trust-print-identity" };
+        WriteStoreWithoutFormation(scratch.Path());
+        auto platform = ScriptedNodeKeyGuard::OwnerOnly();
+        for (auto const name: ServiceWrittenFiles)
+            platform.OwnedBy(
+                std::filesystem::path { name }, std::string { NodeServiceAccount }, std::string { NodeServiceSid });
+        OwnStateAccountsGuard guard { platform, OwnStateAccountIds(caller, StateUseOf(cfg), cfg, &ScriptedAccountId) };
+        ScriptedSecureRandom random { ScriptedSecureRandom::Ascending(Ed25519SeedBytes) };
+
+        auto const resolved = ResolveNodeKey(scratch.Path(), random, guard);
+        REQUIRE_FALSE(resolved.has_value());
+        CHECK(resolved.error().fault == NodeKeyFault::ForeignOwner);
+        CHECK(resolved.error().message.contains(std::format("is owned by {}", NodeServiceAccount)));
+        CHECK(resolved.error().message.contains("Ownership is judged from the account asking"));
+        CHECK_FALSE(OffersRemovalForOwnership(resolved.error().message));
+        CHECK(random.FillCount() == 0);
+    }
+}
+
+TEST_CASE("Which verbs only inspect the state directory is a table and a start runs", "[node][state][trust]")
+{
+    auto start = NodeConfig {};
+    CHECK(StateUseOf(start) == StateUse::Runs);
+    auto surfaces = NodeConfig {};
+    surfaces.printSurfaces = true;
+    CHECK(StateUseOf(surfaces) == StateUse::Inspects);
+    auto identity = NodeConfig {};
+    identity.printIdentity = true;
+    CHECK(StateUseOf(identity) == StateUse::Runs);
+    auto install = NodeConfig {};
+    install.installService = true;
+    CHECK(StateUseOf(install) == StateUse::Runs);
+    for (auto const& row: StateUseRows())
+    {
+        CAPTURE(row.verb);
+        CHECK(row.verb.starts_with("--"));
+        CHECK_FALSE(row.why.empty());
+    }
+}
+
+TEST_CASE("A per-service SID is S-1-5-80 and five sub-authorities", "[node][state][trust]")
+{
+    CHECK(IsPerServiceSid(NodeServiceSid));
+    CHECK(IsPerServiceSid("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")); // TrustedInstaller
+    CHECK_FALSE(IsPerServiceSid(AllServicesSid));
+    CHECK_FALSE(IsPerServiceSid("S-1-5-80-1-2-3-4"));
+    CHECK_FALSE(IsPerServiceSid("S-1-5-80-1-2-3-4-5-6"));
+    CHECK_FALSE(IsPerServiceSid("S-1-5-80-1-2-x-4-5"));
+    CHECK_FALSE(IsPerServiceSid("S-1-5-80-1--3-4-5"));
+    CHECK_FALSE(IsPerServiceSid(PlainUserSid));
+    CHECK_FALSE(IsPerServiceSid(""));
 }

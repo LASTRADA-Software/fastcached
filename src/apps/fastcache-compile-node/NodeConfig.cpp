@@ -2,6 +2,7 @@
 #include "CacheTier.hpp"
 #include "EnrollAutoApprove.hpp"
 #include "NodeConfig.hpp"
+#include "NodeFormation.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeKey.hpp"
 #include "NodeMembership.hpp"
@@ -747,8 +748,22 @@ namespace
         /// pasted conjuncts are the shape that dropped one (#206).
         OptionComponent<NodeConfig> const* scope { nullptr };
         bool (*refuses)(NodeConfig const&); ///< Whether this rule objects.
-        std::string_view message;           ///< What the operator is told, with the remedy.
+        std::string_view message {};        ///< What the operator is told, with the remedy.
+
+        /// What the operator is told when the CAUSE is a fact the configuration carries rather than
+        /// prose: a reading's own refusal, say, which no static sentence can name. Null for every row
+        /// whose `message` says it all; a row carries one or the other (`EachRuleSaysOneThing`).
+        std::string (*explain)(NodeConfig const&) { nullptr };
     };
+
+    /// Whether every row of @p rules says exactly one thing: a `message`, or an `explain`.
+    /// @param rules The table.
+    /// @return True when no row carries both, and none carries neither.
+    [[nodiscard]] constexpr bool EachRuleSaysOneThing(std::span<ConfigRule const> rules) noexcept
+    {
+        return std::ranges::all_of(rules,
+                                   [](ConfigRule const& row) { return row.message.empty() == (row.explain != nullptr); });
+    }
 
     /// Whether a rule scoped to @p scope is asked of @p cfg at all.
     /// @param scope The rule's component, or null.
@@ -767,7 +782,7 @@ namespace
     {
         if (auto const* const rule = core::findIfOrNull(
                 rules, [&cfg](ConfigRule const& row) { return InScope(row.scope, cfg) && row.refuses(cfg); }))
-            return std::string { rule->message };
+            return rule->explain != nullptr ? rule->explain(cfg) : std::string { rule->message };
         return std::nullopt;
     }
 } // namespace
@@ -1149,8 +1164,9 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             // exactly one reader, `MakeNodeServiceSpec`, and that reader now asks the
             // value; a bit nothing reads is a claim nothing can check.
             .description = "this node's identity in the cluster, and what every\n"
-                           "vote is counted against. --listen-raft is what turns\n"
-                           "consensus on; this names the node that runs it.",
+                           "vote is counted against. Its mode, kept in\n"
+                           "--cluster-dir, decides whether it runs consensus;\n"
+                           "this names the node that runs it.",
             .yamlKey = "node_id",
             .same = FieldEq<&NodeConfig::nodeId>(),
         },
@@ -1161,9 +1177,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::raftListen, ParseText>(),
             .explicitBit = &NodeConfig::raftListenExplicit,
             .description = "where peers reach this node's consensus port; 6680\n"
-                           "unless given. The port is what turns consensus ON, so\n"
-                           "a node with no flags is a cluster of one, and an\n"
-                           "empty --listen-raft= runs none. A bare port binds the\n"
+                           "unless given. The mode kept in --cluster-dir decides\n"
+                           "whether the node runs consensus, and every mode but a\n"
+                           "learner's opens this port: a node with no flags is a\n"
+                           "cluster of one, and an empty --listen-raft= closes the\n"
+                           "port and runs none. A bare port binds the\n"
                            "WILDCARD: peers are on other machines by definition,\n"
                            "so loopback would silently not work.",
             .yamlKey = "listen_raft",
@@ -2629,7 +2647,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          // and no machine credentials on the network, and the SCM
                          // creates it from the service name with no account for the
                          // installer to make and no password to keep.
-                         .windowsLogon = WindowsLogonAccount::VirtualAccount };
+                         .windowsLogon = NodeWindowsLogon };
 }
 
 bool RunsWorker(NodeConfig const& cfg) noexcept
@@ -3461,6 +3479,7 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
         // working directory -- is gone, and the default is the platform's machine-wide one,
         // resolved by the service as the process it runs as (`DefaultNodeClusterDirectory`).
     });
+    static_assert(EachRuleSaysOneThing(Rules), "every install rule carries a message or an explanation, never both");
 
     return FirstRefusal(Rules, cfg);
 }
@@ -3597,6 +3616,34 @@ namespace
         return *bad;
     }
 } // namespace
+
+std::string StateDirectoryUnreadRefusal(NodeConfig const& cfg)
+{
+    // "None shaped", never "could not be read": the arm may be the directory's judgement, the
+    // record's bytes, a record `ApplyFormation` refused, or no directory resolved at all, and the
+    // reason that follows says which.
+    return std::format("this node's mode -- whether it runs consensus, opens its consensus port and serves a "
+                       "scheduler -- is the formation record kept in its state directory, {}, and none shaped this "
+                       "line, so no setting on it can be judged by the mode -- {}",
+                       DescribeNodeStateDirectory(cfg),
+                       FormationAbsenceOf(cfg));
+}
+
+std::optional<StartStage> UnreadStateStage(NodeConfig const& cfg) noexcept
+{
+    if (cfg.formation.has_value() || !cfg.formationUnread.has_value())
+        return std::nullopt;
+    return cfg.formationUnread->stage;
+}
+
+std::string RaftSelfWithNoModeRefusal(NodeConfig const& cfg)
+{
+    return std::format("--raft-self names where this node's peers dial it as a member of its consensus, and whether it "
+                       "runs consensus at all is its mode: the formation record kept in its state directory, {}, never "
+                       "a flag. That mode is unknown, so no flag on this line can stand in for it -- {}",
+                       DescribeNodeStateDirectory(cfg),
+                       FormationAbsenceOf(cfg));
+}
 
 std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
 {
@@ -3748,6 +3795,25 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         return UnrunComponentRefusal(*unrun);
 
     constexpr auto Rules = std::to_array<ConfigRule>({
+        // **First, and once: a state directory whose formation record no reading could give.** The
+        // mode decides whether this node runs consensus, opens its consensus port and serves a
+        // scheduler, and here there is none -- so every row below that judges a flag by the mode
+        // would blame the flag (`--raft-self` blamed `--listen-raft`, and `--discovery`,
+        // `--dashboard` and the closed-consensus worker would have answered the same way). The
+        // reading's own refusal is the cause, named through the sentence the `--print-surfaces`
+        // mode line prints (`FormationAbsenceOf`).
+        //
+        // **A row only where that refusal is PERMANENT** (`ProcessExit::Refused`): a row of this
+        // table ends a start as `StartupRules`, which a supervisor does not restart, and a transient
+        // read -- a listing or an access list the platform would not answer -- must stay retried.
+        // So a start and `--print-surfaces` end an unread directory by its OWN stage first
+        // (`UnreadStateStage`), ahead of this table; this row answers any other caller.
+        { .refuses =
+              [](NodeConfig const& c) {
+                  auto const stage = UnreadStateStage(c);
+                  return stage.has_value() && ExitOf(*stage) == ProcessExit::Refused;
+              },
+          .explain = StateDirectoryUnreadRefusal },
         // **A name that reaches only this machine is never offered to a peer** -- and a feature the
         // operator ASKED for that would have to offer it is refused by name, first, so the answer
         // is its cause rather than a downstream symptom (`--discovery needs --listen-raft`,
@@ -4009,12 +4075,23 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                   return !dial.has_value() && dial.error() == ConsensusDialGap::Unstated;
               },
           .message = ConsensusNamesNoDialAddressRefusal },
-        // A host with no port is not an endpoint, and the port is the half this flag
-        // deliberately does not carry.
-        { .refuses = [](NodeConfig const& c) { return !c.raftSelf.empty() && !RunsConsensus(c); },
-          .message = "--raft-self names the host this node's peers dial, and the port comes from --listen-raft, "
-                     "which is also what turns consensus ON. Without it there is no port to pair the host with "
-                     "and no consensus for the pair to name a member of." },
+        // `--raft-self` on a node that runs no consensus: a host named for a member of nothing.
+        // TWO rows, because there are two causes with two remedies, and the one sentence that
+        // served both named the wrong one: since the mode moved into the state (#1600), a
+        // configuration NO record shaped runs no consensus whatever its flags say, and this row
+        // told an operator who had typed `--listen-raft` that its absence was the cause.
+        //
+        // First the configuration no record shaped. Its mode is UNKNOWN, so the row names the mode
+        // and no flag. A READING that refused is answered by the first row of this table; what
+        // reaches this one is a configuration nothing tried to shape.
+        { .refuses = [](NodeConfig const& c) { return !c.raftSelf.empty() && !c.formation.has_value(); },
+          .explain = RaftSelfWithNoModeRefusal },
+        // Then the one a record shaped: its mode opens the consensus port and an empty
+        // `--listen-raft=` closed it -- which is the only way left, since a mode that opens no
+        // port (a learner's) runs consensus by dialling, and a malformed address is answered by
+        // the surface-grammar walk above, echoing what was typed.
+        { .refuses = [](NodeConfig const& c) { return !c.raftSelf.empty() && c.formation.has_value() && !RunsConsensus(c); },
+          .message = RaftSelfWithConsensusClosedRefusal },
         // The other half of the same flag group: the cluster's addresses given with
         // the switch that turns consensus on left off. `--cluster-dir` is deliberately
         // NOT here -- `FleetHistoryPath` reads it for the dashboard's history file, so
@@ -4134,6 +4211,8 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
               },
           .message = NodeRunsNothingRefusal },
     });
+
+    static_assert(EachRuleSaysOneThing(Rules), "every startup rule carries a message or an explanation, never both");
 
     if (auto rejection = FirstRefusal(Rules, cfg))
         return rejection;

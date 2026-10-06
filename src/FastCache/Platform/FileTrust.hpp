@@ -394,6 +394,10 @@ enum class FileOwnerStanding : std::uint8_t
     ThisProcess,    ///< The account this process runs as -- on Windows, or the owner its token stamps on
                     ///< what it creates (Administrators, under an elevated token).
     Administrative, ///< SYSTEM or Administrators on Windows; root on POSIX.
+    NamedAccount,   ///< An account the CALLER counts as its own beside the two above -- never answered
+                    ///< by `FileOwnerOf`, which knows none; a caller's own judgement promotes `Another`
+                    ///< to it, by the owner's `FileOwner::id` (an administrator judging the files of the
+                    ///< service it administers).
     Another,        ///< Any other account: somebody else put this file here.
     Undetermined,   ///< The platform would not say.
     Last,
@@ -404,6 +408,11 @@ struct FileOwner
 {
     FileOwnerStanding standing { FileOwnerStanding::Undetermined }; ///< Whose it is.
     std::string name; ///< The owner as an operator reads it: `DOMAIN\name`, a SID, or `uid N`.
+
+    /// The owner as the PLATFORM identifies it, which a name is not: the SID's string form on Windows
+    /// (`S-1-5-80-...`), `uid N` on POSIX. What a caller compares an account it trusts against
+    /// (`AccountIdOf`), never `name`, which a lookup may spell differently. Empty when undetermined.
+    std::string id;
 };
 
 /// Who owns @p path.
@@ -419,6 +428,24 @@ struct FileOwner
 /// @param path An existing file or directory.
 /// @return Its owner, `Undetermined` when the platform would not say.
 [[nodiscard]] FileOwner FileOwnerOf(std::filesystem::path const& path);
+
+/// @p account as the platform identifies it, in `FileOwner::id`'s terms.
+///
+/// Windows resolves the name to its SID (`LookupAccountName`) -- `NT SERVICE\<name>` resolves only
+/// while that service exists, so an account nothing created resolves to NOTHING, and a caller
+/// trusting it trusts no file. POSIX answers nothing: no account is resolved for this there, and
+/// no POSIX service runs as a per-service virtual account.
+/// @param account `DOMAIN\name`.
+/// @return Its id, or nothing when it does not resolve.
+[[nodiscard]] std::optional<std::string> AccountIdOf(std::string const& account);
+
+/// Whether this process runs as an ADMINISTRATOR: `BUILTIN\Administrators` enabled in its token
+/// on Windows (an elevated administrator; a service's virtual account is not one), root on POSIX.
+///
+/// Narrower than `IsPrivilegedProcess`, which also answers true for a service logon: this asks
+/// who is already trusted with everything an administrator may do, never which instance runs.
+/// @return True for an administrator; false otherwise, and when it cannot be determined.
+[[nodiscard]] bool IsAdministratorProcess();
 
 /// Whether @p path is a link rather than a file or directory of its own: a symbolic link on
 /// POSIX, any reparse point (a symbolic link or a junction) on Windows.
@@ -490,6 +517,17 @@ enum class DirectoryWriters : std::uint8_t
 /// @param directory An existing directory.
 /// @return Who can write in it.
 [[nodiscard]] DirectoryWriters DirectoryWritersOf(std::filesystem::path const& directory);
+
+/// Who BESIDES @p directory's owner and the administrators can add or remove entries in it:
+/// `DirectoryWritersOf` with the owner's question left to the caller, which never answers
+/// `ForeignOwner`.
+///
+/// For a caller that has already decided the owner is one it trusts -- an administrator judging
+/// the directory of the service it administers -- so a directory that account owns is still
+/// refused when a broad principal may plant entries in it.
+/// @param directory An existing directory.
+/// @return `OwnerOnly`, `Others` or `Undetermined`.
+[[nodiscard]] DirectoryWriters DirectoryWritersBeyondOwner(std::filesystem::path const& directory);
 
 /// Create @p directory, and every missing parent, with the directory itself readable, writable
 /// and listable by its owner and the administrators alone from its first instant.

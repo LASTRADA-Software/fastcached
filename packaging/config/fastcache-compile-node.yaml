@@ -165,13 +165,15 @@
 # this node's identity in the cluster, and what every vote is counted
 # against. An OVERRIDE: a node with a consensus port mints one into
 # --cluster-dir on its first start and reads it back forever, so this is only
-# needed for a fleet already named by hand. --listen-raft is what turns
-# consensus on; this names the node that runs it.
+# needed for a fleet already named by hand. Its mode, kept in --cluster-dir,
+# decides whether it runs consensus; this names the node that runs it.
 #node_id:
 
-# where peers reach this node's consensus port; default 6680. The port is what
-# turns consensus ON, so a node with no settings is a cluster of one, and an
-# empty value runs none -- on a cache-only node (slots: 0) alone: a worker with
+# where peers reach this node's consensus port; default 6680. The mode kept in
+# --cluster-dir decides whether the node runs consensus, and every mode but a
+# learner's opens this port: a node with no settings is a cluster of one, and an
+# empty value closes the port and runs none -- on a cache-only node (slots: 0)
+# alone: a worker with
 # no consensus never joins a fleet, so it would register nowhere and is refused
 # at startup. A bare port binds the WILDCARD: peers are on other
 # machines by definition, so loopback would silently not work.

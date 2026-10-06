@@ -1406,8 +1406,9 @@ TEST_CASE("NodeConfig: a cluster configured without --listen-raft is refused bef
 
     for (auto const& [listen, expects]: std::to_array<RaftCase>({
              // Nothing to judge, so the grammar loop skips it and the cross-flag rule
-             // answers: consensus is off, so everything else here is inert.
-             { .listen = "", .expects = "what turns consensus ON" },
+             // answers: the mode opens a port and the empty flag closed it, so everything
+             // else here is inert.
+             { .listen = "", .expects = "an empty --listen-raft= is what closes it" },
              // Text that is not an address, answered where the value can be echoed.
              { .listen = "nope", .expects = "is not [<address>:]<port>" },
              // Zero is not a port anyone can dial, so it is a malformed address
@@ -1431,6 +1432,36 @@ TEST_CASE("NodeConfig: a cluster configured without --listen-raft is refused bef
         CHECK(NodeInstallRejection(cfg).has_value());
     }
 
+    // Two causes of `--raft-self` on a node running no consensus, and two rows: the empty flag
+    // above, and a configuration NO formation record shaped -- whose mode is unknown, so its row
+    // names the mode and the state directory, and no flag at all. They never share a sentence:
+    // one did, and told an operator who had typed `--listen-raft` that its absence was the cause.
+    auto closed = Solitary(Installable());
+    closed.raftSelf = "10.0.0.1";
+    closed.raftListen.clear();
+    auto unshaped = closed;
+    unshaped.raftListen = "6680";
+    unshaped.formation.reset();
+    CHECK(StartupPolicyRejection(closed)
+          == std::optional<std::string> { std::string { RaftSelfWithConsensusClosedRefusal } });
+    // Nothing tried to shape it: the `--raft-self` row names the mode and no flag.
+    auto const unshapedRefusal = StartupPolicyRejection(unshaped);
+    CHECK(unshapedRefusal == std::optional<std::string> { RaftSelfWithNoModeRefusal(unshaped) });
+    CHECK(Unwrap(unshapedRefusal) != RaftSelfWithConsensusClosedRefusal);
+    CHECK(Unwrap(unshapedRefusal).contains("is its mode"));
+    CHECK(Unwrap(unshapedRefusal).contains("cluster (named by --cluster-dir)"));
+    CHECK(Unwrap(unshapedRefusal).ends_with("-- no formation record shaped this configuration"));
+    CHECK_FALSE(Unwrap(unshapedRefusal).contains("--listen-raft"));
+    // A reading that REFUSED is answered ahead of it, by the state directory's own row.
+    unshaped.formationUnread =
+        FormationUnread { .reason = "the formation record in this node's state directory cannot be read (damaged)",
+                          .stage = StartStage::IdentityKey };
+    auto const unread = StartupPolicyRejection(unshaped);
+    CHECK(unread == std::optional<std::string> { StateDirectoryUnreadRefusal(unshaped) });
+    CHECK(Unwrap(unread).contains("cluster (named by --cluster-dir)"));
+    CHECK(Unwrap(unread).contains("cannot be read (damaged)"));
+    CHECK_FALSE(Unwrap(unread).contains("--listen-raft"));
+
     // A bare port is enough, and binds the wildcard -- peers are on other machines
     // by definition.
     auto bare = Solitary(Installable());
@@ -1444,6 +1475,79 @@ TEST_CASE("NodeConfig: a cluster configured without --listen-raft is refused bef
     // And a learner, which dials its leader and listens for nobody, is not asked for a port it
     // has no use for.
     CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
+}
+
+TEST_CASE("NodeConfig: an unreadable state directory is refused once before any flag row can blame a flag",
+          "[node][consensus][policy]")
+{
+    // A configuration whose state directory could not be read has NO mode, and every row below the
+    // first that judges a flag by the mode would blame the flag: `--raft-self` blamed `--listen-raft`
+    // on a redeploy, and `--discovery`, `--dashboard` and the closed-consensus worker would each have
+    // answered the same way. So the first row names the reading's refusal, once, and none of them
+    // fires. Each case also runs WITHOUT a recorded reading -- nothing tried to shape it -- which is
+    // the control that its flag row is live and is what this one pre-empts.
+    struct FlagRow
+    {
+        std::string_view flag;         ///< The flag the row would have blamed.
+        void (*set)(NodeConfig& cfg);  ///< What makes that row fire.
+        std::string_view flagRowOpens; ///< How that row's own sentence opens.
+    };
+    auto const reading = std::string { "/var/lib/fastcache-node/raft-state is owned by NT SERVICE\\SomeOtherService, "
+                                       "which is neither the account judging it" };
+    for (auto const& [flag, set, flagRowOpens]: std::to_array<FlagRow>({
+             { .flag = "--raft-self",
+               .set = [](NodeConfig& cfg) { cfg.raftSelf = "10.0.0.1"; },
+               .flagRowOpens = "--raft-self names where this node's peers dial it" },
+             { .flag = "--discovery",
+               .set =
+                   [](NodeConfig& cfg) {
+                       cfg.discoveryAddress = "255.255.255.255:6681";
+                       cfg.discoveryAddressExplicit = true;
+                   },
+               .flagRowOpens = DiscoveryNeedsConsensusRefusal.substr(0, 30) },
+             { .flag = "--dashboard",
+               .set =
+                   [](NodeConfig& cfg) {
+                       cfg.dashboard = true;
+                       cfg.adminListen = "127.0.0.1:6677";
+                   },
+               .flagRowOpens = "--dashboard needs a node that serves the fleet's scheduler" },
+             { .flag = "--listen-raft=",
+               .set = [](NodeConfig& cfg) { cfg.raftListen.clear(); },
+               .flagRowOpens = WorkerWithConsensusClosedRefusal.substr(0, 30) },
+         }))
+    {
+        INFO(flag);
+        auto cfg = Solitary(Installable());
+        set(cfg);
+        cfg.formation.reset();
+
+        auto const flagRow = StartupPolicyRejection(cfg);
+        REQUIRE(flagRow.has_value());
+        CHECK(Unwrap(flagRow).starts_with(flagRowOpens));
+
+        // A VERDICT on the directory (a foreign owner): permanent, so the table names it.
+        cfg.formationUnread = FormationUnread { .reason = reading, .stage = StartStage::IdentityKey };
+        auto const refusal = StartupPolicyRejection(cfg);
+        CHECK(refusal == std::optional<std::string> { StateDirectoryUnreadRefusal(cfg) });
+        CHECK(Unwrap(refusal).starts_with("this node's mode"));
+        CHECK(Unwrap(refusal).contains(reading));
+        CHECK_FALSE(Unwrap(refusal).starts_with(flagRowOpens));
+        CHECK_FALSE(Unwrap(refusal).contains("--listen-raft"));
+
+        // A TRANSIENT arm is not the table's: a start and `--print-surfaces` end it by that arm
+        // (`UnreadStateStage`), retried, before the table is asked -- and the table, whose rows end a
+        // start as the permanent `StartupRules`, does not claim it.
+        cfg.formationUnread = FormationUnread { .reason = reading, .stage = StartStage::IdentityKeyIo };
+        CHECK(UnreadStateStage(cfg) == std::optional { StartStage::IdentityKeyIo });
+        CHECK(StartupPolicyRejection(cfg) != std::optional<std::string> { StateDirectoryUnreadRefusal(cfg) });
+    }
+
+    // And a configuration a record DID shape is never answered by it, whatever an earlier reading said.
+    auto shaped = Solitary(Installable());
+    shaped.formationUnread = FormationUnread { .reason = reading, .stage = StartStage::IdentityKey };
+    CHECK_FALSE(UnreadStateStage(shaped).has_value());
+    CHECK_FALSE(StartupPolicyRejection(shaped).has_value());
 }
 
 TEST_CASE("NodeConfig: the consensus switch is --listen-raft, not --node-id", "[node][consensus][policy]")
