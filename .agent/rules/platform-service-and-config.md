@@ -734,6 +734,21 @@ readable and silently ignored. Every rule below has already been one of them.
     installed, so nothing writes to it.
   - Deselecting a feature outside an upgrade (`REMOVE=CM_C_Node`, Settings > Apps > Modify, an
     uninstall) removes its service through its own binary, firewall rules included.
+  - **A maintenance transaction resolves `INSTALL_ROOT` from the product's OWN install location**
+    (`SetFastCacheInstallRootFromInstallLocation`: when `Installed`, before `CostFinalize`, from
+    `Uninstall\[ProductCode]`'s `InstallLocation`). CPack's `FindInstallLocation` reads only
+    `Uninstall\[WIX_UPGRADE_DETECTED]`, which is empty outside an upgrade, so a repair, a feature
+    change or an uninstall of a custom root resolved the DEFAULT root. CI run 37456507637
+    MEASURED the uninstall: it ran the default root's `fastcached.exe --uninstall-service`
+    (Info 1721, ignored), removed the files, and left FastCached registered over a deleted
+    binary, while the log showed the installed component's own directory (`CM_DP_Daemon.bin`)
+    correct. The fix is one property rather than a component directory per action, because a
+    feature that a change ADDS, every `Directory="INSTALL_ROOT"`, the PATH entry and
+    `ARPINSTALLLOCATION` all resolve from it as well (INFERRED, none of them measured). It is a
+    type 51 action before `CostFinalize`, never a type 35, which is `MsiSetTargetPath` and is
+    documented as not for a maintenance installation. Step 12 of `msi-custom-action-commands`
+    refuses the package without it while any scheduled action names `INSTALL_ROOT`, and
+    `wix-service-table` pins the rows.
 - **The MSI's service table decides every start mode**, and is applied on every transaction that
   leaves a feature installed -- a first install, a repair, a feature change and an upgrade. With
   the node installed, the node is registered `auto` and started, and fastcached `manual` and

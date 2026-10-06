@@ -35,6 +35,12 @@
 # stopped while running is started again, and each remembered value is written
 # back or deleted as it was found -- so a failed step leaves nothing behind.
 #
+# The FASTCACHE_INSTALL_LOCATION rows pin how a MAINTENANCE transaction resolves
+# INSTALL_ROOT: from the product's OWN uninstall entry, when Installed, before
+# CostFinalize. CPack resolves it only on an upgrade, and an uninstall of a custom
+# root ran the default root's binary and left its service registered (CI run
+# 37456507637). msi-custom-action-commands step 12 judges the same row by its shape.
+#
 # One row is a UNIQUENESS pin rather than an element: its opener is the bare
 # `Before="InstallFinalize"`, so rule 1 requires that text exactly once, and the
 # element it opens to be the forced failure's. FastCacheFailForTest is therefore the
@@ -72,6 +78,15 @@ set(_table [=[
 <Property Id="FASTCACHED_IMAGEPATH"|</Property>|Key="SYSTEM\CurrentControlSet\Services\FastCached"
 <Property Id="FASTCACHED_IMAGEPATH"|</Property>|Name="ImagePath"
 <Property Id="FASTCACHED_IMAGEPATH"|</Property>|Root="HKLM"
+
+<Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Root="HKLM"
+<Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]"
+<Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Name="InstallLocation"
+<Property Id="FASTCACHE_INSTALL_LOCATION"|</Property>|Bitness="always64"
+<SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Id="INSTALL_ROOT"
+<SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Value="[FASTCACHE_INSTALL_LOCATION]"
+<SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Before="CostFinalize" Sequence="both"
+<SetProperty Action="SetFastCacheInstallRootFromInstallLocation"|/>|Condition="Installed AND FASTCACHE_INSTALL_LOCATION"
 
 <CustomAction Id="FastCacheNodeDeleteLeftover"|/>|sc.exe" delete FastCacheCompileNode"
 <CustomAction Id="FastCacheNodeDeleteLeftover"|/>|Execute="deferred"

@@ -68,6 +68,51 @@
        install with error 1721. -->
   <CPackWiXFragment Id="#PRODUCT">
 
+    <!-- A MAINTENANCE transaction (a repair, a feature change, an uninstall)
+         resolves INSTALL_ROOT from where this product IS installed: the
+         InstallLocation of its OWN uninstall entry, read by AppSearch and set
+         before CostFinalize, which derives every directory under the root from
+         it. CPack's properties.wxi sets INSTALL_ROOT only from
+         Uninstall\[WIX_UPGRADE_DETECTED], which is empty outside an upgrade, so
+         every maintenance transaction of a custom root fell back to the default
+         one: the uninstall ran the default root's fastcached.exe
+         uninstall-service over a product installed elsewhere (Info 1721,
+         ignored), removed the files, and left FastCached registered and pointing
+         at a deleted binary (CI run 37456507637). Every action spelling
+         [INSTALL_ROOT], as its command or as its Directory, ran against that
+         wrong root.
+
+         One property rather than each action naming its component's directory:
+         an INSTALLED component's directory is already right (that run logged
+         the custom root for CM_DP_Daemon.bin beside the default INSTALL_ROOT),
+         but a feature a change ADDS derives its directory from INSTALL_ROOT,
+         Directory="INSTALL_ROOT" is the working directory of most actions here,
+         and the PATH entry and ARPINSTALLLOCATION are spelled from it too. A
+         per-action directory would fix the commands and none of those. Nor a
+         type 35 action (MsiSetTargetPath): that one runs after CostFinalize,
+         MOVES a directory, and is documented as not for a maintenance
+         installation; this one restores the directory the product is in,
+         before anything is resolved from it, as the remember-property pattern
+         restores a value.
+
+         Only when Installed: a first install and an upgrade (a new product
+         code, so not Installed) keep CPack's resolution, the command line's
+         INSTALL_ROOT or the old product's location. A maintenance transaction
+         cannot move the product, so the installed location outranks an
+         INSTALL_ROOT on its command line. In both sequences, because each runs
+         CostFinalize. An entry with no InstallLocation changes nothing: the
+         default root, as before. msi-custom-action-commands refuses the package
+         without this row while any scheduled action names INSTALL_ROOT. -->
+    <Property Id="FASTCACHE_INSTALL_LOCATION" Secure="yes">
+      <RegistrySearch Id="FastCacheOwnInstallLocation" Root="HKLM"
+                      Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]"
+                      Name="InstallLocation" Type="raw" Bitness="always64" />
+    </Property>
+    <SetProperty Action="SetFastCacheInstallRootFromInstallLocation" Id="INSTALL_ROOT"
+                 Value="[FASTCACHE_INSTALL_LOCATION]"
+                 Before="CostFinalize" Sequence="both"
+                 Condition="Installed AND FASTCACHE_INSTALL_LOCATION" />
+
     <!-- 1 = start fastcached when the install leaves it the only service. -->
     <Property Id="FASTCACHED_START_SERVICE" Value="1" Secure="yes" />
 
@@ -382,7 +427,8 @@
          the test CLOSED and is left alone.
 
          After CostFinalize, which resolves INSTALL_ROOT (on an upgrade, from the
-         old product's install location). Unconditional, and each test below
+         old product's install location; in maintenance, from this product's,
+         SetFastCacheInstallRootFromInstallLocation). Unconditional, and each test below
          also asks that its prefix is not empty: every string starts with the
          empty string, so an unset prefix would match any registration. -->
     <SetProperty Action="SetFastCacheOwnImagePathPrefix" Id="FASTCACHE_OWN_IMAGEPATH_PREFIX"

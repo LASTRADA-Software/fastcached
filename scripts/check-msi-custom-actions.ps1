@@ -45,7 +45,12 @@
 #  11. the rollback state is discarded only once the transaction has SUCCEEDED: every action that
 #      deletes it is a commit action, a rollback action, or a stated deferred row -- and at least one
 #      SCHEDULED commit action does, so the step cannot pass with the discard gone. The deleters are
-#      found by ONE spelling, and the step fails OPEN for any other (stated at the step).
+#      found by ONE spelling, and the step fails OPEN for any other (stated at the step);
+#  12. a MAINTENANCE transaction resolves INSTALL_ROOT from the product's OWN install location:
+#      while any scheduled action a maintenance transaction can run names INSTALL_ROOT, the fragment
+#      sets it, when Installed, before CostFinalize, from a RegistrySearch of
+#      Uninstall\[ProductCode]'s InstallLocation. CPack resolves it only on an upgrade, and an
+#      uninstall of a custom root ran the default root's binary and left its service registered.
 # Every other action changes a service, the registry or the firewall, and is never started here.
 #
 # Usage: pwsh -NoProfile -File scripts/check-msi-custom-actions.ps1 -SourceDir <repository root>
@@ -81,6 +86,8 @@ $RunnableActions = @{
 # directly after InstallInitialize -- the premise of step 6, stated here because the template is
 # not in this repository to read. An anchor on a standard action with no row is refused.
 $StandardSequence = @{
+    AppSearch              = 50
+    CostFinalize           = 1000
     InstallValidate        = 1400
     InstallInitialize      = 1500
     RemoveExistingProducts = 1501
@@ -490,6 +497,68 @@ if ($discards.Count -eq 0) {
 }
 if ($failures.Count -eq $failuresBeforeDiscard) {
     Pass "the rollback state is discarded only in the commit phase: $($deleters.Count) deleter(s) judged, $($discards.Count) scheduled commit discard(s) ($(@($discards | ForEach-Object Id) -join ', ')), $($DeferredStateDeleters.Count) deferred deleter(s) are stated rows"
+}
+
+# 12. A maintenance transaction resolves INSTALL_ROOT from the product's OWN install location.
+# CPack's properties.wxi sets it only from Uninstall\[WIX_UPGRADE_DETECTED], empty outside an
+# upgrade, so a repair, a feature change or an uninstall of a custom root fell back to the default
+# root: the uninstall ran a fastcached.exe that was not there and left the service registered
+# (CI run 37456507637).
+#
+# The set is DERIVED: every scheduled action whose Directory is INSTALL_ROOT or whose command spells
+# [INSTALL_ROOT], less those a maintenance transaction cannot run -- read as a Condition carrying a
+# `NOT Installed` clause, the ONE spelling recognised. The direction that fails: an action kept out
+# of maintenance some other way still counts as reachable here, which only DEMANDS the resolver, so
+# the step fails CLOSED there. It does not read a component's Directory or the PATH entry, which
+# resolve from INSTALL_ROOT too; they need the same row, so any one action naming it covers them.
+$maintenanceRoot = @($actions | Where-Object {
+        $schedule.ContainsKey($_.Id) -and ($_.Directory -eq 'INSTALL_ROOT' -or $_.ExeCommand -match '\[INSTALL_ROOT\]')
+    } | Where-Object {
+        $row = $fragment.SelectSingleNode("//InstallExecuteSequence/Custom[@Action='$($_.Id)']")
+        $row.GetAttribute('Condition') -notmatch '(^|\s|\()NOT Installed(\s|\)|$)'
+    })
+$failuresBeforeMaintenanceRoot = $failures.Count
+if ($maintenanceRoot.Count -eq 0) { Fail 'no scheduled action a maintenance transaction can run names INSTALL_ROOT, so step 12 judged nothing' }
+$resolvers = @($fragment.SelectNodes('//SetProperty') | Where-Object { $_.GetAttribute('Id') -eq 'INSTALL_ROOT' })
+$needs = "$($maintenanceRoot.Count) scheduled action(s) a repair, a feature change or an uninstall runs name INSTALL_ROOT ($(@($maintenanceRoot | ForEach-Object Id | Select-Object -First 3) -join ', '), ...)"
+if ($resolvers.Count -ne 1) {
+    Fail "$($resolvers.Count) SetProperty rows set INSTALL_ROOT, and exactly one must, from the product's own install location: $needs, and without it CostFinalize resolves the DEFAULT root for a product installed elsewhere. Add SetProperty Id=`"INSTALL_ROOT`" Value=`"[<P>]`" Before=`"CostFinalize`" Condition=`"Installed AND <P>`", with <P> read by a RegistrySearch of HKLM Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode], Name InstallLocation."
+} else {
+    $resolver = $resolvers[0]
+    $resolverId = $resolver.GetAttribute('Action')
+    $source = if ($resolver.GetAttribute('Value') -match '^\[([A-Za-z_][A-Za-z0-9_.]*)\]$') { $Matches[1] } else { $null }
+    if ($null -eq $source) {
+        Fail "$resolverId sets INSTALL_ROOT to '$($resolver.GetAttribute('Value'))', not to ONE property a search read"
+    } else {
+        # Installed, and only when the search FOUND a location: an empty one would set no root at all.
+        if ($resolver.GetAttribute('Condition') -ne "Installed AND $source") {
+            Fail "$resolverId is conditioned '$($resolver.GetAttribute('Condition'))'; it must be 'Installed AND $source': a maintenance transaction only (a first install and an upgrade keep CPack's resolution), and only when the location was found"
+        }
+        $search = $fragment.SelectSingleNode("//Property[@Id='$source']/RegistrySearch")
+        $ownEntry = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]'
+        if ($null -eq $search -or $search.GetAttribute('Root') -ne 'HKLM' -or
+            -not $search.GetAttribute('Key').Equals($ownEntry, [StringComparison]::OrdinalIgnoreCase) -or
+            $search.GetAttribute('Name') -ne 'InstallLocation') {
+            Fail "$source, which $resolverId sets INSTALL_ROOT from, is not read by a RegistrySearch of HKLM $ownEntry, Name InstallLocation: the product's OWN install location"
+        }
+    }
+    $sequence = $resolver.GetAttribute('Sequence')
+    if ($sequence -notin @('', 'both', 'execute')) { Fail "$resolverId runs in Sequence '$sequence', so the execute sequence, which runs every action above, never resolves the root" }
+    # After AppSearch, which reads the location, and before CostFinalize, which resolves every
+    # directory under the root from it. A chain through another row is refused rather than walked.
+    $relation = if ($resolver.HasAttribute('After')) { 'After' } else { 'Before' }
+    $standard = $resolver.GetAttribute($relation)
+    if (-not $StandardSequence.ContainsKey($standard)) {
+        Fail "$resolverId is anchored $relation '$standard', which StandardSequence has no row for: anchor it on a standard action between AppSearch and CostFinalize"
+    } else {
+        $point = [double] $StandardSequence[$standard] + $(if ($relation -eq 'After') { 0.5 } else { -0.5 })
+        if (-not ($point -gt $StandardSequence['AppSearch'] -and $point -lt $StandardSequence['CostFinalize'])) {
+            Fail "$resolverId runs $relation $standard, outside AppSearch..CostFinalize: before AppSearch the location is unread, after CostFinalize every directory is already resolved from the default root"
+        }
+    }
+}
+if ($failures.Count -eq $failuresBeforeMaintenanceRoot) {
+    Pass "a maintenance transaction resolves INSTALL_ROOT from the product's own install location; $needs"
 }
 
 # Positive controls: a walk that found nothing reports nothing wrong about it.
