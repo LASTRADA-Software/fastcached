@@ -3695,6 +3695,139 @@ jobs:
             Remove-FastCacheMachineState
           }
 
+      # #1629: a deliberately FAILED upgrade must leave the machine exactly as it was. The shipped
+      # MSI fails last when FASTCACHE_FAIL_FOR_TEST=1, behind every other script action, so the
+      # rollback runs every rollback action we have. The scenario is chosen so that the upgrade
+      # would CHANGE what is compared -- N installed fastcached-only into a custom root, N+1 adding
+      # the node into the default root moves fastcached's path and start type and creates a second
+      # service -- and the last leg proves that a SUCCESSFUL run of it does.
+      # Two controls run the same failure on patched COPIES and must go red: the exact restores
+      # switched off, and the rollback state discarded in the script again. Not covered, by design:
+      # the window from RemoveExistingProducts to WriteRegistryValues (ChecksBeforeTheRestores), and
+      # a failure after a leftover delete (nothing restores a deleted service; this scenario keeps
+      # both features, so none is deleted).
+      - name: "A failed upgrade restores the previous installation exactly"
+        shell: pwsh
+        working-directory: out/build/cl-release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/lib/MsiServiceTable.psm1')
+          $first = (Get-ChildItem -Filter *.msi | Select-Object -First 1).FullName
+          $newer = (Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP 'second-build') -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          if (-not $newer) { throw "no second build under RUNNER_TEMP\second-build: the upgrade step that makes it did not run" }
+          $family = Get-MsiProperty $first 'UpgradeCode'
+          $firstCode = Get-MsiProperty $first 'ProductCode'
+          # Under Program Files, so the services' accounts can read it as they read the default root;
+          # with a space, as Program Files itself has. The trailing backslash is a SPELLING, not a
+          # requirement: it is the form Windows Installer itself writes a directory property in, and
+          # CostFinalize would normalise a root given without it to the same thing. It is safe on the
+          # command line because Start-Process joins an ArgumentList with plain spaces and msiexec
+          # parses PROPERTY="value" itself, where a backslash before the closing quote is not an
+          # escape (only "" is).
+          $root = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'fastcached 1629 root\'
+          $fastcachedOnly = 'ADDLOCAL=CM_C_Cli,CM_C_Daemon,CM_C_Launcher'
+          $withNode = 'ADDLOCAL=CM_C_Cli,CM_C_Daemon,CM_C_Launcher,CM_C_Node'
+          $failedHere = 'CustomAction FastCacheFailForTest returned actual error code'
+
+          function Install-N([string] $Log) {
+            Invoke-Msiexec -Operation '/i' -Package $first -Log $Log -Properties $fastcachedOnly, "INSTALL_ROOT=`"$root`"" `
+              -What 'build N, fastcached-only, into a custom root'
+            Assert-InstalledProduct $family $firstCode
+            Assert-ServiceTable -Row DaemonAlone -Log $Log
+          }
+          function Remove-All([string] $Log) {
+            Invoke-Msiexec -Operation '/x' -Package $first -Log $Log -What 'uninstalling build N'
+            Assert-InstalledProduct $family ''
+            Assert-ServiceTable -Row NothingInstalled -Log $Log
+            Remove-FastCacheMachineState
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          # A PowerShell function returns EVERYTHING it emits, so the helpers are piped to Out-Null
+          # and the result is asserted to be the one snapshot rather than an array holding it.
+          function Invoke-FailedUpgrade([string] $Package, [string] $Log, [string] $What) {
+            Invoke-Msiexec -Operation '/i' -Package $Package -Log $Log -Properties $withNode, 'FASTCACHE_FAIL_FOR_TEST=1' `
+              -Accept @(1603) -What $What | Out-Null
+            Assert-MsiLog -Path $Log -Present $failedHere | Out-Null
+            $snapshot = Get-InstallationSnapshot -UpgradeCode $family -Root $root
+            if ($snapshot -isnot [System.Collections.Specialized.OrderedDictionary]) { throw "$What`: the snapshot is a $($snapshot.GetType().FullName), not one ordered dictionary" }
+            return $snapshot
+          }
+          function Show-Snapshot($Snapshot, [string] $Title) {
+            Write-Host "== $Title"
+            foreach ($field in $Snapshot.Keys) { foreach ($line in $Snapshot[$field]) { Write-Host "  $field | $line" } }
+          }
+          # A control's reset must put build N back EXACTLY, or a control could go red for reset residue
+          # rather than for its patch: uninstall, clean, reinstall, and compare with the first snapshot.
+          function Reset-ToN([string] $Tag) {
+            Remove-All "$Tag-uninstall.log"
+            Install-N "$Tag-reinstall.log"
+            $fresh = Get-InstallationSnapshot -UpgradeCode $family -Root $root
+            $residue = @(Compare-InstallationSnapshot -Before $before -After $fresh)
+            if ($residue.Count) { Show-Snapshot $fresh "after the $Tag reset"; throw "the $Tag reset did not reinstall build N exactly, so the next leg would compare against residue:`n$($residue -join "`n")" }
+            Write-Host "the $Tag reset reinstalled build N exactly ($($before.Count) fields)"
+          }
+
+          Remove-FastCacheMachineState
+          Install-N 'n-install.log'
+          $before = Get-InstallationSnapshot -UpgradeCode $family -Root $root
+          if ($before -isnot [System.Collections.Specialized.OrderedDictionary]) { throw "the snapshot before is not one ordered dictionary" }
+          Show-Snapshot $before 'build N, before'
+
+          # The subject: the real package fails last, and everything comes back.
+          $after = Invoke-FailedUpgrade $newer 'failed-upgrade.log' 'an upgrade made to fail last'
+          $diff = @(Compare-InstallationSnapshot -Before $before -After $after)
+          if ($diff.Count) { Show-Snapshot $after 'after the failed upgrade'; throw "the failed upgrade did not restore build N exactly:`n$($diff -join "`n")" }
+          Write-Host "the failed upgrade restored all $($before.Count) fields exactly"
+
+          # Control 1: the exact restores switched off. Must differ, in fastcached's registration.
+          $noRestore = Join-Path $env:RUNNER_TEMP 'control-no-restore.msi'
+          New-MsiControlCopy -Package $newer -Destination $noRestore -Statements @(
+              "UPDATE ``InstallExecuteSequence`` SET ``Condition``='0' WHERE ``Action``='FastCachedRestoreRegistrationExactly'",
+              "UPDATE ``InstallExecuteSequence`` SET ``Condition``='0' WHERE ``Action``='FastCacheNodeRestoreRegistrationExactly'") `
+            -Verify @{
+              "SELECT ``Condition`` FROM ``InstallExecuteSequence`` WHERE ``Action``='FastCachedRestoreRegistrationExactly'" = '0'
+              "SELECT ``Condition`` FROM ``InstallExecuteSequence`` WHERE ``Action``='FastCacheNodeRestoreRegistrationExactly'" = '0' } | Out-Null
+          $control = @(Compare-InstallationSnapshot -Before $before -After (Invoke-FailedUpgrade $noRestore 'control-no-restore.log' 'control 1: the exact restores switched off'))
+          Write-Host "control 1 differences:`n  $($control -join "`n  ")"
+          if (-not ($control | Where-Object { $_ -like 'service FastCached:*' })) { throw "control 1 did not go red on fastcached's registration, so the comparison cannot see a restore that did not run" }
+          Reset-ToN 'control-no-restore'
+
+          # Control 2: the rollback state discarded inside the script again (commit bit cleared).
+          $deferred = Join-Path $env:RUNNER_TEMP 'control-deferred-discard.msi'
+          # Read the shipped Type, assert the commit bit (0x200) is set, and clear it.
+          $type = [int](Get-MsiCustomActionType $newer 'FastCacheDiscardRollbackState')
+          if (-not ($type -band 0x200)) { throw "FastCacheDiscardRollbackState has Type $type, without the commit bit: the fix is not in this package" }
+          $cleared = $type -band (-bnot 0x200)
+          New-MsiControlCopy -Package $newer -Destination $deferred `
+            -Statements @("UPDATE ``CustomAction`` SET ``Type``=$cleared WHERE ``Action``='FastCacheDiscardRollbackState'") `
+            -Verify @{ "SELECT ``Type`` FROM ``CustomAction`` WHERE ``Action``='FastCacheDiscardRollbackState'" = "$cleared" } | Out-Null
+          $control = @(Compare-InstallationSnapshot -Before $before -After (Invoke-FailedUpgrade $deferred 'control-deferred-discard.log' 'control 2: the rollback state discarded in the script'))
+          Write-Host "control 2 differences:`n  $($control -join "`n  ")"
+          if (-not ($control | Where-Object { $_ -like 'service FastCached:*' })) { throw "control 2 did not go red: a discard inside the script must cost the exact restore its state" }
+          Reset-ToN 'control-deferred-discard'
+
+          # The scenario discriminates: a SUCCESSFUL run of the same upgrade changes every field the
+          # subject relied on, and never runs the failure action. Each field below is one whose READER
+          # nothing else shows live: an unchanged field is equal on both sides however it was read, so
+          # a reader that returned nothing would pass the subject. The custom root's binary goes, the
+          # installed product is N+1 rather than N, and the node's firewall group is created.
+          Invoke-Msiexec -Operation '/i' -Package $newer -Log 'succeeded-upgrade.log' -Properties $withNode -What 'the same upgrade, succeeding'
+          Assert-MsiLog -Path 'succeeded-upgrade.log' -Present (Get-MsiActionRanPattern 'FastCacheNodeStartService') -Absent (Get-MsiActionRanPattern 'FastCacheFailForTest')
+          $changed = @(Compare-InstallationSnapshot -Before $before -After (Get-InstallationSnapshot -UpgradeCode $family -Root $root))
+          Write-Host "a successful upgrade changes:`n  $($changed -join "`n  ")"
+          foreach ($field in 'service FastCached', 'state FastCached', 'service FastCacheCompileNode', 'binary', 'products',
+                             'firewall fastcached: FastCacheCompileNode') {
+            if (-not ($changed | Where-Object { $_ -like "${field}:*" })) { throw "a successful upgrade left '$field' unchanged, so the failed one proved nothing about it" }
+          }
+          foreach ($value in 'ImagePath', 'Start') {
+            if (-not ($changed | Where-Object { $_ -like 'service FastCached:*' -and $_ -match "\b$value\b" })) { throw "a successful upgrade left fastcached's $value unchanged, so the failed one proved nothing about it" }
+          }
+          Invoke-Msiexec -Operation '/x' -Package $newer -Log 'succeeded-uninstall.log' -What 'uninstalling after the successful upgrade'
+          Assert-InstalledProduct $family ''
+          Assert-ServiceTable -Row NothingInstalled -Log 'succeeded-uninstall.log'
+          Remove-FastCacheMachineState
+          Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+
       # First the DEFAULT install, a plain /i naming no feature and no property, as
       # an operator who double-clicks the package gets it: every feature is selected
       # by default, so the node is registered auto and running and fastcached manual

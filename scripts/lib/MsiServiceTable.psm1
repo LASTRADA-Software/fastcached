@@ -26,16 +26,33 @@
 #
 # `Invoke-MsiServiceTableSelfTest` drives the service verdict over synthetic
 # observations in both directions, the waiting assertion against a service every
-# Windows host runs and a name no host has, and the package reader over an MSI
-# database it creates. It installs nothing. Its two blind spots both fail OPEN:
+# Windows host runs and a name no host has, the package reader over an MSI
+# database it creates, the registry walker over a scratch key in HKCU, and the
+# firewall snapshot over a group no host has. It installs nothing. Its blind
+# spots, each with the direction it fails in:
 #
 #   * `Get-InstalledProductCodes` is exercised only for an UpgradeCode nothing is
 #     installed under, because a non-empty answer needs an installed product.
+#     Fails OPEN.
 #   * The table's rows are checked for VOCABULARY only -- a known start mode and a
 #     known state -- never against the fragment. A row that is wrong the same way
 #     the fragment is wrong (both saying fastcached stays auto beside the node,
 #     say) passes here and passes the packaging job, because there the one agrees
-#     with the other. Only a reader of both catches that.
+#     with the other. Only a reader of both catches that. Fails OPEN.
+#   * `Assert-NodeStatePrivate` reads access lists a real install produced; only
+#     its pure verdicts run here (stated at the function). Fails CLOSED: it throws.
+#   * `Get-InstallationSnapshot` is assembled whole only by the packaging job,
+#     which alone has the services, the HKLM keys and the products it reads. Its
+#     parts run here -- the walker, the settled state through its observation seam,
+#     the comparison over synthetic records -- never the assembly. A field read
+#     wrongly reads wrongly on BOTH sides of a comparison, so that fails OPEN; the
+#     job's discrimination leg, which requires a successful upgrade to change the
+#     fields it names, is what shows those readers live.
+#   * `Get-FirewallGroupSnapshot` renders a POPULATED group only on the packaging
+#     job; here it reads an absent group live and its error decision through its
+#     seam. A line rendered wrongly is wrong on both sides too: fails OPEN.
+#   * `Get-SettledServiceState`'s real sleep runs only live; here it is
+#     `-StableSeconds 0` through the observation seam.
 #
 # And one limit of the assertion itself, not of its self-test: the stability
 # window is about five seconds after a row matches. A service that crashes
@@ -292,37 +309,62 @@ function Show-ServiceDiagnosis([string] $Name) {
 # Packages
 # ---------------------------------------------------------------------------
 
-# Reads one row of a package's Property table.
+# Reads the first column of the first row of one query against a package's database, read-only.
 #
-# Every COM object is released before returning, so the package is not held open
-# when msiexec or cpack next needs it.
+# The ONE place the module reads a package through COM: every COM object is released before
+# returning, so the package is not held open when msiexec or cpack next needs it.
+#
+# @param Path The .msi file.
+# @param Query MSI SQL (backtick-quoted identifiers).
+# @return The value as text, or $null when the query matches no row; each caller owns what that means.
+function Get-MsiScalar([string] $Path, [string] $Query) {
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    try {
+        $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @([string]$Path, 0))
+        try {
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @([string]$Query))
+            try {
+                $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+                $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+                if (-not $record) { return $null }
+                try {
+                    return $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, @(1))
+                } finally {
+                    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($record)
+                }
+            } finally {
+                $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
+                [void][Runtime.InteropServices.Marshal]::ReleaseComObject($view)
+            }
+        } finally {
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
+        }
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
+    }
+}
+
+# Reads one row of a package's Property table.
 #
 # @param Path The .msi file.
 # @param Name The property.
 # @return Its value; a package without it is refused by name.
 function Get-MsiProperty([string] $Path, [string] $Name) {
-    $installer = New-Object -ComObject WindowsInstaller.Installer
-    $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, 0))
-    try {
-        $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db,
-            @("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$Name'"))
-        try {
-            $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
-            $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
-            if (-not $record) { throw "$Path carries no $Name property" }
-            try {
-                return $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, @(1))
-            } finally {
-                [void][Runtime.InteropServices.Marshal]::ReleaseComObject($record)
-            }
-        } finally {
-            $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
-            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($view)
-        }
-    } finally {
-        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
-        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
-    }
+    $value = Get-MsiScalar $Path "SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$Name'"
+    if ($null -eq $value) { throw "$Path carries no $Name property" }
+    return $value
+}
+
+# Reads the Type of one row of a package's CustomAction table (#1629): the bit field that says
+# whether the action is deferred, committed, run in the system context, and so on.
+#
+# @param Path The .msi file.
+# @param Action The custom action's name.
+# @return Its Type as an integer; an action the package does not carry is refused by name.
+function Get-MsiCustomActionType([string] $Path, [string] $Action) {
+    $value = Get-MsiScalar $Path "SELECT ``Type`` FROM ``CustomAction`` WHERE ``Action`` = '$Action'"
+    if ($null -eq $value) { throw "$Path carries no $Action custom action" }
+    return [int]$value
 }
 
 # The ProductCodes Windows Installer holds as installed under one UpgradeCode.
@@ -467,15 +509,48 @@ function Format-FirewallRuleLine($Rule, $Port, $Address, $Application) {
     return "$($Rule.DisplayName) | enabled=$($Rule.Enabled) $($Rule.Direction) $($Rule.Action) profile=$($Rule.Profile) | $($Port.Protocol)/$(@($Port.LocalPort) -join ',') | remote=$(@($Address.RemoteAddress) -join ',') | program=$($Application.Program)"
 }
 
+# The error Get-NetFirewallRule raises for a group that holds no rule, by its id, measured on
+# PowerShell 7.6 (2026-10-06). The ONLY error a snapshot reads as "empty": any other -- access denied,
+# the firewall service down, a CIM failure -- is a read that FAILED, and an empty answer for it
+# would compare as "unchanged" on both sides of a transaction.
+$script:FirewallGroupNotFoundId = 'CmdletizationQuery_NotFound_RuleGroup,Get-NetFirewallRule'
+
 # The firewall group @p Group on the REAL Windows Firewall, one Format-FirewallRuleLine per rule,
 # sorted, so two snapshots compare as text. What Assert-FirewallGroupUnchanged reads.
 # @param Group The group, `fastcached: <service>`.
-# @return The lines; none for an empty or absent group.
-function Get-FirewallGroupSnapshot([string] $Group) {
-    return @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue | ForEach-Object {
+# @param Read Takes a group and returns its rules, as Get-NetFirewallRule -ErrorAction Stop does; a
+#        seam so the self-test can drive the error decision without a firewall.
+# @return The lines; none for an empty or absent group. Throws on a read that failed for any other
+#         reason than the group holding no rule.
+function Get-FirewallGroupSnapshot {
+    param(
+        [Parameter(Mandatory)] [string] $Group,
+        [scriptblock] $Read = { param($group) Get-NetFirewallRule -Group $group -ErrorAction Stop }
+    )
+    $rules = @(try { & $Read $Group } catch {
+            if ($_.FullyQualifiedErrorId -cne $script:FirewallGroupNotFoundId) { throw }
+        })
+    return @($rules | ForEach-Object {
             Format-FirewallRuleLine $_ ($_ | Get-NetFirewallPortFilter) ($_ | Get-NetFirewallAddressFilter) `
                 ($_ | Get-NetFirewallApplicationFilter)
         } | Sort-Object)
+}
+
+# The elements of @p From that @p Without does not match ONE FOR ONE, case-sensitively: a MULTISET
+# difference, so a line held twice where it was held once is a difference. A set test
+# (-cnotcontains) reads @('r') and @('r', 'r') as equal, and a firewall rule a rollback duplicated
+# renders as exactly that line twice (Format-FirewallRuleLine carries no rule Name).
+# @param From The lines to look for.
+# @param Without The lines to match them against, each usable once.
+# @return The unmatched lines of @p From, in its order; nothing when all matched.
+function Get-MultisetDifference([string[]] $From, [string[]] $Without) {
+    $remaining = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in @($Without)) { $remaining.Add($line) }
+    foreach ($line in @($From)) {
+        # List[string].IndexOf compares ordinally, so case-sensitively, as -cnotcontains did.
+        $at = $remaining.IndexOf($line)
+        if ($at -ge 0) { $remaining.RemoveAt($at) } else { $line }
+    }
 }
 
 # Does the group hold, after a transaction, exactly what it held before? A pure verdict so the
@@ -489,8 +564,8 @@ function Get-FirewallGroupUnchangedVerdict([string[]] $Before, [string[]] $After
     $before = @($Before | Where-Object { $_ })
     $after = @($After | Where-Object { $_ })
     if ($before.Count -eq 0) { return "the firewall group '$Group' held no rule BEFORE the transaction, so an unchanged group proves nothing" }
-    $lost = @($before | Where-Object { $after -cnotcontains $_ })
-    $left = @($after | Where-Object { $before -cnotcontains $_ })
+    $lost = @(Get-MultisetDifference $before $after)
+    $left = @(Get-MultisetDifference $after $before)
     if ($lost.Count -eq 0 -and $left.Count -eq 0) { return $null }
     return "the firewall group '$Group' changed: it lost [$($lost -join '; ')] and holds [$($left -join '; ')] it did not"
 }
@@ -597,8 +672,8 @@ function Get-DirectoryOwnerVerdict([string] $OwnerSid) {
 # for the module's own reason: two steps assert this -- the feature change and the
 # upgrade from an exposed 0.3.0 directory -- and a copy that drifts stops saying
 # what its neighbour says. It reads real access lists a real install produced, so
-# the self-test cannot reach it; that is a third blind spot of the same kind as the
-# two named at the top of this module, and it fails CLOSED -- it throws.
+# the self-test cannot reach it; that is one of the blind spots named at the top of
+# this module, and it fails CLOSED -- it throws.
 #
 # Whether the node's service reaches its state directory and its key the way the install means it
 # to: it may ADD to the directory -- it mints the key there -- and may NOT rewrite the directory's
@@ -890,6 +965,187 @@ function Get-MsiActionRanPattern([string] $Action) {
 }
 
 # ---------------------------------------------------------------------------
+# Installation snapshots (#1629)
+# ---------------------------------------------------------------------------
+
+# Service registry values that change on their own between two observations of an UNCHANGED
+# installation, with the reason each is excluded. Starts EMPTY on purpose: a row is added only with
+# the CI log line that shows the value moving, never pre-emptively (#1629).
+$script:VolatileServiceValues = @{}
+
+# Every value under @p Path and its subkeys, one sorted line each, '<subkey>\<name> <kind> <data>',
+# the data UNexpanded. '<absent>' alone when the key does not exist, so absence is a value that
+# compares rather than an empty list that matches anything.
+#
+# A row of VolatileServiceValues is keyed '<service>\<label>', where <label> is the line's own first
+# token: the value's name, behind its subkey path when it lives in a subkey ('Svc\Parameters\X').
+#
+# @param Path Key path relative to @p Hive.
+# @param Service The service the key belongs to, to look its volatile values up; empty for none.
+# @param Hive The hive @p Path is in: HKLM for every snapshot, HKCU for the self-test's scratch key.
+# @return The lines, always an array.
+function Get-RegistryTreeLines([string] $Path, [string] $Service = '', [Microsoft.Win32.RegistryKey] $Hive = [Microsoft.Win32.Registry]::LocalMachine) {
+    $key = $Hive.OpenSubKey($Path)
+    if ($null -eq $key) { return , @('<absent>') }
+    try {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $walk = {
+            param($k, [string] $prefix)
+            foreach ($name in $k.GetValueNames()) {
+                $label = if ($prefix) { "$prefix\$name" } else { $name }
+                if ($Service -and $script:VolatileServiceValues.ContainsKey("$Service\$label")) { continue }
+                $kind = $k.GetValueKind($name)
+                $data = $k.GetValue($name, $null, 'DoNotExpandEnvironmentNames')
+                $text = switch ($kind) {
+                    'Binary' { ($data | ForEach-Object { $_.ToString('x2') }) -join '' }
+                    'MultiString' { ($data | ForEach-Object { "`"$_`"" }) -join ',' }
+                    default { "$data" }
+                }
+                $lines.Add("$label $kind $text")
+            }
+            foreach ($sub in $k.GetSubKeyNames()) {
+                $child = $k.OpenSubKey($sub)
+                try { & $walk $child $(if ($prefix) { "$prefix\$sub" } else { $sub }) } finally { $child.Dispose() }
+            }
+        }
+        & $walk $key ''
+        return , @($lines | Sort-Object)
+    } finally { $key.Dispose() }
+}
+
+# Waits, bounded, until @p Name is in no *Pending state, then requires it to HOLD for @p StableSeconds,
+# and returns what was seen: the state ('absent' when not registered), plus '; unstable: <verdict>'
+# when the second observation disagrees with the first. A rollback restarts services as its last
+# acts, so a reading taken at msiexec's exit can catch Start Pending; and one reading cannot tell a
+# running service from a crash-looping one, so a crash loop must read differently from a steady
+# Running. 30 s is Assert-ServiceState's own bound, measured on a monotonic clock.
+#
+# @param Name The service name.
+# @param StableSeconds How long the settled state must hold before it is believed.
+# @param Observe Takes a service name and returns what Get-ServiceObservation would.
+function Get-SettledServiceState {
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [int] $StableSeconds = 5,
+        [scriptblock] $Observe = { param($name) Get-ServiceObservation $name }
+    )
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $seen = & $Observe $Name
+        if ($null -eq $seen) { return 'absent' }
+        if ($seen.State -notlike '*Pending') { break }
+        if ($clock.Elapsed.TotalSeconds -ge 30) { throw "$Name still $($seen.State) after 30 s" }
+        Start-Sleep -Milliseconds 500
+    }
+    Start-Sleep -Seconds $StableSeconds
+    $verdict = Get-ServiceStabilityVerdict $Name $seen (& $Observe $Name) $StableSeconds
+    if ($null -eq $verdict) { return $seen.State }
+    return "$($seen.State); unstable: $verdict"
+}
+
+# Everything an installation consists of that a rollback must put back, as comparable lines.
+#
+# @param UpgradeCode The product family.
+# @param Root The installation root.
+# @return An ordered hashtable from field name to sorted string[].
+function Get-InstallationSnapshot {
+    param([Parameter(Mandatory)] [string] $UpgradeCode, [Parameter(Mandatory)] [string] $Root)
+    $snapshot = [ordered]@{}
+    foreach ($name in 'FastCached', 'FastCacheCompileNode') {
+        $snapshot["service $name"] = Get-RegistryTreeLines "SYSTEM\CurrentControlSet\Services\$name" $name
+        $snapshot["state $name"] = @(Get-SettledServiceState $name)
+    }
+    $snapshot['installer values'] = Get-RegistryTreeLines 'SOFTWARE\fastcached\Installer'
+    $snapshot['rollback state'] = Get-RegistryTreeLines 'SOFTWARE\fastcached\InstallerRollback'
+    foreach ($group in 'fastcached: FastCached', 'fastcached: FastCacheCompileNode') {
+        $snapshot["firewall $group"] = @(Get-FirewallGroupSnapshot $group)
+    }
+    # Bound first: the reader returns its array as ONE pipeline object, so piping the call itself
+    # would sort a single nested Object[] and compare it by reference.
+    $codes = Get-InstalledProductCodes $UpgradeCode
+    $snapshot['products'] = @($codes | Sort-Object)
+    $snapshot['binary'] = @("fastcached.exe present: $(Test-Path -LiteralPath (Join-Path $Root 'bin\fastcached.exe'))")
+    return $snapshot
+}
+
+# The named differences between two snapshots: a pure decision, so the self-test drives it.
+#
+# @param Before The earlier snapshot.
+# @param After The later snapshot.
+# @return One "<field>: lost [..]; gained [..]" per differing field, NOTHING when equal (wrap the call
+#         in @() to count it). Throws, naming the field, on an element that is not a string.
+function Compare-InstallationSnapshot {
+    param([Parameter(Mandatory)] $Before, [Parameter(Mandatory)] $After)
+    $fields = @($Before.Keys) + @($After.Keys | Where-Object { -not $Before.Contains($_) })
+    foreach ($record in $Before, $After) {
+        foreach ($field in $record.Keys) {
+            $bad = @($record[$field] | Where-Object { $_ -isnot [string] } | ForEach-Object { if ($null -eq $_) { '$null' } else { $_.GetType().Name } })
+            if ($bad.Count) { throw "snapshot field '$field' holds a non-string element ($($bad[0])): the instrument is broken, not the installation" }
+        }
+    }
+    $out = foreach ($field in $fields) {
+        $hadBefore = $Before.Contains($field)
+        $hasAfter = $After.Contains($field)
+        $b = @(if ($hadBefore) { $Before[$field] })
+        $a = @(if ($hasAfter) { $After[$field] })
+        # A multiset difference: a line held twice where it was held once is a change.
+        $lost = @(Get-MultisetDifference $b $a)
+        $gained = @(Get-MultisetDifference $a $b)
+        $text = "${field}: lost [$($lost -join '; ')]; gained [$($gained -join '; ')]"
+        # Presence is a value: an EMPTY field one side lacks would otherwise match anything.
+        if ($hadBefore -ne $hasAfter -and -not ($lost.Count -or $gained.Count)) {
+            "$text <field absent $(if ($hadBefore) { 'after' } else { 'before' })>"
+        } elseif ($lost.Count -or $gained.Count) { $text }
+    }
+    # Enumerated, not wrapped: an empty answer is NOTHING, so a caller's @() counts it as zero.
+    return $out
+}
+
+# A COPY of @p Package with @p Statements applied, each change read back through @p Verify
+# (query -> expected value) before the copy is trusted. An UPDATE matching no row succeeds silently,
+# so an unverified control copy can be the unchanged package -- a control that cannot go red.
+#
+# @param Package The source .msi, left untouched.
+# @param Destination The patched copy.
+# @param Statements MSI SQL run in order against the copy.
+# @param Verify Query (first column of its first row) to the value it must read back.
+function New-MsiControlCopy {
+    param(
+        [Parameter(Mandatory)] [string] $Package, [Parameter(Mandatory)] [string] $Destination,
+        [Parameter(Mandatory)] [string[]] $Statements, [Parameter(Mandatory)] [hashtable] $Verify
+    )
+    Copy-Item -LiteralPath $Package -Destination $Destination -Force
+    Set-ItemProperty -LiteralPath $Destination -Name IsReadOnly -Value $false
+    $invoke = { param($o, [string] $m, [string] $k, $a) $o.GetType().InvokeMember($m, $k, $null, $o, $a) }
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    try {
+        # [string]: COM refuses a wrapped path with DISP_E_TYPEMISMATCH. Mode 1 is transact.
+        $db = & $invoke $installer 'OpenDatabase' 'InvokeMethod' @([string]$Destination, 1)
+        try {
+            foreach ($sql in $Statements) {
+                $view = & $invoke $db 'OpenView' 'InvokeMethod' @($sql)
+                try { & $invoke $view 'Execute' 'InvokeMethod' $null | Out-Null }
+                finally {
+                    & $invoke $view 'Close' 'InvokeMethod' $null | Out-Null
+                    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($view)
+                }
+            }
+            & $invoke $db 'Commit' 'InvokeMethod' $null | Out-Null
+        } finally {
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
+        }
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
+    }
+    # The read-back is a fresh read-only open, after the writing handle is gone.
+    foreach ($query in $Verify.Keys) {
+        $read = Get-MsiScalar $Destination $query
+        if ($null -eq $read) { $read = '<no row>' }
+        if ($read -cne $Verify[$query]) { throw "${Destination}: '$query' read '$read', expected '$($Verify[$query])'" }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
 
@@ -1016,7 +1272,10 @@ function Invoke-MsiServiceTableSelfTest {
         foreach ($sql in @(
                 'CREATE TABLE `Property` (`Property` CHAR(72) NOT NULL, `Value` LONGCHAR NOT NULL LOCALIZABLE PRIMARY KEY `Property`)',
                 "INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('ProductCode', '{11111111-1111-1111-1111-111111111111}')",
-                "INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('UpgradeCode', '{22222222-2222-2222-2222-222222222222}')")) {
+                "INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('UpgradeCode', '{22222222-2222-2222-2222-222222222222}')",
+                'CREATE TABLE `CustomAction` (`Action` CHAR(72) NOT NULL, `Type` SHORT NOT NULL, `Source` CHAR(72), `Target` CHAR(255) PRIMARY KEY `Action`)',
+                "INSERT INTO ``CustomAction`` (``Action``, ``Type``) VALUES ('Committed', 3618)",
+                "INSERT INTO ``CustomAction`` (``Action``, ``Type``) VALUES ('Deferred', 3106)")) {
             $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @($sql))
             $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
             $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
@@ -1034,6 +1293,41 @@ function Invoke-MsiServiceTableSelfTest {
             Pass "package: reads $($property.Name)"
         }
         ExpectThrow 'package: a missing property is refused by name' { Get-MsiProperty $package 'ProductVersion' } 'carries no ProductVersion property'
+
+        # The custom action reader: two rows, so a reader answering with the wrong row is caught, and the
+        # commit bit (0x200) ALONE separates them -- 3618 is 0xE22 and 3106 is 0xC22, both a type-34
+        # in-script, no-impersonation action -- so the rows are the shapes control 2 reads and writes.
+        # A missing action is refused by name.
+        foreach ($action in @(@{ Name = 'Committed'; Type = 3618 }, @{ Name = 'Deferred'; Type = 3106 })) {
+            $type = Get-MsiCustomActionType $package $action.Name
+            if ($type -isnot [int] -or $type -ne $action.Type) { throw "package: custom action $($action.Name) read '$type', expected $($action.Type)" }
+            Pass "package: reads the Type of custom action $($action.Name)"
+        }
+        ExpectThrow 'package: a missing custom action is refused by name' { Get-MsiCustomActionType $package 'NoSuchAction' } 'carries no NoSuchAction custom action'
+
+        # The control copy (#1629): a matching UPDATE reads back, an UPDATE matching no row is refused by name.
+        $copy = Join-Path $scratch 'control.msi'
+        $readBack = @{ 'SELECT `Value` FROM `Property` WHERE `Property` = ''ProductCode''' = '{33333333-3333-3333-3333-333333333333}' }
+        New-MsiControlCopy -Package $package -Destination $copy `
+            -Statements @("UPDATE ``Property`` SET ``Value`` = '{33333333-3333-3333-3333-333333333333}' WHERE ``Property`` = 'ProductCode'") -Verify $readBack
+        if ((Get-MsiProperty $copy 'ProductCode') -ne '{33333333-3333-3333-3333-333333333333}') { throw 'control copy: the patched value is not in the copy' }
+        if ((Get-MsiProperty $package 'ProductCode') -ne '{11111111-1111-1111-1111-111111111111}') { throw 'control copy: the ORIGINAL was changed' }
+        Pass 'control copy: a matching UPDATE reads back, and the original is untouched'
+        ExpectThrow 'control copy: an UPDATE matching no row is refused by name' {
+            New-MsiControlCopy -Package $package -Destination (Join-Path $scratch 'nomatch.msi') `
+                -Statements @("UPDATE ``Property`` SET ``Value`` = 'x' WHERE ``Property`` = 'NoSuchProperty'") `
+                -Verify @{ 'SELECT `Value` FROM `Property` WHERE `Property` = ''NoSuchProperty''' = 'x' }
+        } "= 'NoSuchProperty'' read '<no row>', expected 'x'$"
+        ExpectThrow 'control copy: a row present with another value is refused, naming both' {
+            New-MsiControlCopy -Package $package -Destination (Join-Path $scratch 'wrong.msi') `
+                -Statements @("UPDATE ``Property`` SET ``Value`` = 'abc' WHERE ``Property`` = 'ProductCode'") `
+                -Verify @{ 'SELECT `Value` FROM `Property` WHERE `Property` = ''ProductCode''' = 'xyz' }
+        } "= 'ProductCode'' read 'abc', expected 'xyz'$"
+        ExpectThrow 'control copy: a readback differing only in case is refused' {
+            New-MsiControlCopy -Package $package -Destination (Join-Path $scratch 'case.msi') `
+                -Statements @("UPDATE ``Property`` SET ``Value`` = 'abc' WHERE ``Property`` = 'ProductCode'") `
+                -Verify @{ 'SELECT `Value` FROM `Property` WHERE `Property` = ''ProductCode''' = 'ABC' }
+        } "read 'abc', expected 'ABC'"
     } finally {
         Remove-Item -Recurse -Force $scratch -ErrorAction SilentlyContinue
     }
@@ -1089,8 +1383,8 @@ function Invoke-MsiServiceTableSelfTest {
     }
 
     # The directory-owner verdict Assert-NodeStatePrivate reads, driven without a real
-    # directory. The rest of that function reads a live ACL and is the module's third stated
-    # blind spot; this pure part is not.
+    # directory. The rest of that function reads a live ACL and is one of the module's stated
+    # blind spots; this pure part is not.
     if ($null -ne (Get-DirectoryOwnerVerdict 'S-1-5-32-544')) { throw 'owner verdict: Administrators must pass' }
     Pass 'owner: Administrators owns the state directory'
     ExpectThrow 'owner: a non-administrative owner is refused' {
@@ -1237,6 +1531,62 @@ function Invoke-MsiServiceTableSelfTest {
     ExpectThrow 'unchanged: a rollback that changes the PROFILE is refused, naming it' {
         if ($verdict = Get-FirewallGroupUnchangedVerdict @($programBefore) @($profileAfter) 'fastcached: X') { throw $verdict }
     } 'holds \[.*profile=Private'
+    # A rule the rollback DUPLICATED renders as the same line twice, and a set comparison reads that as
+    # unchanged (#1629, M1): the comparison is a multiset.
+    ExpectThrow 'unchanged: a rule the rollback duplicated is refused, naming the extra one' {
+        if ($verdict = Get-FirewallGroupUnchangedVerdict @($rule) @($rule, $rule) 'fastcached: X') { throw $verdict }
+    } 'lost \[\] and holds \[FastCached cache tcp/6674 .*remote=Any\] it did not$'
+
+    # The firewall snapshot's error decision (#1629, M2): a group that holds no rule reads as empty, and
+    # any OTHER failed read is thrown, never read as an empty group that then compares as unchanged.
+    $failWith = { param([string] $id, [string] $message)
+        { param($group) throw [Management.Automation.ErrorRecord]::new([Exception]::new($message), $id, 'NotSpecified', $group) }.GetNewClosure() }
+    $empty = @(Get-FirewallGroupSnapshot 'fastcached: X' -Read (& $failWith $script:FirewallGroupNotFoundId 'No MSFT_NetFirewallRule objects found'))
+    if ($empty.Count -ne 0) { throw "firewall snapshot: a group holding no rule answered '$($empty -join ' | ')'" }
+    Pass 'firewall snapshot: a group holding no rule reads as empty'
+    ExpectThrow 'firewall snapshot: any other failed read is thrown, never read as empty' {
+        Get-FirewallGroupSnapshot 'fastcached: X' -Read (& $failWith 'HRESULT 0x80070005,Get-NetFirewallRule' 'Access is denied')
+    } '^Access is denied$'
+    # And the id is the one the REAL firewall raises: a group no host has, read live.
+    $noGroup = @(Get-FirewallGroupSnapshot ('fastcached: SelfTest' + [guid]::NewGuid().ToString('N')))
+    if ($noGroup.Count -ne 0) { throw "firewall snapshot: a group no host has answered '$($noGroup -join ' | ')'" }
+    Pass 'firewall snapshot: live, a group no host has reads as empty rather than failing'
+
+    # The registry walker every snapshot field of a service is read through (#1629, M3), over a scratch
+    # key in HKCU: each value kind, a subkey, the data unexpanded, and one volatile row excluded for its
+    # own service and no other. Then the same key absent.
+    $hkcu = [Microsoft.Win32.Registry]::CurrentUser
+    $scratchKey = 'Software\fastcached-selftest-' + [guid]::NewGuid().ToString('N')
+    $volatileRow = 'SelfTestSvc\Sub\Volatile'
+    $created = $hkcu.CreateSubKey($scratchKey)
+    try {
+        $created.SetValue('Text', 'plain', [Microsoft.Win32.RegistryValueKind]::String)
+        $created.SetValue('Path', '%SystemRoot%\x', [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        $created.SetValue('Count', 2, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $created.SetValue('List', [string[]] @('a', 'b c'), [Microsoft.Win32.RegistryValueKind]::MultiString)
+        $created.SetValue('Bytes', [byte[]] @(0x01, 0xab), [Microsoft.Win32.RegistryValueKind]::Binary)
+        $sub = $created.CreateSubKey('Sub')
+        try {
+            $sub.SetValue('Inner', 'deep', [Microsoft.Win32.RegistryValueKind]::String)
+            $sub.SetValue('Volatile', 'moves', [Microsoft.Win32.RegistryValueKind]::String)
+        } finally { $sub.Dispose() }
+        $script:VolatileServiceValues[$volatileRow] = 'self-test row: drives the exclusion branch'
+        $expected = @('Bytes Binary 01ab', 'Count DWord 2', 'List MultiString "a","b c"', 'Path ExpandString %SystemRoot%\x',
+            'Sub\Inner String deep', 'Text String plain') | Sort-Object
+        $lines = Get-RegistryTreeLines $scratchKey 'SelfTestSvc' $hkcu
+        if (($lines -join ' | ') -cne ($expected -join ' | ')) { throw "registry tree: read [$($lines -join ' | ')], expected [$($expected -join ' | ')]" }
+        Pass 'registry tree: every kind, a subkey, unexpanded, and its own volatile row excluded'
+        $unexcluded = Get-RegistryTreeLines $scratchKey 'OtherSvc' $hkcu
+        if ($unexcluded -cnotcontains 'Sub\Volatile String moves') { throw "registry tree: another service's volatile row excluded a value: [$($unexcluded -join ' | ')]" }
+        Pass 'registry tree: a volatile row excludes nothing for another service'
+    } finally {
+        $script:VolatileServiceValues.Remove($volatileRow)
+        $created.Dispose()
+        $hkcu.DeleteSubKeyTree($scratchKey, $false)
+    }
+    $gone = Get-RegistryTreeLines $scratchKey 'SelfTestSvc' $hkcu
+    if ($gone -isnot [array] -or ($gone -join ' | ') -cne '<absent>') { throw "registry tree: an absent key read [$($gone -join ' | ')]" }
+    Pass 'registry tree: an absent key reads as the one line <absent>'
 
     # What failed, read whatever shape Windows Installer gave it: an action that could not START names
     # no CustomAction and no code (round 5), one that ran and failed does, and a clean log says nothing.
@@ -1306,7 +1656,45 @@ function Invoke-MsiServiceTableSelfTest {
         }
     }
 
-    $expectedCases = 79
+    # The installation comparison, over synthetic snapshots (#1629): every outcome, and WHICH field.
+    $base = [ordered]@{ 'service FastCached' = @('ImagePath ExpandString "C:\r\fastcached.exe" --daemon', 'Start DWord 2'); 'state FastCached' = @('Running') }
+    $cmp = @(
+        @{ Case = 'equal snapshots'; After = $base; Match = $null }
+        @{ Case = 'one changed value'; After = [ordered]@{ 'service FastCached' = @('ImagePath ExpandString "C:\r\fastcached.exe" --daemon', 'Start DWord 3'); 'state FastCached' = @('Running') }; Match = '^service FastCached: lost \[Start DWord 2\]; gained \[Start DWord 3\]$' }
+        @{ Case = 'a changed state'; After = [ordered]@{ 'service FastCached' = $base['service FastCached']; 'state FastCached' = @('Stopped') }; Match = '^state FastCached: lost \[Running\]; gained \[Stopped\]$' }
+        @{ Case = 'a field only one side has'; After = [ordered]@{ 'service FastCached' = $base['service FastCached'] }; Match = '^state FastCached: lost \[Running\]; gained \[\]$' }
+        @{ Case = 'a key that vanished'; After = [ordered]@{ 'service FastCached' = @('<absent>'); 'state FastCached' = @('Running') }; Match = '^service FastCached: lost' }
+        @{ Case = 'a line held twice where it was held once'; After = [ordered]@{ 'service FastCached' = @($base['service FastCached']) + @('Start DWord 2'); 'state FastCached' = @('Running') }; Match = '^service FastCached: lost \[\]; gained \[Start DWord 2\]$' }
+    )
+    foreach ($row in $cmp) {
+        $diff = @(Compare-InstallationSnapshot -Before $base -After $row.After)
+        if ($null -eq $row.Match) { if ($diff.Count -ne 0) { throw "compare: $($row.Case): expected none, got [$($diff -join '; ')]" } }
+        elseif ($diff.Count -ne 1 -or $diff[0] -notmatch $row.Match) { throw "compare: $($row.Case): expected one difference matching '$($row.Match)', got [$($diff -join '; ')]" }
+        Pass "compare: $($row.Case)"
+    }
+
+    # Compare refuses an instrument failure BY FIELD, and sees an empty field only one side has.
+    ExpectThrow 'compare: a nested array element is refused, naming the field' {
+        Compare-InstallationSnapshot -Before ([ordered]@{ products = , @(, @('{A}')) }) -After ([ordered]@{ products = @('{A}') })
+    } "field 'products' holds a non-string element \(Object\[\]\)"
+    $oneSided = @(Compare-InstallationSnapshot -Before ([ordered]@{ a = @('x'); fw = @() }) -After ([ordered]@{ a = @('x') }))
+    if ($oneSided.Count -ne 1 -or $oneSided[0] -notmatch '^fw: lost \[\]; gained \[\] <field absent after>$') { throw "compare: an empty one-sided field: got [$($oneSided -join '; ')]" }
+    Pass 'compare: an empty field only one side has is a difference'
+
+    # The settled state, through the observation seam: Pending then Running holds; a restart does not.
+    $script:scripted = $null
+    $scriptedObserve = { param($name) $next = $script:scripted[0]; if ($script:scripted.Count -gt 1) { $script:scripted = $script:scripted[1..($script:scripted.Count - 1)] }; $next }
+    $running = { param($pid_) [pscustomobject]@{ StartMode = 'Auto'; State = 'Running'; ProcessId = $pid_ } }
+    $script:scripted = @([pscustomobject]@{ StartMode = 'Auto'; State = 'Start Pending'; ProcessId = 0 }, (& $running 10), (& $running 10))
+    $settled = Get-SettledServiceState -Name 'X' -StableSeconds 0 -Observe $scriptedObserve
+    if ($settled -cne 'Running') { throw "settled: Pending then steady Running read '$settled'" }
+    Pass 'settled: Pending then Running is a steady Running'
+    $script:scripted = @((& $running 10), (& $running 11))
+    $settled = Get-SettledServiceState -Name 'X' -StableSeconds 0 -Observe $scriptedObserve
+    if ($settled -notmatch '^Running; unstable: X restarted within 0 s \(process 10 became 11\)') { throw "settled: a restart read '$settled'" }
+    Pass 'settled: two process ids read as unstable'
+
+    $expectedCases = 103
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -1314,11 +1702,12 @@ function Invoke-MsiServiceTableSelfTest {
 }
 
 Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert-ServiceState, Assert-ServiceTable,
-    Get-MsiProperty, Get-InstalledProductCodes, Assert-InstalledProduct, Show-MsiLog, Invoke-Msiexec, Assert-MsiLog,
+    Get-MsiProperty, Get-MsiCustomActionType, Get-InstalledProductCodes, Assert-InstalledProduct, Show-MsiLog, Invoke-Msiexec, Assert-MsiLog,
     Get-MsiActionRanPattern, Get-ServiceStabilityVerdict, Get-UpgradeVersionVerdict, Remove-FastCacheMachineState,
     Assert-NodeStatePrivate, Get-NodeServiceAccessVerdict, Get-DirectoryOwnerVerdict, Get-NodeFirewallVerdict, Assert-NodeFirewall,
     Get-NodeFirewallScopeVerdict, Assert-NodeFirewallScope, Get-NodeRegistrationArgumentVerdict,
     Assert-NodeRegistrationArgument, Get-MsiActionOrderVerdict, Assert-MsiActionOrder,
     Get-NodeRegistrationLacksVerdict, Assert-NodeRegistrationLacks, Get-FirewallGroupEmptyVerdict,
     Assert-FirewallGroupEmpty, Format-FirewallRuleLine, Get-FirewallGroupSnapshot, Get-FirewallGroupUnchangedVerdict,
-    Assert-FirewallGroupUnchanged, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Invoke-MsiServiceTableSelfTest
+    Assert-FirewallGroupUnchanged, Split-RegisteredCommandLine, Show-ServiceDiagnosis, Get-InstallationSnapshot, Compare-InstallationSnapshot, New-MsiControlCopy,
+    Invoke-MsiServiceTableSelfTest
