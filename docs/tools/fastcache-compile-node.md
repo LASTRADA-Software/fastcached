@@ -1323,8 +1323,8 @@ by hand.
 dial — so `--raft-self=<host>` says it, and the port comes from `--listen-raft`. Without
 it (`auto`, the default) the node is dialled at the address this machine routes from,
 re-derived when the network changes, and at this machine's fully qualified name until a route
-is known. `--raft-self` takes the same values as `--advertise`, except `auto:<port>`: its port
-is always `--listen-raft`'s. Both are reloadable.
+is known. `--raft-self` takes a HOST, `auto`, or nothing -- never `host:port`, and never
+`auto:<port>`: its port is always `--listen-raft`'s. Both are reloadable.
 
 ```sh
 # The whole of a first node
@@ -2197,7 +2197,7 @@ fastcache-compile-node \
     --listen-node=6675 --fleet-open --toolchain=/usr/bin/g++
 ```
 
-Every node still names **itself** — `--raft-self`, or this machine's name — because that
+Every node still names **itself** — `--raft-self`, or the address it routes from — because that
 is the address its peers dial and only it knows it. What it never names is anybody else.
 
 **Discovery finds members; it no longer admits anybody**
@@ -2280,7 +2280,7 @@ one of them do nothing about it.
 
 **A node joining a discovered fleet still needs an operator to admit its key** —
 `--enroll-approve`, or `--cluster-admit ...@<key>`: discovery supplies the addresses,
-and never the admission. It still names itself — `--raft-self`, or this machine's name —
+and never the admission. It still names itself — `--raft-self`, or the address it routes from —
 as every node in a cluster must. One machine founds the fleet and the rest join it — and
 only one stays a founder, because two clusters cannot be merged: a joiner dissolves the
 cluster of one it started as. A membership
@@ -2949,11 +2949,25 @@ socket. It works without either: each only lets it act sooner.
   registrations under the old endpoint and registers under the new one, the presence
   announcement tells the leader, and a voter closes its consensus connections so they
   redial from the new address, while the leader records the move (see [two ports, and
-  why a member records both](#two-ports-and-why-a-member-records-both)). Each move is an
+  why a member records both](#two-ports-and-why-a-member-records-both)). A voter that no
+  longer hears its leader -- which is every voter whose old address is gone -- reaches it
+  through the other voters it knows, so its own scheduler not knowing who leads does not
+  strand it. Each move is an
   Info line naming the old and the new endpoint, and counts on
   [the two series above](#when-this-nodes-address-moves). Without any event the node
   re-checks every 30 seconds, so a missed change costs half a minute at most. A pinned
   `--advertise` or `--raft-self` is not re-derived.
+- **A move that leaves the voters that did not move without a quorum does not heal by
+  itself** ([#1644](https://github.com/LASTRADA-Software/fastcached/issues/1644)). The leader records a voter's new address by a commit, and that
+  needs a quorum of the voters that did NOT move: a two-voter fleet where either one moves,
+  or a majority of voters renumbered at once (a router replacement, a DHCP scope change),
+  has none, and nothing else re-addresses a recorded member. Run three or more voters and
+  let them move one at a time, or pin `--raft-self` and `--advertise` to DNS names on
+  always-on voters, which every peer re-resolves when it dials. Once it has happened, give
+  enough of the moved voters their old addresses back (a DHCP reservation, a static
+  address) for a quorum to re-form, then let them move one at a time; where a quorum
+  survives and one record is stuck, `fastcache-compile-node
+  --cluster-admit=<id>=<new-host>:6680` on that side re-records it.
 - **A machine that sleeps without saying so** — Modern Standby can sleep and wake
   without reporting either — recovers on its own schedule. The next ordinary
   round registers it again, at most one announcement interval (20 s) after it
@@ -2968,8 +2982,9 @@ socket. It works without either: each only lets it act sooner.
 Only a Windows service hears power events: a node run in the foreground, and every
 node on Linux and macOS, hears network changes alone and relies on its ordinary rounds
 for a sleep. A node whose network watcher cannot start says so once in its log
-(`network changes will not be reported`) and keeps working on those rounds and the
-30-second re-check.
+(`network changes will not be reported`), and one whose watcher stops later says so once
+too (`network changes will no longer be reported`); either keeps working on those rounds
+and the 30-second re-check.
 
 ## Reloading it
 

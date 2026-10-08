@@ -1926,6 +1926,16 @@ and it is recorded here because the question will be asked again.
         and the member reads as uncoupled -- the safe direction, since an uncoupled member
         moves nothing it should not; and a LEARNER whose address moves resets nothing, because
         it dials in and its redial backoff finds the voters from wherever it now is.
+      - **The move is RECORDED by a commit, so it heals only while the voters that did not move
+        are a quorum** ([#1644](https://github.com/LASTRADA-Software/fastcached/issues/1644)). The moved voter reaches the leader through any voter
+        that did not move (its own scheduler hears no leader -- `AppliedSchedulers` walks the
+        recorded voters after it), and the leader re-records it; but `LearnMembers` dials only
+        committed endpoints and a beacon cannot move a coupled host, so nothing ELSE re-addresses
+        a member. A two-voter fleet where either moves, and a majority renumbered at once (a router
+        replacement, a DHCP scope change), commit nothing and stay apart. Before `auto`, records
+        held names and DNS healed both. The docs state the limit and the operator's way out: three
+        or more voters moved one at a time, or names pinned on always-on voters; once it has
+        happened, old addresses back for a quorum, then one move at a time.
   - **`--cluster-admit` is the counterpart `--cluster-forget` never had.** Nothing
     could put a member *into* the replicated state without `--discovery`, so a typed
     fleet could shrink and never grow. It carries `<id>=<host>:<port>` — the same
@@ -2460,6 +2470,12 @@ right, because the wire now trusts it.
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
 
+- **[#1644](https://github.com/LASTRADA-Software/fastcached/issues/1644)** — a voter move that leaves the voters that did not
+  move without a quorum (a two-voter fleet, or a majority renumbered at once) does not heal by
+  itself: the new address is recorded only by a commit, and nothing else re-addresses a recorded
+  member. What is left is a recovery that needs no quorum without the moved voters -- for
+  example a PROVEN self-announcement re-addressing a peer's transport before the commit --
+  without letting a stale beacon revert a committed coupled address (#1528).
 - **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a
   follower answering `/fleet` names the leader but cannot link to it, because
   where a dashboard is served is local configuration and any URL it built would be

@@ -563,6 +563,17 @@ itself, so only its `0xFC` endpoint is moved. Two counters show it:
 `fastcache_node_endpoint_changes_total` and `fastcache_node_raft_endpoint_changes_total`
 ([the node's metrics](../tools/fastcache-compile-node.md#when-this-nodes-address-moves)).
 
+**The move is recorded by a commit, so it heals only while the voters that did not move
+are a quorum** ([#1644](https://github.com/LASTRADA-Software/fastcached/issues/1644)). A moved voter whose own scheduler no longer hears a leader
+announces through the other voters it knows, and the leader re-records it; but nothing
+else re-addresses a recorded member. A two-voter fleet where either voter moves, or a
+majority of voters renumbered at once (a router replacement, a DHCP scope change), has no
+such quorum and stays apart. Run three or more voters and move them one at a time, or pin
+`--raft-self` and `--advertise` to DNS names on always-on voters. Once it has happened,
+give enough of the moved voters their old addresses back for a quorum to re-form, then
+move them one at a time; where a quorum survives and one record is stuck,
+`--cluster-admit=<id>=<new-host>:6680` on that side re-records it.
+
 **Discovery** runs beside it, and is how a machine with no configuration finds a fleet
 to join. A node broadcasts a beacon — its fleet summary, signed when challenged — every 15
 seconds, to every eligible interface's directed broadcast on port `6681` unless

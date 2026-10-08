@@ -300,8 +300,13 @@ A second voter is **not** more available than one: two voters need both for a qu
 either being down stops the fleet. Promote two learners at once, for three voters, or leave A
 alone. Promote only machines that are always on: a voter that sleeps is counted by every
 quorum while it sleeps. A voter whose address moves is followed -- with `advertise` and
-`raft_self` left at their default, it announces its new address and the leader re-records it
-within seconds -- but one pinned to a name is reached again only once DNS catches up. To
+`raft_self` left at their default, it announces its new address and the leader re-records it,
+usually within seconds -- but one pinned to a name is reached again only once DNS catches up.
+That re-recording is a commit, so it needs the voters that did NOT move to be a quorum: with
+two voters, or with most of them renumbered at once (a new router, a new DHCP scope), it does
+not heal by itself ([#1644](https://github.com/LASTRADA-Software/fastcached/issues/1644)). Keep three or more voters on fixed addresses -- a DHCP
+reservation is enough -- or give the moved ones their old addresses back until a quorum
+re-forms, then move them one at a time. To
 promote one, read its `consensus-endpoint` from `fastcache-cli node` on
 that machine, then on A:
 
