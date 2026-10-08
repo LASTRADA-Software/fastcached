@@ -92,9 +92,9 @@ registers the services that follow from the choice:
 The node needs no property to be registered: it finds its scheduler from the fleet it forms or
 joins (the [fastcache-compile-node page](../tools/fastcache-compile-node.md#macos-and-windows)
 has the details). There is no property for the address clients reach the node at: the node
-advertises this machine's fully qualified name, resolved at every start, so a renamed machine or a
-new VPN address needs no reinstall; an address that must be typed goes under `advertise:` in the
-node's configuration file. `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8` is optional, and limits the
+advertises the address this machine routes from and re-derives it when the network changes, so a
+renamed machine or a new VPN address needs no reinstall and no restart; an address that must be
+typed goes under `advertise:` in the node's configuration file. `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8` is optional, and limits the
 firewall rules both registrations create to that remote range; left out, they admit any address. So is
 `FASTCACHE_FLEET_SEED=office-a.vpn.example`, one machine of the fleet for the node to ask when no
 discovery beacon reaches it, as across a VPN; it is registered as the node's `--fleet-seed`, and a

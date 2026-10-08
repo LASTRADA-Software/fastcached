@@ -246,7 +246,11 @@ and only a completed handshake under a key the roster holds sets the second. Nor
 proof here stand in for the consensus wire's own: a member still proves its key again on
 every Raft connection it opens or accepts. A peer that changes the endpoint it advertises
 **loses** its authenticated status: the proof covered the old endpoint, so carrying it
-across would admit an address nobody proved.
+across would admit an address nobody proved. A machine whose address moves -- by default a
+node advertises the address it routes from, and follows it -- proves the new endpoint at the
+next challenge. A voter's recorded consensus endpoint is moved by its own proven
+announcement to the leader, not by discovery, whenever its consensus and `0xFC` endpoints
+share a host (the default): a beacon sent before the move can never move it back.
 
 **It does not remove anybody.** A peer vanishes from a broadcast for reasons that are
 almost never "it left" — a lost datagram, a switch rebooting, a laptop closed for an hour —

@@ -72,6 +72,21 @@ below).
 | A service registration replaying any of those flags, or `--scheduler` on a node that serves | refuses to start under the service manager | `--install-service` again. The MSI does this on upgrade. |
 | MSI properties `FASTCACHE_NODE_SCHEDULER` and `FASTCACHE_NODE_ADVERTISE` | not read; an upgrade forgets the remembered advertised endpoint | Drop them from scripted installs |
 
+### Coming from 0.4.0: nodes follow their own address
+
+`--advertise` and `--raft-self` now default to `auto`: the address the machine routes from,
+re-derived when the network changes, so a node keeps working across a DHCP renewal, a move
+from Wi-Fi to wired or another network, with no edit and no restart (see
+[the node's flags](../tools/fastcache-compile-node.md#-advertise-is-the-flag-to-get-right)).
+A socket-activated node no longer needs `--advertise` either: it reads the address off the
+socket it is handed. This moves no wire version and no stored format.
+
+| What | Step |
+|---|---|
+| A literal `--advertise` (or `advertise:`) added only because a socket-activated 0.4.0 node refused to start without one | Remove it. Kept, it pins the node to that address: the node does not follow the network, and no client gets a dial hint for it. |
+| A literal `--raft-self` (or `raft_self:`) on a machine whose address moves | Remove it, for the same reason. |
+| A name in either | Nothing: a name is an opt-in pin and keeps working as before. |
+
 ## The supported procedure
 
 1. **Stop the builds.** Anything running `fastcache-cc` against the fleet should be

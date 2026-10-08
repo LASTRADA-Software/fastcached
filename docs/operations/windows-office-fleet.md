@@ -127,9 +127,11 @@ next repair, feature change or upgrade, so one that names none of them registers
 install was given; one that states a new value replaces the remembered one. An empty value
 counts as leaving the property out, so it cannot clear one: to drop a remembered value,
 uninstall (which forgets them all) and install again. There is no property for the address
-other machines reach a node at: the node advertises this machine's fully qualified name,
-resolved at every start, so a renamed PC or a new VPN address needs no reinstall. An address
-that must be typed goes under `advertise:` in the configuration file.
+other machines reach a node at: the node advertises the address this PC routes from, and
+re-derives it when the PC changes network -- a new DHCP lease, Wi-Fi to the dock, the VPN
+coming up -- so a renamed PC or a new VPN address needs no reinstall and no restart. A name is
+an opt-in pin: one that must be typed goes under `advertise:` in the configuration file, and a
+literal address typed there stops the node from following the network.
 
 ## 3. Approve the machines that ask
 
@@ -296,9 +298,11 @@ compiles and lets the running ones finish.
 
 A second voter is **not** more available than one: two voters need both for a quorum, so
 either being down stops the fleet. Promote two learners at once, for three voters, or leave A
-alone. Promote only machines that are always on, at a fixed address: a voter that sleeps is
-counted by every quorum while it sleeps, and a voter whose address moves is reached again only
-once DNS catches up. To promote one, read its `consensus-endpoint` from `fastcache-cli node` on
+alone. Promote only machines that are always on: a voter that sleeps is counted by every
+quorum while it sleeps. A voter whose address moves is followed -- with `advertise` and
+`raft_self` left at their default, it announces its new address and the leader re-records it
+within seconds -- but one pinned to a name is reached again only once DNS catches up. To
+promote one, read its `consensus-endpoint` from `fastcache-cli node` on
 that machine, then on A:
 
 ```powershell
@@ -469,11 +473,12 @@ assumption worth knowing about.
   ([#1626](https://github.com/LASTRADA-Software/fastcached/issues/1626)) before the worker has
   proved its key. A machine that is not the worker can no longer return an object the client
   accepts, but it does receive the source. Keep VPN DNS current.
-- **A voter whose address changes is reached again only when DNS catches up**
-  ([#1605](https://github.com/LASTRADA-Software/fastcached/issues/1605)), and **a learner can
-  take up to 30 seconds to reach a newly elected leader**
+- **A voter pinned to a name is reached again only when DNS catches up after its address
+  changes** ([#1605](https://github.com/LASTRADA-Software/fastcached/issues/1605)); one left at
+  the default follows its own announcement instead, so this applies only to a typed
+  `raft_self` name. And **a learner can take up to 30 seconds to reach a newly elected leader**
   ([#1625](https://github.com/LASTRADA-Software/fastcached/issues/1625)). Both apply only once
-  you have promoted more voters, which is why step 6 asks for fixed addresses.
+  you have promoted more voters, which is why step 6 asks for machines that are always on.
 - **`clang-cl` with `/Zi` is cached but never dispatched**
   ([#1602](https://github.com/LASTRADA-Software/fastcached/issues/1602)). `/Z7`, as step 5
   asks, is not affected.

@@ -98,8 +98,10 @@ The `dialled at:` block is not a port to open. It is the address peers dial for
 consensus -- routinely not the `raft` row, because a bare `--listen-raft` binds the
 wildcard -- and it is the one to compare against `--cluster-admit`'s receipt (see
 [Membership at runtime](#membership-at-runtime)). This invocation names none, so the
-block says when it will be known: `AT STARTUP`, this machine's fully qualified name on the
-raft port. With `--raft-self 10.0.0.7` added it reads `10.0.0.7:6680`.
+block says when it will be known: `AT STARTUP`. A started node takes the address this machine
+routes from (`--raft-self` defaults to `auto`), and this machine's fully qualified name — the
+name the line prints — only until a route is known. With `--raft-self 10.0.0.7` added it reads
+`10.0.0.7:6680`.
 
 The `notes:` block is part of the output, not an afterthought: it carries the facts a
 column cannot, including the one that says this list can be **wrong** for the compile
@@ -198,7 +200,8 @@ scheduler. That is consensus even on one machine — a scheduler signs every lea
 own identity key, which its workers check against the voters their own consensus applied
 ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)) — so consensus is on
 by default (`--listen-raft` defaults to `6680`), and `--raft-self` says where another
-member would dial it; without one, it is dialled at this machine's fully qualified name.
+member would dial it; without one, it is dialled at the address this machine routes from,
+which follows the machine when its network changes.
 Its own worker registers with the scheduler it serves, on this machine. The same line with
 `--print-identity` added prints its identity:
 
@@ -240,11 +243,12 @@ makes `--fleet-open` over a bind that faces the network safe: the node compiles 
 client holding a lease its fleet's voters issued. See
 [A node proves which machine it is](#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
 
-**`--listen-node` and `--advertise` are typed together or neither is worth
-anything.** A bare `--listen-node` binds **loopback** on a worker, so naming only
-`--advertise` tells peers to dial an address this node never accepts on; and naming
-only `--listen-node=0.0.0.0:6674` advertises the wildcard, which resolves to the
-*caller's* machine. Both are refused at startup by name; so, since
+**`--listen-node` and `--advertise` have to agree.** A dialable `--advertise` over a
+`--listen-node` bound to loopback tells peers to dial an address this node never accepts
+on, and an advertised wildcard resolves to the *caller's* machine — which is why `auto`
+replaces a wildcard bind with the address this machine routes from, or with its name until a
+route is known. Both are
+refused at startup by name; so, since
 [#463](https://github.com/LASTRADA-Software/fastcached/issues/463), is naming
 neither while the worker registers with a scheduler on another machine. Whichever you got wrong, the
 refusal names the flag and a working value.
@@ -279,8 +283,22 @@ The scheduler hands your string to clients **verbatim**. A worker that
 advertises `127.0.0.1` is leased and then never answers, and the symptom is a
 build that mysteriously falls back to local compiles on every machine but one.
 
-It defaults to `--listen-node`, which is correct only when that already names an
-address other machines can reach.
+It defaults to `auto`. While `--listen-node` binds the wildcard — the default — that is
+the address this machine routes from, on the `--listen-node` port, re-derived whenever an
+interface or address changes (and at the latest every 30 seconds), with this machine's fully
+qualified name standing in until a route is known. A `--listen-node` bound to one address is
+advertised as bound.
+
+| Value | Advertises | Follows the network | Dial hints |
+|---|---|---|---|
+| unset, or `auto` | the routed address, on the bound port | yes | not needed: the registration itself moves |
+| `auto:<port>` | the routed address, on that port (for a port mapped in front of this one) | yes | not needed |
+| `<name>:<port>` | that name; each client resolves it when it dials | no | yes: a client tries the address the scheduler last saw first |
+| `<ip>:<port>` | exactly that address | no — said once in the log | none |
+
+So a name is an opt-in pin, worth it where a DNS name is what clients should dial (a NAT, or
+an address the scheduler cannot see). An IP literal turns roaming off entirely: keep one only
+for an address that never changes.
 
 ### Why a fleet worker still has to widen `--listen-node` by hand
 
@@ -1303,7 +1321,10 @@ by hand.
 
 **A minted identity is typed nowhere**, and a node must name the endpoint its peers
 dial — so `--raft-self=<host>` says it, and the port comes from `--listen-raft`. Without
-it the node is dialled at this machine's fully qualified name, resolved when it starts.
+it (`auto`, the default) the node is dialled at the address this machine routes from,
+re-derived when the network changes, and at this machine's fully qualified name until a route
+is known. `--raft-self` takes the same values as `--advertise`, except `auto:<port>`: its port
+is always `--listen-raft`'s. Both are reloadable.
 
 ```sh
 # The whole of a first node
@@ -1501,7 +1522,7 @@ nobody reads:
 
 | What has to hold | Why |
 |---|---|
-| this node names where its peers dial it, by `--raft-self` or by this machine's resolved name | The address its peers dial is the half only it knows: a node that could name none could never win a vote and could never be voted for. A name that resolves to nothing is refused; one that reaches only this machine (`localhost`) confines consensus to loopback unless `--raft-self` names it: the node runs as a fleet of its own, with its own scheduler and worker, and can neither form nor join a fleet. |
+| this node names where its peers dial it, by `--raft-self` or — with `auto`, the default — by the address it routes from, or this machine's resolved name until a route is known | The address its peers dial is the half only it knows: a node that could name none could never win a vote and could never be voted for. A name that resolves to nothing is refused; one that reaches only this machine (`localhost`) confines consensus to loopback unless `--raft-self` names it: the node runs as a fleet of its own, with its own scheduler and worker, and can neither form nor join a fleet. |
 | `--listen-raft` names a usable port | That is where every peer dials it. A value that is not an address is refused with the text you typed. |
 
 The reverse holds too: `--raft-self` **without** consensus is refused rather than ignored,
@@ -1527,15 +1548,24 @@ it.
 **Every member's record carries its `0xFC` endpoint, learners included**, because
 anything resolving a machine reads it — the redirect reads the leader's, and a
 shared-cache resolver reads any member's. It is the member's own word, and only the
-node itself knows it: the endpoint it advertises (`--advertise`, or else its node
-port with a wildcard host replaced by this machine's name). It is recorded when the
+node itself knows it: the endpoint it advertises (`--advertise`, by default its node
+port with a wildcard host replaced by the address this machine routes from). It is recorded when the
 member's enrollment is approved, from the endpoint its join request stated, and moved
 afterwards only by that machine's own announcement on its presence loop, made under
 the identity key it proved on that connection: the leader re-proposes the member's
 record with the new endpoint, keeping its seat and its key. A leader also asserts its
-own on every reconcile pass. So an accepted reload of `--advertise` reaches the
-record within one announcement interval, and nothing a machine merely claims without
-proving it moves any record.
+own on every reconcile pass. So an accepted reload of `--advertise`, or a move of the
+address it routes from, reaches the record within one announcement interval, and nothing a
+machine merely claims without proving it moves any record.
+
+The announcement moves the **consensus** endpoint too, for a voter whose two recorded
+endpoints are on one host — every voter that leaves both flags at `auto`. The leader keeps
+the recorded consensus port and takes the announced host, so a voter that changed networks
+is dialled at its new address rather than lost. A voter that pins `--raft-self` to a host
+other than its `--advertise` one is never moved this way: it said where each answers, and its
+consensus endpoint moves only by its own word while it leads, or with its discovery beacon. A
+beacon sent before a move cannot move a coupled voter back, and host names are compared as
+spelled, so `Office.lan` and `office.lan` count as two hosts.
 
 A member that has announced none — a bootstrap peer typed with `--raft-peer`, before
 its first announcement — carries no scheduler endpoint, which is not a fault: a
@@ -2561,6 +2591,14 @@ that leases this worker never races its startup, and an idle worker costs
 nothing — which suits a compile fleet, where misses on a warm shared cache are
 bursty and rare.
 
+The worker needs no `advertise:` for it. It asks the socket it is handed where it is
+bound: the shipped `ListenStream=6676` binds every interface, so it advertises the
+address this machine routes from on port 6676 and follows the network when that
+changes; a `ListenStream=10.0.0.5:6676` is advertised as exactly that. An `advertise:`
+in the configuration file still wins. **Coming from 0.4.0**, which refused to start
+under activation without one: if you added a literal address only to get past that
+refusal, remove it, or the node stays pinned to it and does not follow the network.
+
 The service runs as its own `fastcache-node` account, deliberately not
 `fastcached`'s: a worker runs a compiler on input that arrived over the network,
 while `fastcached` owns the cache storage, and sharing an account would let a
@@ -2702,8 +2740,8 @@ These are specific to registering:
 | `--toolchain` *(only with `--no-toolchain-discovery`)* | With both, the worker has nothing to serve: it would register and then refuse every job sent to it. Without the flag the machine answers at boot, so a registration needs no toolchain at all. |
 
 Neither `--advertise` nor `--cluster-dir` is required. A worker that names no `--advertise`
-advertises this machine's fully qualified name, which the service resolves at every start rather
-than baking it in here. And the state directory defaults to the platform's machine-wide one,
+advertises the address this machine routes from, which the service re-derives whenever the
+network changes rather than baking it in here. And the state directory defaults to the platform's machine-wide one,
 resolved by the service as the account it runs as, not relative to a working directory a service
 does not inherit.
 
@@ -2827,10 +2865,10 @@ package registered, which a node that serves now refuses, and the `--advertise` 
 package of this installer registered from the advertised-endpoint property it remembered.
 
 There is no such property any more. The registration carries no `--advertise`, and the node
-advertises this machine's fully qualified name on its `--listen-node` port, resolved at every
-start, so a renamed machine or a new VPN address needs no reinstall -- where a remembered IP
-literal on a roaming laptop vetoed every dial hint at every upgrade. An address that must be typed
-goes under `advertise:` in the configuration file. `FASTCACHE_FIREWALL_ALLOW`
+advertises the address this machine routes from on its `--listen-node` port, re-derived when
+the network changes, so a renamed machine or a new VPN address needs no reinstall or restart --
+where a remembered IP literal on a roaming laptop pinned it and vetoed every dial hint at every
+upgrade. An address that must be typed goes under `advertise:` in the configuration file. `FASTCACHE_FIREWALL_ALLOW`
 is optional: it is passed as `--firewall-allow` (one address with an optional
 `/prefix`) to this registration and to fastcached's, and left out the rules admit any
 address. `FASTCACHE_FLEET_SEED` is optional as well: one name or `name:port`, registered as
@@ -2886,11 +2924,12 @@ and goes when it exits; its rules are removed at once all the same. If Windows
 refuses the delete, the rules are left in place — the service is still registered
 and may be running — and the next uninstall that succeeds removes them.
 
-### When the machine sleeps
+### When the machine sleeps, wakes, or changes network
 
 A worker registered as a Windows service hears the machine's power events, and
-every node on Windows hears its network changes. It works without either: each
-only lets it act sooner.
+every node hears its network changes: on Windows from the system's interface and
+address notifications, on Linux from a netlink routing socket, on macOS from a routing
+socket. It works without either: each only lets it act sooner.
 
 - **Before the machine sleeps** the worker withdraws its registrations, so no
   client is leased a machine that is about to stop answering. It makes one
@@ -2902,9 +2941,19 @@ only lets it act sooner.
 - **When the machine wakes, or an interface or address changes** (reported once
   nothing new arrived for 2 s, or 10 s into a burst), the worker announces itself
   at once rather than at the end of its 20-second interval, and so does the node's
-  presence announcement. Each runs on its own thread, never on the one Windows
-  delivered the event on. A suspend cancels any such wake still pending from
+  presence announcement. Each runs on its own thread, never on the one that
+  delivered the event. A suspend cancels any such wake still pending from
   before it.
+- **When the address it routes from changes**, a node whose `--advertise` and
+  `--raft-self` are left at `auto` re-derives both: the worker withdraws its
+  registrations under the old endpoint and registers under the new one, the presence
+  announcement tells the leader, and a voter closes its consensus connections so they
+  redial from the new address, while the leader records the move (see [two ports, and
+  why a member records both](#two-ports-and-why-a-member-records-both)). Each move is an
+  Info line naming the old and the new endpoint, and counts on
+  [the two series above](#when-this-nodes-address-moves). Without any event the node
+  re-checks every 30 seconds, so a missed change costs half a minute at most. A pinned
+  `--advertise` or `--raft-self` is not re-derived.
 - **A machine that sleeps without saying so** — Modern Standby can sleep and wake
   without reporting either — recovers on its own schedule. The next ordinary
   round registers it again, at most one announcement interval (20 s) after it
@@ -2916,9 +2965,11 @@ only lets it act sooner.
   it again, which its first consensus session after waking brings, with no event
   needed. It raises `consensus-leader-silent` meanwhile.
 
-Only a service hears power events: a worker run in the foreground hears network
-changes alone, and on Linux and macOS the node hears neither and relies on its
-ordinary rounds.
+Only a Windows service hears power events: a node run in the foreground, and every
+node on Linux and macOS, hears network changes alone and relies on its ordinary rounds
+for a sleep. A node whose network watcher cannot start says so once in its log
+(`network changes will not be reported`) and keeps working on those rounds and the
+30-second re-check.
 
 ## Reloading it
 
@@ -3041,12 +3092,17 @@ A node does not always know its own address when it starts: one behind a NAT or 
 balancer learns its external address later, and one waiting on an interface may have
 none worth advertising yet. So `advertise` is reloadable, and a reload does two things
 rather than one — the worker starts telling clients the new address, **and** it retires
-its registration under the old one instead of leaving the scheduler to expire it.
+its registration under the old one instead of leaving the scheduler to expire it. With
+`advertise` left at `auto` the node does the same by itself whenever the address it routes
+from changes, with no reload at all; a reload that changes nothing keeps the address it has
+moved to. `raft_self` is reloadable for the same reason, and moves the address peers dial
+for consensus.
 
 The cost is stated because it is real and it is bounded. `advertise` is inside the
 signature of every lease the scheduler has handed out naming this worker, so grants
-already in clients' hands name the address you have just left. Those are refused, each
-costing that client one local compile, until they expire. In the deployment this exists
+already in clients' hands name the address you have just left. They are honoured until the
+worker has registered under the new address — at once, not at its next interval — and
+refused after that, each costing that client one local compile, until they expire. In the deployment this exists
 for that loses nothing: the address changed because the old one stopped working, so
 those grants named something nobody could reach anyway. What it replaces is worse — a
 worker that can never advertise the reachable address without being restarted.

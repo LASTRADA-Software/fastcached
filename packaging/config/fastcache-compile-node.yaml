@@ -99,7 +99,8 @@
 # binds the wildcard (the default), re-derived when the network changes, with
 # this machine's fully qualified name standing in until a route is known; and
 # listen_node itself when that binds one address. auto:<port> derives the host
-# and states the port. A literal IP pins it and turns that roaming off. Behind
+# and states the port. A name pins it too, and each client resolves it when it
+# dials; a literal IP pins it and turns that roaming off. Behind
 # NAT the derived address is still wrong: the scheduler hands this
 # string to clients verbatim, so a worker that advertises an address only it
 # can reach is leased and then never answers. A wildcard names no host any
