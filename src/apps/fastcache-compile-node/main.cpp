@@ -284,7 +284,7 @@ void InstallNodeStopHandlers()
     // endpoint to clients, and every one of them fails to connect and compiles
     // locally. Nothing reports an error, and the fleet looks healthy from both ends.
     // Refusing at startup, where it can be explained, is the whole difference.
-    if (cfg.advertise.empty())
+    if (AdvertiseModeOf(cfg.advertise) == AdvertiseMode::Auto)
         return std::unexpected { Refusal(NodeRefusalCause::HandedOverListeners,
                                          "--advertise is required under socket activation: the socket unit owns the "
                                          "port, so this worker cannot know what address clients should use") };

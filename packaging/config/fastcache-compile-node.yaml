@@ -12,7 +12,7 @@
 #
 # reloadable-for: fastcache-compile-node
 #
-# SEVEN settings are reloadable and the rest are read once at startup. A reload
+# EIGHT settings are reloadable and the rest are read once at startup. A reload
 # re-reads this file the way the start read it, so a change to anything else is
 # refused BY NAME rather than half-applied -- you are told which key needs the
 # restart instead of running a worker that disagrees with its own file.
@@ -33,6 +33,8 @@
 #                                       one local compile -- which is nothing when
 #                                       the old address is the one that stopped
 #                                       working, and is why this is reloadable
+#   raft_self                           moves the address this node's peers
+#                                       dial it at for consensus
 #
 # Every key is one flag, spelled with underscores instead of dashes, and there
 # is no setting that a file can express and a command line cannot. A flag on the
@@ -92,10 +94,13 @@
 #  - <host:port>
 #  - <host:port>
 
-# host:port CLIENTS should use to reach this worker. Defaults to this
-# machine's fully qualified name on the listen_node port while listen_node
-# binds the wildcard (the default), and to listen_node itself otherwise --
-# which is wrong behind NAT or on a multi-homed host: the scheduler hands this
+# host:port CLIENTS should use to reach this worker. Defaults to auto: the
+# address this machine routes from, on the listen_node port while listen_node
+# binds the wildcard (the default), re-derived when the network changes, with
+# this machine's fully qualified name standing in until a route is known; and
+# listen_node itself when that binds one address. auto:<port> derives the host
+# and states the port. A literal IP pins it and turns that roaming off. Behind
+# NAT the derived address is still wrong: the scheduler hands this
 # string to clients verbatim, so a worker that advertises an address only it
 # can reach is leased and then never answers. A wildcard names no host any
 # client can dial, so the node refuses to advertise one, and refuses a RELOAD
@@ -180,10 +185,12 @@
 #listen_raft: 6680
 
 # the host this node's peers dial it at; the port comes from --listen-raft.
-# This machine's fully qualified name unless given. How a node names ITSELF:
-# its identity is minted, never typed, and no other setting says where its
-# peers reach it. A bare --listen-raft binds the wildcard, so what this node
-# binds is usually not what a peer can dial.
+# Defaults to auto: the address this machine routes from, re-derived when the
+# network changes, and its fully qualified name until a route is known. A
+# literal IP pins it and turns that roaming off. Reloadable. How a node names
+# ITSELF: its identity is minted, never typed, and no other setting says where
+# its peers reach it. A bare --listen-raft binds the wildcard, so what this
+# node binds is usually not what a peer can dial.
 #
 # Which cluster this node is in, and whether it founded it or joined one, is
 # not a setting: the first start mints a cluster of one into the state

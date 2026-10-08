@@ -2932,13 +2932,19 @@ address — so a list is written as one key with every value under it.
 
 | Reloadable | Requires a restart |
 |---|---|
-| `log_level`, `allow_compile_arg`, `requirepass`, `fleet_open`, `toolchain`, `no_toolchain_discovery`, `advertise` | `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
+| `log_level`, `allow_compile_arg`, `requirepass`, `fleet_open`, `toolchain`, `no_toolchain_discovery`, `advertise`, `raft_self` | `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
 
 `log_level`, `allow_compile_arg`, `requirepass` and `fleet_open` take
 effect immediately and tell the fleet nothing; `toolchain` and `no_toolchain_discovery`
 re-register this worker, which is the section after next; `advertise` re-registers it
 too, at a new address, and retires the entry under the old one -- with the cost that
-section states.
+section states. `raft_self` moves the address this node's peers dial for consensus.
+
+Both default to `auto`: the address this machine routes from, on the bound port while the
+listener binds the wildcard, re-derived when the network changes (this machine's fully
+qualified name stands in until a route is known). `auto:<port>` derives the host and
+states the port. A literal IP pins the address and turns that roaming off; a name pins
+it too, and peers resolve it themselves.
 
 ### Revoking a machine
 
