@@ -78,6 +78,7 @@ EndpointResolver ── publishes ──> AnnouncedEndpoint (0xFC)  ──> Work
 
 `--advertise` and `--raft-self` (YAML `advertise:`, `raft-self:`) each take:
 
+<!-- table-total: none -->
 | Value | Mode | Recomputed on network change | Dial hints |
 |---|---|---|---|
 | unset / `auto` | Auto (default) | yes | yes |
@@ -163,6 +164,7 @@ authenticated-beacon desire.
 
 ## Error handling
 
+<!-- table-total: none -->
 | Situation | Behaviour |
 |---|---|
 | Watcher cannot start | Warn once; 30 s periodic re-probe still roams (slower). |
