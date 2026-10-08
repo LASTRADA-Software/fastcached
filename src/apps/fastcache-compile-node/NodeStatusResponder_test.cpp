@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "EnrollmentWindow.hpp"
 #include "MachineStandingTestUtils.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeConfig.hpp"
 #include "NodeFormation.hpp"
 #include "NodeRoster.hpp"
@@ -281,6 +282,8 @@ struct DirectSources
     ISharedCacheStatusSource const* sharedCache { nullptr };
     /// The roster the node verifies grants against; null is nothing wired.
     NodeRoster const* roster { nullptr };
+    /// The Raft endpoint the resolver publishes; null reports the configuration's.
+    Cc::IAdvertisedEndpointSource const* raftEndpoint { nullptr };
 };
 
 /// A `ConfiguredNodeStatus` beside the configuration it holds a reference to.
@@ -321,7 +324,8 @@ struct Fixture
                                       .consensus = direct.consensus,
                                       .conditions = direct.conditions,
                                       .roster = direct.roster,
-                                      .sharedCache = direct.sharedCache } }
+                                      .sharedCache = direct.sharedCache,
+                                      .raftEndpoint = direct.raftEndpoint } }
     {
     }
 
@@ -782,6 +786,36 @@ TEST_CASE("A consensus node reports the address peers DIAL, which is not the one
                        NodeHostNames { .fqdn = "laptop.corp.example", .dnsSuffix = "corp.example", .withheld = {} });
         CHECK(named.status.Describe().runtime.consensusEndpoint
               == std::optional { std::format("laptop.corp.example:{}", RaftPort) });
+    }
+}
+
+TEST_CASE("A consensus node reports the Raft endpoint it publishes NOW, not the one it started with",
+          "[node][node-status][consensus][roaming]")
+{
+    // An operator reads `consensus-endpoint` to type it into `--cluster-admit`. After a roam the
+    // resolver publishes the new Raft endpoint; a status built over the START configuration kept
+    // reporting the old one, and re-recording a member there sends every peer to an address that
+    // is gone. RED before the status read the published endpoint.
+    core::platform::ManualClock clock;
+    AnnouncedEndpoint raft { std::format("10.0.0.4:{}", RaftPort) };
+    Fixture const joiner { { .raft = true, .raftWildcard = true, .raftSelf = "10.0.0.4" },
+                           clock,
+                           {},
+                           std::nullopt,
+                           DirectSources { .raftEndpoint = &raft } };
+    REQUIRE(joiner.status.Describe().runtime.consensusEndpoint == std::optional { std::format("10.0.0.4:{}", RaftPort) });
+
+    raft.Publish(std::format("192.168.7.2:{}", RaftPort));
+    CHECK(joiner.status.Describe().runtime.consensusEndpoint == std::optional { std::format("192.168.7.2:{}", RaftPort) });
+
+    SECTION("and still none on a node that runs no consensus, whatever is published")
+    {
+        // The published endpoint is asked only where the configuration names a consensus address:
+        // a worker's resolver publishes one too, and it is no address any peer dials.
+        Fixture const worker {
+            { .raftSelf = "10.0.0.4" }, clock, {}, std::nullopt, DirectSources { .raftEndpoint = &raft }
+        };
+        CHECK_FALSE(worker.status.Describe().runtime.consensusEndpoint.has_value());
     }
 }
 

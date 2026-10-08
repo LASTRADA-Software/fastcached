@@ -557,8 +557,15 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     // Only an address travels. `NoConsensus` is ABSENT, not an empty string; `Unstated` is
     // refused by the startup table and by every reload, so a serving node cannot be in
     // it -- and were it, absent is the honest reading of an address nobody stated.
+    //
+    // The LIVE endpoint wherever the configuration names one: the published Raft endpoint moves with
+    // a roam or a reloaded `--raft-self`, and the start's would send an operator's `--cluster-admit`
+    // to an address this node has left.
     if (auto dial = ConsensusDialAddressOf(_cfg); dial.has_value())
-        fields.runtime.consensusEndpoint = std::move(*dial);
+    {
+        auto live = _sources.raftEndpoint != nullptr ? _sources.raftEndpoint->Current() : std::string {};
+        fields.runtime.consensusEndpoint = live.empty() ? std::move(*dial) : std::move(live);
+    }
 
     // Where this node keeps its identity, and why there. One machine can hold two identities --
     // the service's in the machine-wide directory and a hand-started node's in the account's

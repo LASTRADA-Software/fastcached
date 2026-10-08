@@ -1219,7 +1219,10 @@ struct RouteParts
                                    .roster = nodeRoster.get(),
                                    // Every node has one, so a node with no shared cache says
                                    // `none` rather than nothing.
-                                   .sharedCache = &sharedCacheStatus },
+                                   .sharedCache = &sharedCacheStatus,
+                                   // The Raft endpoint the resolver publishes, so a roamed node
+                                   // reports where peers dial it NOW rather than at the start.
+                                   .raftEndpoint = &raftAnnounced },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore

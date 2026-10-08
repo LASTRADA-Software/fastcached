@@ -422,8 +422,10 @@ Beside them, what that worker is offering and whether anyone knows about it:
   because no leader is known yet.
 - **`consensus-endpoint`** — the `host:port` this node's consensus peers DIAL it at,
   which is the half of `--cluster-admit`'s receipt to compare against. Not `raft-port`,
-  which is the port the node BOUND, on an address that is routinely the wildcard. A node
-  running no consensus reports no such field rather than an empty one.
+  which is the port the node BOUND, on an address that is routinely the wildcard. It is
+  the endpoint the node publishes NOW: after the machine moves networks, or a reload
+  changes `--raft-self`, it reports the new address rather than the one it started with.
+  A node running no consensus reports no such field rather than an empty one.
 - **`consensus-standing`** — which set consensus counts this node in right now:
   `voter`, `learner`, `no-cluster` (waiting to be admitted) or `outsider` (its
   configuration names others and not it). A learner and a following voter report the
