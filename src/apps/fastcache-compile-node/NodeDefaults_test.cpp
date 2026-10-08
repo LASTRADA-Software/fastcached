@@ -491,6 +491,11 @@ TEST_CASE("A withheld name is offered to no peer, and the node serves this machi
     ApplyHostNames(local, withheld);
     CHECK(AdvertisedNameWithheld(local));
     CHECK(AdvertisedEndpoint(local) == "127.0.0.1:6674");
+    // At the port it BINDS, never an `auto:<port>` override: that names a port mapped in front of
+    // the node for OTHER machines, and a scheduler on this one dials the bind at loopback.
+    auto mapped = local;
+    mapped.advertise = "auto:7000";
+    CHECK(AdvertisedEndpoint(mapped) == "127.0.0.1:6674");
     // The readiness line names where the node BINDS, and what it advertises.
     CHECK(DescribeListeningEndpoint(local, false) == "0.0.0.0:6674");
     CHECK(DescribeListeningEndpoint(local, true) == "the socket its supervisor handed it");

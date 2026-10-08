@@ -2931,10 +2931,11 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
             return FormatHostPort(host, port);
 
     // A withheld name is offered to no peer. A scheduler on THIS machine reaches the wildcard
-    // bind at loopback, so that is what it is told; one elsewhere is told nothing, and the start
-    // refuses it by name (`WorkerNameReachesOnlyThisMachineRefusal`).
+    // bind at loopback, so that is what it is told -- at the port the node BINDS, since an
+    // `auto:<port>` override names a port mapped in front of it for other machines; one elsewhere
+    // is told nothing, and the start refuses it by name (`WorkerNameReachesOnlyThisMachineRefusal`).
     if (AdvertisedNameWithheld(cfg))
-        return SchedulerIsRemote(cfg) ? std::string {} : FormatHostPort(ThisMachineLoopbackHost, port);
+        return SchedulerIsRemote(cfg) ? std::string {} : FormatHostPort(ThisMachineLoopbackHost, node.front().port);
     return FormatHostPort(node.front().host, port);
 }
 
