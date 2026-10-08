@@ -161,11 +161,12 @@ Several things on that table are easy to get wrong and expensive to get wrong:
   credential rule turns on, so widening that address is what makes a token required.
 
 **One caveat `--print-surfaces` states and cannot compute.** Under systemd socket
-activation the `.socket` unit owns the port, and `--listen-node` is read
-by nothing, and this process is never told which port it got — so `--advertise`
-becomes required and is what names where clients actually go. The command is run by
-hand, never under the supervisor, so it cannot detect this; it prints the note
-instead of guessing.
+activation the `.socket` unit owns the address and port, and `--listen-node` is read
+by nothing: the node asks the socket it is handed where it is bound and advertises
+that — a wildcard `ListenStream=` as the address this machine routes from, on the
+socket's port, and one bound to an address as that address. `--advertise` still
+overrides both. The command is run by hand, never under the supervisor, so it cannot
+detect this; it prints the note instead of guessing.
 
 `--advertise` is deliberately **not** a surface. It is what this node tells other
 machines to dial, not a socket it opens.

@@ -3,7 +3,9 @@
 # The compile worker.
 #
 # Socket-activated: fastcache-compile-node.socket owns the port and this unit
-# adopts it, so there is no --bind or --port here. Enable the SOCKET, not this:
+# adopts it, so there is no --listen-node here -- the worker reads the address and
+# port off the socket it is handed, and advertises what it reads. Enable the
+# SOCKET, not this:
 #
 #     systemctl enable --now fastcache-compile-node.socket
 #
@@ -26,11 +28,12 @@ Wants=network-online.target
 Type=simple
 
 # What is SITE-SPECIFIC -- an advertised address other machines must dial in place
-# of this machine's name, a fleet seed across a VPN, the membership policy -- comes
-# from a file an operator writes rather than from this unit. None of it is required:
-# a node with no configuration forms a fleet of its own and registers its worker
-# where its formation record says, never at a scheduler address anybody typed (a
-# node that serves is refused `--scheduler`, which aims the one-shot verbs alone).
+# of the one this machine routes from, a fleet seed across a VPN, the membership
+# policy -- comes from a file an operator writes rather than from this unit. None
+# of it is required: a node with no configuration forms a fleet of its own and
+# registers its worker where its formation record says, never at a scheduler
+# address anybody typed (a node that serves is refused `--scheduler`, which aims
+# the one-shot verbs alone).
 #
 # That file is now the node's own YAML configuration rather than a shell fragment
 # of command-line arguments (#291). One file, one grammar, one precedence rule:

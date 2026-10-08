@@ -29,6 +29,7 @@
 #include "LiveNodeConfig.hpp"
 #include "LiveStatsResponder.hpp"
 #include "LiveStatsSources.hpp"
+#include "NodeActivation.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeAudience.hpp"
 #include "NodeConditions.hpp"
@@ -236,25 +237,22 @@ void InstallNodeStopHandlers()
 
 /// The descriptor a supervisor handed this worker, when there was one.
 ///
-/// Separated from `main` so the whole handoff -- how many descriptors arrived, and
-/// whether the configuration can still describe this worker afterwards -- is one
-/// decision with one answer, rather than three checks interleaved with everything
-/// else a startup does.
+/// Separated from `main` so the whole handoff -- how many descriptors arrived -- is one decision
+/// with one answer, rather than checks interleaved with everything else a startup does. Where the
+/// socket is bound is `Node::AdoptActivatedBind`'s, which `main` asks right after this.
 ///
 /// **A descriptor rather than a listener**, since #290 stage 3. The merged `0xFC`
 /// surface runs on the reactor, and the listener that serves it is built by
 /// `FrameEndpoint::StartAdopted` from this descriptor; building one here would own
 /// it, and handing an owned descriptor on is a double close rather than a handover.
 ///
-/// Nothing here closes what it returns. On the two refusal paths the process exits
+/// Nothing here closes what it returns. On the refusal path the process exits
 /// immediately, and on the success path ownership passes to `Node::ActivationHold`,
 /// which keeps it for the process and hands every body a copy its listener owns --
 /// and takes even when the adoption itself fails.
-/// @param cfg What the operator asked for.
-/// @param logger Where the handoff is announced.
 /// @return The descriptor, `std::nullopt` when nothing was handed over, or why the
 ///         handoff cannot be served.
-[[nodiscard]] std::expected<std::optional<int>, NodeRefusal> ActivatedDescriptor(NodeConfig const& cfg, ILogger& logger)
+[[nodiscard]] std::expected<std::optional<int>, NodeRefusal> ActivatedDescriptor()
 {
     // When a supervisor already bound the port and handed the descriptor over,
     // binding it again would fail with "address already in use" -- against
@@ -275,24 +273,46 @@ void InstallNodeStopHandlers()
             NodeRefusalCause::HandedOverListeners,
             std::format("socket activation handed over {} listeners; this worker serves exactly one", inherited.size())) };
 
-    // Socket activation makes --advertise mandatory, because the fallback becomes a
-    // guess the process cannot make. `--listen-node` was not used -- the socket unit
-    // chose the address and this process is never told which -- so the fallback would
-    // register a value from configuration that describes nothing, and the wildcard is
-    // not an address a remote client can dial anyway.
-    //
-    // The consequence of guessing is the worst-shaped failure this system has: the
-    // registration SUCCEEDS, the worker heartbeats happily, the scheduler leases that
-    // endpoint to clients, and every one of them fails to connect and compiles
-    // locally. Nothing reports an error, and the fleet looks healthy from both ends.
-    // Refusing at startup, where it can be explained, is the whole difference.
-    if (AdvertiseModeOf(cfg.advertise) == AdvertiseMode::Auto)
-        return std::unexpected { Refusal(NodeRefusalCause::HandedOverListeners,
-                                         "--advertise is required under socket activation: the socket unit owns the "
-                                         "port, so this worker cannot know what address clients should use") };
-
-    logger.Logf(LogLevel::Info, "a supervisor handed over a listening socket; --listen-node is not used");
+    // `--advertise` is NOT required here any more. It was, while the socket's address was a fact
+    // this process never read: `--listen-node` described nothing, so the fallback registered a
+    // value that described nothing either. The socket says where it listens (`getsockname`), and
+    // `main` adopts that as the node bind, so the advertised endpoint is derived from the socket
+    // clients actually reach -- a wildcard one advertises the address this machine routes from on
+    // the socket's port, one bound to an address advertises that address.
     return std::optional { inherited.front() };
+}
+
+/// The socket a supervisor handed over, and where it is bound.
+struct ActivatedSocket
+{
+    std::optional<int> descriptor;          ///< The descriptor, or nothing when this node binds its own.
+    std::optional<BoundEndpoint> bind = {}; ///< Where it is bound; engaged exactly when `descriptor` is.
+};
+
+/// Take the socket a supervisor handed over, when there is one, and make @p cfg describe it.
+///
+/// The bind is adopted into the configuration (`Node::AdoptActivatedBind`) rather than carried
+/// beside it, because every endpoint this node derives -- the advertised one, which the startup
+/// table judges, the endpoint resolver publishes and a reload candidate is shaped by -- is derived
+/// from the configuration in force. A bind kept anywhere else would be a second author of the
+/// port clients are sent to, and `--listen-node`'s default is a port the unit does not serve.
+/// @param cfg The configuration the start shaped; the Node surface's bind is the socket's after.
+/// @param logger Where the handoff is announced.
+/// @return The descriptor and its bind, both empty with no handoff, or why the start must stop.
+[[nodiscard]] std::expected<ActivatedSocket, NodeRefusal> AdoptActivation(NodeConfig& cfg, ILogger& logger)
+{
+    auto const descriptor = ActivatedDescriptor();
+    if (!descriptor.has_value())
+        return std::unexpected { descriptor.error() };
+    if (!descriptor->has_value())
+        return ActivatedSocket { .descriptor = std::nullopt };
+
+    auto const bind = BoundEndpointOfDescriptor(**descriptor);
+    if (auto adopted = Node::AdoptActivatedBind(cfg, bind); !adopted.has_value())
+        return std::unexpected { std::move(adopted).error() };
+    logger.Logf(
+        LogLevel::Info, "a supervisor handed over a listening socket on {}; --listen-node is not used", cfg.nodeListen);
+    return ActivatedSocket { .descriptor = *descriptor, .bind = bind };
 }
 
 // A one-shot verb stopped before it runs -- a configuration file that did not load, a command line
@@ -1796,9 +1816,9 @@ void PauseUnlessStopped(std::chrono::milliseconds wait)
 
 /// Serve until a body ends other than for a reform (`Node::RunNodeBodies`).
 ///
-/// What is left here is what only `main` can build -- the socket activation, read once for the
-/// process, and the serving body itself; what a reform decides is `Node::RunNodeBodies`', which a
-/// test target builds.
+/// What is left here is what only `main` can build -- the hold over the socket activation `main`
+/// read once for the process, and the serving body itself; what a reform decides is
+/// `Node::RunNodeBodies`', which a test target builds.
 /// @param cfg The configuration the start shaped: the first body's, and every reformed body's while
 ///        this node has no file. With one, a reformed body is adopted into the reloader's snapshot.
 /// @param identityKey This node's identity key.
@@ -1806,6 +1826,7 @@ void PauseUnlessStopped(std::chrono::milliseconds wait)
 /// @param reloader The live configuration, or null when this node has no file.
 /// @param running What the start adopted; rewritten to what the running body was adopted from.
 /// @param hostEvents Where the host's resume and network events arrive, for every body.
+/// @param activated The socket a supervisor handed over (`AdoptActivation`), or nothing.
 /// @param parts What outlives every body.
 /// @return The last body's exit code.
 [[nodiscard]] int ServeNodeBodies(NodeConfig const& cfg,
@@ -1814,27 +1835,16 @@ void PauseUnlessStopped(std::chrono::milliseconds wait)
                                   NodeReloader* reloader,
                                   IHostEvents& hostEvents,
                                   Node::AdoptedFormation& running,
+                                  std::optional<int> activated,
                                   ServingParts const& parts)
 {
-    // Socket activation is resolved BEFORE the toolchains, and the order is
-    // deliberate. Computing a fingerprint walks the whole include tree and takes
-    // seconds; a bad handoff is decided in microseconds. Doing the cheap, fallible
-    // thing first means a misconfigured unit fails immediately instead of after a
-    // multi-second pause -- and it means the startup log reads in the order things
-    // actually happened, so an operator watching a worker come up sees what it did
-    // with the socket before the long quiet part.
-    //
-    // And ONCE, for the process: the handoff clears the environment it read, and a body's
-    // listener closes what it adopts. The hold keeps the original and every body serves a copy
-    // (`Node::ActivationHold`), so a reformed body never binds a port the supervisor holds.
-    auto const activatedOrError = ActivatedDescriptor(cfg, logger);
-    if (!activatedOrError.has_value())
-    {
-        logger.Logf(LogLevel::Error, "{}", activatedOrError.error().reason);
-        return ExitCodeFor(activatedOrError.error().cause);
-    }
+    // The socket a supervisor handed over was taken by `main`, ONCE for the process, before the
+    // startup table judged the endpoint derived from its bind (`AdoptActivation`): the handoff
+    // clears the environment it read, and a body's listener closes what it adopts. The hold keeps
+    // the original and every body serves a copy (`Node::ActivationHold`), so a reformed body never
+    // binds a port the supervisor holds.
     SystemInheritedDescriptors const inheritedDescriptors;
-    Node::ActivationHold const activation { *activatedOrError, inheritedDescriptors };
+    Node::ActivationHold const activation { activated, inheritedDescriptors };
 
     core::platform::SteadyClock const loopClock;
     auto publisher = std::optional<Node::ReloaderPublisher> {};
@@ -2619,6 +2629,19 @@ int main(int argc, char** argv)
         return RefuseStart(
             startHost, logger, std::format("{}; refusing to start", StateDirectoryUnreadRefusal(cfg)), ExitCodeFor(*stage));
 
+    // **The socket a supervisor handed over, adopted before anything derives an endpoint from the
+    // bind** -- the table below judges the advertised endpoint, and under activation that is the
+    // socket's address and port rather than `--listen-node`'s default (`AdoptActivation`). Resolved
+    // ONCE for the process: the handoff clears the environment it read, and `ServeNodeBodies` keeps
+    // the descriptor for every body (`Node::ActivationHold`). Before the toolchains too, which take
+    // seconds, while a bad handoff is decided in microseconds.
+    auto const activation = AdoptActivation(cfg, logger);
+    if (!activation.has_value())
+        return RefuseStart(startHost,
+                           logger,
+                           std::format("{}; refusing to start", activation.error().reason),
+                           ExitCodeFor(activation.error().cause));
+
     // **The address this machine routes from, probed once before the table judges the endpoints it
     // derives** -- `auto` advertises it on a wildcard bind, and a rule over an address judged without
     // it would judge one this node never advertises. Applied to both configurations as the names are
@@ -2760,6 +2783,9 @@ int main(int argc, char** argv)
                                                          // endpoints from NOW, so the table judges a
                                                          // candidate by the address it would advertise.
                                                          .routeHost = [&routeHost] { return routeHost.Current(); },
+                                                         // The socket a supervisor handed over, which every
+                                                         // candidate binds as the start did.
+                                                         .activatedBind = activation->bind,
                                                      }),
                          Node::ReloadCheckWith(leaseCheck));
 
@@ -2925,9 +2951,17 @@ int main(int argc, char** argv)
                                           },
                                       .leaseCheck = leaseCheck,
                                       .route = RouteParts { .probe = *routeProbe, .cell = routeHost } };
-    return host->Run([&cfg, &identityKey, &logger, reloaderPtr, &hostEvents, &networkClock, &adopted, &parts] {
+    return host->Run([&cfg,
+                      &identityKey,
+                      &logger,
+                      reloaderPtr,
+                      &hostEvents,
+                      &networkClock,
+                      &adopted,
+                      activated = activation->descriptor,
+                      &parts] {
         auto const bodyNetworkWatcher =
             StartNetworkWatcherAt(NetworkWatcherStart::InsideTheBody, hostEvents, networkClock, logger);
-        return ServeNodeBodies(cfg, *identityKey, logger, reloaderPtr, hostEvents, *adopted, parts);
+        return ServeNodeBodies(cfg, *identityKey, logger, reloaderPtr, hostEvents, *adopted, activated, parts);
     });
 }

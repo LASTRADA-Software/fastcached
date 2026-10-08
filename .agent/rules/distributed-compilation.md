@@ -263,19 +263,28 @@ terminal, and each has already been a bug:
   deliberately omits that so a service can re-exec itself, while this worker
   spawns a compiler per job and a compiler holding the listening socket keeps the
   port alive after the worker exits.
-- **Under socket activation `--advertise` is required, because the fallback
-  becomes a guess the process cannot make.** The socket unit owns the port and
-  never tells the service which one, so `--listen-node` describes nothing — and
-  `0.0.0.0` is not an address a remote client can dial regardless. The failure
-  is the worst shape this system has: registration *succeeds*, the worker
-  heartbeats happily, the scheduler leases that endpoint out, and every client
-  fails to connect and compiles locally, with no error anywhere and a fleet that
-  looks healthy from both ends. Refused at startup instead — and refused **before**
-  the toolchain walk, which is the same cheap-and-fallible-first ordering the
+- **Under socket activation the bind is READ off the socket, never guessed.** The
+  socket unit owns the address and port, so `--listen-node`'s value describes
+  nothing — and advertising it is the worst failure shape this system has:
+  registration *succeeds*, the worker heartbeats happily, the scheduler leases that
+  endpoint out, and every client fails to connect and compiles locally, with no
+  error anywhere and a fleet that looks healthy from both ends. This was once
+  closed by requiring `--advertise`, which made the stock package refuse to start.
+  Instead `main` asks the inherited socket where it is bound (`getsockname`,
+  `BoundEndpointOfDescriptor`) and adopts that as the Node surface's bind
+  (`Node::AdoptActivatedBind`) **before anything derives an endpoint from it** —
+  the startup table, the endpoint resolver, and every reload candidate
+  (`ReloadBasis::activatedBind`, since `--listen-node` is unreloadable and a
+  candidate holding the default would be refused). From there the advertised
+  endpoint is derived as for any bind: a **wildcard** socket advertises the
+  routed address on the socket's port (`auto`), a socket bound to **one address**
+  advertises that address (pinned literal), and an `--advertise` that pins a value
+  still wins. Only the value is adopted, never `nodeListenExplicit`: a unit's
+  `ListenStream=` is not a promise the command line made. A socket that will not
+  say where it listens is still refused, with the old text. All of it runs
+  **before** the toolchain walk, the same cheap-and-fallible-first ordering the
   adoption check follows: a fingerprint takes seconds, a misconfiguration is
-  decided in microseconds, and doing the expensive thing first means an operator
-  watching a worker start sees nothing during the part where something can still
-  go wrong.
+  decided in microseconds.
 
 **The scheduler lives where leadership lives, and that is not the cache daemon.**
 `WorkerRegistry` and `LeaseTable` used to be reached through a `Dispatch` role on one

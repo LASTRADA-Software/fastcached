@@ -4760,6 +4760,19 @@ else()
         RUN_SERIAL TRUE
         TIMEOUT 600
     )
+    # The same handover with no `--advertise`: the node must advertise what it reads off the
+    # socket, which is the stock package's configuration.
+    add_test(
+        NAME "node-socket-activation-derived-e2e"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/node-socket-activation-e2e.sh"
+            --node "$<TARGET_FILE:fastcache-compile-node>" --derive-advertise
+    )
+    set_tests_properties("node-socket-activation-derived-e2e" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 600
+    )
 
     add_test(
         NAME "fleet-dashboard-e2e"

@@ -44,6 +44,10 @@
 #                                                   clients are sent to is the one the
 #                                                   supervisor opened.
 #
+# `--derive-advertise` runs it with NO `--advertise` at all: the node reads the address
+# and port off the socket it is handed (`Node::AdoptActivatedBind`) and must advertise
+# them -- the stock package, which once refused to start without that flag.
+#
 # ## The configuration is the packaged one
 #
 # `advertise:` and no `listen_node:` -- byte-for-byte the shape
@@ -58,9 +62,11 @@
 set -uo pipefail
 
 node=""
+derive_advertise="no"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --node) node="$2"; shift 2 ;;
+        --derive-advertise) derive_advertise="yes"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -102,6 +108,7 @@ e2e_begin "node socket-activation E2E" "$workdir"
 # **States which mode it exercised**, so a green run is not silently the skip. A
 # fixture that cannot say what it did is one whose pass means nothing.
 e2e_note "mode: REAL socket activation via ${activator}"
+e2e_note "advertise derived from the socket: ${derive_advertise}"
 
 log="${workdir}/node.log"
 dump_node_log() {
@@ -155,6 +162,11 @@ readonly DEFAULT_NODE_PORT=6674
 # independent sources agreeing when it is one dead fact quoted twice.
 readonly READY_SECONDS=240
 
+# What the node is told to advertise: the activated port, as the packaging job's file says,
+# or nothing at all, so the socket it is handed is the only thing that can say.
+advertise_args=(--advertise="127.0.0.1:${port}")
+[[ "$derive_advertise" = "yes" ]] && advertise_args=()
+
 # The packaged configuration: an advertise naming the ACTIVATED port, the state directory
 # the packaged unit provides for its identity key (#178 PR 6), and deliberately no
 # --listen-node. No scheduler: a node that serves is refused one, and finds the fleet it
@@ -165,7 +177,7 @@ readonly READY_SECONDS=240
         --cluster-dir="${workdir}/state" \
         --listen-raft="127.0.0.1:${raft_port}" \
         --discovery= \
-        --advertise="127.0.0.1:${port}" \
+        "${advertise_args[@]}" \
         --toolchain=/usr/bin/g++ \
         --cache-memory=0 \
     > "$log" 2>&1 &

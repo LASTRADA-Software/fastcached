@@ -73,6 +73,7 @@ add_executable(fastcache-compile-node
     ScratchClaim.cpp
     LocalCache.cpp
     HostEventInbox.cpp
+    NodeActivation.cpp
     NodeAnnounce.cpp
     NodePresenceTier.cpp
     NodeRoster.cpp
@@ -203,6 +204,8 @@ if(FASTCACHED_BUILD_TESTS)
         RemoteUpstream_test.cpp
         OperatorCredentials.cpp
         OperatorCredentials_test.cpp
+        NodeActivation.cpp
+        NodeActivation_test.cpp
         NodeAnnounce.cpp
         NodePresenceTier.cpp
         NodeRoster.cpp

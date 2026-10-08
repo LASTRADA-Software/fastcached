@@ -220,6 +220,57 @@ TEST_CASE("A reload candidate carries the route host the running node derives it
     CHECK_FALSE(offline->routeHost.has_value());
 }
 
+TEST_CASE("A reload candidate keeps the socket a supervisor handed over as the node bind", "[node][reload][activation]")
+{
+    // The resolver re-derives the advertised endpoint from the configuration in force, and a reload
+    // replaces that with a candidate. Shaped without the activated bind, the candidate binds
+    // `--listen-node`'s default port: an unreloadable field that has changed, and an endpoint on a
+    // port the socket unit does not serve.
+    Testing::ScratchDirectory const scratch { "node-reload-activation" };
+    auto const path = WriteFile(scratch.Path(), std::format("cluster_dir: {}\n", (scratch / "state").generic_string()));
+    auto const record = Cluster::FormationRecord { .mode = Cluster::NodeMode::Solitary,
+                                                   .own = { .clusterId = "own-c", .createdAtUnixSeconds = 100 },
+                                                   .joining = std::nullopt,
+                                                   .fleet = std::nullopt,
+                                                   .archivePending = std::nullopt,
+                                                   .rejectedBy = std::nullopt,
+                                                   .askedJoins = {} };
+    auto const readerAdopting = [&record](std::optional<BoundEndpoint> activatedBind) {
+        return ReloadCandidateReader(
+            {},
+            ReloadBasis {
+                .stateDirectory = std::nullopt,
+                .hostNames = NodeHostNames { .fqdn = "box.lan", .dnsSuffix = "lan", .withheld = {} },
+                .formation =
+                    [&record] {
+                        return std::expected<KeptFormation, std::string> { KeptFormation { .record = record,
+                                                                                           .remembered = {} } };
+                    },
+                .identity = NodeIdentity {},
+                .routeHost = [] { return std::string { "10.0.0.9" }; },
+                .activatedBind = std::move(activatedBind),
+            });
+    };
+    auto const read = readerAdopting(BoundEndpoint { .host = "0.0.0.0", .port = 6676 });
+
+    auto const candidate = read(path);
+    REQUIRE(candidate.has_value());
+    CHECK(candidate->nodeListen == "0.0.0.0:6676");
+    CHECK(AdvertisedEndpoint(*candidate) == "10.0.0.9:6676");
+
+    // And the running node, which adopted the same socket at its start, accepts that candidate:
+    // nothing it adopted reads as a field the reload changed.
+    NodeReloader reloader { *candidate, path, read, &ValidateNodeReloadable };
+    auto const reloaded = reloader.Reload();
+    INFO((reloaded.has_value() ? std::string {} : reloaded.error().context));
+    CHECK(reloaded.has_value());
+    CHECK(AdvertisedEndpoint(*reloader.Current()) == "10.0.0.9:6676");
+
+    // Which is the basis's doing: the same file read without it is refused against that node.
+    NodeReloader forgetful { *candidate, path, readerAdopting(std::nullopt), &ValidateNodeReloadable };
+    CHECK_FALSE(forgetful.Reload().has_value());
+}
+
 TEST_CASE("A reload is shaped by the formation kept at the reload and not by the record the start kept",
           "[node][reload][formation]")
 {

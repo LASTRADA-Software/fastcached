@@ -639,6 +639,11 @@ TEST_CASE("The 0xFC row's note says what socket activation does to it", "[node][
     // And the STATE, which is what the vocabulary cannot carry.
     CHECK(note.contains("is served on this surface"));
     CHECK_FALSE(note.contains("NOT yet served"));
+
+    // Including what the advertised endpoint is under activation: read off the socket, since
+    // `Node::AdoptActivatedBind` -- `--advertise` is no longer required there.
+    CHECK(note.contains("reads the address and port off the socket"));
+    CHECK_FALSE(note.contains("required under activation"));
 }
 
 TEST_CASE("Every surface states what a bind failure does, and why", "[node][surfaces][bind]")

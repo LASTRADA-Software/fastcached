@@ -30,9 +30,12 @@ Documentation=https://github.com/LASTRADA-Software/fastcached
 # is never a client-side default; it is only ever what an operator configured,
 # and this file is where they change it.
 #
-# The service must be given --advertise, because a unit owns the address and
-# never tells the service which one. Without it the worker refuses to start
-# rather than register an endpoint it cannot describe.
+# The service needs no --advertise for this: it asks the socket it is handed
+# where it is bound and advertises that. A wildcard ListenStream, as here, is
+# advertised as the address this machine routes from, on this port, and follows
+# the network when that changes; one bound to an address
+# (ListenStream=10.0.0.5:6676) is advertised as that address. An `advertise:`
+# in the node's configuration still overrides both.
 ListenStream=6676
 
 # One connection carries one compile, and a compile occupies a slot for
