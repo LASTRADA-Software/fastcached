@@ -108,6 +108,7 @@ constexpr std::array WriterFiles {
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-compile-node/WorkerTier.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::ConsensusPeerWire,
                         .path = "src/FastCache/Consensus/RaftPeerRefusals.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::ConsensusPeerWire, .path = "src/FastCache/Consensus/RaftPeerServer.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::ConsensusPeerWire,
                         .path = "src/FastCache/Consensus/RaftPeerTransport.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::LiveStats, .path = "src/FastCache/Protocol/LiveStream.cpp" },

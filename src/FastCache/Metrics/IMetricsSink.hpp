@@ -1358,8 +1358,9 @@ class IMetricsSink
         /// A Raft message dropped for a peer this node can place nowhere: it neither dials it nor
         /// was told it dials in.
         RaftSendsDroppedUnknownPeer,
-        /// A two-way Raft session closed because the same id proved a newer one: a learner that
-        /// reconnected, or -- at a steady rate -- two machines sharing one identity key.
+        /// A Raft session closed because the same id proved a newer one -- a two-way session by
+        /// the transport, a one-way session by the acceptor: a member that reconnected, or -- at a
+        /// steady rate -- two machines sharing one identity key.
         RaftInboundSessionsSuperseded,
 
         /// A grant refused because the state this worker applied records no voter's key yet. (#178)

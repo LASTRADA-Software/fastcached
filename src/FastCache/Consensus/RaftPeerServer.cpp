@@ -17,7 +17,6 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -62,6 +61,64 @@ namespace
       private:
         OpenConnections* _open;
         core::net::ISocket* _socket;
+    };
+
+    /// Makes one one-way session the newest its dialler holds, for as long as it is being served.
+    ///
+    /// RAII for `RegisteredConnection`'s reason. The entry is erased only while it still names
+    /// THIS session's socket: a session a newer one superseded ends after the newer one replaced
+    /// it, and erasing by id alone would forget the newer one -- whose own successor would then
+    /// find nothing to close.
+    class NewestOneWaySession
+    {
+      public:
+        /// @param open Where the entry lives; must outlive this.
+        /// @param dialler The member the session proved.
+        /// @param socket The session's connection.
+        NewestOneWaySession(OpenConnections* open, NodeId dialler, core::net::ISocket* socket):
+            _open { open },
+            _dialler { std::move(dialler) },
+            _socket { socket },
+            _superseded { Replace(open, _dialler, socket) }
+        {
+        }
+
+        NewestOneWaySession(NewestOneWaySession const&) = delete;
+        NewestOneWaySession(NewestOneWaySession&&) = delete;
+        NewestOneWaySession& operator=(NewestOneWaySession const&) = delete;
+        NewestOneWaySession& operator=(NewestOneWaySession&&) = delete;
+
+        ~NewestOneWaySession()
+        {
+            auto const guard = std::scoped_lock { _open->mutex };
+            if (auto const entry = _open->oneWay.find(_dialler); entry != _open->oneWay.end() && entry->second == _socket)
+                _open->oneWay.erase(entry);
+        }
+
+        /// @return The socket of the session this one replaced, or null when there was none.
+        [[nodiscard]] core::net::ISocket* Superseded() const noexcept
+        {
+            return _superseded;
+        }
+
+      private:
+        /// Name @p socket as @p dialler's newest one-way session, under the map's lock.
+        /// @param open Where the entry lives.
+        /// @param dialler The member the session proved.
+        /// @param socket The session's connection.
+        /// @return The socket the entry named before, or null when there was none.
+        [[nodiscard]] static core::net::ISocket* Replace(OpenConnections* open,
+                                                         NodeId const& dialler,
+                                                         core::net::ISocket* socket)
+        {
+            auto const guard = std::scoped_lock { open->mutex };
+            return std::exchange(open->oneWay[dialler], socket);
+        }
+
+        OpenConnections* _open;
+        NodeId _dialler;
+        core::net::ISocket* _socket;
+        core::net::ISocket* _superseded; ///< Initialised last: it is read from the entry `_dialler` names.
     };
 
     /// Keeps one two-way session attached to the transport for as long as it is being served.
@@ -273,6 +330,23 @@ core::async::DetachedTask PeerServerAccess::ServePeer(RaftPeerServer* self, std:
                                                             FrameSealer { std::move(proven->session.acceptorToDialler) })
                         : std::shared_ptr<RaftSessionLink> {};
         AttachedLink const attached { &self->_links, std::move(link) };
+
+        // A one-way session is the newest its dialler holds, and closes the one it supersedes: a
+        // dialler holds ONE outbound session to this node, so an older one is a path that vanished
+        // -- a voter whose address moved -- and nothing else would ever end it. Closed outside the
+        // map's lock, because a close may resume that session's task, whose own guard takes it.
+        // Still alive here: its task ends on this reactor, which is running this one.
+        auto newest = std::optional<NewestOneWaySession> {};
+        if (!AcceptorWrites(proven->direction))
+        {
+            newest.emplace(&self->_open, proven->dialler, socket.get());
+            if (auto* const superseded = newest->Superseded(); superseded != nullptr)
+            {
+                superseded->close();
+                self->NoteSuperseded(peer, proven->dialler);
+            }
+        }
+
         co_await Serve(self, &reader, std::move(peer), *std::move(proven));
     }
 
@@ -538,6 +612,16 @@ void RaftPeerServer::NoteProvenRefusal(AcceptorRefusal refusal,
         LogLevel::Warn,
         std::format(
             "raft: refused peer {} at {} because {}{}{}", dialler, peer, row.says, detail.empty() ? "" : ": ", detail));
+}
+
+void RaftPeerServer::NoteSuperseded(std::string_view peer, NodeId const& dialler)
+{
+    _metrics.Increment(IMetricsSink::Counter::RaftInboundSessionsSuperseded);
+    _logger.Log(LogLevel::Debug,
+                std::format("raft: peer {} proved a newer one-way session from {}; its earlier one is superseded and "
+                            "closed",
+                            dialler,
+                            peer));
 }
 
 void RaftPeerServer::NoteSessionEnd(SessionEnding const& ending, std::string_view peer, NodeId const& dialler)

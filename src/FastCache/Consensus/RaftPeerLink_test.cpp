@@ -37,9 +37,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <ranges>
-#include <span>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -690,6 +688,106 @@ struct LearnerLink
     LearnerEnd learnerTransport { reactor, listener, LearnerBuilder(learnerSink, LearnerStart::Idle) };
 };
 
+/// One server ("n2") and any number of real transports dialling it, each under the identity a case
+/// names -- so the same member can dial twice while its first session is still open, which is what
+/// a voter whose address moved looks like from the acceptor: nothing reads an EOF from a path that
+/// vanished, so the old session is still being served when the new one proves the same id.
+///
+/// The server accepts through a `ProbingListener`, so a case can see which accepted sockets the
+/// server ended and destroyed.
+struct RedialLink
+{
+    RedialLink()
+    {
+        [](RaftPeerServer* accepting) -> core::async::DetachedTask {
+            co_await accepting->Run();
+        }(&server);
+        reactor.drain();
+    }
+
+    RedialLink(RedialLink const&) = delete;
+    RedialLink(RedialLink&&) = delete;
+    RedialLink& operator=(RedialLink const&) = delete;
+    RedialLink& operator=(RedialLink&&) = delete;
+
+    /// Every transport stops first, then the listener closes -- each drained on this thread, as
+    /// `~Link` does.
+    ~RedialLink()
+    {
+        for (auto const& transport: transports)
+            transport->RequestStop();
+        reactor.drain();
+        clock.advance(50ms);
+        reactor.drain();
+        transports.clear();
+        listener.close();
+        reactor.drain();
+    }
+
+    /// Start a transport proving @p member, dialling the server, and let it send one vote.
+    /// @param member The id the transport proves.
+    /// @param term The vote's term, so deliveries are distinguishable.
+    /// @param direction Which way the session it dials flows.
+    void Dial(std::string const& member,
+              std::uint64_t term,
+              RaftWire::SessionDirection direction = RaftWire::SessionDirection::OneWay)
+    {
+        auto const& identity = identities.emplace_back(
+            std::make_unique<Testing::TestPeerIdentity>(NodeId { member }, Testing::TestKeyPair(member), roster));
+        auto const& transport = transports.emplace_back(std::make_unique<RaftPeerTransport>(
+            std::vector { PeerEndpoint { .id = NodeId { "n2" }, .host = "in-memory", .port = 1 } },
+            reactor,
+            connector,
+            returned,
+            logger,
+            diallerMetrics,
+            *identity,
+            diallerRandom,
+            PeerTransportOptions { .reconnectBackoff = ReconnectBackoff, .handshakeBound = 0ms, .direction = direction }));
+        transport->Start();
+        transport->Send(NodeId { "n2" },
+                        RaftMessage { RequestVoteResponse { .term = Term { .value = term },
+                                                            .decision = VoteDecision::Granted,
+                                                            .voterId = NodeId { member } } });
+        reactor.drain();
+    }
+
+    /// @return Every acceptor refusal the server counted, summed.
+    [[nodiscard]] std::uint64_t AcceptorRefusalsCounted() const
+    {
+        auto total = std::uint64_t { 0 };
+        for (auto const& row: AcceptorRefusals)
+            total += serverMetrics.Read(row.counter);
+        return total;
+    }
+
+    std::shared_ptr<Testing::SharedRoster> roster { Testing::SharedRoster::Of({ "n1", "n2", "n3" }) };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
+    core::net::testing::InMemoryListener listener;   ///< The server's Raft port.
+    DestructionLog destroyed;                        ///< Which thread destroyed each accepted socket.
+    ProbingListener probing { listener, destroyed }; ///< What the server accepts through.
+    Testing::ListenerConnector connector { listener };
+    RecordingSink sink;     ///< What the server delivered.
+    RecordingSink returned; ///< What the transports read back.
+    AtomicMetricsSink serverMetrics;
+    AtomicMetricsSink diallerMetrics;
+    CapturingLogger serverLogger; ///< Everything the server said.
+    NullLogger logger;
+    Testing::TestPeerIdentity const serverIdentity { NodeId { "n2" }, Testing::TestKeyPair("n2"), roster };
+    SystemSecureRandom serverRandom;
+    SystemSecureRandom diallerRandom;
+    Testing::NoInboundLinks inbound; ///< What the server attached.
+    core::net::AcceptLoopHealth acceptLoops;
+    RaftPeerServer server {
+        probing,       reactor,        sink,         inbound,     serverLogger,
+        serverMetrics, serverIdentity, serverRandom, acceptLoops, PeerServerOptions { .handshakeBound = 0ms }
+    };
+
+    std::vector<std::unique_ptr<Testing::TestPeerIdentity>> identities; ///< One per `Dial`, outliving its transport.
+    std::vector<std::unique_ptr<RaftPeerTransport>> transports;         ///< One per `Dial`, in order.
+};
+
 } // namespace
 
 TEST_CASE("A transport and a server that each prove their id form a session and deliver", "[consensus][raft][handshake]")
@@ -1326,4 +1424,79 @@ TEST_CASE("An offline learner's leader logs nothing per retransmission and dials
     // says at Info, once a learner has actually dialled in.
     link.LearnerSends(1);
     CHECK(CountAtOrAbove(link.leaderLogger.Snapshot(), LogLevel::Info) > 0);
+}
+
+TEST_CASE("A second one-way session from the same member supersedes the first", "[consensus][raft][peerserver]")
+{
+    // A voter whose address moved closes its outbound sessions and redials; the acceptor never
+    // reads an EOF from the path that vanished, and arms no idle bound on a one-way session, so
+    // without this the old session would hold one of the listener's slots forever -- one more per
+    // move.
+    RedialLink link;
+    link.Dial("n1", 1);
+    REQUIRE(link.sink.received.size() == 1);
+    REQUIRE(link.server.ActiveConnections() == 1);
+    REQUIRE(link.destroyed.Threads().empty());
+
+    link.Dial("n1", 2);
+    REQUIRE(link.sink.received.size() == 2);
+    CHECK(std::get<RequestVoteResponse>(link.sink.received[1]).term.value == 2);
+
+    // The first session was ended by the server -- its accepted socket closed and destroyed -- and
+    // only the newest one holds a slot.
+    CHECK(link.probing.Accepted() == 2);
+    CHECK(link.destroyed.Threads().size() == 1);
+    CHECK(link.server.ActiveConnections() == 1);
+    CHECK(link.serverMetrics.Read(IMetricsSink::Counter::RaftInboundSessionsSuperseded) == 1);
+    CHECK(link.AcceptorRefusalsCounted() == 0);
+    auto const records = link.serverLogger.Snapshot();
+    CHECK(std::ranges::any_of(records, [](CapturingLogger::Record const& record) {
+        return record.level == LogLevel::Debug && record.message.contains("n1") && record.message.contains("superseded");
+    }));
+
+    // And the newest session is the one still served.
+    link.transports.back()->Send(NodeId { "n2" },
+                                 RaftMessage { RequestVoteResponse { .term = Term { .value = 3 },
+                                                                     .decision = VoteDecision::Granted,
+                                                                     .voterId = NodeId { "n1" } } });
+    link.reactor.drain();
+    REQUIRE(link.sink.received.size() == 3);
+    CHECK(std::get<RequestVoteResponse>(link.sink.received[2]).term.value == 3);
+
+    // A third move: the first session's end came AFTER the second replaced it, and must not have
+    // erased the second's entry -- or this dial would find nothing to supersede.
+    link.Dial("n1", 4);
+    REQUIRE(link.sink.received.size() == 4);
+    CHECK(link.destroyed.Threads().size() == 2);
+    CHECK(link.server.ActiveConnections() == 1);
+    CHECK(link.serverMetrics.Read(IMetricsSink::Counter::RaftInboundSessionsSuperseded) == 2);
+}
+
+TEST_CASE("One-way sessions from different members coexist", "[consensus][raft][peerserver]")
+{
+    RedialLink link;
+    link.Dial("n1", 1);
+    link.Dial("n3", 2);
+    REQUIRE(link.sink.received.size() == 2);
+
+    CHECK(link.probing.Accepted() == 2);
+    CHECK(link.destroyed.Threads().empty());
+    CHECK(link.server.ActiveConnections() == 2);
+    CHECK(link.serverMetrics.Read(IMetricsSink::Counter::RaftInboundSessionsSuperseded) == 0);
+    CHECK(link.AcceptorRefusalsCounted() == 0);
+}
+
+TEST_CASE("A member's two-way session and its one-way session do not supersede each other", "[consensus][raft][peerserver]")
+{
+    // A learner promoted to voter dials one-way while its two-way session is still attached: that
+    // one belongs to the transport's links (`Attach` supersedes by id there), not to this rule.
+    RedialLink link;
+    link.Dial("n1", 1, RaftWire::SessionDirection::TwoWay);
+    link.Dial("n1", 2);
+    REQUIRE(link.sink.received.size() == 2);
+
+    CHECK(link.inbound.Attaches() == 1);
+    CHECK(link.destroyed.Threads().empty());
+    CHECK(link.server.ActiveConnections() == 2);
+    CHECK(link.serverMetrics.Read(IMetricsSink::Counter::RaftInboundSessionsSuperseded) == 0);
 }

@@ -581,6 +581,24 @@ simpler design gets wrong.
     the backoff above. A voter that is not leading writes a learner nothing, so those sessions end at
     the bound too: one handshake per voter per backoff cycle, the stated price.
 
+- **The newest ONE-WAY session per proven dialler wins; the acceptor closes the one it
+  supersedes** (`OpenConnections::oneWay`, `NewestOneWaySession` in `RaftPeerServer.cpp`). A
+  dialler holds one outbound session per peer, so an older one-way session from the same proven
+  id is a path that vanished -- a voter whose address moved closes its sessions and redials
+  (`RaftPeerTransport::ResetSessions`). Nothing else ends it: the acceptor reads no EOF from a
+  path that is gone, and it arms no idle bound on a one-way session, because follower-to-follower
+  sessions are legitimately silent. Without the supersede every move parks a stale session against
+  `maxConnections` (64), and a member that roams often enough fills the listener and is refused
+  `Full` by its own peers. The entry is erased only by the session it still NAMES (an id-keyed
+  erase from the superseded session's end would forget its successor), the close happens outside
+  the map's lock (an in-memory close resumes the superseded task inline, and its guard takes that
+  lock), and it is counted on the transport's two-way row, `RaftInboundSessionsSuperseded`, because
+  the reading is the same: one per reconnect is a roaming member, a steady rate two machines
+  sharing one key. Logged at Debug. Only a proof of the id can supersede, so a stranger cannot
+  close a member's session. Two-way sessions are not in the map -- the transport's `Attach`
+  supersedes those by id. `RaftPeerLink_test` ("A second one-way session from the same member
+  supersedes the first", "One-way sessions from different members coexist").
+
 - **The acceptor goes first because its port is the surface anybody can reach.** It signs
   nothing until the other end has proved an id, so a stranger who connects learns a nonce
   and an ephemeral public key and nothing else. The dialler signs only for an address it

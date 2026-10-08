@@ -1173,10 +1173,11 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftInboundSessionsSuperseded,
       .prometheusName = "fastcache_raft_inbound_sessions_superseded_total",
-      .help = "Two-way Raft sessions a peer's newer session superseded: the same id proved a second session "
-              "while its first was still attached, and the first was closed. One per reconnect is a roaming "
-              "learner whose old connection had not yet been seen to end; a steady rate from one peer names two "
-              "machines holding one identity key -- a copied --cluster-dir -- taking the session from each other.",
+      .help = "Raft sessions a peer's newer session superseded: the same id proved a second session while its first was "
+              "still open, and the first was closed -- a two-way session by the transport, a one-way session by the "
+              "acceptor. One per reconnect is a roaming member whose old connection had not yet been seen to end; a "
+              "steady rate from one peer names two machines holding one identity key -- a copied --cluster-dir -- "
+              "taking the session from each other.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster,
       .prometheusName = "fastcache_worker_jobs_refused_lease_no_roster_total",
