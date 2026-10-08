@@ -816,7 +816,8 @@ struct SurfaceComponents
 
     /// Answers the scheduler verbs: the scheduler where this node runs one, the redirect to the
     /// leader where it runs consensus and no scheduler (#1639), or nullptr on a node running
-    /// neither -- whose family is then refused `NoCluster` (`UnservedFamilies`).
+    /// neither -- whose family is then refused by verb, as the daemon refuses it: the capacity verbs
+    /// `DispatchNotPermitted` (`UnservedVerbs`), the cluster verbs `NoCluster` (`UnservedFamilies`).
     IFrameResponder* scheduler { nullptr };
 
     /// Answers the compile verbs, or nullptr when this node runs no worker.
@@ -951,8 +952,9 @@ inline constexpr EnumTable<CompileCacheWire::VerbFamily, FamilyRoute> FamilyRout
       .component = "cache" },
     // Null only on a node running neither a scheduler nor consensus: one that runs consensus
     // without scheduling -- a learner -- answers through the redirect to the leader it follows
-    // (`SchedulingRedirectResponder`, #1639), and one running no consensus refuses the family
-    // `NoCluster` (`UnservedFamilies`), never `UnimplementedVerb`.
+    // (`SchedulingRedirectResponder`, #1639), and one running no consensus refuses the family by
+    // verb, as the daemon does -- the capacity verbs `DispatchNotPermitted` (`UnservedVerbs`), the
+    // cluster verbs `NoCluster` (`UnservedFamilies`) -- and never `UnimplementedVerb`.
     { .family = CompileCacheWire::VerbFamily::Scheduler,
       .owner = &SurfaceComponents::scheduler,
       .presence = FamilyPresence::WhenItsComponentRuns,
@@ -1409,9 +1411,9 @@ class MergedResponder final: public IFrameResponder
                                     "or a script at the wrong machine, an ordinary misdirection rather than an event; "
                                     "counted, it would bury the scan it would be read for" },
           .detail = [](SurfaceComponents const&) noexcept -> std::string_view {
-              return "this node runs no consensus and belongs to no cluster; point the client's scheduler "
-                     "(--scheduler for a one-shot verb) at a node that runs consensus -- `fastcache-cli node` names "
-                     "the components a node serves";
+              return "this node runs no consensus and belongs to no cluster; ask a node that runs consensus instead -- "
+                     "--scheduler for a one-shot verb, --addr for fastcache-cli; `fastcache-cli node` names the "
+                     "components a node serves";
           } },
         { .family = CompileCacheWire::VerbFamily::Compile,
           .refusal = { .code = CompileCacheWire::NoCompileWorker::Code,
@@ -1456,8 +1458,9 @@ class MergedResponder final: public IFrameResponder
     /// knob, because a launcher, a worker and a one-shot verb each name their scheduler differently.
     static constexpr std::string_view NoSchedulerHereWhy =
         "this node runs no consensus, so it schedules nothing and follows no leader to redirect you to; point the "
-        "client's scheduler (FASTCACHE_SCHEDULER for a launcher, --scheduler for a worker or a one-shot verb) at a "
-        "node that runs consensus";
+        "client at a node that runs consensus -- FASTCACHE_SCHEDULER for a launcher, --scheduler for a one-shot "
+        "verb, --addr for fastcache-cli; a worker registers where the fleet it joined says, and --fleet-seed joins "
+        "one";
 
     /// The scheduling verbs that ask for CAPACITY, answered `DispatchNotPermitted` -- *this endpoint
     /// does not hand out capacity, a scheduler elsewhere does* -- as the daemon's own rows answer them

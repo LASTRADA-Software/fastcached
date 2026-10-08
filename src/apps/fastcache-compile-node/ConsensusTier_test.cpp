@@ -2582,16 +2582,10 @@ TEST_CASE("A running tier hands its leader-contact observer the election timeout
     NullLogger logger;
     AtomicMetricsSink metrics;
 
-    auto probe = BlockingListener::Bind("127.0.0.1", 0);
-    REQUIRE(probe);
-    REQUIRE(probe->IsBound());
-    auto const port = probe->boundPort();
-    probe.reset();
-
     Testing::ScratchDirectory const scratch { "consensus-contact-bound" };
     auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeId = "n1";
-    cfg.raftListen = std::format("127.0.0.1:{}", port);
+    cfg.raftListen = std::format("127.0.0.1:{}", UnansweredPort());
     cfg.raftSelf = "127.0.0.1";
     cfg.clusterDir = scratch.Path() / "state";
 
@@ -2621,8 +2615,18 @@ TEST_CASE("A running tier hands its leader-contact observer the election timeout
         std::scoped_lock const guard { seenLock };
         return seen;
     };
+    // On a timeout, what the tier was doing: no pass told anything while it ran, or it never ran.
     REQUIRE(Testing::WaitUntil(
-        "a reconcile pass to tell the observer", [&read] { return read().has_value(); }, [] { return std::string {}; }));
+        "a reconcile pass to tell the observer",
+        [&read] { return read().has_value(); },
+        [&tier] {
+            auto const status = tier->Status();
+            return std::format(
+                "no reading yet (role {}, commit {})", static_cast<int>(status.role), status.commitIndex.value);
+        }));
+    // `RaftConfig {}` because the tier builds its node from the consensus defaults and `RaftNode`
+    // exposes no accessor for its timing: should that timing become configurable, compare against
+    // the configured value instead.
     CHECK(read() == std::optional { Consensus::RaftConfig {}.electionTimeoutMax });
 }
 
@@ -2679,15 +2683,27 @@ TEST_CASE("A learner started as main starts it names its leader's scheduling end
     REQUIRE(leaderEndpoint != fleet.founder.raftListen);
     REQUIRE(leaderEndpoint != joinerAdvertised.Current());
     auto const& joiner = fleet.joinerTier;
-    CHECK(Testing::WaitUntil(
+    auto const describe = [&knownLeader, &joiner] {
+        return std::format("names '{}' (known leader {}, commit {})",
+                           knownLeader.LeaderSchedulingEndpoint(),
+                           joiner->Status().knownLeader.value_or("(none)"),
+                           joiner->Status().commitIndex.value);
+    };
+    REQUIRE(Testing::WaitUntil(
         "the learner to name its leader's recorded 0xFC endpoint",
         [&knownLeader, &leaderEndpoint] { return knownLeader.LeaderSchedulingEndpoint() == leaderEndpoint; },
-        [&knownLeader, &joiner] {
-            return std::format("names '{}' (known leader {}, commit {})",
-                               knownLeader.LeaderSchedulingEndpoint(),
-                               joiner->Status().knownLeader.value_or("(none)"),
-                               joiner->Status().commitIndex.value);
-        }));
+        describe));
+
+    // And the other half of R1, through the observer `StartConsensusOrExplain` itself wires: the leader
+    // goes silent, and the learner stops naming it once the tier's election timeout has passed. A
+    // learner has no election timer and keeps its known leader, so the silence path is the ONLY thing
+    // that can empty the holder here -- an observer that told the roster and not the publisher would
+    // name the stopped founder forever.
+    REQUIRE(StopTierWithin(std::move(fleet.founderTier), nullptr));
+    CHECK(Testing::WaitUntil(
+        "the learner to stop naming a leader silent past its election timeout",
+        [&knownLeader] { return knownLeader.LeaderSchedulingEndpoint().empty(); },
+        describe));
 }
 
 namespace

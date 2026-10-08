@@ -182,6 +182,31 @@ using SurfaceFakes::NamedResponder;
     return core::async::syncRun(responder.Answer(frame, PeerIdentity { .host = "127.0.0.1" })).bytes;
 }
 
+/// What the daemon -- a cache, which schedules and compiles nothing -- answers @p frame with: one
+/// connection, the frame and a half-close, then the one framed reply read as its header declares.
+/// @param frame The request.
+/// @return The reply, header and payload.
+[[nodiscard]] std::vector<std::byte> AskDaemon(std::span<std::byte const> frame)
+{
+    core::platform::ManualClock clock;
+    InMemoryLruStorage storage { 0 };
+    CacheEngine engine { storage, clock };
+    auto const pair = core::net::testing::InMemorySocketPair::create();
+    CompileCacheHandler daemon;
+    REQUIRE(core::async::syncRun(core::net::sendAll(pair.client.get(), frame)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+    core::async::syncRun(daemon.Run(pair.server.get(), &engine, {}, SessionContext {}));
+    auto const head = core::async::syncRun(core::net::receiveExactly(pair.client.get(), Wire::ReplyHeaderSize));
+    REQUIRE(head.has_value());
+    auto const header = Wire::DecodeReplyHeader(Unwrap(head));
+    REQUIRE(header.has_value());
+    auto const payload = core::async::syncRun(core::net::receiveExactly(pair.client.get(), Unwrap(header).payloadLength));
+    REQUIRE(payload.has_value());
+    auto reply = Unwrap(head);
+    reply.insert(reply.end(), Unwrap(payload).begin(), Unwrap(payload).end());
+    return reply;
+}
+
 /// A config naming a free loopback port, and that port.
 ///
 /// Per run rather than fixed: `catch_discover_tests` gives every case its own process
@@ -452,24 +477,7 @@ TEST_CASE("The daemon and a node running no worker refuse a cordon with one code
     auto const cordon = Wire::EncodeCordonRequest(Wire::CordonAction::Cordon);
 
     // The daemon, which is a cache.
-    core::platform::ManualClock clock;
-    InMemoryLruStorage storage { 0 };
-    CacheEngine engine { storage, clock };
-    auto const pair = core::net::testing::InMemorySocketPair::create();
-    CompileCacheHandler daemon;
-    REQUIRE(core::async::syncRun(core::net::sendAll(pair.client.get(), cordon)));
-    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
-    core::async::syncRun(daemon.Run(pair.server.get(), &engine, {}, SessionContext {}));
-    // One framed reply, read as the header declares it: the header, then its payload.
-    auto const daemonHead = core::async::syncRun(core::net::receiveExactly(pair.client.get(), Wire::ReplyHeaderSize));
-    REQUIRE(daemonHead.has_value());
-    auto const daemonHeader = Wire::DecodeReplyHeader(Unwrap(daemonHead));
-    REQUIRE(daemonHeader.has_value());
-    auto const daemonPayload =
-        core::async::syncRun(core::net::receiveExactly(pair.client.get(), Unwrap(daemonHeader).payloadLength));
-    REQUIRE(daemonPayload.has_value());
-    auto daemonReply = Unwrap(daemonHead);
-    daemonReply.insert(daemonReply.end(), Unwrap(daemonPayload).begin(), Unwrap(daemonPayload).end());
+    auto const daemonReply = AskDaemon(cordon);
 
     // A node started with `--slots=0`, which builds no compile component.
     NamedResponder cache { "cache" };
@@ -487,6 +495,35 @@ TEST_CASE("The daemon and a node running no worker refuse a cordon with one code
     CHECK(MessageOf(daemonReply).starts_with(Wire::NoCompileWorker::Stem));
     CHECK(MessageOf(nodeReply).starts_with(Wire::NoCompileWorker::Stem));
     CHECK(MessageOf(daemonReply) != MessageOf(nodeReply));
+}
+
+TEST_CASE("The daemon and a node running no consensus refuse each scheduling verb with one code",
+          "[node][merged-responder][scheduling-redirect]")
+{
+    // #1639's M3 ruling, enforced across the two binaries rather than restated in each: neither
+    // endpoint schedules, so a client asking either for capacity is told `DispatchNotPermitted` and
+    // one asking about a cluster `NoCluster`, by both. Asked of the SURFACES on the wire, as the cordon
+    // case above asks them, so a row moved on either side is red here.
+    MergedResponder node { SurfaceComponents {} };
+    auto const verbs = Testing::OpsOfFamily(Wire::VerbFamily::Scheduler);
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::Lease, &Wire::OpDescriptor::code));
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::ClusterStatus, &Wire::OpDescriptor::code));
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::NodeAnnounce, &Wire::OpDescriptor::code));
+    for (auto const& verb: verbs)
+    {
+        INFO("verb " << verb.name);
+        auto const frame = HeaderFor(verb.code);
+        auto const daemonCode = ErrorOf(AskDaemon(frame));
+        auto const nodeCode = ErrorOf(AnswerNow(node, frame));
+        REQUIRE(daemonCode.has_value());
+        REQUIRE(nodeCode.has_value());
+
+        // NODE-ANNOUNCE included: the daemon has no `RelocatedVerbs` row for it, and reaches the SAME code
+        // through `RefusalFor`'s fallback (`DispatchNotPermitted`, with no sentence). The ruling that put it
+        // with the capacity verbs on the node expected the two to differ; they do not, in code. What
+        // differs is the words, which this case does not compare.
+        CHECK(daemonCode == nodeCode);
+    }
 }
 
 TEST_CASE("An unowned verb is refused before its payload is read", "[node][merged-responder]")

@@ -173,7 +173,8 @@ class NodeFrameSurface
 /// @param scheduler The scheduler tier, or nullptr when this node does not schedule.
 /// @param schedulingRedirect What answers the scheduling verbs when @p scheduler is null: the
 ///        redirect to the leader a node running consensus but no scheduler follows (#1639), or
-///        nullptr on a node running neither -- whose family is then refused `NoCluster`. Never
+///        nullptr on a node running neither -- whose family is then refused by verb, as the daemon
+///        refuses it: the capacity verbs `DispatchNotPermitted`, the cluster verbs `NoCluster`. Never
 ///        read while @p scheduler is set: a scheduler answers its own verbs.
 /// @param worker The worker tier, or nullptr when this node runs no worker.
 /// @param node The operator verbs' responder; every node has one.
