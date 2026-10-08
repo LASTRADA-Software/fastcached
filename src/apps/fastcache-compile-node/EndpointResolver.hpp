@@ -79,6 +79,8 @@ class SchedulerProbeTargets final: public IProbeTargets
 /// announces an address a network change has already invalidated -- whichever thread heard the
 /// change first. A seam so a worker case can drive registrations with the endpoint it publishes
 /// itself.
+class IEndpointMoveSink;
+
 class IEndpointRefresh
 {
   public:
@@ -91,6 +93,60 @@ class IEndpointRefresh
 
     /// Re-probe if stale and publish what moved. Cheap when nothing is due; safe from any thread.
     virtual void Refresh() = 0;
+
+    /// @param sink Told whenever the `0xFC` endpoint is published moved, from now on; must outlive
+    ///        its watch, and is watched at most once.
+    virtual void Watch(IEndpointMoveSink& sink) = 0;
+
+    /// @param sink Told nothing once this returns -- a notification to it already in flight on
+    ///        another thread has finished by then.
+    virtual void Unwatch(IEndpointMoveSink& sink) noexcept = 0;
+};
+
+/// Told that the `0xFC` endpoint was published moved, on the publishing thread.
+///
+/// The worker's half of a move: the registrations must follow at once, because the scheduler goes
+/// on granting for the endpoint they were filed under until they do. A sink returns promptly -- it
+/// wakes a thread of its own -- and never calls back into the publisher.
+class IEndpointMoveSink
+{
+  public:
+    IEndpointMoveSink() = default;
+    IEndpointMoveSink(IEndpointMoveSink const&) = delete;
+    IEndpointMoveSink(IEndpointMoveSink&&) = delete;
+    IEndpointMoveSink& operator=(IEndpointMoveSink const&) = delete;
+    IEndpointMoveSink& operator=(IEndpointMoveSink&&) = delete;
+    virtual ~IEndpointMoveSink() = default;
+
+    /// The published `0xFC` endpoint moved.
+    virtual void OnEndpointMoved() noexcept = 0;
+};
+
+/// A watch, ended when this is destroyed. Declared AFTER the sink it names, so the sink outlives it.
+class EndpointMoveWatch
+{
+  public:
+    /// @param refresh What publishes. @param sink What is told.
+    EndpointMoveWatch(IEndpointRefresh& refresh, IEndpointMoveSink& sink):
+        _refresh { refresh },
+        _sink { sink }
+    {
+        _refresh.Watch(_sink);
+    }
+
+    ~EndpointMoveWatch()
+    {
+        _refresh.Unwatch(_sink);
+    }
+
+    EndpointMoveWatch(EndpointMoveWatch const&) = delete;
+    EndpointMoveWatch(EndpointMoveWatch&&) = delete;
+    EndpointMoveWatch& operator=(EndpointMoveWatch const&) = delete;
+    EndpointMoveWatch& operator=(EndpointMoveWatch&&) = delete;
+
+  private:
+    IEndpointRefresh& _refresh;
+    IEndpointMoveSink& _sink;
 };
 
 /// The route host this process last probed, shared by every body's resolver (its writer) and by
@@ -187,6 +243,15 @@ static_assert(RowsInEnumeratorOrder(UnusableRouteHosts, &UnusableRouteHostRow::r
 /// `--advertise` is published at the next refresh and a reload that changes nothing keeps the
 /// roamed address. A probe that finds nothing usable keeps the last route host: this never
 /// publishes an empty or loopback address because the network went away.
+///
+/// **Construction adopts, it does not move.** Both endpoints are set from the configuration and
+/// the cell's live route host when this is built -- silently, uncounted -- so a body reformed after
+/// a roam starts at the address the node already advertises rather than "moving" back to it from
+/// the start's.
+///
+/// **A published `0xFC` move tells every watcher at once** (`Watch`): the worker's heartbeat wakes
+/// and re-registers, rather than leaving the scheduler granting for the old endpoint for up to a
+/// heartbeat interval.
 class EndpointResolver final: public IHostEventSink, public IEndpointRefresh
 {
   public:
@@ -200,8 +265,8 @@ class EndpointResolver final: public IHostEventSink, public IEndpointRefresh
     /// @param clock    What `RefreshInterval` is measured against.
     /// @param routeHost Where the last route host is kept for the process; seeds the first
     ///        derivation, so a body that starts offline keeps the address the last one probed.
-    /// @param node     Published 0xFC endpoint.
-    /// @param raft     Published Raft endpoint.
+    /// @param node     Published 0xFC endpoint; set from the live derivation here, uncounted.
+    /// @param raft     Published Raft endpoint; set from the live derivation here, uncounted.
     /// @param metrics  Where each published move is counted.
     /// @param logger   Where each move, and a pinned literal, is said.
     /// Every reference is borrowed and must outlive this.
@@ -230,7 +295,13 @@ class EndpointResolver final: public IHostEventSink, public IEndpointRefresh
     /// Marks the route stale for the events `StalesRoute` names and wakes `Launch`'s thread;
     /// never probes on the delivering thread.
     /// @param event What the host said.
-    void OnHostEvent(HostEvent event) override;
+    void OnHostEvent(HostEvent event) noexcept override;
+
+    /// @copydoc IEndpointRefresh::Watch
+    void Watch(IEndpointMoveSink& sink) override;
+
+    /// @copydoc IEndpointRefresh::Unwatch
+    void Unwatch(IEndpointMoveSink& sink) noexcept override;
 
     /// Refresh on a thread of this resolver's own: at once, then whenever an event marks the route
     /// stale or `RefreshInterval` passes.
@@ -245,6 +316,7 @@ class EndpointResolver final: public IHostEventSink, public IEndpointRefresh
         std::string (*derive)(NodeConfig const& cfg); ///< Its derivation from a configuration.
         IMetricsSink::Counter counter;                ///< Counted on each move.
         std::string_view what;                        ///< Named in the move's log line.
+        bool tellsWatchers;                           ///< Whether a move is told to `Watch`ers.
     };
 
     /// The background thread's body.
@@ -254,7 +326,12 @@ class EndpointResolver final: public IHostEventSink, public IEndpointRefresh
     void NoticePinned(std::string_view advertise);
 
     /// Publish @p row's derivation from @p cfg when it is non-empty and moved.
-    void PublishIfMoved(Published const& row, NodeConfig const& cfg);
+    /// @return True when it moved.
+    bool PublishIfMoved(Published const& row, NodeConfig const& cfg);
+
+    /// The refresh itself, under `_refreshMutex`.
+    /// @return True when a row that tells watchers moved.
+    bool RefreshLocked();
 
     INodeConfigSource const& _config;
     IRouteProbe const& _probe;
@@ -276,6 +353,10 @@ class EndpointResolver final: public IHostEventSink, public IEndpointRefresh
     std::atomic<bool> _stale { false };
     std::mutex _wakeMutex;
     std::condition_variable_any _wake;
+
+    /// Told of each `0xFC` move; held while they are told, so `Unwatch` waits out a notification.
+    std::mutex _watchMutex;
+    std::vector<IEndpointMoveSink*> _watchers; ///< Guarded by `_watchMutex`.
 };
 
 } // namespace FastCache::Node

@@ -41,12 +41,13 @@
 namespace FastCache::Node
 {
 
-/// The endpoint this worker is announcing, now.
+/// An endpoint this node states, now, held so every reader sees one value change at one point.
 ///
-/// The production `Cc::IAdvertisedEndpointSource`, and the one object the registration
-/// and the lease check both read -- which is what makes *the endpoint the scheduler
-/// signs and the endpoint this worker verifies are one fact* a property of the type
-/// system rather than a sentence in `main`.
+/// The production `Cc::IAdvertisedEndpointSource`. A process holds two kinds:
+///   - the PUBLISHED endpoint (`main`'s, one per process), written by `EndpointResolver` alone and
+///     read by the worker's heartbeat and the presence loop, which file this machine under it;
+///   - the REGISTERED endpoint (`WorkerTier::Advertised`), written by the heartbeat alone as it
+///     rebuilds the registrars, and the one the lease check verifies a grant against.
 ///
 /// ## Why this is not `ConfiguredCredential`'s shape
 ///
@@ -56,21 +57,23 @@ namespace FastCache::Node
 ///
 /// An endpoint is not like that, because a second party holds a copy. The scheduler
 /// files this worker under `(fingerprint, endpoint)` and signs that endpoint into every
-/// grant, so a value that changed the moment a snapshot was published would leave this
-/// worker refusing authentic grants for the address the fleet still has -- and it would
-/// do so for however long the heartbeat interval is, with `LeaseEndpointMismatch`
-/// rising and no configuration anywhere being wrong. Reading the snapshot per call is
-/// the shape that looks most correct and is the one that breaks.
+/// grant, so a lease check that moved the moment a snapshot -- or a route -- changed would
+/// leave this worker refusing authentic grants for the address the fleet still has, for
+/// however long the heartbeat interval is, with `LeaseEndpointMismatch` rising and no
+/// configuration anywhere being wrong.
 ///
-/// So the value changes at ONE point: `EndpointResolver`, the only caller of `Publish`,
-/// which derives it from the configuration in force and the address this machine routes
-/// from. The worker's heartbeat then re-registers under it at its next round (it refreshes
-/// the resolver at the top of every round, so a network change it was woken for is
-/// published before it looks), queuing the old registration for withdrawal.
+/// ## What holds
+///
+/// **A grant for the endpoint this worker is registered under is honoured until the heartbeat
+/// re-registers.** The resolver publishes a move on its own thread, but the lease check reads the
+/// REGISTERED endpoint, which moves only in the step that queues the old registrations for
+/// withdrawal and builds the new ones. And that step is not left for the next interval: a published
+/// `0xFC` move wakes the heartbeat at once (`IEndpointMoveSink`), so the scheduler is told within a
+/// round trip.
 ///
 /// ## The window this still has, stated rather than hidden
 ///
-/// A grant signed for the old endpoint and presented after the change is refused, since
+/// A grant signed for the old endpoint and presented after the re-registration is refused, since
 /// one endpoint is expected at a time. That is bounded by the grant's own lifetime,
 /// counted (`LeaseEndpointMismatch`), and costs the client a local compile -- against
 /// which the alternative, accepting any recently advertised address, widens the window
@@ -96,7 +99,8 @@ class AnnouncedEndpoint final: public Cc::IAdvertisedEndpointSource
 
     /// Make @p endpoint what this worker advertises from now on.
     ///
-    /// Called by `EndpointResolver` alone -- see the class comment for why this is not a
+    /// Called by this instance's one writer -- `EndpointResolver` for the published endpoint, the
+    /// worker's heartbeat for the registered one -- see the class comment for why this is not a
     /// setter anybody may reach for.
     /// @param endpoint The new endpoint; must be non-empty, since nothing can be
     ///        registered under an empty one.

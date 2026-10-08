@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <expected>
@@ -22,6 +23,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -157,9 +159,11 @@ class FixedSchedulers final: public ISchedulerEndpointSource
 struct ResolverRig
 {
     /// @param startedAt What the start's probe found; empty for nothing (then the name stands in).
-    explicit ResolverRig(std::string const& startedAt = "10.0.0.5"):
+    /// @param roamedTo What the process's cell holds when the resolver is built; defaults to
+    ///        @p startedAt, a first body. Another value is a body reformed after a roam.
+    explicit ResolverRig(std::string const& startedAt = "10.0.0.5", std::optional<std::string> const& roamedTo = {}):
         config { WildcardNode(startedAt) },
-        routeHost { startedAt },
+        routeHost { roamedTo.value_or(startedAt) },
         node { AdvertisedEndpoint(config.Current()) },
         raft { RaftSelfEndpoint(config.Current()) }
     {
@@ -509,4 +513,66 @@ TEST_CASE("A network change re-probes on the resolver's own thread", "[node][end
             [&rig] { return rig.node.Current(); }));
     }
     CHECK(rig.NodeMoves() == 2);
+}
+
+TEST_CASE("A body built after a roam adopts the live route without counting a move", "[node][endpoint]")
+{
+    // A reformed body's configuration still carries the START's route host; the process's cell
+    // holds where the node has roamed since. The fleet already knows the roamed address, so building
+    // the body moves nothing: no counter, no log line, and no reader ever sees the start's address.
+    ResolverRig rig { "10.0.0.5", "192.168.7.2" };
+    CHECK(rig.node.Current() == "192.168.7.2:6674");
+    CHECK(rig.raft.Current() == "192.168.7.2:6680");
+
+    rig.probe.Answer(DefaultRoute, "192.168.7.2");
+    rig.resolver.Refresh();
+
+    CHECK(rig.node.Current() == "192.168.7.2:6674");
+    CHECK(rig.NodeMoves() == 0);
+    CHECK(rig.RaftMoves() == 0);
+    CHECK(rig.Logged(LogLevel::Info, "endpoint") == 0);
+}
+
+namespace
+{
+/// Counts how often it was told the published endpoint moved.
+class CountingMoveSink final: public IEndpointMoveSink
+{
+  public:
+    void OnEndpointMoved() noexcept override
+    {
+        ++told;
+    }
+
+    std::atomic<int> told { 0 }; ///< How often.
+};
+} // namespace
+
+TEST_CASE("A published 0xFC move is told to every watcher, and a Raft-only move is not", "[node][endpoint]")
+{
+    ResolverRig rig;
+    CountingMoveSink sink;
+    rig.probe.Answer(DefaultRoute, "10.0.0.5");
+    {
+        EndpointMoveWatch const watch { rig.resolver, sink };
+        rig.resolver.Refresh();
+        CHECK(sink.told == 0);
+
+        // `--advertise` pinned to a name: the route moves only the Raft endpoint.
+        auto named = WildcardNode("10.0.0.5");
+        named.advertise = "build.lan:6674";
+        rig.config.Replace(named);
+        rig.resolver.Refresh();
+        CHECK(sink.told == 1);
+        rig.probe.Answer(DefaultRoute, "192.168.7.2");
+        rig.resolver.OnHostEvent(HostEvent::NetworkChanged);
+        rig.resolver.Refresh();
+        CHECK(rig.raft.Current() == "192.168.7.2:6680");
+        CHECK(sink.told == 1);
+    }
+    // Unwatched: told nothing more.
+    rig.config.Replace(WildcardNode("10.0.0.5"));
+    rig.resolver.Refresh();
+    CHECK(rig.node.Current() == "192.168.7.2:6674");
+    CHECK(sink.told == 1);
 }

@@ -843,3 +843,73 @@ TEST_CASE("A worker re-registers under a moved endpoint and withdraws the old on
     CHECK(fixture.announced.Current() == C);
     CHECK(fixture.endpoints.Calls() >= 3);
 }
+
+TEST_CASE("A move published off the heartbeat wakes it to re-register, and the lease check follows only then",
+          "[node][worker][endpoint]")
+{
+    // The resolver publishes on its own thread (or the presence loop's). The scheduler goes on
+    // granting for the endpoint this worker is registered under until the heartbeat re-registers, so
+    // the lease check must stay there until it does -- and the heartbeat must not wait out its
+    // interval to do it. No host event fires here: only the resolver's own notification.
+    namespace Wire = CompileCacheWire;
+    constexpr auto A = std::string_view { "10.0.0.5:6674" };
+    constexpr auto B = std::string_view { "192.168.7.2:6674" };
+
+    WorkerTierFixture fixture;
+    fixture.cfg.toolchains = { "deadbeef=/opt/none/g++" };
+    auto const ok = Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {});
+    fixture.heartbeatReplies = {
+        RegisterAccepted("w-a"), Testing::Replies({ ok, RegisterAccepted("w-b") }), ok, ok, ok,
+    };
+    fixture.announced.Publish(std::string { A });
+
+    {
+        auto const started = fixture.Start();
+        REQUIRE(started.has_value());
+        REQUIRE(started.value() != nullptr);
+        auto& tier = *started.value();
+        CHECK(fixture.endpoints.WatcherCount() == 1);
+        core::platform::ManualClock statusClock;
+        SchedulerReachability reachability { statusClock, nullptr };
+
+        auto const registered = [&tier] {
+            auto const reading = tier.Runtime().Registration();
+            return reading.has_value() && reading->registered == 1;
+        };
+        auto const describe = [&tier] {
+            auto const reading = tier.Runtime().Registration();
+            return std::format("registered {}; lease check at {}",
+                               reading.has_value() ? reading->registered : 0U,
+                               tier.Advertised().Current());
+        };
+        auto const movedToB = [&fixture] {
+            auto const records = fixture.logger.Snapshot();
+            return std::ranges::any_of(records, [](CapturingLogger::Record const& record) {
+                return record.level == LogLevel::Warn && record.message.contains("now advertising 192.168.7.2:6674");
+            });
+        };
+
+        {
+            auto const heartbeat = tier.Launch(statusClock, reachability);
+            REQUIRE(Testing::WaitUntil("the first registration, at A", registered, describe));
+
+            // Published, and nobody has told the heartbeat: the lease check still verifies A, the
+            // endpoint the scheduler signs grants for.
+            fixture.announced.Publish(std::string { B });
+            CHECK(tier.Advertised().Current() == A);
+
+            fixture.endpoints.TellMoved();
+            // Well inside the heartbeat's interval, so only the wake can have run this round.
+            REQUIRE(Testing::WaitUntil("the re-registration at B", [&] { return movedToB() && registered(); }, describe));
+            CHECK(tier.Advertised().Current() == B);
+        }
+        tier.StopAndDrain();
+
+        auto& dialer = fixture.Dialer();
+        REQUIRE(dialer.Dialed().size() >= 2);
+        CHECK(Occurrences(dialer.SentOn(1), Wire::EncodeWithdraw("w-a")) == 1);
+        CHECK(Occurrences(dialer.SentOn(1), BytesOf(B)) == 1);
+    }
+    // The tier stopped watching when it went.
+    CHECK(fixture.endpoints.WatcherCount() == 0);
+}

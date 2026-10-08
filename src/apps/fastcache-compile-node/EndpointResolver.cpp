@@ -132,19 +132,52 @@ EndpointResolver::EndpointResolver(INodeConfigSource const& config,
         { .target = node,
           .derive = [](NodeConfig const& cfg) { return AdvertisedEndpoint(cfg); },
           .counter = IMetricsSink::Counter::NodeEndpointChanges,
-          .what = "endpoint" },
+          .what = "endpoint",
+          .tellsWatchers = true },
         { .target = raft,
           .derive = [](NodeConfig const& cfg) { return RaftSelfEndpoint(cfg); },
           .counter = IMetricsSink::Counter::NodeRaftEndpointChanges,
-          .what = "raft endpoint" },
+          .what = "raft endpoint",
+          .tellsWatchers = false },
     } }
 {
+    // Adopted, not moved: what a body is seeded with may be the START's route, and the cell holds
+    // where the node has roamed since. Nobody reads either endpoint yet, so nothing is told.
+    auto cfg = _config.Current();
+    ApplyRouteHost(cfg, _routeHost.Current());
+    for (auto const& row: _published)
+        if (auto derived = row.derive(cfg); !derived.empty())
+            row.target.Publish(std::move(derived));
 }
 
 void EndpointResolver::Refresh()
 {
-    auto const lock = std::scoped_lock { _refreshMutex };
+    auto const moved = [this] {
+        auto const lock = std::scoped_lock { _refreshMutex };
+        return RefreshLocked();
+    }();
+    if (!moved)
+        return;
+    // Outside the refresh lock: a watcher wakes a thread that may be about to refresh itself.
+    auto const lock = std::scoped_lock { _watchMutex };
+    for (auto* const watcher: _watchers)
+        watcher->OnEndpointMoved();
+}
 
+void EndpointResolver::Watch(IEndpointMoveSink& sink)
+{
+    auto const lock = std::scoped_lock { _watchMutex };
+    _watchers.push_back(&sink);
+}
+
+void EndpointResolver::Unwatch(IEndpointMoveSink& sink) noexcept
+{
+    auto const lock = std::scoped_lock { _watchMutex };
+    std::erase(_watchers, &sink);
+}
+
+bool EndpointResolver::RefreshLocked()
+{
     // Consumed whether or not a probe follows: a node whose flags follow no route must not leave
     // the flag raised, or the background wait would wake for it forever.
     auto const stale = _stale.exchange(false);
@@ -157,7 +190,8 @@ void EndpointResolver::Refresh()
     {
         _lastProbe = now;
         // Nothing usable keeps the last route host: a machine that dropped off the network still
-        // answers wherever it comes back, and an empty or loopback endpoint helps nobody.
+        // answers wherever it comes back, and an empty or loopback endpoint helps nobody. The probe
+        // is stamped either way, so a lost route is asked again at the next event or interval.
         if (auto found = ProbeRouteHost(_probe, _targets.Targets()))
             _routeHost.Set(*std::move(found));
     }
@@ -165,8 +199,11 @@ void EndpointResolver::Refresh()
     // The live route host, over whatever the snapshot carries: a reload candidate was shaped by the
     // same cell, but the snapshot a body started with was shaped by the START's probe.
     ApplyRouteHost(cfg, _routeHost.Current());
+    auto told = false;
     for (auto const& row: _published)
-        PublishIfMoved(row, cfg);
+        if (PublishIfMoved(row, cfg) && row.tellsWatchers)
+            told = true;
+    return told;
 }
 
 std::string EndpointResolver::RouteHost() const
@@ -174,7 +211,7 @@ std::string EndpointResolver::RouteHost() const
     return _routeHost.Current();
 }
 
-void EndpointResolver::OnHostEvent(HostEvent event)
+void EndpointResolver::OnHostEvent(HostEvent event) noexcept
 {
     if (!StalesRoute.at(static_cast<std::size_t>(event)).stalesRoute)
         return;
@@ -210,15 +247,16 @@ void EndpointResolver::NoticePinned(std::string_view advertise)
     _logger.Log(LogLevel::Warn, std::vformat(row.notice, std::make_format_args(advertise)));
 }
 
-void EndpointResolver::PublishIfMoved(Published const& row, NodeConfig const& cfg)
+bool EndpointResolver::PublishIfMoved(Published const& row, NodeConfig const& cfg)
 {
     auto derived = row.derive(cfg);
     auto const was = row.target.Current();
     if (derived.empty() || derived == was)
-        return;
+        return false;
     _logger.Logf(LogLevel::Info, "{} {} -> {}", row.what, was, derived);
     row.target.Publish(std::move(derived));
     _metrics.Increment(row.counter);
+    return true;
 }
 
 } // namespace FastCache::Node

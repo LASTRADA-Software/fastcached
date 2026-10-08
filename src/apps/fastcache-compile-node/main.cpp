@@ -667,7 +667,12 @@ struct RouteParts
     // taken over exactly this string -- so the endpoint the scheduler
     // signs, the endpoint this worker verifies and the endpoint clients dial are one
     // fact with one author. See `AdvertisedEndpoint`.
-    auto const advertise = Node::AdvertisedEndpoint(cfg);
+    //
+    // Derived over the process's LIVE route host rather than the one `cfg` was shaped with at the
+    // start: a body reformed after a roam starts at the address the fleet already has.
+    auto routed = cfg;
+    Node::ApplyRouteHost(routed, routeAt.cell.Current());
+    auto const advertise = Node::AdvertisedEndpoint(routed);
 
     // **One per process, and that is the whole reason it is here rather than inside the worker
     // tier** (#1440). Both the worker's registrations and the presence loop's announcements
@@ -714,7 +719,7 @@ struct RouteParts
     // marks the route stale before the worker's heartbeat or the presence loop is woken for it --
     // and both refresh it at the top of each round anyway, so that order is a head start rather
     // than a dependency. Declared above every component that reads either endpoint.
-    Node::AnnouncedEndpoint raftAnnounced { Node::RaftSelfEndpoint(cfg) };
+    Node::AnnouncedEndpoint raftAnnounced { Node::RaftSelfEndpoint(routed) };
     Node::LiveNodeConfig const endpointConfig { cfg, reloader };
     Node::SchedulerProbeTargets const probeTargets { appliedSchedulers };
     core::platform::SteadyClock const endpointClock;

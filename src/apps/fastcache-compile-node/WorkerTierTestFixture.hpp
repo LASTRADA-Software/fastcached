@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -63,8 +64,39 @@ class CountingRefresh final: public IEndpointRefresh
         return _calls.load();
     }
 
+    /// @copydoc IEndpointRefresh::Watch
+    void Watch(IEndpointMoveSink& sink) override
+    {
+        auto const lock = std::scoped_lock { _mutex };
+        _watchers.push_back(&sink);
+    }
+
+    /// @copydoc IEndpointRefresh::Unwatch
+    void Unwatch(IEndpointMoveSink& sink) noexcept override
+    {
+        auto const lock = std::scoped_lock { _mutex };
+        std::erase(_watchers, &sink);
+    }
+
+    /// Tell every watcher the published endpoint moved, as `EndpointResolver` does after a publish.
+    void TellMoved()
+    {
+        auto const lock = std::scoped_lock { _mutex };
+        for (auto* const watcher: _watchers)
+            watcher->OnEndpointMoved();
+    }
+
+    /// @return How many sinks watch now -- what a wiring case asserts.
+    [[nodiscard]] std::size_t WatcherCount()
+    {
+        auto const lock = std::scoped_lock { _mutex };
+        return _watchers.size();
+    }
+
   private:
     std::atomic<int> _calls { 0 };
+    std::mutex _mutex;
+    std::vector<IEndpointMoveSink*> _watchers;
 };
 
 /// A discovery that finds nothing and counts how often it was asked.
