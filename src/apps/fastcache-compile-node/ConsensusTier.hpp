@@ -65,6 +65,8 @@
 namespace FastCache::Node
 {
 
+class SchedulingLeaderPublisher;
+
 /// Why a consensus tier cannot start without this node's id.
 ///
 /// Every Raft message is addressed by member id, so a node with none could never be voted for.
@@ -1069,6 +1071,10 @@ struct SharedCacheListeners
 /// @param schedulers Told every applied state: where this node's worker and presence loop register
 ///        next, so a voter that moved its `0xFC` endpoint is reached without a reform. Must outlive
 ///        the tier.
+/// @param schedulingLeader Told who leads at every role change and how long it has been silent at
+///        every pass, on every node that runs consensus whether or not it schedules: what a node
+///        running no scheduler redirects a launcher's scheduling verbs to (#1639). Must outlive
+///        the tier.
 /// @param sharedCache Told every applied state: the directory and the host by reference, since every
 ///        node builds both and a consensus node that told them nothing would neither find nor serve
 ///        the tier the cluster named; the upstream where there is one. Each must outlive the tier.
@@ -1085,6 +1091,7 @@ struct SharedCacheListeners
     NodeMembership& membership,
     NodeRoster& roster,
     AppliedSchedulers& schedulers,
+    SchedulingLeaderPublisher& schedulingLeader,
     SharedCacheListeners sharedCache,
     IMetricsSink& metrics,
     ILogger& logger,

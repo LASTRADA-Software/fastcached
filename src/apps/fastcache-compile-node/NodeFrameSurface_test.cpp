@@ -27,6 +27,7 @@
 #include "PrivateTierProfile.hpp"
 #include "Responders.hpp"
 #include "SchedulerTier.hpp"
+#include "SchedulingRedirect.hpp"
 #include "SessionResponder.hpp"
 #include "SharedCacheResponder.hpp"
 #include "WorkerTierTestFixture.hpp"
@@ -35,6 +36,7 @@
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -1408,6 +1410,7 @@ TEST_CASE("The surface main composes routes each family to the component it was 
     auto const components = ComposeSurfaceComponents(nullptr,
                                                      nullptr,
                                                      nullptr,
+                                                     nullptr,
                                                      every.node,
                                                      std::unexpected { EnrollmentAbsence::NoConsensus },
                                                      every.live,
@@ -1439,6 +1442,149 @@ TEST_CASE("The surface main composes routes each family to the component it was 
     {
         INFO("family " << static_cast<int>(row.family));
         CHECK(FamilyOwner(components, row.family) == row.owner);
+    }
+}
+
+namespace
+{
+/// The scheduling verbs, as `OpTable` lists them.
+/// @return Their rows.
+[[nodiscard]] std::vector<Wire::OpDescriptor> SchedulingVerbs()
+{
+    auto rows = Wire::OpTable | std::views::filter([](Wire::OpDescriptor const& row) {
+                    return row.family == Wire::VerbFamily::Scheduler;
+                });
+    return { rows.begin(), rows.end() };
+}
+} // namespace
+
+TEST_CASE("The surface main composes sends a learner's scheduling verbs to the redirect, and a scheduler's to it",
+          "[node][node-surface][scheduling-redirect]")
+{
+    // #1639 at the composition: a node running consensus and no scheduler hands `main`'s one
+    // composition the redirect, and its scheduling verbs are answered by it -- never refused as a
+    // family served nowhere. A scheduler, where there is one, outranks it: a leader answering
+    // `NotLeader` naming itself would send every launcher round a loop.
+    NodeIoLoop io;
+    AtomicMetricsSink metrics;
+    auto const cfg = BaseConfig().first;
+    FixedFleetSummary const answered { Wire::FleetSummary { .clusterId = "c-office", .nodeId = "n-office" } };
+    auto const identity = Testing::TestKeyPair("n-office");
+    FleetSummaryResponder formation { answered, identity };
+    EveryNodeResponders every { cfg, io, metrics };
+    KnownSchedulingLeader leader;
+    SchedulingRedirectResponder redirect { every.membership, leader };
+
+    SECTION("no scheduler: the redirect owns the family")
+    {
+        auto const components = ComposeSurfaceComponents(nullptr,
+                                                         nullptr,
+                                                         &redirect,
+                                                         nullptr,
+                                                         every.node,
+                                                         std::unexpected { EnrollmentAbsence::NoConsensus },
+                                                         every.live,
+                                                         every.fleet,
+                                                         nullptr,
+                                                         &formation,
+                                                         every.session,
+                                                         every.sharedCache);
+        CHECK(FamilyOwner(components, Wire::VerbFamily::Scheduler) == &redirect);
+        // And it owns nothing else: a redirect placed in another family's slot would answer
+        // `NotLeader` to verbs this node serves itself.
+        for (auto const family: Enumerators<Wire::VerbFamily>())
+        {
+            INFO("family " << static_cast<int>(family));
+            if (family != Wire::VerbFamily::Scheduler)
+                CHECK(FamilyOwner(components, family) != &redirect);
+        }
+    }
+
+    SECTION("a scheduler and a redirect: the scheduler owns the family")
+    {
+        WorkerTierTesting::WorkerTierFixture fix;
+        auto schedulerCfg = Testing::FirstStart(NodeConfig {});
+        schedulerCfg.nodeId = "n1";
+        schedulerCfg.raftListen = "127.0.0.1:6680";
+        core::platform::ManualWallClock wallClock;
+        std::optional<Ed25519KeyPair> const identityKey { Testing::TestKeyPair("n1") };
+        NodeConditions conditions;
+        auto scheduler = SchedulerTier::Start(schedulerCfg,
+                                              fix.membership,
+                                              fix.clock,
+                                              wallClock,
+                                              fix.metrics,
+                                              fix.logger,
+                                              identityKey,
+                                              conditions,
+                                              std::chrono::hours { 24 });
+        REQUIRE(scheduler.has_value());
+        REQUIRE(*scheduler != nullptr);
+
+        auto const components = ComposeSurfaceComponents(nullptr,
+                                                         scheduler->get(),
+                                                         &redirect,
+                                                         nullptr,
+                                                         every.node,
+                                                         std::unexpected { EnrollmentAbsence::NoConsensus },
+                                                         every.live,
+                                                         every.fleet,
+                                                         nullptr,
+                                                         &formation,
+                                                         every.session,
+                                                         every.sharedCache);
+        IFrameResponder const* const schedulerResponder = &(*scheduler)->Responder();
+        CHECK(FamilyOwner(components, Wire::VerbFamily::Scheduler) == schedulerResponder);
+        CHECK(FamilyOwner(components, Wire::VerbFamily::Scheduler) != &redirect);
+    }
+}
+
+TEST_CASE("A node running neither a scheduler nor consensus refuses every scheduling verb NoCluster, on both routes",
+          "[node][node-surface][scheduling-redirect]")
+{
+    // The composition handed neither owner -- a node running no consensus -- leaves the family
+    // unserved, and the router answers it `NoCluster`. **The assertion that it is NOT
+    // `UnimplementedVerb` is the one that means anything**: both refuse, and a launcher told the
+    // latter reports *this node's build is too old* about a node that is current.
+    NodeIoLoop io;
+    AtomicMetricsSink metrics;
+    auto const cfg = BaseConfig().first;
+    FixedFleetSummary const answered { Wire::FleetSummary { .clusterId = "c-office", .nodeId = "n-office" } };
+    auto const identity = Testing::TestKeyPair("n-office");
+    FleetSummaryResponder formation { answered, identity };
+    EveryNodeResponders every { cfg, io, metrics };
+    MergedResponder merged { ComposeSurfaceComponents(nullptr,
+                                                      nullptr,
+                                                      nullptr,
+                                                      nullptr,
+                                                      every.node,
+                                                      std::unexpected { EnrollmentAbsence::NoConsensus },
+                                                      every.live,
+                                                      every.fleet,
+                                                      nullptr,
+                                                      &formation,
+                                                      every.session,
+                                                      every.sharedCache) };
+
+    auto const verbs = SchedulingVerbs();
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::Lease, &Wire::OpDescriptor::code));
+    auto const peer = PeerIdentity { .host = "127.0.0.1" };
+    for (auto const& verb: verbs)
+    {
+        INFO("verb " << verb.name);
+        auto const opRaw = static_cast<std::uint8_t>(verb.code);
+        CHECK(merged.OwnerOf(opRaw) == nullptr);
+
+        auto const atTheDoor = merged.RefusePeer(peer, opRaw);
+        REQUIRE(atTheDoor.has_value());
+        CHECK(ErrorOf(Unwrap(atTheDoor)) == Wire::ErrorCode::NoCluster);
+        CHECK(ErrorOf(Unwrap(atTheDoor)) != Wire::UnimplementedVerb);
+
+        auto const answeredFrame =
+            core::async::syncRun(merged.Answer(Wire::Detail::EncodeRequest(Wire::CurrentVersion, verb.code, {}), peer))
+                .bytes;
+        CHECK(ErrorOf(answeredFrame) == Wire::ErrorCode::NoCluster);
+        CHECK(ErrorOf(answeredFrame) != Wire::UnimplementedVerb);
     }
 }
 
@@ -1508,6 +1654,9 @@ TEST_CASE("With every component present, the surface main composes routes each f
 
     auto const components = ComposeSurfaceComponents(cache->get(),
                                                      scheduler->get(),
+                                                     // A scheduler and a redirect at once is no node `main` builds;
+                                                     // which one wins is the redirect case's to assert.
+                                                     nullptr,
                                                      worker->get(),
                                                      every.node,
                                                      &enrollment,
@@ -1572,6 +1721,7 @@ TEST_CASE("A node's port answers FLEET-SUMMARY over the probe's own nonce and on
     auto surface = StartNodeSurfaceOrExplain(io,
                                              cfg,
                                              ComposeSurfaceComponents(nullptr,
+                                                                      nullptr,
                                                                       nullptr,
                                                                       nullptr,
                                                                       every.node,

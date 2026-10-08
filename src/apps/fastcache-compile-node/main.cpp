@@ -55,6 +55,7 @@
 #include "SchedulerLink.hpp"
 #include "SchedulerReachability.hpp"
 #include "SchedulerTier.hpp"
+#include "SchedulingRedirect.hpp"
 #include "ScratchClaim.hpp"
 #include "SessionResponder.hpp"
 #include "SharedCacheResponder.hpp"
@@ -638,6 +639,13 @@ using Node::NodeReloader;
     // consensus tier below at every apply -- else the formation record's answer (`AppliedSchedulers`).
     // Declared before every tier that reads it or tells it, so it outlives them all.
     Node::AppliedSchedulers appliedSchedulers { cfg, activatedNodeEndpoint };
+
+    // Where the leader the consensus tier follows answers the scheduling verbs, for the launchers a
+    // node running no scheduler redirects there (#1639). Declared beside `appliedSchedulers` and for
+    // its reason: the surface that reads it binds before consensus starts, and the tier that tells
+    // it must not outlive it.
+    Node::KnownSchedulingLeader knownSchedulingLeader;
+    Node::SchedulingLeaderPublisher schedulingLeader { knownSchedulingLeader };
 
     // The ONE derivation, shared with the startup refusal that judges it. This value
     // goes to the worker tier's lease validator and to its REGISTER, and a lease's MAC is
@@ -1270,6 +1278,13 @@ using Node::NodeReloader;
     if (identityKey.has_value())
         fleetSummaryResponder.emplace(summary, *identityKey);
 
+    // What a node running consensus and no scheduler -- a learner -- answers the scheduling verbs
+    // with: `NotLeader` naming the leader it follows (#1639), so a launcher pointed at this machine
+    // reaches the fleet. Asked of the two predicates the tiers themselves ask, never of a mode.
+    std::optional<Node::SchedulingRedirectResponder> schedulingRedirect;
+    if (Node::RunsConsensus(cfg) && !Node::ServesScheduler(cfg))
+        schedulingRedirect.emplace(membership, knownSchedulingLeader);
+
     auto nodeSurfaceOrRefusal = Node::StartNodeSurfaceOrExplain(
         nodeIo,
         cfg,
@@ -1277,6 +1292,7 @@ using Node::NodeReloader;
         // of its own type, so one left out, or two transposed, fails the build here.
         Node::ComposeSurfaceComponents(cacheTier.get(),
                                        schedulerTier.get(),
+                                       AddressOrNull(schedulingRedirect),
                                        workerTier.get(),
                                        nodeStatusResponder,
                                        enrollmentResponder.has_value() ? Node::EnrollmentOwner { &*enrollmentResponder }
@@ -1357,6 +1373,7 @@ using Node::NodeReloader;
         membership,
         *nodeRoster,
         appliedSchedulers,
+        schedulingLeader,
         Node::SharedCacheListeners { .directory = sharedCache.Directory(),
                                      .host = sharedCache.Host(),
                                      .upstream = cacheTier != nullptr ? &cacheTier->Upstream() : nullptr },

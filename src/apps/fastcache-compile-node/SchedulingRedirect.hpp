@@ -4,6 +4,7 @@
 #include "FrameEndpoint.hpp"
 
 #include <FastCache/Distributed/MembershipOracle.hpp>
+#include <FastCache/Distributed/StateLeaseRoster.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -16,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -69,6 +72,60 @@ class KnownSchedulingLeader final: public ISchedulingLeaderSource
   private:
     mutable std::mutex _lock; ///< Guards `_endpoint`.
     std::string _endpoint;    ///< What `Publish` was last given; empty until it is.
+};
+
+/// Which leader endpoint a node names to a redirected client, given what consensus last said.
+///
+/// **A leader silent for longer than @p bound is named by nobody**: a redirect is a promise that the
+/// endpoint answers, and a launcher sent to a leader the whole fleet has stopped hearing spends its
+/// connect on a machine that is not scheduling. Empty is the ordinary answer of an election in
+/// progress, so the launcher declines the lease with `NoLeader` and compiles locally. The bound is the
+/// `consensus-leader-silent` condition's (`Distributed::LeaderSilenceBound`), passed in so the case
+/// that tests this decision does not wait it out -- one number for both questions, never a second.
+///
+/// Nothing heard yet is not silence: the role observer names a leader only once the driver has heard
+/// from it, so an absent reading is a pass that has not happened, never one that measured forever.
+/// @param leaderEndpoint The leader's `0xFC` endpoint as the role observer last gave it; empty while
+///        nobody leads, or while this node does.
+/// @param silentFor How long ago the leader last spoke, as the last consensus pass read it.
+/// @param bound The silence past which the leader is no longer named.
+/// @return @p leaderEndpoint, or empty when it is silent past @p bound.
+[[nodiscard]] std::string_view SchedulingEndpointToPublish(
+    std::string_view leaderEndpoint,
+    std::optional<core::platform::SteadyTimePoint::duration> silentFor,
+    core::platform::SteadyTimePoint::duration bound) noexcept;
+
+/// The writer side of `KnownSchedulingLeader`: what the consensus tier tells this node, folded into
+/// the one endpoint the redirect names.
+///
+/// Two observers feed it on two threads -- the role observer on the consensus reactor, with the
+/// leader's endpoint, and every reconcile pass on the reconciler, with how long that leader has been
+/// silent -- so it keeps the last of each under one lock and republishes through ONE decision,
+/// `SchedulingEndpointToPublish`, whichever of the two moved. Neither observer can then publish an
+/// answer the other would have overruled.
+class SchedulingLeaderPublisher
+{
+  public:
+    /// @param holder Where the decided endpoint is published; must outlive this.
+    explicit SchedulingLeaderPublisher(KnownSchedulingLeader& holder) noexcept;
+
+    /// The role observer's half: who leads, as an endpoint.
+    /// @param leaderEndpoint The leader's `0xFC` endpoint; empty while nobody leads, or this node does.
+    void LeaderChanged(std::string_view leaderEndpoint);
+
+    /// The reconcile pass's half: how long the leader has been silent.
+    /// @param reading The pass's reading; only its `silentFor` is read.
+    void LeaderContact(Distributed::LeaderReading const& reading);
+
+  private:
+    /// Publish what `SchedulingEndpointToPublish` decides from the two halves. Called under `_lock`.
+    void RepublishLocked();
+
+    KnownSchedulingLeader& _holder; ///< Where the decision goes.
+    std::mutex _lock;               ///< Guards the two halves, and orders their publications.
+    std::string _leaderEndpoint;    ///< What `LeaderChanged` was last given.
+    /// What `LeaderContact` was last given; nothing before the first pass.
+    std::optional<core::platform::SteadyTimePoint::duration> _silentFor;
 };
 
 /// Answers every scheduling verb on a node that runs no scheduler: a member is sent to the leader.

@@ -849,6 +849,7 @@ class FormationHarness
                 nullptr,
                 nullptr,
                 nullptr,
+                nullptr,
                 machine.nodeStatus,
                 responder.has_value()
                     ? Node::EnrollmentOwner { &*responder }

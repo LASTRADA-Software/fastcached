@@ -14,6 +14,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -295,4 +296,72 @@ TEST_CASE("KnownSchedulingLeader answers what was last published, and nothing be
 
     leader.Publish({});
     CHECK(leader.LeaderSchedulingEndpoint().empty());
+}
+
+TEST_CASE("A leader silent past the consensus-leader-silent bound is named to nobody", "[node][scheduling-redirect]")
+{
+    // R1 of #1639: the redirect names a leader only while the fleet still hears it, and the bound is
+    // the condition's own. Asked at the bound's edges, on both sides, so an off-by-one in either
+    // direction -- or a second number -- is red.
+    using Duration = core::platform::SteadyTimePoint::duration;
+    constexpr auto Bound = Duration { std::chrono::minutes { 65 } };
+    constexpr auto Tick = Duration { 1 };
+
+    SECTION("within the bound: the endpoint")
+    {
+        CHECK(SchedulingEndpointToPublish(LeaderEndpoint, Duration::zero(), Bound) == LeaderEndpoint);
+        CHECK(SchedulingEndpointToPublish(LeaderEndpoint, Bound, Bound) == LeaderEndpoint);
+    }
+
+    SECTION("past the bound: empty")
+    {
+        CHECK(SchedulingEndpointToPublish(LeaderEndpoint, Bound + Tick, Bound).empty());
+        CHECK(SchedulingEndpointToPublish(LeaderEndpoint, Bound * 10, Bound).empty());
+    }
+
+    SECTION("no leader: empty, whatever the silence")
+    {
+        CHECK(SchedulingEndpointToPublish({}, Duration::zero(), Bound).empty());
+        CHECK(SchedulingEndpointToPublish({}, std::nullopt, Bound).empty());
+    }
+
+    SECTION("no pass yet: not silence, so the endpoint")
+    {
+        CHECK(SchedulingEndpointToPublish(LeaderEndpoint, std::nullopt, Bound) == LeaderEndpoint);
+    }
+
+    // And production asks with the condition's bound, not a copy of its value.
+    CHECK(Distributed::LeaderSilenceBound == Bound);
+}
+
+TEST_CASE("The publisher folds who leads and how long it has been silent into one published endpoint",
+          "[node][scheduling-redirect]")
+{
+    // Two observers on two threads feed it; each one's half alone moves the holder, and the later
+    // half never overrules the earlier one's fact -- a silent leader stays unnamed when the role
+    // observer repeats it, and a named one is named again on the first contact.
+    using Duration = core::platform::SteadyTimePoint::duration;
+    KnownSchedulingLeader holder;
+    SchedulingLeaderPublisher publisher { holder };
+    REQUIRE(holder.LeaderSchedulingEndpoint().empty());
+
+    publisher.LeaderChanged(LeaderEndpoint);
+    CHECK(holder.LeaderSchedulingEndpoint() == LeaderEndpoint);
+
+    auto const silent = Distributed::LeaderReading {
+        .leader = "n1", .silentFor = Duration { Distributed::LeaderSilenceBound } + Duration { std::chrono::seconds { 1 } }
+    };
+    publisher.LeaderContact(silent);
+    CHECK(holder.LeaderSchedulingEndpoint().empty());
+
+    // The role observer repeating the endpoint does not revive a leader the pass found silent.
+    publisher.LeaderChanged(LeaderEndpoint);
+    CHECK(holder.LeaderSchedulingEndpoint().empty());
+
+    publisher.LeaderContact(Distributed::LeaderReading { .leader = "n1", .silentFor = Duration::zero() });
+    CHECK(holder.LeaderSchedulingEndpoint() == LeaderEndpoint);
+
+    // An election: nobody leads, and nobody is named however recently the last leader spoke.
+    publisher.LeaderChanged({});
+    CHECK(holder.LeaderSchedulingEndpoint().empty());
 }

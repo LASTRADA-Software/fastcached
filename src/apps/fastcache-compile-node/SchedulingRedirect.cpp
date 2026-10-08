@@ -104,6 +104,43 @@ std::string KnownSchedulingLeader::LeaderSchedulingEndpoint() const
     return _endpoint;
 }
 
+std::string_view SchedulingEndpointToPublish(std::string_view leaderEndpoint,
+                                             std::optional<core::platform::SteadyTimePoint::duration> silentFor,
+                                             core::platform::SteadyTimePoint::duration bound) noexcept
+{
+    // Strictly past the bound, as the roster's `Isolated` reads it, so the condition and the redirect
+    // change their answer at the same reading.
+    if (silentFor.has_value() && *silentFor > bound)
+        return {};
+    return leaderEndpoint;
+}
+
+SchedulingLeaderPublisher::SchedulingLeaderPublisher(KnownSchedulingLeader& holder) noexcept:
+    _holder { holder }
+{
+}
+
+void SchedulingLeaderPublisher::LeaderChanged(std::string_view leaderEndpoint)
+{
+    std::scoped_lock const guard { _lock };
+    _leaderEndpoint = leaderEndpoint;
+    RepublishLocked();
+}
+
+void SchedulingLeaderPublisher::LeaderContact(Distributed::LeaderReading const& reading)
+{
+    std::scoped_lock const guard { _lock };
+    _silentFor = reading.silentFor;
+    RepublishLocked();
+}
+
+void SchedulingLeaderPublisher::RepublishLocked()
+{
+    // Published under this lock, so two observers racing cannot leave the holder with the answer of
+    // the one that decided first.
+    _holder.Publish(SchedulingEndpointToPublish(_leaderEndpoint, _silentFor, Distributed::LeaderSilenceBound));
+}
+
 SchedulingRedirectResponder::SchedulingRedirectResponder(Distributed::IMembershipOracle const& membership,
                                                          ISchedulingLeaderSource const& leader) noexcept:
     _membership { membership },

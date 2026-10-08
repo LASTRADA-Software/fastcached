@@ -5,6 +5,7 @@
 #include "NodeIdentity.hpp"
 #include "NodeStateFiles.hpp"
 #include "NodeSurfaces.hpp"
+#include "SchedulingRedirect.hpp"
 
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
@@ -1573,6 +1574,7 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
     NodeMembership& membership,
     NodeRoster& roster,
     AppliedSchedulers& schedulers,
+    SchedulingLeaderPublisher& schedulingLeader,
     SharedCacheListeners sharedCache,
     IMetricsSink& metrics,
     ILogger& logger,
@@ -1592,7 +1594,13 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
         cfg,
         advertised,
         identityKey,
-        [&schedulerTier](Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t term) {
+        [&schedulerTier,
+         &schedulingLeader](Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t term) {
+            // Told on every node, scheduler or not: a node running none still names the leader
+            // it follows to the launchers that ask it to schedule (#1639). The endpoint is the
+            // member record's `0xFC` one (`Republish`), never its Raft one.
+            schedulingLeader.LeaderChanged(leaderEndpoint);
+
             // Null when this node runs no scheduler surface, which is a legitimate
             // shape: a member that contributes CPU and consensus without handing out
             // anybody's work. It still votes, and its leadership -- if it wins -- is
@@ -1628,8 +1636,12 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
             sharedCache.Applied(state);
         },
         // And how long that state has gone without a leader it counts speaking: past
-        // `LeaderSilenceBound`, every grant is refused (`consensus-leader-silent`).
-        [&roster](Distributed::LeaderReading const& reading) { roster.ConsensusPass(reading); },
+        // `LeaderSilenceBound`, every grant is refused (`consensus-leader-silent`) -- and past the same
+        // bound the leader is named to nobody (`SchedulingEndpointToPublish`).
+        [&roster, &schedulingLeader](Distributed::LeaderReading const& reading) {
+            roster.ConsensusPass(reading);
+            schedulingLeader.LeaderContact(reading);
+        },
         metrics,
         logger,
         conditions,

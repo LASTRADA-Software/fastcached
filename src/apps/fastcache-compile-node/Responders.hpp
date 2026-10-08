@@ -814,7 +814,9 @@ struct SurfaceComponents
     /// Answers the cache verbs, or nullptr when this node holds no tier.
     IFrameResponder* cache { nullptr };
 
-    /// Answers the scheduler verbs, or nullptr when this node does not schedule.
+    /// Answers the scheduler verbs: the scheduler where this node runs one, the redirect to the
+    /// leader where it runs consensus and no scheduler (#1639), or nullptr on a node running
+    /// neither -- whose family is then refused `NoCluster` (`UnservedFamilies`).
     IFrameResponder* scheduler { nullptr };
 
     /// Answers the compile verbs, or nullptr when this node runs no worker.
@@ -947,6 +949,10 @@ inline constexpr EnumTable<CompileCacheWire::VerbFamily, FamilyRoute> FamilyRout
       .presence = FamilyPresence::WhenItsComponentRuns,
       .ceilings = SessionCeilings::Folded,
       .component = "cache" },
+    // Null only on a node running neither a scheduler nor consensus: one that runs consensus
+    // without scheduling -- a learner -- answers through the redirect to the leader it follows
+    // (`SchedulingRedirectResponder`, #1639), and one running no consensus refuses the family
+    // `NoCluster` (`UnservedFamilies`), never `UnimplementedVerb`.
     { .family = CompileCacheWire::VerbFamily::Scheduler,
       .owner = &SurfaceComponents::scheduler,
       .presence = FamilyPresence::WhenItsComponentRuns,
@@ -1391,6 +1397,21 @@ class MergedResponder final: public IFrameResponder
               [](SurfaceComponents const& components) noexcept {
                   return EnrollmentAbsenceDetail(components.enrollmentAbsence);
               } },
+        // For the enrollment row's reason (#1639): a node running consensus answers these verbs
+        // itself -- a scheduler, or the redirect to the leader a learner follows -- so only a node
+        // running NONE reaches here, and `UnimplementedVerb` would send a launcher's operator to
+        // upgrade a build that is current. `NoCluster` says the question does not apply here.
+        { .family = CompileCacheWire::VerbFamily::Scheduler,
+          .refusal = { .code = CompileCacheWire::ErrorCode::NoCluster,
+                       .rationale = "what a node running no consensus answers every scheduling verb aimed at it: a "
+                                    "launcher pointed at the wrong machine asks once per lease, an ordinary "
+                                    "misdirection rather than an event; counted, one misconfigured build would "
+                                    "dominate the series" },
+          .detail = [](SurfaceComponents const&) noexcept -> std::string_view {
+              return "this node runs no consensus, so it schedules nothing and follows no leader to redirect you to; "
+                     "point FASTCACHE_SCHEDULER at a node of your fleet -- `fastcache-cli node` names the components "
+                     "a node serves";
+          } },
         { .family = CompileCacheWire::VerbFamily::Compile,
           .refusal = { .code = CompileCacheWire::NoCompileWorker::Code,
                        .rationale = "what a node running no worker answers a compile or a cordon aimed at it: nothing "

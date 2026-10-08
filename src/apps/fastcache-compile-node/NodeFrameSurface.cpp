@@ -11,6 +11,7 @@
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 #include "SchedulerTier.hpp"
+#include "SchedulingRedirect.hpp"
 #include "SessionResponder.hpp"
 #include "SharedCacheResponder.hpp"
 #include "WorkerTier.hpp"
@@ -26,6 +27,7 @@ namespace FastCache::Node
 
 SurfaceComponents ComposeSurfaceComponents(CacheTier* cache,
                                            SchedulerTier* scheduler,
+                                           SchedulingRedirectResponder* schedulingRedirect,
                                            WorkerTier* worker,
                                            NodeStatusResponder& node,
                                            EnrollmentOwner enrollment,
@@ -40,7 +42,9 @@ SurfaceComponents ComposeSurfaceComponents(CacheTier* cache,
     // placed in another's slot otherwise, and a transposed pair routes every cache verb to the
     // scheduler -- which answers *served nowhere* for traffic this node holds a tier for.
     return SurfaceComponents { .cache = cache != nullptr ? &cache->Responder() : nullptr,
-                               .scheduler = scheduler != nullptr ? &scheduler->Responder() : nullptr,
+                               // A learner's own answer where no scheduler runs (#1639): sent to
+                               // the leader it follows, never told the verbs are unimplemented.
+                               .scheduler = scheduler != nullptr ? &scheduler->Responder() : schedulingRedirect,
                                // Absent on a node running no worker (#206): the router then answers
                                // the compile family's refusal for a node without one.
                                .compile = worker != nullptr ? &worker->Responder() : nullptr,
