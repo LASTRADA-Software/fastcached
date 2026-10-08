@@ -27,11 +27,12 @@ namespace FastCache::Node
 /// What a node that runs consensus but no scheduler -- a Raft learner -- answers the fleet's
 /// scheduling verbs with: `NotLeader`, naming the leader's `0xFC` endpoint (#1639).
 ///
-/// Before it, the merged listener had no owner for `VerbFamily::Scheduler` on such a node, so a
-/// scheduling verb fell through to `MergedResponder`'s unserved rows (`UnservedVerbs`,
-/// `UnservedFamilies`) and used to be answered `UnimplementedVerb`, which a launcher reads as *this
-/// build is too old* -- so a client configured with this machine's own address as its scheduler
-/// never reached the fleet at all, although the node beside it knew exactly where the leader was.
+/// Before it, the merged listener had no owner and no unserved row for `VerbFamily::Scheduler` on
+/// such a node, so a scheduling verb was answered `UnimplementedVerb`, which a launcher reads as
+/// *this build is too old* -- so a client configured with this machine's own address as its
+/// scheduler never reached the fleet at all, although the node beside it knew exactly where the
+/// leader was. A node running neither a scheduler nor this redirect now answers by verb
+/// (`UnservedVerbs`, `UnservedFamilies`).
 
 /// Where the fleet's leader answers its scheduling verbs, as this node last learned it.
 ///
@@ -57,11 +58,11 @@ class ISchedulingLeaderSource
 
 /// The leader's scheduling endpoint, held for the responder that names it.
 ///
-/// Thread-safe: published from the consensus thread whenever the role observer is told who leads
-/// and again at every reconcile pass, which reads how long that leader has been silent
-/// (`SchedulingLeaderPublisher`), and read on the I/O reactor once per refused verb -- the shape `AppliedSchedulers` has for
-/// the same two threads. It stores what it is given and decides nothing: whether a silent leader is still named is the
-/// publisher's question.
+/// Thread-safe: published whenever the role observer is told who leads and again at every
+/// reconcile pass, which reads how long that leader has been silent (`SchedulingLeaderPublisher`),
+/// and read on the I/O reactor once per refused verb -- the shape `AppliedSchedulers` has for a
+/// value written by the consensus tier and read by the reactor. It stores what it is given and
+/// decides nothing: whether a silent leader is still named is the publisher's question.
 class KnownSchedulingLeader final: public ISchedulingLeaderSource
 {
   public:
