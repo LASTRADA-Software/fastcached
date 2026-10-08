@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConfig.hpp"
+#include "SchedulingRedirect.hpp"
 
-#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -11,14 +11,14 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include <CompileCorrelation.hpp>
 #include <Dispatch.hpp>
+#include <tests/CounterMovement.hpp>
 #include <tests/FleetHarness.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -113,47 +113,15 @@ void JoinAsConfigured(Testing::FleetHarness& fleet,
         fleet.RegisterWorker(SchedulerA, endpoint, Toolchain, *slots);
 }
 
-/// The reply an honest worker sends for @p request's job: an object, and the correlation the
-/// launcher recomputes, signed under the key every grant here names -- so `Compiled` means the
-/// compile was ACCEPTED, not merely that some address answered.
-/// @param request The job the launcher dispatches.
-/// @return The framed reply.
-[[nodiscard]] std::vector<std::byte> CompiledReply(Cc::DispatchRequest const& request)
-{
-    constexpr std::string_view Object = "OBJ";
-    auto const correlation =
-        Cc::CompileCorrelation(Cc::CorrelatedCompile { .preprocessed = request.preprocessed,
-                                                       .args = request.args,
-                                                       .fingerprint = request.fingerprint,
-                                                       .sourceName = request.sourceName,
-                                                       .compileDir = request.compileDir,
-                                                       .compileDirReplacement = request.compileDirReplacement,
-                                                       .sourceRoot = request.sourceRoot,
-                                                       .sourceRootReplacement = request.sourceRootReplacement });
-    auto const enveloped =
-        Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(Object.size()), Wire::AsBytes(Object));
-    return Testing::FleetHarness::SignedWorkerReply(enveloped, correlation);
-}
-
-/// Every counter's reading -- EVERY counter, so one that moved and was not expected is visible.
-/// @param metrics The sink.
-/// @return The readings.
-[[nodiscard]] std::map<IMetricsSink::Counter, std::uint64_t> Readings(IMetricsSink const& metrics)
-{
-    std::map<IMetricsSink::Counter, std::uint64_t> readings;
-    for (auto const counter: Enumerators<IMetricsSink::Counter>())
-        readings.emplace(counter, metrics.Read(counter));
-    return readings;
-}
-
-/// Prove @p fleet's learner counts into the sink `LearnerMetrics` returns, through the surface a
+/// Prove @p fleet's learner counts into the sink `RedirectingLearnerMetrics` returns, through the surface a
 /// launcher reaches: a `MINT-TICKET` from another machine is refused by the session component
 /// beside the redirect, COUNTED. Without it a sink nothing writes would read "no counter moved"
 /// whatever the redirect did.
-/// @param fleet The fleet; its caller is left on loopback, as it was found.
+/// @param fleet The fleet. Its caller is LEFT ON LOOPBACK, the harness's default, whatever it was
+///        before: a case that set another host sets it again afterwards.
 void ShowLearnerSinkIsLive(Testing::FleetHarness& fleet)
 {
-    auto const& metrics = fleet.LearnerMetrics(Learner);
+    auto const& metrics = fleet.RedirectingLearnerMetrics(Learner);
     auto const before = metrics.Read(IMetricsSink::Counter::NodeTicketMintsRefusedNotLocal);
     fleet.SetCallerHost("192.0.2.7");
     auto const minted = fleet.Exchange(Learner,
@@ -442,18 +410,20 @@ TEST_CASE("A launcher pointed at its own learner is redirected to the leader and
     // #1639 end to end: a launcher whose `--scheduler` is its own machine, and that machine a
     // learner -- consensus, no scheduler. The learner's port answers LEASE `NotLeader` naming the
     // leader's scheduling endpoint, the launcher follows it, compiles on the worker the leader
-    // granted, and releases to the leader that ISSUED the lease. Every object on both sides is
-    // production's: the redirect behind the merged router, and the launcher's own `Cc::Dispatch`.
+    // granted, and releases to the leader that ISSUED the lease. Every DECISION on both sides is
+    // production's -- the endpoint's header gate (`DecideHeaderRefusal`), the merged router, the
+    // redirect, and the launcher's own `Cc::Dispatch`; the harness supplies only the socket and the
+    // loop that hands a frame to the gate.
     Testing::FleetHarness fleet;
     fleet.AddScheduler(std::string { SchedulerA });
-    fleet.AddLearner(std::string { Learner });
+    fleet.AddRedirectingLearner(std::string { Learner });
     fleet.ElectLeader(SchedulerA);
     fleet.RegisterWorker(SchedulerA, Worker, Toolchain);
     auto const request = RequestVia(Learner);
-    fleet.SetWorkerReply(CompiledReply(request));
+    fleet.SetWorkerReply(Testing::FleetHarness::CompiledReply(request));
 
     ShowLearnerSinkIsLive(fleet);
-    auto const counted = Readings(fleet.LearnerMetrics(Learner));
+    auto const counted = Testing::CounterReadingsOf(fleet.RedirectingLearnerMetrics(Learner));
     auto const from = fleet.Calls().size();
 
     auto const result = Cc::Dispatch(fleet, request, Cc::DispatchBudgets {}, Cc::Credential {}, {});
@@ -492,7 +462,14 @@ TEST_CASE("A launcher pointed at its own learner is redirected to the leader and
 
     // And it counted nothing doing it: a redirect is every launcher's ordinary traffic, spelled
     // `RefuseWithoutCounter`, on a sink just shown to be the one this surface counts into.
-    CHECK(Readings(fleet.LearnerMetrics(Learner)) == counted);
+    //
+    // **Its blind spot, stated:** today the redirect, the router and the endpoint's gate hold no
+    // counter for this path at all, so no change to any of them short of handing one a sink can turn
+    // this line red. It is a TRIPWIRE for that change: whichever of them gains a sink is handed the
+    // learner's (`FleetHarness::RedirectingLearner::metrics`), and a counted redirect is red here.
+    auto const moved = Testing::CountersMoved(counted, fleet.RedirectingLearnerMetrics(Learner));
+    INFO("counters moved: " << moved);
+    CHECK(moved.empty());
 }
 
 TEST_CASE("A launcher pointed at a learner that knows no leader compiles locally, after one call",
@@ -505,10 +482,10 @@ TEST_CASE("A launcher pointed at a learner that knows no leader compiles locally
     // had not heard of, or a launcher that dialled an empty endpoint, is red here and green above.
     Testing::FleetHarness fleet;
     fleet.AddScheduler(std::string { SchedulerA });
-    fleet.AddLearner(std::string { Learner });
+    fleet.AddRedirectingLearner(std::string { Learner });
 
     ShowLearnerSinkIsLive(fleet);
-    auto const counted = Readings(fleet.LearnerMetrics(Learner));
+    auto const counted = Testing::CounterReadingsOf(fleet.RedirectingLearnerMetrics(Learner));
     auto const from = fleet.Calls().size();
 
     auto const result = Cc::Dispatch(fleet, RequestVia(Learner), Cc::DispatchBudgets {}, Cc::Credential {}, {});
@@ -523,5 +500,64 @@ TEST_CASE("A launcher pointed at a learner that knows no leader compiles locally
     CHECK(calls[0].kind == Cc::CacheOutcomeKind::Rejected);
     CHECK(calls[0].code == Wire::ErrorCode::NotLeader);
     CHECK(calls[0].code != Wire::UnimplementedVerb);
-    CHECK(Readings(fleet.LearnerMetrics(Learner)) == counted);
+    auto const moved = Testing::CountersMoved(counted, fleet.RedirectingLearnerMetrics(Learner));
+    INFO("counters moved: " << moved);
+    CHECK(moved.empty());
+}
+
+TEST_CASE("A learner's port refuses a frame over its request cap before it redirects", "[node][fleet][scheduling-redirect]")
+{
+    // The harness's learner is gated by the endpoint's own header decision (`DecideHeaderRefusal`),
+    // not by a copy of part of it: the surface-wide cap is asked BEFORE admission and before the
+    // redirect, so a LEASE declaring more than the scheduler surface takes is refused for its size --
+    // a gate asking only `RefusePeer` would have redirected it, and this case would be green there
+    // for no reason.
+    Testing::FleetHarness fleet;
+    fleet.AddScheduler(std::string { SchedulerA });
+    fleet.AddRedirectingLearner(std::string { Learner });
+    fleet.ElectLeader(SchedulerA);
+
+    auto const lease = [&fleet](std::size_t payloadBytes) {
+        auto const payload = std::vector<std::byte>(payloadBytes);
+        return fleet.Exchange(
+            Learner,
+            Wire::Detail::EncodeRequest(Wire::CurrentVersion, Wire::Op::Lease, { std::span<std::byte const> { payload } }),
+            Cc::Credential {},
+            Cc::ExchangeBudget {});
+    };
+
+    // The control: a LEASE inside the cap is redirected, so the refusal below is the size's doing.
+    auto const within = lease(1);
+    CHECK(within.kind == Cc::CacheOutcomeKind::Rejected);
+    CHECK(within.code == Wire::ErrorCode::NotLeader);
+
+    auto const over = lease(Node::SchedulingRedirectResponder::RequestBytes + 1);
+    CHECK(over.kind == Cc::CacheOutcomeKind::Rejected);
+    CHECK(over.code == Wire::ErrorCode::PayloadTooLarge);
+}
+
+TEST_CASE("The fleet harness refuses a learner sharing an endpoint with anything else", "[node][fleet][scheduling-redirect]")
+{
+    // `Answer` asks the learners first, so a scheduler or a worker at a learner's endpoint would be
+    // unreachable -- and a case arranged that way would assert against the wrong machine in silence.
+    Testing::FleetHarness fleet;
+    fleet.AddScheduler(std::string { SchedulerA });
+    fleet.ElectLeader(SchedulerA);
+    fleet.RegisterWorker(SchedulerA, Worker, Toolchain);
+    fleet.AddRedirectingLearner(std::string { Learner });
+
+    CHECK_THROWS_AS(fleet.AddRedirectingLearner(std::string { SchedulerA }), std::runtime_error);
+    CHECK_THROWS_AS(fleet.AddRedirectingLearner(std::string { Worker }), std::runtime_error);
+    CHECK_THROWS_AS(fleet.AddRedirectingLearner(std::string { Learner }), std::runtime_error);
+    CHECK_THROWS_AS(fleet.AddScheduler(std::string { Learner }), std::runtime_error);
+    CHECK_THROWS_AS(fleet.AddScheduler(std::string { SchedulerA }), std::runtime_error);
+    CHECK_THROWS_AS(fleet.RegisterWorker(SchedulerA, Learner, Toolchain), std::runtime_error);
+    CHECK_THROWS_AS(fleet.AddWorkerAddress(std::string { Learner }), std::runtime_error);
+    // And a credential presented to it, which no learner endpoint models.
+    CHECK_THROWS_AS(
+        fleet.Exchange(Learner,
+                       Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = Toolchain, .key = Key, .acceptedCodecs = {} }),
+                       fleet.TicketFor("some-machine", std::string { Learner }),
+                       Cc::ExchangeBudget {}),
+        std::runtime_error);
 }

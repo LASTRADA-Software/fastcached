@@ -2,7 +2,6 @@
 #include "Responders.hpp"
 #include "SchedulingRedirect.hpp"
 
-#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
@@ -17,7 +16,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <map>
+#include <format>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -28,6 +27,7 @@
 
 #include <core/async/SyncRun.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/CounterMovement.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/VerbFamilies.hpp>
@@ -115,18 +115,6 @@ struct BothAnswers
     auto const decoded = Wire::DecodeErrorPayload(PayloadOf(reply));
     REQUIRE(decoded.has_value());
     return std::string { Unwrap(decoded).second };
-}
-
-/// Every counter's reading -- EVERY counter, so one that moved and was not
-/// expected is visible.
-/// @param metrics The sink.
-/// @return The readings.
-[[nodiscard]] std::map<IMetricsSink::Counter, std::uint64_t> Readings(IMetricsSink const& metrics)
-{
-    std::map<IMetricsSink::Counter, std::uint64_t> readings;
-    for (auto const counter: Enumerators<IMetricsSink::Counter>())
-        readings.emplace(counter, metrics.Read(counter));
-    return readings;
 }
 
 } // namespace
@@ -264,12 +252,13 @@ TEST_CASE("A learner's redirect moves no counter", "[node][scheduling-redirect]"
     StatedLeader leader { std::string { LeaderEndpoint } };
     SchedulingRedirectResponder responder { membership, leader };
 
-    auto const before = Readings(metrics);
+    auto const before = Testing::CounterReadingsOf(metrics);
     // A reading taken over a sink that moves nothing cannot be told from one that was never read,
     // so prove the instrument first: an increment IS seen, and then undone from the baseline.
     metrics.Increment(IMetricsSink::Counter::DispatchFramesRefusedNotPermitted);
-    REQUIRE(Readings(metrics) != before);
-    auto const baseline = Readings(metrics);
+    REQUIRE(Testing::CountersMoved(before, metrics)
+            == std::format("{} +1\n", Testing::CounterName(IMetricsSink::Counter::DispatchFramesRefusedNotPermitted)));
+    auto const baseline = Testing::CounterReadingsOf(metrics);
 
     auto const verbs = Testing::OpsOfFamily(Wire::VerbFamily::Scheduler);
     // Asked of the table rather than assumed: a sweep over nothing would pass.
@@ -277,7 +266,9 @@ TEST_CASE("A learner's redirect moves no counter", "[node][scheduling-redirect]"
     for (auto const& row: verbs)
         for (auto const& peer: { ThisMachine(), Outsider() })
             static_cast<void>(AskBoth(responder, row.code, peer));
-    CHECK(Readings(metrics) == baseline);
+    auto const moved = Testing::CountersMoved(baseline, metrics);
+    INFO("counters moved: " << moved);
+    CHECK(moved.empty());
 }
 
 TEST_CASE("KnownSchedulingLeader answers what was last published, and nothing before that", "[node][scheduling-redirect]")
