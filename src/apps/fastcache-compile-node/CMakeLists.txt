@@ -231,6 +231,7 @@ if(FASTCACHED_BUILD_TESTS)
         FleetLeaseRouting_test.cpp
         FleetExclusion_test.cpp
         FleetDialHint_test.cpp
+        FleetVoterMove_test.cpp
         NodeConfig_test.cpp
         NodeDefaults.cpp
         NodeDefaults_test.cpp

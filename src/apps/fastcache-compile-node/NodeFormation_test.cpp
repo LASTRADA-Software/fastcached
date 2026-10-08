@@ -244,10 +244,18 @@ TEST_CASE("A node serving no scheduler registers at the voters its applied state
     schedulers.Applied(Cluster::ClusterState {});
     CHECK(schedulers.Current() == remembered);
 
-    // A node serving its own scheduler registers there, whatever any state records.
+    // A node serving its own scheduler registers there FIRST, and at the voters the state records
+    // after it: a voter whose address vanished hears no leader, so its own scheduler names nobody
+    // and only a voter that did not move can take its announcement to the leader.
     auto const solitary = FormedBy(RecordIn(Cluster::NodeMode::Solitary));
     AppliedSchedulers own { solitary, AsConfigured };
+    CHECK(own.Current() == SchedulersOf(solitary, AsConfigured));
     own.Applied(state);
+    auto ownThenRecorded = SchedulersOf(solitary, AsConfigured);
+    ownThenRecorded.insert(ownThenRecorded.end(), recorded.begin(), recorded.end());
+    CHECK(own.Current() == ownThenRecorded);
+    // A state recording only this node leaves its own scheduler alone, as before.
+    own.Applied(Cluster::ClusterState {});
     CHECK(own.Current() == SchedulersOf(solitary, AsConfigured));
 }
 

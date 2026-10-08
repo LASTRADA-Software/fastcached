@@ -323,9 +323,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A WORKER follows `NotLeader` too, or the client half arrives at an empty fleet: `Gate()` refuses
   `Register` as well, a leader is remembered only once a round was ACCEPTED there, and `NotLeader`
   must not clear the worker id where `UnknownLease` must.
-- `--scheduler` aims the ONE-SHOT verbs alone: a serving node is refused it by name and registers
-  where its formation record says (`SchedulersOf`; its OWN scheduler at the endpoint it SERVES,
-  `ActivatedNodeEndpoint`). A LIST, never a leader choice: each value dialled at most once a round,
+- `--scheduler` aims the ONE-SHOT verbs alone: a serving node is refused it by name and registers at
+  its OWN scheduler where it SERVES, THEN its applied state's other voters (`AppliedSchedulers`), or a
+  MOVED voter is heard by nobody. A LIST, never a leader choice: each value dialled at most once a round,
   `NotLeader` never consults it, a verb falls back only where nothing was SENT. Assert WHICH endpoint.
 - `NotLeader` is an instruction, not an answer: a client follows it (`RedirectTarget`), judged by
   PARSING (`ParseDialEndpoint`) and bounded, the RELEASE to whoever ISSUED. A LEARNER sends a member

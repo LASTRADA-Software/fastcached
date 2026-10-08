@@ -211,7 +211,14 @@ inline constexpr std::nullopt_t AsConfigured = std::nullopt;
 /// Where this node's worker and presence loop register, re-read at every round
 /// (`SchedulerLink::Over`).
 ///
-/// A node that serves a scheduler registers at its own (`SchedulersOf`), whatever the state says.
+/// A node that serves a scheduler registers at its own (`SchedulersOf`) FIRST, then at the other
+/// voters its APPLIED state records. Its own answers whenever it hears the leader -- it accepts, or
+/// redirects there -- so the rest of the list is dialled only when it does not: a voter whose
+/// address vanished hears no leader (no leader's message reaches it), so its own scheduler answers
+/// `NotLeader` naming nobody, and its move reaches the leader only through a voter that did not
+/// move (the walk `SchedulerLink` makes, each endpoint at most once a round). Without them the move
+/// was never announced and the voter stayed unreachable until its old address came back.
+///
 /// One that serves none registers at the voters its APPLIED state records (`RecordedSchedulersOf`),
 /// told every applied state by the consensus tier's apply callback (`StartConsensusOrExplain`) -- so
 /// a voter that moves its `0xFC` endpoint, proven, is reached at the next round rather than after a
@@ -238,7 +245,7 @@ class AppliedSchedulers final: public ISchedulerEndpointSource
 
   private:
     std::string _self;                   ///< This node's id, never a scheduler it registers with.
-    bool _servesScheduler;               ///< Whether it registers at its own scheduler, whatever is applied.
+    bool _servesScheduler;               ///< Whether it registers at its own scheduler first, before the voters.
     std::vector<std::string> _formation; ///< `SchedulersOf`'s answer: the fallback.
     mutable std::mutex _lock;            ///< Guards `_recorded`.
     std::vector<std::string> _recorded;  ///< The applied state's voters' endpoints; empty until one is.

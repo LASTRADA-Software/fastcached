@@ -253,10 +253,19 @@ void AppliedSchedulers::Applied(Cluster::ClusterState const& state)
 
 std::vector<std::string> AppliedSchedulers::Current() const
 {
-    if (_servesScheduler)
-        return _formation;
     auto const guard = std::scoped_lock { _lock };
-    return _recorded.empty() ? _formation : _recorded;
+    if (!_servesScheduler)
+        return _recorded.empty() ? _formation : _recorded;
+
+    // Its own scheduler FIRST, then the other voters the state records: a voter that hears its
+    // leader redirects from its own and the rest are never dialled, while one whose address vanished
+    // hears nobody -- its own scheduler answers `NotLeader` naming no one -- and is heard by the
+    // leader only through a voter that did not move. A list to walk, never a leader choice.
+    auto endpoints = _formation;
+    for (auto const& recorded: _recorded)
+        if (!std::ranges::contains(endpoints, recorded))
+            endpoints.push_back(recorded);
+    return endpoints;
 }
 
 std::vector<Cluster::MemberSpec> BootstrapMembersOf(NodeConfig const& cfg)

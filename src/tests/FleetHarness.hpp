@@ -828,6 +828,29 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         return state;
     }
 
+    /// What @p scheduler's service noted as a recorded member's moved `0xFC` endpoint, in the
+    /// order it was told: the member that proved it, and where it now answers. Noted only by a
+    /// scheduler that ANSWERED the announcement -- the leader -- so this is the evidence that an
+    /// announcement reached it, where a reply alone says only that SOME scheduler took it.
+    /// @param scheduler Which scheduler; must have been added.
+    /// @return Each noted (member, endpoint), oldest first.
+    [[nodiscard]] std::vector<std::pair<std::string, std::string>> AnnouncedEndpointsAt(std::string_view scheduler)
+    {
+        return NodeAt(scheduler).cluster.noted;
+    }
+
+    /// @p scheduler stops knowing who leads: a follower whose election timer fired, or a leader
+    /// CheckQuorum deposed -- what a voter whose address vanished is, since no leader's message
+    /// reaches it. It answers every verb `NotLeader` naming NOBODY, which no round can follow.
+    /// @param scheduler Which scheduler; must have been added.
+    void ForgetLeaderAt(std::string_view scheduler)
+    {
+        auto& node = NodeAt(scheduler);
+        // `Undecided`, as `SchedulerRoleFor` maps a candidate that knows no leader.
+        node.service.SetRole(Distributed::SchedulerRole::Undecided, {}, Distributed::StandaloneSchedulerTerm);
+        NoteReadings(node);
+    }
+
     /// Take @p scheduler off the network, or put it back: a dial to it fails, as a machine
     /// that is down or partitioned from the caller answers.
     /// @param scheduler Which scheduler.
@@ -1104,8 +1127,16 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                 return state;
             }
 
+            /// What the service noted, in order: the member that PROVED it and the endpoint it
+            /// announced. Recorded rather than proposed -- the harness runs no consensus -- so a case
+            /// can assert WHICH scheduler a member's announcement reached (`AnnouncedEndpointsAt`).
+            std::vector<std::pair<std::string, std::string>> noted;
+
             /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
-            void NoteAnnouncedEndpoint(Consensus::NodeId const& /*member*/, std::string /*endpoint*/) override {}
+            void NoteAnnouncedEndpoint(Consensus::NodeId const& member, std::string endpoint) override
+            {
+                noted.emplace_back(member, std::move(endpoint));
+            }
 
             [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& /*command*/) override
             {

@@ -228,8 +228,8 @@ std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> WorkerTier::Start(Worker
 
     // The link the heartbeat announces through, built HERE so a worker cannot exist
     // without one: the tier's constructor takes it by value. Aimed where this node registers
-    // NOW (`AppliedSchedulers`: its own scheduler, or the voters its applied state records,
-    // else the formation record's answer), re-read at every round, never at `--scheduler`,
+    // NOW (`AppliedSchedulers`: its own scheduler and then the other voters its applied state
+    // records, or those voters alone, else the formation record's answer), re-read at every round, never at `--scheduler`,
     // which aims one-shot verbs and is refused on a node that serves.
     auto link = SchedulerLink::Over(parts.schedulers);
     if (!link.has_value())

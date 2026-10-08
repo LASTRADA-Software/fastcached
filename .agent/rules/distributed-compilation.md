@@ -2220,6 +2220,19 @@ other moves where the outage is observed and not whether it happens.
     endpoints whose first answers passes under every defect here. `AnnounceRound`
     left `main.cpp` for exactly that: the dial is `IEndpointDialer`, the replies are
     scripted, and the case asserts WHICH endpoint was sent the registration.
+  - **A node that SERVES a scheduler walks its OWN first, then the other voters its applied
+    state records** (`AppliedSchedulers::Current`). Its own answers whenever it hears the
+    leader -- it accepts, or redirects -- so the voters cost nothing in the ordinary round.
+    They are there for the voter whose address VANISHED: no leader's message reaches it, its
+    election timer fires within an election timeout, and its own scheduler then answers
+    `NotLeader` naming NOBODY, which no round can follow. With its own scheduler as the whole
+    list, its NODE-ANNOUNCE and its REGISTER never reached the leader, the move was never
+    committed, and the voter stayed unreachable until its old address came back -- while every
+    membership case went green, because each injected the announcement AT the leader.
+    `FleetVoterMove_test` drives the voter's own rounds through `FleetHarness` (a follower,
+    a deposed leader, and the control whose own scheduler still redirects) and was RED on the
+    tree that answered the own endpoint alone. The same list is the voter's route-probe targets
+    (`SchedulerProbeTargets`), so a split-tunnel voter advertises the address its peers reach.
 - **`NotLeader` must not clear the worker id; `UnknownLease` must.** They are
   different sentences: one says *this scheduler is the wrong one to ask*, the other
   *the fleet has forgotten you*. The registry is replicated, so the leader a redirect

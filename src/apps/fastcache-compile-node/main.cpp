@@ -670,7 +670,8 @@ struct RouteParts
     auto const& activatedNodeEndpoint = *activatedNodeEndpointOrError;
 
     // Where the worker's heartbeat and the presence loop register, ONE for the process and re-read at
-    // every round: this node's own scheduler, or the voters its applied state records -- told by the
+    // every round: this node's own scheduler and then the other voters its applied state records, or
+    // those voters alone on a node serving none -- told by the
     // consensus tier below at every apply -- else the formation record's answer (`AppliedSchedulers`).
     // Declared before every tier that reads it or tells it, so it outlives them all.
     Node::AppliedSchedulers appliedSchedulers { cfg, activatedNodeEndpoint };
