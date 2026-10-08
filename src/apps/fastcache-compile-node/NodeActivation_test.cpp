@@ -95,7 +95,11 @@ TEST_CASE("A socket that will not say where it listens is refused and nothing is
     REQUIRE_FALSE(adopted.has_value());
     CHECK(adopted.error().cause == NodeRefusalCause::HandedOverListeners);
     CHECK(adopted.error().reason == UnreadableActivatedBindRefusal().reason);
-    CHECK(adopted.error().reason.starts_with("--advertise is required under socket activation"));
+    // Named for its CAUSE -- the socket reports no IP endpoint -- never as a missing `--advertise`,
+    // which it fires whatever that flag says, and with the remedy that applies.
+    CHECK(adopted.error().reason.contains("does not report an IP address and port"));
+    CHECK(adopted.error().reason.contains("ListenStream="));
+    CHECK_FALSE(adopted.error().reason.contains("--advertise"));
     CHECK(cfg.nodeListen == before);
 }
 

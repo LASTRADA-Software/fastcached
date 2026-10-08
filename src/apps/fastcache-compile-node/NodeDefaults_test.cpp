@@ -752,10 +752,12 @@ TEST_CASE("unqualified-host-name is raised while peers are told to dial a bare n
     CHECK_FALSE(UnqualifiedHostNameInUse(qualified).has_value());
     CHECK_FALSE(UnqualifiedHostNameInUse(Testing::FirstStart(NodeConfig {})).has_value());
 
-    // --advertise is reloadable, so the remedy does not send an operator to restart for it.
+    // --advertise and --raft-self are both reloadable, so the remedy sends an operator to restart for
+    // neither -- only for a DNS domain, which is read once at startup.
     auto const remedy = RowFor(NodeCondition::UnqualifiedHostName).remedy;
-    CHECK(remedy.contains("--advertise (advertise in the configuration file; a reload applies it)"));
-    CHECK(remedy.contains("--raft-self (raft_self; a restart applies it)"));
+    CHECK(remedy.contains("--advertise (advertise in the configuration file) and --raft-self (raft_self) -- a reload "
+                          "applies both"));
+    CHECK_FALSE(remedy.contains("a restart applies"));
 }
 
 TEST_CASE("host-name-reaches-only-this-machine is raised while a withheld name stood something down",
@@ -785,10 +787,13 @@ TEST_CASE("host-name-reaches-only-this-machine is raised while a withheld name s
     EvaluateHostNameCondition(conditions, stated);
     CHECK(conditions.StateOf(NodeCondition::HostNameReachesOnlyThisMachine) == Wire::ConditionState::Clear);
 
-    // And the remedy says which half a reload reaches.
+    // And the remedy says what a reload reaches: both addresses, never the consensus port this
+    // confinement bound to loopback, which is bound again only at a restart.
     auto const remedy = RowFor(NodeCondition::HostNameReachesOnlyThisMachine).remedy;
-    CHECK(remedy.contains("--advertise (advertise; a reload applies it)"));
-    CHECK(remedy.contains("--raft-self (raft_self; a restart applies it)"));
+    CHECK(remedy.contains("--raft-self (raft_self) and --advertise (advertise)"));
+    CHECK(remedy.contains("a reload applies both to what this node advertises"));
+    CHECK(remedy.contains("bound again only by a restart"));
+    CHECK_FALSE(remedy.contains("a restart applies"));
     CHECK(remedy.contains("Fix this machine's DNS"));
 }
 

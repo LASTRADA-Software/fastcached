@@ -419,8 +419,10 @@ class WorkerTier
     /// its reversal between two beats re-register nothing, and three moves in three beats
     /// withdraw each superseded endpoint exactly once.
     ///
-    /// The lease check moved when the endpoint was published, because the validator reads the
-    /// same seam.
+    /// The lease check does NOT move when the endpoint is published: the validator reads the
+    /// endpoint this worker is REGISTERED under (`RegisterUnder`), which moves here, with the
+    /// registrars, as the old entries are queued for withdrawal -- so between the publication and
+    /// this call a grant the scheduler signed for the endpoint still registered stays valid.
     /// @param statusClock What `node-status` stamps against, for the registrations this retires.
     void FollowAnnouncedEndpoint(core::platform::IClock const& statusClock);
 

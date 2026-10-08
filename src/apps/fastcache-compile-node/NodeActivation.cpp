@@ -10,13 +10,15 @@ namespace FastCache::Node
 
 NodeRefusal UnreadableActivatedBindRefusal()
 {
-    // The text the start gave before the bind was read off the socket, kept for the one case that
-    // still cannot be answered: a socket that will not say where it listens leaves this node with
-    // nothing to advertise but a guess, and a guess registers, heartbeats and sends every client to
-    // an address nothing answers.
+    // The one case the socket cannot answer: it will not report an IP address and port -- a UNIX or
+    // other non-IP socket, most often -- so its port is unknown, and the node surface would hold a
+    // bind no row resolves while every endpoint derived from it is a guess that registers,
+    // heartbeats and sends every client to an address nothing answers. Named whatever `--advertise`
+    // says: the advertised HOST does not make the socket a TCP one this node can serve.
     return Refusal(NodeRefusalCause::HandedOverListeners,
-                   "--advertise is required under socket activation: the socket unit owns the "
-                   "port, so this worker cannot know what address clients should use");
+                   "the socket a supervisor handed over does not report an IP address and port (a UNIX or other "
+                   "non-IP socket?), so this node cannot serve it or say where clients reach it; give the socket "
+                   "unit an IP ListenStream= (a port, or an address and a port)");
 }
 
 std::expected<void, NodeRefusal> AdoptActivatedBind(NodeConfig& cfg, BoundEndpoint const& bound)

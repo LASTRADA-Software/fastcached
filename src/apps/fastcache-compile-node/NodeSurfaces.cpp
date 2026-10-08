@@ -534,8 +534,8 @@ namespace
           .trailer = "-- this node runs consensus and names no address peers dial it at; give --raft-self" },
         { .gap = ConsensusDialGap::AwaitingHostName,
           .address = "AT STARTUP",
-          .trailer = "-- this machine's fully qualified name on the raft port, resolved when the node starts; give "
-                     "--raft-self to state it now" },
+          .trailer = "-- the address this machine routes from on the raft port, or its fully qualified name until a "
+                     "route is known; derived when the node starts; give --raft-self to state it now" },
         { .gap = ConsensusDialGap::DialsIn,
           .address = "-",
           .trailer = "(absent: this node dials its fleet's voters, and nobody dials it)" },

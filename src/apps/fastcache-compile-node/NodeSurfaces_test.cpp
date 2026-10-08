@@ -935,6 +935,10 @@ TEST_CASE("A consensus node that names itself neither way prints NOT STATED and 
     REQUIRE(pending.has_value());
     CHECK(Unwrap(pending).contains("AT STARTUP"));
     CHECK_FALSE(Unwrap(pending).contains("NOT STATED"));
+    // Under `auto` the start derives the ROUTED address, the name only standing in until a route is
+    // known -- so the worksheet names both, the route first, rather than promising the name.
+    CHECK(Unwrap(pending).contains("the address this machine routes from"));
+    CHECK(Unwrap(pending).contains("its fully qualified name until a route is known"));
 }
 
 TEST_CASE("the metrics surfaces a node serves follow the components it was told to run", "[node][surfaces][metrics]")
