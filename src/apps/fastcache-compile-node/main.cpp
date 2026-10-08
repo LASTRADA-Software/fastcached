@@ -2270,7 +2270,8 @@ constexpr auto ThisNetworkWatcherStart = NetworkWatcherStart::InsideTheBody;
 /// @param at Where the caller is.
 /// @param sink Where the events go; must outlive the watcher.
 /// @param clock What the debouncer reads; must outlive the watcher.
-/// @param logger Where a refusal is reported.
+/// @param logger Where a refusal is reported, and a watcher that stops hearing changes says so;
+///        must outlive the watcher.
 /// @return The watcher; null when it does not start here, the platform offers none, or the OS refused.
 [[nodiscard]] std::unique_ptr<NetworkChangeWatcher> StartNetworkWatcherAt(NetworkWatcherStart at,
                                                                           IHostEventSink& sink,
@@ -2279,7 +2280,7 @@ constexpr auto ThisNetworkWatcherStart = NetworkWatcherStart::InsideTheBody;
 {
     if (at != ThisNetworkWatcherStart)
         return nullptr;
-    auto started = StartNetworkChangeWatcher(sink, clock, NetworkDebounce {});
+    auto started = StartNetworkChangeWatcher(sink, clock, NetworkDebounce {}, logger);
     if (started.has_value())
         return std::move(*started);
     logger.Logf(LogLevel::Warn, "network changes will not be reported: {}", started.error());

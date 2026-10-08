@@ -151,12 +151,15 @@ namespace
         int _descriptor = -1;
     };
 
+    #if !defined(__linux__)
     /// @param descriptor Marked close-on-exec, so a compiler the node spawns does not inherit it.
+    /// Only where the platform cannot create a descriptor close-on-exec in one call; Linux always can.
     /// @return Whether it was.
     [[nodiscard]] bool SetCloseOnExec(int descriptor) noexcept
     {
         return ::fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0;
     }
+    #endif
 
     /// The pipe the destructor wakes the reading thread through.
     struct StopPipe
@@ -166,15 +169,26 @@ namespace
     };
 
     /// @return Both ends, close-on-exec; or why not.
+    ///
+    /// Atomically where the platform can (`pipe2(O_CLOEXEC)`, Linux), so no compiler a concurrent
+    /// thread spawns can inherit an end in the window between creating and marking it. macOS has
+    /// no `pipe2`; there the window is closed by ORDER instead -- the watcher starts first thing in
+    /// the serving body, before any tier that spawns a compiler exists.
     [[nodiscard]] std::expected<StopPipe, std::string> MakeStopPipe()
     {
         std::array<int, 2> ends { -1, -1 };
+    #if defined(__linux__)
+        if (::pipe2(ends.data(), O_CLOEXEC) != 0)
+            return std::unexpected { Refusal("stop pipe") };
+        return StopPipe { .readEnd = OwnedDescriptor { ends[0] }, .writeEnd = OwnedDescriptor { ends[1] } };
+    #else
         if (::pipe(ends.data()) != 0)
             return std::unexpected { Refusal("stop pipe") };
         auto stop = StopPipe { .readEnd = OwnedDescriptor { ends[0] }, .writeEnd = OwnedDescriptor { ends[1] } };
         if (!SetCloseOnExec(stop.readEnd.Get()) || !SetCloseOnExec(stop.writeEnd.Get()))
             return std::unexpected { Refusal("stop pipe fcntl") };
         return stop;
+    #endif
     }
 
     /// Reads one change socket on a thread of its own, into one relay.
@@ -187,16 +201,19 @@ namespace
         /// @param sink Where the event goes.
         /// @param clock What the debouncer reads.
         /// @param bound The debounce.
+        /// @param logger Where the read loop ending on its own is said.
         PosixNetworkChangeWatcher(OwnedDescriptor socket,
                                   StopPipe stop,
                                   NetworkChangeClassifier classify,
                                   IHostEventSink& sink,
                                   core::platform::IClock const& clock,
-                                  NetworkDebounce bound):
+                                  NetworkDebounce bound,
+                                  ILogger& logger):
             _relay { sink, clock, bound },
             _socket { std::move(socket) },
             _stop { std::move(stop) },
             _classify { classify },
+            _logger { logger },
             _thread { [this] { Run(); } }
         {
         }
@@ -221,15 +238,31 @@ namespace
         enum class Step : std::uint8_t
         {
             Continue, ///< Poll again.
-            Stop,     ///< Return: stopped, at end of file, or on an error that would repeat.
+            Stopped,  ///< Return: the destructor asked.
+            Ended,    ///< Return: at end of file, or on an error that would repeat; `_ended` says which.
         };
 
-        /// The thread: poll the socket and the stop pipe until the stop pipe is readable.
+        /// The thread: poll the socket and the stop pipe until the stop pipe is readable, or until
+        /// the socket ends -- which is said once, since nothing is heard from here on and a watcher
+        /// that stopped otherwise looks exactly like one on a network that does not change.
         void Run()
         {
             std::vector<std::byte> buffer(ReadBufferSize);
-            while (Poll(buffer) == Step::Continue)
-                continue;
+            auto step = Poll(buffer);
+            while (step == Step::Continue)
+                step = Poll(buffer);
+            if (step == Step::Ended)
+                _logger.Logf(LogLevel::Warn,
+                             "network changes will no longer be reported: {}; only a periodic re-check notices a move",
+                             _ended);
+        }
+
+        /// @param why What ended the read loop.
+        /// @return `Step::Ended`, with @p why kept for the one line `Run` says.
+        [[nodiscard]] Step End(std::string why)
+        {
+            _ended = std::move(why);
+            return Step::Ended;
         }
 
         /// Wait for either descriptor, then read the socket if it is the one ready.
@@ -242,9 +275,9 @@ namespace
                 { .fd = _stop.readEnd.Get(), .events = POLLIN, .revents = 0 },
             });
             if (::poll(fds.data(), fds.size(), -1) < 0)
-                return errno == EINTR ? Step::Continue : Step::Stop;
+                return errno == EINTR ? Step::Continue : End(Refusal("polling the change socket"));
             if (fds[1].revents != 0)
-                return Step::Stop;
+                return Step::Stopped;
             if (fds[0].revents == 0)
                 return Step::Continue;
             return Read(buffer);
@@ -263,7 +296,7 @@ namespace
                 return Step::Continue;
             }
             if (got == 0)
-                return Step::Stop;
+                return End("the change socket was closed");
             switch (errno)
             {
                 case EINTR:
@@ -274,7 +307,7 @@ namespace
                     _relay.Notify();
                     return Step::Continue;
                 default:
-                    return Step::Stop;
+                    return End(Refusal("reading the change socket"));
             }
         }
 
@@ -282,6 +315,8 @@ namespace
         OwnedDescriptor _socket;
         StopPipe _stop;
         NetworkChangeClassifier _classify;
+        ILogger& _logger;
+        std::string _ended; ///< Why the read loop ended on its own; the thread's alone.
         /// LAST, so every member it reads is built before it starts and freed after it joins.
         std::jthread _thread;
     };
@@ -312,6 +347,9 @@ namespace
         std::optional { ChangeSocketRow { .open = &OpenNetlinkSocket, .classify = &NetlinkReportsChange } };
     #elif defined(__APPLE__)
     /// @return A `PF_ROUTE` socket, which hears every family's routing messages; or why not.
+    ///
+    /// Marked close-on-exec after `socket()`: macOS has no `SOCK_CLOEXEC`, so the window is closed
+    /// by ORDER -- the watcher starts before any tier that spawns a compiler exists.
     [[nodiscard]] std::expected<OwnedDescriptor, std::string> OpenRouteSocket()
     {
         auto socket = OwnedDescriptor { ::socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC) };
@@ -334,17 +372,19 @@ namespace
     /// @param sink Where the event goes.
     /// @param clock What the debouncer reads.
     /// @param bound The debounce.
+    /// @param logger Where the read loop ending on its own is said.
     /// @return The running watcher; or why its stop pipe could not be made.
     [[nodiscard]] std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> Watch(
         OwnedDescriptor socket,
         NetworkChangeClassifier classify,
         IHostEventSink& sink,
         core::platform::IClock const& clock,
-        NetworkDebounce bound)
+        NetworkDebounce bound,
+        ILogger& logger)
     {
         return MakeStopPipe().transform([&](StopPipe stop) {
             return std::unique_ptr<NetworkChangeWatcher> { std::make_unique<PosixNetworkChangeWatcher>(
-                std::move(socket), std::move(stop), classify, sink, clock, bound) };
+                std::move(socket), std::move(stop), classify, sink, clock, bound, logger) };
         });
     }
 } // namespace
@@ -354,18 +394,19 @@ std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> WatchNetworkCh
     NetworkChangeClassifier classify,
     IHostEventSink& sink,
     core::platform::IClock const& clock,
-    NetworkDebounce bound)
+    NetworkDebounce bound,
+    ILogger& logger)
 {
-    return Watch(OwnedDescriptor { descriptor }, classify, sink, clock, bound);
+    return Watch(OwnedDescriptor { descriptor }, classify, sink, clock, bound, logger);
 }
 
 std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> StartNetworkChangeWatcher(
-    IHostEventSink& sink, core::platform::IClock const& clock, NetworkDebounce bound)
+    IHostEventSink& sink, core::platform::IClock const& clock, NetworkDebounce bound, ILogger& logger)
 {
     if (!PlatformChangeSocket.has_value())
         return nullptr;
     return PlatformChangeSocket->open().and_then([&](OwnedDescriptor socket) {
-        return Watch(std::move(socket), PlatformChangeSocket->classify, sink, clock, bound);
+        return Watch(std::move(socket), PlatformChangeSocket->classify, sink, clock, bound, logger);
     });
 }
 
@@ -446,8 +487,10 @@ namespace
 } // namespace
 
 std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> StartNetworkChangeWatcher(
-    IHostEventSink& sink, core::platform::IClock const& clock, NetworkDebounce bound)
+    IHostEventSink& sink, core::platform::IClock const& clock, NetworkDebounce bound, ILogger& /*logger*/)
 {
+    // No read loop to end: the OS calls back until the registrations are cancelled, so there is
+    // nothing for the logger to be told.
     auto watcher = std::make_unique<WindowsNetworkChangeWatcher>(sink, clock, bound);
     return watcher->Register().transform(
         [&watcher] { return std::unique_ptr<NetworkChangeWatcher> { std::move(watcher) }; });

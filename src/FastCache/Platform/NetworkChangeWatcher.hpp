@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/HostEvents.hpp>
 
 #include <condition_variable>
@@ -94,10 +95,12 @@ class NetworkChangeWatcher
 /// @param sink Where the event goes; must outlive the watcher.
 /// @param clock What the debouncer's instants are read from; must outlive the watcher.
 /// @param bound The debounce.
+/// @param logger Where a POSIX watcher says, once, that it stopped hearing changes before it was
+///        destroyed -- its socket ended or failed for good; must outlive the watcher.
 /// @return The running watcher, or null where the platform offers nothing; or which registration
 ///         the OS refused, and why.
 [[nodiscard]] std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> StartNetworkChangeWatcher(
-    IHostEventSink& sink, core::platform::IClock const& clock, NetworkDebounce bound);
+    IHostEventSink& sink, core::platform::IClock const& clock, NetworkDebounce bound, ILogger& logger);
 
 #if !defined(_WIN32)
 
@@ -108,7 +111,9 @@ using NetworkChangeClassifier = bool (*)(std::span<std::byte const> buffer) noex
 /// Watch an already-open change socket: a thread of the watcher's own polls it, reads what arrives
 /// and notifies one `NetworkChangeRelay` whenever @p classify says a read reports a change -- or
 /// when the kernel says notifications were dropped (`ENOBUFS`), since a lost change is still one.
-/// The thread stops at end of file or a read error, and always when the watcher is destroyed.
+/// The thread stops at end of file or a read error -- and then says so ONCE, at Warn, because a
+/// watcher that stopped and one that hears nothing look alike from outside -- and always when the
+/// watcher is destroyed, which it does not report.
 ///
 /// The seam `StartNetworkChangeWatcher` opens the OS socket in front of, so the read loop is driven
 /// by a test through a pipe rather than by changing this machine's addresses.
@@ -118,13 +123,15 @@ using NetworkChangeClassifier = bool (*)(std::span<std::byte const> buffer) noex
 /// @param sink Where the event goes; must outlive the watcher.
 /// @param clock What the debouncer's instants are read from; must outlive the watcher.
 /// @param bound The debounce.
+/// @param logger Where the read loop ending on its own is said; must outlive the watcher.
 /// @return The running watcher; or why its stop pipe could not be made.
 [[nodiscard]] std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> WatchNetworkChangeDescriptor(
     int descriptor,
     NetworkChangeClassifier classify,
     IHostEventSink& sink,
     core::platform::IClock const& clock,
-    NetworkDebounce bound);
+    NetworkDebounce bound,
+    ILogger& logger);
 
 #endif
 

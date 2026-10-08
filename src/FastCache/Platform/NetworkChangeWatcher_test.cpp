@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/NetworkChangeMessages.hpp>
 #include <FastCache/Platform/NetworkChangeWatcher.hpp>
 
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -195,10 +197,12 @@ TEST_CASE("The network watcher runs where the platform offers one, and is absent
     {
         core::platform::SteadyClock clock;
         CountingSink sink;
+        FastCache::NullLogger logger;
         std::unique_ptr<FastCache::NetworkChangeWatcher> watcher;
     };
     auto const scene = std::make_shared<Scene>();
-    auto started = FastCache::StartNetworkChangeWatcher(scene->sink, scene->clock, FastCache::NetworkDebounce {});
+    auto started =
+        FastCache::StartNetworkChangeWatcher(scene->sink, scene->clock, FastCache::NetworkDebounce {}, scene->logger);
 
     INFO((started.has_value() ? std::string { "started" } : started.error()));
     REQUIRE(started.has_value());
@@ -282,16 +286,31 @@ struct DescriptorScene
 {
     core::platform::SteadyClock clock;                        ///< Real time: the debounce is short.
     CountingSink sink;                                        ///< Hears the relay.
+    FastCache::CapturingLogger logger;                        ///< Hears the read loop ending on its own.
     Pipe pipe;                                                ///< What the watcher reads.
     std::unique_ptr<FastCache::NetworkChangeWatcher> watcher; ///< The watcher under test.
+
+    /// @return How many lines say the watcher stopped hearing changes.
+    [[nodiscard]] std::size_t StoppedLines() const
+    {
+        auto const records = logger.Snapshot();
+        return static_cast<std::size_t>(std::ranges::count_if(records, [](auto const& record) {
+            return record.level == FastCache::LogLevel::Warn
+                   && record.message.contains("network changes will no longer be reported");
+        }));
+    }
 };
 
 /// @return A scene whose watcher reads its pipe as netlink, with `ShortDebounce`.
 [[nodiscard]] std::shared_ptr<DescriptorScene> MakeDescriptorScene()
 {
     auto scene = std::make_shared<DescriptorScene>();
-    auto started = FastCache::WatchNetworkChangeDescriptor(
-        scene->pipe.TakeReadEnd(), &FastCache::NetlinkReportsChange, scene->sink, scene->clock, ShortDebounce);
+    auto started = FastCache::WatchNetworkChangeDescriptor(scene->pipe.TakeReadEnd(),
+                                                           &FastCache::NetlinkReportsChange,
+                                                           scene->sink,
+                                                           scene->clock,
+                                                           ShortDebounce,
+                                                           scene->logger);
     INFO((started.has_value() ? std::string { "started" } : started.error()));
     REQUIRE(started.has_value());
     REQUIRE(*started != nullptr);
@@ -323,15 +342,24 @@ TEST_CASE("A descriptor watcher reports what its classifier counts and nothing e
 
     INFO("destroying the watcher did not return within DestroyedWithin: its poll ignored the stop");
     REQUIRE(ReturnsWithin(DestroyedWithin, [scene] { scene->watcher.reset(); }));
+    // Stopped by its owner, which is no news: only a read loop that ended ON ITS OWN is said.
+    CHECK(scene->StoppedLines() == 0);
 }
 
-TEST_CASE("A descriptor watcher whose socket ended is still destroyed promptly", "[platform][host-events]")
+TEST_CASE("A descriptor watcher whose socket ended says so once and is still destroyed promptly", "[platform][host-events]")
 {
     auto const scene = MakeDescriptorScene();
     scene->pipe.CloseWriteEnd();
+    // A watcher that stopped hearing changes looks, from outside, exactly like one on a network
+    // that does not change -- so it says so, once, rather than going quiet.
+    REQUIRE(WaitUntil(
+        "the watcher to say its read loop ended",
+        [&scene] { return scene->StoppedLines() == 1; },
+        [&scene] { return std::format("{} stopped line(s)", scene->StoppedLines()); }));
     INFO("destroying the watcher did not return within DestroyedWithin after its descriptor ended");
     REQUIRE(ReturnsWithin(DestroyedWithin, [scene] { scene->watcher.reset(); }));
     CHECK(scene->sink.changes.load() == 0);
+    CHECK(scene->StoppedLines() == 1);
 }
 
 #endif // !_WIN32
