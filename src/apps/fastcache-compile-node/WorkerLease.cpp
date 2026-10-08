@@ -71,7 +71,7 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
                 // What is advertised NOW, which at this moment is what the process
                 // started with -- the seam's value can move later, and this line is a
                 // statement about startup. The move itself is announced where it
-                // happens (`AdvertisedEndpointChange`), so no reader has to infer it
+                // happens (`EndpointResolver`), so no reader has to infer it
                 // from a startup line that was true when it was printed.
                 advertise.Current());
     inForce.Record(BuiltLeaseCheck::Signed);

@@ -320,6 +320,8 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     _metrics { parts.metrics },
     _logger { parts.logger },
     _announced { parts.announced },
+    _endpoints { parts.endpoints },
+    _registeredAs { parts.announced.Current() },
     _locality { parts.locality },
     _machine { std::move(machine) },
     _discovered { std::move(discovered) },
@@ -415,8 +417,12 @@ std::vector<Cc::WorkerRegistrar> WorkerTier::RegistrarsFor(std::map<std::string,
     // The endpoint is asked ONCE for the whole set rather than per registrar: every entry here
     // describes the same machine at the same moment, and a publish landing between two
     // of them would register one toolchain at the new address and the rest at the old.
-    auto const advertised = _announced.Current();
+    return RegistrarsAt(served, _announced.Current());
+}
 
+std::vector<Cc::WorkerRegistrar> WorkerTier::RegistrarsAt(std::map<std::string, ServedToolchain> const& served,
+                                                          std::string const& advertised)
+{
     std::vector<Cc::WorkerRegistrar> built;
     built.reserve(served.size());
     for (auto const& [fingerprint, toolchain]: served)
@@ -437,30 +443,41 @@ void WorkerTier::Serve(std::map<std::string, ServedToolchain> served)
     // refuses a job naming a dropped fingerprint rather than serving it with the new
     // compiler, and it never announces a fingerprint it is not yet ready to serve.
     _jobs.ReplaceToolchains(CompilersOf(_toolchains));
-    AdoptRegistrars(RegistrarsFor(_toolchains), _registrars, _withdrawals);
+    // The endpoint read once and remembered with the set it built, so the next beat compares a
+    // publication against what was REGISTERED.
+    auto endpoint = _announced.Current();
+    AdoptRegistrars(RegistrarsAt(_toolchains, endpoint), _registrars, _withdrawals);
+    _registeredAs = std::move(endpoint);
     // AFTER the two calls above: this says the worker is serving, and it must not say so
     // while the compile port still holds the previous answer.
     PublishToolchains(_runtime, _toolchains.size(), _discovered.entries.size());
 }
 
-void WorkerTier::AnnounceAs(std::string endpoint, core::platform::IClock const& statusClock)
+void WorkerTier::FollowAnnouncedEndpoint(core::platform::IClock const& statusClock)
 {
-    // Published FIRST, so the registrars built below carry the new address and the lease
-    // check moves in the same step. The old registrars still hold the address they
-    // registered under -- `Cc::WorkerRegistrar` keeps its own endpoint precisely so a
-    // withdrawal names the entry that exists rather than the one about to.
-    _announced.Publish(std::move(endpoint));
+    auto now = _announced.Current();
+    if (now == _registeredAs)
+        return;
 
     // The compile port is untouched, and that is the difference from `Serve`: the
     // toolchains and the compilers behind them are unchanged, so nothing about what this
-    // worker will RUN moves. Only the address it is filed under does.
-    AdoptRegistrars(RegistrarsFor(_toolchains), _registrars, _withdrawals);
+    // worker will RUN moves. Only the address it is filed under does. The old registrars still
+    // hold the address they registered under -- `Cc::WorkerRegistrar` keeps its own endpoint
+    // precisely so a withdrawal names the entry that exists rather than the one about to.
+    AdoptRegistrars(RegistrarsAt(_toolchains, now), _registrars, _withdrawals);
 
     // Republished for `node-status`, because the registered count drops to zero until the
     // round that follows re-registers -- and a status still claiming those toolchains
     // registered would be describing entries that were just withdrawn. Nothing was accepted,
     // so the instant of the last acceptance is kept.
     PublishRegistration(_runtime, statusClock, _registrars, 0);
+
+    // At Warn, beside the allowlist's: an address change is a fleet-visible event an operator
+    // is watching for, and the one thing that explains a burst of `LeaseEndpointMismatch` in
+    // the minutes after it. After the republish above, so a reader that sees the line also
+    // sees the registrations it retired.
+    _logger.Log(LogLevel::Warn, DescribeEndpointMove(_registeredAs, now));
+    _registeredAs = std::move(now);
 }
 
 WorkerHeartbeat WorkerTier::Launch(core::platform::IClock const& statusClock, SchedulerReachability& reachability)
@@ -552,17 +569,11 @@ void WorkerTier::Heartbeat(std::stop_token const& stop,
         // reason: this changes what the fleet must be TOLD while changing nothing about
         // the toolchains, so it must not ride the re-survey `reloaded` triggers -- an
         // include-tree walk to move a string would be minutes of work telling the fleet
-        // nothing it could not have had at once. The DERIVED endpoint is what is
-        // compared; `AdvertisedEndpointChange` owns why.
-        //
-        // At Warn, beside the allowlist's: an address change is a fleet-visible event an
-        // operator is watching for, and the one thing that explains a burst of
-        // `LeaseEndpointMismatch` in the minutes after it.
-        if (auto moved = AdvertisedEndpointChange(_announced.Current(), snapshot))
-        {
-            _logger.Log(LogLevel::Warn, moved->announcement);
-            AnnounceAs(std::move(moved->endpoint), statusClock);
-        }
+        // nothing it could not have had at once. The resolver publishes the DERIVED
+        // endpoint -- a reload's and a network change's alike -- and is refreshed first, so
+        // a change this beat was woken for is published before it is compared.
+        _endpoints.Refresh();
+        FollowAnnouncedEndpoint(statusClock);
         auto const depth = RecheckDepthFor(reloaded, beat, SweepEveryBeats);
         auto const voice = SurveyVoiceFor(reloaded, depth);
 
@@ -603,7 +614,9 @@ void WorkerTier::Heartbeat(std::stop_token const& stop,
 
 void WorkerTier::WithdrawForSuspend(HeartbeatRound const& round, core::platform::IClock const& statusClock)
 {
-    RetireAllRegistrations(RegistrarsFor(_toolchains), _registrars, _withdrawals);
+    auto endpoint = _announced.Current();
+    RetireAllRegistrations(RegistrarsAt(_toolchains, endpoint), _registrars, _withdrawals);
+    _registeredAs = std::move(endpoint);
     // Republished: node-status must not claim registrations that were just withdrawn. Nothing
     // was accepted, so the instant of the last acceptance is kept.
     PublishRegistration(_runtime, statusClock, _registrars, 0);

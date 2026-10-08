@@ -6,6 +6,7 @@
 // per file that needs a worker (#1364 needed one to prove every condition row is evaluated).
 
 #include "EndpointDialerTestUtils.hpp"
+#include "EndpointResolver.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeFormation.hpp"
@@ -21,6 +22,7 @@
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <expected>
 #include <filesystem>
@@ -43,6 +45,27 @@
 
 namespace FastCache::Node::WorkerTierTesting
 {
+
+/// A refresh that publishes nothing and counts how often it was asked: a case publishes on
+/// `WorkerTierFixture::announced` itself, as `EndpointResolver` would.
+class CountingRefresh final: public IEndpointRefresh
+{
+  public:
+    /// Counts the call.
+    void Refresh() override
+    {
+        ++_calls;
+    }
+
+    /// @return How often `Refresh` was asked; read after the heartbeat is joined.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls.load();
+    }
+
+  private:
+    std::atomic<int> _calls { 0 };
+};
 
 /// A discovery that finds nothing and counts how often it was asked.
 class CountingDiscovery final: public Cc::IToolchainDiscovery
@@ -121,6 +144,8 @@ struct WorkerTierFixture
     /// borrows it rather than building one, so the presence loop and the worker read the same
     /// value changing at the same moment.
     AnnouncedEndpoint announced { "127.0.0.1:6674" };
+    /// What the heartbeat refreshes at the top of every beat; publishes nothing.
+    CountingRefresh endpoints;
     /// What the next `Start` builds from; a case edits it first.
     NodeConfig cfg = Worker();
     /// Where the tier answers its conditions; a case reads it after `Start`.
@@ -199,6 +224,7 @@ struct WorkerTierFixture
                                                    .reloader = nullptr,
                                                    .capacity = capacity,
                                                    .announced = announced,
+                                                   .endpoints = endpoints,
                                                    .activatedNodeEndpoint = activatedNodeEndpoint,
                                                    .schedulers = *schedulers.back(),
                                                    .membership = membership,

@@ -50,6 +50,7 @@ add_executable(fastcache-compile-node
     CordonCli.cpp
     DiscoveryTier.cpp
     EndpointDialer.cpp
+    EndpointResolver.cpp
     FleetProbe.cpp
     FleetSummaryResponder.cpp
     ForeignFleetWatch.cpp
@@ -147,6 +148,8 @@ if(FASTCACHED_BUILD_TESTS)
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
         EndpointDialer.cpp
+        EndpointResolver.cpp
+        EndpointResolver_test.cpp
         FleetProbe.cpp
         FleetProbe_test.cpp
         FleetSummaryResponder.cpp

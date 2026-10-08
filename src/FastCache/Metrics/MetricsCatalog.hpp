@@ -1474,6 +1474,16 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "few at every start are the boot order; a steady rise is a node that cannot elect or cannot hear its "
               "leader.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeEndpointChanges,
+      .prometheusName = "fastcache_node_endpoint_changes_total",
+      .help = "Times this node's advertised endpoint moved because the address it routes from changed or a reload "
+              "re-pinned it.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeRaftEndpointChanges,
+      .prometheusName = "fastcache_node_raft_endpoint_changes_total",
+      .help = "Times this node's advertised Raft endpoint moved because the address it routes from changed or a "
+              "reload re-pinned it.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents

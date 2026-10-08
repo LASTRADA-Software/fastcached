@@ -190,6 +190,7 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _prover { parts.prover },
     _reachability { parts.reachability },
     _askedJoins { parts.askedJoins },
+    _endpoints { parts.endpoints },
     // `AnnouncedCapacity` rather than `Distributed::CapacityToWire` alone: the latter knows
     // nothing of the version, so a node with no worker sent NODE-ANNOUNCE with none, and the
     // leader recorded it exactly as absent as a build too old to know the field.
@@ -212,9 +213,12 @@ void NodePresence::Loop(std::stop_token const& stop)
     {
         // Read once per round through the seam, never captured: this is the one value the
         // worker registrations and this loop must agree on, and #1279 is what a second reader
-        // of the configuration costs. On a node with no worker nothing republishes it, which
-        // is correct -- there is no re-survey to learn a new address from.
-        //
+        // of the configuration costs. Refreshed first, so a network change that woke this round
+        // is published -- by the resolver, the value's one writer -- before it is read here,
+        // whichever of the two loops and the resolver's own thread heard it first.
+        if (_endpoints != nullptr)
+            _endpoints->Refresh();
+
         // An empty one is a node that advertises nothing. The startup table already refuses
         // that for a worker; for a node running none it is legal and simply means there is no
         // address to file a row under, so the round is skipped rather than sent. Silent,

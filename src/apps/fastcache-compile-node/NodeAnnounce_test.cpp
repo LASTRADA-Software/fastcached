@@ -290,55 +290,17 @@ TEST_CASE("A node re-adopting the same set at the same address retires nothing",
     CHECK(EndpointsOf(current) == std::vector<std::string> { std::string { ThisNode } });
 }
 
-TEST_CASE("The endpoint a heartbeat re-announces is the DERIVED one, not the flag", "[node][announce][advertise]")
+TEST_CASE("The line a worker logs for a moved endpoint names both addresses", "[node][announce][advertise]")
 {
-    // `AdvertisedEndpointChange` is what decides whether a round re-announces at all,
-    // and it is wrong silently in both directions: missed, the fleet keeps leasing an
-    // address nobody answers; fired spuriously, every worker re-registers because
-    // somebody saved a file. Both directions are here.
-    SECTION("no configuration file means no second moment")
-    {
-        // The arm `ConfiguredCredential` has as a null reloader. A worker started with
-        // no file has nothing that could publish a new value, and a change function that
-        // answered anything here would be describing a configuration that cannot arrive.
-        CHECK_FALSE(AdvertisedEndpointChange(ThisNode, nullptr).has_value());
-    }
-
-    SECTION("a moved address is reported, and the line names both")
-    {
-        auto live = std::make_shared<NodeConfig>();
-        live->advertise = std::string { MovedNode };
-
-        auto const moved = AdvertisedEndpointChange(ThisNode, live);
-        REQUIRE(moved.has_value());
-        // `Unwrap` and not `moved->`, which is this repository's rule for an optional in
-        // a test and a build failure otherwise. A reference, safely, because `moved` is a
-        // named local rather than the temporary that form warns about.
-        auto const& change = Unwrap(moved);
-        CHECK(change.endpoint == MovedNode);
-        // Both addresses, because a line naming only the new one cannot be told from a
-        // startup line -- and the minutes after this is logged are when somebody is
-        // reading it to explain a burst of endpoint-mismatch refusals.
-        CHECK(change.announcement.contains(MovedNode));
-        CHECK(change.announcement.contains(ThisNode));
-    }
-
-    SECTION("the same address is not a change, however it is spelled")
-    {
-        // The direction that decides whether this is safe to run every beat. A file that
-        // spells out the value already in force moves the `--advertise` ROW -- which is
-        // what the reload machinery compares -- and moves nothing the scheduler keys on.
-        // Comparing the row here would re-register a fleet for a no-op edit.
-        auto live = std::make_shared<NodeConfig>();
-        auto const derived = AdvertisedEndpoint(*live);
-        REQUIRE_FALSE(derived.empty());
-
-        auto explicitlySpelled = std::make_shared<NodeConfig>();
-        explicitlySpelled->advertise = derived;
-
-        CHECK_FALSE(AdvertisedEndpointChange(derived, live).has_value());
-        CHECK_FALSE(AdvertisedEndpointChange(derived, explicitlySpelled).has_value());
-    }
+    // WHETHER the endpoint moved is `EndpointResolver`'s to decide now, from the DERIVED endpoint
+    // rather than the flag -- `EndpointResolver_test.cpp` holds that half. What stays here is what
+    // is SAID: both addresses, because a line naming only the new one cannot be told from a
+    // startup line -- and the minutes after this is logged are when somebody is reading it to
+    // explain a burst of endpoint-mismatch refusals.
+    auto const said = DescribeEndpointMove(ThisNode, MovedNode);
+    CHECK(said.contains(MovedNode));
+    CHECK(said.contains(ThisNode));
+    CHECK(said.starts_with(std::format("now advertising {} instead of {}", MovedNode, ThisNode)));
 }
 
 // --- The cordon reaches the scheduler (#1303) -------------------------------

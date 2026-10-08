@@ -55,6 +55,11 @@ struct ReloadBasis
     NodeHostNames hostNames;                                ///< This machine's names, as the start asked them.
     KeptFormationReader formation; ///< The formation the running body adopted; a reload never mints one.
     NodeIdentity identity;         ///< The id and key the start resolved.
+    /// The address the RUNNING node routes from now (`RouteHostCell`), asked at every reload: a
+    /// candidate shaped without it derives an `auto` endpoint the running node does not advertise,
+    /// so the startup table would judge -- and refuse -- an address nobody uses. Empty or unset for
+    /// none, which leaves the candidate on the name chain the start would have used offline.
+    std::function<std::string()> routeHost {};
 };
 
 /// How the node's reloader reads its file: a FRESH configuration, the file applied through the

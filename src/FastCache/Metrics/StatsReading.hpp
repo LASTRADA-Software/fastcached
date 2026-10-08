@@ -434,8 +434,9 @@ enum class MetricsSurface : std::uint8_t
 
     /// The node's shared `0xFC` listener and the responders behind it: `FrameEndpoint.cpp`,
     /// `Responders.hpp`, `MembershipGate.hpp`, `NodeProofResponder.cpp`,
-    /// `NodeStatusResponder.cpp` and `FleetTextResponder.cpp`. Always served by the node and
-    /// never by the daemon.
+    /// `NodeStatusResponder.cpp` and `FleetTextResponder.cpp` -- and `EndpointResolver.cpp`, which
+    /// publishes the address that listener is reached at. Always served by the node and never by
+    /// the daemon.
     NodeFrameEndpoint,
 
     /// LAN discovery, `Cluster/DiscoveryService.cpp` (#178). Served only where `--discovery` is
@@ -510,22 +511,22 @@ struct CounterSoleWriter
 /// a row silently absent from the attribution and indistinguishable from one nobody had
 /// considered, cannot recur by omission ([#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)).
 ///
-/// **How the 230 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 58
-/// of them and would have rendered the other 172 absent -- the same defect as the bug, three
+/// **How the 232 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 58
+/// of them and would have rendered the other 174 absent -- the same defect as the bug, three
 /// times larger. The rows are written by five mechanisms, and reading only `SurfaceRefusal`
-/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 145 of the 172 and
+/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 147 of the 174 and
 /// leaves 27 looking unwritten:
 ///
 /// | mechanism | rows |
 /// |---|---|
-/// | a `.counter` table row, spent by `Refuse(row)`, `RefuseAs` or an outcome table's reader | 146 |
+/// | a `.counter` table row, spent by `Refuse(row)`, `RefuseAs` or an outcome table's reader | 148 |
 /// | a `LeaseToken.hpp` outcome row's `workerCounter` | 10 |
 /// | returned by a classifier for its caller to spend | 4 |
 /// | a `CacheTierProfile` member, spent by the tier built with it | 16 |
 /// | `Increment(Counter::X)` directly | 58 |
 ///
-/// The column sums past 230 because four rows are written two ways -- and the 145 above is not
-/// the 146 here: 146 rows HAVE a refusal row, and 145 of those have no increment site, which is
+/// The column sums past 232 because four rows are written two ways -- and the 147 above is not
+/// the 148 here: 148 rows HAVE a refusal row, and 147 of those have no increment site, which is
 /// what a `SurfaceRefusal`-only reading would reach. Two figures one apart, measuring different
 /// things, is exactly how a census comes to be quoted wrong, so both are asserted.
 ///
@@ -978,6 +979,10 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::NodeFormation },
     CounterSoleWriter { .counter = IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied,
                         .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeEndpointChanges,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeRaftEndpointChanges,
+                        .surface = MetricsSurface::NodeFrameEndpoint },
 };
 
 /// Whether every catalogue row has at least one surface attributed to it.
@@ -1005,7 +1010,7 @@ inline constexpr std::array CounterSoleWriterTable {
 }
 
 /// A `consteval` fold rather than a size comparison, because `CounterSoleWriterTable.size()`
-/// counts (counter, surface) PAIRS: it is 231 for 230 counters today, and a row duplicated
+/// counts (counter, surface) PAIRS: it is 233 for 232 counters today, and a row duplicated
 /// while another went missing would leave any arithmetic on the size perfectly consistent.
 ///
 /// @return True when no enumerator is missing from the table.

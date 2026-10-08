@@ -615,7 +615,11 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // Moved when the disk budget became the store's page footprint: `StorageStats` gained
     // `fileBytes`, the length of the file backing a tier, which every storage block now carries
     // beside `bytesUsed`. Clients and nodes upgrade together. Read off the built test.
-    CHECK(StatsReadingLayout == 0xdf701fde48c24916ULL);
+    //
+    // Moved when `node_endpoint_changes` and `node_raft_endpoint_changes` joined the catalogue last
+    // (roaming node addresses: the endpoint resolver counts each published move). Clients and nodes
+    // upgrade together. Read off the built test, never computed by hand.
+    CHECK(StatsReadingLayout == 0x4f985465a864bf5eULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

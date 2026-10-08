@@ -18,6 +18,7 @@
 #include "CordonCli.hpp"
 #include "DiscoveryTier.hpp"
 #include "EndpointDialer.hpp"
+#include "EndpointResolver.hpp"
 #include "EnrollClient.hpp"
 #include "EnrollmentResponder.hpp"
 #include "EnrollmentWindow.hpp"
@@ -25,6 +26,7 @@
 #include "FleetTextResponder.hpp"
 #include "FormationLoop.hpp"
 #include "FormationRuntime.hpp"
+#include "LiveNodeConfig.hpp"
 #include "LiveStatsResponder.hpp"
 #include "LiveStatsSources.hpp"
 #include "NodeAnnounce.hpp"
@@ -597,12 +599,22 @@ using Node::NodeReloader;
     return Node::ActivatedEndpoint { .host = bound->host, .port = bound->port };
 }
 
+/// Where a body asks which address this machine routes from, and where the last answer is kept for
+/// the process -- so a reformed body starts from the route the last one found, and a reload candidate
+/// reads the one the running node advertises.
+struct RouteParts
+{
+    IRouteProbe const& probe;  ///< The kernel's answer.
+    Node::RouteHostCell& cell; ///< The last usable route host.
+};
+
 /// Everything the node runs, under whichever host runs it.
 /// @param cfg The configuration the node started with.
 /// @param identityKey The machine's identity key, or nothing.
 /// @param logger Where the node reports.
 /// @param reloader The live configuration; null with no file.
 /// @param hostEvents Where the host's suspend, resume and network events arrive.
+/// @param routeAt Where this machine's route is asked, and where the last one is kept for the process.
 /// @return The process's exit status.
 [[nodiscard]] int WorkerBody(NodeConfig const& cfg,
                              std::optional<Ed25519KeyPair> const& identityKey,
@@ -611,7 +623,8 @@ using Node::NodeReloader;
                              IHostEvents& hostEvents,
                              Node::FormationBody const& formation,
                              std::optional<int> activated,
-                             Node::LeaseCheckInForce& leaseCheck)
+                             Node::LeaseCheckInForce& leaseCheck,
+                             RouteParts const& routeAt)
 {
     // ONE origin for every uptime this process reports. `/healthz` and the `0xFC`
     // `NodeStatus` verb both answer *how long has this been serving*, and two
@@ -660,8 +673,8 @@ using Node::NodeReloader;
     // tier** (#1440). Both the worker's registrations and the presence loop's announcements
     // name this machine's address, and two sources would be two values changing at two
     // moments -- the defect #1279 closed inside the worker, reopened between two components.
-    // Seeded with what the process started with; the worker tier republishes it when a
-    // re-survey finds the configuration's answer has moved, and is its only writer.
+    // Seeded with what the process started with; `endpointResolver` below republishes it when
+    // the address this machine routes from moves or a reload re-pins it, and is its only writer.
     //
     // Declared up here, above every component that reads it, so it outlives all of them.
     Node::AnnouncedEndpoint announced { advertise };
@@ -694,6 +707,21 @@ using Node::NodeReloader;
         logger.Log(LogLevel::Info, *said);
 
     AtomicMetricsSink metrics;
+
+    // **The sole publisher of both endpoints this node advertises** -- the `0xFC` one above and the
+    // Raft one beside it -- re-derived from the configuration in force and the address this machine
+    // routes from. Subscribed to the host's events BEFORE every other listener, so a network change
+    // marks the route stale before the worker's heartbeat or the presence loop is woken for it --
+    // and both refresh it at the top of each round anyway, so that order is a head start rather
+    // than a dependency. Declared above every component that reads either endpoint.
+    Node::AnnouncedEndpoint raftAnnounced { Node::RaftSelfEndpoint(cfg) };
+    Node::LiveNodeConfig const endpointConfig { cfg, reloader };
+    Node::SchedulerProbeTargets const probeTargets { appliedSchedulers };
+    core::platform::SteadyClock const endpointClock;
+    Node::EndpointResolver endpointResolver { endpointConfig, routeAt.probe, probeTargets, endpointClock, routeAt.cell,
+                                              announced,      raftAnnounced, metrics,      logger };
+    HostEventSubscription const endpointEvents { hostEvents, endpointResolver };
+    auto const endpointRefresh = endpointResolver.Launch();
 
     // **What this node has detected that an operator must act on, as one table** (#1364). Every
     // row was log-only before, and a log line scrolls away. Declared above every component that
@@ -993,6 +1021,7 @@ using Node::NodeReloader;
                                                                            .reloader = reloader,
                                                                            .capacity = capacity,
                                                                            .announced = announced,
+                                                                           .endpoints = endpointResolver,
                                                                            .activatedNodeEndpoint = activatedNodeEndpoint,
                                                                            .schedulers = appliedSchedulers,
                                                                            .membership = membership.Oracle(),
@@ -1631,7 +1660,8 @@ using Node::NodeReloader;
                                                             .reachability = schedulerReachability,
                                                             .dialer = presenceDialer,
                                                             .hostEvents = hostEvents,
-                                                            .askedJoins = Node::AskedJoinsOf(formationRuntime.get()) });
+                                                            .askedJoins = Node::AskedJoinsOf(formationRuntime.get()),
+                                                            .endpoints = &endpointResolver });
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.
@@ -1747,6 +1777,7 @@ struct ServingParts
     Node::ReformRequest& reform;            ///< Raised by a move; ends a body and starts the next.
     Node::FormationRuntimeParts runtime;    ///< What every body's formation acts through.
     Node::LeaseCheckInForce& leaseCheck;    ///< Where every body's worker records the lease check it built.
+    RouteParts route;                       ///< Where every body's endpoint resolver asks and keeps the route.
 };
 
 /// Wait @p wait, returning early once a stop is asked: the pause between two reforms.
@@ -1830,7 +1861,8 @@ void PauseUnlessStopped(std::chrono::milliseconds wait)
                               hostEvents,
                               Node::FormationBody { .record = record, .durables = durables, .reloader = reloader },
                               served,
-                              parts.leaseCheck);
+                              parts.leaseCheck,
+                              parts.route);
         },
         logger);
 }
@@ -2581,6 +2613,17 @@ int main(int argc, char** argv)
     if (auto const stage = UnreadStateStage(cfg); stage.has_value())
         return RefuseStart(
             startHost, logger, std::format("{}; refusing to start", StateDirectoryUnreadRefusal(cfg)), ExitCodeFor(*stage));
+
+    // **The address this machine routes from, probed once before the table judges the endpoints it
+    // derives** -- `auto` advertises it on a wildcard bind, and a rule over an address judged without
+    // it would judge one this node never advertises. Applied to both configurations as the names are
+    // below; asks the kernel's routing table only, sends nothing and waits on nothing. The cell keeps
+    // it for the process: every body's resolver re-probes from it, and every reload candidate is
+    // shaped by its live value (`ReloadBasis::routeHost`).
+    auto const routeProbe = MakeSystemRouteProbe();
+    Node::RouteHostCell routeHost { Node::ProbeRouteHost(*routeProbe, {}).value_or(std::string {}) };
+    Node::ApplyRouteHost(cfg, routeHost.Current());
+    Node::ApplyRouteHost(cliOnly, routeHost.Current());
     if (auto const rejection = StartupPolicyRejection(cfg))
         return RefuseStart(startHost, logger, *rejection, ExitCodeFor(StartStage::StartupRules));
 
@@ -2708,6 +2751,10 @@ int main(int argc, char** argv)
                                                          // loop, the thread a reform adopts on between bodies.
                                                          .formation = Node::RunningFormationOf(*adopted),
                                                          .identity = identity->value_or(Node::NodeIdentity {}),
+                                                         // The route the running node derives its
+                                                         // endpoints from NOW, so the table judges a
+                                                         // candidate by the address it would advertise.
+                                                         .routeHost = [&routeHost] { return routeHost.Current(); },
                                                      }),
                          Node::ReloadCheckWith(leaseCheck));
 
@@ -2871,7 +2918,8 @@ int main(int argc, char** argv)
                                               .srv = *formationSrv,
                                               .wait = formationWait,
                                           },
-                                      .leaseCheck = leaseCheck };
+                                      .leaseCheck = leaseCheck,
+                                      .route = RouteParts { .probe = *routeProbe, .cell = routeHost } };
     return host->Run([&cfg, &identityKey, &logger, reloaderPtr, &hostEvents, &networkClock, &adopted, &parts] {
         auto const bodyNetworkWatcher =
             StartNetworkWatcherAt(NetworkWatcherStart::InsideTheBody, hostEvents, networkClock, logger);

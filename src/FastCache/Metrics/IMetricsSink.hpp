@@ -1554,6 +1554,15 @@ class IMetricsSink
         /// order; a count that keeps rising is a node that cannot elect, or cannot hear its leader.
         NodeProofsRefusedRosterNotYetApplied,
 
+        /// Times this node's advertised `0xFC` endpoint moved: the address it routes from changed
+        /// (a DHCP renewal, Wi-Fi to wired, another network) or a reload re-pinned `--advertise`.
+        /// Written by `EndpointResolver` alone, the endpoint's sole publisher.
+        NodeEndpointChanges,
+        /// Times this node's advertised Raft endpoint moved, for the same two reasons; the Raft
+        /// half of `NodeEndpointChanges`, counted apart because only a voter's move re-addresses it
+        /// in the cluster's record.
+        NodeRaftEndpointChanges,
+
         Last,
     };
 

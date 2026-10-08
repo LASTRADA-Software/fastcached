@@ -5,6 +5,7 @@
 
 #include <FastCache/Config/YamlReader.hpp>
 
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,7 @@ NodeReloader::Reparse ReloadCandidateReader(std::span<char const* const> args, R
         // identity dials the names.
         candidate.stateDirectory = basis.stateDirectory;
         ApplyHostNames(candidate, basis.hostNames);
+        ApplyRouteHost(candidate, basis.routeHost ? basis.routeHost() : std::string {});
 
         // The formation as it is kept NOW: a candidate shaped by no record would run no consensus the
         // running node does, and one shaped by the record the start kept would put a reformed node

@@ -29,8 +29,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <initializer_list>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -710,4 +712,134 @@ TEST_CASE("RegistrarsFor asks RegisteredToolchainLabel rather than sending a lab
     CHECK(records.front().level == LogLevel::Warn);
     CHECK(records.front().message.contains("/opt/cross/bin/g++"));
     CHECK(records.front().message.contains("it is not valid UTF-8"));
+}
+
+namespace
+{
+
+/// How many times @p needle occurs in @p haystack.
+/// @param haystack Bytes a scheduler was sent.
+/// @param needle A frame, or text, to look for.
+/// @return The count.
+[[nodiscard]] std::size_t Occurrences(std::span<std::byte const> haystack, std::span<std::byte const> needle)
+{
+    auto count = std::size_t { 0 };
+    while (!needle.empty())
+    {
+        auto const found = std::ranges::search(haystack, needle);
+        if (found.empty())
+            break;
+        ++count;
+        haystack = std::span<std::byte const> { found.end(), haystack.end() };
+    }
+    return count;
+}
+
+/// @param text Text as it travels.
+/// @return Its bytes.
+[[nodiscard]] std::span<std::byte const> BytesOf(std::string_view text) noexcept
+{
+    return std::as_bytes(std::span<char const> { text });
+}
+
+/// A framed REGISTER reply accepting a worker under @p workerId.
+/// @param workerId The id to assign.
+/// @return The reply bytes.
+[[nodiscard]] std::vector<std::byte> RegisterAccepted(std::string_view workerId)
+{
+    namespace Wire = CompileCacheWire;
+    auto const payload =
+        Wire::EncodeRegisterReply({ .workerId = std::string { workerId }, .clusterId = "fleet-1", .epoch = 1 });
+    return Wire::EncodeReply(Wire::Status::Ok, payload);
+}
+
+} // namespace
+
+TEST_CASE("A worker re-registers under a moved endpoint and withdraws the old one exactly once", "[node][worker][endpoint]")
+{
+    // The resolver publishes; the heartbeat follows at its next beat. Three moves in three beats:
+    // each superseded endpoint is withdrawn once, by the id it was registered under, and the
+    // registrations end at the last one. Compared against what was REGISTERED, so no publish is
+    // withdrawn twice and none is skipped.
+    namespace Wire = CompileCacheWire;
+    constexpr auto A = std::string_view { "10.0.0.5:6674" };
+    constexpr auto B = std::string_view { "192.168.7.2:6674" };
+    constexpr auto C = std::string_view { "172.16.0.9:6674" };
+
+    WorkerTierFixture fixture;
+    // A PINNED identity, so the survey serves it without spawning anything.
+    fixture.cfg.toolchains = { "deadbeef=/opt/none/g++" };
+    auto const ok = Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {});
+    // One dial per round: registered at A; A withdrawn and registered at B; B withdrawn and
+    // registered at C. Spare heartbeats after, because a dial past the script would FAIL on the
+    // heartbeat's thread, where no assertion may run.
+    fixture.heartbeatReplies = {
+        RegisterAccepted("w-a"),
+        Testing::Replies({ ok, RegisterAccepted("w-b") }),
+        Testing::Replies({ ok, RegisterAccepted("w-c") }),
+        ok,
+        ok,
+        ok,
+    };
+    fixture.announced.Publish(std::string { A });
+
+    auto const started = fixture.Start();
+    REQUIRE(started.has_value());
+    REQUIRE(started.value() != nullptr);
+    auto& tier = *started.value();
+    core::platform::ManualClock statusClock;
+    SchedulerReachability reachability { statusClock, nullptr };
+
+    auto const registered = [&tier] {
+        auto const reading = tier.Runtime().Registration();
+        return reading.has_value() && reading->registered == 1;
+    };
+    auto const describe = [&tier, &fixture] {
+        auto const reading = tier.Runtime().Registration();
+        return std::format("registered {} of {}; {} refresh(es)",
+                           reading.has_value() ? reading->registered : 0U,
+                           reading.has_value() ? reading->total : 0U,
+                           fixture.endpoints.Calls());
+    };
+    // The move's Warn is logged after its registrations were republished as retired, so once it is
+    // seen a registered count of one is the round AFTER the move.
+    auto const moveSaid = [&fixture](std::string_view to) {
+        auto const records = fixture.logger.Snapshot();
+        return std::ranges::any_of(records, [to](CapturingLogger::Record const& record) {
+            return record.level == LogLevel::Warn && record.message.contains(std::format("now advertising {}", to));
+        });
+    };
+
+    {
+        auto const heartbeat = tier.Launch(statusClock, reachability);
+        REQUIRE(Testing::WaitUntil("the first registration, at A", registered, describe));
+
+        for (auto const to: { B, C })
+        {
+            fixture.announced.Publish(std::string { to });
+            fixture.hostEvents.Fire(HostEvent::NetworkChanged);
+            REQUIRE(Testing::WaitUntil(
+                std::format("the re-registration at {}", to), [&] { return moveSaid(to) && registered(); }, describe));
+        }
+    }
+    tier.StopAndDrain();
+
+    auto& dialer = fixture.Dialer();
+    REQUIRE(dialer.Dialed().size() >= 3);
+    auto withdrawalsOf = [&dialer](std::string_view workerId) {
+        auto const frame = Wire::EncodeWithdraw(workerId);
+        auto count = std::size_t { 0 };
+        for (auto const index: std::views::iota(std::size_t { 0 }, dialer.Dialed().size()))
+            count += Occurrences(dialer.SentOn(index), frame);
+        return count;
+    };
+    CHECK(withdrawalsOf("w-a") == 1);
+    CHECK(withdrawalsOf("w-b") == 1);
+    CHECK(withdrawalsOf("w-c") == 0);
+    // Each round registered under the endpoint published before it, and the last one is C.
+    CHECK(Occurrences(dialer.SentOn(0), BytesOf(A)) == 1);
+    CHECK(Occurrences(dialer.SentOn(1), BytesOf(B)) == 1);
+    CHECK(Occurrences(dialer.SentOn(2), BytesOf(C)) == 1);
+    CHECK(fixture.announced.Current() == C);
+    CHECK(fixture.endpoints.Calls() >= 3);
 }

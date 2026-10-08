@@ -308,6 +308,13 @@ membership flag, registering with a scheduler on another machine — was refused
 at a hand start, while `--install-service` refused the same command line. That is now a
 startup refusal as well.
 
+### When this node's address moves
+
+| Counter | What a rise means |
+|---|---|
+| `fastcache_node_endpoint_changes_total` | The endpoint this node advertises moved: the address it routes from changed (a DHCP renewal, Wi-Fi to wired, another network), or a reload re-pinned `--advertise`. Each move is logged at Info with the old and the new endpoint; a worker re-registers under the new one at its next heartbeat. Zero forever on a node whose `--advertise` is pinned. |
+| `fastcache_node_raft_endpoint_changes_total` | The Raft endpoint this node advertises moved, for the same two reasons. Read it beside the row above: the two move together unless `--raft-self` is pinned apart from `--advertise`. |
+
 ## Anything the fleet reads has to be text
 
 A value that leaves this machine has to be valid UTF-8, because every other

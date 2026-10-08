@@ -1142,7 +1142,7 @@ inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--
 ///
 /// **A list a `static_assert` reads rather than one any function walks, and that is the
 /// whole of its job today.** The DECISION to re-announce is made by comparing the
-/// DERIVED endpoint (`AdvertisedEndpointChange`), not by comparing this row: a save that
+/// DERIVED endpoint (`EndpointResolver` publishes it), not by comparing this row: a save that
 /// clears `--advertise` where its value equalled the `Node` surface's resolved address
 /// moves this row and changes nothing the scheduler keys on, and re-registering a fleet
 /// for that is the spurious direction. So the list forces the classification at the
