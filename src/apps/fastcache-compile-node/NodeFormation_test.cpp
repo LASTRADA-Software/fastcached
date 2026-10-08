@@ -106,12 +106,32 @@ TEST_CASE("Each mode opens the Raft port its row says and runs the consensus it 
         bool raftPort;
         bool scheduler;
         bool enrollment;
+        bool redirect;
     };
-    for (auto const row:
-         { Row { .mode = Solitary, .consensus = true, .raftPort = true, .scheduler = true, .enrollment = true },
-           Row { .mode = Pending, .consensus = true, .raftPort = true, .scheduler = true, .enrollment = true },
-           Row { .mode = Learner, .consensus = true, .raftPort = false, .scheduler = false, .enrollment = false },
-           Row { .mode = Voter, .consensus = true, .raftPort = true, .scheduler = true, .enrollment = true } })
+    for (auto const row: { Row { .mode = Solitary,
+                                 .consensus = true,
+                                 .raftPort = true,
+                                 .scheduler = true,
+                                 .enrollment = true,
+                                 .redirect = false },
+                           Row { .mode = Pending,
+                                 .consensus = true,
+                                 .raftPort = true,
+                                 .scheduler = true,
+                                 .enrollment = true,
+                                 .redirect = false },
+                           Row { .mode = Learner,
+                                 .consensus = true,
+                                 .raftPort = false,
+                                 .scheduler = false,
+                                 .enrollment = false,
+                                 .redirect = true },
+                           Row { .mode = Voter,
+                                 .consensus = true,
+                                 .raftPort = true,
+                                 .scheduler = true,
+                                 .enrollment = true,
+                                 .redirect = false } })
     {
         INFO(Cluster::NodeModeRowFor(row.mode).name);
         auto const cfg = FormedBy(RecordIn(row.mode));
@@ -122,6 +142,10 @@ TEST_CASE("Each mode opens the Raft port its row says and runs the consensus it 
         CHECK(ServesEnrollment(cfg, ServesScheduler(cfg)) == row.enrollment);
         // A scheduler tier that failed to start serves no window, whatever the mode says.
         CHECK_FALSE(ServesEnrollment(cfg, false));
+        // Asked as `main` asks it (#1639): a learner redirects its launchers, and no node both
+        // schedules and redirects.
+        CHECK(RedirectsScheduling(cfg) == row.redirect);
+        CHECK_FALSE((ServesScheduler(cfg) && RedirectsScheduling(cfg)));
     }
 }
 
@@ -131,6 +155,7 @@ TEST_CASE("A configuration no record shaped runs no consensus and opens no raft 
     CHECK_FALSE(RunsConsensus(cfg));
     CHECK_FALSE(ServesScheduler(cfg));
     CHECK_FALSE(ServesEnrollment(cfg, true));
+    CHECK_FALSE(RedirectsScheduling(cfg));
     CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).empty());
     CHECK(SchedulersOf(cfg, AsConfigured).empty());
     CHECK(BootstrapMembersOf(cfg).empty());
@@ -149,7 +174,19 @@ TEST_CASE("An empty --listen-raft closes consensus for a mode that listens and n
         cfg.raftListen.clear();
         CHECK(RunsConsensus(cfg) == !ModeOpensRaftPort(mode.mode));
         CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).empty());
+        // A node whose consensus is closed follows no leader, so it has none to redirect to; one
+        // that still runs it (a learner) does.
+        CHECK(RedirectsScheduling(cfg) == RunsConsensus(cfg));
+        CHECK_FALSE((ServesScheduler(cfg) && RedirectsScheduling(cfg)));
     }
+
+    // Named, because it is the case a narrowed predicate gets wrong: a voter with its consensus
+    // closed neither schedules nor redirects, so its family reads as a consensus-less node's.
+    auto voter = FormedBy(RecordIn(Cluster::NodeMode::Voter));
+    voter.raftListen.clear();
+    REQUIRE_FALSE(RunsConsensus(voter));
+    CHECK_FALSE(ServesScheduler(voter));
+    CHECK_FALSE(RedirectsScheduling(voter));
 }
 
 TEST_CASE("A pending node keeps serving exactly what it served while solitary", "[node][formation][mode]")
@@ -772,11 +809,13 @@ TEST_CASE("A node pinned to another fleet records nobody, and one pinned to its 
 
     cfg.fleetPin = pinTo("pinned-c", ThisNode);
     CHECK_FALSE(ServesEnrollment(cfg, true));
+    CHECK_FALSE(RedirectsScheduling(cfg));
 
     // Its own cluster, but not under its own key: every answer it signed would be refused by the
     // joiners that pin, so it records nobody.
     cfg.fleetPin = pinTo("own-c", "n-office");
     CHECK_FALSE(ServesEnrollment(cfg, true));
+    CHECK_FALSE(RedirectsScheduling(cfg));
 }
 
 TEST_CASE("A node that records nobody knows which reason, and serves exactly when it names none",

@@ -117,6 +117,17 @@ struct NodeFormationView
 /// @return True when the scheduler tier belongs here.
 [[nodiscard]] bool ServesScheduler(NodeConfig const& cfg) noexcept;
 
+/// Whether @p cfg answers the scheduling verbs by redirecting to the leader it follows (#1639): it
+/// runs consensus, so it knows a leader, and serves no scheduler of its own -- a learner.
+///
+/// A predicate rather than the conjunction spelled at `main`, because `main` is in no test target:
+/// the per-mode table asks THIS, so a narrowed or inverted condition is a red case rather than every
+/// learner silently answering its launchers `DispatchNotPermitted`. Never true where
+/// `ServesScheduler` is: a scheduler answers its own verbs.
+/// @param cfg The configuration.
+/// @return True when the redirect responder belongs on this node's `0xFC` surface.
+[[nodiscard]] bool RedirectsScheduling(NodeConfig const& cfg) noexcept;
+
 /// Whether @p cfg serves the enrollment surface: it runs consensus -- there is a cluster to be
 /// admitted to -- AND a scheduler tier was built, without which the responder has nothing to admit
 /// through. The second half is a runtime fact about what was BUILT, which the caller states. And

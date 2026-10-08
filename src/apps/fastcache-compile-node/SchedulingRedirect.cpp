@@ -108,8 +108,8 @@ std::string_view SchedulingEndpointToPublish(std::string_view leaderEndpoint,
                                              std::optional<core::platform::SteadyTimePoint::duration> silentFor,
                                              core::platform::SteadyTimePoint::duration bound) noexcept
 {
-    // Strictly past the bound, as the roster's `Isolated` reads it, so the condition and the redirect
-    // change their answer at the same reading.
+    // Strictly past the bound: a reading AT it is still a leader inside its election timeout, which a
+    // follower voter would also still name.
     if (silentFor.has_value() && *silentFor > bound)
         return {};
     return leaderEndpoint;
@@ -127,10 +127,12 @@ void SchedulingLeaderPublisher::LeaderChanged(std::string_view leaderEndpoint)
     RepublishLocked();
 }
 
-void SchedulingLeaderPublisher::LeaderContact(Distributed::LeaderReading const& reading)
+void SchedulingLeaderPublisher::LeaderContact(Distributed::LeaderReading const& reading,
+                                              core::platform::SteadyTimePoint::duration bound)
 {
     std::scoped_lock const guard { _lock };
     _silentFor = reading.silentFor;
+    _bound = bound;
     RepublishLocked();
 }
 
@@ -138,7 +140,7 @@ void SchedulingLeaderPublisher::RepublishLocked()
 {
     // Published under this lock, so two observers racing cannot leave the holder with the answer of
     // the one that decided first.
-    _holder.Publish(SchedulingEndpointToPublish(_leaderEndpoint, _silentFor, Distributed::LeaderSilenceBound));
+    _holder.Publish(SchedulingEndpointToPublish(_leaderEndpoint, _silentFor, _bound));
 }
 
 SchedulingRedirectResponder::SchedulingRedirectResponder(Distributed::IMembershipOracle const& membership,

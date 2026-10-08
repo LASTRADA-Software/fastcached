@@ -30,6 +30,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
+#include <tests/VerbFamilies.hpp>
 #include <tests/WireReply.hpp>
 
 using namespace FastCache;
@@ -128,16 +129,6 @@ struct BothAnswers
     return readings;
 }
 
-/// The scheduling verbs, as `OpTable` lists them.
-/// @return Their rows.
-[[nodiscard]] std::vector<Wire::OpDescriptor> SchedulingVerbs()
-{
-    auto rows = Wire::OpTable | std::views::filter([](Wire::OpDescriptor const& row) {
-                    return row.family == Wire::VerbFamily::Scheduler;
-                });
-    return { rows.begin(), rows.end() };
-}
-
 } // namespace
 
 TEST_CASE("A learner redirects a member's LEASE to the leader's scheduling endpoint", "[node][scheduling-redirect]")
@@ -190,7 +181,7 @@ TEST_CASE("A learner refuses an outsider NotAMember and never tells it where the
     CHECK(ErrorOf(AskBoth(responder, Wire::Op::Lease, ThisMachine()).answer)
           == std::optional { Wire::ErrorCode::NotLeader });
 
-    for (auto const& row: SchedulingVerbs())
+    for (auto const& row: Testing::OpsOfFamily(Wire::VerbFamily::Scheduler))
     {
         INFO("verb " << row.name);
         auto const [refusePeer, answer] = AskBoth(responder, row.code, Outsider());
@@ -210,7 +201,7 @@ TEST_CASE("A learner answers every scheduling verb: RELEASE by name, every other
     StatedLeader leader { std::string { LeaderEndpoint } };
     SchedulingRedirectResponder responder { membership, leader };
 
-    auto const verbs = SchedulingVerbs();
+    auto const verbs = Testing::OpsOfFamily(Wire::VerbFamily::Scheduler);
     // Asked of the table rather than assumed: a sweep over nothing would pass.
     REQUIRE(std::ranges::any_of(verbs, [](Wire::OpDescriptor const& row) { return row.code == Wire::Op::Release; }));
     REQUIRE(std::ranges::any_of(verbs, [](Wire::OpDescriptor const& row) { return row.code == Wire::Op::Lease; }));
@@ -277,7 +268,7 @@ TEST_CASE("A learner's redirect moves no counter", "[node][scheduling-redirect]"
     REQUIRE(Readings(metrics) != before);
     auto const baseline = Readings(metrics);
 
-    for (auto const& row: SchedulingVerbs())
+    for (auto const& row: Testing::OpsOfFamily(Wire::VerbFamily::Scheduler))
         for (auto const& peer: { ThisMachine(), Outsider() })
             static_cast<void>(AskBoth(responder, row.code, peer));
     CHECK(Readings(metrics) == baseline);
@@ -298,13 +289,13 @@ TEST_CASE("KnownSchedulingLeader answers what was last published, and nothing be
     CHECK(leader.LeaderSchedulingEndpoint().empty());
 }
 
-TEST_CASE("A leader silent past the consensus-leader-silent bound is named to nobody", "[node][scheduling-redirect]")
+TEST_CASE("A leader silent past the bound it is judged by is named to nobody", "[node][scheduling-redirect]")
 {
-    // R1 of #1639: the redirect names a leader only while the fleet still hears it, and the bound is
-    // the condition's own. Asked at the bound's edges, on both sides, so an off-by-one in either
-    // direction -- or a second number -- is red.
+    // R1 of #1639, as amended: the redirect names a leader only while it is inside the bound it is
+    // handed. Asked at the bound's edges, on both sides, so an off-by-one in either direction is red.
+    // The bound here is arbitrary on purpose: which bound production hands is the observer's case.
     using Duration = core::platform::SteadyTimePoint::duration;
-    constexpr auto Bound = Duration { std::chrono::minutes { 65 } };
+    constexpr auto Bound = Duration { std::chrono::milliseconds { 300 } };
     constexpr auto Tick = Duration { 1 };
 
     SECTION("within the bound: the endpoint")
@@ -329,18 +320,17 @@ TEST_CASE("A leader silent past the consensus-leader-silent bound is named to no
     {
         CHECK(SchedulingEndpointToPublish(LeaderEndpoint, std::nullopt, Bound) == LeaderEndpoint);
     }
-
-    // And production asks with the condition's bound, not a copy of its value.
-    CHECK(Distributed::LeaderSilenceBound == Bound);
 }
 
 TEST_CASE("The publisher folds who leads and how long it has been silent into one published endpoint",
           "[node][scheduling-redirect]")
 {
-    // Two observers on two threads feed it; each one's half alone moves the holder, and the later
-    // half never overrules the earlier one's fact -- a silent leader stays unnamed when the role
-    // observer repeats it, and a named one is named again on the first contact.
+    // Two observers feed it; each one's half alone moves the holder, and the later half never
+    // overrules the earlier one's fact -- a silent leader stays unnamed when the role observer
+    // repeats it, and a named one is named again on the first contact. The bound travels WITH each
+    // reading, so the publisher judges by the one it was last handed and holds no number of its own.
     using Duration = core::platform::SteadyTimePoint::duration;
+    constexpr auto Bound = Duration { std::chrono::milliseconds { 300 } };
     KnownSchedulingLeader holder;
     SchedulingLeaderPublisher publisher { holder };
     REQUIRE(holder.LeaderSchedulingEndpoint().empty());
@@ -348,17 +338,24 @@ TEST_CASE("The publisher folds who leads and how long it has been silent into on
     publisher.LeaderChanged(LeaderEndpoint);
     CHECK(holder.LeaderSchedulingEndpoint() == LeaderEndpoint);
 
-    auto const silent = Distributed::LeaderReading {
-        .leader = "n1", .silentFor = Duration { Distributed::LeaderSilenceBound } + Duration { std::chrono::seconds { 1 } }
-    };
-    publisher.LeaderContact(silent);
+    // AT the bound: still named.
+    publisher.LeaderContact(Distributed::LeaderReading { .leader = "n1", .silentFor = Bound }, Bound);
+    CHECK(holder.LeaderSchedulingEndpoint() == LeaderEndpoint);
+
+    // Past it: nobody.
+    publisher.LeaderContact(Distributed::LeaderReading { .leader = "n1", .silentFor = Bound + Duration { 1 } }, Bound);
     CHECK(holder.LeaderSchedulingEndpoint().empty());
 
     // The role observer repeating the endpoint does not revive a leader the pass found silent.
     publisher.LeaderChanged(LeaderEndpoint);
     CHECK(holder.LeaderSchedulingEndpoint().empty());
 
-    publisher.LeaderContact(Distributed::LeaderReading { .leader = "n1", .silentFor = Duration::zero() });
+    // The same silence judged by a LONGER bound it is now handed is inside it: the bound is the
+    // reading's, never a value the publisher kept from an earlier one.
+    publisher.LeaderContact(Distributed::LeaderReading { .leader = "n1", .silentFor = Bound + Duration { 1 } }, Bound * 2);
+    CHECK(holder.LeaderSchedulingEndpoint() == LeaderEndpoint);
+
+    publisher.LeaderContact(Distributed::LeaderReading { .leader = "n1", .silentFor = Duration::zero() }, Bound);
     CHECK(holder.LeaderSchedulingEndpoint() == LeaderEndpoint);
 
     // An election: nobody leads, and nobody is named however recently the last leader spoke.

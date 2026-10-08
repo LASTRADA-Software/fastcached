@@ -844,7 +844,9 @@ class FormationHarness
             // Composed by production's own function, over the owners this body built. It builds no
             // TIER -- no cache, scheduler or worker tier, and no consensus to verify a node proof against
             // -- so those families are absent here as on a node running none of them, and the surface's
-            // ceiling is the fold of what it does merge.
+            // ceiling is the fold of what it does merge. Nor the redirect a learner answers the
+            // scheduling verbs with (#1639), and permanently so: nothing here names a leader, so the
+            // family reads as a consensus-less node's. A case about the redirect uses `FleetHarness`.
             merged.emplace(Node::ComposeSurfaceComponents(
                 nullptr,
                 nullptr,

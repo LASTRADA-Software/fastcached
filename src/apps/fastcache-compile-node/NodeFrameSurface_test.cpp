@@ -105,6 +105,7 @@
 #include <tests/SecureRandomFakes.hpp>
 #include <tests/SurfaceOwnerFakes.hpp>
 #include <tests/Unwrap.hpp>
+#include <tests/VerbFamilies.hpp>
 #include <tests/WireReply.hpp>
 
 using namespace FastCache;
@@ -1445,19 +1446,6 @@ TEST_CASE("The surface main composes routes each family to the component it was 
     }
 }
 
-namespace
-{
-/// The scheduling verbs, as `OpTable` lists them.
-/// @return Their rows.
-[[nodiscard]] std::vector<Wire::OpDescriptor> SchedulingVerbs()
-{
-    auto rows = Wire::OpTable | std::views::filter([](Wire::OpDescriptor const& row) {
-                    return row.family == Wire::VerbFamily::Scheduler;
-                });
-    return { rows.begin(), rows.end() };
-}
-} // namespace
-
 TEST_CASE("The surface main composes sends a learner's scheduling verbs to the redirect, and a scheduler's to it",
           "[node][node-surface][scheduling-redirect]")
 {
@@ -1539,13 +1527,15 @@ TEST_CASE("The surface main composes sends a learner's scheduling verbs to the r
     }
 }
 
-TEST_CASE("A node running neither a scheduler nor consensus refuses every scheduling verb NoCluster, on both routes",
+TEST_CASE("A node running neither a scheduler nor consensus refuses each scheduling verb as the daemon does, on both routes",
           "[node][node-surface][scheduling-redirect]")
 {
     // The composition handed neither owner -- a node running no consensus -- leaves the family
-    // unserved, and the router answers it `NoCluster`. **The assertion that it is NOT
-    // `UnimplementedVerb` is the one that means anything**: both refuse, and a launcher told the
-    // latter reports *this node's build is too old* about a node that is current.
+    // unserved, and the router answers it VERB by verb as the daemon's `RelocatedVerbs` does: a
+    // capacity verb `DispatchNotPermitted` (*a scheduler elsewhere hands out capacity*), a cluster
+    // verb `NoCluster` (*there is no replicated state here*). One condition, one code on both binaries.
+    // **The assertion that neither is `UnimplementedVerb` is the one that means most**: a client told
+    // that reports *this node's build is too old* about a node that is current.
     NodeIoLoop io;
     AtomicMetricsSink metrics;
     auto const cfg = BaseConfig().first;
@@ -1566,25 +1556,38 @@ TEST_CASE("A node running neither a scheduler nor consensus refuses every schedu
                                                       every.session,
                                                       every.sharedCache) };
 
-    auto const verbs = SchedulingVerbs();
+    // Stated here rather than read from the table under test: which verbs ask for capacity.
+    constexpr auto CapacityVerbs = std::array { Wire::Op::Register, Wire::Op::Heartbeat, Wire::Op::Withdraw,
+                                                Wire::Op::Lease,    Wire::Op::Release,   Wire::Op::NodeAnnounce };
+    auto const verbs = Testing::OpsOfFamily(Wire::VerbFamily::Scheduler);
+    // Both answers are in the sweep, or a sweep missing either half proves nothing about it.
     REQUIRE(std::ranges::contains(verbs, Wire::Op::Lease, &Wire::OpDescriptor::code));
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::ClusterStatus, &Wire::OpDescriptor::code));
+    REQUIRE(std::ranges::all_of(
+        CapacityVerbs, [&verbs](Wire::Op const op) { return std::ranges::contains(verbs, op, &Wire::OpDescriptor::code); }));
     auto const peer = PeerIdentity { .host = "127.0.0.1" };
     for (auto const& verb: verbs)
     {
         INFO("verb " << verb.name);
+        auto const expected = std::ranges::contains(CapacityVerbs, verb.code) ? Wire::ErrorCode::DispatchNotPermitted
+                                                                              : Wire::ErrorCode::NoCluster;
         auto const opRaw = static_cast<std::uint8_t>(verb.code);
         CHECK(merged.OwnerOf(opRaw) == nullptr);
 
         auto const atTheDoor = merged.RefusePeer(peer, opRaw);
         REQUIRE(atTheDoor.has_value());
-        CHECK(ErrorOf(Unwrap(atTheDoor)) == Wire::ErrorCode::NoCluster);
+        CHECK(ErrorOf(Unwrap(atTheDoor)) == expected);
         CHECK(ErrorOf(Unwrap(atTheDoor)) != Wire::UnimplementedVerb);
 
         auto const answeredFrame =
             core::async::syncRun(merged.Answer(Wire::Detail::EncodeRequest(Wire::CurrentVersion, verb.code, {}), peer))
                 .bytes;
-        CHECK(ErrorOf(answeredFrame) == Wire::ErrorCode::NoCluster);
+        CHECK(ErrorOf(answeredFrame) == expected);
         CHECK(ErrorOf(answeredFrame) != Wire::UnimplementedVerb);
+        // Whoever sent it is told where to go: a node that runs consensus, never one knob alone.
+        auto const decoded = Wire::DecodeErrorPayload(Testing::PayloadOf(answeredFrame));
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).second.contains("a node that runs consensus"));
     }
 }
 

@@ -1280,10 +1280,10 @@ using Node::NodeReloader;
 
     // What a node running consensus and no scheduler -- a learner -- answers the scheduling verbs
     // with: `NotLeader` naming the leader it follows (#1639), so a launcher pointed at this machine
-    // reaches the fleet. Asked of the two predicates the tiers themselves ask, never of a mode.
+    // reaches the fleet. Asked of `RedirectsScheduling`, which the per-mode table pins, never of a mode.
     std::optional<Node::SchedulingRedirectResponder> schedulingRedirect;
-    if (Node::RunsConsensus(cfg) && !Node::ServesScheduler(cfg))
-        schedulingRedirect.emplace(membership, knownSchedulingLeader);
+    if (Node::RedirectsScheduling(cfg))
+        schedulingRedirect.emplace(membership.Oracle(), knownSchedulingLeader);
 
     auto nodeSurfaceOrRefusal = Node::StartNodeSurfaceOrExplain(
         nodeIo,

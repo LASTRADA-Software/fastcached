@@ -79,12 +79,23 @@ class KnownSchedulingLeader final: public ISchedulingLeaderSource
 /// **A leader silent for longer than @p bound is named by nobody**: a redirect is a promise that the
 /// endpoint answers, and a launcher sent to a leader the whole fleet has stopped hearing spends its
 /// connect on a machine that is not scheduling. Empty is the ordinary answer of an election in
-/// progress, so the launcher declines the lease with `NoLeader` and compiles locally. The bound is the
-/// `consensus-leader-silent` condition's (`Distributed::LeaderSilenceBound`), passed in so the case
-/// that tests this decision does not wait it out -- one number for both questions, never a second.
+/// progress, so the launcher declines the lease with `NoLeader` and compiles locally.
 ///
-/// Nothing heard yet is not silence: the role observer names a leader only once the driver has heard
-/// from it, so an absent reading is a pass that has not happened, never one that measured forever.
+/// The bound is the consensus tier's own Raft `electionTimeoutMax` -- the silence after which a
+/// follower VOTER would stand for election and stop naming the leader, which a learner, having no
+/// election timer, never does by itself. It is injected (`ConsensusTier::LeaderContactObserver`),
+/// never a constant here, and it is NOT `Distributed::LeaderSilenceBound`: that bounds how long a
+/// worker trusts the state it applied (`consensus-leader-silent`), a different question with an
+/// answer an hour long. Wrong in both directions at some value:
+/// - **too long**: an unreachable leader -- a laptop off the VPN -- goes on being named, and every
+///   redirected miss pays the launcher's connect before it compiles locally;
+/// - **too short**: on a lossy link a learner briefly names nobody, and a TU compiles locally that a
+///   worker could have built -- fail-safe, and healed at the next pass that hears the leader.
+///
+/// The reading arrives once per reconcile pass, so the effective bound is @p bound plus up to one
+/// pass (`ReconcileInterval`). Nothing heard yet is not silence: the role observer names a leader
+/// only once the driver has heard from it, so an absent reading is a pass that has not happened,
+/// never one that measured forever.
 /// @param leaderEndpoint The leader's `0xFC` endpoint as the role observer last gave it; empty while
 ///        nobody leads, or while this node does.
 /// @param silentFor How long ago the leader last spoke, as the last consensus pass read it.
@@ -98,11 +109,11 @@ class KnownSchedulingLeader final: public ISchedulingLeaderSource
 /// The writer side of `KnownSchedulingLeader`: what the consensus tier tells this node, folded into
 /// the one endpoint the redirect names.
 ///
-/// Two observers feed it on two threads -- the role observer on the consensus reactor, with the
-/// leader's endpoint, and every reconcile pass on the reconciler, with how long that leader has been
-/// silent -- so it keeps the last of each under one lock and republishes through ONE decision,
-/// `SchedulingEndpointToPublish`, whichever of the two moved. Neither observer can then publish an
-/// answer the other would have overruled.
+/// Two observers feed it, on whichever threads the tier calls them from -- the role observer with
+/// the leader's endpoint, and every reconcile pass with how long that leader has been silent and the
+/// bound to judge it by -- so it keeps the last of each under one lock and republishes through ONE
+/// decision, `SchedulingEndpointToPublish`, whichever of the two moved. Neither observer can then
+/// publish an answer the other would have overruled.
 class SchedulingLeaderPublisher
 {
   public:
@@ -113,9 +124,10 @@ class SchedulingLeaderPublisher
     /// @param leaderEndpoint The leader's `0xFC` endpoint; empty while nobody leads, or this node does.
     void LeaderChanged(std::string_view leaderEndpoint);
 
-    /// The reconcile pass's half: how long the leader has been silent.
+    /// The reconcile pass's half: how long the leader has been silent, and how long is too long.
     /// @param reading The pass's reading; only its `silentFor` is read.
-    void LeaderContact(Distributed::LeaderReading const& reading);
+    /// @param bound The tier's `electionTimeoutMax`; see `SchedulingEndpointToPublish`.
+    void LeaderContact(Distributed::LeaderReading const& reading, core::platform::SteadyTimePoint::duration bound);
 
   private:
     /// Publish what `SchedulingEndpointToPublish` decides from the two halves. Called under `_lock`.
@@ -126,6 +138,8 @@ class SchedulingLeaderPublisher
     std::string _leaderEndpoint;    ///< What `LeaderChanged` was last given.
     /// What `LeaderContact` was last given; nothing before the first pass.
     std::optional<core::platform::SteadyTimePoint::duration> _silentFor;
+    /// The bound `LeaderContact` was last given; read only once `_silentFor` holds a reading.
+    core::platform::SteadyTimePoint::duration _bound {};
 };
 
 /// Answers every scheduling verb on a node that runs no scheduler: a member is sent to the leader.

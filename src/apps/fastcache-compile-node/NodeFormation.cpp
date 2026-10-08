@@ -198,6 +198,11 @@ bool ServesScheduler(NodeConfig const& cfg) noexcept
            && Cluster::NodeModeRowFor(cfg.formation->mode).scheduler == Cluster::SchedulerDuty::Serves && RunsConsensus(cfg);
 }
 
+bool RedirectsScheduling(NodeConfig const& cfg) noexcept
+{
+    return RunsConsensus(cfg) && !ServesScheduler(cfg);
+}
+
 std::vector<std::string> SchedulersOf(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated)
 {
     if (!cfg.formation.has_value())

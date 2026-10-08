@@ -20,6 +20,7 @@
 #include <FastCache/Cluster/MembershipPolicy.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
+#include <FastCache/Consensus/RaftConfig.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
@@ -2542,6 +2543,87 @@ TEST_CASE("A joined learner is replicated to over the session it dialled and is 
         },
         [&joiner] { return std::format("commit {}", joiner->Status().commitIndex.value); }));
     CHECK(founder->Status().configuration.voters == std::vector<Consensus::NodeId> { "n1" });
+}
+
+TEST_CASE("A pass's observer empties a holder that named a leader once it is silent past the election timeout",
+          "[node][consensus][scheduling-redirect]")
+{
+    // #1639's R1, at the wiring `StartConsensusOrExplain` hands every tier: each pass tells the
+    // roster AND the publisher, with the bound the tier hands it. Probed at exactly the bound, which
+    // keeps the endpoint, and just past it, which empties it -- with the bound named as the
+    // configuration consensus runs on names it, so a pass that stopped telling the publisher, or
+    // told it another bound, is red here.
+    auto const roster = NodeRoster::Build(Testing::FirstStart(NodeConfig {}), RosterClock(), nullptr);
+    REQUIRE(roster.has_value());
+    KnownSchedulingLeader holder;
+    SchedulingLeaderPublisher publisher { holder };
+    auto const observer = LeaderContactObserverFor(*Unwrap(roster), publisher);
+    auto const electionTimeoutMax = Consensus::RaftConfig {}.electionTimeoutMax;
+
+    publisher.LeaderChanged("office:6674");
+    REQUIRE(holder.LeaderSchedulingEndpoint() == "office:6674");
+
+    using Duration = core::platform::SteadyTimePoint::duration;
+    observer(Distributed::LeaderReading { .leader = "n1", .silentFor = Duration { electionTimeoutMax } },
+             electionTimeoutMax);
+    CHECK(holder.LeaderSchedulingEndpoint() == "office:6674");
+
+    observer(Distributed::LeaderReading { .leader = "n1", .silentFor = Duration { electionTimeoutMax } + Duration { 1 } },
+             electionTimeoutMax);
+    CHECK(holder.LeaderSchedulingEndpoint().empty());
+}
+
+TEST_CASE("A running tier hands its leader-contact observer the election timeout its consensus runs with",
+          "[node][consensus][scheduling-redirect]")
+{
+    // The other half of the path above: what bound a REAL tier's pass hands the observer. The node is
+    // built from a `RaftConfig` carrying the consensus defaults, so that is the bound every pass must
+    // name -- never `Distributed::LeaderSilenceBound`, the hour a worker trusts its applied state.
+    NullLogger logger;
+    AtomicMetricsSink metrics;
+
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->boundPort();
+    probe.reset();
+
+    Testing::ScratchDirectory const scratch { "consensus-contact-bound" };
+    auto cfg = Testing::FirstStart(NodeConfig {});
+    cfg.nodeId = "n1";
+    cfg.raftListen = std::format("127.0.0.1:{}", port);
+    cfg.raftSelf = "127.0.0.1";
+    cfg.clusterDir = scratch.Path() / "state";
+
+    // Declared above the tier, which calls into it from its reconciler until it is destroyed.
+    std::mutex seenLock;
+    std::optional<std::chrono::milliseconds> seen;
+    auto started = ConsensusTier::Start(
+        cfg,
+        TestAdvertised(),
+        Testing::TestKeyPair("n1"),
+        [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
+        [](Cluster::ClusterState const&) {},
+        [&seenLock, &seen](Distributed::LeaderReading const&, std::chrono::milliseconds electionTimeoutMax) {
+            std::scoped_lock const guard { seenLock };
+            seen = electionTimeoutMax;
+        },
+        metrics,
+        logger,
+        nullptr,
+        FormationHooks {});
+    INFO("start refused: " << RefusalOf(started));
+    REQUIRE(started.has_value());
+    auto const& tier = *started;
+    REQUIRE(tier != nullptr);
+
+    auto const read = [&seenLock, &seen] {
+        std::scoped_lock const guard { seenLock };
+        return seen;
+    };
+    REQUIRE(Testing::WaitUntil(
+        "a reconcile pass to tell the observer", [&read] { return read().has_value(); }, [] { return std::string {}; }));
+    CHECK(read() == std::optional { Consensus::RaftConfig {}.electionTimeoutMax });
 }
 
 TEST_CASE("A learner started as main starts it names its leader's scheduling endpoint, never its Raft one",

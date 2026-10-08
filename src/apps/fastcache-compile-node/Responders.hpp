@@ -1399,18 +1399,19 @@ class MergedResponder final: public IFrameResponder
               } },
         // For the enrollment row's reason (#1639): a node running consensus answers these verbs
         // itself -- a scheduler, or the redirect to the leader a learner follows -- so only a node
-        // running NONE reaches here, and `UnimplementedVerb` would send a launcher's operator to
-        // upgrade a build that is current. `NoCluster` says the question does not apply here.
+        // running NONE reaches here, and `UnimplementedVerb` would send an operator to upgrade a
+        // build that is current. This row answers the CLUSTER verbs, `NoCluster` as the daemon's
+        // rows do: there is no replicated state here. The capacity verbs answer otherwise, by
+        // verb (`UnservedVerbs`).
         { .family = CompileCacheWire::VerbFamily::Scheduler,
           .refusal = { .code = CompileCacheWire::ErrorCode::NoCluster,
-                       .rationale = "what a node running no consensus answers every scheduling verb aimed at it: a "
-                                    "launcher pointed at the wrong machine asks once per lease, an ordinary "
-                                    "misdirection rather than an event; counted, one misconfigured build would "
-                                    "dominate the series" },
+                       .rationale = "what a node running no consensus answers a cluster verb aimed at it: an operator "
+                                    "or a script at the wrong machine, an ordinary misdirection rather than an event; "
+                                    "counted, it would bury the scan it would be read for" },
           .detail = [](SurfaceComponents const&) noexcept -> std::string_view {
-              return "this node runs no consensus, so it schedules nothing and follows no leader to redirect you to; "
-                     "point FASTCACHE_SCHEDULER at a node of your fleet -- `fastcache-cli node` names the components "
-                     "a node serves";
+              return "this node runs no consensus and belongs to no cluster; point the client's scheduler "
+                     "(--scheduler for a one-shot verb) at a node that runs consensus -- `fastcache-cli node` names "
+                     "the components a node serves";
           } },
         { .family = CompileCacheWire::VerbFamily::Compile,
           .refusal = { .code = CompileCacheWire::NoCompileWorker::Code,
@@ -1434,6 +1435,51 @@ class MergedResponder final: public IFrameResponder
                      "`fastcache-cli node` names the components a node serves";
           } },
     });
+
+    /// A verb whose answer on a node that serves its family nowhere is not its family row's.
+    struct UnservedVerb
+    {
+        CompileCacheWire::Op op;      ///< The verb this row answers.
+        Cc::UncountedRefusal refusal; ///< What the client is told, and why nothing rises.
+        std::string_view detail;      ///< Words for whoever sent it.
+    };
+
+    /// What a node running no consensus tells a client asking it for capacity.
+    static constexpr Cc::UncountedRefusal NoSchedulerHere {
+        .code = CompileCacheWire::ErrorCode::DispatchNotPermitted,
+        .rationale = "what a node running no consensus answers a capacity verb aimed at it: a launcher or a worker "
+                     "pointed at the wrong machine asks once per lease or per round, an ordinary misdirection rather "
+                     "than an event; counted, one misconfigured build would dominate the series"
+    };
+
+    /// Where a client asking this node for capacity should go instead: the destination, never one
+    /// knob, because a launcher, a worker and a one-shot verb each name their scheduler differently.
+    static constexpr std::string_view NoSchedulerHereWhy =
+        "this node runs no consensus, so it schedules nothing and follows no leader to redirect you to; point the "
+        "client's scheduler (FASTCACHE_SCHEDULER for a launcher, --scheduler for a worker or a one-shot verb) at a "
+        "node that runs consensus";
+
+    /// The scheduling verbs that ask for CAPACITY, answered `DispatchNotPermitted` -- *this endpoint
+    /// does not hand out capacity, a scheduler elsewhere does* -- as the daemon's own rows answer them
+    /// (`CompileCacheHandler`'s `RelocatedVerbs`), so one condition is one code on both binaries. A
+    /// client told `NoCluster` here would stop looking for the scheduler it needs. `NodeAnnounce` is
+    /// a presence registration with a scheduler, so it joins them.
+    static constexpr auto UnservedVerbs = std::to_array<UnservedVerb>({
+        { .op = CompileCacheWire::Op::Register, .refusal = NoSchedulerHere, .detail = NoSchedulerHereWhy },
+        { .op = CompileCacheWire::Op::Heartbeat, .refusal = NoSchedulerHere, .detail = NoSchedulerHereWhy },
+        { .op = CompileCacheWire::Op::Withdraw, .refusal = NoSchedulerHere, .detail = NoSchedulerHereWhy },
+        { .op = CompileCacheWire::Op::Lease, .refusal = NoSchedulerHere, .detail = NoSchedulerHereWhy },
+        { .op = CompileCacheWire::Op::Release, .refusal = NoSchedulerHere, .detail = NoSchedulerHereWhy },
+        { .op = CompileCacheWire::Op::NodeAnnounce, .refusal = NoSchedulerHere, .detail = NoSchedulerHereWhy },
+    });
+
+    // A verb row refines its family's answer, so it may only name a family that HAS one: a row for a
+    // verb of any other family would change what a node answers for a family this table never meant.
+    static_assert(std::ranges::all_of(UnservedVerbs, [](UnservedVerb const& row) {
+        return core::findOrNull(
+                   UnservedFamilies, CompileCacheWire::FamilyOf(static_cast<std::uint8_t>(row.op)), &UnservedFamily::family)
+               != nullptr;
+    }));
 
     // The compile row says `CompileCacheWire::NoCompileWorker`'s fact, which the daemon answers too, so
     // neither endpoint can reword it or move its code without the other (#206).
@@ -1491,17 +1537,28 @@ class MergedResponder final: public IFrameResponder
     /// forget it. Every refusal here stays UNCOUNTED for the reason above -- a node that
     /// runs no consensus answers this for every enrolment attempt anybody ever points at it.
     ///
-    /// **The compile family is the second row, since #206 gave a node the means to run no
+    /// **The compile family has a row since #206 gave a node the means to run no
     /// worker** (`--slots=0`). Its verbs are not unimplemented there either: `--cordon`
     /// aimed at such a node would otherwise read *this node is too old to know the verb*,
     /// which sends an operator to upgrade a machine that is current. It takes
     /// `DispatchNotPermitted` through `CompileCacheWire::NoCompileWorker`, the one definition the daemon's
     /// cordon and compile rows reach too -- so the two endpoints send one code for one
     /// condition, as the enrollment row does with `NoCluster`.
+    ///
+    /// **The scheduler family has a row since #1639** -- reached only on a node running no
+    /// consensus, since every other node answers it through a scheduler or the redirect to its
+    /// leader -- and it is split by VERB the way the daemon splits it: the capacity verbs
+    /// (`UnservedVerbs`) `DispatchNotPermitted`, the cluster verbs `NoCluster`. A verb row is
+    /// asked before its family's.
     /// @param opRaw The third header byte, as received.
     /// @return The encoded refusal.
     [[nodiscard]] std::vector<std::byte> UnservedReply(std::uint8_t opRaw) const
     {
+        // Compared as BYTES: the raw byte is a peer's, so it is never cast into an `Op` it may not name.
+        if (auto const* const row = core::findIfOrNull(
+                UnservedVerbs, [opRaw](UnservedVerb const& verb) { return static_cast<std::uint8_t>(verb.op) == opRaw; }))
+            return Cc::RefuseWithoutCounter(row->refusal, row->detail);
+
         auto const family = CompileCacheWire::FamilyOf(opRaw);
         if (auto const* const row = core::findOrNull(UnservedFamilies, family, &UnservedFamily::family))
             return Cc::RefuseWithoutCounter(row->refusal, row->detail(_components));
