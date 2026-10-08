@@ -17,6 +17,10 @@
 # string, the severity of the final report and the phrase of the warning; the all-answer
 # cases are the positive control that the stub RAN, since only it can produce their string.
 #
+# Those cases see only the words the RUNNING CMake prints, so the `classifications` table at
+# the end is the cross-version guard: it hands every measured spelling, 3.28.3's capitalised
+# ones included, straight to Version.cmake's classifier, so each is judged on every CMake.
+#
 # Usage: cmake -DFASTCACHED_SOURCE_DIR=<repo> -DFASTCACHED_SCRATCH_DIR=<dir> -P <this>
 #   (internally re-entered as the driver with -DFC_ROLE=driver, and as the stub with
 #   -DFC_ROLE=stub)
@@ -343,6 +347,7 @@ set(classifications
     "Process terminated due to timeout | timeout | CMake 4.2 and 4.3.1"
     "no such file or directory | unrunnable | CMake 4.2 and 4.3.1"
     "No such file or directory | unrunnable | CMake 3.28.3, #1642"
+    "Permission denied | unrunnable | CMake 3.28.3, #1642"
     "permission denied | unrunnable | CMake 4.2 and 4.3.1"
     "unknown error | unrunnable | CMake 4.3.1 on Windows"
     "Segmentation fault | died | CMake 4.2 on Linux"

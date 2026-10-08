@@ -75,9 +75,12 @@ endif()
 #   a timeout          "Process terminated due to timeout", on both
 #   git did not start  "no such file or directory" and "permission denied" (libuv's spawn
 #                      errors, on both); "unknown error" (Windows, a file that is no image).
-#                      CMake 3.28.3 capitalises the first letter, "No such file or
-#                      directory", so `unrunnable` takes that letter in either case:
-#                      MATCHES is case-sensitive (#1642)
+#                      CMake 3.28.3 capitalises the first letter: "No such file or
+#                      directory" (a missing file) and "Permission denied" (a file that
+#                      is not executable, or a directory). MATCHES is case-sensitive, so
+#                      `unrunnable` takes that letter in either case (#1642). `[Uu]` is
+#                      by analogy only: "unknown error" is a Windows word, and no Windows
+#                      CMake 3.28 was measured
 #   git died, Linux    SIGKILL "Subprocess killed", SIGSEGV "Segmentation fault",
 #                      SIGTERM "Subprocess terminated", SIGABRT "Subprocess aborted"
 #   git died, Windows  0xC0000005 "Access violation", 0xC000013A "User interrupt",
