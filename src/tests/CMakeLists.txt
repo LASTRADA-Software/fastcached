@@ -5991,11 +5991,13 @@ set_tests_properties("crypto-seam-selftest" PROPERTIES
     TIMEOUT 180
 )
 
-# Exactly one first-party file opens a UDP socket: `DiscoveryTier.cpp`. The compile node's
+# Only the permitted first-party files open a UDP socket: `DiscoveryTier.cpp`, and the route
+# probe (`RouteProbe.cpp`), which only connects and never sends or receives. The compile node's
 # Windows firewall rule for a kernel-chosen discovery reply port admits EVERY local UDP port of
-# the program (`discovery-reply udp/any`), so "it exposes discovery alone" -- which the docs and
-# the rulebook say -- holds only while discovery is the only UDP socket there is. The permitted
-# row is the positive control: it must be seen opening one, or it is refused as stale.
+# the program (`discovery-reply udp/any`), so "it exposes discovery and nothing that listens
+# besides" -- which the docs and the rulebook say -- holds only while discovery's are the only UDP
+# sockets that receive. Each permitted row is a positive control: it must be seen opening one, or
+# it is refused as stale.
 add_test(
     NAME "udp-opener"
     COMMAND ${CMAKE_COMMAND}

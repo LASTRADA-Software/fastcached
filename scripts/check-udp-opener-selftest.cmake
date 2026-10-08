@@ -89,8 +89,8 @@ function(fastcached_udp_judge name tree expect mustSay)
     set(failures "${failures}" PARENT_SCOPE)
 endfunction()
 
-set(accepted "the one UDP opener is ${discoveryTier}, and nothing else opens one")
-set(refused "${otherFile}:2: opens a UDP socket outside ${discoveryTier}")
+set(accepted "the UDP openers are ${discoveryTier} and ${routeProbe}, and nothing else opens one")
+set(refused "${otherFile}:2: opens a UDP socket outside the permitted files")
 
 fastcached_udp_tree(clean tree)
 fastcached_udp_judge(clean "${tree}" accept "${accepted}")

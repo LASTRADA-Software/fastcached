@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Exactly ONE first-party file opens a UDP socket: discovery's, in
-# `src/apps/fastcache-compile-node/DiscoveryTier.cpp`.
+# Only the files in `FastCachedUdpOpenerUnits` below open a UDP socket: discovery's, in
+# `src/apps/fastcache-compile-node/DiscoveryTier.cpp`, the one socket that RECEIVES; and the route
+# probe's, in `src/FastCache/Platform/RouteProbe.cpp`, which only `connect()`s to read the kernel's
+# source-address choice, sends and receives nothing, and is closed at once.
 #
 # ## Why this is a rule
 #
@@ -9,10 +11,11 @@
 # Unless `--discovery-reply-port` pins it, the kernel chooses that socket's port at every start, so
 # no port-scoped rule can name it, and the rule admits EVERY local UDP port (`... discovery-reply
 # udp/any`), scoped to the program and its service. What that rule exposes is therefore every UDP
-# socket this program opens. The documentation, the rulebook and `NodeFirewallRules` all say that is
-# "discovery alone" -- true only while discovery is the only UDP socket there is. A second one would
-# be reachable from the network through a rule written for somebody else, and nothing about a green
-# build would say so.
+# socket this program opens. The documentation, the rulebook and `NodeFirewallRules` all say that
+# exposes discovery and nothing that listens besides -- true only while discovery's are the only UDP
+# sockets that receive. A socket that did would be reachable from the network through a rule written
+# for somebody else, and nothing about a green build would say so; the route probe's row is permitted
+# because its socket never reads.
 #
 # ## What is scanned, and what counts as opening a UDP socket
 #
@@ -157,24 +160,24 @@ endforeach()
 if(violations OR stale)
     message("")
     foreach(violation IN LISTS violations)
-        message("  ${violation}: opens a UDP socket outside src/apps/fastcache-compile-node/DiscoveryTier.cpp")
+        message("  ${violation}: opens a UDP socket outside the permitted files")
     endforeach()
     foreach(entry IN LISTS stale)
         message("  STALE permitted row -- ${entry}")
     endforeach()
     message("")
-    message("A second UDP socket in this program would be EXPOSED by the compile node's any-port firewall")
+    message("Another UDP socket in this program would be EXPOSED by the compile node's any-port firewall")
     message("rule. Without --discovery-reply-port, --install-service opens `<service> discovery-reply udp/any`:")
     message("inbound UDP on every local port, scoped to the program and its service, because the kernel")
-    message("chooses the reply socket's port. That is safe only while discovery is the only UDP socket the")
-    message("program opens, and the docs and the rulebook say \"discovery alone\".")
+    message("chooses the reply socket's port. That is safe only while discovery's are the only UDP sockets")
+    message("the program RECEIVES on -- the route probe's only connects -- and the docs and the rulebook say so.")
     message("")
     message("For a violation: open the socket in DiscoveryTier.cpp if it is discovery's. Otherwise the")
     message("any-port rule has to stop covering it -- pin the reply port (--discovery-reply-port) so the")
     message("rule becomes one port, or scope the rule some other way -- and only then add a permitted row")
-    message("to scripts/check-udp-opener.cmake and correct every \"discovery alone\" sentence.")
+    message("to scripts/check-udp-opener.cmake and correct every sentence that names discovery's as the only one.")
     message("")
-    message("A STALE row means DiscoveryTier.cpp stopped opening a UDP socket, moved, or was never")
+    message("A STALE row means its file stopped opening a UDP socket, moved, or was never")
     message("enumerated. Fix the row, or find why the scan did not see what it is anchored on.")
     message("")
     message("NOT covered: a UDP socket made through a primitive this table does not name, or a macro.")
@@ -186,10 +189,10 @@ if(violations OR stale)
     message("Scanned ${scannedCount} first-party C++ source(s), tests excluded, via ${scanSource}; declined ${declinedCount} under third-party roots.")
     list(LENGTH violations violationCount)
     list(LENGTH stale staleCount)
-    message(FATAL_ERROR "udp-opener: ${violationCount} UDP opener(s) outside the permitted file, ${staleCount} stale permitted row(s)")
+    message(FATAL_ERROR "udp-opener: ${violationCount} UDP opener(s) outside the permitted files, ${staleCount} stale permitted row(s)")
 endif()
 
+list(JOIN permittedPaths " and " permittedList)
 message(STATUS
     "udp-opener: ${scannedCount} first-party C++ source(s) via ${scanSource}, tests excluded, ${declinedCount} "
-    "declined under third-party roots; the one UDP opener is src/apps/fastcache-compile-node/DiscoveryTier.cpp, "
-    "and nothing else opens one")
+    "declined under third-party roots; the UDP openers are ${permittedList}, and nothing else opens one")

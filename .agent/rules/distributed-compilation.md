@@ -527,10 +527,15 @@ Consequences that are each load-bearing:
       here ever keyed on a caller's port. And `::ffff:10.0.0.1` versus `10.0.0.1` is a property of how
       the *listener was bound*, so `Core/HostPort::UnmappedHost` folds them or two
       identically configured nodes disagree about one machine.
-    - **A lease's dial hint is `peerId`, and only that.** The default
-      `--advertise` is a DNS name, and after a VPN reconnect the name resolves to an
-      address the machine no longer holds for as long as the TTL says. The scheduler has
-      seen the current one on every heartbeat, so a grant carries it BESIDE the name
+    - **A lease's dial hint is `peerId`, and only that.** The default `--advertise` is
+      `auto` -- the address this machine routes from, an IP literal, re-derived and
+      RE-REGISTERED when the network changes (`EndpointResolver`), so the registration
+      itself moves and no hint rides it. A NAME is the opt-in pin (and `auto`'s stand-in
+      while no route is known), and after a VPN reconnect a name resolves to an address the
+      machine no longer holds for as long as the TTL says -- which is what hints are still
+      for. A pinned LITERAL is the opposite: it does not roam, and it vetoes every hint
+      (`AdvertiseIsLiteral`), so a literal kept as a work-around turns both mechanisms off.
+      The scheduler has seen the current one on every heartbeat, so a grant carries it BESIDE the name
       (`Distributed::DecideDialHint`): never for loopback or a link-local observed host,
       an unparsable or IP-literal advertise, or an address the worker does not itself
       report -- the NAT filter, because a relay's address dialled is somebody else's port.
@@ -637,8 +642,8 @@ Consequences that are each load-bearing:
       (review I-2b). A worker may have built `Cc::UncheckedLeaseValidator()` at startup,
       which is safe only while no machine but this one is admitted -- and neither guard for
       that can see a reload. `StartupPolicyRejection` decides reachability from
-      the listen flags, which describe nothing under socket activation, and
-      `MakeWorkerLeaseValidator`'s backstop for exactly that has already run. Widening
+      the configuration's bind (under socket activation, the socket's own bind, adopted at
+      the start), and `MakeWorkerLeaseValidator`'s activated-case backstop has already run. Widening
       would hand it an open unauthenticated compile port with every refusal counter
       reading zero, which is
       [#282](https://github.com/LASTRADA-Software/fastcached/issues/282) arriving
@@ -1468,6 +1473,33 @@ Consequences that are each load-bearing:
   never `UnknownLease` — that is the SCHEDULER's code, meaning "a lease I issued and
   have since forgotten", and a worker answering with it sent an operator to the
   scheduler to look for a fault that is local.
+- **The two endpoints a node advertises -- the `0xFC` one and the Raft one -- have ONE
+  publisher, `EndpointResolver`, and it re-derives both from the configuration IN FORCE
+  over the LIVE route host**, never from a flag and never from a snapshot. `--advertise` and
+  `--raft-self` default to `auto` (a row of `AdvertiseModeRow`, read through
+  `AdvertiseModeOf`, so `auto` is "unset" at every site that used to ask "empty"): on a
+  wildcard bind the host is the address the kernel would send from (`IRouteProbe`, a
+  connect-only UDP socket that sends nothing), probed toward the IP-literal schedulers this
+  node registers with first and the default route last, re-probed on a network change or a
+  resume and every 30 s regardless. Consequences:
+  - **A failed probe keeps the LAST route host**, and a loopback, link-local, unspecified
+    or multicast answer is refused by one table (`UnusableRouteHost`): publishing one would
+    tell the fleet to dial a client's own machine, or no machine.
+  - **A reload re-derives rather than re-reads.** A save that changes nothing keeps the
+    roamed address; one that re-pins `--advertise` publishes the pin. Judged by comparing
+    FLAGS, a reload would re-register a fleet for a save that moved nothing the scheduler
+    keys on, and miss a move no flag made (`AddressReloadableFlags` says why).
+  - **The route host outlives a body** (`RouteHostCell`, one per process, also read by
+    every reload candidate through `ReloadBasis::routeHost`), and a resolver ADOPTS it at
+    construction, silently and uncounted: a body reformed after a roam otherwise logged and
+    counted a move nobody made.
+  - **A moved `0xFC` endpoint wakes the heartbeat at once** (`IEndpointMoveSink`), and the
+    lease check follows the REGISTERED endpoint, not the published one, so a grant is
+    honoured until the re-registration that moves it.
+  - Two counters, one per endpoint (`fastcache_node_endpoint_changes_total`,
+    `fastcache_node_raft_endpoint_changes_total`), and an Info line per move; a pinned
+    literal is reported ONCE as not roaming. `EndpointResolver_test`, and `WorkerTier_test`'s
+    "A worker re-registers under a moved endpoint and withdraws the old one exactly once".
 - **A fixture that carries the key and never dispatches proves only that a keyed node
   STARTS.** `cluster-e2e` and `fleet-dashboard-e2e` were given `--cluster-key-file`
   because they left `--bind` at the wildcard, and neither compiles anything — so for
@@ -1495,6 +1527,14 @@ Consequences that are each load-bearing:
   > `--listen-node` and lose the two things that make it worth keeping: that this was
   > #282 recurring inside the fix for #282, and that review found it and CI did not.
   > Read `--bind` below as "the flag that then configured the compile port".
+  >
+  > **And the premise moved again with roaming node addresses.** A START now reads where the
+  > handed-over socket is bound and adopts it as the Node row's bind
+  > (`Node::AdoptActivatedBind`, before the startup table, the endpoint resolver and every
+  > reload candidate), so at a start the row describes the real socket and the table judges
+  > it. What still describes nothing is the TYPED value an `--install-service` registration
+  > and `--print-surfaces` judge: neither runs under the supervisor, so neither sees a
+  > socket. Both guards therefore stay, and for the reason below rather than a new one.
 
   `--bind` is the obvious answer to "is this port local",
   and it is wrong for a reason nothing in this tree stated until now. Under
@@ -1529,9 +1569,10 @@ Consequences that are each load-bearing:
     in a guard. Two instances make it a family rather than a coincidence: when a
     premise is doing load-bearing work, check it still holds on every path that reads
     it, not only on the path it was written for.
-  - **And the sibling was known, and did not arrive.** `--listen-node` describes nothing
-    under activation for exactly the same reason, so a scheduler-side refusal asking the
-    bind would have had this hole. The one #178 landed asks `RunsConsensus` -- a port
+  - **And the sibling was known, and did not arrive.** `--listen-node`'s typed value
+    describes nothing under activation for exactly the same reason (a start now replaces
+    it with the socket's adopted bind, a registration never can), so a scheduler-side
+    refusal asking the typed bind would have had this hole. The one #178 landed asks `RunsConsensus` -- a port
     this process binds itself -- so it has none.
 - **The trust decision does not live in `main()`.** It lived there, as
   `[](...){ return true; }`, through a fully passing suite — the shape this file
@@ -1694,10 +1735,21 @@ Consequences that are each load-bearing:
     unregistered machine is leased nothing.
   - Host events reach the node through `Platform/IHostEvents`: power events from the SCM
     (`SERVICE_ACCEPT_POWEREVENT`, a table of `PBT_*`), so only a node running AS A SERVICE hears
-    them, and interface and address changes from `NotifyIpInterfaceChange` and
-    `NotifyUnicastIpAddressChange` through the pure `NetworkChangeDebouncer`, on Windows only.
-    Linux and macOS start no watcher and hear nothing, which the recovery above makes a
-    slower answer rather than a wrong one. `src/tests/ScriptedHostEvents.hpp` is the shared fake.
+    them, and interface and address changes through the pure `NetworkChangeDebouncer` on every
+    platform: `NotifyIpInterfaceChange` and `NotifyUnicastIpAddressChange` on Windows, a
+    `NETLINK_ROUTE` socket (link, address and route groups) on Linux, a `PF_ROUTE` socket on
+    macOS -- whose messages two pure, byte-fixture-tested classifiers judge
+    (`NetlinkReportsChange`, `RouteSocketReportsChange`), with `ENOBUFS` counted as a change
+    because the kernel dropped notifications. A watcher that will not start is warned about
+    once and is not fatal: no consumer may DEPEND on a host event, so the recovery above, and
+    the endpoint resolver's 30-second re-probe, make a missing one a slower answer rather than a
+    wrong one. `src/tests/ScriptedHostEvents.hpp` is the shared fake.
+    - **A POSIX watcher starts INSIDE the body the daemon host runs, never before it**
+      (`NetworkWatcherStart::InsideTheBody`): its thread does not survive `PosixDaemonHost`'s
+      `fork()`, so one started first is a watcher in the parent that exits, and the daemon hears
+      nothing -- silently, since a missing event is only ever a slower answer. Windows starts it before
+      `host->Run`, where nothing forks. Where it starts is one constant per platform, read
+      through `StartNetworkWatcherAt`, so the two call sites cannot both start one.
 - **A reloadable flag that feeds REGISTER is a claim, not a setting, and adopting one
   without telling the fleet is the silent failure the whole column exists to prevent**
   ([#403](https://github.com/LASTRADA-Software/fastcached/issues/403)). `--toolchain`
@@ -1724,10 +1776,17 @@ Consequences that are each load-bearing:
   `main.cpp` is in no test target and this is precisely the rule that fails silently in
   one direction.
 
-  **What stays `Reloadable::No` is a decision with a reason, not an omission.**
-  `--advertise` is inside every outstanding lease's MAC as `expected.endpoint`, so
-  changing it mid-life does not merely mislead the scheduler — it invalidates grants
-  already in clients' hands, which then fail `EndpointMismatch`. `--slots`,
+  **What stays `Reloadable::No` is a decision with a reason, not an omission.** This
+  paragraph opened with `--advertise` until it was wrong twice over: #1279 made it
+  `Reloadable::Yes`, and roaming node addresses made `--raft-self` reloadable beside it
+  (`AddressReloadableFlags`, the kind that moves WHERE a registration is filed rather than
+  what it serves). The reason it once stayed is now the stated COST of moving it:
+  `--advertise` is inside every outstanding lease's MAC as `expected.endpoint`, so a grant
+  for the old endpoint is honoured only until the worker re-registers under the new one
+  (*the address it verifies against is the address it is REGISTERED under*), and after that
+  fails `EndpointMismatch` -- one local compile each, for a grant naming an address that
+  had stopped working anyway. The same cost is paid with no reload at all when `auto`
+  follows the network. `--slots`,
   `--node-class` and `--reserve-cores` feed `NodeCapacityOf`, which is derived **below**
   the cache tier (#167) and would have to re-establish that ordering without restarting
   it. And because "we decided not to" and "we forgot" are the same diff, the reloadable

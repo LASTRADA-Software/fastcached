@@ -961,8 +961,11 @@ readable and silently ignored. Every rule below has already been one of them.
     every local port (`LocalPorts = "*"`, set explicitly, which is also what a new UDP rule reads
     back), named `... discovery-reply udp/any`, scoped to the program AND the service and to
     `--firewall-allow` like every other rule. What it exposes is only the UDP sockets this
-    program opens, which is discovery alone -- and `ctest -R udp-opener` is what keeps that true:
-    it refuses a second first-party UDP opener outside `DiscoveryTier.cpp`. A pinned port gets exactly that port and no
+    program opens: discovery's, which are the only ones that RECEIVE, and the route probe's
+    (`Platform/RouteProbe.cpp`), which only `connect()`s to read the kernel's source-address
+    choice, sends and receives nothing and is closed at once -- and `ctest -R udp-opener` is what
+    keeps that true: it refuses a first-party UDP opener outside its permitted rows, and a new
+    row is a decision about this rule. A pinned port gets exactly that port and no
     any-port rule. The uninstall removes it with the GROUP, never by re-deriving the rules.
     **The MSI pins it and the node does not**: `FASTCACHE_DISCOVERY_REPLY_PORT` (default `6682`,
     empty for the kernel's) reaches `--discovery-reply-port`, and the rule DERIVES from the

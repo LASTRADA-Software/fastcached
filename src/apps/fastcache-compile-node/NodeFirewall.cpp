@@ -42,7 +42,8 @@ namespace
 
     // A port the kernel chooses is one no port-scoped rule can name, so its rule admits every
     // local port -- still scoped to this program and its service, so it reaches only the sockets
-    // of that protocol this program opens, which for UDP is discovery alone.
+    // of that protocol this program opens: for UDP, discovery's, and the route probe's, which only
+    // connects and never receives (`ctest -R udp-opener`).
     constexpr auto PortKindMappings = EnumTable<SurfacePortKind, PortKindMapping> { {
         { .surface = SurfacePortKind::Fixed, .firewall = FirewallPortKind::Fixed },
         { .surface = SurfacePortKind::KernelChosen, .firewall = FirewallPortKind::Any },

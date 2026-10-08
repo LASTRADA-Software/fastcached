@@ -1893,6 +1893,39 @@ and it is recorded here because the question will be asked again.
       announcement, a leader's own word -- states none in its place. Three routes with three
       filters had recorded a loopback member the join route refused, and a resolver sent there
       reaches ITSELF with no error at either end.
+    - **An announced move also moves a COUPLED member's Raft endpoint -- the host-coupling
+      rule** (`Cluster::CoupledRaftEndpoint`). A NODE-ANNOUNCE carries the `0xFC` endpoint
+      alone, and adding a field is a fleet flag day, while a voter whose address moved and
+      whose Raft endpoint did not is unreachable for good: peers dial the old address, and its
+      replies ride their dials. So when a member's recorded Raft host and recorded `0xFC` host
+      are ONE host and its seat is DIALLED, the leader moves the Raft host to the announced one,
+      on the recorded Raft port. `auto` advertises one routed address for both, so every
+      default voter is coupled; a node that pins `--raft-self` and `--advertise` apart said
+      where each answers and is never coupled, and a learner's leftover Raft endpoint is
+      nobody's to dial and is never moved. A moved node resets its own sessions
+      (`RaftPeerTransport::ResetSessions`) so its senders redial instead of writing into dead
+      paths; the acceptor's half is *the newest ONE-WAY session per proven dialler wins*, under
+      The Raft peer wire.
+      - **A discovery desire can never move a coupled member's Raft HOST**
+        (`Cluster::WithCoupledRaftEndpointsKept`, at the decision). Discovery re-publishes its
+        whole authenticated set whenever any peer proves itself, a roamed voter's PRE-move
+        beacon included, and a beacon cannot be ordered against an announcement: the leader
+        re-proposed the old Raft endpoint over a committed coupled move and left the record
+        DECOUPLED for good. Holding the desire (rather than refusing at the decision) did not
+        work, because the next republish overwrote it -- the shape *a forget outranks an
+        observation* already names. A same-host port change, an uncoupled member and a member
+        the state does not record pass. `AnnouncedEndpoints_test` ("Discovery's stale Raft host
+        for a coupled member yields to the record, and nothing else does"), and
+        `MembershipCluster_test` ("A coupled move stays committed under a new leader that holds
+        the stale discovery desire").
+      - **Accepted, and stated so nobody files them as defects:** a `--raft-self` reload onto
+        a host OTHER than the `0xFC` address is not adopted from a follower's beacon -- the
+        record still couples the member, so its Raft host moves only with an announced `0xFC`
+        move (to the ANNOUNCED host) or by its own self desire while it leads; hosts compare
+        by SPELLING, case included (`SameHost`), so `Office.lan` and `office.lan` are two hosts
+        and the member reads as uncoupled -- the safe direction, since an uncoupled member
+        moves nothing it should not; and a LEARNER whose address moves resets nothing, because
+        it dials in and its redial backoff finds the voters from wherever it now is.
   - **`--cluster-admit` is the counterpart `--cluster-forget` never had.** Nothing
     could put a member *into* the replicated state without `--discovery`, so a typed
     fleet could shrink and never grow. It carries `<id>=<host>:<port>` — the same
