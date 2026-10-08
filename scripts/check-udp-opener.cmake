@@ -61,10 +61,11 @@ if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
 
-# The one file allowed to open a UDP socket, and why. One row, and adding a second is a decision
-# about the firewall rule rather than about this check.
+# The files allowed to open a UDP socket, and why. Adding a row is a decision about the firewall
+# rule rather than about this check.
 set(FastCachedUdpOpenerUnits
     "src/apps/fastcache-compile-node/DiscoveryTier.cpp|discovery's shared beacon socket and its private reply socket, the sockets the program-scoped udp/any firewall rule exists for"
+    "src/FastCache/Platform/RouteProbe.cpp|the route probe: connect() only, to read the kernel's source-address choice, and it never sends or receives, so no firewall rule is involved"
 )
 
 # What counts as opening a UDP socket.
