@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include "FrameEndpoint.hpp"
+
+#include <FastCache/Distributed/MembershipOracle.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace FastCache::Node
+{
+
+/// @file SchedulingRedirect.hpp
+/// What a node that runs consensus but no scheduler -- a Raft learner -- answers the fleet's
+/// scheduling verbs with: `NotLeader`, naming the leader's `0xFC` endpoint (#1639).
+///
+/// Without it the merged listener has no owner for `VerbFamily::Scheduler` on such a node and
+/// answers `UnimplementedVerb`, which a launcher reads as *this build is too old* -- so a client
+/// configured with this machine's own address as its scheduler never reaches the fleet at all,
+/// although the node beside it knows exactly where the leader is.
+
+/// Where the fleet's leader answers its scheduling verbs, as this node last learned it.
+///
+/// A seam rather than a reach into the consensus tier, so the responder reads one string and the
+/// tier that learns it can be faked: a case states the leader, never elects one.
+class ISchedulingLeaderSource
+{
+  public:
+    virtual ~ISchedulingLeaderSource() = default;
+
+    ISchedulingLeaderSource() = default;
+    ISchedulingLeaderSource(ISchedulingLeaderSource const&) = default;
+    ISchedulingLeaderSource& operator=(ISchedulingLeaderSource const&) = default;
+    ISchedulingLeaderSource(ISchedulingLeaderSource&&) = default;
+    ISchedulingLeaderSource& operator=(ISchedulingLeaderSource&&) = default;
+
+    /// The current leader's `0xFC` (scheduling) endpoint -- the member record's, never its Raft
+    /// endpoint.
+    /// @return The endpoint, or empty when no leader is known.
+    [[nodiscard]] virtual std::string LeaderSchedulingEndpoint() const = 0;
+};
+
+/// The leader's scheduling endpoint, held for the responder that names it.
+///
+/// Thread-safe: published from the consensus thread whenever the role observer is told who leads,
+/// and read on the I/O reactor once per refused verb -- the shape `AppliedSchedulers` has for the
+/// same two threads. It stores what it is given and decides nothing: whether a silent leader is
+/// still named is the publisher's question.
+class KnownSchedulingLeader final: public ISchedulingLeaderSource
+{
+  public:
+    /// Take @p endpoint as the leader's scheduling endpoint, replacing the previous one.
+    /// @param endpoint The endpoint; empty says no leader is known.
+    void Publish(std::string_view endpoint);
+
+    /// @copydoc ISchedulingLeaderSource::LeaderSchedulingEndpoint
+    [[nodiscard]] std::string LeaderSchedulingEndpoint() const override;
+
+  private:
+    mutable std::mutex _lock; ///< Guards `_endpoint`.
+    std::string _endpoint;    ///< What `Publish` was last given; empty until it is.
+};
+
+/// Answers every scheduling verb on a node that runs no scheduler: a member is sent to the leader.
+///
+/// **Admission first, and through the fold the scheduler uses** (`Distributed::CallerContextOf`): a
+/// caller the node's oracle does not admit is answered `NotAMember` exactly as a scheduler answers
+/// it, and is never told where the leader is. Every admitted caller is then told `NotLeader` with
+/// the leader's endpoint -- what a follower scheduler says -- except for RELEASE, which settles a
+/// lease with whoever granted it, and nothing here granted one.
+///
+/// **No identity check**, deliberately: a verb that needs a proven node (`ProvenNodeOnly`) is
+/// refused or served by the leader the caller is redirected to, on the connection that request
+/// arrives on. Refusing it here would only make the learner a second, stricter door.
+///
+/// `RefusePeer` and `Answer` reach ONE decision (`Decide`), so a caller refused before its payload
+/// is read and one refused after it receive the same bytes. Nothing is counted: each answer's
+/// constant states why.
+class SchedulingRedirectResponder final: public IFrameResponder
+{
+  public:
+    /// Kilobytes, the scheduler surface's own request ceiling: a client sends this node exactly
+    /// what it would have sent the leader.
+    static constexpr std::size_t RequestBytes = 64ULL * 1024ULL;
+
+    /// The scheduler surface's connection allowance: a fleet's worth of launchers.
+    static constexpr std::size_t OpenConnections = 256;
+
+    /// @param membership Decides who is told where the leader is; must outlive this.
+    /// @param leader Where the leader answers; read afresh per answer, must outlive this.
+    SchedulingRedirectResponder(Distributed::IMembershipOracle const& membership,
+                                ISchedulingLeaderSource const& leader) noexcept;
+
+    /// @copydoc IFrameResponder::Answer
+    ///
+    /// Never suspends: the answer is a membership fold and one string.
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
+
+    /// @copydoc IFrameResponder::RefusePeer
+    ///
+    /// Every scheduling verb is refused here, a member's included: there is nothing to read a
+    /// payload FOR, so the answer is given at the header and the payload is stepped over.
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
+                                                                   std::uint8_t opRaw) const override;
+
+    /// @copydoc IFrameResponder::CheckCredential
+    ///
+    /// `NoPolicy`: AUTH is the Session family's; this surface is never routed one.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
+    {
+        return NotTheSessionSurface();
+    }
+
+    /// @copydoc IFrameResponder::RefusalReply
+    ///
+    /// Uncounted, as the scheduler surface's: a size or opcode refusal says the peer is confused.
+    [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
+                                                      std::uint8_t opRaw,
+                                                      std::string_view detail) const override;
+
+    /// @copydoc IFrameResponder::EndpointRefusalReply
+    ///
+    /// The scheduler surface's rows (`Detail::SchedulerEndpointRefusals`), every one uncounted.
+    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
+                                                              std::uint8_t opRaw,
+                                                              std::string_view detail) const override;
+
+    /// @copydoc IFrameResponder::RequestTimeout
+    ///
+    /// The header window: nothing here waits on anything.
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return FrameServer::HeaderTimeout;
+    }
+
+    /// `RequestBytes`.
+    [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
+    {
+        return RequestBytes;
+    }
+
+    /// `OpenConnections`.
+    [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
+    {
+        return OpenConnections;
+    }
+
+    /// The connection cap times the request cap, so the byte budget never refuses what the
+    /// connection cap would allow -- the scheduler surface's 16 MiB.
+    [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
+    {
+        return OpenConnections * RequestBytes;
+    }
+
+    /// @copydoc IFrameResponder::HoldsOwnByteBudget
+    ///
+    /// No: answered from memory, so the endpoint's reservation suffices.
+    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return false;
+    }
+
+    /// @copydoc IFrameResponder::PeerWatchCounter
+    ///
+    /// None: nothing here waits, so a peer has no window to vanish in.
+    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return std::nullopt;
+    }
+
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// None: there is no silence to interpret.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return std::nullopt;
+    }
+
+    /// @copydoc IFrameResponder::StreamFor
+    ///
+    /// **Not a stream**: one refusal per verb.
+    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
+    {
+        return nullptr;
+    }
+
+    /// @copydoc IFrameResponder::NodeProver
+    ///
+    /// **None**: an identity is the leader's question, asked on the redirected request.
+    [[nodiscard]] INodeProver* NodeProver() noexcept override
+    {
+        return nullptr;
+    }
+
+  private:
+    /// The one answer for @p opRaw from @p peer, shared by `RefusePeer` and `Answer`.
+    /// @param peer Who is asking.
+    /// @param opRaw The verb, as received.
+    /// @return The encoded refusal, or nullopt for a verb outside the scheduler family -- which a
+    ///         member is then refused by whoever asked: the endpoint's opcode check, or `Answer`.
+    [[nodiscard]] std::optional<std::vector<std::byte>> Decide(PeerIdentity const& peer, std::uint8_t opRaw) const;
+
+    Distributed::IMembershipOracle const& _membership;
+    ISchedulingLeaderSource const& _leader;
+};
+
+} // namespace FastCache::Node

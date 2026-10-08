@@ -1,0 +1,298 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "Responders.hpp"
+#include "SchedulingRedirect.hpp"
+
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
+#include <FastCache/Distributed/SchedulerProtocol.hpp>
+#include <FastCache/Distributed/SchedulerService.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/LeaderRedirect.hpp>
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <ranges>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <core/async/SyncRun.hpp>
+#include <core/platform/Clock.hpp>
+#include <tests/LeaseRosterFakes.hpp>
+#include <tests/Unwrap.hpp>
+#include <tests/WireReply.hpp>
+
+using namespace FastCache;
+using namespace FastCache::Node;
+using FastCache::Testing::ErrorOf;
+using FastCache::Testing::PayloadOf;
+using FastCache::Testing::Unwrap;
+
+namespace Wire = FastCache::CompileCacheWire;
+
+namespace
+{
+
+/// The leader's scheduling endpoint every redirect case names.
+constexpr std::string_view LeaderEndpoint = "office-a.example.com:6674";
+
+/// A launcher on this machine: admitted by `LoopbackMembership`.
+[[nodiscard]] PeerIdentity ThisMachine()
+{
+    return PeerIdentity { .host = "127.0.0.1" };
+}
+
+/// A machine no route admits: not this one, on no list, holding no key.
+[[nodiscard]] PeerIdentity Outsider()
+{
+    return PeerIdentity { .host = "203.0.113.9" };
+}
+
+/// A leader source that answers a fixed endpoint.
+class StatedLeader final: public ISchedulingLeaderSource
+{
+  public:
+    /// @param endpoint What every read answers; empty for *no leader known*.
+    explicit StatedLeader(std::string endpoint):
+        _endpoint { std::move(endpoint) }
+    {
+    }
+
+    /// @copydoc ISchedulingLeaderSource::LeaderSchedulingEndpoint
+    [[nodiscard]] std::string LeaderSchedulingEndpoint() const override
+    {
+        return _endpoint;
+    }
+
+  private:
+    std::string _endpoint;
+};
+
+/// A header-only request for @p op: this responder reads no payload.
+/// @param op The verb.
+/// @return The frame.
+[[nodiscard]] std::vector<std::byte> FrameOf(Wire::Op op)
+{
+    return Wire::Detail::EncodeRequest(Wire::CurrentVersion, op, {});
+}
+
+/// What the responder answers @p op from @p peer, on BOTH paths.
+struct BothAnswers
+{
+    std::vector<std::byte> refusePeer; ///< What `RefusePeer` answered at the header.
+    std::vector<std::byte> answer;     ///< What `Answer` answered on the whole frame.
+};
+
+/// Ask @p responder both ways.
+/// @param responder Who answers.
+/// @param op The verb.
+/// @param peer Who asks.
+/// @return Both answers; `RefusePeer`'s is required to be a refusal.
+[[nodiscard]] BothAnswers AskBoth(SchedulingRedirectResponder& responder, Wire::Op op, PeerIdentity const& peer)
+{
+    auto refused = responder.RefusePeer(peer, static_cast<std::uint8_t>(op));
+    REQUIRE(refused.has_value());
+    auto answered = core::async::syncRun(responder.Answer(FrameOf(op), peer)).bytes;
+    return BothAnswers { .refusePeer = Unwrap(refused), .answer = std::move(answered) };
+}
+
+/// The words an error reply carries.
+/// @param reply The reply.
+/// @return Its message.
+[[nodiscard]] std::string MessageOf(std::vector<std::byte> const& reply)
+{
+    auto const decoded = Wire::DecodeErrorPayload(PayloadOf(reply));
+    REQUIRE(decoded.has_value());
+    return std::string { Unwrap(decoded).second };
+}
+
+/// Every counter's reading -- EVERY counter, so one that moved and was not
+/// expected is visible.
+/// @param metrics The sink.
+/// @return The readings.
+[[nodiscard]] std::map<IMetricsSink::Counter, std::uint64_t> Readings(IMetricsSink const& metrics)
+{
+    std::map<IMetricsSink::Counter, std::uint64_t> readings;
+    for (auto const counter: Enumerators<IMetricsSink::Counter>())
+        readings.emplace(counter, metrics.Read(counter));
+    return readings;
+}
+
+/// The scheduling verbs, as `OpTable` lists them.
+/// @return Their rows.
+[[nodiscard]] std::vector<Wire::OpDescriptor> SchedulingVerbs()
+{
+    auto rows = Wire::OpTable | std::views::filter([](Wire::OpDescriptor const& row) {
+                    return row.family == Wire::VerbFamily::Scheduler;
+                });
+    return { rows.begin(), rows.end() };
+}
+
+} // namespace
+
+TEST_CASE("A learner redirects a member's LEASE to the leader's scheduling endpoint", "[node][scheduling-redirect]")
+{
+    Distributed::LoopbackMembership membership;
+    StatedLeader leader { std::string { LeaderEndpoint } };
+    SchedulingRedirectResponder responder { membership, leader };
+
+    auto const [refusePeer, answer] = AskBoth(responder, Wire::Op::Lease, ThisMachine());
+    for (auto const& reply: { refusePeer, answer })
+    {
+        CHECK(ErrorOf(reply) == std::optional { Wire::ErrorCode::NotLeader });
+        CHECK(ErrorOf(reply) != std::optional { Wire::UnimplementedVerb });
+        CHECK(MessageOf(reply) == LeaderEndpoint);
+        // What the launcher asks of the reply: the redirect is one it FOLLOWS.
+        auto const message = MessageOf(reply);
+        CHECK(LeaderRedirectTarget(Wire::ErrorCode::NotLeader, message) == std::optional { LeaderEndpoint });
+    }
+    CHECK(refusePeer == answer);
+}
+
+TEST_CASE("A learner that knows no leader says NotLeader naming nobody, which redirects nowhere",
+          "[node][scheduling-redirect]")
+{
+    Distributed::LoopbackMembership membership;
+    StatedLeader leader { std::string {} };
+    SchedulingRedirectResponder responder { membership, leader };
+
+    auto const [refusePeer, answer] = AskBoth(responder, Wire::Op::Lease, ThisMachine());
+    for (auto const& reply: { refusePeer, answer })
+    {
+        CHECK(ErrorOf(reply) == std::optional { Wire::ErrorCode::NotLeader });
+        CHECK(ErrorOf(reply) != std::optional { Wire::UnimplementedVerb });
+        // No endpoint: the wire's default words for the code, exactly what a follower says during an
+        // election -- and nothing a launcher can mistake for somewhere to go.
+        CHECK(reply == Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader));
+        CHECK_FALSE(LeaderRedirectTarget(Wire::ErrorCode::NotLeader, MessageOf(reply)).has_value());
+    }
+    CHECK(refusePeer == answer);
+}
+
+TEST_CASE("A learner refuses an outsider NotAMember and never tells it where the leader is", "[node][scheduling-redirect]")
+{
+    Distributed::LoopbackMembership membership;
+    StatedLeader leader { std::string { LeaderEndpoint } };
+    SchedulingRedirectResponder responder { membership, leader };
+
+    // The control: the same verb from this machine IS redirected, so the outsider's answer below is
+    // the admission's doing and not a leader the responder failed to read.
+    CHECK(ErrorOf(AskBoth(responder, Wire::Op::Lease, ThisMachine()).answer)
+          == std::optional { Wire::ErrorCode::NotLeader });
+
+    for (auto const& row: SchedulingVerbs())
+    {
+        INFO("verb " << row.name);
+        auto const [refusePeer, answer] = AskBoth(responder, row.code, Outsider());
+        for (auto const& reply: { refusePeer, answer })
+        {
+            CHECK(ErrorOf(reply) == std::optional { Wire::ErrorCode::NotAMember });
+            auto const endpoint = std::as_bytes(std::span { LeaderEndpoint });
+            CHECK(std::ranges::search(reply, endpoint).empty());
+        }
+        CHECK(refusePeer == answer);
+    }
+}
+
+TEST_CASE("A learner answers every scheduling verb: RELEASE by name, every other by redirect", "[node][scheduling-redirect]")
+{
+    Distributed::LoopbackMembership membership;
+    StatedLeader leader { std::string { LeaderEndpoint } };
+    SchedulingRedirectResponder responder { membership, leader };
+
+    auto const verbs = SchedulingVerbs();
+    // Asked of the table rather than assumed: a sweep over nothing would pass.
+    REQUIRE(std::ranges::any_of(verbs, [](Wire::OpDescriptor const& row) { return row.code == Wire::Op::Release; }));
+    REQUIRE(std::ranges::any_of(verbs, [](Wire::OpDescriptor const& row) { return row.code == Wire::Op::Lease; }));
+
+    for (auto const& row: verbs)
+    {
+        INFO("verb " << row.name);
+        auto const expected =
+            row.code == Wire::Op::Release ? Wire::ErrorCode::DispatchNotPermitted : Wire::ErrorCode::NotLeader;
+        auto const [refusePeer, answer] = AskBoth(responder, row.code, ThisMachine());
+        for (auto const& reply: { refusePeer, answer })
+        {
+            CHECK(ErrorOf(reply) == std::optional { expected });
+            CHECK(ErrorOf(reply) != std::optional { Wire::UnimplementedVerb });
+            if (expected == Wire::ErrorCode::NotLeader)
+                CHECK(MessageOf(reply) == LeaderEndpoint);
+            else
+                CHECK_FALSE(MessageOf(reply).empty());
+        }
+        CHECK(refusePeer == answer);
+    }
+}
+
+TEST_CASE("A learner's redirect answers the same bytes a follower scheduler does", "[node][scheduling-redirect]")
+{
+    // The learner speaks for a scheduler it does not run, so it must be indistinguishable from one
+    // that is not leading: the same refusal of an outsider, and the same redirect of a member.
+    AtomicMetricsSink metrics;
+    CapturingLogger logger;
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wallClock;
+    Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
+    Distributed::SchedulerProtocol protocol { service, metrics };
+    service.SetRole(Distributed::SchedulerRole::Follower, LeaderEndpoint, 1);
+
+    Distributed::LoopbackMembership membership;
+    SchedulerResponder follower { protocol, membership, metrics };
+    StatedLeader leader { std::string { LeaderEndpoint } };
+    SchedulingRedirectResponder learner { membership, leader };
+
+    auto const lease = Wire::EncodeLease({ .fingerprint = "fp", .key = "key", .acceptedCodecs = {} });
+    auto const followerAnswer = core::async::syncRun(follower.Answer(lease, ThisMachine())).bytes;
+    REQUIRE(ErrorOf(followerAnswer) == std::optional { Wire::ErrorCode::NotLeader });
+    CHECK(core::async::syncRun(learner.Answer(lease, ThisMachine())).bytes == followerAnswer);
+
+    auto const leaseOp = static_cast<std::uint8_t>(Wire::Op::Lease);
+    auto const followerRefusal = follower.RefusePeer(Outsider(), leaseOp);
+    REQUIRE(followerRefusal.has_value());
+    CHECK(learner.RefusePeer(Outsider(), leaseOp) == followerRefusal);
+}
+
+TEST_CASE("A learner's redirect moves no counter", "[node][scheduling-redirect]")
+{
+    AtomicMetricsSink metrics;
+    Distributed::LoopbackMembership membership;
+    StatedLeader leader { std::string { LeaderEndpoint } };
+    SchedulingRedirectResponder responder { membership, leader };
+
+    auto const before = Readings(metrics);
+    // A reading taken over a sink that moves nothing cannot be told from one that was never read,
+    // so prove the instrument first: an increment IS seen, and then undone from the baseline.
+    metrics.Increment(IMetricsSink::Counter::DispatchFramesRefusedNotPermitted);
+    REQUIRE(Readings(metrics) != before);
+    auto const baseline = Readings(metrics);
+
+    for (auto const& row: SchedulingVerbs())
+        for (auto const& peer: { ThisMachine(), Outsider() })
+            static_cast<void>(AskBoth(responder, row.code, peer));
+    CHECK(Readings(metrics) == baseline);
+}
+
+TEST_CASE("KnownSchedulingLeader answers what was last published, and nothing before that", "[node][scheduling-redirect]")
+{
+    KnownSchedulingLeader leader;
+    CHECK(leader.LeaderSchedulingEndpoint().empty());
+
+    leader.Publish(LeaderEndpoint);
+    CHECK(leader.LeaderSchedulingEndpoint() == LeaderEndpoint);
+
+    leader.Publish("office-b.example.com:6674");
+    CHECK(leader.LeaderSchedulingEndpoint() == "office-b.example.com:6674");
+
+    leader.Publish({});
+    CHECK(leader.LeaderSchedulingEndpoint().empty());
+}
