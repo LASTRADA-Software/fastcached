@@ -230,7 +230,10 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// `Scheduler` family, and the every-node owners (`NodeStatus`, live stats, fleet text, session,
     /// the fleet's shared cache), the identity prover a node running consensus serves, and the
     /// fleet-summary owner its identity key answers with -- each built as `main` builds it, over
-    /// sources nothing attaches. Enrollment is refused for the reason a learner gives
+    /// sources nothing attaches -- **except the session owner**, which is not built as `main` builds
+    /// it: it holds no identity key (`SessionKeys {}`), so it mints no ticket where a built learner
+    /// would, and its ticket verifier checks against no roster, under an `ExactAudience` of this
+    /// endpoint. Enrollment is refused for the reason a learner gives
     /// (`EnrollmentAbsenceOf`). It is a learner running **no cache tier and no worker tier**, the two
     /// components a configuration may add, so those families are refused as served nowhere. The request
     /// cap is therefore production's fold -- the shared cache's, the largest -- and not the redirect's

@@ -1613,9 +1613,9 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
             schedulingLeader.LeaderChanged(leaderEndpoint);
 
             // Null when this node runs no scheduler surface, which is a legitimate
-            // shape: a member that contributes CPU and consensus without handing out
-            // anybody's work. It still votes, and its leadership -- if it wins -- is
-            // simply not exercised through a port nobody can reach.
+            // shape: a LEARNER, which applies the fleet's state and may contribute CPU
+            // without handing out anybody's work. It neither votes nor leads, so it has
+            // no role of its own to apply; it only names the leader, above.
             if (schedulerTier != nullptr)
                 schedulerTier->SetRole(role, leaderEndpoint, term);
         },

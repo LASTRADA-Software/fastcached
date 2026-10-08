@@ -27,10 +27,11 @@ namespace FastCache::Node
 /// What a node that runs consensus but no scheduler -- a Raft learner -- answers the fleet's
 /// scheduling verbs with: `NotLeader`, naming the leader's `0xFC` endpoint (#1639).
 ///
-/// Without it the merged listener has no owner for `VerbFamily::Scheduler` on such a node and
-/// answers `UnimplementedVerb`, which a launcher reads as *this build is too old* -- so a client
-/// configured with this machine's own address as its scheduler never reaches the fleet at all,
-/// although the node beside it knows exactly where the leader is.
+/// Before it, the merged listener had no owner for `VerbFamily::Scheduler` on such a node, so a
+/// scheduling verb fell through to `MergedResponder`'s unserved rows (`UnservedVerbs`,
+/// `UnservedFamilies`) and used to be answered `UnimplementedVerb`, which a launcher reads as *this
+/// build is too old* -- so a client configured with this machine's own address as its scheduler
+/// never reached the fleet at all, although the node beside it knew exactly where the leader was.
 
 /// Where the fleet's leader answers its scheduling verbs, as this node last learned it.
 ///
@@ -49,16 +50,18 @@ class ISchedulingLeaderSource
 
     /// The current leader's `0xFC` (scheduling) endpoint -- the member record's, never its Raft
     /// endpoint.
-    /// @return The endpoint, or empty when no leader is known.
+    /// @return The endpoint, or empty when no leader is known or the leader has been silent past
+    ///         the bound `SchedulingEndpointToPublish` judges it by.
     [[nodiscard]] virtual std::string LeaderSchedulingEndpoint() const = 0;
 };
 
 /// The leader's scheduling endpoint, held for the responder that names it.
 ///
-/// Thread-safe: published from the consensus thread whenever the role observer is told who leads,
-/// and read on the I/O reactor once per refused verb -- the shape `AppliedSchedulers` has for the
-/// same two threads. It stores what it is given and decides nothing: whether a silent leader is
-/// still named is the publisher's question.
+/// Thread-safe: published from the consensus thread whenever the role observer is told who leads
+/// and again at every reconcile pass, which reads how long that leader has been silent
+/// (`SchedulingLeaderPublisher`), and read on the I/O reactor once per refused verb -- the shape `AppliedSchedulers` has for
+/// the same two threads. It stores what it is given and decides nothing: whether a silent leader is still named is the
+/// publisher's question.
 class KnownSchedulingLeader final: public ISchedulingLeaderSource
 {
   public:
@@ -157,14 +160,20 @@ class SchedulingLeaderPublisher
 /// `RefusePeer` and `Answer` reach ONE decision (`Decide`), so a caller refused before its payload
 /// is read and one refused after it receive the same bytes. Nothing is counted: each answer's
 /// constant states why.
+///
+/// **It reads a request's opcode and nothing else.** A header of a foreign magic does not decode,
+/// and `Answer` closes on it (an empty reply) as every surface does; the version byte is not
+/// consulted, so a frame of a version this build does not speak is answered as a current one is.
+/// No payload is ever parsed, so no payload can be malformed here.
 class SchedulingRedirectResponder final: public IFrameResponder
 {
   public:
-    /// Kilobytes, the scheduler surface's own request ceiling: a client sends this node exactly
-    /// what it would have sent the leader.
+    /// Bytes: the scheduler surface's own request ceiling, 64 KiB, so a client sends this node
+    /// exactly what it would have sent the leader. A test pins it equal to `SchedulerResponder`'s.
     static constexpr std::size_t RequestBytes = 64ULL * 1024ULL;
 
-    /// The scheduler surface's connection allowance: a fleet's worth of launchers.
+    /// The scheduler surface's connection allowance: a fleet's worth of launchers. A test pins it
+    /// equal to `SchedulerResponder`'s.
     static constexpr std::size_t OpenConnections = 256;
 
     /// @param membership Decides who is told where the leader is; must outlive this.
@@ -281,8 +290,8 @@ class SchedulingRedirectResponder final: public IFrameResponder
     ///         member is then refused by whoever asked: the endpoint's opcode check, or `Answer`.
     [[nodiscard]] std::optional<std::vector<std::byte>> Decide(PeerIdentity const& peer, std::uint8_t opRaw) const;
 
-    Distributed::IMembershipOracle const& _membership;
-    ISchedulingLeaderSource const& _leader;
+    Distributed::IMembershipOracle const& _membership; ///< Who is told where the leader is.
+    ISchedulingLeaderSource const& _leader;            ///< Where the leader answers, read per answer.
 };
 
 } // namespace FastCache::Node

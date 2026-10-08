@@ -2694,6 +2694,23 @@ TEST_CASE("A learner started as main starts it names its leader's scheduling end
         [&knownLeader, &leaderEndpoint] { return knownLeader.LeaderSchedulingEndpoint() == leaderEndpoint; },
         describe));
 
+    // And STILL named a few reconcile passes later. Every pass hands the publisher the leader's
+    // silence, so the first sighting alone could be the role observer's word before any pass judged
+    // it; a pass that misjudged a leader that is still speaking would empty the holder in here, and
+    // the stop below would then pass having proved nothing. Observed as a bounded wait for the name
+    // to be LOST, which must run out: reaching it is the failure.
+    constexpr auto Passes = 3;
+    auto const watched = (Passes * ConsensusTier::ReconcileInterval) + (ConsensusTier::ReconcileInterval / 2);
+    REQUIRE(watched < Testing::WaitHangGuard);
+    auto const lost = Testing::WaitUntilOutcome(
+        "the learner to stop naming a leader that is still speaking",
+        [&knownLeader, &leaderEndpoint] { return knownLeader.LeaderSchedulingEndpoint() != leaderEndpoint; },
+        describe,
+        Testing::WaitOptions { .step = {}, .context = {}, .bound = watched, .rest = std::chrono::milliseconds { 10 } });
+    INFO("after " << lost.elapsed.count() << " ms the learner " << describe());
+    CHECK_FALSE(lost.reached);
+    CHECK(lost.elapsed >= Passes * ConsensusTier::ReconcileInterval);
+
     // And the other half of that decision (a silent leader is named by nobody), through the observer
     // `StartConsensusOrExplain` itself wires: the leader goes silent, and the learner stops naming it
     // once the tier's election timeout has passed. A learner has no election timer and keeps its known

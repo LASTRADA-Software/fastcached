@@ -2,6 +2,7 @@
 #include "Responders.hpp"
 #include "SchedulingRedirect.hpp"
 
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
@@ -13,10 +14,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <format>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -27,8 +28,8 @@
 
 #include <core/async/SyncRun.hpp>
 #include <core/platform/Clock.hpp>
-#include <tests/CounterMovement.hpp>
 #include <tests/LeaseRosterFakes.hpp>
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/VerbFamilies.hpp>
 #include <tests/WireReply.hpp>
@@ -117,6 +118,18 @@ struct BothAnswers
     return std::string { Unwrap(decoded).second };
 }
 
+/// Where a launcher goes after @p reply: the code and words DECODED from it, through the launcher's
+/// own predicate -- never a code the case states beside the reply.
+/// @param reply The reply; the answer views into it.
+/// @return The endpoint it redirects to, or nullopt when it redirects nowhere.
+[[nodiscard]] std::optional<std::string_view> RedirectOf(std::vector<std::byte> const& reply)
+{
+    auto const decoded = Wire::DecodeErrorPayload(PayloadOf(reply));
+    REQUIRE(decoded.has_value());
+    auto const& [code, message] = Unwrap(decoded);
+    return LeaderRedirectTarget(code, message);
+}
+
 } // namespace
 
 TEST_CASE("A learner redirects a member's LEASE to the leader's scheduling endpoint", "[node][scheduling-redirect]")
@@ -132,8 +145,7 @@ TEST_CASE("A learner redirects a member's LEASE to the leader's scheduling endpo
         CHECK(ErrorOf(reply) != std::optional { Wire::UnimplementedVerb });
         CHECK(MessageOf(reply) == LeaderEndpoint);
         // What the launcher asks of the reply: the redirect is one it FOLLOWS.
-        auto const message = MessageOf(reply);
-        CHECK(LeaderRedirectTarget(Wire::ErrorCode::NotLeader, message) == std::optional { LeaderEndpoint });
+        CHECK(RedirectOf(reply) == std::optional { LeaderEndpoint });
     }
     CHECK(refusePeer == answer);
 }
@@ -153,7 +165,7 @@ TEST_CASE("A learner that knows no leader says NotLeader naming nobody, which re
         // No endpoint: the wire's default words for the code, exactly what a follower says during an
         // election -- and nothing a launcher can mistake for somewhere to go.
         CHECK(reply == Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader));
-        CHECK_FALSE(LeaderRedirectTarget(Wire::ErrorCode::NotLeader, MessageOf(reply)).has_value());
+        CHECK_FALSE(RedirectOf(reply).has_value());
     }
     CHECK(refusePeer == answer);
 }
@@ -210,7 +222,13 @@ TEST_CASE("A learner answers every scheduling verb: RELEASE by name, every other
             if (expected == Wire::ErrorCode::NotLeader)
                 CHECK(MessageOf(reply) == LeaderEndpoint);
             else
-                CHECK_FALSE(MessageOf(reply).empty());
+            {
+                // RELEASE's own sentence, never merely words: a refusal with none carries the code's
+                // default ones, so a non-empty check would pass a row that had lost its detail.
+                auto const message = MessageOf(reply);
+                CHECK(message.contains("granted no lease"));
+                CHECK(message.contains("release a lease to the scheduler that granted it"));
+            }
         }
         CHECK(refusePeer == answer);
     }
@@ -218,8 +236,11 @@ TEST_CASE("A learner answers every scheduling verb: RELEASE by name, every other
 
 TEST_CASE("A learner's redirect answers the same bytes a follower scheduler does", "[node][scheduling-redirect]")
 {
-    // The learner speaks for a scheduler it does not run, so it must be indistinguishable from one
-    // that is not leading: the same refusal of an outsider, and the same redirect of a member.
+    // The learner speaks for a scheduler it does not run, so for a LEASE it must be indistinguishable
+    // from one that is not leading: the same refusal of an outsider, and the same redirect of a
+    // member. Not for every verb: a follower refuses an unproven member's `ProvenNodeOnly` verb
+    // (`REGISTER`) `NodeIdentityRequired` at its door, while the learner checks no identity and
+    // answers it `NotLeader` -- the leader it names asks that question on the redirected request.
     AtomicMetricsSink metrics;
     CapturingLogger logger;
     core::platform::ManualClock clock;
@@ -245,30 +266,151 @@ TEST_CASE("A learner's redirect answers the same bytes a follower scheduler does
     CHECK(learner.RefusePeer(Outsider(), leaseOp) == followerRefusal);
 }
 
-TEST_CASE("A learner's redirect moves no counter", "[node][scheduling-redirect]")
+TEST_CASE("A learner's surface limits are the scheduler surface's", "[node][scheduling-redirect]")
 {
+    // The redirect restates the scheduler surface's caps rather than sharing them, so a client is
+    // held to the same ceilings whichever of the two it reaches. Pinned against the responder that
+    // states them, so changing one without the other is red here.
     AtomicMetricsSink metrics;
+    CapturingLogger logger;
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wallClock;
+    Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
+    Distributed::SchedulerProtocol protocol { service, metrics };
     Distributed::LoopbackMembership membership;
+    SchedulerResponder const scheduler { protocol, membership, metrics };
     StatedLeader leader { std::string { LeaderEndpoint } };
-    SchedulingRedirectResponder responder { membership, leader };
+    SchedulingRedirectResponder const learner { membership, leader };
 
-    auto const before = Testing::CounterReadingsOf(metrics);
-    // A reading taken over a sink that moves nothing cannot be told from one that was never read,
-    // so prove the instrument first: an increment IS seen, and then undone from the baseline.
-    metrics.Increment(IMetricsSink::Counter::DispatchFramesRefusedNotPermitted);
-    REQUIRE(Testing::CountersMoved(before, metrics)
-            == std::format("{} +1\n", Testing::CounterName(IMetricsSink::Counter::DispatchFramesRefusedNotPermitted)));
-    auto const baseline = Testing::CounterReadingsOf(metrics);
+    CHECK(learner.MaxRequestBytes() == scheduler.MaxRequestBytes());
+    CHECK(learner.MaxOpenConnections() == scheduler.MaxOpenConnections());
+    CHECK(learner.MaxInFlightBytes() == scheduler.MaxInFlightBytes());
+}
 
-    auto const verbs = Testing::OpsOfFamily(Wire::VerbFamily::Scheduler);
-    // Asked of the table rather than assumed: a sweep over nothing would pass.
-    REQUIRE(std::ranges::contains(verbs, Wire::Op::Lease, &Wire::OpDescriptor::code));
-    for (auto const& row: verbs)
-        for (auto const& peer: { ThisMachine(), Outsider() })
-            static_cast<void>(AskBoth(responder, row.code, peer));
-    auto const moved = Testing::CountersMoved(baseline, metrics);
-    INFO("counters moved: " << moved);
-    CHECK(moved.empty());
+TEST_CASE("A learner refuses a caller presenting a revoked key and never tells it where the leader is",
+          "[node][scheduling-redirect][forget]")
+{
+    // REMOVAL, the direction an admission path fails OPEN in. A machine is forgotten by its KEY, so
+    // the oracle is the production fold over a roster that revoked `gone`, and the key is PRESENTED
+    // on the connection -- proved, or shown in a ticket -- never a host list labelled `Forgotten`.
+    // From loopback too: a revoked key is `Forgotten` from every address, and loopback is the route
+    // that would otherwise admit a caller showing nothing.
+    Testing::RosterFold const fold { { "pc-07" }, { "gone" } };
+    StatedLeader leader { std::string { LeaderEndpoint } };
+    SchedulingRedirectResponder responder { fold.admitted, leader };
+
+    constexpr std::string_view RemoteHost = "198.51.100.12";
+    // The control: the same address proving a key the roster holds IS redirected, so a refusal below
+    // is the revocation's doing and not the address's.
+    CHECK(ErrorOf(AskBoth(responder,
+                          Wire::Op::Lease,
+                          PeerIdentity { .host = std::string { RemoteHost }, .proven = Testing::IdentityOf("pc-07") })
+                      .answer)
+          == std::optional { Wire::ErrorCode::NotLeader });
+
+    auto const revoked = std::to_array<PeerIdentity>({
+        PeerIdentity { .host = std::string { RemoteHost }, .proven = Testing::IdentityOf("gone") },
+        PeerIdentity { .host = std::string { RemoteHost }, .authenticatedMachine = Testing::IdentityOf("gone") },
+        PeerIdentity { .host = "127.0.0.1", .proven = Testing::IdentityOf("gone") },
+    });
+    for (auto const& peer: revoked)
+    {
+        // Through the production fold, so the case says which verdict it is about.
+        REQUIRE(Distributed::CallerContextOf(fold.admitted, peer).membership == Distributed::Membership::Forgotten);
+        INFO("caller " << peer.host << (peer.proven.has_value() ? " proving" : " showing a ticket for") << " gone");
+        auto const [refusePeer, answer] = AskBoth(responder, Wire::Op::Lease, peer);
+        for (auto const& reply: { refusePeer, answer })
+        {
+            CHECK(ErrorOf(reply) == std::optional { Wire::ErrorCode::NotAMember });
+            auto const endpoint = std::as_bytes(std::span { LeaderEndpoint });
+            CHECK(std::ranges::search(reply, endpoint).empty());
+        }
+        CHECK(refusePeer == answer);
+    }
+}
+
+TEST_CASE("A learner redirects a machine on another address that presents a key the fleet holds",
+          "[node][scheduling-redirect]")
+{
+    // A launcher on ANOTHER machine pointed at this node: admitted by its key from wherever it
+    // dials, as every surface admits it, and then sent to the leader like any member. Not loopback
+    // and on no list, so only the key route can admit it -- an admission that asked the address
+    // would refuse it.
+    Testing::RosterFold const fold { { "pc-07" } };
+    StatedLeader leader { std::string { LeaderEndpoint } };
+    SchedulingRedirectResponder responder { fold.admitted, leader };
+
+    constexpr std::string_view RemoteHost = "198.51.100.12";
+    REQUIRE_FALSE(IsLoopbackHost(RemoteHost));
+
+    // The control: the same address showing nothing is refused and told nothing, so the redirect
+    // below is the key's doing.
+    auto const [strangerRefused, strangerAnswered] =
+        AskBoth(responder, Wire::Op::Lease, PeerIdentity { .host = std::string { RemoteHost } });
+    CHECK(ErrorOf(strangerAnswered) == std::optional { Wire::ErrorCode::NotAMember });
+    CHECK(std::ranges::search(strangerAnswered, std::as_bytes(std::span { LeaderEndpoint })).empty());
+    CHECK(strangerRefused == strangerAnswered);
+
+    auto const holders = std::to_array<PeerIdentity>({
+        PeerIdentity { .host = std::string { RemoteHost }, .proven = Testing::IdentityOf("pc-07") },
+        PeerIdentity { .host = std::string { RemoteHost }, .authenticatedMachine = Testing::IdentityOf("pc-07") },
+    });
+    for (auto const& peer: holders)
+    {
+        REQUIRE(Distributed::CallerContextOf(fold.admitted, peer).membership == Distributed::Membership::Member);
+        INFO("caller " << (peer.proven.has_value() ? "proving" : "showing a ticket for") << " pc-07");
+        auto const [refusePeer, answer] = AskBoth(responder, Wire::Op::Lease, peer);
+        for (auto const& reply: { refusePeer, answer })
+        {
+            CHECK(ErrorOf(reply) == std::optional { Wire::ErrorCode::NotLeader });
+            CHECK(MessageOf(reply) == LeaderEndpoint);
+        }
+        CHECK(refusePeer == answer);
+    }
+}
+
+TEST_CASE("A learner sends --cluster-status to the leader, which admits the machine by the ticket it presents there",
+          "[node][scheduling-redirect][ticket]")
+{
+    // The operator's one-shot verb from a learner PC with no `--scheduler`: it asks this machine's own
+    // node, which answers `NotLeader` naming the leader; the client follows it and presents a ticket
+    // minted for THAT endpoint (`ClusterAdminCli_test`'s redirect case pins the client half). What
+    // is left is the leader's half: a remote caller showing a verified ticket for a key the roster
+    // holds is admitted to `ClusterStatus`, which asks no proven identity of its caller.
+    Testing::RosterFold const fold { { "pc-07" } };
+
+    StatedLeader leader { std::string { LeaderEndpoint } };
+    SchedulingRedirectResponder learner { fold.admitted, leader };
+    auto const [refusePeer, answer] = AskBoth(learner, Wire::Op::ClusterStatus, ThisMachine());
+    for (auto const& reply: { refusePeer, answer })
+    {
+        CHECK(RedirectOf(reply) == std::optional { LeaderEndpoint });
+    }
+
+    AtomicMetricsSink metrics;
+    CapturingLogger logger;
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wallClock;
+    Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
+    Distributed::SchedulerProtocol protocol { service, metrics };
+    service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+    SchedulerResponder const leading { protocol, fold.admitted, metrics };
+
+    auto const clusterStatus = static_cast<std::uint8_t>(Wire::Op::ClusterStatus);
+    constexpr std::string_view LearnerHost = "198.51.100.12";
+    // The control: the learner PC's address showing nothing is refused, so the admission below is
+    // the ticket's.
+    auto const stranger = leading.RefusePeer(PeerIdentity { .host = std::string { LearnerHost } }, clusterStatus);
+    REQUIRE(stranger.has_value());
+    CHECK(ErrorOf(Unwrap(stranger)) == std::optional { Wire::ErrorCode::NotAMember });
+
+    auto const ticketed = leading.RefusePeer(
+        PeerIdentity { .host = std::string { LearnerHost }, .authenticatedMachine = Testing::IdentityOf("pc-07") },
+        clusterStatus);
+    INFO("refused: " << (ticketed.has_value() ? MessageOf(Unwrap(ticketed)) : std::string { "(admitted)" }));
+    CHECK_FALSE(ticketed.has_value());
 }
 
 TEST_CASE("KnownSchedulingLeader answers what was last published, and nothing before that", "[node][scheduling-redirect]")

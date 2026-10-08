@@ -533,9 +533,13 @@ TEST_CASE("A learner's port refuses a MINT-TICKET over the verb's own ceiling at
             return Wire::Detail::EncodeRequest(
                 Wire::CurrentVersion, Wire::Op::MintTicket, { std::span<std::byte const> { field } });
         };
-        auto const prefix = Unwrap(Wire::DecodeRequestHeader(frameOf(0))).payloadLength;
+        auto const empty = Wire::DecodeRequestHeader(frameOf(0));
+        REQUIRE(empty.has_value());
+        auto const prefix = Unwrap(empty).payloadLength;
         auto frame = frameOf(declared - prefix);
-        REQUIRE(Unwrap(Wire::DecodeRequestHeader(frame)).payloadLength == declared);
+        auto const header = Wire::DecodeRequestHeader(frame);
+        REQUIRE(header.has_value());
+        REQUIRE(Unwrap(header).payloadLength == declared);
         return fleet.Exchange(Learner, std::move(frame), Cc::Credential {}, Cc::ExchangeBudget {});
     };
 
