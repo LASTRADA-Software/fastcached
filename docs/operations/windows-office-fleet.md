@@ -223,9 +223,9 @@ cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER_LAUNCHER=fastcache-cc -DCMAKE_CX
   it for longer than an election timeout (a PC off the VPN), it names nobody and every miss
   compiles locally. A learner older than this release refuses the lease instead of
   redirecting, and every miss compiles locally; on such a PC name A here, by the same name as
-  the seed. A build tree configured with A's name keeps it, because the value is baked in at
-  configure (below): reconfigure it with `-DFASTCACHE_SCHEDULER=127.0.0.1:6674`. Unset, every
-  miss compiles locally.
+  the seed. A build tree configured through `cmake/portable/CompileCache.cmake` with A's name
+  keeps it (below); reconfigure it with `-DFASTCACHE_SCHEDULER=127.0.0.1:6674`. Any other build
+  reads the variable at each compile. Unset, every miss compiles locally.
 - **`FASTCACHE_ADDR` needs no setting**: its default, `127.0.0.1:6674`, is this PC's own node,
   which is this PC's cache and the node that mints the machine ticket every exchange with
   another machine presents.
@@ -278,11 +278,11 @@ logs as `serving`.
 
 A is the only voter, so while it is down the fleet has no scheduler. Every PC's builds compile
 locally and keep their own cache: within about one consensus pass (a second or so) a PC's own
-node stops naming the silent A, and its launcher then declines the lease without dialling A; reads through to C keep working,
-since each node still holds the cluster state it applied. A elects itself again within seconds
-of starting, the PCs dial it again by themselves, their workers register within one 20-second
-round, and dispatch resumes with nothing to do. An auto-approve window open at the reboot is
-gone: it lived in A's memory.
+node stops naming the silent A, and its launcher then declines the lease without dialling A.
+Reads through to C keep working, since each node still holds the cluster state it applied. A
+elects itself again within seconds of starting, the PCs dial it again by themselves, their
+workers register within one 20-second round, and dispatch resumes with nothing to do. An
+auto-approve window open at the reboot is gone: it lived in A's memory.
 
 A longer outage has one more effect. A PC whose worker has heard from no leader for 65 minutes
 refuses every compile grant and raises `consensus-leader-silent`, because the state it would

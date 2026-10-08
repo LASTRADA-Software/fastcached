@@ -113,9 +113,9 @@ registered against *it*, which is not the fleet. A learner, which runs no
 scheduler, answers the same way.
 
 For the client that refusal is an instruction: it asks the endpoint the refusal
-names, up to two hops. Only a `not-leader` naming nobody (an election in
-progress, or a leader gone silent) means a local compile, as every other refusal
-does.
+names, up to two hops. A `not-leader` naming nobody (an election in progress, or
+a leader gone silent) means a local compile, as every other refusal does, and so
+does one still naming an endpoint after two hops.
 
 ### 3. The leader decides from what heartbeats told it
 
