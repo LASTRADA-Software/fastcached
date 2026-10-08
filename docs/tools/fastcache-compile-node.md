@@ -3708,9 +3708,20 @@ issue the scan can resolve. So the state is reachable only by a deliberate act t
 records where the decision is tracked, and the printed count cannot be driven to
 zero by relabelling.
 
-A verb this node runs **no component for** — a `LEASE` at a plain worker, a `FETCH`
-at a node with no cache tier — is answered `unimplemented-verb` and counted nowhere,
-which is the first case above: it is what a healthy build gets, once per exchange.
+A verb this node runs **no component for** — a `FETCH` at a node with no cache tier —
+is answered `unimplemented-verb` and counted nowhere, which is the first case above: it
+is what a healthy build gets, once per exchange.
+
+A scheduling verb is never answered that way, because `unimplemented-verb` tells a client
+*this build is too old* and the build is current. A node that runs consensus but no
+scheduler — a learner — answers every scheduling verb `not-leader` naming the leader's
+`0xFC` endpoint, once the caller is admitted, so a launcher pointed at its own machine's
+learner follows it to the leader; it names nobody once the leader has been silent past
+the consensus tier's election timeout, and it refuses `RELEASE` `dispatch-not-permitted`,
+having granted no lease. A node running no consensus at all refuses the capacity verbs
+(`REGISTER`, `HEARTBEAT`, `WITHDRAW`, `LEASE`, `RELEASE`, `NODE-ANNOUNCE`)
+`dispatch-not-permitted` and the cluster verbs `no-cluster`, the codes `fastcached` gives
+for the same verbs. None of these is counted.
 
 The cache surface's other six arms are uncounted deliberately, and each for its own
 reason rather than one shared sentence. They are listed so the decision can be

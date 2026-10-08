@@ -328,9 +328,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   where its formation record says (`SchedulersOf`; its OWN scheduler at the endpoint it SERVES,
   `ActivatedNodeEndpoint`). A LIST, never a leader choice: each value dialled at most once a round,
   `NotLeader` never consults it, a verb falls back only where nothing was SENT. Assert WHICH endpoint.
-- `NotLeader` is an instruction, not an answer about the fleet: a client follows it to the
-  endpoint it names (`RedirectTarget`), the RELEASE goes to whoever ISSUED the lease, and it is
-  judged by PARSING — one predicate, `ParseDialEndpoint` — and bounded.
+- `NotLeader` is an instruction, not an answer: a client follows it (`RedirectTarget`), judged by
+  PARSING (`ParseDialEndpoint`) and bounded, the RELEASE to whoever ISSUED. A LEARNER sends a member
+  to the leader's `0xFC` endpoint with it, and names NOBODY once silent past `electionTimeoutMax`.
 - A COMPILE reply is tied to its request or REFUSED (`Mismatched`), the digest taken in
   `CompileJobRunner::Run` from what is about to be spawned and never folded in `WorkerProtocol`.
   It has no counter and can have none, so the alarm is an UNCONDITIONAL stderr line and the

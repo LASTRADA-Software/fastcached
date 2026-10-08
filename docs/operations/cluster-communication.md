@@ -369,7 +369,7 @@ and the dashboard are off unless configured.
 | Opened by | Answered by | Port | When | Carries |
 |---|---|---|---|---|
 | `fastcache-cc` | a cache — `fastcached` or a node's `--listen-node` | `FASTCACHE_ADDR`, default `127.0.0.1:6674` | once per operation | `FETCH`, `STORE` |
-| `fastcache-cc` | the leader's scheduler | `FASTCACHE_SCHEDULER`, the leader's node port, `:6674` by default | on a cache miss, when dispatch is configured | `LEASE` |
+| `fastcache-cc` | the leader's scheduler, or this PC's own node, which redirects | `FASTCACHE_SCHEDULER`, the leader's node port or this PC's own, `:6674` by default | on a cache miss, when dispatch is configured | `LEASE` |
 | `fastcache-cc` | the worker named in the grant | whatever that worker advertises, which defaults to its `--listen-node` surface | once per dispatched compile, held for its duration | `COMPILE` |
 | `fastcache-cc` | the leader's scheduler | `:6674` | a **second** connection, on every path out of the compile | `RELEASE` |
 | a **node** | the leader's scheduler | where its formation record says the fleet's voters answer, `:6674` by default | `REGISTER` once per toolchain, then `HEARTBEAT` every **20 s** | capacity, load, and its closed history buckets — after a handshake proving the node's identity key, with every frame sealed |

@@ -206,18 +206,23 @@ not reaching C, and `shared-cache-unavailable` on C when its tier will not open.
 ```powershell
 $env:FASTCACHE_SOURCE_DIR = 'D:\src\product'
 $env:FASTCACHE_BINARY_DIR = 'D:\src\product\build'
-$env:FASTCACHE_SCHEDULER  = 'office-a.example.com:6674'
+$env:FASTCACHE_SCHEDULER  = '127.0.0.1:6674'
 cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER_LAUNCHER=fastcache-cc -DCMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc
 ```
 
 - **`FASTCACHE_SOURCE_DIR` and `FASTCACHE_BINARY_DIR`** are required: with either unset, nothing
   is cached. They are what lets two checkouts at different paths share an entry.
-- **`FASTCACHE_SCHEDULER` names A**, by the same name as the seed, never `127.0.0.1`. A PC's own
-  node is a learner once approved, and a learner schedules nothing: it refuses a lease as a verb
-  it does not serve, and every miss would compile locally. A not-yet-approved PC asking A is
-  refused, and compiles locally too, so the setting is right from the first day. The launcher
-  follows a `not-leader` answer, so after you promote voters any one of them will do. Unset,
-  every miss compiles locally.
+- **`FASTCACHE_SCHEDULER` is `127.0.0.1:6674` on every PC**, this PC's own node. Once approved
+  that node is a learner: it schedules nothing itself, and answers a lease with `not-leader`
+  naming the leader's scheduling endpoint, which the launcher follows — and it releases the
+  lease where it was issued. So the setting survives leadership moving to another voter, and
+  no PC is re-pointed after an election. A PC whose own node leads, or is still its own
+  solitary cluster (not yet approved), leases from its own scheduler directly, so the setting
+  is right from the first day. While the node knows no leader, or has not heard from it for
+  longer than an election timeout (a PC off the VPN), it names nobody and every miss compiles
+  locally. A node older than this release refuses the lease instead of redirecting, and every
+  miss compiles locally; on such a PC name A here, by the same name as the seed. Unset, every
+  miss compiles locally.
 - **`FASTCACHE_ADDR` needs no setting**: its default, `127.0.0.1:6674`, is this PC's own node,
   which is this PC's cache and the node that mints the machine ticket every exchange with
   another machine presents.
