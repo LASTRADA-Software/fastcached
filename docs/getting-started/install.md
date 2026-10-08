@@ -163,8 +163,8 @@ installer remembered there is forgotten by the next transaction, and that regist
 remembered one. An empty value counts as leaving the property out, so a remembered scope is kept;
 to drop it, uninstall (which forgets the values) and install again. An installer older than this
 remembering has nothing to read back, so the first upgrade from one registers what it states: with
-no property the node is still registered and started, advertising this machine's name with its
-firewall rules admitting any address, so pass `FASTCACHE_FIREWALL_ALLOW` (and any other property
+no property the node is still registered and started, advertising the address this machine routes
+from (re-derived when the network changes) with its firewall rules admitting any address, so pass `FASTCACHE_FIREWALL_ALLOW` (and any other property
 you installed with) on that upgrade to keep it.
 
 ```powershell

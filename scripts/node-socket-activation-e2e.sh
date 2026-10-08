@@ -48,12 +48,14 @@
 # and port off the socket it is handed (`Node::AdoptActivatedBind`) and must advertise
 # them -- the stock package, which once refused to start without that flag.
 #
-# ## The configuration is the packaged one
+# ## The configurations are the packaged ones
 #
-# `advertise:` and no `listen_node:` -- byte-for-byte the shape
-# `.github/workflows/build.yml` writes into the file the unit's ExecStart names. Taken
-# from the workflow rather than from a shape that seemed representative, because #770
-# is precisely a configuration nobody thought to write down.
+# The default mode's is `advertise:` and no `listen_node:` -- byte-for-byte the shape
+# `.github/workflows/build.yml`'s packaging job writes into the file the unit's ExecStart
+# names. Taken from the workflow rather than from a shape that seemed representative,
+# because #770 is precisely a configuration nobody thought to write down. The shipped
+# `fastcache-compile-node.yaml` carries no `advertise:` any more, so `--derive-advertise`
+# is the configuration a stock package installs.
 #
 # Registered in `src/tests/CMakeLists.txt` rather than beside the node, for the reason
 # `fleet-dashboard-e2e` states: a script-driven test naming an executable belongs where
