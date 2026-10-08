@@ -331,10 +331,46 @@ fc_case("a source path with `(`: FATAL_ERROR is still read as FATAL_ERROR" dirty
     - - FATAL_ERROR "git did not answer `git status --porcelain --untracked-files=no`" none
     SOURCE "${parenthesisedTree}")
 
+# ---- the classifier, handed the words of a CMake this run is not ----------------------------
+# The cases above reach the table only through the words the RUNNING CMake chooses, so a
+# spelling only another CMake chooses is never seen: CMake 3.28.3 writes "No such file or
+# directory" where 4.x writes it in lower case, and the case-sensitive `unrunnable` row missed
+# it on 3.28 alone (#1642). Each row hands those words straight to the classifier
+# FastCachedRunGit uses, so every measured spelling is judged on every CMake.
+#   <RESULT_VARIABLE> | <the row it belongs to> | <where it was measured>
+set(classifications
+    "128 | failed | git exiting non-zero"
+    "Process terminated due to timeout | timeout | CMake 4.2 and 4.3.1"
+    "no such file or directory | unrunnable | CMake 4.2 and 4.3.1"
+    "No such file or directory | unrunnable | CMake 3.28.3, #1642"
+    "permission denied | unrunnable | CMake 4.2 and 4.3.1"
+    "unknown error | unrunnable | CMake 4.3.1 on Windows"
+    "Segmentation fault | died | CMake 4.2 on Linux"
+    "Access violation | died | CMake 4.3.1 on Windows"
+    "Exit code 0xc0000409 | died | CMake 4.3.1 on Windows")
+include("${FASTCACHED_SOURCE_DIR}/cmake/Version.cmake")
+foreach(classification IN LISTS classifications)
+    string(REPLACE " | " ";" fields "${classification}")
+    list(GET fields 0 result)
+    list(GET fields 1 wantKind)
+    list(GET fields 2 measuredOn)
+    math(EXPR cases "${cases} + 1")
+    FastCachedGitNonAnswerOf("${result}" got)
+    if(gotKind STREQUAL wantKind)
+        message("  ok   `${result}` (${measuredOn}) is ${wantKind}")
+    else()
+        string(APPEND failures
+            "\n  FAIL `${result}` (${measuredOn}) is classified ${gotKind}, expected ${wantKind}")
+    endif()
+endforeach()
+
 # Every case this file calls must have run: a refactor that returned early would otherwise
-# print a smaller count and pass, having judged less. The number is DERIVED from the calls.
+# print a smaller count and pass, having judged less. The number is DERIVED from the calls
+# and the classification rows.
 file(STRINGS "${self}" calls REGEX "^fc_case\\(")
 list(LENGTH calls called)
+list(LENGTH classifications classified)
+math(EXPR called "${called} + ${classified}")
 message("version-git-unanswered: ${cases} case(s) run")
 if(NOT cases EQUAL called)
     message(FATAL_ERROR "version-git-unanswered ran ${cases} of the ${called} case(s) it calls")
