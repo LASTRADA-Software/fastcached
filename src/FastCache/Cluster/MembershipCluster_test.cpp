@@ -188,8 +188,12 @@ class Fleet
         // What members announced, merged into the desires as the tier merges them, then keyed as the
         // tier keys them: a discovered peer's desire states no key, and the leader fills in the one its
         // roster holds live for it (`WithLiveKeys`). Nothing is held in flight here: a re-proposal of a
-        // record still uncommitted is the same record again.
-        auto const desired = WithAnnouncedEndpoints(DesiredBy(*leader), AnnouncedEndpointDesires(state, _announced, {}));
+        // record still uncommitted is the same record again. A coupled announcement's Raft endpoint
+        // is KEPT in what the leader holds, as the tier keeps it (`WithAnnouncedRaftEndpoints`).
+        auto const announcements = AnnouncedEndpointDesires(state, _announced, {});
+        auto& held = HeldBy(*leader);
+        held = WithAnnouncedRaftEndpoints(std::move(held), announcements);
+        auto const desired = WithAnnouncedEndpoints(held, announcements);
         auto const plan = MembershipProposals(state, configuration, WithLiveKeys(state, desired, *_rosters.at(*leader)));
         for (auto const& command: plan.proposals)
             std::ignore = _cluster.ProposeOnLeader(Encode(command));
@@ -310,6 +314,19 @@ class Fleet
         return ids;
     }
 
+    /// What `who` holds desired across passes, as the tier holds `_desired`: what `DesiredBy` says,
+    /// for every member it has not held a desire for yet, and what it kept for every other.
+    /// @param who The member.
+    /// @return Its held desires.
+    [[nodiscard]] std::vector<DesiredMember>& HeldBy(Consensus::NodeId const& who)
+    {
+        auto& held = _held[who];
+        for (auto& desire: DesiredBy(who))
+            if (!std::ranges::contains(held, desire.id, &DesiredMember::id))
+                held.push_back(std::move(desire));
+        return held;
+    }
+
     /// What `who` desires: itself, asserting its (empty) scheduler endpoint, and every
     /// other member with no opinion about one, as discovery hands proven peers over.
     /// @param who The member.
@@ -337,6 +354,9 @@ class Fleet
     Consensus::RaftClusterHarness _cluster;
     std::vector<Consensus::NodeId> _catchingUp;
     AnnouncedEndpointMap _announced; ///< What members announced, as the leader's tier keeps it.
+
+    /// What each member holds desired across passes, as its tier holds `_desired`.
+    std::map<Consensus::NodeId, std::vector<DesiredMember>> _held;
 };
 
 /// Step until one leader exists, or give up.
@@ -740,5 +760,44 @@ TEST_CASE("A learner's announced endpoint replaces its record through consensus 
         CHECK(record.seat == MemberSeat::Learner);
         CHECK(record.publicKey == std::optional { laptopKey });
     }
+    RequireNoViolations(fleet.Cluster());
+}
+
+TEST_CASE("A voter that announces a moved address has its Raft endpoint re-recorded",
+          "[consensus][cluster][membership][endpoint]")
+{
+    // A voter that advertises the routed address -- its Raft and `0xFC` endpoints on one host -- roams
+    // to another network. Its NODE-ANNOUNCE carries only the `0xFC` endpoint, so the leader moves the
+    // Raft one by the host-coupling rule, through the log, its seat and key kept. Then it STAYS moved:
+    // discovery still desires the voter at the Raft endpoint a beacon stated before the move.
+    Fleet fleet { { "n1", "n2", "n3" } };
+    REQUIRE(SettleOnLeader(fleet.Cluster()));
+    fleet.Reconcile(5);
+    auto const leader = Unwrap(fleet.Cluster().Leader());
+    auto const roamer = Consensus::NodeId { leader == "n2" ? "n3" : "n2" };
+    auto const machine = roamer.substr(1);
+
+    // Its `0xFC` port first, on the machine its Raft port answers on.
+    fleet.Announce(roamer, std::format("10.0.0.{}:6674", machine));
+    fleet.Reconcile(10);
+    auto const before = RecordOf(fleet.StateAt(leader), roamer);
+    REQUIRE(before.schedulerEndpoint == std::format("10.0.0.{}:6674", machine));
+    REQUIRE(before.raftEndpoint == EndpointOf(roamer));
+
+    fleet.Announce(roamer, std::format("192.168.7.{}:6674", machine));
+    fleet.Reconcile(10);
+    for (auto const* const id: { "n1", "n2", "n3" })
+    {
+        INFO(id);
+        auto const record = RecordOf(fleet.StateAt(id), roamer);
+        CHECK(record.raftEndpoint == std::format("192.168.7.{}:6680", machine));
+        CHECK(record.schedulerEndpoint == std::format("192.168.7.{}:6674", machine));
+        CHECK(record.seat == MemberSeat::Voter);
+        CHECK(record.publicKey == before.publicKey);
+    }
+
+    fleet.Reconcile(10);
+    CHECK(fleet.Cluster().Leader() == std::optional { leader });
+    CHECK(RecordOf(fleet.StateAt(leader), roamer).raftEndpoint == std::format("192.168.7.{}:6680", machine));
     RequireNoViolations(fleet.Cluster());
 }

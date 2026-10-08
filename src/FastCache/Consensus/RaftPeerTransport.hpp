@@ -465,6 +465,19 @@ class RaftPeerTransport final: public IRaftTransport, public IRaftInboundLinks
     /// @return What this did.
     PeerChange Learn(PeerEndpoint where);
 
+    /// Close every dialled and attached session so senders redial; the transport keeps running.
+    ///
+    /// Called when this node's own address moved: a session it dialled from the old address is a
+    /// path the network no longer routes, and a write into it fails only once some timeout notices.
+    /// Closed instead, so each sender redials -- at its next *message*, for `Learn`'s reason: a sender
+    /// parked on its outbox is not woken by its socket closing. Nothing is forgotten and no outbox is
+    /// closed: every peer stays dialled, with what is queued for it. Any thread.
+    ///
+    /// No-op unless Running with a sender running, for the lifetime reason `Learn` gives: the
+    /// closing is a detached task on the reactor, and one submitted to a loop nobody drives -- or
+    /// after a stop -- is a frame nobody frees.
+    void ResetSessions();
+
     /// Learn which peers reach this node by dialling in (`PeerLink::DialsIn`). Any thread.
     ///
     /// **Replaces** what the last call said, because the caller -- the node's `LearnMembers`,

@@ -314,7 +314,7 @@ startup refusal as well.
 | Series | What a rise means |
 |---|---|
 | `fastcache_node_endpoint_changes_total` | The endpoint this node advertises moved: the address it routes from changed (a DHCP renewal, Wi-Fi to wired, another network), or a reload re-pinned `--advertise`. Each move is logged at Info with the old and the new endpoint; a worker's heartbeat is woken to re-register under the new one at once, and a lease granted for the old one is honoured until it has. Zero on a node whose `--advertise` stays pinned to one value; a reload that re-pins it to another counts one move. |
-| `fastcache_node_raft_endpoint_changes_total` | The Raft endpoint this node advertises moved, for the same two reasons. Read it beside the row above: the two move together unless `--raft-self` is pinned apart from `--advertise`. |
+| `fastcache_node_raft_endpoint_changes_total` | The Raft endpoint this node advertises moved, for the same two reasons. Read it beside the row above: the two move together unless `--raft-self` is pinned apart from `--advertise`. It stays at zero on a node that dials in (a learner) or runs no consensus: nobody dials such a node's Raft port, so none is derived. |
 
 ## Anything the fleet reads has to be text
 

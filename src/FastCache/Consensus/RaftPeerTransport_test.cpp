@@ -1224,6 +1224,52 @@ TEST_CASE("A peer that moved is redialled at its new address", "[consensus][raft
     harness.RequestStopAndDrain();
 }
 
+TEST_CASE("Resetting sessions makes a dialled peer redial while the transport keeps running", "[consensus][raft][transport]")
+{
+    // This node moved: its session to n2 runs over a path the network no longer routes. Closed, so
+    // the next message redials -- the same address, since it is THIS node that moved -- and is served.
+    Harness harness;
+    harness.Start();
+    harness.transport->Send("n2", Vote(1));
+    harness.reactor.drain();
+    REQUIRE(harness.Writes() == 1);
+    auto const attempts = harness.connector.Attempts();
+
+    harness.transport->ResetSessions();
+    harness.reactor.drain();
+
+    // The next message finds the socket closed, is dropped and counted, and the sender backs off and
+    // redials, exactly as for any dropped connection.
+    harness.transport->Send("n2", Vote(2));
+    harness.reactor.drain();
+    harness.clock.advance(1s);
+    harness.reactor.drain();
+    CHECK(harness.connector.Attempts() == attempts + 1);
+    CHECK(harness.transport->ConnectedPeers() == 1);
+    CHECK(harness.transport->PeerCount() == 1);
+
+    harness.transport->Send("n2", Vote(3));
+    harness.reactor.drain();
+    CHECK(harness.Writes() == 2);
+
+    harness.RequestStopAndDrain();
+}
+
+TEST_CASE("Resetting sessions before the start or after a stop queues nothing", "[consensus][raft][transport]")
+{
+    Harness harness;
+    harness.Build();
+    harness.transport->ResetSessions();
+    CHECK(harness.reactor.pendingSubmissions() == 0);
+
+    harness.transport->Start();
+    harness.reactor.drain();
+    harness.RequestStopAndDrain();
+    harness.transport->ResetSessions();
+    CHECK(harness.reactor.pendingSubmissions() == 0);
+    CHECK(harness.transport->SendersRunning() == 0);
+}
+
 TEST_CASE("A peer that moves during a dial is not served at its old address", "[consensus][raft][transport]")
 {
     // The window nothing else closes. Dropping a moved peer's connection can only

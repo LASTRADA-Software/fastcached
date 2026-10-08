@@ -140,7 +140,10 @@ struct SelfFacts
     /// one object the worker registers under (`AnnouncedEndpoint`). Must outlive the controller.
     Cc::IAdvertisedEndpointSource const& advertised;
 
-    std::string raftEndpoint; ///< Where its Raft port answers; announced EMPTY while its listener is closed.
+    /// Where its Raft port answers, read at every summary -- never captured, so the beacon states where
+    /// a node that roamed answers NOW, and a peer's discovery desires it there (the resolver publishes
+    /// it, `EndpointResolver`). Announced EMPTY while its listener is closed. Must outlive the controller.
+    Cc::IAdvertisedEndpointSource const& raftAdvertised;
 
     /// Whether it may ask a fleet to take it. A node confined to this machine asks no seed and polls
     /// no fleet -- a member admitted at a loopback address is one nobody else can reach -- and so

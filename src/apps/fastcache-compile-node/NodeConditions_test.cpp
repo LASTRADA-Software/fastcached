@@ -81,6 +81,16 @@ namespace Wire = CompileCacheWire;
     return advertised;
 }
 
+/// Where a tier under test says its Raft port answers: nowhere it would assert, so the record the
+/// tier started with stands and no pass reads a move. One object for the whole binary, so it
+/// outlives every tier a case starts.
+/// @return The source.
+[[nodiscard]] FastCache::Cc::IAdvertisedEndpointSource const& TestRaftAdvertised()
+{
+    static FastCache::Node::AnnouncedEndpoint const advertised { std::string {} };
+    return advertised;
+}
+
 /// `NodeMembership` reports an unreadable `fleet-open` row here; no case asserts on it.
 NullLogger membershipLog;
 
@@ -406,6 +416,7 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     auto const consensus = ConsensusTier::Start(
         clusteredNode,
         TestAdvertised(),
+        TestRaftAdvertised(),
         FastCache::Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [&roster](Cluster::ClusterState const& state) { (*roster)->Applied(state); },
@@ -470,8 +481,15 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
                                                                                 .wait = formationWait } },
                         .reloader = nullptr };
     auto const formationKey = std::optional { FastCache::Testing::TestKeyPair("n1") }; // what its Enroll is signed with
-    auto const formation = MakeFormationRuntime(
-        clusteredNode, formationKey, formationBody, TestAdvertised(), nullptr, metrics, logger, &conditions);
+    auto const formation = MakeFormationRuntime(clusteredNode,
+                                                formationKey,
+                                                formationBody,
+                                                TestAdvertised(),
+                                                TestRaftAdvertised(),
+                                                nullptr,
+                                                metrics,
+                                                logger,
+                                                &conditions);
     REQUIRE(formation.has_value());
     REQUIRE(*formation != nullptr);
 

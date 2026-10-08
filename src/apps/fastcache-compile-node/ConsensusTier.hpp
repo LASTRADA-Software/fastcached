@@ -120,6 +120,31 @@ inline constexpr std::string_view ConsensusNeedsIdentityKeyRefusal =
 /// @return `at <endpoint>`, or `with no consensus endpoint` when it is empty.
 [[nodiscard]] std::string DescribeConsensusEndpoint(std::string_view raftEndpoint);
 
+/// The Raft endpoint this node asserts for itself now: @p raftAdvertised when its seat is DIALLED and
+/// another machine may dial it (`PeerDialableOrNone`), else empty -- no assertion.
+///
+/// Empty for a seat that dials in (`Cluster::SeatNeedsEndpoint`): a learner's Raft endpoint is
+/// nobody's to dial, so whatever the resolver derived for it moves nothing. Empty for a loopback or
+/// wildcard one too, which a record never holds -- the recorded one then stands.
+/// @param seat The seat this node holds, as its mode reads it.
+/// @param raftAdvertised Where this node's Raft port answers, as the resolver publishes it now.
+/// @return The endpoint to assert, or empty.
+[[nodiscard]] std::string OwnRaftEndpoint(Cluster::MemberSeat seat, std::string_view raftAdvertised);
+
+/// This node's own desire as a reconcile pass asserts it, read from the live sources: its `0xFC`
+/// endpoint always (`PeerDialableOrNone`, an assertion even empty), and its Raft endpoint whenever
+/// `OwnRaftEndpoint` asserts one -- so a leader that moved records its own new address, as it records
+/// its `0xFC` one, and nobody else has to announce it.
+/// @param held The desire this node holds for itself.
+/// @param seat The seat this node holds, as its mode reads it.
+/// @param advertised Where this node's `0xFC` port answers now.
+/// @param raftAdvertised Where this node's Raft port answers now.
+/// @return The desire this pass asserts.
+[[nodiscard]] Cluster::DesiredMember SelfDesire(Cluster::DesiredMember held,
+                                                Cluster::MemberSeat seat,
+                                                std::string_view advertised,
+                                                std::string_view raftAdvertised);
+
 /// Every peer that reaches this node by dialling in, which the transport places as such.
 ///
 /// Read through the one column two ways, and both are needed. The RECORD's seats
@@ -448,6 +473,10 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     ///        `--advertise` reaches the record at the next pass this node leads. The one object the
     ///        worker registers under and NODE-ANNOUNCE names (`AnnouncedEndpoint`). Must outlive the
     ///        tier.
+    /// @param raftAdvertised Where this node's Raft port answers, read at every reconcile pass: the
+    ///        endpoint its own record asserts while its seat is dialled (`OwnRaftEndpoint`), and the
+    ///        one whose move resets every session (`RaftPeerTransport::ResetSessions`). The resolver
+    ///        publishes it. Must outlive the tier.
     /// @param identityKey This node's identity key, as the start resolved it out of the state
     ///        directory (#178). Taken rather than read again, so the key every peer connection
     ///        proves and the one the node announced are one reading of one file. Disengaged is
@@ -473,6 +502,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     [[nodiscard]] static std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> Start(
         NodeConfig const& cfg,
         Cc::IAdvertisedEndpointSource const& advertised,
+        Cc::IAdvertisedEndpointSource const& raftAdvertised,
         std::optional<Ed25519KeyPair> const& identityKey,
         RoleObserver onRole,
         MembersObserver onMembers,
@@ -615,6 +645,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
   private:
     ConsensusTier(Cluster::ClusterMember self,
                   Cc::IAdvertisedEndpointSource const& advertised,
+                  Cc::IAdvertisedEndpointSource const& raftAdvertised,
                   Consensus::FileRaftStorage storage,
                   Ed25519KeyPair identityKey,
                   std::span<Cluster::MemberSpec const> knownMembers,
@@ -856,6 +887,14 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// Where this node's `0xFC` port answers now: what its own record asserts.
     Cc::IAdvertisedEndpointSource const& _advertised;
 
+    /// Where this node's Raft port answers now: what its own record asserts while its seat is dialled.
+    Cc::IAdvertisedEndpointSource const& _raftAdvertised;
+
+    /// The Raft endpoint the last reconcile pass asserted (`OwnRaftEndpoint`); empty before the first
+    /// that asserted one. A change is THIS node moving, which resets every session. The reconciler
+    /// thread's alone.
+    std::string _lastOwnRaft;
+
     /// Told the member set whenever it changes; may be empty.
     MembersObserver _onMembers;
 
@@ -1086,6 +1125,8 @@ struct SharedCacheListeners
 /// @param schedulerTier Told this node's role; may be null when it serves none.
 /// @param advertised Where this node's `0xFC` port answers now; see `ConsensusTier::Start`.
 ///        Must outlive the tier.
+/// @param raftAdvertised Where this node's Raft port answers now; see `ConsensusTier::Start`.
+///        Must outlive the tier.
 /// @param identityKey This node's identity key, as the start resolved it; see
 ///        `ConsensusTier::Start`.
 /// @param membership Told the replicated member set; must outlive the tier.
@@ -1109,6 +1150,7 @@ struct SharedCacheListeners
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,
     Cc::IAdvertisedEndpointSource const& advertised,
+    Cc::IAdvertisedEndpointSource const& raftAdvertised,
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     NodeRoster& roster,

@@ -1286,6 +1286,17 @@ PeerChange RaftPeerTransport::Learn(PeerEndpoint where)
     return PeerChange::Readdressed;
 }
 
+void RaftPeerTransport::ResetSessions()
+{
+    // `Learn`'s guard and `Learn`'s lock, for `Learn`'s reasons: the test and the submission under
+    // the lock `RequestStop` takes exclusively, and `ResumeOn` posts rather than resuming inline, so
+    // the task's own shared lock is taken after this scope ends. Every sender counts here, an
+    // attached session's included, because those are closed too.
+    auto const guard = std::unique_lock { _peersMutex };
+    if (_lifecycle == Lifecycle::Running && AnySenderRunning())
+        PeerSenderAccess::CloseSockets(this, std::nullopt);
+}
+
 core::async::AsyncQueueOptions RaftPeerTransport::OutboxOptions() const noexcept
 {
     return core::async::AsyncQueueOptions { .capacity = _options.maxQueuedPerPeer,

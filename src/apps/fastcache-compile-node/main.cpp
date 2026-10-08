@@ -881,7 +881,7 @@ struct RouteParts
     // whose service holds the join memos it reads, and before every tier that reads it, so it
     // outlives them all. Its beat begins once consensus runs, below.
     auto formationOrRefusal = Node::MakeFormationRuntime(
-        cfg, identityKey, formation, announced, schedulerTier.get(), metrics, logger, &conditions);
+        cfg, identityKey, formation, announced, raftAnnounced, schedulerTier.get(), metrics, logger, &conditions);
     if (!formationOrRefusal.has_value())
     {
         logger.Logf(LogLevel::Error, "{}; refusing to start", formationOrRefusal.error());
@@ -1425,6 +1425,7 @@ struct RouteParts
         cfg,
         schedulerTier,
         announced,
+        raftAnnounced,
         identityKey,
         membership,
         *nodeRoster,

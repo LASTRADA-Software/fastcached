@@ -208,6 +208,8 @@ class FormationRuntime
     /// @param reloader The live configuration, or null when this node has no file; must outlive this.
     /// @param advertised Where this node's `0xFC` port answers now: what every summary and every
     ///        `Enroll` states. Must outlive this.
+    /// @param raftAdvertised Where this node's Raft port answers now: what every summary states while
+    ///        the mode opens the Raft port. Must outlive this.
     /// @param memos The join memos this fleet's members announced -- the scheduler's, when this node
     ///        serves one -- or null for none. Must outlive this.
     /// @param metrics Where the controller counts; must outlive this.
@@ -220,6 +222,7 @@ class FormationRuntime
                      FormationDurables durables,
                      NodeReloader const* reloader,
                      Cc::IAdvertisedEndpointSource const& advertised,
+                     Cc::IAdvertisedEndpointSource const& raftAdvertised,
                      Cluster::IAnnouncedJoinMemos const* memos,
                      IMetricsSink& metrics,
                      ILogger& logger,
@@ -309,6 +312,7 @@ inline constexpr std::string_view FormationNeedsIdentityKey =
 /// @param identityKey This node's identity key pair, as its start resolved it; must outlive the runtime.
 /// @param body What the body runs its formation by.
 /// @param advertised Where this node's `0xFC` port answers now; must outlive the runtime.
+/// @param raftAdvertised Where this node's Raft port answers now; must outlive the runtime.
 /// @param scheduler This node's scheduler, whose service holds the join memos members announced;
 ///        null when it serves none. Must outlive the runtime.
 /// @param metrics Where the controller counts.
@@ -321,6 +325,7 @@ inline constexpr std::string_view FormationNeedsIdentityKey =
     std::optional<Ed25519KeyPair> const& identityKey,
     FormationBody const& body,
     Cc::IAdvertisedEndpointSource const& advertised,
+    Cc::IAdvertisedEndpointSource const& raftAdvertised,
     SchedulerTier* scheduler,
     IMetricsSink& metrics,
     ILogger& logger,

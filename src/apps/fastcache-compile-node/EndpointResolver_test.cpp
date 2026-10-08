@@ -576,3 +576,33 @@ TEST_CASE("A published 0xFC move is told to every watcher, and a Raft-only move 
     CHECK(rig.node.Current() == "192.168.7.2:6674");
     CHECK(sink.told == 1);
 }
+
+TEST_CASE("A node that dials in or runs no consensus moves no Raft endpoint and counts none", "[node][endpoint]")
+{
+    // A learner's mode closes the Raft port, and a node with no formation runs no consensus: nobody
+    // dials either, so a roam re-derives no Raft endpoint for them and the counter stays where it was.
+    auto const shapes = std::vector<std::pair<char const*, std::function<void(NodeConfig&)>>> {
+        { "learner",
+          [](NodeConfig& cfg) {
+              REQUIRE(cfg.formation.has_value());
+              if (cfg.formation.has_value())
+                  cfg.formation->mode = Cluster::NodeMode::Learner;
+          } },
+        { "no consensus", [](NodeConfig& cfg) { cfg.formation.reset(); } },
+    };
+    for (auto const& [name, shape]: shapes)
+    {
+        INFO(name);
+        ResolverRig rig;
+        auto shaped = WildcardNode("10.0.0.5");
+        shape(shaped);
+        REQUIRE(RaftSelfEndpoint(shaped).empty());
+        rig.config.Replace(shaped);
+        rig.probe.Answer(DefaultRoute, "192.168.7.2");
+        rig.resolver.OnHostEvent(HostEvent::NetworkChanged);
+        rig.resolver.Refresh();
+        CHECK(rig.node.Current() == "192.168.7.2:6674");
+        CHECK(rig.raft.Current() == "10.0.0.5:6680"); // what it started with, never re-derived
+        CHECK(rig.RaftMoves() == 0);
+    }
+}
