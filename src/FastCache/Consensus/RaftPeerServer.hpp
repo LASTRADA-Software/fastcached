@@ -67,9 +67,9 @@ struct PeerServerOptions
 /// closing one is always closing a socket that is still there.
 struct OpenConnections
 {
-    /// Guards `sockets`. The accept loop and each ending connection touch it from
-    /// the reactor's thread while `Shutdown` touches it from whoever is tearing
-    /// the node down.
+    /// Guards `sockets` and `oneWay`. The accept loop and each ending connection touch
+    /// them from the reactor's thread while `Shutdown` touches `sockets` from whoever is
+    /// tearing the node down.
     std::mutex mutex;
 
     std::vector<core::net::ISocket*> sockets; ///< One per connection currently being served.
@@ -295,8 +295,8 @@ class RaftPeerServer
     /// Counted on `RaftInboundSessionsSuperseded`, the transport's row for a two-way session
     /// superseded the same way, because the one reading that row exists for is the same in both
     /// directions: one per reconnect is a member whose address moved, and a steady rate is two
-    /// machines holding one identity key taking the session from each other. Logged at Debug,
-    /// because the first is the ordinary life of a roaming voter.
+    /// machines holding one identity key taking the session from each other. Logged at Info, the
+    /// two-way row's level: one counter, one level, so a cloned pair shows in default logs.
     /// @param peer The address the NEWER connection came from.
     /// @param dialler The member both sessions proved.
     void NoteSuperseded(std::string_view peer, NodeId const& dialler);

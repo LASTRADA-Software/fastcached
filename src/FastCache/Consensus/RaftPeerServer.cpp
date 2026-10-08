@@ -617,7 +617,7 @@ void RaftPeerServer::NoteProvenRefusal(AcceptorRefusal refusal,
 void RaftPeerServer::NoteSuperseded(std::string_view peer, NodeId const& dialler)
 {
     _metrics.Increment(IMetricsSink::Counter::RaftInboundSessionsSuperseded);
-    _logger.Log(LogLevel::Debug,
+    _logger.Log(LogLevel::Info,
                 std::format("raft: peer {} proved a newer one-way session from {}; its earlier one is superseded and "
                             "closed",
                             dialler,

@@ -589,15 +589,31 @@ simpler design gets wrong.
   path that is gone, and it arms no idle bound on a one-way session, because follower-to-follower
   sessions are legitimately silent. Without the supersede every move parks a stale session against
   `maxConnections` (64), and a member that roams often enough fills the listener and is refused
-  `Full` by its own peers. The entry is erased only by the session it still NAMES (an id-keyed
-  erase from the superseded session's end would forget its successor), the close happens outside
-  the map's lock (an in-memory close resumes the superseded task inline, and its guard takes that
-  lock), and it is counted on the transport's two-way row, `RaftInboundSessionsSuperseded`, because
-  the reading is the same: one per reconnect is a roaming member, a steady rate two machines
-  sharing one key. Logged at Debug. Only a proof of the id can supersede, so a stranger cannot
-  close a member's session. Two-way sessions are not in the map -- the transport's `Attach`
-  supersedes those by id. `RaftPeerLink_test` ("A second one-way session from the same member
-  supersedes the first", "One-way sessions from different members coexist").
+  `Full` by its own peers.
+  - **"Newest" is the newest PROOF, never the newest dial.** A dial the dialler abandoned at its
+    handshake bound can have its proof judged after the redial's, and then supersedes the live
+    session; the abandoned socket ends at the dialler's FIN and the dialler redials once the live
+    one closes -- one spurious supersede and one redial. Do not "fix" it by comparing dial times:
+    the acceptor cannot know them, and the proof is the only thing about a connection it can trust.
+  - **The entry is erased by the session's own end, and only while it still NAMES that session.**
+    Never erased, the map would name a freed socket and the next proof of that id would close
+    freed memory -- the ordinary path, a dialler that restarted cleanly. Erased by id alone, a
+    superseded session ending late would forget its successor. The close happens outside the map's
+    lock (an in-memory close resumes the superseded task inline, and its guard takes that lock).
+  - **Counted on the transport's two-way row, `RaftInboundSessionsSuperseded`, and logged at its
+    level, Info**, because the reading is the same: one per reconnect is a roaming member, a steady
+    rate two machines sharing one key. One counter has one level, so a cloned pair shows in default
+    logs whichever direction its sessions run.
+  - **Two machines holding ONE identity key take the one-way session from each other on every
+    redial**, where both sessions used to coexist. An accepted cost, and the same position as a
+    copied state directory (*A state directory copied to a second machine copies the node, and that
+    is NOT refused*, below): nothing here can tell a clone from a move at one event, so the
+    counter's steady RATE is the signal and no condition claims a clone from it.
+  - Only a proof of the id can supersede, so a stranger cannot close a member's session. Two-way
+    sessions are not in the map -- the transport's `Attach` supersedes those by id.
+    `RaftPeerLink_test` ("A second one-way session from the same member supersedes the first",
+    "One-way sessions from different members coexist", "A member's session that ended on its own
+    is not superseded when it redials").
 
 - **The acceptor goes first because its port is the surface anybody can reach.** It signs
   nothing until the other end has proved an id, so a stranger who connects learns a nonce
@@ -1106,6 +1122,10 @@ and it is recorded here because the question will be asked again.
     an operator meets the directory, and that resolution never mints for an invocation
     that only asks a question (`--print-surfaces`, a cluster verb, `--uninstall-service`)
     -- a flag whose own comment says it changes nothing must keep saying so.
+    **Its accepted cost on the Raft wire:** the two copies take each other's sessions on every
+    redial -- two-way at the transport's `Attach`, one-way at the acceptor (*The newest ONE-WAY
+    session per proven dialler wins*, under The Raft peer wire) -- and the steady rate of
+    `raft_inbound_sessions_superseded`, logged at Info, is how it shows.
 - **The hostname is a LABEL on the fleet page and decides nothing.** It reaches the
   leader on REGISTER's nested capacity record, beside `version` and for the same arity
   reason, and renders as a `name` column. Nothing keys on it, routes by it, admits by it

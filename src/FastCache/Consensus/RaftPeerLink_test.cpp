@@ -1451,7 +1451,7 @@ TEST_CASE("A second one-way session from the same member supersedes the first", 
     CHECK(link.AcceptorRefusalsCounted() == 0);
     auto const records = link.serverLogger.Snapshot();
     CHECK(std::ranges::any_of(records, [](CapturingLogger::Record const& record) {
-        return record.level == LogLevel::Debug && record.message.contains("n1") && record.message.contains("superseded");
+        return record.level == LogLevel::Info && record.message.contains("n1") && record.message.contains("superseded");
     }));
 
     // And the newest session is the one still served.
@@ -1499,4 +1499,29 @@ TEST_CASE("A member's two-way session and its one-way session do not supersede e
     CHECK(link.destroyed.Threads().empty());
     CHECK(link.server.ActiveConnections() == 2);
     CHECK(link.serverMetrics.Read(IMetricsSink::Counter::RaftInboundSessionsSuperseded) == 0);
+}
+
+TEST_CASE("A member's session that ended on its own is not superseded when it redials", "[consensus][raft][peerserver]")
+{
+    // The ordinary path: a dialler that restarts closes its session cleanly, and the session's own
+    // end must take its entry with it -- an entry left naming the freed socket would make the
+    // redial's proof close freed memory.
+    RedialLink link;
+    link.Dial("n1", 1);
+    REQUIRE(link.sink.received.size() == 1);
+
+    link.transports.front()->RequestStop();
+    link.reactor.drain();
+    link.clock.advance(50ms);
+    link.reactor.drain();
+    REQUIRE(link.destroyed.Threads().size() == 1);
+    REQUIRE(link.server.ActiveConnections() == 0);
+
+    link.Dial("n1", 2);
+    REQUIRE(link.sink.received.size() == 2);
+    CHECK(std::get<RequestVoteResponse>(link.sink.received[1]).term.value == 2);
+    CHECK(link.server.ActiveConnections() == 1);
+    CHECK(link.destroyed.Threads().size() == 1);
+    CHECK(link.serverMetrics.Read(IMetricsSink::Counter::RaftInboundSessionsSuperseded) == 0);
+    CHECK(link.AcceptorRefusalsCounted() == 0);
 }
