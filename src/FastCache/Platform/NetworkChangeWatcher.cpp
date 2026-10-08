@@ -8,6 +8,30 @@
 #include <system_error>
 #include <utility>
 
+#if !defined(_WIN32)
+    #include <FastCache/Platform/NetworkChangeMessages.hpp>
+
+    #include <sys/socket.h>
+
+    #include <cerrno>
+    #include <cstddef>
+    #include <cstdint>
+    #include <optional>
+    #include <span>
+    #include <vector>
+
+    #include <fcntl.h>
+    #include <poll.h>
+    #include <unistd.h>
+
+    #if defined(__linux__)
+        #include <linux/netlink.h>
+        #include <linux/rtnetlink.h>
+    #elif defined(__APPLE__)
+        #include <net/route.h>
+    #endif
+#endif
+
 #if defined(_WIN32)
     #include <winsock2.h>
 // clang-format off
@@ -68,10 +92,281 @@ void NetworkChangeRelay::Run(std::stop_token const& stop)
 
 #if !defined(_WIN32)
 
-std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> StartNetworkChangeWatcher(
-    IHostEventSink& /*sink*/, core::platform::IClock const& /*clock*/, NetworkDebounce /*bound*/)
+namespace
 {
-    return nullptr;
+    /// How much one read takes: a netlink or route-socket datagram reporting a change is far
+    /// smaller, and one larger is read truncated rather than lost.
+    constexpr std::size_t ReadBufferSize = 16 * 1024;
+
+    /// @param what The call that failed.
+    /// @return A refusal naming @p what and `errno`'s reason.
+    [[nodiscard]] std::string Refusal(std::string_view what)
+    {
+        return std::format("{} failed: {}", what, std::system_category().message(errno));
+    }
+
+    /// A descriptor closed when it goes out of scope.
+    class OwnedDescriptor
+    {
+      public:
+        OwnedDescriptor() = default;
+
+        /// @param descriptor Owned from here on; negative for none.
+        explicit OwnedDescriptor(int descriptor) noexcept:
+            _descriptor { descriptor }
+        {
+        }
+
+        ~OwnedDescriptor()
+        {
+            if (_descriptor >= 0)
+                (void) ::close(_descriptor);
+        }
+
+        OwnedDescriptor(OwnedDescriptor&& other) noexcept:
+            _descriptor { std::exchange(other._descriptor, -1) }
+        {
+        }
+        OwnedDescriptor& operator=(OwnedDescriptor&& other) noexcept
+        {
+            OwnedDescriptor { std::move(other) }.Swap(*this);
+            return *this;
+        }
+        OwnedDescriptor(OwnedDescriptor const&) = delete;
+        OwnedDescriptor& operator=(OwnedDescriptor const&) = delete;
+
+        /// @return The descriptor, still owned; negative for none.
+        [[nodiscard]] int Get() const noexcept
+        {
+            return _descriptor;
+        }
+
+      private:
+        /// @param other Exchanges descriptors with this one.
+        void Swap(OwnedDescriptor& other) noexcept
+        {
+            std::swap(_descriptor, other._descriptor);
+        }
+
+        int _descriptor = -1;
+    };
+
+    /// @param descriptor Marked close-on-exec, so a compiler the node spawns does not inherit it.
+    /// @return Whether it was.
+    [[nodiscard]] bool SetCloseOnExec(int descriptor) noexcept
+    {
+        return ::fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0;
+    }
+
+    /// The pipe the destructor wakes the reading thread through.
+    struct StopPipe
+    {
+        OwnedDescriptor readEnd;  ///< Polled by the thread.
+        OwnedDescriptor writeEnd; ///< Written once, by the destructor.
+    };
+
+    /// @return Both ends, close-on-exec; or why not.
+    [[nodiscard]] std::expected<StopPipe, std::string> MakeStopPipe()
+    {
+        std::array<int, 2> ends { -1, -1 };
+        if (::pipe(ends.data()) != 0)
+            return std::unexpected { Refusal("stop pipe") };
+        auto stop = StopPipe { .readEnd = OwnedDescriptor { ends[0] }, .writeEnd = OwnedDescriptor { ends[1] } };
+        if (!SetCloseOnExec(stop.readEnd.Get()) || !SetCloseOnExec(stop.writeEnd.Get()))
+            return std::unexpected { Refusal("stop pipe fcntl") };
+        return stop;
+    }
+
+    /// Reads one change socket on a thread of its own, into one relay.
+    class PosixNetworkChangeWatcher final: public NetworkChangeWatcher
+    {
+      public:
+        /// @param socket What is read; owned.
+        /// @param stop Wakes the thread; owned.
+        /// @param classify Reads one buffer.
+        /// @param sink Where the event goes.
+        /// @param clock What the debouncer reads.
+        /// @param bound The debounce.
+        PosixNetworkChangeWatcher(OwnedDescriptor socket,
+                                  StopPipe stop,
+                                  NetworkChangeClassifier classify,
+                                  IHostEventSink& sink,
+                                  core::platform::IClock const& clock,
+                                  NetworkDebounce bound):
+            _relay { sink, clock, bound },
+            _socket { std::move(socket) },
+            _stop { std::move(stop) },
+            _classify { classify },
+            _thread { [this] { Run(); } }
+        {
+        }
+
+        /// Wakes the thread in the destructor's BODY, so it has returned -- `_thread` is destroyed
+        /// first, joining it -- before any descriptor it polls is closed or the relay it notifies
+        /// is gone.
+        ~PosixNetworkChangeWatcher() override
+        {
+            constexpr auto wake = std::byte { 1 };
+            while (::write(_stop.writeEnd.Get(), &wake, sizeof(wake)) < 0 && errno == EINTR)
+                continue;
+        }
+
+        PosixNetworkChangeWatcher(PosixNetworkChangeWatcher const&) = delete;
+        PosixNetworkChangeWatcher(PosixNetworkChangeWatcher&&) = delete;
+        PosixNetworkChangeWatcher& operator=(PosixNetworkChangeWatcher const&) = delete;
+        PosixNetworkChangeWatcher& operator=(PosixNetworkChangeWatcher&&) = delete;
+
+      private:
+        /// What one wake of the thread found, and so what it does next.
+        enum class Step : std::uint8_t
+        {
+            Continue, ///< Poll again.
+            Stop,     ///< Return: stopped, at end of file, or on an error that would repeat.
+        };
+
+        /// The thread: poll the socket and the stop pipe until the stop pipe is readable.
+        void Run()
+        {
+            std::vector<std::byte> buffer(ReadBufferSize);
+            while (Poll(buffer) == Step::Continue)
+                continue;
+        }
+
+        /// Wait for either descriptor, then read the socket if it is the one ready.
+        /// @param buffer Where a read lands.
+        /// @return What to do next.
+        [[nodiscard]] Step Poll(std::span<std::byte> buffer)
+        {
+            auto fds = std::to_array<pollfd>({
+                { .fd = _socket.Get(), .events = POLLIN, .revents = 0 },
+                { .fd = _stop.readEnd.Get(), .events = POLLIN, .revents = 0 },
+            });
+            if (::poll(fds.data(), fds.size(), -1) < 0)
+                return errno == EINTR ? Step::Continue : Step::Stop;
+            if (fds[1].revents != 0)
+                return Step::Stop;
+            if (fds[0].revents == 0)
+                return Step::Continue;
+            return Read(buffer);
+        }
+
+        /// Read what the socket holds and notify the relay when it reports a change.
+        /// @param buffer Where the read lands.
+        /// @return What to do next.
+        [[nodiscard]] Step Read(std::span<std::byte> buffer)
+        {
+            auto const got = ::read(_socket.Get(), buffer.data(), buffer.size());
+            if (got > 0)
+            {
+                if (_classify(buffer.first(static_cast<std::size_t>(got))))
+                    _relay.Notify();
+                return Step::Continue;
+            }
+            if (got == 0)
+                return Step::Stop;
+            switch (errno)
+            {
+                case EINTR:
+                case EAGAIN:
+                    return Step::Continue;
+                case ENOBUFS:
+                    // The kernel dropped notifications it had no room for: a change was among them.
+                    _relay.Notify();
+                    return Step::Continue;
+                default:
+                    return Step::Stop;
+            }
+        }
+
+        NetworkChangeRelay _relay;
+        OwnedDescriptor _socket;
+        StopPipe _stop;
+        NetworkChangeClassifier _classify;
+        /// LAST, so every member it reads is built before it starts and freed after it joins.
+        std::jthread _thread;
+    };
+
+    /// One platform's change socket: how it is opened, and how what it delivers is read.
+    struct ChangeSocketRow
+    {
+        std::expected<OwnedDescriptor, std::string> (*open)() {}; ///< The socket, or why not.
+        NetworkChangeClassifier classify {};                      ///< Reads one buffer from it.
+    };
+
+    #if defined(__linux__)
+    /// @return A `NETLINK_ROUTE` socket bound to the link, address and route groups; or why not.
+    [[nodiscard]] std::expected<OwnedDescriptor, std::string> OpenNetlinkSocket()
+    {
+        auto socket = OwnedDescriptor { ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE) };
+        if (socket.Get() < 0)
+            return std::unexpected { Refusal("netlink socket") };
+        sockaddr_nl address {};
+        address.nl_family = AF_NETLINK;
+        address.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR | RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE;
+        if (::bind(socket.Get(), reinterpret_cast<sockaddr const*>(&address), sizeof(address)) != 0)
+            return std::unexpected { Refusal("netlink bind") };
+        return socket;
+    }
+
+    constexpr auto PlatformChangeSocket =
+        std::optional { ChangeSocketRow { .open = &OpenNetlinkSocket, .classify = &NetlinkReportsChange } };
+    #elif defined(__APPLE__)
+    /// @return A `PF_ROUTE` socket, which hears every family's routing messages; or why not.
+    [[nodiscard]] std::expected<OwnedDescriptor, std::string> OpenRouteSocket()
+    {
+        auto socket = OwnedDescriptor { ::socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC) };
+        if (socket.Get() < 0)
+            return std::unexpected { Refusal("route socket") };
+        if (!SetCloseOnExec(socket.Get()))
+            return std::unexpected { Refusal("route socket fcntl") };
+        return socket;
+    }
+
+    constexpr auto PlatformChangeSocket =
+        std::optional { ChangeSocketRow { .open = &OpenRouteSocket, .classify = &RouteSocketReportsChange } };
+    #else
+    /// This platform offers nothing this project watches.
+    constexpr auto PlatformChangeSocket = std::optional<ChangeSocketRow> {};
+    #endif
+
+    /// @param socket What the watcher reads; owned.
+    /// @param classify Reads one buffer.
+    /// @param sink Where the event goes.
+    /// @param clock What the debouncer reads.
+    /// @param bound The debounce.
+    /// @return The running watcher; or why its stop pipe could not be made.
+    [[nodiscard]] std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> Watch(
+        OwnedDescriptor socket,
+        NetworkChangeClassifier classify,
+        IHostEventSink& sink,
+        core::platform::IClock const& clock,
+        NetworkDebounce bound)
+    {
+        return MakeStopPipe().transform([&](StopPipe stop) {
+            return std::unique_ptr<NetworkChangeWatcher> { std::make_unique<PosixNetworkChangeWatcher>(
+                std::move(socket), std::move(stop), classify, sink, clock, bound) };
+        });
+    }
+} // namespace
+
+std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> WatchNetworkChangeDescriptor(
+    int descriptor,
+    NetworkChangeClassifier classify,
+    IHostEventSink& sink,
+    core::platform::IClock const& clock,
+    NetworkDebounce bound)
+{
+    return Watch(OwnedDescriptor { descriptor }, classify, sink, clock, bound);
+}
+
+std::expected<std::unique_ptr<NetworkChangeWatcher>, std::string> StartNetworkChangeWatcher(
+    IHostEventSink& sink, core::platform::IClock const& clock, NetworkDebounce bound)
+{
+    if (!PlatformChangeSocket.has_value())
+        return nullptr;
+    return PlatformChangeSocket->open().and_then([&](OwnedDescriptor socket) {
+        return Watch(std::move(socket), PlatformChangeSocket->classify, sink, clock, bound);
+    });
 }
 
 #else

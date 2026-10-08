@@ -109,6 +109,7 @@
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
@@ -116,6 +117,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -2197,6 +2199,41 @@ bool SelectsOneShotVerb(NodeConfig const& cfg)
     return std::ranges::any_of(EarlyVerbs, [&cfg](EarlyVerbRow const& verb) { return verb.applies(cfg); });
 }
 
+/// Where the network watcher starts, relative to the host's `Run`.
+enum class NetworkWatcherStart : std::uint8_t
+{
+    BeforeTheHost, ///< Windows: no host forks, so the watcher starts before `Run`, outliving all of it.
+    InsideTheBody, ///< POSIX: a thread does not survive `PosixDaemonHost`'s fork.
+};
+
+/// This platform's answer: the one place that decides it.
+#if defined(_WIN32)
+constexpr auto ThisNetworkWatcherStart = NetworkWatcherStart::BeforeTheHost;
+#else
+constexpr auto ThisNetworkWatcherStart = NetworkWatcherStart::InsideTheBody;
+#endif
+
+/// Start the network watcher when @p at is where this platform starts it; a refusal is reported
+/// and not fatal, because no consumer may depend on a host event arriving (`HostEvent` says why).
+/// @param at Where the caller is.
+/// @param sink Where the events go; must outlive the watcher.
+/// @param clock What the debouncer reads; must outlive the watcher.
+/// @param logger Where a refusal is reported.
+/// @return The watcher; null when it does not start here, the platform offers none, or the OS refused.
+[[nodiscard]] std::unique_ptr<NetworkChangeWatcher> StartNetworkWatcherAt(NetworkWatcherStart at,
+                                                                          IHostEventSink& sink,
+                                                                          core::platform::IClock const& clock,
+                                                                          ILogger& logger)
+{
+    if (at != ThisNetworkWatcherStart)
+        return nullptr;
+    auto started = StartNetworkChangeWatcher(sink, clock, NetworkDebounce {});
+    if (started.has_value())
+        return std::move(*started);
+    logger.Logf(LogLevel::Warn, "network changes will not be reported: {}", started.error());
+    return nullptr;
+}
+
 } // namespace
 
 // **`main` scores 37 against a threshold of 60, and NOTHING ENFORCES THAT MARGIN.**
@@ -2753,15 +2790,16 @@ int main(int argc, char** argv)
         ReportSecretExposure<NodeConfig>(cfg, secretFiles, report);
 
     // The host's events: power through the SCM, network changes through the watcher. The hub is
-    // declared with the start host above, and the watcher below the hub it delivers into, because
-    // both outlive the body the host runs. Started BEFORE a POSIX host forks, which is harmless only
-    // because no POSIX watcher exists: one that did would have to start inside the body, since a
-    // thread does not survive the fork. A watcher the OS refused is reported and not fatal, because
-    // no consumer may depend on a host event arriving (`HostEvent` says why).
+    // declared with the start host above, and the clock below the hub, because both outlive the
+    // body the host runs. WHERE the watcher starts is `ThisNetworkWatcherStart`'s: on Windows here,
+    // before `host->Run`; on POSIX inside the body `host->Run` is handed, because the POSIX watcher
+    // reads its socket on a thread and a thread does not survive `PosixDaemonHost`'s fork -- started
+    // here, it would be left behind in the parent that exits. Either way the watcher outlives the
+    // body it serves: this one the whole `Run`, the body's own the `ServeNodeBodies` call. A watcher
+    // the OS refused is reported and not fatal; inside a POSIX daemon's body that report reaches
+    // the logger the body has, whose console the host has redirected.
     core::platform::SteadyClock networkClock;
-    auto const networkWatcher = StartNetworkChangeWatcher(hostEvents, networkClock, NetworkDebounce {});
-    if (!networkWatcher.has_value())
-        logger.Logf(LogLevel::Warn, "network changes will not be reported: {}", networkWatcher.error());
+    auto const networkWatcher = StartNetworkWatcherAt(NetworkWatcherStart::BeforeTheHost, hostEvents, networkClock, logger);
 
     // The host is chosen last, so everything that can be reported to a terminal
     // already has been. `--daemon` is what a SUPERVISOR THAT WANTS BACKGROUNDING
@@ -2834,7 +2872,9 @@ int main(int argc, char** argv)
                                               .wait = formationWait,
                                           },
                                       .leaseCheck = leaseCheck };
-    return host->Run([&cfg, &identityKey, &logger, reloaderPtr, &hostEvents, &adopted, &parts] {
+    return host->Run([&cfg, &identityKey, &logger, reloaderPtr, &hostEvents, &networkClock, &adopted, &parts] {
+        auto const bodyNetworkWatcher =
+            StartNetworkWatcherAt(NetworkWatcherStart::InsideTheBody, hostEvents, networkClock, logger);
         return ServeNodeBodies(cfg, *identityKey, logger, reloaderPtr, hostEvents, *adopted, parts);
     });
 }

@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Platform/NetworkChangeMessages.hpp>
 #include <FastCache/Platform/NetworkChangeWatcher.hpp>
 
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <format>
 #include <memory>
 #include <optional>
@@ -15,6 +20,10 @@
 #include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/ReturnsWithin.hpp>
+
+#if !defined(_WIN32)
+    #include <unistd.h>
+#endif
 
 using FastCache::HostEvent;
 using FastCache::Testing::ReturnsWithin;
@@ -193,7 +202,7 @@ TEST_CASE("The network watcher runs where the platform offers one, and is absent
 
     INFO((started.has_value() ? std::string { "started" } : started.error()));
     REQUIRE(started.has_value());
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
     CHECK(*started != nullptr);
 #else
     // No watcher is not an error: this platform offers nothing this project watches.
@@ -203,3 +212,126 @@ TEST_CASE("The network watcher runs where the platform offers one, and is absent
     INFO("destroying the watcher did not return within DestroyedWithin: its relay's idle wait ignored the stop");
     REQUIRE(ReturnsWithin(DestroyedWithin, [scene] { scene->watcher.reset(); }));
 }
+
+#if !defined(_WIN32)
+
+namespace
+{
+
+/// A pipe both of whose ends close with it; the read end can be handed away.
+struct Pipe
+{
+    Pipe()
+    {
+        std::array<int, 2> ends {};
+        REQUIRE(::pipe(ends.data()) == 0);
+        readEnd = ends[0];
+        writeEnd = ends[1];
+    }
+    ~Pipe()
+    {
+        CloseWriteEnd();
+        if (readEnd >= 0)
+            (void) ::close(readEnd);
+    }
+    Pipe(Pipe const&) = delete;
+    Pipe(Pipe&&) = delete;
+    Pipe& operator=(Pipe const&) = delete;
+    Pipe& operator=(Pipe&&) = delete;
+
+    /// @return The read end, no longer this pipe's to close.
+    [[nodiscard]] int TakeReadEnd() noexcept
+    {
+        return std::exchange(readEnd, -1);
+    }
+
+    /// Close the write end, which the reader sees as end of file.
+    void CloseWriteEnd() noexcept
+    {
+        if (writeEnd >= 0)
+            (void) ::close(std::exchange(writeEnd, -1));
+    }
+
+    /// Write one whole netlink message of @p type, with no payload.
+    /// @param type The `nlmsg_type`.
+    void WriteNetlink(std::uint16_t type) const
+    {
+        struct Header
+        {
+            std::uint32_t length;
+            std::uint16_t type;
+            std::uint16_t flags;
+            std::uint32_t seq;
+            std::uint32_t pid;
+        };
+        auto const bytes = std::bit_cast<std::array<std::byte, sizeof(Header)>>(
+            Header { .length = sizeof(Header), .type = type, .flags = 0, .seq = 1, .pid = 0 });
+        REQUIRE(::write(writeEnd, bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size()));
+    }
+
+    int readEnd = -1;  ///< Owned until taken.
+    int writeEnd = -1; ///< Owned.
+};
+
+/// The netlink types the cases write: one that reports a change, one that does not.
+constexpr std::uint16_t NetlinkNewAddr = 20;
+constexpr std::uint16_t NetlinkDone = 3;
+
+/// A descriptor watcher and everything its threads touch, owned together.
+struct DescriptorScene
+{
+    core::platform::SteadyClock clock;                        ///< Real time: the debounce is short.
+    CountingSink sink;                                        ///< Hears the relay.
+    Pipe pipe;                                                ///< What the watcher reads.
+    std::unique_ptr<FastCache::NetworkChangeWatcher> watcher; ///< The watcher under test.
+};
+
+/// @return A scene whose watcher reads its pipe as netlink, with `ShortDebounce`.
+[[nodiscard]] std::shared_ptr<DescriptorScene> MakeDescriptorScene()
+{
+    auto scene = std::make_shared<DescriptorScene>();
+    auto started = FastCache::WatchNetworkChangeDescriptor(
+        scene->pipe.TakeReadEnd(), &FastCache::NetlinkReportsChange, scene->sink, scene->clock, ShortDebounce);
+    INFO((started.has_value() ? std::string { "started" } : started.error()));
+    REQUIRE(started.has_value());
+    REQUIRE(*started != nullptr);
+    scene->watcher = std::move(*started);
+    return scene;
+}
+
+} // namespace
+
+TEST_CASE("A descriptor watcher reports what its classifier counts and nothing else", "[platform][host-events]")
+{
+    auto const scene = MakeDescriptorScene();
+    auto& sink = scene->sink;
+
+    scene->pipe.WriteNetlink(NetlinkDone);
+    auto const early = WaitUntilOutcome(
+        "a delivery for a message that reports no change",
+        [&sink] { return sink.changes.load() > 0; },
+        [&sink] { return sink.Describe(); },
+        StillWindowWait());
+    CHECK_FALSE(early.reached);
+
+    scene->pipe.WriteNetlink(NetlinkNewAddr);
+    REQUIRE(WaitUntil(
+        "the address change to be delivered",
+        [&sink] { return sink.changes.load() == 1; },
+        [&sink] { return sink.Describe(); }));
+    CHECK(sink.others.load() == 0);
+
+    INFO("destroying the watcher did not return within DestroyedWithin: its poll ignored the stop");
+    REQUIRE(ReturnsWithin(DestroyedWithin, [scene] { scene->watcher.reset(); }));
+}
+
+TEST_CASE("A descriptor watcher whose socket ended is still destroyed promptly", "[platform][host-events]")
+{
+    auto const scene = MakeDescriptorScene();
+    scene->pipe.CloseWriteEnd();
+    INFO("destroying the watcher did not return within DestroyedWithin after its descriptor ended");
+    REQUIRE(ReturnsWithin(DestroyedWithin, [scene] { scene->watcher.reset(); }));
+    CHECK(scene->sink.changes.load() == 0);
+}
+
+#endif // !_WIN32
