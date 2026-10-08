@@ -1092,16 +1092,12 @@ void ConsensusTier::Reconcile()
     auto inFlight = Cluster::MembersInFlight {};
     for (auto const& [id, proposal]: _endpointsInFlight)
         inFlight.insert(id);
+    // Discovery's word about a COUPLED member's Raft host first yields to the record: under the
+    // host-coupling rule its proven announcement owns that host, and a beacon still authenticated from
+    // before a move would otherwise re-propose the old address over the committed one.
     auto const announcements = Cluster::AnnouncedEndpointDesires(state, announced, inFlight);
-    desired = Cluster::WithAnnouncedEndpoints(std::move(desired), announcements);
-    // And KEPT where a member's announcement moved its Raft endpoint by the host-coupling rule: once
-    // the record commits the announcement proposes nothing, and discovery's desire -- the Raft
-    // endpoint a beacon stated before the move -- would otherwise re-propose the old address.
-    if (std::ranges::any_of(announcements, Cluster::SpeaksForRaftEndpoint))
-    {
-        auto const guard = std::unique_lock { _desiredMutex };
-        _desired = Cluster::WithAnnouncedRaftEndpoints(std::move(_desired), announcements);
-    }
+    desired =
+        Cluster::WithAnnouncedEndpoints(Cluster::WithCoupledRaftEndpointsKept(state, std::move(desired)), announcements);
 
     // Outside the lock, both the decision and the proposals: a proposal is a
     // durability write and a broadcast, and holding a lock across one would stall

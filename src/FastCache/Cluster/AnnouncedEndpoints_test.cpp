@@ -158,7 +158,7 @@ TEST_CASE("A record no dial endpoint parses from is never coupled", "[cluster][f
     CHECK(CoupledRaftEndpoint(member("[::ffff:10.0.0.5]:6680", "10.0.0.5:6674"), "192.168.7.2:6674") == "192.168.7.2:6680");
 }
 
-TEST_CASE("A coupled announcement moves the Raft endpoint of a desire with no scheduler opinion, held and folded",
+TEST_CASE("A coupled announcement moves the Raft endpoint of a desire with no scheduler opinion",
           "[cluster][formation][endpoint]")
 {
     // Discovery desires the desk at the Raft endpoint a beacon stated before the move; the desk's own
@@ -173,27 +173,18 @@ TEST_CASE("A coupled announcement moves the Raft endpoint of a desire with no sc
     CHECK(folded[0].raftEndpoint == "192.168.7.2:6680");
     CHECK(folded[0].schedulerEndpoint == std::optional<std::string> { "192.168.7.2:6674" });
 
-    // What the leader keeps: the newer Raft endpoint, and still no `0xFC` opinion, so the next
-    // announcement folds in as this one did.
-    auto const held = WithAnnouncedRaftEndpoints(discovered, announcements);
-    REQUIRE(held.size() == 1);
-    CHECK(held[0].raftEndpoint == "192.168.7.2:6680");
-    CHECK_FALSE(held[0].schedulerEndpoint.has_value());
-
     // A desire that asserts its own endpoints is never moved by an announcement about it.
     auto const asserted = std::vector { DesiredMember {
         .id = "desk", .raftEndpoint = "10.0.0.5:6680", .schedulerEndpoint = "10.0.0.5:6674", .publicKey = std::nullopt } };
     CHECK(WithAnnouncedEndpoints(asserted, announcements)[0].raftEndpoint == "10.0.0.5:6680");
-    CHECK(WithAnnouncedRaftEndpoints(asserted, announcements)[0].raftEndpoint == "10.0.0.5:6680");
 }
 
-TEST_CASE("An uncoupled announcement leaves a held desire's Raft endpoint alone", "[cluster][formation][endpoint]")
+TEST_CASE("An uncoupled announcement leaves a discovered desire's Raft endpoint alone", "[cluster][formation][endpoint]")
 {
     auto const announcements =
         AnnouncedEndpointDesires(WithVoter("peer.lan:6680", "10.0.0.5:6674"), { { "desk", "192.168.7.2:6674" } }, {});
     auto const discovered = std::vector { DesiredMember {
         .id = "desk", .raftEndpoint = "peer2.lan:6680", .schedulerEndpoint = std::nullopt, .publicKey = std::nullopt } };
-    CHECK(WithAnnouncedRaftEndpoints(discovered, announcements)[0].raftEndpoint == "peer2.lan:6680");
     CHECK(WithAnnouncedEndpoints(discovered, announcements)[0].raftEndpoint == "peer2.lan:6680");
 }
 
@@ -204,4 +195,42 @@ TEST_CASE("A learner's empty Raft endpoint stays empty", "[cluster][formation][e
     REQUIRE(desires.size() == 1);
     CHECK(desires[0].raftEndpoint.empty());
     CHECK_FALSE(SpeaksForRaftEndpoint(desires[0]));
+}
+
+TEST_CASE("A learner's leftover Raft endpoint on its scheduler host is never moved", "[cluster][formation][endpoint]")
+{
+    auto state = WithVoter("10.0.0.5:6680", "10.0.0.5:6674");
+    state.members.front().seat = MemberSeat::Learner;
+    CHECK(CoupledRaftEndpoint(state.members.front(), "192.168.7.2:6674") == "10.0.0.5:6680");
+}
+
+TEST_CASE("Discovery's stale Raft host for a coupled member yields to the record, and nothing else does",
+          "[cluster][formation][endpoint]")
+{
+    // The desk's move committed: coupled at 192.168.7.2. Discovery still holds its pre-move beacon.
+    auto const state = WithVoter("192.168.7.2:6680", "192.168.7.2:6674");
+    auto const discovered = [](std::string id, std::string raft) {
+        return DesiredMember { .id = std::move(id),
+                               .raftEndpoint = std::move(raft),
+                               .schedulerEndpoint = std::nullopt,
+                               .publicKey = std::nullopt };
+    };
+
+    auto const kept = WithCoupledRaftEndpointsKept(state,
+                                                   { discovered("desk", "10.0.0.5:6680"),
+                                                     discovered("desk", "192.168.7.2:6690"),
+                                                     discovered("laptop", "10.9.0.4:6680"),
+                                                     DesiredMember { .id = "desk",
+                                                                     .raftEndpoint = "10.0.0.5:6680",
+                                                                     .schedulerEndpoint = "10.0.0.5:6674",
+                                                                     .publicKey = std::nullopt } });
+    REQUIRE(kept.size() == 4);
+    CHECK(kept[0].raftEndpoint == "192.168.7.2:6680"); // the stale host yields to the record
+    CHECK(kept[1].raftEndpoint == "192.168.7.2:6690"); // a port on the recorded host passes
+    CHECK(kept[2].raftEndpoint == "10.9.0.4:6680");    // a member nothing records: discovery's first word
+    CHECK(kept[3].raftEndpoint == "10.0.0.5:6680");    // a desire that asserts its own endpoints
+
+    // An uncoupled member moves where its beacon says.
+    auto const apart = WithVoter("peer.lan:6680", "10.0.0.5:6674");
+    CHECK(WithCoupledRaftEndpointsKept(apart, { discovered("desk", "peer2.lan:6680") })[0].raftEndpoint == "peer2.lan:6680");
 }

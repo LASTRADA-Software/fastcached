@@ -32,6 +32,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/NodeFormationFakes.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -584,9 +585,9 @@ TEST_CASE("A node that dials in or runs no consensus moves no Raft endpoint and 
     auto const shapes = std::vector<std::pair<char const*, std::function<void(NodeConfig&)>>> {
         { "learner",
           [](NodeConfig& cfg) {
-              REQUIRE(cfg.formation.has_value());
-              if (cfg.formation.has_value())
-                  cfg.formation->mode = Cluster::NodeMode::Learner;
+              auto record = Testing::Unwrap(cfg.formation);
+              record.mode = Cluster::NodeMode::Learner;
+              cfg.formation = std::move(record);
           } },
         { "no consensus", [](NodeConfig& cfg) { cfg.formation.reset(); } },
     };

@@ -3,7 +3,8 @@
 #include <FastCache/Core/HostPort.hpp>
 
 #include <algorithm>
-#include <ranges>
+#include <cstdint>
+#include <optional>
 #include <utility>
 
 #include <core/Ranges.hpp>
@@ -11,12 +12,29 @@
 namespace FastCache::Cluster
 {
 
+namespace
+{
+    /// Whether @p recorded is COUPLED: a seat that is dialled, whose recorded Raft and `0xFC`
+    /// endpoints both parse as dial endpoints on the same host.
+    /// @param recorded The member's record.
+    /// @return Its Raft endpoint, split, when coupled; nullopt otherwise.
+    [[nodiscard]] std::optional<std::pair<std::string, std::uint16_t>> CoupledRaft(ClusterMember const& recorded)
+    {
+        if (!SeatNeedsEndpoint(recorded.seat))
+            return std::nullopt;
+        auto raft = ParseDialEndpoint(recorded.raftEndpoint);
+        auto const scheduler = ParseDialEndpoint(recorded.schedulerEndpoint);
+        if (!raft.has_value() || !scheduler.has_value() || !SameHost(raft->first, scheduler->first))
+            return std::nullopt;
+        return raft;
+    }
+} // namespace
+
 std::string CoupledRaftEndpoint(ClusterMember const& recorded, std::string_view announced)
 {
-    auto const raft = ParseDialEndpoint(recorded.raftEndpoint);
-    auto const scheduler = ParseDialEndpoint(recorded.schedulerEndpoint);
+    auto const raft = CoupledRaft(recorded);
     auto const moved = ParseDialEndpoint(announced);
-    if (!raft.has_value() || !scheduler.has_value() || !moved.has_value() || !SameHost(raft->first, scheduler->first))
+    if (!raft.has_value() || !moved.has_value())
         return recorded.raftEndpoint;
     return FormatHostPort(moved->first, raft->second);
 }
@@ -65,16 +83,21 @@ std::vector<DesiredMember> WithAnnouncedEndpoints(std::vector<DesiredMember> des
     return desired;
 }
 
-std::vector<DesiredMember> WithAnnouncedRaftEndpoints(std::vector<DesiredMember> held,
-                                                      std::span<DesiredMember const> announcements)
+std::vector<DesiredMember> WithCoupledRaftEndpointsKept(ClusterState const& state, std::vector<DesiredMember> desired)
 {
-    for (auto const& announcement: announcements | std::views::filter(SpeaksForRaftEndpoint))
+    for (auto& desire: desired)
     {
-        auto const existing = std::ranges::find(held, announcement.id, &DesiredMember::id);
-        if (existing != held.end() && !existing->schedulerEndpoint.has_value())
-            existing->raftEndpoint = announcement.raftEndpoint;
+        if (desire.schedulerEndpoint.has_value())
+            continue;
+        auto const* const recorded = core::findOrNull(state.members, desire.id, &ClusterMember::id);
+        if (recorded == nullptr)
+            continue;
+        auto const raft = CoupledRaft(*recorded);
+        auto const wanted = ParseDialEndpoint(desire.raftEndpoint);
+        if (raft.has_value() && (!wanted.has_value() || !SameHost(wanted->first, raft->first)))
+            desire.raftEndpoint = recorded->raftEndpoint;
     }
-    return held;
+    return desired;
 }
 
 } // namespace FastCache::Cluster
