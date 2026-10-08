@@ -28,7 +28,8 @@ the remedy.
 
 Give A a fixed address (a DHCP reservation) and a DNS name you control, such as an alias
 `office-a.example.com`, that resolves from the office and over the VPN. Every PC reaches A by
-that name: as its seed, and as its builds' scheduler.
+that name as its seed (and, on a learner older than this release, as its builds' scheduler;
+see step 5).
 
 ## 1. Install A first
 
@@ -206,18 +207,25 @@ not reaching C, and `shared-cache-unavailable` on C when its tier will not open.
 ```powershell
 $env:FASTCACHE_SOURCE_DIR = 'D:\src\product'
 $env:FASTCACHE_BINARY_DIR = 'D:\src\product\build'
-$env:FASTCACHE_SCHEDULER  = 'office-a.example.com:6674'
+$env:FASTCACHE_SCHEDULER  = '127.0.0.1:6674'
 cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER_LAUNCHER=fastcache-cc -DCMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc
 ```
 
 - **`FASTCACHE_SOURCE_DIR` and `FASTCACHE_BINARY_DIR`** are required: with either unset, nothing
   is cached. They are what lets two checkouts at different paths share an entry.
-- **`FASTCACHE_SCHEDULER` names A**, by the same name as the seed, never `127.0.0.1`. A PC's own
-  node is a learner once approved, and a learner schedules nothing: it refuses a lease as a verb
-  it does not serve, and every miss would compile locally. A not-yet-approved PC asking A is
-  refused, and compiles locally too, so the setting is right from the first day. The launcher
-  follows a `not-leader` answer, so after you promote voters any one of them will do. Unset,
-  every miss compiles locally.
+- **`FASTCACHE_SCHEDULER` is `127.0.0.1:6674` on every PC**, this PC's own node. Once approved
+  that node is a learner: it schedules nothing itself, and answers a lease with `not-leader`
+  naming the leader's scheduling endpoint, which the launcher follows, and the launcher
+  releases the lease where it was issued. So the setting survives leadership moving to another
+  voter, and no PC is re-pointed after an election. A PC whose own node leads, or is still its
+  own solitary cluster (not yet approved), leases from its own scheduler directly, so the
+  setting is right from the first day. While the node knows no leader, or has not heard from
+  it for longer than an election timeout (a PC off the VPN), it names nobody and every miss
+  compiles locally. A learner older than this release refuses the lease instead of
+  redirecting, and every miss compiles locally; on such a PC name A here, by the same name as
+  the seed. A build tree configured through `cmake/portable/CompileCache.cmake` with A's name
+  keeps it (below); reconfigure it with `-DFASTCACHE_SCHEDULER=127.0.0.1:6674`. Any other build
+  reads the variable at each compile. Unset, every miss compiles locally.
 - **`FASTCACHE_ADDR` needs no setting**: its default, `127.0.0.1:6674`, is this PC's own node,
   which is this PC's cache and the node that mints the machine ticket every exchange with
   another machine presents.
@@ -269,11 +277,12 @@ logs as `serving`.
 ### What a reboot of A means
 
 A is the only voter, so while it is down the fleet has no scheduler. Every PC's builds compile
-locally after a short connect timeout and keep their own cache; reads through to C keep working,
-since each node still holds the cluster state it applied. A elects itself again within seconds
-of starting, the PCs dial it again by themselves, their workers register within one 20-second
-round, and dispatch resumes with nothing to do. An auto-approve window open at the reboot is
-gone: it lived in A's memory.
+locally and keep their own cache: within about one consensus pass (a second or so) a PC's own
+node stops naming the silent A, and its launcher then declines the lease without dialling A.
+Reads through to C keep working, since each node still holds the cluster state it applied. A
+elects itself again within seconds of starting, the PCs dial it again by themselves, their
+workers register within one 20-second round, and dispatch resumes with nothing to do. An
+auto-approve window open at the reboot is gone: it lived in A's memory.
 
 A longer outage has one more effect. A PC whose worker has heard from no leader for 65 minutes
 refuses every compile grant and raises `consensus-leader-silent`, because the state it would
@@ -336,7 +345,7 @@ Start on the machine whose builds are slow:
 | `fastcache-cli node-conditions` | any machine | every condition with its remedy; exits 1 when none is raised, so a loop over machines can test it |
 | `fastcache-cli fleet members` | A | who the fleet has agreed is a member, from the leader; a node that does not lead says where to ask instead |
 | `fastcache-compile-node --enroll-list` | A | who is waiting, and who an auto-approve window let in |
-| `fastcache-compile-node --cluster-status` | A, or any machine with `--scheduler=office-a.example.com:6674` | what the cluster has agreed, settings included |
+| `fastcache-compile-node --cluster-status` | any machine in the fleet: a PC's own node sends the question on to the leader | what the cluster has agreed, settings included |
 | `fastcache-cli explain-admission <machine>` | A, or any machine with `--addr=office-a.example.com:6674` | why A admits or refuses that machine, naming every route that decided |
 | `fastcache-cc --show-stats` | the PC | this PC's hits, misses, dispatches and every fall-back reason |
 

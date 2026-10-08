@@ -957,9 +957,11 @@ set_tests_properties("version-fallback-warning" PROPERTIES
 # yields the bare tag, and either makes the version Provisional, so
 # FASTCACHED_REQUIRE_EXACT_VERSION refuses it. Drives the real GetVersionInformation against a
 # stub git (a `.cmd` on Windows, a shell script elsewhere) that holds one chosen query past an
-# injected bound. The all-answer cases are the positive control that the stub ran. PASS as well
-# as FAIL: the script refuses when fewer cases ran than it calls, and the count line must be
-# printed at all, so a run that stopped before judging anything is not a pass.
+# injected bound. The all-answer cases are the positive control that the stub ran. Its
+# `classifications` table is the cross-version guard: it hands every measured CMake spelling
+# straight to the classifier, so a word only CMake 3.28 prints is judged on every CMake. PASS as
+# well as FAIL: the script refuses when fewer cases ran than it calls, and the count line must
+# be printed at all, so a run that stopped before judging anything is not a pass.
 add_test(
     NAME "version-git-unanswered"
     COMMAND ${CMAKE_COMMAND}

@@ -28,7 +28,6 @@
 #include <string_view>
 #include <vector>
 
-#include <CompileCorrelation.hpp>
 #include <Dispatch.hpp>
 #include <ReachabilityMemo.hpp>
 #include <ReachabilityMemoTestSupport.hpp>
@@ -73,37 +72,16 @@ constexpr std::chrono::system_clock::time_point Noon { std::chrono::seconds { 1'
                                  .sourceRootReplacement = {} };
 }
 
-/// The reply an HONEST worker sends for `Ask`'s job: an object, and the correlation the
-/// launcher recomputes, signed under the key the grant names (W-4) -- so a case asserting
-/// `Ran()` is asserting that the compile was accepted, not merely that some address answered.
+/// The reply an HONEST worker sends for `Ask`'s job (`FleetHarness::CompiledReply`), signed under the
+/// key the grant names (W-4) -- so a case asserting `Ran()` is asserting that the compile was
+/// accepted, not merely that some address answered.
 /// @param signer Whose identity key signs it: the registered worker's unless a case is about an
 ///        impostor; empty for a reply nobody signed.
 /// @return The framed reply.
 [[nodiscard]] std::vector<std::byte> CompiledReply(std::optional<std::string> const& signer = std::string {
                                                        Testing::FleetHarness::ProvenMachine })
 {
-    constexpr std::string_view Object = "OBJ";
-    auto const request = Ask({});
-    auto const correlation =
-        Cc::CompileCorrelation(Cc::CorrelatedCompile { .preprocessed = request.preprocessed,
-                                                       .args = request.args,
-                                                       .fingerprint = request.fingerprint,
-                                                       .sourceName = request.sourceName,
-                                                       .compileDir = request.compileDir,
-                                                       .compileDirReplacement = request.compileDirReplacement,
-                                                       .sourceRoot = request.sourceRoot,
-                                                       .sourceRootReplacement = request.sourceRootReplacement });
-    auto const enveloped =
-        Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(Object.size()), Wire::AsBytes(Object));
-    if (signer.has_value())
-        return Testing::FleetHarness::SignedWorkerReply(enveloped, correlation, *signer);
-    return Wire::EncodeReply(Wire::Status::Ok,
-                             Wire::EncodeCompileResult(Wire::CompileResult { .exitCode = 0,
-                                                                             .object = enveloped,
-                                                                             .stdoutText = {},
-                                                                             .stderrText = {},
-                                                                             .correlation = Wire::AsBytes(correlation),
-                                                                             .signature = {} }));
+    return Testing::FleetHarness::CompiledReply(Ask({}), signer);
 }
 
 /// A leader with the laptop registered under its NAME and last seen at `NewHost`, so every

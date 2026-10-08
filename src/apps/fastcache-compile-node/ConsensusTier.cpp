@@ -5,6 +5,7 @@
 #include "NodeIdentity.hpp"
 #include "NodeStateFiles.hpp"
 #include "NodeSurfaces.hpp"
+#include "SchedulingRedirect.hpp"
 
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
@@ -675,11 +676,12 @@ std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
     // `Create` rather than the constructor, which is private precisely so the
     // configuration validation cannot be bypassed by omission -- so there is no
     // separate `Validate()` call here to forget.
-    auto node =
-        Consensus::RaftNode::Create(Consensus::RaftConfig { .self = cfg.nodeId, .voters = std::move(ids), .learners = {} },
-                                    *_random,
-                                    std::chrono::steady_clock::now(),
-                                    *std::move(recovered));
+    auto raftConfig = Consensus::RaftConfig { .self = cfg.nodeId, .voters = std::move(ids), .learners = {} };
+    // Read off the configuration the node is built from, so what each leader-contact reading is
+    // judged by is the timing this node's consensus actually runs, never a copy of its default.
+    _electionTimeoutMax = raftConfig.electionTimeoutMax;
+    auto node = Consensus::RaftNode::Create(
+        std::move(raftConfig), *_random, std::chrono::steady_clock::now(), *std::move(recovered));
     if (!node.has_value())
         return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, node.error().context) };
 
@@ -992,7 +994,7 @@ void ConsensusTier::Reconcile()
     // Every pass, before anything below can return early: how long this node's applied state has
     // gone unrefreshed by a leader it counts is what bounds the grants its worker honours.
     if (_onLeaderContact)
-        _onLeaderContact(LeaderReadingOf(_driver->CurrentProgress(), _clock.now()));
+        _onLeaderContact(LeaderReadingOf(_driver->CurrentProgress(), _clock.now()), _electionTimeoutMax);
 
     // Every node, leader or not, and BEFORE anything is proposed. A member the
     // cluster agreed to admit has to be dialable by everybody -- the leader
@@ -1565,6 +1567,16 @@ void ConsensusTier::Republish()
         _onRole(scheduled, leaderEndpoint, _lastTerm.value);
 }
 
+ConsensusTier::LeaderContactObserver LeaderContactObserverFor(NodeRoster& roster,
+                                                              SchedulingLeaderPublisher& schedulingLeader)
+{
+    return [&roster, &schedulingLeader](Distributed::LeaderReading const& reading,
+                                        std::chrono::milliseconds electionTimeoutMax) {
+        roster.ConsensusPass(reading);
+        schedulingLeader.LeaderContact(reading, electionTimeoutMax);
+    };
+}
+
 std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExplain(
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,
@@ -1573,6 +1585,7 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
     NodeMembership& membership,
     NodeRoster& roster,
     AppliedSchedulers& schedulers,
+    SchedulingLeaderPublisher& schedulingLeader,
     SharedCacheListeners sharedCache,
     IMetricsSink& metrics,
     ILogger& logger,
@@ -1592,11 +1605,17 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
         cfg,
         advertised,
         identityKey,
-        [&schedulerTier](Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t term) {
+        [&schedulerTier,
+         &schedulingLeader](Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t term) {
+            // Told on every node, scheduler or not: a node running none still names the leader
+            // it follows to the launchers that ask it to schedule (#1639). The endpoint is the
+            // member record's `0xFC` one (`Republish`), never its Raft one.
+            schedulingLeader.LeaderChanged(leaderEndpoint);
+
             // Null when this node runs no scheduler surface, which is a legitimate
-            // shape: a member that contributes CPU and consensus without handing out
-            // anybody's work. It still votes, and its leadership -- if it wins -- is
-            // simply not exercised through a port nobody can reach.
+            // shape: a LEARNER, which applies the fleet's state and may contribute CPU
+            // without handing out anybody's work. It neither votes nor leads, so it has
+            // no role of its own to apply; it only names the leader, above.
             if (schedulerTier != nullptr)
                 schedulerTier->SetRole(role, leaderEndpoint, term);
         },
@@ -1628,8 +1647,9 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
             sharedCache.Applied(state);
         },
         // And how long that state has gone without a leader it counts speaking: past
-        // `LeaderSilenceBound`, every grant is refused (`consensus-leader-silent`).
-        [&roster](Distributed::LeaderReading const& reading) { roster.ConsensusPass(reading); },
+        // `LeaderSilenceBound`, every grant is refused (`consensus-leader-silent`) -- and past the
+        // tier's own election timeout the leader is named to nobody (`SchedulingEndpointToPublish`).
+        LeaderContactObserverFor(roster, schedulingLeader),
         metrics,
         logger,
         conditions,

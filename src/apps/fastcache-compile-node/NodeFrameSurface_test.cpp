@@ -27,6 +27,7 @@
 #include "PrivateTierProfile.hpp"
 #include "Responders.hpp"
 #include "SchedulerTier.hpp"
+#include "SchedulingRedirect.hpp"
 #include "SessionResponder.hpp"
 #include "SharedCacheResponder.hpp"
 #include "WorkerTierTestFixture.hpp"
@@ -35,6 +36,7 @@
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -103,6 +105,7 @@
 #include <tests/SecureRandomFakes.hpp>
 #include <tests/SurfaceOwnerFakes.hpp>
 #include <tests/Unwrap.hpp>
+#include <tests/VerbFamilies.hpp>
 #include <tests/WireReply.hpp>
 
 using namespace FastCache;
@@ -177,6 +180,31 @@ using SurfaceFakes::NamedResponder;
 [[nodiscard]] std::vector<std::byte> AnswerNow(MergedResponder& responder, std::span<std::byte const> frame)
 {
     return core::async::syncRun(responder.Answer(frame, PeerIdentity { .host = "127.0.0.1" })).bytes;
+}
+
+/// What the daemon -- a cache, which schedules and compiles nothing -- answers @p frame with: one
+/// connection, the frame and a half-close, then the one framed reply read as its header declares.
+/// @param frame The request.
+/// @return The reply, header and payload.
+[[nodiscard]] std::vector<std::byte> AskDaemon(std::span<std::byte const> frame)
+{
+    core::platform::ManualClock clock;
+    InMemoryLruStorage storage { 0 };
+    CacheEngine engine { storage, clock };
+    auto const pair = core::net::testing::InMemorySocketPair::create();
+    CompileCacheHandler daemon;
+    REQUIRE(core::async::syncRun(core::net::sendAll(pair.client.get(), frame)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+    core::async::syncRun(daemon.Run(pair.server.get(), &engine, {}, SessionContext {}));
+    auto const head = core::async::syncRun(core::net::receiveExactly(pair.client.get(), Wire::ReplyHeaderSize));
+    REQUIRE(head.has_value());
+    auto const header = Wire::DecodeReplyHeader(Unwrap(head));
+    REQUIRE(header.has_value());
+    auto const payload = core::async::syncRun(core::net::receiveExactly(pair.client.get(), Unwrap(header).payloadLength));
+    REQUIRE(payload.has_value());
+    auto reply = Unwrap(head);
+    reply.insert(reply.end(), Unwrap(payload).begin(), Unwrap(payload).end());
+    return reply;
 }
 
 /// A config naming a free loopback port, and that port.
@@ -449,24 +477,7 @@ TEST_CASE("The daemon and a node running no worker refuse a cordon with one code
     auto const cordon = Wire::EncodeCordonRequest(Wire::CordonAction::Cordon);
 
     // The daemon, which is a cache.
-    core::platform::ManualClock clock;
-    InMemoryLruStorage storage { 0 };
-    CacheEngine engine { storage, clock };
-    auto const pair = core::net::testing::InMemorySocketPair::create();
-    CompileCacheHandler daemon;
-    REQUIRE(core::async::syncRun(core::net::sendAll(pair.client.get(), cordon)));
-    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
-    core::async::syncRun(daemon.Run(pair.server.get(), &engine, {}, SessionContext {}));
-    // One framed reply, read as the header declares it: the header, then its payload.
-    auto const daemonHead = core::async::syncRun(core::net::receiveExactly(pair.client.get(), Wire::ReplyHeaderSize));
-    REQUIRE(daemonHead.has_value());
-    auto const daemonHeader = Wire::DecodeReplyHeader(Unwrap(daemonHead));
-    REQUIRE(daemonHeader.has_value());
-    auto const daemonPayload =
-        core::async::syncRun(core::net::receiveExactly(pair.client.get(), Unwrap(daemonHeader).payloadLength));
-    REQUIRE(daemonPayload.has_value());
-    auto daemonReply = Unwrap(daemonHead);
-    daemonReply.insert(daemonReply.end(), Unwrap(daemonPayload).begin(), Unwrap(daemonPayload).end());
+    auto const daemonReply = AskDaemon(cordon);
 
     // A node started with `--slots=0`, which builds no compile component.
     NamedResponder cache { "cache" };
@@ -484,6 +495,35 @@ TEST_CASE("The daemon and a node running no worker refuse a cordon with one code
     CHECK(MessageOf(daemonReply).starts_with(Wire::NoCompileWorker::Stem));
     CHECK(MessageOf(nodeReply).starts_with(Wire::NoCompileWorker::Stem));
     CHECK(MessageOf(daemonReply) != MessageOf(nodeReply));
+}
+
+TEST_CASE("The daemon and a node running no consensus refuse each scheduling verb with one code",
+          "[node][merged-responder][scheduling-redirect]")
+{
+    // #1639: one condition is one code on both binaries, enforced across them rather than restated in
+    // each. Neither endpoint schedules, so a client asking either for capacity is told
+    // `DispatchNotPermitted` and one asking about a cluster `NoCluster`, by both. Asked of the SURFACES
+    // on the wire, as the cordon case above asks them, so a row moved on either side is red here.
+    MergedResponder node { SurfaceComponents {} };
+    auto const verbs = Testing::OpsOfFamily(Wire::VerbFamily::Scheduler);
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::Lease, &Wire::OpDescriptor::code));
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::ClusterStatus, &Wire::OpDescriptor::code));
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::NodeAnnounce, &Wire::OpDescriptor::code));
+    for (auto const& verb: verbs)
+    {
+        INFO("verb " << verb.name);
+        auto const frame = HeaderFor(verb.code);
+        auto const daemonCode = ErrorOf(AskDaemon(frame));
+        auto const nodeCode = ErrorOf(AnswerNow(node, frame));
+        REQUIRE(daemonCode.has_value());
+        REQUIRE(nodeCode.has_value());
+
+        // NODE-ANNOUNCE included: the daemon has no `RelocatedVerbs` row for it, and reaches the SAME code
+        // through `RefusalFor`'s fallback (`DispatchNotPermitted`, with no sentence). NODE-ANNOUNCE sits
+        // with the capacity verbs on the node because it registers presence with a scheduler, so the
+        // codes agree on it too. What differs is the words, which this case does not compare.
+        CHECK(daemonCode == nodeCode);
+    }
 }
 
 TEST_CASE("An unowned verb is refused before its payload is read", "[node][merged-responder]")
@@ -1408,6 +1448,7 @@ TEST_CASE("The surface main composes routes each family to the component it was 
     auto const components = ComposeSurfaceComponents(nullptr,
                                                      nullptr,
                                                      nullptr,
+                                                     nullptr,
                                                      every.node,
                                                      std::unexpected { EnrollmentAbsence::NoConsensus },
                                                      every.live,
@@ -1439,6 +1480,151 @@ TEST_CASE("The surface main composes routes each family to the component it was 
     {
         INFO("family " << static_cast<int>(row.family));
         CHECK(FamilyOwner(components, row.family) == row.owner);
+    }
+}
+
+TEST_CASE("The surface main composes sends a learner's scheduling verbs to the redirect, and a scheduler's to it",
+          "[node][node-surface][scheduling-redirect]")
+{
+    // #1639 at the composition: a node running consensus and no scheduler hands `main`'s one
+    // composition the redirect, and its scheduling verbs are answered by it -- never refused as a
+    // family served nowhere. A scheduler, where there is one, outranks it: a leader answering
+    // `NotLeader` naming itself would send every launcher round a loop.
+    NodeIoLoop io;
+    AtomicMetricsSink metrics;
+    auto const cfg = BaseConfig().first;
+    FixedFleetSummary const answered { Wire::FleetSummary { .clusterId = "c-office", .nodeId = "n-office" } };
+    auto const identity = Testing::TestKeyPair("n-office");
+    FleetSummaryResponder formation { answered, identity };
+    EveryNodeResponders every { cfg, io, metrics };
+    KnownSchedulingLeader leader;
+    SchedulingRedirectResponder redirect { every.membership, leader };
+
+    SECTION("no scheduler: the redirect owns the family")
+    {
+        auto const components = ComposeSurfaceComponents(nullptr,
+                                                         nullptr,
+                                                         &redirect,
+                                                         nullptr,
+                                                         every.node,
+                                                         std::unexpected { EnrollmentAbsence::NoConsensus },
+                                                         every.live,
+                                                         every.fleet,
+                                                         nullptr,
+                                                         &formation,
+                                                         every.session,
+                                                         every.sharedCache);
+        CHECK(FamilyOwner(components, Wire::VerbFamily::Scheduler) == &redirect);
+        // And it owns nothing else: a redirect placed in another family's slot would answer
+        // `NotLeader` to verbs this node serves itself.
+        for (auto const family: Enumerators<Wire::VerbFamily>())
+        {
+            INFO("family " << static_cast<int>(family));
+            if (family != Wire::VerbFamily::Scheduler)
+                CHECK(FamilyOwner(components, family) != &redirect);
+        }
+    }
+
+    SECTION("a scheduler and a redirect: the scheduler owns the family")
+    {
+        WorkerTierTesting::WorkerTierFixture fix;
+        auto schedulerCfg = Testing::FirstStart(NodeConfig {});
+        schedulerCfg.nodeId = "n1";
+        schedulerCfg.raftListen = "127.0.0.1:6680";
+        core::platform::ManualWallClock wallClock;
+        std::optional<Ed25519KeyPair> const identityKey { Testing::TestKeyPair("n1") };
+        NodeConditions conditions;
+        auto scheduler = SchedulerTier::Start(schedulerCfg,
+                                              fix.membership,
+                                              fix.clock,
+                                              wallClock,
+                                              fix.metrics,
+                                              fix.logger,
+                                              identityKey,
+                                              conditions,
+                                              std::chrono::hours { 24 });
+        REQUIRE(scheduler.has_value());
+        REQUIRE(*scheduler != nullptr);
+
+        auto const components = ComposeSurfaceComponents(nullptr,
+                                                         scheduler->get(),
+                                                         &redirect,
+                                                         nullptr,
+                                                         every.node,
+                                                         std::unexpected { EnrollmentAbsence::NoConsensus },
+                                                         every.live,
+                                                         every.fleet,
+                                                         nullptr,
+                                                         &formation,
+                                                         every.session,
+                                                         every.sharedCache);
+        IFrameResponder const* const schedulerResponder = &(*scheduler)->Responder();
+        CHECK(FamilyOwner(components, Wire::VerbFamily::Scheduler) == schedulerResponder);
+        CHECK(FamilyOwner(components, Wire::VerbFamily::Scheduler) != &redirect);
+    }
+}
+
+TEST_CASE("A node running neither a scheduler nor consensus refuses each scheduling verb as the daemon does, on both routes",
+          "[node][node-surface][scheduling-redirect]")
+{
+    // The composition handed neither owner -- a node running no consensus -- leaves the family
+    // unserved, and the router answers it VERB by verb as the daemon's `RelocatedVerbs` does: a
+    // capacity verb `DispatchNotPermitted` (*a scheduler elsewhere hands out capacity*), a cluster
+    // verb `NoCluster` (*there is no replicated state here*). One condition, one code on both binaries.
+    // **The assertion that neither is `UnimplementedVerb` is the one that means most**: a client told
+    // that reports *this node's build is too old* about a node that is current.
+    NodeIoLoop io;
+    AtomicMetricsSink metrics;
+    auto const cfg = BaseConfig().first;
+    FixedFleetSummary const answered { Wire::FleetSummary { .clusterId = "c-office", .nodeId = "n-office" } };
+    auto const identity = Testing::TestKeyPair("n-office");
+    FleetSummaryResponder formation { answered, identity };
+    EveryNodeResponders every { cfg, io, metrics };
+    MergedResponder merged { ComposeSurfaceComponents(nullptr,
+                                                      nullptr,
+                                                      nullptr,
+                                                      nullptr,
+                                                      every.node,
+                                                      std::unexpected { EnrollmentAbsence::NoConsensus },
+                                                      every.live,
+                                                      every.fleet,
+                                                      nullptr,
+                                                      &formation,
+                                                      every.session,
+                                                      every.sharedCache) };
+
+    // Stated here rather than read from the table under test: which verbs ask for capacity.
+    constexpr auto CapacityVerbs = std::array { Wire::Op::Register, Wire::Op::Heartbeat, Wire::Op::Withdraw,
+                                                Wire::Op::Lease,    Wire::Op::Release,   Wire::Op::NodeAnnounce };
+    auto const verbs = Testing::OpsOfFamily(Wire::VerbFamily::Scheduler);
+    // Both answers are in the sweep, or a sweep missing either half proves nothing about it.
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::Lease, &Wire::OpDescriptor::code));
+    REQUIRE(std::ranges::contains(verbs, Wire::Op::ClusterStatus, &Wire::OpDescriptor::code));
+    REQUIRE(std::ranges::all_of(
+        CapacityVerbs, [&verbs](Wire::Op const op) { return std::ranges::contains(verbs, op, &Wire::OpDescriptor::code); }));
+    auto const peer = PeerIdentity { .host = "127.0.0.1" };
+    for (auto const& verb: verbs)
+    {
+        INFO("verb " << verb.name);
+        auto const expected = std::ranges::contains(CapacityVerbs, verb.code) ? Wire::ErrorCode::DispatchNotPermitted
+                                                                              : Wire::ErrorCode::NoCluster;
+        auto const opRaw = static_cast<std::uint8_t>(verb.code);
+        CHECK(merged.OwnerOf(opRaw) == nullptr);
+
+        auto const atTheDoor = merged.RefusePeer(peer, opRaw);
+        REQUIRE(atTheDoor.has_value());
+        CHECK(ErrorOf(Unwrap(atTheDoor)) == expected);
+        CHECK(ErrorOf(Unwrap(atTheDoor)) != Wire::UnimplementedVerb);
+
+        auto const answeredFrame =
+            core::async::syncRun(merged.Answer(Wire::Detail::EncodeRequest(Wire::CurrentVersion, verb.code, {}), peer))
+                .bytes;
+        CHECK(ErrorOf(answeredFrame) == expected);
+        CHECK(ErrorOf(answeredFrame) != Wire::UnimplementedVerb);
+        // Whoever sent it is told where to go: a node that runs consensus, never one knob alone.
+        auto const decoded = Wire::DecodeErrorPayload(Testing::PayloadOf(answeredFrame));
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).second.contains("a node that runs consensus"));
     }
 }
 
@@ -1508,6 +1694,9 @@ TEST_CASE("With every component present, the surface main composes routes each f
 
     auto const components = ComposeSurfaceComponents(cache->get(),
                                                      scheduler->get(),
+                                                     // A scheduler and a redirect at once is no node `main` builds;
+                                                     // which one wins is the redirect case's to assert.
+                                                     nullptr,
                                                      worker->get(),
                                                      every.node,
                                                      &enrollment,
@@ -1572,6 +1761,7 @@ TEST_CASE("A node's port answers FLEET-SUMMARY over the probe's own nonce and on
     auto surface = StartNodeSurfaceOrExplain(io,
                                              cfg,
                                              ComposeSurfaceComponents(nullptr,
+                                                                      nullptr,
                                                                       nullptr,
                                                                       nullptr,
                                                                       every.node,

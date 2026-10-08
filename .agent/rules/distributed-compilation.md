@@ -2045,6 +2045,43 @@ symptom was that they were slow.
   resolves nothing, and the key stays marked in flight on the machine that actually holds
   it for the whole lease timeout. That is the `already-in-flight` outage #212 records,
   reached from the client's side.
+- **A LEARNER answers the scheduling verbs with that redirect, so this machine's own node is a
+  scheduler to name** ([#1639](https://github.com/LASTRADA-Software/fastcached/issues/1639)).
+  A node that runs consensus and serves no scheduler (`Node::RedirectsScheduling`,
+  `RunsConsensus && !ServesScheduler`) knows where the leader is and used to answer every
+  scheduling verb `UnimplementedVerb` instead, which a launcher reads as *this build is too old*
+  — so `FASTCACHE_SCHEDULER=127.0.0.1:6674`, the one value right on every PC whoever leads,
+  dispatched nothing. `SchedulingRedirectResponder` now answers them as a follower scheduler
+  does, and each half of its answer is a rule:
+  - **Admission FIRST**, through the scheduler's own fold (`Distributed::CallerContextOf`): a
+    caller the node does not admit is answered `NotAMember` naming nobody and never learns where
+    the leader is. No identity check (`ProvenNodeOnly`) is applied here; the leader applies it to
+    the redirected request, so the learner is not a second, stricter door.
+  - **The endpoint is the leader's `0xFC` one, from the applied member record**
+    (`ClusterState::SchedulerEndpointOf`), never its Raft endpoint, read through
+    `ISchedulingLeaderSource` rather than a reach into the consensus tier.
+  - **A silent leader is named by NOBODY once its silence passes the tier's own Raft
+    `electionTimeoutMax`** — 300 ms today, judged once per 1 s reconcile pass, so the effective
+    bound is up to one pass longer. That is the moment a follower VOTER would stop naming it,
+    which a learner, having no election timer, never does by itself; without it a launcher off
+    the VPN pays a connect to an unreachable leader on every miss. Empty is the ordinary
+    election answer: the launcher declines with `NoLeader` and compiles locally. It is NOT
+    `Distributed::LeaderSilenceBound`: the `consensus-leader-silent` condition keeps its own
+    65-minute bound, which answers a different question. One decision,
+    `SchedulingEndpointToPublish`, folds the role observer and the reconcile pass through
+    `SchedulingLeaderPublisher`: the role half is the role observer `StartConsensusOrExplain`
+    hands the tier, the pass half `LeaderContactObserverFor`.
+  - **RELEASE is refused `DispatchNotPermitted`**: it settles a lease with whoever granted it,
+    and a learner granted none, so only a broken client sends one there.
+  - **A node running NO consensus follows no leader**, and answers as the `fastcached` daemon
+    does: the capacity verbs (`Register`, `Heartbeat`, `Withdraw`, `Lease`, `Release`,
+    `NodeAnnounce`) `DispatchNotPermitted`, the cluster verbs `NoCluster` — the daemon reaching
+    `NodeAnnounce`'s code through `RefusalFor`'s fallback. The codes agree on every scheduling
+    verb, and `NodeFrameSurface_test` pins that agreement on the wire; the words are each
+    binary's own.
+  - **Never `UnimplementedVerb`** for a scheduling verb on either kind of node: that code says
+    *upgrade*, and both builds are current. A case asserts its absence beside the positive code,
+    because a positive code alone passes for a row that answers something else.
 - **A fixture with one scheduler cannot fail.** If the first endpoint contacted is
   already the leader, a build that follows no redirect at all passes every assertion. The
   case has to have two, and the assertion is that the SECOND is reached.
@@ -3887,3 +3924,9 @@ half from passing. The in-process fleet asserts it from addresses nobody listed
   it can be spawned and once for its banner, and the first is in a serial loop in
   front of the pool built to hide exactly that. `CompilerBanner` knows both facts
   and reports neither, so two callers reconstruct what it discarded.
+- **[#1641](https://github.com/LASTRADA-Software/fastcached/issues/1641)** — a learner's
+  NODE-STATUS (`fastcache-cli node`) reports no leader endpoint, although the learner knows
+  it: the redirect above names it to every admitted launcher through `ISchedulingLeaderSource`,
+  while NODE-STATUS reads the leader only from `NodeRuntimeSources::scheduler`, which
+  is null on a node that runs no scheduler. So the one surface an operator asks *where is my
+  leader* answers less than the launcher beside it is told.

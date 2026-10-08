@@ -109,10 +109,13 @@ A hit ends the story here. Everything below happens only on a miss.
 
 Only the leader can answer. A follower refuses with `not-leader` and names the
 leader's scheduler address, because a follower's registry holds whatever
-registered against *it*, which is not the fleet.
+registered against *it*, which is not the fleet. A learner, which runs no
+scheduler, answers the same way.
 
-For the client that refusal is ordinary — it compiles locally, exactly as it does
-for every other refusal.
+For the client that refusal is an instruction: it asks the endpoint the refusal
+names, up to two hops. A `not-leader` naming nobody (an election in progress, or
+a leader gone silent) means a local compile, as every other refusal does, and so
+does one still naming an endpoint after two hops.
 
 ### 3. The leader decides from what heartbeats told it
 
@@ -369,9 +372,9 @@ and the dashboard are off unless configured.
 | Opened by | Answered by | Port | When | Carries |
 |---|---|---|---|---|
 | `fastcache-cc` | a cache — `fastcached` or a node's `--listen-node` | `FASTCACHE_ADDR`, default `127.0.0.1:6674` | once per operation | `FETCH`, `STORE` |
-| `fastcache-cc` | the leader's scheduler | `FASTCACHE_SCHEDULER`, the leader's node port, `:6674` by default | on a cache miss, when dispatch is configured | `LEASE` |
+| `fastcache-cc` | the leader's scheduler, or this PC's own node, which redirects to it unless it leads | `FASTCACHE_SCHEDULER`, the leader's node port or this PC's own, `:6674` by default | on a cache miss, when dispatch is configured | `LEASE` |
 | `fastcache-cc` | the worker named in the grant | whatever that worker advertises, which defaults to its `--listen-node` surface | once per dispatched compile, held for its duration | `COMPILE` |
-| `fastcache-cc` | the leader's scheduler | `:6674` | a **second** connection, on every path out of the compile | `RELEASE` |
+| `fastcache-cc` | the scheduler that granted the lease | `:6674` | a **second** connection, on every path out of the compile | `RELEASE` |
 | a **node** | the leader's scheduler | where its formation record says the fleet's voters answer, `:6674` by default | `REGISTER` once per toolchain, then `HEARTBEAT` every **20 s** | capacity, load, and its closed history buckets — after a handshake proving the node's identity key, with every frame sealed |
 | a node | the shared cache | `--upstream`, `:6674` | once per operation, best-effort | `FETCH`, `STORE` — **the only leg that carries a credential** |
 | a node | a voter | `--listen-raft`, `:6680` by default; a learner listens on none and dials every voter, and both ends speak on that one connection | long-lived; the leader speaks every **50 ms** | consensus, after a handshake proving each end's identity key, with every frame tagged. Its own framing, not the cache protocol |

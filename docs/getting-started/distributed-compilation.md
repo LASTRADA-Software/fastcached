@@ -447,7 +447,10 @@ dispatched anyway. The `FASTCACHE_ADDR=` opt-out above is different, and turns
 both off — it is how a build says it wants no launcher at all.
 
 `FASTCACHE_SCHEDULER` is the **scheduler**, which is the `--listen-node` port of
-some node that serves it. Unset it and every miss compiles
+some node that serves it. Once this machine runs a node that has joined the fleet,
+`127.0.0.1:6674` — this machine's own node — is the value to use: a node that runs
+no scheduler answers with the leader's address, and the launcher follows it there,
+wherever the leader moves. Unset it and every miss compiles
 locally again — the behaviour without this feature, and the way to turn it off
 for one build.
 

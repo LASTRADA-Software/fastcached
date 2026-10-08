@@ -70,11 +70,17 @@ endif()
 #
 # <match> is a regular expression over execute_process's RESULT_VARIABLE: an exit status
 # when git ran to completion, and CMake's own words for how it ended otherwise. Those words,
-# measured on CMake 4.2 (Linux) and 4.3.1 (Windows):
+# measured on CMake 4.2 (Linux) and 4.3.1 (Windows), and on 3.28.3 (Linux) where it differs:
 #
 #   a timeout          "Process terminated due to timeout", on both
 #   git did not start  "no such file or directory" and "permission denied" (libuv's spawn
-#                      errors, on both); "unknown error" (Windows, a file that is no image)
+#                      errors, on both); "unknown error" (Windows, a file that is no image).
+#                      CMake 3.28.3 capitalises the first letter: "No such file or
+#                      directory" (a missing file) and "Permission denied" (a file that
+#                      is not executable, or a directory). MATCHES is case-sensitive, so
+#                      `unrunnable` takes that letter in either case (#1642). `[Uu]` is
+#                      by analogy only: "unknown error" is a Windows word, and no Windows
+#                      CMake 3.28 was measured
 #   git died, Linux    SIGKILL "Subprocess killed", SIGSEGV "Segmentation fault",
 #                      SIGTERM "Subprocess terminated", SIGABRT "Subprocess aborted"
 #   git died, Windows  0xC0000005 "Access violation", 0xC000013A "User interrupt",
@@ -98,7 +104,7 @@ endif()
 set(FastCachedGitNonAnswers
     "failed | failed | ^[0-9]+$ | failed `@QUERY@` (exit @RESULT@) | run the quoted git command in the source tree to see why it failed"
     "timeout | unanswered | due to timeout$ | did not answer `@QUERY@` within @BOUND@ s (@RESULT@) | re-run cmake once git answers. A work tree that Windows git and WSL git both use re-hashes every tracked file on each switch, see .agent/rules/build-and-toolchain.md"
-    "unrunnable | unanswered | ^(no such file or directory|permission denied|unknown error)$ | could not run `@QUERY@` (@RESULT@, GIT_EXECUTABLE is @GIT@) | check GIT_EXECUTABLE: a cached path to a git that has since moved or gone is the usual cause"
+    "unrunnable | unanswered | ^([Nn]o such file or directory|[Pp]ermission denied|[Uu]nknown error)$ | could not run `@QUERY@` (@RESULT@, GIT_EXECUTABLE is @GIT@) | check GIT_EXECUTABLE: a cached path to a git that has since moved or gone is the usual cause"
     "died | unanswered | . | ended `@QUERY@` without an answer (@RESULT@) | run the quoted git command in the source tree. The words in parentheses are CMake's for how it ended: a crash or a signal, or a way of failing to start that the unrunnable row does not name yet"
 )
 
@@ -120,6 +126,27 @@ function(FastCachedGitNonAnswerFields Row Prefix)
         set(${Prefix}${name} "${value}" PARENT_SCOPE)
         math(EXPR index "${index} + 1")
     endforeach()
+endfunction()
+
+## The FastCachedGitNonAnswers row a RESULT_VARIABLE other than "0" belongs to.
+## @param Result The RESULT_VARIABLE.
+## @param Prefix Receives the winning row's fields, named as FastCachedGitNonAnswerFields names
+##        them, in the caller's scope.
+# The first row whose <match> the result satisfies wins: an exit status is git saying no, and
+# anything else is CMake's words for a git that did not finish, told apart because their
+# remedies are on different machines. A function of its own so a check can hand it the words
+# of a CMake it is not running on (scripts/check-version-git-unanswered.cmake).
+function(FastCachedGitNonAnswerOf Result Prefix)
+    foreach(row IN LISTS FastCachedGitNonAnswers)
+        FastCachedGitNonAnswerFields("${row}" row)
+        if(Result MATCHES "${rowMatch}")
+            foreach(name IN ITEMS Kind Outcome Match Happened Advice)
+                set(${Prefix}${name} "${row${name}}" PARENT_SCOPE)
+            endforeach()
+            return()
+        endif()
+    endforeach()
+    message(FATAL_ERROR "FastCachedGitNonAnswers has no row for `${Result}`: its last row must match anything")
 endfunction()
 
 # git, located once. find_program and not find_package(Git): this module is
@@ -227,21 +254,10 @@ function(FastCachedRunGit OutputVar OutcomeVar)
         return()
     endif()
 
-    # The first row whose <match> the result satisfies says what happened: an exit
-    # status is git saying no, and anything else is CMake's words for a git that did
-    # not finish, told apart because their remedies are on different machines.
-    set(kind "")
-    foreach(row IN LISTS FastCachedGitNonAnswers)
-        FastCachedGitNonAnswerFields("${row}" row)
-        if(kind STREQUAL "" AND commandResult MATCHES "${rowMatch}")
-            set(kind "${rowKind}")
-            set(outcome "${rowOutcome}")
-            set(happened "${rowHappened}")
-        endif()
-    endforeach()
-    if(kind STREQUAL "")
-        message(FATAL_ERROR "FastCachedGitNonAnswers has no row for `${commandResult}`: its last row must match anything")
-    endif()
+    FastCachedGitNonAnswerOf("${commandResult}" row)
+    set(kind "${rowKind}")
+    set(outcome "${rowOutcome}")
+    set(happened "${rowHappened}")
     set(${OutcomeVar} "${outcome}" PARENT_SCOPE)
     if(outcome STREQUAL "failed" AND git_ANSWER_ON_FAILURE)
         return()

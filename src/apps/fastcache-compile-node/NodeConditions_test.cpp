@@ -409,7 +409,9 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
         FastCache::Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [&roster](Cluster::ClusterState const& state) { (*roster)->Applied(state); },
-        [&roster](Distributed::LeaderReading const& reading) { (*roster)->ConsensusPass(reading); },
+        [&roster](Distributed::LeaderReading const& reading, std::chrono::milliseconds) {
+            (*roster)->ConsensusPass(reading);
+        },
         metrics,
         logger,
         &conditions,

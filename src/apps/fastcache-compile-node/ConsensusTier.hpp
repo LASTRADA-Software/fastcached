@@ -65,6 +65,8 @@
 namespace FastCache::Node
 {
 
+class SchedulingLeaderPublisher;
+
 /// Why a consensus tier cannot start without this node's id.
 ///
 /// Every Raft message is addressed by member id, so a node with none could never be voted for.
@@ -432,7 +434,12 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// Told, at every reconcile pass, who leads and how long ago it last spoke (`LeaderReadingOf`)
     /// -- raw, for the roster to judge against the configuration it APPLIED, and an age, for the
     /// roster to measure on its own clock. Called on the reconciler thread: it records and returns.
-    using LeaderContactObserver = std::function<void(Distributed::LeaderReading const& reading)>;
+    ///
+    /// Handed the election timeout's upper bound of the `RaftConfig` this tier runs with, beside the
+    /// reading: the point at which a follower voter would stop naming a silent leader, which is what
+    /// a learner -- which has no election timer of its own -- redirects by (#1639).
+    using LeaderContactObserver =
+        std::function<void(Distributed::LeaderReading const& reading, std::chrono::milliseconds electionTimeoutMax)>;
 
     /// Start consensus, or explain why the node must not start.
     /// @param cfg The parsed configuration.
@@ -826,6 +833,10 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// The last index the log held when the driver was built: what this node recovered, and what its
     /// applied state must reach before an absent key means an absent member (`CurrentAppliedState`).
     Consensus::LogIndex _recoveredLastIndex {};
+    /// The election timeout's upper bound in the `RaftConfig` this tier's node runs with: what every
+    /// leader-contact reading is handed, so an observer judges silence against the timing consensus
+    /// itself uses rather than a copy of it. Set before either loop starts.
+    std::chrono::milliseconds _electionTimeoutMax {};
     std::unique_ptr<core::net::IListener> _listener;
     std::unique_ptr<Consensus::IRaftMessageSink> _sink;
     core::net::AcceptLoopHealth _acceptLoops; ///< Declared before the server that reports to it.
@@ -1045,6 +1056,19 @@ struct SharedCacheListeners
     }
 };
 
+/// What every reconcile pass tells: the roster, which bounds the grants this node's worker honours by
+/// how long a counted leader has been silent (`consensus-leader-silent`), and the publisher, which
+/// stops naming a leader silent past the tier's own election timeout (#1639).
+///
+/// A named function rather than a lambda inside `StartConsensusOrExplain`, so the wiring is a unit
+/// a test calls: a pass that told the roster and not the publisher would leave a learner naming a
+/// silent leader forever, and nothing else would go red.
+/// @param roster Told every reading; must outlive the observer.
+/// @param schedulingLeader Told every reading and the bound it is judged by; must outlive the observer.
+/// @return The observer `ConsensusTier::Start` takes.
+[[nodiscard]] ConsensusTier::LeaderContactObserver LeaderContactObserverFor(NodeRoster& roster,
+                                                                            SchedulingLeaderPublisher& schedulingLeader);
+
 /// Start consensus when the operator configured a cluster, wiring it to the node.
 ///
 /// A function rather than four lines in `WorkerBody`, for the reason
@@ -1069,6 +1093,10 @@ struct SharedCacheListeners
 /// @param schedulers Told every applied state: where this node's worker and presence loop register
 ///        next, so a voter that moved its `0xFC` endpoint is reached without a reform. Must outlive
 ///        the tier.
+/// @param schedulingLeader Told who leads at every role change and how long it has been silent at
+///        every pass, on every node that runs consensus whether or not it schedules: what a node
+///        running no scheduler redirects a launcher's scheduling verbs to (#1639). Must outlive
+///        the tier.
 /// @param sharedCache Told every applied state: the directory and the host by reference, since every
 ///        node builds both and a consensus node that told them nothing would neither find nor serve
 ///        the tier the cluster named; the upstream where there is one. Each must outlive the tier.
@@ -1085,6 +1113,7 @@ struct SharedCacheListeners
     NodeMembership& membership,
     NodeRoster& roster,
     AppliedSchedulers& schedulers,
+    SchedulingLeaderPublisher& schedulingLeader,
     SharedCacheListeners sharedCache,
     IMetricsSink& metrics,
     ILogger& logger,

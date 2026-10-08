@@ -4,6 +4,7 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Cluster/Roster.hpp>
+#include <FastCache/Consensus/RaftConfig.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
@@ -18,13 +19,16 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/CompileReplySeal.hpp>
+#include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/ProvenIdentity.hpp>
+#include <FastCache/Server/AdminCredential.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <functional>
 #include <map>
 #include <memory>
@@ -37,21 +41,38 @@
 #include <vector>
 
 #include <CacheProtocol.hpp>
+#include <CompileCorrelation.hpp>
 #include <Dispatch.hpp>
 #include <WorkerProtocol.hpp>
+#include <apps/fastcache-compile-node/ConsensusStanding.hpp>
+#include <apps/fastcache-compile-node/DiscoveryTier.hpp>
 #include <apps/fastcache-compile-node/EndpointDialer.hpp>
+#include <apps/fastcache-compile-node/FleetSummaryResponder.hpp>
+#include <apps/fastcache-compile-node/FleetTextResponder.hpp>
+#include <apps/fastcache-compile-node/FrameEndpoint.hpp>
+#include <apps/fastcache-compile-node/LiveStatsResponder.hpp>
+#include <apps/fastcache-compile-node/MachineStandingTestUtils.hpp>
 #include <apps/fastcache-compile-node/NodeConfig.hpp>
 #include <apps/fastcache-compile-node/NodeFormation.hpp>
+#include <apps/fastcache-compile-node/NodeFrameSurface.hpp>
 #include <apps/fastcache-compile-node/NodeMembership.hpp>
 #include <apps/fastcache-compile-node/NodePresenceTier.hpp>
+#include <apps/fastcache-compile-node/NodeProofResponder.hpp>
 #include <apps/fastcache-compile-node/NodeRoster.hpp>
+#include <apps/fastcache-compile-node/NodeStatusResponder.hpp>
+#include <apps/fastcache-compile-node/Responders.hpp>
 #include <apps/fastcache-compile-node/SchedulerLink.hpp>
+#include <apps/fastcache-compile-node/SchedulingRedirect.hpp>
+#include <apps/fastcache-compile-node/SessionResponder.hpp>
+#include <apps/fastcache-compile-node/SharedCacheResponder.hpp>
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
+#include <core/net/testing/TestLoop.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/ExactAudience.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScriptedSocket.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 /// A notice these cases do not inspect.
@@ -191,11 +212,67 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// It starts as a follower knowing no leader, because that is what a node that
     /// has not yet heard from consensus is. `ElectLeader` is what makes a fleet.
     /// @param endpoint How clients address it, e.g. `"sched-a:6676"`.
+    /// @throws std::runtime_error when a scheduler or a learner is already there: `Answer` would
+    ///         route every request to whichever it asks first, and the other would be unreachable.
     void AddScheduler(std::string endpoint)
     {
+        RefuseTaken(endpoint, "a scheduler");
         auto node = std::make_unique<Node>(*this, std::move(endpoint));
         _nodes.push_back(std::move(node));
         Commit(*_nodes.back());
+    }
+
+    /// Add a LEARNER's `0xFC` surface at @p endpoint: a node running consensus and no scheduler,
+    /// which answers the fleet's scheduling verbs with the leader it follows (#1639).
+    ///
+    /// Composed by production's own `ComposeSurfaceComponents` and routed by production's
+    /// `MergedResponder`, over the owners a built learner has: the `SchedulingRedirectResponder` for the
+    /// `Scheduler` family, and the every-node owners (`NodeStatus`, live stats, fleet text, session,
+    /// the fleet's shared cache), the identity prover a node running consensus serves, and the
+    /// fleet-summary owner its identity key answers with -- each built as `main` builds it, over
+    /// sources nothing attaches -- **except the session owner**, which is not built as `main` builds
+    /// it: it holds no identity key (`SessionKeys {}`), so it mints no ticket where a built learner
+    /// would, and its ticket verifier checks against no roster, under an `ExactAudience` of this
+    /// endpoint. Enrollment is refused for the reason a learner gives
+    /// (`EnrollmentAbsenceOf`). It is a learner running **no cache tier and no worker tier**, the two
+    /// components a configuration may add, so those families are refused as served nowhere. The request
+    /// cap is therefore production's fold -- the shared cache's, the largest -- and not the redirect's
+    /// own 64 KiB. The redirect reads a `KnownSchedulingLeader` that a `SchedulingLeaderPublisher`
+    /// feeds from the role observer's endpoint and every pass's reading, as `ConsensusTier`'s two
+    /// observers do. A request passes production's header gate (`Node::DecideHeaderRefusal`) before
+    /// `Answer`, for the caller `SetCallerHost` and `SetCallerIdentity` describe.
+    ///
+    /// **What a learner endpoint models, and what it does not:**
+    /// - the verbs a LAUNCHER sends it, presenting no credential: the scheduling family, and
+    ///   `MINT-TICKET` to the session component;
+    /// - **no `AUTH`**: an exchange presenting a credential is refused loudly (`Exchange` throws).
+    ///   Production answers `AUTH` in the endpoint's own loop (`AnswerAuth` in `FrameEndpoint.cpp`,
+    ///   private), so modelling it here would be a second copy of that switch -- the copy of endpoint
+    ///   logic this harness exists not to have;
+    /// - **no presence dial**: `Dial` reaches schedulers only, so a learner endpoint is unreachable to
+    ///   a node's presence round;
+    /// - **no worker**: it is no compile port (`LearnerWorker` models a learner's), and no worker
+    ///   may be registered at its endpoint.
+    ///
+    /// **Its own metrics sink** (`RedirectingLearnerMetrics`); see `RedirectingLearner::metrics`.
+    /// @param endpoint How clients address it, e.g. `"learner-c:6674"`.
+    /// @throws std::runtime_error when anything already answers there.
+    void AddRedirectingLearner(std::string endpoint)
+    {
+        RefuseTaken(endpoint, "a learner");
+        if (std::ranges::contains(_workerEndpoints, endpoint))
+            throw std::runtime_error { "FleetHarness: a learner at " + endpoint + " would shadow the worker there" };
+        _redirectingLearners.push_back(
+            std::make_unique<RedirectingLearner>(std::move(endpoint), _clock, _wallClock, _logger));
+        Hear(*_redirectingLearners.back());
+    }
+
+    /// The counters one learner's surface moved; see `AddRedirectingLearner`.
+    /// @param endpoint Which learner; must have been added.
+    /// @return Its sink.
+    [[nodiscard]] AtomicMetricsSink& RedirectingLearnerMetrics(std::string_view endpoint)
+    {
+        return RedirectingLearnerAt(endpoint).metrics;
     }
 
     /// Make @p endpoint the leader and every other scheduler its follower.
@@ -203,6 +280,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// One call, both halves: a test that set only the new leader would leave the
     /// old one still answering as leader, which is a fleet no election produces
     /// and would let a wrong client pass.
+    ///
+    /// Every learner (`AddRedirectingLearner`) hears it too, as its role observer would.
     /// @param endpoint The scheduler that now leads; must have been added.
     void ElectLeader(std::string_view endpoint)
     {
@@ -216,6 +295,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                 node->service.SetRole(Distributed::SchedulerRole::Follower, endpoint, Distributed::StandaloneSchedulerTerm);
             NoteReadings(*node);
         }
+        for (auto const& learner: _redirectingLearners)
+            Hear(*learner);
     }
 
     /// Where every subsequent request appears to come from.
@@ -269,11 +350,14 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// @param workerEndpoint Where the worker answers compiles.
     /// @param fingerprint The toolchain it serves.
     /// @param slots How many jobs it will take at once.
+    /// @throws std::runtime_error when a learner answers there (`AddRedirectingLearner`), which would
+    ///         shadow it.
     void RegisterWorker(std::string_view scheduler,
                         std::string_view workerEndpoint,
                         std::string_view fingerprint,
                         std::uint32_t slots = 1)
     {
+        RefuseWorkerAtLearner(workerEndpoint);
         auto const reply = NodeAt(scheduler).service.Register(
             // `SetupCaller`, never the case's caller: this ARRANGES the fleet and throws when
             // refused, so a case that set a forgotten caller host would fail here during setup
@@ -298,10 +382,13 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// @param advertised What the worker advertises, e.g. `laptop.corp:6677`.
     /// @param fingerprint The toolchain it serves.
     /// @return The id the scheduler assigned.
+    /// @throws std::runtime_error when a learner answers there (`AddRedirectingLearner`), which would
+    ///         shadow it.
     [[nodiscard]] std::string RegisterWorkerNamed(std::string_view scheduler,
                                                   std::string_view advertised,
                                                   std::string_view fingerprint)
     {
+        RefuseWorkerAtLearner(advertised);
         auto const reply = NodeAt(scheduler).service.Register(
             SetupCaller(),
             Distributed::WorkerRegistration {
@@ -417,6 +504,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         // current in production, at a pass rather than at an exchange.
         for (auto const& node: _nodes)
             NoteReadings(*node);
+        for (auto const& learner: _redirectingLearners)
+            Hear(*learner);
     }
 
     /// Run @p hook the next time a compile is sent to a worker.
@@ -456,6 +545,42 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                                  .signature = std::span<std::byte const> { signature } }));
     }
 
+    /// The reply an HONEST worker sends for @p request's job: an object, and the correlation the
+    /// launcher recomputes -- signed under the key the grant names unless @p signer says otherwise --
+    /// so a case asserting `Compiled` asserts the compile was ACCEPTED, not merely that some address
+    /// answered.
+    /// @param request The job the launcher dispatches; only the fields the correlation folds are read.
+    /// @param signer Whose identity key signs it: the registered worker's unless a case is about an
+    ///        impostor; nullopt for a reply nobody signed.
+    /// @return The framed reply.
+    [[nodiscard]] static std::vector<std::byte> CompiledReply(Cc::DispatchRequest const& request,
+                                                              std::optional<std::string> const& signer = std::string {
+                                                                  ProvenMachine })
+    {
+        constexpr std::string_view Object = "OBJ";
+        auto const correlation =
+            Cc::CompileCorrelation(Cc::CorrelatedCompile { .preprocessed = request.preprocessed,
+                                                           .args = request.args,
+                                                           .fingerprint = request.fingerprint,
+                                                           .sourceName = request.sourceName,
+                                                           .compileDir = request.compileDir,
+                                                           .compileDirReplacement = request.compileDirReplacement,
+                                                           .sourceRoot = request.sourceRoot,
+                                                           .sourceRootReplacement = request.sourceRootReplacement });
+        auto const enveloped = CompileCacheWire::EncodeCodecEnvelope(
+            CompileCacheWire::IdentityCodec, static_cast<std::uint32_t>(Object.size()), CompileCacheWire::AsBytes(Object));
+        if (signer.has_value())
+            return SignedWorkerReply(enveloped, correlation, *signer);
+        return CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok,
+                                             CompileCacheWire::EncodeCompileResult(CompileCacheWire::CompileResult {
+                                                 .exitCode = 0,
+                                                 .object = enveloped,
+                                                 .stdoutText = {},
+                                                 .stderrText = {},
+                                                 .correlation = CompileCacheWire::AsBytes(correlation),
+                                                 .signature = {} }));
+    }
+
     /// What a worker endpoint answers a COMPILE with.
     /// @param reply A complete reply frame.
     void SetWorkerReply(std::vector<std::byte> reply)
@@ -484,8 +609,11 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// a different fact from a worker a scheduler may GRANT.
     /// @param address The endpoint.
     /// @param reply What that address answers a COMPILE with.
+    /// @throws std::runtime_error when a learner answers there (`AddRedirectingLearner`), which would
+    ///         shadow it.
     void AddWorkerAddress(std::string address, std::optional<std::vector<std::byte>> reply = std::nullopt)
     {
+        RefuseWorkerAtLearner(address);
         if (reply.has_value())
             _workerReplyAt.insert_or_assign(address, *std::move(reply));
         _workerEndpoints.push_back(std::move(address));
@@ -893,8 +1021,9 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// @param frame The complete request.
     /// @param credential What the client presents: a machine ticket to a scheduler, or to a worker
     ///        address `VerifyTicketsAtWorker` named, is decided by that machine's verifier (see the
-    ///        class comment); anything else is answered `Ok` and admits nothing, as a surface with
-    ///        nothing to verify answers it.
+    ///        class comment); presented to a learner, it is refused by throwing, since a learner
+    ///        endpoint models no `AUTH` (`AddRedirectingLearner`); anything else is answered `Ok` and
+    ///        admits nothing, as a surface with nothing to verify answers it.
     /// @param budget Ignored; nothing here blocks.
     /// @return The outcome, decoded by the launcher's own client code.
     [[nodiscard]] Cc::CacheOutcome Exchange(std::string_view hostPort,
@@ -903,6 +1032,12 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                             Cc::ExchangeBudget budget) override
     {
         (void) budget;
+        // A learner endpoint models no AUTH (see `AddRedirectingLearner`): refused loudly, BEFORE the
+        // call is logged, rather than answered `Ok` by `AnswerAuthenticated`'s fallback, which would
+        // verify nothing in silence.
+        if (credential.Configured() && FindRedirectingLearner(hostPort) != nullptr)
+            throw std::runtime_error { "FleetHarness: a learner endpoint models no AUTH, and " + std::string { hostPort }
+                                       + " was presented a credential" };
         // Logged BEFORE the answer, so the log is in the order requests were SENT --
         // an exchange nested inside this one's compile hook would otherwise appear
         // to have happened first. Its outcome is filled in below, by index rather
@@ -1013,20 +1148,227 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     void Commit(Node& node)
     {
         node.roster.Adopt(node.cluster.state);
-        std::map<std::string, Ed25519PublicKey, std::less<>> live;
-        for (auto const& member: node.cluster.state.members)
-            live.emplace(member.id, member.publicKey);
-        std::vector<Ed25519PublicKey> revoked;
-        revoked.reserve(node.cluster.state.revokedKeys.size());
-        for (auto const& key: node.cluster.state.revokedKeys)
-            revoked.push_back(key.publicKey);
-        node.keys.Publish(std::move(live), std::move(revoked));
+        PublishKeys(node.keys, node.cluster.state);
         if (node.published != nullptr)
             node.published->PublishCluster(node.cluster.state);
         for (auto const& worker: _ticketedWorkers)
             if (worker->stateOf == node.endpoint)
                 AdoptAt(*worker, node);
         NoteReadings(node);
+    }
+
+    /// Publish @p state's live and revoked keys into @p keys, as a node's key roster is published at
+    /// every commit.
+    /// @param keys The roster.
+    /// @param state What the node applied.
+    static void PublishKeys(Distributed::KeyRosterMembership& keys, Cluster::ClusterState const& state)
+    {
+        std::map<std::string, Ed25519PublicKey, std::less<>> live;
+        for (auto const& member: state.members)
+            live.emplace(member.id, member.publicKey);
+        std::vector<Ed25519PublicKey> revoked;
+        revoked.reserve(state.revokedKeys.size());
+        for (auto const& key: state.revokedKeys)
+            revoked.push_back(key.publicKey);
+        keys.Publish(std::move(live), std::move(revoked));
+    }
+
+    /// A learner's `0xFC` surface and everything it owns; see `AddRedirectingLearner`.
+    ///
+    /// Declaration order is construction order, and every member below borrows one above it.
+    struct RedirectingLearner
+    {
+        /// @param at How clients address it, and its node id.
+        /// @param clock The harness's clock, which its shared cache and live-stats loop read.
+        /// @param wallClock The harness's wall clock, which its session component reads.
+        /// @param logger Where its components log.
+        RedirectingLearner(std::string at,
+                           core::platform::ManualClock& clock,
+                           core::platform::ManualWallClock& wallClock,
+                           ILogger& logger):
+            endpoint { std::move(at) },
+            cfg { LearnerConfig(endpoint) },
+            identity { TestKeyPair(endpoint) },
+            loop { clock },
+            liveStats { liveSources, fold, AdminCredential {}, loop, metrics },
+            session { verifier, FastCache::Node::SessionKeys {}, random, wallClock, metrics },
+            sharedCache { cfg, fold, clock, metrics, logger, nullptr, FastCache::Node::ReconcileOn::Caller },
+            nodeProof { cfg.nodeId, identity, fold, consensusStanding, random, metrics, logger },
+            surface { FastCache::Node::ComposeSurfaceComponents(
+                nullptr,
+                nullptr,
+                &redirect,
+                nullptr,
+                nodeStatus,
+                std::unexpected { FastCache::Node::EnrollmentAbsenceOf(cfg, false)
+                                      .value_or(FastCache::Node::EnrollmentAbsence::NoIdentityKey) },
+                liveStats,
+                fleetText,
+                &nodeProof,
+                &formation,
+                session,
+                sharedCache) }
+        {
+        }
+
+        /// A learner's configuration: the mode its formation record holds, and the predicate `main`
+        /// asks before it builds the redirect -- refused here when it would not.
+        /// @param nodeId Its id.
+        /// @return The configuration.
+        /// @throws std::runtime_error when the configuration would not redirect the scheduling verbs.
+        [[nodiscard]] static FastCache::Node::NodeConfig LearnerConfig(std::string const& nodeId)
+        {
+            auto cfg = FastCache::Node::NodeConfig {};
+            cfg.nodeId = nodeId;
+            cfg.formation = FastCache::Node::NodeFormationView {
+                .mode = Cluster::NodeMode::Learner,
+                .clusterId = std::string { ClusterId },
+                .createdAtUnixSeconds = 0,
+                .foundedHere = false,
+                .fleetMembers = {},
+                .fleetSchedulers = {},
+            };
+            if (!FastCache::Node::RedirectsScheduling(cfg))
+                throw std::runtime_error { "FleetHarness: a learner's configuration does not redirect scheduling" };
+            return cfg;
+        }
+
+        std::string endpoint;
+        FastCache::Node::NodeConfig cfg; ///< What `main` would have built it from.
+        Ed25519KeyPair identity;         ///< Its identity key: what its node-proof and formation answers sign.
+        /// Its own sink, standing for the one sink `main` hands every component on a node's surface.
+        ///
+        /// **Every component on this surface that holds a sink is handed THIS one** -- the redirect
+        /// included, should it ever count -- so a case asserting that the learner counted nothing
+        /// reads every counter the surface could move. The redirect, the router and the endpoint's
+        /// header gate count nothing on the scheduling path today.
+        AtomicMetricsSink metrics;
+        /// The fold a node composes when it is not open -- this machine, and a key roster of the
+        /// state it applied (`Hear`) -- so a launcher on the learner's own machine is a member. Every
+        /// component asks it, as every component of a node asks `membership.Oracle()`.
+        Distributed::LoopbackMembership loopback;
+        Distributed::KeyRosterMembership keys;
+        Distributed::AnyOfMembership fold { { &loopback, &keys } };
+        /// What the redirect names, written only through `publisher`.
+        FastCache::Node::KnownSchedulingLeader knownLeader;
+        FastCache::Node::SchedulingLeaderPublisher publisher { knownLeader };
+        FastCache::Node::SchedulingRedirectResponder redirect { fold, knownLeader };
+        /// The every-node owners, built as `main` builds them over a source slot nothing attaches --
+        /// each answers that it has nothing to read. Built for their place on the surface, whose
+        /// request cap is their fold.
+        LiveStatsSourceSlot liveSources;
+        SilentNodeStatus describe;
+        FixedStanding const standing {};
+        FastCache::Node::NodeStatusResponder nodeStatus { describe, liveSources, fold, standing, metrics };
+        /// What the live-stats owner is bound to; never turned, since no case here subscribes.
+        core::net::testing::TestLoop loop;
+        FastCache::Node::LiveStatsResponder liveStats;
+        FastCache::Node::FleetTextResponder fleetText { liveSources, fold, AdminCredential {}, metrics };
+        /// The session owner, over no roster: every ticket it is shown is refused -- counted, on `metrics`.
+        ExactAudience audience { endpoint };
+        Distributed::SpentTickets spent;
+        Distributed::TicketVerifier verifier { nullptr, audience, spent };
+        ScriptedSecureRandom random;
+        FastCache::Node::SessionResponder session;
+        /// The fleet's shared cache every node builds, dormant: nothing names this machine.
+        FastCache::Node::SharedCacheService sharedCache;
+        /// The identity prover a node running consensus serves, over a standing slot nothing attaches.
+        FastCache::Node::ConsensusStandingSlot consensusStanding;
+        FastCache::Node::NodeProofResponder nodeProof;
+        /// What it answers `FLEET-SUMMARY` with, signed under `identity`.
+        FastCache::Node::FixedFleetSummary const summary { CompileCacheWire::FleetSummary {
+            .clusterId = std::string { ClusterId }, .nodeId = endpoint } };
+        FastCache::Node::FleetSummaryResponder formation { summary, identity };
+        /// Production's composition of all of the above, routed by production's router.
+        FastCache::Node::MergedResponder surface;
+    };
+
+    /// What @p learner's consensus tier tells it at a pass: who leads -- the harness's leader, whose
+    /// `0xFC` endpoint is its endpoint here, as a member record's `schedulerEndpoint` is -- and that
+    /// it was heard just now; and the state that leader applied, which its key roster publishes.
+    /// @param learner Which learner.
+    void Hear(RedirectingLearner& learner)
+    {
+        learner.publisher.LeaderChanged(_leader.value_or(std::string {}));
+        learner.publisher.LeaderContact(
+            Distributed::LeaderReading { .leads = false, .leader = _leader, .silentFor = std::chrono::seconds { 0 } },
+            Consensus::RaftConfig {}.electionTimeoutMax);
+        if (_leader.has_value())
+            PublishKeys(learner.keys, NodeAt(*_leader).cluster.state);
+    }
+
+    /// The learner at @p endpoint, or null when none was added there.
+    /// @param endpoint Who to find.
+    /// @return The learner, or null.
+    [[nodiscard]] RedirectingLearner* FindRedirectingLearner(std::string_view endpoint) const
+    {
+        auto const found = std::ranges::find(
+            _redirectingLearners, endpoint, [](auto const& learner) { return std::string_view { learner->endpoint }; });
+        return found != _redirectingLearners.end() ? found->get() : nullptr;
+    }
+
+    /// The learner at @p endpoint.
+    /// @param endpoint Who to find.
+    /// @return The learner.
+    /// @throws std::runtime_error when nothing was added there, for `NodeAt`'s reason.
+    [[nodiscard]] RedirectingLearner& RedirectingLearnerAt(std::string_view endpoint) const
+    {
+        auto* const learner = FindRedirectingLearner(endpoint);
+        if (learner == nullptr)
+            throw std::runtime_error { "FleetHarness: no learner at " + std::string { endpoint } };
+        return *learner;
+    }
+
+    /// What @p learner's surface answers @p frame with, through the gate its endpoint asks of every
+    /// header -- production's `Node::DecideHeaderRefusal`: the surface-wide cap, admission, the
+    /// per-verb ceiling, the in-flight budget -- and `Answer` only for a request it lets through. The
+    /// cap is the surface's own `MaxRequestBytes()`, the fold over every owner composed, which the
+    /// endpoint reads.
+    ///
+    /// The in-flight budget is fixed at 0 rather than read, as `FormationHarness::Gate` fixes it: the
+    /// harness answers one request at a time to completion, so nothing else is ever in flight on this
+    /// surface. The peer carries no authenticated machine because `Exchange` refuses to present a
+    /// credential to a learner (`AddRedirectingLearner`), so no `AUTH` ever established one.
+    /// @param learner Which learner.
+    /// @param frame The request.
+    /// @return The reply; empty, which closes, for a frame with no header.
+    [[nodiscard]] std::vector<std::byte> AnswerAtRedirectingLearner(RedirectingLearner& learner,
+                                                                    std::span<std::byte const> frame)
+    {
+        auto const header = CompileCacheWire::DecodeRequestHeader(frame);
+        if (!header.has_value())
+            return {};
+        auto const peer = ConnectionFacts { .host = _callerHost, .proven = _callerIdentity };
+        auto refusal = FastCache::Node::DecideHeaderRefusal(
+            FastCache::Node::HeaderGate { .responder = learner.surface, .what = "node port", .inFlightBytes = 0 },
+            peer,
+            *header,
+            learner.surface.MaxRequestBytes());
+        if (refusal.has_value())
+            return std::move(refusal->reply);
+        return core::async::syncRun(learner.surface.Answer(frame, peer)).bytes;
+    }
+
+    /// Refuse a second answerer at @p endpoint: a scheduler or a learner already there.
+    /// @param endpoint The endpoint about to be added.
+    /// @param what What is being added, for the message.
+    /// @throws std::runtime_error when one is.
+    void RefuseTaken(std::string_view endpoint, std::string_view what) const
+    {
+        if (FindRedirectingLearner(endpoint) != nullptr
+            || std::ranges::any_of(_nodes, [endpoint](auto const& node) { return node->endpoint == endpoint; }))
+            throw std::runtime_error { std::format(
+                "FleetHarness: {} at {} would share the endpoint with a node already there", what, endpoint) };
+    }
+
+    /// Refuse a worker at a learner's endpoint, which `Answer` would never reach.
+    /// @param endpoint The worker's endpoint.
+    /// @throws std::runtime_error when a learner answers there.
+    void RefuseWorkerAtLearner(std::string_view endpoint) const
+    {
+        if (FindRedirectingLearner(endpoint) != nullptr)
+            throw std::runtime_error { std::format("FleetHarness: a worker at {} would be shadowed by the learner there",
+                                                   endpoint) };
     }
 
     /// One consensus pass's reading on @p node: it leads, or it follows the harness's leader.
@@ -1156,6 +1498,9 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// @return What that endpoint answers.
     [[nodiscard]] std::vector<std::byte> Answer(std::string_view hostPort, std::span<std::byte const> frame)
     {
+        if (auto* const learner = FindRedirectingLearner(hostPort); learner != nullptr)
+            return AnswerAtRedirectingLearner(*learner, frame);
+
         auto const worker = std::ranges::find(_workerEndpoints, hostPort);
         if (worker == _workerEndpoints.end())
         {
@@ -1307,6 +1652,9 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// Who `ElectLeader` made leader, and what every node's consensus pass reports.
     std::optional<std::string> _leader;
     std::vector<std::unique_ptr<Node>> _nodes;
+    /// Every learner surface `AddRedirectingLearner` added, each hearing its leader at every `ElectLeader` and
+    /// `Step`.
+    std::vector<std::unique_ptr<RedirectingLearner>> _redirectingLearners;
     /// Every live `LearnerWorker`, each re-adopting its state at every `Step`. Borrowed: a learner
     /// registers itself and leaves when it is destroyed.
     std::vector<LearnerWorker*> _learners;
