@@ -500,7 +500,8 @@ when it becomes leader, because it is the only one that knows it.
 
 For a client that refusal is an instruction: it asks the endpoint the refusal
 names, up to two hops, and compiles locally when it names nobody or two hops have
-not reached a leader, as it does for any other refusal. For an operator it means two things worth knowing:
+not reached a leader, as it does for any other refusal. For an operator it means
+two things worth knowing:
 
 - **The fleet dashboard follows leadership.** A follower answers `/fleet` with
   `503` naming the leader rather than showing a partial picture — it only knows

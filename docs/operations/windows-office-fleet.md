@@ -345,7 +345,7 @@ Start on the machine whose builds are slow:
 | `fastcache-cli node-conditions` | any machine | every condition with its remedy; exits 1 when none is raised, so a loop over machines can test it |
 | `fastcache-cli fleet members` | A | who the fleet has agreed is a member, from the leader; a node that does not lead says where to ask instead |
 | `fastcache-compile-node --enroll-list` | A | who is waiting, and who an auto-approve window let in |
-| `fastcache-compile-node --cluster-status` | A, or any machine with `--scheduler=office-a.example.com:6674` | what the cluster has agreed, settings included |
+| `fastcache-compile-node --cluster-status` | any machine in the fleet: a PC's own node sends the question on to the leader | what the cluster has agreed, settings included |
 | `fastcache-cli explain-admission <machine>` | A, or any machine with `--addr=office-a.example.com:6674` | why A admits or refuses that machine, naming every route that decided |
 | `fastcache-cc --show-stats` | the PC | this PC's hits, misses, dispatches and every fall-back reason |
 
